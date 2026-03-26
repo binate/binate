@@ -1,10 +1,10 @@
 #!/bin/sh
-# Usage: ./conformance/run.sh bootstrap|selfhost
+# Usage: ./conformance/run.sh bootstrap|selfhost|compiled
 # Runs conformance tests against the specified backend.
 
 MODE="$1"
 if [ -z "$MODE" ]; then
-    echo "Usage: $0 bootstrap|selfhost"
+    echo "Usage: $0 bootstrap|selfhost|compiled"
     exit 1
 fi
 
@@ -32,8 +32,23 @@ for bn in "$SCRIPT_DIR"/*.bn; do
         selfhost)
             actual=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/main.bn" -- "$bn" 2>&1) || true
             ;;
+        compiled)
+            tmpll="/tmp/binate_conform_${name}.ll"
+            tmpbin="/tmp/binate_conform_${name}"
+            actual=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/compile.bn" -- "$bn" > "$tmpll" 2>&1) || true
+            if [ -s "$tmpll" ]; then
+                if clang -w -o "$tmpbin" "$tmpll" "$BINATE_DIR/runtime/binate_runtime.c" 2>/dev/null; then
+                    actual=$("$tmpbin" 2>&1) || true
+                else
+                    actual="COMPILE_ERROR: clang failed"
+                fi
+            else
+                actual="COMPILE_ERROR: no LLVM IR produced: $actual"
+            fi
+            rm -f "$tmpll" "$tmpbin"
+            ;;
         *)
-            echo "Unknown mode: $MODE (use bootstrap or selfhost)"
+            echo "Unknown mode: $MODE (use bootstrap|selfhost|compiled)"
             exit 1
             ;;
     esac

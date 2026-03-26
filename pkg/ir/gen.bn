@@ -1,0 +1,755 @@
+package "pkg/ir"
+
+import "pkg/ast"
+import "pkg/types"
+import "pkg/token"
+
+// ============================================================
+// IR Generation: AST → IR Module
+//
+// Currently supports: function declarations, println/print of
+// string/int/bool literals, return statements, integer arithmetic,
+// variable declarations, assignments, if/else, for loops.
+// ============================================================
+
+// GenModule generates an IR module from a parsed and type-checked file.
+func GenModule(file @ast.File) @Module {
+	var m @Module = NewModule(file.PkgName)
+
+	// First pass: register all functions
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if d.Kind == ast.DECL_FUNC {
+			var f @Func = genFunc(d)
+			AddFunc(m, f)
+		}
+	}
+
+	return m
+}
+
+// ============================================================
+// Function generation
+// ============================================================
+
+func genFunc(d @ast.Decl) @Func {
+	// Build params
+	var params []@Param
+	var f @Func = NewFunc(d.Name, nil, nil)
+
+	if d.Params != nil {
+		for i := 0; i < len(d.Params); i++ {
+			var pd @ast.ParamDecl = d.Params[i]
+			var pt @types.Type = resolveTypeExpr(pd.Type)
+			var p @Param = NewParam(f, pd.Name, pt)
+			params = append(params, p)
+		}
+		f.Params = params
+	}
+
+	// Build results
+	if d.Results != nil {
+		var results []@types.Type
+		for i := 0; i < len(d.Results); i++ {
+			results = append(results, resolveTypeExpr(d.Results[i]))
+		}
+		f.Results = results
+	}
+
+	// Generate body
+	if d.Body != nil {
+		var entry @Block = AddBlock(f, "entry")
+
+		// Allocate stack slots for parameters
+		var paramSlots []@Instr
+		for i := 0; i < len(f.Params); i++ {
+			var slot @Instr = EmitAlloc(f, entry, f.Params[i].Typ)
+			// Store param value into slot
+			// We emit a placeholder — the param reference is by ID
+			var paramRef @Instr = make(Instr)
+			paramRef.ID = f.Params[i].ID
+			paramRef.Typ = f.Params[i].Typ
+			paramRef.Op = OP_CONST_INT // placeholder; LLVM emitter uses ID
+			EmitStore(entry, slot, paramRef)
+			paramSlots = append(paramSlots, slot)
+		}
+
+		var ctx @GenContext = make(GenContext)
+		ctx.Func = f
+		ctx.ParamSlots = paramSlots
+
+		// Register params as named variables
+		for i := 0; i < len(f.Params); i++ {
+			defineVar(ctx, f.Params[i].Name, paramSlots[i], f.Params[i].Typ)
+		}
+
+		genBlock(ctx, entry, d.Body)
+
+		// If block isn't terminated, add void return
+		if len(entry.Instrs) == 0 || !IsTerminator(entry.Instrs[len(entry.Instrs)-1]) {
+			EmitReturn(entry, nil)
+		}
+		// Also check all blocks
+		for i := 0; i < len(f.Blocks); i++ {
+			var blk @Block = f.Blocks[i]
+			if len(blk.Instrs) == 0 || !IsTerminator(blk.Instrs[len(blk.Instrs)-1]) {
+				EmitReturn(blk, nil)
+			}
+		}
+	}
+
+	return f
+}
+
+// GenContext holds state during IR generation for one function.
+type GenContext struct {
+	Func       @Func
+	Vars       []VarSlot       // named variable → alloca'd pointer
+	ParamSlots []@Instr        // param index → alloca'd pointer
+	BreakTo    @Block          // current break target
+	ContinueTo @Block          // current continue target
+}
+
+type VarSlot struct {
+	Name []char
+	Ptr  @Instr
+	Typ  @types.Type
+}
+
+func lookupVar(ctx @GenContext, name []char) @Instr {
+	// Search backwards for most recent definition (shadowing)
+	for i := len(ctx.Vars) - 1; i >= 0; i-- {
+		if streq(ctx.Vars[i].Name, name) {
+			return ctx.Vars[i].Ptr
+		}
+	}
+	return nil
+}
+
+func lookupVarType(ctx @GenContext, name []char) @types.Type {
+	for i := len(ctx.Vars) - 1; i >= 0; i-- {
+		if streq(ctx.Vars[i].Name, name) {
+			return ctx.Vars[i].Typ
+		}
+	}
+	return nil
+}
+
+func defineVar(ctx @GenContext, name []char, ptr @Instr, typ @types.Type) {
+	var slot VarSlot
+	slot.Name = name
+	slot.Ptr = ptr
+	slot.Typ = typ
+	ctx.Vars = append(ctx.Vars, slot)
+}
+
+// ============================================================
+// Statement generation
+// ============================================================
+
+func genBlock(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	if stmt.Kind == ast.STMT_BLOCK {
+		var cur @Block = b
+		for i := 0; i < len(stmt.Stmts); i++ {
+			cur = genStmt(ctx, cur, stmt.Stmts[i])
+			// If block is terminated, stop
+			if len(cur.Instrs) > 0 && IsTerminator(cur.Instrs[len(cur.Instrs)-1]) {
+				return cur
+			}
+		}
+		return cur
+	}
+	return genStmt(ctx, b, stmt)
+}
+
+func genStmt(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	if stmt.Kind == ast.STMT_EXPR {
+		genExpr(ctx, b, stmt.X)
+		return b
+	}
+
+	if stmt.Kind == ast.STMT_RETURN {
+		if stmt.Exprs != nil && len(stmt.Exprs) > 0 {
+			var vals []@Instr
+			for i := 0; i < len(stmt.Exprs); i++ {
+				vals = append(vals, genExpr(ctx, b, stmt.Exprs[i]))
+			}
+			EmitReturn(b, vals)
+		} else {
+			EmitReturn(b, nil)
+		}
+		return b
+	}
+
+	if stmt.Kind == ast.STMT_DECL {
+		genDecl(ctx, b, stmt.DeclRef)
+		return b
+	}
+
+	if stmt.Kind == ast.STMT_ASSIGN {
+		return genAssign(ctx, b, stmt)
+	}
+
+	if stmt.Kind == ast.STMT_SHORT_VAR {
+		return genShortVar(ctx, b, stmt)
+	}
+
+	if stmt.Kind == ast.STMT_IF {
+		return genIf(ctx, b, stmt)
+	}
+
+	if stmt.Kind == ast.STMT_FOR {
+		return genFor(ctx, b, stmt)
+	}
+
+	if stmt.Kind == ast.STMT_INC_DEC {
+		return genIncDec(ctx, b, stmt)
+	}
+
+	if stmt.Kind == ast.STMT_BREAK {
+		if ctx.BreakTo != nil {
+			EmitJump(b, ctx.BreakTo)
+		}
+		return b
+	}
+
+	if stmt.Kind == ast.STMT_CONTINUE {
+		if ctx.ContinueTo != nil {
+			EmitJump(b, ctx.ContinueTo)
+		}
+		return b
+	}
+
+	if stmt.Kind == ast.STMT_EMPTY {
+		return b
+	}
+
+	if stmt.Kind == ast.STMT_BLOCK {
+		return genBlock(ctx, b, stmt)
+	}
+
+	// Unsupported statement — skip
+	return b
+}
+
+func genDecl(ctx @GenContext, b @Block, d @ast.Decl) {
+	if d.Kind == ast.DECL_VAR {
+		var typ @types.Type = types.TypInt() // default
+		if d.TypeRef != nil {
+			typ = resolveTypeExpr(d.TypeRef)
+		}
+		var ptr @Instr = EmitAlloc(ctx.Func, b, typ)
+		if d.Value != nil {
+			var val @Instr = genExpr(ctx, b, d.Value)
+			EmitStore(b, ptr, val)
+		}
+		defineVar(ctx, d.Name, ptr, typ)
+	}
+}
+
+func genAssign(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	if len(stmt.Exprs) == 1 && len(stmt.Exprs2) == 1 {
+		var lhs @ast.Expr = stmt.Exprs[0]
+		var rhs @Instr = genExpr(ctx, b, stmt.Exprs2[0])
+		if lhs.Kind == ast.EXPR_IDENT {
+			var ptr @Instr = lookupVar(ctx, lhs.Name)
+			if ptr != nil {
+				EmitStore(b, ptr, rhs)
+			}
+		}
+	}
+	return b
+}
+
+func genShortVar(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	if len(stmt.Exprs) == 1 && len(stmt.Exprs2) == 1 {
+		var name []char = stmt.Exprs[0].Name
+		var val @Instr = genExpr(ctx, b, stmt.Exprs2[0])
+		var typ @types.Type = types.TypInt() // TODO: infer from RHS
+		var ptr @Instr = EmitAlloc(ctx.Func, b, typ)
+		EmitStore(b, ptr, val)
+		defineVar(ctx, name, ptr, typ)
+	}
+	return b
+}
+
+func genIf(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	var cond @Instr = genExpr(ctx, b, stmt.X)
+	var thenBlk @Block = AddBlock(ctx.Func, "if.then")
+	var mergeBlk @Block = AddBlock(ctx.Func, "if.merge")
+
+	if stmt.Else != nil {
+		var elseBlk @Block = AddBlock(ctx.Func, "if.else")
+		EmitBranch(b, cond, thenBlk, elseBlk)
+		var thenEnd @Block = genBlock(ctx, thenBlk, stmt.Body)
+		if len(thenEnd.Instrs) == 0 || !IsTerminator(thenEnd.Instrs[len(thenEnd.Instrs)-1]) {
+			EmitJump(thenEnd, mergeBlk)
+		}
+		var elseEnd @Block = genBlock(ctx, elseBlk, stmt.Else)
+		if len(elseEnd.Instrs) == 0 || !IsTerminator(elseEnd.Instrs[len(elseEnd.Instrs)-1]) {
+			EmitJump(elseEnd, mergeBlk)
+		}
+	} else {
+		EmitBranch(b, cond, thenBlk, mergeBlk)
+		var thenEnd @Block = genBlock(ctx, thenBlk, stmt.Body)
+		if len(thenEnd.Instrs) == 0 || !IsTerminator(thenEnd.Instrs[len(thenEnd.Instrs)-1]) {
+			EmitJump(thenEnd, mergeBlk)
+		}
+	}
+
+	return mergeBlk
+}
+
+func genFor(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	var condBlk @Block = AddBlock(ctx.Func, "for.cond")
+	var bodyBlk @Block = AddBlock(ctx.Func, "for.body")
+	var postBlk @Block = AddBlock(ctx.Func, "for.post")
+	var exitBlk @Block = AddBlock(ctx.Func, "for.exit")
+
+	// Init
+	if stmt.Init != nil {
+		b = genStmt(ctx, b, stmt.Init)
+	}
+	EmitJump(b, condBlk)
+
+	// Condition
+	if stmt.X != nil {
+		var cond @Instr = genExpr(ctx, condBlk, stmt.X)
+		EmitBranch(condBlk, cond, bodyBlk, exitBlk)
+	} else {
+		EmitJump(condBlk, bodyBlk)
+	}
+
+	// Body (with break/continue targets)
+	var savedBreak @Block = ctx.BreakTo
+	var savedContinue @Block = ctx.ContinueTo
+	ctx.BreakTo = exitBlk
+	ctx.ContinueTo = postBlk
+	var bodyEnd @Block = genBlock(ctx, bodyBlk, stmt.Body)
+	ctx.BreakTo = savedBreak
+	ctx.ContinueTo = savedContinue
+	if len(bodyEnd.Instrs) == 0 || !IsTerminator(bodyEnd.Instrs[len(bodyEnd.Instrs)-1]) {
+		EmitJump(bodyEnd, postBlk)
+	}
+
+	// Post
+	if stmt.Post != nil {
+		genStmt(ctx, postBlk, stmt.Post)
+	}
+	if len(postBlk.Instrs) == 0 || !IsTerminator(postBlk.Instrs[len(postBlk.Instrs)-1]) {
+		EmitJump(postBlk, condBlk)
+	}
+
+	return exitBlk
+}
+
+func genIncDec(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	if stmt.X.Kind == ast.EXPR_IDENT {
+		var ptr @Instr = lookupVar(ctx, stmt.X.Name)
+		if ptr != nil {
+			var typ @types.Type = lookupVarType(ctx, stmt.X.Name)
+			var cur @Instr = EmitLoad(ctx.Func, b, ptr, typ)
+			var one @Instr = EmitConstInt(ctx.Func, b, 1, typ)
+			var result @Instr
+			if stmt.Op == cast(int, token.INC) {
+				result = EmitBinop(ctx.Func, b, OP_ADD, cur, one, typ)
+			} else {
+				result = EmitBinop(ctx.Func, b, OP_SUB, cur, one, typ)
+			}
+			EmitStore(b, ptr, result)
+		}
+	}
+	return b
+}
+
+// ============================================================
+// Expression generation
+// ============================================================
+
+func genExpr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	if e.Kind == ast.EXPR_INT_LIT {
+		return EmitConstInt(ctx.Func, b, parseIntLit(e.Name), types.TypInt())
+	}
+
+	if e.Kind == ast.EXPR_STRING_LIT {
+		return EmitConstString(ctx.Func, b, unescapeStr(e.Name))
+	}
+
+	if e.Kind == ast.EXPR_CHAR_LIT {
+		return EmitConstInt(ctx.Func, b, parseCharLit(e.Name), types.TypUint8())
+	}
+
+	if e.Kind == ast.EXPR_BOOL_LIT {
+		if len(e.Name) > 0 {
+			return EmitConstBool(ctx.Func, b, streq(e.Name, "true"))
+		}
+		return EmitConstBool(ctx.Func, b, e.BoolVal)
+	}
+
+	if e.Kind == ast.EXPR_NIL_LIT {
+		return EmitConstNil(ctx.Func, b, types.TypNil())
+	}
+
+	if e.Kind == ast.EXPR_IDENT {
+		var ptr @Instr = lookupVar(ctx, e.Name)
+		if ptr != nil {
+			var typ @types.Type = lookupVarType(ctx, e.Name)
+			return EmitLoad(ctx.Func, b, ptr, typ)
+		}
+		// Unknown ident — return a zero placeholder
+		return EmitConstInt(ctx.Func, b, 0, types.TypInt())
+	}
+
+	if e.Kind == ast.EXPR_BINARY {
+		return genBinary(ctx, b, e)
+	}
+
+	if e.Kind == ast.EXPR_UNARY {
+		return genUnary(ctx, b, e)
+	}
+
+	if e.Kind == ast.EXPR_CALL {
+		return genCall(ctx, b, e)
+	}
+
+	if e.Kind == ast.EXPR_BUILTIN {
+		return genBuiltin(ctx, b, e)
+	}
+
+	// Unsupported expression
+	return EmitConstInt(ctx.Func, b, 0, types.TypInt())
+}
+
+func genBinary(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	var lhs @Instr = genExpr(ctx, b, e.X)
+	var rhs @Instr = genExpr(ctx, b, e.Y)
+	var op int = tokenToOp(e.Op)
+
+	// Comparison ops return bool
+	if op >= OP_EQ && op <= OP_GE {
+		return EmitBinop(ctx.Func, b, op, lhs, rhs, types.TypBool())
+	}
+	if op == OP_LAND || op == OP_LOR {
+		return EmitBinop(ctx.Func, b, op, lhs, rhs, types.TypBool())
+	}
+
+	return EmitBinop(ctx.Func, b, op, lhs, rhs, types.TypInt())
+}
+
+func genUnary(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	var arg @Instr = genExpr(ctx, b, e.X)
+	if e.Op == cast(int, token.MINUS) {
+		return EmitUnary(ctx.Func, b, OP_NEG, arg, types.TypInt())
+	}
+	if e.Op == cast(int, token.NOT) {
+		return EmitUnary(ctx.Func, b, OP_NOT, arg, types.TypBool())
+	}
+	if e.Op == cast(int, token.TILDE) {
+		return EmitUnary(ctx.Func, b, OP_BITNOT, arg, types.TypInt())
+	}
+	return arg
+}
+
+func genCall(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	// Check for print/println builtins
+	if e.X != nil && e.X.Kind == ast.EXPR_IDENT {
+		if streq(e.X.Name, "println") {
+			return genPrintCall(ctx, b, e, true)
+		}
+		if streq(e.X.Name, "print") {
+			return genPrintCall(ctx, b, e, false)
+		}
+		if streq(e.X.Name, "len") {
+			if len(e.Args) == 1 {
+				var arg @Instr = genExpr(ctx, b, e.Args[0])
+				return EmitSliceLen(ctx.Func, b, arg)
+			}
+		}
+		if streq(e.X.Name, "append") {
+			if len(e.Args) >= 2 {
+				var s @Instr = genExpr(ctx, b, e.Args[0])
+				var v @Instr = genExpr(ctx, b, e.Args[1])
+				return EmitAppend(ctx.Func, b, s, v, types.MakeSliceType(types.TypInt()))
+			}
+		}
+		if streq(e.X.Name, "panic") {
+			if len(e.Args) >= 1 {
+				var msg @Instr = genExpr(ctx, b, e.Args[0])
+				EmitPanic(b, msg)
+				return EmitConstNil(ctx.Func, b, types.TypNil())
+			}
+		}
+	}
+
+	// Regular function call
+	var args []@Instr
+	for i := 0; i < len(e.Args); i++ {
+		args = append(args, genExpr(ctx, b, e.Args[i]))
+	}
+
+	var name []char
+	if e.X != nil && e.X.Kind == ast.EXPR_IDENT {
+		name = e.X.Name
+	}
+
+	// Check for package-qualified call (e.g., bootstrap.Write)
+	if e.X != nil && e.X.Kind == ast.EXPR_SELECTOR {
+		if e.X.X != nil && e.X.X.Kind == ast.EXPR_IDENT {
+			if streq(e.X.X.Name, "bootstrap") {
+				return EmitCallBuiltin(ctx.Func, b, e.X.Name, args, types.TypInt())
+			}
+		}
+		// Other package calls: use "pkg.func" name
+		var qualName []char
+		if e.X.X != nil && e.X.X.Kind == ast.EXPR_IDENT {
+			qualName = appendChars(qualName, e.X.X.Name)
+			qualName = append(qualName, '.')
+			qualName = appendChars(qualName, e.X.Name)
+			name = qualName
+		}
+	}
+
+	return EmitCall(ctx.Func, b, name, args, types.TypInt())
+}
+
+// genPrintCall expands println/print into type-specific calls.
+// For each argument, emits a call to the appropriate runtime print function.
+func genPrintCall(ctx @GenContext, b @Block, e @ast.Expr, newline bool) @Instr {
+	for i := 0; i < len(e.Args); i++ {
+		if i > 0 {
+			// Print space between arguments
+			var space @Instr = EmitConstString(ctx.Func, b, " ")
+			var spaceArgs []@Instr
+			spaceArgs = append(spaceArgs, space)
+			EmitCallBuiltin(ctx.Func, b, "bn_print_string", spaceArgs, types.TypVoid())
+		}
+
+		var arg @ast.Expr = e.Args[i]
+
+		// Determine print type based on AST node
+		if arg.Kind == ast.EXPR_STRING_LIT {
+			var val @Instr = genExpr(ctx, b, arg)
+			var args []@Instr
+			args = append(args, val)
+			EmitCallBuiltin(ctx.Func, b, "bn_print_string", args, types.TypVoid())
+		} else if arg.Kind == ast.EXPR_BOOL_LIT {
+			var val @Instr = genExpr(ctx, b, arg)
+			var args []@Instr
+			args = append(args, val)
+			EmitCallBuiltin(ctx.Func, b, "bn_print_bool", args, types.TypVoid())
+		} else {
+			// Default to int printing
+			var val @Instr = genExpr(ctx, b, arg)
+			var args []@Instr
+			args = append(args, val)
+			EmitCallBuiltin(ctx.Func, b, "bn_print_int", args, types.TypVoid())
+		}
+	}
+
+	if newline {
+		EmitCallBuiltin(ctx.Func, b, "bn_print_newline", nil, types.TypVoid())
+	}
+
+	return EmitConstNil(ctx.Func, b, types.TypNil())
+}
+
+func genBuiltin(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	if e.Op == cast(int, token.CAST) || e.Op == cast(int, token.BIT_CAST) {
+		if len(e.Args) >= 1 {
+			var val @Instr = genExpr(ctx, b, e.Args[0])
+			var targetTyp @types.Type = resolveTypeExpr(e.TypeRef)
+			if e.Op == cast(int, token.CAST) {
+				return EmitCast(ctx.Func, b, val, targetTyp)
+			}
+			return EmitBitCast(ctx.Func, b, val, targetTyp)
+		}
+	}
+	if e.Op == cast(int, token.LEN) {
+		if len(e.Args) >= 1 {
+			var arg @Instr = genExpr(ctx, b, e.Args[0])
+			return EmitSliceLen(ctx.Func, b, arg)
+		}
+	}
+	return EmitConstInt(ctx.Func, b, 0, types.TypInt())
+}
+
+// ============================================================
+// Token → IR op mapping
+// ============================================================
+
+func tokenToOp(tok int) int {
+	if tok == cast(int, token.PLUS) { return OP_ADD }
+	if tok == cast(int, token.MINUS) { return OP_SUB }
+	if tok == cast(int, token.STAR) { return OP_MUL }
+	if tok == cast(int, token.SLASH) { return OP_DIV }
+	if tok == cast(int, token.PERCENT) { return OP_REM }
+	if tok == cast(int, token.AMP) { return OP_AND }
+	if tok == cast(int, token.PIPE) { return OP_OR }
+	if tok == cast(int, token.CARET) { return OP_XOR }
+	if tok == cast(int, token.SHL) { return OP_SHL }
+	if tok == cast(int, token.SHR) { return OP_SHR }
+	if tok == cast(int, token.EQ) { return OP_EQ }
+	if tok == cast(int, token.NEQ) { return OP_NE }
+	if tok == cast(int, token.LT) { return OP_LT }
+	if tok == cast(int, token.LEQ) { return OP_LE }
+	if tok == cast(int, token.GT) { return OP_GT }
+	if tok == cast(int, token.GEQ) { return OP_GE }
+	if tok == cast(int, token.LAND) { return OP_LAND }
+	if tok == cast(int, token.LOR) { return OP_LOR }
+	return OP_ADD // fallback
+}
+
+// ============================================================
+// Type resolution (syntax TypeExpr → types.Type)
+// ============================================================
+
+func resolveTypeExpr(te @ast.TypeExpr) @types.Type {
+	if te == nil {
+		return types.TypVoid()
+	}
+	if te.Kind == ast.TEXPR_NAMED {
+		if streq(te.Name, "int") { return types.TypInt() }
+		if streq(te.Name, "int8") { return types.TypInt8() }
+		if streq(te.Name, "int16") { return types.TypInt16() }
+		if streq(te.Name, "int32") { return types.TypInt32() }
+		if streq(te.Name, "int64") { return types.TypInt64() }
+		if streq(te.Name, "uint8") { return types.TypUint8() }
+		if streq(te.Name, "uint16") { return types.TypUint16() }
+		if streq(te.Name, "uint32") { return types.TypUint32() }
+		if streq(te.Name, "uint64") { return types.TypUint64() }
+		if streq(te.Name, "bool") { return types.TypBool() }
+		if streq(te.Name, "char") { return types.TypChar() }
+		return types.TypInt() // fallback
+	}
+	if te.Kind == ast.TEXPR_SLICE {
+		return types.MakeSliceType(resolveTypeExpr(te.Base))
+	}
+	if te.Kind == ast.TEXPR_POINTER {
+		return types.MakePointerType(resolveTypeExpr(te.Base))
+	}
+	if te.Kind == ast.TEXPR_MANAGED {
+		return types.MakeManagedPtrType(resolveTypeExpr(te.Base))
+	}
+	if te.Kind == ast.TEXPR_ARRAY {
+		var arrLen int = 0
+		if te.Len != nil {
+			arrLen = parseIntLit(te.Len.Name)
+		}
+		return types.MakeArrayType(resolveTypeExpr(te.Base), arrLen)
+	}
+	return types.TypVoid()
+}
+
+// ============================================================
+// String/int literal helpers (duplicated from interp since
+// ir cannot import interp)
+// ============================================================
+
+func streq(a []char, b []char) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] { return false }
+	}
+	return true
+}
+
+func appendChars(dst []char, src []char) []char {
+	for i := 0; i < len(src); i++ {
+		dst = append(dst, src[i])
+	}
+	return dst
+}
+
+func parseIntLit(s []char) int {
+	if len(s) == 0 { return 0 }
+	// Hex
+	if len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		var val int = 0
+		for i := 2; i < len(s); i++ {
+			val = val * 16 + hexVal(s[i])
+		}
+		return val
+	}
+	// Octal
+	if len(s) > 1 && s[0] == '0' {
+		var val int = 0
+		for i := 1; i < len(s); i++ {
+			val = val * 8 + cast(int, s[i]) - cast(int, '0')
+		}
+		return val
+	}
+	// Decimal
+	var neg bool = false
+	var start int = 0
+	if s[0] == '-' {
+		neg = true
+		start = 1
+	}
+	var val int = 0
+	for i := start; i < len(s); i++ {
+		val = val * 10 + cast(int, s[i]) - cast(int, '0')
+	}
+	if neg { return 0 - val }
+	return val
+}
+
+func hexVal(c char) int {
+	if c >= '0' && c <= '9' { return cast(int, c) - cast(int, '0') }
+	if c >= 'a' && c <= 'f' { return cast(int, c) - cast(int, 'a') + 10 }
+	if c >= 'A' && c <= 'F' { return cast(int, c) - cast(int, 'A') + 10 }
+	return 0
+}
+
+func parseCharLit(s []char) int {
+	// Strip quotes
+	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+		s = s[1:len(s)-1]
+	}
+	if len(s) == 0 { return 0 }
+	if s[0] == '\\' && len(s) > 1 {
+		if s[1] == 'n' { return 10 }
+		if s[1] == 'r' { return 13 }
+		if s[1] == 't' { return 9 }
+		if s[1] == '\\' { return 92 }
+		if s[1] == '\'' { return 39 }
+		if s[1] == '0' { return 0 }
+		if s[1] == 'x' && len(s) >= 4 {
+			return hexVal(s[2]) * 16 + hexVal(s[3])
+		}
+		return cast(int, s[1])
+	}
+	return cast(int, s[0])
+}
+
+func unescapeStr(s []char) []char {
+	// Strip quotes
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1:len(s)-1]
+	}
+	var buf []char
+	var i int = 0
+	for i < len(s) {
+		if s[i] == '\\' && i+1 < len(s) {
+			i = i + 1
+			if s[i] == 'n' { buf = append(buf, '\n'); i = i + 1; continue }
+			if s[i] == 'r' { buf = append(buf, '\r'); i = i + 1; continue }
+			if s[i] == 't' { buf = append(buf, '\t'); i = i + 1; continue }
+			if s[i] == '\\' { buf = append(buf, '\\'); i = i + 1; continue }
+			if s[i] == '"' { buf = append(buf, '"'); i = i + 1; continue }
+			if s[i] == '0' { buf = append(buf, cast(char, 0)); i = i + 1; continue }
+			if s[i] == 'x' && i+2 < len(s) {
+				var hi int = hexVal(s[i+1])
+				var lo int = hexVal(s[i+2])
+				buf = append(buf, cast(char, hi*16 + lo))
+				i = i + 3
+				continue
+			}
+			buf = append(buf, s[i])
+			i = i + 1
+		} else {
+			buf = append(buf, s[i])
+			i = i + 1
+		}
+	}
+	return buf
+}

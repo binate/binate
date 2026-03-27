@@ -1,12 +1,14 @@
 #!/bin/sh
-# Usage: ./conformance/run.sh bootstrap|selfhost|compiled
+# Usage: ./conformance/run.sh bootstrap|selfhost|compiled [filter...]
 # Runs conformance tests against the specified backend.
+# Optional filters select tests by substring match (e.g. "040" or "recursive").
 
 MODE="$1"
 if [ -z "$MODE" ]; then
-    echo "Usage: $0 bootstrap|selfhost|compiled"
+    echo "Usage: $0 bootstrap|selfhost|compiled [filter...]"
     exit 1
 fi
+shift
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -14,11 +16,24 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 
 passed=0
 failed=0
+skipped=0
 failures=""
 
 for bn in "$SCRIPT_DIR"/*.bn; do
     [ -f "$bn" ] || continue
     name="$(basename "$bn" .bn)"
+
+    # Apply filters: if any filter args given, name must match at least one
+    if [ $# -gt 0 ]; then
+        match=0
+        for f in "$@"; do
+            case "$name" in *"$f"*) match=1; break;; esac
+        done
+        if [ "$match" -eq 0 ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+    fi
     expected="$SCRIPT_DIR/${name}.expected"
     if [ ! -f "$expected" ]; then
         echo "SKIP: $name (no .expected file)"
@@ -67,7 +82,7 @@ for bn in "$SCRIPT_DIR"/*.bn; do
 done
 
 echo ""
-echo "=== Summary: $passed passed, $failed failed ==="
+echo "=== Summary: $passed passed, $failed failed, $skipped skipped ==="
 if [ $failed -gt 0 ]; then
     echo "Failures:$failures"
     exit 1

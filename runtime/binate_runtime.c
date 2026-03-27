@@ -109,6 +109,40 @@ BnSlice bn_append_i8(BnSlice s, int64_t val) {
     return s;
 }
 
+// append(s, v) for struct elements — copies elem_size bytes from ptr
+BnSlice bn_append_struct(BnSlice s, void *ptr, int64_t elem_size) {
+    int64_t newlen = s.len + 1;
+    void *newdata = realloc(s.data, (size_t)newlen * (size_t)elem_size);
+    if (!newdata) {
+        fprintf(stderr, "runtime error: out of memory\n");
+        exit(2);
+    }
+    memcpy((char *)newdata + s.len * elem_size, ptr, (size_t)elem_size);
+    s.data = newdata;
+    s.len = newlen;
+    return s;
+}
+
+// s[i] for struct elements — returns pointer to element in-place
+void *bn_slice_get_struct(BnSlice s, int64_t index, int64_t elem_size) {
+    if (index < 0 || index >= s.len) {
+        fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",
+                (long long)index, (long long)s.len);
+        exit(2);
+    }
+    return (char *)s.data + index * elem_size;
+}
+
+// s[i] = v for struct elements — copies elem_size bytes from ptr
+void bn_slice_set_struct(BnSlice s, int64_t index, void *ptr, int64_t elem_size) {
+    if (index < 0 || index >= s.len) {
+        fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",
+                (long long)index, (long long)s.len);
+        exit(2);
+    }
+    memcpy((char *)s.data + index * elem_size, ptr, (size_t)elem_size);
+}
+
 // Free slice backing data (no-op for nil slices)
 void bn_slice_free(BnSlice s) {
     if (s.data) {

@@ -1,7 +1,15 @@
 #!/bin/sh
-# Usage: ./conformance/run.sh bootstrap|selfhost|compiled [filter...]
+# Usage: ./conformance/run.sh <mode> [filter...]
+#
 # Runs conformance tests against the specified backend.
 # Optional filters select tests by substring match (e.g. "040" or "recursive").
+#
+# Modes:
+#   bootstrap          Go bootstrap interpreter runs .bn files directly
+#   selfhost           Bootstrap interprets main.bn, which runs .bn files
+#   compiled           Bootstrap interprets compile.bn, which compiles .bn to native
+#   compiled-interp    Self-compiled interpreter binary runs .bn files
+#   compiled-compiler  Self-compiled compiler binary compiles .bn to native
 #
 # Test formats:
 #   Single-file: NNN_name.bn + NNN_name.expected
@@ -9,7 +17,15 @@
 
 MODE="$1"
 if [ -z "$MODE" ]; then
-    echo "Usage: $0 bootstrap|selfhost|compiled [filter...]"
+    echo "Usage: $0 <mode> [filter...]"
+    echo ""
+    echo "Modes:"
+    for r in "$(dirname "$0")"/runners/*.sh; do
+        [ -f "$r" ] || continue
+        rname="$(basename "$r" .sh)"
+        desc=$(grep '^# Runner:' "$r" | head -1 | sed 's/^# Runner: //')
+        printf "  %-20s %s\n" "$rname" "$desc"
+    done
     exit 1
 fi
 shift
@@ -17,6 +33,26 @@ shift
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
+export SCRIPT_DIR BINATE_DIR BOOTSTRAP_DIR
+
+# Load the runner
+RUNNER="$SCRIPT_DIR/runners/${MODE}.sh"
+if [ ! -f "$RUNNER" ]; then
+    echo "Unknown mode: $MODE"
+    echo "Available modes:"
+    for r in "$SCRIPT_DIR"/runners/*.sh; do
+        [ -f "$r" ] || continue
+        echo "  $(basename "$r" .sh)"
+    done
+    exit 1
+fi
+. "$RUNNER"
+
+# Run setup (build step for compiled modes)
+runner_setup
+
+# Ensure cleanup runs on exit
+trap 'runner_cleanup' EXIT
 
 passed=0
 failed=0
@@ -29,36 +65,7 @@ run_test() {
     expected="$3"    # path to expected output file
     root="$4"        # root dir for multi-pkg (empty for single-file)
 
-    case "$MODE" in
-        bootstrap)
-            if [ -n "$root" ]; then
-                actual=$(cd "$BOOTSTRAP_DIR" && go run . -root "$root" "$bn" 2>&1) || true
-            else
-                actual=$(cd "$BOOTSTRAP_DIR" && go run . "$bn" 2>&1) || true
-            fi
-            ;;
-        selfhost)
-            actual=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/main.bn" -- "$bn" 2>&1) || true
-            ;;
-        compiled)
-            tmpbin="/tmp/binate_conform_${name}"
-            compile_root="$BINATE_DIR"
-            if [ -n "$root" ]; then
-                compile_root="$root"
-            fi
-            compile_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/compile.bn" -- --root "$compile_root" -o "$tmpbin" "$bn" 2>&1) || true
-            if [ -x "$tmpbin" ]; then
-                actual=$("$tmpbin" 2>&1) || true
-            else
-                actual="COMPILE_ERROR: $compile_out"
-            fi
-            rm -f "$tmpbin"
-            ;;
-        *)
-            echo "Unknown mode: $MODE (use bootstrap|selfhost|compiled)"
-            exit 1
-            ;;
-    esac
+    actual=$(runner_exec "$bn" "$root")
 
     expected_content="$(cat "$expected")"
     known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"

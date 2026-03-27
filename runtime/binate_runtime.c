@@ -2,6 +2,11 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <sys/wait.h>
 
 // Binate runtime library
 // Provides I/O and basic operations for compiled Binate programs.
@@ -272,10 +277,197 @@ void bn_exit(int64_t code) {
     exit((int)code);
 }
 
+// ============================================================
+// Bootstrap package — file I/O, process, string operations
+// ============================================================
+
+// Helper: convert BnSlice of chars to null-terminated C string
+static char *slice_to_cstr(BnSlice s) {
+    char *buf = (char *)malloc((size_t)s.len + 1);
+    if (s.data && s.len > 0) {
+        memcpy(buf, s.data, (size_t)s.len);
+    }
+    buf[s.len] = '\0';
+    return buf;
+}
+
+// Helper: convert C string to BnSlice of chars
+static BnSlice cstr_to_slice(const char *s) {
+    BnSlice r;
+    r.len = (int64_t)strlen(s);
+    if (r.len > 0) {
+        r.data = malloc((size_t)r.len);
+        memcpy(r.data, s, (size_t)r.len);
+    } else {
+        r.data = NULL;
+    }
+    return r;
+}
+
+// Open(path []char, flags int) int
+int64_t bn_bootstrap__Open(BnSlice path, int64_t flags) {
+    char *cpath = slice_to_cstr(path);
+    int oflags = 0;
+    if (flags == 0) oflags = O_RDONLY;
+    else if (flags == 1) oflags = O_WRONLY;
+    else if (flags == 2) oflags = O_RDWR;
+    // Handle combined flags
+    if (flags & 64)  oflags |= O_CREAT;
+    if (flags & 512) oflags |= O_TRUNC;
+    if (flags & 1024) oflags |= O_APPEND;
+    int fd = open(cpath, oflags, 0644);
+    free(cpath);
+    return (int64_t)fd;
+}
+
+// Read(fd int, buf []uint8, n int) int
+int64_t bn_bootstrap__Read(int64_t fd, BnSlice buf, int64_t n) {
+    if (!buf.data || n <= 0) return 0;
+    if (n > buf.len) n = buf.len;
+    ssize_t r = read((int)fd, buf.data, (size_t)n);
+    return (int64_t)r;
+}
+
+// Write(fd int, buf []uint8, n int) int
+int64_t bn_bootstrap__Write(int64_t fd, BnSlice buf, int64_t n) {
+    if (!buf.data || n <= 0) return 0;
+    if (n > buf.len) n = buf.len;
+    ssize_t w = write((int)fd, buf.data, (size_t)n);
+    return (int64_t)w;
+}
+
+// Close(fd int) int
+int64_t bn_bootstrap__Close(int64_t fd) {
+    return (int64_t)close((int)fd);
+}
+
+// ReadDir(path []char) [][]char
+BnSlice bn_bootstrap__ReadDir(BnSlice path) {
+    char *cpath = slice_to_cstr(path);
+    DIR *dir = opendir(cpath);
+    free(cpath);
+
+    BnSlice result;
+    result.data = NULL;
+    result.len = 0;
+
+    if (!dir) return result;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue; // skip hidden and . / ..
+        BnSlice name = cstr_to_slice(entry->d_name);
+        // Append BnSlice to result (slice of slices, each element is sizeof(BnSlice))
+        int64_t newlen = result.len + 1;
+        result.data = realloc(result.data, (size_t)newlen * sizeof(BnSlice));
+        ((BnSlice *)result.data)[result.len] = name;
+        result.len = newlen;
+    }
+    closedir(dir);
+    return result;
+}
+
+// Stat(path []char) int  — returns 0=not found, 1=file, 2=directory
+int64_t bn_bootstrap__Stat(BnSlice path) {
+    char *cpath = slice_to_cstr(path);
+    struct stat st;
+    if (stat(cpath, &st) != 0) {
+        free(cpath);
+        return 0;
+    }
+    free(cpath);
+    if (S_ISDIR(st.st_mode)) return 2;
+    return 1;
+}
+
+// Exit(code int)
+void bn_bootstrap__Exit(int64_t code) {
+    exit((int)code);
+}
+
+// Store argc/argv for Args()
+static int bn_argc = 0;
+static char **bn_argv = NULL;
+
+// Args() [][]char
+BnSlice bn_bootstrap__Args(void) {
+    BnSlice result;
+    result.data = NULL;
+    result.len = 0;
+
+    // Skip program name (argv[0])
+    for (int i = 1; i < bn_argc; i++) {
+        BnSlice arg = cstr_to_slice(bn_argv[i]);
+        int64_t newlen = result.len + 1;
+        result.data = realloc(result.data, (size_t)newlen * sizeof(BnSlice));
+        ((BnSlice *)result.data)[result.len] = arg;
+        result.len = newlen;
+    }
+    return result;
+}
+
+// Exec(program []char, args [][]char) int
+int64_t bn_bootstrap__Exec(BnSlice program, BnSlice args) {
+    char *prog = slice_to_cstr(program);
+
+    // Build argv: [program, args..., NULL]
+    int64_t nargs = args.len;
+    char **argv = (char **)malloc((size_t)(nargs + 2) * sizeof(char *));
+    argv[0] = prog;
+    for (int64_t i = 0; i < nargs; i++) {
+        BnSlice arg = ((BnSlice *)args.data)[i];
+        argv[i + 1] = slice_to_cstr(arg);
+    }
+    argv[nargs + 1] = NULL;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        execvp(prog, argv);
+        _exit(127);
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    // Clean up
+    for (int64_t i = 0; i <= nargs; i++) {
+        free(argv[i]);
+    }
+    free(argv);
+
+    if (WIFEXITED(status)) {
+        return (int64_t)WEXITSTATUS(status);
+    }
+    return -1;
+}
+
+// Itoa(v int) []char
+BnSlice bn_bootstrap__Itoa(int64_t v) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%lld", (long long)v);
+    return cstr_to_slice(buf);
+}
+
+// Concat(a []char, b []char) []char
+BnSlice bn_bootstrap__Concat(BnSlice a, BnSlice b) {
+    BnSlice r;
+    r.len = a.len + b.len;
+    if (r.len > 0) {
+        r.data = malloc((size_t)r.len);
+        if (a.data && a.len > 0) memcpy(r.data, a.data, (size_t)a.len);
+        if (b.data && b.len > 0) memcpy((char *)r.data + a.len, b.data, (size_t)b.len);
+    } else {
+        r.data = NULL;
+    }
+    return r;
+}
+
 /* Entry point: calls Binate's main function */
 extern void bn_main(void);
 
-int main(void) {
+int main(int argc, char **argv) {
+    bn_argc = argc;
+    bn_argv = argv;
     bn_main();
     return 0;
 }

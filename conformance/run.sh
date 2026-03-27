@@ -2,6 +2,10 @@
 # Usage: ./conformance/run.sh bootstrap|selfhost|compiled [filter...]
 # Runs conformance tests against the specified backend.
 # Optional filters select tests by substring match (e.g. "040" or "recursive").
+#
+# Test formats:
+#   Single-file: NNN_name.bn + NNN_name.expected
+#   Multi-package: NNN_name/ directory with main.bn, expected, and pkg/ subdirectory
 
 MODE="$1"
 if [ -z "$MODE" ]; then
@@ -19,37 +23,30 @@ failed=0
 skipped=0
 failures=""
 
-for bn in "$SCRIPT_DIR"/*.bn; do
-    [ -f "$bn" ] || continue
-    name="$(basename "$bn" .bn)"
-
-    # Apply filters: if any filter args given, name must match at least one
-    if [ $# -gt 0 ]; then
-        match=0
-        for f in "$@"; do
-            case "$name" in *"$f"*) match=1; break;; esac
-        done
-        if [ "$match" -eq 0 ]; then
-            skipped=$((skipped + 1))
-            continue
-        fi
-    fi
-    expected="$SCRIPT_DIR/${name}.expected"
-    if [ ! -f "$expected" ]; then
-        echo "SKIP: $name (no .expected file)"
-        continue
-    fi
+run_test() {
+    name="$1"
+    bn="$2"         # path to .bn file (single-file) or main.bn (multi-pkg)
+    expected="$3"    # path to expected output file
+    root="$4"        # root dir for multi-pkg (empty for single-file)
 
     case "$MODE" in
         bootstrap)
-            actual=$(cd "$BOOTSTRAP_DIR" && go run . "$bn" 2>&1) || true
+            if [ -n "$root" ]; then
+                actual=$(cd "$BOOTSTRAP_DIR" && go run . -root "$root" "$bn" 2>&1) || true
+            else
+                actual=$(cd "$BOOTSTRAP_DIR" && go run . "$bn" 2>&1) || true
+            fi
             ;;
         selfhost)
             actual=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/main.bn" -- "$bn" 2>&1) || true
             ;;
         compiled)
             tmpbin="/tmp/binate_conform_${name}"
-            compile_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/compile.bn" -- -o "$tmpbin" "$bn" 2>&1) || true
+            compile_root="$BINATE_DIR"
+            if [ -n "$root" ]; then
+                compile_root="$root"
+            fi
+            compile_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/compile.bn" -- --root "$compile_root" -o "$tmpbin" "$bn" 2>&1) || true
             if [ -x "$tmpbin" ]; then
                 actual=$("$tmpbin" 2>&1) || true
             else
@@ -78,6 +75,62 @@ for bn in "$SCRIPT_DIR"/*.bn; do
         failed=$((failed + 1))
         failures="$failures $name"
     fi
+}
+
+# Single-file tests: NNN_name.bn
+for bn in "$SCRIPT_DIR"/*.bn; do
+    [ -f "$bn" ] || continue
+    name="$(basename "$bn" .bn)"
+
+    # Apply filters
+    if [ $# -gt 0 ]; then
+        match=0
+        for f in "$@"; do
+            case "$name" in *"$f"*) match=1; break;; esac
+        done
+        if [ "$match" -eq 0 ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+    fi
+    expected="$SCRIPT_DIR/${name}.expected"
+    if [ ! -f "$expected" ]; then
+        echo "SKIP: $name (no .expected file)"
+        continue
+    fi
+
+    run_test "$name" "$bn" "$expected" ""
+done
+
+# Multi-package tests: NNN_name/ directories
+for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
+    [ -d "$dir" ] || continue
+    name="$(basename "$dir")"
+
+    # Apply filters
+    if [ $# -gt 0 ]; then
+        match=0
+        for f in "$@"; do
+            case "$name" in *"$f"*) match=1; break;; esac
+        done
+        if [ "$match" -eq 0 ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+    fi
+
+    main_bn="$dir/main.bn"
+    expected="$dir/expected"
+    if [ ! -f "$main_bn" ]; then
+        echo "SKIP: $name (no main.bn)"
+        continue
+    fi
+    if [ ! -f "$expected" ]; then
+        echo "SKIP: $name (no expected file)"
+        continue
+    fi
+
+    run_test "$name" "$main_bn" "$expected" "$dir"
 done
 
 echo ""

@@ -332,7 +332,17 @@ func genStmt(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
 		if stmt.Exprs != nil && len(stmt.Exprs) > 0 {
 			var vals []@Instr
 			for i := 0; i < len(stmt.Exprs); i++ {
-				vals = append(vals, genExpr(ctx, b, stmt.Exprs[i]))
+				var val @Instr = genExpr(ctx, b, stmt.Exprs[i])
+				// Convert string literal to []char if function returns []char
+				if ctx.Func.Results != nil && i < len(ctx.Func.Results) {
+					var retTyp @types.Type = ctx.Func.Results[i]
+					if retTyp.Kind == types.TYP_SLICE && retTyp.Elem != nil && retTyp.Elem.Width == 8 {
+						if val.Typ != nil && val.Typ.Kind == types.TYP_STRING {
+							val = EmitStringToChars(ctx.Func, b, val, retTyp)
+						}
+					}
+				}
+				vals = append(vals, val)
 			}
 			EmitReturn(b, vals)
 		} else {
@@ -402,12 +412,34 @@ func genDecl(ctx @GenContext, b @Block, d @ast.Decl) {
 		if d.TypeRef != nil {
 			typ = resolveTypeExpr(d.TypeRef)
 		}
-		var ptr @Instr = EmitAlloc(ctx.Func, b, typ)
 		if d.Value != nil {
 			var val @Instr = genExpr(ctx, b, d.Value)
+			// Array/struct composite lit returns an alloca — use directly
+			if val.Op == OP_ALLOC && val.TypeArg != nil {
+				if val.TypeArg.Kind == types.TYP_ARRAY || val.TypeArg.Kind == types.TYP_STRUCT {
+					defineVar(ctx, d.Name, val, typ)
+					return
+				}
+			}
+			// String literal assigned to []char: convert via string_to_chars
+			if typ.Kind == types.TYP_SLICE && typ.Elem != nil && typ.Elem.Width == 8 {
+				if val.Typ != nil && val.Typ.Kind == types.TYP_STRING {
+					val = EmitStringToChars(ctx.Func, b, val, typ)
+				}
+			}
+			var ptr @Instr = EmitAlloc(ctx.Func, b, typ)
 			EmitStore(b, ptr, val)
+			defineVar(ctx, d.Name, ptr, typ)
+		} else if typ.Kind == types.TYP_SLICE || typ.Kind == types.TYP_MANAGED_SLICE {
+			// Initialize uninitialized slices to nil
+			var ptr @Instr = EmitAlloc(ctx.Func, b, typ)
+			var nilVal @Instr = EmitConstNil(ctx.Func, b, typ)
+			EmitStore(b, ptr, nilVal)
+			defineVar(ctx, d.Name, ptr, typ)
+		} else {
+			var ptr @Instr = EmitAlloc(ctx.Func, b, typ)
+			defineVar(ctx, d.Name, ptr, typ)
 		}
-		defineVar(ctx, d.Name, ptr, typ)
 	}
 }
 
@@ -437,6 +469,27 @@ func genAssign(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
 			if fieldPtr != nil {
 				EmitStore(b, fieldPtr, rhs)
 			}
+		} else if lhs.Kind == ast.EXPR_INDEX {
+			// s[i] = v: slice or array index assignment
+			var collection @Instr = genExpr(ctx, b, lhs.X)
+			var index @Instr = genExpr(ctx, b, lhs.Y)
+
+			if collection.Typ != nil && collection.Typ.Kind == types.TYP_ARRAY {
+				// Array: GEP + store
+				var arrPtr @Instr = nil
+				if lhs.X.Kind == ast.EXPR_IDENT {
+					arrPtr = lookupVar(ctx, lhs.X.Name)
+				}
+				if arrPtr != nil {
+					var elemTyp @types.Type = collection.Typ.Elem
+					if elemTyp == nil { elemTyp = types.TypInt() }
+					var elemPtr @Instr = EmitGetElemPtr(ctx.Func, b, arrPtr, index, elemTyp)
+					EmitStore(b, elemPtr, rhs)
+				}
+			} else {
+				// Slice: call runtime set
+				EmitSliceSet(b, collection, index, rhs)
+			}
 		}
 	}
 	return b
@@ -459,8 +512,8 @@ func genShortVar(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
 		// Single assign
 		var name []char = stmt.Exprs[0].Name
 		var val @Instr = genExpr(ctx, b, stmt.Exprs2[0])
-		// If the RHS is a struct composite literal, the result is already an alloca
-		if val.Op == OP_ALLOC && val.TypeArg != nil && val.TypeArg.Kind == types.TYP_STRUCT {
+		// If the RHS is a struct/array composite literal, the result is already an alloca
+		if val.Op == OP_ALLOC && val.TypeArg != nil && (val.TypeArg.Kind == types.TYP_STRUCT || val.TypeArg.Kind == types.TYP_ARRAY) {
 			defineVar(ctx, name, val, val.TypeArg)
 		} else {
 			// Infer type from RHS
@@ -504,6 +557,11 @@ func genIf(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
 }
 
 func genFor(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	// For-in loop: for v in collection / for i, v in collection
+	if stmt.ForVal != nil {
+		return genForIn(ctx, b, stmt)
+	}
+
 	var condBlk @Block = AddBlock(ctx.Func, "for.cond")
 	var bodyBlk @Block = AddBlock(ctx.Func, "for.body")
 	var postBlk @Block = AddBlock(ctx.Func, "for.post")
@@ -542,6 +600,92 @@ func genFor(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
 	if len(postBlk.Instrs) == 0 || !IsTerminator(postBlk.Instrs[len(postBlk.Instrs)-1]) {
 		EmitJump(postBlk, condBlk)
 	}
+
+	return exitBlk
+}
+
+func genForIn(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	// Evaluate the collection (stmt.X)
+	var collection @Instr = genExpr(ctx, b, stmt.X)
+
+	// Get the collection length
+	var length @Instr
+	var isArray bool = false
+	if collection.Typ != nil && collection.Typ.Kind == types.TYP_ARRAY {
+		isArray = true
+		length = EmitConstInt(ctx.Func, b, collection.Typ.ArrayLen, types.TypInt())
+	} else {
+		length = EmitSliceLen(ctx.Func, b, collection)
+	}
+
+	// Determine element type
+	var elemTyp @types.Type = types.TypInt()
+	if collection.Typ != nil && collection.Typ.Elem != nil {
+		elemTyp = collection.Typ.Elem
+	}
+
+	// Get the collection alloca for array GEP
+	var arrPtr @Instr = nil
+	if isArray && stmt.X.Kind == ast.EXPR_IDENT {
+		arrPtr = lookupVar(ctx, stmt.X.Name)
+	}
+
+	// Create index variable: alloca i64, init to 0
+	var idxPtr @Instr = EmitAlloc(ctx.Func, b, types.TypInt())
+	var zero @Instr = EmitConstInt(ctx.Func, b, 0, types.TypInt())
+	EmitStore(b, idxPtr, zero)
+
+	var condBlk @Block = AddBlock(ctx.Func, "forin.cond")
+	var bodyBlk @Block = AddBlock(ctx.Func, "forin.body")
+	var postBlk @Block = AddBlock(ctx.Func, "forin.post")
+	var exitBlk @Block = AddBlock(ctx.Func, "forin.exit")
+	EmitJump(b, condBlk)
+
+	// Condition: idx < length
+	var idx @Instr = EmitLoad(ctx.Func, condBlk, idxPtr, types.TypInt())
+	var cond @Instr = EmitBinop(ctx.Func, condBlk, OP_LT, idx, length, types.TypBool())
+	EmitBranch(condBlk, cond, bodyBlk, exitBlk)
+
+	// Body: load element at index
+	var bodyIdx @Instr = EmitLoad(ctx.Func, bodyBlk, idxPtr, types.TypInt())
+	var elem @Instr
+	if isArray && arrPtr != nil {
+		var elemPtr @Instr = EmitGetElemPtr(ctx.Func, bodyBlk, arrPtr, bodyIdx, elemTyp)
+		elem = EmitLoad(ctx.Func, bodyBlk, elemPtr, elemTyp)
+	} else {
+		elem = EmitSliceGet(ctx.Func, bodyBlk, collection, bodyIdx, elemTyp)
+	}
+
+	// Define value variable
+	var valPtr @Instr = EmitAlloc(ctx.Func, bodyBlk, elemTyp)
+	EmitStore(bodyBlk, valPtr, elem)
+	defineVar(ctx, stmt.ForVal.Name, valPtr, elemTyp)
+
+	// Define key variable if present
+	if stmt.ForKey != nil {
+		var keyPtr @Instr = EmitAlloc(ctx.Func, bodyBlk, types.TypInt())
+		EmitStore(bodyBlk, keyPtr, bodyIdx)
+		defineVar(ctx, stmt.ForKey.Name, keyPtr, types.TypInt())
+	}
+
+	// Generate body
+	var savedBreak @Block = ctx.BreakTo
+	var savedContinue @Block = ctx.ContinueTo
+	ctx.BreakTo = exitBlk
+	ctx.ContinueTo = postBlk
+	var bodyEnd @Block = genBlock(ctx, bodyBlk, stmt.Body)
+	ctx.BreakTo = savedBreak
+	ctx.ContinueTo = savedContinue
+	if len(bodyEnd.Instrs) == 0 || !IsTerminator(bodyEnd.Instrs[len(bodyEnd.Instrs)-1]) {
+		EmitJump(bodyEnd, postBlk)
+	}
+
+	// Post: increment index
+	var postIdx @Instr = EmitLoad(ctx.Func, postBlk, idxPtr, types.TypInt())
+	var one @Instr = EmitConstInt(ctx.Func, postBlk, 1, types.TypInt())
+	var nextIdx @Instr = EmitBinop(ctx.Func, postBlk, OP_ADD, postIdx, one, types.TypInt())
+	EmitStore(postBlk, idxPtr, nextIdx)
+	EmitJump(postBlk, condBlk)
 
 	return exitBlk
 }
@@ -699,6 +843,14 @@ func genExpr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 		return genCompositeLit(ctx, b, e)
 	}
 
+	if e.Kind == ast.EXPR_INDEX {
+		return genIndex(ctx, b, e)
+	}
+
+	if e.Kind == ast.EXPR_SLICE {
+		return genSliceExpr(ctx, b, e)
+	}
+
 	// Unsupported expression
 	return EmitConstInt(ctx.Func, b, 0, types.TypInt())
 }
@@ -763,6 +915,9 @@ func genCall(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 		if streq(e.X.Name, "len") {
 			if len(e.Args) == 1 {
 				var arg @Instr = genExpr(ctx, b, e.Args[0])
+				if arg.Typ != nil && arg.Typ.Kind == types.TYP_ARRAY {
+					return EmitConstInt(ctx.Func, b, arg.Typ.ArrayLen, types.TypInt())
+				}
 				return EmitSliceLen(ctx.Func, b, arg)
 			}
 		}
@@ -770,7 +925,12 @@ func genCall(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 			if len(e.Args) >= 2 {
 				var s @Instr = genExpr(ctx, b, e.Args[0])
 				var v @Instr = genExpr(ctx, b, e.Args[1])
-				return EmitAppend(ctx.Func, b, s, v, types.MakeSliceType(types.TypInt()))
+				// Infer slice type from the slice argument
+				var sliceTyp @types.Type = s.Typ
+				if sliceTyp == nil {
+					sliceTyp = types.MakeSliceType(types.TypInt())
+				}
+				return EmitAppend(ctx.Func, b, s, v, sliceTyp)
 			}
 		}
 		if streq(e.X.Name, "panic") {
@@ -845,7 +1005,7 @@ func genPrintCall(ctx @GenContext, b @Block, e @ast.Expr, newline bool) @Instr {
 		if val.Typ != nil && val.Typ.Kind == types.TYP_STRING {
 			printFn = "bn_print_string"
 		} else if val.Typ != nil && val.Typ.Kind == types.TYP_SLICE && val.Typ.Elem != nil && val.Typ.Elem.Width == 8 {
-			printFn = "bn_print_string"
+			printFn = "bn_print_chars"
 		} else if val.Typ != nil && (val.Typ.Kind == types.TYP_BOOL || val.Typ.Kind == types.TYP_UNTYPED_BOOL) {
 			printFn = "bn_print_bool"
 		} else if arg.Kind == ast.EXPR_STRING_LIT {
@@ -877,10 +1037,120 @@ func genBuiltin(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 	if e.Op == cast(int, token.LEN) {
 		if len(e.Args) >= 1 {
 			var arg @Instr = genExpr(ctx, b, e.Args[0])
+			// For arrays, len is a compile-time constant
+			if arg.Typ != nil && arg.Typ.Kind == types.TYP_ARRAY {
+				return EmitConstInt(ctx.Func, b, arg.Typ.ArrayLen, types.TypInt())
+			}
 			return EmitSliceLen(ctx.Func, b, arg)
 		}
 	}
+	if e.Op == cast(int, token.MAKE) {
+		// make([]T, n) or make(T)
+		var targetTyp @types.Type = resolveTypeExpr(e.TypeRef)
+		if targetTyp.Kind == types.TYP_SLICE {
+			if len(e.Args) >= 1 {
+				var length @Instr = genExpr(ctx, b, e.Args[0])
+				return EmitMakeSlice(ctx.Func, b, targetTyp.Elem, length)
+			}
+			// make([]T) with no length — zero-length slice
+			var zero @Instr = EmitConstInt(ctx.Func, b, 0, types.TypInt())
+			return EmitMakeSlice(ctx.Func, b, targetTyp.Elem, zero)
+		}
+		return EmitMake(ctx.Func, b, targetTyp)
+	}
+	if e.Op == cast(int, token.BOX) {
+		if len(e.Args) >= 1 {
+			var val @Instr = genExpr(ctx, b, e.Args[0])
+			// For alloca results, the elem type is in TypeArg (not the pointer type in Typ)
+			var innerTyp @types.Type = val.Typ
+			if val.Op == OP_ALLOC && val.TypeArg != nil {
+				innerTyp = val.TypeArg
+			}
+			var ptrTyp @types.Type = types.MakeManagedPtrType(innerTyp)
+			return EmitBox(ctx.Func, b, val, ptrTyp)
+		}
+	}
 	return EmitConstInt(ctx.Func, b, 0, types.TypInt())
+}
+
+// ============================================================
+// Array literal
+// ============================================================
+
+func genArrayLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	var arrTyp @types.Type = resolveTypeExpr(e.TypeRef)
+	var arrPtr @Instr = EmitAlloc(ctx.Func, b, arrTyp)
+
+	var elemTyp @types.Type = arrTyp.Elem
+	if elemTyp == nil {
+		elemTyp = types.TypInt()
+	}
+
+	// Store each element
+	for i := 0; i < len(e.Elems); i++ {
+		var idx @Instr = EmitConstInt(ctx.Func, b, i, types.TypInt())
+		var elemPtr @Instr = EmitGetElemPtr(ctx.Func, b, arrPtr, idx, elemTyp)
+		var val @Instr = genExpr(ctx, b, e.Elems[i].Value)
+		EmitStore(b, elemPtr, val)
+	}
+
+	return arrPtr
+}
+
+// ============================================================
+// Index and slice expressions
+// ============================================================
+
+func genIndex(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	// e.X = the collection, e.Y = the index
+	var collection @Instr = genExpr(ctx, b, e.X)
+	var index @Instr = genExpr(ctx, b, e.Y)
+
+	// Determine element type
+	var elemTyp @types.Type = types.TypInt()
+	if collection.Typ != nil && collection.Typ.Elem != nil {
+		elemTyp = collection.Typ.Elem
+	}
+
+	if collection.Typ != nil && collection.Typ.Kind == types.TYP_ARRAY {
+		// Array indexing: GEP into the alloca
+		// The collection variable should be an alloca — look it up directly
+		var arrPtr @Instr = nil
+		if e.X.Kind == ast.EXPR_IDENT {
+			arrPtr = lookupVar(ctx, e.X.Name)
+		}
+		if arrPtr != nil {
+			var elemPtr @Instr = EmitGetElemPtr(ctx.Func, b, arrPtr, index, elemTyp)
+			return EmitLoad(ctx.Func, b, elemPtr, elemTyp)
+		}
+	}
+
+	// Slice indexing: call runtime
+	return EmitSliceGet(ctx.Func, b, collection, index, elemTyp)
+}
+
+func genSliceExpr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	// e.X = slice, e.Z = lo (may be nil → 0), e.Y = hi (may be nil → len)
+	var collection @Instr = genExpr(ctx, b, e.X)
+	var lo @Instr
+	var hi @Instr
+
+	if e.Z != nil {
+		lo = genExpr(ctx, b, e.Z)
+	} else {
+		lo = EmitConstInt(ctx.Func, b, 0, types.TypInt())
+	}
+	if e.Y != nil {
+		hi = genExpr(ctx, b, e.Y)
+	} else {
+		hi = EmitSliceLen(ctx.Func, b, collection)
+	}
+
+	var resultTyp @types.Type = collection.Typ
+	if resultTyp == nil {
+		resultTyp = types.MakeSliceType(types.TypInt())
+	}
+	return EmitSliceExpr(ctx.Func, b, collection, lo, hi, resultTyp)
 }
 
 // ============================================================
@@ -899,6 +1169,22 @@ func genSelector(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 					var idx int = lookupFieldIndex(si, e.Name)
 					var ftyp @types.Type = lookupFieldType(si, e.Name)
 					var fieldPtr @Instr = EmitGetFieldPtr(ctx.Func, b, ptr, idx, ftyp)
+					return EmitLoad(ctx.Func, b, fieldPtr, ftyp)
+				}
+			}
+			// Managed pointer: p.x where p is @Struct — load ptr, GEP for field
+			if varTyp != nil && varTyp.Kind == types.TYP_MANAGED_PTR && varTyp.Elem != nil && varTyp.Elem.Kind == types.TYP_STRUCT {
+				var structTyp @types.Type = varTyp.Elem
+				var si int = lookupStructIdx(structTyp.Name)
+				if si >= 0 {
+					// Load the managed pointer (i8*)
+					var mptr @Instr = EmitLoad(ctx.Func, b, ptr, varTyp)
+					// Tag the pointer with the struct type for emitter
+					mptr.TypeArg = structTyp
+					var idx int = lookupFieldIndex(si, e.Name)
+					var ftyp @types.Type = lookupFieldType(si, e.Name)
+					// Emit GET_FIELD_PTR — emitter will bitcast i8* → %Struct* first
+					var fieldPtr @Instr = EmitGetFieldPtr(ctx.Func, b, mptr, idx, ftyp)
 					return EmitLoad(ctx.Func, b, fieldPtr, ftyp)
 				}
 			}
@@ -940,6 +1226,18 @@ func genSelectorPtr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 						var idx int = lookupFieldIndex(si, e.Name)
 						var ftyp @types.Type = lookupFieldType(si, e.Name)
 						return EmitGetFieldPtr(ctx.Func, b, ptr, idx, ftyp)
+					}
+				}
+				// Managed pointer: p.x where p is @Struct
+				if varTyp != nil && varTyp.Kind == types.TYP_MANAGED_PTR && varTyp.Elem != nil && varTyp.Elem.Kind == types.TYP_STRUCT {
+					var structTyp @types.Type = varTyp.Elem
+					var si int = lookupStructIdx(structTyp.Name)
+					if si >= 0 {
+						var mptr @Instr = EmitLoad(ctx.Func, b, ptr, varTyp)
+						mptr.TypeArg = structTyp
+						var idx int = lookupFieldIndex(si, e.Name)
+						var ftyp @types.Type = lookupFieldType(si, e.Name)
+						return EmitGetFieldPtr(ctx.Func, b, mptr, idx, ftyp)
 					}
 				}
 			}
@@ -986,6 +1284,12 @@ func genCompositeLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 	if e.TypeRef == nil {
 		return EmitConstInt(ctx.Func, b, 0, types.TypInt())
 	}
+
+	// Array composite literal: [N]T{...}
+	if e.TypeRef.Kind == ast.TEXPR_ARRAY {
+		return genArrayLit(ctx, b, e)
+	}
+
 	var typeName []char = e.TypeRef.Name
 	var si int = lookupStructIdx(typeName)
 	if si < 0 {

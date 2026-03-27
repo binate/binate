@@ -27,6 +27,9 @@ go run . -root ../binate ../binate/main.bn -- ../binate/mini_driver.bn -- ../bin
 # Run unit tests for a package
 go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/interp pkg/loader
 
+# Run with verbose logging (-v works at both bootstrap and self-hosted level)
+go run . -v -root ../binate ../binate/main.bn -- -v ../binate/selftest.bn
+
 # Run conformance tests
 cd ../binate && ./conformance/run.sh bootstrap
 ```
@@ -50,6 +53,7 @@ binate/
     types/                 Type system (Type struct with Kind enum)
     interp/                Tree-walking interpreter, values, environments
     loader/                Package discovery, loading, merging, topological sort
+    debug/                 Verbose logging (SetVerbose, Log)
     builtin/testing/       Test framework (TestResult type alias)
     bootstrap.bni          Interface for bootstrap-provided OS primitives
 ```
@@ -63,6 +67,26 @@ Programs run through three stages:
 1. **Parse**: Source files are tokenized (lexer) and parsed (parser) into AST nodes.
 2. **Load**: The package loader discovers imported packages on disk, parses their `.bn`/`.bni` files, merges multi-file packages, and computes a dependency-ordered load sequence via topological sort.
 3. **Interpret**: The tree-walking interpreter evaluates AST nodes directly. Packages are loaded in dependency order, each getting its own environment. The main package runs last.
+
+### Verbose Logging
+
+All three layers support `-v` for debug logging to stderr:
+
+```sh
+# Bootstrap verbose (package loading, type checking, interpreter)
+go run . -v -root ../binate ../binate/main.bn -- program.bn
+
+# Self-hosted interpreter verbose (parsing, loading, interpreter entry)
+go run . -root ../binate ../binate/main.bn -- -v program.bn
+
+# Compiler verbose (parsing, IR generation, LLVM emission)
+go run . -root ../binate ../binate/compile.bn -- -v program.bn
+
+# Both layers verbose at once
+go run . -v -root ../binate ../binate/main.bn -- -v program.bn
+```
+
+The `pkg/debug` package provides `SetVerbose`, `IsVerbose`, and `Log` for use in self-hosted code. `Log` writes `[verbose] msg` to stderr only when verbose mode is active.
 
 ### Double Interpretation
 

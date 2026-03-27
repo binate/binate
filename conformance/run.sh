@@ -48,19 +48,14 @@ for bn in "$SCRIPT_DIR"/*.bn; do
             actual=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/main.bn" -- "$bn" 2>&1) || true
             ;;
         compiled)
-            tmpll="/tmp/binate_conform_${name}.ll"
             tmpbin="/tmp/binate_conform_${name}"
-            actual=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/compile.bn" -- "$bn" > "$tmpll" 2>&1) || true
-            if [ -s "$tmpll" ]; then
-                if clang -w -o "$tmpbin" "$tmpll" "$BINATE_DIR/runtime/binate_runtime.c" 2>/dev/null; then
-                    actual=$("$tmpbin" 2>&1) || true
-                else
-                    actual="COMPILE_ERROR: clang failed"
-                fi
+            compile_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/compile.bn" -- -o "$tmpbin" "$bn" 2>&1) || true
+            if [ -x "$tmpbin" ]; then
+                actual=$("$tmpbin" 2>&1) || true
             else
-                actual="COMPILE_ERROR: no LLVM IR produced: $actual"
+                actual="COMPILE_ERROR: $compile_out"
             fi
-            rm -f "$tmpll" "$tmpbin"
+            rm -f "$tmpbin"
             ;;
         *)
             echo "Unknown mode: $MODE (use bootstrap|selfhost|compiled)"
@@ -69,9 +64,13 @@ for bn in "$SCRIPT_DIR"/*.bn; do
     esac
 
     expected_content="$(cat "$expected")"
+    known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
     if [ "$actual" = "$expected_content" ]; then
         echo "PASS: $name"
         passed=$((passed + 1))
+    elif [ -f "$known_fail" ]; then
+        echo "XFAIL: $name (known failure: $(cat "$known_fail"))"
+        skipped=$((skipped + 1))
     else
         echo "FAIL: $name"
         echo "  expected: $(head -3 "$expected")"

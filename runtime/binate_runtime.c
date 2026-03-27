@@ -104,6 +104,13 @@ BnSlice bn_append_i8(BnSlice s, int64_t val) {
     return s;
 }
 
+// Free slice backing data (no-op for nil slices)
+void bn_slice_free(BnSlice s) {
+    if (s.data) {
+        free(s.data);
+    }
+}
+
 // string literal → []char slice (copies string data, excludes null terminator)
 BnSlice bn_string_to_chars(const char *str) {
     int64_t n = (int64_t)strlen(str);

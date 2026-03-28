@@ -305,6 +305,7 @@ void bn_print_bool(int8_t b) {
 
 void bn_print_newline(void) {
     printf("\n");
+    fflush(stdout);
 }
 
 void bn_exit(int64_t code) {

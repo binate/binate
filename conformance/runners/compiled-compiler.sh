@@ -26,14 +26,16 @@ runner_exec() {
         compile_root="$root"
     fi
     if [ -n "$compile_root" ]; then
-        compile_out=$("$COMPILED_COMPILER" --root "$compile_root" -o "$tmpbin" "$bn" 2>&1) || true
+        compile_out=$("$COMPILED_COMPILER" --root "$compile_root" -o "$tmpbin" "$bn" 2>&1)
+        compile_rc=$?
     else
-        compile_out=$("$COMPILED_COMPILER" -o "$tmpbin" "$bn" 2>&1) || true
+        compile_out=$("$COMPILED_COMPILER" -o "$tmpbin" "$bn" 2>&1)
+        compile_rc=$?
     fi
     if [ -x "$tmpbin" ]; then
         "$tmpbin" 2>&1 || true
     else
-        echo "COMPILE_ERROR: $compile_out"
+        echo "COMPILE_ERROR (exit $compile_rc): $compile_out"
     fi
     rm -f "$tmpbin"
 }

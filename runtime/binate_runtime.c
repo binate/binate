@@ -267,6 +267,11 @@ void bn_refcount_dec(void *ptr) {
     header[0]--;
     if (header[0] <= 0) {
         bn_free_fn fn = (bn_free_fn)header[1];
+        if (!fn) {
+            fprintf(stderr, "BUG: bn_refcount_dec: free_fn is NULL for ptr %p (rc was %lld)\n",
+                    ptr, header[0] + 1);
+            abort();
+        }
         fn((void *)header);
     }
 }

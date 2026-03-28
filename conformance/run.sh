@@ -4,6 +4,9 @@
 # Runs conformance tests against the specified backend.
 # Optional filters select tests by substring match (e.g. "040" or "recursive").
 #
+# Environment:
+#   BINATE_FLAGS    Extra flags passed to the Binate compiler (e.g. "-g" for debug info)
+#
 # Modes:
 #   bootstrap          Go bootstrap interpreter runs .bn files directly
 #   selfhost           Bootstrap interprets main.bn, which runs .bn files

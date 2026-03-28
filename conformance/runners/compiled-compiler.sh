@@ -26,10 +26,10 @@ runner_exec() {
         compile_root="$root"
     fi
     if [ -n "$compile_root" ]; then
-        compile_out=$("$COMPILED_COMPILER" --root "$compile_root" -o "$tmpbin" "$bn" 2>&1)
+        compile_out=$("$COMPILED_COMPILER" --root "$compile_root" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1)
         compile_rc=$?
     else
-        compile_out=$("$COMPILED_COMPILER" -o "$tmpbin" "$bn" 2>&1)
+        compile_out=$("$COMPILED_COMPILER" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1)
         compile_rc=$?
     fi
     if [ -x "$tmpbin" ]; then

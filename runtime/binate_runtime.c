@@ -346,9 +346,10 @@ static BnSlice cstr_to_slice(const char *s) {
 int64_t bn_bootstrap__Open(BnSlice path, int64_t flags) {
     char *cpath = slice_to_cstr(path);
     int oflags = 0;
-    if (flags == 0) oflags = O_RDONLY;
-    else if (flags == 1) oflags = O_WRONLY;
-    else if (flags == 2) oflags = O_RDWR;
+    int mode = flags & 3;  // low 2 bits: 0=RDONLY, 1=WRONLY, 2=RDWR
+    if (mode == 0) oflags = O_RDONLY;
+    else if (mode == 1) oflags = O_WRONLY;
+    else if (mode == 2) oflags = O_RDWR;
     // Handle combined flags
     if (flags & 64)  oflags |= O_CREAT;
     if (flags & 512) oflags |= O_TRUNC;

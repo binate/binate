@@ -11,18 +11,28 @@
 // Binate runtime library
 // Provides I/O and basic operations for compiled Binate programs.
 
+// Forward declarations for managed memory (defined below in the managed pointers section)
+void *bn_alloc(int64_t payload_size);
+void bn_refcount_inc(void *ptr);
+
 // ============================================================
 // Slice representation: { data*, len }
 //
 // Binate slices have no capacity field — append always reallocates.
-// Unmanaged slices ([]T) own their data.
-// Managed slices (@[]T) will add a refcount header later.
+// Unmanaged slices ([]T) own their data: { *T data, uint len }.
+// Managed slices (@[]T) have a refcounted backing: { @any refptr, *T data, uint len }.
 // ============================================================
 
 typedef struct {
-    void    *data;
-    int64_t  len;
+    void    *data;      // *T: pointer to first element
+    int64_t  len;       // uint: number of elements
 } BnSlice;
+
+typedef struct {
+    void    *refptr;    // @any: managed pointer to backing array (refcounted)
+    void    *data;      // *T: pointer to first element (= refptr for fresh allocs)
+    int64_t  len;       // uint: number of elements
+} BnManagedSlice;
 
 // make([]T, n) — allocate a zeroed slice with given length and element size
 BnSlice bn_make_slice(int64_t elem_size, int64_t length) {
@@ -33,6 +43,33 @@ BnSlice bn_make_slice(int64_t elem_size, int64_t length) {
     } else {
         s.data = NULL;
     }
+    return s;
+}
+
+// make_slice(T, n) — allocate a managed-slice with refcounted backing array
+BnManagedSlice bn_make_managed_slice(int64_t elem_size, int64_t length) {
+    BnManagedSlice ms;
+    ms.len = length;
+    if (length > 0) {
+        ms.refptr = bn_alloc(length * elem_size);  // refcounted, zero-initialized
+        ms.data = ms.refptr;  // data starts at same address as payload
+    } else {
+        ms.refptr = NULL;
+        ms.data = NULL;
+    }
+    return ms;
+}
+
+// Managed-slice len
+int64_t bn_managed_slice_len(BnManagedSlice ms) {
+    return ms.len;
+}
+
+// Managed-slice element access (extracts inner BnSlice for runtime dispatch)
+static BnSlice bn_managed_slice_to_raw(BnManagedSlice ms) {
+    BnSlice s;
+    s.data = ms.data;
+    s.len = ms.len;
     return s;
 }
 

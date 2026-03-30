@@ -13,6 +13,7 @@
 #   compiled           Bootstrap interprets compile.bn, which compiles .bn to native
 #   compiled-interp    Self-compiled interpreter binary runs .bn files
 #   compiled-compiler  Self-compiled compiler binary compiles .bn to native
+#   gen2-compiler      Second-generation compiler (gen1 compiles itself) compiles .bn to native
 #
 # Test formats:
 #   Single-file: NNN_name.bn + NNN_name.expected

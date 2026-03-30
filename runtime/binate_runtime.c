@@ -283,9 +283,7 @@ void bn_refcount_dec(void *ptr) {
     int64_t *header = ((int64_t *)ptr) - 2;
     if (header[0] == BN_REFCOUNT_IMMORTAL) return;
     header[0]--;
-    // TEMPORARY: disable freeing to diagnose use-after-free cascade.
-    // Objects leak but never produce dangling pointers.
-    // TODO: re-enable once slice ownership semantics are implemented.
+    // TEMPORARY: disable freeing until managed pointer lifecycle is fully correct.
     // if (header[0] <= 0) {
     //     bn_free_fn fn = (bn_free_fn)header[1];
     //     fn((void *)header);

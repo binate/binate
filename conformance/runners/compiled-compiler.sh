@@ -21,7 +21,7 @@ runner_exec() {
     root="$2"
     name="$(basename "$bn" .bn)"
     tmpbin="/tmp/binate_conform_cc_${name}_$$"
-    compile_root=""
+    compile_root="$BINATE_DIR"
     if [ -n "$root" ]; then
         compile_root="$root"
     fi

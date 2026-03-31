@@ -13,14 +13,12 @@
 
 // Forward declarations for managed memory (defined below in the managed pointers section)
 void *bn_alloc(int64_t payload_size);
-void bn_refcount_inc(void *ptr);
 
 // ============================================================
 // Slice representation: { data*, len }
 //
-// Binate slices have no capacity field — append always reallocates.
-// Unmanaged slices ([]T) own their data: { *T data, uint len }.
-// Managed slices (@[]T) have a refcounted backing: { @any refptr, *T data, uint len }.
+// Unmanaged slices ([]T): { *T data, uint len } — no capacity, append always reallocates.
+// Managed slices (@[]T): { *T data, uint len, @any refptr } — provided by pkg/rt.
 // ============================================================
 
 typedef struct {
@@ -28,13 +26,7 @@ typedef struct {
     int64_t  len;       // uint: number of elements
 } BnSlice;
 
-typedef struct {
-    void    *refptr;    // @any: managed pointer to backing array (refcounted)
-    void    *data;      // *T: pointer to first element (= refptr for fresh allocs)
-    int64_t  len;       // uint: number of elements
-} BnManagedSlice;
-
-// make([]T, n) — allocate a zeroed slice with given length and element size
+// make_raw_deprecated([]T, n) — allocate a zeroed unmanaged slice
 BnSlice bn_make_slice(int64_t elem_size, int64_t length) {
     BnSlice s;
     s.len = length;
@@ -43,33 +35,6 @@ BnSlice bn_make_slice(int64_t elem_size, int64_t length) {
     } else {
         s.data = NULL;
     }
-    return s;
-}
-
-// make_slice(T, n) — allocate a managed-slice with refcounted backing array
-BnManagedSlice bn_make_managed_slice(int64_t elem_size, int64_t length) {
-    BnManagedSlice ms;
-    ms.len = length;
-    if (length > 0) {
-        ms.refptr = bn_alloc(length * elem_size);  // refcounted, zero-initialized
-        ms.data = ms.refptr;  // data starts at same address as payload
-    } else {
-        ms.refptr = NULL;
-        ms.data = NULL;
-    }
-    return ms;
-}
-
-// Managed-slice len
-int64_t bn_managed_slice_len(BnManagedSlice ms) {
-    return ms.len;
-}
-
-// Managed-slice element access (extracts inner BnSlice for runtime dispatch)
-static BnSlice bn_managed_slice_to_raw(BnManagedSlice ms) {
-    BnSlice s;
-    s.data = ms.data;
-    s.len = ms.len;
     return s;
 }
 
@@ -306,26 +271,8 @@ void *bn_box(void *val, int64_t val_size) {
     return payload;
 }
 
-// Increment refcount of a managed pointer (no-op for nil)
-void bn_refcount_inc(void *ptr) {
-    if (!ptr) return;
-    int64_t *header = ((int64_t *)ptr) - 2;
-    if (header[0] == BN_REFCOUNT_IMMORTAL) return;
-    header[0]++;
-}
-
-// Decrement refcount of a managed pointer; free if it hits zero (no-op for nil)
-void bn_refcount_dec(void *ptr) {
-    if (!ptr) return;
-    int64_t *header = ((int64_t *)ptr) - 2;
-    if (header[0] == BN_REFCOUNT_IMMORTAL) return;
-    header[0]--;
-    // TEMPORARY: disable freeing until managed pointer lifecycle is fully correct.
-    // if (header[0] <= 0) {
-    //     bn_free_fn fn = (bn_free_fn)header[1];
-    //     fn((void *)header);
-    // }
-}
+// bn_refcount_inc and bn_refcount_dec are now provided by pkg/rt
+// (bn_rt__RefInc, bn_rt__RefDec)
 
 // ============================================================
 // Bounds checking

@@ -224,20 +224,8 @@ void bn_print_chars(BnSlice s) {
     }
 }
 
-// Managed memory (Alloc, Box, RefInc, RefDec, Free) is provided by pkg/rt.
-// See pkg/rt/rt.bn and runtime/rt_stubs.c.
-
-// ============================================================
-// Bounds checking
-// ============================================================
-
-void bn_bounds_check(int64_t index, int64_t length) {
-    if (index < 0 || index >= length) {
-        fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",
-                (long long)index, (long long)length);
-        exit(2);
-    }
-}
+// Managed memory (Alloc, Box, RefInc, RefDec, Free) and bounds checking
+// are provided by pkg/rt. See pkg/rt/rt.bn and runtime/rt_stubs.c.
 
 // ============================================================
 // I/O

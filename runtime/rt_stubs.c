@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
 
 void *bn_rt__c_malloc(int64_t size) {
     return malloc((size_t)size);
@@ -24,4 +25,15 @@ void bn_rt__c_memset(void *ptr, int64_t val, int64_t size) {
 
 void bn_rt__c_memcpy(void *dst, void *src, int64_t size) {
     memcpy(dst, src, (size_t)size);
+}
+
+void bn_rt__c_exit(int64_t code) {
+    exit((int)code);
+}
+
+// Formatted error + abort for bounds check failures (slow path only)
+void bn_rt__c_bounds_fail(int64_t index, int64_t length) {
+    fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",
+            (long long)index, (long long)length);
+    exit(2);
 }

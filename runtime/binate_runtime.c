@@ -11,9 +11,6 @@
 // Binate runtime library
 // Provides I/O and basic operations for compiled Binate programs.
 
-// Forward declarations for managed memory (defined below in the managed pointers section)
-void *bn_alloc(int64_t payload_size);
-
 // ============================================================
 // Slice representation: { data*, len }
 //
@@ -227,52 +224,8 @@ void bn_print_chars(BnSlice s) {
     }
 }
 
-// ============================================================
-// Managed pointers — refcounted with two-word header
-//
-// Layout: [ refcount (int64) | free_fn (ptr) | payload ... ]
-//                                              ^
-//                               managed pointer points here
-//
-// refcount at ptr[-2], free_fn at ptr[-1]
-// free_fn is called with the base pointer (ptr - 16) when refcount hits 0
-// ============================================================
-
-#define BN_HEADER_SIZE (2 * sizeof(int64_t))
-#define BN_REFCOUNT_IMMORTAL INT64_MAX
-
-typedef void (*bn_free_fn)(void *base);
-
-// Default free function — just calls free on the base pointer
-static void bn_default_free(void *base) {
-    free(base);
-}
-
-// bn_alloc — allocate managed memory with refcount header
-// Returns pointer to payload (past the two-word header)
-void *bn_alloc(int64_t payload_size) {
-    void *base = malloc(BN_HEADER_SIZE + (size_t)payload_size);
-    if (!base) {
-        fprintf(stderr, "runtime error: out of memory\n");
-        exit(2);
-    }
-    int64_t *header = (int64_t *)base;
-    header[0] = 1;                          // refcount = 1
-    header[1] = (int64_t)bn_default_free;   // free function
-    void *payload = (void *)(header + 2);
-    memset(payload, 0, (size_t)payload_size);
-    return payload;
-}
-
-// box(val) — allocate val_size bytes on heap with refcount header, copy val into payload
-void *bn_box(void *val, int64_t val_size) {
-    void *payload = bn_alloc(val_size);
-    memcpy(payload, val, (size_t)val_size);
-    return payload;
-}
-
-// bn_refcount_inc and bn_refcount_dec are now provided by pkg/rt
-// (bn_rt__RefInc, bn_rt__RefDec)
+// Managed memory (Alloc, Box, RefInc, RefDec, Free) is provided by pkg/rt.
+// See pkg/rt/rt.bn and runtime/rt_stubs.c.
 
 // ============================================================
 // Bounds checking

@@ -6,7 +6,7 @@ This repository is bootstrapped using the [Go bootstrap interpreter](https://git
 
 ## Status
 
-Self-hosted interpreter is working. The interpreter can interpret itself (double interpretation verified: bootstrap interprets `main.bn`, which interprets `main.bn`, which interprets a target program). The package loader discovers and resolves multi-package projects. Next milestone: self-hosted compiler (Phase 5b).
+Self-hosted interpreter and compiler are working. The interpreter can interpret itself (double interpretation verified). The compiler produces native binaries via LLVM IR. Self-compilation works (bootstrap interprets compiler to compile compiler). Next milestone: fully passing gen2 compiler.
 
 ## Quick Start
 
@@ -17,18 +17,15 @@ Requires Go and the [bootstrap interpreter](https://github.com/binate/bootstrap)
 git clone https://github.com/binate/bootstrap.git
 git clone https://github.com/binate/binate.git
 
-# Run a program
+# Run a program via the self-hosted interpreter
 cd bootstrap
-go run . -root ../binate ../binate/main.bn -- ../binate/selftest.bn
+go run . -root ../binate ../binate/cmd/bni -- ../binate/selftest.bn
 
-# Double interpretation (bootstrap -> main.bn -> mini_driver.bn -> program.bn)
-go run . -root ../binate ../binate/main.bn -- ../binate/mini_driver.bn -- ../binate/selftest.bn
+# Compile and run a program
+go run . -root ../binate ../binate/cmd/bnc -- ../binate/selftest.bn && ./selftest
 
 # Run unit tests for a package
 go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/interp pkg/loader
-
-# Run with verbose logging (-v works at both bootstrap and self-hosted level)
-go run . -v -root ../binate ../binate/main.bn -- -v ../binate/selftest.bn
 
 # Run conformance tests
 cd ../binate && ./conformance/run.sh bootstrap
@@ -38,24 +35,31 @@ cd ../binate && ./conformance/run.sh bootstrap
 
 ```
 binate/
-  main.bn                  Self-hosted driver (parse, load, interpret)
-  mini_driver.bn           Lightweight driver for double-interpretation testing
-  selftest.bn              Quick self-test (arithmetic, strings, loops, recursion)
-  conformance/             Conformance test suite (shared across backends)
-    run.sh                 Test runner (bootstrap / selfhost modes)
-    NNN_name.bn            Test programs
-    NNN_name.expected       Expected stdout
+  cmd/
+    bni/                     Self-hosted interpreter (parse, load, interpret)
+    bnc/                     Self-hosted compiler (parse, load, IR gen, LLVM emit)
+  selftest.bn                Quick self-test (arithmetic, strings, loops, recursion)
+  conformance/               Conformance test suite (shared across backends)
+    run.sh                   Test runner (multiple modes)
+    NNN_name.bn              Test programs
+    NNN_name.expected        Expected stdout
   pkg/
-    token/                 Token types, positions, keyword lookup
-    ast/                   AST node types (Decl, Expr, Stmt, File)
-    lexer/                 Tokenizer with automatic semicolon insertion
-    parser/                Recursive descent parser
-    types/                 Type system (Type struct with Kind enum)
-    interp/                Tree-walking interpreter, values, environments
-    loader/                Package discovery, loading, merging, topological sort
-    debug/                 Verbose logging (SetVerbose, Log)
-    builtin/testing/       Test framework (TestResult type alias)
-    bootstrap.bni          Interface for bootstrap-provided OS primitives
+    token/                   Token types, positions, keyword lookup
+    ast/                     AST node types (Decl, Expr, Stmt, File)
+    lexer/                   Tokenizer with automatic semicolon insertion
+    parser/                  Recursive descent parser
+    types/                   Type system and checker
+    ir/                      IR generation (AST → SSA-like IR)
+    codegen/                 LLVM IR emission
+    interp/                  Tree-walking interpreter, values, environments
+    loader/                  Package discovery, loading, merging, topological sort
+    buf/                     CharBuf for string building
+    debug/                   Verbose logging (SetVerbose, Log)
+    rt/                      Runtime library (written in Binate)
+    builtin/testing/         Test framework (TestResult type alias)
+    bootstrap.bni            Interface for bootstrap-provided OS primitives
+  runtime/
+    binate_runtime.c         C runtime (memory management, slice ops)
 ```
 
 ## Architecture
@@ -66,27 +70,22 @@ Programs run through three stages:
 
 1. **Parse**: Source files are tokenized (lexer) and parsed (parser) into AST nodes.
 2. **Load**: The package loader discovers imported packages on disk, parses their `.bn`/`.bni` files, merges multi-file packages, and computes a dependency-ordered load sequence via topological sort.
-3. **Interpret**: The tree-walking interpreter evaluates AST nodes directly. Packages are loaded in dependency order, each getting its own environment. The main package runs last.
+3. **Execute**: Either interpreted (tree-walking interpreter) or compiled (IR generation → LLVM IR → native binary via clang).
 
 ### Verbose Logging
 
-All three layers support `-v` for debug logging to stderr:
+All layers support `-v` for debug logging to stderr:
 
 ```sh
-# Bootstrap verbose (package loading, type checking, interpreter)
-go run . -v -root ../binate ../binate/main.bn -- program.bn
+# Bootstrap verbose
+go run . -v -root ../binate ../binate/cmd/bni -- program.bn
 
-# Self-hosted interpreter verbose (parsing, loading, interpreter entry)
-go run . -root ../binate ../binate/main.bn -- -v program.bn
+# Self-hosted interpreter verbose
+go run . -root ../binate ../binate/cmd/bni -- -v program.bn
 
-# Compiler verbose (parsing, IR generation, LLVM emission)
-go run . -root ../binate ../binate/compile.bn -- -v program.bn
-
-# Both layers verbose at once
-go run . -v -root ../binate ../binate/main.bn -- -v program.bn
+# Compiler verbose
+go run . -root ../binate ../binate/cmd/bnc -- -v program.bn
 ```
-
-The `pkg/debug` package provides `SetVerbose`, `IsVerbose`, and `Log` for use in self-hosted code. `Log` writes `[verbose] msg` to stderr only when verbose mode is active.
 
 ### Double Interpretation
 
@@ -94,9 +93,9 @@ The self-hosted interpreter can interpret itself:
 
 ```
 Go bootstrap
-  -> interprets main.bn (self-hosted driver)
-    -> interprets main.bn (or mini_driver.bn)
-      -> interprets target.bn
+  → interprets cmd/bni (self-hosted interpreter)
+    → interprets cmd/bni (self-hosted interpreter again)
+      → interprets target.bn
 ```
 
 This works because the bootstrap forwarding layer (`pkg/interp/bootstrap_fwd.bn`) bridges the gap: when interpreted code calls `bootstrap.Open()`, `bootstrap.Read()`, etc., the forwarding layer dispatches these to the real bootstrap functions provided by the Go runtime.
@@ -110,7 +109,8 @@ Binate uses a filesystem-based package system. Each package has:
 
 ```
 myproject/
-  main.bn                    package "main"
+  cmd/myapp/
+    main.bn                    package "main"
   pkg/
     math.bni                 interface: type declarations, func signatures
     math/
@@ -139,6 +139,7 @@ The `pkg/bootstrap` package provides OS-level primitives. In the Go bootstrap, t
 | `Close`  | `(fd int) int` | Close file descriptor |
 | `Exit`   | `(code int)` | Exit process |
 | `Args`   | `() [][]char` | Program arguments (after `--`) |
+| `Exec`   | `(cmd []char, args [][]char) int` | Execute command, returns exit code |
 | `Stat`   | `(path []char) int` | 0=not found, 1=file, 2=directory |
 | `ReadDir`| `(path []char) [][]char` | Sorted directory entries |
 | `Itoa`   | `(v int) []char` | Int to decimal string |
@@ -148,30 +149,35 @@ Constants: `O_RDONLY`, `O_WRONLY`, `O_RDWR`, `O_CREATE`, `O_TRUNC`, `O_APPEND`, 
 
 ## Testing
 
-Three layers of testing:
-
 ### Unit Tests
 
-Each package has `*_test.bn` files with `func TestXxx() testing.TestResult` functions. Run with the bootstrap's `-test` flag:
+Each source file has a corresponding `*_test.bn` file with `func TestXxx() testing.TestResult` functions:
 
 ```sh
 cd bootstrap
-go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/interp pkg/loader
+go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/interp pkg/loader pkg/ir pkg/codegen
+
+# Test main package directories
+go run . -root ../binate -test ../binate/cmd/bni
+go run . -root ../binate -test ../binate/cmd/bnc
 ```
 
 Tests return `""` for pass, or a failure message string.
 
 ### Conformance Suite
 
-Standalone `.bn` programs with expected output. These tests are shared across all execution backends (bootstrap, self-hosted interpreter, future compiler):
+Standalone `.bn` programs with expected output, shared across all execution backends:
 
 ```sh
 cd binate
-./conformance/run.sh bootstrap    # Run via Go bootstrap
-./conformance/run.sh selfhost     # Run via self-hosted interpreter
+./conformance/run.sh bootstrap          # Go bootstrap interpreter
+./conformance/run.sh selfhost           # Self-hosted interpreter (on bootstrap)
+./conformance/run.sh double-interp      # Double interpretation (interp on interp)
+./conformance/run.sh compiled           # Compiler (on bootstrap) → native
+./conformance/run.sh compiled-interp    # Compiled interpreter binary
+./conformance/run.sh compiled-compiler  # Compiled compiler binary
+./conformance/run.sh gen2-compiler      # Second-generation compiled compiler
 ```
-
-Each test is a `package "main"` program that prints to stdout. The runner compares actual output against the `.expected` file.
 
 ### Go-Level Tests
 

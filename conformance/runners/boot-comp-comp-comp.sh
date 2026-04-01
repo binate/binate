@@ -1,8 +1,5 @@
 #!/bin/sh
-# Runner: second-generation self-compiled compiler compiles test to native binary,
-# then runs the binary.
-# Bootstrap compiles compile.bn → gen1, gen1 compiles compile.bn → gen2.
-# gen2 is then used to compile all tests.
+# Runner: boot-comp-comp-comp — boot-comp builds gen1, gen1 compiles cmd/bnc → gen2, gen2 compiles test.bn.
 
 GEN1_COMPILER="/tmp/binate_gen1_$$"
 GEN2_COMPILER="/tmp/binate_gen2_$$"

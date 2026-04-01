@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: compile.bn (via bootstrap) compiles test .bn to native, then runs it.
+# Runner: boot-comp — boot interprets cmd/bnc, which compiles test.bn to native.
 
 runner_setup() {
     : # nothing to build

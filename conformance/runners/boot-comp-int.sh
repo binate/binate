@@ -1,6 +1,5 @@
 #!/bin/sh
-# Runner: self-compiled interpreter binary runs .bn files.
-# The interpreter (main.bn) is compiled once during setup, then reused for all tests.
+# Runner: boot-comp-int — boot-comp compiles cmd/bni → binary, binary interprets test.bn.
 
 COMPILED_INTERP="/tmp/binate_compiled_interp_$$"
 

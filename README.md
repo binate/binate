@@ -28,7 +28,7 @@ go run . -root ../binate ../binate/cmd/bnc -- ../binate/examples/selftest.bn && 
 go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/interp pkg/loader
 
 # Run conformance tests
-cd ../binate && ./conformance/run.sh bootstrap
+cd ../binate && ./conformance/run.sh boot
 ```
 
 ## Project Structure
@@ -171,13 +171,14 @@ Standalone `.bn` programs with expected output, shared across all execution back
 
 ```sh
 cd binate
-./conformance/run.sh bootstrap          # Go bootstrap interpreter
-./conformance/run.sh selfhost           # Self-hosted interpreter (on bootstrap)
-./conformance/run.sh double-interp      # Double interpretation (interp on interp)
-./conformance/run.sh compiled           # Compiler (on bootstrap) → native
-./conformance/run.sh compiled-interp    # Compiled interpreter binary
-./conformance/run.sh compiled-compiler  # Compiled compiler binary
-./conformance/run.sh gen2-compiler      # Second-generation compiled compiler
+./conformance/run.sh boot               # Go bootstrap interpreter
+./conformance/run.sh boot-int           # boot interprets cmd/bni → test.bn
+./conformance/run.sh boot-int-int       # boot → cmd/bni → cmd/bni → test.bn
+./conformance/run.sh boot-comp          # boot interprets cmd/bnc → compile test.bn
+./conformance/run.sh boot-comp-int      # compiled interpreter binary → test.bn
+./conformance/run.sh boot-comp-int-int  # compiled interp → cmd/bni → test.bn
+./conformance/run.sh boot-comp-comp     # compiled compiler (gen1) → compile test.bn
+./conformance/run.sh boot-comp-comp-comp  # gen2 compiler → compile test.bn
 ```
 
 ### Go-Level Tests

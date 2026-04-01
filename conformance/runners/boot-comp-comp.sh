@@ -1,7 +1,5 @@
 #!/bin/sh
-# Runner: self-compiled compiler binary compiles test to native binary,
-# then runs the binary.
-# The compiler (compile.bn) is compiled once during setup, then reused for all tests.
+# Runner: boot-comp-comp — boot-comp compiles cmd/bnc → gen1 binary, gen1 compiles test.bn.
 
 COMPILED_COMPILER="/tmp/binate_compiled_compiler_$$"
 

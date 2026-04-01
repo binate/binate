@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: self-hosted interpreter (main.bn) interpreted by the bootstrap.
+# Runner: boot-int — bootstrap interprets cmd/bni, which interprets .bn.
 
 runner_setup() {
     : # nothing to build

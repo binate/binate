@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: bootstrap interpreter (Go) directly interprets .bn files.
+# Runner: boot — Go bootstrap interpreter runs .bn directly.
 
 runner_setup() {
     : # nothing to build

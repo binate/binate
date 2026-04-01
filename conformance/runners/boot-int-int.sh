@@ -1,6 +1,5 @@
 #!/bin/sh
-# Runner: double interpretation — bootstrap interprets cmd/bni, which
-# interprets cmd/bni, which interprets the test program.
+# Runner: boot-int-int — boot → cmd/bni → cmd/bni → test.bn.
 
 runner_setup() {
     : # nothing to build

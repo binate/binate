@@ -7,13 +7,15 @@
 # Environment:
 #   BINATE_FLAGS    Extra flags passed to the Binate compiler (e.g. "-g" for debug info)
 #
-# Modes:
-#   bootstrap          Go bootstrap interpreter runs .bn files directly
-#   selfhost           Bootstrap interprets main.bn, which runs .bn files
-#   compiled           Bootstrap interprets compile.bn, which compiles .bn to native
-#   compiled-interp    Self-compiled interpreter binary runs .bn files
-#   compiled-compiler  Self-compiled compiler binary compiles .bn to native
-#   gen2-compiler      Second-generation compiler (gen1 compiles itself) compiles .bn to native
+# Modes (chains of: boot=bootstrap, int=interpreter, comp=compiler):
+#   boot                Go bootstrap interpreter runs .bn directly
+#   boot-int            boot interprets cmd/bni, which interprets .bn
+#   boot-int-int        boot → cmd/bni → cmd/bni → .bn
+#   boot-comp           boot interprets cmd/bnc, which compiles .bn to native
+#   boot-comp-int       boot-comp compiles cmd/bni → binary, binary interprets .bn
+#   boot-comp-int-int   boot-comp-int interprets cmd/bni, which interprets .bn
+#   boot-comp-comp      boot-comp compiles cmd/bnc → gen1, gen1 compiles .bn
+#   boot-comp-comp-comp boot-comp-comp builds gen1, gen1 → gen2, gen2 compiles .bn
 #
 # Test formats:
 #   Single-file: NNN_name.bn + NNN_name.expected

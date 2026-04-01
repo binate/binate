@@ -6,7 +6,7 @@ COMPILED_INTERP="/tmp/binate_compiled_interp_$$"
 
 runner_setup() {
     echo "Building compiled interpreter..."
-    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/binatec" -- --root "$BINATE_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/main.bn" 2>&1)
+    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/main.bn" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"

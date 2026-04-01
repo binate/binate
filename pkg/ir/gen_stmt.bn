@@ -1,0 +1,377 @@
+package "pkg/ir"
+
+import "pkg/ast"
+import "pkg/types"
+import "pkg/token"
+import "pkg/buf"
+
+// ============================================================
+// Function generation
+// ============================================================
+
+func genFunc(d @ast.Decl) @Func {
+	// Build params
+	var params @[]@Param = nil
+	var f @Func = NewFunc(d.Name, nil, nil)
+
+	if d.Params != nil {
+		for i := 0; i < len(d.Params); i++ {
+			var pd @ast.ParamDecl = d.Params[i]
+			var pt @types.Type = resolveTypeExpr(pd.Type)
+			var p @Param = NewParam(f, pd.Name, pt)
+			params = appendParamPtr(params, p)
+		}
+		f.Params = params
+	}
+
+	// Build results
+	if d.Results != nil {
+		var results @[]@types.Type = nil
+		for i := 0; i < len(d.Results); i++ {
+			results = appendTypePtr(results, resolveTypeExpr(d.Results[i]))
+		}
+		f.Results = results
+	}
+
+	// If no body, mark as extern (declaration only, e.g. C stub in .bni)
+	if d.Body == nil {
+		f.IsExtern = true
+		return f
+	}
+
+	// Generate body
+	if d.Body != nil {
+		var entry @Block = AddBlock(f, "entry")
+
+		// Allocate stack slots for parameters
+		var paramSlots @[]@Instr = nil
+		for i := 0; i < len(f.Params); i++ {
+			var slot @Instr = EmitAlloc(f, entry, f.Params[i].Typ)
+			// Store param value into slot
+			// We emit a placeholder — the param reference is by ID
+			var paramRef @Instr = make(Instr)
+			paramRef.ID = f.Params[i].ID
+			paramRef.Typ = f.Params[i].Typ
+			paramRef.Op = OP_CONST_INT // placeholder; LLVM emitter uses ID
+			EmitStore(entry, slot, paramRef)
+			paramSlots = appendInstrPtr(paramSlots, slot)
+		}
+
+		var ctx @GenContext = make(GenContext)
+		ctx.Func = f
+		ctx.ParamSlots = paramSlots
+		ctx.CurBlock = entry
+
+		// Register params as named variables (marked as params so slices aren't freed)
+		for i := 0; i < len(f.Params); i++ {
+			defineVarParam(ctx, f.Params[i].Name, paramSlots[i], f.Params[i].Typ)
+		}
+
+		// Increment refcount for managed pointer/slice params (callee owns a reference)
+		for i := 0; i < len(f.Params); i++ {
+			if isManagedPtrType(f.Params[i].Typ) {
+				var ptrVal @Instr = EmitLoad(f, entry, paramSlots[i], f.Params[i].Typ)
+				EmitRefcountInc(entry, ptrVal)
+			}
+			if isManagedSliceType(f.Params[i].Typ) {
+				var sliceVal @Instr = EmitLoad(f, entry, paramSlots[i], f.Params[i].Typ)
+				emitManagedSliceRefInc(f, entry, sliceVal)
+			}
+		}
+
+		genBlock(ctx, entry, d.Body)
+
+		// If block isn't terminated, add return or unreachable
+		var isVoid bool = f.Results == nil || len(f.Results) == 0
+		if len(entry.Instrs) == 0 || !IsTerminator(entry.Instrs[len(entry.Instrs)-1]) {
+			if isVoid {
+				emitDecForManagedLocals(ctx, entry, nil)
+				EmitReturn(entry, nil)
+			} else {
+				EmitUnreachable(entry)
+			}
+		}
+		// Also check all blocks
+		for i := 0; i < len(f.Blocks); i++ {
+			var blk @Block = f.Blocks[i]
+			if len(blk.Instrs) == 0 || !IsTerminator(blk.Instrs[len(blk.Instrs)-1]) {
+				if isVoid {
+					emitDecForManagedLocals(ctx, blk, nil)
+					EmitReturn(blk, nil)
+				} else {
+					EmitUnreachable(blk)
+				}
+			}
+		}
+	}
+
+	return f
+}
+
+// GenContext holds state during IR generation for one function.
+type GenContext struct {
+	Func       @Func
+	Vars       @[]VarSlot      // named variable → alloca'd pointer
+	ParamSlots @[]@Instr       // param index → alloca'd pointer
+	BreakTo    @Block          // current break target
+	ContinueTo @Block          // current continue target
+	CurBlock   @Block          // tracks current block (updated by short-circuit eval)
+}
+
+type VarSlot struct {
+	Name    []char
+	Ptr     @Instr
+	Typ     @types.Type
+	IsParam bool // true for function parameters (don't free slices)
+}
+
+func lookupVar(ctx @GenContext, name []char) @Instr {
+	// Search backwards for most recent definition (shadowing)
+	for i := len(ctx.Vars) - 1; i >= 0; i-- {
+		if streq(ctx.Vars[i].Name, name) {
+			return ctx.Vars[i].Ptr
+		}
+	}
+	// Fall back to global variables
+	for i := 0; i < len(moduleGlobals); i++ {
+		if streq(moduleGlobals[i].Name, name) {
+			// Return a pseudo-instruction representing the global pointer
+			var g @Instr = make(Instr)
+			g.ID = -1
+			g.Op = OP_ALLOC
+			g.StrVal = moduleGlobals[i].Name
+			g.Typ = types.MakePointerType(moduleGlobals[i].Typ)
+			g.TypeArg = moduleGlobals[i].Typ
+			return g
+		}
+	}
+	return nil
+}
+
+func lookupVarType(ctx @GenContext, name []char) @types.Type {
+	for i := len(ctx.Vars) - 1; i >= 0; i-- {
+		if streq(ctx.Vars[i].Name, name) {
+			return ctx.Vars[i].Typ
+		}
+	}
+	// Fall back to global variables
+	for i := 0; i < len(moduleGlobals); i++ {
+		if streq(moduleGlobals[i].Name, name) {
+			return moduleGlobals[i].Typ
+		}
+	}
+	return nil
+}
+
+func defineVar(ctx @GenContext, name []char, ptr @Instr, typ @types.Type) {
+	var slot VarSlot
+	slot.Name = name
+	slot.Ptr = ptr
+	slot.Typ = typ
+	slot.IsParam = false
+	ctx.Vars = appendVarSlot(ctx.Vars, slot)
+}
+
+func defineVarParam(ctx @GenContext, name []char, ptr @Instr, typ @types.Type) {
+	var slot VarSlot
+	slot.Name = name
+	slot.Ptr = ptr
+	slot.Typ = typ
+	slot.IsParam = true
+	ctx.Vars = appendVarSlot(ctx.Vars, slot)
+}
+
+// ============================================================
+// Statement generation
+// ============================================================
+
+func genBlock(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	if stmt.Kind == ast.STMT_BLOCK {
+		// Save scope depth to restore on exit
+		var savedVarLen int = len(ctx.Vars)
+		var cur @Block = b
+		for i := 0; i < len(stmt.Stmts); i++ {
+			cur = genStmt(ctx, cur, stmt.Stmts[i])
+			// If block is terminated (return/break/continue), stop
+			if len(cur.Instrs) > 0 && IsTerminator(cur.Instrs[len(cur.Instrs)-1]) {
+				// Don't emit scope cleanup here — return already handles its own dec,
+				// and break/continue jump to blocks that will handle cleanup
+				ctx.Vars = ctx.Vars[:savedVarLen]
+				return cur
+			}
+		}
+		// Normal scope exit: dec managed ptr vars declared in this scope
+		emitDecForScopeVars(ctx, cur, savedVarLen)
+		ctx.Vars = ctx.Vars[:savedVarLen]
+		return cur
+	}
+	return genStmt(ctx, b, stmt)
+}
+
+func genStmt(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	if stmt.Kind == ast.STMT_EXPR {
+		genExpr(ctx, b, stmt.X)
+		return ctx.CurBlock
+	}
+
+	if stmt.Kind == ast.STMT_RETURN {
+		if stmt.Exprs != nil && len(stmt.Exprs) > 0 {
+			var vals @[]@Instr = nil
+			for i := 0; i < len(stmt.Exprs); i++ {
+				var val @Instr = genExpr(ctx, b, stmt.Exprs[i])
+				b = ctx.CurBlock
+				// Fix nil type to match return type
+				if ctx.Func.Results != nil && i < len(ctx.Func.Results) {
+					var retTyp @types.Type = ctx.Func.Results[i]
+					if val.Op == OP_CONST_NIL && val.Typ != nil && val.Typ.Kind == types.TYP_NIL {
+						val.Typ = retTyp
+					}
+					// Convert string literal to []char if function returns []char
+					if retTyp.Kind == types.TYP_SLICE && retTyp.Elem != nil && retTyp.Elem.Width == 8 {
+						if val.Typ != nil && val.Typ.Kind == types.TYP_STRING {
+							val = EmitStringToChars(ctx.Func, b, val, retTyp)
+						}
+					}
+					// Convert @[]T to []T if function returns raw slice
+					if retTyp.Kind == types.TYP_SLICE && val.Typ != nil && val.Typ.Kind == types.TYP_MANAGED_SLICE {
+						val = EmitManagedToRaw(ctx.Func, b, val)
+					}
+				}
+				// Load struct/array value from alloca before returning
+				if val.Op == OP_ALLOC && val.TypeArg != nil && (val.TypeArg.Kind == types.TYP_STRUCT || val.TypeArg.Kind == types.TYP_ARRAY) {
+					val = EmitLoad(ctx.Func, b, val, val.TypeArg)
+				}
+				vals = appendInstrPtr(vals, val)
+			}
+			// Dec managed ptr locals before returning (skip returned variables)
+			emitDecForManagedLocals(ctx, b, stmt.Exprs)
+			EmitReturn(b, vals)
+		} else {
+			// Dec all managed ptr locals before void return
+			emitDecForManagedLocals(ctx, b, nil)
+			EmitReturn(b, nil)
+		}
+		return b
+	}
+
+	if stmt.Kind == ast.STMT_DECL {
+		ctx.CurBlock = b
+		genDecl(ctx, b, stmt.DeclRef)
+		return ctx.CurBlock
+	}
+
+	if stmt.Kind == ast.STMT_ASSIGN {
+		return genAssign(ctx, b, stmt)
+	}
+
+	if stmt.Kind == ast.STMT_SHORT_VAR {
+		return genShortVar(ctx, b, stmt)
+	}
+
+	if stmt.Kind == ast.STMT_IF {
+		return genIf(ctx, b, stmt)
+	}
+
+	if stmt.Kind == ast.STMT_FOR {
+		return genFor(ctx, b, stmt)
+	}
+
+	if stmt.Kind == ast.STMT_INC_DEC {
+		return genIncDec(ctx, b, stmt)
+	}
+
+	if stmt.Kind == ast.STMT_BREAK {
+		if ctx.BreakTo != nil {
+			EmitJump(b, ctx.BreakTo)
+		}
+		return b
+	}
+
+	if stmt.Kind == ast.STMT_CONTINUE {
+		if ctx.ContinueTo != nil {
+			EmitJump(b, ctx.ContinueTo)
+		}
+		return b
+	}
+
+	if stmt.Kind == ast.STMT_EMPTY {
+		return b
+	}
+
+	if stmt.Kind == ast.STMT_BLOCK {
+		return genBlock(ctx, b, stmt)
+	}
+
+	if stmt.Kind == ast.STMT_SWITCH {
+		return genSwitch(ctx, b, stmt)
+	}
+
+	// Unsupported statement — skip
+	return b
+}
+
+func genDecl(ctx @GenContext, b @Block, d @ast.Decl) {
+	if d.Kind == ast.DECL_VAR {
+		var typ @types.Type = types.TypInt() // default
+		if d.TypeRef != nil {
+			typ = resolveTypeExpr(d.TypeRef)
+		}
+		if d.Value != nil {
+			var val @Instr = genExpr(ctx, b, d.Value)
+			b = ctx.CurBlock
+			// Array/struct composite lit returns an alloca — use directly
+			if val.Op == OP_ALLOC && val.TypeArg != nil {
+				if val.TypeArg.Kind == types.TYP_ARRAY || val.TypeArg.Kind == types.TYP_STRUCT {
+					defineVar(ctx, d.Name, val, typ)
+					return
+				}
+			}
+			// String literal assigned to []char: convert via string_to_chars
+			if typ.Kind == types.TYP_SLICE && typ.Elem != nil && typ.Elem.Width == 8 {
+				if val.Typ != nil && val.Typ.Kind == types.TYP_STRING {
+					val = EmitStringToChars(ctx.Func, b, val, typ)
+				}
+			}
+			// @[]T → []T conversion
+			if typ.Kind == types.TYP_SLICE && val.Typ != nil && val.Typ.Kind == types.TYP_MANAGED_SLICE {
+				val = EmitManagedToRaw(ctx.Func, b, val)
+			}
+			// Coerce nil to proper slice/managed-slice type
+			if val.Op == OP_CONST_NIL && val.Typ != nil && val.Typ.Kind == types.TYP_NIL {
+				if typ.Kind == types.TYP_SLICE || typ.Kind == types.TYP_MANAGED_SLICE {
+					val.Typ = typ
+				}
+			}
+			// Ensure value width matches declared type
+			val = ensureWidth(ctx, b, val, typ)
+			// Inc refcount if copying a managed pointer (not a fresh creation)
+			if isManagedPtrType(typ) && !isFreshManagedPtr(val) {
+				EmitRefcountInc(b, val)
+			}
+			// Inc refcount if copying a managed slice (not a fresh creation)
+			if isManagedSliceType(typ) && !isFreshManagedSlice(val) {
+				emitManagedSliceRefInc(ctx.Func, b, val)
+			}
+			var ptr @Instr = EmitAlloc(ctx.Func, b, typ)
+			EmitStore(b, ptr, val)
+			defineVar(ctx, d.Name, ptr, typ)
+		} else if typ.Kind == types.TYP_SLICE || typ.Kind == types.TYP_MANAGED_SLICE {
+			// Initialize uninitialized slices to nil
+			var ptr @Instr = EmitAlloc(ctx.Func, b, typ)
+			var nilVal @Instr = EmitConstNil(ctx.Func, b, typ)
+			EmitStore(b, ptr, nilVal)
+			defineVar(ctx, d.Name, ptr, typ)
+		} else if typ.Kind == types.TYP_MANAGED_PTR {
+			// Initialize uninitialized managed pointers to nil so
+			// refcount_dec on first assignment doesn't hit garbage
+			var ptr @Instr = EmitAlloc(ctx.Func, b, typ)
+			var nilVal @Instr = EmitConstNil(ctx.Func, b, typ)
+			EmitStore(b, ptr, nilVal)
+			defineVar(ctx, d.Name, ptr, typ)
+		} else {
+			var ptr @Instr = EmitAlloc(ctx.Func, b, typ)
+			defineVar(ctx, d.Name, ptr, typ)
+		}
+	}
+}
+

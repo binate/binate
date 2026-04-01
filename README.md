@@ -19,10 +19,10 @@ git clone https://github.com/binate/binate.git
 
 # Run a program via the self-hosted interpreter
 cd bootstrap
-go run . -root ../binate ../binate/cmd/bni -- ../binate/selftest.bn
+go run . -root ../binate ../binate/cmd/bni -- ../binate/examples/selftest.bn
 
 # Compile and run a program
-go run . -root ../binate ../binate/cmd/bnc -- ../binate/selftest.bn && ./selftest
+go run . -root ../binate ../binate/cmd/bnc -- ../binate/examples/selftest.bn && ./selftest
 
 # Run unit tests for a package
 go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/interp pkg/loader
@@ -38,7 +38,8 @@ binate/
   cmd/
     bni/                     Self-hosted interpreter (parse, load, interpret)
     bnc/                     Self-hosted compiler (parse, load, IR gen, LLVM emit)
-  selftest.bn                Quick self-test (arithmetic, strings, loops, recursion)
+  examples/
+    selftest.bn              Quick smoke test (arithmetic, strings, loops, recursion)
   conformance/               Conformance test suite (shared across backends)
     run.sh                   Test runner (multiple modes)
     NNN_name.bn              Test programs

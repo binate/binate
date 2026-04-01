@@ -14,7 +14,7 @@ runner_exec() {
     if [ -n "$root" ]; then
         compile_root="$root"
     fi
-    compile_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/compile.bn" -- --root "$compile_root" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
+    compile_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/binatec" -- --root "$compile_root" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         "$tmpbin" 2>&1 || true
     else

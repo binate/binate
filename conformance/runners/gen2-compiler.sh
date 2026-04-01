@@ -9,7 +9,7 @@ GEN2_COMPILER="/tmp/binate_gen2_$$"
 
 runner_setup() {
     echo "Building gen1 compiler (bootstrap → compile.bn)..."
-    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/compile.bn" -- --root "$BINATE_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/compile.bn" 2>&1)
+    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/binatec" -- --root "$BINATE_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/binatec" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"
@@ -18,7 +18,7 @@ runner_setup() {
     echo "gen1 ready: $GEN1_COMPILER"
 
     echo "Building gen2 compiler (gen1 → compile.bn)..."
-    build_out=$("$GEN1_COMPILER" --root "$BINATE_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/compile.bn" 2>&1)
+    build_out=$("$GEN1_COMPILER" --root "$BINATE_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/binatec" 2>&1)
     if [ ! -x "$GEN2_COMPILER" ]; then
         echo "ERROR: Failed to build gen2 compiler:"
         echo "$build_out"

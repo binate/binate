@@ -7,7 +7,7 @@ COMPILED_COMPILER="/tmp/binate_compiled_compiler_$$"
 
 runner_setup() {
     echo "Building compiled compiler..."
-    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/compile.bn" -- --root "$BINATE_DIR" -o "$COMPILED_COMPILER" "$BINATE_DIR/compile.bn" 2>&1)
+    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/binatec" -- --root "$BINATE_DIR" -o "$COMPILED_COMPILER" "$BINATE_DIR/binatec" 2>&1)
     if [ ! -x "$COMPILED_COMPILER" ]; then
         echo "ERROR: Failed to build compiled compiler:"
         echo "$build_out"

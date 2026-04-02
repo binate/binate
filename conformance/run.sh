@@ -32,9 +32,36 @@ if [ -z "$MODE" ]; then
         desc=$(grep '^# Runner:' "$r" | head -1 | sed 's/^# Runner: //')
         printf "  %-20s %s\n" "$rname" "$desc"
     done
+    echo ""
+    echo "Mode sets:"
+    echo "  basic                boot, boot-int, boot-comp"
+    echo "  all                  all modes"
     exit 1
 fi
 shift
+
+# Expand mode sets into multiple sequential runs
+expand_set() {
+    case "$1" in
+        basic) echo "boot boot-int boot-comp" ;;
+        all)   echo "boot boot-int boot-int-int boot-comp boot-comp-int boot-comp-int-int boot-comp-comp boot-comp-comp-comp" ;;
+        *)     return 1 ;;
+    esac
+}
+
+MODES="$(expand_set "$MODE" 2>/dev/null)" && {
+    overall_exit=0
+    for m in $MODES; do
+        echo "========================================"
+        echo "=== Mode: $m"
+        echo "========================================"
+        "$0" "$m" "$@"
+        rc=$?
+        if [ $rc -ne 0 ]; then overall_exit=$rc; fi
+        echo ""
+    done
+    exit $overall_exit
+}
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"

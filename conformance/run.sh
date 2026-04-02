@@ -10,7 +10,6 @@
 # Modes (chains of: boot=bootstrap, int=interpreter, comp=compiler):
 #   boot                Go bootstrap interpreter runs .bn directly
 #   boot-int            boot interprets cmd/bni, which interprets .bn
-#   boot-int-int        boot → cmd/bni → cmd/bni → .bn
 #   boot-comp           boot interprets cmd/bnc, which compiles .bn to native
 #   boot-comp-int       boot-comp compiles cmd/bni → binary, binary interprets .bn
 #   boot-comp-int-int   boot-comp-int interprets cmd/bni, which interprets .bn
@@ -44,7 +43,7 @@ shift
 expand_set() {
     case "$1" in
         basic) echo "boot boot-int boot-comp" ;;
-        all)   echo "boot boot-int boot-int-int boot-comp boot-comp-int boot-comp-int-int boot-comp-comp boot-comp-comp-comp" ;;
+        all)   echo "boot boot-int boot-comp boot-comp-int boot-comp-int-int boot-comp-comp boot-comp-comp-comp" ;;
         *)     return 1 ;;
     esac
 }

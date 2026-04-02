@@ -6,7 +6,7 @@ This repository is bootstrapped using the [Go bootstrap interpreter](https://git
 
 ## Status
 
-Self-hosted interpreter and compiler are working. The interpreter can interpret itself (double interpretation verified). The compiler produces native binaries via LLVM IR. Self-compilation works (bootstrap interprets compiler to compile compiler). Next milestone: fully passing gen2 compiler.
+Self-hosted interpreter and compiler are working. The interpreter can interpret itself (double interpretation verified). The compiler produces native binaries via LLVM IR. Self-compilation works: gen1 (boot-comp-comp) and gen2 (boot-comp-comp-comp) compilers both pass all 98 conformance tests.
 
 ## Quick Start
 

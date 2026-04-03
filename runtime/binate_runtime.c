@@ -149,14 +149,13 @@ void bn_slice_free(BnSlice s) {
     }
 }
 
-// string literal → []char slice (copies string data, excludes null terminator)
-BnSlice bn_string_to_chars(const char *str) {
-    int64_t n = (int64_t)strlen(str);
+// string literal → []char slice (copies string data)
+BnSlice bn_string_to_chars(const char *str, int64_t len) {
     BnSlice s;
-    s.len = n;
-    if (n > 0) {
-        s.data = malloc((size_t)n);
-        memcpy(s.data, str, (size_t)n);
+    s.len = len;
+    if (len > 0) {
+        s.data = malloc((size_t)len);
+        memcpy(s.data, str, (size_t)len);
     } else {
         s.data = NULL;
     }
@@ -231,8 +230,10 @@ void bn_print_chars(BnSlice s) {
 // I/O
 // ============================================================
 
-void bn_print_string(const char *s) {
-    fputs(s, stdout);
+void bn_print_string(const char *s, int64_t len) {
+    if (s && len > 0) {
+        fwrite(s, 1, (size_t)len, stdout);
+    }
 }
 
 void bn_print_int(int64_t n) {
@@ -270,7 +271,7 @@ static char *slice_to_cstr(BnSlice s) {
     return buf;
 }
 
-// Helper: convert C string to BnSlice of chars
+// Helper: convert C string to BnSlice of chars (null-terminated C strings only)
 static BnSlice cstr_to_slice(const char *s) {
     BnSlice r;
     r.len = (int64_t)strlen(s);

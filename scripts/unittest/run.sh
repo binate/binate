@@ -6,12 +6,10 @@
 #
 # Modes (chains of: boot=bootstrap, int=interpreter, comp=compiler):
 #   boot                Go bootstrap interpreter runs -test directly
-#
-# Future modes will follow the same chain convention as conformance tests
-# (e.g. boot-comp for compiled test binaries).
+#   boot-int            Bootstrap interprets bni, which runs --test
 #
 # Mode sets:
-#   basic               boot
+#   basic               boot, boot-int
 #   all                 all modes
 #
 # Filters select packages by substring match (e.g. "ir" matches "pkg/ir").
@@ -43,8 +41,8 @@ shift
 # Expand mode sets into multiple sequential runs
 expand_set() {
     case "$1" in
-        basic) echo "boot" ;;
-        all)   echo "boot" ;;
+        basic) echo "boot boot-int" ;;
+        all)   echo "boot boot-int" ;;
         *)     return 1 ;;
     esac
 }

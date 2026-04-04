@@ -1,0 +1,344 @@
+package "main"
+
+import "pkg/bootstrap"
+import "pkg/buf"
+import "pkg/debug"
+import "pkg/parser"
+import "pkg/ast"
+import "pkg/ir"
+import "pkg/codegen"
+import "pkg/loader"
+
+// runTestMode compiles test packages into a test binary and runs it.
+func runTestMode(cli CLIArgs) {
+	if cli.Filenames == nil || len(cli.Filenames) == 0 {
+		println("error: --test requires package paths (e.g. pkg/foo)")
+		bootstrap.Exit(1)
+	}
+	if cli.RootFlag == nil {
+		println("error: --test requires --root")
+		bootstrap.Exit(1)
+	}
+
+	var root @[]char = buf.CopyStr(cli.RootFlag)
+
+	// Set up loader with test packages enabled
+	var ldr @loader.Loader = loader.NewLoader(root)
+	loader.RegisterBuiltin(ldr, "pkg/bootstrap")
+	for i := 0; i < len(cli.Filenames); i++ {
+		ldr.TestPackages = appendCharSlice(ldr.TestPackages, buf.CopyStr(cli.Filenames[i]))
+	}
+
+	// Load test packages and their dependencies
+	var syntheticImports []@ast.ImportSpec
+	for i := 0; i < len(cli.Filenames); i++ {
+		var imp @ast.ImportSpec = make(ast.ImportSpec)
+		imp.Path = quotePath(cli.Filenames[i])
+		syntheticImports = appendImportSpecPtr(syntheticImports, imp)
+	}
+	loader.LoadImports(ldr, syntheticImports)
+	if ldr.Errors != nil && len(ldr.Errors) > 0 {
+		for i := 0; i < len(ldr.Errors); i++ {
+			println(ldr.Errors[i])
+		}
+		bootstrap.Exit(1)
+	}
+	ensureRtLoaded(ldr)
+
+	var runtimePath []char = cli.RuntimePath
+	if runtimePath == nil {
+		// Try to find runtime relative to root
+		var candidate []char = bootstrap.Concat(root, "/runtime/binate_runtime.c")
+		if bootstrap.Stat(candidate) == 1 {
+			runtimePath = candidate
+		}
+	}
+	var binateRoot @[]char = buf.CopyStr(discoverBinateRoot(runtimePath))
+	if binateRoot != nil && !streq(binateRoot, root) {
+		loader.AddRoot(ldr, binateRoot)
+	}
+
+	// Discover Test* functions in test packages
+	var testFuncs @[]TestFunc
+	for pi := 0; pi < len(cli.Filenames); pi++ {
+		var pkgPath []char = cli.Filenames[pi]
+		var pkg @loader.Package = loader.GetPackage(ldr, pkgPath)
+		if pkg == nil || pkg.Merged == nil {
+			print("warning: no implementation for ")
+			println(pkgPath)
+			continue
+		}
+		for di := 0; di < len(pkg.Merged.Decls); di++ {
+			var d @ast.Decl = pkg.Merged.Decls[di]
+			if d.Kind != ast.DECL_FUNC { continue }
+			if d.Body == nil { continue }
+			if !hasPrefix(d.Name, "Test") { continue }
+			if len(d.Params) != 0 { continue }
+			if !isTestResultReturn(d) { continue }
+			var tf TestFunc
+			tf.PkgPath = pkgPath
+			tf.FuncName = d.Name
+			testFuncs = appendTestFunc(testFuncs, tf)
+		}
+	}
+
+	// Generate synthetic test runner main
+	var runnerSrc []char = genTestRunner(cli.Filenames, testFuncs)
+	debug.Log("generated test runner")
+
+	var rp @parser.Parser = parser.New(toBytes(runnerSrc), "test_runner.bn")
+	var runnerFile @ast.File = parser.ParseFile(rp)
+	var runnerErrors []parser.ParseError = parser.Errors(rp)
+	if runnerErrors != nil && len(runnerErrors) > 0 {
+		println("error: test runner parse failed:")
+		for i := 0; i < len(runnerErrors); i++ {
+			println(runnerErrors[i].Msg)
+		}
+		if cli.Verbose {
+			println("--- generated source ---")
+			println(runnerSrc)
+			println("--- end ---")
+		}
+		bootstrap.Exit(1)
+	}
+
+	var outPrefix []char = "/tmp/binate_test"
+
+	// Compile dependency packages
+	var oFiles [][]char
+	if ldr.Order != nil {
+		for i := 0; i < len(ldr.Order); i++ {
+			var pkg @loader.Package = loader.GetPackage(ldr, ldr.Order[i])
+			if pkg == nil || pkg.Builtin || pkg.Merged == nil { continue }
+			debug.Log(bootstrap.Concat("compiling ", ldr.Order[i]))
+			var mod @ir.Module = ir.InitModule(quotePath(ldr.Order[i]))
+			registerPkgImports(ldr, pkg, mod, root)
+			if pkg.BNI != nil { ir.RegisterSelfTypes(pkg.BNI) }
+			ir.GeneratePackage(pkg.Merged, mod)
+			var llvmIR []char = codegen.EmitModule(mod)
+			var oFile []char = compileLL(llvmIR, outPrefix, shortName(ldr.Order[i]))
+			oFiles = appendRawCharSlice(oFiles, oFile)
+		}
+	}
+
+	// Compile test runner main
+	debug.Log("compiling test runner")
+	var mainMod @ir.Module = ir.InitModule("\"main\"")
+	registerTestRunnerImports(ldr, runnerFile, mainMod, root, cli.Filenames)
+	ir.GeneratePackage(runnerFile, mainMod)
+	var mainIR []char = codegen.EmitModule(mainMod)
+
+	if cli.EmitLLVM {
+		print(mainIR)
+		for i := 0; i < len(oFiles); i++ { remove(oFiles[i]) }
+		return
+	}
+
+	var mainO []char = compileLL(mainIR, outPrefix, "test_main")
+	oFiles = appendRawCharSlice(oFiles, mainO)
+
+	// Link
+	var output []char = "/tmp/binate_test_bin"
+	var clangArgs [][]char
+	clangArgs = appendRawCharSlice(clangArgs, "-w")
+	if debugInfo { clangArgs = appendRawCharSlice(clangArgs, "-g") }
+	clangArgs = appendRawCharSlice(clangArgs, "-o")
+	clangArgs = appendRawCharSlice(clangArgs, output)
+	for i := 0; i < len(oFiles); i++ {
+		clangArgs = appendRawCharSlice(clangArgs, oFiles[i])
+	}
+	if runtimePath != nil {
+		clangArgs = appendRawCharSlice(clangArgs, runtimePath)
+		var rtStubs []char = findRtStubs(runtimePath)
+		if rtStubs != nil {
+			clangArgs = appendRawCharSlice(clangArgs, rtStubs)
+		}
+	}
+
+	debug.Log("linking test binary")
+	var linkExit int = bootstrap.Exec("clang", clangArgs)
+	for i := 0; i < len(oFiles); i++ { remove(oFiles[i]) }
+	if linkExit != 0 {
+		println("error: link failed")
+		bootstrap.Exit(1)
+	}
+
+	// Run the test binary
+	debug.Log("running tests")
+	var emptyArgs [][]char
+	var runExit int = bootstrap.Exec(output, emptyArgs)
+	remove(output)
+	bootstrap.Exit(runExit)
+}
+
+// registerTestRunnerImports is like registerMainImports but uses the merged
+// file (including _test.bn) for test packages, so Test* function signatures
+// are available to the runner.
+func registerTestRunnerImports(ldr @loader.Loader, file @ast.File, mod @ir.Module, root []char, testPkgs [][]char) {
+	registerAllStructTypes(ldr, root)
+
+	var aliases @[]@[]char
+	var files []@ast.File
+	if file.Imports != nil {
+		for i := 0; i < len(file.Imports); i++ {
+			var impPath @[]char = unquote(file.Imports[i].Path)
+			var depFile @ast.File = nil
+			// For test packages, use merged file (includes _test.bn)
+			if isTestPkg(impPath, testPkgs) {
+				var pkg @loader.Package = loader.GetPackage(ldr, impPath)
+				if pkg != nil && pkg.Merged != nil {
+					depFile = pkg.Merged
+				}
+			}
+			if depFile == nil {
+				depFile = collectPkgFile(ldr, impPath, root)
+			}
+			if depFile != nil {
+				aliases = appendCharSlice(aliases, shortName(impPath))
+				files = appendFilePtr(files, depFile)
+			}
+		}
+	}
+
+	appendRtImport(ldr, root, &aliases, &files)
+	ir.RegisterImports(aliases, files, mod)
+}
+
+func isTestPkg(path []char, testPkgs [][]char) bool {
+	for i := 0; i < len(testPkgs); i++ {
+		if streq(path, testPkgs[i]) { return true }
+	}
+	return false
+}
+
+type TestFunc struct {
+	PkgPath  []char
+	FuncName []char
+}
+
+func appendTestFunc(s @[]TestFunc, v TestFunc) @[]TestFunc {
+	var n int = len(s)
+	var ns @[]TestFunc = make_slice(TestFunc, n + 1)
+	for i := 0; i < n; i++ { ns[i] = s[i] }
+	ns[n] = v
+	return ns
+}
+
+// genTestRunner generates Binate source for a test runner main() that calls
+// all discovered test functions and reports results.
+func genTestRunner(pkgPaths [][]char, tests @[]TestFunc) []char {
+	var cb buf.CharBuf = buf.New()
+	cb = buf.WriteStr(cb, "package \"main\"\n\n")
+
+	// Import test packages
+	for i := 0; i < len(pkgPaths); i++ {
+		cb = buf.WriteStr(cb, "import \"")
+		cb = buf.WriteStr(cb, pkgPaths[i])
+		cb = buf.WriteStr(cb, "\"\n")
+	}
+	cb = buf.WriteStr(cb, "import \"pkg/bootstrap\"\n\n")
+
+	// main function
+	cb = buf.WriteStr(cb, "func main() {\n")
+	cb = buf.WriteStr(cb, "\tvar passed int = 0\n")
+	cb = buf.WriteStr(cb, "\tvar failed int = 0\n\n")
+
+	for i := 0; i < len(tests); i++ {
+		var alias []char = lastSegment(tests[i].PkgPath)
+		var name []char = tests[i].FuncName
+
+		// println("=== RUN   TestName")
+		cb = buf.WriteStr(cb, "\tprintln(\"=== RUN   ")
+		cb = buf.WriteStr(cb, name)
+		cb = buf.WriteStr(cb, "\")\n")
+
+		// var r_N @[]char = alias.TestName()
+		cb = buf.WriteStr(cb, "\tvar r_")
+		cb = buf.WriteInt(cb, i)
+		cb = buf.WriteStr(cb, " @[]char = ")
+		cb = buf.WriteStr(cb, alias)
+		cb = buf.WriteStr(cb, ".")
+		cb = buf.WriteStr(cb, name)
+		cb = buf.WriteStr(cb, "()\n")
+
+		// if r_N != nil && len(r_N) > 0 { ... } else { ... }
+		cb = buf.WriteStr(cb, "\tif r_")
+		cb = buf.WriteInt(cb, i)
+		cb = buf.WriteStr(cb, " != nil && len(r_")
+		cb = buf.WriteInt(cb, i)
+		cb = buf.WriteStr(cb, ") > 0 {\n")
+
+		cb = buf.WriteStr(cb, "\t\tprint(\"--- FAIL: ")
+		cb = buf.WriteStr(cb, name)
+		cb = buf.WriteStr(cb, "\\n    \")\n")
+		cb = buf.WriteStr(cb, "\t\tprintln(r_")
+		cb = buf.WriteInt(cb, i)
+		cb = buf.WriteStr(cb, ")\n")
+		cb = buf.WriteStr(cb, "\t\tfailed = failed + 1\n")
+
+		cb = buf.WriteStr(cb, "\t} else {\n")
+		cb = buf.WriteStr(cb, "\t\tprintln(\"--- PASS: ")
+		cb = buf.WriteStr(cb, name)
+		cb = buf.WriteStr(cb, "\")\n")
+		cb = buf.WriteStr(cb, "\t\tpassed = passed + 1\n")
+		cb = buf.WriteStr(cb, "\t}\n\n")
+	}
+
+	// Summary
+	cb = buf.WriteStr(cb, "\tprintln(\"\")\n")
+	cb = buf.WriteStr(cb, "\tif failed > 0 {\n")
+	cb = buf.WriteStr(cb, "\t\tprint(\"FAIL\\t\")\n")
+	cb = buf.WriteStr(cb, "\t\tprint(bootstrap.Itoa(passed))\n")
+	cb = buf.WriteStr(cb, "\t\tprint(\" passed, \")\n")
+	cb = buf.WriteStr(cb, "\t\tprint(bootstrap.Itoa(failed))\n")
+	cb = buf.WriteStr(cb, "\t\tprintln(\" failed\")\n")
+	cb = buf.WriteStr(cb, "\t\tbootstrap.Exit(1)\n")
+	cb = buf.WriteStr(cb, "\t} else {\n")
+	cb = buf.WriteStr(cb, "\t\tprint(\"ok\\t\")\n")
+	cb = buf.WriteStr(cb, "\t\tprint(bootstrap.Itoa(passed))\n")
+	cb = buf.WriteStr(cb, "\t\tprintln(\" passed\")\n")
+	cb = buf.WriteStr(cb, "\t}\n")
+	cb = buf.WriteStr(cb, "}\n")
+	return buf.Bytes(cb)
+}
+
+func lastSegment(path []char) []char {
+	var last int = 0
+	for i := 0; i < len(path); i++ {
+		if path[i] == '/' { last = i + 1 }
+	}
+	return path[last:]
+}
+
+func hasPrefix(s []char, prefix []char) bool {
+	if len(s) < len(prefix) { return false }
+	for i := 0; i < len(prefix); i++ {
+		if s[i] != prefix[i] { return false }
+	}
+	return true
+}
+
+func isTestResultReturn(d @ast.Decl) bool {
+	if d.Results == nil || len(d.Results) != 1 { return false }
+	var r @ast.TypeExpr = d.Results[0]
+	if r.Kind == ast.TEXPR_NAMED && len(r.Pkg) > 0 {
+		if streq(r.Pkg, "testing") && streq(r.Name, "TestResult") {
+			return true
+		}
+	}
+	if r.Kind == ast.TEXPR_MANAGED_SLICE && r.Base != nil {
+		if r.Base.Kind == ast.TEXPR_NAMED && streq(r.Base.Name, "char") {
+			return true
+		}
+	}
+	return false
+}
+
+func toBytes(s []char) @[]uint8 {
+	var b @[]uint8 = make_slice(uint8, len(s))
+	for i := 0; i < len(s); i++ {
+		b[i] = cast(uint8, s[i])
+	}
+	return b
+}
+

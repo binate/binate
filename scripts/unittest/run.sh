@@ -43,7 +43,7 @@ shift
 # Expand mode sets into multiple sequential runs
 expand_set() {
     case "$1" in
-        basic) echo "boot boot-int boot-comp" ;;
+        basic) echo "boot boot-comp-int boot-comp" ;;
         all)   echo "boot boot-int boot-comp boot-comp-int" ;;
         *)     return 1 ;;
     esac

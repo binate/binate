@@ -130,17 +130,20 @@ for pkg in $PACKAGES; do
         continue
     fi
 
-    # Run tests
+    # Run tests with timing
+    start_time=$(date +%s)
     output=$(runner_test "$pkg" 2>&1)
     rc=$?
+    end_time=$(date +%s)
+    elapsed=$((end_time - start_time))
 
     if [ $rc -eq 0 ]; then
         # Extract test count from output
         count=$(echo "$output" | grep -o '[0-9]* passed' | head -1)
-        echo "PASS: $pkg ($count)"
+        echo "PASS: $pkg ($count) [${elapsed}s]"
         passed=$((passed + 1))
     else
-        echo "FAIL: $pkg"
+        echo "FAIL: $pkg [${elapsed}s]"
         echo "$output" | sed 's/^/  /' | tail -5
         failed=$((failed + 1))
         failures="$failures $pkg"

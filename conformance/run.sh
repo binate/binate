@@ -215,7 +215,7 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
 done
 
 echo ""
-echo "=== Summary: $passed passed, $failed failed, $skipped skipped ==="
+echo "=== Summary ($MODE): $passed passed, $failed failed, $skipped skipped ==="
 if [ $failed -gt 0 ]; then
     echo "Failures:$failures"
     exit 1

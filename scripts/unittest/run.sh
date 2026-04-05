@@ -152,7 +152,7 @@ for pkg in $PACKAGES; do
 done
 
 echo ""
-echo "=== Summary: $passed passed, $failed failed, $xfailed xfail, $skipped skipped ==="
+echo "=== Summary ($MODE): $passed passed, $failed failed, $xfailed xfail, $skipped skipped ==="
 if [ $failed -gt 0 ]; then
     echo "Failures:$failures"
     exit 1

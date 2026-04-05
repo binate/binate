@@ -1,1 +1,1 @@
-bootstrap does not support *any type or raw memory operations (bit_cast, pointer indexing)
+bootstrap does not support raw memory operations (bit_cast, pointer indexing)

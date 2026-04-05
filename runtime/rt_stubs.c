@@ -31,6 +31,12 @@ void bn_rt__c_exit(int64_t code) {
     exit((int)code);
 }
 
+// Call a destructor function pointer: dtor(ptr).
+void bn_rt__c_call_dtor(void *dtor, void *ptr) {
+    typedef void (*dtor_fn)(void *);
+    ((dtor_fn)dtor)(ptr);
+}
+
 // Formatted error + abort for bounds check failures (slow path only)
 void bn_rt__c_bounds_fail(int64_t index, int64_t length) {
     fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",

@@ -9,10 +9,13 @@
 #   boot-int            Bootstrap interprets bni, which runs --test
 #   boot-comp           Bootstrap interprets bnc, which compiles and runs tests
 #   boot-comp-int       Compiled bni runs --test natively
+#   boot-comp-comp      Self-compiled compiler (gen1) runs --test
+#   boot-comp-comp-comp Gen2 compiler runs --test
 #
 # Mode sets:
-#   basic               boot, boot-int, boot-comp
-#   all                 boot, boot-int, boot-comp, boot-comp-int
+#   basic               boot, boot-comp-int, boot-comp
+#   all                 boot, boot-int, boot-comp, boot-comp-int, boot-comp-comp
+#   full                all + boot-comp-comp-comp
 #
 # Filters select packages by substring match (e.g. "ir" matches "pkg/ir").
 #
@@ -34,8 +37,9 @@ if [ -z "$MODE" ]; then
     done
     echo ""
     echo "Mode sets:"
-    echo "  basic                boot"
-    echo "  all                  all modes"
+    echo "  basic                boot, boot-comp-int, boot-comp"
+    echo "  all                  basic + boot-int, boot-comp-comp"
+    echo "  full                 all + boot-comp-comp-comp"
     exit 1
 fi
 shift
@@ -44,7 +48,8 @@ shift
 expand_set() {
     case "$1" in
         basic) echo "boot boot-comp-int boot-comp" ;;
-        all)   echo "boot boot-int boot-comp boot-comp-int" ;;
+        all)   echo "boot boot-int boot-comp boot-comp-int boot-comp-comp" ;;
+        full)  echo "boot boot-int boot-comp boot-comp-int boot-comp-comp boot-comp-comp-comp" ;;
         *)     return 1 ;;
     esac
 }

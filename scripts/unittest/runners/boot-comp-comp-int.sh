@@ -1,8 +1,8 @@
 #!/bin/sh
-# Runner: boot-comp-int — Compiled bni runs --test natively.
+# Runner: boot-comp-comp-int — Gen1-compiled interpreter runs --test.
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
-runner_setup() { build_interp_boot_comp; }
+runner_setup() { build_gen1; build_interp "$GEN1_COMPILER"; }
 
 runner_test() {
     pkg="$1"

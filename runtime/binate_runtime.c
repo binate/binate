@@ -23,6 +23,13 @@ typedef struct {
     int64_t  len;       // uint: number of elements
 } BnSlice;
 
+typedef struct {
+    void    *data;       // *T: pointer to first element
+    int64_t  len;        // uint: number of elements
+    void    *backing;    // managed backing pointer (refcounted)
+    int64_t  backing_len; // total element count in backing
+} BnManagedSlice;
+
 // make_raw_deprecated([]T, n) — allocate a zeroed unmanaged slice
 BnSlice bn_make_slice(int64_t elem_size, int64_t length) {
     BnSlice s;
@@ -392,11 +399,16 @@ int64_t bn_bootstrap__Exec(BnSlice program, BnSlice args) {
     char *prog = slice_to_cstr(program);
 
     // Build argv: [program, args..., NULL]
+    // args is []@[]char — each element is a BnManagedSlice (4 words).
+    // We extract the {data, len} prefix from each for slice_to_cstr.
     int64_t nargs = args.len;
     char **argv = (char **)malloc((size_t)(nargs + 2) * sizeof(char *));
     argv[0] = prog;
     for (int64_t i = 0; i < nargs; i++) {
-        BnSlice arg = ((BnSlice *)args.data)[i];
+        BnManagedSlice ms = ((BnManagedSlice *)args.data)[i];
+        BnSlice arg;
+        arg.data = ms.data;
+        arg.len = ms.len;
         argv[i + 1] = slice_to_cstr(arg);
     }
     argv[nargs + 1] = NULL;

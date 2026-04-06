@@ -9,7 +9,6 @@
 #
 # Modes (chains of: boot=bootstrap, int=interpreter, comp=compiler):
 #   boot                Go bootstrap interpreter runs .bn directly
-#   boot-int            boot interprets cmd/bni, which interprets .bn
 #   boot-comp           boot interprets cmd/bnc, which compiles .bn to native
 #   boot-comp-int       boot-comp compiles cmd/bni → binary, binary interprets .bn
 #   boot-comp-int-int   boot-comp-int interprets cmd/bni, which interprets .bn
@@ -34,7 +33,7 @@ if [ -z "$MODE" ]; then
     done
     echo ""
     echo "Mode sets:"
-    echo "  basic                boot, boot-int, boot-comp"
+    echo "  basic                boot, boot-comp, boot-comp-int"
     echo "  all                  all modes"
     exit 1
 fi
@@ -43,8 +42,9 @@ shift
 # Expand mode sets into multiple sequential runs
 expand_set() {
     case "$1" in
-        basic) echo "boot boot-int boot-comp" ;;
-        all)   echo "boot boot-int boot-comp boot-comp-int boot-comp-int-int boot-comp-comp boot-comp-comp-comp" ;;
+        basic) echo "boot boot-comp boot-comp-int" ;;
+        all)   echo "boot boot-comp boot-comp-int boot-comp-comp boot-comp-comp-comp" ;;
+        full)  echo "boot boot-comp boot-comp-int boot-comp-int-int boot-comp-comp boot-comp-comp-int boot-comp-comp-comp" ;;
         *)     return 1 ;;
     esac
 }

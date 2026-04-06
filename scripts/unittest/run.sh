@@ -48,7 +48,8 @@ expand_set() {
     case "$1" in
         basic) echo "boot boot-comp boot-comp-int" ;;
         all)   echo "boot boot-comp boot-comp-int boot-comp-comp boot-comp-comp-comp" ;;
-        full)  echo "boot boot-comp boot-comp-int boot-comp-int-int boot-comp-comp boot-comp-comp-int boot-comp-comp-comp" ;;
+        # TODO: add boot-comp-int-int back once flat memory path doesn't depend on compiled-only pkg/rt
+        full)  echo "boot boot-comp boot-comp-int boot-comp-comp boot-comp-comp-int boot-comp-comp-comp" ;;
         *)     return 1 ;;
     esac
 }

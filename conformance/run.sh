@@ -129,15 +129,16 @@ run_error_test() {
     known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
 
     # The program should have failed (non-zero exit or error output)
-    # Check that each line in the .error file appears as a substring in output
+    # Check that each line in the .error file matches as a regex in output
     all_found=true
     missing=""
     while IFS= read -r pattern || [ -n "$pattern" ]; do
         [ -z "$pattern" ] && continue
-        case "$actual" in
-            *"$pattern"*) ;;
-            *) all_found=false; missing="$pattern"; break ;;
-        esac
+        if ! echo "$actual" | grep -qE "$pattern"; then
+            all_found=false
+            missing="$pattern"
+            break
+        fi
     done < "$errorfile"
 
     if $all_found; then

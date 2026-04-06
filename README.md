@@ -1,5 +1,7 @@
 # Binate
 
+[![CI](https://github.com/binate/binate/actions/workflows/ci.yml/badge.svg)](https://github.com/binate/binate/actions/workflows/ci.yml)
+
 The self-hosted Binate toolchain — interpreter, compiler, and supporting packages — written in Binate itself.
 
 This repository is bootstrapped using the [Go bootstrap interpreter](https://github.com/binate/bootstrap), which runs the code here until the compiler can compile itself.

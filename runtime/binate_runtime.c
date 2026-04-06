@@ -443,6 +443,79 @@ BnSlice bn_bootstrap__Concat(BnSlice a, BnSlice b) {
     return r;
 }
 
+/* ============================================================
+ * Raw memory access (for interpreter flat memory model)
+ * ============================================================ */
+
+void *bn_bootstrap__Malloc(int64_t size) {
+    if (size <= 0) return NULL;
+    void *p = malloc((size_t)size);
+    if (p) memset(p, 0, (size_t)size);
+    return p;
+}
+
+void bn_bootstrap__Free(void *ptr) {
+    free(ptr);
+}
+
+void bn_bootstrap__Memset(void *ptr, int64_t val, int64_t size) {
+    if (ptr && size > 0) memset(ptr, (int)val, (size_t)size);
+}
+
+void bn_bootstrap__Memcpy(void *dst, void *src, int64_t size) {
+    if (dst && src && size > 0) memcpy(dst, src, (size_t)size);
+}
+
+int64_t bn_bootstrap__PeekI64(void *ptr, int64_t offset) {
+    if (!ptr) return 0;
+    return *(int64_t *)((char *)ptr + offset);
+}
+
+void bn_bootstrap__PokeI64(void *ptr, int64_t offset, int64_t val) {
+    if (!ptr) return;
+    *(int64_t *)((char *)ptr + offset) = val;
+}
+
+int64_t bn_bootstrap__PeekI32(void *ptr, int64_t offset) {
+    if (!ptr) return 0;
+    return (int64_t)*(uint32_t *)((char *)ptr + offset);
+}
+
+void bn_bootstrap__PokeI32(void *ptr, int64_t offset, int64_t val) {
+    if (!ptr) return;
+    *(uint32_t *)((char *)ptr + offset) = (uint32_t)val;
+}
+
+int64_t bn_bootstrap__PeekI16(void *ptr, int64_t offset) {
+    if (!ptr) return 0;
+    return (int64_t)*(uint16_t *)((char *)ptr + offset);
+}
+
+void bn_bootstrap__PokeI16(void *ptr, int64_t offset, int64_t val) {
+    if (!ptr) return;
+    *(uint16_t *)((char *)ptr + offset) = (uint16_t)val;
+}
+
+int64_t bn_bootstrap__PeekI8(void *ptr, int64_t offset) {
+    if (!ptr) return 0;
+    return (int64_t)*(uint8_t *)((char *)ptr + offset);
+}
+
+void bn_bootstrap__PokeI8(void *ptr, int64_t offset, int64_t val) {
+    if (!ptr) return;
+    *(uint8_t *)((char *)ptr + offset) = (uint8_t)val;
+}
+
+void *bn_bootstrap__PeekPtr(void *ptr, int64_t offset) {
+    if (!ptr) return NULL;
+    return *(void **)((char *)ptr + offset);
+}
+
+void bn_bootstrap__PokePtr(void *ptr, int64_t offset, void *val) {
+    if (!ptr) return;
+    *(void **)((char *)ptr + offset) = val;
+}
+
 /* Entry point: calls Binate's main function */
 extern void bn_main(void);
 

@@ -1,1 +1,0 @@
-bootstrap does not support the any type (used by pkg/rt)

@@ -94,8 +94,7 @@ trap 'runner_cleanup' EXIT
 
 # Discover all packages with _test.bn files
 PACKAGES=""
-for testfile in "$BINATE_DIR"/pkg/*/_test.bn "$BINATE_DIR"/pkg/*/*_test.bn \
-                "$BINATE_DIR"/cmd/*/_test.bn "$BINATE_DIR"/cmd/*/*_test.bn; do
+for testfile in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" -name '*_test.bn' 2>/dev/null); do
     [ -f "$testfile" ] || continue
     dir="$(dirname "$testfile")"
     # Convert absolute path to package path (e.g. /path/to/binate/pkg/ir -> pkg/ir)

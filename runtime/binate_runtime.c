@@ -87,48 +87,6 @@ void bn_slice_set_i8(BnSlice s, int64_t index, int64_t val) {
     ((uint8_t *)s.data)[index] = (uint8_t)val;
 }
 
-// append(s, v) for i64 elements — always reallocates (no capacity)
-BnSlice bn_append_i64(BnSlice s, int64_t val) {
-    int64_t newlen = s.len + 1;
-    void *newdata = realloc(s.data, (size_t)newlen * sizeof(int64_t));
-    if (!newdata) {
-        fprintf(stderr, "runtime error: out of memory\n");
-        exit(2);
-    }
-    ((int64_t *)newdata)[s.len] = val;
-    s.data = newdata;
-    s.len = newlen;
-    return s;
-}
-
-// append(s, v) for i8 elements — always reallocates (no capacity)
-BnSlice bn_append_i8(BnSlice s, int64_t val) {
-    int64_t newlen = s.len + 1;
-    void *newdata = realloc(s.data, (size_t)newlen);
-    if (!newdata) {
-        fprintf(stderr, "runtime error: out of memory\n");
-        exit(2);
-    }
-    ((uint8_t *)newdata)[s.len] = (uint8_t)val;
-    s.data = newdata;
-    s.len = newlen;
-    return s;
-}
-
-// append(s, v) for struct elements — copies elem_size bytes from ptr
-BnSlice bn_append_struct(BnSlice s, void *ptr, int64_t elem_size) {
-    int64_t newlen = s.len + 1;
-    void *newdata = realloc(s.data, (size_t)newlen * (size_t)elem_size);
-    if (!newdata) {
-        fprintf(stderr, "runtime error: out of memory\n");
-        exit(2);
-    }
-    memcpy((char *)newdata + s.len * elem_size, ptr, (size_t)elem_size);
-    s.data = newdata;
-    s.len = newlen;
-    return s;
-}
-
 // s[i] for struct elements — returns pointer to element in-place
 void *bn_slice_get_struct(BnSlice s, int64_t index, int64_t elem_size) {
     if (index < 0 || index >= s.len) {

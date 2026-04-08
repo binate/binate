@@ -1,0 +1,242 @@
+package "pkg/ir"
+
+import "pkg/ast"
+import "pkg/types"
+
+// ============================================================
+// Refcounting helpers
+// ============================================================
+
+// isManagedPtrType returns true if t is @T (managed pointer).
+func isManagedPtrType(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_MANAGED_PTR
+}
+
+// isManagedSliceType returns true if t is @[]T (managed slice).
+func isManagedSliceType(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_MANAGED_SLICE
+}
+
+// isSliceType returns true if t is []T or @[]T (any slice type).
+func isSliceType(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_SLICE || t.Kind == types.TYP_MANAGED_SLICE
+}
+
+// isCharSliceType returns true if t is []char or @[]char.
+func isCharSliceType(t @types.Type) bool {
+	if t == nil { return false }
+	if t.Kind != types.TYP_SLICE && t.Kind != types.TYP_MANAGED_SLICE {
+		return false
+	}
+	return t.Elem != nil && t.Elem.Width == 8
+}
+
+// isNillableType returns true if t can hold nil.
+func isNillableType(t @types.Type) bool {
+	if t == nil { return false }
+	var k int = t.Kind
+	return k == types.TYP_SLICE || k == types.TYP_MANAGED_SLICE ||
+		k == types.TYP_MANAGED_PTR || k == types.TYP_POINTER
+}
+
+// isStructOrArrayAlloc returns true if instr is an alloca for a struct or array.
+func isStructOrArrayAlloc(instr @Instr) bool {
+	if instr.Op != OP_ALLOC { return false }
+	if instr.TypeArg == nil { return false }
+	return instr.TypeArg.Kind == types.TYP_STRUCT || instr.TypeArg.Kind == types.TYP_ARRAY
+}
+
+// isManagedPtrToStruct returns true if t is @T where T is a struct.
+func isManagedPtrToStruct(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_MANAGED_PTR && t.Elem != nil &&
+		t.Elem.Kind == types.TYP_STRUCT
+}
+
+// isFreshManagedPtr returns true if the instruction creates a new managed
+// pointer (make/box/call), meaning refcount is already 1.
+func isFreshManagedPtr(instr @Instr) bool {
+	if instr == nil { return false }
+	if instr.Op == OP_CONST_NIL { return true }
+	if instr.Op == OP_BOX { return true }
+	if instr.Op == OP_MAKE { return true }
+	if instr.Op == OP_CALL && instr.Typ != nil && isManagedPtrType(instr.Typ) {
+		return true
+	}
+	return false
+}
+
+// isFreshManagedSlice returns true if the instruction creates a new managed
+// slice (make_slice), meaning refcount is already 1.
+func isFreshManagedSlice(instr @Instr) bool {
+	if instr == nil { return false }
+	if instr.Op == OP_CONST_NIL { return true }
+	if instr.Op == OP_MAKE_SLICE { return true }
+	if instr.Op == OP_CALL && instr.Typ != nil && isManagedSliceType(instr.Typ) {
+		return true
+	}
+	// Subslicing @[]T already RefInc'd the backing in genSliceExpr
+	if instr.Op == OP_SLICE_EXPR && instr.Typ != nil && isManagedSliceType(instr.Typ) {
+		return true
+	}
+	return false
+}
+
+// emitManagedPtrRefDec emits RefDec for a managed pointer value, passing the
+// pointee's struct destructor if the pointee type needs destruction.
+func emitManagedPtrRefDec(f @Func, b @Block, ptrVal @Instr) {
+	var elemTyp @types.Type
+	if ptrVal.Typ != nil {
+		elemTyp = ptrVal.Typ.Elem
+	}
+	if elemTyp != nil {
+		if elemTyp.Kind == types.TYP_STRUCT {
+			if types.NeedsDestruction(elemTyp) {
+				var dtor @Instr = EmitFuncAddr(f, b, qualifiedDtorName(elemTyp.Name))
+				EmitRefcountDecDtor(b, ptrVal, dtor)
+				return
+			}
+		}
+	}
+	EmitRefcountDec(b, ptrVal)
+}
+
+// registerPendingMsDtor records a managed-slice type that needs a dtor.
+func registerPendingMsDtor(msTyp @types.Type) {
+	var name @[]char = dtorNameForType(msTyp)
+	for i := 0; i < len(pendingMsDtors); i++ {
+		if streq(dtorNameForType(pendingMsDtors[i]), name) { return }
+	}
+	pendingMsDtors = appendTypePtr(pendingMsDtors, msTyp)
+}
+
+// emitManagedSliceRefInc extracts the refptr (field 2) and increments it.
+func emitManagedSliceRefInc(f @Func, b @Block, sliceVal @Instr) {
+	var refptr @Instr = EmitExtract(f, b, sliceVal, 2, types.MakeManagedPtrType(nil))
+	EmitRefcountInc(b, refptr)
+}
+
+// emitManagedSliceRefDec cleans up a managed-slice value. If the element type
+// needs destruction, stores the value to a temp alloca and calls the dtor.
+// Otherwise just RefDec's the backing refptr.
+func emitManagedSliceRefDec(f @Func, b @Block, sliceVal @Instr) @Block {
+	var refptr @Instr = EmitExtract(f, b, sliceVal, 2, types.MakeManagedPtrType(nil))
+
+	var elemTyp @types.Type
+	if sliceVal.Typ != nil {
+		elemTyp = sliceVal.Typ.Elem
+	}
+	if elemTyp == nil || !types.NeedsDestruction(elemTyp) {
+		EmitRefcountDec(b, refptr)
+		return b
+	}
+
+	registerPendingMsDtor(sliceVal.Typ)
+	var msSlot @Instr = EmitAlloc(f, b, sliceVal.Typ)
+	EmitStore(b, msSlot, sliceVal)
+	var rawSlot @Instr = EmitBitCast(f, b, msSlot, types.MakePointerType(types.TypUint8()))
+	var dtorN @[]char = dtorNameForType(sliceVal.Typ)
+	var dtorArgs @[]@Instr = make_slice(@Instr, 1)
+	dtorArgs[0] = rawSlot
+	EmitCall(f, b, dtorN, dtorArgs, types.TypVoid())
+	return b
+}
+
+// registerTemp adds a managed temporary for cleanup at end of statement.
+func registerTemp(ctx @GenContext, instr @Instr) {
+	ctx.Temps = appendInstrPtr(ctx.Temps, instr)
+}
+
+// consumeTemp removes a specific instruction from the temps list.
+func consumeTemp(ctx @GenContext, instr @Instr) {
+	if len(ctx.Temps) == 0 { return }
+	for i := 0; i < len(ctx.Temps); i++ {
+		if ctx.Temps[i].ID == instr.ID {
+			for j := i; j < len(ctx.Temps) - 1; j++ {
+				ctx.Temps[j] = ctx.Temps[j + 1]
+			}
+			ctx.Temps = ctx.Temps[:len(ctx.Temps) - 1]
+			return
+		}
+	}
+}
+
+// emitTempCleanup emits RefDec for all managed temporaries and clears the list.
+func emitTempCleanup(ctx @GenContext, b @Block) @Block {
+	for i := 0; i < len(ctx.Temps); i++ {
+		var tmp @Instr = ctx.Temps[i]
+		if tmp.Typ == nil { continue }
+		if isManagedPtrType(tmp.Typ) {
+			emitManagedPtrRefDec(ctx.Func, b, tmp)
+		}
+		if isManagedSliceType(tmp.Typ) {
+			b = emitManagedSliceRefDec(ctx.Func, b, tmp)
+		}
+	}
+	ctx.Temps = ctx.Temps[:0]
+	return b
+}
+
+// emitTempCleanupSince emits RefDec for temps added since savedLen.
+func emitTempCleanupSince(ctx @GenContext, b @Block, savedLen int) @Block {
+	if len(ctx.Temps) == 0 { return b }
+	for i := savedLen; i < len(ctx.Temps); i++ {
+		var tmp @Instr = ctx.Temps[i]
+		if tmp.Typ == nil { continue }
+		if isManagedPtrType(tmp.Typ) {
+			emitManagedPtrRefDec(ctx.Func, b, tmp)
+		}
+		if isManagedSliceType(tmp.Typ) {
+			b = emitManagedSliceRefDec(ctx.Func, b, tmp)
+		}
+	}
+	ctx.Temps = ctx.Temps[:savedLen]
+	return b
+}
+
+// emitDecForScopeVars emits cleanup for managed vars declared since savedVarLen.
+func emitDecForScopeVars(ctx @GenContext, b @Block, savedVarLen int) @Block {
+	for i := savedVarLen; i < len(ctx.Vars); i++ {
+		var slot VarSlot = ctx.Vars[i]
+		if isManagedPtrType(slot.Typ) {
+			var ptrVal @Instr = EmitLoad(ctx.Func, b, slot.Ptr, slot.Typ)
+			emitManagedPtrRefDec(ctx.Func, b, ptrVal)
+		}
+		if isManagedSliceType(slot.Typ) {
+			var sliceVal @Instr = EmitLoad(ctx.Func, b, slot.Ptr, slot.Typ)
+			b = emitManagedSliceRefDec(ctx.Func, b, sliceVal)
+		}
+	}
+	return b
+}
+
+// emitDecForManagedLocals emits cleanup for all managed locals,
+// skipping variables being returned (ownership transfers to caller).
+func emitDecForManagedLocals(ctx @GenContext, b @Block, retExprs []@ast.Expr) @Block {
+	for i := 0; i < len(ctx.Vars); i++ {
+		var slot VarSlot = ctx.Vars[i]
+		var needsCleanup bool = isManagedPtrType(slot.Typ) || isManagedSliceType(slot.Typ)
+		if !needsCleanup { continue }
+		var isReturned bool = false
+		if len(retExprs) > 0 {
+			for j := 0; j < len(retExprs); j++ {
+				if retExprs[j].Kind == ast.EXPR_IDENT && streq(retExprs[j].Name, slot.Name) {
+					isReturned = true
+				}
+			}
+		}
+		if isReturned { continue }
+		if isManagedPtrType(slot.Typ) {
+			var ptrVal @Instr = EmitLoad(ctx.Func, b, slot.Ptr, slot.Typ)
+			emitManagedPtrRefDec(ctx.Func, b, ptrVal)
+		}
+		if isManagedSliceType(slot.Typ) {
+			var sliceVal @Instr = EmitLoad(ctx.Func, b, slot.Ptr, slot.Typ)
+			b = emitManagedSliceRefDec(ctx.Func, b, sliceVal)
+		}
+	}
+	return b
+}

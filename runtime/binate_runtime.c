@@ -43,66 +43,6 @@ BnSlice bn_make_slice(int64_t elem_size, int64_t length) {
 }
 
 
-// s[i] for i64 elements — returns element value
-int64_t bn_slice_get_i64(BnSlice s, int64_t index) {
-    if (index < 0 || index >= s.len) {
-        fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",
-                (long long)index, (long long)s.len);
-        exit(2);
-    }
-    return ((int64_t *)s.data)[index];
-}
-
-// s[i] = v for i64 elements
-void bn_slice_set_i64(BnSlice s, int64_t index, int64_t val) {
-    if (index < 0 || index >= s.len) {
-        fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",
-                (long long)index, (long long)s.len);
-        exit(2);
-    }
-    ((int64_t *)s.data)[index] = val;
-}
-
-// s[i] for i8 (char/byte) elements
-int64_t bn_slice_get_i8(BnSlice s, int64_t index) {
-    if (index < 0 || index >= s.len) {
-        fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",
-                (long long)index, (long long)s.len);
-        exit(2);
-    }
-    return (int64_t)(((uint8_t *)s.data)[index]);
-}
-
-// s[i] = v for i8 (char/byte) elements
-void bn_slice_set_i8(BnSlice s, int64_t index, int64_t val) {
-    if (index < 0 || index >= s.len) {
-        fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",
-                (long long)index, (long long)s.len);
-        exit(2);
-    }
-    ((uint8_t *)s.data)[index] = (uint8_t)val;
-}
-
-// s[i] for struct elements — returns pointer to element in-place
-void *bn_slice_get_struct(BnSlice s, int64_t index, int64_t elem_size) {
-    if (index < 0 || index >= s.len) {
-        fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",
-                (long long)index, (long long)s.len);
-        exit(2);
-    }
-    return (char *)s.data + index * elem_size;
-}
-
-// s[i] = v for struct elements — copies elem_size bytes from ptr
-void bn_slice_set_struct(BnSlice s, int64_t index, void *ptr, int64_t elem_size) {
-    if (index < 0 || index >= s.len) {
-        fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",
-                (long long)index, (long long)s.len);
-        exit(2);
-    }
-    memcpy((char *)s.data + index * elem_size, ptr, (size_t)elem_size);
-}
-
 // Free slice backing data (no-op for nil slices)
 void bn_slice_free(BnSlice s) {
     if (s.data) {

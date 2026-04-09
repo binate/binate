@@ -195,3 +195,7 @@ go test ./...
 ## Language
 
 Binate is a systems programming language with dual-mode execution (compiled and interpreted), reference-counted memory management, and an embeddable interpreter. See the [explorations repo](https://github.com/binate/explorations) for language design documents.
+
+## License
+
+[MIT](LICENSE)

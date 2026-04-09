@@ -42,10 +42,6 @@ BnSlice bn_make_slice(int64_t elem_size, int64_t length) {
     return s;
 }
 
-// len(s) — returns slice length (0 for nil)
-int64_t bn_slice_len(BnSlice s) {
-    return s.len;
-}
 
 // s[i] for i64 elements — returns element value
 int64_t bn_slice_get_i64(BnSlice s, int64_t index) {

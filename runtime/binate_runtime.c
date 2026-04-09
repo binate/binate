@@ -63,60 +63,6 @@ BnSlice bn_string_to_chars(const char *str, int64_t len) {
     return s;
 }
 
-// s[lo:hi] for i8 elements — sub-slice (copies data for safety)
-BnSlice bn_slice_expr_i8(BnSlice s, int64_t lo, int64_t hi) {
-    if (lo < 0 || hi < lo || hi > s.len) {
-        fprintf(stderr, "runtime error: slice bounds out of range [%lld:%lld] (len %lld)\n",
-                (long long)lo, (long long)hi, (long long)s.len);
-        exit(2);
-    }
-    BnSlice r;
-    r.len = hi - lo;
-    if (r.len > 0) {
-        r.data = malloc((size_t)r.len);
-        memcpy(r.data, (uint8_t *)s.data + lo, (size_t)r.len);
-    } else {
-        r.data = NULL;
-    }
-    return r;
-}
-
-// s[lo:hi] for i64 elements — sub-slice (copies data for safety)
-BnSlice bn_slice_expr_i64(BnSlice s, int64_t lo, int64_t hi) {
-    if (lo < 0 || hi < lo || hi > s.len) {
-        fprintf(stderr, "runtime error: slice bounds out of range [%lld:%lld] (len %lld)\n",
-                (long long)lo, (long long)hi, (long long)s.len);
-        exit(2);
-    }
-    BnSlice r;
-    r.len = hi - lo;
-    if (r.len > 0) {
-        r.data = malloc((size_t)r.len * sizeof(int64_t));
-        memcpy(r.data, ((int64_t *)s.data) + lo, (size_t)r.len * sizeof(int64_t));
-    } else {
-        r.data = NULL;
-    }
-    return r;
-}
-
-// s[lo:hi] for struct elements — sub-slice (copies data for safety)
-BnSlice bn_slice_expr_struct(BnSlice s, int64_t lo, int64_t hi, int64_t elem_size) {
-    if (lo < 0 || hi < lo || hi > s.len) {
-        fprintf(stderr, "runtime error: slice bounds out of range [%lld:%lld] (len %lld)\n",
-                (long long)lo, (long long)hi, (long long)s.len);
-        exit(2);
-    }
-    BnSlice r;
-    r.len = hi - lo;
-    if (r.len > 0) {
-        r.data = malloc((size_t)r.len * (size_t)elem_size);
-        memcpy(r.data, (char *)s.data + lo * elem_size, (size_t)r.len * (size_t)elem_size);
-    } else {
-        r.data = NULL;
-    }
-    return r;
-}
-
 // Print []char slice as string
 void bn_print_chars(BnSlice s) {
     if (s.data && s.len > 0) {

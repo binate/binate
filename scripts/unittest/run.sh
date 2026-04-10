@@ -64,10 +64,14 @@ if [ -z "$MODE" ]; then
         printf "  %-20s %s\n" "$rname" "$desc"
     done
     echo ""
-    echo "Mode sets:"
-    echo "  basic                boot, boot-comp, boot-comp-int"
-    echo "  all                  basic + boot-comp-comp"
-    echo "  full                 all + boot-comp-comp-comp"
+    echo "Mode sets (from scripts/modesets/):"
+    msd="$(cd "$(dirname "$0")/../modesets" && pwd)"
+    for sf in "$msd"/*; do
+        [ -f "$sf" ] || continue
+        sname="$(basename "$sf")"
+        modes="$(grep -v '^#' "$sf" | grep -v '^$' | tr '\n' ' ' | sed 's/ *$//')"
+        printf "  %-20s %s\n" "$sname" "$modes"
+    done
     echo ""
     echo "Xfail: scripts/unittest/<pkg-path>.xfail.<mode>"
     echo "  e.g. scripts/unittest/pkg-rt.xfail.boot"
@@ -76,15 +80,12 @@ if [ -z "$MODE" ]; then
 fi
 shift
 
-# Expand mode sets into multiple sequential runs
+# Expand mode sets — reads from scripts/modesets/ files
+MODESETS_DIR="$(cd "$(dirname "$0")/../modesets" && pwd)"
 expand_set() {
-    case "$1" in
-        basic) echo "boot boot-comp boot-comp-int" ;;
-        all)   echo "boot boot-comp boot-comp-int boot-comp-comp boot-comp-comp-comp" ;;
-        # TODO: add boot-comp-int-int back once flat memory path doesn't depend on compiled-only pkg/rt
-        full)  echo "boot boot-comp boot-comp-int boot-comp-comp boot-comp-comp-int boot-comp-comp-comp" ;;
-        *)     return 1 ;;
-    esac
+    local setfile="$MODESETS_DIR/$1"
+    [ -f "$setfile" ] || return 1
+    grep -v '^#' "$setfile" | grep -v '^$' | tr '\n' ' '
 }
 
 MODES="$(expand_set "$MODE" 2>/dev/null)" && {

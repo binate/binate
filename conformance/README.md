@@ -34,7 +34,7 @@ Each mode is a chain of: `boot` (bootstrap interpreter), `comp` (compiler), `int
 | `boot-comp-comp` | Gen1 compiler compiles test |
 | `boot-comp-comp-comp` | Gen2 compiler compiles test |
 
-Mode sets: `basic` (boot, boot-comp, boot-comp-int), `all` (all modes).
+Mode sets are defined in `scripts/modesets/` (one file per set, one mode per line). Adding a new mode set is just adding a file. Current sets: `basic`, `all`, `full`.
 
 ### Filters
 

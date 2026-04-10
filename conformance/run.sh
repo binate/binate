@@ -24,6 +24,17 @@ MODE="$1"
 if [ -z "$MODE" ]; then
     echo "Usage: $0 <mode> [filter...]"
     echo ""
+    echo "Runs conformance tests against the specified backend mode."
+    echo ""
+    echo "Filters select tests by substring match on the test name."
+    echo "Multiple filters are OR'd: any match includes the test."
+    echo ""
+    echo "Examples:"
+    echo "  $0 boot                   Run all tests via bootstrap interpreter"
+    echo "  $0 boot-comp 040          Run test(s) matching '040' via compiler"
+    echo "  $0 basic                  Run boot, boot-comp, boot-comp-int"
+    echo "  $0 boot-comp slice nil    Run tests matching 'slice' or 'nil'"
+    echo ""
     echo "Modes:"
     for r in "$(dirname "$0")"/runners/*.sh; do
         [ -f "$r" ] || continue
@@ -35,6 +46,16 @@ if [ -z "$MODE" ]; then
     echo "Mode sets:"
     echo "  basic                boot, boot-comp, boot-comp-int"
     echo "  all                  all modes"
+    echo ""
+    echo "Test formats:"
+    echo "  NNN_name.bn + .expected   Positive: run and compare stdout"
+    echo "  NNN_name.bn + .error      Negative: must fail with matching error"
+    echo "  NNN_name/ directory        Multi-package test (main.bn + pkg/)"
+    echo ""
+    echo "Xfail: NNN_name.xfail.<mode> marks a test as expected failure."
+    echo ""
+    echo "Environment:"
+    echo "  BINATE_FLAGS              Extra flags for the compiler (e.g. \"-g\")"
     exit 1
 fi
 shift

@@ -27,6 +27,18 @@ MODE="$1"
 if [ -z "$MODE" ]; then
     echo "Usage: $0 <mode> [filter...]"
     echo ""
+    echo "Runs unit tests for all packages (or filtered packages) using"
+    echo "the specified backend mode."
+    echo ""
+    echo "Filters select packages by substring match (e.g. 'ir' matches"
+    echo "'pkg/ir'). Multiple filters are OR'd."
+    echo ""
+    echo "Examples:"
+    echo "  $0 boot                   Run all tests via bootstrap"
+    echo "  $0 boot-comp interp       Run pkg/interp tests via compiler"
+    echo "  $0 basic                  Run boot, boot-comp, boot-comp-int"
+    echo "  $0 boot ir codegen        Run pkg/ir and pkg/codegen tests"
+    echo ""
     echo "Modes:"
     for r in "$(dirname "$0")"/runners/*.sh; do
         [ -f "$r" ] || continue
@@ -39,6 +51,10 @@ if [ -z "$MODE" ]; then
     echo "  basic                boot, boot-comp, boot-comp-int"
     echo "  all                  basic + boot-comp-comp"
     echo "  full                 all + boot-comp-comp-comp"
+    echo ""
+    echo "Xfail: scripts/unittest/<pkg-path>.xfail.<mode>"
+    echo "  e.g. scripts/unittest/pkg-rt.xfail.boot"
+    echo "  (slashes in package path replaced with dashes)"
     exit 1
 fi
 shift

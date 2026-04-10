@@ -1,0 +1,260 @@
+package "pkg/ir"
+
+import "pkg/types"
+
+// ============================================================
+// Copy function generation
+// ============================================================
+
+// generateCopies generates copy functions for all types that need
+// destruction in the current module. Called after struct fields are populated.
+// Mirrors generateDtors but emits RefInc instead of RefDec.
+func generateCopies(m @Module) {
+	var modPkg @[]char = shortPkgName(m.Name)
+
+	// Track generated copy names to avoid duplicates
+	var generated @[]@[]char
+
+	// Pass 1: local struct copies (unqualified names, including anonymous)
+	for i := 0; i < len(moduleStructs); i++ {
+		var ms ModuleStruct = moduleStructs[i]
+		if ms.Typ == nil { continue }
+		if hasDot(ms.Name) { continue }
+		if !types.NeedsDestruction(ms.Typ) { continue }
+		var cname @[]char = copyNameForType(ms.Typ)
+		if !hasName(generated, cname) {
+			var copyFunc @Func = genStructCopyWithName(cname, ms.Typ)
+			AddFunc(m, copyFunc)
+			generated = appendCharSlicePtr(generated, cname)
+		}
+	}
+
+	// Pass 2: qualified struct names
+	for i := 0; i < len(moduleStructs); i++ {
+		var ms ModuleStruct = moduleStructs[i]
+		if ms.Typ == nil { continue }
+		if !hasDot(ms.Name) { continue }
+		if !types.NeedsDestruction(ms.Typ) { continue }
+
+		var pkg []char = dotPrefix(ms.Name)
+		var base []char = dotSuffix(ms.Name)
+
+		if streq(pkg, modPkg) && !hasName(generated, copyName(base)) {
+			var copyFunc @Func = genStructCopy(base, ms.Typ)
+			AddFunc(m, copyFunc)
+			generated = appendCharSlicePtr(generated, copyFunc.Name)
+		} else if !streq(pkg, modPkg) {
+			declareExternCopy(m, qualifiedCopyName(ms.Name))
+		}
+	}
+
+	// Pass 3: array copy functions for arrays with destructible elements
+	// (found in struct fields of local types)
+	for i := 0; i < len(moduleStructs); i++ {
+		var ms ModuleStruct = moduleStructs[i]
+		if ms.Typ == nil { continue }
+		if !types.NeedsDestruction(ms.Typ) { continue }
+		var isLocal bool = !hasDot(ms.Name)
+		if hasDot(ms.Name) {
+			if streq(dotPrefix(ms.Name), modPkg) {
+				isLocal = true
+			}
+		}
+		if !isLocal { continue }
+		for j := 0; j < len(ms.Typ.Fields); j++ {
+			var ft @types.Type = types.ResolveAlias(ms.Typ.Fields[j].Type)
+			if ft.Kind == types.TYP_ARRAY && types.NeedsDestruction(ft.Elem) {
+				generated = ensureArrayCopy(m, ft, generated)
+			}
+		}
+	}
+
+	// From pending struct/array registrations (scope cleanup during function gen)
+	for i := 0; i < len(pendingStructDtors); i++ {
+		var pst @types.Type = pendingStructDtors[i]
+		if pst.Kind == types.TYP_ARRAY && types.NeedsDestruction(pst.Elem) {
+			generated = ensureArrayCopy(m, pst, generated)
+		}
+		if pst.Kind == types.TYP_STRUCT {
+			for j := 0; j < len(pst.Fields); j++ {
+				var ft @types.Type = types.ResolveAlias(pst.Fields[j].Type)
+				if ft.Kind == types.TYP_ARRAY && types.NeedsDestruction(ft.Elem) {
+					generated = ensureArrayCopy(m, ft, generated)
+				}
+			}
+		}
+	}
+}
+
+// ensureArrayCopy ensures an array copy function exists for the given type.
+func ensureArrayCopy(m @Module, arrTyp @types.Type, generated @[]@[]char) @[]@[]char {
+	var name @[]char = copyNameForType(arrTyp)
+	if hasName(generated, name) { return generated }
+	// If element type needs a copy too (nested array), ensure it
+	var elemTyp @types.Type = arrTyp.Elem
+	if elemTyp != nil {
+		if elemTyp.Kind == types.TYP_ARRAY && types.NeedsDestruction(elemTyp.Elem) {
+			generated = ensureArrayCopy(m, elemTyp, generated)
+		}
+	}
+	var copyFunc @Func = genArrayCopy(name, arrTyp)
+	AddFunc(m, copyFunc)
+	generated = appendCharSlicePtr(generated, name)
+	return generated
+}
+
+// declareExternCopy adds an extern function declaration for a cross-package copy.
+func declareExternCopy(m @Module, name @[]char) {
+	var ptrParam @Param = make(Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@Param = make_slice(@Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+	var ef @Func = NewExternFunc(name, params, noResults)
+	AddFunc(m, ef)
+}
+
+// ============================================================
+// Struct copy function generation
+// ============================================================
+
+// genStructCopy generates a copy function for a struct type.
+// For each field that NeedsDestruction:
+//   - @T: load managed ptr, RefInc
+//   - @[]T: load managed-slice, extract backing refptr, RefInc
+//   - struct, [N]T: get field pointer, call field type's copy function
+func genStructCopy(structName []char, structTyp @types.Type) @Func {
+	return genStructCopyWithName(copyName(structName), structTyp)
+}
+
+func genStructCopyWithName(name @[]char, structTyp @types.Type) @Func {
+	var ptrParam @Param = make(Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@Param = make_slice(@Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+
+	var f @Func = NewFunc(name, params, noResults)
+	f.IsLinkOnce = true
+	var b @Block = AddBlock(f, "entry")
+
+	// Reference to parameter 0
+	var rawPtr @Instr = make(Instr)
+	rawPtr.ID = f.Params[0].ID
+	rawPtr.Typ = f.Params[0].Typ
+	rawPtr.Op = OP_CONST_INT
+
+	// Bitcast to struct pointer
+	var structPtrTyp @types.Type = types.MakePointerType(structTyp)
+	var structPtr @Instr = EmitBitCast(f, b, rawPtr, structPtrTyp)
+
+	for i := 0; i < len(structTyp.Fields); i++ {
+		var fieldTyp @types.Type = structTyp.Fields[i].Type
+		if !types.NeedsDestruction(fieldTyp) { continue }
+		fieldTyp = types.ResolveAlias(fieldTyp)
+
+		if fieldTyp.Kind == types.TYP_MANAGED_PTR {
+			// @T field: load the managed pointer, RefInc
+			var fieldPtr @Instr = EmitGetFieldPtr(f, b, structPtr, i, fieldTyp)
+			var fieldVal @Instr = EmitLoad(f, b, fieldPtr, fieldTyp)
+			EmitRefcountInc(b, fieldVal)
+		} else if fieldTyp.Kind == types.TYP_MANAGED_SLICE {
+			// @[]T field: load managed-slice, extract backing refptr, RefInc
+			var fieldPtr @Instr = EmitGetFieldPtr(f, b, structPtr, i, fieldTyp)
+			var fieldVal @Instr = EmitLoad(f, b, fieldPtr, fieldTyp)
+			var refptr @Instr = EmitExtract(f, b, fieldVal, 2, types.MakeManagedPtrType(nil))
+			EmitRefcountInc(b, refptr)
+		} else {
+			// struct, [N]T stored inline: get field pointer, call copy
+			var fieldPtr @Instr = EmitGetFieldPtr(f, b, structPtr, i, fieldTyp)
+			var fieldRawPtr @Instr = EmitBitCast(f, b, fieldPtr, types.MakePointerType(types.TypUint8()))
+			emitIndirectCall(f, b, EmitFuncAddr(f, b, qualifiedCopyNameForType(fieldTyp)), fieldRawPtr)
+		}
+	}
+
+	var noRetVals @[]@Instr
+	EmitReturn(b, noRetVals)
+	return f
+}
+
+// ============================================================
+// Array copy function generation
+// ============================================================
+
+// genArrayCopy generates a copy function for an array type [N]T.
+// It iterates N elements and calls element copy on each.
+func genArrayCopy(name @[]char, arrTyp @types.Type) @Func {
+	var ptrParam @Param = make(Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@Param = make_slice(@Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+
+	var f @Func = NewFunc(name, params, noResults)
+	f.IsLinkOnce = true
+	var entry @Block = AddBlock(f, "entry")
+
+	// Reference to parameter 0
+	var rawPtr @Instr = make(Instr)
+	rawPtr.ID = f.Params[0].ID
+	rawPtr.Typ = f.Params[0].Typ
+	rawPtr.Op = OP_CONST_INT
+
+	var elemTyp @types.Type = arrTyp.Elem
+	var arrLen int = arrTyp.ArrayLen
+
+	// Loop counter via alloca
+	var iSlot @Instr = EmitAlloc(f, entry, types.TypInt())
+	var zero @Instr = EmitConstInt(f, entry, 0, types.TypInt())
+	EmitStore(entry, iSlot, zero)
+
+	var loopCond @Block = AddBlock(f, "arr_copy_cond")
+	EmitJump(entry, loopCond)
+
+	// Loop condition: i < N
+	var iv @Instr = EmitLoad(f, loopCond, iSlot, types.TypInt())
+	var lenConst @Instr = EmitConstInt(f, loopCond, arrLen, types.TypInt())
+	var cmp @Instr = EmitBinop(f, loopCond, OP_LT, iv, lenConst, types.TypBool())
+	var loopBody @Block = AddBlock(f, "arr_copy_body")
+	var exitBlock @Block = AddBlock(f, "arr_copy_exit")
+	EmitBranch(loopCond, cmp, loopBody, exitBlock)
+
+	// Loop body: compute element address, call element copy
+	var one @Instr = EmitConstInt(f, loopBody, 1, types.TypInt())
+	var elemSize @Instr = EmitConstInt(f, loopBody, types.SizeOf(elemTyp), types.TypInt())
+	var offset @Instr = EmitBinop(f, loopBody, OP_MUL, iv, elemSize, types.TypInt())
+	var elemAddr @Instr = EmitGetElemPtr(f, loopBody, rawPtr, offset, types.TypUint8())
+	var elemRawPtr @Instr = EmitBitCast(f, loopBody, elemAddr, types.MakePointerType(types.TypUint8()))
+
+	if elemTyp.Kind == types.TYP_MANAGED_PTR {
+		// Element is @T — load the pointer, RefInc
+		var elemPtrTyp @types.Type = types.MakePointerType(elemTyp)
+		var typedElemPtr @Instr = EmitBitCast(f, loopBody, elemAddr, elemPtrTyp)
+		var elem @Instr = EmitLoad(f, loopBody, typedElemPtr, elemTyp)
+		EmitRefcountInc(loopBody, elem)
+	} else if elemTyp.Kind == types.TYP_MANAGED_SLICE {
+		// Element is @[]T — load the managed-slice, extract backing refptr, RefInc
+		var elemPtrTyp @types.Type = types.MakePointerType(elemTyp)
+		var typedElemPtr @Instr = EmitBitCast(f, loopBody, elemAddr, elemPtrTyp)
+		var elem @Instr = EmitLoad(f, loopBody, typedElemPtr, elemTyp)
+		var refptr @Instr = EmitExtract(f, loopBody, elem, 2, types.MakeManagedPtrType(nil))
+		EmitRefcountInc(loopBody, refptr)
+	} else {
+		// Element is struct or [N]T — call element type's copy function
+		var elemCopyRef @Instr = EmitFuncAddr(f, loopBody, qualifiedCopyNameForType(elemTyp))
+		emitIndirectCall(f, loopBody, elemCopyRef, elemRawPtr)
+	}
+
+	// Increment counter, loop back
+	var iNext @Instr = EmitBinop(f, loopBody, OP_ADD, iv, one, types.TypInt())
+	EmitStore(loopBody, iSlot, iNext)
+	EmitJump(loopBody, loopCond)
+
+	// Exit
+	var noRetVals @[]@Instr
+	EmitReturn(exitBlock, noRetVals)
+	return f
+}

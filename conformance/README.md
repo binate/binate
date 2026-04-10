@@ -42,6 +42,7 @@ Optional arguments filter tests by substring match against the test name. Multip
 
 ```sh
 ./conformance/run.sh boot-comp recursive int_lit switch
+./conformance/run.sh boot,boot-comp 040    # comma-separated modes
 ```
 
 ## Test Formats

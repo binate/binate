@@ -51,10 +51,11 @@ if [ -z "$MODE" ]; then
     echo "'pkg/ir'). Multiple filters are OR'd."
     echo ""
     echo "Examples:"
-    echo "  $0 boot                   Run all tests via bootstrap"
-    echo "  $0 boot-comp interp       Run pkg/interp tests via compiler"
-    echo "  $0 basic                  Run boot, boot-comp, boot-comp-int"
-    echo "  $0 boot ir codegen        Run pkg/ir and pkg/codegen tests"
+    echo "  $0 boot                       Run all tests via bootstrap"
+    echo "  $0 boot-comp interp           Run pkg/interp tests via compiler"
+    echo "  $0 basic                      Run boot, boot-comp, boot-comp-int"
+    echo "  $0 boot,boot-comp interp      Run pkg/interp in boot and boot-comp"
+    echo "  $0 boot ir codegen            Run pkg/ir and pkg/codegen tests"
     echo ""
     echo "Modes:"
     for r in "$(dirname "$0")"/runners/*.sh; do
@@ -88,7 +89,14 @@ expand_set() {
     grep -v '^#' "$setfile" | grep -v '^$' | tr '\n' ' '
 }
 
-MODES="$(expand_set "$MODE" 2>/dev/null)" && {
+# Try mode set file first, then comma-separated list
+MODES="$(expand_set "$MODE" 2>/dev/null)" || {
+    case "$MODE" in
+        *,*) MODES="$(echo "$MODE" | tr ',' ' ')" ;;
+    esac
+}
+
+[ -n "$MODES" ] && {
     overall_exit=0
     for m in $MODES; do
         echo "========================================"
@@ -150,11 +158,11 @@ skipped=0
 failures=""
 
 for pkg in $PACKAGES; do
-    # Apply filters (exact match on full package path)
+    # Apply filters (substring match on package path)
     if [ $# -gt 0 ]; then
         match=0
         for f in "$@"; do
-            if [ "$pkg" = "$f" ]; then match=1; break; fi
+            case "$pkg" in *"$f"*) match=1; break;; esac
         done
         if [ "$match" -eq 0 ]; then
             skipped=$((skipped + 1))

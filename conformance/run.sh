@@ -47,10 +47,11 @@ if [ -z "$MODE" ]; then
     echo "Multiple filters are OR'd: any match includes the test."
     echo ""
     echo "Examples:"
-    echo "  $0 boot                   Run all tests via bootstrap interpreter"
-    echo "  $0 boot-comp 040          Run test(s) matching '040' via compiler"
-    echo "  $0 basic                  Run boot, boot-comp, boot-comp-int"
-    echo "  $0 boot-comp slice nil    Run tests matching 'slice' or 'nil'"
+    echo "  $0 boot                       Run all tests via bootstrap interpreter"
+    echo "  $0 boot-comp 040              Run test(s) matching '040' via compiler"
+    echo "  $0 basic                      Run boot, boot-comp, boot-comp-int"
+    echo "  $0 boot,boot-comp 040         Run '040' in boot and boot-comp"
+    echo "  $0 boot-comp slice nil        Run tests matching 'slice' or 'nil'"
     echo ""
     echo "Modes:"
     for r in "$(dirname "$0")"/runners/*.sh; do
@@ -90,7 +91,14 @@ expand_set() {
     grep -v '^#' "$setfile" | grep -v '^$' | tr '\n' ' '
 }
 
-MODES="$(expand_set "$MODE" 2>/dev/null)" && {
+# Try mode set file first, then comma-separated list
+MODES="$(expand_set "$MODE" 2>/dev/null)" || {
+    case "$MODE" in
+        *,*) MODES="$(echo "$MODE" | tr ',' ' ')" ;;
+    esac
+}
+
+[ -n "$MODES" ] && {
     overall_exit=0
     for m in $MODES; do
         echo "========================================"

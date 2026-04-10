@@ -277,16 +277,19 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
 
     main_bn="$dir/main.bn"
     expected="$dir/expected"
+    errorfile="$dir/error"
     if [ ! -f "$main_bn" ]; then
         echo "SKIP: $name (no main.bn)"
         continue
     fi
-    if [ ! -f "$expected" ]; then
-        echo "SKIP: $name (no expected file)"
+    if [ -f "$errorfile" ]; then
+        run_error_test "$name" "$main_bn" "$errorfile" "$dir"
+    elif [ -f "$expected" ]; then
+        run_test "$name" "$main_bn" "$expected" "$dir"
+    else
+        echo "SKIP: $name (no expected or error file)"
         continue
     fi
-
-    run_test "$name" "$main_bn" "$expected" "$dir"
 done
 
 # Newline after dots in default mode

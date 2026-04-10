@@ -5,8 +5,10 @@ Standalone `.bn` programs with expected output, shared across all execution back
 ## Running
 
 ```sh
-./conformance/run.sh <mode> [filter...]
+./conformance/run.sh [-v|-q] <mode> [filter...]
 ```
+
+Flags: `-v` (verbose — show all test names), `-q` (quiet — failures and summary only), default (dots for passes, detail for failures).
 
 Run `./conformance/run.sh` with no arguments for full help.
 

@@ -5,8 +5,10 @@ Runs unit tests for all Binate packages across multiple execution backends.
 ## Running
 
 ```sh
-./scripts/unittest/run.sh <mode> [filter...]
+./scripts/unittest/run.sh [-v|-q] <mode> [filter...]
 ```
+
+Flags: `-v` (verbose — show all package results), `-q` (quiet — failures and summary only), default (dots for passes, detail for failures).
 
 Run `./scripts/unittest/run.sh` with no arguments for full help.
 

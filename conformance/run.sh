@@ -20,11 +20,28 @@
 #   Single-file: NNN_name.bn + NNN_name.error    (negative: must fail, output contains error strings)
 #   Multi-package: NNN_name/ directory with main.bn, expected, and pkg/ subdirectory
 
+# Parse flags
+VERBOSE=0
+QUIET=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v|--verbose) VERBOSE=1; shift ;;
+        -q|--quiet)   QUIET=1; shift ;;
+        *)            break ;;
+    esac
+done
+export VERBOSE QUIET
+
 MODE="$1"
 if [ -z "$MODE" ]; then
-    echo "Usage: $0 <mode> [filter...]"
+    echo "Usage: $0 [-v|-q] <mode> [filter...]"
     echo ""
     echo "Runs conformance tests against the specified backend mode."
+    echo ""
+    echo "Flags:"
+    echo "  -v, --verbose   Show all test names (PASS, FAIL, XFAIL)"
+    echo "  -q, --quiet     Show only failures and summary"
+    echo "  (default)       Show failures in detail, passes as dots"
     echo ""
     echo "Filters select tests by substring match on the test name."
     echo "Multiple filters are OR'd: any match includes the test."
@@ -77,7 +94,10 @@ MODES="$(expand_set "$MODE" 2>/dev/null)" && {
         echo "========================================"
         echo "=== Mode: $m"
         echo "========================================"
-        "$0" "$m" "$@"
+        flags=""
+        [ "$VERBOSE" -eq 1 ] && flags="-v"
+        [ "$QUIET" -eq 1 ] && flags="-q"
+        "$0" $flags "$m" "$@"
         rc=$?
         if [ $rc -ne 0 ]; then overall_exit=$rc; fi
         echo ""
@@ -125,15 +145,26 @@ run_test() {
     expected_content="$(cat "$expected")"
     known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
     if [ "$actual" = "$expected_content" ]; then
-        echo "PASS: $name"
+        if [ "$VERBOSE" -eq 1 ]; then
+            echo "PASS: $name"
+        elif [ "$QUIET" -eq 0 ]; then
+            printf "."
+        fi
         passed=$((passed + 1))
     elif [ -f "$known_fail" ]; then
-        echo "XFAIL: $name (known failure: $(cat "$known_fail"))"
+        if [ "$VERBOSE" -eq 1 ]; then
+            echo "XFAIL: $name (known failure: $(cat "$known_fail"))"
+        elif [ "$QUIET" -eq 0 ]; then
+            printf "x"
+        fi
         skipped=$((skipped + 1))
     else
-        echo "FAIL: $name"
-        echo "  expected: $(head -3 "$expected")"
-        echo "  actual:   $(echo "$actual" | head -3)"
+        if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
+            echo ""
+            echo "FAIL: $name"
+            echo "  expected: $(head -3 "$expected")"
+            echo "  actual:   $(echo "$actual" | head -3)"
+        fi
         failed=$((failed + 1))
         failures="$failures $name"
     fi
@@ -164,15 +195,26 @@ run_error_test() {
     done < "$errorfile"
 
     if $all_found; then
-        echo "PASS: $name (error)"
+        if [ "$VERBOSE" -eq 1 ]; then
+            echo "PASS: $name (error)"
+        elif [ "$QUIET" -eq 0 ]; then
+            printf "."
+        fi
         passed=$((passed + 1))
     elif [ -f "$known_fail" ]; then
-        echo "XFAIL: $name (known failure: $(cat "$known_fail"))"
+        if [ "$VERBOSE" -eq 1 ]; then
+            echo "XFAIL: $name (known failure: $(cat "$known_fail"))"
+        elif [ "$QUIET" -eq 0 ]; then
+            printf "x"
+        fi
         skipped=$((skipped + 1))
     else
-        echo "FAIL: $name (error)"
-        echo "  missing: $missing"
-        echo "  actual:  $(echo "$actual" | head -3)"
+        if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
+            echo ""
+            echo "FAIL: $name (error)"
+            echo "  missing: $missing"
+            echo "  actual:  $(echo "$actual" | head -3)"
+        fi
         failed=$((failed + 1))
         failures="$failures $name"
     fi
@@ -237,6 +279,10 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
     run_test "$name" "$main_bn" "$expected" "$dir"
 done
 
+# Newline after dots in default mode
+if [ "$VERBOSE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+    echo ""
+fi
 echo ""
 echo "=== Summary ($MODE): $passed passed, $failed failed, $skipped skipped ==="
 if [ $failed -gt 0 ]; then

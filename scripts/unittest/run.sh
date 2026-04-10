@@ -23,12 +23,29 @@
 #   e.g. scripts/unittest/pkg-rt.xfail.boot
 #   Contents are the reason for the expected failure.
 
+# Parse flags
+VERBOSE=0
+QUIET=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v|--verbose) VERBOSE=1; shift ;;
+        -q|--quiet)   QUIET=1; shift ;;
+        *)            break ;;
+    esac
+done
+export VERBOSE QUIET
+
 MODE="$1"
 if [ -z "$MODE" ]; then
-    echo "Usage: $0 <mode> [filter...]"
+    echo "Usage: $0 [-v|-q] <mode> [filter...]"
     echo ""
     echo "Runs unit tests for all packages (or filtered packages) using"
     echo "the specified backend mode."
+    echo ""
+    echo "Flags:"
+    echo "  -v, --verbose   Show per-test PASS/FAIL output"
+    echo "  -q, --quiet     Show only failures and summary"
+    echo "  (default)       Show pass/fail per package, failures in detail"
     echo ""
     echo "Filters select packages by substring match (e.g. 'ir' matches"
     echo "'pkg/ir'). Multiple filters are OR'd."
@@ -76,7 +93,10 @@ MODES="$(expand_set "$MODE" 2>/dev/null)" && {
         echo "========================================"
         echo "=== Mode: $m"
         echo "========================================"
-        "$0" "$m" "$@"
+        flags=""
+        [ "$VERBOSE" -eq 1 ] && flags="-v"
+        [ "$QUIET" -eq 1 ] && flags="-q"
+        "$0" $flags "$m" "$@"
         rc=$?
         if [ $rc -ne 0 ]; then overall_exit=$rc; fi
         echo ""
@@ -146,7 +166,11 @@ for pkg in $PACKAGES; do
     xfail_file="$SCRIPT_DIR/${xfail_key}.xfail.${MODE}"
     if [ -f "$xfail_file" ]; then
         reason="$(cat "$xfail_file")"
-        echo "XFAIL: $pkg ($reason)"
+        if [ "$VERBOSE" -eq 1 ]; then
+            echo "XFAIL: $pkg ($reason)"
+        elif [ "$QUIET" -eq 0 ]; then
+            printf "x"
+        fi
         xfailed=$((xfailed + 1))
         continue
     fi
@@ -159,18 +183,27 @@ for pkg in $PACKAGES; do
     elapsed=$((end_time - start_time))
 
     if [ $rc -eq 0 ]; then
-        # Extract test count from output
         count=$(echo "$output" | grep -o '[0-9]* passed' | head -1)
-        echo "PASS: $pkg ($count) [${elapsed}s]"
+        if [ "$VERBOSE" -eq 1 ]; then
+            echo "PASS: $pkg ($count) [${elapsed}s]"
+        elif [ "$QUIET" -eq 0 ]; then
+            printf "."
+        fi
         passed=$((passed + 1))
     else
-        echo "FAIL: $pkg [${elapsed}s]"
-        echo "$output" | sed 's/^/  /' | tail -5
+        if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
+            echo ""
+            echo "FAIL: $pkg [${elapsed}s]"
+            echo "$output" | sed 's/^/  /' | tail -5
+        fi
         failed=$((failed + 1))
         failures="$failures $pkg"
     fi
 done
 
+if [ "$VERBOSE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+    echo ""
+fi
 echo ""
 echo "=== Summary ($MODE): $passed passed, $failed failed, $xfailed xfail, $skipped skipped ==="
 if [ $failed -gt 0 ]; then

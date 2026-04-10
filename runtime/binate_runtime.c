@@ -30,39 +30,6 @@ typedef struct {
     int64_t  backing_len; // total element count in backing
 } BnManagedSlice;
 
-// make_raw_deprecated([]T, n) — allocate a zeroed unmanaged slice
-BnSlice bn_make_slice(int64_t elem_size, int64_t length) {
-    BnSlice s;
-    s.len = length;
-    if (length > 0) {
-        s.data = calloc((size_t)length, (size_t)elem_size);
-    } else {
-        s.data = NULL;
-    }
-    return s;
-}
-
-
-// Free slice backing data (no-op for nil slices)
-void bn_slice_free(BnSlice s) {
-    if (s.data) {
-        free(s.data);
-    }
-}
-
-// string literal → []char slice (copies string data)
-BnSlice bn_string_to_chars(const char *str, int64_t len) {
-    BnSlice s;
-    s.len = len;
-    if (len > 0) {
-        s.data = malloc((size_t)len);
-        memcpy(s.data, str, (size_t)len);
-    } else {
-        s.data = NULL;
-    }
-    return s;
-}
-
 // Print []char slice as string
 void bn_print_chars(BnSlice s) {
     if (s.data && s.len > 0) {

@@ -203,7 +203,7 @@ for pkg in $PACKAGES; do
         if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
             echo ""
             echo "FAIL: $pkg [${elapsed}s]"
-            echo "$output" | sed 's/^/  /' | tail -5
+            echo "$output" | sed 's/^/  /'
         fi
         failed=$((failed + 1))
         failures="$failures $pkg"

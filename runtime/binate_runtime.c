@@ -98,6 +98,32 @@ static BnSlice cstr_to_slice(const char *s) {
     return r;
 }
 
+// Helper: allocate a managed block (16-byte header + payload, refcount=1)
+static void *managed_alloc(size_t payload_size) {
+    void *base = calloc(1, 16 + payload_size);
+    int64_t *header = (int64_t *)base;
+    header[0] = 1;  // refcount = 1
+    header[1] = 0;  // dtor = null
+    return (char *)base + 16;  // return pointer past header
+}
+
+// Helper: convert C string to BnManagedSlice of chars
+static BnManagedSlice cstr_to_managed_slice(const char *s) {
+    BnManagedSlice r;
+    r.len = (int64_t)strlen(s);
+    if (r.len > 0) {
+        r.data = managed_alloc((size_t)r.len);
+        memcpy(r.data, s, (size_t)r.len);
+        r.backing = r.data;
+        r.backing_len = r.len;
+    } else {
+        r.data = NULL;
+        r.backing = NULL;
+        r.backing_len = 0;
+    }
+    return r;
+}
+
 // Open(path []char, flags int) int
 int64_t bn_bootstrap__Open(BnSlice path, int64_t flags) {
     char *cpath = slice_to_cstr(path);
@@ -136,29 +162,50 @@ int64_t bn_bootstrap__Close(int64_t fd) {
     return (int64_t)close((int)fd);
 }
 
-// ReadDir(path []char) [][]char
-BnSlice bn_bootstrap__ReadDir(BnSlice path) {
+// ReadDir(path []char) @[]@[]char
+BnManagedSlice bn_bootstrap__ReadDir(BnSlice path) {
     char *cpath = slice_to_cstr(path);
     DIR *dir = opendir(cpath);
     free(cpath);
 
-    BnSlice result;
+    BnManagedSlice result;
     result.data = NULL;
     result.len = 0;
+    result.backing = NULL;
+    result.backing_len = 0;
 
     if (!dir) return result;
 
+    // First pass: count entries
+    int64_t count = 0;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue; // skip hidden and . / ..
-        BnSlice name = cstr_to_slice(entry->d_name);
-        // Append BnSlice to result (slice of slices, each element is sizeof(BnSlice))
-        int64_t newlen = result.len + 1;
-        result.data = realloc(result.data, (size_t)newlen * sizeof(BnSlice));
-        ((BnSlice *)result.data)[result.len] = name;
-        result.len = newlen;
+        if (entry->d_name[0] == '.') continue;
+        count++;
+    }
+    if (count == 0) { closedir(dir); return result; }
+
+    // Allocate managed backing for the outer slice
+    size_t elem_size = sizeof(BnManagedSlice);
+    void *backing = managed_alloc(count * elem_size);
+    BnManagedSlice *elems = (BnManagedSlice *)backing;
+
+    // Second pass: fill entries
+    rewinddir(dir);
+    int64_t idx = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        if (idx < count) {
+            elems[idx] = cstr_to_managed_slice(entry->d_name);
+            idx++;
+        }
     }
     closedir(dir);
+
+    result.data = backing;
+    result.len = idx;
+    result.backing = backing;
+    result.backing_len = idx;
     return result;
 }
 
@@ -184,20 +231,27 @@ void bn_bootstrap__Exit(int64_t code) {
 static int bn_argc = 0;
 static char **bn_argv = NULL;
 
-// Args() [][]char
-BnSlice bn_bootstrap__Args(void) {
-    BnSlice result;
-    result.data = NULL;
-    result.len = 0;
-
-    // Skip program name (argv[0])
-    for (int i = 1; i < bn_argc; i++) {
-        BnSlice arg = cstr_to_slice(bn_argv[i]);
-        int64_t newlen = result.len + 1;
-        result.data = realloc(result.data, (size_t)newlen * sizeof(BnSlice));
-        ((BnSlice *)result.data)[result.len] = arg;
-        result.len = newlen;
+// Args() @[]@[]char
+BnManagedSlice bn_bootstrap__Args(void) {
+    BnManagedSlice result;
+    int64_t count = bn_argc > 1 ? bn_argc - 1 : 0;
+    if (count == 0) {
+        result.data = NULL;
+        result.len = 0;
+        result.backing = NULL;
+        result.backing_len = 0;
+        return result;
     }
+    size_t elem_size = sizeof(BnManagedSlice);
+    void *backing = managed_alloc(count * elem_size);
+    BnManagedSlice *elems = (BnManagedSlice *)backing;
+    for (int i = 0; i < count; i++) {
+        elems[i] = cstr_to_managed_slice(bn_argv[i + 1]);
+    }
+    result.data = backing;
+    result.len = count;
+    result.backing = backing;
+    result.backing_len = count;
     return result;
 }
 

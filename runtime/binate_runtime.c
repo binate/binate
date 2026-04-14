@@ -148,11 +148,10 @@ int64_t bn_bootstrap__Read(int64_t fd, BnSlice buf) {
     return (int64_t)r;
 }
 
-// Write(fd int, buf []uint8, n int) int
-int64_t bn_bootstrap__Write(int64_t fd, BnSlice buf, int64_t n) {
-    if (!buf.data || n <= 0) return 0;
-    if (n > buf.len) n = buf.len;
-    ssize_t w = write((int)fd, buf.data, (size_t)n);
+// Write(fd int, buf []uint8) int — writes len(buf) bytes
+int64_t bn_bootstrap__Write(int64_t fd, BnSlice buf) {
+    if (!buf.data || buf.len <= 0) return 0;
+    ssize_t w = write((int)fd, buf.data, (size_t)buf.len);
     return (int64_t)w;
 }
 

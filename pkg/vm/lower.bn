@@ -1,0 +1,445 @@
+package "pkg/vm"
+
+import "pkg/ir"
+import "pkg/types"
+import "pkg/buf"
+
+// LowerModule converts all functions in an IR module to bytecode.
+func LowerModule(vm @VM, m @ir.Module) {
+	// Finalize string constants
+	if len(m.Strings) == 0 {
+		ir.FinalizeStrings(m)
+	}
+
+	for i := 0; i < len(m.Funcs); i++ {
+		var f @ir.Func = m.Funcs[i]
+		if f.IsExtern { continue }
+		var vmf @VMFunc = lowerFunc(f)
+		vm.Funcs = appendVMFunc(vm.Funcs, vmf)
+	}
+}
+
+func lowerFunc(f @ir.Func) @VMFunc {
+	var vmf @VMFunc = make(VMFunc)
+	vmf.Name = f.Name
+	vmf.NumRegs = f.NextID
+	vmf.NumParams = len(f.Params)
+	vmf.NumResults = len(f.Results)
+
+	// First pass: compute stack frame layout (alloca offsets)
+	var frameOffset int = 0
+	var allocaOffsets @[]int = make_slice(int, f.NextID)
+	for i := 0; i < len(f.Blocks); i++ {
+		var blk @ir.Block = f.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var instr @ir.Instr = blk.Instrs[j]
+			if instr.Op == ir.OP_ALLOC && instr.TypeArg != nil {
+				var size int = types.SizeOf(instr.TypeArg)
+				// Align to 8 bytes
+				frameOffset = (frameOffset + 7) / 8 * 8
+				allocaOffsets[instr.ID] = frameOffset
+				frameOffset = frameOffset + size
+			}
+		}
+	}
+	vmf.FrameSize = frameOffset
+
+	// Second pass: compute block offsets (label → bytecode index)
+	// We need to know how many bytecodes each block produces.
+	// Do a dry run to count, then a real emit pass.
+	var blockOffsets @[]int = make_slice(int, len(f.Blocks))
+	var totalInstrs int = 0
+	for i := 0; i < len(f.Blocks); i++ {
+		blockOffsets[i] = totalInstrs
+		var blk @ir.Block = f.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var instr @ir.Instr = blk.Instrs[j]
+			if instr.Op == ir.OP_PHI {
+				// Phi nodes don't emit directly — copies are inserted in predecessors
+				continue
+			}
+			totalInstrs = totalInstrs + 1
+			// Some IR ops expand to multiple bytecodes
+			if instr.Op == ir.OP_ALLOC {
+				// STACK_ALLOC is one instruction
+			}
+		}
+		// Count phi copies that predecessors need to insert
+		// (handled in third pass)
+	}
+
+	// Add space for phi copies (conservative: count all phi entries)
+	for i := 0; i < len(f.Blocks); i++ {
+		var blk @ir.Block = f.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			if blk.Instrs[j].Op == ir.OP_PHI {
+				totalInstrs = totalInstrs + len(blk.Instrs[j].Phis)
+			}
+		}
+	}
+
+	// Third pass: emit bytecode
+	var code @[]BCInstr = make_slice(BCInstr, totalInstrs)
+	var codeIdx int = 0
+
+	// Collect phi copies per block (inserted before terminator)
+	// phiCopies[blockIdx] = list of (dst, src) pairs
+	for i := 0; i < len(f.Blocks); i++ {
+		blockOffsets[i] = codeIdx
+		var blk @ir.Block = f.Blocks[i]
+
+		for j := 0; j < len(blk.Instrs); j++ {
+			var instr @ir.Instr = blk.Instrs[j]
+
+			if instr.Op == ir.OP_PHI {
+				continue // handled by predecessor insertion
+			}
+
+			// Before terminators, insert phi copies for successor blocks
+			if ir.IsTerminator(instr) {
+				codeIdx = insertPhiCopies(f, code, codeIdx, blk, instr)
+			}
+
+			var bc BCInstr = lowerInstr(instr, allocaOffsets, blockOffsets, f)
+			code[codeIdx] = bc
+			codeIdx = codeIdx + 1
+		}
+	}
+
+	vmf.Code = code[:codeIdx]
+	return vmf
+}
+
+// insertPhiCopies inserts MOV instructions for phi nodes in successor blocks.
+func insertPhiCopies(f @ir.Func, code @[]BCInstr, codeIdx int, curBlock @ir.Block, terminator @ir.Instr) int {
+	// Find successor blocks
+	if terminator.Block1 != nil {
+		codeIdx = insertPhiCopiesForSucc(f, code, codeIdx, curBlock, terminator.Block1)
+	}
+	if terminator.Block2 != nil {
+		codeIdx = insertPhiCopiesForSucc(f, code, codeIdx, curBlock, terminator.Block2)
+	}
+	return codeIdx
+}
+
+func insertPhiCopiesForSucc(f @ir.Func, code @[]BCInstr, codeIdx int, curBlock @ir.Block, succBlock @ir.Block) int {
+	for i := 0; i < len(succBlock.Instrs); i++ {
+		var instr @ir.Instr = succBlock.Instrs[i]
+		if instr.Op != ir.OP_PHI { break }
+		// Find the phi entry for curBlock
+		for j := 0; j < len(instr.Phis); j++ {
+			if instr.Phis[j].Block == curBlock {
+				var bc BCInstr
+				bc.Op = BC_MOV
+				bc.Dst = instr.ID
+				bc.Src1 = instr.Phis[j].Val.ID
+				code[codeIdx] = bc
+				codeIdx = codeIdx + 1
+			}
+		}
+	}
+	return codeIdx
+}
+
+// lowerInstr converts one IR instruction to one bytecode instruction.
+func lowerInstr(instr @ir.Instr, allocaOffsets []int, blockOffsets []int, f @ir.Func) BCInstr {
+	var bc BCInstr
+	bc.Dst = instr.ID
+
+	// Constants
+	if instr.Op == ir.OP_CONST_INT {
+		bc.Op = BC_LOAD_IMM
+		bc.Imm = instr.IntVal
+		return bc
+	}
+	if instr.Op == ir.OP_CONST_BOOL {
+		bc.Op = BC_LOAD_IMM
+		if instr.BoolVal { bc.Imm = 1 } else { bc.Imm = 0 }
+		return bc
+	}
+	if instr.Op == ir.OP_CONST_NIL {
+		bc.Op = BC_LOAD_IMM
+		bc.Imm = 0
+		return bc
+	}
+	if instr.Op == ir.OP_CONST_STRING {
+		// For now, load string address as immediate (to be resolved later)
+		bc.Op = BC_LOAD_STR
+		bc.Imm = 0 // TODO: string constant index
+		return bc
+	}
+
+	// Arithmetic
+	if instr.Op == ir.OP_ADD { bc.Op = BC_ADD; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_SUB { bc.Op = BC_SUB; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_MUL { bc.Op = BC_MUL; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_DIV { bc.Op = BC_DIV; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_REM { bc.Op = BC_REM; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_AND { bc.Op = BC_AND; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_OR  { bc.Op = BC_OR;  bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_XOR { bc.Op = BC_XOR; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_SHL { bc.Op = BC_SHL; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_SHR { bc.Op = BC_SHR; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+
+	// Comparison
+	if instr.Op == ir.OP_EQ { bc.Op = BC_EQ; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_NE { bc.Op = BC_NE; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_LT { bc.Op = BC_SLT; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_LE { bc.Op = BC_SLE; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_GT { bc.Op = BC_SGT; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+	if instr.Op == ir.OP_GE { bc.Op = BC_SGE; bc.Src1 = instr.Args[0].ID; bc.Src2 = instr.Args[1].ID; return bc }
+
+	// Unary
+	if instr.Op == ir.OP_NEG { bc.Op = BC_NEG; bc.Src1 = instr.Args[0].ID; return bc }
+	if instr.Op == ir.OP_NOT { bc.Op = BC_NOT; bc.Src1 = instr.Args[0].ID; return bc }
+	if instr.Op == ir.OP_BITNOT { bc.Op = BC_BITNOT; bc.Src1 = instr.Args[0].ID; return bc }
+
+	// Memory
+	if instr.Op == ir.OP_ALLOC {
+		bc.Op = BC_STACK_ALLOC
+		bc.Imm = allocaOffsets[instr.ID]
+		return bc
+	}
+	if instr.Op == ir.OP_LOAD {
+		var loadSize int = 8
+		if instr.Typ != nil && instr.Typ.Width == 8 { loadSize = 1 }
+		if instr.Typ != nil && instr.Typ.Kind == types.TYP_BOOL { loadSize = 1 }
+		if loadSize == 1 {
+			bc.Op = BC_LOAD8
+		} else {
+			bc.Op = BC_LOAD64
+		}
+		bc.Src1 = instr.Args[0].ID
+		return bc
+	}
+	if instr.Op == ir.OP_STORE {
+		var storeSize int = 8
+		if instr.Args[1].Typ != nil && instr.Args[1].Typ.Width == 8 { storeSize = 1 }
+		if instr.Args[1].Typ != nil && instr.Args[1].Typ.Kind == types.TYP_BOOL { storeSize = 1 }
+		// For structs, use memcpy
+		if instr.Args[1].Typ != nil && instr.Args[1].Typ.Kind == types.TYP_STRUCT {
+			bc.Op = BC_MEMCPY
+			bc.Src1 = instr.Args[0].ID
+			bc.Src2 = instr.Args[1].ID
+			bc.Imm = types.SizeOf(instr.Args[1].Typ)
+			bc.Dst = -1
+			return bc
+		}
+		if storeSize == 1 {
+			bc.Op = BC_STORE8
+		} else {
+			bc.Op = BC_STORE64
+		}
+		bc.Dst = -1
+		bc.Src1 = instr.Args[0].ID
+		bc.Src2 = instr.Args[1].ID
+		return bc
+	}
+	if instr.Op == ir.OP_GET_FIELD_PTR {
+		bc.Op = BC_FIELD_PTR
+		bc.Src1 = instr.Args[0].ID
+		if instr.Args[0].TypeArg != nil {
+			bc.Imm = types.FieldOffset(instr.Args[0].TypeArg, instr.Index)
+		}
+		return bc
+	}
+	if instr.Op == ir.OP_GET_ELEM_PTR {
+		bc.Op = BC_ELEM_PTR
+		bc.Src1 = instr.Args[0].ID
+		bc.Src2 = instr.Args[1].ID
+		if instr.Typ != nil && instr.Typ.Elem != nil {
+			bc.Imm = types.SizeOf(instr.Typ.Elem)
+		} else {
+			bc.Imm = 8
+		}
+		return bc
+	}
+
+	// Control flow
+	if instr.Op == ir.OP_JUMP {
+		bc.Op = BC_JUMP
+		bc.Dst = -1
+		bc.Aux = findBlockOffset(f, instr.Block1, blockOffsets)
+		return bc
+	}
+	if instr.Op == ir.OP_BRANCH {
+		bc.Op = BC_BRANCH
+		bc.Dst = -1
+		bc.Src1 = instr.Args[0].ID
+		bc.Imm = findBlockOffset(f, instr.Block1, blockOffsets)
+		bc.Aux = findBlockOffset(f, instr.Block2, blockOffsets)
+		return bc
+	}
+	if instr.Op == ir.OP_RETURN {
+		bc.Op = BC_RETURN
+		if len(instr.Args) > 0 {
+			bc.Dst = 0 // signal: has return value
+			bc.Src1 = instr.Args[0].ID
+		} else {
+			bc.Dst = -1
+		}
+		return bc
+	}
+
+	// Managed memory
+	if instr.Op == ir.OP_REFCOUNT_INC {
+		bc.Op = BC_REFINC
+		bc.Dst = -1
+		bc.Src1 = instr.Args[0].ID
+		return bc
+	}
+	if instr.Op == ir.OP_REFCOUNT_DEC {
+		bc.Op = BC_REFDEC
+		bc.Dst = -1
+		bc.Src1 = instr.Args[0].ID
+		if len(instr.Args) > 1 {
+			bc.Src2 = instr.Args[1].ID
+		}
+		return bc
+	}
+	if instr.Op == ir.OP_BOX {
+		bc.Op = BC_BOX
+		bc.Src1 = instr.Args[0].ID
+		if instr.TypeArg != nil {
+			bc.Imm = types.SizeOf(instr.TypeArg)
+		} else {
+			bc.Imm = 8
+		}
+		return bc
+	}
+	if instr.Op == ir.OP_MAKE {
+		bc.Op = BC_ALLOC
+		if instr.TypeArg != nil {
+			bc.Imm = types.SizeOf(instr.TypeArg)
+		} else {
+			bc.Imm = 8
+		}
+		return bc
+	}
+	if instr.Op == ir.OP_MAKE_SLICE {
+		bc.Op = BC_MAKE_SLICE
+		bc.Src1 = instr.Args[0].ID
+		if instr.TypeArg != nil {
+			bc.Imm = types.SizeOf(instr.TypeArg)
+		} else {
+			bc.Imm = 8
+		}
+		return bc
+	}
+	if instr.Op == ir.OP_DEREF {
+		bc.Op = BC_LOAD64
+		bc.Src1 = instr.Args[0].ID
+		return bc
+	}
+	if instr.Op == ir.OP_NIL_CHECK {
+		bc.Op = BC_NIL_CHECK
+		bc.Dst = -1
+		bc.Src1 = instr.Args[0].ID
+		return bc
+	}
+	if instr.Op == ir.OP_BOUNDS_CHECK {
+		bc.Op = BC_BOUNDS_CHECK
+		bc.Dst = -1
+		bc.Src1 = instr.Args[0].ID
+		bc.Src2 = instr.Args[1].ID
+		return bc
+	}
+
+	// Conversions
+	if instr.Op == ir.OP_CAST {
+		// Simple width conversion
+		if instr.TypeArg != nil && instr.TypeArg.Width == 8 {
+			bc.Op = BC_TRUNC8
+		} else {
+			bc.Op = BC_MOV // same-size cast
+		}
+		bc.Src1 = instr.Args[0].ID
+		return bc
+	}
+	if instr.Op == ir.OP_BIT_CAST {
+		bc.Op = BC_MOV
+		bc.Src1 = instr.Args[0].ID
+		return bc
+	}
+	if instr.Op == ir.OP_MANAGED_TO_RAW {
+		// Extract first 2 words from managed-slice
+		// For now, just copy the pointer (the managed-slice starts with raw slice layout)
+		bc.Op = BC_MOV
+		bc.Src1 = instr.Args[0].ID
+		return bc
+	}
+
+	if instr.Op == ir.OP_EXTRACT {
+		bc.Op = BC_EXTRACT
+		bc.Src1 = instr.Args[0].ID
+		bc.Imm = instr.Index
+		return bc
+	}
+
+	if instr.Op == ir.OP_FUNC_ADDR {
+		bc.Op = BC_FUNC_ADDR
+		bc.Imm = 0 // TODO: resolve function address
+		return bc
+	}
+
+	if instr.Op == ir.OP_STRUCT_LIT {
+		// For now, treat as NOP — struct lit construction is done via stores
+		bc.Op = BC_NOP
+		bc.Dst = -1
+		return bc
+	}
+
+	if instr.Op == ir.OP_UNREACHABLE {
+		bc.Op = BC_NOP
+		bc.Dst = -1
+		return bc
+	}
+	if instr.Op == ir.OP_PANIC {
+		bc.Op = BC_NOP // TODO: implement panic
+		bc.Dst = -1
+		return bc
+	}
+
+	// Calls
+	if instr.Op == ir.OP_CALL {
+		bc.Op = BC_CALL
+		bc.Imm = len(instr.Args) // number of args
+		if len(instr.Args) > 0 {
+			bc.Src1 = instr.Args[0].ID // first arg register
+		}
+		bc.Aux = 0 // TODO: resolve function index
+		return bc
+	}
+	if instr.Op == ir.OP_CALL_BUILTIN {
+		bc.Op = BC_CALL_BUILTIN
+		bc.Imm = len(instr.Args)
+		if len(instr.Args) > 0 {
+			bc.Src1 = instr.Args[0].ID
+		}
+		bc.Aux = 0 // TODO: resolve builtin ID
+		return bc
+	}
+
+	// Default: NOP with warning
+	bc.Op = BC_NOP
+	bc.Dst = -1
+	return bc
+}
+
+func findBlockOffset(f @ir.Func, target @ir.Block, blockOffsets []int) int {
+	for i := 0; i < len(f.Blocks); i++ {
+		if f.Blocks[i] == target {
+			return blockOffsets[i]
+		}
+	}
+	return 0
+}
+
+// Append helper
+func appendVMFunc(s @[]@VMFunc, v @VMFunc) @[]@VMFunc {
+	var n int = len(s)
+	var ns @[]@VMFunc = make_slice(@VMFunc, n + 1)
+	for i := 0; i < n; i++ { ns[i] = s[i] }
+	ns[n] = v
+	return ns
+}

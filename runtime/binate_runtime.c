@@ -141,11 +141,10 @@ int64_t bn_bootstrap__Open(BnSlice path, int64_t flags) {
     return (int64_t)fd;
 }
 
-// Read(fd int, buf []uint8, n int) int
-int64_t bn_bootstrap__Read(int64_t fd, BnSlice buf, int64_t n) {
-    if (!buf.data || n <= 0) return 0;
-    if (n > buf.len) n = buf.len;
-    ssize_t r = read((int)fd, buf.data, (size_t)n);
+// Read(fd int, buf []uint8) int — reads up to len(buf) bytes
+int64_t bn_bootstrap__Read(int64_t fd, BnSlice buf) {
+    if (!buf.data || buf.len <= 0) return 0;
+    ssize_t r = read((int)fd, buf.data, (size_t)buf.len);
     return (int64_t)r;
 }
 

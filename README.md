@@ -1,6 +1,7 @@
 # Binate
 
 [![CI](https://github.com/binate/binate/actions/workflows/ci.yml/badge.svg)](https://github.com/binate/binate/actions/workflows/ci.yml)
+[![Code hygiene](https://github.com/binate/binate/actions/workflows/hygiene.yml/badge.svg)](https://github.com/binate/binate/actions/workflows/hygiene.yml)
 
 The self-hosted Binate toolchain — interpreter, compiler, and supporting packages — written in Binate itself.
 

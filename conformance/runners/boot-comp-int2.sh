@@ -18,7 +18,11 @@ runner_setup() {
 
 runner_exec() {
     bn="$1"; root="$2"
-    "$COMPILED_INT2" "$bn" 2>&1 || true
+    if [ -n "$root" ]; then
+        "$COMPILED_INT2" --root "$root" --binate-root "$BINATE_DIR" "$bn" 2>&1 || true
+    else
+        "$COMPILED_INT2" "$bn" 2>&1 || true
+    fi
 }
 
 runner_cleanup() {

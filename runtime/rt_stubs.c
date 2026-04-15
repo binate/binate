@@ -41,5 +41,5 @@ void bn_rt__c_call_dtor(void *dtor, void *ptr) {
 void bn_rt__c_bounds_fail(int64_t index, int64_t length) {
     fprintf(stderr, "runtime error: index out of bounds: %lld (len %lld)\n",
             (long long)index, (long long)length);
-    exit(2);
+    abort();
 }

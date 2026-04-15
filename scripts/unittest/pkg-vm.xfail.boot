@@ -1,0 +1,1 @@
+bootstrap does not support raw memory operations (bit_cast, pointer indexing)

@@ -31,7 +31,7 @@ Run `./scripts/unittest/run.sh` with no arguments for full help.
 | `boot-comp-comp` | Gen1 compiler compiles and runs tests |
 | `boot-comp-comp-comp` | Gen2 compiler compiles and runs tests |
 
-Mode sets are defined in `scripts/modesets/` (one file per set, one mode per line). Adding a new mode set is just adding a file. Current sets: `basic`, `all`, `full`.
+Mode sets are defined in `scripts/modesets/` (one file per set, one mode per line). Adding a new mode set is just adding a file. Current sets: `basic`, `all`.
 
 ### Filters
 

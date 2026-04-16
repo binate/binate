@@ -13,8 +13,7 @@
 #
 # Mode sets:
 #   basic               boot, boot-comp, boot-comp-int
-#   all                 boot, boot-comp, boot-comp-int, boot-comp-comp
-#   full                all + boot-comp-comp-comp
+#   all                 basic + boot-comp-comp, boot-comp-comp-int, boot-comp-comp-comp
 #
 # Filters select packages by substring match (e.g. "ir" matches "pkg/ir").
 #

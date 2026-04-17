@@ -23,14 +23,16 @@
 # Parse flags
 VERBOSE=0
 QUIET=0
+CHECK_XPASS=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        -v|--verbose) VERBOSE=1; shift ;;
-        -q|--quiet)   QUIET=1; shift ;;
-        *)            break ;;
+        -v|--verbose)     VERBOSE=1; shift ;;
+        -q|--quiet)       QUIET=1; shift ;;
+        --check-xpass)    CHECK_XPASS=1; shift ;;
+        *)                break ;;
     esac
 done
-export VERBOSE QUIET
+export VERBOSE QUIET CHECK_XPASS
 
 MODE="$1"
 if [ -z "$MODE" ]; then
@@ -41,6 +43,9 @@ if [ -z "$MODE" ]; then
     echo "Flags:"
     echo "  -v, --verbose   Show all test names (PASS, FAIL, XFAIL)"
     echo "  -q, --quiet     Show only failures and summary"
+    echo "  --check-xpass   Run xfailed tests anyway; if any passes, fail"
+    echo "                  the run (XPASS). Default is to skip xfailed tests"
+    echo "                  without running them (they may hang or be slow)."
     echo "  (default)       Show failures in detail, passes as dots"
     echo ""
     echo "Filters select tests by substring match on the test name."
@@ -105,8 +110,9 @@ MODES="$(expand_set "$MODE" 2>/dev/null)" || {
         echo "=== Mode: $m"
         echo "========================================"
         flags=""
-        [ "$VERBOSE" -eq 1 ] && flags="-v"
-        [ "$QUIET" -eq 1 ] && flags="-q"
+        [ "$VERBOSE" -eq 1 ] && flags="$flags -v"
+        [ "$QUIET" -eq 1 ] && flags="$flags -q"
+        [ "$CHECK_XPASS" -eq 1 ] && flags="$flags --check-xpass"
         "$0" $flags "$m" "$@"
         rc=$?
         if [ $rc -ne 0 ]; then overall_exit=$rc; fi
@@ -150,17 +156,41 @@ run_test() {
     expected="$3"    # path to expected output file
     root="$4"        # root dir for multi-pkg (empty for single-file)
 
+    known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
+
+    # Default: skip xfailed tests without running them — they may hang
+    # or be very slow. With --check-xpass, run them anyway so we can
+    # detect stale xfails (tests that pass despite the xfail marker).
+    if [ -f "$known_fail" ] && [ "$CHECK_XPASS" -eq 0 ]; then
+        if [ "$VERBOSE" -eq 1 ]; then
+            echo "XFAIL: $name (skipped; known failure: $(cat "$known_fail"))"
+        elif [ "$QUIET" -eq 0 ]; then
+            printf "x"
+        fi
+        skipped=$((skipped + 1))
+        return
+    fi
+
     actual=$(runner_exec "$bn" "$root")
 
     expected_content="$(cat "$expected")"
-    known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
     if [ "$actual" = "$expected_content" ]; then
-        if [ "$VERBOSE" -eq 1 ]; then
-            echo "PASS: $name"
-        elif [ "$QUIET" -eq 0 ]; then
-            printf "."
+        if [ -f "$known_fail" ]; then
+            # XPASS: xfail marker exists but the test passes — stale xfail.
+            if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
+                echo ""
+                echo "XPASS: $name (passed despite xfail marker — stale xfail?)"
+            fi
+            failed=$((failed + 1))
+            failures="$failures $name(XPASS)"
+        else
+            if [ "$VERBOSE" -eq 1 ]; then
+                echo "PASS: $name"
+            elif [ "$QUIET" -eq 0 ]; then
+                printf "."
+            fi
+            passed=$((passed + 1))
         fi
-        passed=$((passed + 1))
     elif [ -f "$known_fail" ]; then
         if [ "$VERBOSE" -eq 1 ]; then
             echo "XFAIL: $name (known failure: $(cat "$known_fail"))"
@@ -186,10 +216,21 @@ run_error_test() {
     errorfile="$3"  # path to .error file (each line is a required substring)
     root="$4"       # root dir for multi-pkg (empty for single-file)
 
+    known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
+
+    # Default: skip xfailed tests without running them. See run_test.
+    if [ -f "$known_fail" ] && [ "$CHECK_XPASS" -eq 0 ]; then
+        if [ "$VERBOSE" -eq 1 ]; then
+            echo "XFAIL: $name (skipped; known failure: $(cat "$known_fail"))"
+        elif [ "$QUIET" -eq 0 ]; then
+            printf "x"
+        fi
+        skipped=$((skipped + 1))
+        return
+    fi
+
     actual=$(runner_exec "$bn" "$root")
     rc=$?
-
-    known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
 
     # The program should have failed (non-zero exit or error output)
     # Check that each line in the .error file matches as a regex in output
@@ -205,12 +246,22 @@ run_error_test() {
     done < "$errorfile"
 
     if $all_found; then
-        if [ "$VERBOSE" -eq 1 ]; then
-            echo "PASS: $name (error)"
-        elif [ "$QUIET" -eq 0 ]; then
-            printf "."
+        if [ -f "$known_fail" ]; then
+            # XPASS: xfail marker exists but test passes — stale xfail.
+            if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
+                echo ""
+                echo "XPASS: $name (passed despite xfail marker — stale xfail?)"
+            fi
+            failed=$((failed + 1))
+            failures="$failures $name(XPASS)"
+        else
+            if [ "$VERBOSE" -eq 1 ]; then
+                echo "PASS: $name (error)"
+            elif [ "$QUIET" -eq 0 ]; then
+                printf "."
+            fi
+            passed=$((passed + 1))
         fi
-        passed=$((passed + 1))
     elif [ -f "$known_fail" ]; then
         if [ "$VERBOSE" -eq 1 ]; then
             echo "XFAIL: $name (known failure: $(cat "$known_fail"))"

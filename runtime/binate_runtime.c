@@ -14,7 +14,7 @@
 // ============================================================
 // Slice representation: { data*, len }
 //
-// Unmanaged slices ([]T): { *T data, uint len } — no capacity, append always reallocates.
+// Unmanaged slices (*[]T): { *T data, uint len } — no capacity, append always reallocates.
 // Managed slices (@[]T): { *T data, uint len, @any refptr } — provided by pkg/rt.
 // ============================================================
 
@@ -30,7 +30,7 @@ typedef struct {
     int64_t  backing_len; // total element count in backing
 } BnManagedSlice;
 
-// Print []char slice as string
+// Print *[]char slice as string
 void bn_print_chars(BnSlice s) {
     if (s.data && s.len > 0) {
         fwrite(s.data, 1, (size_t)s.len, stdout);
@@ -124,7 +124,7 @@ static BnManagedSlice cstr_to_managed_slice(const char *s) {
     return r;
 }
 
-// Open(path []char, flags int) int
+// Open(path *[]char, flags int) int
 int64_t bn_bootstrap__Open(BnSlice path, int64_t flags) {
     char *cpath = slice_to_cstr(path);
     int oflags = 0;
@@ -141,14 +141,14 @@ int64_t bn_bootstrap__Open(BnSlice path, int64_t flags) {
     return (int64_t)fd;
 }
 
-// Read(fd int, buf []uint8) int — reads up to len(buf) bytes
+// Read(fd int, buf *[]uint8) int — reads up to len(buf) bytes
 int64_t bn_bootstrap__Read(int64_t fd, BnSlice buf) {
     if (!buf.data || buf.len <= 0) return 0;
     ssize_t r = read((int)fd, buf.data, (size_t)buf.len);
     return (int64_t)r;
 }
 
-// Write(fd int, buf []uint8) int — writes len(buf) bytes
+// Write(fd int, buf *[]uint8) int — writes len(buf) bytes
 int64_t bn_bootstrap__Write(int64_t fd, BnSlice buf) {
     if (!buf.data || buf.len <= 0) return 0;
     ssize_t w = write((int)fd, buf.data, (size_t)buf.len);
@@ -160,7 +160,7 @@ int64_t bn_bootstrap__Close(int64_t fd) {
     return (int64_t)close((int)fd);
 }
 
-// ReadDir(path []char) @[]@[]char
+// ReadDir(path *[]char) @[]@[]char
 BnManagedSlice bn_bootstrap__ReadDir(BnSlice path) {
     char *cpath = slice_to_cstr(path);
     DIR *dir = opendir(cpath);
@@ -207,7 +207,7 @@ BnManagedSlice bn_bootstrap__ReadDir(BnSlice path) {
     return result;
 }
 
-// Stat(path []char) int  — returns 0=not found, 1=file, 2=directory
+// Stat(path *[]char) int  — returns 0=not found, 1=file, 2=directory
 int64_t bn_bootstrap__Stat(BnSlice path) {
     char *cpath = slice_to_cstr(path);
     struct stat st;
@@ -253,12 +253,12 @@ BnManagedSlice bn_bootstrap__Args(void) {
     return result;
 }
 
-// Exec(program []char, args [][]char) int
+// Exec(program *[]char, args *[]*[]char) int
 int64_t bn_bootstrap__Exec(BnSlice program, BnSlice args) {
     char *prog = slice_to_cstr(program);
 
     // Build argv: [program, args..., NULL]
-    // args is []@[]char — each element is a BnManagedSlice (4 words).
+    // args is *[]@[]char — each element is a BnManagedSlice (4 words).
     // We extract the {data, len} prefix from each for slice_to_cstr.
     int64_t nargs = args.len;
     char **argv = (char **)malloc((size_t)(nargs + 2) * sizeof(char *));
@@ -326,7 +326,7 @@ BnManagedSlice bn_bootstrap__Itoa(int64_t v) {
     return ms;
 }
 
-// Concat(a []char, b []char) @[]char
+// Concat(a *[]char, b *[]char) @[]char
 BnManagedSlice bn_bootstrap__Concat(BnSlice a, BnSlice b) {
     int64_t len = a.len + b.len;
     BnManagedSlice ms = alloc_managed_chars(len);

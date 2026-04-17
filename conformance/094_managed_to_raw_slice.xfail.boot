@@ -1,1 +1,1 @@
-@[]T → []T conversion not implemented in bootstrap interpreter
+@[]T → *[]T conversion not implemented in bootstrap interpreter

@@ -31,8 +31,8 @@ binate -root <binate-src> cmd/bnlint -- --root <binate-src> pkg/foo
 One line per diagnostic:
 
 ```
-pkg/types:17:29: [managed-to-raw-assign] assigning @[]uint8 to []uint8 drops managed wrapper
-pkg/codegen:41:19: [raw-slice-return] returning @[]uint8 as []uint8 drops managed wrapper
+pkg/types:17:29: [managed-to-raw-assign] assigning @[]uint8 to *[]uint8 drops managed wrapper
+pkg/codegen:41:19: [raw-slice-return] returning @[]uint8 as *[]uint8 drops managed wrapper
 ```
 
 Format: `package:line:col: [rule] message`
@@ -44,17 +44,17 @@ Exit code 0 if no diagnostics, 1 if any are found (or on error).
 ### managed-to-raw-assign
 
 Flags assignments where the right-hand side is `@[]T` (managed-slice) but the
-left-hand side is `[]T` (raw slice). This silently drops the managed wrapper —
+left-hand side is `*[]T` (raw slice). This silently drops the managed wrapper —
 if the `@[]T` was a temporary (e.g., a function return value), the raw slice
 is immediately dangling.
 
 Checked in:
-- Variable declarations: `var s []T = managedSliceExpr`
+- Variable declarations: `var s *[]T = managedSliceExpr`
 - Assignments: `s = managedSliceExpr`
 
 ### raw-slice-return
 
-Flags return statements where the function declares a `[]T` return type but
+Flags return statements where the function declares a `*[]T` return type but
 the returned expression has type `@[]T`. The managed wrapper is stripped at the
 return boundary, and the caller receives a raw slice whose backing may be freed.
 

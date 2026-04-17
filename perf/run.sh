@@ -27,6 +27,11 @@ MODE="$1"
 if [ -z "$MODE" ]; then
     echo "Usage: $0 <mode> [filter...]"
     echo ""
+    echo "Mode argument forms:"
+    echo "  <name>                single mode (e.g. boot-comp)"
+    echo "  <name>,<name>,...     comma-separated list of modes"
+    echo "  <modeset>             mode set file (e.g. basic, all)"
+    echo ""
     echo "Modes:"
     for r in "$SCRIPT_DIR"/runners/*.sh; do
         [ -f "$r" ] || continue
@@ -34,9 +39,47 @@ if [ -z "$MODE" ]; then
         desc=$(grep '^# Runner:' "$r" | head -1 | sed 's/^# Runner: //')
         printf "  %-20s %s\n" "$rname" "$desc"
     done
+    echo ""
+    echo "Mode sets (from scripts/modesets/):"
+    msd="$(cd "$(dirname "$0")/../scripts/modesets" && pwd)"
+    for sf in "$msd"/*; do
+        [ -f "$sf" ] || continue
+        sname="$(basename "$sf")"
+        modes="$(grep -v '^#' "$sf" | grep -v '^$' | tr '\n' ' ' | sed 's/ *$//')"
+        printf "  %-20s %s\n" "$sname" "$modes"
+    done
     exit 1
 fi
 shift
+
+# Expand mode sets — reads from scripts/modesets/ files
+MODESETS_DIR="$(cd "$(dirname "$0")/../scripts/modesets" && pwd)"
+expand_set() {
+    setfile="$MODESETS_DIR/$1"
+    [ -f "$setfile" ] || return 1
+    grep -v '^#' "$setfile" | grep -v '^$' | tr '\n' ' '
+}
+
+# Try mode set file first, then comma-separated list
+MODES="$(expand_set "$MODE" 2>/dev/null)" || {
+    case "$MODE" in
+        *,*) MODES="$(echo "$MODE" | tr ',' ' ')" ;;
+    esac
+}
+
+if [ -n "$MODES" ]; then
+    overall_exit=0
+    for m in $MODES; do
+        echo "========================================"
+        echo "=== Mode: $m"
+        echo "========================================"
+        "$0" "$m" "$@"
+        rc=$?
+        if [ $rc -ne 0 ]; then overall_exit=$rc; fi
+        echo ""
+    done
+    exit $overall_exit
+fi
 
 RUNNER="$SCRIPT_DIR/runners/${MODE}.sh"
 if [ ! -f "$RUNNER" ]; then

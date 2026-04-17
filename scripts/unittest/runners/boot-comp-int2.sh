@@ -1,6 +1,6 @@
 #!/bin/sh
-# Runner: boot-comp-int2 — Compiled bni2 (bytecode VM) runs --test natively.
-# NOTE: cmd/bni2 does not support --test yet. This runner is a placeholder.
+# Runner: boot-comp-int2 — Compiled bni2 (bytecode VM) runs --test
+# natively.
 
 COMPILED_INT2=""
 

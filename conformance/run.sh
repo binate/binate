@@ -149,6 +149,7 @@ passed=0
 failed=0
 skipped=0
 failures=""
+suite_start=$(date +%s)
 
 run_test() {
     name="$1"
@@ -171,7 +172,10 @@ run_test() {
         return
     fi
 
+    t_start=$(date +%s)
     actual=$(runner_exec "$bn" "$root")
+    t_end=$(date +%s)
+    elapsed=$((t_end - t_start))
 
     expected_content="$(cat "$expected")"
     if [ "$actual" = "$expected_content" ]; then
@@ -179,13 +183,13 @@ run_test() {
             # XPASS: xfail marker exists but the test passes — stale xfail.
             if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
                 echo ""
-                echo "XPASS: $name (passed despite xfail marker — stale xfail?)"
+                echo "XPASS: $name [${elapsed}s] (passed despite xfail marker — stale xfail?)"
             fi
             failed=$((failed + 1))
             failures="$failures $name(XPASS)"
         else
             if [ "$VERBOSE" -eq 1 ]; then
-                echo "PASS: $name"
+                echo "PASS: $name [${elapsed}s]"
             elif [ "$QUIET" -eq 0 ]; then
                 printf "."
             fi
@@ -193,7 +197,7 @@ run_test() {
         fi
     elif [ -f "$known_fail" ]; then
         if [ "$VERBOSE" -eq 1 ]; then
-            echo "XFAIL: $name (known failure: $(cat "$known_fail"))"
+            echo "XFAIL: $name [${elapsed}s] (known failure: $(cat "$known_fail"))"
         elif [ "$QUIET" -eq 0 ]; then
             printf "x"
         fi
@@ -201,7 +205,7 @@ run_test() {
     else
         if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
             echo ""
-            echo "FAIL: $name"
+            echo "FAIL: $name [${elapsed}s]"
             echo "  expected: $(head -3 "$expected")"
             echo "  actual:   $(echo "$actual" | head -3)"
         fi
@@ -229,8 +233,11 @@ run_error_test() {
         return
     fi
 
+    t_start=$(date +%s)
     actual=$(runner_exec "$bn" "$root")
     rc=$?
+    t_end=$(date +%s)
+    elapsed=$((t_end - t_start))
 
     # The program should have failed (non-zero exit or error output)
     # Check that each line in the .error file matches as a regex in output
@@ -250,13 +257,13 @@ run_error_test() {
             # XPASS: xfail marker exists but test passes — stale xfail.
             if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
                 echo ""
-                echo "XPASS: $name (passed despite xfail marker — stale xfail?)"
+                echo "XPASS: $name [${elapsed}s] (passed despite xfail marker — stale xfail?)"
             fi
             failed=$((failed + 1))
             failures="$failures $name(XPASS)"
         else
             if [ "$VERBOSE" -eq 1 ]; then
-                echo "PASS: $name (error)"
+                echo "PASS: $name (error) [${elapsed}s]"
             elif [ "$QUIET" -eq 0 ]; then
                 printf "."
             fi
@@ -264,7 +271,7 @@ run_error_test() {
         fi
     elif [ -f "$known_fail" ]; then
         if [ "$VERBOSE" -eq 1 ]; then
-            echo "XFAIL: $name (known failure: $(cat "$known_fail"))"
+            echo "XFAIL: $name [${elapsed}s] (known failure: $(cat "$known_fail"))"
         elif [ "$QUIET" -eq 0 ]; then
             printf "x"
         fi
@@ -272,7 +279,7 @@ run_error_test() {
     else
         if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
             echo ""
-            echo "FAIL: $name (error)"
+            echo "FAIL: $name (error) [${elapsed}s]"
             echo "  missing: $missing"
             echo "  actual:  $(echo "$actual" | head -3)"
         fi
@@ -348,7 +355,9 @@ if [ "$VERBOSE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     echo ""
 fi
 echo ""
-echo "=== Summary ($MODE): $passed passed, $failed failed, $skipped skipped ==="
+suite_end=$(date +%s)
+suite_elapsed=$((suite_end - suite_start))
+echo "=== Summary ($MODE): $passed passed, $failed failed, $skipped skipped [${suite_elapsed}s] ==="
 if [ $failed -gt 0 ]; then
     echo "Failures:$failures"
     exit 1

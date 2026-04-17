@@ -11,7 +11,7 @@
 #   boot                Go bootstrap interpreter runs .bn directly
 #   boot-comp           boot interprets cmd/bnc, which compiles .bn to native
 #   boot-comp-int       boot-comp compiles cmd/bni → binary, binary interprets .bn
-#   boot-comp-int-int   boot-comp-int interprets cmd/bni, which interprets .bn
+#   boot-comp-int2-int2 boot-comp-int2 interprets cmd/bni2, which interprets .bn
 #   boot-comp-comp      boot-comp compiles cmd/bnc → gen1, gen1 compiles .bn
 #   boot-comp-comp-comp boot-comp-comp builds gen1, gen1 → gen2, gen2 compiles .bn
 #

@@ -139,17 +139,17 @@ The `pkg/bootstrap` package provides OS-level primitives. In the Go bootstrap, t
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `Open`   | `(path []char, flags int) int` | Open file, returns fd |
-| `Read`   | `(fd int, buf []uint8, n int) int` | Read bytes into buffer |
-| `Write`  | `(fd int, buf []uint8, n int) int` | Write bytes from buffer |
+| `Open`   | `(path *[]char, flags int) int` | Open file, returns fd |
+| `Read`   | `(fd int, buf *[]uint8, n int) int` | Read bytes into buffer |
+| `Write`  | `(fd int, buf *[]uint8, n int) int` | Write bytes from buffer |
 | `Close`  | `(fd int) int` | Close file descriptor |
 | `Exit`   | `(code int)` | Exit process |
-| `Args`   | `() [][]char` | Program arguments (after `--`) |
-| `Exec`   | `(cmd []char, args [][]char) int` | Execute command, returns exit code |
-| `Stat`   | `(path []char) int` | 0=not found, 1=file, 2=directory |
-| `ReadDir`| `(path []char) [][]char` | Sorted directory entries |
-| `Itoa`   | `(v int) []char` | Int to decimal string |
-| `Concat` | `(a []char, b []char) []char` | String concatenation |
+| `Args`   | `() *[]*[]char` | Program arguments (after `--`) |
+| `Exec`   | `(cmd *[]char, args *[]*[]char) int` | Execute command, returns exit code |
+| `Stat`   | `(path *[]char) int` | 0=not found, 1=file, 2=directory |
+| `ReadDir`| `(path *[]char) *[]*[]char` | Sorted directory entries |
+| `Itoa`   | `(v int) *[]char` | Int to decimal string |
+| `Concat` | `(a *[]char, b *[]char) *[]char` | String concatenation |
 
 Constants: `O_RDONLY`, `O_WRONLY`, `O_RDWR`, `O_CREATE`, `O_TRUNC`, `O_APPEND`, `STDIN`, `STDOUT`, `STDERR`.
 

@@ -30,7 +30,7 @@ go run . -root ../binate ../binate/cmd/bni2 -- ../binate/examples/selftest.bn
 go run . -root ../binate ../binate/cmd/bnc -- ../binate/examples/selftest.bn && ./selftest
 
 # Run unit tests for a package
-go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/vm pkg/loader pkg/interp
+go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/vm pkg/loader
 
 # Run conformance tests
 cd ../binate && ./conformance/run.sh boot
@@ -60,7 +60,6 @@ binate/
     ir/                      IR generation (AST → SSA-like IR)
     codegen/                 LLVM IR emission
     vm/                      Bytecode VM used by cmd/bni2
-    interp/                  Tree-walking interpreter (legacy; being retired)
     loader/                  Package discovery, loading, merging, topological sort
     buf/                     CharBuf for string building
     debug/                   Verbose logging (SetVerbose, Log)
@@ -162,7 +161,7 @@ Each source file has a corresponding `*_test.bn` file with `func TestXxx() testi
 
 ```sh
 cd bootstrap
-go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/vm pkg/loader pkg/ir pkg/codegen pkg/interp
+go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/vm pkg/loader pkg/ir pkg/codegen
 
 # Test main package directories
 go run . -root ../binate -test ../binate/cmd/bni2

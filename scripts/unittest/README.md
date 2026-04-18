@@ -16,7 +16,7 @@ Run `./scripts/unittest/run.sh` with no arguments for full help.
 
 ```sh
 ./scripts/unittest/run.sh boot              # All packages via bootstrap
-./scripts/unittest/run.sh boot-comp interp  # pkg/interp via compiler
+./scripts/unittest/run.sh boot-comp vm      # pkg/vm via compiler
 ./scripts/unittest/run.sh basic             # boot + boot-comp + boot-comp-int2
 ./scripts/unittest/run.sh boot ir codegen   # pkg/ir and pkg/codegen
 ```

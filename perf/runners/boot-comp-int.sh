@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: boot-comp-int — boot-comp compiles cmd/bni2 → binary, binary interprets test.bn via bytecode VM.
+# Runner: boot-comp-int — boot-comp compiles cmd/bni → binary, binary interprets test.bn via bytecode VM.
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
 runner_setup() { build_interp_boot_comp; }

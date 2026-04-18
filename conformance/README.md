@@ -30,9 +30,9 @@ Each mode is a chain of: `boot` (bootstrap interpreter), `comp` (compiler), `int
 |------|-------------|
 | `boot` | Go bootstrap interpreter runs .bn directly |
 | `boot-comp` | Bootstrap interprets cmd/bnc → compiles test to native |
-| `boot-comp-int` | Compiled cmd/bni2 runs test via bytecode VM |
+| `boot-comp-int` | Compiled cmd/bni runs test via bytecode VM |
 | `boot-comp-comp` | Gen1 compiler compiles test |
-| `boot-comp-comp-int` | Gen1-compiled cmd/bni2 runs test via bytecode VM |
+| `boot-comp-comp-int` | Gen1-compiled cmd/bni runs test via bytecode VM |
 | `boot-comp-comp-comp` | Gen2 compiler compiles test |
 
 Mode sets are defined in `scripts/modesets/` (one file per set, one mode per line). Adding a new mode set is just adding a file. Current sets: `basic`, `all`.

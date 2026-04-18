@@ -24,7 +24,7 @@ git clone https://github.com/binate/binate.git
 
 # Run a program via the self-hosted interpreter
 cd bootstrap
-go run . -root ../binate ../binate/cmd/bni2 -- ../binate/examples/selftest.bn
+go run . -root ../binate ../binate/cmd/bni -- ../binate/examples/selftest.bn
 
 # Compile and run a program
 go run . -root ../binate ../binate/cmd/bnc -- ../binate/examples/selftest.bn && ./selftest
@@ -41,7 +41,7 @@ cd ../binate && ./conformance/run.sh boot
 ```
 binate/
   cmd/
-    bni2/                    Self-hosted interpreter (bytecode VM)
+    bni/                    Self-hosted interpreter (bytecode VM)
     bnc/                     Self-hosted compiler (parse, load, IR gen, LLVM emit)
     bnas/                    Assembler
     bnlint/                  Linter
@@ -59,7 +59,7 @@ binate/
     types/                   Type system and checker
     ir/                      IR generation (AST → SSA-like IR)
     codegen/                 LLVM IR emission
-    vm/                      Bytecode VM used by cmd/bni2
+    vm/                      Bytecode VM used by cmd/bni
     loader/                  Package discovery, loading, merging, topological sort
     buf/                     CharBuf for string building
     debug/                   Verbose logging (SetVerbose, Log)
@@ -86,10 +86,10 @@ All layers support `-v` for debug logging to stderr:
 
 ```sh
 # Bootstrap verbose
-go run . -v -root ../binate ../binate/cmd/bni2 -- program.bn
+go run . -v -root ../binate ../binate/cmd/bni -- program.bn
 
 # Self-hosted interpreter verbose
-go run . -root ../binate ../binate/cmd/bni2 -- -v program.bn
+go run . -root ../binate ../binate/cmd/bni -- -v program.bn
 
 # Compiler verbose
 go run . -root ../binate ../binate/cmd/bnc -- -v program.bn
@@ -101,8 +101,8 @@ The self-hosted interpreter can interpret itself:
 
 ```
 Go bootstrap
-  → interprets cmd/bni2 (self-hosted interpreter)
-    → interprets cmd/bni2 (self-hosted interpreter again)
+  → interprets cmd/bni (self-hosted interpreter)
+    → interprets cmd/bni (self-hosted interpreter again)
       → interprets target.bn
 ```
 
@@ -164,7 +164,7 @@ cd bootstrap
 go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/vm pkg/loader pkg/ir pkg/codegen
 
 # Test main package directories
-go run . -root ../binate -test ../binate/cmd/bni2
+go run . -root ../binate -test ../binate/cmd/bni
 go run . -root ../binate -test ../binate/cmd/bnc
 ```
 
@@ -178,10 +178,10 @@ Standalone `.bn` programs with expected output, shared across all execution back
 cd binate
 ./conformance/run.sh boot                   # Go bootstrap interpreter
 ./conformance/run.sh boot-comp              # boot interprets cmd/bnc → compile test.bn
-./conformance/run.sh boot-comp-int          # compiled bni2 (bytecode VM) → test.bn
-./conformance/run.sh boot-comp-int-int      # compiled bni2 → cmd/bni2 → test.bn
+./conformance/run.sh boot-comp-int          # compiled bni (bytecode VM) → test.bn
+./conformance/run.sh boot-comp-int-int      # compiled bni → cmd/bni → test.bn
 ./conformance/run.sh boot-comp-comp         # compiled compiler (gen1) → compile test.bn
-./conformance/run.sh boot-comp-comp-int     # gen1-compiled bni2 → test.bn
+./conformance/run.sh boot-comp-comp-int     # gen1-compiled bni → test.bn
 ./conformance/run.sh boot-comp-comp-comp    # gen2 compiler → compile test.bn
 ```
 

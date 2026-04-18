@@ -7,9 +7,9 @@
 # Modes (chains of: boot=bootstrap, int=bytecode VM, comp=compiler):
 #   boot                  Go bootstrap interpreter runs -test directly
 #   boot-comp             Bootstrap interprets bnc, which compiles and runs tests
-#   boot-comp-int         Compiled bni2 runs --test natively via bytecode VM
+#   boot-comp-int         Compiled bni runs --test natively via bytecode VM
 #   boot-comp-comp        Self-compiled compiler (gen1) runs --test
-#   boot-comp-comp-int    Gen1-compiled bni2 runs --test natively via bytecode VM
+#   boot-comp-comp-int    Gen1-compiled bni runs --test natively via bytecode VM
 #   boot-comp-comp-comp   Gen2 compiler runs --test
 #
 # Mode sets:

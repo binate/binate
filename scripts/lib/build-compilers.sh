@@ -31,12 +31,12 @@ build_gen2() {
     echo "Gen2 compiler ready: $GEN2_COMPILER"
 }
 
-# Build compiled interpreter (bni2, a bytecode VM) using bootstrap→bnc.
+# Build compiled interpreter (bni, a bytecode VM) using bootstrap→bnc.
 # Sets COMPILED_INTERP to the path.
 build_interp_boot_comp() {
     COMPILED_INTERP="/tmp/binate_compiled_interp_$$"
     echo "Building compiled interpreter..."
-    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni2" 2>&1)
+    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"
@@ -45,14 +45,14 @@ build_interp_boot_comp() {
     echo "Compiled interpreter ready: $COMPILED_INTERP"
 }
 
-# Build compiled interpreter (bni2, a bytecode VM) using a given compiler.
+# Build compiled interpreter (bni, a bytecode VM) using a given compiler.
 # $1 = compiler binary path
 # Sets COMPILED_INTERP to the path.
 build_interp() {
     local compiler="$1"
     COMPILED_INTERP="/tmp/binate_compiled_interp_$$"
     echo "Building compiled interpreter..."
-    build_out=$("$compiler" --root "$BINATE_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni2" 2>&1)
+    build_out=$("$compiler" --root "$BINATE_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"

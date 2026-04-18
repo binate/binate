@@ -7,13 +7,13 @@
 # Environment:
 #   BINATE_FLAGS    Extra flags passed to the Binate compiler (e.g. "-g" for debug info)
 #
-# Modes (chains of: boot=bootstrap, int2=bytecode VM, comp=compiler):
+# Modes (chains of: boot=bootstrap, int=bytecode VM, comp=compiler):
 #   boot                  Go bootstrap interpreter runs .bn directly
 #   boot-comp             boot interprets cmd/bnc, which compiles .bn to native
-#   boot-comp-int2        boot-comp compiles cmd/bni2 → binary, binary runs .bn via bytecode VM
-#   boot-comp-int2-int2   boot-comp-int2 interprets cmd/bni2, which interprets .bn
+#   boot-comp-int         boot-comp compiles cmd/bni2 → binary, binary runs .bn via bytecode VM
+#   boot-comp-int-int     boot-comp-int interprets cmd/bni2, which interprets .bn
 #   boot-comp-comp        boot-comp compiles cmd/bnc → gen1, gen1 compiles .bn
-#   boot-comp-comp-int2   gen1 compiles cmd/bni2 → binary, binary runs .bn via bytecode VM
+#   boot-comp-comp-int    gen1 compiles cmd/bni2 → binary, binary runs .bn via bytecode VM
 #   boot-comp-comp-comp   boot-comp-comp builds gen1, gen1 → gen2, gen2 compiles .bn
 #
 # Test formats:
@@ -55,7 +55,7 @@ if [ -z "$MODE" ]; then
     echo "Examples:"
     echo "  $0 boot                       Run all tests via bootstrap interpreter"
     echo "  $0 boot-comp 040              Run test(s) matching '040' via compiler"
-    echo "  $0 basic                      Run boot, boot-comp, boot-comp-int2"
+    echo "  $0 basic                      Run boot, boot-comp, boot-comp-int"
     echo "  $0 boot,boot-comp 040         Run '040' in boot and boot-comp"
     echo "  $0 boot-comp slice nil        Run tests matching 'slice' or 'nil'"
     echo ""

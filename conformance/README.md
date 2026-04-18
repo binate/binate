@@ -18,21 +18,21 @@ Run `./conformance/run.sh` with no arguments for full help.
 ./conformance/run.sh boot              # All tests via bootstrap interpreter
 ./conformance/run.sh boot-comp         # All tests via compiler
 ./conformance/run.sh boot-comp 040     # Test(s) matching '040'
-./conformance/run.sh basic             # boot + boot-comp + boot-comp-int2
+./conformance/run.sh basic             # boot + boot-comp + boot-comp-int
 ./conformance/run.sh boot slice nil    # Tests matching 'slice' or 'nil'
 ```
 
 ### Modes
 
-Each mode is a chain of: `boot` (bootstrap interpreter), `comp` (compiler), `int2` (bytecode VM).
+Each mode is a chain of: `boot` (bootstrap interpreter), `comp` (compiler), `int` (bytecode VM).
 
 | Mode | Description |
 |------|-------------|
 | `boot` | Go bootstrap interpreter runs .bn directly |
 | `boot-comp` | Bootstrap interprets cmd/bnc → compiles test to native |
-| `boot-comp-int2` | Compiled cmd/bni2 runs test via bytecode VM |
+| `boot-comp-int` | Compiled cmd/bni2 runs test via bytecode VM |
 | `boot-comp-comp` | Gen1 compiler compiles test |
-| `boot-comp-comp-int2` | Gen1-compiled cmd/bni2 runs test via bytecode VM |
+| `boot-comp-comp-int` | Gen1-compiled cmd/bni2 runs test via bytecode VM |
 | `boot-comp-comp-comp` | Gen2 compiler compiles test |
 
 Mode sets are defined in `scripts/modesets/` (one file per set, one mode per line). Adding a new mode set is just adding a file. Current sets: `basic`, `all`.

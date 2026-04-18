@@ -17,7 +17,7 @@ Run `./scripts/unittest/run.sh` with no arguments for full help.
 ```sh
 ./scripts/unittest/run.sh boot              # All packages via bootstrap
 ./scripts/unittest/run.sh boot-comp vm      # pkg/vm via compiler
-./scripts/unittest/run.sh basic             # boot + boot-comp + boot-comp-int2
+./scripts/unittest/run.sh basic             # boot + boot-comp + boot-comp-int
 ./scripts/unittest/run.sh boot ir codegen   # pkg/ir and pkg/codegen
 ```
 
@@ -27,9 +27,9 @@ Run `./scripts/unittest/run.sh` with no arguments for full help.
 |------|-------------|
 | `boot` | Go bootstrap interpreter runs `-test` directly |
 | `boot-comp` | Bootstrap interprets cmd/bnc → compiles and runs tests |
-| `boot-comp-int2` | Compiled cmd/bni2 runs `--test` natively via bytecode VM |
+| `boot-comp-int` | Compiled cmd/bni2 runs `--test` natively via bytecode VM |
 | `boot-comp-comp` | Gen1 compiler compiles and runs tests |
-| `boot-comp-comp-int2` | Gen1-compiled cmd/bni2 runs `--test` natively via bytecode VM |
+| `boot-comp-comp-int` | Gen1-compiled cmd/bni2 runs `--test` natively via bytecode VM |
 | `boot-comp-comp-comp` | Gen2 compiler compiles and runs tests |
 
 Mode sets are defined in `scripts/modesets/` (one file per set, one mode per line). Adding a new mode set is just adding a file. Current sets: `basic`, `all`.

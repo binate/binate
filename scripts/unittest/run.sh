@@ -4,17 +4,17 @@
 # Runs unit tests for all packages (or filtered packages) using the specified
 # backend mode.
 #
-# Modes (chains of: boot=bootstrap, int2=bytecode VM, comp=compiler):
+# Modes (chains of: boot=bootstrap, int=bytecode VM, comp=compiler):
 #   boot                  Go bootstrap interpreter runs -test directly
 #   boot-comp             Bootstrap interprets bnc, which compiles and runs tests
-#   boot-comp-int2        Compiled bni2 runs --test natively via bytecode VM
+#   boot-comp-int         Compiled bni2 runs --test natively via bytecode VM
 #   boot-comp-comp        Self-compiled compiler (gen1) runs --test
-#   boot-comp-comp-int2   Gen1-compiled bni2 runs --test natively via bytecode VM
+#   boot-comp-comp-int    Gen1-compiled bni2 runs --test natively via bytecode VM
 #   boot-comp-comp-comp   Gen2 compiler runs --test
 #
 # Mode sets:
-#   basic               boot, boot-comp, boot-comp-int2
-#   all                 basic + boot-comp-comp, boot-comp-comp-int2, boot-comp-comp-comp
+#   basic               boot, boot-comp, boot-comp-int
+#   all                 basic + boot-comp-comp, boot-comp-comp-int, boot-comp-comp-comp
 #
 # Filters select packages by substring match (e.g. "ir" matches "pkg/ir").
 #
@@ -53,7 +53,7 @@ if [ -z "$MODE" ]; then
     echo "Examples:"
     echo "  $0 boot                       Run all tests via bootstrap"
     echo "  $0 boot-comp vm               Run pkg/vm tests via compiler"
-    echo "  $0 basic                      Run boot, boot-comp, boot-comp-int2"
+    echo "  $0 basic                      Run boot, boot-comp, boot-comp-int"
     echo "  $0 boot,boot-comp vm          Run pkg/vm in boot and boot-comp"
     echo "  $0 boot ir codegen            Run pkg/ir and pkg/codegen tests"
     echo ""

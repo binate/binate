@@ -45,6 +45,21 @@ type regMap struct {
 	IDs  @[]int    // SSA IDs (index aligns with Regs)
 	Regs @[]int    // aarch64.X<N> (parallel to IDs)
 	Next int       // index of next free register in regPool
+
+	// Stack-slot map for OP_ALLOC. Survives regmap resets (an alloca's
+	// address is stable for the whole function; LOAD/STORE through it
+	// references the same frame slot every time).
+	AllocIDs     @[]int   // SSA IDs of OP_ALLOC instructions
+	AllocOffsets @[]int   // negative FP offset for each AllocIDs entry
+}
+
+// lookupAlloc returns the SP-relative offset of an OP_ALLOC value, or
+// -1 if id is not an alloca. (Offsets are always >= 0; see planFrame.)
+func lookupAlloc(m @regMap, id int) int {
+	for i := 0; i < len(m.AllocIDs); i++ {
+		if m.AllocIDs[i] == id { return m.AllocOffsets[i] }
+	}
+	return -1
 }
 
 // regPool is the callee-clobbering scratch set we hand out to values.
@@ -120,21 +135,26 @@ func EmitObject(mod @ir.Module, path *[]char) bool {
 // emitFunc — prologue, body, epilogue
 // ============================================================
 
-// emitFunc lowers one function. Prologue saves FP/LR so calls are safe;
-// epilogue restores and returns. Register assignment is a single forward
+// emitFunc lowers one function. Prologue saves FP/LR and allocates local
+// stack frame; epilogue reverses. Register assignment is a single forward
 // pass (see regMap).
 func emitFunc(a @asm.Assembler, pkgName *[]char, f @ir.Func) {
 	var sym @[]char = symFor(pkgName, f.Name)
 	asm.DefineLabel(a, sym)
 	asm.SetGlobal(a, sym)
 
-	// Prologue: save FP/LR on stack (16 bytes, aligned).
-	//   stp x29, x30, [sp, #-16]!
-	//   mov x29, sp
+	var rm @regMap = make(regMap)
+	var frameSize int = planFrame(rm, f)  // assigns AllocIDs/AllocOffsets
+
+	// Prologue:
+	//   stp x29, x30, [sp, #-16]!   // save FP/LR, sp -= 16
+	//   mov x29, sp                 // FP := SP (saved FP/LR at [fp, #0])
+	//   sub sp, sp, #frameSize      // reserve locals
 	aarch64.Stp(a, true, aarch64.FP, aarch64.LR, aarch64.MemPre(aarch64.SP, -16))
 	aarch64.Mov(a, true, aarch64.FP, aarch64.Reg(aarch64.SP))
-
-	var rm @regMap = make(regMap)
+	if frameSize > 0 {
+		aarch64.Sub(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(frameSize))
+	}
 
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var b @ir.Block = f.Blocks[bi]
@@ -143,15 +163,42 @@ func emitFunc(a @asm.Assembler, pkgName *[]char, f @ir.Func) {
 		}
 	}
 
-	// If the IR didn't end with OP_RETURN, still emit an epilogue so the
-	// function is well-formed. (OP_RETURN emits its own epilogue.)
-	emitEpilogueAndRet(a)
+	// Safety net: emit an epilogue if the IR didn't end with OP_RETURN.
+	emitEpilogueAndRet(a, frameSize)
 }
 
-// emitEpilogueAndRet emits the function epilogue and `ret`.
+// planFrame assigns each OP_ALLOC a positive SP-relative offset and
+// returns the frame size (16-byte aligned). Positive offsets avoid the
+// negative-immediate limitation of AArch64's scaled LDR/STR encoding
+// (which only supports unsigned imm12). Walking-skeleton assumption:
+// every alloca is 8 bytes (TypInt-sized).
+func planFrame(m @regMap, f @ir.Func) int {
+	var count int = 0
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			if ins.Op != ir.OP_ALLOC { continue }
+			m.AllocIDs = appendInt(m.AllocIDs, ins.ID)
+			m.AllocOffsets = appendInt(m.AllocOffsets, 8 * count)
+			count = count + 1
+		}
+	}
+	var size int = count * 8
+	if size % 16 != 0 {
+		size = size + (16 - size % 16)
+	}
+	return size
+}
+
+// emitEpilogueAndRet tears down the frame.
+//   add sp, sp, #frameSize       (if non-zero)
 //   ldp x29, x30, [sp], #16
 //   ret
-func emitEpilogueAndRet(a @asm.Assembler) {
+func emitEpilogueAndRet(a @asm.Assembler, frameSize int) {
+	if frameSize > 0 {
+		aarch64.Add(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(frameSize))
+	}
 	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR, aarch64.MemPost(aarch64.SP, 16))
 	aarch64.Ret(a)
 }
@@ -184,7 +231,39 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, rm @regMap, ins @ir.Instr) {
 	}
 
 	if ins.Op == ir.OP_RETURN {
-		emitEpilogueAndRet(a)
+		// planFrame's result is only known to emitFunc, which passes it
+		// implicitly via planned AllocOffsets. Derive frameSize from
+		// the number of allocas (same calc as planFrame).
+		var n int = len(rm.AllocIDs)
+		var size int = n * 8
+		if size % 16 != 0 { size = size + (16 - size % 16) }
+		emitEpilogueAndRet(a, size)
+		return
+	}
+
+	if ins.Op == ir.OP_ALLOC {
+		// Offset already assigned in planFrame; no code needed here.
+		return
+	}
+
+	if ins.Op == ir.OP_LOAD {
+		if len(ins.Args) < 1 { return }
+		var off int = lookupAlloc(rm, ins.Args[0].ID)
+		if off >= 0 {
+			var rd int = nextReg(rm, ins.ID)
+			aarch64.Ldr(a, true, rd, aarch64.MemImm(aarch64.SP, off))
+		}
+		return
+	}
+
+	if ins.Op == ir.OP_STORE {
+		// Args[0] = pointer destination, Args[1] = value.
+		if len(ins.Args) < 2 { return }
+		var off int = lookupAlloc(rm, ins.Args[0].ID)
+		var valReg int = lookupReg(rm, ins.Args[1].ID)
+		if off >= 0 && valReg >= 0 {
+			aarch64.Str(a, true, valReg, aarch64.MemImm(aarch64.SP, off))
+		}
 		return
 	}
 

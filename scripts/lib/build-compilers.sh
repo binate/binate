@@ -31,35 +31,6 @@ build_gen2() {
     echo "Gen2 compiler ready: $GEN2_COMPILER"
 }
 
-# Build compiled interpreter using a given compiler.
-# $1 = compiler binary path
-# Sets COMPILED_INTERP to the path.
-build_interp() {
-    local compiler="$1"
-    COMPILED_INTERP="/tmp/binate_compiled_interp_$$"
-    echo "Building compiled interpreter..."
-    build_out=$("$compiler" --root "$BINATE_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
-    if [ ! -x "$COMPILED_INTERP" ]; then
-        echo "ERROR: Failed to build compiled interpreter:"
-        echo "$build_out"
-        exit 1
-    fi
-    echo "Compiled interpreter ready: $COMPILED_INTERP"
-}
-
-# Build compiled interpreter using bootstrap→bnc (boot-comp).
-build_interp_boot_comp() {
-    COMPILED_INTERP="/tmp/binate_compiled_interp_$$"
-    echo "Building compiled interpreter..."
-    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
-    if [ ! -x "$COMPILED_INTERP" ]; then
-        echo "ERROR: Failed to build compiled interpreter:"
-        echo "$build_out"
-        exit 1
-    fi
-    echo "Compiled interpreter ready: $COMPILED_INTERP"
-}
-
 # Build compiled bytecode interpreter (bni2) using bootstrap→bnc.
 # Sets COMPILED_INT2 to the path.
 build_int2_boot_comp() {
@@ -92,5 +63,5 @@ build_int2() {
 
 # Cleanup helper — removes all temp binaries.
 cleanup_compilers() {
-    rm -f "$GEN1_COMPILER" "$GEN2_COMPILER" "$COMPILED_INTERP" "$COMPILED_INT2"
+    rm -f "$GEN1_COMPILER" "$GEN2_COMPILER" "$COMPILED_INT2"
 }

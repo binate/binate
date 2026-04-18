@@ -176,14 +176,13 @@ Standalone `.bn` programs with expected output, shared across all execution back
 
 ```sh
 cd binate
-./conformance/run.sh boot               # Go bootstrap interpreter
-./conformance/run.sh boot-int           # boot interprets cmd/bni → test.bn
-./conformance/run.sh boot-int-int       # boot → cmd/bni → cmd/bni → test.bn
-./conformance/run.sh boot-comp          # boot interprets cmd/bnc → compile test.bn
-./conformance/run.sh boot-comp-int      # compiled interpreter binary → test.bn
-./conformance/run.sh boot-comp-int2-int2  # compiled bni2 → cmd/bni2 → test.bn
-./conformance/run.sh boot-comp-comp     # compiled compiler (gen1) → compile test.bn
-./conformance/run.sh boot-comp-comp-comp  # gen2 compiler → compile test.bn
+./conformance/run.sh boot                   # Go bootstrap interpreter
+./conformance/run.sh boot-comp              # boot interprets cmd/bnc → compile test.bn
+./conformance/run.sh boot-comp-int2         # compiled bni2 (bytecode VM) → test.bn
+./conformance/run.sh boot-comp-int2-int2    # compiled bni2 → cmd/bni2 → test.bn
+./conformance/run.sh boot-comp-comp         # compiled compiler (gen1) → compile test.bn
+./conformance/run.sh boot-comp-comp-int2    # gen1-compiled bni2 → test.bn
+./conformance/run.sh boot-comp-comp-comp    # gen2 compiler → compile test.bn
 ```
 
 ### Go-Level Tests

@@ -24,13 +24,13 @@ git clone https://github.com/binate/binate.git
 
 # Run a program via the self-hosted interpreter
 cd bootstrap
-go run . -root ../binate ../binate/cmd/bni -- ../binate/examples/selftest.bn
+go run . -root ../binate ../binate/cmd/bni2 -- ../binate/examples/selftest.bn
 
 # Compile and run a program
 go run . -root ../binate ../binate/cmd/bnc -- ../binate/examples/selftest.bn && ./selftest
 
 # Run unit tests for a package
-go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/interp pkg/loader
+go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/vm pkg/loader pkg/interp
 
 # Run conformance tests
 cd ../binate && ./conformance/run.sh boot
@@ -41,8 +41,10 @@ cd ../binate && ./conformance/run.sh boot
 ```
 binate/
   cmd/
-    bni/                     Self-hosted interpreter (parse, load, interpret)
+    bni2/                    Self-hosted interpreter (bytecode VM)
     bnc/                     Self-hosted compiler (parse, load, IR gen, LLVM emit)
+    bnas/                    Assembler
+    bnlint/                  Linter
   examples/
     selftest.bn              Quick smoke test (arithmetic, strings, loops, recursion)
   conformance/               Conformance test suite (shared across backends)
@@ -57,7 +59,8 @@ binate/
     types/                   Type system and checker
     ir/                      IR generation (AST → SSA-like IR)
     codegen/                 LLVM IR emission
-    interp/                  Tree-walking interpreter, values, environments
+    vm/                      Bytecode VM used by cmd/bni2
+    interp/                  Tree-walking interpreter (legacy; being retired)
     loader/                  Package discovery, loading, merging, topological sort
     buf/                     CharBuf for string building
     debug/                   Verbose logging (SetVerbose, Log)
@@ -76,7 +79,7 @@ Programs run through three stages:
 
 1. **Parse**: Source files are tokenized (lexer) and parsed (parser) into AST nodes.
 2. **Load**: The package loader discovers imported packages on disk, parses their `.bn`/`.bni` files, merges multi-file packages, and computes a dependency-ordered load sequence via topological sort.
-3. **Execute**: Either interpreted (tree-walking interpreter) or compiled (IR generation → LLVM IR → native binary via clang).
+3. **Execute**: Either interpreted (bytecode VM) or compiled (IR generation → LLVM IR → native binary via clang).
 
 ### Verbose Logging
 
@@ -84,10 +87,10 @@ All layers support `-v` for debug logging to stderr:
 
 ```sh
 # Bootstrap verbose
-go run . -v -root ../binate ../binate/cmd/bni -- program.bn
+go run . -v -root ../binate ../binate/cmd/bni2 -- program.bn
 
 # Self-hosted interpreter verbose
-go run . -root ../binate ../binate/cmd/bni -- -v program.bn
+go run . -root ../binate ../binate/cmd/bni2 -- -v program.bn
 
 # Compiler verbose
 go run . -root ../binate ../binate/cmd/bnc -- -v program.bn
@@ -99,12 +102,10 @@ The self-hosted interpreter can interpret itself:
 
 ```
 Go bootstrap
-  → interprets cmd/bni (self-hosted interpreter)
-    → interprets cmd/bni (self-hosted interpreter again)
+  → interprets cmd/bni2 (self-hosted interpreter)
+    → interprets cmd/bni2 (self-hosted interpreter again)
       → interprets target.bn
 ```
-
-This works because the bootstrap forwarding layer (`pkg/interp/bootstrap_fwd.bn`) bridges the gap: when interpreted code calls `bootstrap.Open()`, `bootstrap.Read()`, etc., the forwarding layer dispatches these to the real bootstrap functions provided by the Go runtime.
 
 ### Packages
 
@@ -161,10 +162,10 @@ Each source file has a corresponding `*_test.bn` file with `func TestXxx() testi
 
 ```sh
 cd bootstrap
-go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/interp pkg/loader pkg/ir pkg/codegen
+go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/vm pkg/loader pkg/ir pkg/codegen pkg/interp
 
 # Test main package directories
-go run . -root ../binate -test ../binate/cmd/bni
+go run . -root ../binate -test ../binate/cmd/bni2
 go run . -root ../binate -test ../binate/cmd/bnc
 ```
 

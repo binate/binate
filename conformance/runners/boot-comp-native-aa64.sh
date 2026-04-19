@@ -17,7 +17,16 @@ runner_exec() {
     fi
     compile_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$compile_root" -backend native $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
-        "$tmpbin" 2>&1 || true
+        # The skeleton produces incorrect code for features it doesn't
+        # handle (e.g. function parameters), which can yield infinite
+        # loops. Cap wall-clock via timeout(1) so the sweep doesn't wedge.
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 3 "$tmpbin" 2>&1 || true
+        elif command -v gtimeout >/dev/null 2>&1; then
+            gtimeout 3 "$tmpbin" 2>&1 || true
+        else
+            "$tmpbin" 2>&1 || true
+        fi
     else
         echo "COMPILE_ERROR: $compile_out"
     fi

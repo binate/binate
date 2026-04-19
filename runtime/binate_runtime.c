@@ -62,6 +62,13 @@ void bn_print_bool(int8_t b) {
     }
 }
 
+void bn_print_float(double d) {
+    // %g uses up to 6 significant digits and drops trailing zeros.
+    // Good enough for conformance tests that check readable output;
+    // a real fmt package will replace println in the long run.
+    printf("%g", d);
+}
+
 void bn_print_newline(void) {
     printf("\n");
     fflush(stdout);

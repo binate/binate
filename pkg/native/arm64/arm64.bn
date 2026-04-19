@@ -3,208 +3,18 @@ package "pkg/native/arm64"
 import "pkg/asm"
 import "pkg/asm/aarch64"
 import "pkg/asm/macho"
-import "pkg/buf"
 import "pkg/ir"
 import "pkg/mangle"
 import "pkg/types"
 
 // ============================================================
-// Small helpers
-// ============================================================
-
-// stripQuotes strips surrounding '"' from a string (if present).
-// Duplicated from pkg/codegen/emit_util.bn; would move to a shared
-// layer as part of the planned layout extraction.
-func stripQuotes(s *[]char) *[]char {
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return s[1:len(s)-1]
-	}
-	return s
-}
-
-// symFor mangles a Binate (pkgName, funcName) pair to a Mach-O symbol,
-// prepending the '_' required by Mach-O C-linkage.
-func symFor(pkgName *[]char, funcName *[]char) @[]char {
-	var mangled buf.CharBuf = mangle.FuncName(pkgName, funcName)
-	var out buf.CharBuf = buf.New()
-	out = buf.WriteStr(out, "_")
-	out = buf.WriteStr(out, buf.Bytes(mangled))
-	return buf.Bytes(out)
-}
-
-// ============================================================
-// Walking-skeleton register map
-// ============================================================
-
-// regMap maps SSA instr IDs to physical registers. The scheme is naive:
-// every value-producing instruction gets the next X9..X15 (7 regs). That
-// limits each function to ~7 live values and assumes nothing is live
-// across a call (since X9..X15 are caller-saved, a BL clobbers them).
-// Programs outside these bounds won't codegen correctly — by design, this
-// is the walking skeleton.
-type regMap struct {
-	IDs  @[]int    // SSA IDs (index aligns with Regs)
-	Regs @[]int    // aarch64.X<N> (parallel to IDs)
-	Next int       // index of next free register in regPool
-
-	// Stack-slot map for OP_ALLOC. Survives regmap resets (an alloca's
-	// address is stable for the whole function; LOAD/STORE through it
-	// references the same frame slot every time).
-	AllocIDs     @[]int   // SSA IDs of OP_ALLOC instructions
-	AllocOffsets @[]int   // SP-relative offset for each AllocIDs entry
-	AllocSizes   @[]int   // byte size of each alloca slot (for zero-init)
-
-	// Spill-slot map: every call result (and later, any value live across
-	// a regmap reset) is immediately spilled to a stack slot so a later
-	// use can reload it. Also survives regmap resets.
-	SpillIDs     @[]int
-	SpillOffsets @[]int
-}
-
-// lookupAlloc returns the SP-relative offset of an OP_ALLOC value, or
-// -1 if id is not an alloca. (Offsets are always >= 0; see planFrame.)
-func lookupAlloc(m @regMap, id int) int {
-	for i := 0; i < len(m.AllocIDs); i++ {
-		if m.AllocIDs[i] == id { return m.AllocOffsets[i] }
-	}
-	return -1
-}
-
-// lookupAllocSize returns the byte size of an alloca slot, or -1.
-func lookupAllocSize(m @regMap, id int) int {
-	for i := 0; i < len(m.AllocIDs); i++ {
-		if m.AllocIDs[i] == id { return m.AllocSizes[i] }
-	}
-	return -1
-}
-
-// isAggregateTyp reports whether a type is a struct or array — i.e.,
-// not an in-register value.
-func isAggregateTyp(t @types.Type) bool {
-	if t == nil { return false }
-	return t.Kind == types.TYP_STRUCT || t.Kind == types.TYP_ARRAY
-}
-
-// elemSizeOf returns the byte size of one element of the array/slice
-// pointed to by `base`, or 0 if not an indexable type.
-// Walking skeleton: slices aren't indexable yet.
-func elemSizeOf(base @ir.Instr) int {
-	if base == nil { return 0 }
-	// Look at TypeArg (e.g. OP_ALLOC with [5]int TypeArg) first, then
-	// fall through to Typ.Elem.
-	var t @types.Type = base.TypeArg
-	if t == nil && base.Typ != nil { t = base.Typ.Elem }
-	if t == nil { return 0 }
-	if t.Kind == types.TYP_ARRAY && t.Elem != nil {
-		return types.SizeOf(t.Elem)
-	}
-	return 0
-}
-
-// emitStructCopy lowers an OP_STORE that is copying a struct (or
-// array) as a byte-for-byte memcpy. Source pointer comes from Args[1]
-// (which, per OP_LOAD's struct handling, is a pointer in a register);
-// dest from Args[0].
-func emitStructCopy(a @asm.Assembler, rm @regMap, ins @ir.Instr) {
-	var sz int = types.SizeOf(ins.Args[1].Typ)
-	if sz <= 0 { return }
-
-	var srcPtr int = getOperand(a, rm, ins.Args[1].ID)
-	if srcPtr < 0 { return }
-
-	var dstPtr int
-	var allocOff int = lookupAlloc(rm, ins.Args[0].ID)
-	if allocOff >= 0 {
-		dstPtr = scratchReg(rm)
-		aarch64.Add(a, true, dstPtr, aarch64.SP, aarch64.Imm(allocOff))
-	} else {
-		dstPtr = getOperand(a, rm, ins.Args[0].ID)
-	}
-	if dstPtr < 0 { return }
-
-	var tmp int = scratchReg(rm)
-	for off := 0; off < sz; off = off + 8 {
-		aarch64.Ldr(a, true, tmp, aarch64.MemImm(srcPtr, off))
-		aarch64.Str(a, true, tmp, aarch64.MemImm(dstPtr, off))
-	}
-}
-
-// scratchReg hands out an ephemeral register (not registered in the
-// id→reg map). Used when we need working registers that won't outlive
-// the current instruction.
-func scratchReg(m @regMap) int {
-	var r int = regPool(m.Next)
-	m.Next = m.Next + 1
-	return r
-}
-
-// structTypeOf returns the struct type underlying a pointer-valued
-// instruction (OP_ALLOC with struct TypeArg, OP_GET_FIELD_PTR to a
-// nested struct field, etc.). Returns nil if not available.
-func structTypeOf(ins @ir.Instr) @types.Type {
-	if ins == nil { return nil }
-	if ins.TypeArg != nil && ins.TypeArg.Kind == types.TYP_STRUCT {
-		return ins.TypeArg
-	}
-	if ins.Typ != nil && ins.Typ.Elem != nil {
-		if ins.Typ.Elem.Kind == types.TYP_STRUCT { return ins.Typ.Elem }
-	}
-	return nil
-}
-
-// regPool is the callee-clobbering scratch set we hand out to values.
-// X0..X7 are reserved for arg/ret; X9..X15 are caller-saved temporaries.
-func regPool(i int) int {
-	if i == 0 { return aarch64.X9  }
-	if i == 1 { return aarch64.X10 }
-	if i == 2 { return aarch64.X11 }
-	if i == 3 { return aarch64.X12 }
-	if i == 4 { return aarch64.X13 }
-	if i == 5 { return aarch64.X14 }
-	return aarch64.X15
-}
-
-// assignReg records that SSA id = reg and returns reg.
-func assignReg(m @regMap, id int, reg int) int {
-	m.IDs = appendInt(m.IDs, id)
-	m.Regs = appendInt(m.Regs, reg)
-	return reg
-}
-
-// nextReg allocates the next free register for SSA id.
-func nextReg(m @regMap, id int) int {
-	var r int = regPool(m.Next)
-	m.Next = m.Next + 1
-	return assignReg(m, id, r)
-}
-
-// lookupReg returns the register holding SSA id, or -1 if not found.
-func lookupReg(m @regMap, id int) int {
-	for i := 0; i < len(m.IDs); i++ {
-		if m.IDs[i] == id { return m.Regs[i] }
-	}
-	return -1
-}
-
-// appendInt grows an @[]int by one.
-func appendInt(s @[]int, v int) @[]int {
-	var out @[]int = make_slice(int, len(s)+1)
-	for i := 0; i < len(s); i++ {
-		out[i] = s[i]
-	}
-	out[len(s)] = v
-	return out
-}
-
-// ============================================================
 // EmitObject — module entry
 // ============================================================
 
-// EmitObject is the entry point. It emits one __text section containing
-// every function in the module, plus a __const section with collected
-// string literals, resolves fixups, and writes a Mach-O .o.
+// EmitObject emits one __text section containing every function in the
+// module, plus a string table with collected literals, resolves
+// fixups, and writes a Mach-O .o.
 func EmitObject(mod @ir.Module, path *[]char) bool {
-	// Dedup string literals into mod.Strings.
 	ir.FinalizeStrings(mod)
 
 	var a @asm.Assembler = asm.New(8)
@@ -234,69 +44,59 @@ func EmitObject(mod @ir.Module, path *[]char) bool {
 // round-trippable through `ld`, so cross-section ADR won't link.
 func emitStringTable(a @asm.Assembler, strings @[]ir.StringConst) {
 	if len(strings) == 0 { return }
-	// Stay in the text section (set at the start of EmitObject). The
-	// loader treats the bytes as data because we never branch into them.
 	for i := 0; i < len(strings); i++ {
 		var sc ir.StringConst = strings[i]
 		asm.DefineLabel(a, stringLabel(sc.ID))
 		asm.EmitAsciz(a, sc.Data)
 	}
 	// Pad back up to instruction alignment so any subsequent emissions
-	// stay on 4-byte boundaries. (Currently nothing comes after, but
-	// keeps the invariant stable if we add more.)
+	// stay on 4-byte boundaries.
 	asm.Align(a, 4)
-}
-
-// stringLabel is the local asm label for string constant <id>.
-func stringLabel(id int) @[]char {
-	var out buf.CharBuf = buf.New()
-	out = buf.WriteStr(out, "Lstr_")
-	out = buf.WriteInt(out, id)
-	return buf.Bytes(out)
 }
 
 // ============================================================
 // emitFunc — prologue, body, epilogue
 // ============================================================
 
-// emitFunc lowers one function. Prologue saves FP/LR and allocates local
-// stack frame; epilogue reverses. Register assignment is a single forward
-// pass (see regMap).
-func emitFunc(a @asm.Assembler, pkgName *[]char, f @ir.Func, strings @[]ir.StringConst) {
+// emitFunc lowers one function. Prologue saves FP/LR and allocates
+// the local stack frame; epilogue reverses.
+func emitFunc(a @asm.Assembler, pkgName *[]char, f @ir.Func,
+	strings @[]ir.StringConst) {
 	var sym @[]char = symFor(pkgName, f.Name)
 	asm.DefineLabel(a, sym)
 	asm.SetGlobal(a, sym)
 
 	var rm @regMap = make(regMap)
-	var frameSize int = planFrame(rm, f)  // assigns AllocIDs/AllocOffsets
+	var frameSize int = planFrame(rm, f)
 
 	// Prologue:
-	//   stp x29, x30, [sp, #-16]!   // save FP/LR, sp -= 16
-	//   mov x29, sp                 // FP := SP (saved FP/LR at [fp, #0])
-	//   sub sp, sp, #frameSize      // reserve locals
-	aarch64.Stp(a, true, aarch64.FP, aarch64.LR, aarch64.MemPre(aarch64.SP, -16))
+	//   stp x29, x30, [sp, #-16]!
+	//   mov x29, sp
+	//   sub sp, sp, #frameSize
+	aarch64.Stp(a, true, aarch64.FP, aarch64.LR,
+		aarch64.MemPre(aarch64.SP, -16))
 	aarch64.Mov(a, true, aarch64.FP, aarch64.Reg(aarch64.SP))
 	if frameSize > 0 {
-		aarch64.Sub(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(frameSize))
+		aarch64.Sub(a, true, aarch64.SP, aarch64.SP,
+			aarch64.Imm(frameSize))
 	}
 	// Spill incoming parameter registers to their stack slots so later
 	// uses (which go through getOperand → spill reload) see them.
 	for pi := 0; pi < len(f.Params) && pi < 8; pi++ {
 		var off int = lookupSpill(rm, f.Params[pi].ID)
 		if off >= 0 {
-			aarch64.Str(a, true, argReg(pi), aarch64.MemImm(aarch64.SP, off))
+			aarch64.Str(a, true, argReg(pi),
+				aarch64.MemImm(aarch64.SP, off))
 		}
 	}
 
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var b @ir.Block = f.Blocks[bi]
-		// Entry block is already labelled by DefineLabel(sym) above.
 		if bi > 0 {
 			asm.DefineLabel(a, blockLabel(sym, b.Label))
 		}
 		// Each block starts with a fresh regmap. Cross-block values
-		// (and now all value-producing instructions) flow through
-		// spill slots.
+		// flow through spill slots.
 		resetRegs(rm)
 		for ii := 0; ii < len(b.Instrs); ii++ {
 			emitInstr(a, pkgName, sym, rm, strings, b.Instrs[ii])
@@ -311,145 +111,14 @@ func emitFunc(a @asm.Assembler, pkgName *[]char, f @ir.Func, strings @[]ir.Strin
 	emitEpilogueAndRet(a, frameSize)
 }
 
-// blockLabel mints a function-scoped label name for a basic block. The
-// 'L' prefix keeps it out of the exported symbol list.
-func blockLabel(funcSym @[]char, blockLabel @[]char) @[]char {
-	var out buf.CharBuf = buf.New()
-	out = buf.WriteStr(out, "L")
-	out = buf.WriteStr(out, funcSym)
-	out = buf.WriteStr(out, "__")
-	out = buf.WriteStr(out, blockLabel)
-	return buf.Bytes(out)
-}
-
-// planFrame assigns a stack slot to every function parameter and every
-// value-producing SSA instruction (allocas sized by types.SizeOf;
-// every other non-void value gets 8 bytes for spill-after-compute).
-// Returns the 16-byte aligned frame size.
-//
-// The "spill everything" policy keeps the register pool from
-// overflowing: the 7-register rotating pool was enough when values
-// were short-lived but broke on larger expressions (struct literal
-// init had 10+ live values simultaneously, and all extras collided
-// on X15). Now each op loads operands, computes, and immediately
-// spills its result; subsequent uses reload via getOperand.
-// Slow but correct.
-func planFrame(m @regMap, f @ir.Func) int {
-	var offset int = 0
-	// Each parameter gets a spill slot, populated at function entry
-	// from its ABI register (X0..X7) so later uses can reload.
-	for pi := 0; pi < len(f.Params); pi++ {
-		m.SpillIDs = appendInt(m.SpillIDs, f.Params[pi].ID)
-		m.SpillOffsets = appendInt(m.SpillOffsets, offset)
-		offset = offset + 8
-	}
-	for bi := 0; bi < len(f.Blocks); bi++ {
-		var b @ir.Block = f.Blocks[bi]
-		for ii := 0; ii < len(b.Instrs); ii++ {
-			var ins @ir.Instr = b.Instrs[ii]
-			if ins.Op == ir.OP_ALLOC {
-				var sz int = 8
-				if ins.TypeArg != nil { sz = types.SizeOf(ins.TypeArg) }
-				if sz < 8 { sz = 8 }
-				if sz % 8 != 0 { sz = sz + (8 - sz % 8) }
-				m.AllocIDs = appendInt(m.AllocIDs, ins.ID)
-				m.AllocSizes = appendInt(m.AllocSizes, sz)
-				m.AllocOffsets = appendInt(m.AllocOffsets, offset)
-				offset = offset + sz
-			} else if ins.ID >= 0 && !instrIsVoid(ins) {
-				m.SpillIDs = appendInt(m.SpillIDs, ins.ID)
-				m.SpillOffsets = appendInt(m.SpillOffsets, offset)
-				// Multi-return calls get N*8 bytes so X0..X(N-1) can
-				// all land in the same slot contiguously; OP_EXTRACT
-				// later reads the i-th word.
-				var slotSz int = 8
-				if (ins.Op == ir.OP_CALL || ins.Op == ir.OP_CALL_BUILTIN) &&
-					ins.Typ != nil && ins.Typ.Kind == types.TYP_STRUCT {
-					slotSz = 8 * len(ins.Typ.Fields)
-					if slotSz < 8 { slotSz = 8 }
-				}
-				offset = offset + slotSz
-			}
-		}
-	}
-	var size int = offset
-	if size % 16 != 0 {
-		size = size + (16 - size % 16)
-	}
-	return size
-}
-
-// instrIsVoid reports whether an instruction produces no SSA value.
-// Void-producing ops (OP_RETURN, OP_JUMP, OP_BRANCH, OP_STORE,
-// OP_NIL_CHECK, REFCOUNT_INC/DEC, etc.) have ID == -1 by convention;
-// here we also catch the case where Typ indicates void.
-func instrIsVoid(ins @ir.Instr) bool {
-	if ins.ID < 0 { return true }
-	if ins.Typ == nil { return true }
-	return ins.Typ.Kind == types.TYP_VOID
-}
-
-// callReturnsVoid returns true if an OP_CALL/OP_CALL_BUILTIN has no
-// result (e.g. bn_print_int, bootstrap.Exit).
-func callReturnsVoid(ins @ir.Instr) bool {
-	if ins.Typ == nil { return true }
-	return ins.Typ.Kind == types.TYP_VOID
-}
-
-// lookupSpill returns the SP-relative slot for a spilled SSA value,
-// or -1 if not spilled.
-func lookupSpill(m @regMap, id int) int {
-	for i := 0; i < len(m.SpillIDs); i++ {
-		if m.SpillIDs[i] == id { return m.SpillOffsets[i] }
-	}
-	return -1
-}
-
-// getOperand returns the register holding SSA id, loading from the
-// spill slot into a fresh scratch register if necessary. Returns -1
-// if the value is neither in the regmap nor spilled.
-func getOperand(a @asm.Assembler, m @regMap, id int) int {
-	var r int = lookupReg(m, id)
-	if r >= 0 { return r }
-	var off int = lookupSpill(m, id)
-	if off >= 0 {
-		var rd int = nextReg(m, id)
-		aarch64.Ldr(a, true, rd, aarch64.MemImm(aarch64.SP, off))
-		return rd
-	}
-	return -1
-}
-
-// frameSizeFromRegMap recomputes the frame size from the planFrame
-// entries. Sums each alloca's actual size (structs can be > 8 bytes)
-// plus 8 bytes per call spill slot, rounded up to 16.
-func frameSizeFromRegMap(m @regMap) int {
-	var size int = 0
-	for i := 0; i < len(m.AllocSizes); i++ { size = size + m.AllocSizes[i] }
-	size = size + len(m.SpillIDs) * 8
-	if size % 16 != 0 { size = size + (16 - size % 16) }
-	return size
-}
-
-// emitEpilogueAndRet tears down the frame.
-//   add sp, sp, #frameSize       (if non-zero)
-//   ldp x29, x30, [sp], #16
-//   ret
-func emitEpilogueAndRet(a @asm.Assembler, frameSize int) {
-	if frameSize > 0 {
-		aarch64.Add(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(frameSize))
-	}
-	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR, aarch64.MemPost(aarch64.SP, 16))
-	aarch64.Ret(a)
-}
-
 // ============================================================
 // emitInstr — instruction selection
 // ============================================================
 
 // emitInstr lowers one IR instruction. Walking-skeleton subset only;
 // instructions outside this set are silently ignored.
-func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, strings @[]ir.StringConst, ins @ir.Instr) {
+func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char,
+	rm @regMap, strings @[]ir.StringConst, ins @ir.Instr) {
 	if ins.Op == ir.OP_CONST_INT {
 		var r int = nextReg(rm, ins.ID)
 		// 16-bit immediate fits in a single MOVZ; larger values need
@@ -482,18 +151,16 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, s
 	}
 
 	if ins.Op == ir.OP_CALL_BUILTIN {
-		// Builtin calls (e.g. bn_print_int, bn_print_newline) use the
-		// StrVal verbatim as the C symbol — no pkg-level mangling.
+		// Builtin calls use StrVal verbatim as the C symbol.
 		emitCall(a, pkgName, rm, ins, true)
 		return
 	}
 
 	if ins.Op == ir.OP_RETURN {
-		// Each return value goes in X0..X(N-1). Note: if any two args
-		// already live in clashing registers, a naive move sequence
-		// could overwrite one. Walking-skeleton gets away with it
-		// because spillAndReset keeps values in stack slots between
-		// instructions — each getOperand loads into a fresh scratch.
+		// Each return value goes in X0..X(N-1). If any two args already
+		// live in clashing regs, a naive move sequence could clobber.
+		// Walking-skeleton gets away with it because every getOperand
+		// loads fresh from the spill slot into X9..X15.
 		for ri := 0; ri < len(ins.Args) && ri < 8; ri++ {
 			var src int = getOperand(a, rm, ins.Args[ri].ID)
 			if src >= 0 && src != argReg(ri) {
@@ -505,30 +172,30 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, s
 	}
 
 	if ins.Op == ir.OP_EXTRACT {
-		// Extract the ins.Index-th word of a multi-return struct value.
-		// The source's spill slot holds N*8 bytes with component i at
+		// ins.Index-th word of a multi-return struct value. The
+		// source's spill slot holds N*8 bytes with component i at
 		// slot + 8*i (see emitCall).
 		if len(ins.Args) < 1 { return }
 		var srcSlot int = lookupSpill(rm, ins.Args[0].ID)
 		if srcSlot < 0 { return }
 		var rd int = nextReg(rm, ins.ID)
-		aarch64.Ldr(a, true, rd, aarch64.MemImm(aarch64.SP, srcSlot + 8*ins.Index))
+		aarch64.Ldr(a, true, rd,
+			aarch64.MemImm(aarch64.SP, srcSlot + 8*ins.Index))
 		return
 	}
 
 	if ins.Op == ir.OP_ALLOC {
-		// Offset was assigned in planFrame. If this is a struct or
-		// array alloca, emit zero-init stores so the semantics match
-		// the LLVM backend (`store ... zeroinitializer`).
+		// Offset was assigned in planFrame. Struct/array allocas
+		// zero-init to match LLVM's `store ... zeroinitializer`.
 		if ins.TypeArg != nil {
 			if ins.TypeArg.Kind == types.TYP_STRUCT ||
 				ins.TypeArg.Kind == types.TYP_ARRAY {
 				var off int = lookupAlloc(rm, ins.ID)
 				var sz int = lookupAllocSize(rm, ins.ID)
 				if off >= 0 && sz > 0 {
-					// str xzr, [sp, #off]  (8 bytes at a time)
 					for bo := 0; bo < sz; bo = bo + 8 {
-						aarch64.Str(a, true, aarch64.XZR, aarch64.MemImm(aarch64.SP, off + bo))
+						aarch64.Str(a, true, aarch64.XZR,
+							aarch64.MemImm(aarch64.SP, off + bo))
 					}
 				}
 			}
@@ -539,13 +206,13 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, s
 	if ins.Op == ir.OP_LOAD {
 		if len(ins.Args) < 1 { return }
 		// Struct/array load: pass the source pointer through; the IR
-		// uses LOAD+STORE as a struct copy idiom, and the subsequent
-		// store does the memcpy.
+		// uses LOAD+STORE as a struct copy idiom.
 		if isAggregateTyp(ins.Typ) {
 			var rd int = nextReg(rm, ins.ID)
 			var allocOff int = lookupAlloc(rm, ins.Args[0].ID)
 			if allocOff >= 0 {
-				aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(allocOff))
+				aarch64.Add(a, true, rd, aarch64.SP,
+					aarch64.Imm(allocOff))
 			} else {
 				var src int = getOperand(a, rm, ins.Args[0].ID)
 				if src < 0 { return }
@@ -568,8 +235,8 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, s
 	}
 
 	if ins.Op == ir.OP_STORE {
-		// Args[0] = pointer destination, Args[1] = value (or source pointer
-		// if the IR "value" is actually a struct/array — see OP_LOAD).
+		// Args[0] = dest ptr, Args[1] = value (or source ptr for
+		// struct-copy — see OP_LOAD's aggregate path).
 		if len(ins.Args) < 2 { return }
 		if isAggregateTyp(ins.Args[1].Typ) {
 			emitStructCopy(a, rm, ins)
@@ -580,7 +247,8 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, s
 		var valReg int = getOperand(a, rm, ins.Args[1].ID)
 		if valReg < 0 { return }
 		if off >= 0 {
-			aarch64.Str(a, true, valReg, aarch64.MemImm(aarch64.SP, off))
+			aarch64.Str(a, true, valReg,
+				aarch64.MemImm(aarch64.SP, off))
 			return
 		}
 		var ptr int = getOperand(a, rm, ins.Args[0].ID)
@@ -591,8 +259,7 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, s
 
 	if ins.Op == ir.OP_GET_ELEM_PTR {
 		// Args[0] = array/slice pointer, Args[1] = index (i64).
-		// Walking skeleton: arrays only. Slices need a data-pointer
-		// deref through the slice header and aren't handled yet.
+		// Walking skeleton: arrays only.
 		if len(ins.Args) < 2 { return }
 		var elemSize int = elemSizeOf(ins.Args[0])
 		if elemSize <= 0 { return }
@@ -608,8 +275,8 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, s
 		var rd int = nextReg(rm, ins.ID)
 		var allocOff int = lookupAlloc(rm, ins.Args[0].ID)
 		if allocOff >= 0 {
-			// rd = sp + allocOff; rd += byteOff
-			aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(allocOff))
+			aarch64.Add(a, true, rd, aarch64.SP,
+				aarch64.Imm(allocOff))
 			aarch64.Add(a, true, rd, rd, aarch64.Reg(byteOff))
 			return
 		}
@@ -620,19 +287,17 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, s
 	}
 
 	if ins.Op == ir.OP_GET_FIELD_PTR {
-		// Args[0] = struct pointer, Index = field index.
 		if len(ins.Args) < 1 { return }
 		var baseTyp @types.Type = structTypeOf(ins.Args[0])
 		if baseTyp == nil { return }
 		var fieldOff int = types.FieldOffset(baseTyp, ins.Index)
 		var rd int = nextReg(rm, ins.ID)
-		// If base is an alloca, compute address relative to SP.
 		var allocOff int = lookupAlloc(rm, ins.Args[0].ID)
 		if allocOff >= 0 {
-			aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(allocOff + fieldOff))
+			aarch64.Add(a, true, rd, aarch64.SP,
+				aarch64.Imm(allocOff + fieldOff))
 			return
 		}
-		// Otherwise the base is a pointer in a register.
 		var ptr int = getOperand(a, rm, ins.Args[0].ID)
 		if ptr < 0 { return }
 		aarch64.Add(a, true, rd, ptr, aarch64.Imm(fieldOff))
@@ -647,14 +312,14 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, s
 
 	if ins.Op == ir.OP_BRANCH {
 		// Args[0] = cond, Block1 = then, Block2 = else.
-		if ins.Block1 == nil || ins.Block2 == nil || len(ins.Args) < 1 {
+		if ins.Block1 == nil || ins.Block2 == nil ||
+			len(ins.Args) < 1 {
 			return
 		}
 		var condReg int = getOperand(a, rm, ins.Args[0].ID)
 		if condReg < 0 { return }
-		// cbnz <cond>, <then>   ; branch if cond != 0
-		// b    <else>           ; fall-through is always "else"
-		aarch64.Cbnz(a, true, condReg, blockLabel(funcSym, ins.Block1.Label))
+		aarch64.Cbnz(a, true, condReg,
+			blockLabel(funcSym, ins.Block1.Label))
 		aarch64.B(a, blockLabel(funcSym, ins.Block2.Label))
 		return
 	}
@@ -662,202 +327,5 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, s
 	if emitBinop(a, rm, ins) { return }
 	if emitUnop(a, rm, ins)  { return }
 
-	// Any other op is a no-op in this skeleton.  Intentional.
-}
-
-// emitBinop handles the integer arithmetic, bitwise, and shift ops.
-// Returns true if it matched and emitted code; false otherwise.
-func emitBinop(a @asm.Assembler, rm @regMap, ins @ir.Instr) bool {
-	if ins.Op != ir.OP_ADD &&
-		ins.Op != ir.OP_SUB &&
-		ins.Op != ir.OP_MUL &&
-		ins.Op != ir.OP_DIV &&
-		ins.Op != ir.OP_REM &&
-		ins.Op != ir.OP_AND &&
-		ins.Op != ir.OP_OR  &&
-		ins.Op != ir.OP_XOR &&
-		ins.Op != ir.OP_SHL &&
-		ins.Op != ir.OP_SHR {
-		return false
-	}
-	if len(ins.Args) != 2 { return false }
-
-	var lhs int = getOperand(a, rm, ins.Args[0].ID)
-	var rhs int = getOperand(a, rm, ins.Args[1].ID)
-	if lhs < 0 || rhs < 0 { return false }
-
-	var rd int = nextReg(rm, ins.ID)
-	var rhsOp aarch64.Operand = aarch64.Reg(rhs)
-
-	if ins.Op == ir.OP_ADD { aarch64.Add(a, true, rd, lhs, rhsOp); return true }
-	if ins.Op == ir.OP_SUB { aarch64.Sub(a, true, rd, lhs, rhsOp); return true }
-	if ins.Op == ir.OP_MUL { aarch64.Mul(a, true, rd, lhs, rhs);   return true }
-	if ins.Op == ir.OP_DIV { aarch64.Sdiv(a, true, rd, lhs, rhs);  return true }
-	// OP_REM: synthesize via SDIV + MSUB (rd = lhs - (lhs/rhs)*rhs).
-	if ins.Op == ir.OP_REM {
-		aarch64.Sdiv(a, true, rd, lhs, rhs)
-		aarch64.Msub(a, true, rd, rd, rhs, lhs)
-		return true
-	}
-	if ins.Op == ir.OP_AND { aarch64.And(a, true, rd, lhs, rhsOp); return true }
-	if ins.Op == ir.OP_OR  { aarch64.Orr(a, true, rd, lhs, rhsOp); return true }
-	if ins.Op == ir.OP_XOR { aarch64.Eor(a, true, rd, lhs, rhsOp); return true }
-	if ins.Op == ir.OP_SHL { aarch64.Lsl(a, true, rd, lhs, rhsOp); return true }
-	// OP_SHR: arithmetic shift right (preserves sign for signed ints).
-	if ins.Op == ir.OP_SHR { aarch64.Asr(a, true, rd, lhs, rhsOp); return true }
-	return false
-}
-
-// emitCompare handles OP_EQ/NE/LT/LE/GT/GE by emitting CMP + CSINC with
-// XZR (the CSET idiom). The assembler doesn't expose CSET directly, but
-// CSET Rd, cond ≡ CSINC Rd, XZR, XZR, invert(cond).
-func emitCompare(a @asm.Assembler, rm @regMap, ins @ir.Instr) bool {
-	if ins.Op != ir.OP_EQ && ins.Op != ir.OP_NE &&
-		ins.Op != ir.OP_LT && ins.Op != ir.OP_LE &&
-		ins.Op != ir.OP_GT && ins.Op != ir.OP_GE {
-		return false
-	}
-	if len(ins.Args) != 2 { return false }
-	var lhs int = getOperand(a, rm, ins.Args[0].ID)
-	var rhs int = getOperand(a, rm, ins.Args[1].ID)
-	if lhs < 0 || rhs < 0 { return false }
-
-	var rd int = nextReg(rm, ins.ID)
-	aarch64.Cmp(a, true, lhs, aarch64.Reg(rhs))
-
-	var invCond int = invertCondForOp(ins.Op)
-	// csinc rd, xzr, xzr, invCond : rd = invCond ? 0 : (0+1) = !invCond bit
-	aarch64.Csinc(a, true, rd, aarch64.XZR, aarch64.XZR, invCond)
-	return true
-}
-
-// invertCondForOp returns the AArch64 condition code that is the
-// logical inverse of the IR comparison, so `csinc rd,xzr,xzr,invCond`
-// sets rd=1 exactly when the comparison holds.
-func invertCondForOp(op int) int {
-	if op == ir.OP_EQ { return aarch64.COND_NE }
-	if op == ir.OP_NE { return aarch64.COND_EQ }
-	if op == ir.OP_LT { return aarch64.COND_GE }  // signed
-	if op == ir.OP_LE { return aarch64.COND_GT }  // signed
-	if op == ir.OP_GT { return aarch64.COND_LE }  // signed
-	return aarch64.COND_LT                         // OP_GE, signed
-}
-
-// emitUnop handles unary ops (-, ~). Returns true if matched.
-func emitUnop(a @asm.Assembler, rm @regMap, ins @ir.Instr) bool {
-	if ins.Op != ir.OP_NEG && ins.Op != ir.OP_BITNOT && ins.Op != ir.OP_NOT {
-		return false
-	}
-	if len(ins.Args) != 1 { return false }
-	var src int = getOperand(a, rm, ins.Args[0].ID)
-	if src < 0 { return false }
-
-	var rd int = nextReg(rm, ins.ID)
-	if ins.Op == ir.OP_NEG {
-		aarch64.Neg(a, true, rd, aarch64.Reg(src))
-		return true
-	}
-	if ins.Op == ir.OP_BITNOT {
-		aarch64.Mvn(a, true, rd, aarch64.Reg(src))
-		return true
-	}
-	// OP_NOT: logical negation on a bool. Flip bit 0:
-	//   eor rd, src, #1   (XOR with 1)
-	if ins.Op == ir.OP_NOT {
-		aarch64.Eor(a, true, rd, src, aarch64.Imm(1))
-		return true
-	}
-	return false
-}
-
-// emitCall moves args into X0..X7 and branches to the callee symbol.
-// If isBuiltin, ins.StrVal is already the mangled C symbol (e.g.
-// "bn_print_int") and only needs the Mach-O '_' prefix. Otherwise it's
-// a Binate-level name (e.g. "bootstrap.Exit") and goes through
-// pkg/mangle.FuncName.
-// Declares the callee as a global so Finalize emits a relocation rather
-// than failing with "undefined symbol."
-func emitCall(a @asm.Assembler, pkgName *[]char, rm @regMap, ins @ir.Instr, isBuiltin bool) {
-	for ai := 0; ai < len(ins.Args); ai++ {
-		var src int = getOperand(a, rm, ins.Args[ai].ID)
-		if src < 0 { continue }
-		aarch64.Mov(a, true, argReg(ai), aarch64.Reg(src))
-	}
-
-	var callee @[]char
-	if isBuiltin {
-		callee = underscorePrefix(ins.StrVal)
-	} else {
-		callee = symFor(pkgName, ins.StrVal)
-	}
-	asm.SetGlobal(a, callee)
-	aarch64.Bl(a, callee)
-
-	// BL clobbers X9..X15 (caller-saved). Any value the regmap was
-	// tracking is now dead (or already spilled to a stack slot if it's
-	// needed again — planFrame pre-allocated one slot per call result).
-	// Reset the register pool so subsequent values start at X9 again,
-	// then spill this call's return value if any.
-	resetRegs(rm)
-	if ins.ID >= 0 {
-		var spillOff int = lookupSpill(rm, ins.ID)
-		if spillOff >= 0 {
-			// Multi-return callers expect X0..X(N-1) packed at the slot.
-			var nRet int = 1
-			if ins.Typ != nil && ins.Typ.Kind == types.TYP_STRUCT {
-				nRet = len(ins.Typ.Fields)
-			}
-			for ri := 0; ri < nRet && ri < 8; ri++ {
-				aarch64.Str(a, true, argReg(ri), aarch64.MemImm(aarch64.SP, spillOff + 8*ri))
-			}
-		}
-	}
-}
-
-// spillAndReset spills the result of a just-emitted instruction to its
-// stack slot (if any) and then clears the register map. Called after
-// every instruction — sees the "spill everything" policy through: each
-// op loads operands, computes, then immediately hands off to memory.
-func spillAndReset(a @asm.Assembler, m @regMap, ins @ir.Instr) {
-	if ins.ID >= 0 {
-		var reg int = lookupReg(m, ins.ID)
-		if reg >= 0 {
-			var off int = lookupSpill(m, ins.ID)
-			if off >= 0 {
-				aarch64.Str(a, true, reg, aarch64.MemImm(aarch64.SP, off))
-			}
-		}
-	}
-	resetRegs(m)
-}
-
-// resetRegs clears the regmap after a BL: all live values in X9..X15
-// are gone, so we start from the top of the pool next time.
-func resetRegs(m @regMap) {
-	var emptyIDs @[]int
-	var emptyRegs @[]int
-	m.IDs = emptyIDs
-	m.Regs = emptyRegs
-	m.Next = 0
-}
-
-// underscorePrefix returns "_" + s, the Mach-O C-linkage convention.
-func underscorePrefix(s *[]char) @[]char {
-	var out buf.CharBuf = buf.New()
-	out = buf.WriteStr(out, "_")
-	out = buf.WriteStr(out, s)
-	return buf.Bytes(out)
-}
-
-// argReg returns the AArch64 register that carries the i-th integer arg
-// under the Procedure Call Standard (X0..X7).
-func argReg(i int) int {
-	if i == 0 { return aarch64.X0 }
-	if i == 1 { return aarch64.X1 }
-	if i == 2 { return aarch64.X2 }
-	if i == 3 { return aarch64.X3 }
-	if i == 4 { return aarch64.X4 }
-	if i == 5 { return aarch64.X5 }
-	if i == 6 { return aarch64.X6 }
-	return aarch64.X7
+	// Any other op is a no-op in this skeleton.
 }

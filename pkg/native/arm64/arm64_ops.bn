@@ -1,0 +1,260 @@
+package "pkg/native/arm64"
+
+import "pkg/asm"
+import "pkg/asm/aarch64"
+import "pkg/buf"
+import "pkg/ir"
+import "pkg/mangle"
+import "pkg/types"
+
+// ============================================================
+// Binary / unary / compare ops
+// ============================================================
+
+// emitBinop handles the integer arithmetic, bitwise, and shift ops.
+// Returns true if it matched and emitted code; false otherwise.
+func emitBinop(a @asm.Assembler, rm @regMap, ins @ir.Instr) bool {
+	if ins.Op != ir.OP_ADD &&
+		ins.Op != ir.OP_SUB &&
+		ins.Op != ir.OP_MUL &&
+		ins.Op != ir.OP_DIV &&
+		ins.Op != ir.OP_REM &&
+		ins.Op != ir.OP_AND &&
+		ins.Op != ir.OP_OR  &&
+		ins.Op != ir.OP_XOR &&
+		ins.Op != ir.OP_SHL &&
+		ins.Op != ir.OP_SHR {
+		return false
+	}
+	if len(ins.Args) != 2 { return false }
+
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	var rhs int = getOperand(a, rm, ins.Args[1].ID)
+	if lhs < 0 || rhs < 0 { return false }
+
+	var rd int = nextReg(rm, ins.ID)
+	var rhsOp aarch64.Operand = aarch64.Reg(rhs)
+
+	if ins.Op == ir.OP_ADD { aarch64.Add(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_SUB { aarch64.Sub(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_MUL { aarch64.Mul(a, true, rd, lhs, rhs);   return true }
+	if ins.Op == ir.OP_DIV { aarch64.Sdiv(a, true, rd, lhs, rhs);  return true }
+	// OP_REM: synthesize via SDIV + MSUB (rd = lhs - (lhs/rhs)*rhs).
+	if ins.Op == ir.OP_REM {
+		aarch64.Sdiv(a, true, rd, lhs, rhs)
+		aarch64.Msub(a, true, rd, rd, rhs, lhs)
+		return true
+	}
+	if ins.Op == ir.OP_AND { aarch64.And(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_OR  { aarch64.Orr(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_XOR { aarch64.Eor(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_SHL { aarch64.Lsl(a, true, rd, lhs, rhsOp); return true }
+	// OP_SHR: arithmetic shift right (preserves sign for signed ints).
+	if ins.Op == ir.OP_SHR { aarch64.Asr(a, true, rd, lhs, rhsOp); return true }
+	return false
+}
+
+// emitCompare handles OP_EQ/NE/LT/LE/GT/GE by emitting CMP + CSINC with
+// XZR (the CSET idiom). The assembler doesn't expose CSET directly, but
+// CSET Rd, cond ≡ CSINC Rd, XZR, XZR, invert(cond).
+func emitCompare(a @asm.Assembler, rm @regMap, ins @ir.Instr) bool {
+	if ins.Op != ir.OP_EQ && ins.Op != ir.OP_NE &&
+		ins.Op != ir.OP_LT && ins.Op != ir.OP_LE &&
+		ins.Op != ir.OP_GT && ins.Op != ir.OP_GE {
+		return false
+	}
+	if len(ins.Args) != 2 { return false }
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	var rhs int = getOperand(a, rm, ins.Args[1].ID)
+	if lhs < 0 || rhs < 0 { return false }
+
+	var rd int = nextReg(rm, ins.ID)
+	aarch64.Cmp(a, true, lhs, aarch64.Reg(rhs))
+
+	var invCond int = invertCondForOp(ins.Op)
+	aarch64.Csinc(a, true, rd, aarch64.XZR, aarch64.XZR, invCond)
+	return true
+}
+
+// invertCondForOp returns the AArch64 condition code that is the
+// logical inverse of the IR comparison, so `csinc rd,xzr,xzr,invCond`
+// sets rd=1 exactly when the comparison holds.
+func invertCondForOp(op int) int {
+	if op == ir.OP_EQ { return aarch64.COND_NE }
+	if op == ir.OP_NE { return aarch64.COND_EQ }
+	if op == ir.OP_LT { return aarch64.COND_GE }  // signed
+	if op == ir.OP_LE { return aarch64.COND_GT }  // signed
+	if op == ir.OP_GT { return aarch64.COND_LE }  // signed
+	return aarch64.COND_LT                         // OP_GE, signed
+}
+
+// emitUnop handles unary ops (-, ~, !). Returns true if matched.
+func emitUnop(a @asm.Assembler, rm @regMap, ins @ir.Instr) bool {
+	if ins.Op != ir.OP_NEG && ins.Op != ir.OP_BITNOT && ins.Op != ir.OP_NOT {
+		return false
+	}
+	if len(ins.Args) != 1 { return false }
+	var src int = getOperand(a, rm, ins.Args[0].ID)
+	if src < 0 { return false }
+
+	var rd int = nextReg(rm, ins.ID)
+	if ins.Op == ir.OP_NEG {
+		aarch64.Neg(a, true, rd, aarch64.Reg(src))
+		return true
+	}
+	if ins.Op == ir.OP_BITNOT {
+		aarch64.Mvn(a, true, rd, aarch64.Reg(src))
+		return true
+	}
+	// OP_NOT: logical negation on a bool. Flip bit 0.
+	if ins.Op == ir.OP_NOT {
+		aarch64.Eor(a, true, rd, src, aarch64.Imm(1))
+		return true
+	}
+	return false
+}
+
+// ============================================================
+// Function calls and struct copy
+// ============================================================
+
+// emitCall moves args into X0..X7 and branches to the callee symbol.
+// If isBuiltin, ins.StrVal is already the mangled C symbol (e.g.
+// "bn_print_int") and only needs the Mach-O '_' prefix. Otherwise it's
+// a Binate-level name and goes through pkg/mangle.FuncName.
+// Declares the callee as a global so Finalize emits a relocation
+// rather than failing with "undefined symbol."
+func emitCall(a @asm.Assembler, pkgName *[]char, rm @regMap,
+	ins @ir.Instr, isBuiltin bool) {
+	for ai := 0; ai < len(ins.Args); ai++ {
+		var src int = getOperand(a, rm, ins.Args[ai].ID)
+		if src < 0 { continue }
+		aarch64.Mov(a, true, argReg(ai), aarch64.Reg(src))
+	}
+
+	var callee @[]char
+	if isBuiltin {
+		callee = underscorePrefix(ins.StrVal)
+	} else {
+		callee = symFor(pkgName, ins.StrVal)
+	}
+	asm.SetGlobal(a, callee)
+	aarch64.Bl(a, callee)
+
+	// BL clobbers X9..X15. Reset the pool, then spill this call's
+	// return value(s) directly to the slot so later uses can reload.
+	resetRegs(rm)
+	if ins.ID >= 0 {
+		var spillOff int = lookupSpill(rm, ins.ID)
+		if spillOff >= 0 {
+			var nRet int = 1
+			if ins.Typ != nil && ins.Typ.Kind == types.TYP_STRUCT {
+				nRet = len(ins.Typ.Fields)
+			}
+			for ri := 0; ri < nRet && ri < 8; ri++ {
+				aarch64.Str(a, true, argReg(ri),
+					aarch64.MemImm(aarch64.SP, spillOff + 8*ri))
+			}
+		}
+	}
+}
+
+// emitStructCopy lowers an OP_STORE that is copying a struct (or
+// array) as a byte-for-byte memcpy. Source pointer comes from Args[1]
+// (which, per OP_LOAD's struct handling, is a pointer in a register);
+// dest from Args[0].
+func emitStructCopy(a @asm.Assembler, rm @regMap, ins @ir.Instr) {
+	var sz int = types.SizeOf(ins.Args[1].Typ)
+	if sz <= 0 { return }
+
+	var srcPtr int = getOperand(a, rm, ins.Args[1].ID)
+	if srcPtr < 0 { return }
+
+	var dstPtr int
+	var allocOff int = lookupAlloc(rm, ins.Args[0].ID)
+	if allocOff >= 0 {
+		dstPtr = scratchReg(rm)
+		aarch64.Add(a, true, dstPtr, aarch64.SP, aarch64.Imm(allocOff))
+	} else {
+		dstPtr = getOperand(a, rm, ins.Args[0].ID)
+	}
+	if dstPtr < 0 { return }
+
+	var tmp int = scratchReg(rm)
+	for off := 0; off < sz; off = off + 8 {
+		aarch64.Ldr(a, true, tmp, aarch64.MemImm(srcPtr, off))
+		aarch64.Str(a, true, tmp, aarch64.MemImm(dstPtr, off))
+	}
+}
+
+// emitEpilogueAndRet tears down the frame.
+func emitEpilogueAndRet(a @asm.Assembler, frameSize int) {
+	if frameSize > 0 {
+		aarch64.Add(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(frameSize))
+	}
+	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR,
+		aarch64.MemPost(aarch64.SP, 16))
+	aarch64.Ret(a)
+}
+
+// ============================================================
+// Name helpers
+// ============================================================
+
+// symFor mangles a Binate (pkgName, funcName) pair to a Mach-O symbol,
+// prepending the '_' required by Mach-O C-linkage.
+func symFor(pkgName *[]char, funcName *[]char) @[]char {
+	var mangled buf.CharBuf = mangle.FuncName(pkgName, funcName)
+	var out buf.CharBuf = buf.New()
+	out = buf.WriteStr(out, "_")
+	out = buf.WriteStr(out, buf.Bytes(mangled))
+	return buf.Bytes(out)
+}
+
+// underscorePrefix returns "_" + s, the Mach-O C-linkage convention.
+func underscorePrefix(s *[]char) @[]char {
+	var out buf.CharBuf = buf.New()
+	out = buf.WriteStr(out, "_")
+	out = buf.WriteStr(out, s)
+	return buf.Bytes(out)
+}
+
+// argReg returns the AArch64 register that carries the i-th integer
+// arg under the Procedure Call Standard (X0..X7).
+func argReg(i int) int {
+	if i == 0 { return aarch64.X0 }
+	if i == 1 { return aarch64.X1 }
+	if i == 2 { return aarch64.X2 }
+	if i == 3 { return aarch64.X3 }
+	if i == 4 { return aarch64.X4 }
+	if i == 5 { return aarch64.X5 }
+	if i == 6 { return aarch64.X6 }
+	return aarch64.X7
+}
+
+// stringLabel is the local asm label for string constant <id>.
+func stringLabel(id int) @[]char {
+	var out buf.CharBuf = buf.New()
+	out = buf.WriteStr(out, "Lstr_")
+	out = buf.WriteInt(out, id)
+	return buf.Bytes(out)
+}
+
+// blockLabel mints a function-scoped label name for a basic block.
+// The 'L' prefix keeps it out of the exported symbol list.
+func blockLabel(funcSym @[]char, blockLabel @[]char) @[]char {
+	var out buf.CharBuf = buf.New()
+	out = buf.WriteStr(out, "L")
+	out = buf.WriteStr(out, funcSym)
+	out = buf.WriteStr(out, "__")
+	out = buf.WriteStr(out, blockLabel)
+	return buf.Bytes(out)
+}
+
+// stripQuotes strips surrounding '"' from a string (if present).
+func stripQuotes(s *[]char) *[]char {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1:len(s)-1]
+	}
+	return s
+}

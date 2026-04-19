@@ -52,6 +52,7 @@ type regMap struct {
 	// references the same frame slot every time).
 	AllocIDs     @[]int   // SSA IDs of OP_ALLOC instructions
 	AllocOffsets @[]int   // SP-relative offset for each AllocIDs entry
+	AllocSizes   @[]int   // byte size of each alloca slot (for zero-init)
 
 	// Spill-slot map: every call result (and later, any value live across
 	// a regmap reset) is immediately spilled to a stack slot so a later
@@ -67,6 +68,72 @@ func lookupAlloc(m @regMap, id int) int {
 		if m.AllocIDs[i] == id { return m.AllocOffsets[i] }
 	}
 	return -1
+}
+
+// lookupAllocSize returns the byte size of an alloca slot, or -1.
+func lookupAllocSize(m @regMap, id int) int {
+	for i := 0; i < len(m.AllocIDs); i++ {
+		if m.AllocIDs[i] == id { return m.AllocSizes[i] }
+	}
+	return -1
+}
+
+// isAggregateTyp reports whether a type is a struct or array — i.e.,
+// not an in-register value.
+func isAggregateTyp(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_STRUCT || t.Kind == types.TYP_ARRAY
+}
+
+// emitStructCopy lowers an OP_STORE that is copying a struct (or
+// array) as a byte-for-byte memcpy. Source pointer comes from Args[1]
+// (which, per OP_LOAD's struct handling, is a pointer in a register);
+// dest from Args[0].
+func emitStructCopy(a @asm.Assembler, rm @regMap, ins @ir.Instr) {
+	var sz int = types.SizeOf(ins.Args[1].Typ)
+	if sz <= 0 { return }
+
+	var srcPtr int = getOperand(a, rm, ins.Args[1].ID)
+	if srcPtr < 0 { return }
+
+	var dstPtr int
+	var allocOff int = lookupAlloc(rm, ins.Args[0].ID)
+	if allocOff >= 0 {
+		dstPtr = scratchReg(rm)
+		aarch64.Add(a, true, dstPtr, aarch64.SP, aarch64.Imm(allocOff))
+	} else {
+		dstPtr = getOperand(a, rm, ins.Args[0].ID)
+	}
+	if dstPtr < 0 { return }
+
+	var tmp int = scratchReg(rm)
+	for off := 0; off < sz; off = off + 8 {
+		aarch64.Ldr(a, true, tmp, aarch64.MemImm(srcPtr, off))
+		aarch64.Str(a, true, tmp, aarch64.MemImm(dstPtr, off))
+	}
+}
+
+// scratchReg hands out an ephemeral register (not registered in the
+// id→reg map). Used when we need working registers that won't outlive
+// the current instruction.
+func scratchReg(m @regMap) int {
+	var r int = regPool(m.Next)
+	m.Next = m.Next + 1
+	return r
+}
+
+// structTypeOf returns the struct type underlying a pointer-valued
+// instruction (OP_ALLOC with struct TypeArg, OP_GET_FIELD_PTR to a
+// nested struct field, etc.). Returns nil if not available.
+func structTypeOf(ins @ir.Instr) @types.Type {
+	if ins == nil { return nil }
+	if ins.TypeArg != nil && ins.TypeArg.Kind == types.TYP_STRUCT {
+		return ins.TypeArg
+	}
+	if ins.Typ != nil && ins.Typ.Elem != nil {
+		if ins.Typ.Elem.Kind == types.TYP_STRUCT { return ins.Typ.Elem }
+	}
+	return nil
 }
 
 // regPool is the callee-clobbering scratch set we hand out to values.
@@ -196,6 +263,14 @@ func emitFunc(a @asm.Assembler, pkgName *[]char, f @ir.Func, strings @[]ir.Strin
 	if frameSize > 0 {
 		aarch64.Sub(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(frameSize))
 	}
+	// Spill incoming parameter registers to their stack slots so later
+	// uses (which go through getOperand → spill reload) see them.
+	for pi := 0; pi < len(f.Params) && pi < 8; pi++ {
+		var off int = lookupSpill(rm, f.Params[pi].ID)
+		if off >= 0 {
+			aarch64.Str(a, true, argReg(pi), aarch64.MemImm(aarch64.SP, off))
+		}
+	}
 
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var b @ir.Block = f.Blocks[bi]
@@ -203,21 +278,16 @@ func emitFunc(a @asm.Assembler, pkgName *[]char, f @ir.Func, strings @[]ir.Strin
 		if bi > 0 {
 			asm.DefineLabel(a, blockLabel(sym, b.Label))
 		}
-		// Each block starts with a fresh regmap (no SSA values are
-		// considered live across block boundaries; cross-block values
-		// flow through allocas).
+		// Each block starts with a fresh regmap. Cross-block values
+		// (and now all value-producing instructions) flow through
+		// spill slots.
 		resetRegs(rm)
-		// In the entry block, seed the regmap so the first N params
-		// are visible as X0..X7 (AArch64 PCS). IR typically spills
-		// them into allocas immediately; the seed makes the initial
-		// store find the value.
-		if bi == 0 {
-			for pi := 0; pi < len(f.Params) && pi < 8; pi++ {
-				assignReg(rm, f.Params[pi].ID, argReg(pi))
-			}
-		}
 		for ii := 0; ii < len(b.Instrs); ii++ {
 			emitInstr(a, pkgName, sym, rm, strings, b.Instrs[ii])
+			// Spill the result (if this instruction produced a value)
+			// and reset the register pool. emitCall handles its own
+			// spill/reset internally, so this is a no-op for calls.
+			spillAndReset(a, rm, b.Instrs[ii])
 		}
 	}
 
@@ -236,37 +306,62 @@ func blockLabel(funcSym @[]char, blockLabel @[]char) @[]char {
 	return buf.Bytes(out)
 }
 
-// planFrame assigns each OP_ALLOC and each non-void call result a
-// positive SP-relative stack slot and returns the frame size
-// (16-byte aligned). Positive offsets avoid the negative-immediate
-// limitation of AArch64's scaled LDR/STR encoding. Walking-skeleton
-// assumption: every slot is 8 bytes.
+// planFrame assigns a stack slot to every function parameter and every
+// value-producing SSA instruction (allocas sized by types.SizeOf;
+// every other non-void value gets 8 bytes for spill-after-compute).
+// Returns the 16-byte aligned frame size.
+//
+// The "spill everything" policy keeps the register pool from
+// overflowing: the 7-register rotating pool was enough when values
+// were short-lived but broke on larger expressions (struct literal
+// init had 10+ live values simultaneously, and all extras collided
+// on X15). Now each op loads operands, computes, and immediately
+// spills its result; subsequent uses reload via getOperand.
+// Slow but correct.
 func planFrame(m @regMap, f @ir.Func) int {
-	var count int = 0
+	var offset int = 0
+	// Each parameter gets a spill slot, populated at function entry
+	// from its ABI register (X0..X7) so later uses can reload.
+	for pi := 0; pi < len(f.Params); pi++ {
+		m.SpillIDs = appendInt(m.SpillIDs, f.Params[pi].ID)
+		m.SpillOffsets = appendInt(m.SpillOffsets, offset)
+		offset = offset + 8
+	}
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var b @ir.Block = f.Blocks[bi]
 		for ii := 0; ii < len(b.Instrs); ii++ {
 			var ins @ir.Instr = b.Instrs[ii]
 			if ins.Op == ir.OP_ALLOC {
+				var sz int = 8
+				if ins.TypeArg != nil { sz = types.SizeOf(ins.TypeArg) }
+				if sz < 8 { sz = 8 }
+				if sz % 8 != 0 { sz = sz + (8 - sz % 8) }
 				m.AllocIDs = appendInt(m.AllocIDs, ins.ID)
-				m.AllocOffsets = appendInt(m.AllocOffsets, 8 * count)
-				count = count + 1
-			} else if ins.Op == ir.OP_CALL || ins.Op == ir.OP_CALL_BUILTIN {
-				// Every call result gets a spill slot so later uses
-				// survive regmap resets (see emitCall).
-				if ins.ID >= 0 && !callReturnsVoid(ins) {
-					m.SpillIDs = appendInt(m.SpillIDs, ins.ID)
-					m.SpillOffsets = appendInt(m.SpillOffsets, 8 * count)
-					count = count + 1
-				}
+				m.AllocSizes = appendInt(m.AllocSizes, sz)
+				m.AllocOffsets = appendInt(m.AllocOffsets, offset)
+				offset = offset + sz
+			} else if ins.ID >= 0 && !instrIsVoid(ins) {
+				m.SpillIDs = appendInt(m.SpillIDs, ins.ID)
+				m.SpillOffsets = appendInt(m.SpillOffsets, offset)
+				offset = offset + 8
 			}
 		}
 	}
-	var size int = count * 8
+	var size int = offset
 	if size % 16 != 0 {
 		size = size + (16 - size % 16)
 	}
 	return size
+}
+
+// instrIsVoid reports whether an instruction produces no SSA value.
+// Void-producing ops (OP_RETURN, OP_JUMP, OP_BRANCH, OP_STORE,
+// OP_NIL_CHECK, REFCOUNT_INC/DEC, etc.) have ID == -1 by convention;
+// here we also catch the case where Typ indicates void.
+func instrIsVoid(ins @ir.Instr) bool {
+	if ins.ID < 0 { return true }
+	if ins.Typ == nil { return true }
+	return ins.Typ.Kind == types.TYP_VOID
 }
 
 // callReturnsVoid returns true if an OP_CALL/OP_CALL_BUILTIN has no
@@ -301,9 +396,12 @@ func getOperand(a @asm.Assembler, m @regMap, id int) int {
 }
 
 // frameSizeFromRegMap recomputes the frame size from the planFrame
-// entries. Matches planFrame's size rule: allocas + call spill slots.
+// entries. Sums each alloca's actual size (structs can be > 8 bytes)
+// plus 8 bytes per call spill slot, rounded up to 16.
 func frameSizeFromRegMap(m @regMap) int {
-	var size int = (len(m.AllocIDs) + len(m.SpillIDs)) * 8
+	var size int = 0
+	for i := 0; i < len(m.AllocSizes); i++ { size = size + m.AllocSizes[i] }
+	size = size + len(m.SpillIDs) * 8
 	if size % 16 != 0 { size = size + (16 - size % 16) }
 	return size
 }
@@ -379,28 +477,95 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, s
 	}
 
 	if ins.Op == ir.OP_ALLOC {
-		// Offset already assigned in planFrame; no code needed here.
+		// Offset was assigned in planFrame. If this is a struct or
+		// array alloca, emit zero-init stores so the semantics match
+		// the LLVM backend (`store ... zeroinitializer`).
+		if ins.TypeArg != nil {
+			if ins.TypeArg.Kind == types.TYP_STRUCT ||
+				ins.TypeArg.Kind == types.TYP_ARRAY {
+				var off int = lookupAlloc(rm, ins.ID)
+				var sz int = lookupAllocSize(rm, ins.ID)
+				if off >= 0 && sz > 0 {
+					// str xzr, [sp, #off]  (8 bytes at a time)
+					for bo := 0; bo < sz; bo = bo + 8 {
+						aarch64.Str(a, true, aarch64.XZR, aarch64.MemImm(aarch64.SP, off + bo))
+					}
+				}
+			}
+		}
 		return
 	}
 
 	if ins.Op == ir.OP_LOAD {
 		if len(ins.Args) < 1 { return }
+		// Struct/array load: pass the source pointer through; the IR
+		// uses LOAD+STORE as a struct copy idiom, and the subsequent
+		// store does the memcpy.
+		if isAggregateTyp(ins.Typ) {
+			var rd int = nextReg(rm, ins.ID)
+			var allocOff int = lookupAlloc(rm, ins.Args[0].ID)
+			if allocOff >= 0 {
+				aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(allocOff))
+			} else {
+				var src int = getOperand(a, rm, ins.Args[0].ID)
+				if src < 0 { return }
+				aarch64.Mov(a, true, rd, aarch64.Reg(src))
+			}
+			return
+		}
+		// Scalar load.
 		var off int = lookupAlloc(rm, ins.Args[0].ID)
 		if off >= 0 {
 			var rd int = nextReg(rm, ins.ID)
 			aarch64.Ldr(a, true, rd, aarch64.MemImm(aarch64.SP, off))
+			return
 		}
+		var ptr int = getOperand(a, rm, ins.Args[0].ID)
+		if ptr < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Ldr(a, true, rd, aarch64.MemImm(ptr, 0))
 		return
 	}
 
 	if ins.Op == ir.OP_STORE {
-		// Args[0] = pointer destination, Args[1] = value.
+		// Args[0] = pointer destination, Args[1] = value (or source pointer
+		// if the IR "value" is actually a struct/array — see OP_LOAD).
 		if len(ins.Args) < 2 { return }
+		if isAggregateTyp(ins.Args[1].Typ) {
+			emitStructCopy(a, rm, ins)
+			return
+		}
+		// Scalar store.
 		var off int = lookupAlloc(rm, ins.Args[0].ID)
 		var valReg int = getOperand(a, rm, ins.Args[1].ID)
-		if off >= 0 && valReg >= 0 {
+		if valReg < 0 { return }
+		if off >= 0 {
 			aarch64.Str(a, true, valReg, aarch64.MemImm(aarch64.SP, off))
+			return
 		}
+		var ptr int = getOperand(a, rm, ins.Args[0].ID)
+		if ptr < 0 { return }
+		aarch64.Str(a, true, valReg, aarch64.MemImm(ptr, 0))
+		return
+	}
+
+	if ins.Op == ir.OP_GET_FIELD_PTR {
+		// Args[0] = struct pointer, Index = field index.
+		if len(ins.Args) < 1 { return }
+		var baseTyp @types.Type = structTypeOf(ins.Args[0])
+		if baseTyp == nil { return }
+		var fieldOff int = types.FieldOffset(baseTyp, ins.Index)
+		var rd int = nextReg(rm, ins.ID)
+		// If base is an alloca, compute address relative to SP.
+		var allocOff int = lookupAlloc(rm, ins.Args[0].ID)
+		if allocOff >= 0 {
+			aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(allocOff + fieldOff))
+			return
+		}
+		// Otherwise the base is a pointer in a register.
+		var ptr int = getOperand(a, rm, ins.Args[0].ID)
+		if ptr < 0 { return }
+		aarch64.Add(a, true, rd, ptr, aarch64.Imm(fieldOff))
 		return
 	}
 
@@ -570,6 +735,23 @@ func emitCall(a @asm.Assembler, pkgName *[]char, rm @regMap, ins @ir.Instr, isBu
 			aarch64.Str(a, true, aarch64.X0, aarch64.MemImm(aarch64.SP, spillOff))
 		}
 	}
+}
+
+// spillAndReset spills the result of a just-emitted instruction to its
+// stack slot (if any) and then clears the register map. Called after
+// every instruction — sees the "spill everything" policy through: each
+// op loads operands, computes, then immediately hands off to memory.
+func spillAndReset(a @asm.Assembler, m @regMap, ins @ir.Instr) {
+	if ins.ID >= 0 {
+		var reg int = lookupReg(m, ins.ID)
+		if reg >= 0 {
+			var off int = lookupSpill(m, ins.ID)
+			if off >= 0 {
+				aarch64.Str(a, true, reg, aarch64.MemImm(aarch64.SP, off))
+			}
+		}
+	}
+	resetRegs(m)
 }
 
 // resetRegs clears the regmap after a BL: all live values in X9..X15

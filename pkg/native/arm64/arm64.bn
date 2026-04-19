@@ -6,6 +6,7 @@ import "pkg/asm/macho"
 import "pkg/buf"
 import "pkg/ir"
 import "pkg/mangle"
+import "pkg/types"
 
 // ============================================================
 // Small helpers
@@ -50,7 +51,13 @@ type regMap struct {
 	// address is stable for the whole function; LOAD/STORE through it
 	// references the same frame slot every time).
 	AllocIDs     @[]int   // SSA IDs of OP_ALLOC instructions
-	AllocOffsets @[]int   // negative FP offset for each AllocIDs entry
+	AllocOffsets @[]int   // SP-relative offset for each AllocIDs entry
+
+	// Spill-slot map: every call result (and later, any value live across
+	// a regmap reset) is immediately spilled to a stack slot so a later
+	// use can reload it. Also survives regmap resets.
+	SpillIDs     @[]int
+	SpillOffsets @[]int
 }
 
 // lookupAlloc returns the SP-relative offset of an OP_ALLOC value, or
@@ -166,6 +173,15 @@ func emitFunc(a @asm.Assembler, pkgName *[]char, f @ir.Func) {
 		// considered live across block boundaries; cross-block values
 		// flow through allocas).
 		resetRegs(rm)
+		// In the entry block, seed the regmap so the first N params
+		// are visible as X0..X7 (AArch64 PCS). IR typically spills
+		// them into allocas immediately; the seed makes the initial
+		// store find the value.
+		if bi == 0 {
+			for pi := 0; pi < len(f.Params) && pi < 8; pi++ {
+				assignReg(rm, f.Params[pi].ID, argReg(pi))
+			}
+		}
 		for ii := 0; ii < len(b.Instrs); ii++ {
 			emitInstr(a, pkgName, sym, rm, b.Instrs[ii])
 		}
@@ -186,21 +202,30 @@ func blockLabel(funcSym @[]char, blockLabel @[]char) @[]char {
 	return buf.Bytes(out)
 }
 
-// planFrame assigns each OP_ALLOC a positive SP-relative offset and
-// returns the frame size (16-byte aligned). Positive offsets avoid the
-// negative-immediate limitation of AArch64's scaled LDR/STR encoding
-// (which only supports unsigned imm12). Walking-skeleton assumption:
-// every alloca is 8 bytes (TypInt-sized).
+// planFrame assigns each OP_ALLOC and each non-void call result a
+// positive SP-relative stack slot and returns the frame size
+// (16-byte aligned). Positive offsets avoid the negative-immediate
+// limitation of AArch64's scaled LDR/STR encoding. Walking-skeleton
+// assumption: every slot is 8 bytes.
 func planFrame(m @regMap, f @ir.Func) int {
 	var count int = 0
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var b @ir.Block = f.Blocks[bi]
 		for ii := 0; ii < len(b.Instrs); ii++ {
 			var ins @ir.Instr = b.Instrs[ii]
-			if ins.Op != ir.OP_ALLOC { continue }
-			m.AllocIDs = appendInt(m.AllocIDs, ins.ID)
-			m.AllocOffsets = appendInt(m.AllocOffsets, 8 * count)
-			count = count + 1
+			if ins.Op == ir.OP_ALLOC {
+				m.AllocIDs = appendInt(m.AllocIDs, ins.ID)
+				m.AllocOffsets = appendInt(m.AllocOffsets, 8 * count)
+				count = count + 1
+			} else if ins.Op == ir.OP_CALL || ins.Op == ir.OP_CALL_BUILTIN {
+				// Every call result gets a spill slot so later uses
+				// survive regmap resets (see emitCall).
+				if ins.ID >= 0 && !callReturnsVoid(ins) {
+					m.SpillIDs = appendInt(m.SpillIDs, ins.ID)
+					m.SpillOffsets = appendInt(m.SpillOffsets, 8 * count)
+					count = count + 1
+				}
+			}
 		}
 	}
 	var size int = count * 8
@@ -210,10 +235,41 @@ func planFrame(m @regMap, f @ir.Func) int {
 	return size
 }
 
-// frameSizeFromRegMap recomputes the frame size from the number of
-// AllocIDs registered. Matches planFrame's size rule.
+// callReturnsVoid returns true if an OP_CALL/OP_CALL_BUILTIN has no
+// result (e.g. bn_print_int, bootstrap.Exit).
+func callReturnsVoid(ins @ir.Instr) bool {
+	if ins.Typ == nil { return true }
+	return ins.Typ.Kind == types.TYP_VOID
+}
+
+// lookupSpill returns the SP-relative slot for a spilled SSA value,
+// or -1 if not spilled.
+func lookupSpill(m @regMap, id int) int {
+	for i := 0; i < len(m.SpillIDs); i++ {
+		if m.SpillIDs[i] == id { return m.SpillOffsets[i] }
+	}
+	return -1
+}
+
+// getOperand returns the register holding SSA id, loading from the
+// spill slot into a fresh scratch register if necessary. Returns -1
+// if the value is neither in the regmap nor spilled.
+func getOperand(a @asm.Assembler, m @regMap, id int) int {
+	var r int = lookupReg(m, id)
+	if r >= 0 { return r }
+	var off int = lookupSpill(m, id)
+	if off >= 0 {
+		var rd int = nextReg(m, id)
+		aarch64.Ldr(a, true, rd, aarch64.MemImm(aarch64.SP, off))
+		return rd
+	}
+	return -1
+}
+
+// frameSizeFromRegMap recomputes the frame size from the planFrame
+// entries. Matches planFrame's size rule: allocas + call spill slots.
 func frameSizeFromRegMap(m @regMap) int {
-	var size int = len(m.AllocIDs) * 8
+	var size int = (len(m.AllocIDs) + len(m.SpillIDs)) * 8
 	if size % 16 != 0 { size = size + (16 - size % 16) }
 	return size
 }
@@ -268,6 +324,14 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, i
 	}
 
 	if ins.Op == ir.OP_RETURN {
+		// Single return value goes in X0. Multi-return is not yet
+		// supported (walking skeleton).
+		if len(ins.Args) >= 1 {
+			var src int = getOperand(a, rm, ins.Args[0].ID)
+			if src >= 0 && src != aarch64.X0 {
+				aarch64.Mov(a, true, aarch64.X0, aarch64.Reg(src))
+			}
+		}
 		emitEpilogueAndRet(a, frameSizeFromRegMap(rm))
 		return
 	}
@@ -291,7 +355,7 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, i
 		// Args[0] = pointer destination, Args[1] = value.
 		if len(ins.Args) < 2 { return }
 		var off int = lookupAlloc(rm, ins.Args[0].ID)
-		var valReg int = lookupReg(rm, ins.Args[1].ID)
+		var valReg int = getOperand(a, rm, ins.Args[1].ID)
 		if off >= 0 && valReg >= 0 {
 			aarch64.Str(a, true, valReg, aarch64.MemImm(aarch64.SP, off))
 		}
@@ -309,7 +373,7 @@ func emitInstr(a @asm.Assembler, pkgName *[]char, funcSym @[]char, rm @regMap, i
 		if ins.Block1 == nil || ins.Block2 == nil || len(ins.Args) < 1 {
 			return
 		}
-		var condReg int = lookupReg(rm, ins.Args[0].ID)
+		var condReg int = getOperand(a, rm, ins.Args[0].ID)
 		if condReg < 0 { return }
 		// cbnz <cond>, <then>   ; branch if cond != 0
 		// b    <else>           ; fall-through is always "else"
@@ -341,8 +405,8 @@ func emitBinop(a @asm.Assembler, rm @regMap, ins @ir.Instr) bool {
 	}
 	if len(ins.Args) != 2 { return false }
 
-	var lhs int = lookupReg(rm, ins.Args[0].ID)
-	var rhs int = lookupReg(rm, ins.Args[1].ID)
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	var rhs int = getOperand(a, rm, ins.Args[1].ID)
 	if lhs < 0 || rhs < 0 { return false }
 
 	var rd int = nextReg(rm, ins.ID)
@@ -377,8 +441,8 @@ func emitCompare(a @asm.Assembler, rm @regMap, ins @ir.Instr) bool {
 		return false
 	}
 	if len(ins.Args) != 2 { return false }
-	var lhs int = lookupReg(rm, ins.Args[0].ID)
-	var rhs int = lookupReg(rm, ins.Args[1].ID)
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	var rhs int = getOperand(a, rm, ins.Args[1].ID)
 	if lhs < 0 || rhs < 0 { return false }
 
 	var rd int = nextReg(rm, ins.ID)
@@ -408,7 +472,7 @@ func emitUnop(a @asm.Assembler, rm @regMap, ins @ir.Instr) bool {
 		return false
 	}
 	if len(ins.Args) != 1 { return false }
-	var src int = lookupReg(rm, ins.Args[0].ID)
+	var src int = getOperand(a, rm, ins.Args[0].ID)
 	if src < 0 { return false }
 
 	var rd int = nextReg(rm, ins.ID)
@@ -438,7 +502,7 @@ func emitUnop(a @asm.Assembler, rm @regMap, ins @ir.Instr) bool {
 // than failing with "undefined symbol."
 func emitCall(a @asm.Assembler, pkgName *[]char, rm @regMap, ins @ir.Instr, isBuiltin bool) {
 	for ai := 0; ai < len(ins.Args); ai++ {
-		var src int = lookupReg(rm, ins.Args[ai].ID)
+		var src int = getOperand(a, rm, ins.Args[ai].ID)
 		if src < 0 { continue }
 		aarch64.Mov(a, true, argReg(ai), aarch64.Reg(src))
 	}
@@ -452,13 +516,17 @@ func emitCall(a @asm.Assembler, pkgName *[]char, rm @regMap, ins @ir.Instr, isBu
 	asm.SetGlobal(a, callee)
 	aarch64.Bl(a, callee)
 
-	// BL clobbers X9..X15 (caller-saved). Under the walking-skeleton
-	// assumption "nothing is live across a call", the old regmap is
-	// dead. Clear it so subsequent values start at X9 again, and the
-	// 7-register pool isn't exhausted by the first handful of values.
+	// BL clobbers X9..X15 (caller-saved). Any value the regmap was
+	// tracking is now dead (or already spilled to a stack slot if it's
+	// needed again — planFrame pre-allocated one slot per call result).
+	// Reset the register pool so subsequent values start at X9 again,
+	// then spill this call's return value if any.
 	resetRegs(rm)
 	if ins.ID >= 0 {
-		assignReg(rm, ins.ID, aarch64.X0)
+		var spillOff int = lookupSpill(rm, ins.ID)
+		if spillOff >= 0 {
+			aarch64.Str(a, true, aarch64.X0, aarch64.MemImm(aarch64.SP, spillOff))
+		}
 	}
 }
 

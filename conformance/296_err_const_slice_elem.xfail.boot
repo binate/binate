@@ -1,1 +1,1 @@
-bootstrap does not parse `const` type modifier
+bootstrap does not enforce const

@@ -1,0 +1,285 @@
+package "pkg/native/common"
+
+import "pkg/ir"
+import "pkg/types"
+
+// ============================================================
+// RegMap — layout for one function
+// ============================================================
+
+// RegMap tracks live register assignments and the per-function stack
+// layout. The same structure works across architectures: individual
+// Regs entries are arch-specific register numbers, but the algorithms
+// below — lookup, frame planning, slot assignment — don't care. Per-
+// arch emitters consume RegMap through the lookups and through
+// their own nextReg / scratchReg / getOperand helpers.
+//
+// Under the "spill everything" policy in PlanFrame, the register table
+// only holds values live within a single instruction; the alloc and
+// spill slot tables describe the stable stack frame.
+type RegMap struct {
+	IDs  @[]int    // SSA IDs (index aligns with Regs)
+	Regs @[]int    // arch-specific register number (parallel to IDs)
+	Next int       // index of next free register in the arch's pool
+
+	// Stack-slot map for OP_ALLOC. An alloca's address is stable for
+	// the whole function; LOAD/STORE through it references the same
+	// frame slot every time.
+	AllocIDs     @[]int
+	AllocOffsets @[]int
+	AllocSizes   @[]int
+
+	// Spill-slot map: every non-void SSA value is spilled here after
+	// computation so a later use can reload.
+	SpillIDs     @[]int
+	SpillOffsets @[]int
+
+	// FrameSize is set by PlanFrame and returned by FrameSize() so
+	// epilogue emission stays in sync with prologue. Spill slots
+	// aren't uniformly 8 bytes (aggregates reserve dedicated data
+	// regions; multi-return packs N*8), so we cache the value rather
+	// than recomputing it from slot counts.
+	FrameSize int
+}
+
+// LookupAlloc returns the SP-relative offset of an OP_ALLOC value (or
+// of any op that reserves a dedicated data region via AllocIDs —
+// notably OP_MAKE_SLICE and aggregate OP_CONST_NIL), or -1 if id has
+// no such region.
+func LookupAlloc(m @RegMap, id int) int {
+	for i := 0; i < len(m.AllocIDs); i++ {
+		if m.AllocIDs[i] == id { return m.AllocOffsets[i] }
+	}
+	return -1
+}
+
+// LookupAllocSize returns the byte size of an alloca/data-region slot,
+// or -1.
+func LookupAllocSize(m @RegMap, id int) int {
+	for i := 0; i < len(m.AllocIDs); i++ {
+		if m.AllocIDs[i] == id { return m.AllocSizes[i] }
+	}
+	return -1
+}
+
+// LookupSpill returns the SP-relative offset of a spilled SSA value,
+// or -1 if not spilled.
+func LookupSpill(m @RegMap, id int) int {
+	for i := 0; i < len(m.SpillIDs); i++ {
+		if m.SpillIDs[i] == id { return m.SpillOffsets[i] }
+	}
+	return -1
+}
+
+// LookupReg returns the arch-specific register holding SSA id, or -1
+// if not found.
+func LookupReg(m @RegMap, id int) int {
+	for i := 0; i < len(m.IDs); i++ {
+		if m.IDs[i] == id { return m.Regs[i] }
+	}
+	return -1
+}
+
+// AssignReg records that SSA id = reg (the arch-specific register
+// number) and returns reg. Callers typically use this after picking a
+// register from their arch's pool (e.g. the arm64 regPool).
+func AssignReg(m @RegMap, id int, reg int) int {
+	m.IDs = AppendInt(m.IDs, id)
+	m.Regs = AppendInt(m.Regs, reg)
+	return reg
+}
+
+// ResetRegs clears the register map but leaves alloc/spill tables
+// intact — those describe the stable stack frame, not transient live
+// values.
+func ResetRegs(m @RegMap) {
+	var emptyIDs @[]int
+	var emptyRegs @[]int
+	m.IDs = emptyIDs
+	m.Regs = emptyRegs
+	m.Next = 0
+}
+
+// AppendInt grows an @[]int by one. O(n) copy; fine for the small
+// (per-function) sizes here.
+func AppendInt(s @[]int, v int) @[]int {
+	var out @[]int = make_slice(int, len(s)+1)
+	for i := 0; i < len(s); i++ {
+		out[i] = s[i]
+	}
+	out[len(s)] = v
+	return out
+}
+
+// ============================================================
+// Frame planning
+// ============================================================
+
+// PlanFrame assigns a stack slot to every function parameter and every
+// value-producing SSA instruction. Returns the 16-byte-aligned total
+// frame size (also cached on m.FrameSize).
+//
+// Slot sizes:
+//   - OP_ALLOC: types.SizeOf(TypeArg), rounded up to 8.
+//   - Aggregate-producing OPs whose SSA value is a *pointer* to a
+//     dedicated data region (OP_MAKE_SLICE; aggregate OP_CONST_NIL):
+//     a types.SizeOf(Typ) data region (via AllocIDs) PLUS an 8-byte
+//     spill slot for the pointer.
+//   - Multi-return calls (OP_CALL/OP_CALL_BUILTIN returning TYP_STRUCT):
+//     N*8-byte spill slot so X0..X(N-1) can be packed at slot + 8*i.
+//   - Aggregate params: same as OP_MAKE_SLICE — data region + pointer
+//     spill slot. Callee prologue writes the N arg-reg words into the
+//     data region.
+//   - Everything else: 8-byte spill slot.
+//
+// Under the "spill everything" policy, the register allocator is
+// trivial: a rotating small pool, with operands reloaded from their
+// slot on use. Correct but slow; a real allocator can reclaim later.
+func PlanFrame(m @RegMap, f @ir.Func) int {
+	var offset int = 0
+
+	// Parameters come first so entry-point register stores can find
+	// their slots by ID. Aggregate (slice) params are passed spread
+	// across multiple arg registers; we reserve a data region for the
+	// bytes plus an 8-byte spill slot that holds a pointer to that
+	// region, matching OP_MAKE_SLICE / OP_LOAD's aggregate form so
+	// downstream OP_STORE-struct-copy and OP_EXTRACT just work.
+	for pi := 0; pi < len(f.Params); pi++ {
+		var p @ir.Param = f.Params[pi]
+		if IsAggregateTyp(p.Typ) {
+			var dataSz int = types.SizeOf(p.Typ)
+			if dataSz > 0 {
+				m.AllocIDs = AppendInt(m.AllocIDs, p.ID)
+				m.AllocSizes = AppendInt(m.AllocSizes, dataSz)
+				m.AllocOffsets = AppendInt(m.AllocOffsets, offset)
+				offset = offset + dataSz
+			}
+		}
+		m.SpillIDs = AppendInt(m.SpillIDs, p.ID)
+		m.SpillOffsets = AppendInt(m.SpillOffsets, offset)
+		offset = offset + 8
+	}
+
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			if ins.Op == ir.OP_ALLOC {
+				var sz int = 8
+				if ins.TypeArg != nil { sz = types.SizeOf(ins.TypeArg) }
+				if sz < 8 { sz = 8 }
+				if sz % 8 != 0 { sz = sz + (8 - sz % 8) }
+				m.AllocIDs = AppendInt(m.AllocIDs, ins.ID)
+				m.AllocSizes = AppendInt(m.AllocSizes, sz)
+				m.AllocOffsets = AppendInt(m.AllocOffsets, offset)
+				offset = offset + sz
+			} else if ins.ID >= 0 && !InstrIsVoid(ins) {
+				// OP_MAKE_SLICE and aggregate OP_CONST_NIL get a
+				// dedicated data region; their spill slot then holds a
+				// *pointer* to that region, matching OP_LOAD's
+				// aggregate form so downstream OP_EXTRACT / OP_STORE
+				// can treat them uniformly.
+				if (ins.Op == ir.OP_MAKE_SLICE ||
+					(ins.Op == ir.OP_CONST_NIL &&
+						IsAggregateTyp(ins.Typ))) &&
+					ins.Typ != nil {
+					var dataSz int = types.SizeOf(ins.Typ)
+					if dataSz > 0 {
+						m.AllocIDs = AppendInt(m.AllocIDs, ins.ID)
+						m.AllocSizes = AppendInt(m.AllocSizes, dataSz)
+						m.AllocOffsets = AppendInt(m.AllocOffsets, offset)
+						offset = offset + dataSz
+					}
+				}
+				m.SpillIDs = AppendInt(m.SpillIDs, ins.ID)
+				m.SpillOffsets = AppendInt(m.SpillOffsets, offset)
+				// Multi-return calls reserve N*8 contiguous bytes so
+				// X0..X(N-1) can land at slot + 8*i; OP_EXTRACT later
+				// reads the i-th word.
+				var slotSz int = 8
+				if (ins.Op == ir.OP_CALL || ins.Op == ir.OP_CALL_BUILTIN) &&
+					ins.Typ != nil && ins.Typ.Kind == types.TYP_STRUCT {
+					slotSz = 8 * len(ins.Typ.Fields)
+					if slotSz < 8 { slotSz = 8 }
+				}
+				offset = offset + slotSz
+			}
+		}
+	}
+	var size int = offset
+	if size % 16 != 0 {
+		size = size + (16 - size % 16)
+	}
+	m.FrameSize = size
+	return size
+}
+
+// FrameSize returns the frame size computed by PlanFrame.
+func FrameSize(m @RegMap) int { return m.FrameSize }
+
+// ============================================================
+// Type predicates
+// ============================================================
+
+// InstrIsVoid reports whether an instruction produces no SSA value.
+func InstrIsVoid(ins @ir.Instr) bool {
+	if ins.ID < 0 { return true }
+	if ins.Typ == nil { return true }
+	return ins.Typ.Kind == types.TYP_VOID
+}
+
+// CallReturnsVoid reports whether an OP_CALL/OP_CALL_BUILTIN has no
+// result (e.g. bn_print_int, bootstrap.Exit).
+func CallReturnsVoid(ins @ir.Instr) bool {
+	if ins.Typ == nil { return true }
+	return ins.Typ.Kind == types.TYP_VOID
+}
+
+// IsAggregateTyp reports whether a type is a struct, array, or slice —
+// i.e., not an in-register value. OP_LOAD passes a pointer through
+// rather than materializing the bytes; OP_STORE does a memcpy.
+func IsAggregateTyp(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_STRUCT ||
+		t.Kind == types.TYP_ARRAY ||
+		t.Kind == types.TYP_MANAGED_SLICE ||
+		t.Kind == types.TYP_SLICE
+}
+
+// SpillHoldsAggregatePointer reports whether ins's 8-byte spill slot
+// holds a pointer to its data (as opposed to the data itself). True
+// for every aggregate SSA value EXCEPT multi-return calls, which pack
+// their N*8 bytes directly into the spill slot. This matters for
+// OP_EXTRACT, which must indirect through the pointer in the former
+// case but read at slot+8*Index in the latter.
+func SpillHoldsAggregatePointer(ins @ir.Instr) bool {
+	if ins == nil || !IsAggregateTyp(ins.Typ) { return false }
+	if (ins.Op == ir.OP_CALL || ins.Op == ir.OP_CALL_BUILTIN) &&
+		ins.Typ.Kind == types.TYP_STRUCT {
+		return false
+	}
+	return true
+}
+
+// ElemSizeOf returns the element byte size for an OP_GET_ELEM_PTR
+// instruction. The GEP's own result type is `*elemTyp` (set by
+// ir.EmitGetElemPtr), which covers both array indexing and slice
+// indexing (where the base pointer has already been extracted to a raw
+// i8* and the element type lives only on the GEP itself).
+func ElemSizeOf(gep @ir.Instr) int {
+	if gep == nil || gep.Typ == nil || gep.Typ.Elem == nil { return 0 }
+	return types.SizeOf(gep.Typ.Elem)
+}
+
+// StructTypeOf returns the struct type underlying a pointer-valued
+// instruction, or nil if not a struct pointer.
+func StructTypeOf(ins @ir.Instr) @types.Type {
+	if ins == nil { return nil }
+	if ins.TypeArg != nil && ins.TypeArg.Kind == types.TYP_STRUCT {
+		return ins.TypeArg
+	}
+	if ins.Typ != nil && ins.Typ.Elem != nil {
+		if ins.Typ.Elem.Kind == types.TYP_STRUCT { return ins.Typ.Elem }
+	}
+	return nil
+}

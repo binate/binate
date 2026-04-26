@@ -1,6 +1,12 @@
 #!/bin/sh
-# Runner: boot-comp-native-aa64 — boot interprets cmd/bnc with -backend=native,
+# Runner: boot-comp_native_aa64 — boot interprets cmd/bnc with -backend=native,
 # compiling test.bn via pkg/native (aarch64 Mach-O). macOS/Apple Silicon only.
+#
+# Mode-name convention: stages within one compile chain are joined with
+# `_` (the chain here is comp_native_aa64 — bnc with the native aarch64
+# backend); separate stages join with `-` (a hypothetical
+# `boot-comp_native_aa64-comp_native_aa64` would build bnc with the
+# native backend, then re-run that bnc to compile the test).
 
 runner_setup() {
     : # nothing to build

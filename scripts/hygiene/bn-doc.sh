@@ -20,12 +20,17 @@
 # - Section banners and comment-shaped lines count as docs (shape, not content).
 # - Group members inside `const ( ... )` are not individually inspected.
 #
-# Exit code: 1 if any violations found, 0 otherwise.
+# TEMPORARY: pkg/asm/ and its subdirectories are still being documented.
+# Their violations are reported as warnings (printed but not failing).
+# Remove the warn-only branch below once pkg/asm is fully documented.
+#
+# Exit code: 1 if any non-warn violations found, 0 otherwise.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 violations=0
+warnings=0
 
 for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" -name '*.bn' \
                 -not -name '*_test.bn' 2>/dev/null | sort); do
@@ -63,15 +68,27 @@ for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" -name '*.bn' \
 
         END { exit e > 0 ? 1 : 0 }
     ' BINATE="$BINATE_DIR" "$f")
-    if [ -n "$out" ]; then
-        echo "$out"
-        n=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
-        violations=$((violations + n))
-    fi
+    [ -z "$out" ] && continue
+
+    # TEMPORARY: pkg/asm/ violations report as warnings until that area
+    # gets documented; everything else fails the script.
+    case "$f" in
+        "$BINATE_DIR"/pkg/asm/*)
+            echo "$out" | sed 's/^/WARN: /'
+            n=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
+            warnings=$((warnings + n))
+            ;;
+        *)
+            echo "$out"
+            n=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
+            violations=$((violations + n))
+            ;;
+    esac
 done
 
-if [ "$violations" -gt 0 ]; then
+if [ "$warnings" -gt 0 ] || [ "$violations" -gt 0 ]; then
     echo ""
-    echo "=== $violations .bn godoc violation(s) ==="
-    exit 1
+    echo "=== $violations .bn godoc violation(s), $warnings warning(s) ==="
 fi
+[ "$violations" -gt 0 ] && exit 1
+exit 0

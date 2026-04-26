@@ -49,17 +49,118 @@ func emitConstNil(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
 	aarch64.Movz(a, true, rd, 0, 0)
 }
 
-// emitStringToChars: OP_STRING_TO_CHARS — materialize the string
-// literal at the reserved data region on each use. Fills
-// {data=ADR(Lstr_N), len, refptr=0, backingLen=0}; safe because
-// RefInc/RefDec no-op on null refptr. Produces a pointer to the
-// region (aggregate-pointer form).
+// emitStringToChars: OP_STRING_TO_CHARS. Two paths, per the IR's
+// BoolVal flag (set by ir.stringToCharsNeedsImplicitCopy):
+//
+//   BoolVal=false (rodata alias): materialize the slice header at
+//     the reserved data region. Used for *[]const char and
+//     @[]const char where the holder can only read.
+//   BoolVal=true (Stage 2b implicit copy): allocate a fresh managed
+//     backing via bn_rt__MakeManagedSlice and memcpy the literal in.
+//     Used for @[]char where the holder is OWNED + MUTABLE — aliasing
+//     would let `s[0] = 'X'` target rodata and SIGBUS.
+//
+// Both paths produce a pointer to the data region (aggregate-pointer
+// form) so downstream OP_LOAD / OP_GET_FIELD_PTR see the same shape.
 func emitStringToChars(a @asm.Assembler, rm @common.RegMap,
 	strings @[]ir.StringConst, ins @ir.Instr) {
 	if len(ins.Args) < 1 { return }
 	var strArg @ir.Instr = ins.Args[0]
+	if ins.BoolVal {
+		emitStringToCharsCopy(a, rm, strings, ins, strArg.StrVal)
+		return
+	}
 	emitRodataSliceHeader(a, rm, strings, ins,
 		strArg.StrVal, ins.Typ)
+}
+
+// emitStringToCharsCopy: Stage 2b lowering. Allocates a fresh
+// managed-slice via the runtime, then memcpys the literal bytes
+// from rodata into the new backing. Sequence:
+//
+//   X0 = 1, X1 = strLen
+//   bl _bn_rt__MakeManagedSlice  → 32-byte slice header in X0..X3
+//   STR X0..X3 → data_region[0..24]   (preserve the slice header)
+//   X1 = ADR(Lstr_N), X2 = strLen     (X0 still holds the new data ptr)
+//   bl _bn_rt__c_memcpy
+//   ADD rd, SP, #data_region          (produce aggregate pointer)
+func emitStringToCharsCopy(a @asm.Assembler, rm @common.RegMap,
+	strings @[]ir.StringConst, ins @ir.Instr, bytes @[]char) {
+	var sid int = ir.FindStringID(strings, bytes)
+	if sid < 0 { return }
+	var dataOff int = common.LookupAlloc(rm, ins.ID)
+	if dataOff < 0 { return }
+	var strLen int = len(bytes)
+
+	emitConstInt64(a, aarch64.X0, 1)
+	emitConstInt64(a, aarch64.X1, strLen)
+	var mkSym @[]char = underscorePrefix("bn_rt__MakeManagedSlice")
+	asm.SetGlobal(a, mkSym)
+	aarch64.Bl(a, mkSym)
+	aarch64.Str(a, true, aarch64.X0,
+		aarch64.MemImm(aarch64.SP, dataOff))
+	aarch64.Str(a, true, aarch64.X1,
+		aarch64.MemImm(aarch64.SP, dataOff + 8))
+	aarch64.Str(a, true, aarch64.X2,
+		aarch64.MemImm(aarch64.SP, dataOff + 16))
+	aarch64.Str(a, true, aarch64.X3,
+		aarch64.MemImm(aarch64.SP, dataOff + 24))
+	// X0 still holds the data pointer from MakeManagedSlice's first
+	// return word — feed straight into memcpy as dst.
+	aarch64.Adr(a, aarch64.X1, stringLabel(sid))
+	emitConstInt64(a, aarch64.X2, strLen)
+	var memcpy @[]char = underscorePrefix("bn_rt__c_memcpy")
+	asm.SetGlobal(a, memcpy)
+	aarch64.Bl(a, memcpy)
+	common.ResetRegs(rm)
+	var rd int = nextReg(rm, ins.ID)
+	aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(dataOff))
+}
+
+// emitStringToArray: OP_STRING_TO_ARRAY. `var s [N]char = "..."`
+// allocates a fresh N-byte buffer in the data region, zeroes it,
+// then memcpys the first strLen bytes from rodata into the head.
+// strLen is enforced ≤ N at IR-gen time. Result is a pointer to the
+// buffer; downstream OP_STORE struct-copy memcpys it into the
+// destination alloca.
+func emitStringToArray(a @asm.Assembler, rm @common.RegMap,
+	strings @[]ir.StringConst, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var strArg @ir.Instr = ins.Args[0]
+	var sid int = ir.FindStringID(strings, strArg.StrVal)
+	if sid < 0 { return }
+	var dataOff int = common.LookupAlloc(rm, ins.ID)
+	if dataOff < 0 { return }
+	var arrLen int = 0
+	if ins.Typ != nil && ins.Typ.Kind == types.TYP_ARRAY {
+		arrLen = ins.Typ.ArrayLen
+	}
+	if arrLen <= 0 { return }
+	var strLen int = len(strArg.StrVal)
+	if strLen > arrLen { strLen = arrLen }
+
+	// Zero-fill the entire reserved buffer (rounded up to 8 bytes by
+	// PlanFrame) in 64-bit chunks. Covers the tail past strLen and
+	// keeps any padding bytes deterministic.
+	var bufSz int = common.LookupAllocSize(rm, ins.ID)
+	var i int = 0
+	for i < bufSz {
+		aarch64.Str(a, true, aarch64.XZR,
+			aarch64.MemImm(aarch64.SP, dataOff + i))
+		i = i + 8
+	}
+	if strLen > 0 {
+		aarch64.Add(a, true, aarch64.X0, aarch64.SP,
+			aarch64.Imm(dataOff))
+		aarch64.Adr(a, aarch64.X1, stringLabel(sid))
+		emitConstInt64(a, aarch64.X2, strLen)
+		var memcpy @[]char = underscorePrefix("bn_rt__c_memcpy")
+		asm.SetGlobal(a, memcpy)
+		aarch64.Bl(a, memcpy)
+	}
+	common.ResetRegs(rm)
+	var rd int = nextReg(rm, ins.ID)
+	aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(dataOff))
 }
 
 // emitRodataMSliceOrSlice: OP_RODATA_MSLICE / OP_RODATA_SLICE —

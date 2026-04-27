@@ -264,49 +264,9 @@ int64_t bn_bootstrap__Exec(BnSlice program, BnSlice args) {
     return -1;
 }
 
-// alloc_managed_chars allocates a managed char buffer with refcount header.
-// Returns a BnManagedSlice where data and backing both point to the payload.
-static BnManagedSlice alloc_managed_chars(int64_t len) {
-    BnManagedSlice ms;
-    ms.len = len;
-    ms.backing_len = len;
-    if (len > 0) {
-        // Header: [refcount, free_fn] then payload
-        int64_t *base = (int64_t *)calloc(1, (size_t)(2 * sizeof(int64_t) + len));
-        base[0] = 1;  // refcount = 1
-        base[1] = 0;  // free_fn = null
-        void *payload = &base[2];
-        ms.data = payload;
-        ms.backing = payload;
-    } else {
-        ms.data = NULL;
-        ms.backing = NULL;
-    }
-    return ms;
-}
-
-// Itoa(v int) @[]char
-BnManagedSlice bn_bootstrap__Itoa(int64_t v) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "%lld", (long long)v);
-    int64_t len = (int64_t)strlen(buf);
-    BnManagedSlice ms = alloc_managed_chars(len);
-    if (len > 0) {
-        memcpy(ms.data, buf, (size_t)len);
-    }
-    return ms;
-}
-
-// Concat(a *[]char, b *[]char) @[]char
-BnManagedSlice bn_bootstrap__Concat(BnSlice a, BnSlice b) {
-    int64_t len = a.len + b.len;
-    BnManagedSlice ms = alloc_managed_chars(len);
-    if (len > 0) {
-        if (a.data && a.len > 0) memcpy(ms.data, a.data, (size_t)a.len);
-        if (b.data && b.len > 0) memcpy((char *)ms.data + a.len, b.data, (size_t)b.len);
-    }
-    return ms;
-}
+// bn_bootstrap__Itoa and bn_bootstrap__Concat have moved to
+// pkg/bootstrap/bootstrap.bn — pure Binate, no C dependency.
+// (Their former alloc_managed_chars helper was deleted with them.)
 
 /* Entry point: calls Binate's main function */
 extern void bn_main(void);

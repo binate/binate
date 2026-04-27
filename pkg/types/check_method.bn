@@ -1,0 +1,176 @@
+package "pkg/types"
+
+import "pkg/ast"
+import "pkg/buf"
+
+// ============================================================
+// Method-call type checking (Stage 3 of plan-receivers.md)
+// ============================================================
+
+// tryMethodCall handles `obj.M(args)` when M is a method on obj's base
+// named type. Returns the call's result type, or nil if e is not a
+// method call (caller falls back to the regular function-call path).
+//
+// Caller must guarantee e.X is an EXPR_SELECTOR.
+func tryMethodCall(c @Checker, e @ast.Expr) @Type {
+	var sel @ast.Expr = e.X
+	// Skip package-qualified calls (pkg.Func(...)). Detect by looking
+	// up sel.X as an identifier of kind SYM_PKG; we don't evaluate
+	// it as a value expression.
+	if sel.X != nil && sel.X.Kind == ast.EXPR_IDENT {
+		var sym @Symbol = Lookup(c.Scope, sel.X.Name)
+		if sym != nil && sym.Kind == SYM_PKG {
+			return nil
+		}
+	}
+
+	var recvType @Type = checkExpr(c, sel.X)
+	var named @Type = ReceiverBaseNamed(recvType)
+	if named == nil {
+		return nil
+	}
+	var m @Method = LookupMethod(named, sel.Name)
+	if m == nil {
+		return nil
+	}
+	return checkResolvedMethodCall(c, e, recvType, m)
+}
+
+// checkResolvedMethodCall validates a method call once the method has
+// been resolved. Checks receiver smoothing and argument types, returns
+// the result type.
+func checkResolvedMethodCall(c @Checker, e @ast.Expr, recvType @Type, m @Method) @Type {
+	if !receiverAssignable(recvType, m.RecvType) {
+		var cb buf.CharBuf = buf.New()
+		cb = buf.WriteStr(cb, "cannot call method ")
+		cb = buf.WriteStr(cb, m.Name)
+		cb = buf.WriteStr(cb, ": receiver type ")
+		cb = buf.WriteStr(cb, TypeName(recvType))
+		cb = buf.WriteStr(cb, " not assignable to ")
+		cb = buf.WriteStr(cb, TypeName(m.RecvType))
+		addCheckError(c, e.X.Pos, buf.Bytes(cb))
+	}
+
+	// m.FuncType has the receiver as Params[0]; user args correspond to
+	// Params[1:].
+	var ft @Type = m.FuncType
+	var numArgs int = len(e.Args)
+	var numUserParams int = len(ft.Params) - 1
+	if numArgs != numUserParams {
+		addCheckError(c, e.Pos, "wrong number of arguments")
+	} else {
+		for i := 0; i < numArgs; i++ {
+			var at @Type = checkExpr(c, e.Args[i])
+			if !AssignableTo(at, ft.Params[i+1].Type) {
+				errCannotAssign(c, e.Args[i].Pos, at, ft.Params[i+1].Type)
+			}
+		}
+	}
+
+	if len(ft.Results) == 0 {
+		return TypVoid()
+	}
+	if len(ft.Results) == 1 {
+		return ft.Results[0]
+	}
+	// Multiple returns — return the FuncType itself (matches the
+	// regular function-call path's contract for multi-assign detection).
+	return ft
+}
+
+// ============================================================
+// Receiver smoothing
+// ============================================================
+
+// receiverShape reduces a type to (basetype, kind, isConst):
+//   - basetype: the underlying named type (or nil if not a named type)
+//   - kind: 0 = value (T), 1 = raw pointer (*T), 2 = managed pointer (@T)
+//   - isConst: whether any const wrapper was peeled along the way
+//
+// Returns (nil, 0, false) if t isn't (a wrapper around) a named type.
+func receiverShape(t @Type) (@Type, int, bool) {
+	if t == nil {
+		return nil, 0, false
+	}
+	t = ResolveAlias(t)
+	var isConst bool = false
+	if t != nil && t.Kind == TYP_CONST {
+		isConst = true
+		t = ResolveAlias(t.Elem)
+	}
+	if t == nil {
+		return nil, 0, false
+	}
+	if t.Kind == TYP_POINTER {
+		var inner @Type = ResolveAlias(t.Elem)
+		if inner != nil && inner.Kind == TYP_CONST {
+			isConst = true
+			inner = ResolveAlias(inner.Elem)
+		}
+		if inner != nil && inner.Kind == TYP_NAMED {
+			return inner, 1, isConst
+		}
+		return nil, 0, false
+	}
+	if t.Kind == TYP_MANAGED_PTR {
+		var inner @Type = ResolveAlias(t.Elem)
+		if inner != nil && inner.Kind == TYP_CONST {
+			isConst = true
+			inner = ResolveAlias(inner.Elem)
+		}
+		if inner != nil && inner.Kind == TYP_NAMED {
+			return inner, 2, isConst
+		}
+		return nil, 0, false
+	}
+	if t.Kind == TYP_NAMED {
+		return t, 0, isConst
+	}
+	return nil, 0, false
+}
+
+// receiverAssignable reports whether an expression of type src can be
+// passed as the receiver of a method declared with receiver type dst,
+// applying the smoothing rules from claude-notes.md:828:
+//
+//   src @T  → dst @T / @const T / *T / *const T / T  (OK; deref allowed)
+//   src *T  → dst *T / *const T / T                  (OK; deref allowed)
+//   src *T  → dst @T / @const T                      (REJECT; never raw → managed)
+//   src T   → dst T / *T / *const T                  (OK; auto-take-address)
+//   src T   → dst @T                                 (REJECT)
+//
+// Const direction: adding const at the receiver position is allowed
+// (more-permissive → more-restrictive). Dropping const is rejected.
+func receiverAssignable(src @Type, dst @Type) bool {
+	var srcBase @Type
+	var srcKind int
+	var srcConst bool
+	srcBase, srcKind, srcConst = receiverShape(src)
+	var dstBase @Type
+	var dstKind int
+	var dstConst bool
+	dstBase, dstKind, dstConst = receiverShape(dst)
+
+	if srcBase == nil || dstBase == nil {
+		return false
+	}
+	if !Identical(srcBase, dstBase) {
+		return false
+	}
+
+	// Adding const is OK; dropping is not.
+	if srcConst && !dstConst {
+		return false
+	}
+
+	// Indirection table:
+	//   srcKind \ dstKind   0 (T)   1 (*T)   2 (@T)
+	//   0 (T)               OK      OK*      REJECT
+	//   1 (*T)              OK      OK       REJECT
+	//   2 (@T)              OK      OK       OK
+	// (* = take-address; allowed for now without addressability check.)
+	if dstKind == 2 && srcKind != 2 {
+		return false
+	}
+	return true
+}

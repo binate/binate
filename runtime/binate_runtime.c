@@ -34,25 +34,11 @@ typedef struct {
 // are provided by pkg/rt. See pkg/rt/rt.bn and runtime/rt_stubs.c.
 
 // ============================================================
-// I/O — only bn_print_float and bn_exit remain. The rest were
-// removed: print/println's IR-gen now lowers strings/chars/bools/
-// newlines/inter-arg-spaces/ints to bootstrap.formatX (where
-// needed) + bootstrap.Write. See
+// I/O — only bn_exit remains. All bn_print_* shims have been
+// removed: print/println's IR-gen now lowers each type through
+// bootstrap.formatX (where needed) + bootstrap.Write. See
 // explorations/plan-print-builtin-runtime-decoupling.md.
-// %g semantics for floats are non-trivial to reproduce in pure
-// Binate, so bn_print_float is deferred to a follow-up.
 // ============================================================
-
-void bn_print_float(double d) {
-    // %g uses up to 6 significant digits and drops trailing zeros.
-    // Good enough for conformance tests that check readable output;
-    // a real fmt package will replace println in the long run.
-    char buf[32];
-    int n = snprintf(buf, sizeof(buf), "%g", d);
-    if (n < 0) return;
-    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
-    ssize_t _ = write(1, buf, (size_t)n); (void)_;
-}
 
 void bn_exit(int64_t code) {
     exit((int)code);

@@ -45,18 +45,3 @@ void bn_rt__c_bounds_fail(int64_t index, int64_t length) {
     abort();
 }
 
-// c_print_float — format a float64 with %g and write it to stdout
-// via a direct write(2) syscall. The VM's int/bool/string print
-// paths use write(2) directly (bypassing libc stdio), so mixing
-// printf() in here caused the float output to sit in libc's buffer
-// while later direct writes appeared first. Keeping everything on
-// the write(2) side avoids the interleaving entirely. Called from
-// pkg/rt; the Binate-side declaration is in pkg/rt.bni.
-void bn_rt__c_print_float(double d) {
-    char buf[32];
-    int n = snprintf(buf, sizeof(buf), "%g", d);
-    if (n < 0) return;
-    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
-    ssize_t _ = write(1, buf, (size_t)n);
-    (void)_;
-}

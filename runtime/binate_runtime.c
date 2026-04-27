@@ -30,38 +30,18 @@ typedef struct {
     int64_t  backing_len; // total element count in backing
 } BnManagedSlice;
 
-// Print *[]char slice as string. Uses unbuffered write(2) for
-// consistency with the new bootstrap.Write-based int-print path —
-// mixing fwrite (buffered) with write (unbuffered) interleaves
-// output unpredictably. These bn_print_* shims are slated for
-// removal once their IR-gen call sites migrate (see
-// explorations/plan-print-builtin-runtime-decoupling.md step 3).
-void bn_print_chars(BnSlice s) {
-    if (s.data && s.len > 0) {
-        ssize_t _ = write(1, s.data, (size_t)s.len); (void)_;
-    }
-}
-
 // Managed memory (Alloc, Box, RefInc, RefDec, Free) and bounds checking
 // are provided by pkg/rt. See pkg/rt/rt.bn and runtime/rt_stubs.c.
 
 // ============================================================
-// I/O
+// I/O — only bn_print_float and bn_exit remain. The rest were
+// removed: print/println's IR-gen now lowers strings/chars/bools/
+// newlines/inter-arg-spaces/ints to bootstrap.formatX (where
+// needed) + bootstrap.Write. See
+// explorations/plan-print-builtin-runtime-decoupling.md.
+// %g semantics for floats are non-trivial to reproduce in pure
+// Binate, so bn_print_float is deferred to a follow-up.
 // ============================================================
-
-void bn_print_string(const char *s, int64_t len) {
-    if (s && len > 0) {
-        ssize_t _ = write(1, s, (size_t)len); (void)_;
-    }
-}
-
-void bn_print_bool(int8_t b) {
-    if (b) {
-        ssize_t _ = write(1, "true", 4); (void)_;
-    } else {
-        ssize_t _ = write(1, "false", 5); (void)_;
-    }
-}
 
 void bn_print_float(double d) {
     // %g uses up to 6 significant digits and drops trailing zeros.
@@ -72,10 +52,6 @@ void bn_print_float(double d) {
     if (n < 0) return;
     if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
     ssize_t _ = write(1, buf, (size_t)n); (void)_;
-}
-
-void bn_print_newline(void) {
-    ssize_t _ = write(1, "\n", 1); (void)_;
 }
 
 void bn_exit(int64_t code) {

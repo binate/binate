@@ -1,0 +1,160 @@
+package "pkg/ir"
+
+import "pkg/ast"
+import "pkg/types"
+
+// IR-gen for the print/println builtin. Decoupled from any
+// dedicated C runtime function: format steps run as pure Binate
+// (bootstrap.formatInt, bootstrap.formatBool) and the I/O sink is
+// always bootstrap.Write. See
+// explorations/plan-print-builtin-runtime-decoupling.md.
+//
+// Float remains the lone exception (bn_print_float still handles
+// formatting) — %g semantics are non-trivial to reproduce in pure
+// Binate, so the format-side migration is deferred.
+
+// genPrintCall expands println/print into per-arg format + write
+// sequences.
+//
+// All output goes through bootstrap.Write (the single I/O sink),
+// preceded by a per-type format step where needed:
+//   - int  → bootstrap.formatInt + bootstrap.Write
+//   - bool → bootstrap.formatBool + bootstrap.Write
+//   - string/chars → bootstrap.Write directly (already bytes)
+//   - inter-arg space and trailing newline → bootstrap.Write of a
+//     1-byte constant slice
+//   - float → bn_print_float (deferred; %g semantics are gnarly)
+func genPrintCall(ctx @GenContext, b @Block, e @ast.Expr, newline bool) @Instr {
+	for i := 0; i < len(e.Args); i++ {
+		if i > 0 {
+			emitWriteConstBytes(ctx, b, " ", 1)
+		}
+
+		var arg @ast.Expr = e.Args[i]
+		var val @Instr = genExpr(ctx, b, arg)
+		b = ctx.CurBlock
+
+		if val.Typ != nil && types.IsFloat(val.Typ) {
+			// bn_print_float takes a C double. Widen float32 and
+			// untyped-float values to float64 so the LLVM call
+			// site matches the callee's `double` parameter.
+			if val.Typ.Kind == types.TYP_FLOAT && val.Typ.Width == 32 {
+				val = EmitCast(ctx.Func, b, val, types.TypFloat64())
+			} else if val.Typ.Kind == types.TYP_UNTYPED_FLOAT {
+				val = EmitCast(ctx.Func, b, val, types.TypFloat64())
+			}
+			EmitCallBuiltin(ctx.Func, b, "bn_print_float", makeArgs1(val), types.TypVoid())
+		} else if val.Op == OP_CONST_STRING {
+			var strLen int = 0
+			if len(val.StrVal) > 0 { strLen = len(val.StrVal) }
+			emitWriteRawSlice(ctx, b, val,
+				EmitConstInt(ctx.Func, b, strLen, types.TypInt()))
+		} else if isCharSliceType(val.Typ) {
+			if val.Typ.Kind == types.TYP_MANAGED_SLICE {
+				val = EmitManagedToRaw(ctx.Func, b, val)
+			}
+			emitWriteSlice(ctx, b, val)
+		} else if val.Typ != nil &&
+			(val.Typ.Kind == types.TYP_BOOL || val.Typ.Kind == types.TYP_UNTYPED_BOOL) {
+			emitPrintBool(ctx, b, val)
+		} else if arg.Kind == ast.EXPR_STRING_LIT {
+			var strLen int = 0
+			if len(val.StrVal) > 0 { strLen = len(val.StrVal) }
+			emitWriteRawSlice(ctx, b, val,
+				EmitConstInt(ctx.Func, b, strLen, types.TypInt()))
+		} else if arg.Kind == ast.EXPR_BOOL_LIT {
+			emitPrintBool(ctx, b, val)
+		} else {
+			emitPrintInt(ctx, b, val)
+		}
+	}
+
+	if newline {
+		emitWriteConstBytes(ctx, b, "\n", 1)
+	}
+
+	return EmitConstNil(ctx.Func, b, types.TypNil())
+}
+
+// emitPrintInt lowers `print(intExpr)` into a stack-buffer +
+// bootstrap.formatInt + bootstrap.Write sequence. This decouples
+// the print/println builtin from any int-printing C runtime
+// function — the format step is pure Binate and the I/O goes
+// through the single sink (bootstrap.Write).
+func emitPrintInt(ctx @GenContext, b @Block, val @Instr) {
+	// Stack-alloc [20]uint8 buffer (int64 needs at most 19 digits + sign).
+	var u8 @types.Type = types.TypUint8()
+	var bufType @types.Type = types.MakeArrayType(u8, 20)
+	var bufPtr @Instr = EmitAlloc(ctx.Func, b, bufType)
+
+	// Construct *[]uint8 slice {data: bufPtr, len: 20} for formatInt.
+	var sliceTyp @types.Type = types.MakeSliceType(u8)
+	var fmtSlice @Instr = emitMakeRawSlice(ctx, b, sliceTyp, bufPtr,
+		EmitConstInt(ctx.Func, b, 20, types.TypInt()))
+
+	// n = bootstrap.formatInt(val, fmtSlice)
+	var fmtArgs @[]@Instr = makeArgs2(val, fmtSlice)
+	var n @Instr = EmitCall(ctx.Func, b, "bootstrap.formatInt", fmtArgs, types.TypInt())
+
+	emitWriteRawSlice(ctx, b, bufPtr, n)
+}
+
+// emitPrintBool lowers `print(boolExpr)` into formatBool + Write.
+// "false" is the longer of the two outputs, so the buffer is 5 bytes.
+func emitPrintBool(ctx @GenContext, b @Block, val @Instr) {
+	var u8 @types.Type = types.TypUint8()
+	var bufType @types.Type = types.MakeArrayType(u8, 5)
+	var bufPtr @Instr = EmitAlloc(ctx.Func, b, bufType)
+
+	var sliceTyp @types.Type = types.MakeSliceType(u8)
+	var fmtSlice @Instr = emitMakeRawSlice(ctx, b, sliceTyp, bufPtr,
+		EmitConstInt(ctx.Func, b, 5, types.TypInt()))
+
+	var fmtArgs @[]@Instr = makeArgs2(val, fmtSlice)
+	var n @Instr = EmitCall(ctx.Func, b, "bootstrap.formatBool", fmtArgs, types.TypInt())
+
+	emitWriteRawSlice(ctx, b, bufPtr, n)
+}
+
+// emitWriteConstBytes constructs a slice for a constant byte
+// sequence (e.g. " " or "\n") and writes it to STDOUT via
+// bootstrap.Write. Used for inter-arg spaces and trailing newlines
+// in the print/println builtin.
+func emitWriteConstBytes(ctx @GenContext, b @Block, s @[]char, length int) {
+	var ptr @Instr = EmitConstString(ctx.Func, b, s)
+	var lenArg @Instr = EmitConstInt(ctx.Func, b, length, types.TypInt())
+	emitWriteRawSlice(ctx, b, ptr, lenArg)
+}
+
+// emitWriteRawSlice constructs a *[]uint8 slice header from
+// (dataPtr, length) and calls bootstrap.Write(STDOUT, slice).
+func emitWriteRawSlice(ctx @GenContext, b @Block, dataPtr @Instr, length @Instr) {
+	var sliceTyp @types.Type = types.MakeSliceType(types.TypUint8())
+	var slice @Instr = emitMakeRawSlice(ctx, b, sliceTyp, dataPtr, length)
+	emitWriteSlice(ctx, b, slice)
+}
+
+// emitWriteSlice writes an existing slice value to STDOUT via
+// bootstrap.Write. The slice's element type is treated as bytes at
+// the LLVM level (BnSlice is ABI-identical regardless of T) — no
+// bit-cast needed.
+func emitWriteSlice(ctx @GenContext, b @Block, slice @Instr) {
+	var stdout @Instr = EmitConstInt(ctx.Func, b, 1, types.TypInt())
+	var args @[]@Instr = makeArgs2(stdout, slice)
+	EmitCall(ctx.Func, b, "bootstrap.Write", args, types.TypInt())
+}
+
+// emitMakeRawSlice allocates a `*[]T` slice header on the stack and
+// initializes its data and len fields, returning the loaded slice
+// value. Used by the print/println builtin to construct slices for
+// bootstrap.Write without going through make_slice (no heap alloc).
+func emitMakeRawSlice(ctx @GenContext, b @Block, sliceTyp @types.Type,
+		dataPtr @Instr, length @Instr) @Instr {
+	var ptrTyp @types.Type = types.MakePointerType(types.TypUint8())
+	var sliceAlloca @Instr = EmitAlloc(ctx.Func, b, sliceTyp)
+	var ptrField @Instr = EmitGetFieldPtr(ctx.Func, b, sliceAlloca, 0, ptrTyp)
+	EmitStore(b, ptrField, dataPtr)
+	var lenField @Instr = EmitGetFieldPtr(ctx.Func, b, sliceAlloca, 1, types.TypInt())
+	EmitStore(b, lenField, length)
+	return EmitLoad(ctx.Func, b, sliceAlloca, sliceTyp)
+}

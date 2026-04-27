@@ -41,8 +41,10 @@ for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" -name '*.bn' \
                    rel, NR, kind, $0)
             e++
         }
-        # Doc comment opens or extends a doc block.
-        /^[\t ]*\/\// { doc_pending = 1; next }
+        # Doc comment (column 0) opens or extends a doc block.
+        # Indented `// ...` comments are body content, not doc — handled
+        # by the indented-line rule below.
+        /^\/\// { doc_pending = 1; next }
 
         # Blank line: neutral.
         NF == 0 { next }

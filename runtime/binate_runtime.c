@@ -34,15 +34,13 @@ typedef struct {
 // are provided by pkg/rt. See pkg/rt/rt.bn and runtime/rt_stubs.c.
 
 // ============================================================
-// I/O — only bn_exit remains. All bn_print_* shims have been
-// removed: print/println's IR-gen now lowers each type through
-// bootstrap.formatX (where needed) + bootstrap.Write. See
+// I/O and process: all bn_* shims have been removed. Print/println's
+// IR-gen now lowers each type through bootstrap.formatX (where
+// needed) + bootstrap.Write. OP_PANIC lowers to rt.Exit (which
+// currently wraps c_exit; on a libc-free target this would route
+// through a syscall stub instead). See
 // explorations/plan-print-builtin-runtime-decoupling.md.
 // ============================================================
-
-void bn_exit(int64_t code) {
-    exit((int)code);
-}
 
 // ============================================================
 // Bootstrap package — file I/O, process, string operations

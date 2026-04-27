@@ -30,10 +30,15 @@ typedef struct {
     int64_t  backing_len; // total element count in backing
 } BnManagedSlice;
 
-// Print *[]char slice as string
+// Print *[]char slice as string. Uses unbuffered write(2) for
+// consistency with the new bootstrap.Write-based int-print path —
+// mixing fwrite (buffered) with write (unbuffered) interleaves
+// output unpredictably. These bn_print_* shims are slated for
+// removal once their IR-gen call sites migrate (see
+// explorations/plan-print-builtin-runtime-decoupling.md step 3).
 void bn_print_chars(BnSlice s) {
     if (s.data && s.len > 0) {
-        fwrite(s.data, 1, (size_t)s.len, stdout);
+        ssize_t _ = write(1, s.data, (size_t)s.len); (void)_;
     }
 }
 
@@ -46,19 +51,15 @@ void bn_print_chars(BnSlice s) {
 
 void bn_print_string(const char *s, int64_t len) {
     if (s && len > 0) {
-        fwrite(s, 1, (size_t)len, stdout);
+        ssize_t _ = write(1, s, (size_t)len); (void)_;
     }
-}
-
-void bn_print_int(int64_t n) {
-    printf("%lld", (long long)n);
 }
 
 void bn_print_bool(int8_t b) {
     if (b) {
-        printf("true");
+        ssize_t _ = write(1, "true", 4); (void)_;
     } else {
-        printf("false");
+        ssize_t _ = write(1, "false", 5); (void)_;
     }
 }
 
@@ -66,12 +67,15 @@ void bn_print_float(double d) {
     // %g uses up to 6 significant digits and drops trailing zeros.
     // Good enough for conformance tests that check readable output;
     // a real fmt package will replace println in the long run.
-    printf("%g", d);
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%g", d);
+    if (n < 0) return;
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    ssize_t _ = write(1, buf, (size_t)n); (void)_;
 }
 
 void bn_print_newline(void) {
-    printf("\n");
-    fflush(stdout);
+    ssize_t _ = write(1, "\n", 1); (void)_;
 }
 
 void bn_exit(int64_t code) {

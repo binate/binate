@@ -7,7 +7,12 @@ runner_setup() { build_gen1; }
 runner_compile() {
     bn="$1"
     tmpbin="$2"
-    "$GEN1_COMPILER" --root "$(dirname "$bn")" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1
+    bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
+    out=$("$GEN1_COMPILER" --root "$(dirname "$bn")" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1)
+    rc=$?
+    rm -rf "$bdir"
+    [ -n "$out" ] && echo "$out"
+    return $rc
 }
 
 runner_run() {

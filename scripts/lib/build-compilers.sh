@@ -1,13 +1,31 @@
 #!/bin/sh
 # Shared helpers for building gen1/gen2 compilers and compiled interpreters.
 # Source this from runner scripts.
+#
+# Each helper allocates its own --build-dir under /tmp via mktemp so
+# concurrent test runs don't clobber each other's intermediate .ll/.o
+# files. The dirs are tracked in BUILD_DIRS and removed by
+# cleanup_compilers.
+
+# BUILD_DIRS holds the per-helper build directories created during this
+# runner_setup; cleanup_compilers tears them down.
+BUILD_DIRS=""
+
+# _new_build_dir prints a fresh build dir under /tmp (caller is
+# responsible for tracking + removing it via cleanup_compilers).
+_new_build_dir() {
+    d=$(mktemp -d "/tmp/binate_build_XXXXXX")
+    BUILD_DIRS="$BUILD_DIRS $d"
+    echo "$d"
+}
 
 # Build gen1 compiler (boot-comp compiles cmd/bnc → gen1 binary)
 # Sets GEN1_COMPILER to the path.
 build_gen1() {
     GEN1_COMPILER="/tmp/binate_gen1_compiler_$$"
+    GEN1_BUILD_DIR="$(_new_build_dir)"
     echo "Building gen1 compiler..."
-    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"
@@ -21,8 +39,9 @@ build_gen1() {
 # Sets GEN2_COMPILER to the path.
 build_gen2() {
     GEN2_COMPILER="/tmp/binate_gen2_compiler_$$"
+    GEN2_BUILD_DIR="$(_new_build_dir)"
     echo "Building gen2 compiler..."
-    build_out=$("$GEN1_COMPILER" --root "$BINATE_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$GEN1_COMPILER" --root "$BINATE_DIR" --build-dir "$GEN2_BUILD_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN2_COMPILER" ]; then
         echo "ERROR: Failed to build gen2 compiler:"
         echo "$build_out"
@@ -35,8 +54,9 @@ build_gen2() {
 # Sets COMPILED_INTERP to the path.
 build_interp_boot_comp() {
     COMPILED_INTERP="/tmp/binate_compiled_interp_$$"
+    INTERP_BUILD_DIR="$(_new_build_dir)"
     echo "Building compiled interpreter..."
-    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"
@@ -51,8 +71,9 @@ build_interp_boot_comp() {
 build_interp() {
     local compiler="$1"
     COMPILED_INTERP="/tmp/binate_compiled_interp_$$"
+    INTERP_BUILD_DIR="$(_new_build_dir)"
     echo "Building compiled interpreter..."
-    build_out=$("$compiler" --root "$BINATE_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    build_out=$("$compiler" --root "$BINATE_DIR" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"
@@ -61,7 +82,11 @@ build_interp() {
     echo "Compiled interpreter ready: $COMPILED_INTERP"
 }
 
-# Cleanup helper — removes all temp binaries.
+# Cleanup helper — removes all temp binaries and build dirs.
 cleanup_compilers() {
     rm -f "$GEN1_COMPILER" "$GEN2_COMPILER" "$COMPILED_INTERP"
+    for d in $BUILD_DIRS; do
+        rm -rf "$d"
+    done
+    BUILD_DIRS=""
 }

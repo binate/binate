@@ -4,9 +4,14 @@
 runner_compile() {
     bn="$1"
     tmpbin="$2"
-    cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
+    bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
+    out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
         "$BINATE_DIR/cmd/bnc" -- --root "$(dirname "$bn")" \
-        -o "$tmpbin" "$bn" 2>&1
+        --build-dir "$bdir" -o "$tmpbin" "$bn" 2>&1)
+    rc=$?
+    rm -rf "$bdir"
+    [ -n "$out" ] && echo "$out"
+    return $rc
 }
 
 runner_run() {

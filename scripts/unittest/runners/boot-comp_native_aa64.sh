@@ -12,14 +12,16 @@ runner_setup() {
 
 runner_test() {
     pkg="$1"
-    testbin=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --test --backend native --root "$BINATE_DIR" "$pkg" 2>&1)
+    bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
+    testbin=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --test --backend native --root "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
     if [ ! -x "$testbin" ]; then
         echo "$testbin"  # error output
+        rm -rf "$bdir"
         return 1
     fi
     "$testbin" 2>&1
     rc=$?
-    rm -f "$testbin"
+    rm -rf "$bdir"
     return $rc
 }
 

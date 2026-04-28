@@ -17,11 +17,12 @@ runner_exec() {
     root="$2"
     name="$(basename "$bn" .bn)"
     tmpbin="/tmp/binate_conform_${name}_$$"
+    bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
     compile_root="$BINATE_DIR"
     if [ -n "$root" ]; then
         compile_root="$root"
     fi
-    compile_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$compile_root" -backend native $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
+    compile_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$compile_root" --build-dir "$bdir" -backend native $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         # The skeleton produces incorrect code for features it doesn't
         # handle (e.g. function parameters), which can yield infinite
@@ -37,6 +38,7 @@ runner_exec() {
         echo "COMPILE_ERROR: $compile_out"
     fi
     rm -f "$tmpbin"
+    rm -rf "$bdir"
 }
 
 runner_cleanup() {

@@ -31,8 +31,7 @@ typedef struct {
 } BnManagedSlice;
 
 // Managed memory (Alloc, Box, RefInc, RefDec, Free) and bounds checking
-// are provided by pkg/rt. See pkg/rt/rt.bn, runtime/libc_stubs.c
-// (libc bridges), and runtime/rt_stubs.c (residual C helpers).
+// are provided by pkg/rt. See pkg/rt/rt.bn and runtime/rt_stubs.c.
 
 // ============================================================
 // I/O and process: all bn_* shims have been removed. Print/println's

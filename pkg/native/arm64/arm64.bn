@@ -3,6 +3,7 @@ package "pkg/native/arm64"
 import "pkg/asm"
 import "pkg/asm/aarch64"
 import "pkg/asm/macho"
+import "pkg/buf"
 import "pkg/ir"
 import "pkg/mangle"
 import "pkg/native/common"
@@ -31,6 +32,7 @@ func EmitObject(mod @ir.Module, path *[]const char) bool {
 
 	emitStringTable(a, mod.Strings)
 	emitGlobals(a, pkgName, mod.Globals)
+	emitFuncValueVtables(a, pkgName, mod)
 
 	aarch64.ResolveFixups(a)
 	asm.Finalize(a)
@@ -54,6 +56,86 @@ func emitStringTable(a @asm.Assembler, strings @[]ir.StringConst) {
 	// Pad back up to instruction alignment so any subsequent emissions
 	// stay on 4-byte boundaries.
 	asm.Align(a, 4)
+}
+
+// emitFuncValueVtables walks the module for OP_FUNC_VALUE references
+// and emits one 16-byte vtable per unique function name in __DATA:
+//   __vt.<mangled>:
+//       .quad 0                ; dtor (no captured ctx for non-capturing)
+//       .quad <mangled_func>   ; call slot — real C function pointer
+// Globals are emitted with weak (Mach-O equivalent of weak_odr) so the
+// linker dedupes across .o's without dropping them. See plan-function-
+// values.md "VM-mode vtables — interop-compatible from Phase 1" for the
+// design; native arm64 sits in compiled mode so vtable.call holds the
+// real function pointer (not a Phase-3 trampoline).
+func emitFuncValueVtables(a @asm.Assembler, pkgName *[]const char,
+		mod @ir.Module) {
+	var seen @[]@[]char
+	for i := 0; i < len(mod.Funcs); i++ {
+		var f @ir.Func = mod.Funcs[i]
+		if f.IsExtern { continue }
+		for j := 0; j < len(f.Blocks); j++ {
+			var blk @ir.Block = f.Blocks[j]
+			for k := 0; k < len(blk.Instrs); k++ {
+				var ins @ir.Instr = blk.Instrs[k]
+				if ins.Op != ir.OP_FUNC_VALUE { continue }
+				var dup bool = false
+				for s := 0; s < len(seen); s++ {
+					if charEqAA64(seen[s], ins.StrVal) {
+						dup = true
+						break
+					}
+				}
+				if dup { continue }
+				seen = appendNameAA64(seen, ins.StrVal)
+			}
+		}
+	}
+	if len(seen) == 0 { return }
+	asm.SetSection(a, "data", -1)
+	for i := 0; i < len(seen); i++ {
+		var label @[]char = vtableSymFor(pkgName, seen[i])
+		var fnLabel @[]char = symFor(pkgName, seen[i])
+		asm.DefineLabel(a, label)
+		asm.SetWeak(a, label)
+		// Reference fnLabel so the assembler resolves it as a relocation.
+		asm.SetGlobal(a, fnLabel)
+		// dtor slot: 8 bytes of zero.
+		asm.Zero(a, 8)
+		// call slot: word-sized pointer to the function. EmitAddr
+		// records a fixup that the linker resolves to the function's
+		// runtime address.
+		asm.EmitAddr(a, fnLabel)
+	}
+}
+
+// vtableSymFor returns the underscore-prefixed Mach-O label for a
+// function's vtable global: "_bn_<pkg>__<name>__vt".
+func vtableSymFor(pkgName *[]const char, fnName *[]const char) @[]char {
+	var fn @[]char = symFor(pkgName, fnName)
+	var cb buf.CharBuf = buf.New()
+	cb = cb.WriteStr(fn)
+	cb = cb.WriteStr("__vt")
+	return cb.Bytes()
+}
+
+// charEqAA64 compares two char slices for equality. Local helper
+// (pkg/native/arm64 doesn't pull in pkg/buf's full set).
+func charEqAA64(a *[]const char, b *[]const char) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] { return false }
+	}
+	return true
+}
+
+// appendNameAA64 appends a name to a managed slice (O(n) copy).
+func appendNameAA64(s @[]@[]char, v @[]char) @[]@[]char {
+	var n int = len(s)
+	var ns @[]@[]char = make_slice(@[]char, n + 1)
+	for i := 0; i < n; i++ { ns[i] = s[i] }
+	ns[n] = v
+	return ns
 }
 
 // emitGlobals emits package-level variable storage in a new __DATA
@@ -318,6 +400,33 @@ func emitInstr(a @asm.Assembler, pkgName *[]const char, funcSym @[]char,
 		var rd int = nextReg(rm, ins.ID)
 		aarch64.Adrp(a, rd, label)
 		aarch64.AddImmLabel(a, true, rd, rd, label)
+		return
+	}
+	if ins.Op == ir.OP_FUNC_VALUE {
+		// Function-value construction. Builds a 16-byte
+		// {vtable_addr, null} aggregate in the IR-instruction's
+		// pre-allocated data region (PlanFrame allocated it via
+		// the OP_FUNC_VALUE arm in IsAggregateTyp).
+		// vtable_addr is the address of the per-function vtable
+		// global emitted by emitFuncValueVtables.
+		if len(ins.StrVal) == 0 { return }
+		var dataOff int = common.LookupAlloc(rm, ins.ID)
+		if dataOff < 0 { return }
+		var vtLabel @[]char = vtableSymFor(pkgName, ins.StrVal)
+		asm.SetGlobal(a, vtLabel)
+		// Compute vtable address into a scratch reg via ADRP+ADD.
+		var addrTmp int = scratchReg(rm)
+		aarch64.Adrp(a, addrTmp, vtLabel)
+		aarch64.AddImmLabel(a, true, addrTmp, addrTmp, vtLabel)
+		// Store vtable_addr at dataOff+0.
+		aarch64.Str(a, true, addrTmp,
+			aarch64.MemImm(aarch64.SP, dataOff))
+		// Store 0 at dataOff+8 (data slot is null in compiled mode).
+		aarch64.Str(a, true, aarch64.XZR,
+			aarch64.MemImm(aarch64.SP, dataOff + 8))
+		// Produce the data-region pointer as the result.
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(dataOff))
 		return
 	}
 

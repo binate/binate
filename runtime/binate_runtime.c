@@ -70,12 +70,19 @@ static BnSlice cstr_to_slice(const char *s) {
     return r;
 }
 
+// Forward decl: pkg/rt's RawFree, used as the free_fn in headers
+// allocated through this C-side helper. pkg/rt.Free reads header[1]
+// and dispatches indirect through it (via OP_CALL_INDIRECT). Setting
+// it here keeps managed allocations created in C consistent with
+// those created via rt.Alloc — both are released through RawFree.
+extern void bn_rt__RawFree(void *ptr);
+
 // Helper: allocate a managed block (16-byte header + payload, refcount=1)
 static void *managed_alloc(size_t payload_size) {
     void *base = calloc(1, 16 + payload_size);
     int64_t *header = (int64_t *)base;
     header[0] = 1;  // refcount = 1
-    header[1] = 0;  // dtor = null
+    header[1] = (int64_t)(intptr_t)&bn_rt__RawFree;  // free_fn = &RawFree
     return (char *)base + 16;  // return pointer past header
 }
 

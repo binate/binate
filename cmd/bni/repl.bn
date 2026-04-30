@@ -1,0 +1,182 @@
+package "main"
+
+import "pkg/ast"
+import "pkg/bootstrap"
+import "pkg/buf"
+import "pkg/debug"
+import "pkg/ir"
+import "pkg/loader"
+import "pkg/parser"
+import "pkg/types"
+import "pkg/vm"
+
+// runRepl loads the module specified by cli.Filenames, then enters
+// an interactive prompt that accepts immediate-mode statement
+// lists against the loaded scope.  Tier 1 PoC: no new top-level
+// declarations at the prompt, no redefinition, no forward refs,
+// and no auto-`println` wrap of bare expressions (type
+// `println(...)` explicitly to print).  Errors during a prompt
+// turn are reported and control returns to the prompt; nothing
+// in the loaded module is affected.  Ctrl-D exits.
+func runRepl(cli CLIArgs) {
+	cli.Filenames = expandDirArgs(cli.Filenames)
+	if len(cli.Filenames) == 0 {
+		println("error: --repl requires a source file or package")
+		bootstrap.Exit(1)
+	}
+
+	// === Setup mirrors runProgram (parse → load imports → typecheck
+	// → IR-gen → lower) but ends BEFORE invoking main, and uses
+	// CheckMainPersistent so the main file's scope is left
+	// installed on c.Scope for prompt entries.
+	var files @[]@ast.File = parseSourceFiles(cli.Filenames)
+	var merged @ast.File = loader.MergeFiles(files)
+	debug.Log("parsed and merged source files")
+
+	var root @[]char = buf.CopyStr(
+		resolveRoot(cli.RootOverride, cli.Filenames[0]))
+
+	var ldr @loader.Loader = loader.NewLoader(root)
+	for i := 0; i < len(cli.AddRoots); i++ {
+		loader.AddRoot(ldr, cli.AddRoots[i])
+	}
+	applyPathFlags(ldr, cli)
+	loader.LoadImports(ldr, merged.Imports)
+	ensureBootstrapLoaded(ldr)
+	if len(ldr.Errors) > 0 {
+		for i := 0; i < len(ldr.Errors); i++ {
+			println(ldr.Errors[i])
+		}
+		bootstrap.Exit(1)
+	}
+	debug.Log("imports loaded successfully")
+
+	// Type-check, leaving main file's scope installed on c.Scope.
+	var c @types.Checker = types.NewChecker()
+	loadBuiltinBNIs(c, ldr, root)
+	for i := 0; i < len(ldr.Order); i++ {
+		var pkg @loader.Package = loader.GetPackage(
+			ldr, ldr.Order[i])
+		if pkg == nil || pkg.Builtin { continue }
+		if pkg.BNI != nil {
+			types.LoadPackageInterface(c, ldr.Order[i], pkg.BNI)
+		}
+		if pkg.Merged != nil {
+			types.CheckPackage(c, ldr.Order[i], pkg.Merged)
+		}
+	}
+	types.CheckMainPersistent(c, merged)
+	var errs @[]types.CheckError = types.CheckerErrors(c)
+	if len(errs) > 0 {
+		for i := 0; i < len(errs); i++ {
+			println(errs[i].Msg)
+		}
+		bootstrap.Exit(1)
+	}
+	debug.Log("type checking passed")
+
+	// Build VM and lower all packages.
+	var vmInst @vm.VM = vm.NewVM(8 * 1024 * 1024)
+	for i := 0; i < len(ldr.Order); i++ {
+		var pkg @loader.Package = loader.GetPackage(
+			ldr, ldr.Order[i])
+		if pkg == nil || pkg.Builtin { continue }
+		if pkg.Merged == nil { continue }
+		var mod @ir.Module = ir.InitModule(
+			quotePath(ldr.Order[i]))
+		registerPkgImports(ldr, pkg, mod, root, cli.AddRoots)
+		if pkg.BNI != nil {
+			ir.RegisterSelfTypes(pkg.BNI)
+		}
+		ir.GeneratePackage(pkg.Merged, mod)
+		vm.LowerModule(vmInst, mod)
+	}
+
+	// Lower main package.  Keep mainMod around — synthetic REPL
+	// functions are appended to it and routed through LowerOneFunc
+	// against this same module (so their context is main's).
+	var mainMod @ir.Module = ir.InitModule(merged.PkgName)
+	registerMainImports(ldr, merged, mainMod, root, cli.AddRoots)
+	ir.GeneratePackage(merged, mainMod)
+	vm.LowerModule(vmInst, mainMod)
+
+	// === REPL loop ===
+	println("Binate REPL (Tier 1 PoC). Ctrl-D to exit.")
+	var replCounter int = 0
+	for {
+		print("> ")
+		var line @[]uint8
+		var eof bool
+		line, eof = readReplLine()
+		if eof { println(""); return }
+		if len(line) == 0 { continue }
+		evalReplLine(vmInst, mainMod, c, line, replCounter)
+		replCounter = replCounter + 1
+	}
+}
+
+// evalReplLine parses a single line of REPL input as a statement
+// list, type-checks it, lowers it as a synthetic __repl_<n>
+// function, and runs it.  Any errors at parse / check stages are
+// reported and the function returns without lowering — the loaded
+// state is unaffected.
+func evalReplLine(vmInst @vm.VM, m @ir.Module, c @types.Checker,
+		src @[]uint8, n int) {
+	var p @parser.Parser = parser.New(src, "<repl>")
+	var ss @[]@ast.Stmt = parser.ParseStmtList(p)
+	var perrs @[]parser.ParseError = parser.Errors(p)
+	if len(perrs) > 0 {
+		for i := 0; i < len(perrs); i++ {
+			println(perrs[i].Msg)
+		}
+		return
+	}
+	var prevErrs int = len(types.CheckerErrors(c))
+	types.CheckStmtListInScope(c, ss)
+	var allErrs @[]types.CheckError = types.CheckerErrors(c)
+	if len(allErrs) > prevErrs {
+		for i := prevErrs; i < len(allErrs); i++ {
+			println(allErrs[i].Msg)
+		}
+		return
+	}
+	var name @[]char = bootstrap.Concat(
+		"__repl_", bootstrap.Itoa(n))
+	var f @ir.Func = ir.GenSyntheticFunc(name, ss)
+	ir.AddFunc(m, f)
+	var vmf @vm.VMFunc = vm.LowerOneFunc(vmInst, m, f)
+	if vmf == nil { return }
+	var noArgs @[]int
+	vm.CallByVMFunc(vmInst, vmf, noArgs)
+}
+
+// readReplLine reads a line from stdin, byte by byte.  Returns the
+// line bytes (without the trailing newline) and an EOF flag.  On a
+// genuine EOF (no bytes read since the last line), eof is true; on
+// EOF mid-line, the buffered bytes are returned with eof = false
+// (the caller will see eof on the next read).
+func readReplLine() (@[]uint8, bool) {
+	var line @[]uint8
+	var buf @[]uint8 = make_slice(uint8, 1)
+	for {
+		var n int = bootstrap.Read(0, buf)
+		if n <= 0 {
+			return line, len(line) == 0
+		}
+		if buf[0] == 10 {  // '\n'
+			return line, false
+		}
+		line = appendByteRepl(line, buf[0])
+	}
+}
+
+// appendByteRepl is a minimal append helper for @[]uint8.  REPL-
+// local; pkg/buf has richer string helpers but this avoids pulling
+// in extra surface for one byte at a time.
+func appendByteRepl(s @[]uint8, b uint8) @[]uint8 {
+	var n int = len(s)
+	var ns @[]uint8 = make_slice(uint8, n + 1)
+	for i := 0; i < n; i++ { ns[i] = s[i] }
+	ns[n] = b
+	return ns
+}

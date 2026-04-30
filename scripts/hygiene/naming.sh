@@ -3,6 +3,8 @@
 #
 # Checks the naming convention from explorations/code-hygiene-check.md §6:
 #   Exported symbols (in `.bni`) must start with an uppercase letter.
+# Names starting with a lowercase letter or `_` are flagged; both
+# patterns are reserved for non-exported / compiler-internal use.
 #
 # Targets every top-level `func`, `type`, `const`, and enumerator inside
 # `const ( ... )` groups in `.bni` files under pkg/.
@@ -44,24 +46,24 @@ for f in $(find "$BINATE_DIR/pkg" -name '*.bni' 2>/dev/null | sort); do
             printf("%s:%d: lowercase %s name in .bni: %s\n", rel, FNR, kind, name)
             e++
         }
-        /^func [a-z]/  {
+        /^func [a-z_]/  {
             name = name_of_func($0)
             if (name != "") flag("func", name)
             next
         }
-        /^type [a-z]/  {
+        /^type [a-z_]/  {
             name = name_of_type($0)
             if (name != "") flag("type", name)
             next
         }
         /^const \(/    { in_grp = 1; next }
         in_grp && /^\)/ { in_grp = 0; next }
-        /^const [a-z]/ {
+        /^const [a-z_]/ {
             name = name_of_const_single($0)
             if (name != "") flag("const", name)
             next
         }
-        in_grp && /^[\t ]+[a-z]/ {
+        in_grp && /^[\t ]+[a-z_]/ {
             name = name_of_enumerator($0)
             if (name != "") flag("const enumerator", name)
         }

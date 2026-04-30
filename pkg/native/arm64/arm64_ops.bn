@@ -481,6 +481,162 @@ func emitCallIndirect(a @asm.Assembler, rm @common.RegMap,
 	}
 }
 
+// emitCallFuncValue lowers OP_CALL_FUNC_VALUE: call through a 2-word
+// function value's vtable.call. Compiled-mode dispatch — the call
+// slot holds a real function pointer (vs. VM-mode, where the slot
+// is a Phase-1 placeholder and the bytecode short-circuits via the
+// closure record's vm_func_idx). Args[0] is the function value's
+// address; Args[1..] are the call args, dispatched the same way as
+// emitCallIndirect / emitCall.
+func emitCallFuncValue(a @asm.Assembler, rm @common.RegMap,
+	allFuncs @[]@ir.Func, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+
+	// Two-step load to populate X17 with vtable.call:
+	//   LDR X17, [fvAddr + 0]   ; X17 = vtable_ptr
+	//   LDR X17, [X17 + 8]      ; X17 = vtable.call
+	// Same X17 for source+dest in the second LDR is fine — AArch64
+	// updates the dest after the load completes.
+	var fvAddr int = getOperand(a, rm, ins.Args[0].ID)
+	if fvAddr < 0 { return }
+	aarch64.Ldr(a, true, aarch64.X17,
+		aarch64.MemImm(fvAddr, 0))
+	aarch64.Ldr(a, true, aarch64.X17,
+		aarch64.MemImm(aarch64.X17, 8))
+
+	// AAPCS arg dispatch on the call args (Args[1..]). Mirrors
+	// emitCallIndirect's body — see plan-function-values.md.
+	var nCallArgs int = len(ins.Args) - 1
+	var argTypes @[]@types.Type = make_slice(@types.Type, nCallArgs)
+	for i := 0; i < nCallArgs; i++ {
+		argTypes[i] = ins.Args[i + 1].Typ
+	}
+	var nsrn int = 0
+	for ai := 0; ai < nCallArgs; ai++ {
+		var arg @ir.Instr = ins.Args[ai + 1]
+		if isFloatTyp(arg.Typ) {
+			var src int = getOperand(a, rm, arg.ID)
+			if src < 0 { continue }
+			if nsrn < 8 {
+				aarch64.Fmov_gp_to_fp(a,
+					aarch64.D0 + nsrn, src)
+				nsrn = nsrn + 1
+			}
+			continue
+		}
+		var regStart int = common.CallArgRegStart(argTypes, ai)
+		var stackOff int = common.CallArgStackOff(argTypes, ai)
+		if common.IsAggregateTyp(arg.Typ) {
+			var ptr int = getOperand(a, rm, arg.ID)
+			if ptr < 0 { continue }
+			var nWords int = common.ArgWords(arg.Typ)
+			if regStart >= 0 {
+				for w := 0; w < nWords; w++ {
+					aarch64.Ldr(a, true,
+						argReg(regStart + w),
+						aarch64.MemImm(ptr, 8*w))
+				}
+			} else {
+				var tmp int = aarch64.X16
+				for w := 0; w < nWords; w++ {
+					aarch64.Ldr(a, true, tmp,
+						aarch64.MemImm(ptr, 8*w))
+					aarch64.Str(a, true, tmp,
+						aarch64.MemImm(aarch64.SP,
+							stackOff + 8*w))
+				}
+			}
+		} else {
+			var src int = getOperand(a, rm, arg.ID)
+			if src < 0 { continue }
+			if regStart >= 0 {
+				if src != argReg(regStart) {
+					aarch64.Mov(a, true,
+						argReg(regStart),
+						aarch64.Reg(src))
+				}
+			} else {
+				aarch64.Str(a, true, src,
+					aarch64.MemImm(aarch64.SP, stackOff))
+			}
+		}
+	}
+
+	// AAPCS sret — indirect-call shape, see emitCallIndirect note.
+	var bigMultiRet bool = ins.ID >= 0 &&
+		common.CallReturnsBigMultiReturn(ins)
+	var bigRet bool = ins.ID >= 0 &&
+		(common.CallReturnsBigAggregate(ins) || bigMultiRet)
+	if bigRet {
+		var sretOff int = -1
+		if bigMultiRet {
+			sretOff = common.LookupSpill(rm, ins.ID)
+		} else {
+			sretOff = common.LookupAlloc(rm, ins.ID)
+		}
+		if sretOff >= 0 {
+			aarch64.Add(a, true, aarch64.X8, aarch64.SP,
+				aarch64.Imm(sretOff))
+		}
+	}
+
+	aarch64.Blr(a, aarch64.X17)
+	common.ResetRegs(rm)
+	if ins.ID < 0 { return }
+
+	// Aggregate single-return: spill X0..X(N-1) into the alloc region
+	// and produce its pointer. Same as emitCallIndirect / emitCall.
+	if ins.Typ != nil && common.IsAggregateTyp(ins.Typ) &&
+		!common.IsMultiReturnCall(ins) {
+		var dataOff int = common.LookupAlloc(rm, ins.ID)
+		if dataOff < 0 { return }
+		var sz int = types.SizeOf(ins.Typ)
+		if sz <= 0 { return }
+		if !bigRet {
+			var nWords int = sz / 8
+			for ri := 0; ri < nWords && ri < 8; ri++ {
+				aarch64.Str(a, true, argReg(ri),
+					aarch64.MemImm(aarch64.SP,
+						dataOff + 8*ri))
+			}
+		}
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(dataOff))
+		return
+	}
+
+	var spillOff int = common.LookupSpill(rm, ins.ID)
+	if spillOff < 0 { return }
+	if bigMultiRet { return }
+	if !common.IsMultiReturnCall(ins) {
+		aarch64.Str(a, true, argReg(0),
+			aarch64.MemImm(aarch64.SP, spillOff))
+		return
+	}
+	var rIdx int = 0
+	for fi := 0; fi < len(ins.Typ.Fields) && rIdx < 8; fi++ {
+		var fldTyp @types.Type = ins.Typ.Fields[fi].Type
+		var fldOff int = types.FieldOffset(ins.Typ, fi)
+		if common.IsAggregateTyp(fldTyp) {
+			var fldSz int = types.SizeOf(fldTyp)
+			var nWords int = fldSz / 8
+			if nWords < 1 { nWords = 1 }
+			for w := 0; w < nWords && rIdx < 8; w++ {
+				aarch64.Str(a, true, argReg(rIdx),
+					aarch64.MemImm(aarch64.SP,
+						spillOff + fldOff + 8*w))
+				rIdx = rIdx + 1
+			}
+		} else {
+			var fldSz int = types.SizeOf(fldTyp)
+			if fldSz <= 0 { fldSz = 8 }
+			emitScalarStore(a, argReg(rIdx), aarch64.SP,
+				spillOff + fldOff, fldSz)
+			rIdx = rIdx + 1
+		}
+	}
+}
+
 // emitRefcountCall emits a call to bn_rt__RefInc or bn_rt__RefDec.
 // For RefDec (takesDtor=true), Args[1] is the optional destructor
 // pointer; if absent, pass null in X1 (the IR uses null to mean "no

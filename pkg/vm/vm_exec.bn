@@ -3,7 +3,7 @@ package "pkg/vm"
 import "pkg/rt"
 
 // execFunc enters the VM for a function call. This is the entry
-// point from compiled code (CallFunc, vmRefDec, execExtern).
+// point from compiled code (CallFunc, execExtern's rt.CallDtor arm).
 // Pushes an initial frame and runs the iterative dispatch loop.
 func execFunc(vm @VM, funcIdx int, args @[]int) int {
 	var f @VMFunc = vm.Funcs[funcIdx]
@@ -46,6 +46,14 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int {
 	var frameBase *uint8 = bit_cast(*uint8,
 		bit_cast(int, vm.Stack) + regsOff + f.NumRegs * 8)
 	var pc int = 0
+	// Hoisted: BC_CALL extern's per-call args buffer. Declared
+	// here at function entry so its alloca is in the entry block;
+	// declaring it inside the BC_CALL branch caused bnc to emit
+	// the alloca in that branch, leaking 32 bytes of host stack
+	// per extern call (only released when execLoop returned).
+	// For boot-comp-int-int, that triggered host stack overflow
+	// after ~218s on any non-trivial run.
+	var callArgs @[]int
 
 	for {
 		var instr BCInstr = code[pc]
@@ -378,6 +386,12 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int {
 			var callerRegsOff int = hdr[2]
 			var callerSP int = hdr[3]
 			var callerDst int = hdr[4]
+			// freeOnPop: set by BC_REFDEC's iterative dispatch when
+			// it pushes a dtor frame. After we restore caller state
+			// below, rt.Free this payload — completing the
+			// "decrement → run dtor → free" sequence without host
+			// recursion. 0 = no action.
+			var freeOnPop int = hdr[5]
 			// If retVal points into the callee's region (a struct
 			// alloca, packed multi-return, or managed-slice
 			// header), we must copy it back to caller space so
@@ -411,6 +425,9 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int {
 			if callerDst >= 0 {
 				regs[callerDst] = retVal
 			}
+			if freeOnPop != 0 {
+				rt.Free(bit_cast(*uint8, freeOnPop))
+			}
 			continue
 		}
 
@@ -420,9 +437,12 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int {
 			var calleeFuncIdx int = LookupFunc(vm,
 				callName)
 			if calleeFuncIdx < 0 {
-				// Extern call
-				var callArgs @[]int = make_slice(int,
-					instr.Imm)
+				// Extern call: reuse the hoisted callArgs slot.
+				// Only re-make_slice if the existing buffer can't
+				// hold this call's args (or doesn't exist yet).
+				if len(callArgs) < instr.Imm {
+					callArgs = make_slice(int, instr.Imm)
+				}
 				for i := 0; i < instr.Imm; i++ {
 					callArgs[i] = regs[instr.Src1 + i]
 				}
@@ -500,7 +520,39 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int {
 			if ptr == nil { continue }
 			var dtorIdx int = 0
 			if instr.Src2 >= 0 { dtorIdx = regs[instr.Src2] }
-			if dtorIdx == 0 { rt.RefDec(ptr, nil) } else { vmRefDec(vm, ptr, dtorIdx) }
+			if dtorIdx == 0 {
+				// No dtor: native fast path, doesn't recurse into VM.
+				rt.RefDec(ptr, nil)
+				continue
+			}
+			// Decrement refcount inline (vmRefDec previously did this).
+			var hd *int = bit_cast(*int,
+				bit_cast(int, ptr) - 16)
+			hd[0] = hd[0] - 1
+			if hd[0] != 0 { continue }
+			// Refcount hit 0: dispatch the dtor as an iterative VM
+			// call (mirrors BC_CALL), instead of recursing through
+			// execFunc on the host stack. The dtor's frame stashes
+			// the ptr-to-free in freeOnPop; BC_RETURN's pop will
+			// rt.Free it after restoring caller state. This keeps
+			// host stack flat across dtor cascades.
+			var dtorFunc @VMFunc = vm.Funcs[dtorIdx - 1]
+			var newRegsOff int = pushFrame(vm, dtorFunc, pc,
+				funcIdx, regsOff, vm.SP, -1)
+			var newHdr *int = stackPtr(vm,
+				newRegsOff - FRAME_HDR)
+			newHdr[5] = bit_cast(int, ptr)
+			var newRegs *int = stackPtr(vm, newRegsOff)
+			newRegs[0] = bit_cast(int, ptr)
+			funcIdx = dtorIdx - 1
+			f = dtorFunc
+			code = f.Code
+			regsOff = newRegsOff
+			regs = newRegs
+			frameBase = bit_cast(*uint8,
+				bit_cast(int, vm.Stack) + newRegsOff +
+					f.NumRegs * 8)
+			pc = 0
 			continue
 		}
 		if instr.Op == BC_ALLOC {

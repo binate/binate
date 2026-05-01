@@ -1,0 +1,238 @@
+package "pkg/native/common"
+
+import "pkg/builtin/testing"
+import "pkg/ir"
+import "pkg/types"
+
+// AAPCS-style argument dispatch tests — the helpers that classify
+// where each call argument lands (X-regs, D-regs, stack overflow,
+// reg/stack split for aggregates) and the sret/big-return predicates.
+
+
+
+// AAPCS dispatch helpers must skip float scalars from the X-register
+// budget — floats consume D-regs (NSRN) tracked separately by the call
+// site. Mixed (int, float, slice) signatures must place the slice in
+// the X-regs immediately after the int, not after the int+float.
+func TestCallArgRegStartSkipsFloats() testing.TestResult {
+	var argTypes @[]@types.Type = make_slice(@types.Type, 3)
+	argTypes[0] = types.TypInt()                          // X0
+	argTypes[1] = types.TypFloat64()                      // D0 (no X reg)
+	argTypes[2] = types.MakeSliceType(types.TypUint8())   // X1..X2
+	if CallArgRegStart(argTypes, 0) != 0 {
+		return "int arg should be at X0"
+	}
+	if CallArgRegStart(argTypes, 1) != -1 {
+		return "float arg should not consume X-regs (regStart -1)"
+	}
+	if CallArgRegStart(argTypes, 2) != 1 {
+		return "slice after float should start at X1, not X2"
+	}
+	if CallStackBytes(argTypes) != 0 {
+		return "no stack args expected for (int, float, *[]u8)"
+	}
+	return ""
+}
+// AAPCS-style argument dispatch: scalars consume one reg each up to
+// X7; an aggregate that doesn't fit in remaining regs goes ENTIRELY
+// on stack. The exact rule matters because a "split" (some words in
+// regs, some on stack) was the regression that silently dropped
+// Entry.Val in 135 — the caller wrote 4 of 5 words to X4..X7 and
+// dropped word 5.
+
+func TestArgWordsAggregateRoundsUp() testing.TestResult {
+	// @[]int = managed slice = 32 bytes = 4 words.
+	var ms @types.Type = types.MakeManagedSliceType(types.TypInt())
+	if ArgWords(ms) != 4 {
+		return "managed slice should be 4 words"
+	}
+	// Plain pointer (managed-ptr): 1 word.
+	if ArgWords(types.TypInt()) != 1 {
+		return "scalar should be 1 word"
+	}
+	return ""
+}
+func TestCallStackBytesAllInRegs() testing.TestResult {
+	// (int, @[]int): 1 + 4 = 5 words. Fits in X0..X4. Zero stack.
+	var ts @[]@types.Type = make_slice(@types.Type, 2)
+	ts[0] = types.TypInt()
+	ts[1] = types.MakeManagedSliceType(types.TypInt())
+	if CallStackBytes(ts) != 0 {
+		return "all-fit args should need 0 stack bytes"
+	}
+	if CallArgRegStart(ts, 0) != 0 { return "arg 0 should be at X0" }
+	if CallArgRegStart(ts, 1) != 1 { return "arg 1 should start at X1" }
+	if CallArgStackOff(ts, 0) != -1 { return "arg 0 should not be on stack" }
+	return ""
+}
+func TestCallStackBytesAggregateSplitAcrossRegsAndStack() testing.TestResult {
+	// (@[]int, Entry5w): 4 + 5 = 9 words. Slice fits in X0..X3 (NGRN
+	// 0→4); Entry straddles — 4 words in X4..X7, 1 word on stack.
+	// Total stack = 1*8 = 8, padded up to 16 (16-aligned).
+	//
+	// Split is what LLVM's byval AAPCS lowering emits, so native must
+	// match (otherwise native main calling LLVM-built deps mismatches
+	// — conformance 337). An earlier all-on-stack ("atomic overflow")
+	// variant of this code dropped Entry.Val in 135; the fix is to
+	// implement split correctly (caller fills regs AND writes overflow
+	// to stack; callee reads regs AND copies overflow from caller's
+	// stack-args area), not to fall back to atomic overflow.
+	var fields @[]@types.Field = make_slice(@types.Field, 2)
+	fields[0] = make(types.Field)
+	fields[0].Type = types.MakeManagedSliceType(types.TypInt())
+	fields[1] = make(types.Field)
+	fields[1].Type = types.TypInt()
+	var entry @types.Type = types.MakeStructType("Entry", fields)
+	var ts @[]@types.Type = make_slice(@types.Type, 2)
+	ts[0] = types.MakeManagedSliceType(types.TypInt())
+	ts[1] = entry
+	if CallArgRegStart(ts, 0) != 0 { return "slice arg should start X0" }
+	if CallArgRegStart(ts, 1) != 4 {
+		return "Entry should start at X4 (split across X4..X7 + stack)"
+	}
+	if CallArgStackOff(ts, 1) != 0 {
+		return "Entry overflow should be at stack offset 0"
+	}
+	if CallStackBytes(ts) != 16 {
+		return "1-word stack overflow should reserve 16 bytes (16-aligned)"
+	}
+	return ""
+}
+func TestCallArgRegStartFullyOnStackAfterRegsExhausted() testing.TestResult {
+	// (Tup8w, int): Tup occupies X0..X7 fully (NGRN 0→8); int has no
+	// regs left → entirely on stack[0]. Confirms that once the boundary
+	// is crossed completely, subsequent args are stack-only (not split).
+	var fields @[]@types.Field = make_slice(@types.Field, 8)
+	for i := 0; i < 8; i++ {
+		fields[i] = make(types.Field)
+		fields[i].Type = types.TypInt()
+	}
+	var tup @types.Type = types.MakeStructType("Tup8", fields)
+	var ts @[]@types.Type = make_slice(@types.Type, 2)
+	ts[0] = tup
+	ts[1] = types.TypInt()
+	if CallArgRegStart(ts, 0) != 0 { return "Tup should start X0" }
+	if CallArgStackOff(ts, 0) != -1 { return "Tup should be all in regs" }
+	if CallArgRegStart(ts, 1) != -1 { return "int should overflow to stack" }
+	if CallArgStackOff(ts, 1) != 0 { return "int stack off should be 0" }
+	return ""
+}
+func TestCallStackBytesScalarOverflowAfterEightFilled() testing.TestResult {
+	// 9 ints: X0..X7 used, then 9th goes on stack at offset 0.
+	var ts @[]@types.Type = make_slice(@types.Type, 9)
+	for i := 0; i < 9; i++ {
+		ts[i] = types.TypInt()
+	}
+	if CallArgRegStart(ts, 7) != 7 { return "arg 7 should be in X7" }
+	if CallArgRegStart(ts, 8) != -1 { return "arg 8 should overflow" }
+	if CallArgStackOff(ts, 8) != 0 { return "arg 8 stack offset should be 0" }
+	if CallStackBytes(ts) != 16 {
+		return "1-word stack arg should pad to 16 bytes"
+	}
+	return ""
+}
+// CalleeUsesCSret applies the stricter clang/AAPCS-C threshold (>16
+// bytes) when the callee is a C-extern, even though our internal
+// Binate convention only triggers sret at >64 bytes. This is an ABI
+// interop requirement: pkg/codegen emits LLVM `sret(...)` for
+// IsCExtern callees with aggregate returns >16 bytes, so the caller
+// (us) must pass X8 = &returnBuffer for those calls. Without this,
+// bootstrap.Concat (returning @[]char = 32 bytes via X8 sret) gets
+// called with garbage in X8 → 064 SIGSEGVs.
+
+func TestCalleeUsesCSretBootstrapConcat() testing.TestResult {
+	// Build a func list that includes a synthetic IsCExtern entry
+	// returning @[]char (32 bytes).
+	var f @ir.Func = ir.NewFunc("bootstrap.Concat", makeNoParams(),
+		makeNoResults())
+	f.IsCExtern = true
+	f.Results = make_slice(@types.Type, 1)
+	f.Results[0] = types.MakeManagedSliceType(types.TypChar())
+	var funcs @[]@ir.Func = make_slice(@ir.Func, 1)
+	funcs[0] = f
+	// CALL instr targeting it.
+	var ins @ir.Instr = make(ir.Instr)
+	ins.Op = ir.OP_CALL
+	ins.StrVal = "bootstrap.Concat"
+	ins.Typ = types.MakeManagedSliceType(types.TypChar())
+	if !CalleeUsesCSret(funcs, ins) {
+		return "C-extern @[]char (32 bytes) return should trigger sret"
+	}
+	return ""
+}
+func TestCalleeUsesCSretInternalBinateNo() testing.TestResult {
+	// Internal Binate function with the same return type — does NOT
+	// use sret. Our internal convention packs into X0..X3.
+	var f @ir.Func = ir.NewFunc("local", makeNoParams(),
+		makeNoResults())
+	f.IsCExtern = false
+	f.Results = make_slice(@types.Type, 1)
+	f.Results[0] = types.MakeManagedSliceType(types.TypChar())
+	var funcs @[]@ir.Func = make_slice(@ir.Func, 1)
+	funcs[0] = f
+	var ins @ir.Instr = make(ir.Instr)
+	ins.Op = ir.OP_CALL
+	ins.StrVal = "local"
+	ins.Typ = types.MakeManagedSliceType(types.TypChar())
+	if CalleeUsesCSret(funcs, ins) {
+		return "internal Binate call should NOT use sret"
+	}
+	return ""
+}
+func TestCalleeUsesCSretSmallReturnNo() testing.TestResult {
+	// C-extern returning a 16-byte raw slice — at the threshold; the
+	// rule is "> 16", so 16-byte returns stay reg-packed.
+	var f @ir.Func = ir.NewFunc("bootstrap.Bytes", makeNoParams(),
+		makeNoResults())
+	f.IsCExtern = true
+	f.Results = make_slice(@types.Type, 1)
+	f.Results[0] = types.MakeSliceType(types.TypUint8())
+	var funcs @[]@ir.Func = make_slice(@ir.Func, 1)
+	funcs[0] = f
+	var ins @ir.Instr = make(ir.Instr)
+	ins.Op = ir.OP_CALL
+	ins.StrVal = "bootstrap.Bytes"
+	ins.Typ = types.MakeSliceType(types.TypUint8())
+	if CalleeUsesCSret(funcs, ins) {
+		return "16-byte return should NOT use sret"
+	}
+	return ""
+}
+// AAPCS X8/sret kicks in for return values larger than 64 bytes
+// (more than 8 GP registers' worth). At ≤64 bytes the callee packs
+// X0..X(N-1); at >64 bytes the caller passes a buffer pointer in X8
+// and the callee writes through it. The threshold lives here so
+// caller and callee agree.
+
+func TestCallReturnsBigAggregateBigStruct() testing.TestResult {
+	// 80-byte struct (10 ints): > 64 bytes → sret.
+	var fields @[]@types.Field = make_slice(@types.Field, 10)
+	for i := 0; i < 10; i++ {
+		fields[i] = make(types.Field)
+		fields[i].Type = types.TypInt()
+	}
+	var bigStruct @types.Type = types.MakeStructType("Big", fields)
+	var ins @ir.Instr = make(ir.Instr)
+	ins.Op = ir.OP_CALL
+	ins.Typ = bigStruct
+	if !CallReturnsBigAggregate(ins) {
+		return "80-byte struct call should be sret"
+	}
+	return ""
+}
+func TestCallReturnsBigAggregateSmallStruct() testing.TestResult {
+	// 48-byte struct (6 ints): ≤ 64 bytes → reg-packed, not sret.
+	var fields @[]@types.Field = make_slice(@types.Field, 6)
+	for i := 0; i < 6; i++ {
+		fields[i] = make(types.Field)
+		fields[i].Type = types.TypInt()
+	}
+	var smallStruct @types.Type = types.MakeStructType("Small", fields)
+	var ins @ir.Instr = make(ir.Instr)
+	ins.Op = ir.OP_CALL
+	ins.Typ = smallStruct
+	if CallReturnsBigAggregate(ins) {
+		return "48-byte struct call should NOT be sret"
+	}
+	return ""
+}

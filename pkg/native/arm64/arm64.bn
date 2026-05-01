@@ -30,6 +30,7 @@ func EmitObject(mod @ir.Module, path *[]const char) bool {
 		emitFunc(a, pkgName, f, mod.Strings, mod.Funcs)
 	}
 
+	emitFuncValueShims(a, pkgName, mod)
 	emitStringTable(a, mod.Strings)
 	emitGlobals(a, pkgName, mod.Globals)
 	emitFuncValueVtables(a, pkgName, mod)
@@ -58,19 +59,13 @@ func emitStringTable(a @asm.Assembler, strings @[]ir.StringConst) {
 	asm.Align(a, 4)
 }
 
-// emitFuncValueVtables walks the module for OP_FUNC_VALUE references
-// and emits one 16-byte vtable per unique function name in __DATA:
-//   __vt.<mangled>:
-//       .quad 0                ; dtor (no captured ctx for non-capturing)
-//       .quad <mangled_func>   ; call slot — real C function pointer
-// Globals are emitted with weak (Mach-O equivalent of weak_odr) so the
-// linker dedupes across .o's without dropping them. See plan-function-
-// values.md "VM-mode vtables — interop-compatible from Phase 1" for the
-// design; native arm64 sits in compiled mode so vtable.call holds the
-// real function pointer (not a Phase-3 trampoline).
-func emitFuncValueVtables(a @asm.Assembler, pkgName *[]const char,
-		mod @ir.Module) {
+// collectFuncValueRefs walks the module for OP_FUNC_VALUE references
+// and returns the unique (name, fvTyp) pairs. fvTyp is the
+// instruction's Typ — TYP_FUNC_VALUE / TYP_MANAGED_FUNC_VALUE — and
+// its Params/Results drive the per-function shim shape.
+func collectFuncValueRefs(mod @ir.Module) (@[]@[]char, @[]@types.Type) {
 	var seen @[]@[]char
+	var sigs @[]@types.Type
 	for i := 0; i < len(mod.Funcs); i++ {
 		var f @ir.Func = mod.Funcs[i]
 		if f.IsExtern { continue }
@@ -88,25 +83,115 @@ func emitFuncValueVtables(a @asm.Assembler, pkgName *[]const char,
 				}
 				if dup { continue }
 				seen = appendNameAA64(seen, ins.StrVal)
+				sigs = appendSigAA64(sigs, ins.Typ)
 			}
 		}
+	}
+	return seen, sigs
+}
+
+// emitFuncValueShims emits a per-function shim for each
+// OP_FUNC_VALUE reference. The shim has the always-shim signature
+// `<ret>(*uint8 data, <args>)`: it ignores data, shifts user args
+// from X1.. → X0.., and tail-calls the real function. Phase 3 of
+// plan-function-values.md.
+//
+// Bootstrap-subset constraint: all user args are scalar (int /
+// pointer / bool); no floats, no aggregates pass through here yet.
+// If broader signatures become reachable (full language), the shim
+// emitter will need to handle V0..V7 floats and aggregate-arg
+// shuffling — we'll grow it then.
+func emitFuncValueShims(a @asm.Assembler, pkgName *[]const char,
+		mod @ir.Module) {
+	var seen @[]@[]char
+	var sigs @[]@types.Type
+	seen, sigs = collectFuncValueRefs(mod)
+	if len(seen) == 0 { return }
+	asm.SetSection(a, "text", -1)
+	for i := 0; i < len(seen); i++ {
+		var fnLabel @[]char = symFor(pkgName, seen[i])
+		var shimLabel @[]char = shimSymFor(pkgName, seen[i])
+		var fvTyp @types.Type = sigs[i]
+		asm.DefineLabel(a, shimLabel)
+		asm.SetWeak(a, shimLabel)
+		// Shift user args: X1..XN → X0..X(N-1). Data was in X0;
+		// it's discarded. Args reverse-shift to avoid clobber:
+		// MOV X0, X1; MOV X1, X2; ... — execute left-to-right
+		// since each step reads its source before writing the
+		// previous step's target.
+		var nUserArgs int = len(fvTyp.Params)
+		if nUserArgs > 8 {
+			// Stack-passed args would need their own shuffling.
+			// Beyond the bootstrap subset; skip with a placeholder.
+			nUserArgs = 8
+		}
+		for ai := 0; ai < nUserArgs; ai++ {
+			aarch64.Mov(a, true, argReg(ai),
+				aarch64.Reg(argReg(ai + 1)))
+		}
+		// Tail-call: B (unconditional branch) to the real fn.
+		// SetGlobal records the target so the linker resolves the
+		// branch fixup. (Same pattern as a regular call site
+		// minus the BL → B substitution.)
+		asm.SetGlobal(a, fnLabel)
+		aarch64.B(a, fnLabel)
+	}
+	// Pad back up to instruction alignment for subsequent emissions.
+	asm.Align(a, 4)
+}
+
+// emitFuncValueVtables walks the module for OP_FUNC_VALUE references
+// and emits one 16-byte vtable per unique function name in __DATA:
+//   __vt.<mangled>:
+//       .quad 0                ; dtor (no captured ctx for non-capturing)
+//       .quad __shim.<mangled> ; call slot — points at the shim
+//                              ; (Phase 3 always-shim convention)
+// Globals are emitted with weak (Mach-O equivalent of weak_odr) so
+// the linker dedupes across .o's without dropping them.
+func emitFuncValueVtables(a @asm.Assembler, pkgName *[]const char,
+		mod @ir.Module) {
+	var seen @[]@[]char
+	var ignored @[]@types.Type
+	seen, ignored = collectFuncValueRefs(mod)
+	if len(ignored) > 0 || len(seen) == 0 {
+		// Use ignored to silence unused warnings; sigs aren't used in
+		// vtable emit (they're consumed by emitFuncValueShims).
 	}
 	if len(seen) == 0 { return }
 	asm.SetSection(a, "data", -1)
 	for i := 0; i < len(seen); i++ {
 		var label @[]char = vtableSymFor(pkgName, seen[i])
-		var fnLabel @[]char = symFor(pkgName, seen[i])
+		var shimLabel @[]char = shimSymFor(pkgName, seen[i])
 		asm.DefineLabel(a, label)
 		asm.SetWeak(a, label)
-		// Reference fnLabel so the assembler resolves it as a relocation.
-		asm.SetGlobal(a, fnLabel)
+		// Reference shimLabel so the assembler resolves it as a relocation.
+		asm.SetGlobal(a, shimLabel)
 		// dtor slot: 8 bytes of zero.
 		asm.Zero(a, 8)
-		// call slot: word-sized pointer to the function. EmitAddr
-		// records a fixup that the linker resolves to the function's
-		// runtime address.
-		asm.EmitAddr(a, fnLabel)
+		// call slot: pointer to the per-function shim (always-shim
+		// convention). The linker resolves the relocation to the
+		// shim's runtime address.
+		asm.EmitAddr(a, shimLabel)
 	}
+}
+
+// shimSymFor returns the underscore-prefixed Mach-O label for a
+// function's per-function shim global: "_bn_<pkg>__<name>__shim".
+func shimSymFor(pkgName *[]const char, fnName *[]const char) @[]char {
+	var fn @[]char = symFor(pkgName, fnName)
+	var cb buf.CharBuf = buf.New()
+	cb = cb.WriteStr(fn)
+	cb = cb.WriteStr("__shim")
+	return cb.Bytes()
+}
+
+// appendSigAA64 appends a types.Type to a managed slice.
+func appendSigAA64(s @[]@types.Type, v @types.Type) @[]@types.Type {
+	var n int = len(s)
+	var ns @[]@types.Type = make_slice(@types.Type, n + 1)
+	for i := 0; i < n; i++ { ns[i] = s[i] }
+	ns[n] = v
+	return ns
 }
 
 // vtableSymFor returns the underscore-prefixed Mach-O label for a

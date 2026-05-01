@@ -303,6 +303,53 @@ println(helper(7))
 > 14
 > "
 
+# --- Case 18 (Tier 4 redef): redefining a func with the same
+# signature replaces the old body.  The fixture's `helper` is
+# x*2; the new one is x*3.  Subsequent calls hit the new body. ---
+run_repl "tier4-redef-replace" \
+"println(helper(7))
+func helper(x int) int { return x * 3 }
+println(helper(7))
+" \
+"$BANNER
+> 14
+> > 21
+> "
+
+# --- Case 19 (Tier 4 redef): a previously-defined caller continues
+# to work, but its calls now route to the redefined body.  Verifies
+# the in-place vm.Funcs rebind keeps cached call indices valid. ---
+run_repl "tier4-redef-caller-sees-new" \
+"func caller() int { return helper(10) }
+println(caller())
+func helper(x int) int { return x * 5 }
+println(caller())
+" \
+"$BANNER
+> > 20
+> > 50
+> "
+
+# --- Case 20 (Tier 4 redef): redefining with a DIFFERENT signature
+# is currently rejected (compatible-sig replace only in this cut).
+# The diagnostic comes from the .bni-sig-match path and reads
+# misleadingly (".bni declares 1") — slated for a clearer message
+# in the shadow-path commit.  Note: the rejected redef leaves the
+# c.Scope symbol partially clobbered (type-checker known limitation,
+# pre-existing, separate from Tier 4); the session continues for
+# unrelated operations like a fresh decl. ---
+run_repl "tier4-redef-diff-sig-rejected" \
+"println(helper(7))
+func helper(x int, y int) int { return x + y }
+func unrelated() int { return 100 }
+println(unrelated())
+" \
+"$BANNER
+> 14
+> helper: .bn has 2 parameters but .bni declares 1
+> > 100
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

@@ -107,10 +107,13 @@ run_repl "basic-call" \
 > 14
 > "
 
-# --- Case 2: multi-statement single-line input.  Locals are
-# visible to later stmts in the same turn. ---
+# --- Case 2: multi-statement single-line input.  Locals (declared
+# via short-var `:=`) are visible to later stmts in the same turn.
+# Note: a leading `var` would route to the Tier 2 decl path (which
+# errors "first cut") rather than the stmt-list path; short-var
+# stays on the stmt path. ---
 run_repl "multi-stmt" \
-"var x int = 5; x = x + 10; println(x)
+"x := 5; x = x + 10; println(x)
 " \
 "$BANNER
 > 15
@@ -149,6 +152,53 @@ run_repl "braces-in-string" \
 ' \
 "$BANNER
 > hello {world}
+> "
+
+# --- Case 6 (Tier 2): top-level `func` decl typed at the prompt
+# persists, and a subsequent turn can call it. ---
+run_repl "tier2-func-persists" \
+"func double(x int) int { return x * 2 }
+println(double(7))
+" \
+"$BANNER
+> > 14
+> "
+
+# --- Case 7 (Tier 2): two prompt-defined funcs where the second
+# calls the first.  Verifies cross-decl call resolution works for
+# REPL-introduced VMFuncs (not just for funcs from the loaded
+# module). ---
+run_repl "tier2-cross-decl-call" \
+"func a(x int) int { return x + 1 }
+func b(x int) int { return a(x) * 10 }
+println(b(4))
+" \
+"$BANNER
+> > > 50
+> "
+
+# --- Case 8 (Tier 2): type / var / const decls aren't yet
+# supported.  GenDecl surfaces a clear diagnostic and the session
+# stays usable. ---
+run_repl "tier2-type-rejected" \
+"type T struct { X int }
+println(helper(7))
+" \
+"$BANNER
+> only func declarations are supported at the prompt (Tier 2 first cut)
+> 14
+> "
+
+# --- Case 9 (Tier 2): a func decl with a body type error reports
+# the error and does NOT register the symbol.  A subsequent turn
+# is unaffected: helpers from the loaded module still work. ---
+run_repl "tier2-bad-body-recovery" \
+"func bad() bool { return 1 }
+println(helper(11))
+" \
+"$BANNER
+> cannot assign untyped int to bool
+> 22
 > "
 
 echo ""

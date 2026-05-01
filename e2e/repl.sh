@@ -127,6 +127,30 @@ println(helper(3))
 > 6
 > "
 
+# --- Case 4: multi-line input.  Lines accumulate while brace
+# depth is positive; continuation prompt is `... `; evaluation
+# fires once `}` closes the block.  Output of the loop body
+# concatenates onto the same prompt line as the leading `... `s. ---
+run_repl "multi-line-for" \
+"for i := 0; i < 3; i++ {
+println(helper(i))
+}
+" \
+"$BANNER
+> ... ... 0
+2
+4
+> "
+
+# --- Case 5: braces inside a string literal must NOT trigger
+# multi-line accumulation.  This input is one balanced line. ---
+run_repl "braces-in-string" \
+'println("hello {world}")
+' \
+"$BANNER
+> hello {world}
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

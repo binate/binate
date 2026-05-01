@@ -247,6 +247,23 @@ println(tripled(11))
 > > > 33
 > "
 
+# --- Case 14: multi-line const ( ... ) is recognized as a
+# continuation by the paren-aware accumulator (computeOpenDepth
+# now tracks `(` / `)` in addition to `{` / `}`).  Each non-final
+# input line that leaves depth > 0 yields a `... ` continuation
+# prompt; the closing `)` triggers evaluation. ---
+run_repl "multi-line-const-group" \
+"const (
+A = 100
+B = 200
+)
+println(A); println(B)
+" \
+"$BANNER
+> ... ... ... > 100
+200
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

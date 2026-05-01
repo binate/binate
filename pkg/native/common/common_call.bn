@@ -1,0 +1,221 @@
+package "pkg/native/common"
+
+import "pkg/ir"
+import "pkg/types"
+
+// ============================================================
+// AAPCS-style argument dispatch
+// ============================================================
+//
+// AArch64 Procedure Call Standard, B.4 simplified for our needs:
+// - NGRN (next general register number) starts at 0.
+// - For a scalar arg: if NGRN < 8 → reg X(NGRN), NGRN += 1.
+//                     else → 8-byte stack slot.
+// - For an aggregate arg of N words: if NGRN + N ≤ 8 → spread into
+//   X(NGRN)..X(NGRN+N-1), NGRN += N.
+//   Otherwise (no reg/stack split): NGRN := 8, place the entire arg
+//   on the stack as N×8 bytes.
+//
+// We don't yet support floats, HFAs/HVAs, or variadics — none of
+// those exist in pkg/native today.
+
+// ArgWords returns the 8-byte word count for an argument of type t.
+// Scalars (and managed/raw pointers) are 1; aggregates are
+// SizeOf(t) / 8 rounded up to at least 1.
+func ArgWords(t @types.Type) int {
+	if !IsAggregateTyp(t) { return 1 }
+	var sz int = types.SizeOf(t)
+	var w int = sz / 8
+	if w < 1 { w = 1 }
+	return w
+}
+
+// CallArgRegStart returns the first arg-reg index (0..7) for arg i,
+// or -1 if it's passed entirely on the stack. argTypes lists the arg
+// types in order. Float scalars don't consume X-register budget — they
+// travel in D-regs under a separate NSRN counter the call site tracks
+// independently — so this helper skips them. Returns -1 for floats;
+// the caller should detect floats via IsFloatScalarTyp first and
+// place them in D(NSRN). (Re-runs the dispatch from arg 0 — O(n) per
+// call site, fine at our scale.)
+//
+// SPLIT semantics (matches LLVM byval AAPCS lowering): if an aggregate
+// straddles the X0..X7 boundary (NGRN < 8 but NGRN+w > 8), this
+// function still returns NGRN — the caller fills `8 - NGRN` words in
+// regs from argReg(NGRN..7), and the remaining `w - (8 - NGRN)` words
+// go to the stack at CallArgStackOff(argTypes, i). Both are non-
+// negative simultaneously in the split case. Conformance test
+// 337_cross_pkg_struct_arg pins this down: native main calling an
+// LLVM-compiled callee disagreed when we used "atomic overflow" (all
+// on stack once it didn't fit).
+func CallArgRegStart(argTypes @[]@types.Type, i int) int {
+	var ngrn int = 0
+	for k := 0; k <= i; k++ {
+		if IsFloatScalarTyp(argTypes[k]) {
+			if k == i { return -1 }
+			continue
+		}
+		var w int = ArgWords(argTypes[k])
+		if ngrn >= 8 {
+			if k == i { return -1 }
+			continue
+		}
+		// ngrn < 8: arg starts in regs (possibly straddles the boundary).
+		if k == i { return ngrn }
+		var inRegs int = w
+		if ngrn + inRegs > 8 { inRegs = 8 - ngrn }
+		ngrn = ngrn + inRegs
+	}
+	return -1
+}
+
+// CallArgStackOff returns the byte offset into the outgoing-args
+// area for arg i's stack portion. Returns -1 if arg i is fully in
+// registers (or is a float scalar — they go in D-regs). Returns >=0
+// when the arg has any words on the stack, including the SPLIT case
+// (some words in X2..X7, overflow on stack[CallArgStackOff(..)..]).
+func CallArgStackOff(argTypes @[]@types.Type, i int) int {
+	var ngrn int = 0
+	var soff int = 0
+	for k := 0; k <= i; k++ {
+		if IsFloatScalarTyp(argTypes[k]) {
+			if k == i { return -1 }
+			continue
+		}
+		var w int = ArgWords(argTypes[k])
+		var stackWords int = 0
+		if ngrn >= 8 {
+			stackWords = w
+		} else if ngrn + w > 8 {
+			stackWords = w - (8 - ngrn)
+			ngrn = 8
+		} else {
+			ngrn = ngrn + w
+		}
+		if k == i {
+			if stackWords > 0 { return soff }
+			return -1
+		}
+		soff = soff + stackWords * 8
+	}
+	return -1
+}
+
+// CallStackBytes returns the total outgoing-args area size in bytes
+// for a call with the given arg types. 16-byte aligned so
+// `sub sp, sp, #N` (or a static reservation) keeps SP 16-aligned.
+// Float scalars don't contribute (D-reg passing only). Mirrors the
+// SPLIT semantics in CallArgRegStart/CallArgStackOff: only words past
+// X7 count toward the stack tally.
+func CallStackBytes(argTypes @[]@types.Type) int {
+	var ngrn int = 0
+	var soff int = 0
+	for k := 0; k < len(argTypes); k++ {
+		if IsFloatScalarTyp(argTypes[k]) { continue }
+		var w int = ArgWords(argTypes[k])
+		var stackWords int = 0
+		if ngrn >= 8 {
+			stackWords = w
+		} else if ngrn + w > 8 {
+			stackWords = w - (8 - ngrn)
+			ngrn = 8
+		} else {
+			ngrn = ngrn + w
+		}
+		soff = soff + stackWords * 8
+	}
+	if soff % 16 != 0 {
+		soff = soff + (16 - soff % 16)
+	}
+	return soff
+}
+
+// callArgTypes returns the types of an OP_CALL's arguments in a fresh
+// slice, used by PlanFrame to feed CallStackBytes without exposing
+// the IR-instruction shape there.
+func callArgTypes(ins @ir.Instr) @[]@types.Type {
+	var ts @[]@types.Type = make_slice(@types.Type, len(ins.Args))
+	for i := 0; i < len(ins.Args); i++ {
+		ts[i] = ins.Args[i].Typ
+	}
+	return ts
+}
+
+// FuncReturnsBigAggregate reports whether f returns a single
+// aggregate value larger than 64 bytes — the threshold at which our
+// AArch64 calling convention switches from X0..X7 packing to AAPCS-
+// style X8 indirect-result (sret).
+func FuncReturnsBigAggregate(f @ir.Func) bool {
+	if len(f.Results) != 1 { return false }
+	if !IsAggregateTyp(f.Results[0]) { return false }
+	return types.SizeOf(f.Results[0]) > 64
+}
+
+// CallReturnsBigAggregate is the symmetric predicate for an OP_CALL.
+// True when the callee returns a single aggregate > 64 bytes — the
+// caller must pass X8 = &returnBuffer before BL and skip the X0..X7
+// return-collect afterwards.
+func CallReturnsBigAggregate(ins @ir.Instr) bool {
+	if ins == nil || ins.Typ == nil { return false }
+	if IsMultiReturnCall(ins) { return false }
+	if !IsAggregateTyp(ins.Typ) { return false }
+	return types.SizeOf(ins.Typ) > 64
+}
+
+// FuncReturnsBigMultiReturn reports whether f's multi-return tuple
+// total size exceeds 64 bytes. Multi-return values are normally
+// packed into X0..X7 (8 × 8-byte words = 64 bytes). When the tuple
+// exceeds that, the X0..X7-packing path silently drops the bytes
+// past word 8, so we need to switch to AAPCS-style sret here too —
+// caller passes X8 = &tupleBuffer before BL, callee writes each
+// return value through X8 + FieldOffset(MultiReturnType, i).
+func FuncReturnsBigMultiReturn(f @ir.Func) bool {
+	if len(f.Results) <= 1 { return false }
+	if f.MultiReturnType == nil { return false }
+	return types.SizeOf(f.MultiReturnType) > 64
+}
+
+// CallReturnsBigMultiReturn is the symmetric predicate for an
+// OP_CALL whose result is a multi-return tuple > 64 bytes.
+func CallReturnsBigMultiReturn(ins @ir.Instr) bool {
+	if ins == nil || ins.Typ == nil { return false }
+	if !IsMultiReturnCall(ins) { return false }
+	return types.SizeOf(ins.Typ) > 64
+}
+
+// CalleeUsesCSret reports whether ins (an OP_CALL) targets a C-extern
+// callee whose return type triggers the AAPCS sret convention
+// (aggregate > 16 bytes). pkg/codegen emits the LLVM declaration with
+// `sret(...)` for these — clang lowers the corresponding C definition
+// to take a hidden X8 pointer, write the result through it, and
+// return void. For our native backend to interop with bootstrap.*
+// (e.g. bootstrap.Concat returning @[]char = 32 bytes), the caller
+// must pass X8 = &dataRegion before BL even though the size is below
+// our internal-Binate sret threshold of 64 bytes.
+//
+// Returns false for internal Binate calls — they keep packing into
+// X0..X7 unless CallReturnsBigAggregate is also true.
+func CalleeUsesCSret(funcs @[]@ir.Func, ins @ir.Instr) bool {
+	if ins == nil || ins.Typ == nil { return false }
+	if ins.Op != ir.OP_CALL { return false }
+	if IsMultiReturnCall(ins) { return false }
+	if !IsAggregateTyp(ins.Typ) { return false }
+	if types.SizeOf(ins.Typ) <= 16 { return false }
+	for i := 0; i < len(funcs); i++ {
+		var f @ir.Func = funcs[i]
+		if f == nil { continue }
+		if !f.IsCExtern { continue }
+		if charSliceEq(f.Name, ins.StrVal) { return true }
+	}
+	return false
+}
+
+// charSliceEq compares two char slices byte-for-byte. Used by the
+// callee-name lookup in CalleeUsesCSret.
+func charSliceEq(a *[]const char, b *[]const char) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] { return false }
+	}
+	return true
+}

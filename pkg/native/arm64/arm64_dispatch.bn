@@ -1,0 +1,322 @@
+package "pkg/native/arm64"
+
+import "pkg/asm"
+import "pkg/asm/aarch64"
+import "pkg/ir"
+import "pkg/native/common"
+import "pkg/types"
+
+// ============================================================
+// emitInstr — instruction selection
+// ============================================================
+
+// emitInstr lowers one IR instruction. Walking-skeleton subset only;
+// instructions outside this set are silently ignored. The big op
+// handlers (MAKE*, STRING_TO_CHARS, LOAD, STORE, EXTRACT, GEP, etc.)
+// live in arm64_emit.bn; this is the dispatcher.
+func emitInstr(a @asm.Assembler, pkgName *[]const char, funcSym @[]char,
+	rm @common.RegMap, strings @[]ir.StringConst,
+	allFuncs @[]@ir.Func, ins @ir.Instr) {
+	if ins.Op == ir.OP_CONST_INT {
+		var r int = nextReg(rm, ins.ID)
+		emitConstInt64(a, r, ins.IntVal)
+		return
+	}
+	if ins.Op == ir.OP_CONST_BOOL {
+		var r int = nextReg(rm, ins.ID)
+		var v int = 0
+		if ins.BoolVal { v = 1 }
+		aarch64.Movz(a, true, r, v, 0)
+		return
+	}
+	if ins.Op == ir.OP_CONST_NIL {
+		emitConstNil(a, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_CONST_STRING {
+		var id int = ir.FindStringID(strings, ins.StrVal)
+		if id < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		// Strings live in __cstring (cross-section). Mach-O has no
+		// reloc for ADR; use ADRP + ADD for the @PAGE / @PAGEOFF
+		// pair that ld accepts.
+		aarch64.Adrp(a, rd, stringLabel(id))
+		aarch64.AddImmLabel(a, true, rd, rd, stringLabel(id))
+		return
+	}
+	if ins.Op == ir.OP_CONST_FLOAT {
+		var rd int = nextReg(rm, ins.ID)
+		emitConstFloat(a, rd, ins)
+		return
+	}
+	if ins.Op == ir.OP_RODATA_ARRAY {
+		emitStringToArray(a, rm, strings, ins)
+		return
+	}
+	if ins.Op == ir.OP_RODATA_MSLICE ||
+			ins.Op == ir.OP_RODATA_SLICE {
+		emitRodataMSliceOrSlice(a, rm, strings, ins)
+		return
+	}
+	if ins.Op == ir.OP_RODATA_MSLICE_COPY {
+		emitStringToCharsCopy(a, rm, strings, ins, ins.StrVal)
+		return
+	}
+
+	if emitCompare(a, rm, ins) { return }
+
+	if ins.Op == ir.OP_CALL {
+		emitCall(a, pkgName, rm, allFuncs, ins)
+		return
+	}
+	if ins.Op == ir.OP_CALL_INDIRECT {
+		emitCallIndirect(a, rm, allFuncs, ins)
+		return
+	}
+	if ins.Op == ir.OP_CALL_FUNC_VALUE {
+		emitCallFuncValue(a, rm, allFuncs, ins)
+		return
+	}
+	if ins.Op == ir.OP_FUNC_ADDR {
+		// Address of a named function, used as an i8* (e.g. a dtor
+		// pointer for RefDec). Reach it via ADRP+ADD against the
+		// function symbol; same PAGE21/PAGEOFF12 relocation pair as
+		// global-variable addresses.
+		if len(ins.StrVal) == 0 { return }
+		var label @[]char = symFor(pkgName, ins.StrVal)
+		asm.SetGlobal(a, label)
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Adrp(a, rd, label)
+		aarch64.AddImmLabel(a, true, rd, rd, label)
+		return
+	}
+	if ins.Op == ir.OP_FUNC_VALUE {
+		// Function-value construction. Builds a 16-byte
+		// {vtable_addr, null} aggregate in the IR-instruction's
+		// pre-allocated data region (PlanFrame allocated it via
+		// the OP_FUNC_VALUE arm in IsAggregateTyp).
+		// vtable_addr is the address of the per-function vtable
+		// global emitted by emitFuncValueVtables.
+		if len(ins.StrVal) == 0 { return }
+		var dataOff int = common.LookupAlloc(rm, ins.ID)
+		if dataOff < 0 { return }
+		var vtLabel @[]char = vtableSymFor(pkgName, ins.StrVal)
+		asm.SetGlobal(a, vtLabel)
+		// Compute vtable address into a scratch reg via ADRP+ADD.
+		var addrTmp int = scratchReg(rm)
+		aarch64.Adrp(a, addrTmp, vtLabel)
+		aarch64.AddImmLabel(a, true, addrTmp, addrTmp, vtLabel)
+		// Store vtable_addr at dataOff+0.
+		aarch64.Str(a, true, addrTmp,
+			aarch64.MemImm(aarch64.SP, dataOff))
+		// Store 0 at dataOff+8 (data slot is null in compiled mode).
+		aarch64.Str(a, true, aarch64.XZR,
+			aarch64.MemImm(aarch64.SP, dataOff + 8))
+		// Produce the data-region pointer as the result.
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(dataOff))
+		return
+	}
+
+	if ins.Op == ir.OP_REFINC {
+		emitRefIncInline(a, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_REFDEC {
+		emitRefDecInline(a, rm, ins)
+		return
+	}
+
+	if ins.Op == ir.OP_RETURN {
+		// A single aggregate return: pack into X0..X(N-1) when N≤8
+		// (size ≤ 64 bytes). For sizes > 64 bytes, AAPCS sret —
+		// memcpy through the X8 pointer the caller stashed in
+		// SretSlotOff, then return void.
+		if len(ins.Args) == 1 &&
+			common.IsAggregateTyp(ins.Args[0].Typ) {
+			var ptr int = getOperand(a, rm, ins.Args[0].ID)
+			if ptr >= 0 {
+				var sz int = types.SizeOf(ins.Args[0].Typ)
+				var nWords int = sz / 8
+				if rm.SretSlotOff >= 0 {
+					var dstPtr int = scratchReg(rm)
+					aarch64.Ldr(a, true, dstPtr,
+						aarch64.MemImm(aarch64.SP,
+							rm.SretSlotOff))
+					var tmp int = scratchReg(rm)
+					for ri := 0; ri < nWords; ri++ {
+						aarch64.Ldr(a, true, tmp,
+							aarch64.MemImm(ptr, 8*ri))
+						aarch64.Str(a, true, tmp,
+							aarch64.MemImm(dstPtr, 8*ri))
+					}
+				} else {
+					for ri := 0; ri < nWords && ri < 8; ri++ {
+						aarch64.Ldr(a, true, argReg(ri),
+							aarch64.MemImm(ptr, 8*ri))
+					}
+				}
+			}
+			emitEpilogueAndRet(a, common.FrameSize(rm))
+			return
+		}
+		// Multi-return tuple > 64 bytes: AAPCS-style sret. The caller
+		// stashed &tupleBuffer in our SretSlotOff at entry; load it
+		// back, then write each return value through it at the
+		// MultiReturnType field offset. Mirrors the single-aggregate
+		// sret path above, but per-arg.
+		if rm.SretSlotOff >= 0 && rm.MultiReturnType != nil &&
+			len(ins.Args) > 1 {
+			var dstPtr int = scratchReg(rm)
+			aarch64.Ldr(a, true, dstPtr,
+				aarch64.MemImm(aarch64.SP, rm.SretSlotOff))
+			for ai := 0; ai < len(ins.Args); ai++ {
+				var arg @ir.Instr = ins.Args[ai]
+				var fldOff int = types.FieldOffset(
+					rm.MultiReturnType, ai)
+				if common.IsAggregateTyp(arg.Typ) {
+					var ptr int = getOperand(a, rm, arg.ID)
+					if ptr < 0 { continue }
+					var sz int = types.SizeOf(arg.Typ)
+					var nWords int = sz / 8
+					var tmp int = scratchReg(rm)
+					for w := 0; w < nWords; w++ {
+						aarch64.Ldr(a, true, tmp,
+							aarch64.MemImm(ptr, 8*w))
+						aarch64.Str(a, true, tmp,
+							aarch64.MemImm(dstPtr,
+								fldOff + 8*w))
+					}
+				} else {
+					var src int = getOperand(a, rm, arg.ID)
+					if src < 0 { continue }
+					var sz int = types.SizeOf(arg.Typ)
+					if sz <= 0 { sz = 8 }
+					emitScalarStore(a, src, dstPtr,
+						fldOff, sz)
+				}
+			}
+			emitEpilogueAndRet(a, common.FrameSize(rm))
+			return
+		}
+		// Multi-return / scalar-tuple return ≤64 bytes: pack values
+		// into X0..X7. Aggregate args (e.g. a struct field of a
+		// multi-return tuple) spread across multiple consecutive
+		// regs — `return st, off` where st is a 5-word StrTab and
+		// off is an int needs X0..X4 = st bytes, X5 = off.
+		var rIdx int = 0
+		for ai := 0; ai < len(ins.Args); ai++ {
+			var arg @ir.Instr = ins.Args[ai]
+			if common.IsAggregateTyp(arg.Typ) {
+				var ptr int = getOperand(a, rm, arg.ID)
+				if ptr < 0 { continue }
+				var sz int = types.SizeOf(arg.Typ)
+				var nWords int = sz / 8
+				for w := 0; w < nWords && rIdx < 8; w++ {
+					aarch64.Ldr(a, true, argReg(rIdx),
+						aarch64.MemImm(ptr, 8*w))
+					rIdx = rIdx + 1
+				}
+			} else {
+				var src int = getOperand(a, rm, arg.ID)
+				if src < 0 { continue }
+				if rIdx < 8 && src != argReg(rIdx) {
+					aarch64.Mov(a, true, argReg(rIdx),
+						aarch64.Reg(src))
+				}
+				rIdx = rIdx + 1
+			}
+		}
+		emitEpilogueAndRet(a, common.FrameSize(rm))
+		return
+	}
+
+	if ins.Op == ir.OP_MANAGED_TO_RAW {
+		// @[]T → *[]T: pass the source pointer through; the first 16
+		// bytes of a managed-slice ARE the raw-slice representation.
+		if len(ins.Args) < 1 { return }
+		var src int = getOperand(a, rm, ins.Args[0].ID)
+		if src < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Mov(a, true, rd, aarch64.Reg(src))
+		return
+	}
+
+	if ins.Op == ir.OP_BIT_CAST {
+		// Reinterpret same-size bits — a plain move in a 64-bit file.
+		if len(ins.Args) < 1 { return }
+		var src int = getOperand(a, rm, ins.Args[0].ID)
+		if src < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Mov(a, true, rd, aarch64.Reg(src))
+		return
+	}
+
+	if ins.Op == ir.OP_CAST {
+		// Numeric conversion with explicit LSL+LSR/ASR narrowing; our
+		// regmap is all X-regs, so we can't lean on 32-bit-view
+		// zero-extension. emitFloatCast handles any branch where
+		// either side is float (SCVTF / FCVTZS / float→float move).
+		if len(ins.Args) < 1 || ins.TypeArg == nil { return }
+		var src int = getOperand(a, rm, ins.Args[0].ID)
+		if src < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		if emitFloatCast(a, rd, src, ins.Args[0].Typ, ins.TypeArg) {
+			return
+		}
+		emitCast(a, rd, src, ins.TypeArg)
+		return
+	}
+
+	if ins.Op == ir.OP_EXTRACT      { emitExtract(a, rm, ins);     return }
+	if ins.Op == ir.OP_ALLOC        { emitAlloc(a, rm, ins);       return }
+	if ins.Op == ir.OP_MAKE         { emitMake(a, rm, ins);        return }
+	if ins.Op == ir.OP_BOX          { emitBox(a, rm, ins);         return }
+	if ins.Op == ir.OP_MAKE_SLICE   { emitMakeSlice(a, rm, ins);   return }
+	if ins.Op == ir.OP_LOAD         { emitLoad(a, pkgName, rm, ins);        return }
+	if ins.Op == ir.OP_STORE        { emitStore(a, pkgName, rm, ins);       return }
+	if ins.Op == ir.OP_GET_ELEM_PTR { emitGetElemPtr(a, pkgName, rm, ins);  return }
+	if ins.Op == ir.OP_GET_FIELD_PTR { emitGetFieldPtr(a, pkgName, rm, ins); return }
+
+	if ins.Op == ir.OP_BOUNDS_CHECK {
+		// Lower to a call to bn_rt__BoundsCheck(index, len). The
+		// runtime aborts with "index out of bounds: %lld (len %lld)\n"
+		// if the unsigned comparison fails — same fast-path the LLVM
+		// backend uses, since pkg/rt provides the implementation.
+		if len(ins.Args) < 2 { return }
+		var idx int = getOperand(a, rm, ins.Args[0].ID)
+		var ln int = getOperand(a, rm, ins.Args[1].ID)
+		if idx < 0 || ln < 0 { return }
+		aarch64.Mov(a, true, aarch64.X0, aarch64.Reg(idx))
+		aarch64.Mov(a, true, aarch64.X1, aarch64.Reg(ln))
+		var callee @[]char = underscorePrefix("bn_rt__BoundsCheck")
+		asm.SetGlobal(a, callee)
+		aarch64.Bl(a, callee)
+		common.ResetRegs(rm)
+		return
+	}
+
+	if ins.Op == ir.OP_JUMP {
+		if ins.Block1 == nil { return }
+		aarch64.B(a, blockLabel(funcSym, ins.Block1.Label))
+		return
+	}
+	if ins.Op == ir.OP_BRANCH {
+		// Args[0] = cond, Block1 = then, Block2 = else.
+		if ins.Block1 == nil || ins.Block2 == nil ||
+			len(ins.Args) < 1 {
+			return
+		}
+		var condReg int = getOperand(a, rm, ins.Args[0].ID)
+		if condReg < 0 { return }
+		aarch64.Cbnz(a, true, condReg,
+			blockLabel(funcSym, ins.Block1.Label))
+		aarch64.B(a, blockLabel(funcSym, ins.Block2.Label))
+		return
+	}
+
+	if emitBinop(a, rm, ins) { return }
+	if emitUnop(a, rm, ins)  { return }
+
+	// Any other op is a no-op in this skeleton.
+}

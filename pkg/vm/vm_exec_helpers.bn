@@ -1,0 +1,237 @@
+package "pkg/vm"
+
+import "pkg/rt"
+
+// execFunc enters the VM for a function call. This is the entry
+// point from compiled code (CallFunc, execExtern's rt.CallDtor arm).
+// Pushes an initial frame and runs the iterative dispatch loop.
+func execFunc(vm @VM, funcIdx int, args @[]int) int {
+	var f @VMFunc = vm.Funcs[funcIdx]
+	var savedSP int = vm.SP
+
+	// Push frame: header + registers + allocas
+	var regsOff int = pushFrame(vm, f, -1, -1, 0, 0, -1)
+
+	// Copy arguments into parameter registers
+	var regs *int = stackPtr(vm, regsOff)
+	for i := 0; i < len(args) && i < f.NumParams; i++ {
+		regs[i] = args[i]
+	}
+
+	var result int = execLoop(vm, funcIdx, regsOff)
+
+	// If result points into callee's stack region, copy it
+	// to caller space before popping.
+	var sbase int = bit_cast(int, vm.Stack)
+	if result >= sbase + savedSP && result < sbase + vm.SP {
+		var sz int = sbase + vm.SP - result
+		if sz > 64 { sz = 64 }
+		rt.MemCopy(bit_cast(*uint8, sbase + savedSP),
+			bit_cast(*uint8, result), sz)
+		result = sbase + savedSP
+		savedSP = savedSP + sz
+	}
+
+	vm.SP = savedSP
+	return result
+}
+
+// execStringOp dispatches BC_LOAD_STR / BC_STRING_COPY_MS /
+// BC_STRING_COPY_ARR. These don't touch execLoop's control-flow
+// state (pc, funcIdx, frameBase) — they only read instr / f /
+// regs and push managed-slice headers / array buffers onto vm.SP.
+// Returns true if instr.Op was one of these and the dispatch was
+// handled; false otherwise so execLoop falls through to the next
+// arm.
+func execStringOp(vm @VM, f @VMFunc, regs *int, instr BCInstr) bool {
+	if instr.Op == BC_LOAD_STR {
+		// Return a stable pointer directly to the i-th
+		// managed-slice header inside f.Strings's backing
+		// (which is alive for the lifetime of the VMFunc /
+		// module). Previously we copied the header onto
+		// vm.SP per call — that turned `for { f("foo") }`-
+		// style loops into vm.Stack overflows at ~262K
+		// iterations because pushManagedSlice never popped.
+		//
+		// f.Strings is a 4-word managed slice: {data, len,
+		// refptr, backingLen}. The `data` field (first
+		// word) points at an array of @[]char headers (32
+		// bytes each). Hand-compute the offset because
+		// Binate's `&slice[i]` is currently restricted to
+		// slice-of-struct in genIndexPtr.
+		var stringsField *int = bit_cast(*int, &f.Strings)
+		var dataPtr int = stringsField[0]
+		var hdrPtr int = dataPtr + instr.Imm * 32
+		if instr.Aux == 1 {
+			regs[instr.Dst] = hdrPtr
+		} else {
+			var p *int = bit_cast(*int, hdrPtr)
+			regs[instr.Dst] = p[0]
+		}
+		return true
+	}
+	if instr.Op == BC_STRING_COPY_MS {
+		// Stage 2b: allocate a fresh managed-slice copy of the
+		// literal. Refcount 1; independent of rodata.
+		var str @[]char = f.Strings[instr.Imm]
+		var strHdr int = pushManagedSlice(vm,
+			bit_cast(*uint8, &str))
+		var hdrP *int = bit_cast(*int, strHdr)
+		var srcPtr int = hdrP[0]
+		var strLen int = hdrP[1]
+		var ms rt.ManagedSlice = rt.MakeManagedSlice(1, strLen)
+		if strLen > 0 {
+			rt.MemCopy(ms.Data,
+				bit_cast(*uint8, srcPtr), strLen)
+		}
+		var msAddr *int = stackPtr(vm, vm.SP)
+		vm.SP = vm.SP + 32
+		msAddr[0] = bit_cast(int, ms.Data)
+		msAddr[1] = ms.Len
+		msAddr[2] = bit_cast(int, ms.Refptr)
+		msAddr[3] = ms.BackingLen
+		regs[instr.Dst] = bit_cast(int, msAddr)
+		return true
+	}
+	if instr.Op == BC_STRING_COPY_ARR {
+		// Stage 2c Phase 1: copy a string literal into a fresh
+		// stack buffer of size Aux, zero-padded. Returns pointer
+		// to the buffer; OP_STORE memcpys it into the target alloca.
+		var str @[]char = f.Strings[instr.Imm]
+		var strHdr int = pushManagedSlice(vm,
+			bit_cast(*uint8, &str))
+		var hdrP *int = bit_cast(*int, strHdr)
+		var srcPtr int = hdrP[0]
+		var strLen int = hdrP[1]
+		var arrLen int = instr.Aux
+		var bufAddr int = bit_cast(int, vm.Stack) + vm.SP
+		vm.SP = vm.SP + arrLen
+		rt.MemZero(bit_cast(*uint8, bufAddr), arrLen)
+		var copyLen int = strLen
+		if copyLen > arrLen { copyLen = arrLen }
+		if copyLen > 0 {
+			rt.MemCopy(bit_cast(*uint8, bufAddr),
+				bit_cast(*uint8, srcPtr), copyLen)
+		}
+		regs[instr.Dst] = bufAddr
+		return true
+	}
+	return false
+}
+
+// execFuncRefOp dispatches BC_FUNC_ADDR / BC_FUNC_VALUE. These
+// read the call-site name cache and may lazily allocate a vtable +
+// VM closure record on the heap — but they don't touch execLoop's
+// control flow.
+func execFuncRefOp(vm @VM, f @VMFunc, regs *int, instr BCInstr) bool {
+	if instr.Op == BC_FUNC_ADDR {
+		var idx int = f.CallCache[instr.Aux]
+		if idx == -2 {
+			idx = LookupFunc(vm, f.Names[instr.Aux])
+			f.CallCache[instr.Aux] = idx
+		}
+		if idx < 0 {
+			var name @[]char = f.Names[instr.Aux]
+			print("vm: dtor not found: "); println(name); rt.Exit(1)
+		}
+		regs[instr.Dst] = idx + 1
+		return true
+	}
+	if instr.Op == BC_FUNC_VALUE {
+		// Function-value construction. Look up the target
+		// function (caching the index on the call site for
+		// repeated executions), lazily allocate its vtable +
+		// VM closure record on first use, and copy the 16-byte
+		// {vtable_addr, closure_rec_addr} pair into a fresh
+		// stack slot.
+		//
+		// Phase 1: vtable.call is left as 0 (placeholder).
+		// Phase 3 will populate it with a per-signature
+		// trampoline so cross-mode dispatch works. See
+		// explorations/plan-function-values.md "VM-mode
+		// vtables — interop-compatible from Phase 1".
+		var idx int = f.CallCache[instr.Aux]
+		if idx == -2 {
+			idx = LookupFunc(vm, f.Names[instr.Aux])
+			f.CallCache[instr.Aux] = idx
+		}
+		if idx < 0 {
+			var name @[]char = f.Names[instr.Aux]
+			print("vm: function not found: "); println(name)
+			rt.Exit(1)
+		}
+		var callee @VMFunc = vm.Funcs[idx]
+		if callee.Vtable == 0 {
+			var vtPtr *uint8 = rt.RawAlloc(16)
+			rt.MemZero(vtPtr, 16)
+			// dtor=0 (no captured ctx); call=0 (Phase 1 placeholder).
+			callee.Vtable = bit_cast(int, vtPtr)
+		}
+		if callee.VMClosureRec == 0 {
+			var rec *int = bit_cast(*int, rt.RawAlloc(16))
+			rt.MemZero(bit_cast(*uint8, rec), 16)
+			rec[0] = idx + 1   // 1-based VM function index
+			rec[1] = 0         // captured_ctx (Phase 1: none)
+			callee.VMClosureRec = bit_cast(int, rec)
+		}
+		// Build the function value in a fresh 16-byte stack
+		// slot at SP. SP grows by 16; the slot's address is
+		// the result.
+		var fvAddr *int = stackPtr(vm, vm.SP)
+		var fvAddrInt int = bit_cast(int, vm.Stack) + vm.SP
+		vm.SP = vm.SP + 16
+		fvAddr[0] = callee.Vtable
+		fvAddr[1] = callee.VMClosureRec
+		regs[instr.Dst] = fvAddrInt
+		return true
+	}
+	return false
+}
+
+// execNumericCast dispatches the numeric narrowing / int-float casts
+// (BC_TRUNC8, BC_SITOF, BC_FTOSI, BC_F32TOSI, BC_F64_TO_F32,
+// BC_F32_TO_F64). Pure register-to-register; no side effects.
+func execNumericCast(regs *int, instr BCInstr) bool {
+	if instr.Op == BC_TRUNC8 { regs[instr.Dst] = regs[instr.Src1] & 255; return true }
+	if instr.Op == BC_SITOF {
+		// Signed int → float64. Src1 is the int value in register
+		// form; coerce through the native `int` width (which is
+		// what the VM registers are) and let the cast produce the
+		// float.
+		var i int = regs[instr.Src1]
+		regs[instr.Dst] = bit_cast(int, cast(float64, i))
+		return true
+	}
+	if instr.Op == BC_FTOSI {
+		// float64 → signed int. Truncates toward zero (Binate's
+		// cast semantics).
+		var f float64 = bit_cast(float64, regs[instr.Src1])
+		regs[instr.Dst] = cast(int, f)
+		return true
+	}
+	if instr.Op == BC_F32TOSI {
+		// float32 (IEEE bits in low 4 bytes of Src1) → signed int.
+		var u32 uint32 = cast(uint32, regs[instr.Src1])
+		var f32 float32 = bit_cast(float32, u32)
+		regs[instr.Dst] = cast(int, f32)
+		return true
+	}
+	if instr.Op == BC_F64_TO_F32 {
+		// Narrow float64 → float32. Result is the float32 IEEE
+		// bits in the low 4 bytes (zero-extended via uint32).
+		var f64 float64 = bit_cast(float64, regs[instr.Src1])
+		var f32 float32 = cast(float32, f64)
+		var u32 uint32 = bit_cast(uint32, f32)
+		regs[instr.Dst] = cast(int, u32)
+		return true
+	}
+	if instr.Op == BC_F32_TO_F64 {
+		// Widen float32 (low 4 bytes of Src1) → float64.
+		var u32 uint32 = cast(uint32, regs[instr.Src1])
+		var f32 float32 = bit_cast(float32, u32)
+		var f64 float64 = cast(float64, f32)
+		regs[instr.Dst] = bit_cast(int, f64)
+		return true
+	}
+	return false
+}

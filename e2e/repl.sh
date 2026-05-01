@@ -177,15 +177,15 @@ println(b(4))
 > > > 50
 > "
 
-# --- Case 8 (Tier 2): type / var / const decls aren't yet
-# supported.  GenDecl surfaces a clear diagnostic and the session
-# stays usable. ---
+# --- Case 8 (Tier 2): type / var decls aren't yet supported.
+# GenDecl surfaces a clear diagnostic and the session stays
+# usable. ---
 run_repl "tier2-type-rejected" \
 "type T struct { X int }
 println(helper(7))
 " \
 "$BANNER
-> only func declarations are supported at the prompt (Tier 2 first cut)
+> only func and const declarations are supported at the prompt (Tier 2)
 > 14
 > "
 
@@ -199,6 +199,52 @@ println(helper(11))
 "$BANNER
 > cannot assign untyped int to bool
 > 22
+> "
+
+# --- Case 10 (Tier 2 const): single typed const persists and is
+# usable from a subsequent stmt-list turn. ---
+run_repl "tier2-const-typed" \
+"const K int = 42
+println(K)
+" \
+"$BANNER
+> > 42
+> "
+
+# --- Case 11 (Tier 2 const): single untyped const persists and
+# is usable in arithmetic combined with a later untyped const. ---
+run_repl "tier2-const-untyped" \
+"const A = 7
+const B = 35
+println(A + B)
+" \
+"$BANNER
+> > > 42
+> "
+
+# --- Case 12 (Tier 2 const): single-line grouped const block;
+# both members register and are usable.  (Multi-line const(...)
+# groups would need the brace-depth scanner to track parens too —
+# documented PoC limitation.) ---
+run_repl "tier2-const-group-inline" \
+"const ( A = 10; B = 20 )
+println(A); println(B)
+" \
+"$BANNER
+> > 10
+20
+> "
+
+# --- Case 13 (Tier 2 const): a const can be referenced inside a
+# func decl typed at the prompt.  Registration ordering: const
+# first, then func, then call. ---
+run_repl "tier2-const-then-func" \
+"const SCALE int = 3
+func tripled(x int) int { return x * SCALE }
+println(tripled(11))
+" \
+"$BANNER
+> > > 33
 > "
 
 echo ""

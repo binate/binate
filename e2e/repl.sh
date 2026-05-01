@@ -177,7 +177,7 @@ println(b(4))
 > > > 50
 > "
 
-# --- Case 8 (Tier 2): type / var decls aren't yet supported.
+# --- Case 8 (Tier 2): `type` decls aren't yet supported.
 # GenDecl surfaces a clear diagnostic and the session stays
 # usable. ---
 run_repl "tier2-type-rejected" \
@@ -185,7 +185,7 @@ run_repl "tier2-type-rejected" \
 println(helper(7))
 " \
 "$BANNER
-> only func and const declarations are supported at the prompt (Tier 2)
+> only func, const, and var declarations are supported at the prompt (Tier 2)
 > 14
 > "
 
@@ -262,6 +262,45 @@ println(A); println(B)
 "$BANNER
 > ... ... ... > 100
 200
+> "
+
+# --- Case 15 (Tier 2 var): a typed var registers a global,
+# zero-initialized.  Reads and writes from subsequent prompt
+# entries see the same storage. ---
+run_repl "tier2-var-readwrite" \
+"var x int
+println(x)
+x = 42
+println(x)
+" \
+"$BANNER
+> > 0
+> > 42
+> "
+
+# --- Case 16 (Tier 2 var): a func defined at the prompt can
+# read AND mutate a previously-declared var.  Verifies that the
+# func's lowered bytecode wires up to the same global storage
+# as bare-expr reads. ---
+run_repl "tier2-var-func-mutates" \
+"var counter int
+func bump() { counter = counter + 1 }
+bump(); bump(); bump()
+println(counter)
+" \
+"$BANNER
+> > > > 3
+> "
+
+# --- Case 17 (Tier 2 var): a var without an explicit type is
+# rejected with a clear diagnostic; the session stays usable. ---
+run_repl "tier2-var-no-type-rejected" \
+"var x = 5
+println(helper(7))
+" \
+"$BANNER
+> var decl at the prompt requires an explicit type
+> 14
 > "
 
 echo ""

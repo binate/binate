@@ -265,8 +265,8 @@ println(A); println(B)
 > "
 
 # --- Case 15 (Tier 2 var): a typed var registers a global,
-# zero-initialized.  Reads and writes from subsequent prompt
-# entries see the same storage. ---
+# zero-initialized when no initializer is given.  Reads and
+# writes from subsequent prompt entries see the same storage. ---
 run_repl "tier2-var-readwrite" \
 "var x int
 println(x)
@@ -276,6 +276,20 @@ println(x)
 "$BANNER
 > > 0
 > > 42
+> "
+
+# --- Case 15b (Tier 2 var-init): `var x T = expr` at the prompt
+# now runs the initializer right after registration, so the
+# global has its declared value before the next prompt entry
+# sees it.  Inter-decl references work too (b reads a). ---
+run_repl "tier2-var-init-eval" \
+"var a int = 5
+var b int = a * 10 + 1
+println(a); println(b)
+" \
+"$BANNER
+> > > 5
+51
 > "
 
 # --- Case 16 (Tier 2 var): a func defined at the prompt can

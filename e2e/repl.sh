@@ -330,24 +330,25 @@ println(caller())
 > > 50
 > "
 
-# --- Case 20 (Tier 4 redef): redefining with a DIFFERENT signature
-# is currently rejected (compatible-sig replace only in this cut).
-# The diagnostic comes from the .bni-sig-match path and reads
-# misleadingly (".bni declares 1") — slated for a clearer message
-# in the shadow-path commit.  Note: the rejected redef leaves the
-# c.Scope symbol partially clobbered (type-checker known limitation,
-# pre-existing, separate from Tier 4); the session continues for
-# unrelated operations like a fresh decl. ---
-run_repl "tier4-redef-diff-sig-rejected" \
-"println(helper(7))
-func helper(x int, y int) int { return x + y }
-func unrelated() int { return 100 }
-println(unrelated())
+# --- Case 20 (Tier 4 shadow): redefining with a DIFFERENT
+# signature now SHADOWS rather than rejects.  The OLD helper stays
+# callable through any caller whose CallCache already resolved
+# it — they invoke the old shape via the still-live old idx.
+# A direct call from a fresh prompt entry (lowered AFTER the
+# shadow) routes through the new sig.  The warning surfaces
+# explicitly so the user knows it happened. ---
+run_repl "tier4-shadow-diff-sig" \
+"func caller() int { return helper(5) }
+println(caller())
+func helper(a int, b int) int { return a + b }
+println(caller())
+println(helper(3, 4))
 " \
 "$BANNER
-> 14
-> helper: .bn has 2 parameters but .bni declares 1
-> > 100
+> > 10
+> warning: helper shadowed (incompatible signature); existing callers retain old definition
+> 10
+> 7
 > "
 
 echo ""

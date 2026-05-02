@@ -306,14 +306,22 @@ println(counter)
 > > > > 3
 > "
 
-# --- Case 17 (Tier 2 var): a var without an explicit type is
-# rejected with a clear diagnostic; the session stays usable. ---
-run_repl "tier2-var-no-type-rejected" \
-"var x = 5
+# --- Case 17 (Tier 2 var-untyped): `var x = expr` with a literal
+# initializer infers the type (int / bool / char-slice / etc.).
+# Non-literal initializers like `var x = i + 100` still need an
+# explicit type; rejected with a clear diagnostic. ---
+run_repl "tier2-var-untyped" \
+"var i = 7
+var s = \"hi\"
+println(i)
+println(s)
+var x = i + 100
 println(helper(7))
 " \
 "$BANNER
-> var decl at the prompt requires an explicit type
+> > > 7
+> hi
+> var decl at the prompt requires an explicit type or a literal initializer
 > 14
 > "
 

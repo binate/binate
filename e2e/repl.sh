@@ -177,15 +177,29 @@ println(b(4))
 > > > 50
 > "
 
-# --- Case 8 (Tier 2): `type` decls aren't yet supported.
-# GenDecl surfaces a clear diagnostic and the session stays
-# usable. ---
-run_repl "tier2-type-rejected" \
-"type T struct { X int }
+# --- Case 8 (Tier 2): struct-type decl (no managed fields)
+# at the prompt registers the type so subsequent var decls
+# and field reads work against it. ---
+run_repl "tier2-type-struct" \
+"type Point struct { X int; Y int }
+var p Point
+p.X = 10
+p.Y = 20
+println(p.X + p.Y)
+" \
+"$BANNER
+> > > > > 30
+> "
+
+# --- Case 8a (Tier 2): managed-field structs are deferred
+# (the dtor-regen machinery to support them properly is
+# follow-up work).  Diagnostic surfaces; session continues. ---
+run_repl "tier2-type-managed-rejected" \
+"type Bag struct { items @[]int }
 println(helper(7))
 " \
 "$BANNER
-> only func, const, and var declarations are supported at the prompt (Tier 2)
+> type with managed fields not yet supported at the prompt
 > 14
 > "
 

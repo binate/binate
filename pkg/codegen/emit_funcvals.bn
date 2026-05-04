@@ -9,13 +9,48 @@ import "pkg/types"
 // Function-value LLVM emission
 // ============================================================
 
+// isAggregateReturn reports whether the function value's return type
+// is too large to fit in a single 8-byte return register and thus
+// needs the retbuf-style shim (`void(i8* retbuf, i8* data, <args>)`)
+// rather than the scalar-style shim (`<ret>(i8* data, <args>)`).
+//
+// Threshold: SizeOf > 8 covers slices (16 bytes), managed-slices
+// (32 bytes), function values (16 bytes), and any struct/array whose
+// layout exceeds an int.  ≤ 8 byte returns (int, pointer, bool,
+// float, 1-int struct) keep using the scalar shape so existing
+// dispatch paths (Phase 3 dispatchCompiledFuncValue's
+// rt._call_shim_scalar) work unchanged.
+//
+// Multi-return is treated as aggregate (the anonymous-struct return
+// type is by definition multi-word).
+func isAggregateReturn(fvTyp @types.Type) bool {
+	if len(fvTyp.Results) == 0 { return false }
+	if len(fvTyp.Results) > 1 { return true }
+	return types.SizeOf(fvTyp.Results[0]) > 8
+}
+
 // funcSignatureLLVM formats the LLVM function-pointer type for a
-// function-value type. As of Phase 3 (always-shim), the call slot
-// always takes `i8* data` as its first parameter, followed by the
-// function's user-visible arg types: `<ret>(i8*, <args>)*`.
+// function-value type's vtable.call slot.
+//
+// Scalar/void return: `<ret>(i8*, <args>)*` — Phase 3's always-shim
+// shape from plan-function-values-phase-3.md (Slice 3.1).
+// Aggregate return: `void(i8*, i8*, <args>)*` — retbuf-style shim
+// (first param is retbuf, second is data, then user args).  The
+// shim writes the result to *retbuf and returns void; callers
+// allocate retbuf of the right size and read back after the call.
+//
 // fvTyp must be a TYP_FUNC_VALUE or TYP_MANAGED_FUNC_VALUE.
 func funcSignatureLLVM(fvTyp @types.Type) @[]char {
 	var b buf.CharBuf = buf.New()
+	if isAggregateReturn(fvTyp) {
+		b = b.WriteStr("void(i8*, i8*")
+		for i := 0; i < len(fvTyp.Params); i++ {
+			b = b.WriteStr(", ")
+			b = b.WriteStr(llvmType(fvTyp.Params[i].Type))
+		}
+		b = b.WriteStr(")*")
+		return b.Bytes()
+	}
 	b = writeFuncResultsLLVM(b, fvTyp)
 	b = b.WriteByte('(')
 	b = b.WriteStr("i8*")
@@ -90,15 +125,34 @@ func emitFuncValueVtables(out buf.CharBuf, m @ir.Module) buf.CharBuf {
 	return out
 }
 
-// emitFuncValueShim emits the always-shim wrapper:
-//   define <ret> @__shim.<mangled>(i8* %data, <args>) {
-//     <ret> %r = tail call <ret> @<mangled>(<args>)
+// emitFuncValueShim emits the per-function shim wrapper.
+//
+// Scalar/void return — Phase 3's always-shim shape:
+//   define <ret> @__shim.<m>(i8* %data, <args>) {
+//     <ret> %r = tail call <ret> @<m>(<args>)
 //     ret <ret> %r
 //   }
-// For void return: tail call + ret void. data is unused.
-// weak_odr matches the existing vtable-global linkage, so cross-TU
+//
+// Aggregate return — retbuf-style shim:
+//   define void @__shim.<m>(i8* %retbuf, i8* %data, <args>) {
+//     <ret> %r = call <ret> @<m>(<args>)
+//     <ret>* %rb = bitcast i8* %retbuf to <ret>*
+//     store <ret> %r, <ret>* %rb
+//     ret void
+//   }
+// The retbuf shape lets bytecode dispatchers (dispatchExternBinding,
+// dispatchCompiledFuncValue) capture the full multi-word result via
+// a fixed-shape rt._call_shim_aggregate helper.  The compiled-side
+// caller (emitCallFuncValue) allocates retbuf, calls the shim, and
+// loads the result back.
+//
+// data is unused in non-capturing function values (Phase 1); future
+// Phase 2 closures will populate it.  weak_odr lets cross-TU
 // duplicate shims dedupe at link time.
 func emitFuncValueShim(out buf.CharBuf, mangled @[]char, fvTyp @types.Type) buf.CharBuf {
+	if isAggregateReturn(fvTyp) {
+		return emitFuncValueShimAggregate(out, mangled, fvTyp)
+	}
 	var isVoid bool = len(fvTyp.Results) == 0
 	out = out.WriteStr("define weak_odr ")
 	out = writeFuncResultsLLVM(out, fvTyp)
@@ -134,6 +188,44 @@ func emitFuncValueShim(out buf.CharBuf, mangled @[]char, fvTyp @types.Type) buf.
 		out = writeFuncResultsLLVM(out, fvTyp)
 		out = out.WriteStr(" %r\n}\n")
 	}
+	return out
+}
+
+// emitFuncValueShimAggregate emits the retbuf-style aggregate shim.
+// Called from emitFuncValueShim when the return type is multi-word.
+func emitFuncValueShimAggregate(out buf.CharBuf, mangled @[]char, fvTyp @types.Type) buf.CharBuf {
+	out = out.WriteStr("define weak_odr void @__shim.")
+	out = out.WriteStr(mangled)
+	out = out.WriteStr("(i8* %retbuf, i8* %data")
+	for i := 0; i < len(fvTyp.Params); i++ {
+		out = out.WriteStr(", ")
+		out = out.WriteStr(llvmType(fvTyp.Params[i].Type))
+		out = out.WriteStr(" %a")
+		out = out.WriteInt(i)
+	}
+	out = out.WriteStr(") {\n  ")
+	// Call the underlying with the aggregate return.
+	out = out.WriteStr("%r = call ")
+	out = writeFuncResultsLLVM(out, fvTyp)
+	out = out.WriteStr(" @")
+	out = out.WriteStr(mangled)
+	out = out.WriteByte('(')
+	for i := 0; i < len(fvTyp.Params); i++ {
+		if i > 0 { out = out.WriteStr(", ") }
+		out = out.WriteStr(llvmType(fvTyp.Params[i].Type))
+		out = out.WriteStr(" %a")
+		out = out.WriteInt(i)
+	}
+	out = out.WriteStr(")\n  ")
+	// Bitcast retbuf to the aggregate type pointer and store.
+	out = out.WriteStr("%rb = bitcast i8* %retbuf to ")
+	out = writeFuncResultsLLVM(out, fvTyp)
+	out = out.WriteStr("*\n  ")
+	out = out.WriteStr("store ")
+	out = writeFuncResultsLLVM(out, fvTyp)
+	out = out.WriteStr(" %r, ")
+	out = writeFuncResultsLLVM(out, fvTyp)
+	out = out.WriteStr("* %rb\n  ret void\n}\n")
 	return out
 }
 

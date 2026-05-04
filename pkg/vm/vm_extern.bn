@@ -7,18 +7,24 @@ import "pkg/rt"
 // dispatchExternBinding routes a registered extern call through the
 // compiled-side function value's vtable.call (the per-function shim),
 // packing args into the always-shim convention's fixed 7-int register
-// bank.  Mirrors dispatchCompiledFuncValue (vm_exec_helpers.bn) — same
-// rt._call_shim_scalar path; the only difference is args come from
-// the VM's argv int[] rather than regs[Src2 + i].
+// bank.  Mirrors dispatchCompiledFuncValue (vm_exec_helpers.bn).
+//
+// Branches on b.ResultSize:
+//   - ≤ 8: scalar dispatch via rt._call_shim_scalar.  Result returns
+//     in X0; caller writes to instr.Dst.
+//   - > 8: aggregate dispatch via rt._call_shim_aggregate.  Allocates
+//     a retbuf of ResultSize bytes on vm.Stack, passes its address as
+//     the shim's first argument, returns the retbuf address (the
+//     bytecode caller's aggregate-return convention).
 //
 // Works in both native and bytecode dispatch contexts: when run
-// natively, rt._call_shim_scalar lowers to a direct LLVM indirect
-// call to the shim; when run as bytecode (a nested-VM scenario where
-// pkg/vm itself runs as bytecode in an outer VM), the bytecode
-// rt._call_shim_scalar emits BC_CALL_INDIRECT against the shim
-// address, which the outer native execLoop's BC_CALL_INDIRECT handler
-// dispatches via dispatchNativeIndirect's Imm==8 arm.
-func dispatchExternBinding(b ExternBinding, args @[]int) int {
+// natively, the rt._call_shim_* helpers lower to direct LLVM
+// indirect calls to the shim; when run as bytecode (a nested-VM
+// scenario where pkg/vm itself runs as bytecode in an outer VM),
+// the bytecode emits BC_CALL_INDIRECT, which the outer native
+// execLoop's BC_CALL_INDIRECT handler dispatches via
+// dispatchNativeIndirect's Imm==8 / Imm==9 arms.
+func dispatchExternBinding(vm @VM, b ExternBinding, args @[]int) int {
 	if b.VtableAddr == 0 {
 		println("vm: registered extern has nil vtable")
 		rt.Exit(1)
@@ -46,6 +52,17 @@ func dispatchExternBinding(b ExternBinding, args @[]int) int {
 	if nArgs > 4 { a4 = args[4] }
 	if nArgs > 5 { a5 = args[5] }
 	if nArgs > 6 { a6 = args[6] }
+	if b.ResultSize > 8 {
+		// Aggregate path: allocate retbuf on vm.Stack, call shim,
+		// return retbuf address.  Bytecode caller's aggregate-
+		// return convention reads the multi-word value from there.
+		var retbuf *uint8 = bit_cast(*uint8,
+			bit_cast(int, vm.Stack) + vm.SP)
+		vm.SP = vm.SP + b.ResultSize
+		rt._call_shim_aggregate(fnPtr, retbuf, dataPtr,
+			a0, a1, a2, a3, a4, a5, a6)
+		return bit_cast(int, retbuf)
+	}
 	return rt._call_shim_scalar(fnPtr, dataPtr,
 		a0, a1, a2, a3, a4, a5, a6)
 }
@@ -55,27 +72,28 @@ func dispatchExternBinding(b ExternBinding, args @[]int) int {
 //
 // First consults the vm.Externs registry (populated via
 // RegisterExtern at VM-init time, typically through
-// RegisterStandardExterns).  Hits dispatch through the always-shim
-// convention via rt._call_shim_scalar — the same path
-// dispatchCompiledFuncValue uses for bytecode→compiled function-value
-// calls.  The legacy hand-coded arms below remain for residual cases
-// the registry can't yet handle:
-//   - rt.MakeManagedSlice — multi-word (32-byte) aggregate return
-//     pushed onto vm.Stack.  Needs an aggregate-shim shape.
-//   - bootstrap.Open / Read / Write / Stat / Exec — slice/multi-word
-//     args (the scalar-shim's int-args shape can't unpack them).
-//   - bootstrap.Args / ReadDir — multi-word return + RefInc surgery.
-//   - pkg/libc.* and bootstrap.Close / Exit — pure C externs (no
-//     `.bn` body).  BC_FUNC_VALUE on these fails LookupFunc, so the
-//     RegisterExtern call site can't construct a function value
-//     when running as bytecode (only natively).  Migrating these
-//     needs either a BC_FUNC_VALUE fallback to LookupExtern or a
-//     parallel "register-by-shim-addr" API.
+// RegisterStandardExterns + cmd/bni's registerPureCExterns).  Hits
+// dispatch through the appropriate rt._call_shim_* helper — same
+// path dispatchCompiledFuncValue uses for bytecode→compiled
+// function-value calls.
+//
+// The legacy hand-coded arms below remain for residual cases the
+// registry can't yet handle:
+//   - rt.MakeManagedSlice — aggregate return that's only reached via
+//     execExtern when pkg/rt isn't loaded (compileAndRun-style
+//     fresh-VM tests).  Real cmd/bni runtime resolves it through
+//     LookupFunc since pkg/rt is loaded as bytecode.  Migration
+//     blocked on vm.TrampolineAggregate (Phase-1's BC_FUNC_VALUE
+//     always uses TrampolineScalar, which loses the multi-word
+//     result).
+//   - bootstrap.Open / Read / Write / Stat / Exec / ReadDir —
+//     slice-typed args (the scalar-shim's int-args shape can't
+//     unpack a 16-byte slice value into a register pair).
 func execExtern(vm @VM, name *[]const char, args @[]int,
 	instr BCInstr) int {
 	var bindIdx int = LookupExtern(vm, name)
 	if bindIdx >= 0 {
-		return dispatchExternBinding(vm.Externs[bindIdx], args)
+		return dispatchExternBinding(vm, vm.Externs[bindIdx], args)
 	}
 	// pkg/libc — pure C externs reached when pkg/rt's bytecode
 	// runs in the VM and emits BC_CALL_EXTERN against libc.*.
@@ -103,13 +121,6 @@ func execExtern(vm @VM, name *[]const char, args @[]int,
 		libc.Exit(args[0])
 		return 0
 	}
-	if streq(name, "bootstrap.Close") {
-		return bootstrap.Close(args[0])
-	}
-	if streq(name, "bootstrap.Exit") {
-		bootstrap.Exit(args[0])
-		return 0
-	}
 	if streq(name, "rt.MakeManagedSlice") {
 		var ms rt.ManagedSlice = rt.MakeManagedSlice(
 			args[0], args[1])
@@ -122,6 +133,13 @@ func execExtern(vm @VM, name *[]const char, args @[]int,
 		dst[2] = bit_cast(int, ms.Refptr)
 		dst[3] = ms.BackingLen
 		return bit_cast(int, msAddr)
+	}
+	if streq(name, "bootstrap.Close") {
+		return bootstrap.Close(args[0])
+	}
+	if streq(name, "bootstrap.Exit") {
+		bootstrap.Exit(args[0])
+		return 0
 	}
 	if streq(name, "bootstrap.Open") {
 		// args[0] = ptr to *[]const char on VM stack (layout-

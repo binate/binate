@@ -203,6 +203,21 @@ println(helper(7))
 > 14
 > "
 
+# --- Case 8b (Tier 2): methods on a prompt-defined type
+# work end-to-end.  Pointer receiver mutates; value receiver
+# reads.  Both invoked via the obj.M() selector path. ---
+run_repl "tier2-method-on-prompt-type" \
+"type Counter struct { n int }
+func (c *Counter) Inc() { c.n = c.n + 1 }
+func (c Counter) Get() int { return c.n }
+var k Counter
+k.Inc(); k.Inc(); k.Inc()
+println(k.Get())
+" \
+"$BANNER
+> > > > > > 3
+> "
+
 # --- Case 9 (Tier 2): a func decl with a body type error reports
 # the error and does NOT register the symbol.  A subsequent turn
 # is unaffected: helpers from the loaded module still work. ---

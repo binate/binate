@@ -53,9 +53,13 @@ if [ ! -x "$BNI_BIN" ]; then
 fi
 echo "Built: $BNI_BIN"
 
-# ----- Fixture: tiny module with a callable helper. -----
+# ----- Fixture: tiny module with a callable helper plus a
+# loaded-module struct type so REPL cases can attach methods
+# to it without first declaring a fresh prompt-defined type. ---
 cat > "$FIXTURE" <<'EOF'
 package "main"
+
+type Box struct { V int }
 
 func helper(x int) int {
     return x * 2
@@ -216,6 +220,35 @@ println(k.Get())
 " \
 "$BANNER
 > > > > > > 3
+> "
+
+# --- Case 8c (Tier 2): methods can also attach to a type
+# defined in the loaded module (Box, from the fixture above),
+# not just to types declared at the prompt.  The receiver
+# resolution path is the same — type checker accepts any
+# local named type. ---
+run_repl "tier2-method-on-loaded-type" \
+"func (b *Box) Doubled() int { return b.V * 2 }
+var b Box
+b.V = 21
+println(b.Doubled())
+" \
+"$BANNER
+> > > > 42
+> "
+
+# --- Case 8d (Tier 2): named non-struct type
+# (`type Celsius int`).  No new IR-side state needed — the
+# type checker owns the symbol via collectTypeDecl; reads
+# / writes go through the underlying int. ---
+run_repl "tier2-type-named-nonstruct" \
+"type Celsius int
+var t Celsius
+t = 100
+println(t)
+" \
+"$BANNER
+> > > > 100
 > "
 
 # --- Case 9 (Tier 2): a func decl with a body type error reports

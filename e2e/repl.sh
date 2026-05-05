@@ -195,16 +195,19 @@ println(p.X + p.Y)
 > > > > > 30
 > "
 
-# --- Case 8a (Tier 2): managed-field structs are deferred
-# (the dtor-regen machinery to support them properly is
-# follow-up work).  Diagnostic surfaces; session continues. ---
-run_repl "tier2-type-managed-rejected" \
+# --- Case 8a (Tier 2): managed-field structs work end-to-end.
+# `type T struct { S @[]int }` triggers dedup-aware emission
+# of __dtor_T + __copy_T (and the field-type's __dtor_) into
+# the module; the REPL driver lowers each new helper. ---
+run_repl "tier2-type-managed-field" \
 "type Bag struct { items @[]int }
-println(helper(7))
+var b Bag
+b.items = make_slice(int, 3)
+b.items[0] = 10; b.items[1] = 20; b.items[2] = 30
+println(b.items[0] + b.items[1] + b.items[2])
 " \
 "$BANNER
-> type with managed fields not yet supported at the prompt
-> 14
+> > > > > 60
 > "
 
 # --- Case 8b (Tier 2): methods on a prompt-defined type

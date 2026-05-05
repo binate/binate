@@ -76,7 +76,7 @@ func GenDecl(d @ast.Decl, m @Module) @[]char {
 		return ""
 	}
 	if d.Kind == ast.DECL_TYPE {
-		return genReplTypeDecl(d)
+		return genReplTypeDecl(d, m)
 	}
 	if d.Kind != ast.DECL_FUNC {
 		return "only func / const / var / type declarations are supported at the prompt (Tier 2)"
@@ -147,7 +147,7 @@ func GenDecl(d @ast.Decl, m @Module) @[]char {
 // what GeneratePackage's pass-1/pass-2 do on the IR side
 // (register in `moduleStructs` for structs / `moduleTypeAliases`
 // for aliases; named non-structs need no IR-side state).
-func genReplTypeDecl(d @ast.Decl) @[]char {
+func genReplTypeDecl(d @ast.Decl, m @Module) @[]char {
 	if d.IsAlias && d.TypeRef != nil {
 		var ta ModuleTypeAlias
 		ta.Name = buf.CopyStr(d.Name)
@@ -168,26 +168,124 @@ func genReplTypeDecl(d @ast.Decl) @[]char {
 			f.Type = resolveTypeExpr(fd.Type)
 			fields = appendFieldPtr(fields, f)
 		}
-		// Reject managed-field structs in this first cut: they'd
-		// need a fresh `__dtor_<T>` (and possibly `__copy_<T>`)
-		// emitted into m.Funcs, with dedup so subsequent type
-		// decls don't double-emit.  Substantial follow-up work.
-		for j := 0; j < len(fields); j++ {
-			if types.NeedsDestruction(fields[j].Type) {
-				return "type with managed fields not yet supported at the prompt"
-			}
-		}
 		var ms ModuleStruct
 		ms.Name = buf.CopyStr(d.Name)
 		ms.Typ = types.MakeStructType(d.Name, fields)
 		ms.Fields = fields
 		moduleStructs = appendModuleStruct(moduleStructs, ms)
+		// If the struct contains any managed field, emit its
+		// dtor + copy (and any field-type helpers it needs)
+		// into m.Funcs, dedup'd against helpers that already
+		// landed for previously-loaded types.  Caller
+		// (cmd/bni/repl.bn evalReplDecl) lowers everything
+		// added during this GenDecl call.
+		if structTypeNeedsHelpers(ms.Typ) {
+			ensureReplStructHelpers(m, ms.Typ)
+		}
 		return ""
 	}
 	// Named non-struct (`type Celsius int`): the type checker
 	// owns the symbol; IR-gen has no per-decl state for these.
 	// Methods on the type would be a separate Tier 2 follow-up.
 	return ""
+}
+
+// structTypeNeedsHelpers reports whether `t` (a TYP_STRUCT)
+// requires `__dtor_<T>` / `__copy_<T>` emission.  True iff the
+// struct or any of its fields contains a managed pointer or
+// managed slice that requires cleanup.
+func structTypeNeedsHelpers(t @types.Type) bool {
+	return types.NeedsDestruction(t)
+}
+
+// ensureReplStructHelpers emits `__dtor_<T>` and `__copy_<T>`
+// for a freshly-registered prompt-defined struct, plus any
+// field-type helpers (managed-slice / array dtors+copies).
+// Dedup'd against m.Funcs: pre-populates the per-call
+// `generated` slice with names of helper-shaped functions
+// already present, so previously-emitted helpers from earlier
+// `type` decls or the loaded module aren't re-emitted.
+//
+// The substrate (genStructDtorWithName, ensureMsDtor, etc.)
+// is reused from gen_dtor_emit.bn / gen_copy_emit.bn — same
+// helpers the file-load passes call.  Difference is just the
+// scope: we target one struct at a time and skip work already
+// done.
+func ensureReplStructHelpers(m @Module, structTyp @types.Type) {
+	var generated @[]@[]char = collectExistingHelperNames(m)
+
+	// Struct dtor.
+	var dname @[]char = dtorNameForType(structTyp)
+	if !hasName(generated, dname) {
+		AddFunc(m, genStructDtorWithName(dname, structTyp))
+		generated = appendCharSlicePtr(generated, dname)
+	}
+	// Struct copy.
+	var cname @[]char = copyNameForType(structTyp)
+	if !hasName(generated, cname) {
+		AddFunc(m, genStructCopyWithName(cname, structTyp))
+		generated = appendCharSlicePtr(generated, cname)
+	}
+	// Field-type helpers (managed-slice + array-with-destructible
+	// element).  Mirrors the file-load generateNonStructDtors /
+	// generateCopies pass-3 logic, scoped to this struct.
+	for j := 0; j < len(structTyp.Fields); j++ {
+		var ft @types.Type = types.ResolveAlias(structTyp.Fields[j].Type)
+		if ft.Kind == types.TYP_MANAGED_SLICE {
+			generated = ensureMsDtor(m, ft, generated)
+		}
+		if ft.Kind == types.TYP_ARRAY &&
+				types.NeedsDestruction(ft.Elem) {
+			generated = ensureArrayDtor(m, ft, generated)
+			generated = ensureArrayCopy(m, ft, generated)
+		}
+	}
+}
+
+// collectExistingHelperNames returns the UNQUALIFIED names of
+// every __dtor_/__copy_-shaped function already present in
+// m.Funcs.  NewFunc qualifies names with currentModulePkgShort
+// (so "__dtor_Bag" lands as "test.__dtor_Bag" in m.Funcs);
+// this strips the qualifier so dedup compares unqualified-to-
+// unqualified — matching what dtorNameForType / copyNameForType
+// produce for the about-to-be-emitted helper.
+func collectExistingHelperNames(m @Module) @[]@[]char {
+	var names @[]@[]char
+	for i := 0; i < len(m.Funcs); i++ {
+		var u @[]char = unqualifiedHelperName(m.Funcs[i].Name)
+		if len(u) > 0 {
+			names = appendCharSlicePtr(names, u)
+		}
+	}
+	return names
+}
+
+// unqualifiedHelperName returns the `__dtor_<...>` /
+// `__copy_<...>` suffix of `n` (stripping any `pkg.` prefix
+// before it), or empty if `n` isn't a helper-shaped name.
+func unqualifiedHelperName(n @[]char) @[]char {
+	// Find the start of the helper prefix: either at index 0
+	// or immediately after the last '.'.
+	var start int = 0
+	for i := 0; i < len(n); i++ {
+		if n[i] == '.' { start = i + 1 }
+	}
+	var rest @[]char = n[start:]
+	if startsWithChars(rest, "__dtor_") ||
+			startsWithChars(rest, "__copy_") {
+		return rest
+	}
+	var empty @[]char
+	return empty
+}
+
+// startsWithChars returns true if n begins with prefix.
+func startsWithChars(n @[]char, prefix *[]const char) bool {
+	if len(n) < len(prefix) { return false }
+	for i := 0; i < len(prefix); i++ {
+		if n[i] != prefix[i] { return false }
+	}
+	return true
 }
 
 // GenSyntheticFunc wraps a stmt list as a no-arg, no-result IR

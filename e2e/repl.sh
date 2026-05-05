@@ -438,6 +438,51 @@ println(helper(3, 4))
 > 7
 > "
 
+# --- Case 21 (Tier 3 forward refs): a func decl whose body
+# references an undefined name parks rather than erroring.
+# When the missing dep arrives, the parked func is auto-
+# resolved and lowered.  Subsequent calls work normally. ---
+run_repl "tier3-forward-ref" \
+"func f() int { return g() + 1 }
+func g() int { return 41 }
+println(f())
+" \
+"$BANNER
+> function f parked (pending: g)
+> function f resolved
+> 42
+> "
+
+# --- Case 22 (Tier 3): chain forward refs (a → b → c), all
+# parked, all resolve when c arrives. ---
+run_repl "tier3-forward-ref-chain" \
+"func a() int { return b() + 1 }
+func b() int { return c() + 10 }
+func c() int { return 100 }
+println(a())
+" \
+"$BANNER
+> function a parked (pending: b)
+> function b parked (pending: c)
+> function a resolved
+function b resolved
+> 111
+> "
+
+# --- Case 23 (Tier 3): calling a still-parked func surfaces
+# a clean type-checker error (rather than letting the runtime
+# hit \"extern not found\"). ---
+run_repl "tier3-pending-use-site-error" \
+"func f() int { return g() }
+println(f())
+println(helper(7))
+" \
+"$BANNER
+> function f parked (pending: g)
+> function f is unresolved (pending: g)
+> 14
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

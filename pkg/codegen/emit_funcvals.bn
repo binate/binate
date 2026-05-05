@@ -11,8 +11,7 @@ import "pkg/types"
 
 // isAggregateReturn reports whether the function value's return type
 // is too large to fit in a single 8-byte return register and thus
-// needs the retbuf-style shim (`void(i8* retbuf, i8* data, <args>)`)
-// rather than the scalar-style shim (`<ret>(i8* data, <args>)`).
+// needs the retbuf-style shim.
 //
 // Threshold: SizeOf > 8 covers slices (16 bytes), managed-slices
 // (32 bytes), function values (16 bytes), and any struct/array whose
@@ -29,15 +28,31 @@ func isAggregateReturn(fvTyp @types.Type) bool {
 	return types.SizeOf(fvTyp.Results[0]) > 8
 }
 
+// isAggregateArg reports whether a parameter type doesn't fit in a
+// single 8-byte register slot and thus needs pointer-to-aggregate
+// passing in the shim convention.  Same threshold as isAggregateReturn:
+// SizeOf > 8.  Slices, managed-slices, function values, and any
+// >8-byte struct/array qualify.
+//
+// In the shim, aggregate-arg slots take `i8*` (pointer to the
+// aggregate); the shim loads the value before calling the underlying.
+// This lets the bytecode-side dispatcher (rt._call_shim_scalar /
+// rt._call_shim_aggregate, both of which pass int args) carry slice
+// values via their existing pointer-in-register convention without
+// needing a parallel int-pair-per-slice ABI.
+func isAggregateArg(t @types.Type) bool {
+	return types.SizeOf(t) > 8
+}
+
 // funcSignatureLLVM formats the LLVM function-pointer type for a
 // function-value type's vtable.call slot.
 //
-// Scalar/void return: `<ret>(i8*, <args>)*` — Phase 3's always-shim
-// shape from plan-function-values-phase-3.md (Slice 3.1).
-// Aggregate return: `void(i8*, i8*, <args>)*` — retbuf-style shim
-// (first param is retbuf, second is data, then user args).  The
-// shim writes the result to *retbuf and returns void; callers
-// allocate retbuf of the right size and read back after the call.
+//   - Scalar/void return + scalar args: `<ret>(i8*, <args>)*` — the
+//     Phase 3 shape from plan-function-values-phase-3.md (Slice 3.1).
+//   - Aggregate return: `void(i8*, i8*, <args>)*` — retbuf-style.
+//   - Aggregate args: each aggregate arg becomes i8* (pointer-to-
+//     aggregate); shim loads before calling underlying.
+// All three transforms compose freely.
 //
 // fvTyp must be a TYP_FUNC_VALUE or TYP_MANAGED_FUNC_VALUE.
 func funcSignatureLLVM(fvTyp @types.Type) @[]char {
@@ -46,7 +61,7 @@ func funcSignatureLLVM(fvTyp @types.Type) @[]char {
 		b = b.WriteStr("void(i8*, i8*")
 		for i := 0; i < len(fvTyp.Params); i++ {
 			b = b.WriteStr(", ")
-			b = b.WriteStr(llvmType(fvTyp.Params[i].Type))
+			b = b.WriteStr(shimParamType(fvTyp.Params[i].Type))
 		}
 		b = b.WriteStr(")*")
 		return b.Bytes()
@@ -56,10 +71,22 @@ func funcSignatureLLVM(fvTyp @types.Type) @[]char {
 	b = b.WriteStr("i8*")
 	for i := 0; i < len(fvTyp.Params); i++ {
 		b = b.WriteStr(", ")
-		b = b.WriteStr(llvmType(fvTyp.Params[i].Type))
+		b = b.WriteStr(shimParamType(fvTyp.Params[i].Type))
 	}
 	b = b.WriteStr(")*")
 	return b.Bytes()
+}
+
+// shimParamType returns the LLVM type for a shim parameter.
+// Aggregate args (SizeOf > 8) become i8* (pointer-to-aggregate);
+// scalars keep their natural type.
+func shimParamType(t @types.Type) @[]char {
+	if isAggregateArg(t) {
+		var b buf.CharBuf = buf.New()
+		b = b.WriteStr("i8*")
+		return b.Bytes()
+	}
+	return llvmType(t)
 }
 
 // writeFuncResultsLLVM writes the LLVM return-type form for a
@@ -161,11 +188,14 @@ func emitFuncValueShim(out buf.CharBuf, mangled @[]char, fvTyp @types.Type) buf.
 	out = out.WriteStr("(i8* %data")
 	for i := 0; i < len(fvTyp.Params); i++ {
 		out = out.WriteStr(", ")
-		out = out.WriteStr(llvmType(fvTyp.Params[i].Type))
+		out = out.WriteStr(shimParamType(fvTyp.Params[i].Type))
 		out = out.WriteStr(" %a")
 		out = out.WriteInt(i)
 	}
 	out = out.WriteStr(") {\n  ")
+	// Load aggregate args from their pointer slots before calling the
+	// underlying.  Scalars pass through unchanged.
+	out = emitShimArgLoads(out, fvTyp)
 	if !isVoid {
 		out = out.WriteStr("%r = ")
 	}
@@ -177,8 +207,7 @@ func emitFuncValueShim(out buf.CharBuf, mangled @[]char, fvTyp @types.Type) buf.
 	for i := 0; i < len(fvTyp.Params); i++ {
 		if i > 0 { out = out.WriteStr(", ") }
 		out = out.WriteStr(llvmType(fvTyp.Params[i].Type))
-		out = out.WriteStr(" %a")
-		out = out.WriteInt(i)
+		out = writeShimArgRef(out, fvTyp.Params[i].Type, i)
 	}
 	out = out.WriteStr(")\n  ")
 	if isVoid {
@@ -191,19 +220,64 @@ func emitFuncValueShim(out buf.CharBuf, mangled @[]char, fvTyp @types.Type) buf.
 	return out
 }
 
+// emitShimArgLoads emits LLVM `load` instructions for each aggregate
+// arg in the shim's signature, producing %a<i>_v values that hold the
+// dereferenced aggregate.  Scalars don't need loading; they pass
+// through as %a<i>.
+func emitShimArgLoads(out buf.CharBuf, fvTyp @types.Type) buf.CharBuf {
+	for i := 0; i < len(fvTyp.Params); i++ {
+		var pt @types.Type = fvTyp.Params[i].Type
+		if !isAggregateArg(pt) { continue }
+		out = out.WriteStr("%a")
+		out = out.WriteInt(i)
+		out = out.WriteStr("_p = bitcast i8* %a")
+		out = out.WriteInt(i)
+		out = out.WriteStr(" to ")
+		out = out.WriteStr(llvmType(pt))
+		out = out.WriteStr("*\n  %a")
+		out = out.WriteInt(i)
+		out = out.WriteStr("_v = load ")
+		out = out.WriteStr(llvmType(pt))
+		out = out.WriteStr(", ")
+		out = out.WriteStr(llvmType(pt))
+		out = out.WriteStr("* %a")
+		out = out.WriteInt(i)
+		out = out.WriteStr("_p\n  ")
+	}
+	return out
+}
+
+// writeShimArgRef writes the arg reference used in the underlying-
+// call argument list.  For aggregate args, it's `%a<i>_v` (the
+// loaded value).  For scalars, it's `%a<i>` (the parameter
+// directly).  A leading space is included for readability after
+// the type.
+func writeShimArgRef(out buf.CharBuf, t @types.Type, i int) buf.CharBuf {
+	if isAggregateArg(t) {
+		out = out.WriteStr(" %a")
+		out = out.WriteInt(i)
+		return out.WriteStr("_v")
+	}
+	out = out.WriteStr(" %a")
+	return out.WriteInt(i)
+}
+
 // emitFuncValueShimAggregate emits the retbuf-style aggregate shim.
 // Called from emitFuncValueShim when the return type is multi-word.
+// Aggregate args still use the pointer-arg convention (shim derefs).
 func emitFuncValueShimAggregate(out buf.CharBuf, mangled @[]char, fvTyp @types.Type) buf.CharBuf {
 	out = out.WriteStr("define weak_odr void @__shim.")
 	out = out.WriteStr(mangled)
 	out = out.WriteStr("(i8* %retbuf, i8* %data")
 	for i := 0; i < len(fvTyp.Params); i++ {
 		out = out.WriteStr(", ")
-		out = out.WriteStr(llvmType(fvTyp.Params[i].Type))
+		out = out.WriteStr(shimParamType(fvTyp.Params[i].Type))
 		out = out.WriteStr(" %a")
 		out = out.WriteInt(i)
 	}
 	out = out.WriteStr(") {\n  ")
+	// Load aggregate args (if any) before calling the underlying.
+	out = emitShimArgLoads(out, fvTyp)
 	// Call the underlying with the aggregate return.
 	out = out.WriteStr("%r = call ")
 	out = writeFuncResultsLLVM(out, fvTyp)
@@ -213,8 +287,7 @@ func emitFuncValueShimAggregate(out buf.CharBuf, mangled @[]char, fvTyp @types.T
 	for i := 0; i < len(fvTyp.Params); i++ {
 		if i > 0 { out = out.WriteStr(", ") }
 		out = out.WriteStr(llvmType(fvTyp.Params[i].Type))
-		out = out.WriteStr(" %a")
-		out = out.WriteInt(i)
+		out = writeShimArgRef(out, fvTyp.Params[i].Type, i)
 	}
 	out = out.WriteStr(")\n  ")
 	// Bitcast retbuf to the aggregate type pointer and store.

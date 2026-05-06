@@ -189,14 +189,25 @@ func evalReplDecl(vmInst @vm.VM, m @ir.Module, c @types.Checker,
 	if d == nil { return }
 
 	// Capture the pre-check func type so we can decide replace vs
-	// shadow after the checker overwrites it.  Only relevant for
-	// non-method func decls.
+	// shadow after the checker overwrites it.
+	//
+	//   - Free func: look up the symbol by name in c.Scope.
+	//   - Method:    walk d.Recv to its base named type and look up
+	//                the method by name on that type's method set.
+	//
+	// We have to read this BEFORE CheckDeclInScope because the
+	// checker (under c.AllowRedef) overwrites the method-set entry
+	// in place via SetOrAppendMethod / overwrites the func symbol
+	// in c.Scope via defineFunc.
 	var oldFuncType @types.Type = nil
 	if d.Kind == ast.DECL_FUNC && d.Recv == nil {
 		var existing @types.Symbol = types.Lookup(c.Scope, d.Name)
 		if existing != nil && existing.Kind == types.SYM_FUNC {
 			oldFuncType = existing.Type
 		}
+	} else if d.Kind == ast.DECL_FUNC && d.Recv != nil {
+		var existing @types.Method = types.LookupMethodForDecl(c, d)
+		if existing != nil { oldFuncType = existing.FuncType }
 	}
 
 	var prevErrs int = len(types.CheckerErrors(c))
@@ -243,9 +254,16 @@ func evalReplDecl(vmInst @vm.VM, m @ir.Module, c @types.Checker,
 			vm.LowerOneFunc(vmInst, m, f)
 		} else {
 			// Redefinition.  Compare new sig to old to choose path.
-			var newSym @types.Symbol = types.Lookup(c.Scope, d.Name)
+			// Method new-type lookup goes through the receiver type's
+			// method set; free-func lookup goes through c.Scope.
 			var newType @types.Type = nil
-			if newSym != nil { newType = newSym.Type }
+			if d.Recv != nil {
+				var newM @types.Method = types.LookupMethodForDecl(c, d)
+				if newM != nil { newType = newM.FuncType }
+			} else {
+				var newSym @types.Symbol = types.Lookup(c.Scope, d.Name)
+				if newSym != nil { newType = newSym.Type }
+			}
 			if newType != nil &&
 					types.Identical(oldFuncType, newType) {
 				// Same signature: replace in place.
@@ -256,7 +274,7 @@ func evalReplDecl(vmInst @vm.VM, m @ir.Module, c @types.Checker,
 				// caller whose CallCache already resolved it
 				// continues to invoke the old shape.
 				print("warning: ")
-				print(d.Name)
+				printRedefName(d)
 				println(" shadowed (incompatible signature); existing callers retain old definition")
 				vm.LowerOneFuncShadow(vmInst, m, f)
 			}
@@ -284,6 +302,30 @@ func evalReplDecl(vmInst @vm.VM, m @ir.Module, c @types.Checker,
 	// for typical sessions) and safe (a still-unresolved decl
 	// stays parked).
 	retryPending(vmInst, m, c)
+}
+
+// printRedefName prints the user-facing name for a redefinition
+// warning: bare `Name` for a free func, `RecvType.Name` for a
+// method.  Helper for the shadow-warning emitter.
+func printRedefName(d @ast.Decl) {
+	if d.Recv != nil {
+		var rb @ast.TypeExpr = d.Recv.Type
+		for rb != nil {
+			if rb.Kind == ast.TEXPR_POINTER ||
+				rb.Kind == ast.TEXPR_MANAGED ||
+				rb.Kind == ast.TEXPR_CONST ||
+				rb.Kind == ast.TEXPR_PAREN {
+				rb = rb.Base
+			} else {
+				break
+			}
+		}
+		if rb != nil && rb.Kind == ast.TEXPR_NAMED {
+			print(rb.Name)
+			print(".")
+		}
+	}
+	print(d.Name)
 }
 
 // announceParked prints a one-line "function X parked
@@ -394,109 +436,5 @@ func evalReplStmtList(vmInst @vm.VM, m @ir.Module, c @types.Checker,
 	vm.CallByVMFunc(vmInst, vmf, noArgs)
 }
 
-// readReplLine reads a line from stdin, byte by byte.  Returns the
-// line bytes (without the trailing newline) and an EOF flag.  On a
-// genuine EOF (no bytes read since the last line), eof is true; on
-// EOF mid-line, the buffered bytes are returned with eof = false
-// (the caller will see eof on the next read).
-func readReplLine() (@[]uint8, bool) {
-	var line @[]uint8
-	var buf @[]uint8 = make_slice(uint8, 1)
-	for {
-		var n int = bootstrap.Read(0, buf)
-		if n <= 0 {
-			return line, len(line) == 0
-		}
-		if buf[0] == 10 {  // '\n'
-			return line, false
-		}
-		line = appendByteRepl(line, buf[0])
-	}
-}
-
-// appendByteRepl is a minimal append helper for @[]uint8.  REPL-
-// local; pkg/buf has richer string helpers but this avoids pulling
-// in extra surface for one byte at a time.
-func appendByteRepl(s @[]uint8, b uint8) @[]uint8 {
-	var n int = len(s)
-	var ns @[]uint8 = make_slice(uint8, n + 1)
-	for i := 0; i < n; i++ { ns[i] = s[i] }
-	ns[n] = b
-	return ns
-}
-
-// computeOpenDepth scans `src` and returns the running open-bracket
-// depth — the count of unclosed `{` plus unclosed `(`, ignoring
-// any inside string literals (`"..."`), char literals (`'...'`),
-// line comments (`// ...`), or block comments (`/* ... */`).
-//
-// Used by the REPL loop to decide whether the accumulated input is
-// complete (depth 0) or whether to keep reading on a continuation
-// prompt.  A negative depth — more closes than opens — is clamped
-// to 0 so the parser can see and report the imbalance.
-//
-// Heuristic, not a real parser: a counter shared between `{` and
-// `(` will balance even on syntactically wrong interleavings like
-// `{(}`).  The parser catches those; this function only decides
-// "is more input expected?".
-func computeOpenDepth(src @[]uint8) int {
-	var depth int = 0
-	var i int = 0
-	var n int = len(src)
-	for i < n {
-		var c uint8 = src[i]
-		// `// ...` line comment — skip to next newline.
-		if c == 47 && i + 1 < n && src[i + 1] == 47 {
-			i = i + 2
-			for i < n && src[i] != 10 { i = i + 1 }
-			continue
-		}
-		// `/* ... */` block comment — skip to closing `*/`.
-		if c == 47 && i + 1 < n && src[i + 1] == 42 {
-			i = i + 2
-			for i + 1 < n {
-				if src[i] == 42 && src[i + 1] == 47 {
-					i = i + 2
-					break
-				}
-				i = i + 1
-			}
-			continue
-		}
-		// `"..."` string — skip to closing quote, honouring `\`-escapes.
-		if c == 34 {
-			i = i + 1
-			for i < n && src[i] != 34 {
-				if src[i] == 92 && i + 1 < n {
-					i = i + 2
-				} else {
-					i = i + 1
-				}
-			}
-			if i < n { i = i + 1 }
-			continue
-		}
-		// `'...'` char literal — same shape as string but at most
-		// one logical char (plus optional `\`-escape).
-		if c == 39 {
-			i = i + 1
-			for i < n && src[i] != 39 {
-				if src[i] == 92 && i + 1 < n {
-					i = i + 2
-				} else {
-					i = i + 1
-				}
-			}
-			if i < n { i = i + 1 }
-			continue
-		}
-		if c == 123 { depth = depth + 1 }  // '{'
-		if c == 40 { depth = depth + 1 }   // '('
-		if c == 125 || c == 41 {            // '}' or ')'
-			depth = depth - 1
-			if depth < 0 { depth = 0 }
-		}
-		i = i + 1
-	}
-	return depth
-}
+// REPL input handling (readReplLine, appendByteRepl,
+// computeOpenDepth) lives in repl_input.bn.

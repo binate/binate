@@ -483,6 +483,47 @@ println(helper(7))
 > 14
 > "
 
+# --- Case 24 (Tier 4 method redef): redefining a method with
+# the same signature replaces the old body.  Same property as
+# the free-func replace path, keyed on the qualified
+# <pkg>.<TypeName>.<Method> name.  Subsequent calls hit the new
+# body. ---
+run_repl "tier4-method-redef-replace" \
+"type Counter struct { n int }
+func (c *Counter) Inc() { c.n = c.n + 1 }
+var k Counter
+k.Inc(); k.Inc()
+println(k.n)
+func (c *Counter) Inc() { c.n = c.n + 10 }
+k.Inc()
+println(k.n)
+" \
+"$BANNER
+> > > > > 2
+> > > 12
+> "
+
+# --- Case 25 (Tier 4 method redef): redefining a method with
+# a DIFFERENT signature shadows.  Old callers retain the old
+# shape via their eager-filled CallCache; fresh calls route
+# through the new sig.  Warning prints with the qualified
+# Type.Method name. ---
+run_repl "tier4-method-shadow-diff-sig" \
+"type Counter struct { n int }
+func (c *Counter) Add() { c.n = c.n + 1 }
+var k Counter
+k.Add()
+println(k.n)
+func (c *Counter) Add(amt int) { c.n = c.n + amt }
+k.Add(7)
+println(k.n)
+" \
+"$BANNER
+> > > > > 1
+> warning: Counter.Add shadowed (incompatible signature); existing callers retain old definition
+> > 8
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

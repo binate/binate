@@ -1,0 +1,265 @@
+package "pkg/vm"
+
+import "pkg/rt"
+
+// Func-ref / function-value bytecode dispatch (BC_FUNC_ADDR,
+// BC_FUNC_VALUE, plus the cross-mode call shims). Split out of
+// vm_exec_helpers.bn so that file stays under the soft length cap.
+// execLoop in vm_exec.bn still calls execFuncRefOp directly; the
+// move is text-only.
+
+// execFuncRefOp dispatches BC_FUNC_ADDR / BC_FUNC_VALUE. These
+// read the call-site name cache and may lazily allocate a vtable +
+// VM closure record on the heap — but they don't touch execLoop's
+// control flow.
+func execFuncRefOp(vm @VM, f @VMFunc, regs *int, instr BCInstr) bool {
+	if instr.Op == BC_FUNC_ADDR {
+		var idx int = f.CallCache[instr.Aux]
+		if idx == -2 {
+			idx = LookupFunc(vm, f.Names[instr.Aux])
+			f.CallCache[instr.Aux] = idx
+		}
+		if idx < 0 {
+			var name @[]char = f.Names[instr.Aux]
+			print("vm: dtor not found: "); println(name); rt.Exit(1)
+		}
+		regs[instr.Dst] = idx + 1
+		return true
+	}
+	if instr.Op == BC_FUNC_VALUE {
+		// Function-value construction. Look up the target
+		// function (caching the index on the call site for
+		// repeated executions), lazily allocate its vtable +
+		// VM closure record on first use, and copy the 16-byte
+		// {vtable_addr, closure_rec_addr} pair into a fresh
+		// stack slot.
+		//
+		// Phase 1: vtable.call is left as 0 (placeholder).
+		// Phase 3 will populate it with a per-signature
+		// trampoline so cross-mode dispatch works. See
+		// explorations/plan-function-values.md "VM-mode
+		// vtables — interop-compatible from Phase 1".
+		var idx int = f.CallCache[instr.Aux]
+		if idx == -2 {
+			idx = LookupFunc(vm, f.Names[instr.Aux])
+			f.CallCache[instr.Aux] = idx
+		}
+		if idx < 0 {
+			// LookupFunc miss: fall back to the executing VM's
+			// vm.Externs registry.  Hosts (cmd/bni's main, test
+			// drivers) populate the registry with bindings whose
+			// VtableAddr already points at the right __vt — for
+			// pure-C externs (libc.*, the C-shaped pkg/bootstrap
+			// surface) this is the only construction path
+			// available because they have no `.bn` body to
+			// resolve via LookupFunc.  Each layer's host
+			// registers into the next layer's VM before that
+			// layer's main runs, so this dispatch works at
+			// arbitrary recursion depth (cmd/bni-on-cmd/bni etc.).
+			var name @[]char = f.Names[instr.Aux]
+			var eIdx int = LookupExtern(vm, name)
+			if eIdx >= 0 {
+				var binding ExternBinding = vm.Externs[eIdx]
+				var fvAddr *int = stackPtr(vm, vm.SP)
+				var fvAddrInt int =
+					bit_cast(int, vm.Stack) + vm.SP
+				vm.SP = vm.SP + 16
+				fvAddr[0] = binding.VtableAddr
+				fvAddr[1] = binding.DataAddr
+				regs[instr.Dst] = fvAddrInt
+				return true
+			}
+			print("vm: function not found: "); println(name)
+			rt.Exit(1)
+		}
+		var callee @VMFunc = vm.Funcs[idx]
+		if callee.Vtable == 0 {
+			// Vtable layout (16 bytes): {dtor, call}.
+			//   dtor = 0 — non-capturing has no captured ctx
+			//     to clean up; Phase 2 will populate this for
+			//     capturing closures.
+			//   call = address of TrampolineScalar (scalar
+			//     return) or TrampolineAggregate (multi-word
+			//     return) — ABI-aware bridge that decodes its
+			//     incoming register bank using sig info from
+			//     `data` and dispatches into the current VM
+			//     (Slices 3.2 + aggregate extension of plan-
+			//     function-values-phase-3.md).  The choice is
+			//     keyed on the VMFunc's return shape:
+			//     ResultMultiWord[0] picks the aggregate
+			//     trampoline.  Compiled code reaching
+			//     vtable.call gets cross-mode dispatch
+			//     automatically.  Same-mode VM dispatch
+			//     (BC_CALL_FUNC_VALUE) short-circuits via the
+			//     closure record's vm_func_idx and never
+			//     invokes the trampoline — see vm_exec.bn.
+			var vtPtr *int = bit_cast(*int, rt.RawAlloc(16))
+			rt.MemZero(bit_cast(*uint8, vtPtr), 16)
+			vtPtr[0] = 0
+			if len(callee.ResultMultiWord) == 1 &&
+					callee.ResultMultiWord[0] {
+				vtPtr[1] = bit_cast(int,
+					_raw_func_addr(TrampolineAggregate))
+			} else {
+				vtPtr[1] = bit_cast(int,
+					_raw_func_addr(TrampolineScalar))
+			}
+			callee.Vtable = bit_cast(int, vtPtr)
+		}
+		if callee.VMClosureRec == 0 {
+			// VMClosureRec layout (32 bytes): { kind, vm_handle,
+			// vm_func_idx, captured_ctx_or_nil }. The kind field
+			// discriminates VM closure records from other Phase-3
+			// data shapes (compiled-side captured closure structs,
+			// etc.); the vm_handle is what the cross-mode
+			// trampoline (TrampolineScalar) dispatches into.
+			// Storing the VM in the record (vs a global) keeps
+			// each function value self-contained and lets multiple
+			// VMs coexist without ordering concerns. See
+			// `plan-function-values-phase-3.md` (Slice 3.2).
+			var rec *int = bit_cast(*int, rt.RawAlloc(32))
+			rt.MemZero(bit_cast(*uint8, rec), 32)
+			rec[0] = rt.DATA_KIND_VM_CLOSURE_REC
+			rec[1] = bit_cast(int, vm)
+			rec[2] = idx + 1   // 1-based VM function index
+			rec[3] = 0         // captured_ctx (Phase 1: none)
+			callee.VMClosureRec = bit_cast(int, rec)
+		}
+		// Build the function value in a fresh 16-byte stack
+		// slot at SP. SP grows by 16; the slot's address is
+		// the result.
+		var fvAddr *int = stackPtr(vm, vm.SP)
+		var fvAddrInt int = bit_cast(int, vm.Stack) + vm.SP
+		vm.SP = vm.SP + 16
+		fvAddr[0] = callee.Vtable
+		fvAddr[1] = callee.VMClosureRec
+		regs[instr.Dst] = fvAddrInt
+		return true
+	}
+	if execIfaceOp(vm, f, regs, instr) { return true }
+	return false
+}
+
+// dispatchNativeIndirect handles the cross-mode arm of
+// BC_CALL_INDIRECT: when fnIdx isn't a valid VM index, treat it as
+// a native function pointer stored by compiled code (e.g. native
+// rt.Alloc storing RawFree's address in h[1], later RefDec'd from
+// bytecode). Dispatches via rt._call_free_fn — its lowering in the
+// natively-compiled VM is OP_CALL_INDIRECT against the native
+// pointer. Currently only the single-arg `func(*uint8)` shape
+// (Imm==1) is handled; other signatures fall through to the
+// caller's diagnostic. Returns true if dispatched.
+func dispatchNativeIndirect(regs *int, instr BCInstr, fnIdx int) bool {
+	var nativeFn *uint8 = bit_cast(*uint8, fnIdx)
+	if instr.Imm == 1 {
+		// rt._call_free_fn(freeFn, ptr) shape — single-arg
+		// func(*uint8) used by RefDec's free-fn dispatch.
+		var arg *uint8 = bit_cast(*uint8, regs[instr.Src2])
+		rt._call_free_fn(nativeFn, arg)
+		return true
+	}
+	if instr.Imm == 8 {
+		// rt._call_shim_scalar(fn, data, a0..a6) shape — the
+		// always-shim convention from
+		// plan-function-values-phase-3.md (Slice 3.1).  Dispatches
+		// any compiled-side function value (and any registered
+		// extern via dispatchExternBinding) to its per-function
+		// shim.  When this path runs natively (e.g. from a bytecode
+		// program executed by cmd/bni's native execLoop), the
+		// rt._call_shim_scalar IR-magic call lowers to OP_CALL_INDIRECT
+		// → real native indirect call to the shim.  When this same
+		// dispatch runs as bytecode (a nested-VM scenario where
+		// pkg/vm itself is bytecode in the outer VM), the bytecode
+		// rt._call_shim_scalar emits BC_CALL_INDIRECT against the
+		// shim address, which re-enters this very arm — ultimately
+		// the outer native execLoop runs the actual call.
+		var data *uint8 = bit_cast(*uint8, regs[instr.Src2])
+		var a0 int = regs[instr.Src2 + 1]
+		var a1 int = regs[instr.Src2 + 2]
+		var a2 int = regs[instr.Src2 + 3]
+		var a3 int = regs[instr.Src2 + 4]
+		var a4 int = regs[instr.Src2 + 5]
+		var a5 int = regs[instr.Src2 + 6]
+		var a6 int = regs[instr.Src2 + 7]
+		var result int = rt._call_shim_scalar(nativeFn, data,
+			a0, a1, a2, a3, a4, a5, a6)
+		if instr.Dst >= 0 {
+			regs[instr.Dst] = result
+		}
+		return true
+	}
+	if instr.Imm == 9 {
+		// rt._call_shim_aggregate(fn, retbuf, data, a0..a6) shape —
+		// the retbuf-style aggregate counterpart.  Dispatches
+		// aggregate-return function values (slices, managed-slices,
+		// multi-word structs) through their retbuf-style shim.  The
+		// caller (dispatchExternBinding's aggregate path, or compiled
+		// emitCallFuncValue's aggregate branch) has already alloca'd
+		// retbuf and writes the aggregate result there; the shim
+		// returns void.  Same nested-bytecode soundness rationale as
+		// the Imm==8 arm above.
+		var retbuf *uint8 = bit_cast(*uint8, regs[instr.Src2])
+		var data *uint8 = bit_cast(*uint8, regs[instr.Src2 + 1])
+		var a0 int = regs[instr.Src2 + 2]
+		var a1 int = regs[instr.Src2 + 3]
+		var a2 int = regs[instr.Src2 + 4]
+		var a3 int = regs[instr.Src2 + 5]
+		var a4 int = regs[instr.Src2 + 6]
+		var a5 int = regs[instr.Src2 + 7]
+		var a6 int = regs[instr.Src2 + 8]
+		rt._call_shim_aggregate(nativeFn, retbuf, data,
+			a0, a1, a2, a3, a4, a5, a6)
+		// instr.Dst is -1 for the void return; nothing to store.
+		return true
+	}
+	return false
+}
+
+// dispatchCompiledFuncValue handles the cross-mode arm of
+// BC_CALL_FUNC_VALUE: compiled-side function value (data == null)
+// reached from bytecode. Reads vtable.call (the per-function shim,
+// always-shim convention) and dispatches via rt._call_shim_scalar
+// — its lowering in the natively-compiled VM is OP_CALL_INDIRECT
+// against the native pointer. The fixed 7-int-arg shape mirrors
+// vm.TrampolineScalar's variadic-style register-bank reading.
+//
+// fv points at the function value's 16-byte {vtable_addr,
+// data_addr} struct on vm.Stack; data_addr is null on entry (the
+// caller already branched on it). regs and instr are the
+// bytecode call site's register bank and BCInstr.
+func dispatchCompiledFuncValue(fv *int, regs *int, instr BCInstr) {
+	var vtableAddr int = fv[0]
+	if vtableAddr == 0 {
+		println("vm: function value has nil vtable")
+		rt.Exit(1)
+	}
+	var vtable *int = bit_cast(*int, vtableAddr)
+	var callPtr int = vtable[1]
+	if callPtr == 0 {
+		println("vm: function value's vtable.call is nil")
+		rt.Exit(1)
+	}
+	var fnPtr *uint8 = bit_cast(*uint8, callPtr)
+	var dataPtr *uint8 = nil
+	var nArgs int = instr.Imm
+	var a0 int = 0
+	var a1 int = 0
+	var a2 int = 0
+	var a3 int = 0
+	var a4 int = 0
+	var a5 int = 0
+	var a6 int = 0
+	if nArgs > 0 { a0 = regs[instr.Src2 + 0] }
+	if nArgs > 1 { a1 = regs[instr.Src2 + 1] }
+	if nArgs > 2 { a2 = regs[instr.Src2 + 2] }
+	if nArgs > 3 { a3 = regs[instr.Src2 + 3] }
+	if nArgs > 4 { a4 = regs[instr.Src2 + 4] }
+	if nArgs > 5 { a5 = regs[instr.Src2 + 5] }
+	if nArgs > 6 { a6 = regs[instr.Src2 + 6] }
+	var result int = rt._call_shim_scalar(fnPtr, dataPtr,
+		a0, a1, a2, a3, a4, a5, a6)
+	if instr.Dst >= 0 {
+		regs[instr.Dst] = result
+	}
+}
+

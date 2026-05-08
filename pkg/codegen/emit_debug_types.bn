@@ -1,0 +1,245 @@
+package "pkg/codegen"
+
+import "pkg/buf"
+import "pkg/ir"
+import "pkg/types"
+
+// DWARF type-coverage step 4 — DIDerivedType for pointers and
+// DICompositeType for structs.  Builds a per-module registry of
+// non-scalar types referenced by named alloca TypeArgs; each gets
+// a fresh metadata-id on first sight, with the ids assigned
+// sequentially after the per-function metadata block.  Scalar
+// kinds keep the fixed slot layout (!5..!15) defined in
+// emit_debug.bn:dbgTypeID.
+//
+// Step 1 covered scalars; this file covers pointers (`*T` / `@T`)
+// and structs.  Slices, managed-slices, interface-values,
+// function-values, named typedefs and arrays still fall back to
+// !5 and remain follow-up work.
+
+// dbgTypeEntry records one registered non-scalar type.  ID is the
+// primary metadata id (the DIDerivedType for a pointer; the
+// DICompositeType for a struct).  MemberIDs is populated for
+// structs only — one entry per field, used when emitting the
+// member list metadata tuple.
+type dbgTypeEntry struct {
+	Key       @[]char
+	ID        int
+	MemberIDs @[]int
+	Typ       @types.Type
+}
+
+// dbgTypeRegistry accumulates entries seen during function
+// emission.  Reset at the start of every EmitModule.
+var dbgTypeRegistry @[]dbgTypeEntry
+
+// nextDbgTypeID is the next free metadata-id for a non-scalar DI
+// node.  Initialised by setDbgTypeIDBase() to point past the
+// per-function metadata block; bumped each time intern* allocates
+// a new slot.
+var nextDbgTypeID int
+
+// resetDbgTypeRegistry clears the registry at the start of
+// EmitModule.  setDbgTypeIDBase() then anchors the id counter.
+func resetDbgTypeRegistry() {
+	var empty @[]dbgTypeEntry
+	dbgTypeRegistry = empty
+	nextDbgTypeID = 0
+}
+
+// setDbgTypeIDBase sets the first metadata-id non-scalar entries
+// will use.  Called after the per-function metadata block size is
+// known (dbgFuncIDBase + 2 * non-extern func count).
+func setDbgTypeIDBase(base int) {
+	nextDbgTypeID = base
+}
+
+// appendDbgTypeEntry returns a new slice with e appended.
+func appendDbgTypeEntry(s @[]dbgTypeEntry, e dbgTypeEntry) @[]dbgTypeEntry {
+	var n int = len(s)
+	var ns @[]dbgTypeEntry = make_slice(dbgTypeEntry, n + 1)
+	for i := 0; i < n; i++ { ns[i] = s[i] }
+	ns[n] = e
+	return ns
+}
+
+// dbgScalarSlot returns the fixed scalar metadata-id for t, or -1
+// if t isn't a scalar covered by the !5..!15 bank.  Used by
+// dbgTypeID before consulting the non-scalar registry.
+func dbgScalarSlot(t @types.Type) int {
+	if t == nil { return -1 }
+	if t.Kind == types.TYP_BOOL { return 15 }
+	if t.Kind == types.TYP_INT {
+		if t.Signed {
+			if t.Width == 8 { return 6 }
+			if t.Width == 16 { return 7 }
+			if t.Width == 32 { return 8 }
+			return 5
+		}
+		if t.Width == 8 { return 10 }
+		if t.Width == 16 { return 11 }
+		if t.Width == 32 { return 12 }
+		return 9
+	}
+	if t.Kind == types.TYP_FLOAT {
+		if t.Width == 32 { return 13 }
+		return 14
+	}
+	return -1
+}
+
+// dbgTypeKey produces a structural string used to dedup types in
+// the registry.  Pointers carry a `*` or `@` prefix to distinguish
+// raw vs managed; structs key on their (already-qualified) name.
+// Non-step-4 kinds fall through to "?" so the !5 fallback applies.
+func dbgTypeKey(t @types.Type) @[]char {
+	if t == nil { return "?" }
+	if t.Kind == types.TYP_POINTER {
+		var b buf.CharBuf = buf.New()
+		b = b.WriteByte('*')
+		b = b.WriteStr(dbgTypeKey(t.Elem))
+		return b.Bytes()
+	}
+	if t.Kind == types.TYP_MANAGED_PTR {
+		var b buf.CharBuf = buf.New()
+		b = b.WriteByte('@')
+		b = b.WriteStr(dbgTypeKey(t.Elem))
+		return b.Bytes()
+	}
+	if t.Kind == types.TYP_STRUCT {
+		if len(t.Name) > 0 { return t.Name }
+		return "<anon-struct>"
+	}
+	if t.Kind == types.TYP_BOOL { return "bool" }
+	if t.Kind == types.TYP_INT { return t.Name }
+	if t.Kind == types.TYP_FLOAT { return t.Name }
+	return "?"
+}
+
+// lookupDbgType returns the metadata-id for a type already in the
+// registry, or -1 if not yet registered.
+func lookupDbgType(key *[]const char) int {
+	for i := 0; i < len(dbgTypeRegistry); i++ {
+		if charsEqual(dbgTypeRegistry[i].Key, key) {
+			return dbgTypeRegistry[i].ID
+		}
+	}
+	return -1
+}
+
+// internDbgPointer registers a pointer type and returns its id.
+// Eagerly recurses into the pointed-to type so its id is allocated
+// before the pointer's DIDerivedType references it.
+func internDbgPointer(t @types.Type, key @[]char) int {
+	var id int = nextDbgTypeID
+	nextDbgTypeID = nextDbgTypeID + 1
+	var e dbgTypeEntry
+	e.Key = key
+	e.ID = id
+	e.Typ = t
+	dbgTypeRegistry = appendDbgTypeEntry(dbgTypeRegistry, e)
+	dbgTypeID(t.Elem)
+	return id
+}
+
+// internDbgStruct registers a struct type and returns its id.
+// Allocates the DICompositeType id PLUS one DW_TAG_member id per
+// field (so the member list can reference them).  Eagerly
+// recurses into field types so their ids are allocated.  Allocates
+// the primary id BEFORE recursing so self-referential structs
+// resolve to a forward reference rather than a fresh id.
+func internDbgStruct(t @types.Type, key @[]char) int {
+	var id int = nextDbgTypeID
+	nextDbgTypeID = nextDbgTypeID + 1
+	var memberIDs @[]int = make_slice(int, len(t.Fields))
+	for i := 0; i < len(t.Fields); i++ {
+		memberIDs[i] = nextDbgTypeID
+		nextDbgTypeID = nextDbgTypeID + 1
+	}
+	var e dbgTypeEntry
+	e.Key = key
+	e.ID = id
+	e.MemberIDs = memberIDs
+	e.Typ = t
+	dbgTypeRegistry = appendDbgTypeEntry(dbgTypeRegistry, e)
+	for i := 0; i < len(t.Fields); i++ {
+		dbgTypeID(t.Fields[i].Type)
+	}
+	return id
+}
+
+// emitDbgTypeNodes appends one DI node per registered non-scalar
+// type.  Order matches insertion order, but LLVM tolerates forward
+// references so the exact order is not load-bearing.
+func emitDbgTypeNodes(out buf.CharBuf) buf.CharBuf {
+	for i := 0; i < len(dbgTypeRegistry); i++ {
+		var e dbgTypeEntry = dbgTypeRegistry[i]
+		if e.Typ.Kind == types.TYP_POINTER ||
+			e.Typ.Kind == types.TYP_MANAGED_PTR {
+			out = emitDbgPointerNode(out, e)
+		} else if e.Typ.Kind == types.TYP_STRUCT {
+			out = emitDbgStructNode(out, e)
+		}
+	}
+	return out
+}
+
+// emitDbgPointerNode emits a DIDerivedType DW_TAG_pointer_type
+// node referencing the pointed-to type's metadata id.  Both raw
+// (`*T`) and managed (`@T`) pointers are i8* in LLVM and 64 bits
+// wide; the `name` field carries the language-level prefix so
+// lldb shows the distinction.
+func emitDbgPointerNode(out buf.CharBuf, e dbgTypeEntry) buf.CharBuf {
+	out = out.WriteByte('!')
+	out = out.WriteInt(e.ID)
+	out = out.WriteStr(" = !DIDerivedType(tag: DW_TAG_pointer_type, name: \"")
+	out = out.WriteStr(e.Key)
+	out = out.WriteStr("\", baseType: !")
+	out = out.WriteInt(dbgTypeID(e.Typ.Elem))
+	out = out.WriteStr(", size: 64)\n")
+	return out
+}
+
+// emitDbgStructNode emits a DICompositeType DW_TAG_structure_type
+// node plus one DIDerivedType DW_TAG_member node per field.
+// Field offsets / sizes come from types.StructLayout to match the
+// LLVM struct layout (with explicit padding).
+func emitDbgStructNode(out buf.CharBuf, e dbgTypeEntry) buf.CharBuf {
+	var t @types.Type = e.Typ
+	var sizeBits int = t.SizeOf() * 8
+	// Member nodes first.
+	var layout @[]types.FieldLayout = t.StructLayout()
+	for i := 0; i < len(t.Fields); i++ {
+		var ft @types.Type = t.Fields[i].Type
+		var offsetBits int = layout[i].Offset * 8
+		var fieldSizeBits int = ft.SizeOf() * 8
+		out = out.WriteByte('!')
+		out = out.WriteInt(e.MemberIDs[i])
+		out = out.WriteStr(" = !DIDerivedType(tag: DW_TAG_member, name: \"")
+		out = out.WriteStr(t.Fields[i].Name)
+		out = out.WriteStr("\", scope: !")
+		out = out.WriteInt(e.ID)
+		out = out.WriteStr(", file: !3, baseType: !")
+		out = out.WriteInt(dbgTypeID(ft))
+		out = out.WriteStr(", size: ")
+		out = out.WriteInt(fieldSizeBits)
+		out = out.WriteStr(", offset: ")
+		out = out.WriteInt(offsetBits)
+		out = out.WriteStr(")\n")
+	}
+	// Composite type referencing the member list.
+	out = out.WriteByte('!')
+	out = out.WriteInt(e.ID)
+	out = out.WriteStr(" = !DICompositeType(tag: DW_TAG_structure_type, name: \"")
+	out = out.WriteStr(t.Name)
+	out = out.WriteStr("\", file: !3, size: ")
+	out = out.WriteInt(sizeBits)
+	out = out.WriteStr(", elements: !{")
+	for i := 0; i < len(e.MemberIDs); i++ {
+		if i > 0 { out = out.WriteStr(", ") }
+		out = out.WriteByte('!')
+		out = out.WriteInt(e.MemberIDs[i])
+	}
+	out = out.WriteStr("})\n")
+	return out
+}

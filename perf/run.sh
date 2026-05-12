@@ -121,6 +121,12 @@ if command -v runner_compile >/dev/null 2>&1; then
     has_compile=1
 fi
 
+# Track per-mode failures so a compile error or output mismatch
+# fails the script (and therefore CI). Without this, a mode where
+# every test compile-errors silently reports green.
+failures=0
+failure_names=""
+
 for bn in "$SCRIPT_DIR"/*.bn; do
     [ -f "$bn" ] || continue
     name="$(basename "$bn" .bn)"
@@ -154,6 +160,8 @@ for bn in "$SCRIPT_DIR"/*.bn; do
                 "$MODE" "$name" "$compile_s"
             echo "$compile_out" | sed 's/^/  /'
             rm -f "$tmpbin"
+            failures=$((failures + 1))
+            failure_names="$failure_names $name"
             continue
         fi
     else
@@ -170,6 +178,8 @@ for bn in "$SCRIPT_DIR"/*.bn; do
         status="PASS"
     else
         status="FAIL"
+        failures=$((failures + 1))
+        failure_names="$failure_names $name"
     fi
     printf "%-12s %-20s compile=%-8s run=%-8s [%s]\n" \
         "$MODE" "$name" "$compile_s" "$run_s" "$status"
@@ -178,3 +188,9 @@ for bn in "$SCRIPT_DIR"/*.bn; do
         echo "  actual:   $actual"
     fi
 done
+
+if [ "$failures" -gt 0 ]; then
+    echo ""
+    echo "=== $MODE: $failures failure(s):$failure_names ==="
+    exit 1
+fi

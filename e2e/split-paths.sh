@@ -114,22 +114,32 @@ check "bnc" "$actual"
 echo "SKIP: bni (bootstrap can't interp cmd/bni — needs boot-comp build)"
 
 # ----- bnlint (lint pkg/splitlib via -I/-L) -----------------------
-# bnlint requires --root, so we point it at an empty dir and supply
-# the real package via -I/-L. A clean lint = no diagnostic output.
-bnlint_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
-    "$BINATE_DIR/cmd/bnlint" -- \
-    --root "$EMPTY_ROOT" \
-    -I "$BNI_ROOT:$BINATE_DIR" -L "$IMPL_ROOT:$BINATE_DIR" \
-    pkg/splitlib 2>&1) || true
-if [ -z "$bnlint_out" ]; then
-    echo "PASS: bnlint"
-    PASSES=$((PASSES + 1))
-else
+# bnlint is no longer required to be bootstrap-runnable, so we build
+# it via bnc first and exercise the resulting binary.  A clean lint =
+# no diagnostic output.
+BNLINT_BIN="$TMP/bnlint-bin"
+bnlint_build_log=$("$BINATE_DIR/scripts/build-bnlint.sh" \
+    -o "$BNLINT_BIN" 2>&1) || true
+if [ ! -x "$BNLINT_BIN" ]; then
     echo "FAIL: bnlint"
-    echo "  expected: <empty>"
-    echo "  actual:   $bnlint_out"
+    echo "  build error: $bnlint_build_log"
     FAILS=$((FAILS + 1))
     FAIL_NAMES="$FAIL_NAMES bnlint"
+else
+    bnlint_out=$("$BNLINT_BIN" \
+        --root "$EMPTY_ROOT" \
+        -I "$BNI_ROOT:$BINATE_DIR" -L "$IMPL_ROOT:$BINATE_DIR" \
+        pkg/splitlib 2>&1) || true
+    if [ -z "$bnlint_out" ]; then
+        echo "PASS: bnlint"
+        PASSES=$((PASSES + 1))
+    else
+        echo "FAIL: bnlint"
+        echo "  expected: <empty>"
+        echo "  actual:   $bnlint_out"
+        FAILS=$((FAILS + 1))
+        FAIL_NAMES="$FAIL_NAMES bnlint"
+    fi
 fi
 
 echo ""

@@ -40,16 +40,17 @@ if [ -z "$TARGETS" ]; then
     exit 1
 fi
 
-# Build bootstrap once. bnlint's "main package" arg (cmd/bnlint) is resolved
-# relative to cwd by the bootstrap (only -test mode resolves package paths via
-# -root), so we have to run from BINATE_DIR. `go run` won't work from there
-# because it looks for a Go module in cwd, so build the binary first.
-BOOTSTRAP_BIN="$(mktemp -t binate-lint-bootstrap.XXXXXX)"
-trap 'rm -f "$BOOTSTRAP_BIN"' EXIT
-(cd "$BOOTSTRAP_DIR" && go build -o "$BOOTSTRAP_BIN" .) || exit 1
+# Build bnlint via bnc (bnlint is no longer required to be bootstrap-runnable;
+# see scripts/unittest/cmd-bnlint.xfail.boot and the bootstrap-surface scoping
+# in CLAUDE.md).  No caching for now — each invocation rebuilds.
+BNLINT_BIN="$(mktemp -t binate-lint.XXXXXX)"
+trap 'rm -f "$BNLINT_BIN"' EXIT
+"$SCRIPT_DIR/../build-bnlint.sh" -o "$BNLINT_BIN" >/dev/null || {
+    echo "lint: failed to build bnlint" >&2
+    exit 1
+}
 
-(cd "$BINATE_DIR" && "$BOOTSTRAP_BIN" -root "$BINATE_DIR" cmd/bnlint \
-    -- --root "$BINATE_DIR" $TARGETS)
+"$BNLINT_BIN" --root "$BINATE_DIR" $TARGETS
 rc=$?
 
 if [ "$rc" -ne 0 ]; then

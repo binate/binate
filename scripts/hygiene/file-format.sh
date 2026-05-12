@@ -1,10 +1,12 @@
 #!/bin/sh
 # Usage: ./scripts/hygiene/file-format.sh
 #
-# Three checks across authored text files in the repo:
+# Four checks across authored text files in the repo:
 #   1. No trailing whitespace (spaces or tabs) at end of any line.
 #   2. Every non-empty file ends with a final newline.
-#   3. (.bn / .bni only) Each contiguous run of `import "..."` lines is
+#   3. No trailing blank lines — the last byte before the file's
+#      final newline must not itself be a newline.
+#   4. (.bn / .bni only) Each contiguous run of `import "..."` lines is
 #      sorted alphabetically. A blank line or any non-import line ends
 #      the current group; the next run is a fresh group.
 #
@@ -57,7 +59,20 @@ while IFS= read -r f; do
     fi
 done < "$LIST"
 
-# 3. Import group ordering (.bn, .bni only)
+# 3. No trailing blank lines.  A correctly-terminated file ends with
+#    `<content>\n`; one trailing blank line makes it `<content>\n\n`.
+#    Detect by checking whether the last two bytes are both newlines.
+while IFS= read -r f; do
+    if [ -s "$f" ]; then
+        if [ "$(tail -c 2 "$f" | wc -l | tr -d ' ')" -eq 2 ]; then
+            rel=${f#"$BINATE_DIR"/}
+            echo "$rel: trailing blank line(s) at end of file"
+            violations=$((violations + 1))
+        fi
+    fi
+done < "$LIST"
+
+# 4. Import group ordering (.bn, .bni only)
 while IFS= read -r f; do
     case "$f" in
         *.bn|*.bni) ;;

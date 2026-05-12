@@ -21,20 +21,42 @@ Requires Go and the [bootstrap interpreter](https://github.com/binate/bootstrap)
 # Clone both repos
 git clone https://github.com/binate/bootstrap.git
 git clone https://github.com/binate/binate.git
+cd binate
 
-# Run a program via the self-hosted interpreter
-cd bootstrap
-go run . -root ../binate ../binate/cmd/bni -- ../binate/examples/selftest.bn
+# Compile and run a program via bnc-via-bootstrap
+cd ../bootstrap
+go run . -root ../binate ../binate/cmd/bnc -- -o /tmp/selftest ../binate/examples/selftest.bn && /tmp/selftest
 
-# Compile and run a program
-go run . -root ../binate ../binate/cmd/bnc -- ../binate/examples/selftest.bn && ./selftest
+# Build the self-hosted interpreter (bni) and run a program through it
+cd ../binate
+./scripts/build-bni.sh -o /tmp/bni
+/tmp/bni examples/selftest.bn
 
-# Run unit tests for a package
-go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/vm pkg/loader
+# Run unit tests for some bootstrap-runnable packages
+cd ../bootstrap
+go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/loader
 
 # Run conformance tests
 cd ../binate && ./conformance/run.sh boot
 ```
+
+### What the bootstrap can and can't run
+
+The Go bootstrap interpreter implements only a subset of the Binate language —
+no floats, no raw memory ops, no method dispatch via interface, etc.  That's
+enough to interpret `cmd/bnc` (the compiler) and the packages it depends on,
+but *not* the bytecode VM (`pkg/vm`, `cmd/bni`).  Practical consequence:
+
+- **Always bootstrap-runnable:** `cmd/bnc` and its dependency tree
+  (`pkg/{token,lexer,ast,parser,types,ir,codegen,loader,buf,debug,mangle,builtin/testing,bootstrap,rt}`),
+  plus `cmd/bnas` and `cmd/bnlint`.
+- **Needs bnc to build first:** `cmd/bni`, `pkg/vm`.  Use
+  `scripts/build-bni.sh -o <path>` (or the test runners' `boot-comp*` modes)
+  rather than `go run . -test pkg/vm` / `go run . cmd/bni`.
+
+See [explorations/bootstrap-subset.md](https://github.com/binate/explorations/blob/main/bootstrap-subset.md)
+for the language subset; see `scripts/unittest/*.xfail.boot` for the
+per-package "this can't run under boot" markers the test runner consults.
 
 ## Project Structure
 
@@ -85,26 +107,29 @@ Programs run through three stages:
 All layers support `-v` for debug logging to stderr:
 
 ```sh
-# Bootstrap verbose
-go run . -v -root ../binate ../binate/cmd/bni -- program.bn
-
-# Self-hosted interpreter verbose
-go run . -root ../binate ../binate/cmd/bni -- -v program.bn
+# Bootstrap verbose (driving the compiler)
+go run . -v -root ../binate ../binate/cmd/bnc -- program.bn
 
 # Compiler verbose
 go run . -root ../binate ../binate/cmd/bnc -- -v program.bn
+
+# Self-hosted interpreter verbose (built bni binary)
+./scripts/build-bni.sh -o /tmp/bni
+/tmp/bni -v program.bn
 ```
 
 ### Double Interpretation
 
-The self-hosted interpreter can interpret itself:
+The self-hosted interpreter can interpret itself.  The bootstrap can't run
+cmd/bni directly, so the outermost driver is a compiled bni:
 
 ```
-Go bootstrap
+compiled bni (built via bnc-via-bootstrap)
   → interprets cmd/bni (self-hosted interpreter)
-    → interprets cmd/bni (self-hosted interpreter again)
-      → interprets target.bn
+    → interprets target.bn
 ```
+
+This is the `boot-comp-int-int` mode in the test harness.
 
 ### Packages
 
@@ -157,15 +182,25 @@ Constants: `O_RDONLY`, `O_WRONLY`, `O_RDWR`, `O_CREATE`, `O_TRUNC`, `O_APPEND`, 
 
 ### Unit Tests
 
-Each source file has a corresponding `*_test.bn` file with `func TestXxx() testing.TestResult` functions:
+Each source file has a corresponding `*_test.bn` file with `func TestXxx() testing.TestResult` functions.  The recommended entry point is `scripts/unittest/run.sh`, which knows which packages can run under which modes (see the [Quick Start](#what-the-bootstrap-can-and-cant-run) note):
+
+```sh
+# Run all unit tests under boot (Go bootstrap interpreter) — skips pkg/vm,
+# cmd/bni and any other package marked xfail.boot.
+./scripts/unittest/run.sh boot
+
+# Filter to specific packages.
+./scripts/unittest/run.sh boot pkg/types
+
+# pkg/vm and cmd/bni need a compiled bni; use a boot-comp* mode.
+./scripts/unittest/run.sh boot-comp-int pkg/vm cmd/bni
+```
+
+For ad-hoc bootstrap-direct invocations (skipping the runner), invoke the bootstrap interpreter manually but only on bootstrap-runnable packages:
 
 ```sh
 cd bootstrap
-go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/vm pkg/loader pkg/ir pkg/codegen
-
-# Test main package directories
-go run . -root ../binate -test ../binate/cmd/bni
-go run . -root ../binate -test ../binate/cmd/bnc
+go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/loader pkg/ir pkg/codegen
 ```
 
 Tests return `""` for pass, or a failure message string.

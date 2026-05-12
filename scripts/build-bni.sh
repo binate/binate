@@ -6,16 +6,19 @@
 # Not used by the test/conformance harness; those have their own
 # build helpers in scripts/lib/build-compilers.sh.
 #
+# The output path is required (no implicit default) so concurrent
+# invocations — e.g. from different worktrees — don't clobber each
+# other.  Build scratch goes through `mktemp -d` for the same reason.
+#
 # Usage:
-#   ./scripts/build-bni.sh                   # → /tmp/bni  (-O2)
-#   ./scripts/build-bni.sh -o /path/to/bni   # custom output path
-#   ./scripts/build-bni.sh --debug           # -O0 -g (slower runtime, debuggable)
+#   ./scripts/build-bni.sh -o <path>         # release (-O2)
+#   ./scripts/build-bni.sh -o <path> --debug # -O0 -g (slower, debuggable)
 #   ./scripts/build-bni.sh -h                # help
 #
 # After building:
-#   /tmp/bni <file.bn|dir>                run a program
-#   /tmp/bni --repl <file.bn|dir>         REPL against the loaded module
-#   /tmp/bni --test [-root <dir>] <pkg>   run unit tests in a package
+#   <path> <file.bn|dir>                  run a program
+#   <path> --repl <file.bn|dir>           REPL against the loaded module
+#   <path> --test [-root <dir>] <pkg>     run unit tests in a package
 
 set -e
 
@@ -23,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 
-OUT="/tmp/bni"
+OUT=""
 DEBUG=0
 
 while [ $# -gt 0 ]; do
@@ -47,6 +50,13 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+if [ -z "$OUT" ]; then
+    echo "ERROR: output path is required" >&2
+    echo "  usage: $0 -o <path> [--debug]" >&2
+    echo "  try:   $0 --help" >&2
+    exit 1
+fi
 
 if [ ! -d "$BOOTSTRAP_DIR" ]; then
     echo "ERROR: bootstrap dir not found at $BOOTSTRAP_DIR" >&2

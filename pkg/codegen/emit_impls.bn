@@ -98,20 +98,18 @@ func emitImportedImplVtableDecl(out buf.CharBuf, m @ir.Module,
 }
 
 // vtableSlotCount returns the total number of slots in the vtable
-// global named `name` — len(MethodFuncs) + 1 to account for the
-// dtor at slot 0 — or 0 if no impl matches. Slice 2.8 also walks
-// the imported-impl list so cross-package OP_IFACE_VALUE sites can
-// spell the bitcast source type with the right array size; for
-// imported entries MethodFuncs is empty (the imported TU emits the
-// vtable, not us), so the slot count is recovered from the
-// canonical interface's method set via vtableSlotCountForInfo.
+// global named `name`, computed under the concat layout (Slice E.3):
+// dtor any-block + recursive parent vtables + own methods.  Returns
+// 0 if no impl matches.  Slice 2.8 also walks the imported-impl
+// list so cross-package OP_IFACE_VALUE sites can spell the bitcast
+// source type with the right array size.
 func vtableSlotCount(name *[]const char) int {
 	for i := 0; i < len(currentModuleImpls); i++ {
 		var info @ir.ImplInfo = currentModuleImpls[i]
 		if info == nil { continue }
 		var built @[]char = implVtableName(info)
 		if charsEqual(built, name) {
-			return len(info.MethodFuncs) + 1
+			return vtableSlotCountForInfo(info)
 		}
 	}
 	for i := 0; i < len(currentModuleImportedImpls); i++ {
@@ -125,37 +123,104 @@ func vtableSlotCount(name *[]const char) int {
 	return 0
 }
 
-// vtableSlotCountForInfo returns N+1 where N is the interface's
-// method count, recovered via ir.IfaceMethodCount which queries
-// IR-gen's moduleInterfaces. Used for imported-impl vtable
-// declarations whose MethodFuncs slice is empty (Slice 2.8).
+// vtableSlotCountForInfo returns the full vtable slot count for an
+// `(R, I)` pair under the concat layout from
+// plan-interface-embedding.md:
+//   size(I) = 1 (any-block: dtor) + sum(size(P) for P in I.Parents)
+//                                 + len(I's own methods)
+// For interfaces with no parents this reduces to N+1 — the original
+// Slice 2.5 / 2.8 layout.  Used by both vtable emission (here) and
+// imported-impl declarations (Slice 2.8) so both sides agree on
+// the array size regardless of which TU defines the vtable.
 func vtableSlotCountForInfo(info @ir.ImplInfo) int {
-	var n int = ir.IfaceMethodCount(info.IfacePkg, info.IfaceName)
-	return n + 1
+	return ir.IfaceFullVtableSize(info.IfacePkg, info.IfaceName)
 }
 
-// emitImplVtable emits one vtable global for the given (impl, iface)
-// info. Slot 0 is the receiver type's struct dtor (or i8* null for
-// types that don't need destruction); slots 1..N+1 hold the impl
-// methods in interface declaration order. Slice 2.5 of plan-
-// interface-syntax-revision.md.
+// emitImplVtable emits one vtable global for the `(R, I)` pair on
+// `info`, with the concat layout from
+// plan-interface-embedding.md:
+//   [any-block: R's dtor]
+//   for each parent P (declaration order): full vtable of (R, P)
+//                                          (recursive)
+//   R's methods for I's own methods
+// For non-extending interfaces this reduces to slot 0 = dtor +
+// slots 1..N+1 = own methods — the original Slice 2.5 layout.
+//
+// The recursive structure is materialized inline: when emitting
+// (R, Child), we re-emit the parent's slot values (same `i8*
+// bitcast (... @method to i8*)` expressions) at the right offsets,
+// rather than referencing the parent's symbol via GEP — this is
+// what makes `*Child → *Parent` upcast work as a fixed pointer
+// offset (Slice E.4).  The parent's symbol is still emitted
+// separately for direct `*Parent` use.
 func emitImplVtable(out buf.CharBuf, m @ir.Module,
 		info @ir.ImplInfo) buf.CharBuf {
-	var nMethods int = len(info.MethodFuncs)
-	var nSlots int = nMethods + 1
+	var nSlots int = vtableSlotCountForInfo(info)
 	var vtName @[]char = implVtableName(info)
 	out = out.WriteStr("@")
 	out = out.WriteStr(vtName)
 	out = out.WriteStr(" = weak_odr constant [")
 	out = out.WriteInt(nSlots)
 	out = out.WriteStr(" x i8*] [")
-	out = emitImplVtableDtorSlot(out, m, info.DtorFuncName)
-	for j := 0; j < nMethods; j++ {
-		out = out.WriteStr(", ")
-		out = emitImplVtableSlot(out, m, info.MethodFuncs[j])
-	}
+	out = emitImplVtableLayout(out, m, info, info.IfacePkg,
+		info.IfaceName, true)
 	out = out.WriteStr("]\n")
 	return out
+}
+
+// emitImplVtableLayout writes the slot values for a single
+// `(R, X)` block (where X is identified by ifacePkg / ifaceName)
+// into a vtable constant initializer.  `isFirst` indicates
+// whether the caller has already written a leading comma — false
+// means a leading ", " is emitted before the dtor slot.
+//
+// The layout written is: dtor, then for each parent P of X a
+// nested layout (recursive), then X's own method slots.  The
+// recursion bottoms out at interfaces with no parents — those
+// emit just `[dtor, m1, m2, ...]`.
+func emitImplVtableLayout(out buf.CharBuf, m @ir.Module,
+		info @ir.ImplInfo, ifacePkg *[]const char,
+		ifaceName *[]const char, isFirst bool) buf.CharBuf {
+	if !isFirst {
+		out = out.WriteStr(", ")
+	}
+	out = emitImplVtableDtorSlot(out, m, info.DtorFuncName)
+	// Recurse into each parent's full vtable.
+	var parentPkgs @[]@[]char = ir.IfaceParentPkgs(ifacePkg,
+		ifaceName)
+	var parentNames @[]@[]char = ir.IfaceParentNames(ifacePkg,
+		ifaceName)
+	for i := 0; i < len(parentPkgs); i++ {
+		out = emitImplVtableLayout(out, m, info, parentPkgs[i],
+			parentNames[i], false)
+	}
+	// Own methods of this level, in declaration order.
+	var ownMethods @[]@[]char = ir.IfaceOwnMethodNames(ifacePkg,
+		ifaceName)
+	for i := 0; i < len(ownMethods); i++ {
+		out = out.WriteStr(", ")
+		var qualified @[]char = buildMethodFuncName(info.RecvPkg,
+			info.RecvTypeName, ownMethods[i])
+		out = emitImplVtableSlot(out, m, qualified)
+	}
+	return out
+}
+
+// buildMethodFuncName builds `<recvPkg>.<recvName>.<methodName>`
+// — the IR-level qualified name a method registered on the
+// receiver type would have under methodFuncName / methodQualName.
+// Duplicated in codegen for the parent-slot emission path so we
+// don't reach across into pkg/ir for what's purely a name format.
+func buildMethodFuncName(recvPkg *[]const char,
+		recvName *[]const char,
+		methodName *[]const char) @[]char {
+	var b buf.CharBuf = buf.New()
+	b = b.WriteStr(recvPkg)
+	b = b.WriteByte('.')
+	b = b.WriteStr(recvName)
+	b = b.WriteByte('.')
+	b = b.WriteStr(methodName)
+	return b.Bytes()
 }
 
 // emitImplVtableDtorSlot emits slot 0 of the vtable: the receiver

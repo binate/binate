@@ -97,6 +97,24 @@ expand_set() {
     grep -v '^#' "$setfile" | grep -v '^$' | tr '\n' ' '
 }
 
+# strip_signal_msgs filters shell-emitted signal-death diagnostics
+# from a captured runner output stream.  When a child process dies
+# from SIGSEGV / SIGABRT / etc., Linux's shell (dash, bash) writes
+# a line like "Segmentation fault" or "Segmentation fault (core
+# dumped)" to its own stderr.  Because the runners capture the
+# child's stderr via `2>&1` and the whole thing flows through `$()`
+# command substitution, those shell-emitted diagnostics end up
+# concatenated to the program's actual stdout in $actual.  macOS
+# doesn't emit them, so tests pinning silent-SEGV behavior (e.g.
+# 385_iface_nil_dispatch) pass locally but fail on Linux CI.
+# Strip the well-known patterns here so the comparison sees only
+# the program's real output across both OSes.
+strip_signal_msgs() {
+    printf '%s\n' "$1" | grep -Ev \
+        '^(Segmentation fault|Killed|Aborted|Bus error|Floating point exception|Trace/breakpoint trap)( \(core dumped\))?$' \
+        | awk 'BEGIN { first = 1 } { if (!first) printf "\n"; printf "%s", $0; first = 0 }'
+}
+
 # Try mode set file first, then comma-separated list
 MODES="$(expand_set "$MODE" 2>/dev/null)" || {
     case "$MODE" in
@@ -175,6 +193,7 @@ run_test() {
 
     t_start=$(date +%s)
     actual=$(runner_exec "$bn" "$root")
+    actual=$(strip_signal_msgs "$actual")
     t_end=$(date +%s)
     elapsed=$((t_end - t_start))
 
@@ -237,6 +256,7 @@ run_error_test() {
     t_start=$(date +%s)
     actual=$(runner_exec "$bn" "$root")
     rc=$?
+    actual=$(strip_signal_msgs "$actual")
     t_end=$(date +%s)
     elapsed=$((t_end - t_start))
 

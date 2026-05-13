@@ -26,18 +26,47 @@
 # Parse flags
 VERBOSE=0
 QUIET=0
+SHARD_IDX=0
+SHARD_COUNT=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -v|--verbose) VERBOSE=1; shift ;;
         -q|--quiet)   QUIET=1; shift ;;
+        --shard)
+            # Expect `i/n` (1-based shard index out of count).
+            if [ -z "$2" ]; then
+                echo "--shard requires an argument of the form i/n" >&2
+                exit 2
+            fi
+            case "$2" in
+                */*) ;;
+                *)   echo "--shard argument must be i/n, got: $2" >&2
+                     exit 2 ;;
+            esac
+            SHARD_IDX="${2%%/*}"
+            SHARD_COUNT="${2##*/}"
+            case "$SHARD_IDX" in
+                ''|*[!0-9]*) echo "shard index must be a positive integer" >&2
+                             exit 2 ;;
+            esac
+            case "$SHARD_COUNT" in
+                ''|*[!0-9]*) echo "shard count must be a positive integer" >&2
+                             exit 2 ;;
+            esac
+            if [ "$SHARD_COUNT" -lt 1 ] || [ "$SHARD_IDX" -lt 1 ] ||
+                    [ "$SHARD_IDX" -gt "$SHARD_COUNT" ]; then
+                echo "--shard $2: index must be in [1, count]" >&2
+                exit 2
+            fi
+            shift 2 ;;
         *)            break ;;
     esac
 done
-export VERBOSE QUIET
+export VERBOSE QUIET SHARD_IDX SHARD_COUNT
 
 MODE="$1"
 if [ -z "$MODE" ]; then
-    echo "Usage: $0 [-v|-q] <mode> [filter...]"
+    echo "Usage: $0 [-v|-q] [--shard i/n] <mode> [filter...]"
     echo ""
     echo "Runs unit tests for all packages (or filtered packages) using"
     echo "the specified backend mode."
@@ -45,6 +74,9 @@ if [ -z "$MODE" ]; then
     echo "Flags:"
     echo "  -v, --verbose   Show per-test PASS/FAIL output"
     echo "  -q, --quiet     Show only failures and summary"
+    echo "  --shard i/n     Run only this shard's packages (1-based: shard"
+    echo "                  i of n, by 0-based position in the discovered"
+    echo "                  package list modulo n)"
     echo "  (default)       Show pass/fail per package, failures in detail"
     echo ""
     echo "Filters select packages by substring match (e.g. 'ir' matches"
@@ -105,6 +137,8 @@ MODES="$(expand_set "$MODE" 2>/dev/null)" || {
         flags=""
         [ "$VERBOSE" -eq 1 ] && flags="-v"
         [ "$QUIET" -eq 1 ] && flags="-q"
+        [ "$SHARD_COUNT" -gt 0 ] && \
+            flags="$flags --shard $SHARD_IDX/$SHARD_COUNT"
         "$0" $flags "$m" "$@"
         rc=$?
         if [ $rc -ne 0 ]; then overall_exit=$rc; fi
@@ -157,6 +191,12 @@ xfailed=0
 skipped=0
 failures=""
 
+# Counter for the shard's modulo selection.  Incremented for every
+# package that survives the substring filter (i.e. would have been
+# run absent the --shard flag), so the same shard config produces a
+# stable subset regardless of which filters are active.
+shard_pos=0
+
 for pkg in $PACKAGES; do
     # Apply filters (substring match on package path)
     if [ $# -gt 0 ]; then
@@ -169,6 +209,18 @@ for pkg in $PACKAGES; do
             continue
         fi
     fi
+
+    # Apply shard selection (1-based: shard i of n keeps positions
+    # where shard_pos % n == i - 1).  Packages skipped by sharding
+    # are NOT counted in `skipped` — they're being handled by some
+    # other shard's invocation.
+    if [ "$SHARD_COUNT" -gt 0 ]; then
+        if [ $((shard_pos % SHARD_COUNT)) -ne $((SHARD_IDX - 1)) ]; then
+            shard_pos=$((shard_pos + 1))
+            continue
+        fi
+    fi
+    shard_pos=$((shard_pos + 1))
 
     # Check for xfail
     xfail_key="$(echo "$pkg" | tr '/' '-')"
@@ -214,7 +266,11 @@ if [ "$VERBOSE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     echo ""
 fi
 echo ""
-echo "=== Summary ($MODE): $passed passed, $failed failed, $xfailed xfail, $skipped skipped ==="
+shard_suffix=""
+if [ "$SHARD_COUNT" -gt 0 ]; then
+    shard_suffix=" (shard $SHARD_IDX/$SHARD_COUNT)"
+fi
+echo "=== Summary ($MODE)$shard_suffix: $passed passed, $failed failed, $xfailed xfail, $skipped skipped ==="
 if [ $failed -gt 0 ]; then
     echo "Failures:$failures"
     exit 1

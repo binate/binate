@@ -6,7 +6,13 @@ runner_setup() { build_interp_boot_comp; }
 
 runner_test() {
     pkg="$1"
-    "$COMPILED_INTERP" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bni" -- --test -root "$BINATE_DIR" "$pkg"
+    if [ -n "$SKIP_FILTER" ]; then
+        "$COMPILED_INTERP" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bni" -- \
+            --test --skip "$SKIP_FILTER" -root "$BINATE_DIR" "$pkg"
+    else
+        "$COMPILED_INTERP" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bni" -- \
+            --test -root "$BINATE_DIR" "$pkg"
+    fi
 }
 
 runner_cleanup() { cleanup_compilers; }

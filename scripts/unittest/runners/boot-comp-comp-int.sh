@@ -6,7 +6,12 @@ runner_setup() { build_gen1; build_interp "$GEN1_COMPILER"; }
 
 runner_test() {
     pkg="$1"
-    "$COMPILED_INTERP" --test -root "$BINATE_DIR" "$pkg"
+    if [ -n "$SKIP_FILTER" ]; then
+        "$COMPILED_INTERP" --test --skip "$SKIP_FILTER" \
+            -root "$BINATE_DIR" "$pkg"
+    else
+        "$COMPILED_INTERP" --test -root "$BINATE_DIR" "$pkg"
+    fi
 }
 
 runner_cleanup() { cleanup_compilers; }

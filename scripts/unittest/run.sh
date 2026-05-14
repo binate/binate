@@ -22,6 +22,12 @@
 #   scripts/unittest/<pkg-with-slashes-replaced-by-dashes>.xfail.<mode>
 #   e.g. scripts/unittest/pkg-rt.xfail.boot
 #   Contents are the reason for the expected failure.
+#
+# Per-test skip (bni-based runners only):
+#   scripts/unittest/<pkg-with-slashes-replaced-by-dashes>.skip.<mode>
+#   e.g. scripts/unittest/pkg-codegen.skip.boot-comp-int-int
+#   Contents are a name substring; matching Test* functions are
+#   skipped via `--skip` to the runner.
 
 # Parse flags
 VERBOSE=0
@@ -109,6 +115,12 @@ if [ -z "$MODE" ]; then
     echo "Xfail: scripts/unittest/<pkg-path>.xfail.<mode>"
     echo "  e.g. scripts/unittest/pkg-rt.xfail.boot"
     echo "  (slashes in package path replaced with dashes)"
+    echo ""
+    echo "Per-test skip: scripts/unittest/<pkg-path>.skip.<mode>"
+    echo "  Contents are a name substring; matching Test*"
+    echo "  functions are skipped (passed as --skip to the"
+    echo "  runner).  Honored by bni-based runners (boot-comp-int,"
+    echo "  boot-comp-int-int, boot-comp-comp-int)."
     exit 1
 fi
 shift
@@ -236,8 +248,21 @@ for pkg in $PACKAGES; do
         continue
     fi
 
+    # Per-test skip file: <pkg-key>.skip.<mode>.  Contents are a
+    # substring pattern; tests whose name contains the pattern are
+    # skipped (passed as --skip to the runner).  Only the bni-based
+    # runners (boot-comp-int, boot-comp-int-int, boot-comp-comp-int)
+    # honor this; other modes ignore SKIP_FILTER.
+    skip_file="$SCRIPT_DIR/${xfail_key}.skip.${MODE}"
+    SKIP_FILTER=""
+    if [ -f "$skip_file" ]; then
+        SKIP_FILTER="$(cat "$skip_file")"
+    fi
+    export SKIP_FILTER
+
     # Run tests with timing
     start_time=$(date +%s)
+    if [ "$VERBOSE" -eq 1 ]; then echo "STARTING: $pkg"; fi
     output=$(runner_test "$pkg" 2>&1)
     rc=$?
     end_time=$(date +%s)

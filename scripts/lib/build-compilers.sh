@@ -50,6 +50,29 @@ build_gen2() {
     echo "Gen2 compiler ready: $GEN2_COMPILER"
 }
 
+# Build a bnc binary using the native AArch64 backend (bootstrap
+# interpreter runs cmd/bnc with --backend native, asking it to compile
+# cmd/bnc itself).  Dependency modules of bnc still go through the
+# LLVM path (compileMainNative falls back to LLVM for everything that
+# isn't the main module); the cmd/bnc module is the only one emitted
+# via the native aarch64 path.  The resulting binary is a native
+# program that's much faster than re-running bootstrap-interp-bnc for
+# every test package — used by the boot-comp_native_aa64-comp_native_aa64
+# runner to amortise the bootstrap-interp tax over many test compiles.
+# Sets BNC_NATIVE to the path.
+build_bnc_native_aa64() {
+    BNC_NATIVE="/tmp/binate_bnc_native_aa64_$$"
+    BNC_NATIVE_BUILD_DIR="$(_new_build_dir)"
+    echo "Building bnc with native aarch64 backend..."
+    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --backend native --root "$BINATE_DIR" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
+    if [ ! -x "$BNC_NATIVE" ]; then
+        echo "ERROR: Failed to build bnc (native aarch64):"
+        echo "$build_out"
+        exit 1
+    fi
+    echo "bnc (native aarch64) ready: $BNC_NATIVE"
+}
+
 # Build compiled interpreter (bni, a bytecode VM) using bootstrap→bnc.
 # Sets COMPILED_INTERP to the path.
 build_interp_boot_comp() {
@@ -84,7 +107,7 @@ build_interp() {
 
 # Cleanup helper — removes all temp binaries and build dirs.
 cleanup_compilers() {
-    rm -f "$GEN1_COMPILER" "$GEN2_COMPILER" "$COMPILED_INTERP"
+    rm -f "$GEN1_COMPILER" "$GEN2_COMPILER" "$COMPILED_INTERP" "$BNC_NATIVE"
     for d in $BUILD_DIRS; do
         rm -rf "$d"
     done

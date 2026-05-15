@@ -1,0 +1,221 @@
+package "pkg/ir"
+
+import "pkg/buf"
+import "pkg/types"
+
+// IV-dispatch receiver thunks for value-receiver impls.
+//
+// Per `plan-primitives-impl-interfaces.md` § "Interface-value
+// dispatch and value receivers", an iv data slot stores a
+// pointer; a vtable slot pointing at a value-receiver method
+// would receive that pointer where the function expects the
+// value.  The fix is a per-(R, I, method) thunk that takes
+// `*const T`, derefs to load the value, and tail-calls the
+// value-receiver method.  Pointer-receiver impls get no
+// thunk — the iv data slot already matches.
+//
+// This pass walks `m.Impls` after method bodies are
+// generated, generates the thunks it needs, and rewrites
+// the affected MethodFuncs entries to point at thunk
+// names instead.  Both LLVM codegen and the bytecode VM
+// then dispatch through the thunk uniformly.
+
+// generateIvDispatchThunks walks every value-receiver method in
+// m.Funcs and synthesizes a per-method thunk for it.  The thunk
+// is a small `*const T` → load → call → return wrapper.
+// Consumers (codegen, vm/lower) consult LookupVtableSlotName to
+// decide whether a vtable slot should point at the thunk or
+// the underlying method.  Idempotent: a thunk that already
+// exists isn't re-generated.
+//
+// We thunk every value-receiver method (not just those reached
+// via current m.Impls) because the same method can be reached
+// via parent-interface vtable slots that emit_impls /
+// vm/lower's recursive layout walks reconstruct names for —
+// and those reconstructed lookups need a thunk to be findable
+// even when this module's m.Impls doesn't directly list the
+// (R, parent) pair.
+func generateIvDispatchThunks(m @Module) {
+	if m == nil { return }
+	// Snapshot the funcs slice up-front: AddFunc may grow
+	// m.Funcs, and we don't want to re-thunk our own thunks.
+	var existing int = len(m.Funcs)
+	for i := 0; i < existing; i++ {
+		var f @Func = m.Funcs[i]
+		if f == nil || !needsRecvThunk(f) { continue }
+		var thunkName @[]char = thunkNameForMethod(f.Name)
+		if LookupModuleFunc(m, thunkName) != nil { continue }
+		m.AddFunc(genIvRecvThunk(thunkName, f))
+	}
+}
+
+// LookupVtableSlotName returns the symbol name a vtable slot
+// for `methodFuncName` should point at: the thunk's name if the
+// method is a value-receiver method that has a generated thunk
+// in m.Funcs, otherwise `methodFuncName` itself.  Single source
+// of truth for the codegen vtable emitter and the VM
+// vtable-lowering pass — both call this so the LLVM global and
+// vm.IfaceVtables agree on which symbol fills each slot.
+func LookupVtableSlotName(m @Module, methodFuncName @[]char) @[]char {
+	if m == nil { return methodFuncName }
+	var thunkName @[]char = thunkNameForMethod(methodFuncName)
+	if LookupModuleFunc(m, thunkName) != nil {
+		return thunkName
+	}
+	return methodFuncName
+}
+
+// LookupModuleFunc returns the @Func with the given name in
+// m.Funcs, or nil.  Public so codegen / vm can reuse it
+// (pkg/codegen has its own private copy from before this
+// helper existed; that copy can be dropped opportunistically).
+func LookupModuleFunc(m @Module, name *[]const char) @Func {
+	if m == nil { return nil }
+	for i := 0; i < len(m.Funcs); i++ {
+		if streq(m.Funcs[i].Name, name) {
+			return m.Funcs[i]
+		}
+	}
+	return nil
+}
+
+// needsRecvThunk reports whether f needs an iv-dispatch
+// receiver-thunk wrapper.  Conditions:
+//   1. f is a method (qualified name has the methodQualName
+//      shape `<pkgShort>.<TypeName>.<MethodName>`, i.e., at
+//      least two dots).  Free functions whose first param
+//      happens to be value-typed don't get thunks; they're
+//      not iv-dispatch targets.
+//   2. f's first param (the receiver) is value-typed (not
+//      pointer / managed pointer).
+//   3. Single result (or none).  Multi-return methods aren't
+//      thunked yet — the sret ABI requires extra plumbing.
+//      Interface methods rarely use multi-return; revisit if
+//      a real use case appears.
+func needsRecvThunk(f @Func) bool {
+	if f == nil || len(f.Params) == 0 { return false }
+	if f.IsExtern { return false }
+	if !nameLooksLikeMethod(f.Name) { return false }
+	if len(f.Results) > 1 { return false }
+	var recvTyp @types.Type = f.Params[0].Typ
+	if recvTyp == nil { return false }
+	if recvTyp.Kind == types.TYP_POINTER { return false }
+	if recvTyp.Kind == types.TYP_MANAGED_PTR { return false }
+	return true
+}
+
+// nameLooksLikeMethod reports whether `name` has the
+// `<pkgShort>.<TypeName>.<MethodName>` shape produced by
+// methodQualName — i.e., at least two `.` separators.
+// Free-function qualified names have one (`<pkgShort>.<name>`),
+// so the dot count distinguishes them.
+func nameLooksLikeMethod(name @[]char) bool {
+	var dots int = 0
+	for i := 0; i < len(name); i++ {
+		if name[i] == '.' {
+			dots = dots + 1
+			if dots >= 2 { return true }
+		}
+	}
+	return false
+}
+
+// thunkNameForMethod returns the qualified IR-level name for
+// the iv-dispatch thunk of a value-receiver method.  Input is
+// the method's qualified name `<recvPkg>.<recvName>.<method>`;
+// output inserts `__bn_thunk_` before the method part:
+// `<recvPkg>.<recvName>.__bn_thunk_<method>`.  The `__bn_`
+// prefix marks compiler-generated names.
+func thunkNameForMethod(methodFuncName *[]const char) @[]char {
+	var lastDot int = -1
+	for i := 0; i < len(methodFuncName); i++ {
+		if methodFuncName[i] == '.' { lastDot = i }
+	}
+	var cb buf.CharBuf = buf.New()
+	if lastDot < 0 {
+		// Defensive: unqualified method name.  Prefix the whole
+		// name with the synthetic marker.
+		cb = cb.WriteStr("__bn_thunk_")
+		cb = cb.WriteStr(methodFuncName)
+		return cb.Bytes()
+	}
+	for i := 0; i <= lastDot; i++ {
+		cb = cb.WriteByte(methodFuncName[i])
+	}
+	cb = cb.WriteStr("__bn_thunk_")
+	for i := lastDot + 1; i < len(methodFuncName); i++ {
+		cb = cb.WriteByte(methodFuncName[i])
+	}
+	return cb.Bytes()
+}
+
+// genIvRecvThunk synthesizes an @Func that takes `*const T`
+// (where T is f's value-typed first param) and forwards to f
+// after loading the receiver value through the pointer.
+// Subsequent params, if any, are passed through unchanged.
+func genIvRecvThunk(name @[]char, f @Func) @Func {
+	var origRecvTyp @types.Type = f.Params[0].Typ
+	var ptrRecvTyp @types.Type = types.MakePointerType(
+		types.MakeConstType(origRecvTyp))
+
+	// Build the thunk's param list: pointer receiver first,
+	// then any user args from f (positions 1..).
+	var params @[]@Param
+	var ptrParam @Param = make(Param)
+	ptrParam.Name = buf.CopyStr("__recv_ptr")
+	ptrParam.Typ = ptrRecvTyp
+	params = appendParamPtr(params, ptrParam)
+	for i := 1; i < len(f.Params); i++ {
+		params = appendParamPtr(params, f.Params[i])
+	}
+
+	var thunk @Func = NewFunc(name, params, f.Results)
+	if f.MultiReturnType != nil {
+		thunk.MultiReturnType = f.MultiReturnType
+	}
+	var b @Block = AddBlock(thunk, "entry")
+
+	// Reference to the pointer-typed receiver param (param[0]).
+	var ptrRef @Instr = make(Instr)
+	ptrRef.ID = thunk.Params[0].ID
+	ptrRef.Typ = thunk.Params[0].Typ
+	ptrRef.Op = OP_CONST_INT
+	// Load T from *const T.
+	var recvVal @Instr = b.EmitLoad(ptrRef, origRecvTyp)
+
+	// Build call args: the loaded receiver, then forwarded
+	// pass-through params.
+	var args @[]@Instr
+	args = appendInstrPtr(args, recvVal)
+	for i := 1; i < len(thunk.Params); i++ {
+		var paramRef @Instr = make(Instr)
+		paramRef.ID = thunk.Params[i].ID
+		paramRef.Typ = thunk.Params[i].Typ
+		paramRef.Op = OP_CONST_INT
+		args = appendInstrPtr(args, paramRef)
+	}
+
+	// Determine the call's result type.  Multi-return uses the
+	// MultiReturnType struct; single-result is just that result;
+	// no results = void.
+	var resultTyp @types.Type
+	if len(f.Results) == 0 {
+		resultTyp = types.TypVoid()
+	} else if len(f.Results) == 1 {
+		resultTyp = f.Results[0]
+	} else {
+		resultTyp = thunk.MultiReturnType
+	}
+
+	if len(f.Results) == 0 {
+		b.EmitCall(f.Name, args, resultTyp)
+		var noVals @[]@Instr
+		b.EmitReturn(noVals)
+	} else {
+		var callResult @Instr = b.EmitCall(f.Name, args, resultTyp)
+		var vals @[]@Instr = make_slice(@Instr, 1)
+		vals[0] = callResult
+		b.EmitReturn(vals)
+	}
+	return thunk
+}

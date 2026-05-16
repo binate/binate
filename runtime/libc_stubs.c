@@ -12,11 +12,18 @@
 #include <string.h>
 #include <stdint.h>
 
-void *bn_libc__Malloc(int64_t size) {
+// Binate's `int` is target word-sized — see binate_runtime.c for the
+// rationale.  The libc bridges below take and return Binate-int
+// values, so their C signatures must use the same type so that the
+// LLVM IR emitted by pkg/codegen (which uses intLL() at these sites)
+// links cleanly to the C symbol.
+typedef intptr_t bn_int_t;
+
+void *bn_libc__Malloc(bn_int_t size) {
     return malloc((size_t)size);
 }
 
-void *bn_libc__Calloc(int64_t count, int64_t size) {
+void *bn_libc__Calloc(bn_int_t count, bn_int_t size) {
     return calloc((size_t)count, (size_t)size);
 }
 
@@ -24,14 +31,14 @@ void bn_libc__Free(void *ptr) {
     free(ptr);
 }
 
-void bn_libc__Memset(void *ptr, int64_t val, int64_t size) {
+void bn_libc__Memset(void *ptr, bn_int_t val, bn_int_t size) {
     memset(ptr, (int)val, (size_t)size);
 }
 
-void bn_libc__Memcpy(void *dst, const void *src, int64_t size) {
+void bn_libc__Memcpy(void *dst, const void *src, bn_int_t size) {
     memcpy(dst, src, (size_t)size);
 }
 
-void bn_libc__Exit(int64_t code) {
+void bn_libc__Exit(bn_int_t code) {
     exit((int)code);
 }

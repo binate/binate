@@ -11,6 +11,13 @@
 // Binate runtime library
 // Provides I/O and basic operations for compiled Binate programs.
 
+// Binate's `int` type is the target word-sized signed integer (8
+// bytes on LP64, 4 bytes on 32-bit ARM Linux ILP32).  Every C field /
+// function arg / return value here that represents a Binate `int`
+// uses `bn_int_t`, so the C ABI tracks the LLVM IR emitted by
+// pkg/codegen (which uses intLL() at the same sites).
+typedef intptr_t bn_int_t;
+
 // ============================================================
 // Slice representation: { data*, len }
 //
@@ -20,14 +27,14 @@
 
 typedef struct {
     void    *data;      // *T: pointer to first element
-    int64_t  len;       // uint: number of elements
+    bn_int_t  len;       // uint: number of elements
 } BnSlice;
 
 typedef struct {
     void    *data;       // *T: pointer to first element
-    int64_t  len;        // uint: number of elements
+    bn_int_t  len;        // uint: number of elements
     void    *backing;    // managed backing pointer (refcounted)
-    int64_t  backing_len; // total element count in backing
+    bn_int_t  backing_len; // total element count in backing
 } BnManagedSlice;
 
 // Managed memory (Alloc, Box, RefInc, RefDec, Free) and bounds checking
@@ -60,7 +67,7 @@ static char *slice_to_cstr(BnSlice s) {
 // Helper: convert C string to BnSlice of chars (null-terminated C strings only)
 static BnSlice cstr_to_slice(const char *s) {
     BnSlice r;
-    r.len = (int64_t)strlen(s);
+    r.len = (bn_int_t)strlen(s);
     if (r.len > 0) {
         r.data = malloc((size_t)r.len);
         memcpy(r.data, s, (size_t)r.len);
@@ -77,19 +84,23 @@ static BnSlice cstr_to_slice(const char *s) {
 // those created via rt.Alloc — both are released through RawFree.
 extern void bn_rt__RawFree(void *ptr);
 
-// Helper: allocate a managed block (16-byte header + payload, refcount=1)
+// Helper: allocate a managed block (header + payload, refcount=1).
+// Header is 2 * sizeof(bn_int_t) — 16 bytes on LP64, 8 bytes on
+// 32-bit ARM Linux.  Layout: [refcount, free_fn_ptr] both bn_int_t
+// (refcount is target-int; free_fn_ptr is bitcast through bn_int_t
+// since pointer width matches int width on every supported target).
 static void *managed_alloc(size_t payload_size) {
-    void *base = calloc(1, 16 + payload_size);
-    int64_t *header = (int64_t *)base;
+    void *base = calloc(1, 2 * sizeof(bn_int_t) + payload_size);
+    bn_int_t *header = (bn_int_t *)base;
     header[0] = 1;  // refcount = 1
-    header[1] = (int64_t)(intptr_t)&bn_rt__RawFree;  // free_fn = &RawFree
-    return (char *)base + 16;  // return pointer past header
+    header[1] = (bn_int_t)&bn_rt__RawFree;  // free_fn = &RawFree
+    return (char *)base + 2 * sizeof(bn_int_t);  // return pointer past header
 }
 
 // Helper: convert C string to BnManagedSlice of chars
 static BnManagedSlice cstr_to_managed_slice(const char *s) {
     BnManagedSlice r;
-    r.len = (int64_t)strlen(s);
+    r.len = (bn_int_t)strlen(s);
     if (r.len > 0) {
         r.data = managed_alloc((size_t)r.len);
         memcpy(r.data, s, (size_t)r.len);
@@ -104,7 +115,7 @@ static BnManagedSlice cstr_to_managed_slice(const char *s) {
 }
 
 // Open(path *[]char, flags int) int
-int64_t bn_bootstrap__Open(BnSlice path, int64_t flags) {
+bn_int_t bn_bootstrap__Open(BnSlice path, bn_int_t flags) {
     char *cpath = slice_to_cstr(path);
     int oflags = 0;
     int mode = flags & 3;  // low 2 bits: 0=RDONLY, 1=WRONLY, 2=RDWR
@@ -117,26 +128,26 @@ int64_t bn_bootstrap__Open(BnSlice path, int64_t flags) {
     if (flags & 1024) oflags |= O_APPEND;
     int fd = open(cpath, oflags, 0644);
     free(cpath);
-    return (int64_t)fd;
+    return (bn_int_t)fd;
 }
 
 // Read(fd int, buf *[]uint8) int — reads up to len(buf) bytes
-int64_t bn_bootstrap__Read(int64_t fd, BnSlice buf) {
+bn_int_t bn_bootstrap__Read(bn_int_t fd, BnSlice buf) {
     if (!buf.data || buf.len <= 0) return 0;
     ssize_t r = read((int)fd, buf.data, (size_t)buf.len);
-    return (int64_t)r;
+    return (bn_int_t)r;
 }
 
 // Write(fd int, buf *[]uint8) int — writes len(buf) bytes
-int64_t bn_bootstrap__Write(int64_t fd, BnSlice buf) {
+bn_int_t bn_bootstrap__Write(bn_int_t fd, BnSlice buf) {
     if (!buf.data || buf.len <= 0) return 0;
     ssize_t w = write((int)fd, buf.data, (size_t)buf.len);
-    return (int64_t)w;
+    return (bn_int_t)w;
 }
 
 // Close(fd int) int
-int64_t bn_bootstrap__Close(int64_t fd) {
-    return (int64_t)close((int)fd);
+bn_int_t bn_bootstrap__Close(bn_int_t fd) {
+    return (bn_int_t)close((int)fd);
 }
 
 // ReadDir(path *[]char) @[]@[]char
@@ -154,7 +165,7 @@ BnManagedSlice bn_bootstrap__ReadDir(BnSlice path) {
     if (!dir) return result;
 
     // First pass: count entries
-    int64_t count = 0;
+    bn_int_t count = 0;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
@@ -169,7 +180,7 @@ BnManagedSlice bn_bootstrap__ReadDir(BnSlice path) {
 
     // Second pass: fill entries
     rewinddir(dir);
-    int64_t idx = 0;
+    bn_int_t idx = 0;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
         if (idx < count) {
@@ -187,7 +198,7 @@ BnManagedSlice bn_bootstrap__ReadDir(BnSlice path) {
 }
 
 // Stat(path *[]char) int  — returns 0=not found, 1=file, 2=directory
-int64_t bn_bootstrap__Stat(BnSlice path) {
+bn_int_t bn_bootstrap__Stat(BnSlice path) {
     char *cpath = slice_to_cstr(path);
     struct stat st;
     if (stat(cpath, &st) != 0) {
@@ -200,7 +211,7 @@ int64_t bn_bootstrap__Stat(BnSlice path) {
 }
 
 // Exit(code int)
-void bn_bootstrap__Exit(int64_t code) {
+void bn_bootstrap__Exit(bn_int_t code) {
     exit((int)code);
 }
 
@@ -211,7 +222,7 @@ static char **bn_argv = NULL;
 // Args() @[]@[]char
 BnManagedSlice bn_bootstrap__Args(void) {
     BnManagedSlice result;
-    int64_t count = bn_argc > 1 ? bn_argc - 1 : 0;
+    bn_int_t count = bn_argc > 1 ? bn_argc - 1 : 0;
     if (count == 0) {
         result.data = NULL;
         result.len = 0;
@@ -233,16 +244,16 @@ BnManagedSlice bn_bootstrap__Args(void) {
 }
 
 // Exec(program *[]char, args *[]*[]char) int
-int64_t bn_bootstrap__Exec(BnSlice program, BnSlice args) {
+bn_int_t bn_bootstrap__Exec(BnSlice program, BnSlice args) {
     char *prog = slice_to_cstr(program);
 
     // Build argv: [program, args..., NULL]
     // args is *[]@[]char — each element is a BnManagedSlice (4 words).
     // We extract the {data, len} prefix from each for slice_to_cstr.
-    int64_t nargs = args.len;
+    bn_int_t nargs = args.len;
     char **argv = (char **)malloc((size_t)(nargs + 2) * sizeof(char *));
     argv[0] = prog;
-    for (int64_t i = 0; i < nargs; i++) {
+    for (bn_int_t i = 0; i < nargs; i++) {
         BnManagedSlice ms = ((BnManagedSlice *)args.data)[i];
         BnSlice arg;
         arg.data = ms.data;
@@ -261,13 +272,13 @@ int64_t bn_bootstrap__Exec(BnSlice program, BnSlice args) {
     waitpid(pid, &status, 0);
 
     // Clean up
-    for (int64_t i = 0; i <= nargs; i++) {
+    for (bn_int_t i = 0; i <= nargs; i++) {
         free(argv[i]);
     }
     free(argv);
 
     if (WIFEXITED(status)) {
-        return (int64_t)WEXITSTATUS(status);
+        return (bn_int_t)WEXITSTATUS(status);
     }
     return -1;
 }

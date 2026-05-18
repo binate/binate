@@ -177,16 +177,32 @@ func emitCallIndirect(a @asm.Assembler, rm @common.RegMap,
 }
 
 // emitCallFuncValue lowers OP_CALL_FUNC_VALUE: call through a 2-word
-// function value's vtable.call. Always-shim convention (Phase 3 of
-// plan-function-values.md): the call slot has signature
-// `<ret>(*uint8 data, <args>)`. Caller loads data from the function
-// value's data slot (offset 8), passes it as the first integer arg
-// (X0 for the typical case), then shifts user args one register
-// over via a synthetic argTypes list that has *uint8 prepended.
+// function value's vtable.call.  Always-shim convention (Phase 3 of
+// plan-function-values.md).  Two calling conventions for the shim,
+// distinguished by return type:
+//
+//   Scalar / void return: shim signature
+//     `<ret>(*uint8 data, <args>)`.  Caller loads data from the
+//     function value's data slot (offset 8), passes it in X0, then
+//     puts user args in X1+ (one synthetic prepended *uint8 slot
+//     shifts AAPCS register-start by one).
+//
+//   Aggregate return: shim signature
+//     `void(*uint8 retbuf, *uint8 data, <args>)` — retbuf-style.
+//     Caller allocates retbuf (PlanFrame's alloc region for the
+//     instruction), passes retbuf in X0, data in X1, user args in
+//     X2+ (TWO synthetic prepended slots).  After the call the
+//     retbuf alloc region holds the return value — no X0..X(N-1)
+//     spill required.  Mirrors emit_call.bn:emitCallFuncValue
+//     (LLVM-side) which allocates an `<ret>` alloca + passes its
+//     address.  Pre-fix this used the scalar shape (data in X0,
+//     packed X0..X(N-1) return), which only worked while
+//     emitFuncValueShims was scalar-only too — broke once the
+//     shim grew the pack/sret aggregate paths.
 //
 // VM-mode dispatch is unchanged (see BC_CALL_FUNC_VALUE in
 // vm_exec.bn): the bytecode short-circuits via the closure record's
-// vm_func_idx and never goes through vtable.call. This compiled
+// vm_func_idx and never goes through vtable.call.  This compiled
 // path is the one that uses the shim.
 func emitCallFuncValue(a @asm.Assembler, rm @common.RegMap,
 	allFuncs @[]@ir.Func, ins @ir.Instr) {
@@ -204,22 +220,35 @@ func emitCallFuncValue(a @asm.Assembler, rm @common.RegMap,
 	aarch64.Ldr(a, true, aarch64.X17,
 		aarch64.MemImm(aarch64.X17, 8))
 
-	// Build a synthetic argTypes list with *uint8 prepended for
-	// data, so AAPCS register-start computations account for it.
+	// Aggregate-return: shim shape prepends two synthetic *uint8
+	// slots (retbuf + data) before user args.  Scalar shape: one
+	// (data).  `prefixSlots` is also the AAPCS reg offset for user
+	// args (they start at X(prefixSlots)).
+	var aggregateRet bool = ins.ID >= 0 && ins.Typ != nil &&
+		common.IsAggregateTyp(ins.Typ) &&
+		!common.IsMultiReturnCall(ins)
+	var prefixSlots int = 1
+	if aggregateRet { prefixSlots = 2 }
+
+	// Build a synthetic argTypes list with the prepended *uint8
+	// slot(s) so AAPCS register-start computations account for
+	// them.
 	var nCallArgs int = len(ins.Args) - 1
 	var argTypes @[]@types.Type =
-		make_slice(@types.Type, nCallArgs + 1)
-	argTypes[0] = types.MakePointerType(types.TypUint8())
+		make_slice(@types.Type, nCallArgs + prefixSlots)
+	for p := 0; p < prefixSlots; p++ {
+		argTypes[p] = types.MakePointerType(types.TypUint8())
+	}
 	for i := 0; i < nCallArgs; i++ {
-		argTypes[i + 1] = ins.Args[i + 1].Typ
+		argTypes[i + prefixSlots] = ins.Args[i + 1].Typ
 	}
 
 	// AAPCS arg dispatch for user args, indexed in the synthetic
-	// argTypes (offset by 1 to skip the data slot). User args
-	// land in X1+ (since X0 is reserved for data); doing this
-	// before the data-load means a user arg whose source reg
-	// happens to be X0 still reads the right value before we
-	// overwrite X0.
+	// argTypes (offset by prefixSlots to skip retbuf + data).  User
+	// args land in X(prefixSlots)+; doing this before the
+	// retbuf/data loads means a user arg whose source reg happens
+	// to be X0 / X1 still reads the right value before we overwrite
+	// it.
 	var nsrn int = 0
 	for ai := 0; ai < nCallArgs; ai++ {
 		var arg @ir.Instr = ins.Args[ai + 1]
@@ -233,8 +262,10 @@ func emitCallFuncValue(a @asm.Assembler, rm @common.RegMap,
 			}
 			continue
 		}
-		var regStart int = common.CallArgRegStart(argTypes, ai + 1)
-		var stackOff int = common.CallArgStackOff(argTypes, ai + 1)
+		var regStart int = common.CallArgRegStart(argTypes,
+			ai + prefixSlots)
+		var stackOff int = common.CallArgStackOff(argTypes,
+			ai + prefixSlots)
 		if common.IsAggregateTyp(arg.Typ) {
 			var ptr int = getOperand(a, rm, arg.ID)
 			if ptr < 0 { continue }
@@ -278,36 +309,43 @@ func emitCallFuncValue(a @asm.Assembler, rm @common.RegMap,
 		rm.ResetRegs()
 	}
 
-	// Load data (function value's data slot at offset 8) into the
-	// AAPCS register slot for arg index 0 (typically X0). Done
-	// AFTER the user-args dispatch so that any user arg whose
-	// source reg was X0 has already been read.
+	// Load retbuf (aggregate path) and data into the AAPCS register
+	// slots for arg indices 0 and 1 (typically X0 / X1).  Done AFTER
+	// the user-args dispatch so any user arg whose source reg was X0
+	// / X1 has already been read.
 	//
 	// If the arg loop ran, the per-arg ResetRegs above will have
 	// reallocated slot 0 (X9 = fvAddr's reg) for an arg's scratch,
-	// clobbering fvAddr's contents.  Reload before the data read.
+	// clobbering fvAddr's contents.  Reload before the retbuf/data
+	// computation.
 	if nCallArgs > 0 {
 		fvAddr = getOperand(a, rm, ins.Args[0].ID)
 		if fvAddr < 0 { return }
 	}
-	var dataRegStart int = common.CallArgRegStart(argTypes, 0)
-	if dataRegStart >= 0 {
-		aarch64.Ldr(a, true, argReg(dataRegStart),
+	if aggregateRet {
+		var retbufOff int = rm.LookupAlloc(ins.ID)
+		if retbufOff < 0 { return }
+		// X0 = SP + retbufOff (address of pre-allocated retbuf).
+		aarch64.Add(a, true, argReg(0), aarch64.SP,
+			aarch64.Imm(retbufOff))
+		// X1 = [fvAddr + 8] (data).
+		aarch64.Ldr(a, true, argReg(1),
 			aarch64.MemImm(fvAddr, 8))
+	} else {
+		var dataRegStart int = common.CallArgRegStart(argTypes, 0)
+		if dataRegStart >= 0 {
+			aarch64.Ldr(a, true, argReg(dataRegStart),
+				aarch64.MemImm(fvAddr, 8))
+		}
 	}
 
-	// AAPCS sret — indirect-call shape, see emitCallIndirect note.
+	// AAPCS sret applies only to multi-return aggregates passed
+	// through the always-shim convention; single-aggregate returns
+	// use the retbuf-in-X0 convention above instead.
 	var bigMultiRet bool = ins.ID >= 0 &&
 		common.CallReturnsBigMultiReturn(ins)
-	var bigRet bool = ins.ID >= 0 &&
-		(common.CallReturnsBigAggregate(ins) || bigMultiRet)
-	if bigRet {
-		var sretOff int = -1
-		if bigMultiRet {
-			sretOff = rm.LookupSpill(ins.ID)
-		} else {
-			sretOff = rm.LookupAlloc(ins.ID)
-		}
+	if bigMultiRet {
+		var sretOff int = rm.LookupSpill(ins.ID)
 		if sretOff >= 0 {
 			aarch64.Add(a, true, aarch64.X8, aarch64.SP,
 				aarch64.Imm(sretOff))
@@ -318,22 +356,13 @@ func emitCallFuncValue(a @asm.Assembler, rm @common.RegMap,
 	rm.ResetRegs()
 	if ins.ID < 0 { return }
 
-	// Aggregate single-return: spill X0..X(N-1) into the alloc region
-	// and produce its pointer. Same as emitCallIndirect / emitCall.
-	if ins.Typ != nil && common.IsAggregateTyp(ins.Typ) &&
-		!common.IsMultiReturnCall(ins) {
+	// Aggregate single-return: the shim wrote the result through
+	// the retbuf we passed in X0.  No X0..X(N-1) spill — just
+	// produce the alloc-region pointer as this instruction's
+	// result.
+	if aggregateRet {
 		var dataOff int = rm.LookupAlloc(ins.ID)
 		if dataOff < 0 { return }
-		var sz int = ins.Typ.SizeOf()
-		if sz <= 0 { return }
-		if !bigRet {
-			var nWords int = sz / 8
-			for ri := 0; ri < nWords && ri < 8; ri++ {
-				aarch64.Str(a, true, argReg(ri),
-					aarch64.MemImm(aarch64.SP,
-						dataOff + 8*ri))
-			}
-		}
 		var rd int = nextReg(rm, ins.ID)
 		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(dataOff))
 		return

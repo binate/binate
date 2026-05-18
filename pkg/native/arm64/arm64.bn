@@ -91,17 +91,49 @@ func collectFuncValueRefs(mod @ir.Module) (@[]@[]char, @[]@types.Type) {
 	return seen, sigs
 }
 
+// shimReturnSize returns the byte size of a function value's
+// return type (0 for void / multi-return — multi-return is also
+// 0 here because the per-field tuple shape isn't represented as
+// SizeOf yet; the shim's pack-and-copy path only handles single-
+// result aggregates).  Used by emitFuncValueShims to pick between
+// the scalar, pack-return, and sret shim shapes.
+func shimReturnSize(fvTyp @types.Type) int {
+	if fvTyp == nil { return 0 }
+	if len(fvTyp.Results) != 1 { return 0 }
+	if fvTyp.Results[0] == nil { return 0 }
+	return fvTyp.Results[0].SizeOf()
+}
+
 // emitFuncValueShims emits a per-function shim for each
-// OP_FUNC_VALUE reference. The shim has the always-shim signature
-// `<ret>(*uint8 data, <args>)`: it ignores data, shifts user args
-// from X1.. → X0.., and tail-calls the real function. Phase 3 of
-// plan-function-values.md.
+// OP_FUNC_VALUE reference.  Three shapes depending on the function
+// value's return type:
 //
-// Bootstrap-subset constraint: all user args are scalar (int /
-// pointer / bool); no floats, no aggregates pass through here yet.
-// If broader signatures become reachable (full language), the shim
-// emitter will need to handle V0..V7 floats and aggregate-arg
-// shuffling — we'll grow it then.
+//   Scalar / void return (SizeOf ≤ 8): the shim has signature
+//     `<ret>(*uint8 data, <args>)` — call passes data in X0 and
+//     user args in X1+.  Shim shifts X1..XN → X0..X(N-1) (data
+//     discarded) and tail-branches to the real fn.
+//
+//   Pack-return aggregate (SizeOf 9..64 bytes — Binate's by-value
+//   AAPCS return path): the shim has signature
+//     `void(*uint8 retbuf, *uint8 data, <args>)` — call passes
+//   retbuf in X0, data in X1, user args in X2+.  Shim builds a
+//   real frame, stashes retbuf, shifts user args X2..X(N+1) →
+//   X0..X(N-1), BL's the underlying fn, then copies X0..X(R-1)
+//   (the underlying's packed register return) through the stashed
+//   retbuf.  Matches what rt._call_shim_aggregate's caller expects:
+//   the aggregate result materialized at retbuf.
+//
+//   Sret-return aggregate (SizeOf > 64 bytes): same incoming shape
+//   as pack-return, but underlying uses AAPCS sret (X8 = retbuf
+//   pointer).  Shim moves retbuf X0 → X8, shifts user args, tail-
+//   branches.  Multi-return tuples > 64 bytes go through here too
+//   (sret-via-X8 is universal for big returns).
+//
+// Bootstrap-subset constraint: scalar args only (no floats; no
+// aggregate args).  Pack-return path also requires nUserWords ≤ 6
+// (X2..X7 after retbuf in X0 and dropped data in X1) so all user
+// args fit in registers — stack-arg shuffling for >6 register-
+// words isn't implemented.
 func emitFuncValueShims(a @asm.Assembler, pkgName *[]const char,
 		mod @ir.Module) {
 	var seen @[]@[]char
@@ -115,18 +147,12 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]const char,
 		var fvTyp @types.Type = sigs[i]
 		a.DefineLabel(shimLabel)
 		a.SetWeak(shimLabel)
-		// Shift user args: X1..XN → X0..X(N-1). Data was in X0;
-		// it's discarded. Args reverse-shift to avoid clobber:
-		// MOV X0, X1; MOV X1, X2; ... — execute left-to-right
-		// since each step reads its source before writing the
-		// previous step's target.
-		//
 		// Count REGISTER WORDS, not params: a slice / managed-slice
 		// param occupies 2 / 4 consecutive arg registers and the
 		// shim has to shift all of them, not just the first.  Before
-		// this fix, a `*func(*[]const char) int` shim ran a single
-		// MOV X0, X1 and left the slice's len in X2 dangling, so the
-		// callee read X1 (= slice.data) as its len.
+		// the per-arg-words fix (7096a94), a
+		// `*func(*[]const char) int` shim ran a single MOV X0, X1
+		// and left the slice's len in X2 dangling.
 		var nUserWords int = 0
 		for pi := 0; pi < len(fvTyp.Params); pi++ {
 			nUserWords = nUserWords +
@@ -138,16 +164,76 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]const char,
 			// words and accept the truncation.
 			nUserWords = 8
 		}
-		for ai := 0; ai < nUserWords; ai++ {
-			aarch64.Mov(a, true, argReg(ai),
-				aarch64.Reg(argReg(ai + 1)))
+		var retSz int = shimReturnSize(fvTyp)
+		var multiRet bool = fvTyp != nil && len(fvTyp.Results) > 1
+		var useSret bool = retSz > 64 || multiRet
+		var usePack bool = retSz > 8 && retSz <= 64 && !multiRet
+		if usePack && nUserWords <= 6 {
+			// Pack-return aggregate shim — see top of function.
+			// Frame: 32 bytes (16 for FP/LR, 16 for the retbuf save
+			// slot + alignment pad).  Saves retbuf at [SP+16];
+			// X19+ are unnecessary because the only inter-BL state
+			// we need is retbuf, and we reload it from the stack
+			// after BL into a caller-saved reg (no need to preserve
+			// across the call ourselves).
+			aarch64.Stp(a, true, aarch64.FP, aarch64.LR,
+				aarch64.MemPre(aarch64.SP, -32))
+			aarch64.Mov(a, true, aarch64.FP,
+				aarch64.Reg(aarch64.SP))
+			aarch64.Str(a, true, aarch64.X0,
+				aarch64.MemImm(aarch64.SP, 16))
+			// Shift user args X2..X(N+1) → X0..X(N-1).  Left-to-
+			// right preserves correctness (each src read before
+			// its dest is overwritten).
+			for ai := 0; ai < nUserWords; ai++ {
+				aarch64.Mov(a, true, argReg(ai),
+					aarch64.Reg(argReg(ai + 2)))
+			}
+			a.SetGlobal(fnLabel)
+			aarch64.Bl(a, fnLabel)
+			// X0..X(retWords-1) hold underlying's packed return.
+			// X4..X7 are free (caller-saved, no longer holding
+			// shifted args after the BL).  Use X4 as the retbuf
+			// reload reg; never collides with the return regs since
+			// the largest pack-return is 8 words = X0..X7 and we
+			// already constrained retSz ≤ 64 (max 8 words = X0..X7,
+			// so X4..X7 may overlap with return regs).  Reload into
+			// X9 instead — that's outside both the arg and the
+			// return register banks.
+			aarch64.Ldr(a, true, aarch64.X9,
+				aarch64.MemImm(aarch64.SP, 16))
+			var retWords int = retSz / 8
+			if retSz % 8 != 0 { retWords = retWords + 1 }
+			for ri := 0; ri < retWords; ri++ {
+				aarch64.Str(a, true, argReg(ri),
+					aarch64.MemImm(aarch64.X9, 8 * ri))
+			}
+			aarch64.Ldp(a, true, aarch64.FP, aarch64.LR,
+				aarch64.MemPost(aarch64.SP, 32))
+			aarch64.Ret(a)
+		} else if useSret {
+			// Sret-return aggregate shim: retbuf → X8, drop data,
+			// shift user args X2..X(N+1) → X0..X(N-1), tail-branch.
+			// X8 must be set BEFORE the X2..→X0.. shifts because
+			// X0 itself is one of the shift sources.
+			aarch64.Mov(a, true, aarch64.X8,
+				aarch64.Reg(aarch64.X0))
+			for ai := 0; ai < nUserWords; ai++ {
+				aarch64.Mov(a, true, argReg(ai),
+					aarch64.Reg(argReg(ai + 2)))
+			}
+			a.SetGlobal(fnLabel)
+			aarch64.B(a, fnLabel)
+		} else {
+			// Scalar / void shim: data was in X0; drop it and shift
+			// user args X1..XN → X0..X(N-1).
+			for ai := 0; ai < nUserWords; ai++ {
+				aarch64.Mov(a, true, argReg(ai),
+					aarch64.Reg(argReg(ai + 1)))
+			}
+			a.SetGlobal(fnLabel)
+			aarch64.B(a, fnLabel)
 		}
-		// Tail-call: B (unconditional branch) to the real fn.
-		// SetGlobal records the target so the linker resolves the
-		// branch fixup. (Same pattern as a regular call site
-		// minus the BL → B substitution.)
-		a.SetGlobal(fnLabel)
-		aarch64.B(a, fnLabel)
 	}
 	// Pad back up to instruction alignment for subsequent emissions.
 	a.Align(4)

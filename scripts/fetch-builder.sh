@@ -16,11 +16,15 @@
 #                     reproducibility anchor; checking out that tag
 #                     before building is the user's responsibility.
 #
-#   bnc-X.Y.Z         (Future.)  Download the bnc binary for the host
+#   bnc-X.Y.Z         Download the prebuilt bnc binary for the host
 #                     platform from the matching GitHub release and
-#                     cache it.  Verifies sha256 against the release
-#                     manifest.  Not yet implemented — falls through
-#                     to an error.
+#                     cache it.  Asset name follows the release
+#                     workflow's convention:
+#                     `bnc-X.Y.Z-<host-os>-<host-arch>`.  Verifies
+#                     sha256 against the release's SHA256SUMS
+#                     manifest before caching.  Cache hits skip the
+#                     download (and the re-verify — the cache is
+#                     trusted on hit).
 #
 # See explorations/plan-bnc-as-builder.md for the broader migration.
 
@@ -89,8 +93,54 @@ case "$BUILDER_VERSION" in
         echo "$BUILDER_BIN"
         ;;
     bnc-*)
-        echo "fetch-builder: bnc-X.Y.Z prefix not yet implemented — see plan-bnc-as-builder.md" >&2
-        exit 1
+        # Cache hit: trust the prior download (sha256 was verified on
+        # the way in).  On miss, fetch the SHA256SUMS manifest first,
+        # locate the expected hash for this platform's asset, then
+        # download the binary and verify before placing into the
+        # cache.  A failed verify removes the downloaded file rather
+        # than leaving a half-trusted artifact in the cache dir.
+        if [ ! -x "$BUILDER_BIN" ]; then
+            asset="$BUILDER_VERSION-$HOST_OS-$HOST_ARCH"
+            release_url="${BINATE_RELEASE_URL:-https://github.com/binate/binate/releases/download}/$BUILDER_VERSION"
+            tmpdir="$(mktemp -d)"
+            trap 'rm -rf "$tmpdir"' EXIT INT TERM
+            if ! curl -fL --retry 3 --retry-delay 2 \
+                    -o "$tmpdir/SHA256SUMS" \
+                    "$release_url/SHA256SUMS" 2>"$tmpdir/curl.err"; then
+                echo "fetch-builder: failed to download $release_url/SHA256SUMS" >&2
+                cat "$tmpdir/curl.err" >&2 2>/dev/null || true
+                exit 1
+            fi
+            expected_sha="$(awk -v a="$asset" '$2 == a { print $1; exit }' \
+                "$tmpdir/SHA256SUMS")"
+            if [ -z "$expected_sha" ]; then
+                echo "fetch-builder: no SHA256SUMS entry for $asset in $BUILDER_VERSION" >&2
+                echo "fetch-builder: (manifest may be missing this platform's build)" >&2
+                exit 1
+            fi
+            if ! curl -fL --retry 3 --retry-delay 2 \
+                    -o "$tmpdir/$asset" \
+                    "$release_url/$asset" 2>"$tmpdir/curl.err"; then
+                echo "fetch-builder: failed to download $release_url/$asset" >&2
+                cat "$tmpdir/curl.err" >&2 2>/dev/null || true
+                exit 1
+            fi
+            if command -v sha256sum >/dev/null 2>&1; then
+                actual_sha="$(sha256sum "$tmpdir/$asset" | awk '{print $1}')"
+            else
+                actual_sha="$(shasum -a 256 "$tmpdir/$asset" | awk '{print $1}')"
+            fi
+            if [ "$actual_sha" != "$expected_sha" ]; then
+                echo "fetch-builder: sha256 mismatch for $asset" >&2
+                echo "  expected: $expected_sha" >&2
+                echo "  actual:   $actual_sha" >&2
+                exit 1
+            fi
+            mkdir -p "$(dirname "$BUILDER_BIN")"
+            mv "$tmpdir/$asset" "$BUILDER_BIN"
+            chmod +x "$BUILDER_BIN"
+        fi
+        echo "$BUILDER_BIN"
         ;;
     *)
         echo "fetch-builder: unrecognized BUILDER_VERSION prefix: $BUILDER_VERSION" >&2

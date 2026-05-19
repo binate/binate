@@ -19,13 +19,25 @@ _new_build_dir() {
     echo "$d"
 }
 
+# _resolve_builder caches the BUILDER_VERSION binary at first use and
+# echoes its path.  All build_* helpers go through this so the
+# fetcher's per-test rebuild check (a stat of bootstrap's .go files
+# against the cache) runs once per runner_setup rather than per call.
+_resolve_builder() {
+    if [ -z "$_BUILDER_BIN" ]; then
+        _BUILDER_BIN="$("$BINATE_DIR/scripts/fetch-builder.sh")"
+    fi
+    echo "$_BUILDER_BIN"
+}
+
 # Build gen1 compiler (boot-comp compiles cmd/bnc → gen1 binary)
 # Sets GEN1_COMPILER to the path.
 build_gen1() {
     GEN1_COMPILER="/tmp/binate_gen1_compiler_$$"
     GEN1_BUILD_DIR="$(_new_build_dir)"
     echo "Building gen1 compiler..."
-    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    builder="$(_resolve_builder)"
+    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"
@@ -64,7 +76,8 @@ build_bnc_native_aa64() {
     BNC_NATIVE="/tmp/binate_bnc_native_aa64_$$"
     BNC_NATIVE_BUILD_DIR="$(_new_build_dir)"
     echo "Building bnc with native aarch64 backend..."
-    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --backend native --root "$BINATE_DIR" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
+    builder="$(_resolve_builder)"
+    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --backend native --root "$BINATE_DIR" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$BNC_NATIVE" ]; then
         echo "ERROR: Failed to build bnc (native aarch64):"
         echo "$build_out"
@@ -79,7 +92,8 @@ build_interp_boot_comp() {
     COMPILED_INTERP="/tmp/binate_compiled_interp_$$"
     INTERP_BUILD_DIR="$(_new_build_dir)"
     echo "Building compiled interpreter..."
-    build_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    builder="$(_resolve_builder)"
+    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"

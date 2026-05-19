@@ -34,12 +34,14 @@ runner_setup() {
         exit 2
     fi
     rm -f /tmp/_bn_arm32_probe.o
+    BOOT_BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 }
 
 runner_test() {
     pkg="$1"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
-    testbin=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --test --target arm32-linux --root "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
+    # cd / — see runners/boot.sh for the CLI-disambiguation rationale.
+    testbin=$(cd / && "$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --test --target arm32-linux --root "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
     if [ ! -x "$testbin" ]; then
         echo "$testbin"  # error output
         rm -rf "$bdir"

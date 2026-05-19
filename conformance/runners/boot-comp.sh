@@ -1,8 +1,10 @@
 #!/bin/sh
-# Runner: boot-comp — boot interprets cmd/bnc, which compiles test.bn to native.
+# Runner: boot-comp — the BUILDER_VERSION binary interprets cmd/bnc,
+# which compiles test.bn to native.  (BUILDER_VERSION currently names
+# the bootstrap interpreter.)
 
 runner_setup() {
-    : # nothing to build
+    BOOT_BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 }
 
 runner_exec() {
@@ -15,7 +17,7 @@ runner_exec() {
     if [ -n "$root" ]; then
         compile_root="$root"
     fi
-    compile_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$compile_root" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
+    compile_out=$("$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$compile_root" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         "$tmpbin" 2>&1 || true
     else

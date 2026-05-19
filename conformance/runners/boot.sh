@@ -1,17 +1,19 @@
 #!/bin/sh
-# Runner: boot — Go bootstrap interpreter runs .bn directly.
+# Runner: boot — the BUILDER_VERSION binary runs .bn directly.
+# (BUILDER_VERSION currently names the bootstrap interpreter; once
+# bnc-X.Y.Z releases ship, this runner will be renamed `builder`.)
 
 runner_setup() {
-    : # nothing to build
+    BOOT_BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 }
 
 runner_exec() {
     bn="$1"
     root="$2"
     if [ -n "$root" ]; then
-        (cd "$BOOTSTRAP_DIR" && go run . -root "$root" -add-root "$BINATE_DIR" "$bn" 2>&1) || true
+        "$BOOT_BUILDER" -root "$root" -add-root "$BINATE_DIR" "$bn" 2>&1 || true
     else
-        (cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$bn" 2>&1) || true
+        "$BOOT_BUILDER" -root "$BINATE_DIR" "$bn" 2>&1 || true
     fi
 }
 

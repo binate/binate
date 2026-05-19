@@ -48,6 +48,7 @@ runner_setup() {
         exit 2
     fi
     rm -f /tmp/_bn_arm32_probe.o
+    BOOT_BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 }
 
 runner_exec() {
@@ -60,7 +61,7 @@ runner_exec() {
     if [ -n "$root" ]; then
         compile_root="$root"
     fi
-    compile_out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$compile_root" --target arm32-linux --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
+    compile_out=$("$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$compile_root" --target arm32-linux --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         # Wall-clock cap via timeout(1) so a runaway test doesn't
         # wedge the sweep.

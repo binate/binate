@@ -81,9 +81,9 @@ echo "  bootstrap:      $BOOTSTRAP_DIR"
 echo "  build scratch:  $BUILD_DIR"
 echo
 
-cd "$BOOTSTRAP_DIR"
+BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 if [ -n "$DBG_FLAG" ]; then
-    go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
+    "$BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
         --root "$BINATE_DIR" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
@@ -91,7 +91,7 @@ if [ -n "$DBG_FLAG" ]; then
         -o "$OUT" \
         "$BINATE_DIR/cmd/bnlint"
 else
-    go run . -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
+    "$BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
         --root "$BINATE_DIR" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \

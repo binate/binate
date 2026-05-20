@@ -18,6 +18,26 @@
 	.arm
 
 @ ============================================================
+@ bn_semihost__SemihostWriteChar(c char) — write one byte to the
+@ debug console via SYS_WRITEC.  pkg/bootstrap.Write loops over
+@ the buffer calling this for each byte.  Cheaper than SYS_WRITE0
+@ (which would need a null-terminated copy) or SYS_WRITE (which
+@ would need to open a "console" file handle first).
+@ ============================================================
+	.globl bn_semihost__SemihostWriteChar
+	.type  bn_semihost__SemihostWriteChar, %function
+bn_semihost__SemihostWriteChar:
+	@ r0 (param) holds the byte to write — AAPCS zero-extends
+	@ a `char` arg into the full 32-bit register.
+	push    {r0}            @ stack: [byte]
+	mov     r1, sp          @ r1 = &byte (SYS_WRITEC takes a pointer)
+	mov     r0, #0x03       @ SYS_WRITEC
+	svc     #0x123456
+	add     sp, sp, #4      @ pop the byte we pushed
+	bx      lr
+	.size   bn_semihost__SemihostWriteChar, . - bn_semihost__SemihostWriteChar
+
+@ ============================================================
 @ bn_semihost__SemihostExit(code int) — exit the program with
 @ the given exit code via SYS_EXIT_EXTENDED.  Does not return.
 @

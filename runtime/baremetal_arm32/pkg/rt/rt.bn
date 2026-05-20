@@ -1,0 +1,264 @@
+package "pkg/rt"
+
+import "pkg/semihost"
+
+// Bare-metal ARM32 implementation of pkg/rt.  Selected via the
+// path mechanism when bnc is invoked with --target arm32-baremetal.
+//
+// Differs from the libc-host pkg/rt only in the underlying
+// transport for the few host primitives:
+//   - Exit → semihost.SemihostExit (vs libc.Exit)
+//   - RawAlloc / RawAllocZero / RawFree → in-process bump
+//     allocator over a static `heap` array (vs libc.Malloc /
+//     Calloc / Free)
+//   - MemCopy → pure-Binate byte loop (vs libc.Memcpy)
+//   - MemZero → pure-Binate byte loop (vs libc.Memset)
+//
+// Everything above the host-primitive layer (Alloc, Free, RefInc /
+// RefDec, BoundsCheck, Box, MakeManagedSlice, headerPtr, etc.) is
+// target-agnostic and identical to the libc-host impl — kept here
+// verbatim so the bare-metal target supplies a complete pkg/rt.
+//
+// Bump-allocator caveats: Free is a no-op (allocations are never
+// reclaimed); refcount-driven reuse doesn't happen.  Enough for
+// v1's QEMU-bound conformance subset — replace with a real free-
+// list before serious workloads.
+
+// Management header layout (2 words = 16 bytes):
+//   word 0: refcount (int)
+//   word 1: free function pointer (int, stored as int)
+// Header sits at negative offset from payload pointer.
+
+// HEADER_WORDS is the size of the management header in words
+// (refcount + free_fn).  Always 2, regardless of target.
+const HEADER_WORDS int = 2
+// HEADER_SIZE is the size of the management header in bytes —
+// HEADER_WORDS * sizeof(int).  16 under LP64, 8 under arm32-linux
+// (4-byte int).  Matches binate_runtime.c's `2 * sizeof(bn_int_t)`
+// header math, so allocations created by either side share the
+// same layout.
+const HEADER_SIZE int = HEADER_WORDS * cast(int, sizeof(int))
+
+// Function-value `data`-record kind tags. When the data slot of a
+// function value is non-null, it points at a record whose first
+// word is one of these constants. Lets every dispatcher
+// (BC_CALL_FUNC_VALUE, the cross-mode trampoline, future Phase 2
+// closure handling) tell apart what's behind the pointer without
+// fragile null-vs-non-null heuristics. Phase 3 of
+// plan-function-values.md.
+const (
+	// VM-side function value: data points at a VMClosureRec
+	// `{ kind, vm_func_idx, captured_ctx_or_nil }`.
+	DATA_KIND_VM_CLOSURE_REC int = 1
+
+	// Phase 2 placeholder: compiled-side capturing closure. data
+	// points at a per-closure captured-fields struct. The constant
+	// is reserved now so the dispatch shape doesn't have to be
+	// re-touched when Phase 2 lands.
+	DATA_KIND_COMPILED_CLOSURE int = 2
+)
+
+// Exit terminates the program via the semihosting SYS_EXIT_EXTENDED
+// host call (see runtime/baremetal_arm32/semihost.s).  Does not
+// return.
+func Exit(code int) {
+	semihost.SemihostExit(code)
+	// Defensive fallback for hosts that don't honor the request.
+	for { }
+}
+
+// RawAlloc / RawAllocZero / RawFree: placeholder stubs.  A real
+// bare-metal bump allocator is wanted here, but a Binate global
+// array (e.g. `var heap [262144]uint8`) with a variable index
+// hits a current bnc codegen path that doesn't resolve the global
+// in the GEP — `%v-1` instead of `@bn_rt__heap`.  Once that's
+// fixed (or once linker-script-defined heap symbols are
+// importable from Binate), replace these stubs with a real bump
+// allocator.  In the meantime, hello-world / println-only
+// conformance tests don't touch RawAlloc — they pass via the
+// rodata-string + Write path — so the stub-abort serves as a
+// loud trip-wire for the first allocating test.
+func RawAlloc(size int) *uint8 {
+	println("rt.RawAlloc: not implemented on arm32-baremetal yet")
+	Exit(1)
+	var p *uint8
+	return p
+}
+
+func RawAllocZero(size int) *uint8 {
+	println("rt.RawAllocZero: not implemented on arm32-baremetal yet")
+	Exit(1)
+	var p *uint8
+	return p
+}
+
+func RawFree(ptr *uint8) {
+	// No-op — pairs with RawAlloc's "never reclaim" semantics.
+	if ptr == nil { return }
+}
+
+// MemCopy copies size bytes from src to dst (no overlap). size ==
+// 0 is a no-op (no pointer requirements); size < 0 aborts.
+// Byte-at-a-time loop — replaceable with an arm32-tuned word-copy
+// once perf matters.
+func MemCopy(dst *uint8, src *const uint8, size int) {
+	if size == 0 { return }
+	if size < 0 {
+		println("rt.MemCopy: size must be >= 0")
+		Exit(1)
+	}
+	for i := 0; i < size; i++ {
+		dst[i] = src[i]
+	}
+}
+
+// MemZero writes size zero bytes starting at ptr.  Byte-at-a-time
+// loop — replaceable with a word-store loop once perf matters.
+func MemZero(ptr *uint8, size int) {
+	if size == 0 { return }
+	if size < 0 {
+		println("rt.MemZero: size must be >= 0")
+		Exit(1)
+	}
+	for i := 0; i < size; i++ {
+		ptr[i] = 0
+	}
+}
+
+// BoundsFail prints a bounds-check failure diagnostic and aborts.
+// Pure-Binate impl using println + Exit (output goes to stdout,
+// matching other VM/runtime panic messages).
+func BoundsFail(index int, length int) {
+	print("runtime error: index out of bounds: ")
+	print(index)
+	print(" (len ")
+	print(length)
+	println(")")
+	Exit(1)
+}
+
+// Alloc allocates a managed object with the given payload size.
+// Returns a pointer to the payload; the header (refcount=1,
+// free_fn=&RawFree) is at a negative offset. The payload is zero-
+// initialized. The free_fn slot records *which* allocator's free
+// function releases this allocation — Free reads it and dispatches
+// indirectly. A different pkg/rt impl that doesn't use libc-backed
+// RawAlloc would still set header[1] to *its own* free function;
+// Free's body doesn't need to know which.
+func Alloc(payloadSize int) *uint8 {
+	var totalSize int = HEADER_SIZE + payloadSize
+	var base *uint8 = RawAlloc(totalSize)
+	var header *int = bit_cast(*int, base)
+	header[0] = 1  // refcount = 1
+	header[1] = bit_cast(int, _raw_func_addr(RawFree))
+	var payload *uint8 = bit_cast(*uint8, &header[HEADER_WORDS])
+	MemZero(payload, payloadSize)
+	return payload
+}
+
+// headerPtr returns a pointer to the management header for a managed payload.
+// The header is HEADER_SIZE bytes before the payload pointer.
+func headerPtr(ptr *uint8) *int {
+	// ptr points to payload; header is HEADER_WORDS ints before it
+	var asInt *int = bit_cast(*int, ptr)
+	var addr int = bit_cast(int, asInt)
+	var headerAddr int = addr - HEADER_SIZE
+	return bit_cast(*int, headerAddr)
+}
+
+// Free releases the memory for a managed payload (including its header).
+// ptr must be a managed payload pointer from Alloc, or nil (no-op).
+// Dispatches through header[1] (the free_fn slot Alloc populated) so
+// the value's origin allocator releases it — important for cross-
+// allocator scenarios where the value's origin and current owner may
+// not agree on a globally-hardcoded free function.
+func Free(ptr *uint8) {
+	if ptr == nil { return }
+	var h *int = headerPtr(ptr)
+	var freeFn *uint8 = bit_cast(*uint8, h[1])
+	_call_free_fn(freeFn, bit_cast(*uint8, h))
+}
+
+// RefInc increments the reference count. ptr must be a managed payload pointer, or nil (no-op).
+func RefInc(ptr *uint8) {
+	if ptr == nil { return }
+	var h *int = headerPtr(ptr)
+	h[0] = h[0] + 1
+}
+
+// RefDec decrements the reference count. If it reaches zero, calls dtor (if non-nil)
+// to clean up managed fields, then frees the allocation. ptr must be a managed
+// payload pointer, or nil (no-op).
+func RefDec(ptr *uint8, dtor *uint8) {
+	if ptr == nil { return }
+	var h *int = headerPtr(ptr)
+	if h[0] <= 0 {
+		BoundsFail(h[0], 0)  // abuse bounds_fail to print the bad refcount
+	}
+	h[0] = h[0] - 1
+	if h[0] == 0 {
+		if dtor != nil {
+			_call_dtor(dtor, ptr)
+		}
+		Free(ptr)
+	}
+}
+
+// ZeroRefDestroy is the slow-path helper for the inline RefDec fast
+// path. Backends that inline RefDec call this when the decrement leaves
+// the refcount at zero — at which point ptr is non-nil (the inline
+// fast path filtered nil) and the refcount has already been written
+// out as zero by the caller. Runs the optional destructor and frees.
+func ZeroRefDestroy(ptr *uint8, dtor *uint8) {
+	if dtor != nil {
+		_call_dtor(dtor, ptr)
+	}
+	Free(ptr)
+}
+
+// Refcount returns the current reference count of a managed allocation.
+// ptr must be a managed payload pointer (i.e., the result of Alloc or
+// the raw pointer underlying an @T). Use bit_cast to convert @T to *uint8.
+func Refcount(ptr *uint8) int {
+	if ptr == nil { return 0 }
+	var h *int = headerPtr(ptr)
+	return h[0]
+}
+
+// BoundsCheck aborts with a bounds-failure diagnostic if index is out of [0, length).
+func BoundsCheck(index int, length int) {
+	if index < 0 || index >= length {
+		BoundsFail(index, length)
+	}
+}
+
+// Box allocates a managed copy of size bytes from src and returns the payload pointer.
+// The new allocation has refcount=1.
+func Box(src *uint8, size int) *uint8 {
+	var payload *uint8 = Alloc(size)
+	MemCopy(payload, src, size)
+	return payload
+}
+
+// ManagedSlice layout matches @[]T: { data, len, backing_refptr, backing_len }
+type ManagedSlice struct {
+	Data       *uint8
+	Len        int
+	Refptr     *uint8
+	BackingLen int
+}
+
+// MakeManagedSlice allocates a zero-initialized managed slice with the given
+// element count. Returns a ManagedSlice where Data and Refptr point to the
+// same allocation (refcount=1). If length is 0, Data and Refptr are nil.
+func MakeManagedSlice(elemSize int, length int) ManagedSlice {
+	var ms ManagedSlice
+	if length > 0 {
+		var ptr *uint8 = Alloc(length * elemSize)
+		ms.Data = ptr
+		ms.Refptr = ptr
+	}
+	ms.Len = length
+	ms.BackingLen = length
+	return ms
+}

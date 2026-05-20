@@ -11,7 +11,8 @@ runner_compile() {
     bn="$1"
     tmpbin="$2"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
-    out=$("$BNC_NATIVE" --root "$(dirname "$bn")" --build-dir "$bdir" \
+    src_dir="$(dirname "$bn")"
+    out=$("$BNC_NATIVE" -I "$src_dir" -L "$src_dir" --build-dir "$bdir" \
         -backend native -o "$tmpbin" "$bn" 2>&1)
     rc=$?
     rm -rf "$bdir"

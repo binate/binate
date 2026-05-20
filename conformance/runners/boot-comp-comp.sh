@@ -11,7 +11,7 @@ runner_exec() {
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
     compile_root="$BINATE_DIR"
     if [ -n "$root" ]; then compile_root="$root"; fi
-    compile_out=$("$GEN1_COMPILER" --root "$compile_root" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
+    compile_out=$("$GEN1_COMPILER" -I "$compile_root" -L "$compile_root" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         "$tmpbin" 2>&1 || true
     else

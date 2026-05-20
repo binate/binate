@@ -4,7 +4,12 @@
 # directly:
 #
 #     BUILDER="$(scripts/fetch-builder.sh)"
-#     "$BUILDER" --root "$BINATE_DIR" ...
+#     "$BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- ...
+#
+# (The `-root` flag above is the bootstrap interpreter's pointer to
+# the binate source root used to resolve `pkg/...` imports while
+# interpreting cmd/bnc; once BUILDER_VERSION names a `bnc-*` binary
+# instead, callers will invoke `"$BUILDER" -I ... -L ...` directly.)
 #
 # Supports two BUILDER_VERSION schemes:
 #

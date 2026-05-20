@@ -18,7 +18,7 @@
 # After building:
 #   <path> -o <bin> <file.bn|dir>         compile a program
 #   <path> --emit-llvm <file.bn>          emit LLVM IR text
-#   <path> --test --root <dir> <pkg>      run unit tests in a package
+#   <path> --test -I <dir> -L <dir> <pkg> run unit tests in a package
 
 set -e
 
@@ -87,7 +87,7 @@ echo
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 if [ -n "$DBG_FLAG" ]; then
     "$BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
-        --root "$BINATE_DIR" \
+        -I "$BINATE_DIR" -L "$BINATE_DIR" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         "$DBG_FLAG" \
@@ -95,7 +95,7 @@ if [ -n "$DBG_FLAG" ]; then
         "$BINATE_DIR/cmd/bnc"
 else
     "$BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
-        --root "$BINATE_DIR" \
+        -I "$BINATE_DIR" -L "$BINATE_DIR" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         -o "$OUT" \
@@ -108,4 +108,4 @@ echo
 echo "Try:"
 echo "  $OUT -o /tmp/myprog file.bn                  # compile a program"
 echo "  $OUT --emit-llvm file.bn                     # emit LLVM IR text"
-echo "  $OUT --test --root $BINATE_DIR pkg/foo       # run unit tests in pkg/foo"
+echo "  $OUT --test -I $BINATE_DIR -L $BINATE_DIR pkg/foo  # run unit tests in pkg/foo"

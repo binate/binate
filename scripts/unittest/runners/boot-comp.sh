@@ -17,7 +17,7 @@ runner_test() {
     # cd / so neither bootstrap nor bnc's CLI auto-routes the package
     # path arg to its directory-test mode via os.Stat lookup against
     # the caller's CWD; see runners/boot.sh for the full rationale.
-    testbin=$(cd / && "$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --test --root "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
+    testbin=$(cd / && "$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --test -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
     if [ ! -x "$testbin" ]; then
         echo "$testbin"  # error output
         rm -rf "$bdir"

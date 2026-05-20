@@ -7,7 +7,7 @@ runner_setup() { build_gen1; }
 runner_test() {
     pkg="$1"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
-    testbin=$("$GEN1_COMPILER" --test --root "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
+    testbin=$("$GEN1_COMPILER" --test -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
     if [ ! -x "$testbin" ]; then echo "$testbin"; rm -rf "$bdir"; return 1; fi
     "$testbin" 2>&1; rc=$?; rm -rf "$bdir"; return $rc
 }

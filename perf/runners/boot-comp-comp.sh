@@ -8,7 +8,8 @@ runner_compile() {
     bn="$1"
     tmpbin="$2"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
-    out=$("$GEN1_COMPILER" --root "$(dirname "$bn")" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1)
+    src_dir="$(dirname "$bn")"
+    out=$("$GEN1_COMPILER" -I "$src_dir" -L "$src_dir" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1)
     rc=$?
     rm -rf "$bdir"
     [ -n "$out" ] && echo "$out"

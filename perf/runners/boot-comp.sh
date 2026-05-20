@@ -5,8 +5,9 @@ runner_compile() {
     bn="$1"
     tmpbin="$2"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
+    src_dir="$(dirname "$bn")"
     out=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
-        "$BINATE_DIR/cmd/bnc" -- --root "$(dirname "$bn")" \
+        "$BINATE_DIR/cmd/bnc" -- -I "$src_dir" -L "$src_dir" \
         --build-dir "$bdir" -o "$tmpbin" "$bn" 2>&1)
     rc=$?
     rm -rf "$bdir"

@@ -44,7 +44,7 @@ FIXTURE="$TMP/fixture.bn"
 echo "Building bni via boot-comp..."
 build_log=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
     "$BINATE_DIR/cmd/bnc" -- \
-    --root "$BINATE_DIR" --build-dir "$BUILD_DIR" \
+    -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$BUILD_DIR" \
     -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1)
 if [ ! -x "$BNI_BIN" ]; then
     echo "FAIL: bni build failed:"

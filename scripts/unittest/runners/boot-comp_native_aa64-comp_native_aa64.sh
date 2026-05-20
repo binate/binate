@@ -26,7 +26,7 @@ runner_setup() { build_bnc_native_aa64; }
 runner_test() {
     pkg="$1"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
-    testbin=$("$BNC_NATIVE" --test --backend native --root "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
+    testbin=$("$BNC_NATIVE" --test --backend native -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
     if [ ! -x "$testbin" ]; then
         echo "$testbin"  # error output
         rm -rf "$bdir"

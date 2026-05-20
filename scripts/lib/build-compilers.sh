@@ -37,7 +37,7 @@ build_gen1() {
     GEN1_BUILD_DIR="$(_new_build_dir)"
     echo "Building gen1 compiler..."
     builder="$(_resolve_builder)"
-    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"
@@ -53,7 +53,7 @@ build_gen2() {
     GEN2_COMPILER="/tmp/binate_gen2_compiler_$$"
     GEN2_BUILD_DIR="$(_new_build_dir)"
     echo "Building gen2 compiler..."
-    build_out=$("$GEN1_COMPILER" --root "$BINATE_DIR" --build-dir "$GEN2_BUILD_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$GEN1_COMPILER" -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$GEN2_BUILD_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN2_COMPILER" ]; then
         echo "ERROR: Failed to build gen2 compiler:"
         echo "$build_out"
@@ -77,7 +77,7 @@ build_bnc_native_aa64() {
     BNC_NATIVE_BUILD_DIR="$(_new_build_dir)"
     echo "Building bnc with native aarch64 backend..."
     builder="$(_resolve_builder)"
-    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --backend native --root "$BINATE_DIR" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --backend native -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$BNC_NATIVE" ]; then
         echo "ERROR: Failed to build bnc (native aarch64):"
         echo "$build_out"
@@ -93,7 +93,7 @@ build_interp_boot_comp() {
     INTERP_BUILD_DIR="$(_new_build_dir)"
     echo "Building compiled interpreter..."
     builder="$(_resolve_builder)"
-    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$BINATE_DIR" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"
@@ -110,7 +110,7 @@ build_interp() {
     COMPILED_INTERP="/tmp/binate_compiled_interp_$$"
     INTERP_BUILD_DIR="$(_new_build_dir)"
     echo "Building compiled interpreter..."
-    build_out=$("$compiler" --root "$BINATE_DIR" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    build_out=$("$compiler" -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"

@@ -81,7 +81,7 @@ check() {
 BNI_BIN="$TMP/bni-bin"
 bni_compile_log=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
     "$BINATE_DIR/cmd/bnc" -- \
-    --root "$BINATE_DIR" \
+    -I "$BINATE_DIR" -L "$BINATE_DIR" \
     --runtime "$BINATE_DIR/runtime/binate_runtime.c" \
     --build-dir "$BUILD_DIR" -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1) || true
 if [ ! -x "$BNI_BIN" ]; then
@@ -94,7 +94,7 @@ fi
 NATIVE_BIN="$TMP/print_args-bin"
 native_compile_log=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
     "$BINATE_DIR/cmd/bnc" -- \
-    --root "$BINATE_DIR" \
+    -I "$BINATE_DIR" -L "$BINATE_DIR" \
     --runtime "$BINATE_DIR/runtime/binate_runtime.c" \
     --build-dir "$BUILD_DIR" -o "$NATIVE_BIN" "$TMP/print_args.bn" 2>&1) || true
 if [ -x "$NATIVE_BIN" ]; then

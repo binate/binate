@@ -18,16 +18,16 @@
 	.arm
 
 @ ============================================================
-@ bn_baremetal__SemihostExit(code int) — exit the program with
+@ bn_semihost__SemihostExit(code int) — exit the program with
 @ the given exit code via SYS_EXIT_EXTENDED.  Does not return.
 @
 @ Per the semihosting ABI, SYS_EXIT_EXTENDED takes a {reason,
 @ exit_status} parameter block.  reason = 0x20026 = ADP_Stopped_
 @ ApplicationExit signals a clean application exit (vs a fault).
 @ ============================================================
-	.globl bn_baremetal__SemihostExit
-	.type  bn_baremetal__SemihostExit, %function
-bn_baremetal__SemihostExit:
+	.globl bn_semihost__SemihostExit
+	.type  bn_semihost__SemihostExit, %function
+bn_semihost__SemihostExit:
 	@ r0 (param) holds the exit code on entry.
 	push    {r0}            @ stack: [exit_status]
 	movw    r0, #0x0026
@@ -39,4 +39,4 @@ bn_baremetal__SemihostExit:
 	@ Should not return.  Spin defensively in case the host doesn't
 	@ honor SYS_EXIT_EXTENDED — gives the program a stable halt point.
 1:	b       1b
-	.size   bn_baremetal__SemihostExit, . - bn_baremetal__SemihostExit
+	.size   bn_semihost__SemihostExit, . - bn_semihost__SemihostExit

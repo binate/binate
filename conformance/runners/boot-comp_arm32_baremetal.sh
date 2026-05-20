@@ -57,7 +57,7 @@ runner_exec() {
     if [ -n "$root" ]; then
         compile_root="$root"
     fi
-    compile_out=$("$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --root "$compile_root" --target arm32-baremetal --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
+    compile_out=$("$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$compile_root" -L "$compile_root" --target arm32-baremetal --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         # `-M virt -cpu cortex-a15` matches the linker script's
         # 0x40000000 RAM base.  `-nographic` routes the QEMU

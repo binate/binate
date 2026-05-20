@@ -41,7 +41,7 @@ runner_test() {
     pkg="$1"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
     # cd / — see runners/boot.sh for the CLI-disambiguation rationale.
-    testbin=$(cd / && "$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --test --target arm32-baremetal --root "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
+    testbin=$(cd / && "$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --test --target arm32-baremetal -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
     if [ ! -x "$testbin" ]; then
         echo "$testbin"  # error output
         rm -rf "$bdir"

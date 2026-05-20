@@ -30,6 +30,20 @@ _resolve_builder() {
     echo "$_BUILDER_BIN"
 }
 
+# _resolve_builder_lib caches and echoes the builder bundle's stdlib
+# root.  Builder-link callers append this to -I/-L so a bnc-X.Y.Z
+# bundle can supply stdlib pieces missing from the current checkout
+# (or, when the user wants the bundled version specifically, override
+# their checkout by prepending the bundle dir instead).  For
+# bootstrap-* this echoes $BINATE_DIR — duplicate path entries are
+# cheap.
+_resolve_builder_lib() {
+    if [ -z "$_BUILDER_LIB" ]; then
+        _BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
+    fi
+    echo "$_BUILDER_LIB"
+}
+
 # Build gen1 compiler (boot-comp compiles cmd/bnc → gen1 binary)
 # Sets GEN1_COMPILER to the path.
 build_gen1() {
@@ -37,7 +51,8 @@ build_gen1() {
     GEN1_BUILD_DIR="$(_new_build_dir)"
     echo "Building gen1 compiler..."
     builder="$(_resolve_builder)"
-    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    blib="$(_resolve_builder_lib)"
+    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$BINATE_DIR:$blib" -L "$BINATE_DIR:$blib" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"
@@ -77,7 +92,8 @@ build_bnc_native_aa64() {
     BNC_NATIVE_BUILD_DIR="$(_new_build_dir)"
     echo "Building bnc with native aarch64 backend..."
     builder="$(_resolve_builder)"
-    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --backend native -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
+    blib="$(_resolve_builder_lib)"
+    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --backend native -I "$BINATE_DIR:$blib" -L "$BINATE_DIR:$blib" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$BNC_NATIVE" ]; then
         echo "ERROR: Failed to build bnc (native aarch64):"
         echo "$build_out"
@@ -93,7 +109,8 @@ build_interp_boot_comp() {
     INTERP_BUILD_DIR="$(_new_build_dir)"
     echo "Building compiled interpreter..."
     builder="$(_resolve_builder)"
-    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    blib="$(_resolve_builder_lib)"
+    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$BINATE_DIR:$blib" -L "$BINATE_DIR:$blib" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"

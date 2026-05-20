@@ -5,6 +5,7 @@
 
 runner_setup() {
     BOOT_BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
+    BOOT_BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 }
 
 runner_exec() {
@@ -17,7 +18,7 @@ runner_exec() {
     if [ -n "$root" ]; then
         compile_root="$root"
     fi
-    compile_out=$("$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$compile_root" -L "$compile_root" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
+    compile_out=$("$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$compile_root:$BOOT_BUILDER_LIB" -L "$compile_root:$BOOT_BUILDER_LIB" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         "$tmpbin" 2>&1 || true
     else

@@ -107,7 +107,7 @@ fi
 check "native" "$actual"
 
 # ----- (b) compiled bni interprets print_args.bn ------------------
-actual=$("$BNI_BIN" -root "$BINATE_DIR" "$TMP/print_args.bn" -- \
+actual=$("$BNI_BIN" -I "$BINATE_DIR" -L "$BINATE_DIR" "$TMP/print_args.bn" -- \
     alpha beta gamma 2>&1) || true
 check "bni" "$actual"
 

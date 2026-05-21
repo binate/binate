@@ -47,7 +47,7 @@ runner_test() {
         rm -rf "$bdir"
         return 1
     fi
-    "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 1M \
+    "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 16M \
         -nographic -semihosting -no-reboot \
         -kernel "$testbin" 2>&1
     rc=$?

@@ -68,15 +68,15 @@ runner_exec() {
         # via timeout(1) so a runaway test doesn't wedge the
         # sweep.
         if command -v timeout >/dev/null 2>&1; then
-            timeout 10 "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 1M \
+            timeout 10 "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 16M \
                 -nographic -semihosting -no-reboot \
                 -kernel "$tmpbin" 2>&1 || true
         elif command -v gtimeout >/dev/null 2>&1; then
-            gtimeout 10 "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 1M \
+            gtimeout 10 "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 16M \
                 -nographic -semihosting -no-reboot \
                 -kernel "$tmpbin" 2>&1 || true
         else
-            "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 1M \
+            "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 16M \
                 -nographic -semihosting -no-reboot \
                 -kernel "$tmpbin" 2>&1 || true
         fi

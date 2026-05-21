@@ -21,7 +21,15 @@ ENTRY(_start)
 
 MEMORY
 {
-	RAM (rwx) : ORIGIN = 0x40000000, LENGTH = 1M
+	/* QEMU virt's default RAM is 1 GiB; we use 8 MiB to give the
+	 * bump allocator (pkg/rt's `var heap [N]uint8`) headroom for
+	 * tests that allocate many managed-slices or refcounted
+	 * objects in a single pass.  At 1 MiB total, CI surfaced
+	 * `rt.RawAlloc: bump heap exhausted` on a handful of tests;
+	 * 8 MiB clears that and leaves room to bump heap size
+	 * further if needed.
+	 */
+	RAM (rwx) : ORIGIN = 0x40000000, LENGTH = 8M
 }
 
 SECTIONS

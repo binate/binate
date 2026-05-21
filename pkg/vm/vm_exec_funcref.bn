@@ -14,27 +14,22 @@ import "pkg/rt"
 // control flow.
 func execFuncRefOp(vm @VM, f @VMFunc, regs *int, instr BCInstr) bool {
 	if instr.Op == BC_FUNC_ADDR {
-		// Check the executing vm's Externs first.  When the name
-		// resolves to a registered extern, the binding's
-		// RawFnAddr field carries the function's native address —
-		// populated by the registrant via `_raw_func_addr(F)` at
-		// outermost native level and propagated through nested
-		// vms by the existing Externs-copy mechanism.  This is
-		// what makes `_raw_func_addr(F)` return a real native
-		// pointer at any bytecode-nesting depth, eliminating the
-		// idx-vs-native ambiguity that BC_CALL_INDIRECT used to
-		// distinguish via magnitude check.
+		// Compiler-internal — emitted only by emitManagedPtrRefDec
+		// for the dtor reference that feeds BC_REFDEC_INLINE_FAST.
+		// Returns a 1-based vm function index (intra-vm idx) which
+		// BC_REFDEC_INLINE_FAST consumes via vm.Funcs[dtorIdx-1].
+		// User-facing `_raw_func_addr(F)` / `_func_handle(F)` lowers
+		// to OP_FUNC_HANDLE → BC_FUNC_HANDLE.  Phase 3 also stored
+		// RawFnAddr in ExternBinding so registered names resolve to
+		// a native fn ptr directly; the Externs fast path stays
+		// here for dtors that happen to also be extern-registered
+		// (rare).
 		var name @[]char = f.Names[instr.Aux]
 		var eIdx int = vm.LookupExtern(name)
 		if eIdx >= 0 && vm.Externs[eIdx].RawFnAddr != 0 {
 			regs[instr.Dst] = vm.Externs[eIdx].RawFnAddr
 			return true
 		}
-		// Fallback: legacy idx+1 (1-based vm idx).  Preserves the
-		// intra-vm dtor case where a function isn't in Externs
-		// but is in vm.Funcs.  BC_CALL_INDIRECT's existing
-		// magnitude-gated arm dispatches via vm.Funcs.  Phase 4
-		// of plan-uniform-native-fnptrs.md drops this fallback.
 		var idx int = f.CallCache[instr.Aux]
 		if idx == -2 {
 			idx = vm.LookupFunc(name)
@@ -44,6 +39,35 @@ func execFuncRefOp(vm @VM, f @VMFunc, regs *int, instr BCInstr) bool {
 			print("vm: dtor not found: "); println(name); rt.Exit(1)
 		}
 		regs[instr.Dst] = idx + 1
+		return true
+	}
+	if instr.Op == BC_FUNC_HANDLE {
+		// Phase 4: return *uint8 pointing at a 16-byte {vtable_ptr,
+		// data_ptr} handle — same shape as native `@__handle.F`.
+		// Two sources:
+		//   1. Externs registry (the function is registered via
+		//      RegisterExtern with a handle pointer in RawFnAddr) —
+		//      propagated through nested vms by Externs-copy.
+		//   2. Lazy heap-alloc on the VMFunc.Handle field for vm-
+		//      local-only functions; the universal trampoline reads
+		//      the closure record to dispatch via execFunc.
+		var name @[]char = f.Names[instr.Aux]
+		var eIdx int = vm.LookupExtern(name)
+		if eIdx >= 0 && vm.Externs[eIdx].RawFnAddr != 0 {
+			regs[instr.Dst] = vm.Externs[eIdx].RawFnAddr
+			return true
+		}
+		var idx int = f.CallCache[instr.Aux]
+		if idx == -2 {
+			idx = vm.LookupFunc(name)
+			f.CallCache[instr.Aux] = idx
+		}
+		if idx < 0 {
+			print("vm: function not found: "); println(name); rt.Exit(1)
+		}
+		var callee @VMFunc = vm.Funcs[idx]
+		ensureHandle(vm, callee, idx)
+		regs[instr.Dst] = bit_cast(int, callee.Handle)
 		return true
 	}
 	if instr.Op == BC_FUNC_VALUE {
@@ -93,86 +117,7 @@ func execFuncRefOp(vm @VM, f @VMFunc, regs *int, instr BCInstr) bool {
 			rt.Exit(1)
 		}
 		var callee @VMFunc = vm.Funcs[idx]
-		if callee.Vtable == nil {
-			// Vtable layout (16 bytes): {dtor, call}.
-			//   dtor = 0 — non-capturing has no captured ctx
-			//     to clean up; capturing closures will populate
-			//     this later.
-			//   call = NATIVE function address of TrampolineScalar
-			//     / TrampolineAggregate (NOT a per-function shim
-			//     address) — ABI-aware bridge that decodes its
-			//     incoming register bank using sig info from
-			//     `data` and dispatches into the target VM.
-			//     Compiled code reaching vtable.call gets cross-
-			//     mode dispatch automatically.  Same-mode VM
-			//     dispatch (BC_CALL_FUNC_VALUE) short-circuits via
-			//     the closure record's vm_func_idx and never
-			//     invokes the trampoline — see vm_exec.bn.
-			//
-			// We source the native address from the executing
-			// vm's Externs registry, where `registerVmTrampolines`
-			// (in `extern_register_std.bn`) hand-built a binding
-			// whose vtable.call slot is the trampoline's actual
-			// function address (NOT the per-function shim that
-			// the standard `var x = func(...)` registration would
-			// produce — the shim convention strips the implicit
-			// `data` param, but the trampolines need `data` as
-			// their closure-record argument).  The Externs-copy
-			// mechanism propagates this native address through
-			// nested vms at any depth — same pattern libc.* uses.
-			// See `explorations/plan-uniform-native-fnptrs.md`.
-			//
-			// Earlier this slot was populated with
-			// `_raw_func_addr(TrampolineScalar)`, which works in
-			// native compilation but lowers to a 1-based vm idx
-			// in bytecode mode — wrong identity once the binding
-			// crosses vm boundaries (e.g. is copied into a nested
-			// vm's Externs).
-			var trampolineName *[]const char = "vm.TrampolineScalar"
-			if len(callee.ResultMultiWord) == 1 &&
-					callee.ResultMultiWord[0] {
-				trampolineName = "vm.TrampolineAggregate"
-			}
-			// Self-reference: when callee is itself a trampoline
-			// function, the result-type heuristic above is wrong —
-			// TrampolineAggregate returns void, so it would land in
-			// the scalar branch and the binding for
-			// "vm.TrampolineAggregate" would inherit
-			// TrampolineScalar's call slot.  Match on callee.Name
-			// so each trampoline's binding always points to itself.
-			if streq(callee.Name, "vm.TrampolineScalar") {
-				trampolineName = "vm.TrampolineScalar"
-			}
-			if streq(callee.Name, "vm.TrampolineAggregate") {
-				trampolineName = "vm.TrampolineAggregate"
-			}
-			var tIdx int = vm.LookupExtern(trampolineName)
-			if tIdx < 0 {
-				print("vm: BC_FUNC_VALUE: cross-mode trampoline not registered in vm.Externs: ")
-				println(trampolineName)
-				rt.Exit(1)
-			}
-			var tVtable *int = bit_cast(*int,
-				vm.Externs[tIdx].VtableAddr)
-			var vt @VMFuncVtable = make(VMFuncVtable)
-			vt.Dtor = 0
-			vt.Call = tVtable[1]
-			callee.Vtable = vt
-		}
-		if callee.ClosureRec == nil {
-			// VMClosureRec carries {Kind, Vm, FnIdx, Captured};
-			// the universal trampoline reads it as its `data`
-			// argument and dispatches via `execFunc(Vm, FnIdx-1,
-			// args)`.  Storing the VM in the record (vs a global)
-			// keeps each function value self-contained and lets
-			// multiple VMs coexist without ordering concerns.
-			var rec @VMClosureRec = make(VMClosureRec)
-			rec.Kind = rt.DATA_KIND_VM_CLOSURE_REC
-			rec.Vm = bit_cast(int, vm)
-			rec.FnIdx = idx + 1   // 1-based VM function index
-			rec.Captured = 0      // Phase 1: no closures
-			callee.ClosureRec = rec
-		}
+		ensureHandle(vm, callee, idx)
 		// Build the function value in a fresh 16-byte stack
 		// slot at SP. SP grows by 16; the slot's address is
 		// the result.
@@ -186,6 +131,58 @@ func execFuncRefOp(vm @VM, f @VMFunc, regs *int, instr BCInstr) bool {
 	}
 	if execIfaceOp(vm, f, regs, instr) { return true }
 	return false
+}
+
+// ensureHandle lazy-populates callee.Vtable, callee.ClosureRec, and
+// callee.Handle so BC_FUNC_HANDLE / BC_FUNC_VALUE can return stable
+// references without per-call allocation.  All three fields are
+// managed (refcounted) so VMFunc's auto-emitted dtor releases them
+// on VMFunc death.  The vtable's call slot points at the universal
+// trampoline whose native address is reachable from the executing
+// vm's Externs registry.  TrampolineAggregate is picked when the
+// callee returns a single multi-word value; the self-reference
+// override handles the trampolines themselves so they don't recurse.
+// Phase 4 of plan-uniform-native-fnptrs.md.
+func ensureHandle(vm @VM, callee @VMFunc, idx int) {
+	if callee.Vtable == nil {
+		var trampolineName *[]const char = "vm.TrampolineScalar"
+		if len(callee.ResultMultiWord) == 1 &&
+				callee.ResultMultiWord[0] {
+			trampolineName = "vm.TrampolineAggregate"
+		}
+		if streq(callee.Name, "vm.TrampolineScalar") {
+			trampolineName = "vm.TrampolineScalar"
+		}
+		if streq(callee.Name, "vm.TrampolineAggregate") {
+			trampolineName = "vm.TrampolineAggregate"
+		}
+		var tIdx int = vm.LookupExtern(trampolineName)
+		if tIdx < 0 {
+			print("vm: ensureHandle: trampoline not registered: ")
+			println(trampolineName)
+			rt.Exit(1)
+		}
+		var tVtable *int = bit_cast(*int,
+			vm.Externs[tIdx].VtableAddr)
+		var vt @VMFuncVtable = make(VMFuncVtable)
+		vt.Dtor = 0
+		vt.Call = tVtable[1]
+		callee.Vtable = vt
+	}
+	if callee.ClosureRec == nil {
+		var rec @VMClosureRec = make(VMClosureRec)
+		rec.Kind = rt.DATA_KIND_VM_CLOSURE_REC
+		rec.Vm = bit_cast(int, vm)
+		rec.FnIdx = idx + 1
+		rec.Captured = 0
+		callee.ClosureRec = rec
+	}
+	if callee.Handle == nil {
+		var h @VMFuncHandle = make(VMFuncHandle)
+		h.VtableAddr = bit_cast(int, callee.Vtable)
+		h.DataAddr = bit_cast(int, callee.ClosureRec)
+		callee.Handle = h
+	}
 }
 
 // dispatchNativeIndirect handles the cross-mode arm of

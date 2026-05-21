@@ -84,6 +84,42 @@ static BnSlice cstr_to_slice(const char *s) {
 // those created via rt.Alloc — both are released through RawFree.
 extern void bn_rt__RawFree(void *ptr);
 
+// C-side function-value handle for bn_rt__RawFree.  Phase 4 of
+// plan-uniform-native-fnptrs.md established that header[1] for
+// every managed allocation carries a function-value HANDLE
+// POINTER (not a raw fn ptr) so rt.Free's `_call_free_fn(handle,
+// h)` dispatch can do `handle.vtable.call(handle.data, h)`
+// uniformly.  bnc emits its own @__handle.bn_rt__RawFree symbol
+// when pkg/rt is compiled, but the assembler-level name contains
+// dots that aren't valid C identifiers — and we'd need every test
+// binary to drag pkg/rt's emission set in just to satisfy this
+// reference.  Instead, we define a self-contained handle in C:
+// same {vtable, data} layout, no external symbol dependency.
+// bnc-emitted handles and these C-side handles have equivalent
+// semantics — they wrap the same underlying function with the
+// same shim convention.  TODO (option 2 from the Phase 4
+// discussion): refactor managed_alloc out of C entirely so the
+// header init runs in Binate where _func_handle() naturally
+// resolves; that drops this whole block.
+static void __c_shim_bn_rt__RawFree(void *data, void *ptr) {
+    (void)data;
+    bn_rt__RawFree(ptr);
+}
+static const struct {
+    void *dtor;
+    void *call;
+} __c_vt_bn_rt__RawFree = {
+    NULL,
+    (void *)__c_shim_bn_rt__RawFree,
+};
+static const struct {
+    void *vtable_ptr;
+    void *data_ptr;
+} __c_handle_bn_rt__RawFree = {
+    (void *)&__c_vt_bn_rt__RawFree,
+    NULL,
+};
+
 // Helper: allocate a managed block (header + payload, refcount=1).
 // Header is 2 * sizeof(bn_int_t) — 16 bytes on LP64, 8 bytes on
 // 32-bit ARM Linux.  Layout: [refcount, free_fn_ptr] both bn_int_t
@@ -93,7 +129,7 @@ static void *managed_alloc(size_t payload_size) {
     void *base = calloc(1, 2 * sizeof(bn_int_t) + payload_size);
     bn_int_t *header = (bn_int_t *)base;
     header[0] = 1;  // refcount = 1
-    header[1] = (bn_int_t)&bn_rt__RawFree;  // free_fn = &RawFree
+    header[1] = (bn_int_t)&__c_handle_bn_rt__RawFree;  // free_fn = C-side handle
     return (char *)base + 2 * sizeof(bn_int_t);  // return pointer past header
 }
 

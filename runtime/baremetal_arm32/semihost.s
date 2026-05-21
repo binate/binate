@@ -18,6 +18,94 @@
 	.arm
 
 @ ============================================================
+@ Stubs for the libc / libgcc symbols clang emits implicitly:
+@   memcpy, memset, memmove, memcmp.
+@ The IR for any Binate struct-by-value copy or aggregate
+@ initialization lowers to one of these (LLVM's memcpy intrinsic
+@ resolves to libc's memcpy at link time).  We don't have libc
+@ on bare-metal, so provide byte-at-a-time impls here.  Cheap
+@ and obviously-correct; replaceable with arm-tuned word-copy
+@ loops once perf matters.
+@ ============================================================
+	.globl memcpy
+	.type  memcpy, %function
+memcpy:
+	@ r0 = dst (preserved on return), r1 = src, r2 = len
+	push    {r0, r4}        @ save dst for return; r4 scratch
+	cmp     r2, #0
+	beq     2f
+1:	ldrb    r4, [r1], #1
+	strb    r4, [r0], #1
+	subs    r2, r2, #1
+	bne     1b
+2:	pop     {r0, r4}        @ restore original dst into r0
+	bx      lr
+	.size   memcpy, . - memcpy
+
+@ memmove: same as memcpy for non-overlapping; for overlap,
+@ copy backwards when dst > src.  Bare-metal v1 doesn't
+@ exercise overlap in user code, but compilers sometimes emit
+@ memmove for type-erased aggregate copies.
+	.globl memmove
+	.type  memmove, %function
+memmove:
+	@ r0 = dst, r1 = src, r2 = len
+	push    {r0, r4}
+	cmp     r2, #0
+	beq     4f
+	cmp     r0, r1
+	bls     1f              @ dst <= src → forward copy
+	@ Backward copy: i = len; while (i--) dst[i] = src[i].
+	add     r0, r0, r2
+	add     r1, r1, r2
+3:	ldrb    r4, [r1, #-1]!
+	strb    r4, [r0, #-1]!
+	subs    r2, r2, #1
+	bne     3b
+	b       4f
+1:	ldrb    r4, [r1], #1    @ forward (same as memcpy)
+	strb    r4, [r0], #1
+	subs    r2, r2, #1
+	bne     1b
+4:	pop     {r0, r4}
+	bx      lr
+	.size   memmove, . - memmove
+
+	.globl memset
+	.type  memset, %function
+memset:
+	@ r0 = dst (preserved on return), r1 = byte, r2 = len
+	push    {r0, r4}
+	and     r1, r1, #0xff   @ memset takes int but uses low byte
+	cmp     r2, #0
+	beq     2f
+1:	strb    r1, [r0], #1
+	subs    r2, r2, #1
+	bne     1b
+2:	pop     {r0, r4}
+	bx      lr
+	.size   memset, . - memset
+
+	.globl memcmp
+	.type  memcmp, %function
+memcmp:
+	@ r0 = a, r1 = b, r2 = len; returns r0 = signed-cmp result
+	push    {r4, r5}
+	mov     r4, #0          @ default result = 0 (equal)
+	cmp     r2, #0
+	beq     2f
+1:	ldrb    r3, [r0], #1
+	ldrb    r5, [r1], #1
+	subs    r4, r3, r5
+	bne     2f
+	subs    r2, r2, #1
+	bne     1b
+2:	mov     r0, r4
+	pop     {r4, r5}
+	bx      lr
+	.size   memcmp, . - memcmp
+
+@ ============================================================
 @ abort() — libgcc's AEABI helpers (e.g. __aeabi_ldivmod, the
 @ idiv0 trap) call into libc's `abort()` on undefined or
 @ overflow conditions.  Bare-metal has no libc, so provide a

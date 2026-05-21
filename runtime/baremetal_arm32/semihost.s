@@ -18,6 +18,30 @@
 	.arm
 
 @ ============================================================
+@ abort() — libgcc's AEABI helpers (e.g. __aeabi_ldivmod, the
+@ idiv0 trap) call into libc's `abort()` on undefined or
+@ overflow conditions.  Bare-metal has no libc, so provide a
+@ matching C-ABI symbol that exits via semihosting.  Same SVC
+@ shape as SemihostExit but the exit code is hardcoded to 134
+@ (SIGABRT convention).
+@ ============================================================
+	.globl abort
+	.type  abort, %function
+abort:
+	mov     r0, #134        @ exit_status = SIGABRT
+	push    {r0}            @ stack: [exit_status]
+	movw    r0, #0x0026
+	movt    r0, #0x0002     @ r0 = 0x00020026 (ADP_Stopped_ApplicationExit)
+	push    {r0}            @ stack: [reason, exit_status]
+	mov     r1, sp          @ r1 = &{reason, exit_status}
+	mov     r0, #0x20       @ SYS_EXIT_EXTENDED
+	svc     #0x123456
+	@ Should not return.  Defensive spin if the host doesn't
+	@ honor SYS_EXIT_EXTENDED.
+1:	b       1b
+	.size   abort, . - abort
+
+@ ============================================================
 @ bn_semihost__SemihostWriteChar(c char) — write one byte to the
 @ debug console via SYS_WRITEC.  pkg/bootstrap.Write loops over
 @ the buffer calling this for each byte.  Cheaper than SYS_WRITE0

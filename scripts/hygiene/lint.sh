@@ -50,7 +50,7 @@ trap 'rm -f "$BNLINT_BIN"' EXIT
     exit 1
 }
 
-"$BNLINT_BIN" --root "$BINATE_DIR" $TARGETS
+"$BNLINT_BIN" -I "$BINATE_DIR" -L "$BINATE_DIR" $TARGETS
 rc=$?
 
 if [ "$rc" -ne 0 ]; then

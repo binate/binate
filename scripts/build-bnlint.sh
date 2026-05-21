@@ -15,7 +15,7 @@
 #   ./scripts/build-bnlint.sh -h                # help
 #
 # After building:
-#   <path> --root <dir> <pkg1> [pkg2 ...]   lint one or more packages
+#   <path> -I <dir> [-L <dir>] <pkg1> [pkg2 ...]   lint one or more packages
 
 set -e
 
@@ -104,4 +104,4 @@ echo
 echo "Built: $OUT"
 echo
 echo "Try:"
-echo "  $OUT --root $BINATE_DIR pkg/parser           # lint a package"
+echo "  $OUT -I $BINATE_DIR -L $BINATE_DIR pkg/parser    # lint a package"

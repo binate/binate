@@ -6,25 +6,32 @@ mistakes that the type checker accepts but lead to runtime bugs.
 ## Usage
 
 ```
-bnlint --root <project-dir> <pkg1> [pkg2 ...]
+bnlint -I <project-dir> [-L <project-dir>] <pkg1> [pkg2 ...]
 ```
+
+The first `-I` entry doubles as the project root (used to strip path
+prefixes from diagnostic file paths).  `-L` mirrors the `-I` list when
+the impl tree lives next to the .bni tree (typical for an in-tree
+checkout); see `e2e/split-paths.sh` for the split-tree shape.
 
 Run via the bootstrap interpreter:
 
 ```
-go run . -root <binate-src> cmd/bnlint -- --root <binate-src> pkg/foo pkg/bar
+go run . -root <binate-src> cmd/bnlint -- -I <binate-src> -L <binate-src> pkg/foo pkg/bar
 ```
 
 Or via the self-hosted interpreter:
 
 ```
-binate -root <binate-src> cmd/bnlint -- --root <binate-src> pkg/foo
+binate -I <binate-src> -L <binate-src> cmd/bnlint -- -I <binate-src> -L <binate-src> pkg/foo
 ```
 
 ## Flags
 
-- `--root <dir>` — Project root directory (required). Used to resolve package
-  paths and locate `.bni` interface files.
+- `-I <dirs>` / `--interface-path <dirs>` — Colon-separated dirs searched for
+  `.bni` files.  Repeatable; the first entry seeds the source root.  Required.
+- `-L <dirs>` / `--impl-path <dirs>` — Colon-separated dirs searched for impl
+  directories.  Repeatable.
 
 ## Output
 
@@ -63,13 +70,13 @@ return boundary, and the caller receives a raw slice whose backing may be freed.
 Lint a single package:
 
 ```
-go run . -root ~/binate/binate cmd/bnlint -- --root ~/binate/binate pkg/ir
+go run . -root ~/binate/binate cmd/bnlint -- -I ~/binate/binate -L ~/binate/binate pkg/ir
 ```
 
 Lint multiple packages:
 
 ```
-go run . -root ~/binate/binate cmd/bnlint -- --root ~/binate/binate pkg/ir pkg/types pkg/codegen
+go run . -root ~/binate/binate cmd/bnlint -- -I ~/binate/binate -L ~/binate/binate pkg/ir pkg/types pkg/codegen
 ```
 
 ## Running Tests

@@ -8,9 +8,9 @@
 # both, so every tool must search BniPath and ImplPath independently
 # and pair the results across roots.
 #
-# Each tool is invoked WITHOUT --root for the fixture package; the
-# split is supplied via -I and -L. $BINATE_DIR is added on each path
-# so that pkg/bootstrap, pkg/rt, etc. resolve normally.
+# Each tool resolves the fixture package purely via -I and -L (no
+# extra root flag).  $BINATE_DIR is added on each path so
+# pkg/bootstrap, pkg/rt, etc. resolve normally.
 #
 # Exit 0 on full pass; non-zero with per-tool diagnostics on failure.
 
@@ -127,7 +127,6 @@ if [ ! -x "$BNLINT_BIN" ]; then
     FAIL_NAMES="$FAIL_NAMES bnlint"
 else
     bnlint_out=$("$BNLINT_BIN" \
-        --root "$EMPTY_ROOT" \
         -I "$BNI_ROOT:$BINATE_DIR" -L "$IMPL_ROOT:$BINATE_DIR" \
         pkg/splitlib 2>&1) || true
     if [ -z "$bnlint_out" ]; then

@@ -83,7 +83,7 @@ run_repl() {
     label="$1"
     input="$2"
     expected="$3"
-    actual=$(printf '%s' "$input" | "$BNI_BIN" --repl --root "$BINATE_DIR" "$FIXTURE" 2>&1)
+    actual=$(printf '%s' "$input" | "$BNI_BIN" --repl -I "$BINATE_DIR" -L "$BINATE_DIR" "$FIXTURE" 2>&1)
     if [ "$actual" = "$expected" ]; then
         echo "PASS: $label"
         PASSES=$((PASSES + 1))

@@ -1,1 +1,0 @@
-bootstrap interp: pointer index-assign (`p[0] = v` on `*int`) is not supported — boot reports "cannot index-assign to *interpreter.PointerVal". Self-hosted toolchain (boot-comp / boot-comp-int) handles it correctly. Track and remove this xfail when bootstrap grows pointer index-assign.

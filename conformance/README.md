@@ -15,21 +15,20 @@ Run `./conformance/run.sh` with no arguments for full help.
 ### Quick examples
 
 ```sh
-./conformance/run.sh boot              # All tests via bootstrap interpreter
-./conformance/run.sh boot-comp         # All tests via compiler
-./conformance/run.sh boot-comp 040     # Test(s) matching '040'
-./conformance/run.sh basic             # boot + boot-comp + boot-comp-int
-./conformance/run.sh boot slice nil    # Tests matching 'slice' or 'nil'
+./conformance/run.sh boot-comp                 # All tests via the builder
+./conformance/run.sh boot-comp 040             # Test(s) matching '040'
+./conformance/run.sh basic                     # boot-comp + boot-comp-int
+./conformance/run.sh boot-comp,boot-comp-comp  # Comma-separated modes
+./conformance/run.sh boot-comp slice nil       # Tests matching 'slice' or 'nil'
 ```
 
 ### Modes
 
-Each mode is a chain of: `boot` (bootstrap interpreter), `comp` (compiler), `int` (bytecode VM).
+Each mode is a chain of: `builder` (resolved BUILDER_VERSION binary, named `boot-` historically), `comp` (compiler), `int` (bytecode VM).
 
 | Mode | Description |
 |------|-------------|
-| `boot` | Go bootstrap interpreter runs .bn directly |
-| `boot-comp` | Bootstrap interprets cmd/bnc → compiles test to native |
+| `boot-comp` | Builder interprets cmd/bnc → compiles test to native |
 | `boot-comp-int` | Compiled cmd/bni runs test via bytecode VM |
 | `boot-comp-comp` | Gen1 compiler compiles test |
 | `boot-comp-comp-int` | Gen1-compiled cmd/bni runs test via bytecode VM |
@@ -43,7 +42,7 @@ Optional arguments filter tests by substring match against the test name. Multip
 
 ```sh
 ./conformance/run.sh boot-comp recursive int_lit switch
-./conformance/run.sh boot,boot-comp 040    # comma-separated modes
+./conformance/run.sh boot-comp,boot-comp-comp 040    # comma-separated modes
 ```
 
 ## Test Formats

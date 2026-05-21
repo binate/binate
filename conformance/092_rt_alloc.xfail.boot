@@ -1,1 +1,0 @@
-pkg/rt requires compiled mode (bit_cast, pointer indexing)

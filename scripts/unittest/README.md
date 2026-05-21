@@ -15,18 +15,19 @@ Run `./scripts/unittest/run.sh` with no arguments for full help.
 ### Quick examples
 
 ```sh
-./scripts/unittest/run.sh boot              # All packages via bootstrap
-./scripts/unittest/run.sh boot-comp vm      # pkg/vm via compiler
-./scripts/unittest/run.sh basic             # boot + boot-comp + boot-comp-int
-./scripts/unittest/run.sh boot ir codegen   # pkg/ir and pkg/codegen
+./scripts/unittest/run.sh boot-comp                Run all packages via the builder
+./scripts/unittest/run.sh boot-comp vm             pkg/vm via the builder
+./scripts/unittest/run.sh basic                    boot-comp + boot-comp-int
+./scripts/unittest/run.sh boot-comp ir codegen     pkg/ir and pkg/codegen
 ```
 
 ### Modes
 
+Each mode is a chain of: `builder` (resolved BUILDER_VERSION binary, named `boot-` historically), `comp` (compiler), `int` (bytecode VM).
+
 | Mode | Description |
 |------|-------------|
-| `boot` | Go bootstrap interpreter runs `-test` directly |
-| `boot-comp` | Bootstrap interprets cmd/bnc → compiles and runs tests |
+| `boot-comp` | Builder interprets cmd/bnc → compiles and runs tests |
 | `boot-comp-int` | Compiled cmd/bni runs `--test` natively via bytecode VM |
 | `boot-comp-comp` | Gen1 compiler compiles and runs tests |
 | `boot-comp-comp-int` | Gen1-compiled cmd/bni runs `--test` natively via bytecode VM |
@@ -50,7 +51,7 @@ Optional arguments filter packages by substring match (e.g. `ir` matches `pkg/ir
 
 `scripts/unittest/<pkg-path>.xfail.<mode>` marks a package as expected failure for that mode. Slashes in the package path are replaced with dashes.
 
-Example: `scripts/unittest/pkg-rt.xfail.boot` with contents `bootstrap does not support raw memory operations`.
+Example: `scripts/unittest/pkg-vm.xfail.boot-comp-comp-int` with contents describing the reason.
 
 ## Package Discovery
 

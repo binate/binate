@@ -4,23 +4,27 @@
 # Runs unit tests for all packages (or filtered packages) using the specified
 # backend mode.
 #
-# Modes (chains of: boot=bootstrap, int=bytecode VM, comp=compiler):
-#   boot                  Go bootstrap interpreter runs -test directly
-#   boot-comp             Bootstrap interprets bnc, which compiles and runs tests
+# Modes (chains of: builder=resolved BUILDER_VERSION binary running bnc,
+# int=bytecode VM, comp=compiler).  Modes are named with the legacy
+# `boot-` prefix for historical continuity; the first link is the
+# BUILDER_VERSION-resolved binary (currently bootstrap-* via
+# scripts/fetch-builder.sh, eventually a tagged bnc-X.Y.Z bundle).
+#
+#   boot-comp             Builder interprets bnc, which compiles and runs tests
 #   boot-comp-int         Compiled bni runs --test natively via bytecode VM
 #   boot-comp-comp        Self-compiled compiler (gen1) runs --test
 #   boot-comp-comp-int    Gen1-compiled bni runs --test natively via bytecode VM
 #   boot-comp-comp-comp   Gen2 compiler runs --test
 #
 # Mode sets:
-#   basic               boot, boot-comp, boot-comp-int
+#   basic               boot-comp, boot-comp-int
 #   all                 basic + boot-comp-comp, boot-comp-comp-int, boot-comp-comp-comp
 #
 # Filters select packages by substring match (e.g. "ir" matches "pkg/ir").
 #
 # Per-package xfail:
 #   scripts/unittest/<pkg-with-slashes-replaced-by-dashes>.xfail.<mode>
-#   e.g. scripts/unittest/pkg-rt.xfail.boot
+#   e.g. scripts/unittest/pkg-vm.xfail.boot-comp-comp-int
 #   Contents are the reason for the expected failure.
 #
 # Per-test skip (bni-based runners only):
@@ -89,11 +93,11 @@ if [ -z "$MODE" ]; then
     echo "'pkg/ir'). Multiple filters are OR'd."
     echo ""
     echo "Examples:"
-    echo "  $0 boot                       Run all tests via bootstrap"
-    echo "  $0 boot-comp vm               Run pkg/vm tests via compiler"
-    echo "  $0 basic                      Run boot, boot-comp, boot-comp-int"
-    echo "  $0 boot,boot-comp vm          Run pkg/vm in boot and boot-comp"
-    echo "  $0 boot ir codegen            Run pkg/ir and pkg/codegen tests"
+    echo "  $0 boot-comp                  Run all tests via the builder"
+    echo "  $0 boot-comp vm               Run pkg/vm tests via the builder"
+    echo "  $0 basic                      Run boot-comp, boot-comp-int"
+    echo "  $0 boot-comp,boot-comp-comp   Run all tests in two modes"
+    echo "  $0 boot-comp ir codegen       Run pkg/ir and pkg/codegen tests"
     echo ""
     echo "Modes:"
     for r in "$(dirname "$0")"/runners/*.sh; do
@@ -113,7 +117,7 @@ if [ -z "$MODE" ]; then
     done
     echo ""
     echo "Xfail: scripts/unittest/<pkg-path>.xfail.<mode>"
-    echo "  e.g. scripts/unittest/pkg-rt.xfail.boot"
+    echo "  e.g. scripts/unittest/pkg-vm.xfail.boot-comp-comp-int"
     echo "  (slashes in package path replaced with dashes)"
     echo ""
     echo "Per-test skip: scripts/unittest/<pkg-path>.skip.<mode>"

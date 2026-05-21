@@ -1,1 +1,0 @@
-pointer indexing requires raw memory (compiled mode only)

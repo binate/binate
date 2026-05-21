@@ -7,9 +7,13 @@
 # Environment:
 #   BINATE_FLAGS    Extra flags passed to the Binate compiler (e.g. "-g" for debug info)
 #
-# Modes (chains of: boot=bootstrap, int=bytecode VM, comp=compiler):
-#   boot                  Go bootstrap interpreter runs .bn directly
-#   boot-comp             boot interprets cmd/bnc, which compiles .bn to native
+# Modes (chains of: builder=resolved BUILDER_VERSION binary,
+# int=bytecode VM, comp=compiler).  Modes keep the legacy `boot-`
+# prefix for historical continuity; the first link is the
+# BUILDER_VERSION-resolved binary (currently bootstrap-* via
+# scripts/fetch-builder.sh, eventually a tagged bnc-X.Y.Z bundle).
+#
+#   boot-comp             Builder interprets cmd/bnc, which compiles .bn to native
 #   boot-comp-int         boot-comp compiles cmd/bni → binary, binary runs .bn via bytecode VM
 #   boot-comp-int-int     boot-comp-int interprets cmd/bni, which interprets .bn
 #   boot-comp-comp        boot-comp compiles cmd/bnc → gen1, gen1 compiles .bn
@@ -53,10 +57,10 @@ if [ -z "$MODE" ]; then
     echo "Multiple filters are OR'd: any match includes the test."
     echo ""
     echo "Examples:"
-    echo "  $0 boot                       Run all tests via bootstrap interpreter"
-    echo "  $0 boot-comp 040              Run test(s) matching '040' via compiler"
-    echo "  $0 basic                      Run boot, boot-comp, boot-comp-int"
-    echo "  $0 boot,boot-comp 040         Run '040' in boot and boot-comp"
+    echo "  $0 boot-comp                  Run all tests via the builder"
+    echo "  $0 boot-comp 040              Run test(s) matching '040'"
+    echo "  $0 basic                      Run boot-comp, boot-comp-int"
+    echo "  $0 boot-comp,boot-comp-comp   Run all tests in two modes"
     echo "  $0 boot-comp slice nil        Run tests matching 'slice' or 'nil'"
     echo ""
     echo "Modes:"

@@ -32,6 +32,23 @@ SECTIONS
 		*(.rodata*)
 	} > RAM
 
+	/* ARM unwind tables.  We don't run the unwinder in v1, but
+	 * libgcc.a's bn_rt__BoundsCheck / __aeabi_* helpers reference
+	 * `__exidx_start` and `__exidx_end` even when no actual
+	 * unwinding happens — so we must keep the section + define
+	 * the markers (an empty exidx is fine; libgcc just walks
+	 * start..end looking for matching PCs).
+	 */
+	.ARM.exidx : ALIGN(4) {
+		__exidx_start = .;
+		*(.ARM.exidx*)
+		__exidx_end = .;
+	} > RAM
+
+	.ARM.extab : ALIGN(4) {
+		*(.ARM.extab*)
+	} > RAM
+
 	.data : ALIGN(4) {
 		*(.data*)
 	} > RAM
@@ -45,13 +62,4 @@ SECTIONS
 
 	. = ALIGN(8);
 	_stack_top = ORIGIN(RAM) + LENGTH(RAM);
-
-	/DISCARD/ : {
-		/* ARM unwind tables — not needed for v1, and clang's
-		 * default would leave .ARM.exidx in the binary even
-		 * with `-funwind-tables` off.
-		 */
-		*(.ARM.exidx*)
-		*(.ARM.extab*)
-	}
 }

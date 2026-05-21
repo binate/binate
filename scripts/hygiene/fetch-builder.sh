@@ -31,9 +31,31 @@ if [ ! -x "$BUILDER" ]; then
     echo "fetch-builder smoke: resolved path is not executable: $BUILDER" >&2
     exit 1
 fi
+BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 
-# Run it against the simplest conformance test as an end-to-end check.
-output="$("$BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/conformance/001_hello.bn" 2>&1)"
+# End-to-end check: compile + run the simplest conformance test
+# through the resolved BUILDER.  Under bootstrap-* the wrapper
+# is the Go interpreter directly — give it the cmd/bnc source
+# prefix and let it interpret bnc which then compiles.  Under
+# bnc-* the wrapper bakes in the bin and strips the same prefix
+# when present, so the same invocation works (the wrapper's
+# prefix-strip kicks in).  Either way the chain is:
+#   <builder> [bootstrap-prefix] -I LIB -L LIB --runtime ... -o BIN HELLO
+# and the produced BIN should print the expected output.
+TMP="$(mktemp -d -t binate-fetch-builder-smoke.XXXXXX)"
+trap 'rm -rf "$TMP"' EXIT
+BIN="$TMP/hello"
+build_log="$("$BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
+    -I "$BUILDER_LIB" -L "$BUILDER_LIB" \
+    --runtime "$BUILDER_LIB/runtime/binate_runtime.c" \
+    --build-dir "$TMP" -o "$BIN" \
+    "$BINATE_DIR/conformance/001_hello.bn" 2>&1)" || true
+if [ ! -x "$BIN" ]; then
+    echo "fetch-builder smoke: 001_hello compile failed under $BUILDER_VERSION" >&2
+    echo "$build_log" >&2
+    exit 1
+fi
+output="$("$BIN" 2>&1)"
 expected="$(cat "$BINATE_DIR/conformance/001_hello.expected")"
 if [ "$output" != "$expected" ]; then
     echo "fetch-builder smoke: 001_hello output mismatch" >&2
@@ -42,10 +64,10 @@ if [ "$output" != "$expected" ]; then
     exit 1
 fi
 
-# --lib mode: must print a non-empty path.  For bootstrap-* this is
-# $BINATE_DIR; for bnc-* this is the bundle's lib/.  Either way the
-# fetcher must not return empty or fail.
-BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
+# --lib already resolved above for the compile.  Sanity-check the
+# value: must be a non-empty existing directory regardless of
+# BUILDER_VERSION (bootstrap-* prints $BINATE_DIR; bnc-* prints
+# bundle/lib).
 if [ -z "$BUILDER_LIB" ]; then
     echo "fetch-builder smoke: --lib returned empty path" >&2
     exit 1

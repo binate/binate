@@ -28,8 +28,8 @@ runner_setup() {
         echo "error: boot-comp_arm32_baremetal requires clang" >&2
         exit 2
     fi
-    if ! echo 'int main(void){return 0;}' | clang -target armv7a-none-eabi -mfloat-abi=soft -ffreestanding -nostdlib -x c -c - -o /tmp/_bn_baremetal_probe.o 2>/dev/null; then
-        echo "error: clang cannot target armv7a-none-eabi" >&2
+    if ! echo 'int main(void){return 0;}' | clang -target arm-none-eabi -mfloat-abi=soft -ffreestanding -nostdlib -x c -c - -o /tmp/_bn_baremetal_probe.o 2>/dev/null; then
+        echo "error: clang cannot target arm-none-eabi" >&2
         rm -f /tmp/_bn_baremetal_probe.o
         exit 2
     fi

@@ -42,4 +42,37 @@ if [ "$output" != "$expected" ]; then
     exit 1
 fi
 
+# --lib mode: must print a non-empty path.  For bootstrap-* this is
+# $BINATE_DIR; for bnc-* this is the bundle's lib/.  Either way the
+# fetcher must not return empty or fail.
+BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
+if [ -z "$BUILDER_LIB" ]; then
+    echo "fetch-builder smoke: --lib returned empty path" >&2
+    exit 1
+fi
+if [ ! -d "$BUILDER_LIB" ]; then
+    echo "fetch-builder smoke: --lib path is not a directory: $BUILDER_LIB" >&2
+    exit 1
+fi
+
+# --tool with an unknown name: must exit non-zero with a diagnostic.
+# Catches a regression where the validation switch silently accepts
+# typos and produces a bogus binary path.
+if "$BINATE_DIR/scripts/fetch-builder.sh" --tool bogus_tool >/dev/null 2>&1; then
+    echo "fetch-builder smoke: --tool bogus_tool should have failed" >&2
+    exit 1
+fi
+
+# --tool with a name that's invalid for bootstrap-* (e.g. bni): must
+# fail for bootstrap-* (single Go binary, no toolchain bundle) but
+# succeed for bnc-* (bundle ships all four).
+case "$BUILDER_VERSION" in
+    bootstrap-*)
+        if "$BINATE_DIR/scripts/fetch-builder.sh" --tool bni >/dev/null 2>&1; then
+            echo "fetch-builder smoke: --tool bni should have failed under $BUILDER_VERSION" >&2
+            exit 1
+        fi
+        ;;
+esac
+
 echo "PASS: fetch-builder smoke ($BUILDER_VERSION)"

@@ -86,6 +86,27 @@ memset:
 	bx      lr
 	.size   memset, . - memset
 
+@ pkg/codegen emits direct `call void @bn_libc__Memcpy(...)` for
+@ string-to-managed-chars rodata copies (emit_strings.bn).  Bare-
+@ metal has no pkg/libc impl, so alias the bn_libc__Memcpy /
+@ Memset / Malloc / Calloc / Free / Exit symbols to the
+@ C-ABI / Binate equivalents we already provide.  Signature
+@ shapes match — Binate's `int` on arm32 = i32 = size_t, and
+@ libc Memcpy / Memset return void but memcpy / memset return
+@ void* (the dst); the codegen-emitted call sites discard the
+@ return, so the ABI mismatch is benign.
+	.globl bn_libc__Memcpy
+	.type  bn_libc__Memcpy, %function
+bn_libc__Memcpy:
+	b       memcpy
+	.size   bn_libc__Memcpy, . - bn_libc__Memcpy
+
+	.globl bn_libc__Memset
+	.type  bn_libc__Memset, %function
+bn_libc__Memset:
+	b       memset
+	.size   bn_libc__Memset, . - bn_libc__Memset
+
 	.globl memcmp
 	.type  memcmp, %function
 memcmp:

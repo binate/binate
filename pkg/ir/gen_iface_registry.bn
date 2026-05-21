@@ -1,0 +1,255 @@
+package "pkg/ir"
+
+import "pkg/ast"
+import "pkg/buf"
+import "pkg/types"
+
+// Module-local interface registry: name → ordered method-name
+// list, plus result-type / alias / parent metadata.  Built up
+// during GeneratePackage / GenModule's first pass via
+// collectInterfaceFromDecl; consumed by impl-collection
+// (gen_impl.bn) and the use-site dispatch helpers
+// (gen_iface.bn, gen_iface_extends.bn).  Slice 2.3a-1 of
+// plan-interface-syntax-revision.md introduced the registry;
+// Slices 2.4 / 2.7 / E.3 added the alias / cross-package /
+// parent fields.
+
+// ModuleInterface caches an interface's method-name list (in
+// declaration order) so collectImplVtables can populate vtable
+// slots without re-walking the interface's AST. Module-local
+// because Slice 2.3a-1 only handles same-package impls; cross-
+// package interface refs are deferred. MethodResults stores each
+// method's single return type (TypVoid for void methods); used by
+// genInterfaceMethodCall to type the dispatch result. Multi-return
+// interface methods are deferred — len(Results) > 1 currently
+// stores nil, which the dispatch path treats as void (caller
+// already type-checked the call so no value is ever read).
+type ModuleInterface struct {
+	// Pkg: short package name where the interface is declared
+	// ("main" / "greeter" / etc.). Cross-package references match
+	// on (Pkg, Name); same-package references use Pkg = current
+	// module's pkgShort. Slice 2.7 of plan-cross-package-
+	// interfaces.md.
+	Pkg           @[]char
+	Name          @[]char
+	MethodNames   @[]@[]char
+	MethodResults @[]@types.Type
+	// AliasTarget (Slice 2.4): for `interface X = Y` aliases,
+	// holds the target interface's name. Lookups follow the
+	// chain on read so dispatch + vtable lookup work uniformly
+	// through either name. Empty for non-alias entries. For
+	// cross-package alias targets, AliasTargetPkg names the
+	// target's package; both fields together identify the
+	// canonical underlying interface.
+	AliasTarget    @[]char
+	AliasTargetPkg @[]char
+	// ParentPkgs / ParentNames (plan-interface-embedding.md Slice
+	// E.3): parallel arrays naming each parent interface this one
+	// extends, in declaration order. ParentPkgs[i] / ParentNames[i]
+	// identify a single parent under the same (Pkg, Name) keying
+	// used elsewhere. Empty for interfaces that don't extend.
+	ParentPkgs  @[]@[]char
+	ParentNames @[]@[]char
+}
+
+// moduleInterfaces is the per-module interface registry built up
+// during GeneratePackage / GenModule's first pass. Indexed by name
+// via lookupModuleInterface; reset by InitModule between modules
+// so test runs and successive packages stay isolated.
+var moduleInterfaces @[]ModuleInterface
+
+// collectInterfaceFromDecl records a DECL_INTERFACE's method names
+// (in source order — matches the slot ordering codegen uses for
+// the vtable global). Alias forms (`interface X = Y`) record the
+// target name only; methods are read via alias-following lookups
+// (lookupModuleInterface / findInterfaceMethod). pkgShort is the
+// short package name where this interface is declared; same-package
+// (Slice 2.3a-1) callers pass currentModulePkgShort, RegisterImport
+// (Slice 2.7) passes the import's alias.
+func collectInterfaceFromDecl(d @ast.Decl, pkgShort *[]const char) {
+	if d == nil || d.Kind != ast.DECL_INTERFACE {
+		return
+	}
+	// Generic interface decls (TypeParams non-empty): stash the
+	// AST decl in genericIfaceDecls for use sites
+	// (ensureInstantiatedInterface) and impl-collection
+	// (collectImplsFromDecl's TEXPR_INSTANTIATE branch) to find.
+	// Per plan-generics.md Slice 6c, each instantiation needs its
+	// own ModuleInterface with substituted method types — that
+	// happens lazily.  Registering the bare generic decl under
+	// the source-text name with unresolved T-typed methods would
+	// create stale data that downstream vtable / impl-satisfaction
+	// passes would mis-interpret.
+	if len(d.TypeParams) > 0 {
+		genericIfaceDecls = appendDeclPtr(genericIfaceDecls, d)
+		return
+	}
+	var mi ModuleInterface
+	mi.Pkg = buf.CopyStr(pkgShort)
+	mi.Name = buf.CopyStr(d.Name)
+	if d.IsAlias {
+		// Slice 2.4: interface alias. Target is a TEXPR_NAMED
+		// produced by parseInterfaceRef; copy its Name into
+		// AliasTarget so lookups can follow. For cross-package
+		// alias targets (Slice 2.7), also store the target's
+		// package; otherwise default to this interface's own
+		// package (alias to a same-package iface).
+		if d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_NAMED {
+			mi.AliasTarget = buf.CopyStr(d.TypeRef.Name)
+			if len(d.TypeRef.Pkg) > 0 {
+				mi.AliasTargetPkg = buf.CopyStr(d.TypeRef.Pkg)
+			} else {
+				mi.AliasTargetPkg = buf.CopyStr(pkgShort)
+			}
+		}
+		moduleInterfaces = appendModuleInterface(
+			moduleInterfaces, mi)
+		return
+	}
+	for i := 0; i < len(d.Decls); i++ {
+		var m @ast.Decl = d.Decls[i]
+		if m == nil || m.Kind != ast.DECL_FUNC {
+			continue
+		}
+		mi.MethodNames = appendCharSlicePtr(mi.MethodNames,
+			buf.CopyStr(m.Name))
+		var resultTyp @types.Type = nil
+		if len(m.Results) == 1 {
+			resultTyp = resolveTypeExpr(m.Results[0])
+		}
+		mi.MethodResults = appendTypePtr(mi.MethodResults,
+			resultTyp)
+	}
+	// plan-interface-embedding.md Slice E.3: record this
+	// interface's parents (in declaration order).  Each parent ref
+	// is a TEXPR_NAMED produced by parseInterfaceRef; the Pkg
+	// field is populated for cross-package refs (`pkg.Parent`),
+	// empty for same-package — default empty to pkgShort.
+	for i := 0; i < len(d.Interfaces); i++ {
+		var ref @ast.TypeExpr = d.Interfaces[i]
+		if ref == nil || ref.Kind != ast.TEXPR_NAMED {
+			continue
+		}
+		var parentPkg @[]char
+		if len(ref.Pkg) > 0 {
+			parentPkg = buf.CopyStr(ref.Pkg)
+		} else {
+			parentPkg = buf.CopyStr(pkgShort)
+		}
+		mi.ParentPkgs = appendCharSlicePtr(mi.ParentPkgs, parentPkg)
+		mi.ParentNames = appendCharSlicePtr(mi.ParentNames,
+			buf.CopyStr(ref.Name))
+	}
+	moduleInterfaces = appendModuleInterface(
+		moduleInterfaces, mi)
+}
+
+// resolveModuleInterface returns the index in moduleInterfaces of
+// the entry for (pkg, name), following any alias chain. Returns -1
+// on not-found or cycle (defensive cap at 32 hops). Slice 2.7
+// keys lookup on (Pkg, Name) so cross-package interface refs
+// resolve to the imported package's entry without colliding with
+// a same-named local interface.
+func resolveModuleInterface(pkg *[]const char,
+		name *[]const char) int {
+	var found int = lookupModuleInterfaceIndex(pkg, name)
+	if found < 0 { return -1 }
+	var curPkg @[]char = buf.CopyStr(pkg)
+	var curName @[]char = buf.CopyStr(name)
+	for hop := 0; hop < 32; hop++ {
+		var alias @[]char = moduleInterfaces[found].AliasTarget
+		if len(alias) == 0 { return found }
+		curPkg = moduleInterfaces[found].AliasTargetPkg
+		curName = alias
+		found = lookupModuleInterfaceIndex(curPkg, curName)
+		if found < 0 { return -1 }
+	}
+	return -1
+}
+
+// canonicalIfaceName resolves an interface (pkg, name) through the
+// alias chain and returns the chain tail's name. If the input
+// doesn't refer to a registered interface, returns a fresh copy of
+// the input name — at worst the symbol mangles on the impl-site
+// reference. Slice 2.6 / 2.7.
+func canonicalIfaceName(pkg *[]const char,
+		name *[]const char) @[]char {
+	var idx int = resolveModuleInterface(pkg, name)
+	if idx < 0 {
+		return buf.CopyStr(name)
+	}
+	return buf.CopyStr(moduleInterfaces[idx].Name)
+}
+
+// canonicalIfacePkg returns the canonical package short-name for
+// the chain-tail of (pkg, name). Used by Slice 2.6's vtable
+// mangling (`__ivt.bn_<recv_pkg>__<recv>__<iface_pkg>__<iface>`)
+// to ensure aliases collapse to the underlying interface's
+// package. If lookup fails, returns the input pkg unchanged.
+func canonicalIfacePkg(pkg *[]const char,
+		name *[]const char) @[]char {
+	var idx int = resolveModuleInterface(pkg, name)
+	if idx < 0 {
+		return buf.CopyStr(pkg)
+	}
+	return buf.CopyStr(moduleInterfaces[idx].Pkg)
+}
+
+// lookupModuleInterfaceIndex returns the index of the entry in
+// moduleInterfaces matching (pkg, name), or -1 if absent. No alias
+// resolution.
+func lookupModuleInterfaceIndex(pkg *[]const char,
+		name *[]const char) int {
+	for i := 0; i < len(moduleInterfaces); i++ {
+		if !charEq(moduleInterfaces[i].Pkg, pkg) { continue }
+		if !charEq(moduleInterfaces[i].Name, name) { continue }
+		return i
+	}
+	return -1
+}
+
+// lookupModuleInterface returns the cached method-name list for the
+// interface (pkg, name), or an empty slice if not found. Follows
+// alias chains. Slice 2.7 keys lookup on (Pkg, Name).
+func lookupModuleInterface(pkg *[]const char,
+		name *[]const char) @[]@[]char {
+	var idx int = resolveModuleInterface(pkg, name)
+	if idx < 0 {
+		var empty @[]@[]char
+		return empty
+	}
+	return moduleInterfaces[idx].MethodNames
+}
+
+// IfaceMethodCount returns the number of methods declared on the
+// interface identified by canonical (pkg, name), following alias
+// chains. Returns 0 if the interface isn't registered. Used by
+// codegen (Slice 2.8) to size the array type when declaring an
+// imported vtable as `external constant [N+1 x i8*]`.
+func IfaceMethodCount(pkg *[]const char,
+		name *[]const char) int {
+	return len(lookupModuleInterface(pkg, name))
+}
+
+// IfaceOwnMethodNames returns the OWN method names of the
+// interface (pkg, name), in declaration order — the same list
+// IR-gen records during DECL_INTERFACE collection.  Inherited
+// methods are not included; walk parents (via IfaceParentPkgs /
+// IfaceParentNames) for the full set.
+func IfaceOwnMethodNames(pkg *[]const char,
+		name *[]const char) @[]@[]char {
+	return lookupModuleInterface(pkg, name)
+}
+
+// appendModuleInterface returns ms with v appended.
+func appendModuleInterface(ms @[]ModuleInterface,
+		v ModuleInterface) @[]ModuleInterface {
+	var n int = len(ms)
+	var out @[]ModuleInterface =
+		make_slice(ModuleInterface, n+1)
+	for i := 0; i < n; i++ {
+		out[i] = ms[i]
+	}
+	out[n] = v
+	return out
+}

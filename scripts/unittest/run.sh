@@ -206,6 +206,7 @@ failed=0
 xfailed=0
 skipped=0
 failures=""
+suite_start=$(date +%s)
 
 # Counter for the shard's modulo selection.  Incremented for every
 # package that survives the substring filter (i.e. would have been
@@ -299,7 +300,8 @@ shard_suffix=""
 if [ "$SHARD_COUNT" -gt 0 ]; then
     shard_suffix=" (shard $SHARD_IDX/$SHARD_COUNT)"
 fi
-echo "=== Summary ($MODE)$shard_suffix: $passed passed, $failed failed, $xfailed xfail, $skipped skipped ==="
+suite_elapsed=$(( $(date +%s) - suite_start ))
+echo "=== Summary ($MODE)$shard_suffix: $passed passed, $failed failed, $xfailed xfail, $skipped skipped [${suite_elapsed}s] ==="
 if [ $failed -gt 0 ]; then
     echo "Failures:$failures"
     exit 1

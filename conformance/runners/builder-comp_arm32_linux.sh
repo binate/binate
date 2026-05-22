@@ -1,17 +1,19 @@
 #!/bin/sh
 # Runner: builder-comp_arm32_linux — current-tree cmd/bnc (compiled via
 # the BUILDER during runner_setup → GEN1_COMPILER) cross-compiles
-# each conformance test for armv7-linux-gnueabihf (32-bit ARM Linux)
-# via clang's `--target=armv7-linux-gnueabihf`.  The resulting binary
-# is executed under qemu-arm user-mode emulation.
+# each conformance test for arm-linux-gnueabihf (32-bit ARMv7-A
+# Linux) via clang's `--target=arm-linux-gnueabihf -march=armv7-a`.
+# The resulting binary is executed under qemu-arm user-mode emulation.
 
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 #
 # Required toolchain (CI installs these on ubuntu-latest; for local
 # dev see scripts/setup/arm32-linux-deps.sh):
 #   - clang (host)
-#   - libc6-armhf-cross + linux-libc-dev-armhf-cross  (sysroot)
-#   - binutils-arm-linux-gnueabihf or clang's lld with --target
+#   - gcc-arm-linux-gnueabihf (pulls binutils-arm-linux-gnueabihf +
+#     libc6-armhf-cross + libc6-dev-armhf-cross as deps; gives clang
+#     a complete cross-toolchain it can auto-discover under
+#     /usr/arm-linux-gnueabihf/)
 #   - qemu-user-static (provides qemu-arm-static / qemu-arm)
 #
 # Why this exists: validates the v0 ARM32-Linux derisking path end-
@@ -40,12 +42,12 @@ runner_setup() {
         echo "error: builder-comp_arm32_linux requires clang" >&2
         exit 2
     fi
-    # Sanity check: ensure clang can produce armv7-linux-gnueabihf
-    # output.  This catches missing cross-libc early instead of
+    # Sanity check: ensure clang can produce arm-linux-gnueabihf
+    # output.  Catches missing cross-toolchain early instead of
     # failing test-by-test.
-    if ! echo 'int main(void){return 0;}' | clang -target armv7-linux-gnueabihf -x c -c - -o /tmp/_bn_arm32_probe.o 2>/dev/null; then
-        echo "error: clang cannot target armv7-linux-gnueabihf — install cross-libc" >&2
-        echo "  Linux:  sudo apt-get install libc6-armhf-cross linux-libc-dev-armhf-cross" >&2
+    if ! echo 'int main(void){return 0;}' | clang -target arm-linux-gnueabihf -march=armv7-a -x c -c - -o /tmp/_bn_arm32_probe.o 2>/dev/null; then
+        echo "error: clang cannot target arm-linux-gnueabihf — install cross-toolchain" >&2
+        echo "  Linux:  sudo apt-get install gcc-arm-linux-gnueabihf" >&2
         echo "  macOS:  no easy native path; use Docker or a Linux VM" >&2
         rm -f /tmp/_bn_arm32_probe.o
         exit 2

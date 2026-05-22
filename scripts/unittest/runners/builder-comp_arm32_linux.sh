@@ -1,6 +1,6 @@
 #!/bin/sh
 # Runner: builder-comp_arm32_linux — current-tree cmd/bnc cross-compiles
-# each unit-test package for armv7-linux-gnueabihf; the resulting
+# each unit-test package for arm-linux-gnueabihf (ARMv7-A); the resulting
 # binary runs under qemu-arm user-mode emulation.  See
 # conformance/runners/builder-comp_arm32_linux.sh for toolchain
 # requirements and the v0 ARM32-Linux derisking plan rationale.
@@ -30,9 +30,9 @@ runner_setup() {
         echo "error: builder-comp_arm32_linux requires clang" >&2
         exit 2
     fi
-    if ! echo 'int main(void){return 0;}' | clang -target armv7-linux-gnueabihf -x c -c - -o /tmp/_bn_arm32_probe.o 2>/dev/null; then
-        echo "error: clang cannot target armv7-linux-gnueabihf — install cross-libc" >&2
-        echo "  Linux:  sudo apt-get install libc6-armhf-cross linux-libc-dev-armhf-cross" >&2
+    if ! echo 'int main(void){return 0;}' | clang -target arm-linux-gnueabihf -march=armv7-a -x c -c - -o /tmp/_bn_arm32_probe.o 2>/dev/null; then
+        echo "error: clang cannot target arm-linux-gnueabihf — install cross-toolchain" >&2
+        echo "  Linux:  sudo apt-get install gcc-arm-linux-gnueabihf" >&2
         rm -f /tmp/_bn_arm32_probe.o
         exit 2
     fi

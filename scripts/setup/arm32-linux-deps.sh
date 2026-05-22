@@ -2,8 +2,10 @@
 # Install / verify the local-dev toolchain for the arm32-linux mode.
 #
 # The builder-comp_arm32_linux conformance and unit-test runners need:
-#   - clang (host) with cross-compile support for armv7-linux-gnueabihf
-#   - ARM Linux cross-libc / linux-libc-dev sysroot
+#   - clang (host) with cross-compile support for arm-linux-gnueabihf
+#   - gcc-arm-linux-gnueabihf (pulls binutils + libc6-armhf-cross +
+#     libc6-dev-armhf-cross; gives clang a complete cross-toolchain
+#     auto-discovered under /usr/arm-linux-gnueabihf/)
 #   - qemu-user (qemu-arm or qemu-arm-static) for user-mode ELF
 #     execution
 #
@@ -58,7 +60,7 @@ esac
 # Sanity-check the installed toolchain.
 echo ">>> sanity check"
 echo 'int main(void){return 0;}' \
-    | clang -target armv7-linux-gnueabihf -x c -c - -o /tmp/_bn_arm32_probe.o
+    | clang -target arm-linux-gnueabihf -march=armv7-a -x c -c - -o /tmp/_bn_arm32_probe.o
 rm -f /tmp/_bn_arm32_probe.o
 qemu_arm=""
 if command -v qemu-arm-static >/dev/null 2>&1; then

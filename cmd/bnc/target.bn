@@ -1,0 +1,238 @@
+package "main"
+
+import "pkg/bootstrap"
+import "pkg/types"
+
+// ============================================================
+// Target handling
+// ============================================================
+//
+// applyTarget translates the --target CLI key into a
+// types.TargetInfo + a clang triple + per-target clang flags, runtime
+// files, impl-path suffixes, and (for bare-metal) a linker script.
+// The driver code in main.bn / test.bn reads the populated vars
+// during compile/link and via nativeArchForTarget when picking which
+// pkg/native sub-backend to dispatch to.
+//
+// Split out of main.bn to keep that file under the file-length soft
+// cap and to co-locate every target-related piece (vars, applyTarget,
+// helpers, native-backend mapping).
+
+// targetTriple is the clang target triple to pass via `-target ...`
+// to clang invocations (compile-IR-to-.o + link).  Empty for the
+// default host build; set by applyTarget() when --target selects a
+// non-host target.  Read by compileLL and the link steps in main()
+// and runTestMode.
+var targetTriple @[]char
+
+// targetClangFlags is additional fixed clang flags for the current
+// --target (after `-target <triple>`).  E.g. bare-metal targets
+// need `-mfloat-abi=soft` + `-ffreestanding`; libc-host targets
+// don't.  Populated by applyTarget alongside targetTriple.  Empty
+// for the default host build.
+var targetClangFlags @[]@[]char
+
+// targetImplPathSuffixes is a list of impl-path directories
+// relative to the binate root that should be prepended to the
+// loader's impl-path when this target is active — used by the
+// path mechanism to swap in target-specific runtime impls
+// (e.g. arm32-baremetal swaps in runtime/baremetal_arm32/pkg/...
+// over the default libc-host pkg/...).  Resolved against the
+// concrete root in applyPathFlags.  Empty for the host build.
+var targetImplPathSuffixes @[]@[]char
+
+// targetRuntimeFiles is the list of additional files (relative to
+// the binate root) that bnc should pass to clang at link time for
+// this target — e.g. arm32-baremetal's crt0.s + semihost.s.  See
+// appendTargetRuntime.  Empty for the host build.
+var targetRuntimeFiles @[]@[]char
+
+// targetLinkerScript is the linker script (relative to the binate
+// root) that bnc should pass to clang via `-Wl,-T,<script>`.  Used
+// by bare-metal targets to lay out memory under the host RAM map
+// (e.g. QEMU virt's 0x40000000 base).  Empty for the host build.
+var targetLinkerScript @[]char
+
+// suppressHostRuntime, when true, tells the link step to NOT add
+// the default `runtime/binate_runtime.c` + rt_stubs + libc_stubs.
+// Used by freestanding / no-libc targets (arm32-baremetal) that
+// supply their own crt0 + runtime via targetRuntimeFiles.
+var suppressHostRuntime bool
+
+// applyTarget translates the --target CLI key into a types.TargetInfo
+// and applies it via types.SetTarget. Empty / "host" leaves the
+// current LP64 defaults in place; any unknown key is a hard error
+// before compilation begins. Recognised keys:
+//   ""                — same as "host"
+//   "host"            — default 64-bit LP64 layout
+//   "x86_64-linux"    — SysV-AMD64 / LP64 / Linux ELF.  LLVM path is
+//                       fully supported; native path (--backend
+//                       native) routes to pkg/native/x64 — Phase 2
+//                       stub until per-op lowering lands.  See
+//                       explorations/plan-native-x64.md.
+//   "arm32-linux"     — 32-bit ILP32 ARM Linux (hard-float ABI), with
+//                       libc-host runtime cross-compiled.  v0
+//                       derisking path for the bare-metal target.
+//   "arm32-baremetal" — 32-bit ILP32 ARM bare-metal (soft-float),
+//                       freestanding (no libc, no hosted env).  v1
+//                       target — see plan-arm32-bare-metal.md.
+func applyTarget(key *[]const char) {
+	if len(key) == 0 || streq(key, "host") { return }
+	if streq(key, "x86_64-linux") {
+		// LP64 layout is already the default — no SetTarget needed.
+		// Triple matches stock x86_64-linux-gnu clang configuration;
+		// no extra clang flags required for the LLVM path (codegen
+		// emits standard SysV-AMD64).  The native backend
+		// (--backend native) routes to pkg/native/x64 via
+		// pkg/native.EmitObject's "x86_64" branch; that backend is
+		// a Phase 2 stub until per-op lowering lands.
+		targetTriple = "x86_64-linux-gnu"
+		return
+	}
+	if streq(key, "arm32-linux") {
+		setArm32Layout()
+		// Use `arm-linux-gnueabihf` (not armv7-linux-gnueabihf) so
+		// clang's GCC-toolchain discovery matches the
+		// `gcc-arm-linux-gnueabihf` package's `/usr/arm-linux-gnueabihf/`
+		// install root — that's where the cross-binutils (including
+		// `arm-linux-gnueabihf-ld`) live, and clang only finds them
+		// when the triple matches the install path.  `-march=armv7-a`
+		// pins the CPU.  Mirrors the arm32-baremetal config below.
+		targetTriple = "arm-linux-gnueabihf"
+		targetClangFlags = appendRawCharSlice(targetClangFlags, "-march=armv7-a")
+		return
+	}
+	if streq(key, "arm32-baremetal") {
+		setArm32Layout()
+		// Use `arm-none-eabi` (not armv7a-none-eabi) so clang's
+		// GCC-toolchain discovery matches gcc-arm-none-eabi's
+		// `arm-none-eabi` target directory.  `-march=armv7-a`
+		// pins the CPU.
+		targetTriple = "arm-none-eabi"
+		targetClangFlags = appendRawCharSlice(targetClangFlags, "-march=armv7-a")
+		targetClangFlags = appendRawCharSlice(targetClangFlags, "-mfloat-abi=soft")
+		targetClangFlags = appendRawCharSlice(targetClangFlags, "-ffreestanding")
+		// `-nostartfiles -nodefaultlibs` instead of `-nostdlib`:
+		// strips libc + crt startup files, but lets us explicitly
+		// add libgcc (`-lgcc`) so AEABI helpers (__aeabi_ldivmod
+		// for int64 / int64, etc.) are linkable on demand.  Point
+		// clang at the gcc-arm-none-eabi install root via
+		// `--gcc-toolchain` so its driver adds the right -L paths
+		// to the link — lld doesn't search the GCC toolchain dirs
+		// on its own.  `--sysroot=/usr/lib/gcc/arm-none-eabi`
+		// would also work but `--gcc-toolchain` is the more
+		// targeted flag.
+		targetClangFlags = appendRawCharSlice(targetClangFlags, "-nostartfiles")
+		targetClangFlags = appendRawCharSlice(targetClangFlags, "-nodefaultlibs")
+		// On macOS dev boxes the bare-metal ELF link won't work
+		// out of the box — Apple's `ld` rejects ELF flags like
+		// -T / --target2=rel.  Install `llvm` via Homebrew and
+		// pass `--cflag -fuse-ld=lld` to bnc, or run the bare-
+		// metal pipeline on a Linux host where clang's default
+		// linker handles ELF cross-targets.  CI's ubuntu-latest
+		// runner picks up the cross-linker automatically.
+		targetImplPathSuffixes = appendRawCharSlice(targetImplPathSuffixes,
+			"runtime/baremetal_arm32")
+		targetRuntimeFiles = appendRawCharSlice(targetRuntimeFiles,
+			"runtime/baremetal_arm32/crt0.s")
+		targetRuntimeFiles = appendRawCharSlice(targetRuntimeFiles,
+			"runtime/baremetal_arm32/semihost.s")
+		// libgcc.a (which provides AEABI helpers like __aeabi_ldivmod
+		// for 64-bit divide / shift) is NOT pinned here because its
+		// path depends on the host toolchain layout — apt installs to
+		// /usr/lib/gcc/arm-none-eabi/<v>/, brew installs to a Cellar
+		// path.  The runner script probes the host and passes the
+		// concrete path via `--link-after-objs` so bnc appends it
+		// after the .o files (archive order matters for lld).
+		targetLinkerScript = "runtime/baremetal_arm32/baremetal.ld"
+		suppressHostRuntime = true
+		return
+	}
+	print("error: unknown --target ")
+	println(key)
+	bootstrap.Exit(1)
+}
+
+// nativeArchForTarget returns the arch string pkg/native.EmitObject
+// expects for the currently-active target.  Derived from
+// targetTriple (set by applyTarget); falls back to the host arch
+// when no explicit --target was passed.
+//
+// Recognised mappings:
+//   x86_64-linux-gnu   → "x86_64"
+//   arm-linux-gnueabihf / arm-none-eabi → "" (no native backend
+//                          yet — caller should use the LLVM path)
+//   default (host)     → "aarch64" (the only native backend that
+//                          currently produces real objects)
+//
+// When this returns "", callers should hard-error rather than
+// passing it through to native.EmitObject (which only knows the
+// non-empty arch strings).
+func nativeArchForTarget() *[]const char {
+	if len(targetTriple) == 0 {
+		return "aarch64"
+	}
+	if streq(targetTriple, "x86_64-linux-gnu") {
+		return "x86_64"
+	}
+	return ""
+}
+
+// setArm32Layout sets the 32-bit ILP32 layout (4-byte pointers and
+// ints, 4-byte max alignment).  Shared by arm32-linux and
+// arm32-baremetal; layout doesn't depend on the platform ABI or
+// freestanding-ness.
+func setArm32Layout() {
+	var t types.TargetInfo
+	t.PointerSize = 4
+	t.IntSize = 4
+	t.MaxAlign = 4
+	types.SetTarget(t)
+}
+
+// appendTargetFlags adds `-target <triple>` and the per-target
+// fixed clang flags to a clang argv when a non-host target is
+// active.  No-op for the default host build.
+func appendTargetFlags(args @[]@[]char) @[]@[]char {
+	if len(targetTriple) == 0 { return args }
+	args = appendRawCharSlice(args, "-target")
+	args = appendRawCharSlice(args, targetTriple)
+	for i := 0; i < len(targetClangFlags); i++ {
+		args = appendRawCharSlice(args, targetClangFlags[i])
+	}
+	return args
+}
+
+// appendTargetRuntime adds the target-specific runtime files to a
+// clang link argv plus the `-Wl,-T,<linker-script>` directive when
+// one is set.  No-op for the default host build; bare-metal
+// targets append crt0.s + semihost.s + the QEMU virt linker script
+// via this path.  Host-toolchain archives like libgcc.a — whose
+// concrete path varies between dev hosts — are passed via
+// `--link-after-objs` from the runner script instead.
+//
+// Entries in targetRuntimeFiles that start with '/' are passed
+// through verbatim (already-absolute paths from a system toolchain);
+// everything else is joined with `root` first.
+func appendTargetRuntime(args @[]@[]char, root *[]const char) @[]@[]char {
+	for i := 0; i < len(targetRuntimeFiles); i++ {
+		var entry @[]char = targetRuntimeFiles[i]
+		var abs @[]char
+		if len(entry) > 0 && entry[0] == '/' {
+			abs = entry
+		} else {
+			abs = bootstrap.Concat(
+				bootstrap.Concat(root, "/"),
+				entry)
+		}
+		args = appendRawCharSlice(args, abs)
+	}
+	if len(targetLinkerScript) > 0 {
+		var script @[]char = bootstrap.Concat(
+			bootstrap.Concat(root, "/"),
+			targetLinkerScript)
+		args = appendRawCharSlice(args,
+			bootstrap.Concat("-Wl,-T,", script))
+	}
+	return args
+}

@@ -111,21 +111,23 @@ expand_set() {
     grep -v '^#' "$setfile" | grep -v '^$' | tr '\n' ' '
 }
 
-# strip_signal_msgs filters shell-emitted signal-death diagnostics
-# from a captured runner output stream.  When a child process dies
-# from SIGSEGV / SIGABRT / etc., Linux's shell (dash, bash) writes
-# a line like "Segmentation fault" or "Segmentation fault (core
-# dumped)" to its own stderr.  Because the runners capture the
-# child's stderr via `2>&1` and the whole thing flows through `$()`
-# command substitution, those shell-emitted diagnostics end up
-# concatenated to the program's actual stdout in $actual.  macOS
-# doesn't emit them, so tests pinning silent-SEGV behavior (e.g.
-# 385_iface_nil_dispatch) pass locally but fail on Linux CI.
-# Strip the well-known patterns here so the comparison sees only
-# the program's real output across both OSes.
+# strip_signal_msgs filters out-of-band signal-death diagnostics
+# from a captured runner output stream so silent-SEGV tests (e.g.
+# 385_iface_nil_dispatch) get the same `actual` across macOS dev
+# and Linux CI.  Three sources of noise:
+#   - the shell (dash, bash) prints "Segmentation fault" /
+#     "Segmentation fault (core dumped)" on a child's signal
+#     death (Linux only).
+#   - qemu-user prints "qemu: uncaught target signal N (Foo) -
+#     core dumped" when its guest dies on a signal.  Hits every
+#     arm32-linux SEGV test even though the guest binary itself
+#     produced no extra output.
+#   - GNU `timeout` (used by the arm32 runners to cap wall-clock)
+#     prints "the monitored command dumped core" when it observes
+#     SIGSEGV (its own postscript, separate from the guest's).
 strip_signal_msgs() {
     printf '%s\n' "$1" | grep -Ev \
-        '^(Segmentation fault|Killed|Aborted|Bus error|Floating point exception|Trace/breakpoint trap)( \(core dumped\))?$' \
+        '^(Segmentation fault|Killed|Aborted|Bus error|Floating point exception|Trace/breakpoint trap)( \(core dumped\))?$|^qemu(-[^:]*)?: uncaught target signal .*$|^timeout: the monitored command dumped core$' \
         | awk 'BEGIN { first = 1 } { if (!first) printf "\n"; printf "%s", $0; first = 0 }'
 }
 

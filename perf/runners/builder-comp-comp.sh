@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: boot-comp-comp — gen1 compiler compiles test.bn to native.
+# Runner: builder-comp-comp — gen1 compiler compiles test.bn to native.
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
 runner_setup() { build_gen1; }

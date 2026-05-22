@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install / verify the local-dev toolchain for the arm32-linux mode.
 #
-# The boot-comp_arm32_linux conformance and unit-test runners need:
+# The builder-comp_arm32_linux conformance and unit-test runners need:
 #   - clang (host) with cross-compile support for armv7-linux-gnueabihf
 #   - ARM Linux cross-libc / linux-libc-dev sysroot
 #   - qemu-user (qemu-arm or qemu-arm-static) for user-mode ELF
@@ -40,10 +40,10 @@ macOS has no convenient native cross-toolchain for arm32-linux
 (Apple clang doesn't ship the Linux sysroot, and Homebrew doesn't
 package one cleanly).  Two recommended options:
 
-  1.  Run the boot-comp_arm32_linux runner inside a Linux container:
+  1.  Run the builder-comp_arm32_linux runner inside a Linux container:
         docker run --rm -it -v "$PWD":/work -w /work ubuntu:24.04 \
             sh -c "scripts/setup/arm32-linux-deps.sh && \
-                   conformance/run.sh boot-comp_arm32_linux"
+                   conformance/run.sh builder-comp_arm32_linux"
 
   2.  Use a Linux dev VM / SSH host and run the same commands there.
 

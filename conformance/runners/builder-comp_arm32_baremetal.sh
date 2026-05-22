@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: boot-comp_arm32_baremetal — current-tree cmd/bnc (compiled
+# Runner: builder-comp_arm32_baremetal — current-tree cmd/bnc (compiled
 # via the BUILDER during runner_setup → GEN1_COMPILER) compiles each
 # conformance test for ARMv7-A bare-metal (--target arm32-baremetal).
 # The resulting ELF binary boots
@@ -27,14 +27,14 @@ fi
 
 runner_setup() {
     if [ -z "$QEMU_SYSTEM_ARM" ]; then
-        echo "error: boot-comp_arm32_baremetal requires qemu-system-arm" >&2
+        echo "error: builder-comp_arm32_baremetal requires qemu-system-arm" >&2
         echo "  Linux:  sudo apt-get install qemu-system-arm" >&2
         echo "  macOS:  brew install qemu" >&2
         echo "  Override with QEMU_SYSTEM_ARM=<path>" >&2
         exit 2
     fi
     if ! command -v clang >/dev/null 2>&1; then
-        echo "error: boot-comp_arm32_baremetal requires clang" >&2
+        echo "error: builder-comp_arm32_baremetal requires clang" >&2
         exit 2
     fi
     # Sanity check: ensure clang can produce arm-none-eabi

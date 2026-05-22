@@ -28,7 +28,7 @@ if [ -z "$MODE" ]; then
     echo "Usage: $0 <mode> [filter...]"
     echo ""
     echo "Mode argument forms:"
-    echo "  <name>                single mode (e.g. boot-comp)"
+    echo "  <name>                single mode (e.g. builder-comp)"
     echo "  <name>,<name>,...     comma-separated list of modes"
     echo "  <modeset>             mode set file (e.g. basic, all)"
     echo ""

@@ -115,10 +115,10 @@ check "bni" "$actual"
 # SKIP: blocked on a separate bug — when inner cmd/bni runs in
 # interpreted context, registerPureCExterns crashes constructing a
 # function value for a pure-C extern (libc.Malloc has no `.bn` body,
-# so LookupFunc fails).  See claude-todo.md "boot-comp-int-int:
+# so LookupFunc fails).  See claude-todo.md "builder-comp-int-int:
 # registerPureCExterns crashes from interpreted cmd/bni".  The Args
 # half of double-bni (no recursion) is verified by 001_hello in
-# manual boot-comp-int-int runs.
+# manual builder-comp-int-int runs.
 echo "SKIP: bni-under-bni (registerPureCExterns crashes from interpreted cmd/bni; tracked in claude-todo.md)"
 
 echo ""

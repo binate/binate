@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: boot-comp-int — Compiled bni (bytecode VM) runs --test natively.
+# Runner: builder-comp-int — Compiled bni (bytecode VM) runs --test natively.
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
 runner_setup() { build_interp_boot_comp; }

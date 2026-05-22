@@ -11,7 +11,7 @@ This repository is bootstrapped using the [Go bootstrap interpreter](https://git
 
 ## Status
 
-Self-hosted interpreter and compiler are working. The interpreter can interpret itself (double interpretation verified). The compiler produces native binaries via LLVM IR. Self-compilation works: gen1 (boot-comp-comp) and gen2 (boot-comp-comp-comp) compilers both pass all 98 conformance tests.
+Self-hosted interpreter and compiler are working. The interpreter can interpret itself (double interpretation verified). The compiler produces native binaries via LLVM IR. Self-compilation works: gen1 (builder-comp-comp) and gen2 (builder-comp-comp-comp) compilers both pass all 98 conformance tests.
 
 ## Quick Start
 
@@ -37,7 +37,7 @@ cd ../bootstrap
 go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/loader
 
 # Run conformance tests
-cd ../binate && ./conformance/run.sh boot
+cd ../binate && ./conformance/run.sh builder-comp
 ```
 
 ### What the bootstrap can and can't run
@@ -51,12 +51,14 @@ but *not* the bytecode VM (`pkg/vm`, `cmd/bni`).  Practical consequence:
   (`pkg/{token,lexer,ast,parser,types,ir,codegen,loader,buf,debug,mangle,builtin/testing,bootstrap,rt}`),
   plus `cmd/bnas` and `cmd/bnlint`.
 - **Needs bnc to build first:** `cmd/bni`, `pkg/vm`.  Use
-  `scripts/build-bni.sh -o <path>` (or the test runners' `boot-comp*` modes)
+  `scripts/build-bni.sh -o <path>` (or the test runners' `builder-comp*` modes)
   rather than `go run . -test pkg/vm` / `go run . cmd/bni`.
 
 See [explorations/bootstrap-subset.md](https://github.com/binate/explorations/blob/main/bootstrap-subset.md)
-for the language subset; see `scripts/unittest/*.xfail.boot` for the
-per-package "this can't run under boot" markers the test runner consults.
+for the language subset.  The CI test runners pin BUILDER_VERSION to
+the bnc release the current tree was built from (or
+`bootstrap-X.Y.Z` while bnc is still pre-1.0); each test mode goes
+through `scripts/fetch-builder.sh` to resolve it.
 
 ## Project Structure
 
@@ -129,7 +131,7 @@ compiled bni (built via bnc-via-bootstrap)
     → interprets target.bn
 ```
 
-This is the `boot-comp-int-int` mode in the test harness.
+This is the `builder-comp-int-int` mode in the test harness.
 
 ### Packages
 
@@ -185,15 +187,16 @@ Constants: `O_RDONLY`, `O_WRONLY`, `O_RDWR`, `O_CREATE`, `O_TRUNC`, `O_APPEND`, 
 Each source file has a corresponding `*_test.bn` file with `func TestXxx() testing.TestResult` functions.  The recommended entry point is `scripts/unittest/run.sh`, which knows which packages can run under which modes (see the [Quick Start](#what-the-bootstrap-can-and-cant-run) note):
 
 ```sh
-# Run all unit tests under boot (Go bootstrap interpreter) — skips pkg/vm,
-# cmd/bni and any other package marked xfail.boot.
-./scripts/unittest/run.sh boot
+# Run all unit tests through current-tree cmd/bnc — the BUILDER
+# compiles cmd/bnc once, then that compiles + runs each test
+# package.
+./scripts/unittest/run.sh builder-comp
 
 # Filter to specific packages.
-./scripts/unittest/run.sh boot pkg/types
+./scripts/unittest/run.sh builder-comp pkg/types
 
-# pkg/vm and cmd/bni need a compiled bni; use a boot-comp* mode.
-./scripts/unittest/run.sh boot-comp-int pkg/vm cmd/bni
+# pkg/vm and cmd/bni use a compiled bni; use a *-int mode.
+./scripts/unittest/run.sh builder-comp-int pkg/vm cmd/bni
 ```
 
 For ad-hoc bootstrap-direct invocations (skipping the runner), invoke the bootstrap interpreter manually but only on bootstrap-runnable packages:
@@ -211,13 +214,12 @@ Standalone `.bn` programs with expected output, shared across all execution back
 
 ```sh
 cd binate
-./conformance/run.sh boot                   # Go bootstrap interpreter
-./conformance/run.sh boot-comp              # boot interprets cmd/bnc → compile test.bn
-./conformance/run.sh boot-comp-int          # compiled bni (bytecode VM) → test.bn
-./conformance/run.sh boot-comp-int-int      # compiled bni → cmd/bni → test.bn
-./conformance/run.sh boot-comp-comp         # compiled compiler (gen1) → compile test.bn
-./conformance/run.sh boot-comp-comp-int     # gen1-compiled bni → test.bn
-./conformance/run.sh boot-comp-comp-comp    # gen2 compiler → compile test.bn
+./conformance/run.sh builder-comp              # current-tree cmd/bnc compiles test.bn → native
+./conformance/run.sh builder-comp-int          # compiled bni (bytecode VM) → test.bn
+./conformance/run.sh builder-comp-int-int      # compiled bni → cmd/bni → test.bn
+./conformance/run.sh builder-comp-comp         # gen1 compiles gen2; gen2 compiles test.bn
+./conformance/run.sh builder-comp-comp-int     # gen1-compiled bni → test.bn
+./conformance/run.sh builder-comp-comp-comp    # ... gen3 compiles test.bn (self-host check)
 ```
 
 ### Go-Level Tests

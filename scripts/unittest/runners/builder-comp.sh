@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: boot-comp — current-tree cmd/bnc compiles each test package.
+# Runner: builder-comp — current-tree cmd/bnc compiles each test package.
 # The BUILDER (resolved BUILDER_VERSION binary) is used to compile
 # current cmd/bnc once during runner_setup → GEN1_COMPILER; every
 # per-test compile then goes through GEN1, so the "comp" link is

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: boot-comp-comp-int — Gen1-compiled bytecode VM runs --test natively.
+# Runner: builder-comp-comp-int — Gen1-compiled bytecode VM runs --test natively.
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
 runner_setup() { build_gen1; build_interp "$GEN1_COMPILER"; }

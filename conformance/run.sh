@@ -8,17 +8,17 @@
 #   BINATE_FLAGS    Extra flags passed to the Binate compiler (e.g. "-g" for debug info)
 #
 # Modes (chains of: builder=resolved BUILDER_VERSION binary,
-# int=bytecode VM, comp=compiler).  Modes keep the legacy `boot-`
-# prefix for historical continuity; the first link is the
-# BUILDER_VERSION-resolved binary (currently bootstrap-* via
-# scripts/fetch-builder.sh, eventually a tagged bnc-X.Y.Z bundle).
+# comp=compiler from current tree, int=bytecode VM).  The first
+# link is the BUILDER_VERSION-resolved binary (currently bootstrap-*
+# via scripts/fetch-builder.sh, eventually a tagged bnc-X.Y.Z
+# bundle).
 #
-#   boot-comp             Builder interprets cmd/bnc, which compiles .bn to native
-#   boot-comp-int         boot-comp compiles cmd/bni → binary, binary runs .bn via bytecode VM
-#   boot-comp-int-int     boot-comp-int interprets cmd/bni, which interprets .bn
-#   boot-comp-comp        boot-comp compiles cmd/bnc → gen1, gen1 compiles .bn
-#   boot-comp-comp-int    gen1 compiles cmd/bni → binary, binary runs .bn via bytecode VM
-#   boot-comp-comp-comp   boot-comp-comp builds gen1, gen1 → gen2, gen2 compiles .bn
+#   builder-comp             Builder interprets cmd/bnc, which compiles .bn to native
+#   builder-comp-int         builder-comp compiles cmd/bni → binary, binary runs .bn via bytecode VM
+#   builder-comp-int-int     builder-comp-int interprets cmd/bni, which interprets .bn
+#   builder-comp-comp        builder-comp compiles cmd/bnc → gen1, gen1 compiles .bn
+#   builder-comp-comp-int    gen1 compiles cmd/bni → binary, binary runs .bn via bytecode VM
+#   builder-comp-comp-comp   builder-comp-comp builds gen1, gen1 → gen2, gen2 compiles .bn
 #
 # Test formats:
 #   Single-file: NNN_name.bn + NNN_name.expected (positive: run and compare output)
@@ -57,11 +57,11 @@ if [ -z "$MODE" ]; then
     echo "Multiple filters are OR'd: any match includes the test."
     echo ""
     echo "Examples:"
-    echo "  $0 boot-comp                  Run all tests via the builder"
-    echo "  $0 boot-comp 040              Run test(s) matching '040'"
-    echo "  $0 basic                      Run boot-comp, boot-comp-int"
-    echo "  $0 boot-comp,boot-comp-comp   Run all tests in two modes"
-    echo "  $0 boot-comp slice nil        Run tests matching 'slice' or 'nil'"
+    echo "  $0 builder-comp                  Run all tests via the builder"
+    echo "  $0 builder-comp 040              Run test(s) matching '040'"
+    echo "  $0 basic                      Run builder-comp, builder-comp-int"
+    echo "  $0 builder-comp,builder-comp-comp   Run all tests in two modes"
+    echo "  $0 builder-comp slice nil        Run tests matching 'slice' or 'nil'"
     echo ""
     echo "Modes:"
     for r in "$(dirname "$0")"/runners/*.sh; do

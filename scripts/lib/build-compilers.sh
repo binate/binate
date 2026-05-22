@@ -44,7 +44,7 @@ _resolve_builder_lib() {
     echo "$_BUILDER_LIB"
 }
 
-# Build gen1 compiler (boot-comp compiles cmd/bnc → gen1 binary)
+# Build gen1 compiler (builder-comp compiles cmd/bnc → gen1 binary)
 # Sets GEN1_COMPILER to the path.
 build_gen1() {
     GEN1_COMPILER="/tmp/binate_gen1_compiler_$$"
@@ -84,7 +84,7 @@ build_gen2() {
 # back to LLVM for everything that isn't the main module); only the
 # cmd/bnc main module gets the native aarch64 lowering.  The resulting
 # binary is much faster than re-running gen1 for every test compile
-# — used by the boot-comp_native_aa64-comp_native_aa64 runner.
+# — used by the builder-comp_native_aa64-comp_native_aa64 runner.
 # Calls build_gen1 if GEN1_COMPILER isn't set, so the "first comp"
 # is always current-tree cmd/bnc rather than the BUILDER directly
 # (under bnc-* BUILDER, bnc-X.Y.Z's native backend may lag behind

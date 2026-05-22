@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: boot-comp — bootstrap interprets bnc to compile, then runs binary.
+# Runner: builder-comp — bootstrap interprets bnc to compile, then runs binary.
 
 runner_compile() {
     bn="$1"

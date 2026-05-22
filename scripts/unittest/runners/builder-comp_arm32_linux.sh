@@ -1,8 +1,8 @@
 #!/bin/sh
-# Runner: boot-comp_arm32_linux — current-tree cmd/bnc cross-compiles
+# Runner: builder-comp_arm32_linux — current-tree cmd/bnc cross-compiles
 # each unit-test package for armv7-linux-gnueabihf; the resulting
 # binary runs under qemu-arm user-mode emulation.  See
-# conformance/runners/boot-comp_arm32_linux.sh for toolchain
+# conformance/runners/builder-comp_arm32_linux.sh for toolchain
 # requirements and the v0 ARM32-Linux derisking plan rationale.
 # The BUILDER is used once during runner_setup to compile current
 # cmd/bnc → GEN1_COMPILER; every per-test compile then goes through
@@ -20,14 +20,14 @@ fi
 
 runner_setup() {
     if [ -z "$QEMU_ARM" ]; then
-        echo "error: boot-comp_arm32_linux requires qemu-arm or qemu-arm-static" >&2
+        echo "error: builder-comp_arm32_linux requires qemu-arm or qemu-arm-static" >&2
         echo "  Linux:  sudo apt-get install qemu-user-static" >&2
         echo "  macOS:  brew install qemu" >&2
         echo "  Override with QEMU_ARM=<path>" >&2
         exit 2
     fi
     if ! command -v clang >/dev/null 2>&1; then
-        echo "error: boot-comp_arm32_linux requires clang" >&2
+        echo "error: builder-comp_arm32_linux requires clang" >&2
         exit 2
     fi
     if ! echo 'int main(void){return 0;}' | clang -target armv7-linux-gnueabihf -x c -c - -o /tmp/_bn_arm32_probe.o 2>/dev/null; then

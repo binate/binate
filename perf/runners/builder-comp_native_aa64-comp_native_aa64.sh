@@ -1,8 +1,8 @@
 #!/bin/sh
-# Runner: boot-comp_native_aa64-comp_native_aa64 — bootstrap builds bnc
+# Runner: builder-comp_native_aa64-comp_native_aa64 — bootstrap builds bnc
 # with --backend native once, then that native bnc binary compiles each
 # perf test with --backend native.  macOS/Apple Silicon only.  Mirrors
-# conformance/runners/boot-comp_native_aa64-comp_native_aa64.sh.
+# conformance/runners/builder-comp_native_aa64-comp_native_aa64.sh.
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
 runner_setup() { build_bnc_native_aa64; }

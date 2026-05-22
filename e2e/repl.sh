@@ -1,7 +1,7 @@
 #!/bin/sh
 # e2e/repl.sh — End-to-end test for `bni --repl` (Tier 1 PoC).
 #
-# Builds bni via boot-comp (cmd/bni isn't bootstrap-runnable since
+# Builds bni via builder-comp (cmd/bni isn't bootstrap-runnable since
 # pkg/vm uses floats), creates a tiny fixture module that defines a
 # `helper` function, then drives the REPL via piped stdin and
 # compares output byte-for-byte against expectations.
@@ -40,8 +40,8 @@ BUILD_DIR="$TMP/build"
 mkdir -p "$BUILD_DIR"
 FIXTURE="$TMP/fixture.bn"
 
-# ----- Build bni via boot-comp -----
-echo "Building bni via boot-comp..."
+# ----- Build bni via builder-comp -----
+echo "Building bni via builder-comp..."
 build_log=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
     "$BINATE_DIR/cmd/bnc" -- \
     -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$BUILD_DIR" \

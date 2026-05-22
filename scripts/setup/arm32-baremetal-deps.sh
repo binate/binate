@@ -2,7 +2,7 @@
 # Install / verify the local-dev toolchain for the arm32-baremetal
 # mode.
 #
-# The boot-comp_arm32_baremetal conformance + unit-test runners
+# The builder-comp_arm32_baremetal conformance + unit-test runners
 # need:
 #   - clang (host) with armv7a-none-eabi target support
 #   - lld (LLVM linker) — clang's default linker on macOS / many

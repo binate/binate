@@ -4,32 +4,32 @@
 # Runs unit tests for all packages (or filtered packages) using the specified
 # backend mode.
 #
-# Modes (chains of: builder=resolved BUILDER_VERSION binary running bnc,
-# int=bytecode VM, comp=compiler).  Modes are named with the legacy
-# `boot-` prefix for historical continuity; the first link is the
-# BUILDER_VERSION-resolved binary (currently bootstrap-* via
-# scripts/fetch-builder.sh, eventually a tagged bnc-X.Y.Z bundle).
+# Modes (chains of: builder=resolved BUILDER_VERSION binary running
+# cmd/bnc, comp=compiler from current tree, int=bytecode VM).  The
+# first link is the BUILDER_VERSION-resolved binary (currently
+# bootstrap-* via scripts/fetch-builder.sh, eventually a tagged
+# bnc-X.Y.Z bundle).
 #
-#   boot-comp             Builder interprets bnc, which compiles and runs tests
-#   boot-comp-int         Compiled bni runs --test natively via bytecode VM
-#   boot-comp-comp        Self-compiled compiler (gen1) runs --test
-#   boot-comp-comp-int    Gen1-compiled bni runs --test natively via bytecode VM
-#   boot-comp-comp-comp   Gen2 compiler runs --test
+#   builder-comp             Builder interprets bnc, which compiles and runs tests
+#   builder-comp-int         Compiled bni runs --test natively via bytecode VM
+#   builder-comp-comp        Self-compiled compiler (gen1) runs --test
+#   builder-comp-comp-int    Gen1-compiled bni runs --test natively via bytecode VM
+#   builder-comp-comp-comp   Gen2 compiler runs --test
 #
 # Mode sets:
-#   basic               boot-comp, boot-comp-int
-#   all                 basic + boot-comp-comp, boot-comp-comp-int, boot-comp-comp-comp
+#   basic               builder-comp, builder-comp-int
+#   all                 basic + builder-comp-comp, builder-comp-comp-int, builder-comp-comp-comp
 #
 # Filters select packages by substring match (e.g. "ir" matches "pkg/ir").
 #
 # Per-package xfail:
 #   scripts/unittest/<pkg-with-slashes-replaced-by-dashes>.xfail.<mode>
-#   e.g. scripts/unittest/pkg-vm.xfail.boot-comp-comp-int
+#   e.g. scripts/unittest/pkg-vm.xfail.builder-comp-comp-int
 #   Contents are the reason for the expected failure.
 #
 # Per-test skip (bni-based runners only):
 #   scripts/unittest/<pkg-with-slashes-replaced-by-dashes>.skip.<mode>
-#   e.g. scripts/unittest/pkg-codegen.skip.boot-comp-int-int
+#   e.g. scripts/unittest/pkg-codegen.skip.builder-comp-int-int
 #   Contents are a name substring; matching Test* functions are
 #   skipped via `--skip` to the runner.
 
@@ -93,11 +93,11 @@ if [ -z "$MODE" ]; then
     echo "'pkg/ir'). Multiple filters are OR'd."
     echo ""
     echo "Examples:"
-    echo "  $0 boot-comp                  Run all tests via the builder"
-    echo "  $0 boot-comp vm               Run pkg/vm tests via the builder"
-    echo "  $0 basic                      Run boot-comp, boot-comp-int"
-    echo "  $0 boot-comp,boot-comp-comp   Run all tests in two modes"
-    echo "  $0 boot-comp ir codegen       Run pkg/ir and pkg/codegen tests"
+    echo "  $0 builder-comp                  Run all tests via the builder"
+    echo "  $0 builder-comp vm               Run pkg/vm tests via the builder"
+    echo "  $0 basic                      Run builder-comp, builder-comp-int"
+    echo "  $0 builder-comp,builder-comp-comp   Run all tests in two modes"
+    echo "  $0 builder-comp ir codegen       Run pkg/ir and pkg/codegen tests"
     echo ""
     echo "Modes:"
     for r in "$(dirname "$0")"/runners/*.sh; do
@@ -117,14 +117,14 @@ if [ -z "$MODE" ]; then
     done
     echo ""
     echo "Xfail: scripts/unittest/<pkg-path>.xfail.<mode>"
-    echo "  e.g. scripts/unittest/pkg-vm.xfail.boot-comp-comp-int"
+    echo "  e.g. scripts/unittest/pkg-vm.xfail.builder-comp-comp-int"
     echo "  (slashes in package path replaced with dashes)"
     echo ""
     echo "Per-test skip: scripts/unittest/<pkg-path>.skip.<mode>"
     echo "  Contents are a name substring; matching Test*"
     echo "  functions are skipped (passed as --skip to the"
-    echo "  runner).  Honored by bni-based runners (boot-comp-int,"
-    echo "  boot-comp-int-int, boot-comp-comp-int)."
+    echo "  runner).  Honored by bni-based runners (builder-comp-int,"
+    echo "  builder-comp-int-int, builder-comp-comp-int)."
     exit 1
 fi
 shift
@@ -256,7 +256,7 @@ for pkg in $PACKAGES; do
     # Per-test skip file: <pkg-key>.skip.<mode>.  Contents are a
     # substring pattern; tests whose name contains the pattern are
     # skipped (passed as --skip to the runner).  Only the bni-based
-    # runners (boot-comp-int, boot-comp-int-int, boot-comp-comp-int)
+    # runners (builder-comp-int, builder-comp-int-int, builder-comp-comp-int)
     # honor this; other modes ignore SKIP_FILTER.
     skip_file="$SCRIPT_DIR/${xfail_key}.skip.${MODE}"
     SKIP_FILTER=""

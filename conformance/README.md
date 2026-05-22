@@ -15,24 +15,24 @@ Run `./conformance/run.sh` with no arguments for full help.
 ### Quick examples
 
 ```sh
-./conformance/run.sh boot-comp                 # All tests via the builder
-./conformance/run.sh boot-comp 040             # Test(s) matching '040'
-./conformance/run.sh basic                     # boot-comp + boot-comp-int
-./conformance/run.sh boot-comp,boot-comp-comp  # Comma-separated modes
-./conformance/run.sh boot-comp slice nil       # Tests matching 'slice' or 'nil'
+./conformance/run.sh builder-comp                 # All tests via the builder
+./conformance/run.sh builder-comp 040             # Test(s) matching '040'
+./conformance/run.sh basic                     # builder-comp + builder-comp-int
+./conformance/run.sh builder-comp,builder-comp-comp  # Comma-separated modes
+./conformance/run.sh builder-comp slice nil       # Tests matching 'slice' or 'nil'
 ```
 
 ### Modes
 
-Each mode is a chain of: `builder` (resolved BUILDER_VERSION binary, named `boot-` historically), `comp` (compiler), `int` (bytecode VM).
+Each mode is a chain of: `builder` (resolved BUILDER_VERSION binary), `comp` (compiler from current tree), `int` (bytecode VM).
 
 | Mode | Description |
 |------|-------------|
-| `boot-comp` | Builder interprets cmd/bnc → compiles test to native |
-| `boot-comp-int` | Compiled cmd/bni runs test via bytecode VM |
-| `boot-comp-comp` | Gen1 compiler compiles test |
-| `boot-comp-comp-int` | Gen1-compiled cmd/bni runs test via bytecode VM |
-| `boot-comp-comp-comp` | Gen2 compiler compiles test |
+| `builder-comp` | Builder interprets cmd/bnc → compiles test to native |
+| `builder-comp-int` | Compiled cmd/bni runs test via bytecode VM |
+| `builder-comp-comp` | Gen1 compiler compiles test |
+| `builder-comp-comp-int` | Gen1-compiled cmd/bni runs test via bytecode VM |
+| `builder-comp-comp-comp` | Gen2 compiler compiles test |
 
 Mode sets are defined in `scripts/modesets/` (one file per set, one mode per line). Adding a new mode set is just adding a file. Current sets: `basic`, `all`.
 
@@ -41,8 +41,8 @@ Mode sets are defined in `scripts/modesets/` (one file per set, one mode per lin
 Optional arguments filter tests by substring match against the test name. Multiple filters are OR'd.
 
 ```sh
-./conformance/run.sh boot-comp recursive int_lit switch
-./conformance/run.sh boot-comp,boot-comp-comp 040    # comma-separated modes
+./conformance/run.sh builder-comp recursive int_lit switch
+./conformance/run.sh builder-comp,builder-comp-comp 040    # comma-separated modes
 ```
 
 ## Test Formats
@@ -63,7 +63,7 @@ Optional arguments filter tests by substring match against the test name. Multip
 
 `NNN_name.xfail.<mode>` marks a test as expected failure for that mode. The file contents describe the reason. Known failures show as `XFAIL` instead of `FAIL` and don't count as failures in the summary.
 
-Example: `042_foo.xfail.boot` with contents `requires bit_cast (compiled mode only)`.
+Example: `042_foo.xfail.builder-comp-int` with contents `requires bit_cast (compiled mode only)`.
 
 ## Environment
 

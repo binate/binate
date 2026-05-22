@@ -108,10 +108,10 @@ check "bnc" "$actual"
 # bni is skipped here: cmd/bni imports pkg/vm, which uses float
 # literals that the bootstrap lexer doesn't recognize, so we can't
 # interpret bni via bootstrap. To cover bni we would have to first
-# compile it (via boot-comp) and then invoke the binary against the
+# compile it (via builder-comp) and then invoke the binary against the
 # fixture. That belongs in the broader e2e build-out — see the
 # "Build out e2e testing" entry in explorations/claude-todo.md.
-echo "SKIP: bni (bootstrap can't interp cmd/bni — needs boot-comp build)"
+echo "SKIP: bni (bootstrap can't interp cmd/bni — needs builder-comp build)"
 
 # ----- bnlint (lint pkg/splitlib via -I/-L) -----------------------
 # bnlint is no longer required to be bootstrap-runnable, so we build

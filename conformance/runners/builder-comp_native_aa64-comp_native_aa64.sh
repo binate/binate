@@ -1,11 +1,11 @@
 #!/bin/sh
-# Runner: boot-comp_native_aa64-comp_native_aa64 — Bootstrap builds bnc
+# Runner: builder-comp_native_aa64-comp_native_aa64 — Bootstrap builds bnc
 # with --backend native (cmd/bnc's main module emitted via the native
 # aarch64 path; deps still go through LLVM as in compileMainNative's
 # hybrid).  That native bnc binary then compiles each conformance test
 # with --backend native.  macOS/Apple Silicon only.
 #
-# Why this exists: the older `boot-comp_native_aa64` runner invoked
+# Why this exists: the older `builder-comp_native_aa64` runner invoked
 # `go run bootstrap → bnc --backend native` per test, paying the
 # bootstrap-interpretation tax on every compile.  Native EmitObject
 # under bootstrap interp is the dominant cost — running it once for
@@ -28,7 +28,7 @@ runner_exec() {
     if [ -x "$tmpbin" ]; then
         # Cap wall-clock via timeout(1) so a runaway test (e.g. a
         # codegen bug that yields an infinite loop) doesn't wedge the
-        # sweep.  Inherited from the older boot-comp_native_aa64
+        # sweep.  Inherited from the older builder-comp_native_aa64
         # runner.
         if command -v timeout >/dev/null 2>&1; then
             timeout 3 "$tmpbin" 2>&1 || true

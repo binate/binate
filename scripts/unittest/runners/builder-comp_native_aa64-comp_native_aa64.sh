@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: boot-comp_native_aa64-comp_native_aa64 — current-tree
+# Runner: builder-comp_native_aa64-comp_native_aa64 — current-tree
 # cmd/bnc (compiled via the LLVM path → GEN1) is then re-compiled
 # with its own native AArch64 backend → BNC_NATIVE; that BNC_NATIVE
 # binary compiles each test package with --backend native and the

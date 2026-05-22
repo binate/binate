@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner: boot-comp_arm32_linux — current-tree cmd/bnc (compiled via
+# Runner: builder-comp_arm32_linux — current-tree cmd/bnc (compiled via
 # the BUILDER during runner_setup → GEN1_COMPILER) cross-compiles
 # each conformance test for armv7-linux-gnueabihf (32-bit ARM Linux)
 # via clang's `--target=armv7-linux-gnueabihf`.  The resulting binary
@@ -30,14 +30,14 @@ fi
 
 runner_setup() {
     if [ -z "$QEMU_ARM" ]; then
-        echo "error: boot-comp_arm32_linux requires qemu-arm or qemu-arm-static" >&2
+        echo "error: builder-comp_arm32_linux requires qemu-arm or qemu-arm-static" >&2
         echo "  Linux:  sudo apt-get install qemu-user-static" >&2
         echo "  macOS:  brew install qemu" >&2
         echo "  Override with QEMU_ARM=<path>" >&2
         exit 2
     fi
     if ! command -v clang >/dev/null 2>&1; then
-        echo "error: boot-comp_arm32_linux requires clang" >&2
+        echo "error: builder-comp_arm32_linux requires clang" >&2
         exit 2
     fi
     # Sanity check: ensure clang can produce armv7-linux-gnueabihf

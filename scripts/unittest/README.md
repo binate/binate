@@ -15,23 +15,23 @@ Run `./scripts/unittest/run.sh` with no arguments for full help.
 ### Quick examples
 
 ```sh
-./scripts/unittest/run.sh boot-comp                Run all packages via the builder
-./scripts/unittest/run.sh boot-comp vm             pkg/vm via the builder
-./scripts/unittest/run.sh basic                    boot-comp + boot-comp-int
-./scripts/unittest/run.sh boot-comp ir codegen     pkg/ir and pkg/codegen
+./scripts/unittest/run.sh builder-comp                Run all packages via the builder
+./scripts/unittest/run.sh builder-comp vm             pkg/vm via the builder
+./scripts/unittest/run.sh basic                    builder-comp + builder-comp-int
+./scripts/unittest/run.sh builder-comp ir codegen     pkg/ir and pkg/codegen
 ```
 
 ### Modes
 
-Each mode is a chain of: `builder` (resolved BUILDER_VERSION binary, named `boot-` historically), `comp` (compiler), `int` (bytecode VM).
+Each mode is a chain of: `builder` (resolved BUILDER_VERSION binary), `comp` (compiler from current tree), `int` (bytecode VM).
 
 | Mode | Description |
 |------|-------------|
-| `boot-comp` | Builder interprets cmd/bnc → compiles and runs tests |
-| `boot-comp-int` | Compiled cmd/bni runs `--test` natively via bytecode VM |
-| `boot-comp-comp` | Gen1 compiler compiles and runs tests |
-| `boot-comp-comp-int` | Gen1-compiled cmd/bni runs `--test` natively via bytecode VM |
-| `boot-comp-comp-comp` | Gen2 compiler compiles and runs tests |
+| `builder-comp` | Builder interprets cmd/bnc → compiles and runs tests |
+| `builder-comp-int` | Compiled cmd/bni runs `--test` natively via bytecode VM |
+| `builder-comp-comp` | Gen1 compiler compiles and runs tests |
+| `builder-comp-comp-int` | Gen1-compiled cmd/bni runs `--test` natively via bytecode VM |
+| `builder-comp-comp-comp` | Gen2 compiler compiles and runs tests |
 
 Mode sets are defined in `scripts/modesets/` (one file per set, one mode per line). Adding a new mode set is just adding a file. Current sets: `basic`, `all`.
 
@@ -51,7 +51,7 @@ Optional arguments filter packages by substring match (e.g. `ir` matches `pkg/ir
 
 `scripts/unittest/<pkg-path>.xfail.<mode>` marks a package as expected failure for that mode. Slashes in the package path are replaced with dashes.
 
-Example: `scripts/unittest/pkg-vm.xfail.boot-comp-comp-int` with contents describing the reason.
+Example: `scripts/unittest/pkg-vm.xfail.builder-comp-comp-int` with contents describing the reason.
 
 ## Package Discovery
 

@@ -8,58 +8,51 @@
 
 The self-hosted Binate toolchain — interpreter, compiler, and supporting packages — written in Binate itself.
 
-This repository is bootstrapped using the [Go bootstrap interpreter](https://github.com/binate/bootstrap), which runs the code here until the compiler can compile itself.
+Builds use a **prebuilt `bnc`** (the **BUILDER**) fetched by `scripts/fetch-builder.sh`. The version is pinned in the `BUILDER_VERSION` file at the repo root (currently `bnc-0.0.1`). See [BUILDER_VERSION](#builder_version) and [Releases](#releases) below.
 
 ## Status
 
-Self-hosted interpreter and compiler are working. The interpreter can interpret itself (double interpretation verified). The compiler produces native binaries via LLVM IR. Self-compilation works: gen1 (builder-comp-comp) and gen2 (builder-comp-comp-comp) compilers both pass all 98 conformance tests.
+The self-hosted interpreter and compiler are working. The interpreter can interpret itself (double interpretation verified). The compiler produces native binaries via LLVM IR. Self-compilation works: gen1 (`builder-comp-comp`) and gen2 (`builder-comp-comp-comp`) compilers both pass the conformance suite.
 
 ## Quick Start
 
-Requires Go and the [bootstrap interpreter](https://github.com/binate/bootstrap):
-
 ```sh
-# Clone both repos
-git clone https://github.com/binate/bootstrap.git
+# Clone
 git clone https://github.com/binate/binate.git
 cd binate
 
-# Compile and run a program via bnc-via-bootstrap
-cd ../bootstrap
-go run . -root ../binate ../binate/cmd/bnc -- -o /tmp/selftest ../binate/examples/selftest.bn && /tmp/selftest
+# Resolve the BUILDER (downloads the pinned bnc release on first run,
+# caches under ~/.cache/binate/builders/<version>/).
+BUILDER="$(scripts/fetch-builder.sh)"
 
-# Build the self-hosted interpreter (bni) and run a program through it
-cd ../binate
+# Compile and run a program via the BUILDER directly.
+"$BUILDER" -o /tmp/selftest examples/selftest.bn && /tmp/selftest
+
+# Or: build a current-tree bnc and use that.
+./scripts/build-bnc.sh -o /tmp/bnc
+/tmp/bnc -o /tmp/selftest examples/selftest.bn
+
+# Build the self-hosted bytecode VM (bni) and run a program through it.
 ./scripts/build-bni.sh -o /tmp/bni
 /tmp/bni examples/selftest.bn
 
-# Run unit tests for some bootstrap-runnable packages
-cd ../bootstrap
-go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/loader
+# Run unit tests for some packages.
+./scripts/unittest/run.sh builder-comp pkg/types pkg/loader
 
-# Run conformance tests
-cd ../binate && ./conformance/run.sh builder-comp
+# Run conformance tests.
+./conformance/run.sh builder-comp
 ```
 
-### What the bootstrap can and can't run
+Requires `clang` on `PATH` (used as the final linker for compiled output).
 
-The Go bootstrap interpreter implements only a subset of the Binate language —
-no floats, no raw memory ops, no method dispatch via interface, etc.  That's
-enough to interpret `cmd/bnc` (the compiler) and the packages it depends on,
-but *not* the bytecode VM (`pkg/vm`, `cmd/bni`).  Practical consequence:
+### BUILDER_VERSION
 
-- **Always bootstrap-runnable:** `cmd/bnc` and its dependency tree
-  (`pkg/{token,lexer,ast,parser,types,ir,codegen,loader,buf,debug,mangle,builtin/testing,bootstrap,rt}`),
-  plus `cmd/bnas` and `cmd/bnlint`.
-- **Needs bnc to build first:** `cmd/bni`, `pkg/vm`.  Use
-  `scripts/build-bni.sh -o <path>` (or the test runners' `builder-comp*` modes)
-  rather than `go run . -test pkg/vm` / `go run . cmd/bni`.
+The `BUILDER_VERSION` file at the repo root names the compiler used to build the current tree's compiler. Two schemes are recognized by `scripts/fetch-builder.sh`:
 
-See [explorations/bootstrap-subset.md](https://github.com/binate/explorations/blob/main/bootstrap-subset.md)
-for the language subset.  The CI test runners pin BUILDER_VERSION to
-the bnc release the current tree was built from (or
-`bootstrap-X.Y.Z` while bnc is still pre-1.0); each test mode goes
-through `scripts/fetch-builder.sh` to resolve it.
+- **`bnc-X.Y.Z`** (the default; current pin: `bnc-0.0.1`): downloaded from a published GitHub release as a tarball containing `bnc`, `bni`, `bnas`, `bnlint`, and a `lib/` stdlib root. Cached under `~/.cache/binate/builders/<version>/`. No source build needed.
+- **`bootstrap-X.Y.Z`**: builds the sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter on demand and uses it as the BUILDER. Slow (multi-minute) and limited to a language subset (no floats, no method dispatch via interface, etc.) — only used when bootstrapping a new `bnc-X.Y.Z` release where no prior `bnc` exists. See [explorations/bootstrap-subset.md](https://github.com/binate/explorations/blob/main/bootstrap-subset.md) for what the bootstrap subset covers.
+
+All test runners and `scripts/build-*.sh` helpers go through `fetch-builder.sh`; you don't normally invoke it directly outside the Quick Start example.
 
 ## Project Structure
 
@@ -90,7 +83,7 @@ binate/
     debug/                   Verbose logging (SetVerbose, Log)
     rt/                      Runtime library (written in Binate)
     builtin/testing/         Test framework (TestResult type alias)
-    bootstrap.bni            Interface for bootstrap-provided OS primitives
+    bootstrap.bni            OS primitives used during bootstrap — slated for replacement
   runtime/
     binate_runtime.c         C runtime (memory management, slice ops)
 ```
@@ -110,24 +103,22 @@ Programs run through three stages:
 All layers support `-v` for debug logging to stderr:
 
 ```sh
-# Bootstrap verbose (driving the compiler)
-go run . -v -root ../binate ../binate/cmd/bnc -- program.bn
+BUILDER="$(scripts/fetch-builder.sh)"
 
 # Compiler verbose
-go run . -root ../binate ../binate/cmd/bnc -- -v program.bn
+"$BUILDER" -v -o /tmp/prog program.bn
 
-# Self-hosted interpreter verbose (built bni binary)
+# Self-hosted interpreter verbose
 ./scripts/build-bni.sh -o /tmp/bni
 /tmp/bni -v program.bn
 ```
 
 ### Double Interpretation
 
-The self-hosted interpreter can interpret itself.  The bootstrap can't run
-cmd/bni directly, so the outermost driver is a compiled bni:
+The self-hosted interpreter can interpret itself:
 
 ```
-compiled bni (built via bnc-via-bootstrap)
+bni (built via the BUILDER)
   → interprets cmd/bni (self-hosted interpreter)
     → interprets target.bn
 ```
@@ -163,7 +154,11 @@ func main() {
 
 ### pkg/bootstrap
 
-The `pkg/bootstrap` package provides OS-level primitives. In the Go bootstrap, these are backed by Go's standard library. In the self-hosted interpreter, they are forwarded through `RegisterBootstrapPackage`.
+The `pkg/bootstrap` package provides the OS-level primitives we lean on while bootstrapping the toolchain. In compiled binaries they're backed by the C runtime in `runtime/binate_runtime.c`; in `bni` (the bytecode VM) they're forwarded by the host process through the extern registry.
+
+It's slated for replacement by a proper OS-abstraction package once the stdlib design lands (see [explorations/claude-todo.md](https://github.com/binate/explorations/blob/main/claude-todo.md)). Existing uses are fine until then; **don't extend its surface with new primitives** — wait for the replacement instead.
+
+Current surface:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
@@ -185,26 +180,17 @@ Constants: `O_RDONLY`, `O_WRONLY`, `O_RDWR`, `O_CREATE`, `O_TRUNC`, `O_APPEND`, 
 
 ### Unit Tests
 
-Each source file has a corresponding `*_test.bn` file with `func TestXxx() testing.TestResult` functions.  The recommended entry point is `scripts/unittest/run.sh`, which knows which packages can run under which modes (see the [Quick Start](#what-the-bootstrap-can-and-cant-run) note):
+Each source file has a corresponding `*_test.bn` file with `func TestXxx() testing.TestResult` functions. The recommended entry point is `scripts/unittest/run.sh`, which uses the BUILDER to compile the current-tree `cmd/bnc` and then runs each test package through the selected mode:
 
 ```sh
-# Run all unit tests through current-tree cmd/bnc — the BUILDER
-# compiles cmd/bnc once, then that compiles + runs each test
-# package.
+# Run all unit tests through current-tree cmd/bnc.
 ./scripts/unittest/run.sh builder-comp
 
 # Filter to specific packages.
 ./scripts/unittest/run.sh builder-comp pkg/types
 
-# pkg/vm and cmd/bni use a compiled bni; use a *-int mode.
+# pkg/vm and cmd/bni need bni (the bytecode VM); use a *-int mode.
 ./scripts/unittest/run.sh builder-comp-int pkg/vm cmd/bni
-```
-
-For ad-hoc bootstrap-direct invocations (skipping the runner), invoke the bootstrap interpreter manually but only on bootstrap-runnable packages:
-
-```sh
-cd bootstrap
-go run . -root ../binate -test pkg/token pkg/lexer pkg/types pkg/loader pkg/ir pkg/codegen
 ```
 
 Tests return `""` for pass, or a failure message string.
@@ -225,12 +211,18 @@ cd binate
 
 ### Go-Level Tests
 
-The bootstrap interpreter has its own Go test suite:
+The sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter has its own Go test suite (`go test ./...` in that repo). It's relevant only when the BUILDER is set to `bootstrap-X.Y.Z`.
 
-```sh
-cd bootstrap
-go test ./...
-```
+## Releases
+
+Releases are tagged `bnc-X.Y.Z` and built by `.github/workflows/release.yml`:
+
+1. A tag push (`bnc-X.Y.Z`) triggers the workflow.
+2. For each release platform, the BUILDER (from the current `BUILDER_VERSION`) compiles `cmd/bnc`, `cmd/bni`, `cmd/bnas`, `cmd/bnlint` against the tagged source. The resulting binaries plus a `lib/` stdlib root are packaged as a tarball.
+3. The release publishes the tarballs and a `SHA256SUMS` manifest.
+4. Cutting the next release usually means bumping `BUILDER_VERSION` to the just-published `bnc-X.Y.Z` and tagging again.
+
+`scripts/fetch-builder.sh` downloads release tarballs into `~/.cache/binate/builders/`.
 
 ## Language
 

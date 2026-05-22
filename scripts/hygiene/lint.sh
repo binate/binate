@@ -40,15 +40,20 @@ if [ -z "$TARGETS" ]; then
     exit 1
 fi
 
-# Build bnlint via bnc (bnlint is no longer required to be bootstrap-runnable;
-# see scripts/unittest/cmd-bnlint.xfail.boot and the bootstrap-surface scoping
-# in CLAUDE.md).  No caching for now — each invocation rebuilds.
-BNLINT_BIN="$(mktemp -t binate-lint.XXXXXX)"
-trap 'rm -f "$BNLINT_BIN"' EXIT
-"$SCRIPT_DIR/../build-bnlint.sh" -o "$BNLINT_BIN" >/dev/null || {
-    echo "lint: failed to build bnlint" >&2
-    exit 1
-}
+# Prefer the bundled bnlint from BUILDER_VERSION when available
+# (bnc-* mode) — saves the per-invocation cost of compiling bnlint
+# from source.  Falls back to building from current source under
+# bootstrap-* (no toolchain bundle exists) or when the fetcher
+# doesn't return a usable path.
+BNLINT_BIN="$("$BINATE_DIR/scripts/fetch-builder.sh" --tool bnlint 2>/dev/null || true)"
+if [ -z "$BNLINT_BIN" ] || [ ! -x "$BNLINT_BIN" ]; then
+    BNLINT_BIN="$(mktemp -t binate-lint.XXXXXX)"
+    trap 'rm -f "$BNLINT_BIN"' EXIT
+    "$SCRIPT_DIR/../build-bnlint.sh" -o "$BNLINT_BIN" >/dev/null || {
+        echo "lint: failed to build bnlint" >&2
+        exit 1
+    }
+fi
 
 "$BNLINT_BIN" -I "$BINATE_DIR" -L "$BINATE_DIR" $TARGETS
 rc=$?

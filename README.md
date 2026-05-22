@@ -2,6 +2,7 @@
 
 [![Unit tests](https://github.com/binate/binate/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/binate/binate/actions/workflows/unit-tests.yml)
 [![Conformance tests](https://github.com/binate/binate/actions/workflows/conformance-tests.yml/badge.svg)](https://github.com/binate/binate/actions/workflows/conformance-tests.yml)
+[![E2E tests](https://github.com/binate/binate/actions/workflows/e2e-tests.yml/badge.svg)](https://github.com/binate/binate/actions/workflows/e2e-tests.yml)
 [![Code hygiene](https://github.com/binate/binate/actions/workflows/hygiene.yml/badge.svg)](https://github.com/binate/binate/actions/workflows/hygiene.yml)
 [![Perf tests](https://github.com/binate/binate/actions/workflows/perf-tests.yml/badge.svg)](https://github.com/binate/binate/actions/workflows/perf-tests.yml)
 

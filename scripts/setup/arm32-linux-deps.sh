@@ -19,8 +19,7 @@ case "$os" in
     Linux)
         if ! command -v apt-get >/dev/null 2>&1; then
             echo "error: this helper only supports apt-based distros."
-            echo "       install equivalents for clang + libc6-armhf-cross"
-            echo "       + libc6-dev-armhf-cross + linux-libc-dev-armhf-cross"
+            echo "       install equivalents for clang + gcc-arm-linux-gnueabihf"
             echo "       + qemu-user-static manually."
             exit 1
         fi
@@ -29,9 +28,7 @@ case "$os" in
         echo ">>> sudo apt-get install ..."
         sudo apt-get install -y \
             clang \
-            libc6-armhf-cross \
-            libc6-dev-armhf-cross \
-            linux-libc-dev-armhf-cross \
+            gcc-arm-linux-gnueabihf \
             qemu-user-static
         ;;
     Darwin)

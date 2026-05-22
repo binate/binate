@@ -13,6 +13,7 @@
 # Toolchain requirements: see
 # conformance/runners/builder-comp_arm32_baremetal.sh.
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
+. "$BINATE_DIR/scripts/lib/find-arm32-baremetal-toolchain.sh"
 
 QEMU_SYSTEM_ARM="${QEMU_SYSTEM_ARM:-}"
 if [ -z "$QEMU_SYSTEM_ARM" ]; then
@@ -39,13 +40,35 @@ runner_setup() {
         exit 2
     fi
     rm -f /tmp/_bn_baremetal_probe.o
+    if [ -z "$BAREMETAL_LIBGCC_A" ]; then
+        echo "error: boot-comp_arm32_baremetal requires arm-none-eabi libgcc.a" >&2
+        echo "  Linux:  sudo apt-get install gcc-arm-none-eabi" >&2
+        echo "  macOS:  brew install arm-none-eabi-gcc" >&2
+        exit 2
+    fi
     build_gen1
+}
+
+# Build the per-invocation `--cflag` / `--link-after-objs` args
+# from $BAREMETAL_LD_FLAGS / $BAREMETAL_LIBGCC_A.  Stored in a
+# function so the conformance runner can share the recipe.
+_baremetal_bnc_extra_args() {
+    set --
+    if [ -n "$BAREMETAL_LD_FLAGS" ]; then
+        set -- "$@" --cflag "$BAREMETAL_LD_FLAGS"
+    fi
+    set -- "$@" --link-after-objs "$BAREMETAL_LIBGCC_A"
+    printf '%s\n' "$@"
 }
 
 runner_test() {
     pkg="$1"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
+    # Read the extra args (one per line) into positional params.
+    OLDIFS=$IFS; IFS='
+'; set -- $(_baremetal_bnc_extra_args); IFS=$OLDIFS
     testbin=$("$GEN1_COMPILER" --test --target arm32-baremetal \
+        "$@" \
         -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
     if [ ! -x "$testbin" ]; then
         echo "$testbin"  # error output

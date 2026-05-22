@@ -17,6 +17,7 @@
 #     assembler / linker is preferred over clang's defaults.
 
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
+. "$BINATE_DIR/scripts/lib/find-arm32-baremetal-toolchain.sh"
 
 QEMU_SYSTEM_ARM="${QEMU_SYSTEM_ARM:-}"
 if [ -z "$QEMU_SYSTEM_ARM" ]; then
@@ -47,7 +48,26 @@ runner_setup() {
         exit 2
     fi
     rm -f /tmp/_bn_baremetal_probe.o
+    if [ -z "$BAREMETAL_LIBGCC_A" ]; then
+        echo "error: boot-comp_arm32_baremetal requires arm-none-eabi libgcc.a" >&2
+        echo "  Linux:  sudo apt-get install gcc-arm-none-eabi" >&2
+        echo "  macOS:  brew install arm-none-eabi-gcc" >&2
+        exit 2
+    fi
     build_gen1
+}
+
+# Compose the host-specific bnc args: macOS needs `-fuse-ld=lld`
+# (Apple's `ld` is Mach-O only); both apt and brew expose
+# libgcc.a at host-specific paths so it's passed positionally via
+# `--link-after-objs`.
+_baremetal_bnc_extra_args() {
+    set --
+    if [ -n "$BAREMETAL_LD_FLAGS" ]; then
+        set -- "$@" --cflag "$BAREMETAL_LD_FLAGS"
+    fi
+    set -- "$@" --link-after-objs "$BAREMETAL_LIBGCC_A"
+    printf '%s\n' "$@"
 }
 
 runner_exec() {
@@ -67,8 +87,11 @@ runner_exec() {
     # package tests, compile_root is the test's own dir;
     # AddBniPath dedups so passing BINATE_DIR twice when
     # compile_root == BINATE_DIR is a no-op.
+    OLDIFS=$IFS; IFS='
+'; set -- $(_baremetal_bnc_extra_args); IFS=$OLDIFS
     compile_out=$("$GEN1_COMPILER" -I "$BINATE_DIR" -L "$BINATE_DIR" \
         -I "$compile_root" -L "$compile_root" --target arm32-baremetal \
+        "$@" \
         --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         # `-M virt -cpu cortex-a15` matches the linker script's

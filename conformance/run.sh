@@ -24,6 +24,13 @@
 #   Single-file: NNN_name.bn + NNN_name.expected (positive: run and compare output)
 #   Single-file: NNN_name.bn + NNN_name.error    (negative: must fail, output contains error strings)
 #   Multi-package: NNN_name/ directory with main.bn, expected, and pkg/ subdirectory
+#
+# Per-mode overrides:
+#   NNN_name.expected.<mode> / NNN_name.error.<mode> (single-file) or
+#   <dir>/expected.<mode> / <dir>/error.<mode> (multi-package) — used in
+#   preference to the generic file when the current MODE matches.
+#   Lets a target-specific output (e.g. ILP32 sizeof) override the
+#   canonical LP64 .expected without rewriting the .bn.
 
 # Parse flags
 VERBOSE=0
@@ -86,6 +93,9 @@ if [ -z "$MODE" ]; then
     echo "  NNN_name/ directory        Multi-package test (main.bn + pkg/)"
     echo ""
     echo "Xfail: NNN_name.xfail.<mode> marks a test as expected failure."
+    echo "Per-mode .expected / .error: NNN_name.{expected,error}.<mode>"
+    echo "                             overrides the generic file for that mode"
+    echo "                             (e.g. LP64-vs-ILP32 size output)."
     echo ""
     echo "Environment:"
     echo "  BINATE_FLAGS              Extra flags for the compiler (e.g. \"-g\")"
@@ -331,6 +341,16 @@ for bn in "$SCRIPT_DIR"/*.bn; do
     fi
     expected="$SCRIPT_DIR/${name}.expected"
     errorfile="$SCRIPT_DIR/${name}.error"
+    # Per-mode overrides: NNN_name.{expected,error}.<MODE> takes
+    # precedence over the generic NNN_name.{expected,error} when
+    # present.  Used for tests whose canonical .expected is target-
+    # specific (e.g. LP64-pinned sizeof output on arm32 ILP32).
+    if [ -f "$SCRIPT_DIR/${name}.expected.${MODE}" ]; then
+        expected="$SCRIPT_DIR/${name}.expected.${MODE}"
+    fi
+    if [ -f "$SCRIPT_DIR/${name}.error.${MODE}" ]; then
+        errorfile="$SCRIPT_DIR/${name}.error.${MODE}"
+    fi
     if [ -f "$errorfile" ]; then
         run_error_test "$name" "$bn" "$errorfile" ""
     elif [ -f "$expected" ]; then
@@ -361,6 +381,14 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
     main_bn="$dir/main.bn"
     expected="$dir/expected"
     errorfile="$dir/error"
+    # Per-mode overrides: $dir/{expected,error}.<MODE> takes
+    # precedence when present.  Mirrors the single-file convention.
+    if [ -f "$dir/expected.${MODE}" ]; then
+        expected="$dir/expected.${MODE}"
+    fi
+    if [ -f "$dir/error.${MODE}" ]; then
+        errorfile="$dir/error.${MODE}"
+    fi
     if [ ! -f "$main_bn" ]; then
         echo "SKIP: $name (no main.bn)"
         continue

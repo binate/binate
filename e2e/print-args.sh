@@ -77,9 +77,12 @@ check() {
     fi
 }
 
+# Resolve the BUILDER once; (b) and (c) both need bni built via it.
+BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
+
 # Build a native bni binary up front; (b) and (c) both need it.
 BNI_BIN="$TMP/bni-bin"
-bni_compile_log=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
+bni_compile_log=$("$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" \
     "$BINATE_DIR/cmd/bnc" -- \
     -I "$BINATE_DIR" -L "$BINATE_DIR" \
     --runtime "$BINATE_DIR/runtime/binate_runtime.c" \
@@ -92,7 +95,7 @@ fi
 
 # ----- (a) native binary ------------------------------------------
 NATIVE_BIN="$TMP/print_args-bin"
-native_compile_log=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
+native_compile_log=$("$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" \
     "$BINATE_DIR/cmd/bnc" -- \
     -I "$BINATE_DIR" -L "$BINATE_DIR" \
     --runtime "$BINATE_DIR/runtime/binate_runtime.c" \

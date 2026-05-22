@@ -87,7 +87,7 @@ echo
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 if [ -n "$DBG_FLAG" ]; then
-    "$BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
+    "$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
         -I "$BINATE_DIR:$BUILDER_LIB" -L "$BINATE_DIR:$BUILDER_LIB" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
@@ -95,7 +95,7 @@ if [ -n "$DBG_FLAG" ]; then
         -o "$OUT" \
         "$BINATE_DIR/cmd/bnc"
 else
-    "$BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
+    "$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
         -I "$BINATE_DIR:$BUILDER_LIB" -L "$BINATE_DIR:$BUILDER_LIB" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \

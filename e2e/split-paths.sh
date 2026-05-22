@@ -90,9 +90,11 @@ actual=$(cd "$BOOTSTRAP_DIR" && go run . \
 check "bootstrap" "$actual"
 
 # ----- bnc (compile to native binary, then run) -------------------
-# Bootstrap interprets cmd/bnc; bnc itself sees -I/-L as user args.
+# The resolved BUILDER drives cmd/bnc; bnc itself sees the -I/-L
+# after `--` as its own user args.
 BNC_BIN="$TMP/bnc-bin"
-bnc_compile_log=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
+BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
+bnc_compile_log=$("$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" \
     "$BINATE_DIR/cmd/bnc" -- \
     -I "$BNI_ROOT:$BINATE_DIR" -L "$IMPL_ROOT:$BINATE_DIR" \
     --runtime "$BINATE_DIR/runtime/binate_runtime.c" \

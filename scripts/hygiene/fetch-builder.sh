@@ -45,7 +45,7 @@ BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 TMP="$(mktemp -d -t binate-fetch-builder-smoke.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 BIN="$TMP/hello"
-build_log="$("$BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
+build_log="$("$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
     -I "$BUILDER_LIB" -L "$BUILDER_LIB" \
     --runtime "$BUILDER_LIB/runtime/binate_runtime.c" \
     --build-dir "$TMP" -o "$BIN" \

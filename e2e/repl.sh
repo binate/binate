@@ -40,9 +40,10 @@ BUILD_DIR="$TMP/build"
 mkdir -p "$BUILD_DIR"
 FIXTURE="$TMP/fixture.bn"
 
-# ----- Build bni via builder-comp -----
+# ----- Build bni via the resolved BUILDER -----
 echo "Building bni via builder-comp..."
-build_log=$(cd "$BOOTSTRAP_DIR" && go run . -root "$BINATE_DIR" \
+BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
+build_log=$("$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" \
     "$BINATE_DIR/cmd/bnc" -- \
     -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$BUILD_DIR" \
     -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1)

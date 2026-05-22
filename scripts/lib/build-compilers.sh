@@ -52,7 +52,7 @@ build_gen1() {
     echo "Building gen1 compiler..."
     builder="$(_resolve_builder)"
     blib="$(_resolve_builder_lib)"
-    build_out=$("$builder" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$BINATE_DIR:$blib" -L "$BINATE_DIR:$blib" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$builder" -I "$BINATE_DIR" -L "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$BINATE_DIR:$blib" -L "$BINATE_DIR:$blib" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"

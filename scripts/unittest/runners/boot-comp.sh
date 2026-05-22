@@ -1,24 +1,18 @@
 #!/bin/sh
-# Runner: boot-comp — the BUILDER_VERSION binary interprets bnc, which
-# compiles tests to a binary.  (BUILDER_VERSION currently names the
-# bootstrap interpreter.)
+# Runner: boot-comp — current-tree cmd/bnc compiles each test package.
+# The BUILDER (resolved BUILDER_VERSION binary) is used to compile
+# current cmd/bnc once during runner_setup → GEN1_COMPILER; every
+# per-test compile then goes through GEN1, so the "comp" link is
+# always current-tree cmd/bnc regardless of which builder is pinned.
+. "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
-runner_setup() {
-    BOOT_BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-    BOOT_BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-}
+runner_setup() { build_gen1; }
 
 runner_test() {
     pkg="$1"
-    # bnc --test compiles and prints the test binary path. Per-pkg
-    # build dir keeps intermediates (and the binary, which lives
-    # under <build-dir> in --build-dir mode) isolated from concurrent
-    # test runs.
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
-    # cd / so neither bootstrap nor bnc's CLI auto-routes the package
-    # path arg to its directory-test mode via os.Stat lookup against
-    # the caller's CWD; see runners/boot.sh for the full rationale.
-    testbin=$(cd / && "$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --test -I "$BINATE_DIR:$BOOT_BUILDER_LIB" -L "$BINATE_DIR:$BOOT_BUILDER_LIB" --build-dir "$bdir" "$pkg" 2>&1)
+    testbin=$("$GEN1_COMPILER" --test -I "$BINATE_DIR" -L "$BINATE_DIR" \
+        --build-dir "$bdir" "$pkg" 2>&1)
     if [ ! -x "$testbin" ]; then
         echo "$testbin"  # error output
         rm -rf "$bdir"
@@ -30,6 +24,4 @@ runner_test() {
     return $rc
 }
 
-runner_cleanup() {
-    : # nothing to clean up
-}
+runner_cleanup() { cleanup_compilers; }

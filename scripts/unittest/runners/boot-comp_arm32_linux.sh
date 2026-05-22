@@ -1,10 +1,13 @@
 #!/bin/sh
-# Runner: boot-comp_arm32_linux — Bootstrap interprets bnc, which
-# compiles each unit-test package for armv7-linux-gnueabihf via
-# clang's `--target=armv7-linux-gnueabihf`.  The resulting binary is
-# executed under qemu-arm user-mode emulation.  See
+# Runner: boot-comp_arm32_linux — current-tree cmd/bnc cross-compiles
+# each unit-test package for armv7-linux-gnueabihf; the resulting
+# binary runs under qemu-arm user-mode emulation.  See
 # conformance/runners/boot-comp_arm32_linux.sh for toolchain
 # requirements and the v0 ARM32-Linux derisking plan rationale.
+# The BUILDER is used once during runner_setup to compile current
+# cmd/bnc → GEN1_COMPILER; every per-test compile then goes through
+# GEN1, so the "comp" link is always current-tree cmd/bnc.
+. "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
 QEMU_ARM="${QEMU_ARM:-}"
 if [ -z "$QEMU_ARM" ]; then
@@ -34,15 +37,14 @@ runner_setup() {
         exit 2
     fi
     rm -f /tmp/_bn_arm32_probe.o
-    BOOT_BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-    BOOT_BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
+    build_gen1
 }
 
 runner_test() {
     pkg="$1"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
-    # cd / — see runners/boot.sh for the CLI-disambiguation rationale.
-    testbin=$(cd / && "$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --test --target arm32-linux -I "$BINATE_DIR:$BOOT_BUILDER_LIB" -L "$BINATE_DIR:$BOOT_BUILDER_LIB" --build-dir "$bdir" "$pkg" 2>&1)
+    testbin=$("$GEN1_COMPILER" --test --target arm32-linux \
+        -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
     if [ ! -x "$testbin" ]; then
         echo "$testbin"  # error output
         rm -rf "$bdir"
@@ -54,6 +56,4 @@ runner_test() {
     return $rc
 }
 
-runner_cleanup() {
-    : # nothing to clean up
-}
+runner_cleanup() { cleanup_compilers; }

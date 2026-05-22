@@ -1,12 +1,11 @@
 #!/bin/sh
-# Runner: boot-comp — the BUILDER_VERSION binary interprets cmd/bnc,
-# which compiles test.bn to native.  (BUILDER_VERSION currently names
-# the bootstrap interpreter.)
+# Runner: boot-comp — current-tree cmd/bnc (compiled via the BUILDER
+# during runner_setup → GEN1_COMPILER) compiles each test.bn to a
+# native binary.  The "comp" link is always current-tree cmd/bnc,
+# regardless of whether BUILDER_VERSION names bootstrap-* or bnc-*.
+. "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
-runner_setup() {
-    BOOT_BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-    BOOT_BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-}
+runner_setup() { build_gen1; }
 
 runner_exec() {
     bn="$1"
@@ -18,7 +17,8 @@ runner_exec() {
     if [ -n "$root" ]; then
         compile_root="$root"
     fi
-    compile_out=$("$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$compile_root:$BOOT_BUILDER_LIB" -L "$compile_root:$BOOT_BUILDER_LIB" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
+    compile_out=$("$GEN1_COMPILER" -I "$compile_root" -L "$compile_root" \
+        --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         "$tmpbin" 2>&1 || true
     else
@@ -28,6 +28,4 @@ runner_exec() {
     rm -rf "$bdir"
 }
 
-runner_cleanup() {
-    : # nothing to clean up
-}
+runner_cleanup() { cleanup_compilers; }

@@ -1,8 +1,11 @@
 #!/bin/sh
-# Runner: boot-comp_arm32_linux — Bootstrap interprets bnc, which
-# compiles each conformance test for armv7-linux-gnueabihf (32-bit
-# ARM Linux) via clang's `--target=armv7-linux-gnueabihf`.  The
-# resulting binary is executed under qemu-arm user-mode emulation.
+# Runner: boot-comp_arm32_linux — current-tree cmd/bnc (compiled via
+# the BUILDER during runner_setup → GEN1_COMPILER) cross-compiles
+# each conformance test for armv7-linux-gnueabihf (32-bit ARM Linux)
+# via clang's `--target=armv7-linux-gnueabihf`.  The resulting binary
+# is executed under qemu-arm user-mode emulation.
+
+. "$BINATE_DIR/scripts/lib/build-compilers.sh"
 #
 # Required toolchain (CI installs these on ubuntu-latest; for local
 # dev see scripts/setup/arm32-linux-deps.sh):
@@ -48,8 +51,7 @@ runner_setup() {
         exit 2
     fi
     rm -f /tmp/_bn_arm32_probe.o
-    BOOT_BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-    BOOT_BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
+    build_gen1
 }
 
 runner_exec() {
@@ -62,7 +64,9 @@ runner_exec() {
     if [ -n "$root" ]; then
         compile_root="$root"
     fi
-    compile_out=$("$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- -I "$compile_root:$BOOT_BUILDER_LIB" -L "$compile_root:$BOOT_BUILDER_LIB" --target arm32-linux --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
+    compile_out=$("$GEN1_COMPILER" -I "$compile_root" -L "$compile_root" \
+        --target arm32-linux --build-dir "$bdir" $BINATE_FLAGS \
+        -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         # Wall-clock cap via timeout(1) so a runaway test doesn't
         # wedge the sweep.
@@ -80,6 +84,4 @@ runner_exec() {
     rm -rf "$bdir"
 }
 
-runner_cleanup() {
-    : # nothing to clean up
-}
+runner_cleanup() { cleanup_compilers; }

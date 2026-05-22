@@ -1,19 +1,12 @@
 #!/bin/sh
-# Runner: boot-comp_native_aa64-comp_native_aa64 — Bootstrap builds bnc
-# with --backend native (cmd/bnc's main module emitted via the native
-# aarch64 path; bnc's own dep modules still go through LLVM as in
-# compileMainNative's hybrid).  That native bnc binary then compiles
-# each test package with --backend native and the test binary runs
-# natively.
-#
-# Why this exists: the older `boot-comp_native_aa64` runner invokes
-# `go run bootstrap → bnc --backend native` per package, paying the
-# bootstrap-interpretation tax for every test compile.  Big packages
-# (pkg/types ~20min, pkg/native/arm64 ~12min on macOS Apple Silicon)
-# blow past CI's 30-min timeout one shard at a time.  This runner
-# pays the bootstrap-interp tax once (building bnc itself), then
-# every per-package test compile runs through the native bnc binary
-# — fast because it's a real compiled program, not interpreted source.
+# Runner: boot-comp_native_aa64-comp_native_aa64 — current-tree
+# cmd/bnc (compiled via the LLVM path → GEN1) is then re-compiled
+# with its own native AArch64 backend → BNC_NATIVE; that BNC_NATIVE
+# binary compiles each test package with --backend native and the
+# test binary runs natively.  build_bnc_native_aa64 calls build_gen1
+# up-front so the "first comp" is always current-tree cmd/bnc — the
+# BUILDER (bnc-X.Y.Z or bootstrap) only ever drives the gen1 build,
+# never directly emits native code.
 #
 # Mode-name convention: stages within one compile chain are joined
 # with `_` (chains here are comp_native_aa64 — bnc built with the

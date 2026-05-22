@@ -1,13 +1,18 @@
 #!/bin/sh
-# Runner: boot-comp_arm32_baremetal — Bootstrap interprets bnc,
-# which compiles each unit-test package for ARMv7-A bare-metal
-# (--target arm32-baremetal).  The resulting ELF binary boots
-# under `qemu-system-arm -M virt -semihosting`; test output goes
-# through pkg/bootstrap.Write (semihosting SYS_WRITEC), the
-# binary exits via pkg/bootstrap.Exit (SYS_EXIT_EXTENDED).
+# Runner: boot-comp_arm32_baremetal — current-tree cmd/bnc compiles
+# each unit-test package for ARMv7-A bare-metal
+# (--target arm32-baremetal).  The resulting ELF binary boots under
+# `qemu-system-arm -M virt -semihosting`; test output goes through
+# pkg/bootstrap.Write (semihosting SYS_WRITEC), the binary exits via
+# pkg/bootstrap.Exit (SYS_EXIT_EXTENDED).
+#
+# The BUILDER is used once during runner_setup to compile current
+# cmd/bnc → GEN1_COMPILER; every per-test compile then goes through
+# GEN1, so the "comp" link is always current-tree cmd/bnc.
 #
 # Toolchain requirements: see
 # conformance/runners/boot-comp_arm32_baremetal.sh.
+. "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
 QEMU_SYSTEM_ARM="${QEMU_SYSTEM_ARM:-}"
 if [ -z "$QEMU_SYSTEM_ARM" ]; then
@@ -34,14 +39,14 @@ runner_setup() {
         exit 2
     fi
     rm -f /tmp/_bn_baremetal_probe.o
-    BOOT_BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
+    build_gen1
 }
 
 runner_test() {
     pkg="$1"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
-    # cd / — see runners/boot.sh for the CLI-disambiguation rationale.
-    testbin=$(cd / && "$BOOT_BUILDER" -root "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- --test --target arm32-baremetal -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
+    testbin=$("$GEN1_COMPILER" --test --target arm32-baremetal \
+        -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$bdir" "$pkg" 2>&1)
     if [ ! -x "$testbin" ]; then
         echo "$testbin"  # error output
         rm -rf "$bdir"
@@ -55,6 +60,4 @@ runner_test() {
     return $rc
 }
 
-runner_cleanup() {
-    : # nothing to clean up
-}
+runner_cleanup() { cleanup_compilers; }

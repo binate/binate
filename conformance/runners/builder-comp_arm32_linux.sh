@@ -70,8 +70,13 @@ runner_exec() {
         --target arm32-linux --build-dir "$bdir" $BINATE_FLAGS \
         -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
-        # Wall-clock cap via timeout(1) so a runaway test doesn't
-        # wedge the sweep.
+        # QEMU_LD_PREFIX points qemu-user at the cross-toolchain's
+        # sysroot so it can resolve `/lib/ld-linux-armhf.so.3`
+        # (the dynamic linker the binary asks for) under
+        # /usr/arm-linux-gnueabihf/lib/.  Wall-clock cap via
+        # timeout(1) so a runaway test doesn't wedge the sweep.
+        QEMU_LD_PREFIX="${QEMU_LD_PREFIX:-/usr/arm-linux-gnueabihf}"
+        export QEMU_LD_PREFIX
         if command -v timeout >/dev/null 2>&1; then
             timeout 10 "$QEMU_ARM" "$tmpbin" 2>&1 || true
         elif command -v gtimeout >/dev/null 2>&1; then

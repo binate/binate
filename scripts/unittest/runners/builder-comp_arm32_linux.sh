@@ -50,7 +50,13 @@ runner_test() {
         rm -rf "$bdir"
         return 1
     fi
-    "$QEMU_ARM" "$testbin" 2>&1
+    # QEMU_LD_PREFIX points qemu-user at the cross-toolchain's
+    # sysroot so it can find the ARM dynamic linker
+    # (`/lib/ld-linux-armhf.so.3` from the binary's perspective →
+    # `/usr/arm-linux-gnueabihf/lib/ld-linux-armhf.so.3` on the
+    # host).  Defaulted only when the caller hasn't set it.
+    QEMU_LD_PREFIX="${QEMU_LD_PREFIX:-/usr/arm-linux-gnueabihf}" \
+        "$QEMU_ARM" "$testbin" 2>&1
     rc=$?
     rm -rf "$bdir"
     return $rc

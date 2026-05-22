@@ -20,7 +20,8 @@ case "$os" in
         if ! command -v apt-get >/dev/null 2>&1; then
             echo "error: this helper only supports apt-based distros."
             echo "       install equivalents for clang + libc6-armhf-cross"
-            echo "       + linux-libc-dev-armhf-cross + qemu-user-static manually."
+            echo "       + libc6-dev-armhf-cross + linux-libc-dev-armhf-cross"
+            echo "       + qemu-user-static manually."
             exit 1
         fi
         echo ">>> sudo apt-get update"
@@ -29,6 +30,7 @@ case "$os" in
         sudo apt-get install -y \
             clang \
             libc6-armhf-cross \
+            libc6-dev-armhf-cross \
             linux-libc-dev-armhf-cross \
             qemu-user-static
         ;;

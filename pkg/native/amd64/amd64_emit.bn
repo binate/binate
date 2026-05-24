@@ -1,0 +1,266 @@
+package "pkg/native/amd64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/ir"
+import "pkg/native/common"
+import "pkg/types"
+
+// ============================================================
+// Memory ops (Phase 3d) — alloc, load, store, GEP
+// ============================================================
+
+// emitAlloc: OP_ALLOC — aggregate allocas zero-init their storage
+// to match the LLVM `store ... zeroinitializer` shape (matters when
+// downstream code reads a field before storing).  Scalar allocas
+// are uninitialised; the following STORE fills them.
+//
+// Zero-init lowering: `mov qword ptr [rsp + off + 8*i], 0` for
+// each 8-byte word.  Inline for small slots; matches aa64's
+// approach (str xzr, [sp, #off + 8*i]).
+func emitAlloc(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if common.IsAggregateTyp(ins.TypeArg) {
+		var off int = rm.LookupAlloc(ins.ID)
+		var sz int = rm.LookupAllocSize(ins.ID)
+		if off >= 0 && sz > 0 {
+			for bo := 0; bo < sz; bo = bo + 8 {
+				x64.Mov(a,
+					x64.Mem(x64.RSP, off + bo, x64.SZ64),
+					x64.Imm(0))
+			}
+		}
+	}
+}
+
+// emitScalarLoad: size-dispatched `mov` / `movzx` / `movsxd` for
+// 1/2/4/8-byte loads.  Sub-8-byte loads with `signed=false` use
+// MOVZX (which zero-extends in one instruction); with `signed=true`
+// use MOVSX (sign-extend).  4-byte signed uses MOVSXD; 4-byte
+// unsigned uses MOV r32, which the CPU automatically zero-extends
+// to 64 bits.  8-byte uses MOV r64.
+func emitScalarLoad(a @asm.Assembler, rd int, base int, off int, sz int,
+		signed bool) {
+	if sz == 1 {
+		if signed {
+			x64.Movsx(a, x64.Reg(rd, x64.SZ64),
+				x64.Mem(base, off, x64.SZ8))
+		} else {
+			x64.Movzx(a, x64.Reg(rd, x64.SZ64),
+				x64.Mem(base, off, x64.SZ8))
+		}
+		return
+	}
+	if sz == 2 {
+		if signed {
+			x64.Movsx(a, x64.Reg(rd, x64.SZ64),
+				x64.Mem(base, off, x64.SZ16))
+		} else {
+			x64.Movzx(a, x64.Reg(rd, x64.SZ64),
+				x64.Mem(base, off, x64.SZ16))
+		}
+		return
+	}
+	if sz == 4 {
+		if signed {
+			x64.Movsxd(a, x64.Reg(rd, x64.SZ64),
+				x64.Mem(base, off, x64.SZ32))
+		} else {
+			// MOV r32, m32 — CPU zero-extends to 64 bits.
+			x64.Mov(a, x64.Reg(rd, x64.SZ32),
+				x64.Mem(base, off, x64.SZ32))
+		}
+		return
+	}
+	x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Mem(base, off, x64.SZ64))
+}
+
+// emitScalarStore: size-dispatched store.  x64.Mov picks the right
+// opcode + size prefix when src is given the matching width.
+func emitScalarStore(a @asm.Assembler, rt int, base int, off int, sz int) {
+	if sz == 1 {
+		x64.Mov(a, x64.Mem(base, off, x64.SZ8), x64.Reg(rt, x64.SZ8))
+		return
+	}
+	if sz == 2 {
+		x64.Mov(a, x64.Mem(base, off, x64.SZ16),
+			x64.Reg(rt, x64.SZ16))
+		return
+	}
+	if sz == 4 {
+		x64.Mov(a, x64.Mem(base, off, x64.SZ32),
+			x64.Reg(rt, x64.SZ32))
+		return
+	}
+	x64.Mov(a, x64.Mem(base, off, x64.SZ64), x64.Reg(rt, x64.SZ64))
+}
+
+// emitLoad: OP_LOAD — scalar loads dispatch by size + signedness
+// to emitScalarLoad; aggregate loads pass a pointer through (LLVM's
+// LOAD+STORE struct-copy idiom — the downstream OP_STORE memcpys).
+//
+// Globals (cross-section RIP-relative LEA) are deferred to Phase
+// 3e along with calls and string constants.
+func emitLoad(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var arg @ir.Instr = ins.Args[0]
+	if common.IsAggregateTyp(ins.Typ) {
+		var rd int = nextReg(rm, ins.ID)
+		var allocOff int = rm.LookupAlloc(arg.ID)
+		if allocOff >= 0 {
+			x64.Lea(a, x64.Reg(rd, x64.SZ64),
+				x64.Mem(x64.RSP, allocOff, x64.SZ64))
+			return
+		}
+		var src int = getOperand(a, rm, arg.ID)
+		if src < 0 { return }
+		x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(src, x64.SZ64))
+		return
+	}
+	var sz int = 8
+	if ins.Typ != nil { sz = ins.Typ.SizeOf() }
+	if sz <= 0 { sz = 8 }
+	var signed bool = ins.Typ != nil && ins.Typ.Signed
+	var off int = rm.LookupAlloc(arg.ID)
+	if off >= 0 {
+		var rd int = nextReg(rm, ins.ID)
+		emitScalarLoad(a, rd, x64.RSP, off, sz, signed)
+		return
+	}
+	var ptr int = getOperand(a, rm, arg.ID)
+	if ptr < 0 { return }
+	var rd int = nextReg(rm, ins.ID)
+	emitScalarLoad(a, rd, ptr, 0, sz, signed)
+}
+
+// emitStore: OP_STORE — scalar stores dispatch by size to
+// emitScalarStore.  Aggregate stores (struct copy / memcpy) are
+// deferred to Phase 3g along with MAKE/BOX/refcount; for now they
+// silently no-op so Phase 3d test programs (no aggregates) keep
+// working and Phase 3g shapes (with aggregates) fall through.
+func emitStore(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 2 { return }
+	if common.IsAggregateTyp(ins.Args[1].Typ) { return }
+	var sz int = 8
+	if ins.Args[1].Typ != nil { sz = ins.Args[1].Typ.SizeOf() }
+	if sz <= 0 { sz = 8 }
+	var off int = rm.LookupAlloc(ins.Args[0].ID)
+	var valReg int = getOperand(a, rm, ins.Args[1].ID)
+	if valReg < 0 { return }
+	if off >= 0 {
+		emitScalarStore(a, valReg, x64.RSP, off, sz)
+		return
+	}
+	var ptr int = getOperand(a, rm, ins.Args[0].ID)
+	if ptr < 0 { return }
+	emitScalarStore(a, valReg, ptr, 0, sz)
+}
+
+// emitGetFieldPtr: OP_GET_FIELD_PTR — compute base + FieldOffset.
+// Alloca base: LEA rd, [rsp + allocOff + fieldOff] (one instr).
+// Otherwise: LEA rd, [base + fieldOff].
+//
+// Slice bases (raw or managed) get a flat 8 * Index offset — fields
+// are data, len, [refptr, backingLen] in word-sized slots, matching
+// types.SliceDataOffset / MSliceDataOffset etc.
+func emitGetFieldPtr(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var fieldOff int
+	var baseTyp @types.Type = common.StructTypeOf(ins.Args[0])
+	if baseTyp != nil {
+		fieldOff = baseTyp.FieldOffset(ins.Index)
+	} else if isSliceFieldBase(ins.Args[0]) {
+		fieldOff = 8 * ins.Index
+	} else {
+		return
+	}
+	var rd int = nextReg(rm, ins.ID)
+	var allocOff int = rm.LookupAlloc(ins.Args[0].ID)
+	if allocOff >= 0 {
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(x64.RSP, allocOff + fieldOff, x64.SZ64))
+		return
+	}
+	var ptr int = getOperand(a, rm, ins.Args[0].ID)
+	if ptr < 0 { return }
+	if fieldOff == 0 {
+		x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(ptr, x64.SZ64))
+	} else {
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(ptr, fieldOff, x64.SZ64))
+	}
+}
+
+// isSibScale reports whether sz is a power-of-2 ∈ {1, 2, 4, 8} —
+// i.e., a valid SIB scale.  Used by emitGetElemPtr to decide
+// between the one-instruction LEA-with-SIB form and the slower
+// IMUL + ADD fallback.
+func isSibScale(sz int) bool {
+	return sz == 1 || sz == 2 || sz == 4 || sz == 8
+}
+
+// emitGetElemPtr: OP_GET_ELEM_PTR — compute base + idx * elemSize.
+// When elemSize ∈ {1, 2, 4, 8} the SIB addressing mode lets a
+// single LEA compute the address: `lea rd, [base + idx*scale]`.
+// Otherwise fall back to `imul tmp, idx, elemSize ; lea rd,
+// [base + tmp]`.
+func emitGetElemPtr(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 2 { return }
+	var elemSize int = common.ElemSizeOf(ins)
+	if elemSize <= 0 { return }
+	var idx int = getOperand(a, rm, ins.Args[1].ID)
+	if idx < 0 { return }
+
+	if isSibScale(elemSize) {
+		var rd int = nextReg(rm, ins.ID)
+		var allocOff int = rm.LookupAlloc(ins.Args[0].ID)
+		if allocOff >= 0 {
+			x64.Lea(a, x64.Reg(rd, x64.SZ64),
+				x64.MemIdx(x64.RSP, idx, elemSize, allocOff,
+					x64.SZ64))
+			return
+		}
+		var base int = getOperand(a, rm, ins.Args[0].ID)
+		if base < 0 { return }
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.MemIdx(base, idx, elemSize, 0, x64.SZ64))
+		return
+	}
+	// Non-SIB elemSize: compute idx * elemSize into a scratch, then
+	// LEA the result.
+	var byteOff int = scratchReg(rm)
+	x64.Mov(a, x64.Reg(byteOff, x64.SZ64), x64.Reg(idx, x64.SZ64))
+	x64.Imul3(a, x64.Reg(byteOff, x64.SZ64),
+		x64.Reg(byteOff, x64.SZ64), elemSize)
+	var rd int = nextReg(rm, ins.ID)
+	var allocOff int = rm.LookupAlloc(ins.Args[0].ID)
+	if allocOff >= 0 {
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.MemIdx(x64.RSP, byteOff, 1, allocOff, x64.SZ64))
+		return
+	}
+	var base int = getOperand(a, rm, ins.Args[0].ID)
+	if base < 0 { return }
+	x64.Lea(a, x64.Reg(rd, x64.SZ64),
+		x64.MemIdx(base, byteOff, 1, 0, x64.SZ64))
+}
+
+// isSliceFieldBase reports whether ins names a base whose
+// OP_GET_FIELD_PTR fields are word-sized slice fields rather than
+// a real struct's.  The IR uses the raw value's pointee type — a
+// pointer to (managed)slice — to mean "I'm taking field N (data /
+// len / refptr / backingLen) of the slice through this address."
+func isSliceFieldBase(ins @ir.Instr) bool {
+	if ins == nil { return false }
+	if ins.TypeArg != nil &&
+		(ins.TypeArg.Kind == types.TYP_SLICE ||
+			ins.TypeArg.Kind == types.TYP_MANAGED_SLICE) {
+		return true
+	}
+	if ins.Typ != nil && ins.Typ.Elem != nil {
+		var k int = ins.Typ.Elem.Kind
+		if k == types.TYP_SLICE || k == types.TYP_MANAGED_SLICE {
+			return true
+		}
+	}
+	return false
+}

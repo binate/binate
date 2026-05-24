@@ -60,10 +60,18 @@ func emitStringTable(a @asm.Assembler, strings @[]ir.StringConst) {
 	a.Align(4)
 }
 
-// collectFuncValueRefs walks the module for OP_FUNC_VALUE references
-// and returns the unique (name, fvTyp) pairs. fvTyp is the
-// instruction's Typ — TYP_FUNC_VALUE / TYP_MANAGED_FUNC_VALUE — and
-// its Params/Results drive the per-function shim shape.
+// collectFuncValueRefs walks the module for OP_FUNC_VALUE and
+// OP_FUNC_HANDLE references and returns the unique (name, fvTyp)
+// pairs.  fvTyp is the instruction's Typ for OP_FUNC_VALUE
+// (TYP_FUNC_VALUE / TYP_MANAGED_FUNC_VALUE) and synthesized from the
+// target function's signature for OP_FUNC_HANDLE (whose IR result
+// type is the opaque *uint8).  Cross-module references — those
+// whose qualified function name doesn't resolve in mod.Funcs — are
+// excluded: the defining module's LLVM-emitted __handle / __vt /
+// __shim triplet is already in its .o, and the linker resolves the
+// reference cross-TU; emitting our own definitions would be wasteful
+// and risks the previous attempt's duplicate-symbol pitfall
+// (plan-uniform-native-fnptrs.md Phase 4).
 func collectFuncValueRefs(mod @ir.Module) (@[]@[]char, @[]@types.Type) {
 	var seen @[]@[]char
 	var sigs @[]@types.Type
@@ -74,7 +82,10 @@ func collectFuncValueRefs(mod @ir.Module) (@[]@[]char, @[]@types.Type) {
 			var blk @ir.Block = f.Blocks[j]
 			for k := 0; k < len(blk.Instrs); k++ {
 				var ins @ir.Instr = blk.Instrs[k]
-				if ins.Op != ir.OP_FUNC_VALUE { continue }
+				if ins.Op != ir.OP_FUNC_VALUE &&
+						ins.Op != ir.OP_FUNC_HANDLE {
+					continue
+				}
 				var dup bool = false
 				for s := 0; s < len(seen); s++ {
 					if charEqAA64(seen[s], ins.StrVal) {
@@ -83,12 +94,55 @@ func collectFuncValueRefs(mod @ir.Module) (@[]@[]char, @[]@types.Type) {
 					}
 				}
 				if dup { continue }
+				var sigTyp @types.Type = ins.Typ
+				if ins.Op == ir.OP_FUNC_HANDLE {
+					sigTyp = lookupFuncValueTypeAA64(mod, ins.StrVal)
+					if sigTyp == nil { continue }
+				}
 				seen = appendNameAA64(seen, ins.StrVal)
-				sigs = appendSigAA64(sigs, ins.Typ)
+				sigs = appendSigAA64(sigs, sigTyp)
 			}
 		}
 	}
 	return seen, sigs
+}
+
+// lookupFuncValueTypeAA64 finds a function in the module by qualified
+// name and synthesizes a TYP_FUNC_VALUE from its parameter / result
+// signature.  Mirrors lookupFuncValueType in pkg/codegen — used to
+// back OP_FUNC_HANDLE references (whose IR result is opaque *uint8)
+// with the same per-function shim/vtable/handle emission as
+// OP_FUNC_VALUE.  Returns nil for cross-module references (function
+// not in mod.Funcs); the caller skips local emission, since the
+// defining TU already provides the triplet.
+func lookupFuncValueTypeAA64(mod @ir.Module, qname @[]char) @types.Type {
+	for i := 0; i < len(mod.Funcs); i++ {
+		var f @ir.Func = mod.Funcs[i]
+		if !charEqAA64(f.Name, qname) { continue }
+		// ir.Param has Name + Typ; types.Param has Name + Type.
+		// Copy field-by-field into a fresh @[]@types.Param.
+		var params @[]@types.Param
+		for j := 0; j < len(f.Params); j++ {
+			var p @types.Param = make(types.Param)
+			p.Name = f.Params[j].Name
+			p.Type = f.Params[j].Typ
+			params = appendTypesParamAA64(params, p)
+		}
+		return types.MakeFuncValueType(params, f.Results)
+	}
+	return nil
+}
+
+// appendTypesParamAA64 appends a @types.Param to a managed slice.
+// Local helper because pkg/native/arm64 doesn't pull in the
+// generic-append helpers pkg/codegen uses.
+func appendTypesParamAA64(s @[]@types.Param,
+		v @types.Param) @[]@types.Param {
+	var n int = len(s)
+	var ns @[]@types.Param = make_slice(@types.Param, n + 1)
+	for i := 0; i < n; i++ { ns[i] = s[i] }
+	ns[n] = v
+	return ns
 }
 
 // shimReturnSize returns the byte size of a function value's
@@ -238,14 +292,24 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]const char,
 	a.Align(4)
 }
 
-// emitFuncValueVtables walks the module for OP_FUNC_VALUE references
-// and emits one 16-byte vtable per unique function name in __DATA:
-//   __vt.<mangled>:
-//       .quad 0                ; dtor (no captured ctx for non-capturing)
-//       .quad __shim.<mangled> ; call slot — points at the shim
-//                              ; (Phase 3 always-shim convention)
-// Globals are emitted with weak (Mach-O equivalent of weak_odr) so
-// the linker dedupes across .o's without dropping them.
+// emitFuncValueVtables walks the module for OP_FUNC_VALUE and
+// OP_FUNC_HANDLE references and emits the per-function backing
+// globals each one needs:
+//
+//   _bn_<pkg>__<fn>__vt           ; aa64-style vtable, weak.
+//                                ;   .quad 0                ; dtor
+//                                ;   .quad _bn_..__shim     ; call
+//   ___handle.bn_<pkg>__<fn>     ; LLVM-shape handle, weak (Phase 4).
+//                                ;   .quad <vt label>       ; vtable
+//                                ;   .quad 0                ; data
+//
+// Two distinct vtable symbols coexist: the aa64-style one is what
+// OP_FUNC_VALUE construction reaches via vtableSymFor, while the
+// LLVM-shape handle's vt slot points at the same aa64 vtable (layout
+// agrees — `{dtor, call}` either way).  OP_FUNC_HANDLE references
+// read the handle via handleSymFor; OP_CALL_HANDLE loads
+// handle.vtable.call from that, dispatches as `call(data, args)`.
+// Phase 4 of plan-uniform-native-fnptrs.md.
 func emitFuncValueVtables(a @asm.Assembler, pkgName *[]const char,
 		mod @ir.Module) {
 	var seen @[]@[]char
@@ -258,10 +322,10 @@ func emitFuncValueVtables(a @asm.Assembler, pkgName *[]const char,
 	if len(seen) == 0 { return }
 	a.SetSection("data", -1)
 	for i := 0; i < len(seen); i++ {
-		var label @[]char = vtableSymFor(pkgName, seen[i])
+		var vtLabel @[]char = vtableSymFor(pkgName, seen[i])
 		var shimLabel @[]char = shimSymFor(pkgName, seen[i])
-		a.DefineLabel(label)
-		a.SetWeak(label)
+		a.DefineLabel(vtLabel)
+		a.SetWeak(vtLabel)
 		// Reference shimLabel so the assembler resolves it as a relocation.
 		a.SetGlobal(shimLabel)
 		// dtor slot: 8 bytes of zero.
@@ -270,6 +334,17 @@ func emitFuncValueVtables(a @asm.Assembler, pkgName *[]const char,
 		// convention). The linker resolves the relocation to the
 		// shim's runtime address.
 		a.EmitAddr(shimLabel)
+
+		// Phase 4 handle global — points at the vtable above; data
+		// slot is null (non-capturing).  Mirrors emitFuncValueHandle
+		// in pkg/codegen.  Weak (N_WEAK_DEF) so an LLVM-emitted dep
+		// that happens to export the same symbol gets deduped by the
+		// linker rather than producing a duplicate-definition error.
+		var handleLabel @[]char = handleSymFor(pkgName, seen[i])
+		a.DefineLabel(handleLabel)
+		a.SetWeak(handleLabel)
+		a.EmitAddr(vtLabel)
+		a.Zero(8)
 	}
 }
 

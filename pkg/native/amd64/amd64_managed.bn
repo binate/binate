@@ -1,0 +1,234 @@
+package "pkg/native/amd64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/ir"
+import "pkg/native/common"
+
+// ============================================================
+// Managed memory + struct copy (Phase 3g)
+// ============================================================
+//
+// Refcount, box, make, make-slice, aggregate const-nil, struct
+// copy.  Split out of amd64_emit.bn along the natural Phase
+// 3g-vs-3d boundary to keep amd64_emit.bn under the file-length
+// soft cap.
+//
+// All runtime calls reach the C-compiled pkg/rt symbols by bare
+// name (no symFor mangling) — bn_rt__Alloc / Box / RefInc /
+// RefDec / MakeManagedSlice / ZeroRefDestroy are the actual
+// linker symbol names.
+
+// emitConstNil: OP_CONST_NIL — aggregate nil zero-inits its data
+// region and produces a pointer.  Scalar nil is `mov rd, 0`.
+// Mirrors arm64's emitConstNil.
+func emitConstNil(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if common.IsAggregateTyp(ins.Typ) {
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		var sz int = rm.LookupAllocSize(ins.ID)
+		if dataOff >= 0 && sz > 0 {
+			for bo := 0; bo < sz; bo = bo + 8 {
+				x64.Mov(a,
+					x64.Mem(x64.RSP, dataOff + bo, x64.SZ64),
+					x64.Imm(0))
+			}
+			var rd int = nextReg(rm, ins.ID)
+			x64.Lea(a, x64.Reg(rd, x64.SZ64),
+				x64.Mem(x64.RSP, dataOff, x64.SZ64))
+			return
+		}
+	}
+	var rd int = nextReg(rm, ins.ID)
+	x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Imm(0))
+}
+
+// emitRefInc: OP_REFINC — slow-path runtime call.  SysV-AMD64
+// first arg in RDI.  arm64 has an inline fast path (CBZ + LDR-
+// pre-index + ADD + STR); the x86-64 equivalent is a follow-on
+// perf optimisation, deferred.  The runtime function handles nil
+// and the refcount-zero edge cases.
+func emitRefInc(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var ptr int = getOperand(a, rm, ins.Args[0].ID)
+	if ptr < 0 { return }
+	if ptr != x64.RDI {
+		x64.Mov(a, x64.Reg(x64.RDI, x64.SZ64), x64.Reg(ptr, x64.SZ64))
+	}
+	a.SetGlobal("bn_rt__RefInc")
+	x64.Call(a, "bn_rt__RefInc")
+	rm.ResetRegs()
+}
+
+// emitRefDec: OP_REFDEC — slow-path runtime call.  The runtime
+// decrements, and if the count hits zero, invokes the destructor
+// (Args[1], if present) and frees.  SysV-AMD64 first arg = RDI
+// (ptr), second arg = RSI (dtor or nil).
+func emitRefDec(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var ptr int = getOperand(a, rm, ins.Args[0].ID)
+	if ptr < 0 { return }
+	var dtor int = -1
+	if len(ins.Args) > 1 {
+		dtor = getOperand(a, rm, ins.Args[1].ID)
+	}
+	// Move ptr to RDI first so the dtor reload (if any) doesn't
+	// clobber RDI before we set it.  The arg might already be in
+	// RDI — Mov from RDI to RDI is a no-op, skip.
+	if ptr != x64.RDI {
+		x64.Mov(a, x64.Reg(x64.RDI, x64.SZ64), x64.Reg(ptr, x64.SZ64))
+	}
+	if dtor >= 0 {
+		if dtor != x64.RSI {
+			x64.Mov(a, x64.Reg(x64.RSI, x64.SZ64),
+				x64.Reg(dtor, x64.SZ64))
+		}
+	} else {
+		x64.Mov(a, x64.Reg(x64.RSI, x64.SZ64), x64.Imm(0))
+	}
+	a.SetGlobal("bn_rt__RefDec")
+	x64.Call(a, "bn_rt__RefDec")
+	rm.ResetRegs()
+}
+
+// emitMake: OP_MAKE — call bn_rt__Alloc(SizeOf(T)) for a fresh
+// zero-initialised @T with refcount=1.  Result (RAX) → rd.
+func emitMake(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if ins.TypeArg == nil { return }
+	x64.Mov(a, x64.Reg(x64.RDI, x64.SZ64),
+		x64.Imm(ins.TypeArg.SizeOf()))
+	a.SetGlobal("bn_rt__Alloc")
+	x64.Call(a, "bn_rt__Alloc")
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	if rd != x64.RAX {
+		x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+	}
+}
+
+// emitBox: OP_BOX — call bn_rt__Box(srcPtr, size) to heap-copy
+// val.  Two source shapes:
+//   - OP_ALLOC: srcPtr = LEA [rsp + allocOff]; size = TypeArg.SizeOf()
+//   - Aggregate Load / Extract / etc.: srcPtr = the operand's
+//     spill pointer; size = val.Typ.SizeOf()
+func emitBox(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var val @ir.Instr = ins.Args[0]
+	var sz int = 0
+	if val.Op == ir.OP_ALLOC && val.TypeArg != nil {
+		var allocOff int = rm.LookupAlloc(val.ID)
+		if allocOff < 0 { return }
+		x64.Lea(a, x64.Reg(x64.RDI, x64.SZ64),
+			x64.Mem(x64.RSP, allocOff, x64.SZ64))
+		sz = val.TypeArg.SizeOf()
+	} else if common.IsAggregateTyp(val.Typ) {
+		var src int = getOperand(a, rm, val.ID)
+		if src < 0 { return }
+		if src != x64.RDI {
+			x64.Mov(a, x64.Reg(x64.RDI, x64.SZ64),
+				x64.Reg(src, x64.SZ64))
+		}
+		sz = val.Typ.SizeOf()
+	} else {
+		// Scalar / unhandled — silent return, matches arm64.
+		return
+	}
+	x64.Mov(a, x64.Reg(x64.RSI, x64.SZ64), x64.Imm(sz))
+	a.SetGlobal("bn_rt__Box")
+	x64.Call(a, "bn_rt__Box")
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	if rd != x64.RAX {
+		x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+	}
+}
+
+// emitMakeSlice: OP_MAKE_SLICE — call bn_rt__MakeManagedSlice.
+// The runtime returns a 32-byte managed-slice header, which on
+// SysV-AMD64 (InternalSretBytes=16) is sret-returned via a hidden
+// RDI buffer pointer.  All other args shift by one:
+//   RDI = &data_region (the 32-byte buffer we hand it)
+//   RSI = elemSize
+//   RDX = len
+// After CALL, data_region holds the header; rd = data_region addr.
+//
+// Differs from arm64's lowering: AAPCS64 (InternalSretBytes=64)
+// returns the 32-byte struct packed into X0..X3 directly, so
+// arm64 stores each register into the data region post-call.
+// SysV's lower threshold means the runtime writes the bytes
+// directly via the hidden buffer pointer.
+func emitMakeSlice(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 || ins.TypeArg == nil { return }
+	var dataOff int = rm.LookupAlloc(ins.ID)
+	if dataOff < 0 { return }
+	var lenReg int = getOperand(a, rm, ins.Args[0].ID)
+	if lenReg < 0 { return }
+	// Move len to RDX first (since the sret-buffer LEA goes to RDI
+	// and elemSize to RSI), so the RDI/RSI setup doesn't clobber
+	// the len before we capture it.
+	if lenReg != x64.RDX {
+		x64.Mov(a, x64.Reg(x64.RDX, x64.SZ64),
+			x64.Reg(lenReg, x64.SZ64))
+	}
+	x64.Lea(a, x64.Reg(x64.RDI, x64.SZ64),
+		x64.Mem(x64.RSP, dataOff, x64.SZ64))
+	x64.Mov(a, x64.Reg(x64.RSI, x64.SZ64),
+		x64.Imm(ins.TypeArg.SizeOf()))
+	a.SetGlobal("bn_rt__MakeManagedSlice")
+	x64.Call(a, "bn_rt__MakeManagedSlice")
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	x64.Lea(a, x64.Reg(rd, x64.SZ64),
+		x64.Mem(x64.RSP, dataOff, x64.SZ64))
+}
+
+// emitStructCopy: OP_STORE where the source is an aggregate.
+// Byte-for-byte memcpy via an inline qword-MOV loop (one MOV per
+// 8-byte chunk).  Mirrors arm64's emitStructCopy approach.
+// Either endpoint may be a package-level global, reached via
+// emitGlobalAddr (RIP-relative LEA).
+func emitStructCopy(a @asm.Assembler, pkgName *[]const char,
+		rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 2 { return }
+	if ins.Args[1].Typ == nil { return }
+	var sz int = ins.Args[1].Typ.SizeOf()
+	if sz <= 0 { return }
+
+	var srcPtr int
+	if isGlobalRef(ins.Args[1]) {
+		srcPtr = scratchReg(rm)
+		emitGlobalAddr(a, pkgName, srcPtr, ins.Args[1])
+	} else if common.IsMultiReturnCall(ins.Args[1]) {
+		// Multi-return spill holds the N*8 bytes themselves; the
+		// address of those bytes is the source for the copy.
+		var srcOff int = rm.LookupSpill(ins.Args[1].ID)
+		if srcOff < 0 { return }
+		srcPtr = scratchReg(rm)
+		x64.Lea(a, x64.Reg(srcPtr, x64.SZ64),
+			x64.Mem(x64.RSP, srcOff, x64.SZ64))
+	} else {
+		srcPtr = getOperand(a, rm, ins.Args[1].ID)
+	}
+	if srcPtr < 0 { return }
+
+	var dstPtr int
+	var allocOff int = rm.LookupAlloc(ins.Args[0].ID)
+	if allocOff >= 0 {
+		dstPtr = scratchReg(rm)
+		x64.Lea(a, x64.Reg(dstPtr, x64.SZ64),
+			x64.Mem(x64.RSP, allocOff, x64.SZ64))
+	} else if isGlobalRef(ins.Args[0]) {
+		dstPtr = scratchReg(rm)
+		emitGlobalAddr(a, pkgName, dstPtr, ins.Args[0])
+	} else {
+		dstPtr = getOperand(a, rm, ins.Args[0].ID)
+	}
+	if dstPtr < 0 { return }
+
+	var tmp int = scratchReg(rm)
+	for off := 0; off < sz; off = off + 8 {
+		x64.Mov(a, x64.Reg(tmp, x64.SZ64),
+			x64.Mem(srcPtr, off, x64.SZ64))
+		x64.Mov(a, x64.Mem(dstPtr, off, x64.SZ64),
+			x64.Reg(tmp, x64.SZ64))
+	}
+}

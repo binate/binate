@@ -32,22 +32,50 @@ import "pkg/types"
 func emitCall(a @asm.Assembler, pkgName *[]const char, rm @common.RegMap,
 		allFuncs @[]@ir.Func, ins @ir.Instr) {
 	// Build the argTypes slice once for the CallConv dispatch.
-	var argTypes @[]@types.Type = make_slice(@types.Type, len(ins.Args))
-	for i := 0; i < len(ins.Args); i++ {
-		argTypes[i] = ins.Args[i].Typ
+	// SysV-AMD64 sret: an aggregate or multi-return tuple bigger
+	// than CallConv.InternalSretBytes (or CExternSretBytes for
+	// C-extern callees) is returned via a hidden buffer pointer
+	// in RDI, shifting every user arg by one register.  We model
+	// the shift by synthesising a pointer-typed leading entry in
+	// argTypes — CallArgRegStart then naturally places user arg i
+	// at register slot i+1.
+	var bigMultiRet bool = ins.ID >= 0 &&
+		rm.CC.CallReturnsBigMultiReturn(ins)
+	var bigRet bool = ins.ID >= 0 &&
+		(rm.CC.CallReturnsBigAggregate(ins) ||
+		 rm.CC.CalleeUsesCSret(allFuncs, ins) ||
+		 bigMultiRet)
+	var nDispatchArgs int = len(ins.Args)
+	if bigRet { nDispatchArgs = nDispatchArgs + 1 }
+	var argTypes @[]@types.Type = make_slice(@types.Type, nDispatchArgs)
+	if bigRet {
+		// First slot is the hidden sret-buffer pointer — a single
+		// 8-byte word that consumes one GP arg register.
+		argTypes[0] = types.TypInt()
+		for i := 0; i < len(ins.Args); i++ {
+			argTypes[i+1] = ins.Args[i].Typ
+		}
+	} else {
+		for i := 0; i < len(ins.Args); i++ {
+			argTypes[i] = ins.Args[i].Typ
+		}
 	}
 
 	for ai := 0; ai < len(ins.Args); ai++ {
 		var arg @ir.Instr = ins.Args[ai]
-		// Aggregate args are deferred to Phase 3h (SysV INTEGER/SSE/
+		// Aggregate args are deferred to Phase 4 (SysV INTEGER/SSE/
 		// MEMORY classification).  Float args are Phase 4 (XMM regs).
 		// Skip them for now — conformance tests that hit those
 		// signatures will misbehave at runtime; that's the expected
-		// pre-3h/4 state.
+		// pre-4 state.
 		if common.IsAggregateTyp(arg.Typ) { continue }
 		if common.IsFloatScalarTyp(arg.Typ) { continue }
-		var regStart int = rm.CC.CallArgRegStart(argTypes, ai)
-		var stackOff int = rm.CC.CallArgStackOff(argTypes, ai)
+		// User arg i lives at dispatch slot i (no sret) or i+1
+		// (sret — the synthesised pointer takes slot 0).
+		var dispatchIdx int = ai
+		if bigRet { dispatchIdx = ai + 1 }
+		var regStart int = rm.CC.CallArgRegStart(argTypes, dispatchIdx)
+		var stackOff int = rm.CC.CallArgStackOff(argTypes, dispatchIdx)
 		var src int = getOperand(a, rm, arg.ID)
 		if src < 0 { continue }
 		if regStart >= 0 {
@@ -67,6 +95,23 @@ func emitCall(a @asm.Assembler, pkgName *[]const char, rm @common.RegMap,
 		rm.ResetRegs()
 	}
 
+	// sret setup: LEA &returnBuffer into RDI.  Single-aggregate
+	// returns land in the alloc data region; multi-return tuples
+	// land in the spill slot (sized to the full tuple by
+	// PlanFrame).
+	if bigRet {
+		var sretOff int = -1
+		if bigMultiRet {
+			sretOff = rm.LookupSpill(ins.ID)
+		} else {
+			sretOff = rm.LookupAlloc(ins.ID)
+		}
+		if sretOff >= 0 {
+			x64.Lea(a, x64.Reg(x64.RDI, x64.SZ64),
+				x64.Mem(x64.RSP, sretOff, x64.SZ64))
+		}
+	}
+
 	// Emit the CALL.  symFor handles dot-qualified names (e.g.
 	// "bootstrap.println") and bare names alike; a.SetGlobal
 	// declares the callee for cross-section relocs.
@@ -80,14 +125,14 @@ func emitCall(a @asm.Assembler, pkgName *[]const char, rm @common.RegMap,
 	rm.ResetRegs()
 	if ins.ID < 0 { return }
 	if ins.Typ == nil { return }
-	// Multi-return tuple ≤ 16 bytes: SysV-AMD64 packs the first
-	// 8-byte word into RAX and the second into RDX.  Store each
-	// into the spill slot at the field's offset within the tuple
-	// (FieldOffset, not 8*Index — fields may be sub-8-byte and
-	// their offsets reflect the C-style packing).  Phase 3f scope:
-	// at most 2 fields fit RAX/RDX; bigger tuples need sret
-	// (Phase 3h).
+
+	// Multi-return tuple: bigRet (sret) wrote the bytes directly
+	// into the spill slot via the hidden RDI buffer pointer — no
+	// register-to-slot copying needed.  ≤ 16 bytes: SysV packs
+	// RAX (first word) + RDX (second word); store each into the
+	// spill slot at the field's offset.
 	if common.IsMultiReturnCall(ins) {
+		if bigMultiRet { return }
 		var spillOff int = rm.LookupSpill(ins.ID)
 		if spillOff < 0 { return }
 		var n int = len(ins.Typ.Fields)
@@ -105,8 +150,33 @@ func emitCall(a @asm.Assembler, pkgName *[]const char, rm @common.RegMap,
 		}
 		return
 	}
-	// Single aggregate return / sret are Phase 3h.
-	if common.IsAggregateTyp(ins.Typ) { return }
+
+	// Single aggregate return.  Three cases:
+	//   - bigRet (> 16 bytes via sret): callee wrote through RDI;
+	//     just LEA the data-region pointer into rd.
+	//   - ≤ 8 bytes: packed into RAX; store RAX into the data
+	//     region; LEA rd.
+	//   - 9..16 bytes: packed into RAX (low 8) + RDX (high 8);
+	//     store both into the data region; LEA rd.
+	if common.IsAggregateTyp(ins.Typ) {
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var sz int = ins.Typ.SizeOf()
+		if sz <= 0 { return }
+		if !bigRet {
+			// ≤ 16 bytes — pack RAX (+ RDX) into the data region.
+			x64.Mov(a, x64.Mem(x64.RSP, dataOff, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
+			if sz > 8 {
+				x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8, x64.SZ64),
+					x64.Reg(x64.RDX, x64.SZ64))
+			}
+		}
+		var rd int = nextReg(rm, ins.ID)
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(x64.RSP, dataOff, x64.SZ64))
+		return
+	}
 	if ins.Typ.Kind == types.TYP_VOID { return }
 	// Single scalar return: RAX → rd → spill.
 	var rd int = nextReg(rm, ins.ID)

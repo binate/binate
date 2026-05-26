@@ -1,0 +1,219 @@
+package "pkg/ir"
+
+import "pkg/ast"
+import "pkg/types"
+
+// ============================================================
+// Binary-expression lowering + integer-width handling
+// ============================================================
+
+// genBinary generates IR for a binary expression, with short-circuit for && and ||.
+func genBinary(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	// Phase A4 of plan-ir-gen-typed-literals.md: if the type
+	// checker folded this binop to a literal value (foldIntArith
+	// / foldIntBitwise wrote HasLitVal on the result type), emit
+	// a single OP_CONST_INT for the folded value and skip the
+	// binop IR.  Folds through typed-const operand references
+	// too — pkg/types now stores HasLitVal/LitMag/LitSign on
+	// iota'd const symbols, so `keyword_start + 1` folds to the
+	// correct iota + 1 rather than the literal-1 value
+	// commonType used to inherit.
+	//
+	// Mirrors genExprInner's `ctx.CurBlock = b` pre-amble so
+	// callers landing `b = ctx.CurBlock` after the call see the
+	// same block they passed in.
+	if currentChecker != nil && e.ResolvedTypeID != 0 {
+		var t @types.Type = currentChecker.ExprType(e.ResolvedTypeID)
+		if t != nil && t.HasLitVal &&
+				t.Kind == types.TYP_UNTYPED_INT {
+			ctx.CurBlock = b
+			var v int = bignumToInt(t.LitMag, t.LitSign)
+			if v < -2147483648 || v > 2147483647 {
+				return b.EmitConstInt(v, types.TypInt64())
+			}
+			return b.EmitConstInt(v, types.TypUntypedInt())
+		}
+	}
+
+	var op int = tokenToOp(e.Op)
+
+	// Short-circuit evaluation for && and ||
+	if op == OP_LAND {
+		return genShortCircuitAnd(ctx, b, e)
+	}
+	if op == OP_LOR {
+		return genShortCircuitOr(ctx, b, e)
+	}
+
+	var lhs @Instr = genExpr(ctx, b, e.X)
+	b = ctx.CurBlock
+	// Phase B of plan-ir-gen-typed-literals.md: when one operand
+	// is a typed integer and the other is an integer literal,
+	// emit the literal directly at the typed operand's type so
+	// the binop result stays in that type (instead of widening
+	// up to int64 via the literal's magnitude-promoted TypInt64).
+	// This is what flips `x & 0xFFFFFFFF` (x: uint32) from a
+	// uint32-widened-to-int64 binop into a clean uint32 binop —
+	// the original ror32-mask bug from claude-todo.md.
+	var rhs @Instr = genIntLitWithHint(ctx, b, e.Y, lhs.Typ)
+	if rhs == nil {
+		rhs = genExpr(ctx, b, e.Y)
+	}
+	b = ctx.CurBlock
+	// Symmetric: if the RHS we got was a typed int and the LHS
+	// was an untyped literal we've already generated, redo the
+	// LHS with the RHS's type as the hint.  The double-pass is
+	// regrettable; the cleaner shape would pass hints through
+	// genExpr itself, but that's a wider refactor.
+	if e.X != nil && e.X.Kind == ast.EXPR_INT_LIT &&
+			lhs.Typ != nil &&
+			(lhs.Typ.Kind == types.TYP_UNTYPED_INT ||
+				lhs.Typ == types.TypInt64()) {
+		var narrowed @Instr = genIntLitWithHint(ctx, b, e.X, rhs.Typ)
+		if narrowed != nil {
+			lhs = narrowed
+		}
+	}
+
+	// Determine the wider type for mixed-width arithmetic (e.g., char + int)
+	var resultTyp @types.Type = widenType(lhs.Typ, rhs.Typ)
+	lhs = ensureWidth(ctx, b, lhs, resultTyp)
+	rhs = ensureWidth(ctx, b, rhs, resultTyp)
+
+	// Comparison ops return bool
+	if op >= OP_EQ {
+		if op <= OP_GE {
+			return b.EmitBinop(op, lhs, rhs, types.TypBool())
+		}
+	}
+
+	return b.EmitBinop(op, lhs, rhs, resultTyp)
+}
+
+// genShortCircuitAnd implements short-circuit evaluation for a && b:
+// Allocates a result bool (default false), evaluates LHS. If LHS is true,
+// evaluates RHS and stores result. Otherwise skips RHS (result stays false).
+func genShortCircuitAnd(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	// Alloca for result in current block, default false
+	var resultPtr @Instr = b.EmitAlloc(types.TypBool())
+	b.EmitStore(resultPtr, b.EmitConstBool(false))
+
+	// Evaluate LHS — clean up any managed temps before branching
+	var savedTemps int = len(ctx.Temps)
+	var lhs @Instr = genExpr(ctx, b, e.X)
+	b = ctx.CurBlock // LHS might have changed block (nested short-circuit)
+	b = emitTempCleanupSince(ctx, b, savedTemps)
+
+	// Create RHS and merge blocks
+	var rhsBlk @Block = AddBlock(ctx.Func, "land.rhs")
+	var mergeBlk @Block = AddBlock(ctx.Func, "land.merge")
+
+	// Branch: if LHS true → evaluate RHS, else → merge (result is false)
+	b.EmitBranch(lhs, rhsBlk, mergeBlk)
+
+	// RHS block: evaluate RHS, clean up temps, store to result, jump to merge
+	var savedTemps2 int = len(ctx.Temps)
+	var rhs @Instr = genExpr(ctx, rhsBlk, e.Y)
+	rhsBlk = ctx.CurBlock // RHS might have changed block
+	rhsBlk = emitTempCleanupSince(ctx, rhsBlk, savedTemps2)
+	rhsBlk.EmitStore(resultPtr, rhs)
+	rhsBlk.EmitJump(mergeBlk)
+
+	// Merge block: load result
+	ctx.CurBlock = mergeBlk
+	return mergeBlk.EmitLoad(resultPtr, types.TypBool())
+}
+
+// genShortCircuitOr implements short-circuit evaluation for a || b:
+// Allocates a result bool (default true), evaluates LHS. If LHS is false,
+// evaluates RHS and stores result. Otherwise skips RHS (result stays true).
+func genShortCircuitOr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	// Alloca for result in current block, default true
+	var resultPtr @Instr = b.EmitAlloc(types.TypBool())
+	b.EmitStore(resultPtr, b.EmitConstBool(true))
+
+	// Evaluate LHS — clean up any managed temps before branching
+	var savedTemps int = len(ctx.Temps)
+	var lhs @Instr = genExpr(ctx, b, e.X)
+	b = ctx.CurBlock
+	b = emitTempCleanupSince(ctx, b, savedTemps)
+
+	// Create RHS and merge blocks
+	var rhsBlk @Block = AddBlock(ctx.Func, "lor.rhs")
+	var mergeBlk @Block = AddBlock(ctx.Func, "lor.merge")
+
+	// Branch: if LHS true → merge (result is true), else → evaluate RHS
+	b.EmitBranch(lhs, mergeBlk, rhsBlk)
+
+	// RHS block: evaluate RHS, clean up temps, store to result, jump to merge
+	var savedTemps2 int = len(ctx.Temps)
+	var rhs @Instr = genExpr(ctx, rhsBlk, e.Y)
+	rhsBlk = ctx.CurBlock
+	rhsBlk = emitTempCleanupSince(ctx, rhsBlk, savedTemps2)
+	rhsBlk.EmitStore(resultPtr, rhs)
+	rhsBlk.EmitJump(mergeBlk)
+
+	// Merge block: load result
+	ctx.CurBlock = mergeBlk
+	return mergeBlk.EmitLoad(resultPtr, types.TypBool())
+}
+
+// widenType returns the wider of two integer types (or int as default)
+func widenType(a @types.Type, b @types.Type) @types.Type {
+	// If both are bool, keep bool
+	if a != nil && a.Kind == types.TYP_BOOL && b != nil && b.Kind == types.TYP_BOOL {
+		return types.TypBool()
+	}
+	// Untyped int adopts the other operand's type.
+	// If both are untyped, default to int.
+	var aUntyped bool = a != nil && a.Kind == types.TYP_UNTYPED_INT
+	var bUntyped bool = b != nil && b.Kind == types.TYP_UNTYPED_INT
+	if aUntyped && bUntyped {
+		return types.TypUntypedInt()
+	}
+	if aUntyped && b != nil && b.IsInteger() {
+		return b
+	}
+	if bUntyped && a != nil && a.IsInteger() {
+		return a
+	}
+	var aw int = typeWidth(a)
+	var bw int = typeWidth(b)
+	if aw >= bw {
+		if a != nil && a.Kind == types.TYP_INT { return a }
+		if aw == bw && a != nil { return a }
+		return types.TypInt()
+	}
+	if b != nil && b.Kind == types.TYP_INT { return b }
+	if b != nil { return b }
+	return types.TypInt()
+}
+
+// typeWidth returns the bit width of a type for IR-level width
+// comparisons.  Must agree with codegen's llvmType for the same
+// type — under --target arm32-linux or arm32-baremetal,
+// `int` and untyped-int both lower to i32 (4 bytes), so they must
+// report 32 here.  Earlier the fallback for nil / Width=0 was a
+// hardcoded 64, which silently dropped ensureWidth casts when an
+// untyped-int operand met a 32-bit `int` on arm32 — the resulting
+// IR then had two operands of mismatched LLVM widths.
+func typeWidth(t @types.Type) int {
+	var targetIntBits int = types.GetTarget().IntSize * 8
+	if t == nil { return targetIntBits }
+	if t.Kind == types.TYP_BOOL || t.Kind == types.TYP_UNTYPED_BOOL { return 1 }
+	if t.Kind == types.TYP_UNTYPED_FLOAT { return 64 }
+	if t.Kind == types.TYP_FLOAT {
+		if t.Width > 0 { return t.Width }
+		return 64
+	}
+	if t.Width > 0 { return t.Width }
+	return targetIntBits
+}
+
+// ensureWidth casts val to targetTyp if their widths differ
+func ensureWidth(ctx @GenContext, b @Block, val @Instr, targetTyp @types.Type) @Instr {
+	var valW int = typeWidth(val.Typ)
+	var targetW int = typeWidth(targetTyp)
+	if valW == targetW { return val }
+	return b.EmitCast(val, targetTyp)
+}

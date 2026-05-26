@@ -65,6 +65,20 @@ Flags return statements where the function declares a `*[]T` return type but
 the returned expression has type `@[]T`. The managed wrapper is stripped at the
 return boundary, and the caller receives a raw slice whose backing may be freed.
 
+### unused-import
+
+Flags an import whose package name is never referenced in the file that
+declared it (Go-style, per-file). A reference is any `pkg.X` expression or
+`pkg.T` type qualified by the import's local name (its alias, or the path's
+last segment when there's no alias).
+
+Blank imports (`import _ "pkg/foo"`) are intentional side-effect imports and
+are never flagged.
+
+Because a package is linted as its merged AST and imports are deduplicated by
+(alias, path) at merge time, a path imported-and-unused in one file but
+imported-and-used in another is not flagged — a rare, safe under-warning.
+
 ## Examples
 
 Lint a single package:

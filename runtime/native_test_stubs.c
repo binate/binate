@@ -13,6 +13,6 @@
 // rt.Free dispatches indirect through it. The libc-target rt's real
 // RawFree is a calloc/free wrapper, so the stub just calls free —
 // behaves identically when reached.
-__attribute__((weak)) void bn_rt__RawFree(void *ptr) {
+__attribute__((weak)) void bn_pkg__rt__RawFree(void *ptr) {
     free(ptr);
 }

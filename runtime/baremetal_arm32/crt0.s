@@ -32,7 +32,7 @@ _start:
 	@ shape, so this is 0 in practice; a future
 	@ `func main() int` would route a status through here).
 	mov     r0, #0
-	bl      bn_semihost__SemihostExit
+	bl      bn_pkg__semihost__SemihostExit
 
 	@ Defensive halt in case SemihostExit ever returns.
 1:	b       1b

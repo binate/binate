@@ -1,0 +1,354 @@
+package "pkg/native/x64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/ir"
+import "pkg/native/common"
+import "pkg/types"
+
+// ============================================================
+// Interface dispatch — emitCallIfaceMethod, emitImplVtables
+//
+// Mirrors aarch64_iface.bn (and the LLVM lowering in pkg/codegen/
+// emit_impls.bn): each `impl T : I` declaration produces one
+// `__ivt.bn_<recv>__<iface>` global containing [dtor, m1, m2, ...]
+// function pointers; an `OP_IFACE_VALUE` site packs {data,
+// vtable_global_addr} into a 16-byte aggregate; `OP_CALL_IFACE_METHOD`
+// loads vtable[Index] and calls it indirectly with `data` as the
+// first arg; `OP_IFACE_DTOR` loads vtable[0] for the @Iface
+// scope-exit cleanup path.  See plan-interface-syntax-revision.md
+// slices 2.3a / 2.5.
+// ============================================================
+
+// emitCallIfaceMethod lowers OP_CALL_IFACE_METHOD.  Args[0] is the
+// iv value (a 16-byte {data, vtable} aggregate held at the alloc
+// region pointed to by getOperand); Args[1..] are user args;
+// Index is the absolute vtable slot (already accounting for the
+// dtor at slot 0 + any parent sub-vtable inlining).  Shape mirrors
+// emitCall but with the callee loaded from iv.vtable[Index] and
+// the data pointer passed as arg 0.
+func emitCallIfaceMethod(a @asm.Assembler, rm @common.RegMap,
+		allFuncs @[]@ir.Func, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+
+	// Two-step load through R11 (caller-saved scratch, not in regPool
+	// for the SysV arg-pass path, not RAX):
+	//   R11 = iv.vtable     (mov r11, [ivAddr + 8])
+	//   R11 = vt[Index]     (mov r11, [r11 + 8 * Index])
+	// `ins.Index` is the ABSOLUTE vtable slot — see
+	// pkg/ir/gen_iface.bn:findInterfaceMethodFromBase.  Matches LLVM
+	// emission in pkg/codegen/emit_impls.bn:emitCallIfaceMethod.
+	var ivAddr int = getOperand(a, rm, ins.Args[0].ID)
+	if ivAddr < 0 { return }
+	x64.Mov(a, x64.Reg(x64.R11, x64.SZ64),
+		x64.Mem(ivAddr, 8, x64.SZ64))
+	x64.Mov(a, x64.Reg(x64.R11, x64.SZ64),
+		x64.Mem(x64.R11, 8 * ins.Index, x64.SZ64))
+	// Spill R11 immediately to a stack slot so the arg-load loop
+	// below — which freely calls getOperand / ResetRegs and clobbers
+	// every regPool slot — can't lose the function pointer.  Reload
+	// just before CALL.
+	var fnPtrSlot int = rm.LookupSpill(ins.ID)
+	if fnPtrSlot < 0 {
+		// Use the data region's first 8 bytes as a scratch slot when
+		// the call has no result spill (void return).  PlanFrame
+		// always reserves an alloc region for an iface call (the
+		// receiver is an aggregate).  If neither is available, fall
+		// back to a fixed offset — but this shouldn't happen.
+		fnPtrSlot = rm.LookupAlloc(ins.ID)
+	}
+	if fnPtrSlot >= 0 {
+		x64.Mov(a, x64.Mem(x64.RSP, fnPtrSlot, x64.SZ64),
+			x64.Reg(x64.R11, x64.SZ64))
+	}
+
+	// Synthetic argTypes list with *uint8 prepended for the data
+	// (receiver) slot so the SysV register-start computations
+	// account for it.  Identical to the LLVM lowering's shape.
+	var nCallArgs int = len(ins.Args) - 1
+	var argTypes @[]@types.Type =
+		make_slice(@types.Type, nCallArgs + 1)
+	argTypes[0] = types.MakePointerType(types.TypUint8())
+	for i := 0; i < nCallArgs; i++ {
+		argTypes[i + 1] = ins.Args[i + 1].Typ
+	}
+
+	// User args land in RSI+ (RDI reserved for data).  Per-arg
+	// ResetRegs keeps the scratch pool from saturating on long arg
+	// lists (mirrors emitCall in x64_call.bn).
+	for ai := 0; ai < nCallArgs; ai++ {
+		var arg @ir.Instr = ins.Args[ai + 1]
+		if common.IsFloatScalarTyp(arg.Typ) { continue }
+		var regStart int = rm.CC.CallArgRegStart(argTypes, ai + 1)
+		var stackOff int = rm.CC.CallArgStackOff(argTypes, ai + 1)
+		if common.IsAggregateTyp(arg.Typ) {
+			emitAggregateArg(a, rm, arg, regStart, stackOff)
+			rm.ResetRegs()
+			continue
+		}
+		var src int = getOperand(a, rm, arg.ID)
+		if src < 0 { continue }
+		if regStart >= 0 {
+			var dst int = argReg(regStart)
+			if src != dst {
+				x64.Mov(a, x64.Reg(dst, x64.SZ64),
+					x64.Reg(src, x64.SZ64))
+			}
+		} else {
+			x64.Mov(a, x64.Mem(x64.RSP, stackOff, x64.SZ64),
+				x64.Reg(src, x64.SZ64))
+		}
+		rm.ResetRegs()
+	}
+
+	// Load data (iv[0]) into the SysV register for arg 0 (RDI).
+	// Reload ivAddr — the arg loop's ResetRegs may have stranded it.
+	ivAddr = getOperand(a, rm, ins.Args[0].ID)
+	if ivAddr >= 0 {
+		x64.Mov(a, x64.Reg(x64.RDI, x64.SZ64),
+			x64.Mem(ivAddr, 0, x64.SZ64))
+	}
+
+	// SysV sret for big aggregate / multi-return results — the
+	// hidden buffer pointer goes in RDI, shifting every user arg
+	// by one register (the receiver "data" is already in RDI here,
+	// so an sret return shifts ALL of them — but no current iface
+	// shape returns big aggregates that need sret; keep the guard
+	// for symmetry with the LLVM path).
+	var bigMultiRet bool = ins.ID >= 0 &&
+		rm.CC.CallReturnsBigMultiReturn(ins)
+	var bigRet bool = ins.ID >= 0 &&
+		(rm.CC.CallReturnsBigAggregate(ins) || bigMultiRet)
+	if bigRet {
+		var sretOff int = -1
+		if bigMultiRet {
+			sretOff = rm.LookupSpill(ins.ID)
+		} else {
+			sretOff = rm.LookupAlloc(ins.ID)
+		}
+		if sretOff >= 0 {
+			x64.Lea(a, x64.Reg(x64.RDI, x64.SZ64),
+				x64.Mem(x64.RSP, sretOff, x64.SZ64))
+		}
+	}
+
+	// Reload the function pointer from the slot we stashed it in.
+	if fnPtrSlot >= 0 {
+		x64.Mov(a, x64.Reg(x64.R11, x64.SZ64),
+			x64.Mem(x64.RSP, fnPtrSlot, x64.SZ64))
+	}
+	x64.CallReg(a, x64.R11)
+	rm.ResetRegs()
+	if ins.ID < 0 { return }
+
+	// Aggregate single-return: pack RAX (+ RDX) into the alloc
+	// region and produce its pointer.  Mirrors the post-CALL path
+	// in x64_call.bn::emitCall.
+	if ins.Typ != nil && common.IsAggregateTyp(ins.Typ) &&
+			!common.IsMultiReturnCall(ins) {
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var sz int = ins.Typ.SizeOf()
+		if sz <= 0 { return }
+		if !bigRet {
+			x64.Mov(a, x64.Mem(x64.RSP, dataOff, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
+			if sz > 8 {
+				x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8, x64.SZ64),
+					x64.Reg(x64.RDX, x64.SZ64))
+			}
+		}
+		var rd int = nextReg(rm, ins.ID)
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(x64.RSP, dataOff, x64.SZ64))
+		return
+	}
+	if ins.Typ != nil && ins.Typ.Kind == types.TYP_VOID { return }
+
+	// Scalar / multi-return tuple return collection.
+	if common.IsMultiReturnCall(ins) {
+		if bigMultiRet { return }
+		var spillOff int = rm.LookupSpill(ins.ID)
+		if spillOff < 0 { return }
+		var n int = len(ins.Typ.Fields)
+		if n > 2 { n = 2 }
+		for fi := 0; fi < n; fi++ {
+			var fldTyp @types.Type = ins.Typ.Fields[fi].Type
+			var fldOff int = ins.Typ.FieldOffset(fi)
+			var fldSz int = 8
+			if fldTyp != nil { fldSz = fldTyp.SizeOf() }
+			if fldSz <= 0 { fldSz = 8 }
+			var srcReg int = x64.RAX
+			if fi == 1 { srcReg = x64.RDX }
+			emitScalarStore(a, srcReg, x64.RSP,
+				spillOff + fldOff, fldSz)
+		}
+		return
+	}
+	// Single scalar return: RAX → rd → spill.
+	var rd int = nextReg(rm, ins.ID)
+	if rd != x64.RAX {
+		x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+	}
+}
+
+// emitImplVtables emits one `__ivt.<...>` constant for each
+// (impl, iface) pair the module defines.  Layout matches the LLVM
+// backend's emit_impls.bn and the arm64 backend's emitImplVtables:
+//   slot 0:        dtor pointer (or 0 if the type has no dtor)
+//   slots 1..N+1:  method pointers in interface-declaration order
+// where N is the number of methods on the interface (own-only —
+// no parent recursion for non-extending interfaces).  Vtables live
+// in the data section with global visibility so cross-TU
+// OP_IFACE_VALUE sites can reach them through a single shared
+// symbol.
+func emitImplVtables(a @asm.Assembler, pkgName *[]const char,
+		mod @ir.Module) {
+	if len(mod.Impls) == 0 { return }
+	a.SetSection("data", -1)
+	for i := 0; i < len(mod.Impls); i++ {
+		var info @ir.ImplInfo = mod.Impls[i]
+		if info == nil { continue }
+		emitOneImplVtable(a, pkgName, mod, info)
+	}
+}
+
+// emitOneImplVtable writes a single __ivt.<...> array of pointers
+// with the concat-recursive layout from plan-interface-embedding.md
+// Slice E.3.
+func emitOneImplVtable(a @asm.Assembler, pkgName *[]const char,
+		mod @ir.Module, info @ir.ImplInfo) {
+	var vtName @[]char = implVtableName_x64(info)
+	a.DefineLabel(vtName)
+	a.SetGlobal(vtName)
+	emitImplVtableLayout_x64(a, pkgName, mod, info,
+		info.IfacePkg, info.IfaceName)
+}
+
+// emitImplVtableLayout_x64 writes one (R, X) sub-block of the
+// recursive layout: dtor, then each parent's nested layout, then
+// X's own methods on R.  Mirrors emitImplVtableLayoutNative in
+// aarch64_iface.bn.
+func emitImplVtableLayout_x64(a @asm.Assembler,
+		pkgName *[]const char, mod @ir.Module, info @ir.ImplInfo,
+		ifacePkg *[]const char, ifaceName *[]const char) {
+	if len(info.DtorFuncName) > 0 &&
+			lookupModuleFuncIface(mod, info.DtorFuncName) != nil {
+		var dtorLabel @[]char = symFor(pkgName, info.DtorFuncName)
+		a.SetGlobal(dtorLabel)
+		emitQuadLabelIface(a, dtorLabel)
+	} else {
+		emitQuadZeroIface(a)
+	}
+	var parentPkgs @[]@[]char = ir.IfaceParentPkgs(
+		ifacePkg, ifaceName)
+	var parentNames @[]@[]char = ir.IfaceParentNames(
+		ifacePkg, ifaceName)
+	for i := 0; i < len(parentPkgs); i++ {
+		emitImplVtableLayout_x64(a, pkgName, mod, info,
+			parentPkgs[i], parentNames[i])
+	}
+	var ownMethods @[]@[]char = ir.IfaceOwnMethodNames(
+		ifacePkg, ifaceName)
+	for mi := 0; mi < len(ownMethods); mi++ {
+		var qualified @[]char = buildMethodFuncName_x64(
+			info.RecvPkg, info.RecvTypeName, ownMethods[mi])
+		var slotName @[]char =
+			ir.LookupVtableSlotName(mod, qualified)
+		var mLabel @[]char = symFor(pkgName, slotName)
+		a.SetGlobal(mLabel)
+		emitQuadLabelIface(a, mLabel)
+	}
+}
+
+// implVtableName_x64 builds the object-format-prefixed symbol for an
+// (R, I) impl vtable.  Format-driven prefix matches the rest of the
+// x64 backend's symbol-naming conventions (Mach-O leading '_', ELF
+// bare).
+func implVtableName_x64(info @ir.ImplInfo) @[]char {
+	var b @[]char
+	b = appendStrIface(b, "__ivt.bn_")
+	b = appendPkgIdent_x64(b, info.RecvPkg)
+	b = appendStrIface(b, "__")
+	b = appendStrIface(b, info.RecvTypeName)
+	b = appendStrIface(b, "__")
+	b = appendPkgIdent_x64(b, info.IfacePkg)
+	b = appendStrIface(b, "__")
+	b = appendStrIface(b, info.IfaceName)
+	return symPrefixed(b)
+}
+
+// appendPkgIdent_x64 appends a package path to b with every `/`
+// replaced by `__`, matching the mangler's package-component
+// encoding.
+func appendPkgIdent_x64(b @[]char, pkg *[]const char) @[]char {
+	var start int = 0
+	for i := 0; i < len(pkg); i++ {
+		if pkg[i] == '/' {
+			b = appendStrIface(b, pkg[start:i])
+			b = appendStrIface(b, "__")
+			start = i + 1
+		}
+	}
+	b = appendStrIface(b, pkg[start:len(pkg)])
+	return b
+}
+
+// buildMethodFuncName_x64 mirrors aarch64's buildMethodFuncNameNative
+// — `<recvPkg>.<recvName>.<methodName>` (pre-mangle form that symFor
+// will mangle to bn_<...>).
+func buildMethodFuncName_x64(recvPkg *[]const char,
+		recvName *[]const char, methodName *[]const char) @[]char {
+	var b @[]char
+	b = appendStrIface(b, recvPkg)
+	b = appendStrIface(b, ".")
+	b = appendStrIface(b, recvName)
+	b = appendStrIface(b, ".")
+	b = appendStrIface(b, methodName)
+	return b
+}
+
+// emitQuadLabelIface writes an 8-byte placeholder for a vtable slot
+// plus a fixup the linker rewrites to the symbol's final absolute
+// address.  Mirrors `.quad <label>` in a hand-written stub.
+func emitQuadLabelIface(a @asm.Assembler, label *[]const char) {
+	a.AddFixup(label, 0, 0, 8)
+	a.Fill(8, cast(uint8, 0))
+}
+
+// emitQuadZeroIface writes 8 zero bytes — slot 0 when the receiver
+// type has no dtor (null function pointer).
+func emitQuadZeroIface(a @asm.Assembler) {
+	a.Fill(8, cast(uint8, 0))
+}
+
+// lookupModuleFuncIface returns the ir.Func with the given canonical
+// name, or nil if absent.  Used by the vtable dtor slot to fall back
+// to a null pointer when the dtor function wasn't emitted in this
+// translation unit.
+func lookupModuleFuncIface(mod @ir.Module, name *[]const char) @ir.Func {
+	for i := 0; i < len(mod.Funcs); i++ {
+		var f @ir.Func = mod.Funcs[i]
+		if f == nil { continue }
+		if charEqIface_x64(f.Name, name) { return f }
+	}
+	return nil
+}
+
+// charEqIface_x64 is a local byte-compare for char slices.
+func charEqIface_x64(a *[]const char, b *[]const char) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] { return false }
+	}
+	return true
+}
+
+// appendStrIface appends src bytes to dst, returning the new slice.
+func appendStrIface(dst @[]char, src *[]const char) @[]char {
+	var n int = len(dst)
+	var ns @[]char = make_slice(char, n + len(src))
+	for i := 0; i < n; i++ { ns[i] = dst[i] }
+	for i := 0; i < len(src); i++ { ns[n + i] = src[i] }
+	return ns
+}

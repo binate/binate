@@ -47,6 +47,16 @@ type CallConv struct {
 	// StackAlign is the required alignment of the stack pointer at a
 	// call boundary. 16 for both AAPCS64 and SysV-AMD64.
 	StackAlign int
+
+	// SplitAggregates is true when the ABI allows an aggregate that
+	// doesn't fit entirely in the remaining GP arg registers to be
+	// *split* across registers and stack (AAPCS64 / LLVM byval).
+	// False under SysV-AMD64, where any aggregate that won't fit
+	// wholly in registers — or that exceeds AggregateInRegMax —
+	// is MEMORY-classified and passed *entirely* on the stack
+	// (never split, NGRN unchanged so later args can still take
+	// remaining GP regs).
+	SplitAggregates bool
 }
 
 // AAPCS64 returns the CallConv for the AArch64 Procedure Call Standard,
@@ -59,6 +69,7 @@ func AAPCS64() CallConv {
 	cc.CExternSretBytes = 16
 	cc.AggregateInRegMax = 64
 	cc.StackAlign = 16
+	cc.SplitAggregates = true
 	return cc
 }
 
@@ -73,6 +84,7 @@ func SysV_AMD64() CallConv {
 	cc.CExternSretBytes = 16
 	cc.AggregateInRegMax = 16
 	cc.StackAlign = 16
+	cc.SplitAggregates = false
 	return cc
 }
 
@@ -80,20 +92,70 @@ func SysV_AMD64() CallConv {
 // Call argument dispatch (parameterised by CallConv)
 // ============================================================
 //
-// AAPCS64-style argument dispatch generalised by NumGpArgRegs:
-// - NGRN starts at 0.
-// - For a scalar arg: if NGRN < NumGpArgRegs → reg, NGRN += 1.
-//                     else → 8-byte stack slot.
-// - For an aggregate of N words: if NGRN + N ≤ NumGpArgRegs → spread
-//   across NGRN..NGRN+N-1; otherwise place the in-reg-eligible words
-//   in NGRN..NumGpArgRegs-1 and the remainder on the stack (SPLIT).
+// Per-arg classification is computed by argRegWordsStackWords below,
+// which folds two shapes into one helper:
 //
-// The SPLIT case matters because LLVM byval lowering also splits, and
-// native callers of LLVM-compiled callees must match (conformance 337).
-// SysV-AMD64 differs in aggregate handling (classification-based,
-// AggregateInRegMax = 16 → otherwise memory); the SysV backend will
-// implement aggregate dispatch separately. The helpers below cover the
-// scalar / "spread" shape that both backends share for scalars.
+//   AAPCS64 (SplitAggregates = true):
+//     - NGRN starts at 0.
+//     - Scalar: if NGRN < NumGpArgRegs → reg, NGRN += 1, else stack.
+//     - Aggregate of N words: if NGRN + N ≤ NumGpArgRegs → spread
+//       across NGRN..NGRN+N-1; otherwise place the in-reg-eligible
+//       words in NGRN..NumGpArgRegs-1 and the remainder on the stack
+//       (SPLIT).  Matches LLVM byval lowering, which native callers of
+//       LLVM-compiled callees must match (conformance 337).
+//
+//   SysV-AMD64 (SplitAggregates = false):
+//     - NGRN starts at 0.
+//     - Scalar: same as AAPCS.
+//     - Aggregate of N words: if size > AggregateInRegMax (=16) or
+//       NGRN + N > NumGpArgRegs → MEMORY: entire aggregate on the
+//       stack, NGRN unchanged so later args can still take remaining
+//       GP regs.  Otherwise fits wholly in regs at NGRN..NGRN+N-1.
+//       Matches LLVM's by-value lowering of structs > 16 B on x86_64.
+//
+// The three exported helpers (CallArgRegStart, CallArgStackOff,
+// CallStackBytes) walk the arg list calling argRegWordsStackWords to
+// avoid divergence between them.
+
+// argRegWordsStackWords classifies arg k given the running NGRN, and
+// returns (regStart, regWords, stackWords): regStart is the first
+// arg-reg index (or -1 if fully on stack / float), regWords is how
+// many GP arg regs the caller consumes for this arg (NGRN += regWords
+// after the call), and stackWords is how many 8-byte stack slots this
+// arg writes to the outgoing-args area starting at the current
+// running offset.
+//
+// Float scalars return (-1, 0, 0) — they go in FP regs tracked by a
+// separate NSRN counter and don't contribute to the GP/stack tally.
+func (cc CallConv) argRegWordsStackWords(t @types.Type, ngrn int) (int, int, int) {
+	if IsFloatScalarTyp(t) { return -1, 0, 0 }
+	var w int = ArgWords(t)
+	var agg bool = IsAggregateTyp(t)
+	// SysV MEMORY-by-size: any aggregate larger than AggregateInRegMax
+	// goes entirely on the stack regardless of remaining reg budget.
+	if !cc.SplitAggregates && agg && t.SizeOf() > cc.AggregateInRegMax {
+		return -1, 0, w
+	}
+	// Fits wholly in remaining GP regs.
+	if ngrn + w <= cc.NumGpArgRegs {
+		return ngrn, w, 0
+	}
+	// Doesn't fit.  Three sub-cases:
+	//   - AAPCS SPLIT: aggregate straddles regs + stack.
+	//   - SysV non-split aggregate: whole aggregate to MEMORY (stack),
+	//     NGRN unchanged so later (smaller) args can still take any
+	//     remaining regs.
+	//   - Scalar overflow (w = 1 with ngrn already at NumGpArgRegs):
+	//     single stack word; common to both ABIs.
+	if cc.SplitAggregates && agg && ngrn < cc.NumGpArgRegs {
+		var regWords int = cc.NumGpArgRegs - ngrn
+		return ngrn, regWords, w - regWords
+	}
+	if !cc.SplitAggregates && agg {
+		return -1, 0, w
+	}
+	return -1, 0, w
+}
 
 // CallArgRegStart returns the first arg-reg index (0..NumGpArgRegs-1)
 // for arg i, or -1 if it's passed entirely on the stack. Float scalars
@@ -103,21 +165,9 @@ func SysV_AMD64() CallConv {
 func (cc CallConv) CallArgRegStart(argTypes @[]@types.Type, i int) int {
 	var ngrn int = 0
 	for k := 0; k <= i; k++ {
-		if IsFloatScalarTyp(argTypes[k]) {
-			if k == i { return -1 }
-			continue
-		}
-		var w int = ArgWords(argTypes[k])
-		if ngrn >= cc.NumGpArgRegs {
-			if k == i { return -1 }
-			continue
-		}
-		if k == i { return ngrn }
-		var inRegs int = w
-		if ngrn + inRegs > cc.NumGpArgRegs {
-			inRegs = cc.NumGpArgRegs - ngrn
-		}
-		ngrn = ngrn + inRegs
+		rs, rw, _ := cc.argRegWordsStackWords(argTypes[k], ngrn)
+		if k == i { return rs }
+		ngrn = ngrn + rw
 	}
 	return -1
 }
@@ -125,56 +175,37 @@ func (cc CallConv) CallArgRegStart(argTypes @[]@types.Type, i int) int {
 // CallArgStackOff returns the byte offset into the outgoing-args area
 // for arg i's stack portion. Returns -1 if arg i is fully in registers
 // (or is a float scalar — those go in FP regs). Returns >=0 when the
-// arg has any words on the stack, including the SPLIT case (some words
-// in regs, overflow on stack at the returned offset).
+// arg has any words on the stack, including the AAPCS SPLIT case (some
+// words in regs, overflow on stack at the returned offset) and the
+// SysV MEMORY case (entire aggregate at the offset).
 func (cc CallConv) CallArgStackOff(argTypes @[]@types.Type, i int) int {
 	var ngrn int = 0
 	var soff int = 0
 	for k := 0; k <= i; k++ {
-		if IsFloatScalarTyp(argTypes[k]) {
-			if k == i { return -1 }
-			continue
-		}
-		var w int = ArgWords(argTypes[k])
-		var stackWords int = 0
-		if ngrn >= cc.NumGpArgRegs {
-			stackWords = w
-		} else if ngrn + w > cc.NumGpArgRegs {
-			stackWords = w - (cc.NumGpArgRegs - ngrn)
-			ngrn = cc.NumGpArgRegs
-		} else {
-			ngrn = ngrn + w
-		}
+		_, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn)
 		if k == i {
-			if stackWords > 0 { return soff }
+			if sw > 0 { return soff }
 			return -1
 		}
-		soff = soff + stackWords * 8
+		ngrn = ngrn + rw
+		soff = soff + sw * 8
 	}
 	return -1
 }
 
 // CallStackBytes returns the total outgoing-args area size in bytes for
 // a call with the given arg types, rounded up to StackAlign. Float
-// scalars don't contribute (FP-reg passing only). Mirrors the SPLIT
-// semantics in CallArgRegStart/CallArgStackOff: only words past the
-// last GP arg reg count toward the stack tally.
+// scalars don't contribute (FP-reg passing only).  Accounts for both
+// AAPCS SPLIT semantics (only words past the last GP arg reg count
+// toward the stack tally) and SysV MEMORY semantics (the whole
+// aggregate counts when it goes to MEMORY).
 func (cc CallConv) CallStackBytes(argTypes @[]@types.Type) int {
 	var ngrn int = 0
 	var soff int = 0
 	for k := 0; k < len(argTypes); k++ {
-		if IsFloatScalarTyp(argTypes[k]) { continue }
-		var w int = ArgWords(argTypes[k])
-		var stackWords int = 0
-		if ngrn >= cc.NumGpArgRegs {
-			stackWords = w
-		} else if ngrn + w > cc.NumGpArgRegs {
-			stackWords = w - (cc.NumGpArgRegs - ngrn)
-			ngrn = cc.NumGpArgRegs
-		} else {
-			ngrn = ngrn + w
-		}
-		soff = soff + stackWords * 8
+		_, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn)
+		ngrn = ngrn + rw
+		soff = soff + sw * 8
 	}
 	if cc.StackAlign > 1 && soff % cc.StackAlign != 0 {
 		soff = soff + (cc.StackAlign - soff % cc.StackAlign)

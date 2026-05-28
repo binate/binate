@@ -525,6 +525,49 @@ println(k.n)
 > > 8
 > "
 
+# --- Case 26 (Tier 2 body-introduced shape): a prompt-typed
+# func body introduces a managed-aggregate shape with a
+# DESTRUCTIBLE element type — `@[]@Box`, where Box is the loaded
+# fixture struct.  The element `@Box` is a managed pointer and
+# requires RefDec at slice-free time, so `__dtor_ms_mp_Box` must
+# exist; the loaded module never uses this shape so the helper
+# is missing without EnsureReplBodyHelpers.  Before the drain
+# fix the func's end-of-statement cleanup hit a missing extern;
+# after, the helper is emitted and lowered before the body. ---
+run_repl "tier2-body-introduces-managed-slice-of-managed-ptr" \
+"func g() { var s @[]@Box = make_slice(@Box, 2); println(len(s)) }
+g()
+" \
+"$BANNER
+> > 2
+> "
+
+# --- Case 27 (Tier 2 body-introduced shape, stmt-list path):
+# same shape, but typed as a bare statement list at the prompt
+# (short-var `:=` keeps the parser on the stmt-list path; a
+# leading `var` would route to the decl path instead).  Verifies
+# the drain runs on the evalReplStmtList synthetic too. ---
+run_repl "tier2-body-stmt-list-managed-slice-of-managed-ptr" \
+"s := make_slice(@Box, 3); println(len(s))
+" \
+"$BANNER
+> 3
+> "
+
+# --- Case 28 (Tier 2 body-introduced shape, var-init path):
+# var-initializer evaluation runs through runReplVarInit's
+# synthetic.  A managed-slice-of-managed-ptr initializer
+# registers a pending dtor; the drain emits the helper before
+# the synthetic is lowered.  Read-back through a subsequent
+# bare-stmt println. ---
+run_repl "tier2-body-var-init-managed-slice-of-managed-ptr" \
+"var t @[]@Box = make_slice(@Box, 4)
+println(len(t))
+" \
+"$BANNER
+> > 4
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

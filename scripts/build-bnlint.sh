@@ -83,9 +83,17 @@ echo
 
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
+# The BUILDER emits bnlint's objects with the BUILDER's own mangling/
+# ABI, so link them against the BUILDER bundle's C runtime (--runtime),
+# not the checkout's — the checkout runtime tracks the current tree's
+# mangling, which can differ from the pinned BUILDER (e.g. a
+# symbol-mangling change not yet in BUILDER_VERSION).  Mirrors
+# build_gen1 in scripts/lib/build-compilers.sh.
+BUILDER_RUNTIME="$BUILDER_LIB/runtime/binate_runtime.c"
 if [ -n "$DBG_FLAG" ]; then
     "$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
         -I "$BINATE_DIR:$BUILDER_LIB" -L "$BINATE_DIR:$BUILDER_LIB" \
+        --runtime "$BUILDER_RUNTIME" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         "$DBG_FLAG" \
@@ -94,6 +102,7 @@ if [ -n "$DBG_FLAG" ]; then
 else
     "$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
         -I "$BINATE_DIR:$BUILDER_LIB" -L "$BINATE_DIR:$BUILDER_LIB" \
+        --runtime "$BUILDER_RUNTIME" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         -o "$OUT" \

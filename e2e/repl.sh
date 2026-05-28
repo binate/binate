@@ -131,7 +131,7 @@ run_repl "error-recovery" \
 println(helper(3))
 " \
 "$BANNER
-> undefined: undefined_name
+> <repl>:1:1: undefined: undefined_name
 > 6
 > "
 
@@ -263,7 +263,7 @@ run_repl "tier2-bad-body-recovery" \
 println(helper(11))
 " \
 "$BANNER
-> cannot assign untyped int to bool
+> <repl>:1:26: cannot assign untyped int to bool
 > 22
 > "
 
@@ -480,7 +480,7 @@ println(helper(7))
 " \
 "$BANNER
 > function f parked (pending: g)
-> function f is unresolved (pending: g)
+> <repl>:1:9: function f is unresolved (pending: g)
 > 14
 > "
 

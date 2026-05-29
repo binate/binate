@@ -895,6 +895,36 @@ println(repldemo.Double(21))
 > 42
 > "
 
+# --- Case 46 (Tier 5 import alias): `import alt "pkg/repldemo"`
+# binds the package to `alt` rather than the default last-segment
+# name.  Calls through the alias work; the default name `repldemo`
+# does NOT (would be an undefined identifier).  Verifies the
+# alias-bearing branch of evalReplImport. ---
+run_repl "tier5-mid-session-import-alias" \
+'import alt "pkg/repldemo"
+println(alt.Double(11))
+' \
+"$BANNER
+> package pkg/repldemo loaded
+> 22
+> "
+
+# --- Case 47 (Tier 5 re-import idempotence): importing the same
+# package twice in a session is a no-op on the second attempt —
+# replProcessedPkgs.containsPath skips re-processing.  The
+# session scope still has the alias defined, so the call works.
+# ---
+run_repl "tier5-mid-session-reimport-idempotent" \
+'import "pkg/repldemo"
+import "pkg/repldemo"
+println(repldemo.Double(5))
+' \
+"$BANNER
+> package pkg/repldemo loaded
+> package pkg/repldemo loaded
+> 10
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

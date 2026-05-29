@@ -1,0 +1,181 @@
+package "pkg/native/x64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/ir"
+import "pkg/native/common"
+
+// ============================================================
+// OP_RETURN lowering
+// ============================================================
+//
+// SysV-AMD64 return conventions, picked here in priority order:
+//   - void return (no args): just the epilogue.
+//   - sret (rm.SretSlotOff >= 0): callee writes the result through
+//     the hidden RDI buffer (stashed by emitFunc at SretSlotOff),
+//     then returns the buffer pointer in RAX per SysV.  Covers both
+//     single aggregate > 16 bytes and multi-return tuple > 16 bytes.
+//   - multi-return tuple ≤ 16 bytes: pack RAX (first word) + RDX
+//     (second word).
+//   - single aggregate ≤ 16 bytes: pack RAX (+ RDX) from the data
+//     region pointer.
+//   - single scalar float: bits return in XMM0 (MOVQ XMM0, gp).
+//   - single scalar non-float: value returns in RAX (MOV RAX, gp).
+//
+// Split out of x64_dispatch.bn so emitInstr's already-long dispatch
+// table doesn't grow further with return-shape handlers.  Helpers
+// (emitSretReturn / emitMultiReturnPack / emitAggregateReturnPack)
+// only have one caller (emitReturn), so they sit beside it here.
+
+// emitReturn dispatches OP_RETURN to the correct shape-handler then
+// emits the epilogue + RET.  Every path below ends in an
+// emitEpilogueAndRet call (handled outside any helper because the
+// epilogue is shared across all shapes).
+func emitReturn(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	// Sret-returning function: callee writes the result through
+	// the hidden RDI buffer (stashed by emitFunc at SretSlotOff),
+	// then returns the buffer pointer in RAX per SysV.
+	if rm.SretSlotOff >= 0 {
+		emitSretReturn(a, rm, ins)
+		emitEpilogueAndRet(a, rm.FrameSize())
+		return
+	}
+	// Multi-return tuple ≤ 16 bytes: pack RAX/RDX.
+	if rm.MultiReturnType != nil && len(ins.Args) > 1 {
+		emitMultiReturnPack(a, rm, ins)
+		emitEpilogueAndRet(a, rm.FrameSize())
+		return
+	}
+	// Single aggregate ≤ 16 bytes: pack RAX (+ RDX).
+	if len(ins.Args) == 1 && common.IsAggregateTyp(ins.Args[0].Typ) {
+		emitAggregateReturnPack(a, rm, ins)
+		emitEpilogueAndRet(a, rm.FrameSize())
+		return
+	}
+	// Scalar / void.  Float scalars return in XMM0 per SysV-AMD64;
+	// every other scalar returns in RAX.
+	if len(ins.Args) == 1 && !common.IsAggregateTyp(ins.Args[0].Typ) {
+		var src int = getOperand(a, rm, ins.Args[0].ID)
+		if src >= 0 {
+			if common.IsFloatScalarTyp(ins.Args[0].Typ) {
+				x64.Movq_gp_to_xmm(a, x64.XMM0, src)
+			} else if src != x64.RAX {
+				x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+					x64.Reg(src, x64.SZ64))
+			}
+		}
+	}
+	emitEpilogueAndRet(a, rm.FrameSize())
+}
+
+// emitSretReturn copies the local result into the caller's sret
+// buffer and loads RAX with the buffer pointer.  Single aggregate:
+// memcpy the data region into the buffer.  Multi-return tuple:
+// per-field write at FieldOffset.
+func emitSretReturn(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	// Load the saved sret-buffer pointer into a scratch reg.
+	var dstPtr int = scratchReg(rm)
+	x64.Mov(a, x64.Reg(dstPtr, x64.SZ64),
+		x64.Mem(x64.RSP, rm.SretSlotOff, x64.SZ64))
+
+	if len(ins.Args) == 1 && common.IsAggregateTyp(ins.Args[0].Typ) {
+		// Single aggregate: memcpy via qword-MOV loop from the
+		// argument's pointer to the destination buffer.
+		var srcPtr int = getOperand(a, rm, ins.Args[0].ID)
+		if srcPtr >= 0 {
+			var sz int = ins.Args[0].Typ.SizeOf()
+			var tmp int = scratchReg(rm)
+			for off := 0; off < sz; off = off + 8 {
+				x64.Mov(a, x64.Reg(tmp, x64.SZ64),
+					x64.Mem(srcPtr, off, x64.SZ64))
+				x64.Mov(a, x64.Mem(dstPtr, off, x64.SZ64),
+					x64.Reg(tmp, x64.SZ64))
+			}
+		}
+	} else if rm.MultiReturnType != nil {
+		// Multi-return: write each scalar field through the buffer.
+		// Reload dstPtr each iteration in case the per-arg
+		// ResetRegs strands it; matches arm64's pattern.
+		for ai := 0; ai < len(ins.Args); ai++ {
+			var arg @ir.Instr = ins.Args[ai]
+			var fldOff int = rm.MultiReturnType.FieldOffset(ai)
+			if common.IsAggregateTyp(arg.Typ) {
+				// Aggregate field: memcpy.
+				var ptr int = getOperand(a, rm, arg.ID)
+				if ptr >= 0 {
+					var sz int = arg.Typ.SizeOf()
+					var tmp int = scratchReg(rm)
+					for off := 0; off < sz; off = off + 8 {
+						x64.Mov(a, x64.Reg(tmp, x64.SZ64),
+							x64.Mem(ptr, off, x64.SZ64))
+						x64.Mov(a,
+							x64.Mem(dstPtr, fldOff + off, x64.SZ64),
+							x64.Reg(tmp, x64.SZ64))
+					}
+				}
+			} else {
+				var src int = getOperand(a, rm, arg.ID)
+				if src >= 0 {
+					var sz int = 8
+					if arg.Typ != nil { sz = arg.Typ.SizeOf() }
+					if sz <= 0 { sz = 8 }
+					emitScalarStore(a, src, dstPtr, fldOff, sz)
+				}
+			}
+			rm.ResetRegs()
+			// Reload dstPtr if we still have more args.
+			if ai + 1 < len(ins.Args) {
+				dstPtr = scratchReg(rm)
+				x64.Mov(a, x64.Reg(dstPtr, x64.SZ64),
+					x64.Mem(x64.RSP, rm.SretSlotOff, x64.SZ64))
+			}
+		}
+	}
+
+	// SysV requires sret-returning funcs to return the buffer
+	// pointer in RAX.  Reload it.
+	x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+		x64.Mem(x64.RSP, rm.SretSlotOff, x64.SZ64))
+}
+
+// emitMultiReturnPack handles ≤ 16-byte multi-return tuples: pack the
+// first two scalar fields into RAX and RDX per SysV ABI.  Aggregate
+// fields can't fit (would push tuple > 16 bytes and trigger sret);
+// they shouldn't reach this path.
+func emitMultiReturnPack(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	var n int = len(ins.Args)
+	if n > 2 { n = 2 }
+	for ai := 0; ai < n; ai++ {
+		var src int = getOperand(a, rm, ins.Args[ai].ID)
+		if src < 0 {
+			rm.ResetRegs()
+			continue
+		}
+		var dst int = x64.RAX
+		if ai == 1 { dst = x64.RDX }
+		if src != dst {
+			x64.Mov(a, x64.Reg(dst, x64.SZ64),
+				x64.Reg(src, x64.SZ64))
+		}
+		rm.ResetRegs()
+	}
+}
+
+// emitAggregateReturnPack handles single-aggregate returns ≤ 16
+// bytes: pack RAX (first 8 bytes) + RDX (second 8 bytes).
+// Aggregates larger than 16 bytes go through emitSretReturn (the
+// SretSlotOff branch in emitReturn).
+func emitAggregateReturnPack(a @asm.Assembler, rm @common.RegMap,
+		ins @ir.Instr) {
+	var src int = getOperand(a, rm, ins.Args[0].ID)
+	if src < 0 { return }
+	var sz int = ins.Args[0].Typ.SizeOf()
+	if sz > 0 {
+		x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+			x64.Mem(src, 0, x64.SZ64))
+	}
+	if sz > 8 {
+		x64.Mov(a, x64.Reg(x64.RDX, x64.SZ64),
+			x64.Mem(src, 8, x64.SZ64))
+	}
+}

@@ -1,0 +1,200 @@
+package "pkg/native/x64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/ir"
+import "pkg/native/common"
+import "pkg/types"
+
+// Floating-point lowering for the SysV-AMD64 backend.
+//
+// Strategy mirrors the aarch64 backend (see aarch64_float.bn): all
+// SSA values (including floats) live in 8-byte GP-spill slots; XMM
+// regs only "light up" for the duration of one FP instruction, with
+// the value MOVQ'd in from a GP scratch and back out.  No separate
+// FP regalloc; the integer regmap covers every SSA value.
+//
+// We use XMM14 / XMM15 as inline FP scratches — caller-saved per
+// SysV-AMD64, no save/restore needed.
+//
+// The decimal-literal → IEEE 754 bit pattern converter lives in
+// pkg/native/common (ParseFloatLitToBits): integer-only arithmetic
+// shared by every native backend so the same literal text produces
+// the same bits regardless of arch.
+
+// FP_SCRATCH_A is the inline FP scratch register holding the LHS /
+// first operand / sole operand for unary FP work.
+const FP_SCRATCH_A int = x64.XMM14
+// FP_SCRATCH_B is the inline FP scratch register holding the RHS /
+// second operand.
+const FP_SCRATCH_B int = x64.XMM15
+
+// isFloatTyp reports whether t is a TYP_FLOAT or TYP_UNTYPED_FLOAT.
+// Mirrors the aarch64 predicate (kept module-private; the common
+// helper IsFloatScalarTyp is the canonical one for cross-package
+// use, but inside one backend the local form reads more directly).
+func isFloatTyp(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_FLOAT || t.Kind == types.TYP_UNTYPED_FLOAT
+}
+
+// floatBitWidth returns 32 for float32, 64 for float64 / untyped-float.
+func floatBitWidth(t @types.Type) int {
+	if t == nil { return 64 }
+	if t.Kind == types.TYP_UNTYPED_FLOAT { return 64 }
+	if t.Kind == types.TYP_FLOAT && t.Width == 32 { return 32 }
+	return 64
+}
+
+// ============================================================
+// FP op emitters
+// ============================================================
+
+// emitConstFloat: OP_CONST_FLOAT — convert the literal to IEEE 754
+// bits and materialize via MOV reg64, imm64 (the same encoder
+// emitConstInt64 uses).  Bits live in the GP scratch / spill slot
+// like any other 64-bit value.
+func emitConstFloat(a @asm.Assembler, rd int, ins @ir.Instr) {
+	var bits uint64 = common.ParseFloatLitToBits(ins.StrVal)
+	// cast(int64, …) reinterprets the full 64-bit IEEE pattern;
+	// cast(int, …) would drop the high 32 bits on a 32-bit host.
+	emitConstInt64(a, rd, cast(int64, bits))
+}
+
+// emitFloatBinop: OP_ADD/SUB/MUL/DIV when the result is float.
+// Operands are spilled GP regs; we MOVQ them into XMM scratches,
+// run the SSE2 scalar instruction, and MOVQ the result back.
+// Returns true if the op was handled (i.e. ins.Typ was a float).
+//
+// Only float64 / untyped-float arithmetic is handled here — the
+// tests that exercise this op use those.  Float32 arithmetic would
+// route through CVTSS2SD up front, the op, then CVTSD2SS back; not
+// yet exercised.
+func emitFloatBinop(a @asm.Assembler, rm @common.RegMap,
+		ins @ir.Instr) bool {
+	if !isFloatTyp(ins.Typ) { return false }
+	if len(ins.Args) < 2 { return false }
+	var ra int = getOperand(a, rm, ins.Args[0].ID)
+	var rb int = getOperand(a, rm, ins.Args[1].ID)
+	if ra < 0 || rb < 0 { return false }
+	x64.Movq_gp_to_xmm(a, FP_SCRATCH_A, ra)
+	x64.Movq_gp_to_xmm(a, FP_SCRATCH_B, rb)
+	if ins.Op == ir.OP_ADD {
+		x64.Addsd(a, FP_SCRATCH_A, FP_SCRATCH_B)
+	} else if ins.Op == ir.OP_SUB {
+		x64.Subsd(a, FP_SCRATCH_A, FP_SCRATCH_B)
+	} else if ins.Op == ir.OP_MUL {
+		x64.Mulsd(a, FP_SCRATCH_A, FP_SCRATCH_B)
+	} else if ins.Op == ir.OP_DIV {
+		x64.Divsd(a, FP_SCRATCH_A, FP_SCRATCH_B)
+	} else {
+		return false
+	}
+	var rd int = nextReg(rm, ins.ID)
+	x64.Movq_xmm_to_gp(a, rd, FP_SCRATCH_A)
+	return true
+}
+
+// emitFloatNeg: OP_NEG on a float.  Negation is a single-bit flip
+// of the sign bit (bit 63 for float64, bit 31 for float32), which
+// is faster + simpler in GP than a round-trip through XMM (x64's
+// SSE has no native FNEG — the typical sequence would be xorpd
+// with a sign-mask constant, requiring extra constant materialization).
+// Returns true if the op was a float NEG.
+func emitFloatNeg(a @asm.Assembler, rm @common.RegMap,
+		ins @ir.Instr) bool {
+	if !isFloatTyp(ins.Typ) { return false }
+	if ins.Op != ir.OP_NEG { return false }
+	if len(ins.Args) < 1 { return false }
+	var src int = getOperand(a, rm, ins.Args[0].ID)
+	if src < 0 { return false }
+	var rd int = nextReg(rm, ins.ID)
+	var rdOp x64.Operand = x64.Reg(rd, x64.SZ64)
+	if rd != src {
+		x64.Mov(a, rdOp, x64.Reg(src, x64.SZ64))
+	}
+	if floatBitWidth(ins.Typ) == 32 {
+		// XOR low 32 bits with 0x80000000.  x86 32-bit ops zero
+		// the upper 32 of the GP, which is fine — float32 only
+		// occupies the low dword.  Imm(-2147483648) → imm32
+		// bit pattern 0x80000000.
+		x64.Xor(a, x64.Reg(rd, x64.SZ32),
+			x64.Imm(-2147483647 - 1))
+		return true
+	}
+	// float64: 64-bit XOR with 1<<63.  Materialize the sign mask
+	// in a scratch GP because XOR r/m64, imm32 sign-extends and
+	// can't represent 0x8000000000000000.
+	var tmp int = scratchReg(rm)
+	var signMask int64 = cast(int64, 1) << 63
+	emitConstInt64(a, tmp, signMask)
+	x64.Xor(a, rdOp, x64.Reg(tmp, x64.SZ64))
+	return true
+}
+
+// emitFloatCast: OP_CAST when source or target is a float.  Returns
+// true if handled.  Cases (all variants present here, with float32
+// rare in conformance — test 283 is the only mover):
+//   int → float64    : CVTSI2SD xmm,gp ; MOVQ rd,xmm
+//   int → float32    : CVTSI2SD xmm,gp ; CVTSD2SS xmm,xmm ; MOVD rd,xmm
+//   float64 → int    : MOVQ xmm,gp ; CVTTSD2SI rd,xmm  (round-toward-zero)
+//   float32 → int    : MOVD xmm,gp ; CVTSS2SD xmm,xmm ; CVTTSD2SI rd,xmm
+//   float32 → float64: MOVD xmm,gp ; CVTSS2SD xmm,xmm ; MOVQ rd,xmm
+//   float64 → float32: MOVQ xmm,gp ; CVTSD2SS xmm,xmm ; MOVD rd,xmm
+//   same-width float→float: plain MOV (no bit change needed).
+//
+// Spill slots are uniformly 8 bytes; float32 occupies the low half,
+// float64 the full 8.  The integer-bit-pattern interpretation lets
+// us treat MOV / MOVQ / MOVD uniformly without reasoning about the
+// upper-bits-zero state in the spill.
+func emitFloatCast(a @asm.Assembler, rd int, src int,
+		srcTyp @types.Type, dstTyp @types.Type) bool {
+	var srcF bool = isFloatTyp(srcTyp)
+	var dstF bool = isFloatTyp(dstTyp)
+	if !srcF && !dstF { return false }
+	var srcW int = 64
+	var dstW int = 64
+	if srcF { srcW = floatBitWidth(srcTyp) }
+	if dstF { dstW = floatBitWidth(dstTyp) }
+
+	if srcF && dstF {
+		if srcW == dstW {
+			x64.Mov(a, x64.Reg(rd, x64.SZ64),
+				x64.Reg(src, x64.SZ64))
+			return true
+		}
+		if srcW == 32 && dstW == 64 {
+			x64.Movd_gp_to_xmm(a, FP_SCRATCH_A, src)
+			x64.Cvtss2sd(a, FP_SCRATCH_A, FP_SCRATCH_A)
+			x64.Movq_xmm_to_gp(a, rd, FP_SCRATCH_A)
+			return true
+		}
+		// f64 → f32.
+		x64.Movq_gp_to_xmm(a, FP_SCRATCH_A, src)
+		x64.Cvtsd2ss(a, FP_SCRATCH_A, FP_SCRATCH_A)
+		x64.Movd_xmm_to_gp(a, rd, FP_SCRATCH_A)
+		return true
+	}
+	if !srcF && dstF {
+		// Int → float.  CVTSI2SD always lands in XMM as float64;
+		// narrow to float32 with CVTSD2SS if requested.
+		x64.Cvtsi2sd(a, FP_SCRATCH_A, src)
+		if dstW == 32 {
+			x64.Cvtsd2ss(a, FP_SCRATCH_A, FP_SCRATCH_A)
+			x64.Movd_xmm_to_gp(a, rd, FP_SCRATCH_A)
+		} else {
+			x64.Movq_xmm_to_gp(a, rd, FP_SCRATCH_A)
+		}
+		return true
+	}
+	// Float → int.  CVTTSD2SI is double-precision-only; widen
+	// float32 to float64 first.
+	if srcW == 32 {
+		x64.Movd_gp_to_xmm(a, FP_SCRATCH_A, src)
+		x64.Cvtss2sd(a, FP_SCRATCH_A, FP_SCRATCH_A)
+	} else {
+		x64.Movq_gp_to_xmm(a, FP_SCRATCH_A, src)
+	}
+	x64.Cvttsd2si(a, rd, FP_SCRATCH_A)
+	return true
+}

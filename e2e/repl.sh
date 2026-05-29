@@ -652,11 +652,13 @@ println(x)
 > <repl>:1:9: variable x is unresolved (pending: g)
 > "
 
-# --- Case 34 (Stage 1): a const group with one member whose
-# value references an undefined name parks the whole group
-# atomically (first-cut group behavior — a follow-up commit
-# refines this to per-member parking).  Defining the missing
-# name resolves the group; both members become usable. ---
+# --- Case 34 (Stage 1 (c) — per-member group parking):
+# a const group with one member whose value references an
+# undefined name parks ONLY that member (groups are syntactic
+# sugar with no semantic effect).  A's clean value lands
+# immediately; B parks alone with its iota position preserved
+# (so retry computes B = M + iota_at_position).  Defining M
+# resolves B independently. ---
 run_repl "tier3-pending-const-group-resolves" \
 "const (
 A int = 1
@@ -666,10 +668,35 @@ const M int = 40
 println(A); println(B)
 " \
 "$BANNER
-> ... ... ... const group parked (pending: M)
-> const group resolved
+> ... ... ... constant B parked (pending: M)
+> constant B resolved
 > 1
 41
+> "
+
+# --- Case 35 (Stage 1 (c)): iota position is preserved across
+# parking.  In `const (A=iota; B=M+iota; C=iota)`, B parks at
+# position 1 with iota=1 recorded.  A's iota=0 and C's iota=2
+# land immediately.  When M=10 arrives, B's retry uses
+# iota=1, giving B = 10 + 1 = 11 (not 10 + 0 = 10).  This
+# verifies parkPendingDeclMember + RetryPendingDecls iota
+# restoration + GenConstMember's positional iota correctness
+# end-to-end. ---
+run_repl "tier3-pending-const-group-iota-positional" \
+"const (
+A int = iota
+B int = M + iota
+C int = iota
+)
+const M int = 10
+println(A); println(B); println(C)
+" \
+"$BANNER
+> ... ... ... ... constant B parked (pending: M)
+> constant B resolved
+> 0
+11
+2
 > "
 
 echo ""

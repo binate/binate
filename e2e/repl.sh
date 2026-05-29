@@ -735,6 +735,92 @@ variable x resolved
 > resolved
 > "
 
+# --- Case 38 (Stage 2 (d): alias forward-ref): `type R = X`
+# where X is undefined parks the alias.  Defining X resolves
+# it.  Mirrors the struct-type parking flow for the alias
+# branch of collectTypeDecl. ---
+run_repl "tier3-pending-alias-resolves" \
+"type R = Bag
+type Bag struct { N int }
+var x R
+x.N = 7
+println(x.N)
+" \
+"$BANNER
+> type R parked (pending: Bag)
+> type R resolved
+> > > 7
+> "
+
+# --- Case 39 (Stage 2 (d): named-non-struct forward-ref):
+# `type C Heat` where Heat is undefined parks; defining Heat
+# resolves it.  Covers the named-non-struct branch of
+# collectTypeDecl. ---
+run_repl "tier3-pending-named-nonstruct-resolves" \
+"type Celsius Heat
+type Heat int
+var t Celsius
+println(t)
+" \
+"$BANNER
+> type Celsius parked (pending: Heat)
+> type Celsius resolved
+> > 0
+> "
+
+# --- Case 40 (Stage 2 (d): reference use doesn't propagate):
+# `var p *T` (raw pointer to a pending struct) does NOT park
+# — the pointer wrapper is size-stable regardless of T's
+# layout.  Only the pending type's parked message appears;
+# `var p *T` lands quietly. ---
+run_repl "tier3-pending-type-reference-use-no-park" \
+"type T struct { F Bag }
+var p *T
+type Bag struct { N int }
+println(\"reached\")
+" \
+"$BANNER
+> type T parked (pending: Bag)
+> > type T resolved
+> reached
+> "
+
+# --- Case 41 (Stage 2 (d): mutual recursion via managed
+# pointers).  `type A struct { Next @B }`, `type B struct
+# { Next @A }`.  A parks waiting on B; defining B (which
+# references @A — reference use, doesn't propagate) lets
+# B land cleanly and A retry. ---
+run_repl "tier3-pending-mutual-recursion-resolves" \
+"type A struct { Next @B }
+type B struct { Next @A }
+println(\"resolved\")
+" \
+"$BANNER
+> type A parked (pending: B)
+> type A resolved
+> resolved
+> "
+
+# --- Case 42 (Stage 2 (d): func sig parks func).  T is
+# initially parked (waiting on Bag); `func f(x T) int`
+# references T in its sig — captureFuncSigPendingDeps in
+# CheckDeclInScope's DECL_FUNC tentative pass captures T,
+# parking f.  When Bag arrives → T resolves → f resolves
+# (via the sig-audit branch in RetryPendingDecls). ---
+run_repl "tier3-pending-func-sig-parks-func" \
+"type T struct { F Bag }
+func f(x T) int { return 0 }
+type Bag struct { N int }
+println(\"done\")
+" \
+"$BANNER
+> type T parked (pending: Bag)
+> function f parked (pending: T)
+> type T resolved
+function f resolved
+> done
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

@@ -606,6 +606,72 @@ println(k.V)
 > > > > 2
 > "
 
+# --- Case 31 (Stage 1 of pending-non-func): a typed var
+# whose initializer references an undefined name parks
+# rather than erroring.  Subsequent definition of the
+# missing name resolves the var; its initializer runs
+# (via runReplVarInit's synthetic in retryPending) and
+# the value is observable on next read. ---
+run_repl "tier3-pending-var-resolves" \
+"var x int = g() + 1
+func g() int { return 41 }
+println(x)
+" \
+"$BANNER
+> variable x parked (pending: g)
+> variable x resolved
+> 42
+> "
+
+# --- Case 32 (Stage 1): a typed const whose value expression
+# references an undefined name parks; defining the missing
+# name resolves it.  Consts are folded at IR-gen time so
+# retryPending only re-runs GenDecl (no synthetic, no slot
+# materialization). ---
+run_repl "tier3-pending-const-resolves" \
+"const N int = M + 1
+const M int = 41
+println(N)
+" \
+"$BANNER
+> constant N parked (pending: M)
+> constant N resolved
+> 42
+> "
+
+# --- Case 33 (Stage 1): reading a still-pending var from
+# non-tentative code surfaces a clean "variable x is
+# unresolved" type-checker error.  Mirrors the pending-func
+# use-site error case from the Tier 3 first cut. ---
+run_repl "tier3-pending-var-use-site-error" \
+"var x int = g() + 1
+println(x)
+" \
+"$BANNER
+> variable x parked (pending: g)
+> <repl>:1:9: variable x is unresolved (pending: g)
+> "
+
+# --- Case 34 (Stage 1): a const group with one member whose
+# value references an undefined name parks the whole group
+# atomically (first-cut group behavior — a follow-up commit
+# refines this to per-member parking).  Defining the missing
+# name resolves the group; both members become usable. ---
+run_repl "tier3-pending-const-group-resolves" \
+"const (
+A int = 1
+B int = M + 1
+)
+const M int = 40
+println(A); println(B)
+" \
+"$BANNER
+> ... ... ... const group parked (pending: M)
+> const group resolved
+> 1
+41
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

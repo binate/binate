@@ -699,6 +699,42 @@ println(A); println(B); println(C)
 2
 > "
 
+# --- Case 36 (Stage 2 (b) of plan-repl-tier3-pending-types.md):
+# a struct type whose field type references an undefined name
+# parks rather than erroring.  When the missing type arrives,
+# the parked type is auto-resolved.  After resolution a var of
+# that type works end-to-end. ---
+run_repl "tier3-pending-struct-type-resolves" \
+"type T struct { F Bag }
+type Bag struct { N int }
+var x T
+x.F.N = 42
+println(x.F.N)
+" \
+"$BANNER
+> type T parked (pending: Bag)
+> type T resolved
+> > > 42
+> "
+
+# --- Case 37 (Stage 2 (c): use-site propagation): a var of a
+# pending type propagates the pending dependency — the var
+# itself parks.  Resolving the pending type also resolves the
+# parked var. ---
+run_repl "tier3-pending-type-use-site-propagates" \
+"type T struct { F Bag }
+var x T
+type Bag struct { N int }
+println(\"resolved\")
+" \
+"$BANNER
+> type T parked (pending: Bag)
+> variable x parked (pending: T)
+> type T resolved
+variable x resolved
+> resolved
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

@@ -841,6 +841,23 @@ method T.M resolved
 > > 7
 > "
 
+# --- Case 44 (Stage 4: cycle detection).  `type A struct { B B }`
+# parks A waiting on B; `type B struct { A A }` parks B waiting
+# on A.  Both fields are sized uses, so the references propagate
+# through capturePendingIfSized.  The cycle detector at park-
+# close time reports `pending cycle: B -> A -> B` so the user
+# knows the chain won't resolve via retry alone — they need to
+# break it (e.g., use a pointer). ---
+run_repl "tier3-pending-cycle-detected" \
+"type A struct { B B }
+type B struct { A A }
+" \
+"$BANNER
+> type A parked (pending: B)
+> type B parked (pending: A)
+pending cycle: B -> A -> B
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

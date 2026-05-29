@@ -73,6 +73,26 @@ func main() {
 }
 EOF
 
+# ----- Sibling package fixture for Tier 5 (mid-session
+# imports) cases.  The main fixture above does NOT import
+# pkg/repldemo — that's the whole point: the user types
+# `import "pkg/repldemo"` at the prompt and the loader pulls
+# it in lazily.  The package lives under $TMP so the test's
+# -I/-L paths see it. ---
+mkdir -p "$TMP/pkg/repldemo"
+cat > "$TMP/pkg/repldemo.bni" <<'EOF'
+package "pkg/repldemo"
+
+func Double(x int) int
+EOF
+cat > "$TMP/pkg/repldemo/repldemo.bn" <<'EOF'
+package "pkg/repldemo"
+
+func Double(x int) int {
+    return x + x
+}
+EOF
+
 PASSES=0
 FAILS=0
 FAIL_NAMES=""
@@ -84,7 +104,10 @@ run_repl() {
     label="$1"
     input="$2"
     expected="$3"
-    actual=$(printf '%s' "$input" | "$BNI_BIN" --repl -I "$BINATE_DIR" -L "$BINATE_DIR" "$FIXTURE" 2>&1)
+    actual=$(printf '%s' "$input" | "$BNI_BIN" --repl \
+        -I "$BINATE_DIR" -L "$BINATE_DIR" \
+        -I "$TMP" -L "$TMP" \
+        "$FIXTURE" 2>&1)
     if [ "$actual" = "$expected" ]; then
         echo "PASS: $label"
         PASSES=$((PASSES + 1))
@@ -856,6 +879,20 @@ type B struct { A A }
 > type A parked (pending: B)
 > type B parked (pending: A)
 pending cycle: B -> A -> B
+> "
+
+# --- Case 45 (Tier 5: mid-session imports).  pkg/repldemo
+# isn't imported by the loaded fixture; user types
+# `import "pkg/repldemo"` at the prompt and the loader pulls
+# it in.  After the load + type-check + lower, subsequent
+# prompt entries can call repldemo.Double. ---
+run_repl "tier5-mid-session-import-call" \
+'import "pkg/repldemo"
+println(repldemo.Double(21))
+' \
+"$BANNER
+> package pkg/repldemo loaded
+> 42
 > "
 
 echo ""

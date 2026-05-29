@@ -568,6 +568,44 @@ println(len(t))
 > > 4
 > "
 
+# --- Case 29 (Tier 2 + Tier 3 interaction): a parked func
+# whose body introduces a new managed-aggregate shape works
+# end-to-end when the missing name arrives.  retryPending's
+# IR-gen registers the new shape's dtor in pendingMsDtors;
+# retryPending's drain emits the helper before f is lowered,
+# so its eager CallCache fills the helper slot directly.
+# (Note: even without retryPending's drain, the test would
+# pass — the next prompt entry's drain plus
+# backfillExternCachesForName would upgrade f's -1 cache
+# slot.  Keeping the drain in retryPending is an optimization
+# + consistency win, not a sole correctness fix.) ---
+run_repl "tier3-body-introduced-shape-via-retry" \
+"func f() { var s @[]@Box = make_slice(@Box, 2); h(); println(len(s)) }
+func h() {}
+f()
+" \
+"$BANNER
+> function f parked (pending: h)
+> function f resolved
+> 2
+> "
+
+# --- Case 30 (Tier 2 method body-introduced shape): a method
+# whose body introduces a new managed-aggregate shape goes
+# through evalReplDecl's DECL_FUNC drain just like a free
+# func.  Verifies the drain runs on the genMethod IR path
+# (not just genFunc) — the call site is the same, the IR-
+# gen routine is different. ---
+run_repl "tier2-method-body-introduced-shape" \
+"func (b *Box) Reset() { var s @[]@Box = make_slice(@Box, 2); b.V = len(s) }
+var k Box
+k.Reset()
+println(k.V)
+" \
+"$BANNER
+> > > > 2
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

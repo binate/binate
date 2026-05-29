@@ -821,6 +821,26 @@ function f resolved
 > done
 > "
 
+# --- Case 43 (Stage 2 (e): methods on pending receivers).
+# T parks (waiting on Bag); a method on *T parks too
+# (captureFuncSigPendingDeps peels the pointer wrapper to
+# T's IsPending).  When Bag arrives: T resolves, then
+# the method resolves.  After that the method is callable. ---
+run_repl "tier3-pending-method-on-pending-receiver" \
+"type T struct { F Bag }
+func (t *T) M() int { return 7 }
+type Bag struct { N int }
+var x T
+println(x.M())
+" \
+"$BANNER
+> type T parked (pending: Bag)
+> method T.M parked (pending: T)
+> type T resolved
+method T.M resolved
+> > 7
+> "
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

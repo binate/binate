@@ -97,7 +97,7 @@ if [ -z "$MODE" ]; then
     echo "  $0 builder-comp vm               Run pkg/vm tests via the builder"
     echo "  $0 basic                      Run builder-comp, builder-comp-int"
     echo "  $0 builder-comp,builder-comp-comp   Run all tests in two modes"
-    echo "  $0 builder-comp ir codegen       Run pkg/binate/ir and pkg/codegen tests"
+    echo "  $0 builder-comp ir codegen       Run pkg/binate/ir and pkg/binate/codegen tests"
     echo ""
     echo "Modes:"
     for r in "$(dirname "$0")"/runners/*.sh; do

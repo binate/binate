@@ -15,7 +15,7 @@
 // Binate's `int` is target word-sized — see binate_runtime.c for the
 // rationale.  The libc bridges below take and return Binate-int
 // values, so their C signatures must use the same type so that the
-// LLVM IR emitted by pkg/codegen (which uses intLL() at these sites)
+// LLVM IR emitted by pkg/binate/codegen (which uses intLL() at these sites)
 // links cleanly to the C symbol.
 typedef intptr_t bn_int_t;
 

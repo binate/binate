@@ -18,7 +18,7 @@ Run `./scripts/unittest/run.sh` with no arguments for full help.
 ./scripts/unittest/run.sh builder-comp                Run all packages via the builder
 ./scripts/unittest/run.sh builder-comp vm             pkg/vm via the builder
 ./scripts/unittest/run.sh basic                    builder-comp + builder-comp-int
-./scripts/unittest/run.sh builder-comp ir codegen     pkg/binate/ir and pkg/codegen
+./scripts/unittest/run.sh builder-comp ir codegen     pkg/binate/ir and pkg/binate/codegen
 ```
 
 ### Modes

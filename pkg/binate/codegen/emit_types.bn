@@ -1,0 +1,261 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// ============================================================
+// Type mapping
+// ============================================================
+
+// needsSret returns true if a C-extern return type needs an
+// indirect return (sret) under the target's C ABI.  Binate's own
+// IR-level struct returns use a register convention that LLVM
+// legalizes consistently on both sides, so this only matters at
+// the boundary with clang-compiled C externs (binate_runtime.c) —
+// there, Binate's declaration must carry the same sret attribute
+// clang's C frontend inserts, or the calling conventions diverge
+// and the returned struct is read from the wrong place (garbage).
+//
+// The size threshold is target-specific:
+//   - LP64 (x86-64 SysV, AArch64 AAPCS64): composites > 16 bytes
+//     (two register-words) return via sret; up to 16 bytes go in
+//     register pairs.
+//   - ILP32 ARM (AAPCS32, arm-linux-gnueabihf): composites > 4
+//     bytes (one word) return via sret.  Verified against clang:
+//     an 8-byte struct already gets `sret` there, while a 4-byte
+//     one returns in r0.
+func needsSret(t @types.Type) bool {
+	if t == nil { return false }
+	t = t.ResolveAlias()
+	var threshold int = 16
+	if types.GetTarget().PointerSize == 4 {
+		threshold = 4
+	}
+	return t.SizeOf() > threshold
+}
+
+// llvmType maps a Binate type to its LLVM IR type string.
+func llvmType(t @types.Type) @[]char {
+	if t == nil {
+		return intLL()
+	}
+	// const is purely a semantic flag — unwrap for layout / LLVM
+	// type purposes.
+	if t.Kind == types.TYP_CONST { return llvmType(t.Elem) }
+	if t.Kind == types.TYP_VOID { return "void" }
+	if t.Kind == types.TYP_BOOL { return "i1" }
+	if t.Kind == types.TYP_UNTYPED_BOOL { return "i1" }
+	if t.Kind == types.TYP_NIL { return "i8*" }
+	if t.Kind == types.TYP_POINTER { return "i8*" }
+	if t.Kind == types.TYP_MANAGED_PTR { return "i8*" }
+	if t.Kind == types.TYP_SLICE { return "%BnSlice" }
+	if t.Kind == types.TYP_MANAGED_SLICE { return "%BnManagedSlice" }
+	if t.Kind == types.TYP_FUNC_VALUE ||
+		t.Kind == types.TYP_MANAGED_FUNC_VALUE {
+		return "%BnFuncValue"
+	}
+	if t.Kind == types.TYP_INTERFACE_VALUE ||
+		t.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		return "%BnIfaceValue"
+	}
+
+	if t.Kind == types.TYP_ARRAY {
+		// [N]T → [N x llvmType(T)]
+		var b buf.CharBuf = buf.New()
+		b = b.WriteStr("[")
+		b = b.WriteInt(t.ArrayLen)
+		b = b.WriteStr(" x ")
+		b = b.WriteStr(llvmType(t.Elem))
+		b = b.WriteStr("]")
+		return b.Bytes()
+	}
+
+	if t.Kind == types.TYP_STRUCT {
+		// Named struct → %bn_pkg__Name
+		if len(t.Name) > 0 {
+			var b buf.CharBuf = buf.New()
+			b = b.WriteStr("%")
+			b = writeBuf(b, mangle.StructName(modulePkgName,t.Name))
+			return b.Bytes()
+		}
+		// Anonymous struct (e.g., multi-return) → inline {T1, T2, ...}
+		if len(t.Fields) > 0 {
+			return multiReturnType_fields(t.Fields)
+		}
+		return intLL()
+	}
+
+	// Integer types: use Width field. Width=64 maps to i64 explicitly
+	// (for `int64` on any target); Width=0 (untyped, no concrete
+	// width assigned) falls back to the target's Binate-int width.
+	if t.Kind == types.TYP_INT || t.Kind == types.TYP_UNTYPED_INT {
+		if t.Width == 8 { return "i8" }
+		if t.Width == 16 { return "i16" }
+		if t.Width == 32 { return "i32" }
+		if t.Width == 64 { return "i64" }
+		return intLL()
+	}
+
+	// Float types: 32 → float, 64 → double.
+	if t.Kind == types.TYP_FLOAT {
+		if t.Width == 32 { return "float" }
+		return "double"
+	}
+	if t.Kind == types.TYP_UNTYPED_FLOAT { return "double" }
+
+	return intLL()
+}
+
+// collectStructTypes scans all functions in the module to discover named struct types.
+func collectStructTypes(m @ir.Module) {
+	for i := 0; i < len(m.Funcs); i++ {
+		var f @ir.Func = m.Funcs[i]
+		// Scan function parameters
+		if len(f.Params) > 0 {
+			for p := 0; p < len(f.Params); p++ {
+				discoverStructFromType(f.Params[p].Typ)
+			}
+		}
+		// Scan function return types
+		if len(f.Results) > 0 {
+			for r := 0; r < len(f.Results); r++ {
+				discoverStructFromType(f.Results[r])
+			}
+		}
+		for j := 0; j < len(f.Blocks); j++ {
+			var blk @ir.Block = f.Blocks[j]
+			for k := 0; k < len(blk.Instrs); k++ {
+				var instr @ir.Instr = blk.Instrs[k]
+				// Scan all type references on this instruction
+				discoverStructFromType(instr.Typ)
+				discoverStructFromType(instr.TypeArg)
+				if len(instr.Args) > 0 {
+					for a := 0; a < len(instr.Args); a++ {
+						discoverStructFromType(instr.Args[a].Typ)
+						discoverStructFromType(instr.Args[a].TypeArg)
+					}
+				}
+			}
+		}
+	}
+}
+
+// discoverStructFromType recursively discovers struct types from any type reference
+func discoverStructFromType(t @types.Type) {
+	if t == nil { return }
+	// Peel const wrappers — const doesn't affect layout / struct
+	// registration.
+	if t.Kind == types.TYP_CONST {
+		discoverStructFromType(t.Elem)
+		return
+	}
+	if t.Kind == types.TYP_STRUCT {
+		addStructDef(t)
+		return
+	}
+	if t.Kind == types.TYP_MANAGED_PTR || t.Kind == types.TYP_POINTER {
+		discoverStructFromType(t.Elem)
+		return
+	}
+	if t.Kind == types.TYP_SLICE || t.Kind == types.TYP_MANAGED_SLICE {
+		discoverStructFromType(t.Elem)
+		return
+	}
+}
+
+// addStructDef registers a named struct type for LLVM type definition emission.
+func addStructDef(t @types.Type) {
+	// Truly anonymous — shouldn't happen, IR gen assigns
+	// synthetic names.
+	if len(t.Name) == 0 { return }
+	// Check if already registered (by mangled LLVM name to catch
+	// both "Foo" and "pkg.Foo" mapping to the same %bn_pkg__Foo)
+	var mangledName @[]char = mangle.StructName(modulePkgName,t.Name).Bytes()
+	for i := 0; i < len(moduleStructDefs); i++ {
+		if charsEqual(mangledName, moduleStructDefs[i].MangledName) { return }
+	}
+	// Register first (before recursing) to prevent infinite recursion
+	var sd StructDef
+	sd.Name = t.Name
+	sd.MangledName = mangledName
+	sd.Typ = t
+	moduleStructDefs = slices.Append[StructDef](moduleStructDefs, sd)
+	// Recurse for field types
+	if len(t.Fields) > 0 {
+		for i := 0; i < len(t.Fields); i++ {
+			discoverStructFromType(t.Fields[i].Type)
+		}
+	}
+}
+
+// typeBits returns the bit width of a type for LLVM IR (e.g., 1 for
+// bool, 64 for int64).  Must agree with llvmType for each Kind:
+// untyped int falls back to the target's Binate-int width (i32 under
+// arm32-linux), untyped float falls back to 64 (double), bool is 1.
+// Mismatch with llvmType causes emitCast's bits-driven trunc /
+// sext / zext path to emit nonsense against the actual IR-level
+// value width.
+func typeBits(t @types.Type) int {
+	var targetIntBits int = types.GetTarget().IntSize * 8
+	if t == nil { return targetIntBits }
+	if t.Kind == types.TYP_CONST { return typeBits(t.Elem) }
+	if t.Kind == types.TYP_BOOL || t.Kind == types.TYP_UNTYPED_BOOL { return 1 }
+	if t.Kind == types.TYP_UNTYPED_FLOAT { return 64 }
+	if t.Kind == types.TYP_FLOAT {
+		if t.Width > 0 { return t.Width }
+		return 64
+	}
+	if t.Width > 0 { return t.Width }
+	return targetIntBits
+}
+
+// isUnsigned returns true if the type is unsigned (for choosing zext vs sext).
+func isUnsigned(t @types.Type) bool {
+	if t == nil { return false }
+	if t.Kind == types.TYP_CONST { return isUnsigned(t.Elem) }
+	return !t.Signed
+}
+
+// multiReturnType_fields produces inline LLVM struct type from struct fields
+func multiReturnType_fields(fields *[]@types.Field) @[]char {
+	var b buf.CharBuf = buf.New()
+	b = b.WriteStr("{")
+	for i := 0; i < len(fields); i++ {
+		if i > 0 {
+			b = b.WriteStr(", ")
+		}
+		b = b.WriteStr(llvmType(fields[i].Type))
+	}
+	b = b.WriteStr("}")
+	return b.Bytes()
+}
+
+// multiReturnType produces LLVM struct type like {i64, i64}
+func multiReturnType(results *[]@types.Type) @[]char {
+	var b buf.CharBuf = buf.New()
+	b = b.WriteStr("{")
+	for i := 0; i < len(results); i++ {
+		if i > 0 {
+			b = b.WriteStr(", ")
+		}
+		b = b.WriteStr(llvmType(results[i]))
+	}
+	b = b.WriteStr("}")
+	return b.Bytes()
+}
+
+// multiReturnTypeFromArgs produces LLVM struct type from instruction args
+func multiReturnType_args(args *[]@ir.Instr) @[]char {
+	var b buf.CharBuf = buf.New()
+	b = b.WriteStr("{")
+	for i := 0; i < len(args); i++ {
+		if i > 0 {
+			b = b.WriteStr(", ")
+		}
+		b = b.WriteStr(llvmType(args[i].Typ))
+	}
+	b = b.WriteStr("}")
+	return b.Bytes()
+}

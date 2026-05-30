@@ -1,0 +1,489 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// ============================================================
+// LLVM IR Text Emitter
+//
+// Walks an ir.Module and produces LLVM IR text (.ll format).
+// Currently supports: functions, int/bool/string constants,
+// arithmetic, comparisons, loads/stores/alloca, branches,
+// calls to runtime builtins, return.
+// ============================================================
+
+// modulePkgName holds the current module's package path (for name
+// mangling).  It is the full import path (e.g. `pkg/native/x64`);
+// the mangler short-names it internally for now (see pkg/binate/mangle —
+// full-path migration).
+var modulePkgName *[]const char
+
+// retSeq is a per-function counter for unique multi-return temporary names.
+var retSeq int
+
+// tmpSeq is a per-function counter for unique temporary names in void instructions.
+var tmpSeq int
+
+// currentFuncUsesSret is set by emitFuncDbg before walking the body, so
+// emitReturn can route OP_RETURN to a store-through-%v.retbuf + ret void
+// instead of `ret <T> <val>`.  Per-function state — emitFuncDbg sets it
+// at entry; nothing else relies on it across functions.
+var currentFuncUsesSret bool
+
+// emitDebugInfo controls whether DWARF debug metadata is emitted.
+var emitDebugInfo bool
+
+// SetDebugInfo enables or disables DWARF debug metadata emission.
+func SetDebugInfo(enabled bool) {
+	emitDebugInfo = enabled
+}
+
+// EmitModule produces LLVM IR text for the given module.
+func EmitModule(m @ir.Module) @[]char {
+	var out buf.CharBuf = buf.New()
+
+	// Set module package path for mangling (full path; mangler
+	// short-names internally during the full-path migration).
+	modulePkgName = stripQuotes(m.Name)
+
+	// Module header
+	out = out.WriteStr("; ModuleID = '")
+	out = out.WriteStr(stripQuotes(m.Name))
+	out = out.WriteStr("'\n")
+	out = out.WriteStr("source_filename = \"")
+	out = out.WriteStr(stripQuotes(m.Name))
+	out = out.WriteStr(".bn\"\n")
+	// NOTE: omitting target triple; clang will use the host default
+	out = out.WriteByte('\n')
+
+	// Slice type definitions.  The length fields use the target's
+	// Binate-int width — i64 under LP64, i32 under --target arm32-linux.
+	out = out.WriteStr("%BnSlice = type { i8*, ")
+	out = out.WriteStr(intLL())
+	out = out.WriteStr(" }\n")
+	out = out.WriteStr("%BnManagedSlice = type { i8*, ")
+	out = out.WriteStr(intLL())
+	out = out.WriteStr(", i8*, ")
+	out = out.WriteStr(intLL())
+	out = out.WriteStr(" }\n")
+	// Function-value type: {vtable_ptr, data_ptr}. Same layout for
+	// raw (*func(...)) and managed (@func(...)) — only refcounting
+	// of the data pointer differs, and that's at the IR level.
+	out = out.WriteStr("%BnFuncValue = type { i8*, i8* }\n")
+	// Vtable type for function-value vtables: {dtor, call}, both
+	// untyped pointers. dtor is per-(function, capture-shape); for
+	// non-capturing it's null. call slot holds the bitcasted real
+	// function pointer (compiled mode); VM mode's call slot stays
+	// null in Phase 1 — Phase 3 fills it with a per-signature
+	// trampoline.
+	out = out.WriteStr("%BnVtable = type { i8*, i8* }\n")
+	// Interface-value type: {data_ptr, vtable_ptr}. Same 2-word
+	// layout as %BnFuncValue but field meanings differ — slot 0
+	// is the data pointer (raw or managed; the runtime treats the
+	// data slot uniformly as i8*), slot 1 is the vtable pointer
+	// (`@__ivt.<mangled>` global from emit_impls.bn). Same shape
+	// for `*Iface` and `@Iface`; the refcounting on the data ptr
+	// is what distinguishes the managed form (Slice 2.3b).
+	out = out.WriteStr("%BnIfaceValue = type { i8*, i8* }\n\n")
+
+	// Collect and emit struct type definitions (packed with explicit padding)
+	var emptyStructDefs @[]StructDef
+	moduleStructDefs = emptyStructDefs
+	collectStructTypes(m)
+	for i := 0; i < len(moduleStructDefs); i++ {
+		var sd StructDef = moduleStructDefs[i]
+		out = out.WriteStr("%")
+		out = writeBuf(out, mangle.StructName(modulePkgName,sd.Name))
+		out = out.WriteStr(" = type <{ ")
+		var layout @[]types.FieldLayout = sd.Typ.StructLayout()
+		var first bool = true
+		for j := 0; j < len(layout); j++ {
+			var fl types.FieldLayout = layout[j]
+			if fl.PaddingBefore > 0 {
+				if !first { out = out.WriteStr(", ") }
+				out = out.WriteByte('[')
+				out = out.WriteInt(fl.PaddingBefore)
+				out = out.WriteStr(" x i8]")
+				first = false
+			}
+			if !first { out = out.WriteStr(", ") }
+			out = out.WriteStr(llvmType(sd.Typ.Fields[j].Type))
+			first = false
+		}
+		// Trailing padding
+		var trailing int = sd.Typ.TrailingPadding()
+		if trailing > 0 {
+			out = out.WriteStr(", [")
+			out = out.WriteInt(trailing)
+			out = out.WriteStr(" x i8]")
+		}
+		out = out.WriteStr(" }>\n")
+	}
+	if len(moduleStructDefs) > 0 {
+		out = out.WriteByte('\n')
+	}
+
+	// Emit string constants as globals (from module-level data)
+	if len(m.Strings) == 0 {
+		m.FinalizeStrings()
+	}
+	var strings @[]ir.StringConst = m.Strings
+	for i := 0; i < len(strings); i++ {
+		out = emitStringGlobal(out, strings[i])
+	}
+	if len(strings) > 0 {
+		out = out.WriteByte('\n')
+	}
+
+	// Global variables
+	for i := 0; i < len(m.Globals); i++ {
+		var g @ir.Global = m.Globals[i]
+		out = out.WriteStr("@")
+		out = writeBuf(out, mangle.GlobalName(modulePkgName,g.Name))
+		out = out.WriteStr(" = global ")
+		var gTypStr @[]char = llvmType(g.Typ)
+		out = out.WriteStr(gTypStr)
+		// Choose appropriate zero value for the type
+		if g.Typ != nil && (g.Typ.Kind == types.TYP_MANAGED_PTR || g.Typ.Kind == types.TYP_POINTER) {
+			out = out.WriteStr(" null\n")
+		} else if g.Typ != nil &&
+			(g.Typ.Kind == types.TYP_SLICE ||
+				g.Typ.Kind == types.TYP_MANAGED_SLICE ||
+				g.Typ.Kind == types.TYP_STRUCT ||
+				g.Typ.Kind == types.TYP_ARRAY) {
+			out = out.WriteStr(" zeroinitializer\n")
+		} else {
+			out = out.WriteStr(" 0\n")
+		}
+	}
+	if len(m.Globals) > 0 {
+		out = out.WriteByte('\n')
+	}
+
+	// (The C-runtime manifest is empty; bn_print_* / bn_exit
+	// migrated to bootstrap.formatX + bootstrap.Write / rt.Exit.)
+	// bn_bounds_check is provided by pkg/rt (rt.BoundsCheck)
+	// bn_box, bn_alloc, bn_refcount_inc, bn_refcount_dec are provided by pkg/rt
+	// (declared via extern function declarations below)
+	out = out.WriteByte('\n')
+
+	// Extern function declarations (from imports)
+	for i := 0; i < len(m.Funcs); i++ {
+		var f @ir.Func = m.Funcs[i]
+		if !f.IsExtern {
+			continue
+		}
+		// Check if this extern needs sret for the return type.
+		// Applies to ALL externs returning a single aggregate above
+		// the sret threshold (16 bytes on 64-bit, 4 on 32-bit) —
+		// IsCExtern (libc bridges) and plain cross-package Binate
+		// externs both need sret marking so the AAPCS-C-style
+		// indirect-result convention is consistent across the LLVM
+		// boundary.  Without this, LLVM's AArch64 backend silently
+		// picks pack-vs-sret based on field-count for unannotated
+		// aggregate returns, which doesn't match what the call site
+		// emits.
+		var useSret bool = false
+		if len(f.Results) == 1 {
+			useSret = needsSret(f.Results[0])
+		}
+
+		out = out.WriteStr("declare ")
+		if useSret {
+			out = out.WriteStr("void")
+		} else if len(f.Results) == 0 {
+			out = out.WriteStr("void")
+		} else if len(f.Results) == 1 {
+			out = out.WriteStr(llvmType(f.Results[0]))
+		} else if f.MultiReturnType != nil {
+			out = out.WriteStr(llvmType(f.MultiReturnType))
+		} else {
+			out = out.WriteStr(multiReturnType(f.Results))
+		}
+		out = out.WriteStr(" @")
+		out = writeBuf(out, mangle.FuncName(modulePkgName,f.Name))
+		out = out.WriteByte('(')
+		if useSret {
+			out = out.WriteStr("ptr sret(")
+			out = out.WriteStr(llvmType(f.Results[0]))
+			out = out.WriteStr(") align 8")
+			if len(f.Params) > 0 { out = out.WriteStr(", ") }
+		}
+		for j := 0; j < len(f.Params); j++ {
+			if j > 0 {
+				out = out.WriteStr(", ")
+			}
+			out = writeParamTypeLLVM(out, f.Params[j].Typ)
+		}
+		out = out.WriteStr(")\n")
+	}
+
+	// String-literal lowering for `@[]char` and `[N]char` targets
+	// emits `call @bn_pkg__libc__Memcpy` regardless of whether the user
+	// module imports pkg/libc. Make sure the symbol is declared even
+	// when no explicit `libc.Memcpy` extern was registered, so clang
+	// doesn't error on `use of undefined value '@bn_pkg__libc__Memcpy'`.
+	// Skip if the module DOES import pkg/libc (the extern loop above
+	// already emitted the declare) or if no string-literal copy ops
+	// reach codegen (nothing references the symbol).
+	if needsImplicitLibcMemcpyDecl(m) {
+		out = out.WriteStr("declare void @bn_pkg__libc__Memcpy(i8*, i8*, ")
+		out = out.WriteStr(intLL())
+		out = out.WriteStr(")\n")
+	}
+
+	// LLVM intrinsic for byval-param memcpy.  Always declared
+	// because pkg/codegen/emit_instr.bn's OP_STORE branch emits
+	// `call void @llvm.memcpy.p0.p0.i64(...)` for the byval-param
+	// alloca-and-copy pattern (see gen_func.bn's IsByvalParamRef).
+	// LLVM accepts an undeclared call to a recognised intrinsic in
+	// many cases, but explicit declare avoids verifier warnings on
+	// older toolchains.
+	out = out.WriteStr(
+		"declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n")
+
+	// Raw C symbols referenced by __c_call: emit unmangled declares
+	// (one per distinct symbol).
+	out = emitCCallDeclares(out, m)
+
+	out = out.WriteByte('\n')
+
+	// Function-value vtable globals. Each function-taken-as-value
+	// gets a weak_odr `%BnVtable` global named `__vt.<mangled>`.
+	// weak_odr (not linkonce_odr) so -O2 doesn't drop the body when
+	// it has no in-TU references — other TUs may link against it.
+	// See plan-function-values.md (VM-mode vtables — Phase 1) for
+	// the layout rationale.
+	out = emitFuncValueVtables(out, m)
+
+	// Interface-impl vtable globals (Slice 2.3a-1 of plan-interface-
+	// syntax-revision.md). One `[N x i8*]` constant per (impl,
+	// interface) pair, named `__ivt.<mangled>`. Slot j holds the
+	// impl method that satisfies the interface's j'th method;
+	// dispatch sites (Slice 2.3a-3) bitcast the slot to a uniform
+	// shim signature when calling.
+	out = emitImplVtables(out, m)
+
+	// Build function return type map for multi-return calls
+	var funcRetTypes @[]FuncRetType
+	for i := 0; i < len(m.Funcs); i++ {
+		var f @ir.Func = m.Funcs[i]
+		if len(f.Results) > 0 {
+			var frt FuncRetType
+			frt.Name = mangle.FuncName(modulePkgName,f.Name).Bytes()
+			if len(f.Results) == 1 {
+				frt.RetType = llvmType(f.Results[0])
+				if needsSret(f.Results[0]) {
+					frt.IsSret = true
+				}
+			} else if f.MultiReturnType != nil {
+				frt.RetType = llvmType(f.MultiReturnType)
+			} else {
+				frt.RetType = multiReturnType(f.Results)
+			}
+			funcRetTypes = slices.Append[FuncRetType](funcRetTypes, frt)
+		}
+	}
+
+	// Assign debug metadata IDs to non-extern functions.
+	// Layout: !0=CU, !1=DwarfVersion, !2=DebugInfoVersion,
+	//   !3=DIFile, !4=DISubroutineType, !5..!15=DIBasicType slots
+	//   (see dbgTypeID in emit_debug.bn for the slot assignment).
+	// Then for each non-extern func i:
+	//   !(dbgFuncIDBase+i*2)=DISubprogram, !(dbgFuncIDBase+i*2+1)=DILocation
+	// After all per-function entries, non-scalar DI nodes from the
+	// registry (see emit_debug_types.bn) starting at
+	// dbgFuncIDBase + 2*dbgNonExternCount.
+	resetDbgTypeRegistry()
+	var dbgFuncIDs @[]int
+	var dbgFuncSubrTypeIDs @[]int
+	var dbgNonExternCount int = 0
+	if emitDebugInfo {
+		for i := 0; i < len(m.Funcs); i++ {
+			if m.Funcs[i].IsExtern {
+				dbgFuncIDs = slices.Append[int](dbgFuncIDs, -1)
+			} else {
+				dbgFuncIDs = slices.Append[int](dbgFuncIDs, dbgFuncIDBase + dbgNonExternCount * 2)
+				dbgNonExternCount = dbgNonExternCount + 1
+			}
+		}
+		setDbgTypeIDBase(dbgFuncIDBase + dbgNonExternCount * 2)
+		// Allocate per-function DISubroutineType + types-tuple IDs.
+		// Eagerly interns param + return types so the tuple's
+		// references are resolvable.  Done after the per-function
+		// metadata block so the registry IDs interleave naturally.
+		dbgFuncSubrTypeIDs = setupDbgFuncSubroutineTypes(m)
+	}
+
+	// Functions
+	for i := 0; i < len(m.Funcs); i++ {
+		var dbgID int = -1
+		if emitDebugInfo && len(dbgFuncIDs) > 0 {
+			dbgID = dbgFuncIDs[i]
+		}
+		out = emitFuncDbg(out, m.Funcs[i], strings, funcRetTypes, dbgID)
+		out = out.WriteByte('\n')
+	}
+
+	// Emit debug metadata at end of module
+	if emitDebugInfo && dbgNonExternCount > 0 {
+		out = emitDebugMetadata(out, m, dbgFuncIDs, dbgFuncSubrTypeIDs)
+	}
+
+	return out.Bytes()
+}
+
+// writeBuf appends the contents of src CharBuf into dst CharBuf.
+func writeBuf(dst buf.CharBuf, src buf.CharBuf) buf.CharBuf {
+	return dst.WriteStr(src.Bytes())
+}
+
+// FuncRetType records the LLVM return-type string for one mangled func
+// name (Name) so call sites can spell the call correctly. IsSret marks
+// callees that return their aggregate result via an X8/sret pointer
+// instead of in registers.
+type FuncRetType struct {
+	Name    @[]char
+	RetType @[]char
+	IsSret  bool
+}
+
+// Struct type definitions for LLVM named types
+type StructDef struct {
+	Name        @[]char         // Binate struct name (e.g., "Point")
+	MangledName @[]char         // mangled LLVM name, cached to avoid re-mangling on lookup
+	Fields      @[]@types.Type  // field types
+	Typ         @types.Type     // original struct type (for layout computation)
+}
+
+// moduleStructDefs accumulates StructDefs encountered during EmitModule
+// so the module preamble can emit each named LLVM struct once. Reset at
+// the start of every EmitModule call.
+var moduleStructDefs @[]StructDef
+
+// lookupRetType finds the LLVM return type string for a function by mangled name.
+func lookupRetType(funcRetTypes *[]FuncRetType, name @[]char) @[]char {
+	for i := 0; i < len(funcRetTypes); i++ {
+		if charsEqual(funcRetTypes[i].Name, name) {
+			return funcRetTypes[i].RetType
+		}
+	}
+	return ""
+}
+
+// lookupIsSret checks whether a function uses sret (indirect return) convention.
+func lookupIsSret(funcRetTypes *[]FuncRetType, name *[]const char) bool {
+	for i := 0; i < len(funcRetTypes); i++ {
+		if charsEqual(funcRetTypes[i].Name, name) {
+			return funcRetTypes[i].IsSret
+		}
+	}
+	return false
+}
+
+
+
+// emitStringGlobal emits a string constant as a global byte array and a static %BnManagedSlice.
+func emitStringGlobal(out buf.CharBuf, sc ir.StringConst) buf.CharBuf {
+	// @.str.0 = private unnamed_addr constant [5 x i8] c"hello", align 1
+	out = out.WriteStr("@.str.")
+	out = out.WriteInt(sc.ID)
+	out = out.WriteStr(" = private unnamed_addr constant [")
+	out = out.WriteInt(sc.Len)
+	out = out.WriteStr(" x i8] ")
+	if sc.Len == 0 {
+		out = out.WriteStr("zeroinitializer")
+	} else {
+		out = out.WriteStr("c\"")
+		out = emitStringBytes(out, sc.Data)
+		out = out.WriteStr("\"")
+	}
+	out = out.WriteStr(", align 1\n")
+
+	// Emit a statically-initialized %BnManagedSlice global for this string.
+	// backing_refptr = null (immortal — RefInc/RefDec are no-ops on null).
+	out = out.WriteStr("@.str.")
+	out = out.WriteInt(sc.ID)
+	out = out.WriteStr(".ms = private constant %BnManagedSlice { i8* getelementptr inbounds ([")
+	out = out.WriteInt(sc.Len)
+	out = out.WriteStr(" x i8], [")
+	out = out.WriteInt(sc.Len)
+	out = out.WriteStr(" x i8]* @.str.")
+	out = out.WriteInt(sc.ID)
+	out = out.WriteStr(", i64 0, i64 0), ")
+	out = out.WriteStr(intLL())
+	out = out.WriteByte(' ')
+	out = out.WriteInt(sc.Len)
+	out = out.WriteStr(", i8* null, ")
+	out = out.WriteStr(intLL())
+	out = out.WriteByte(' ')
+	out = out.WriteInt(sc.Len)
+	out = out.WriteStr(" }\n")
+
+	return out
+}
+
+// emitStringBytes writes string data as LLVM IR c"..." byte content, escaping special chars.
+func emitStringBytes(out buf.CharBuf, data *[]const char) buf.CharBuf {
+	for i := 0; i < len(data); i++ {
+		var c char = data[i]
+		if c == '\n' {
+			out = out.WriteStr("\\0A")
+		} else if c == '\r' {
+			out = out.WriteStr("\\0D")
+		} else if c == '\t' {
+			out = out.WriteStr("\\09")
+		} else if c == '"' {
+			out = out.WriteStr("\\22")
+		} else if c == '\\' {
+			out = out.WriteStr("\\5C")
+		} else if cast(int, c) < 32 || cast(int, c) > 126 {
+			// Hex escape
+			out = out.WriteByte('\\')
+			out = out.WriteHexByte(cast(int, c))
+		} else {
+			out = out.WriteByte(c)
+		}
+	}
+	return out
+}
+
+// needsImplicitLibcMemcpyDecl reports whether the module references
+// `@bn_pkg__libc__Memcpy` via string-literal lowering (OP_RODATA_MSLICE_COPY
+// or OP_RODATA_ARRAY with bytes to copy) but has no `libc.Memcpy`
+// extern import. When true, EmitModule emits an extra `declare` so
+// clang accepts the resulting `.ll` even if pkg/libc isn't otherwise
+// in the module's import set.
+func needsImplicitLibcMemcpyDecl(m @ir.Module) bool {
+	if moduleHasLibcMemcpyExtern(m) { return false }
+	for i := 0; i < len(m.Funcs); i++ {
+		var f @ir.Func = m.Funcs[i]
+		if f.IsExtern { continue }
+		for bi := 0; bi < len(f.Blocks); bi++ {
+			var b @ir.Block = f.Blocks[bi]
+			for ii := 0; ii < len(b.Instrs); ii++ {
+				var ins @ir.Instr = b.Instrs[ii]
+				if ins.Op == ir.OP_RODATA_MSLICE_COPY ||
+						ins.Op == ir.OP_RODATA_ARRAY {
+					if len(ins.StrVal) > 0 { return true }
+				}
+			}
+		}
+	}
+	return false
+}
+
+// moduleHasLibcMemcpyExtern reports whether the module's extern
+// function list already includes `libc.Memcpy` (which the regular
+// extern-decl loop will declare). Used to avoid a duplicate declare.
+func moduleHasLibcMemcpyExtern(m @ir.Module) bool {
+	for i := 0; i < len(m.Funcs); i++ {
+		var f @ir.Func = m.Funcs[i]
+		if !f.IsExtern { continue }
+		if charsEqual(f.Name, "pkg/libc.Memcpy") { return true }
+	}
+	return false
+}

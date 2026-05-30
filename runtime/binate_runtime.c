@@ -15,7 +15,7 @@
 // bytes on LP64, 4 bytes on 32-bit ARM Linux ILP32).  Every C field /
 // function arg / return value here that represents a Binate `int`
 // uses `bn_int_t`, so the C ABI tracks the LLVM IR emitted by
-// pkg/codegen (which uses intLL() at the same sites).
+// pkg/binate/codegen (which uses intLL() at the same sites).
 typedef intptr_t bn_int_t;
 
 // ============================================================

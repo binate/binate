@@ -1,0 +1,372 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/types"
+
+// emitInstr dispatches a single IR instruction to the appropriate LLVM IR emitter.
+func emitInstr(
+	out buf.CharBuf, instr @ir.Instr,
+	strings *[]ir.StringConst,
+	funcRetTypes *[]FuncRetType,
+) buf.CharBuf {
+	if instr.Op == ir.OP_SP_RESTORE {
+		// Statement-end marker for the bytecode VM. LLVM-side no-op:
+		// alloca'd temporaries are scoped to the LLVM function and
+		// get DCE'd / SROA'd by the optimizer; there's no equivalent
+		// of vm.Stack accumulation to reclaim. Return BEFORE the "  "
+		// prefix so emit_debug.bn's addDbgToLastLine doesn't try to
+		// attach a !dbg suffix to a phantom blank line.
+		return out
+	}
+	out = out.WriteStr("  ")
+
+	// Arithmetic / comparison families are op-RANGES (OP_ADD..OP_SHR,
+	// OP_EQ..OP_GE), not single values, so they stay as range guards
+	// ahead of the per-op switch below.
+	if instr.Op >= ir.OP_ADD && instr.Op <= ir.OP_SHR {
+		return emitBinop(out, instr)
+	}
+	if instr.Op >= ir.OP_EQ && instr.Op <= ir.OP_GE {
+		return emitCmp(out, instr)
+	}
+
+	switch instr.Op {
+	case ir.OP_CONST_INT:
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = add ")
+		out = out.WriteStr(llvmType(instr.Typ))
+		out = out.WriteByte(' ')
+		out = out.WriteInt64(instr.IntVal)
+		out = out.WriteStr(", 0\n")
+		return out
+	case ir.OP_CONST_FLOAT:
+		// LLVM accepts decimal floats but is picky: "1." must be
+		// written "1.0". We also fold the literal into a register via
+		// `fadd <type> 0.0, literal` so the SSA shape matches
+		// OP_CONST_INT's add-against-zero idiom.
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = fadd ")
+		out = out.WriteStr(llvmType(instr.Typ))
+		out = out.WriteStr(" 0.0, ")
+		out = writeBuf(out, normalizeFloatLiteral(instr.StrVal))
+		out = out.WriteByte('\n')
+		return out
+	case ir.OP_CONST_BOOL:
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = add i1 ")
+		if instr.BoolVal {
+			out = out.WriteByte('1')
+		} else {
+			out = out.WriteByte('0')
+		}
+		out = out.WriteStr(", 0\n")
+		return out
+	case ir.OP_CONST_STRING:
+		var sid int = ir.FindStringID(strings, instr.StrVal)
+		var slen int = len(instr.StrVal)
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = getelementptr inbounds [")
+		out = out.WriteInt(slen)
+		out = out.WriteStr(" x i8], [")
+		out = out.WriteInt(slen)
+		out = out.WriteStr(" x i8]* @.str.")
+		out = out.WriteInt(sid)
+		out = out.WriteStr(", i64 0, i64 0\n")
+		return out
+	case ir.OP_CONST_NIL:
+		return emitConstNil(out, instr)
+	case ir.OP_LAND, ir.OP_LOR:
+		return emitLogical(out, instr)
+	case ir.OP_NEG:
+		out = emitRef(out, instr.ID)
+		var isFloat bool = instr.Typ != nil &&
+			(instr.Typ.Kind == types.TYP_FLOAT ||
+				instr.Typ.Kind == types.TYP_UNTYPED_FLOAT)
+		if isFloat {
+			out = out.WriteStr(" = fneg ")
+			out = out.WriteStr(llvmType(instr.Typ))
+			out = out.WriteByte(' ')
+			out = emitRef(out, instr.Args[0].ID)
+		} else {
+			out = out.WriteStr(" = sub ")
+			out = out.WriteStr(llvmType(instr.Typ))
+			out = out.WriteStr(" 0, ")
+			out = emitRef(out, instr.Args[0].ID)
+		}
+		out = out.WriteByte('\n')
+		return out
+	case ir.OP_NOT:
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = xor i1 ")
+		out = emitRef(out, instr.Args[0].ID)
+		out = out.WriteStr(", 1\n")
+		return out
+	case ir.OP_BITNOT:
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = xor ")
+		out = out.WriteStr(llvmType(instr.Typ))
+		out = out.WriteByte(' ')
+		out = emitRef(out, instr.Args[0].ID)
+		out = out.WriteStr(", -1\n")
+		return out
+	case ir.OP_ALLOC:
+		return emitAlloc(out, instr)
+	case ir.OP_LOAD:
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = load ")
+		out = out.WriteStr(llvmType(instr.Typ))
+		out = out.WriteStr(", ")
+		out = out.WriteStr(llvmType(instr.Typ))
+		out = out.WriteStr("* ")
+		out = emitPtrRef(out, instr.Args[0])
+		out = out.WriteByte('\n')
+		return out
+	case ir.OP_GET_FIELD_PTR:
+		return emitGetFieldPtr(out, instr)
+	case ir.OP_GET_ELEM_PTR:
+		return emitGetElemPtr(out, instr)
+	case ir.OP_STORE:
+		// Byval-param spill: the value (Args[1]) is a `ptr byval(<T>)`
+		// param at the LLVM-IR level, not a struct value.  A plain
+		// `store <T> <val>, ptr <slot>` type-mismatches.  Emit
+		// llvm.memcpy from the byval pointer to the slot alloca
+		// instead — semantically equivalent to byval's "callee gets
+		// its own copy" contract.
+		if instr.Args[1].IsByvalParamRef && instr.Args[1].Typ != nil {
+			var sz int = instr.Args[1].Typ.SizeOf()
+			out = out.WriteStr(
+				"call void @llvm.memcpy.p0.p0.i64(ptr ")
+			out = emitPtrRef(out, instr.Args[0])
+			out = out.WriteStr(", ptr ")
+			out = emitRef(out, instr.Args[1].ID)
+			out = out.WriteStr(", i64 ")
+			out = out.WriteInt(sz)
+			out = out.WriteStr(", i1 false)\n")
+			return out
+		}
+		var valTyp @[]char = llvmType(instr.Args[1].Typ)
+		out = out.WriteStr("store ")
+		out = out.WriteStr(valTyp)
+		out = out.WriteByte(' ')
+		out = emitRef(out, instr.Args[1].ID)
+		out = out.WriteStr(", ")
+		out = out.WriteStr(valTyp)
+		out = out.WriteStr("* ")
+		out = emitPtrRef(out, instr.Args[0])
+		out = out.WriteByte('\n')
+		return out
+	case ir.OP_JUMP:
+		out = out.WriteStr("br label %")
+		out = out.WriteStr(instr.Block1.Label)
+		out = out.WriteByte('\n')
+		return out
+	case ir.OP_BRANCH:
+		out = out.WriteStr("br i1 ")
+		out = emitRef(out, instr.Args[0].ID)
+		out = out.WriteStr(", label %")
+		out = out.WriteStr(instr.Block1.Label)
+		out = out.WriteStr(", label %")
+		out = out.WriteStr(instr.Block2.Label)
+		out = out.WriteByte('\n')
+		return out
+	case ir.OP_RETURN:
+		return emitReturn(out, instr)
+	case ir.OP_PANIC:
+		out = out.WriteStr("call void @bn_pkg__rt__Exit(")
+		out = out.WriteStr(intLL())
+		out = out.WriteStr(" 1)\n  unreachable\n")
+		return out
+	case ir.OP_UNREACHABLE:
+		out = out.WriteStr("unreachable\n")
+		return out
+	case ir.OP_CALL:
+		return emitCall(out, instr, funcRetTypes)
+	case ir.OP_CALL_INDIRECT:
+		return emitCallIndirect(out, instr)
+	case ir.OP_CALL_HANDLE:
+		return emitCallHandle(out, instr)
+	case ir.OP_C_CALL:
+		return emitCCall(out, instr)
+	case ir.OP_EXTRACT:
+		return emitExtract(out, instr, funcRetTypes)
+	case ir.OP_CAST:
+		return emitCast(out, instr)
+	case ir.OP_BIT_CAST:
+		return emitBitCast(out, instr)
+	case ir.OP_MANAGED_TO_RAW:
+		return emitManagedToRawInstr(out, instr)
+	case ir.OP_MAKE:
+		var sizeBytes int = typeSizeBytes(instr.TypeArg)
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = call i8* @bn_pkg__rt__Alloc(")
+		out = out.WriteStr(intLL())
+		out = out.WriteByte(' ')
+		out = out.WriteInt(sizeBytes)
+		out = out.WriteStr(")\n")
+		return out
+	case ir.OP_MAKE_SLICE:
+		return emitMakeSliceInstr(out, instr)
+	case ir.OP_RODATA_ARRAY:
+		out = emitStringToArrayInstr(out, instr, strings)
+		return out
+	// Phase 3: rodata composite-literal ops alias the same static
+	// `@.str.N.ms` global that string literals use. The byte sequence
+	// is on `instr.StrVal`; FindStringID returns the matching ID.
+	case ir.OP_RODATA_MSLICE_COPY:
+		var sid int = ir.FindStringID(strings, instr.StrVal)
+		var strLen int = len(instr.StrVal)
+		out = emitStringToCharsCopy(out, instr, sid, strLen)
+		return out
+	case ir.OP_RODATA_MSLICE:
+		var sid int = ir.FindStringID(strings, instr.StrVal)
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = load %BnManagedSlice, %BnManagedSlice* @.str.")
+		out = out.WriteInt(sid)
+		out = out.WriteStr(".ms\n")
+		return out
+	case ir.OP_RODATA_SLICE:
+		var sid int = ir.FindStringID(strings, instr.StrVal)
+		out = emitStringToRawSlice(out, instr, sid)
+		return out
+	case ir.OP_BOX:
+		return emitBoxInstr(out, instr)
+	case ir.OP_DEREF:
+		return emitDerefInstr(out, instr)
+	case ir.OP_REFINC:
+		return emitRefIncInline(out, instr)
+	case ir.OP_REFDEC:
+		return emitRefDecInline(out, instr)
+	case ir.OP_FUNC_HANDLE:
+		// Phase 4 of plan-uniform-native-fnptrs.md: returns a
+		// *uint8 pointing at the static 16-byte {vtable, data}
+		// handle bnc emits per function (see emitFuncValueHandle
+		// in emit_funcvals.bn).  Consumed by OP_CALL_HANDLE via
+		// handle.vtable.call(handle.data, args).
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = bitcast %BnFuncValue* @__handle.")
+		out = writeBuf(out, mangle.FuncName(modulePkgName, instr.StrVal))
+		out = out.WriteStr(" to i8*\n")
+		return out
+	case ir.OP_CALL_FUNC_VALUE:
+		return emitCallFuncValue(out, instr)
+	case ir.OP_FUNC_VALUE:
+		// Build a 2-word {vtable, data} value:
+		//   vtable = bitcast (%BnVtable* @__vt.<mangled> to i8*)
+		//   data   = null  (Phase 1 non-capturing) or
+		//   data   = bitcast (instr.Args[0] to i8*)  (B.2 capturing
+		//            closure: Args[0] is the alloca'd closure-struct
+		//            pointer).
+		// emitFuncValueVtables (called at module emit time) ensured
+		// @__vt.<mangled> exists as a weak_odr constant.
+		var mangled @[]char =
+			mangle.FuncName(modulePkgName, instr.StrVal).Bytes()
+		// %v.vt = bitcast %BnVtable* @__vt.<mangled> to i8*
+		out = out.WriteStr("%v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".vt = bitcast %BnVtable* @__vt.")
+		out = out.WriteStr(mangled)
+		out = out.WriteStr(" to i8*\n  ")
+		// %v.0 = insertvalue %BnFuncValue undef, i8* %v.vt, 0
+		out = out.WriteStr("%v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".0 = insertvalue %BnFuncValue undef, i8* %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".vt, 0\n  ")
+		// data slot: null for non-capturing, bitcast Args[0] for B.2.
+		if len(instr.Args) == 0 {
+			out = emitRef(out, instr.ID)
+			out = out.WriteStr(" = insertvalue %BnFuncValue %v")
+			out = out.WriteInt(instr.ID)
+			out = out.WriteStr(".0, i8* null, 1\n")
+		} else {
+			var dataArg @ir.Instr = instr.Args[0]
+			out = out.WriteStr("%v")
+			out = out.WriteInt(instr.ID)
+			out = out.WriteStr(".dp = bitcast ")
+			out = out.WriteStr(llvmType(dataArg.Typ))
+			out = out.WriteByte(' ')
+			out = emitRef(out, dataArg.ID)
+			out = out.WriteStr(" to i8*\n  ")
+			out = emitRef(out, instr.ID)
+			out = out.WriteStr(" = insertvalue %BnFuncValue %v")
+			out = out.WriteInt(instr.ID)
+			out = out.WriteStr(".0, i8* %v")
+			out = out.WriteInt(instr.ID)
+			out = out.WriteStr(".dp, 1\n")
+		}
+		return out
+	case ir.OP_CALL_IFACE_METHOD:
+		return emitCallIfaceMethod(out, instr)
+	case ir.OP_IFACE_DTOR:
+		return emitIfaceDtor(out, instr)
+	case ir.OP_IFACE_UPCAST:
+		return emitIfaceUpcast(out, instr)
+	case ir.OP_IFACE_VALUE:
+		// Build a 2-word interface value:
+		//   data    = bitcast (<srcType> %data to i8*)   ; field 0
+		//   vtable  = bitcast ([N x i8*]* @<__ivt> to i8*) ; field 1
+		// instr.Args[0] is the data ptr (raw or managed), instr.StrVal
+		// is the mangled name of the `__ivt.<...>` global. The vtable
+		// global itself is emitted by emitImplVtables (Slice 2.3a-1);
+		// here we just point at it.
+		var dataInstr @ir.Instr = instr.Args[0]
+		out = out.WriteStr("%v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".dp = bitcast ")
+		if dataInstr.IsGlobalRef {
+			// The data ptr is a global's address (`@<mangled>`),
+			// which has LLVM type `<pointee>*`.  llvmType collapses
+			// a raw pointer to `i8*`, which would mismatch the
+			// global symbol's real pointer type — so spell the
+			// pointee type (TypeArg) explicitly and reference the
+			// symbol via emitPtrRef rather than a nonexistent
+			// `%v<id>` (the global pseudo-instr has ID -1).
+			out = out.WriteStr(llvmType(dataInstr.TypeArg))
+			out = out.WriteStr("* ")
+			out = emitPtrRef(out, dataInstr)
+		} else {
+			out = out.WriteStr(llvmType(dataInstr.Typ))
+			out = out.WriteByte(' ')
+			out = emitRef(out, dataInstr.ID)
+		}
+		out = out.WriteStr(" to i8*\n  ")
+		var nSlots int = vtableSlotCount(instr.StrVal)
+		out = out.WriteStr("%v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".vt = bitcast [")
+		out = out.WriteInt(nSlots)
+		out = out.WriteStr(" x i8*]* @")
+		out = out.WriteStr(instr.StrVal)
+		out = out.WriteStr(" to i8*\n  ")
+		out = out.WriteStr("%v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".0 = insertvalue %BnIfaceValue undef, i8* %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".dp, 0\n  ")
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = insertvalue %BnIfaceValue %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".0, i8* %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".vt, 1\n")
+		return out
+	case ir.OP_BOUNDS_CHECK:
+		out = out.WriteStr("call void @bn_pkg__rt__BoundsCheck(")
+		out = out.WriteStr(intLL())
+		out = out.WriteByte(' ')
+		out = emitRef(out, instr.Args[0].ID)
+		out = out.WriteStr(", ")
+		out = out.WriteStr(intLL())
+		out = out.WriteByte(' ')
+		out = emitRef(out, instr.Args[1].ID)
+		out = out.WriteStr(")\n")
+		return out
+	}
+	out = out.WriteStr("; unhandled op ")
+	out = out.WriteInt(instr.Op)
+	out = out.WriteByte('\n')
+	return out
+}
+
+// --- Extracted helpers ---

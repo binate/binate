@@ -1,0 +1,452 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/types"
+
+// ============================================================
+// Function emission
+// ============================================================
+
+// emitFuncDbg emits an LLVM function definition with optional DWARF debug annotations.
+func emitFuncDbg(
+	out buf.CharBuf, f @ir.Func,
+	strings *[]ir.StringConst,
+	funcRetTypes *[]FuncRetType,
+	dbgSubprogramID int,
+) buf.CharBuf {
+	if f.IsExtern {
+		return out
+	}
+
+	retSeq = 0
+	tmpSeq = 0
+
+	// Detect whether this function returns its single aggregate
+	// result via the sret convention.  When true, the define-line
+	// becomes `define void @name(ptr sret(%T) align 8 %v.retbuf,
+	// <params>)` and OP_RETURN writes through %v.retbuf instead
+	// of `ret %T %val`.  See round-5 audit in claude-todo.md for
+	// the rationale (forcing LLVM to use sret consistently rather
+	// than its per-shape pack-vs-sret heuristic).
+	var useSret bool = false
+	var sretRetType @[]char
+	if len(f.Results) == 1 && needsSret(f.Results[0]) {
+		useSret = true
+		sretRetType = llvmType(f.Results[0])
+	}
+	currentFuncUsesSret = useSret
+
+	// define <rettype> @<name>(<params>) [!dbg !N] {
+	var retTyp @[]char
+	if useSret {
+		retTyp = "void"
+	} else if len(f.Results) == 0 {
+		retTyp = "void"
+	} else if len(f.Results) == 1 {
+		retTyp = llvmType(f.Results[0])
+	} else {
+		retTyp = multiReturnType(f.Results)
+	}
+
+	if f.IsLinkOnce {
+		// weak_odr: same merge semantics as linkonce_odr, but cannot be
+		// discarded when locally unreferenced.  Required for cross-TU dtor /
+		// copy helpers — at -O2 the optimizer would otherwise DCE the
+		// definition in its home TU after inlining all local callers, leaving
+		// extern references in other TUs unresolved.
+		out = out.WriteStr("define weak_odr ")
+	} else {
+		out = out.WriteStr("define ")
+	}
+	out = out.WriteStr(retTyp)
+	out = out.WriteStr(" @")
+	out = writeBuf(out, mangle.FuncName(modulePkgName,f.Name))
+	out = out.WriteByte('(')
+
+	if useSret {
+		out = out.WriteStr("ptr sret(")
+		out = out.WriteStr(sretRetType)
+		out = out.WriteStr(") align 8 %v.retbuf")
+		if len(f.Params) > 0 {
+			out = out.WriteStr(", ")
+		}
+	}
+	for i := 0; i < len(f.Params); i++ {
+		if i > 0 {
+			out = out.WriteStr(", ")
+		}
+		out = writeParamTypeLLVM(out, f.Params[i].Typ)
+		out = out.WriteByte(' ')
+		out = emitRef(out, f.Params[i].ID)
+	}
+
+	if dbgSubprogramID >= 0 {
+		out = out.WriteStr(") !dbg !")
+		out = out.WriteInt(dbgSubprogramID)
+		out = out.WriteStr(" {\n")
+	} else {
+		out = out.WriteStr(") {\n")
+	}
+
+	// Build function body with per-instruction debug locations.
+	// All allocas are hoisted to the top of the entry block so that
+	// allocas inside loop bodies / if-branches don't leak native
+	// stack per execution (LLVM allocas in non-entry blocks aren't
+	// freed until function return). Three sources of allocas need
+	// hoisting:
+	//   - OP_ALLOC: ordinary stack-allocated locals.
+	//   - OP_MAKE_SLICE: bn_pkg__rt__MakeManagedSlice's .p slot.
+	//   - sret OP_CALL: the .sret out-parameter slot for callees
+	//     that return a large struct via sret convention.
+	// In each case the alloca is emitted here at entry; the rest
+	// of the lowering (zero-init store, call body, load, etc.)
+	// stays at the instr's original location.
+	for i := 0; i < len(f.Blocks); i++ {
+		var blk @ir.Block = f.Blocks[i]
+		if i > 0 {
+			out = out.WriteByte('\n')
+		}
+		out = out.WriteStr(blk.Label)
+		out = out.WriteStr(":\n")
+		// Hoist all allocas to the top of the entry block.
+		if i == 0 {
+			for hi := 0; hi < len(f.Blocks); hi++ {
+				var hblk @ir.Block = f.Blocks[hi]
+				for hj := 0; hj < len(hblk.Instrs); hj++ {
+					var hinstr @ir.Instr = hblk.Instrs[hj]
+					var hadAlloc bool = false
+					if hinstr.Op == ir.OP_ALLOC {
+						out = emitAllocDecl(out, hinstr)
+						hadAlloc = true
+					} else if hinstr.Op == ir.OP_MAKE_SLICE {
+						out = emitMakeSliceAllocDecl(out, hinstr)
+						hadAlloc = true
+					} else if hinstr.Op == ir.OP_RODATA_MSLICE_COPY {
+						// emitStringToCharsCopy also calls
+						// MakeManagedSlice now via sret; hoist
+						// its `.p` alloca to entry block.
+						out = emitMakeSliceAllocDecl(out, hinstr)
+						hadAlloc = true
+					} else if hinstr.Op == ir.OP_CALL {
+						var beforeLen int = out.Len()
+						out = emitSretAllocDecl(out, hinstr,
+							funcRetTypes)
+						hadAlloc = out.Len() > beforeLen
+					}
+					if hadAlloc && dbgSubprogramID >= 0 {
+						var hline int = hinstr.Line
+						if hline <= 0 { hline = 1 }
+						out = addDbgToLastLine(out, hline, dbgSubprogramID)
+					}
+				}
+			}
+		}
+		for j := 0; j < len(blk.Instrs); j++ {
+			var instr @ir.Instr = blk.Instrs[j]
+			out = emitInstr(out, instr, strings, funcRetTypes)
+			// Append !dbg with real line number if debug info is enabled.
+			// For OP_ALLOC, emitAlloc now emits only the zero-init store
+			// (or nothing for non-struct/array), so we only add !dbg if
+			// something was actually emitted.
+			if dbgSubprogramID >= 0 {
+				var line int = instr.Line
+				if line <= 0 { line = 1 }
+				if instr.Op == ir.OP_ALLOC {
+					var needsZero bool = instr.TypeArg != nil &&
+						(instr.TypeArg.Kind == types.TYP_STRUCT ||
+							instr.TypeArg.Kind == types.TYP_ARRAY)
+					if needsZero {
+						out = addDbgToLastLine(out, line, dbgSubprogramID)
+					}
+				} else if instr.Op == ir.OP_SP_RESTORE {
+					// emitInstr emits nothing for OP_SP_RESTORE on
+					// the LLVM backend (statement-end marker is a
+					// VM-only concept). Skip the dbg-loc append so
+					// it doesn't attach to the previous instruction's
+					// emitted line and double up the !dbg suffix.
+				} else {
+					out = addDbgToLastLine(out, line, dbgSubprogramID)
+				}
+				// Emit llvm.dbg.declare for named allocas
+				if instr.Op == ir.OP_ALLOC && len(instr.StrVal) > 0 {
+					out = emitDbgDeclare(out, instr, dbgSubprogramID, line)
+				}
+			}
+		}
+	}
+
+	out = out.WriteStr("}\n")
+	return out
+}
+
+// addDbgToLastLine replaces the trailing newline of the last emitted line
+// with ", !dbg !DILocation(line: N, scope: !M)\n".
+//
+// Skips the modification if the last line is a basic-block label
+// declaration (ends with ':') — `!dbg` metadata is only valid on
+// instructions, not labels. Multi-line emitters that end on a label
+// (e.g. emitRefIncInline, emitRefDecInline) leave that label
+// un-annotated; intermediate instructions in such emissions also
+// lack `!dbg` (LLVM tolerates this — the surrounding DISubprogram
+// is enough metadata for the IR to be valid; only source-line
+// attribution within those sites is lost).
+func addDbgToLastLine(out buf.CharBuf, line int, scopeID int) buf.CharBuf {
+	// The last character in out should be '\n' from emitInstr.
+	// If the character before that '\n' is ':', the last line is a
+	// label declaration — skip.
+	if out.Len >= 2 && out.Data[out.Len - 2] == ':' {
+		return out
+	}
+	// Decrement Len to remove it, then append dbg + newline.
+	if out.Len > 0 {
+		out.Len = out.Len - 1
+	}
+	out = out.WriteStr(", !dbg !DILocation(line: ")
+	out = out.WriteInt(line)
+	out = out.WriteStr(", scope: !")
+	out = out.WriteInt(scopeID)
+	out = out.WriteStr(")\n")
+	return out
+}
+
+// emitDbgDeclare emits a call to @llvm.dbg.declare for a named alloca.
+// For parameter allocas (instr.ParamIndex > 0), the DILocalVariable
+// gets `arg: <N>` so lldb shows the var as a function argument; for
+// regular locals the field is omitted.
+func emitDbgDeclare(out buf.CharBuf, instr @ir.Instr, scopeID int, line int) buf.CharBuf {
+	// call void @llvm.dbg.declare(metadata <type>* %vN,
+	//   metadata !DILocalVariable(...),
+	//   metadata !DIExpression()), !dbg !DILocation(...)
+	var allocTyp @[]char = llvmType(instr.TypeArg)
+	out = out.WriteStr("  call void @llvm.dbg.declare(metadata ")
+	out = out.WriteStr(allocTyp)
+	out = out.WriteStr("* ")
+	out = emitRef(out, instr.ID)
+	out = out.WriteStr(", metadata !DILocalVariable(name: \"")
+	out = out.WriteStr(instr.StrVal)
+	out = out.WriteStr("\"")
+	if instr.ParamIndex > 0 {
+		out = out.WriteStr(", arg: ")
+		out = out.WriteInt(instr.ParamIndex)
+	}
+	out = out.WriteStr(", scope: !")
+	out = out.WriteInt(scopeID)
+	out = out.WriteStr(", file: !3, line: ")
+	out = out.WriteInt(line)
+	out = out.WriteStr(", type: !")
+	out = out.WriteInt(dbgTypeID(instr.TypeArg))
+	out = out.WriteByte(')')
+	out = out.WriteStr(", metadata !DIExpression())")
+	out = out.WriteStr(", !dbg !DILocation(line: ")
+	out = out.WriteInt(line)
+	out = out.WriteStr(", scope: !")
+	out = out.WriteInt(scopeID)
+	out = out.WriteStr(")\n")
+	return out
+}
+
+// dbgFuncIDBase is the metadata-id offset where per-function DISubprogram /
+// DILocation pairs start. Slots !0..!4 are CU/flags/file/subroutine-type;
+// !5..!(dbgFuncIDBase-1) are DIBasicType slots emitted by emitDebugMetadata.
+const dbgFuncIDBase int = 16
+
+// dbgTypeID returns the metadata-id of the DI node that describes
+// the given type.  Scalar kinds (bool, signed/unsigned int widths,
+// floats) live in the fixed !5..!15 bank; pointer and struct types
+// are interned into a per-module registry (see emit_debug_types.bn)
+// and assigned ids past the per-function metadata block.  Kinds
+// not yet handled fall back to !5 (the legacy "int" slot).
+//
+// Scalar slot layout:
+//   !5  int    (signed 64) — also the non-scalar fallback
+//   !6  int8
+//   !7  int16
+//   !8  int32
+//   !9  uint   (unsigned 64)
+//   !10 uint8  (also char / byte)
+//   !11 uint16
+//   !12 uint32
+//   !13 float32
+//   !14 float64
+//   !15 bool
+func dbgTypeID(t @types.Type) int {
+	if t == nil { return 5 }
+	var s int = dbgScalarSlot(t)
+	if s >= 0 { return s }
+	if t.Kind == types.TYP_POINTER || t.Kind == types.TYP_MANAGED_PTR {
+		var key @[]char = dbgTypeKey(t)
+		var existing int = lookupDbgType(key)
+		if existing >= 0 { return existing }
+		return internDbgPointer(t, key)
+	}
+	if t.Kind == types.TYP_STRUCT {
+		var key @[]char = dbgTypeKey(t)
+		var existing int = lookupDbgType(key)
+		if existing >= 0 { return existing }
+		return internDbgStruct(t, key)
+	}
+	if t.Kind == types.TYP_SLICE || t.Kind == types.TYP_MANAGED_SLICE {
+		var key @[]char = dbgTypeKey(t)
+		var existing int = lookupDbgType(key)
+		if existing >= 0 { return existing }
+		return internDbgSlice(t, key)
+	}
+	if t.Kind == types.TYP_INTERFACE_VALUE ||
+		t.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		var key @[]char = dbgTypeKey(t)
+		var existing int = lookupDbgType(key)
+		if existing >= 0 { return existing }
+		return internDbgIfaceValue(t, key)
+	}
+	if t.Kind == types.TYP_FUNC_VALUE ||
+		t.Kind == types.TYP_MANAGED_FUNC_VALUE {
+		var key @[]char = dbgTypeKey(t)
+		var existing int = lookupDbgType(key)
+		if existing >= 0 { return existing }
+		return internDbgFuncValue(t, key)
+	}
+	if t.Kind == types.TYP_ARRAY {
+		var key @[]char = dbgTypeKey(t)
+		var existing int = lookupDbgType(key)
+		if existing >= 0 { return existing }
+		return internDbgArray(t, key)
+	}
+	if t.Kind == types.TYP_NAMED && t.Underlying != nil {
+		var key @[]char = dbgTypeKey(t)
+		var existing int = lookupDbgType(key)
+		if existing >= 0 { return existing }
+		return internDbgNamed(t, key)
+	}
+	return 5
+}
+
+// addDbgAnnotations inserts dbgRef (e.g., ", !dbg !6") before the newline
+// on every instruction line (lines starting with a space character).
+// Writes directly into out.
+func addDbgAnnotations(out buf.CharBuf, body *[]const char, dbgRef *[]const char) buf.CharBuf {
+	var lineStart int = 0
+	for i := 0; i < len(body); i++ {
+		if body[i] == '\n' {
+			var isInstr bool = lineStart < i && body[lineStart] == ' '
+			out = out.WriteStr(body[lineStart:i])
+			if isInstr {
+				out = out.WriteStr(dbgRef)
+			}
+			out = out.WriteByte('\n')
+			lineStart = i + 1
+		}
+	}
+	// Copy any trailing content without newline
+	if lineStart < len(body) {
+		out = out.WriteStr(body[lineStart:len(body)])
+	}
+	return out
+}
+
+// emitDebugMetadata appends DWARF debug metadata nodes to the module output.
+// Uses LineTablesOnly emission for lightweight function-level debug info.
+func emitDebugMetadata(out buf.CharBuf, m @ir.Module, dbgFuncIDs *[]int,
+	dbgFuncSubrTypeIDs *[]int) buf.CharBuf {
+	var modName *[]const char = stripQuotes(m.Name)
+
+	// Named metadata
+	out = out.WriteStr("!llvm.dbg.cu = !{!0}\n")
+	out = out.WriteStr("!llvm.module.flags = !{!1, !2}\n\n")
+
+	// !0 = DICompileUnit
+	out = out.WriteStr("!0 = distinct !DICompileUnit(")
+	out = out.WriteStr("language: DW_LANG_C99, file: !3, ")
+	out = out.WriteStr("producer: \"binate\", ")
+	out = out.WriteStr("isOptimized: false, ")
+	out = out.WriteStr("runtimeVersion: 0, ")
+	out = out.WriteStr("emissionKind: FullDebug)\n")
+
+	// !1 = Dwarf Version flag
+	out = out.WriteStr("!1 = !{i32 7, !\"Dwarf Version\", i32 4}\n")
+
+	// !2 = Debug Info Version flag
+	out = out.WriteStr("!2 = !{i32 2, !\"Debug Info Version\", i32 3}\n")
+
+	// !3 = DIFile
+	out = out.WriteStr("!3 = !DIFile(filename: \"")
+	out = out.WriteStr(modName)
+	out = out.WriteStr(".bn\", directory: \".\")\n")
+
+	// !4 = DISubroutineType (shared, generic)
+	out = out.WriteStr("!4 = !DISubroutineType(types: !{})\n")
+
+	// !5..!15 = DIBasicType slots for each scalar kind (see dbgTypeID
+	// for the slot assignment). Slot !5 doubles as the fallback for
+	// non-scalar TypeArgs until step 4 of the DWARF type-coverage work
+	// lands DICompositeType / DIDerivedType.
+	out = out.WriteStr("!5 = !DIBasicType(name: \"int\", size: 64, encoding: DW_ATE_signed)\n")
+	out = out.WriteStr("!6 = !DIBasicType(name: \"int8\", size: 8, encoding: DW_ATE_signed)\n")
+	out = out.WriteStr("!7 = !DIBasicType(name: \"int16\", size: 16, encoding: DW_ATE_signed)\n")
+	out = out.WriteStr("!8 = !DIBasicType(name: \"int32\", size: 32, encoding: DW_ATE_signed)\n")
+	out = out.WriteStr("!9 = !DIBasicType(name: \"uint\", size: 64, encoding: DW_ATE_unsigned)\n")
+	out = out.WriteStr("!10 = !DIBasicType(name: \"uint8\", ")
+	out = out.WriteStr("size: 8, encoding: DW_ATE_unsigned_char)\n")
+	out = out.WriteStr("!11 = !DIBasicType(name: \"uint16\", size: 16, encoding: DW_ATE_unsigned)\n")
+	out = out.WriteStr("!12 = !DIBasicType(name: \"uint32\", size: 32, encoding: DW_ATE_unsigned)\n")
+	out = out.WriteStr("!13 = !DIBasicType(name: \"float32\", size: 32, encoding: DW_ATE_float)\n")
+	out = out.WriteStr("!14 = !DIBasicType(name: \"float64\", size: 64, encoding: DW_ATE_float)\n")
+	out = out.WriteStr("!15 = !DIBasicType(name: \"bool\", size: 8, encoding: DW_ATE_boolean)\n")
+
+	// Emit DISubprogram + DILocation for each non-extern function
+	for i := 0; i < len(m.Funcs); i++ {
+		if dbgFuncIDs[i] < 0 {
+			continue
+		}
+		var f @ir.Func = m.Funcs[i]
+		var spID int = dbgFuncIDs[i]
+		var locID int = spID + 1
+
+		// DISubprogram. f.Line is the source line of the func decl
+		// (1-based; 0 for synthetic dtors / init / entry wrappers
+		// that have no source position).  type: references the
+		// per-function DISubroutineType (signature-specific) when
+		// available, else !4 (the legacy shared empty placeholder).
+		var subrTypeID int = 4
+		if i < len(dbgFuncSubrTypeIDs) && dbgFuncSubrTypeIDs[i] >= 0 {
+			subrTypeID = dbgFuncSubrTypeIDs[i]
+		}
+		out = out.WriteByte('!')
+		out = out.WriteInt(spID)
+		out = out.WriteStr(" = distinct !DISubprogram(name: \"")
+		out = out.WriteStr(f.Name)
+		out = out.WriteStr("\", linkageName: \"")
+		out = writeBuf(out, mangle.FuncName(modulePkgName,f.Name))
+		out = out.WriteStr("\", scope: !3, file: !3, ")
+		out = out.WriteStr("line: ")
+		out = out.WriteInt(f.Line)
+		out = out.WriteStr(", type: !")
+		out = out.WriteInt(subrTypeID)
+		out = out.WriteStr(", scopeLine: ")
+		out = out.WriteInt(f.Line)
+		out = out.WriteStr(", spFlags: DISPFlagDefinition, ")
+		out = out.WriteStr("unit: !0)\n")
+
+		// DILocation entries are now emitted inline on each instruction.
+		// Keep the metadata slot reserved for ID numbering consistency.
+		out = out.WriteByte('!')
+		out = out.WriteInt(locID)
+		out = out.WriteStr(" = !DILocation(line: 0, scope: !")
+		out = out.WriteInt(spID)
+		out = out.WriteStr(")\n")
+	}
+
+	// Non-scalar DI nodes (DIDerivedType for pointers, DICompositeType
+	// for structs).  IDs were allocated past the per-function block
+	// during function emission; see emit_debug_types.bn.
+	out = emitDbgTypeNodes(out)
+
+	// Per-function DISubroutineType + types-tuple nodes (step 7).
+	out = emitDbgFuncSubroutineTypes(out, m, dbgFuncSubrTypeIDs)
+
+	return out
+}
+
+// ============================================================
+// Instruction emission
+// ============================================================

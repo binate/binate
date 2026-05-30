@@ -1,0 +1,403 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+
+// ============================================================
+// Call lowering
+// ============================================================
+
+// emitCall emits a call instruction, handling sret, name mangling, and arg width casts.
+func emitCall(out buf.CharBuf, instr @ir.Instr, funcRetTypes *[]FuncRetType) buf.CharBuf {
+	var isVoid bool = false
+	if instr.Typ != nil && instr.Typ.Kind == types.TYP_VOID {
+		isVoid = true
+	}
+	if instr.Typ == nil {
+		isVoid = true
+	}
+
+	// Emit argument casts where LLVM actual type differs from declared/expected type
+	for i := 0; i < len(instr.Args); i++ {
+		var argBits int = llvmTypeBits(instr.Args[i])
+		var declBits int = typeBits(instr.Args[i].Typ)
+		var targetBits int = declBits
+
+		if argBits != targetBits && argBits > 0 && targetBits > 0 {
+			out = out.WriteStr("%v")
+			out = out.WriteInt(instr.ID)
+			out = out.WriteStr(".a")
+			out = out.WriteInt(i)
+			if argBits > targetBits {
+				out = out.WriteStr(" = trunc ")
+			} else {
+				out = out.WriteStr(" = zext ")
+			}
+			out = out.WriteStr(llvmTypeForBits(argBits))
+			out = out.WriteByte(' ')
+			out = emitRef(out, instr.Args[i].ID)
+			out = out.WriteStr(" to ")
+			out = out.WriteStr(llvmTypeForBits(targetBits))
+			out = out.WriteStr("\n  ")
+		}
+	}
+
+	// Pre-emit alloca + store for byval-eligible aggregate args so the
+	// call line below can reference `%v<callID>.bv<i>` with byval.
+	out = writeByvalArgPreamble(out, instr)
+
+	// Mangle the function name (OP_CALL is the only call op now).
+	var callNameBuf buf.CharBuf = mangle.FuncName(modulePkgName, instr.StrVal)
+
+	// Check if this call needs sret (C extern returning large struct)
+	var isSret bool = lookupIsSret(funcRetTypes, callNameBuf.Bytes())
+	var sretRetType @[]char
+	if isSret {
+		sretRetType = lookupRetType(funcRetTypes, callNameBuf.Bytes())
+	}
+
+	if isSret {
+		// Sret call: the `.sret` alloca is hoisted to function
+		// entry by emitSretAllocDecl; here we only emit the
+		// `call void` with sret first param + the result load.
+		out = out.WriteStr("call void @")
+		out = writeBuf(out, callNameBuf)
+		out = out.WriteStr("(ptr sret(")
+		out = out.WriteStr(sretRetType)
+		out = out.WriteStr(") align 8 ")
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(".sret")
+	} else if isVoid {
+		out = out.WriteStr("call void @")
+		out = writeBuf(out, callNameBuf)
+		out = out.WriteByte('(')
+	} else {
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = call ")
+		var retStr @[]char = lookupRetType(funcRetTypes, callNameBuf.Bytes())
+		if len(retStr) > 0 {
+			out = out.WriteStr(retStr)
+		} else {
+			out = out.WriteStr(llvmType(instr.Typ))
+		}
+		out = out.WriteStr(" @")
+		out = writeBuf(out, callNameBuf)
+		out = out.WriteByte('(')
+	}
+
+	for i := 0; i < len(instr.Args); i++ {
+		if i > 0 || isSret {
+			out = out.WriteStr(", ")
+		}
+		out = writeByvalArgLLVM(out, instr, i)
+	}
+
+	out = out.WriteStr(")\n")
+
+	if isSret {
+		// Load the result from the sret alloca
+		out = out.WriteStr("  ")
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = load ")
+		out = out.WriteStr(sretRetType)
+		out = out.WriteStr(", ptr ")
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(".sret\n")
+	}
+
+	return out
+}
+
+// emitCallIndirect emits an indirect call through a function pointer.
+// instr.Args[0] is the fn_ptr (i8*); instr.Args[1..] are the call args;
+// instr.Typ is the return type. The signature is reconstructed at the
+// call site, the i8* is bitcast to the matching function-pointer type,
+// then a `call` is emitted through the bitcasted register.
+func emitCallIndirect(out buf.CharBuf, instr @ir.Instr) buf.CharBuf {
+	var isVoid bool = false
+	if instr.Typ == nil { isVoid = true }
+	if instr.Typ != nil && instr.Typ.Kind == types.TYP_VOID { isVoid = true }
+
+	var nArgs int = len(instr.Args) - 1
+
+	// Per-arg width casts (parallel to emitCall): emit zext/trunc when
+	// the arg's LLVM-emitted width differs from its declared type's
+	// width. The cast result is named `%v.ID.aN`.
+	for i := 0; i < nArgs; i++ {
+		var argInstr @ir.Instr = instr.Args[i + 1]
+		var argBits int = llvmTypeBits(argInstr)
+		var declBits int = typeBits(argInstr.Typ)
+		if argBits != declBits && argBits > 0 && declBits > 0 {
+			out = out.WriteStr("%v")
+			out = out.WriteInt(instr.ID)
+			out = out.WriteStr(".a")
+			out = out.WriteInt(i)
+			if argBits > declBits {
+				out = out.WriteStr(" = trunc ")
+			} else {
+				out = out.WriteStr(" = zext ")
+			}
+			out = out.WriteStr(llvmTypeForBits(argBits))
+			out = out.WriteByte(' ')
+			out = emitRef(out, argInstr.ID)
+			out = out.WriteStr(" to ")
+			out = out.WriteStr(llvmTypeForBits(declBits))
+			out = out.WriteStr("\n  ")
+		}
+	}
+
+	// Build the function-pointer LLVM type: <ret>(<arg_types>)*
+	var sigBuf buf.CharBuf = buf.New()
+	if isVoid {
+		sigBuf = sigBuf.WriteStr("void")
+	} else {
+		sigBuf = sigBuf.WriteStr(llvmType(instr.Typ))
+	}
+	sigBuf = sigBuf.WriteByte('(')
+	for i := 0; i < nArgs; i++ {
+		if i > 0 { sigBuf = sigBuf.WriteStr(", ") }
+		sigBuf = sigBuf.WriteStr(llvmType(instr.Args[i + 1].Typ))
+	}
+	sigBuf = sigBuf.WriteStr(")*")
+
+	// Bitcast the i8* fn_ptr to the function-pointer type.
+	out = out.WriteStr("%v")
+	out = out.WriteInt(instr.ID)
+	out = out.WriteStr(".fn = bitcast i8* ")
+	out = emitRef(out, instr.Args[0].ID)
+	out = out.WriteStr(" to ")
+	out = writeBuf(out, sigBuf)
+	out = out.WriteStr("\n  ")
+
+	// Emit the call through the bitcasted function pointer.
+	if isVoid {
+		out = out.WriteStr("call void %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".fn(")
+	} else {
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = call ")
+		out = out.WriteStr(llvmType(instr.Typ))
+		out = out.WriteStr(" %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".fn(")
+	}
+
+	for i := 0; i < nArgs; i++ {
+		if i > 0 { out = out.WriteStr(", ") }
+		var argInstr @ir.Instr = instr.Args[i + 1]
+		var argBits int = llvmTypeBits(argInstr)
+		var declBits int = typeBits(argInstr.Typ)
+		out = out.WriteStr(llvmType(argInstr.Typ))
+		out = out.WriteByte(' ')
+		if argBits != declBits && argBits > 0 && declBits > 0 {
+			out = out.WriteStr("%v")
+			out = out.WriteInt(instr.ID)
+			out = out.WriteStr(".a")
+			out = out.WriteInt(i)
+		} else {
+			out = emitRef(out, argInstr.ID)
+		}
+	}
+	out = out.WriteStr(")\n")
+	return out
+}
+
+// emitCallFuncValue lowers OP_CALL_FUNC_VALUE: call through a 2-word
+// {vtable_ptr, data_ptr} function value.
+//
+// Scalar/void return — Phase 3's always-shim shape from
+// plan-function-values-phase-3.md: vtable.call has signature
+// `<ret>(i8* data, <args>)*`.  Caller extracts data + vtable.call,
+// bitcasts to the shim signature, passes data as the first argument.
+//
+// Aggregate return — retbuf-style shape: vtable.call has signature
+// `void(i8* retbuf, i8* data, <args>)*`.  Caller allocates retbuf
+// of the aggregate type's size on the stack, calls the shim, then
+// loads the result back from retbuf.  The retbuf-style is uniform
+// across compiled and bytecode dispatchers, so the same shim shape
+// serves OP_CALL_FUNC_VALUE here and dispatchExternBinding's
+// aggregate path in pkg/vm.
+func emitCallFuncValue(out buf.CharBuf, instr @ir.Instr) buf.CharBuf {
+	// Args[0] = function value; Args[1..] = call args.
+	var fnVal @ir.Instr = instr.Args[0]
+	var fnTyp @types.Type = fnVal.Typ
+	if fnTyp == nil { return out }
+	var nArgs int = len(instr.Args) - 1
+
+	var isVoid bool = false
+	if instr.Typ == nil { isVoid = true }
+	if instr.Typ != nil && instr.Typ.Kind == types.TYP_VOID { isVoid = true }
+	var isAggregate bool = isAggregateReturn(fnTyp)
+
+	// Extract data (field 1 of %BnFuncValue) → i8*. Passed as the
+	// shim's first argument (or second, in retbuf shape).
+	out = out.WriteStr("%v")
+	out = out.WriteInt(instr.ID)
+	out = out.WriteStr(".dt = extractvalue %BnFuncValue ")
+	out = emitRef(out, fnVal.ID)
+	out = out.WriteStr(", 1\n  ")
+	// Extract vtable_ptr (field 0 of %BnFuncValue) → i8*.
+	out = out.WriteStr("%v")
+	out = out.WriteInt(instr.ID)
+	out = out.WriteStr(".vt8 = extractvalue %BnFuncValue ")
+	out = emitRef(out, fnVal.ID)
+	out = out.WriteStr(", 0\n  ")
+	// Bitcast to %BnVtable*.
+	out = out.WriteStr("%v")
+	out = out.WriteInt(instr.ID)
+	out = out.WriteStr(".vt = bitcast i8* %v")
+	out = out.WriteInt(instr.ID)
+	out = out.WriteStr(".vt8 to %BnVtable*\n  ")
+	// GEP to vtable.call (field 1).
+	out = out.WriteStr("%v")
+	out = out.WriteInt(instr.ID)
+	out = out.WriteStr(".cp = getelementptr inbounds %BnVtable, %BnVtable* %v")
+	out = out.WriteInt(instr.ID)
+	out = out.WriteStr(".vt, i32 0, i32 1\n  ")
+	// Load the call slot (i8*).
+	out = out.WriteStr("%v")
+	out = out.WriteInt(instr.ID)
+	out = out.WriteStr(".cb = load i8*, i8** %v")
+	out = out.WriteInt(instr.ID)
+	out = out.WriteStr(".cp\n  ")
+
+	// Bitcast call slot to the shim signature.
+	var sig @[]char = funcSignatureLLVM(fnTyp)
+	out = out.WriteStr("%v")
+	out = out.WriteInt(instr.ID)
+	out = out.WriteStr(".fn = bitcast i8* %v")
+	out = out.WriteInt(instr.ID)
+	out = out.WriteStr(".cb to ")
+	out = out.WriteStr(sig)
+	out = out.WriteStr("\n  ")
+
+	// Pre-emit allocas + stores for aggregate args.  Each one becomes
+	// a pointer-typed slot that the shim derefs internally.
+	out = emitFuncValueArgPreamble(out, instr, fnTyp, nArgs)
+
+	if isAggregate {
+		// Allocate retbuf, call shim with (retbuf, data, args...),
+		// load result.
+		out = out.WriteStr("%v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".rb = alloca ")
+		out = writeFuncResultsLLVM(out, fnTyp)
+		out = out.WriteStr("\n  ")
+		out = out.WriteStr("%v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".rb8 = bitcast ")
+		out = writeFuncResultsLLVM(out, fnTyp)
+		out = out.WriteStr("* %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".rb to i8*\n  ")
+		out = out.WriteStr("call void %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".fn(i8* %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".rb8, i8* %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".dt")
+		out = emitFuncValueArgList(out, instr, fnTyp, nArgs)
+		out = out.WriteStr(")\n  ")
+		// Load the result from retbuf.
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = load ")
+		out = writeFuncResultsLLVM(out, fnTyp)
+		out = out.WriteStr(", ")
+		out = writeFuncResultsLLVM(out, fnTyp)
+		out = out.WriteStr("* %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".rb\n")
+		return out
+	}
+
+	// Scalar/void path — original Phase 3 always-shim convention.
+	if isVoid {
+		out = out.WriteStr("call void %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".fn(i8* %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".dt")
+	} else {
+		out = emitRef(out, instr.ID)
+		out = out.WriteStr(" = call ")
+		out = out.WriteStr(llvmType(instr.Typ))
+		out = out.WriteStr(" %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".fn(i8* %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".dt")
+	}
+	out = emitFuncValueArgList(out, instr, fnTyp, nArgs)
+	out = out.WriteStr(")\n")
+	return out
+}
+
+// emitFuncValueArgPreamble emits alloca + store for each aggregate
+// arg in a function-value call, producing %v<id>.ap<i> pointer
+// slots that the call site references in place of the natural value.
+func emitFuncValueArgPreamble(out buf.CharBuf, instr @ir.Instr,
+		fnTyp @types.Type, nArgs int) buf.CharBuf {
+	for i := 0; i < nArgs; i++ {
+		var pt @types.Type = fnTyp.Params[i].Type
+		if !isAggregateArg(pt) { continue }
+		var argInstr @ir.Instr = instr.Args[i + 1]
+		// alloca <pt>; store <pt> %arg, <pt>* %slot; bitcast to i8*.
+		out = out.WriteStr("%v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".ap")
+		out = out.WriteInt(i)
+		out = out.WriteStr(" = alloca ")
+		out = out.WriteStr(llvmType(pt))
+		out = out.WriteStr("\n  ")
+		out = out.WriteStr("store ")
+		out = out.WriteStr(llvmType(argInstr.Typ))
+		out = out.WriteByte(' ')
+		out = emitRef(out, argInstr.ID)
+		out = out.WriteStr(", ")
+		out = out.WriteStr(llvmType(pt))
+		out = out.WriteStr("* %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".ap")
+		out = out.WriteInt(i)
+		out = out.WriteStr("\n  ")
+		out = out.WriteStr("%v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".ap8.")
+		out = out.WriteInt(i)
+		out = out.WriteStr(" = bitcast ")
+		out = out.WriteStr(llvmType(pt))
+		out = out.WriteStr("* %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".ap")
+		out = out.WriteInt(i)
+		out = out.WriteStr(" to i8*\n  ")
+	}
+	return out
+}
+
+// emitFuncValueArgList emits the comma-separated arg list following
+// the (data,...) prefix in a function-value call.  Aggregate args
+// reference the i8* preamble slot; scalars pass their natural value.
+func emitFuncValueArgList(out buf.CharBuf, instr @ir.Instr,
+		fnTyp @types.Type, nArgs int) buf.CharBuf {
+	for i := 0; i < nArgs; i++ {
+		out = out.WriteStr(", ")
+		var pt @types.Type = fnTyp.Params[i].Type
+		if isAggregateArg(pt) {
+			out = out.WriteStr("i8* %v")
+			out = out.WriteInt(instr.ID)
+			out = out.WriteStr(".ap8.")
+			out = out.WriteInt(i)
+			continue
+		}
+		var argInstr @ir.Instr = instr.Args[i + 1]
+		out = out.WriteStr(llvmType(argInstr.Typ))
+		out = out.WriteByte(' ')
+		out = emitRef(out, argInstr.ID)
+	}
+	return out
+}

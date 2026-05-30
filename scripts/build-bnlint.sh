@@ -113,4 +113,4 @@ echo
 echo "Built: $OUT"
 echo
 echo "Try:"
-echo "  $OUT -I $BINATE_DIR -L $BINATE_DIR pkg/parser    # lint a package"
+echo "  $OUT -I $BINATE_DIR -L $BINATE_DIR pkg/binate/parser    # lint a package"

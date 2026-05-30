@@ -39,5 +39,5 @@ bnc -g -o myapp cmd/myapp/
 bnc --emit-llvm hello.bn
 
 # Run unit tests for a package
-bnc --test --root . pkg/binate/lexer pkg/parser
+bnc --test --root . pkg/binate/lexer pkg/binate/parser
 ```

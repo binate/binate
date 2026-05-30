@@ -1,0 +1,354 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// ============================================================
+// Function call lowering
+// ============================================================
+//
+// Dispatch order (genCall):
+//
+//   1. print/println/len/panic builtins (special-cased here
+//      because they don't have a regular function symbol).
+//   2. Function-value call where the callee is a SELECTOR / INDEX
+//      whose value is a function-value type. Must come before
+//      method-call dispatch — otherwise `op.Fn(args)` would route
+//      to a non-existent <Type>__<Field> method symbol.
+//   3. Method call: SELECTOR with a value receiver in scope.
+//   4. Function-value call where the callee is an IDENT bound to
+//      a function-value-typed local.
+//   5. Direct function call by name (with package qualification
+//      for SELECTOR forms like `pkg.Func`).
+//
+// Method-call lowering lives in gen_method.bn. This file is the
+// generic-call + function-value-call dispatch.
+
+// genCall generates IR for a function call, including builtins (println, len, panic).
+func genCall(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	// Check for print/println builtins
+	if e.X != nil && e.X.Kind == ast.EXPR_IDENT {
+		if streq(e.X.Name, "println") {
+			return genPrintCall(ctx, b, e, true)
+		}
+		if streq(e.X.Name, "print") {
+			return genPrintCall(ctx, b, e, false)
+		}
+		if streq(e.X.Name, "len") {
+			if len(e.Args) == 1 {
+				var arg @Instr = genExpr(ctx, b, e.Args[0])
+				b = ctx.CurBlock
+				if arg.Typ != nil && arg.Typ.Kind == types.TYP_ARRAY {
+					return b.EmitConstInt(arg.Typ.ArrayLen, types.TypInt())
+				}
+				return b.EmitSliceLen(arg)
+			}
+		}
+		if streq(e.X.Name, "panic") {
+			if len(e.Args) >= 1 {
+				var msg @Instr = genExpr(ctx, b, e.Args[0])
+				b = ctx.CurBlock
+				b.EmitPanic(msg)
+				return b.EmitConstNil(types.TypNil())
+			}
+		}
+	}
+
+	// Generic-instantiation call (plan-generics.md Slice 4a):
+	// callee is an EXPR_INSTANTIATE_OR_INDEX whose head identifier
+	// resolves to a generic decl registered on genericDecls.  Route
+	// to genCallInstantiate, which ensures the specialized IR func
+	// exists and emits a direct call to the mangled name.  Must
+	// come before the func-value-call branch below — the
+	// instantiation's result is a TYP_FUNC, not a TYP_FUNC_VALUE.
+	//
+	// Slice 7: also recognize the package-qualified form
+	// `pkg.Id[int](...)` (e.X.X is EXPR_SELECTOR), looking up the
+	// generic decl in the imported package's registry slot via
+	// lookupGenericDeclPkg.
+	if e.X != nil &&
+			e.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX &&
+			e.X.X != nil && e.X.X.Kind == ast.EXPR_IDENT {
+		var gd @ast.Decl = lookupGenericDecl(e.X.X.Name)
+		if gd != nil {
+			return genCallInstantiate(ctx, b, e, gd)
+		}
+	}
+	if e.X != nil &&
+			e.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX &&
+			e.X.X != nil && e.X.X.Kind == ast.EXPR_SELECTOR &&
+			e.X.X.X != nil && e.X.X.X.Kind == ast.EXPR_IDENT {
+		var gd @ast.Decl = lookupGenericDeclPkg(e.X.X.X.Name,
+			e.X.X.Name)
+		if gd != nil {
+			return genCallInstantiate(ctx, b, e, gd)
+		}
+	}
+
+	// Function-value call (struct-field / index / nested-selector form):
+	// callee is a SELECTOR / INDEX whose value is of TYP_FUNC_VALUE /
+	// TYP_MANAGED_FUNC_VALUE. Must check before method-call dispatch
+	// so that calling a function-value-typed field doesn't get routed
+	// to a non-existent <Type>__<Field> method symbol.
+	if e.X != nil && (e.X.Kind == ast.EXPR_SELECTOR ||
+			e.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX) {
+		var calleeTyp @types.Type = getSelectorType(ctx, e.X)
+		if calleeTyp != nil &&
+			(calleeTyp.Kind == types.TYP_FUNC_VALUE ||
+				calleeTyp.Kind == types.TYP_MANAGED_FUNC_VALUE) {
+			return genFuncValueCallExpr(ctx, b, e, calleeTyp)
+		}
+	}
+
+	// Method call: obj.M(args). Detected when the callee is a SELECTOR
+	// whose receiver is a value expression (not a package alias).
+	// (Stage 5b of plan-receivers.md.) For receivers of interface-
+	// value type, route to the vtable-dispatch path instead of the
+	// regular named-type method-call path. Slice 2.3a-3 of plan-
+	// interface-syntax-revision.md.
+	if e.X != nil && e.X.Kind == ast.EXPR_SELECTOR {
+		if isMethodCallSel(ctx, e.X) {
+			if isInterfaceMethodCall(ctx, e.X) {
+				return genInterfaceMethodCall(ctx, b, e)
+			}
+			return genMethodCall(ctx, b, e)
+		}
+	}
+
+	// Function-value call: callee is an Ident resolving to a local
+	// variable of TYP_FUNC_VALUE / TYP_MANAGED_FUNC_VALUE. Emit
+	// OP_CALL_FUNC_VALUE; backends dispatch mode-specifically (see
+	// plan-function-values.md "VM-mode vtables — Phase 1").
+	if e.X != nil && e.X.Kind == ast.EXPR_IDENT {
+		var localTyp @types.Type = lookupVarType(ctx, e.X.Name)
+		if localTyp != nil &&
+			(localTyp.Kind == types.TYP_FUNC_VALUE ||
+				localTyp.Kind == types.TYP_MANAGED_FUNC_VALUE) {
+			return genFuncValueCall(ctx, b, e, localTyp)
+		}
+	}
+
+	// Resolve function name (qualified for package calls). For both
+	// `pkg.Func` and method expressions `T.M`, funcRefName produces
+	// the right qualified form — pkg.Func and <pkg>.T.M respectively.
+	var name @[]char
+	if e.X != nil && (e.X.Kind == ast.EXPR_IDENT ||
+			e.X.Kind == ast.EXPR_SELECTOR) {
+		name = funcRefName(e.X)
+	}
+
+	var paramTypes @[]@types.Type = lookupFuncParams(name)
+	var args @[]@Instr
+	for i := 0; i < len(e.Args); i++ {
+		var paramTyp @types.Type = nil
+		if i < len(paramTypes) { paramTyp = paramTypes[i] }
+		var arg @Instr = genExprOrFuncRef(ctx, b, e.Args[i], paramTyp)
+		b = ctx.CurBlock
+		// Coerce string literal to *[]const char or @[]char if function parameter expects a slice
+		if arg.Op == OP_CONST_STRING && i < len(paramTypes) {
+			var pt @types.Type = paramTypes[i]
+			if pt != nil && (pt.Kind == types.TYP_SLICE || pt.Kind == types.TYP_MANAGED_SLICE) {
+				arg = b.EmitStringToChars(arg, pt)
+				noteSPGrowingResult(ctx, arg)
+			}
+		}
+		// Coerce nil to proper slice type if function parameter expects a slice
+		if arg.Op == OP_CONST_NIL && i < len(paramTypes) {
+			var pt @types.Type = paramTypes[i]
+			if pt != nil && (pt.Kind == types.TYP_SLICE || pt.Kind == types.TYP_MANAGED_SLICE) {
+				arg.Typ = pt
+			}
+		}
+		// Coerce @[]T → *[]T if function parameter expects a raw slice.
+		// The managed-slice temp stays in the cleanup list — it's borrowed
+		// by the raw slice during the call and RefDec'd at end of statement.
+		if i < len(paramTypes) {
+			var pt @types.Type = paramTypes[i]
+			if pt != nil && pt.Kind == types.TYP_SLICE {
+				if isManagedSliceType(arg.Typ) {
+					arg = b.EmitManagedToRaw(arg)
+				}
+			}
+		}
+		// RefInc managed fields for struct/array args passed by value.
+		// The callee's scope cleanup will dtor the parameter copy.
+		if i < len(paramTypes) {
+			var pt @types.Type = paramTypes[i]
+			if needsStructCopy(pt) {
+				// Load from alloca if arg is a struct alloca
+				if isStructOrArrayAlloc(arg) {
+					var tmpPtr @Instr = arg
+					emitStructCopy(ctx.Func, b, tmpPtr, pt)
+					arg = b.EmitLoad(tmpPtr, arg.TypeArg)
+				} else {
+					var tmpSlot @Instr = b.EmitAlloc(pt)
+					b.EmitStore(tmpSlot, arg)
+					emitStructCopy(ctx.Func, b, tmpSlot, pt)
+					arg = b.EmitLoad(tmpSlot, pt)
+				}
+			}
+		}
+		args = slices.Append[@Instr](args, arg)
+	}
+
+	// Look up return type from function signature
+	var resultTyp @types.Type = types.TypInt()
+	var results @[]@types.Type = lookupFuncResults(name)
+	var funcFound bool = lookupFuncExists(name)
+	if funcFound && len(results) == 0 {
+		resultTyp = types.TypVoid()
+	} else if len(results) == 1 {
+		resultTyp = results[0]
+	} else if len(results) > 1 {
+		// Multi-return: use the callee's anonymous struct type
+		var mrt @types.Type = lookupFuncMultiReturnType(name)
+		if mrt != nil {
+			resultTyp = mrt
+		} else {
+			resultTyp = makeMultiReturnStructType(results)
+		}
+	}
+	// Compiler-internal indirect-call magics.  Two dispatch shapes:
+	//   * `_call_dtor` / `_call_free_fn`: Args[0] is a function-value
+	//     HANDLE POINTER (result of `_raw_func_addr(F)` /
+	//     `_func_handle(F)`, or — for `_call_dtor` — the dtor handle
+	//     emitManagedPtrRefDec now emits via EmitFuncHandle).  Lowers
+	//     to OP_CALL_HANDLE.  Phase 4 of plan-uniform-native-fnptrs.md.
+	//   * `_call_shim_scalar` / `_call_shim_aggregate`: Args[0] is
+	//     a per-function SHIM ADDRESS directly; Args[1] is the
+	//     closure-data argument; Args[2..] are user args.  Lowers
+	//     to OP_CALL_INDIRECT — pkg/vm internal dispatch
+	//     (dispatchExternBinding / dispatchNativeIndirect) already
+	//     splits the handle into shim+data before invoking these.
+	// In all cases the .bni declarations are type-checking shapes
+	// only — there are no callable symbols to link against.
+	if streq(name, "_call_dtor") ||
+		streq(name, "pkg/rt._call_dtor") ||
+		streq(name, "_call_free_fn") ||
+		streq(name, "pkg/rt._call_free_fn") {
+		if len(args) >= 1 {
+			var handle @Instr = args[0]
+			var callArgs @[]@Instr =
+				make_slice(@Instr, len(args) - 1)
+			for i := 0; i < len(callArgs); i++ {
+				callArgs[i] = args[i + 1]
+			}
+			return b.EmitCallHandle(handle,
+				callArgs, resultTyp)
+		}
+	}
+	if streq(name, "_call_shim_scalar") ||
+		streq(name, "pkg/rt._call_shim_scalar") ||
+		streq(name, "_call_shim_aggregate") ||
+		streq(name, "pkg/rt._call_shim_aggregate") {
+		if len(args) >= 1 {
+			var fnPtr @Instr = args[0]
+			var callArgs @[]@Instr =
+				make_slice(@Instr, len(args) - 1)
+			for i := 0; i < len(callArgs); i++ {
+				callArgs[i] = args[i + 1]
+			}
+			return b.EmitCallIndirect(fnPtr,
+				callArgs, resultTyp)
+		}
+	}
+
+	var result @Instr = b.EmitCall(name, args, resultTyp)
+	// Register managed return values as temporaries for end-of-statement cleanup
+	if isManagedPtrType(resultTyp) {
+		registerTemp(ctx, result)
+	}
+	if isManagedSliceType(resultTyp) {
+		registerTemp(ctx, result)
+		// BC_RETURN copy-back grows caller vm.SP by 32 (slice header).
+		ctx.StmtGrewSP = true
+	}
+	if needsStructCopy(resultTyp) {
+		registerTemp(ctx, result)
+		// BC_RETURN copy-back grows caller vm.SP by SizeOf(struct).
+		ctx.StmtGrewSP = true
+	}
+	return result
+}
+
+// genFuncValueCall lowers `f(args)` where f is a local of type
+// TYP_FUNC_VALUE / TYP_MANAGED_FUNC_VALUE. Loads the function value
+// from f's storage and delegates to genFuncValueCallWithFn.
+func genFuncValueCall(ctx @GenContext, b @Block, e @ast.Expr,
+		fnTyp @types.Type) @Instr {
+	var ptr @Instr = lookupVar(ctx, e.X.Name)
+	var fnVal @Instr = b.EmitLoad(ptr, fnTyp)
+	b = ctx.CurBlock
+	return genFuncValueCallWithFn(ctx, b, e, fnTyp, fnVal)
+}
+
+// genFuncValueCallExpr lowers `<expr>(args)` where <expr> is any
+// non-Ident expression (struct field, index, nested selector, etc.)
+// of function-value type. genExpr the callee — for a struct field
+// SELECTOR, that yields the loaded function value — then delegate.
+func genFuncValueCallExpr(ctx @GenContext, b @Block, e @ast.Expr,
+		fnTyp @types.Type) @Instr {
+	var fnVal @Instr = genExpr(ctx, b, e.X)
+	b = ctx.CurBlock
+	return genFuncValueCallWithFn(ctx, b, e, fnTyp, fnVal)
+}
+
+// genFuncValueCallWithFn: shared back end for the two entry points.
+// fnVal is the already-loaded function value; e.Args are the user
+// args. Result type comes from fnTyp.Results.
+func genFuncValueCallWithFn(ctx @GenContext, b @Block, e @ast.Expr,
+		fnTyp @types.Type, fnVal @Instr) @Instr {
+	// Evaluate args. Param-type-driven coercions (string → slice,
+	// nil → slice/managed-slice) mirror genCall's, since the
+	// signature shape is identical.
+	var args @[]@Instr
+	for i := 0; i < len(e.Args); i++ {
+		var pt @types.Type = nil
+		if i < len(fnTyp.Params) && fnTyp.Params[i] != nil {
+			pt = fnTyp.Params[i].Type
+		}
+		var arg @Instr = genExprOrFuncRef(ctx, b, e.Args[i], pt)
+		b = ctx.CurBlock
+		if pt != nil {
+			if arg.Op == OP_CONST_STRING &&
+				(pt.Kind == types.TYP_SLICE ||
+					pt.Kind == types.TYP_MANAGED_SLICE) {
+				arg = b.EmitStringToChars(arg, pt)
+				noteSPGrowingResult(ctx, arg)
+			}
+			if arg.Op == OP_CONST_NIL &&
+				(pt.Kind == types.TYP_SLICE ||
+					pt.Kind == types.TYP_MANAGED_SLICE) {
+				arg.Typ = pt
+			}
+			if pt.Kind == types.TYP_SLICE &&
+				isManagedSliceType(arg.Typ) {
+				arg = b.EmitManagedToRaw(arg)
+			}
+		}
+		args = slices.Append[@Instr](args, arg)
+	}
+
+	// Determine return type.
+	var resultTyp @types.Type = types.TypVoid()
+	if len(fnTyp.Results) == 1 {
+		resultTyp = fnTyp.Results[0]
+	} else if len(fnTyp.Results) > 1 {
+		resultTyp = makeMultiReturnStructType(fnTyp.Results)
+	}
+
+	var result @Instr = b.EmitCallFuncValue(fnVal, args, resultTyp)
+	if isManagedPtrType(resultTyp) {
+		registerTemp(ctx, result)
+	}
+	if isManagedSliceType(resultTyp) {
+		registerTemp(ctx, result)
+		ctx.StmtGrewSP = true
+	}
+	if needsStructCopy(resultTyp) {
+		registerTemp(ctx, result)
+		ctx.StmtGrewSP = true
+	}
+	return result
+}

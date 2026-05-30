@@ -1,0 +1,438 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// ============================================================
+// Token → IR op mapping
+// ============================================================
+
+// tokenToOp converts an AST token kind to the corresponding IR opcode.
+func tokenToOp(tok int) int {
+	if tok == cast(int, token.PLUS) { return OP_ADD }
+	if tok == cast(int, token.MINUS) { return OP_SUB }
+	if tok == cast(int, token.STAR) { return OP_MUL }
+	if tok == cast(int, token.SLASH) { return OP_DIV }
+	if tok == cast(int, token.PERCENT) { return OP_REM }
+	if tok == cast(int, token.AMP) { return OP_AND }
+	if tok == cast(int, token.PIPE) { return OP_OR }
+	if tok == cast(int, token.CARET) { return OP_XOR }
+	if tok == cast(int, token.SHL) { return OP_SHL }
+	if tok == cast(int, token.SHR) { return OP_SHR }
+	if tok == cast(int, token.EQ) { return OP_EQ }
+	if tok == cast(int, token.NEQ) { return OP_NE }
+	if tok == cast(int, token.LT) { return OP_LT }
+	if tok == cast(int, token.LEQ) { return OP_LE }
+	if tok == cast(int, token.GT) { return OP_GT }
+	if tok == cast(int, token.GEQ) { return OP_GE }
+	if tok == cast(int, token.LAND) { return OP_LAND }
+	if tok == cast(int, token.LOR) { return OP_LOR }
+	return OP_ADD // fallback
+}
+
+// compoundToIROp converts a compound assignment token (+=, -=, etc.) to the IR binary op.
+func compoundToIROp(op int) int {
+	if op == cast(int, token.ADD_ASSIGN) { return OP_ADD }
+	if op == cast(int, token.SUB_ASSIGN) { return OP_SUB }
+	if op == cast(int, token.MUL_ASSIGN) { return OP_MUL }
+	if op == cast(int, token.QUO_ASSIGN) { return OP_DIV }
+	if op == cast(int, token.REM_ASSIGN) { return OP_REM }
+	if op == cast(int, token.AND_ASSIGN) { return OP_AND }
+	if op == cast(int, token.OR_ASSIGN) { return OP_OR }
+	if op == cast(int, token.XOR_ASSIGN) { return OP_XOR }
+	if op == cast(int, token.SHL_ASSIGN) { return OP_SHL }
+	if op == cast(int, token.SHR_ASSIGN) { return OP_SHR }
+	return OP_ADD
+}
+
+// ============================================================
+// Type resolution (syntax TypeExpr → types.Type)
+// ============================================================
+
+// isFuncRefExpr reports whether e is a syntactic function reference
+// — a bare Ident, a pkg.Name Selector, or a method expression
+// (T.M Selector where T is a known local type and M a method on it).
+// Doesn't validate that the name actually resolves to a function;
+// callers (e.g. genVarDecl) gate on lookupFuncExists, which the
+// qualified name produced by funcRefName will satisfy.
+func isFuncRefExpr(e @ast.Expr) bool {
+	if e == nil { return false }
+	if e.Kind == ast.EXPR_IDENT { return true }
+	if e.Kind == ast.EXPR_SELECTOR &&
+		e.X != nil && e.X.Kind == ast.EXPR_IDENT {
+		return true
+	}
+	return false
+}
+
+// funcRefName returns the qualified function name for a function-
+// reference expression. Three shapes:
+//   - Ident `f`              → `f`            (free function)
+//   - Selector `pkg.Func`    → `pkg.Func`     (package-qualified)
+//   - Selector `T.M`         → `<pkg>.T.M`    (method expression)
+// The method-expression case is detected by checking whether the
+// X identifier is a known local type (lookupStructIdx). A.6 of
+// plan-function-values.md.
+func funcRefName(e @ast.Expr) @[]char {
+	if e == nil { return "" }
+	if e.Kind == ast.EXPR_IDENT { return e.Name }
+	if e.Kind == ast.EXPR_SELECTOR &&
+		e.X != nil && e.X.Kind == ast.EXPR_IDENT {
+		if lookupStructIdx(e.X.Name) >= 0 {
+			return buildMethodQualName(currentModulePkgPath,
+				e.X.Name, e.Name)
+		}
+		return buildQualName(e.X.Name, e.Name)
+	}
+	return ""
+}
+
+// genExprOrFuncRef evaluates e in the receiving context of targetTyp.
+// When targetTyp is a function-value type and e is a function reference
+// (Ident or pkg.Name), emits OP_FUNC_VALUE. When targetTyp is an
+// interface-value type and e produces a pointer-shaped value, wraps
+// the value with OP_IFACE_VALUE pointing at the matching impl's
+// vtable (Slice 2.3a-4 of plan-interface-syntax-revision.md).
+// Otherwise falls back to genExpr. targetTyp may be nil — the helper
+// is then a thin wrapper.
+//
+// Use this at every site where a function reference may legitimately
+// flow into a function-value-typed slot OR a pointer-shaped value
+// may legitimately flow into an interface-value slot: var decl with
+// explicit type, call arg, return value, plain/selector/index
+// assignment.
+func genExprOrFuncRef(ctx @GenContext, b @Block, e @ast.Expr,
+		targetTyp @types.Type) @Instr {
+	if e != nil && targetTyp != nil &&
+		(targetTyp.Kind == types.TYP_FUNC_VALUE ||
+			targetTyp.Kind == types.TYP_MANAGED_FUNC_VALUE) &&
+		isFuncRefExpr(e) {
+		var fnName @[]char = funcRefName(e)
+		if lookupFuncExists(fnName) {
+			var fv @Instr = b.EmitFuncValue(fnName, targetTyp)
+			noteSPGrowingResult(ctx, fv)
+			return fv
+		}
+	}
+	// Phase B of plan-ir-gen-typed-literals.md.  Narrow an
+	// integer-valued expression to its typed-int context.  The
+	// expression may be a direct EXPR_INT_LIT or a more complex
+	// untyped-int expression that the type checker folded (e.g.
+	// EXPR_UNARY(MINUS, lit) producing int64-min; EXPR_BINARY of
+	// two literals).  Both cases land HasLitVal=true on the
+	// resolved Type via foldIntArith / checkUnaryExpr.
+	//
+	// Mirrors genExprInner's `ctx.CurBlock = b` pre-amble so
+	// callers that do `b = ctx.CurBlock` after this call land on
+	// the same block they passed in.  Without this sync the
+	// caller would pick up a stale ctx.CurBlock — observable as
+	// for-loop epilogue code emitted into the wrong block in any
+	// function that does e.g. `for ...; sec.Data[i] = 0` (the
+	// loop tail's CurBlock leaks past the post-loop statement).
+	if e != nil && isTypedInt(targetTyp) && needsHintNarrowing(targetTyp) &&
+			currentChecker != nil && e.ResolvedTypeID != 0 {
+		var t @types.Type = currentChecker.ExprType(e.ResolvedTypeID)
+		if t != nil && t.HasLitVal {
+			var v int64 = bignumToInt(t.LitMag, t.LitSign)
+			if intFitsInType(v, targetTyp) {
+				ctx.CurBlock = b
+				return b.EmitConstInt64(v, targetTyp)
+			}
+		}
+	}
+	// Fallback for the no-Checker test path: direct EXPR_INT_LIT
+	// still narrows via parseIntLit.
+	if e != nil && e.Kind == ast.EXPR_INT_LIT &&
+			isTypedInt(targetTyp) && needsHintNarrowing(targetTyp) {
+		var v int64 = exprIntLitValue(e)
+		if intFitsInType(v, targetTyp) {
+			ctx.CurBlock = b
+			return b.EmitConstInt64(v, targetTyp)
+		}
+	}
+	var val @Instr = genExpr(ctx, b, e)
+	if val != nil && targetTyp != nil &&
+		(targetTyp.Kind == types.TYP_INTERFACE_VALUE ||
+			targetTyp.Kind ==
+				types.TYP_INTERFACE_VALUE_MANAGED) &&
+		val.Typ != nil &&
+		val.Typ.Kind != types.TYP_INTERFACE_VALUE &&
+		val.Typ.Kind != types.TYP_INTERFACE_VALUE_MANAGED {
+		var iv @Instr = wrapAsIfaceValue(ctx, ctx.CurBlock, val,
+			targetTyp)
+		if iv != nil {
+			noteSPGrowingResult(ctx, iv)
+			return iv
+		}
+	}
+	// plan-interface-embedding.md Slice E.4 part 2b: source is
+	// already an iface value but the target is a different iface
+	// (an ancestor of the source's interface, since the type-
+	// checker accepted the assignment).  Emit OP_IFACE_UPCAST.
+	// Both Args[0].Typ.Elem (source iface) and the Instr.Typ.Elem
+	// (target iface) ride on the resulting Instr so codegen + VM
+	// can derive the static slot offset / target vtable name at
+	// lowering time.  Identical-type assignment is handled by the
+	// caller's AssignableTo Identical check and never reaches
+	// here with a non-trivial upcast.
+	if val != nil && targetTyp != nil &&
+			(targetTyp.Kind == types.TYP_INTERFACE_VALUE ||
+				targetTyp.Kind ==
+					types.TYP_INTERFACE_VALUE_MANAGED) &&
+			val.Typ != nil &&
+			(val.Typ.Kind == types.TYP_INTERFACE_VALUE ||
+				val.Typ.Kind ==
+					types.TYP_INTERFACE_VALUE_MANAGED) &&
+			!ifaceValueTypesAgree(val.Typ, targetTyp) {
+		var iv @Instr = ctx.CurBlock.EmitIfaceUpcast(val, "",
+			targetTyp)
+		noteSPGrowingResult(ctx, iv)
+		return iv
+	}
+	return val
+}
+
+// ifaceValueTypesAgree reports whether two iface-value types
+// wrap the same canonical interface (by (Pkg, Name)).  Kind
+// differences (raw vs managed) flow through here as "not the
+// same" — those go through the upcast path too (managed-to-raw
+// decay across the same interface).
+func ifaceValueTypesAgree(a @types.Type, b @types.Type) bool {
+	if a == nil || b == nil { return false }
+	if a.Kind != b.Kind { return false }
+	if a.Elem == nil || b.Elem == nil { return false }
+	if a.Elem.Kind != types.TYP_INTERFACE { return false }
+	if b.Elem.Kind != types.TYP_INTERFACE { return false }
+	return charEq(a.Elem.Pkg, b.Elem.Pkg) &&
+		charEq(a.Elem.Name, b.Elem.Name)
+}
+
+// resolveTypeExpr resolves a syntax-level TypeExpr to the corresponding types.Type.
+func resolveTypeExpr(te @ast.TypeExpr) @types.Type {
+	if te == nil {
+		return types.TypVoid()
+	}
+	if te.Kind == ast.TEXPR_NAMED {
+		// Generic-instantiation substitution (plan-generics.md
+		// Slice 4a).  When IR-gen is emitting the body of an
+		// instantiated generic, a bare type-param reference like
+		// `T` must resolve to the concrete type the caller
+		// supplied — not to the fallback TypInt() at the end of
+		// this function, which would silently miscompile.
+		if len(te.Pkg) == 0 {
+			for i := 0; i < len(currentTypeParamNames); i++ {
+				if streq(te.Name, currentTypeParamNames[i]) {
+					return currentTypeParamTypes[i]
+				}
+			}
+		}
+		// Check for package-qualified type (e.g., ast.File)
+		if len(te.Pkg) > 0 {
+			var qualName @[]char = buildQualName(te.Pkg, te.Name)
+			var si int = lookupStructIdx(qualName)
+			if si >= 0 {
+				return moduleStructs[si].Typ
+			}
+			// Check type aliases
+			var aliasTyp @types.Type = lookupTypeAlias(qualName)
+			if aliasTyp != nil {
+				return aliasTyp
+			}
+			return types.TypInt() // fallback
+		}
+		if streq(te.Name, "int") { return types.TypInt() }
+		if streq(te.Name, "uint") { return types.TypUint() }
+		if streq(te.Name, "int8") { return types.TypInt8() }
+		if streq(te.Name, "int16") { return types.TypInt16() }
+		if streq(te.Name, "int32") { return types.TypInt32() }
+		if streq(te.Name, "int64") { return types.TypInt64() }
+		if streq(te.Name, "uint8") { return types.TypUint8() }
+		if streq(te.Name, "uint16") { return types.TypUint16() }
+		if streq(te.Name, "uint32") { return types.TypUint32() }
+		if streq(te.Name, "uint64") { return types.TypUint64() }
+		if streq(te.Name, "float32") { return types.TypFloat32() }
+		if streq(te.Name, "float64") { return types.TypFloat64() }
+		if streq(te.Name, "byte") { return types.TypByte() }
+		if streq(te.Name, "bool") { return types.TypBool() }
+		if streq(te.Name, "char") { return types.TypChar() }
+		// Check module-level struct types
+		var si int = lookupStructIdx(te.Name)
+		if si >= 0 {
+			return moduleStructs[si].Typ
+		}
+		// Check local type aliases
+		var localAlias @types.Type = lookupTypeAlias(te.Name)
+		if localAlias != nil {
+			return localAlias
+		}
+		// Try with current import alias prefix
+		if len(currentImportAlias) > 0 {
+			var qualName @[]char = buildQualName(
+				currentImportAlias, te.Name)
+			si = lookupStructIdx(qualName)
+			if si >= 0 {
+				return moduleStructs[si].Typ
+			}
+			var prefixedAlias @types.Type = lookupTypeAlias(qualName)
+			if prefixedAlias != nil {
+				return prefixedAlias
+			}
+		}
+		return types.TypInt() // fallback
+	}
+	if te.Kind == ast.TEXPR_INSTANTIATE {
+		// Generic struct instantiation (Slice 5c of
+		// plan-generics.md): look up the generic decl, resolve
+		// each type arg, then register / fetch the per-(decl,
+		// args) instantiated struct via ensureInstantiatedStruct.
+		//
+		// Slice 7b: also accept pkg-qualified heads
+		// (`pkg.Vec[int]`); lookupGenericTypeDeclPkg keys on the
+		// import alias.
+		if te.Base != nil && te.Base.Kind == ast.TEXPR_NAMED {
+			var lookupPkg @[]char
+			if len(te.Base.Pkg) > 0 {
+				lookupPkg = te.Base.Pkg
+			} else {
+				lookupPkg = currentModulePkgPath
+			}
+			var d @ast.Decl = lookupGenericTypeDeclPkg(lookupPkg,
+				te.Base.Name)
+			if d != nil {
+				var argTypes @[]@types.Type
+				for i := 0; i < len(te.TypeArgs); i++ {
+					argTypes = slices.Append[@types.Type](argTypes,
+						resolveTypeExpr(te.TypeArgs[i]))
+				}
+				return ensureInstantiatedStruct(d, argTypes)
+			}
+		}
+		return types.TypInt()
+	}
+	if te.Kind == ast.TEXPR_PAREN {
+		return resolveTypeExpr(te.Base)
+	}
+	if te.Kind == ast.TEXPR_CONST {
+		// Stage 0 of the const rollout: wrap the resolved inner type
+		// with TYP_CONST. const is transparent to layout and most
+		// queries, so the rest of IR gen doesn't need to know.
+		return types.MakeConstType(resolveTypeExpr(te.Base))
+	}
+	if te.Kind == ast.TEXPR_SLICE {
+		return types.MakeSliceType(resolveTypeExpr(te.Base))
+	}
+	if te.Kind == ast.TEXPR_POINTER {
+		// `*Iface` (raw interface value) — base resolves to the
+		// declared interface name. Per Slice 2.0 of plan-interface-
+		// syntax-revision.md, the bare interface name isn't a usable
+		// type expression; only `*Iface` / `@Iface` are. IR-gen's
+		// type resolver detects the form via the per-module
+		// interface registry and produces TYP_INTERFACE_VALUE so
+		// codegen can emit `%BnIfaceValue` for the slot.
+		if isInterfaceTypeExpr(te.Base) {
+			return types.MakeInterfaceValueType(
+				ifaceTypeForName(te.Base))
+		}
+		return types.MakePointerType(resolveTypeExpr(te.Base))
+	}
+	if te.Kind == ast.TEXPR_MANAGED {
+		// `@Iface` (managed interface value) — same recognition as
+		// TEXPR_POINTER's interface-value path, producing
+		// TYP_INTERFACE_VALUE_MANAGED.
+		if isInterfaceTypeExpr(te.Base) {
+			return types.MakeManagedInterfaceValueType(
+				ifaceTypeForName(te.Base))
+		}
+		return types.MakeManagedPtrType(resolveTypeExpr(te.Base))
+	}
+	if te.Kind == ast.TEXPR_MANAGED_SLICE {
+		return types.MakeManagedSliceType(resolveTypeExpr(te.Base))
+	}
+	if te.Kind == ast.TEXPR_ARRAY {
+		var arrLen int = 0
+		if te.Len != nil {
+			arrLen = parseIntLit(te.Len.Name)
+		}
+		return types.MakeArrayType(resolveTypeExpr(te.Base), arrLen)
+	}
+	if te.Kind == ast.TEXPR_FUNC_VALUE ||
+		te.Kind == ast.TEXPR_MANAGED_FUNC_VALUE {
+		// Function-value type. The signature (Params/Results) is
+		// only load-bearing for vtable type generation downstream;
+		// here we just build the right Type kind so SizeOf returns
+		// 16 and emitConstNil / lowerStore route through the
+		// multi-word path.
+		var params @[]@types.Param
+		for i := 0; i < len(te.ParamTypes); i++ {
+			var p @types.Param = make(types.Param)
+			p.Type = resolveTypeExpr(te.ParamTypes[i])
+			params = slices.Append[@types.Param](params, p)
+		}
+		var results @[]@types.Type
+		for i := 0; i < len(te.ResultTypes); i++ {
+			results = slices.Append[@types.Type](results,
+				resolveTypeExpr(te.ResultTypes[i]))
+		}
+		if te.Kind == ast.TEXPR_FUNC_VALUE {
+			return types.MakeFuncValueType(params, results)
+		}
+		return types.MakeManagedFuncValueType(params, results)
+	}
+	if te.Kind == ast.TEXPR_STRUCT {
+		var fields @[]@types.Field
+		for i := 0; i < len(te.Fields); i++ {
+			var fd @ast.FieldDecl = te.Fields[i]
+			var f @types.Field = make(types.Field)
+			f.Name = fd.Name
+			f.Type = resolveTypeExpr(fd.Type)
+			fields = slices.Append[@types.Field](fields, f)
+		}
+		// Check if identical anonymous struct already registered
+		var existing @types.Type = findAnonStruct(fields)
+		if existing != nil {
+			return existing
+		}
+		// Assign synthetic name for codegen
+		var cb buf.CharBuf = buf.New()
+		cb = cb.WriteStr("__anon_")
+		cb = cb.WriteInt(anonStructCounter)
+		anonStructCounter = anonStructCounter + 1
+		var synthName @[]char = cb.Bytes()
+		var anonTyp @types.Type = types.MakeStructType(synthName, fields)
+		var ms ModuleStruct
+		ms.Name = synthName
+		ms.Typ = anonTyp
+		ms.Fields = fields
+		moduleStructs = slices.Append[ModuleStruct](moduleStructs, ms)
+		return anonTyp
+	}
+	return types.TypVoid()
+}
+
+// findAnonStruct looks for an existing anonymous struct in moduleStructs
+// with identical field names and types.
+func findAnonStruct(fields @[]@types.Field) @types.Type {
+	for i := 0; i < len(moduleStructs); i++ {
+		var ms ModuleStruct = moduleStructs[i]
+		if ms.Typ == nil { continue }
+		if ms.Typ.Kind != types.TYP_STRUCT { continue }
+		// Only match synthetic anonymous names
+		if len(ms.Name) < 7 { continue }
+		if ms.Name[0] != '_' || ms.Name[1] != '_' { continue }
+		if len(ms.Typ.Fields) != len(fields) { continue }
+		var match bool = true
+		for j := 0; j < len(fields); j++ {
+			if !streq(ms.Typ.Fields[j].Name, fields[j].Name) {
+				match = false
+			}
+			if !ms.Typ.Fields[j].Type.Identical(fields[j].Type) {
+				match = false
+			}
+		}
+		if match { return ms.Typ }
+	}
+	return nil
+}

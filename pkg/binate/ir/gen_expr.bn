@@ -1,0 +1,369 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// ============================================================
+// Expression generation
+// ============================================================
+
+// genExpr generates IR for an expression, propagating source line info.
+func genExpr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	var result @Instr = genExprInner(ctx, b, e)
+	if result != nil && e != nil && e.Pos.Line > 0 {
+		result.Line = e.Pos.Line
+	}
+	return result
+}
+
+// genExprInner dispatches expression generation by AST node kind.
+func genExprInner(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	ctx.CurBlock = b
+	if e.Kind == ast.EXPR_INT_LIT {
+		// Phase A3 of plan-ir-gen-typed-literals.md: prefer the
+		// type checker's bignum value (LitMag/LitSign on the
+		// resolved Type) over re-parsing the literal text via
+		// parseIntLit.  Same result for all values parseIntLit
+		// handles correctly; more robust at the int64-min /
+		// uint64 boundary.  Falls back to parseIntLit when the
+		// checker isn't available (e.g. genFromSource tests that
+		// skip type-check, until A3-test-helper migration).
+		var v int64 = exprIntLitValue(e)
+		return b.EmitConstInt64(v, types.TypUntypedInt())
+	}
+
+	if e.Kind == ast.EXPR_FLOAT_LIT {
+		return b.EmitConstFloat(e.Name, types.TypUntypedFloat())
+	}
+
+	if e.Kind == ast.EXPR_STRING_LIT {
+		return b.EmitConstString(unescapeStr(e.Name))
+	}
+
+	if e.Kind == ast.EXPR_CHAR_LIT {
+		return b.EmitConstInt(parseCharLit(e.Name), types.TypUint8())
+	}
+
+	if e.Kind == ast.EXPR_BOOL_LIT {
+		if len(e.Name) > 0 {
+			return b.EmitConstBool(streq(e.Name, "true"))
+		}
+		return b.EmitConstBool(e.BoolVal)
+	}
+
+	if e.Kind == ast.EXPR_NIL_LIT {
+		return b.EmitConstNil(types.TypNil())
+	}
+
+	if e.Kind == ast.EXPR_IDENT {
+		var ptr @Instr = lookupVar(ctx, e.Name)
+		if ptr != nil {
+			var typ @types.Type = lookupVarType(ctx, e.Name)
+			return b.EmitLoad(ptr, typ)
+		}
+		// Check module-level constants
+		var cval int
+		var ctyp @types.Type
+		var cfound bool
+		cval, ctyp, cfound = lookupConst(e.Name)
+		if cfound {
+			if ctyp == nil {
+				ctyp = types.TypUntypedInt()
+			}
+			return b.EmitConstInt(cval, ctyp)
+		}
+		// Unknown ident — return a zero placeholder
+		return b.EmitConstInt(0, types.TypInt())
+	}
+
+	if e.Kind == ast.EXPR_BINARY {
+		var folded @Instr = tryFoldOversizedConst(b, e)
+		if folded != nil { return folded }
+		return genBinary(ctx, b, e)
+	}
+
+	if e.Kind == ast.EXPR_UNARY {
+		var folded @Instr = tryFoldOversizedConst(b, e)
+		if folded != nil { return folded }
+		return genUnary(ctx, b, e)
+	}
+
+	if e.Kind == ast.EXPR_CALL {
+		return genCall(ctx, b, e)
+	}
+
+	if e.Kind == ast.EXPR_BUILTIN {
+		return genBuiltin(ctx, b, e)
+	}
+
+	if e.Kind == ast.EXPR_SELECTOR {
+		// B.4 of plan-function-values-phase-2.md: a selector
+		// whose resolved type is a function-value AND whose
+		// X-side is a value (not a known type / package) is a
+		// method value `x.M`.  Route to the method-value handler
+		// which synthesizes a per-(method, receiver-shape) wrapper
+		// + closure struct.
+		if isMethodValueSelector(e) {
+			return genMethodValue(ctx, b, e)
+		}
+		return genSelector(ctx, b, e)
+	}
+
+	if e.Kind == ast.EXPR_COMPOSITE {
+		return genCompositeLit(ctx, b, e)
+	}
+
+	if e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		return genIndex(ctx, b, e, true)  // checked
+	}
+
+	if e.Kind == ast.EXPR_SLICE {
+		return genSliceExpr(ctx, b, e)
+	}
+
+	if e.Kind == ast.EXPR_FUNC_LIT {
+		return genFuncLit(ctx, b, e)
+	}
+
+	// Unsupported expression
+	return b.EmitConstInt(0, types.TypInt())
+}
+
+// genUnary generates IR for unary expressions (&, *, -, !, ~).
+func genUnary(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	// Address-of: &x returns the alloca pointer directly
+	if e.Op == cast(int, token.AMP) {
+		if e.X.Kind == ast.EXPR_IDENT {
+			var ptr @Instr = lookupVar(ctx, e.X.Name)
+			if ptr != nil {
+				return ptr
+			}
+		}
+		// &arr[i]: return pointer to element (GEP, not loaded value)
+		if e.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+			var ptr @Instr = genIndexPtr(ctx, b, e.X)
+			if ptr != nil {
+				return ptr
+			}
+		}
+		// &s.field / &p.field / &globalStruct.field: delegate to
+		// genSelectorPtr, which already covers value structs,
+		// managed-ptr-to-struct, raw-ptr-to-struct, and indexed
+		// element struct fields. Returns the field pointer (a
+		// GEP), NOT the loaded field value.
+		if e.X.Kind == ast.EXPR_SELECTOR {
+			var ptr @Instr = genSelectorPtr(ctx, b, e.X)
+			if ptr != nil {
+				return ptr
+			}
+		}
+		return genExpr(ctx, b, e.X)
+	}
+	// Dereference: *p loads the pointer value, then loads through it.
+	// Handles raw and managed pointers identically at the IR-gen level
+	// — the deref produces an rvalue of the pointed-to type either
+	// way.  Refcount semantics for the @T case stay on the *operand*
+	// (the @T variable still owns its ref); the deref is a value
+	// load, not an ownership transfer.  Required so that iv-method
+	// dispatch routes correctly through `(*p).Foo()` when p is
+	// `@(*Iface)` / `@(@Iface)` — otherwise the load is sized as
+	// `i64` and the receiver carries the wrong type, failing the
+	// `iv.Typ.Elem == nil` guard in genInterfaceMethodCall.
+	if e.Op == cast(int, token.STAR) {
+		var ptrVal @Instr = genExpr(ctx, b, e.X)
+		b = ctx.CurBlock
+		// Determine pointed-to type from the pointer's type
+		var elemTyp @types.Type = types.TypInt()
+		if ptrVal.Typ != nil &&
+				(ptrVal.Typ.Kind == types.TYP_POINTER ||
+				 ptrVal.Typ.Kind == types.TYP_MANAGED_PTR) &&
+				ptrVal.Typ.Elem != nil {
+			elemTyp = ptrVal.Typ.Elem
+		} else if e.X.Kind == ast.EXPR_IDENT {
+			var varTyp @types.Type = lookupVarType(ctx, e.X.Name)
+			if varTyp != nil &&
+					(varTyp.Kind == types.TYP_POINTER ||
+					 varTyp.Kind == types.TYP_MANAGED_PTR) &&
+					varTyp.Elem != nil {
+				elemTyp = varTyp.Elem
+			}
+		}
+		return b.EmitLoad(ptrVal, elemTyp)
+	}
+
+	var arg @Instr = genExpr(ctx, b, e.X)
+	b = ctx.CurBlock
+	if e.Op == cast(int, token.MINUS) {
+		// Preserve the operand's numeric type so the backend can pick
+		// between integer and floating-point negation.  int64 also
+		// passes through verbatim so 32-bit targets don't truncate
+		// (e.g. -9223372036854775808 lowered against i32 silently
+		// turns into 0 — see emitPrintInt and conformance 423).
+		// The type checker's resolved TYP_INT-with-Width is preferred
+		// over the operand's IR-emitted Typ (which may be
+		// TYP_UNTYPED_INT for a literal), since the literal carries
+		// no Width but the resolved type does.
+		var negTyp @types.Type = types.TypInt()
+		if arg.Typ != nil && arg.Typ.IsFloat() {
+			negTyp = arg.Typ
+		} else if arg.Typ != nil && arg.Typ.Kind == types.TYP_INT &&
+				arg.Typ.Width == 64 {
+			negTyp = arg.Typ
+		} else if currentChecker != nil && e.ResolvedTypeID != 0 {
+			// Pick up an int64 (or any typed-int) resolution the
+			// type checker assigned to the unary-minus expression
+			// when the operand's IR-emitted type doesn't carry it
+			// (typical for untyped int literals).  Concrete TYP_INT
+			// only — leave untyped resolutions alone so downstream
+			// signedness inference behaves as before.
+			var t @types.Type = currentChecker.ExprType(e.ResolvedTypeID)
+			if t != nil && t.Kind == types.TYP_INT && t.Width == 64 {
+				negTyp = t
+			}
+		}
+		return b.EmitUnary(OP_NEG, arg, negTyp)
+	}
+	if e.Op == cast(int, token.NOT) {
+		return b.EmitUnary(OP_NOT, arg, types.TypBool())
+	}
+	if e.Op == cast(int, token.TILDE) {
+		return b.EmitUnary(OP_BITNOT, arg, types.TypInt())
+	}
+	return arg
+}
+// genBuiltin generates IR for builtin keyword expressions
+// (cast, bit_cast, len, make, make_slice, box).
+func genBuiltin(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	if e.Op == cast(int, token.CAST) || e.Op == cast(int, token.BIT_CAST) {
+		if len(e.Args) >= 1 {
+			var targetTyp @types.Type = resolveTypeExpr(e.TypeRef)
+			// Phase B of plan-ir-gen-typed-literals.md: when the
+			// cast operand is an integer literal that fits the
+			// target type, emit it at the target type directly.
+			// Otherwise `cast(uint64, 0x0102030405060708)` on a
+			// 32-bit target would first lower the literal at the
+			// untyped-int default (i32), truncating it to
+			// 0x05060708 before the widening cast ever runs.
+			// Only fires for CAST (value-preserving conversion);
+			// BIT_CAST requires same-width operands so its literal
+			// is already correctly typed by the type checker.
+			var val @Instr = nil
+			if e.Op == cast(int, token.CAST) {
+				val = genIntLitWithHint(ctx, b, e.Args[0], targetTyp)
+			}
+			if val == nil {
+				val = genExpr(ctx, b, e.Args[0])
+			}
+			b = ctx.CurBlock
+			if e.Op == cast(int, token.CAST) {
+				return b.EmitCast(val, targetTyp)
+			}
+			return b.EmitBitCast(val, targetTyp)
+		}
+	}
+	if e.Op == cast(int, token.LEN) {
+		if len(e.Args) >= 1 {
+			var arg @Instr = genExpr(ctx, b, e.Args[0])
+			b = ctx.CurBlock
+			// For arrays, len is a compile-time constant
+			if arg.Typ != nil && arg.Typ.Kind == types.TYP_ARRAY {
+				return b.EmitConstInt(arg.Typ.ArrayLen, types.TypInt())
+			}
+			return b.EmitSliceLen(arg)
+		}
+	}
+	if e.Op == cast(int, token.UNSAFE_INDEX) {
+		// unsafe_index(coll, idx): same lowering as coll[idx] but with
+		// the bounds check skipped. Synthesize an EXPR_INSTANTIATE_OR_INDEX
+		// node and call genIndex with checked=false.
+		var proxy @ast.Expr = make(ast.Expr)
+		proxy.Kind = ast.EXPR_INSTANTIATE_OR_INDEX
+		proxy.Pos = e.Pos
+		proxy.X = e.Args[0]
+		var idxArgs @[]@ast.Expr = make_slice(@ast.Expr, 1)
+		idxArgs[0] = e.Args[1]
+		proxy.Args = idxArgs
+		return genIndex(ctx, b, proxy, false)  // unchecked
+	}
+	if e.Op == cast(int, token.SIZEOF) {
+		// Compile-time constant: the type's size in bytes. Returns
+		// a uint-typed constant.
+		var targetTyp @types.Type = resolveTypeExpr(e.TypeRef)
+		return b.EmitConstInt(targetTyp.SizeOf(), types.TypUint())
+	}
+	if e.Op == cast(int, token.ALIGNOF) {
+		// Compile-time constant: the type's alignment in bytes.
+		var targetTyp @types.Type = resolveTypeExpr(e.TypeRef)
+		return b.EmitConstInt(targetTyp.AlignOf(), types.TypUint())
+	}
+	if e.Op == cast(int, token.RAW_FUNC_ADDR) {
+		// _raw_func_addr(F) (to be renamed _func_handle): emit
+		// OP_FUNC_HANDLE.  Result is a *uint8 pointing at a
+		// 16-byte {vtable_ptr, data_ptr} handle (the bnc-emitted
+		// static `@__handle.F` natively, or a heap handle in
+		// bytecode for vm-local functions).  Phase 4 of
+		// plan-uniform-native-fnptrs.md.
+		if len(e.Args) >= 1 {
+			var arg @ast.Expr = e.Args[0]
+			var name @[]char
+			if arg.Kind == ast.EXPR_IDENT {
+				name = arg.Name
+			}
+			if arg.Kind == ast.EXPR_SELECTOR &&
+				arg.X != nil &&
+				arg.X.Kind == ast.EXPR_IDENT {
+				name = buildQualName(arg.X.Name, arg.Name)
+			}
+			return b.EmitFuncHandle(name)
+		}
+	}
+	if e.Op == cast(int, token.C_CALL) {
+		// __c_call("sym", RetType, args...): a verbatim C call.  Lower
+		// each argument, then emit OP_C_CALL carrying the raw symbol.
+		// Args are scalars/pointers (the type checker rejects anything
+		// needing refcount handling), so no per-arg copy/RefInc here.
+		var retTyp @types.Type = resolveTypeExpr(e.TypeRef)
+		var args @[]@Instr
+		for i := 0; i < len(e.Args); i++ {
+			var arg @Instr = genExpr(ctx, b, e.Args[i])
+			b = ctx.CurBlock
+			args = slices.Append[@Instr](args, arg)
+		}
+		return b.EmitCCall(e.Name, args, retTyp, e.CFixedArgs)
+	}
+	if e.Op == cast(int, token.MAKE) {
+		// make(T) — allocate @T for any type T
+		var targetTyp @types.Type = resolveTypeExpr(e.TypeRef)
+		var result @Instr = b.EmitMake(targetTyp)
+		registerTemp(ctx, result)
+		return result
+	}
+	if e.Op == cast(int, token.MAKE_SLICE) {
+		// make_slice(T, n) — T is element type, n is size. Returns @[]T (managed-slice).
+		var elemTyp @types.Type = resolveTypeExpr(e.TypeRef)
+		var length @Instr = genExpr(ctx, b, e.Args[0])
+		b = ctx.CurBlock
+		var result @Instr = b.EmitMakeSlice(elemTyp, length)
+		registerTemp(ctx, result)
+		noteSPGrowingResult(ctx, result)
+		return result
+	}
+	if e.Op == cast(int, token.BOX) {
+		if len(e.Args) >= 1 {
+			var val @Instr = genExpr(ctx, b, e.Args[0])
+			b = ctx.CurBlock
+			// For alloca results, the elem type is in TypeArg (not the pointer type in Typ)
+			var innerTyp @types.Type = val.Typ
+			if val.Op == OP_ALLOC && val.TypeArg != nil {
+				innerTyp = val.TypeArg
+			}
+			var ptrTyp @types.Type = types.MakeManagedPtrType(innerTyp)
+			var result @Instr = b.EmitBox(val, ptrTyp)
+			registerTemp(ctx, result)
+			return result
+		}
+	}
+	return b.EmitConstInt(0, types.TypInt())
+}

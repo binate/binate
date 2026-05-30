@@ -20,7 +20,7 @@
 #   basic               builder-comp, builder-comp-int
 #   all                 basic + builder-comp-comp, builder-comp-comp-int, builder-comp-comp-comp
 #
-# Filters select packages by substring match (e.g. "ir" matches "pkg/ir").
+# Filters select packages by substring match (e.g. "ir" matches "pkg/binate/ir").
 #
 # Per-package xfail:
 #   scripts/unittest/<pkg-with-slashes-replaced-by-dashes>.xfail.<mode>
@@ -90,14 +90,14 @@ if [ -z "$MODE" ]; then
     echo "  (default)       Show pass/fail per package, failures in detail"
     echo ""
     echo "Filters select packages by substring match (e.g. 'ir' matches"
-    echo "'pkg/ir'). Multiple filters are OR'd."
+    echo "'pkg/binate/ir'). Multiple filters are OR'd."
     echo ""
     echo "Examples:"
     echo "  $0 builder-comp                  Run all tests via the builder"
     echo "  $0 builder-comp vm               Run pkg/vm tests via the builder"
     echo "  $0 basic                      Run builder-comp, builder-comp-int"
     echo "  $0 builder-comp,builder-comp-comp   Run all tests in two modes"
-    echo "  $0 builder-comp ir codegen       Run pkg/ir and pkg/codegen tests"
+    echo "  $0 builder-comp ir codegen       Run pkg/binate/ir and pkg/codegen tests"
     echo ""
     echo "Modes:"
     for r in "$(dirname "$0")"/runners/*.sh; do
@@ -192,7 +192,7 @@ PACKAGES=""
 for testfile in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" -name '*_test.bn' 2>/dev/null); do
     [ -f "$testfile" ] || continue
     dir="$(dirname "$testfile")"
-    # Convert absolute path to package path (e.g. /path/to/binate/pkg/ir -> pkg/ir)
+    # Convert absolute path to package path (e.g. /path/to/binate/pkg/binate/ir -> pkg/binate/ir)
     pkg="${dir#"$BINATE_DIR"/}"
     # Deduplicate
     case " $PACKAGES " in

@@ -1,0 +1,293 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// IR-gen for impl declarations: walks DECL_IMPL entries to
+// construct an ImplInfo per (impl, interface) pair, looking up
+// each referenced interface in the per-module registry built by
+// collectInterfaceFromDecl (gen_iface_registry.bn).  ImplInfos
+// go on m.Impls; codegen later emits a vtable global per entry.
+// Slice 2.3a-1 of plan-interface-syntax-revision.md.
+
+// currentModule (declared in gen.bn) references the Module being
+// generated. setCurrentModule below is a paired setter that runs
+// during GeneratePackage / GenModule init alongside the impl-state
+// reset, so IR-gen helpers (wrapAsIfaceValue, findImplVtableName)
+// can walk m.Impls from any context without threading m through.
+
+// resetImplState clears the per-compile impl-state side data
+// (currentModule). moduleInterfaces is cleared by InitModule (Slice
+// 2.7) so import-registered entries aren't wiped between
+// RegisterImports and GeneratePackage.
+func resetImplState() {
+	currentModule = nil
+}
+
+// setCurrentModule records the Module being generated so IR-gen
+// helpers (wrapAsIfaceValue, findImplVtableName) can walk m.Impls
+// from context-light call sites.
+func setCurrentModule(m @Module) {
+	currentModule = m
+}
+
+// collectImplsFromDecl appends an ImplInfo to m.Impls for each
+// `impl R : I1, I2, ...` interface in d, plus one ImplInfo per
+// distinct ancestor of those interfaces (transitive registration
+// per plan-interface-embedding.md Slice E.3 — `impl T : Child`
+// also satisfies `Closer` if `Child : Closer`).  Each emitted
+// ImplInfo holds the qualified method-func names for the OWN
+// methods of its target interface; the recursive concat layout
+// is assembled at codegen time by walking the parent chain.
+//
+// Receiver type-name is extracted via recvTypeName (the same
+// helper genMethod uses).  The impl declaration itself lives in
+// the current package (`pkgShort`); either or both of the
+// receiver and the interface may live in different packages
+// (Slices 2.7 / 2.9), reflected in RecvPkg / IfacePkg on the
+// resulting ImplInfo.  RecvPkg drives the canonical vtable
+// mangling AND the qualified function names emitted into
+// MethodFuncs (so dispatch resolves through the receiver's
+// defining package's symbols regardless of where the impl was
+// declared).
+func collectImplsFromDecl(d @ast.Decl, pkgShort *[]const char,
+		m @Module) {
+	if d == nil || d.Kind != ast.DECL_IMPL {
+		return
+	}
+	var recvName @[]char = recvTypeName(d.TypeRef)
+	if len(recvName) == 0 {
+		return
+	}
+	// Slice 2.9: derive the receiver's defining package. For a
+	// qualified receiver (`impl *hello.Hello : ...`) the AST carries
+	// ref.Pkg; for a same-package receiver (`impl *Hello : ...`)
+	// default to the impl declaration's package.
+	var recvPkg @[]char = resolveImportPkg(recvTypePkg(d.TypeRef))
+	if len(recvPkg) == 0 {
+		recvPkg = buf.CopyStr(pkgShort)
+	}
+	var dtorName @[]char = implDtorFuncName(recvPkg, recvName)
+
+	// Walk each listed interface plus its ancestor closure,
+	// deduping by canonical (Pkg, Name) so an interface listed
+	// twice (e.g. `impl T : Child, Parent` where Parent is
+	// reachable from Child) is registered once.  The dedup also
+	// spans previously-collected impl decls in the same module
+	// so two siblings that both transitively imply a common
+	// ancestor (e.g., `impl T : Orderable` + `impl T : Hashable`,
+	// both extending Comparable) don't emit the (T, Comparable)
+	// vtable twice.  See Slice 2b of plan-primitives-impl-
+	// interfaces.md.
+	var seenPkgs @[]@[]char
+	var seenNames @[]@[]char
+	for i := 0; i < len(d.Interfaces); i++ {
+		var ref @ast.TypeExpr = d.Interfaces[i]
+		if ref == nil {
+			continue
+		}
+		// Slice 6c-full: `impl R : Container[int]` — instantiate
+		// the named generic iface and use the mangled name as the
+		// iface key (`<pkg>.Container__bn_inst__int`).
+		// Pre-resolve ref to (refIfacePkg, refIfaceName) so the rest
+		// of the loop works uniformly for both TEXPR_NAMED and
+		// TEXPR_INSTANTIATE.
+		var refIfacePkg @[]char
+		var refIfaceName @[]char
+		if ref.Kind == ast.TEXPR_NAMED {
+			// Slice 2.7: an `impl R : pkg.Iface` (cross-package
+			// interface) carries ref.Pkg; impl decls on a same-
+			// package interface have ref.Pkg empty and default to
+			// the impl's own package.
+			if len(ref.Pkg) > 0 {
+				refIfacePkg = resolveImportPkg(ref.Pkg)
+			} else {
+				refIfacePkg = buf.CopyStr(pkgShort)
+			}
+			refIfaceName = ref.Name
+		} else if ref.Kind == ast.TEXPR_INSTANTIATE {
+			// Slice 7c: `impl Foo : pkg.Container[int]` looks up
+			// the generic iface decl under the import alias;
+			// same-package `impl Foo : Container[int]` uses
+			// pkgShort (the impl decl's own package).
+			if ref.Base == nil { continue }
+			if ref.Base.Kind != ast.TEXPR_NAMED { continue }
+			var lookupPkg @[]char
+			if len(ref.Base.Pkg) > 0 {
+				lookupPkg = ref.Base.Pkg
+			} else {
+				lookupPkg = buf.CopyStr(pkgShort)
+			}
+			var gd @ast.Decl = lookupGenericIfaceDeclPkg(
+				lookupPkg, ref.Base.Name)
+			if gd == nil { continue }
+			var argTypes @[]@types.Type
+			for ai := 0; ai < len(ref.TypeArgs); ai++ {
+				argTypes = slices.Append[@types.Type](argTypes,
+					resolveTypeExpr(ref.TypeArgs[ai]))
+			}
+			refIfacePkg = buf.CopyStr(pkgShort)
+			refIfaceName = ensureInstantiatedInterface(gd, argTypes)
+		} else {
+			continue
+		}
+		// Resolve aliases to canonical identity before recording
+		// or chasing parents — the impl-table is keyed on the
+		// canonical form, and dispatch / codegen agree on that.
+		var canonPkg @[]char = canonicalIfacePkg(refIfacePkg,
+			refIfaceName)
+		var canonName @[]char = canonicalIfaceName(refIfacePkg,
+			refIfaceName)
+
+		// The listed interface itself.
+		if !containsPkgName(seenPkgs, seenNames, canonPkg, canonName) &&
+				!moduleHasImpl(m, recvPkg, recvName, canonPkg, canonName) {
+			seenPkgs = slices.Append[@[]char](seenPkgs, canonPkg)
+			seenNames = slices.Append[@[]char](seenNames, canonName)
+			m.Impls = slices.Append[@ImplInfo](m.Impls,
+				makeOwnMethodsImplInfo(recvPkg, recvName, dtorName,
+					canonPkg, canonName))
+		}
+		// Each ancestor of the listed interface.
+		var aPkgs @[]@[]char = IfaceAncestorClosurePkgs(canonPkg,
+			canonName)
+		var aNames @[]@[]char = IfaceAncestorClosure(canonPkg,
+			canonName)
+		for j := 0; j < len(aPkgs); j++ {
+			if containsPkgName(seenPkgs, seenNames, aPkgs[j],
+					aNames[j]) {
+				continue
+			}
+			if moduleHasImpl(m, recvPkg, recvName, aPkgs[j],
+					aNames[j]) {
+				continue
+			}
+			seenPkgs = slices.Append[@[]char](seenPkgs, aPkgs[j])
+			seenNames = slices.Append[@[]char](seenNames, aNames[j])
+			m.Impls = slices.Append[@ImplInfo](m.Impls,
+				makeOwnMethodsImplInfo(recvPkg, recvName, dtorName,
+					aPkgs[j], aNames[j]))
+		}
+	}
+}
+
+// moduleHasImpl reports whether m.Impls already has an entry
+// for the (recvPkg, recvName) × (ifacePkg, ifaceName) pair.
+// Used by collectImplsFromDecl's dedup to prevent two impl
+// decls for the same receiver type whose interface ancestor
+// closures share a common interface (e.g., Orderable and
+// Hashable both extending Comparable) from emitting the same
+// (R, I) vtable twice.
+func moduleHasImpl(m @Module, recvPkg @[]char, recvName @[]char,
+		ifacePkg *[]const char, ifaceName *[]const char) bool {
+	if m == nil { return false }
+	for i := 0; i < len(m.Impls); i++ {
+		var info @ImplInfo = m.Impls[i]
+		if info == nil { continue }
+		if !charEq(info.RecvPkg, recvPkg) { continue }
+		if !charEq(info.RecvTypeName, recvName) { continue }
+		if !charEq(info.IfacePkg, ifacePkg) { continue }
+		if !charEq(info.IfaceName, ifaceName) { continue }
+		return true
+	}
+	return false
+}
+
+// makeOwnMethodsImplInfo builds an ImplInfo for the (R, I) pair
+// identified by (recvPkg, recvName) × (ifacePkg, ifaceName).  The
+// ImplInfo's MethodFuncs entries correspond to I's OWN methods
+// only (in declaration order) — inherited methods are emitted via
+// the parent's own ImplInfo at codegen time, which is what makes
+// the concat vtable layout work.  Slice E.3.
+func makeOwnMethodsImplInfo(recvPkg @[]char, recvName @[]char,
+		dtorName @[]char, ifacePkg @[]char,
+		ifaceName @[]char) @ImplInfo {
+	var info @ImplInfo = make(ImplInfo)
+	info.RecvPkg = recvPkg
+	info.RecvTypeName = buf.CopyStr(recvName)
+	info.IfacePkg = ifacePkg
+	info.IfaceName = ifaceName
+	info.DtorFuncName = dtorName
+	var methodNames @[]@[]char = lookupModuleInterface(ifacePkg,
+		ifaceName)
+	for j := 0; j < len(methodNames); j++ {
+		var qualified @[]char = methodFuncName(recvPkg, recvName,
+			methodNames[j])
+		info.MethodFuncs = slices.Append[@[]char](info.MethodFuncs,
+			qualified)
+	}
+	return info
+}
+
+// collectImportedImplsFromDecl is the cross-package counterpart of
+// collectImplsFromDecl: it appends to m.ImportedImpls (not m.Impls)
+// so codegen doesn't try to re-emit the vtable in this TU. The
+// vtable global lives in the imported package's TU with weak_odr
+// linkage; this entry exists only so findImplVtableName at use
+// sites here in the importing TU can produce the canonical symbol
+// name that the linker resolves to it. Slice 2.8 of plan-cross-
+// package-interfaces.md.
+//
+// pkgShort is the import alias's pkg-short (e.g., "hello" for an
+// `import "pkg/hello"`) — equals the impl declaration's package.
+// MethodFuncs and DtorFuncName are deliberately left empty: those
+// drive vtable emission, which is the imported TU's job.
+func collectImportedImplsFromDecl(d @ast.Decl,
+		pkgShort *[]const char, m @Module) {
+	if d == nil || d.Kind != ast.DECL_IMPL {
+		return
+	}
+	var recvName @[]char = recvTypeName(d.TypeRef)
+	if len(recvName) == 0 {
+		return
+	}
+	for i := 0; i < len(d.Interfaces); i++ {
+		var ref @ast.TypeExpr = d.Interfaces[i]
+		if ref == nil || ref.Kind != ast.TEXPR_NAMED {
+			continue
+		}
+		var refIfacePkg @[]char
+		if len(ref.Pkg) > 0 {
+			refIfacePkg = resolveImportPkg(ref.Pkg)
+		} else {
+			refIfacePkg = resolveImportPkg(pkgShort)
+		}
+		var info @ImplInfo = make(ImplInfo)
+		info.RecvPkg = resolveImportPkg(pkgShort)
+		info.RecvTypeName = buf.CopyStr(recvName)
+		info.IfacePkg = canonicalIfacePkg(refIfacePkg, ref.Name)
+		info.IfaceName = canonicalIfaceName(refIfacePkg, ref.Name)
+		m.ImportedImpls = slices.Append[@ImplInfo](m.ImportedImpls, info)
+	}
+}
+
+// implDtorFuncName builds the qualified dtor name for an impl's
+// receiver struct: `<pkgShort>.__dtor_<recvName>`. Same pattern as
+// dtorNameForType for a TYP_STRUCT. The function may not exist
+// for the receiver type (NeedsDestruction == false); codegen /
+// VM lower handle the absence by emitting a null slot 0.
+func implDtorFuncName(pkgShort *[]const char,
+		recvName @[]char) @[]char {
+	var cb buf.CharBuf = buf.New()
+	cb = cb.WriteStr(pkgShort)
+	cb = cb.WriteStr(".__dtor_")
+	cb = cb.WriteStr(recvName)
+	return cb.Bytes()
+}
+
+// methodFuncName builds the IR-level qualified name for a method:
+// `<pkgShort>.<recvTypeName>.<methodName>`. Mirrors methodQualName
+// in gen_method.bn — kept separate to avoid coupling the impl
+// codepath to the method-decl codepath.
+func methodFuncName(pkgShort *[]const char, recvName @[]char,
+		methodName @[]char) @[]char {
+	var cb buf.CharBuf = buf.New()
+	cb = cb.WriteStr(pkgShort)
+	cb = cb.WriteByte('.')
+	cb = cb.WriteStr(recvName)
+	cb = cb.WriteByte('.')
+	cb = cb.WriteStr(methodName)
+	return cb.Bytes()
+}

@@ -18,7 +18,7 @@ Run `./scripts/unittest/run.sh` with no arguments for full help.
 ./scripts/unittest/run.sh builder-comp                Run all packages via the builder
 ./scripts/unittest/run.sh builder-comp vm             pkg/vm via the builder
 ./scripts/unittest/run.sh basic                    builder-comp + builder-comp-int
-./scripts/unittest/run.sh builder-comp ir codegen     pkg/ir and pkg/codegen
+./scripts/unittest/run.sh builder-comp ir codegen     pkg/binate/ir and pkg/codegen
 ```
 
 ### Modes
@@ -37,7 +37,7 @@ Mode sets are defined in `scripts/modesets/` (one file per set, one mode per lin
 
 ### Filters
 
-Optional arguments filter packages by substring match (e.g. `ir` matches `pkg/ir`). Multiple filters are OR'd.
+Optional arguments filter packages by substring match (e.g. `ir` matches `pkg/binate/ir`). Multiple filters are OR'd.
 
 ## Test Convention
 

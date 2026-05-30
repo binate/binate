@@ -1,0 +1,477 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/types"
+
+// ============================================================
+// Array literal
+// ============================================================
+
+// genArrayLit generates IR for an array literal expression, allocating and storing each element.
+func genArrayLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	var arrTyp @types.Type = resolveTypeExpr(e.TypeRef)
+	var arrPtr @Instr = b.EmitAlloc(arrTyp)
+
+	var elemTyp @types.Type = arrTyp.Elem
+	if elemTyp == nil {
+		elemTyp = types.TypInt()
+	}
+
+	// Store each element
+	for i := 0; i < len(e.Elems); i++ {
+		var idx @Instr = b.EmitConstInt(i, types.TypInt())
+		var elemPtr @Instr = b.EmitGetElemPtr(arrPtr, idx, elemTyp)
+		var val @Instr = genExpr(ctx, b, e.Elems[i].Value)
+		b = ctx.CurBlock
+		// Same conversions other store sites apply: a string literal
+		// stored into a char-slice element needs the full managed-
+		// slice header (data, len, refptr, backing_len), not just
+		// the bare data pointer that OP_CONST_STRING carries.  Without
+		// this, the slot's len reads back as 0 — silent wrong output.
+		if isCharSliceType(elemTyp) && val.Op == OP_CONST_STRING {
+			val = b.EmitStringToChars(val, elemTyp)
+			noteSPGrowingResult(ctx, val)
+		}
+		// Nested composite-lit: genCompositeLit returns a struct
+		// alloca pointer.  When the array element type is the struct
+		// itself (not a pointer to it), load the struct value before
+		// storing — otherwise EmitStore writes the alloca pointer (8
+		// bytes) into the struct-sized slot.  Mirrors the equivalent
+		// guard in gen_control.bn's array-index-assign branch.
+		if val.Op == OP_ALLOC && val.TypeArg != nil && val.TypeArg.Kind == types.TYP_STRUCT {
+			if elemTyp.Kind == types.TYP_STRUCT {
+				val = b.EmitLoad(val, val.TypeArg)
+			}
+		}
+		b.EmitStore(elemPtr, val)
+	}
+
+	return arrPtr
+}
+
+// genRawSliceLit generates IR for a raw-slice composite literal
+// `*[]const T{e0, e1, ...}`. Stack-allocates an `[N]T` backing,
+// stores each element, then builds a `%BnSlice{data, N}` view of
+// the stack array. The view's lifetime is the enclosing scope —
+// the language's existing raw-slice-borrow rules keep this honest
+// (you can't return or otherwise escape a raw slice).
+//
+// Phase 3 fast path: when the element type is `const uint8` and
+// every element is a compile-time char/int literal that fits in a
+// byte, emit `OP_RODATA_SLICE` directly so codegen can alias a
+// shared static rodata global (zero-copy, zero stack frame use).
+func genRawSliceLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	var sliceTyp @types.Type = resolveTypeExpr(e.TypeRef)
+	var elemTyp @types.Type = sliceTyp.Elem
+	if elemTyp == nil {
+		elemTyp = types.TypInt()
+	}
+	var bytes @[]char
+	var ok bool
+	bytes, ok = collectConstByteElems(e, elemTyp)
+	if ok {
+		return b.EmitRodataSlice(bytes, sliceTyp)
+	}
+	var n int = len(e.Elems)
+	// 1. Allocate a stack `[N]T` backing.
+	var arrTyp @types.Type = types.MakeArrayType(elemTyp, n)
+	var arrPtr @Instr = b.EmitAlloc(arrTyp)
+	for i := 0; i < n; i++ {
+		var idx @Instr = b.EmitConstInt(i, types.TypInt())
+		var elemPtr @Instr = b.EmitGetElemPtr(arrPtr, idx, elemTyp)
+		var val @Instr = genExpr(ctx, b, e.Elems[i].Value)
+		b = ctx.CurBlock
+		b.EmitStore(elemPtr, val)
+	}
+	// 2. Build a %BnSlice {data, N} view via alloca + field stores.
+	var sliceAlloca @Instr = b.EmitAlloc(sliceTyp)
+	var rawPtrTyp @types.Type = types.MakePointerType(types.TypUint8())
+	var dataPtr @Instr = b.EmitBitCast(arrPtr, rawPtrTyp)
+	var ptrField @Instr = b.EmitGetFieldPtr(sliceAlloca, 0, rawPtrTyp)
+	b.EmitStore(ptrField, dataPtr)
+	var lenInstr @Instr = b.EmitConstInt(n, types.TypInt())
+	var lenField @Instr = b.EmitGetFieldPtr(sliceAlloca, 1, types.TypInt())
+	b.EmitStore(lenField, lenInstr)
+	return b.EmitLoad(sliceAlloca, sliceTyp)
+}
+
+// genManagedSliceLit generates IR for a managed-slice composite
+// literal `@[]T{e0, e1, ...}`. Allocates a fresh backing via
+// `MakeManagedSlice(sizeof(T), N)`, stores each element, and
+// returns the resulting %BnManagedSlice. Refcount-wise the result
+// is fresh (refcount=1) — same as `make_slice(T, N)` followed by
+// element initialization.
+//
+// Phase 3 fast path: same const-byte detection as genRawSliceLit
+// — when applicable, emit `OP_RODATA_MSLICE` so codegen aliases a
+// shared static `%BnManagedSlice` global instead of running the
+// MakeSlice + N stores at runtime.
+func genManagedSliceLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	var sliceTyp @types.Type = resolveTypeExpr(e.TypeRef)
+	var elemTyp @types.Type = sliceTyp.Elem
+	if elemTyp == nil {
+		elemTyp = types.TypInt()
+	}
+	var bytes @[]char
+	var ok bool
+	bytes, ok = collectConstByteElems(e, elemTyp)
+	if ok {
+		return b.EmitRodataMSlice(bytes, sliceTyp)
+	}
+	var n int = len(e.Elems)
+	var nInstr @Instr = b.EmitConstInt(n, types.TypInt())
+	var slice @Instr = b.EmitMakeSlice(elemTyp, nInstr)
+	noteSPGrowingResult(ctx, slice)
+
+	// Store each element via slice-set semantics: extract data ptr,
+	// GEP to the element, store.
+	for i := 0; i < n; i++ {
+		var idx @Instr = b.EmitConstInt(i, types.TypInt())
+		var val @Instr = genExpr(ctx, b, e.Elems[i].Value)
+		b = ctx.CurBlock
+		// Same conversion the var-decl / array-lit / array-index-
+		// assign / struct-field-init paths apply: a string literal
+		// stored into a char-slice element needs the full managed-
+		// slice header, not the bare data pointer of OP_CONST_STRING.
+		// Without this, an `@[]@[]char{"a","b",...}` literal stores
+		// 8-byte pointers into 32-byte slots and the slot's len
+		// reads back as 0 (silent empty output).
+		if isCharSliceType(elemTyp) && val.Op == OP_CONST_STRING {
+			val = b.EmitStringToChars(val, elemTyp)
+			noteSPGrowingResult(ctx, val)
+		}
+		// Refcount handoff for managed element types — mirrors
+		// gen_short_var.bn's `var x = ...` path.  Without this, a
+		// fresh managed value from a call (e.g.
+		// `@[]@[]char{copyStr("a"), ...}`) gets RefDec'd by the
+		// end-of-statement temp cleanup, leaving the slot with a
+		// dangling data pointer.  Fresh values transfer ownership
+		// via consumeTemp; shared references RefInc so the slot
+		// owns its own reference.
+		if isManagedPtrType(elemTyp) {
+			if isFreshManagedPtr(val) {
+				consumeTemp(ctx, val)
+			} else {
+				b.EmitRefInc(val)
+			}
+		} else if isManagedSliceType(elemTyp) {
+			if isFreshManagedSlice(val) {
+				consumeTemp(ctx, val)
+			} else {
+				emitManagedSliceRefInc(ctx.Func, b, val)
+			}
+		}
+		b.EmitSliceSet(slice, idx, val, elemTyp)
+	}
+	return slice
+}
+
+// collectConstByteElems returns the byte sequence of a composite
+// literal whose target element type is `const uint8` and whose every
+// element is a compile-time char/int literal that fits in [0, 255].
+// Returns (bytes, true) on success; (nil, false) when the literal
+// doesn't qualify (different element type, mixed/runtime elements,
+// or out-of-range int literals).
+func collectConstByteElems(e @ast.Expr, elemTyp @types.Type) (@[]char, bool) {
+	if !isConstByteElemType(elemTyp) {
+		var none @[]char
+		return none, false
+	}
+	var n int = len(e.Elems)
+	var bytes @[]char = make_slice(char, n)
+	for i := 0; i < n; i++ {
+		var v @ast.Expr = e.Elems[i].Value
+		if v == nil {
+			var none @[]char
+			return none, false
+		}
+		var b int
+		if v.Kind == ast.EXPR_CHAR_LIT {
+			b = parseCharLit(v.Name)
+		} else if v.Kind == ast.EXPR_INT_LIT {
+			b = parseIntLit(v.Name)
+			if b < 0 || b > 255 {
+				var none @[]char
+				return none, false
+			}
+		} else {
+			var none @[]char
+			return none, false
+		}
+		bytes[i] = cast(char, b)
+	}
+	return bytes, true
+}
+
+// isConstByteElemType reports whether `elemTyp` is `const uint8`
+// (or any const-wrapped 8-bit unsigned int after alias peeling).
+// The const wrapper is required: aliasing rodata is sound only for
+// read-only views.
+func isConstByteElemType(elemTyp @types.Type) bool {
+	for elemTyp != nil && elemTyp.Kind == types.TYP_ALIAS {
+		elemTyp = elemTyp.Target
+	}
+	if elemTyp == nil { return false }
+	if elemTyp.Kind != types.TYP_CONST { return false }
+	var inner @types.Type = elemTyp.Elem
+	for inner != nil && inner.Kind == types.TYP_ALIAS {
+		inner = inner.Target
+	}
+	if inner == nil { return false }
+	return inner.Kind == types.TYP_INT && inner.Width == 8 && !inner.Signed
+}
+
+// ============================================================
+// Index and slice expressions
+// ============================================================
+
+// emitIndexBoundsCheck emits OP_BOUNDS_CHECK for `index` against the
+// collection's runtime length (compile-time for arrays, EmitSliceLen for
+// slices). Pointer indexing is skipped — pointers don't carry a length and
+// are inherently unchecked. Other kinds (e.g., a non-collection collection
+// reaching this helper) are also skipped to stay conservative.
+func emitIndexBoundsCheck(ctx @GenContext, b @Block,
+		collection @Instr, index @Instr) {
+	if collection == nil || collection.Typ == nil { return }
+	if collection.Typ.Kind == types.TYP_POINTER { return }
+	var length @Instr = nil
+	if collection.Typ.Kind == types.TYP_ARRAY {
+		length = b.EmitConstInt(collection.Typ.ArrayLen, types.TypInt())
+	} else if isSliceType(collection.Typ) {
+		length = b.EmitSliceLen(collection)
+	} else {
+		return
+	}
+	b.EmitBoundsCheck(index, length)
+}
+
+// genIndex generates IR for an index expression (array, pointer, or slice
+// element access). When `checked` is true, emits a runtime bounds check
+// before the access. The unsafe_index builtin passes false to opt out.
+func genIndex(ctx @GenContext, b @Block, e @ast.Expr, checked bool) @Instr {
+	// e.X = the collection, e.Args[0] = the index.
+	// Multi-arg `e.Args` is the instantiation shape — type checker
+	// rejects it for now (Slice 2+ work); reaching genIndex with
+	// len(Args) != 1 would mean a stale AST.
+	var collection @Instr = genExpr(ctx, b, e.X)
+	b = ctx.CurBlock
+	var index @Instr = genExpr(ctx, b, e.Args[0])
+	b = ctx.CurBlock
+
+	if checked {
+		emitIndexBoundsCheck(ctx, b, collection, index)
+	}
+
+	// Determine element type
+	var elemTyp @types.Type = types.TypInt()
+	if collection.Typ != nil && collection.Typ.Elem != nil {
+		elemTyp = collection.Typ.Elem
+	}
+
+	if collection.Typ != nil && collection.Typ.Kind == types.TYP_ARRAY {
+		// Array indexing: GEP into the alloca holding the array.
+		// The simple case is a local: `arr[i]` where `arr` is an
+		// EXPR_IDENT we can look up directly. The struct-field
+		// case `t.name[i]` (where `name [N]T` is a field) needs
+		// `genSelectorPtr` to get a pointer to the field; that's
+		// the array-typed slot we GEP into.
+		var arrPtr @Instr = nil
+		if e.X.Kind == ast.EXPR_IDENT {
+			arrPtr = lookupVar(ctx, e.X.Name)
+		} else if e.X.Kind == ast.EXPR_SELECTOR {
+			arrPtr = genSelectorPtr(ctx, b, e.X)
+			b = ctx.CurBlock
+		}
+		if arrPtr != nil {
+			var elemPtr @Instr = b.EmitGetElemPtr(arrPtr, index, elemTyp)
+			return b.EmitLoad(elemPtr, elemTyp)
+		}
+	}
+
+	if collection.Typ != nil && collection.Typ.Kind == types.TYP_POINTER {
+		// Pointer indexing: GEP on raw pointer, then load
+		var elemPtr @Instr = b.EmitGetElemPtr(collection, index, elemTyp)
+		return b.EmitLoad(elemPtr, elemTyp)
+	}
+
+	// Slice indexing: call runtime
+	return b.EmitSliceGet(collection, index, elemTyp)
+}
+
+// genIndexPtr returns a pointer to an array element (for field access on indexed structs)
+func genIndexPtr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	if e.X == nil || len(e.Args) != 1 { return nil }
+	var index @Instr = genExpr(ctx, b, e.Args[0])
+	b = ctx.CurBlock
+
+	if e.X.Kind == ast.EXPR_IDENT {
+		var arrPtr @Instr = lookupVar(ctx, e.X.Name)
+		var arrTyp @types.Type = lookupVarType(ctx, e.X.Name)
+		if arrPtr != nil && arrTyp != nil {
+			if arrTyp.Kind == types.TYP_ARRAY {
+				var elemTyp @types.Type = arrTyp.Elem
+				if elemTyp == nil { elemTyp = types.TypInt() }
+				var lenInstr @Instr = b.EmitConstInt(arrTyp.ArrayLen, types.TypInt())
+				b.EmitBoundsCheck(index, lenInstr)
+				return b.EmitGetElemPtr(arrPtr, index, elemTyp)
+			}
+			// Pointer indexing: load pointer value, GEP on it
+			if arrTyp.Kind == types.TYP_POINTER {
+				var ptrVal @Instr = b.EmitLoad(arrPtr, arrTyp)
+				var elemTyp @types.Type = arrTyp.Elem
+				if elemTyp == nil { elemTyp = types.TypInt() }
+				return b.EmitGetElemPtr(ptrVal, index, elemTyp)
+			}
+			// Slice of structs: get typed pointer to element in-place
+			if isSliceType(arrTyp) && arrTyp.Elem != nil &&
+				arrTyp.Elem.Kind == types.TYP_STRUCT {
+				var sliceVal @Instr = b.EmitLoad(arrPtr, arrTyp)
+				var lenInstr @Instr = b.EmitSliceLen(sliceVal)
+				b.EmitBoundsCheck(index, lenInstr)
+				return b.EmitSliceElemPtr(sliceVal, index, arrTyp.Elem)
+			}
+		}
+	}
+	// Selector base: e.g., c.Items[i] where c.Items is a selector
+	if e.X.Kind == ast.EXPR_SELECTOR {
+		var collTyp @types.Type = getSelectorType(ctx, e.X)
+		if collTyp != nil && collTyp.Kind == types.TYP_ARRAY {
+			// Array field: get pointer to the array field, then GEP for element
+			var arrPtr @Instr = genSelectorPtr(ctx, b, e.X)
+			b = ctx.CurBlock
+			if arrPtr != nil {
+				var elemTyp @types.Type = collTyp.Elem
+				if elemTyp == nil { elemTyp = types.TypInt() }
+				var lenInstr @Instr = b.EmitConstInt(collTyp.ArrayLen, types.TypInt())
+				b.EmitBoundsCheck(index, lenInstr)
+				return b.EmitGetElemPtr(arrPtr, index, elemTyp)
+			}
+		}
+		if collTyp != nil && isSliceType(collTyp) && collTyp.Elem != nil &&
+			collTyp.Elem.Kind == types.TYP_STRUCT {
+			var sliceVal @Instr = genExpr(ctx, b, e.X)
+			b = ctx.CurBlock
+			var lenInstr @Instr = b.EmitSliceLen(sliceVal)
+			b.EmitBoundsCheck(index, lenInstr)
+			return b.EmitSliceElemPtr(sliceVal, index, collTyp.Elem)
+		}
+	}
+	return nil
+}
+
+// getIndexElemType returns the element type of an index expression
+func getIndexElemType(ctx @GenContext, e @ast.Expr) @types.Type {
+	if e.X == nil { return nil }
+	if e.X.Kind == ast.EXPR_IDENT {
+		var arrTyp @types.Type = lookupVarType(ctx, e.X.Name)
+		if arrTyp != nil && arrTyp.Elem != nil {
+			return arrTyp.Elem
+		}
+	}
+	// Handle selector collection: e.X is a selector (e.g., c.Packages in c.Packages[i])
+	if e.X.Kind == ast.EXPR_SELECTOR {
+		var collTyp @types.Type = getSelectorType(ctx, e.X)
+		if collTyp != nil && collTyp.Elem != nil {
+			return collTyp.Elem
+		}
+	}
+	return nil
+}
+
+// genSliceExpr generates IR for a slice expression (s[lo:hi]), including array-to-slice conversion.
+func genSliceExpr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	// e.X = slice, e.Z = lo (may be nil → 0), e.Y = hi (may be nil → len)
+	var collection @Instr = genExpr(ctx, b, e.X)
+	b = ctx.CurBlock
+
+	// Array-to-slice conversion: convert [N]T alloca to BnSlice{ptr, len}
+	// so that slice expressions on arrays work through the standard slice path.
+	if collection.Typ != nil && collection.Typ.Kind == types.TYP_ARRAY {
+		var arrPtr @Instr = nil
+		if e.X.Kind == ast.EXPR_IDENT {
+			arrPtr = lookupVar(ctx, e.X.Name)
+		}
+		if arrPtr == nil {
+			// Fallback: alloc + store
+			arrPtr = b.EmitAlloc(collection.Typ)
+			b.EmitStore(arrPtr, collection)
+		}
+		// Build BnSlice: bitcast array ptr to i8*, insert {ptr, len}
+		var elemTyp @types.Type = collection.Typ.Elem
+		if elemTyp == nil { elemTyp = types.TypInt() }
+		var sliceTyp @types.Type = types.MakeSliceType(elemTyp)
+		var arrLen int = collection.Typ.ArrayLen
+		// Emit as a call to get a proper BnSlice from the array
+		var dataPtr @Instr = b.EmitBitCast(arrPtr, types.MakePointerType(types.TypUint8()))
+		var lenInstr @Instr = b.EmitConstInt(arrLen, types.TypInt())
+		// Build the struct: insertvalue undef, ptr, 0; insertvalue _, len, 1
+		var nilSlice @Instr = b.EmitConstNil(sliceTyp)
+		var noFields @[]@Instr
+		var withPtr @Instr = b.EmitStructLit(noFields, sliceTyp)
+		// Use OP_EXTRACT-like pattern — actually we need insertvalue
+		// Simpler: just use the slice_expr on this constructed slice
+		// Actually, the simplest approach: emit a struct literal {ptr, len}
+		// For now, use EmitSliceExpr with the proper slice type
+		collection = nilSlice
+		collection.Typ = sliceTyp
+		// Override: construct the slice manually via alloca+store
+		// Alloca a BnSlice, GEP field 0 (ptr), store bitcast, GEP field 1 (len), store
+		var sliceAlloca @Instr = b.EmitAlloc(sliceTyp)
+		var ptrTyp @types.Type = types.MakePointerType(types.TypUint8())
+		var ptrField @Instr = b.EmitGetFieldPtr(sliceAlloca, 0, ptrTyp)
+		b.EmitStore(ptrField, dataPtr)
+		var lenField @Instr = b.EmitGetFieldPtr(sliceAlloca, 1, types.TypInt())
+		b.EmitStore(lenField, lenInstr)
+		collection = b.EmitLoad(sliceAlloca, sliceTyp)
+	}
+
+	var lo @Instr
+	var hi @Instr
+	var hiExplicit bool = e.Y != nil
+	var loExplicit bool = e.Z != nil
+
+	if loExplicit {
+		lo = genExpr(ctx, b, e.Z)
+		b = ctx.CurBlock
+	} else {
+		lo = b.EmitConstInt(0, types.TypInt())
+	}
+	if hiExplicit {
+		hi = genExpr(ctx, b, e.Y)
+		b = ctx.CurBlock
+	} else {
+		hi = b.EmitSliceLen(collection)
+	}
+
+	// Bounds checks: 0 ≤ lo ≤ hi ≤ len. The runtime BoundsCheck primitive
+	// asserts 0 ≤ idx < length, so we use it twice with adjusted upper
+	// bounds — passing N+1 turns the strict comparison into ≤. Order:
+	// check hi first (catches hi < 0 or hi > len), then check lo (catches
+	// lo < 0 or lo > hi). When an endpoint is implicit (defaults to 0 or
+	// len), the corresponding check is statically true and skipped.
+	if collection.Typ != nil && isSliceType(collection.Typ) {
+		var length @Instr = b.EmitSliceLen(collection)
+		var one @Instr = b.EmitConstInt(1, types.TypInt())
+		if hiExplicit {
+			var lenPlus1 @Instr = b.EmitBinop(OP_ADD, length, one, types.TypInt())
+			b.EmitBoundsCheck(hi, lenPlus1)
+		}
+		if loExplicit {
+			var hiPlus1 @Instr = b.EmitBinop(OP_ADD, hi, one, types.TypInt())
+			b.EmitBoundsCheck(lo, hiPlus1)
+		}
+	}
+
+	var resultTyp @types.Type = collection.Typ
+	if resultTyp == nil {
+		resultTyp = types.MakeSliceType(types.TypInt())
+	}
+	var result @Instr = b.EmitSliceExpr(collection, lo, hi, resultTyp)
+	// Subslicing @[]T shares the backing — RefInc the backing refptr
+	if isManagedSliceType(resultTyp) {
+		emitManagedSliceRefInc(ctx.Func, b, result)
+		registerTemp(ctx, result)
+	}
+	return result
+}

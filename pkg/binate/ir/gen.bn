@@ -1,0 +1,351 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// ============================================================
+// IR Generation: AST → IR Module
+//
+// Currently supports: function declarations, println/print of
+// string/int/bool literals, return statements, integer arithmetic,
+// variable declarations, assignments, if/else, for loops.
+// ============================================================
+
+// GenModule generates an IR module from a parsed and type-checked file.
+// Module-level constants (name → integer value)
+type ModuleConst struct {
+	Name @[]char
+	Val  int
+	Typ  @types.Type  // declared type (nil means untyped/iota)
+}
+
+// moduleConsts collects every named const seen during IR generation so
+// later expressions in the same module can resolve identifiers to their
+// constant values. Reset at the start of GeneratePackage.
+var moduleConsts @[]ModuleConst
+
+// Module-level function signatures (for multi-return type lookup)
+type FuncSig struct {
+	Name            @[]char
+	Params          @[]@types.Type
+	Results         @[]@types.Type
+	MultiReturnType @types.Type
+}
+
+// moduleFuncs collects every function declared in the module so call
+// sites can recover the result types (especially MultiReturnType for
+// multi-return calls). Reset at the start of GeneratePackage.
+var moduleFuncs @[]FuncSig
+
+// Module-level struct type definitions
+type ModuleStruct struct {
+	Name   @[]char
+	Fields @[]@types.Field
+	Typ    @types.Type
+}
+
+// moduleStructs records every struct type declared in the module so
+// composite literals and field accesses can recover the layout.
+// Reset at the start of GeneratePackage.
+var moduleStructs @[]ModuleStruct
+
+// Module-level global variables
+type ModuleGlobal struct {
+	Name @[]char
+	Typ  @types.Type
+	Init int // initial value (integer only for now)
+}
+
+// moduleGlobals collects top-level `var` declarations so name lookups
+// in function bodies can resolve to globals when no local of the same
+// name exists. Reset at the start of GeneratePackage.
+var moduleGlobals @[]ModuleGlobal
+
+// Module-level type aliases (name → resolved type)
+type ModuleTypeAlias struct {
+	Name @[]char
+	Typ  @types.Type
+}
+
+// moduleTypeAliases records `type T = U` aliases so subsequent type
+// references resolve correctly. Reset at the start of GeneratePackage.
+var moduleTypeAliases @[]ModuleTypeAlias
+
+// Pending managed-slice dtor types — collected during IR gen, generated after.
+var pendingMsDtors @[]@types.Type
+
+// Pending struct/array types that need dtors and copies — collected during
+// scope cleanup emission, generated after function IR gen.
+var pendingStructDtors @[]@types.Type
+
+// Counter for anonymous struct synthetic names.
+var anonStructCounter int
+
+// Package alias for current RegisterImport context (for resolving unqualified types)
+var currentImportAlias @[]char
+
+// importAliasNames / importAliasPaths form a parallel map from an
+// import's local alias (the last path segment, e.g. `buf`) to its
+// full package path (e.g. `pkg/binate/buf`).  Populated via RecordImportPath
+// (and a file-based fallback), consulted by resolveImportPkg so
+// cross-package qualified names carry the full path — which is what
+// lets the mangler distinguish two packages that share a last-segment
+// name (full-path mangling; see pkg/binate/mangle).  Reset per module in
+// InitModule.  importAliasNames holds the alias keys.
+var importAliasNames @[]@[]char
+// importAliasPaths holds the full-path values parallel to
+// importAliasNames (same length, same order).
+var importAliasPaths @[]@[]char
+
+// resolveImportPkg maps an import alias to its full package path.
+// Returns a copy of the input unchanged when it isn't a known
+// import alias — covering same-package references, names that are
+// already full paths, and the universe package.  This is the single
+// point where the short source-level alias becomes the full path in
+// the IR namespace.
+func resolveImportPkg(alias *[]const char) @[]char {
+	for i := 0; i < len(importAliasNames); i++ {
+		if streq(importAliasNames[i], alias) {
+			return importAliasPaths[i]
+		}
+	}
+	return buf.CopyStr(alias)
+}
+
+// currentModulePkgPath is the full package path of the module
+// being generated (e.g., `pkg/geom`). Set by GeneratePackage and
+// GenModule, read by genCall to qualify method names. Empty when no
+// module is being generated.  The mangler short-names it internally
+// for now (full-path migration — see pkg/binate/mangle).
+var currentModulePkgPath @[]char
+
+// currentModule is the IR Module being populated by the in-progress
+// GeneratePackage call. Function literals lifted at IR-gen time
+// (Slice A.7.b of plan-function-values.md) need to register a fresh
+// top-level Func mid-stream; this is the handle they use. nil
+// outside any module-gen context.
+var currentModule @Module
+
+// currentChecker is the type-Checker populated by the preceding
+// type-check pass.  Set via SetChecker before any GeneratePackage /
+// GenModule call so IR-gen can consult Checker.ExprType(id) for
+// per-expression resolved types and bignum-folded values.  Nil-safe:
+// IR-gen falls back to the legacy parseIntLit / magnitude-heuristic
+// path when nil (e.g. older test helpers that skip type-check).
+// Phase A2 of plan-ir-gen-typed-literals.md.
+var currentChecker @types.Checker
+
+// SetChecker installs the type-Checker that IR-gen will consult for
+// per-expression resolved types.  Pass nil to clear (test isolation).
+// Driver code calls this once per compilation, between
+// typecheckAll/Packages and the first GeneratePackage/GenModule.
+func SetChecker(c @types.Checker) {
+	currentChecker = c
+}
+
+// funcLitCounter generates monotonically increasing ids for
+// synthetic function-literal names (`__funclit_<n>`). Reset at the
+// start of GeneratePackage so each package gets its own sequence —
+// the qualified form is `<pkg>.__funclit_<n>`.
+var funcLitCounter int
+
+// Generic-instantiation substitution context.  When IR-gen is
+// emitting the body of a specialized instantiation `f[T1, T2,
+// ...]`, currentTypeParamNames lists the AST-level type-param
+// names (`["T", "U"]`) and currentTypeParamTypes carries the
+// concrete @types.Type the IR-gen layer should substitute for
+// each.  resolveTypeExpr consults them: a TEXPR_NAMED whose name
+// matches an entry returns the corresponding concrete @Type.
+// Empty / nil outside any generic instantiation.  Per
+// plan-generics.md Slice 4a.
+var currentTypeParamNames @[]@[]char
+// currentTypeParamTypes is the parallel concrete-@Type list for
+// currentTypeParamNames (same length, same order); index i maps
+// the source-text name to its substituted IR-layer type.
+var currentTypeParamTypes @[]@types.Type
+
+// emittedInstantiations records every monomorphized generic
+// instantiation already emitted for the current module, keyed by
+// mangled name.  Lookups happen at every generic-call site to
+// dedupe — `id[int](5)` called from two places emits one IR func.
+// Reset at the start of GeneratePackage / GenModule alongside the
+// other per-module state.
+var emittedInstantiations @[]@[]char
+
+// genericDecls is the per-module registry of generic AST decls.
+// Populated alongside moduleFuncs during signature registration
+// (gen_module.bn) — once filled, IR-gen call sites can ask
+// "does name N refer to a generic decl in this package?" without
+// re-walking the file list.  Indexed in registration order.
+var genericDecls @[]@ast.Decl
+
+// genericDeclPkgs is a parallel array carrying each decl's
+// defining package's short-name — current module's pkgShort for
+// same-package decls, the import alias for imported decls
+// (Slice 7 of plan-generics.md).  The pkg-aware lookup
+// lookupGenericDeclPkg uses both to disambiguate.
+var genericDeclPkgs @[]@[]char
+
+// genericTypeDecls is the per-module registry of generic struct
+// AST decls.  Populated during struct-type registration; used at
+// TEXPR_INSTANTIATE resolution time so the IR layer can find
+// the source AST and substitute fields per Slice 5c of
+// plan-generics.md.
+var genericTypeDecls @[]@ast.Decl
+
+// genericTypeDeclPkgs is the parallel pkg-pairing for
+// genericTypeDecls (Slice 7 of plan-generics.md).
+var genericTypeDeclPkgs @[]@[]char
+
+// genericIfaceDecls is the per-module registry of generic
+// interface AST decls.  Populated by collectInterfaceFromDecl
+// when a DECL_INTERFACE carries TypeParams; used by
+// ensureInstantiatedInterface to materialize a per-(decl, args)
+// ModuleInterface entry with the type-params substituted in
+// method signatures.  Slice 6c of plan-generics.md.
+var genericIfaceDecls @[]@ast.Decl
+
+// genericIfaceDeclPkgs is the parallel pkg-pairing for
+// genericIfaceDecls (Slice 7 of plan-generics.md).
+var genericIfaceDeclPkgs @[]@[]char
+
+// qualifyForCurrentModule returns the canonical fully-qualified form
+// of a function name in the current module's context. Pass-through
+// for already-dotted names (cross-package references, methods,
+// qualified-dtor names like "ast.__dtor_File"). Bare names get
+// "<currentModulePkgPath>." prepended. Outside any module-gen
+// context (currentModulePkgPath empty), bare names are returned
+// unchanged so legacy bare-name lookups still match.
+//
+// Used to normalize both sides of the IR-internal name namespace:
+// moduleFuncs[i].Name (storage) and the input to lookupFunc* /
+// EmitCall / EmitFuncHandle / EmitFuncValue (consumption). Once both
+// sides are normalized, the duplication that used to live in each
+// backend (modulePkgName + bare-name dance) lives in IR alone.
+func qualifyForCurrentModule(name @[]char) @[]char {
+	if len(currentModulePkgPath) == 0 { return name }
+	return mangle.QualifyName(currentModulePkgPath, name)
+}
+
+// lookupTypeAlias searches moduleTypeAliases for a type alias by name.
+func lookupTypeAlias(name *[]const char) @types.Type {
+	for i := 0; i < len(moduleTypeAliases); i++ {
+		if streq(moduleTypeAliases[i].Name, name) {
+			return moduleTypeAliases[i].Typ
+		}
+	}
+	return nil
+}
+
+// lookupStructIdx returns the index of a struct in moduleStructs, or -1 if not found.
+func lookupStructIdx(name *[]const char) int {
+	for i := 0; i < len(moduleStructs); i++ {
+		if streq(moduleStructs[i].Name, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// lookupFieldIndex returns the field index within a struct, or -1 if not found.
+func lookupFieldIndex(si int, fieldName *[]const char) int {
+	var styp @types.Type = moduleStructs[si].Typ
+	if styp == nil || len(styp.Fields) == 0 { return -1 }
+	for i := 0; i < len(styp.Fields); i++ {
+		if streq(styp.Fields[i].Name, fieldName) {
+			return i
+		}
+	}
+	return -1
+}
+
+// lookupFieldType returns the type of a named struct field, defaulting to int.
+func lookupFieldType(si int, fieldName *[]const char) @types.Type {
+	var styp @types.Type = moduleStructs[si].Typ
+	if styp == nil || len(styp.Fields) == 0 { return types.TypInt() }
+	for i := 0; i < len(styp.Fields); i++ {
+		if streq(styp.Fields[i].Name, fieldName) {
+			return styp.Fields[i].Type
+		}
+	}
+	return types.TypInt()
+}
+
+// lookupFuncParams returns the parameter types for a function in moduleFuncs.
+// Normalizes the input name so callers passing either bare or qualified
+// forms find the same entry (storage is always qualified post-Step-4).
+func lookupFuncParams(name *[]const char) @[]@types.Type {
+	var qname @[]char = qualifyForCurrentModule(buf.CopyStr(name))
+	for i := 0; i < len(moduleFuncs); i++ {
+		if streq(moduleFuncs[i].Name, qname) {
+			return moduleFuncs[i].Params
+		}
+	}
+	var empty @[]@types.Type
+	return empty
+}
+
+// lookupFuncResults returns the result types for a function in moduleFuncs.
+func lookupFuncResults(name *[]const char) @[]@types.Type {
+	var qname @[]char = qualifyForCurrentModule(buf.CopyStr(name))
+	for i := 0; i < len(moduleFuncs); i++ {
+		if streq(moduleFuncs[i].Name, qname) {
+			return moduleFuncs[i].Results
+		}
+	}
+	var empty @[]@types.Type
+	return empty
+}
+
+// lookupFuncMultiReturnType returns the multi-return struct type for a function, or nil.
+func lookupFuncMultiReturnType(name *[]const char) @types.Type {
+	var qname @[]char = qualifyForCurrentModule(buf.CopyStr(name))
+	for i := 0; i < len(moduleFuncs); i++ {
+		if streq(moduleFuncs[i].Name, qname) {
+			return moduleFuncs[i].MultiReturnType
+		}
+	}
+	return nil
+}
+
+// setOrAppendFuncSig stores `sig` in moduleFuncs, replacing any
+// existing entry with the same Name (in place) or appending a new
+// one if no match.  Used by `GenDecl` so that re-typing a func at
+// the REPL prompt updates the IR-side sig table (otherwise the
+// FIRST-match `lookupFunc*` paths would still see the stale sig).
+func setOrAppendFuncSig(sig FuncSig) {
+	for i := 0; i < len(moduleFuncs); i++ {
+		if streq(moduleFuncs[i].Name, sig.Name) {
+			moduleFuncs[i] = sig
+			return
+		}
+	}
+	moduleFuncs = slices.Append[FuncSig](moduleFuncs, sig)
+}
+
+// lookupFuncExists returns true if a function signature exists in moduleFuncs.
+func lookupFuncExists(name *[]const char) bool {
+	var qname @[]char = qualifyForCurrentModule(buf.CopyStr(name))
+	for i := 0; i < len(moduleFuncs); i++ {
+		if streq(moduleFuncs[i].Name, qname) {
+			return true
+		}
+	}
+	return false
+}
+
+// lookupConst searches moduleConsts for a constant by name, returning (value, type, found).
+func lookupConst(name *[]const char) (int, @types.Type, bool) {
+	for i := 0; i < len(moduleConsts); i++ {
+		if streq(moduleConsts[i].Name, name) {
+			return moduleConsts[i].Val, moduleConsts[i].Typ, true
+		}
+	}
+	return 0, nil, false
+}
+
+// InitModule creates a new module and clears IR gen state.
+// Call RegisterImport for each dependency before calling GeneratePackage.

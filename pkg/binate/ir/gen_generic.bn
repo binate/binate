@@ -1,0 +1,463 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// Generic-instantiation IR generation — Slice 4a of
+// plan-generics.md.  Monomorphizes each unique `f[T1, T2, ...]`
+// call site to a specialized IR func with the type-params
+// substituted for concrete @types.Type instances.  Constraint-
+// method dispatch inside the body is Slice 4b territory; this
+// slice covers unconstrained `[T any]` generics where the body
+// uses T purely as a value carrier.
+
+// instantiationMangledName returns the unique IR-level name for
+// a specific (generic_decl, type_args) instantiation.  Mangling
+// scheme (Q2-style placeholder; can be canonicalized later):
+//   `<original-qualified-name>__bn_inst__<arg1>_<arg2>...`
+// Each `arg_i` is `mangleTypeArg(t)` — primitives use their
+// type name, pointers prepend `ptr_`, etc.  Stable across
+// repeated calls so cache lookups work.
+func instantiationMangledName(d @ast.Decl, args @[]@types.Type) @[]char {
+	var cb buf.CharBuf = buf.New()
+	cb = cb.WriteStr(qualifyForCurrentModule(d.Name))
+	cb = cb.WriteStr("__bn_inst")
+	for i := 0; i < len(args); i++ {
+		cb = cb.WriteStr("__")
+		cb = cb.WriteStr(mangleTypeArg(args[i]))
+	}
+	return cb.Bytes()
+}
+
+// mangleTypeArg produces a stable per-type token for use in the
+// instantiation mangled name.  Slice 4a handles primitives,
+// named types, and raw pointers; broader shapes (managed, slice,
+// nested instantiations) land later as the surface grows.
+func mangleTypeArg(t @types.Type) @[]char {
+	if t == nil { return buf.CopyStr("nil") }
+	if t.Kind == types.TYP_POINTER {
+		var cb buf.CharBuf = buf.New()
+		cb = cb.WriteStr("ptr_")
+		cb = cb.WriteStr(mangleTypeArg(t.Elem))
+		return cb.Bytes()
+	}
+	if t.Kind == types.TYP_MANAGED_PTR {
+		var cb buf.CharBuf = buf.New()
+		cb = cb.WriteStr("mptr_")
+		cb = cb.WriteStr(mangleTypeArg(t.Elem))
+		return cb.Bytes()
+	}
+	if t.Kind == types.TYP_SLICE {
+		var cb buf.CharBuf = buf.New()
+		cb = cb.WriteStr("slc_")
+		cb = cb.WriteStr(mangleTypeArg(t.Elem))
+		return cb.Bytes()
+	}
+	if t.Kind == types.TYP_MANAGED_SLICE {
+		var cb buf.CharBuf = buf.New()
+		cb = cb.WriteStr("mslc_")
+		cb = cb.WriteStr(mangleTypeArg(t.Elem))
+		return cb.Bytes()
+	}
+	// Default: use the type's printable name (primitives, named
+	// structs, etc.), folding both '.' and '/' to "__" so the token
+	// is identifier-safe.  A cross-package named type's TypeName is
+	// the full path plus member (`pkg/binate/ast.File`); both separators
+	// must be folded here, because the def and call sites mangle the
+	// instance name through different mangle.FuncName paths and only
+	// one folds the raw token.  The instance name is `<consumer-
+	// pkg>.<token>`: the call site keeps the whole dotted name and
+	// hits writeBnDotted (folds '.' and '/'), while the definition
+	// has the leading `<pkg>.` stripped by stripCurrentModuleQualifier
+	// and hits the non-dotted path, which folds only the pkgPath and
+	// writes the token verbatim.  A surviving '.' or '/' in the token
+	// therefore desyncs the two symbols (and a '/' is not even a valid
+	// identifier char in the object format).  Folding both here leaves
+	// the instance name's only separator as the leading package dot,
+	// so both sides resolve consistently.
+	var name @[]char = t.TypeName()
+	var cb buf.CharBuf = buf.New()
+	for i := 0; i < len(name); i++ {
+		if name[i] == '.' || name[i] == '/' {
+			cb = cb.WriteStr("__")
+		} else {
+			cb = cb.WriteByte(name[i])
+		}
+	}
+	return cb.Bytes()
+}
+
+// ensureInstantiated emits the specialized IR func for `(d,
+// args)` if it isn't already registered on m.  Returns the
+// mangled name (which the call site uses as the call target).
+func ensureInstantiated(m @Module, d @ast.Decl,
+		args @[]@types.Type) @[]char {
+	var name @[]char = instantiationMangledName(d, args)
+	if instantiationAlreadyEmitted(name) {
+		return name
+	}
+	emittedInstantiations = slices.Append[@[]char](emittedInstantiations, name)
+
+	// Push type-param substitution context: walk the AST decl's
+	// type-param list, snapshotting names and concrete types in
+	// parallel so resolveTypeExpr's TEXPR_NAMED branch can replace
+	// them while genFunc emits the body.
+	var savedNames @[]@[]char = currentTypeParamNames
+	var savedTypes @[]@types.Type = currentTypeParamTypes
+	var newNames @[]@[]char
+	var newTypes @[]@types.Type
+	for i := 0; i < len(d.TypeParams); i++ {
+		newNames = slices.Append[@[]char](newNames, d.TypeParams[i].Name)
+		if i < len(args) {
+			newTypes = slices.Append[@types.Type](newTypes, args[i])
+		} else {
+			newTypes = slices.Append[@types.Type](newTypes, types.TypVoid())
+		}
+	}
+	currentTypeParamNames = newNames
+	currentTypeParamTypes = newTypes
+
+	// genFunc consumes d.Name for the func's own Name.  We need
+	// the mangled name on the IR func instead, so build the func
+	// from a synthetic Decl that shares everything with d except
+	// Name (and TypeParams, which the IR layer no longer needs).
+	var synth @ast.Decl = make(ast.Decl)
+	synth.Kind = d.Kind
+	synth.Pos = d.Pos
+	synth.Name = stripCurrentModuleQualifier(name)
+	synth.Recv = d.Recv
+	synth.Params = d.Params
+	synth.Results = d.Results
+	synth.Body = d.Body
+	synth.TypeRef = d.TypeRef
+	synth.Value = d.Value
+	synth.IsAlias = d.IsAlias
+
+	var f @Func = genFunc(synth)
+	m.AddFunc(f)
+	// Append the generated func to moduleFuncs (signature
+	// registry) so subsequent call sites can resolve it like any
+	// other top-level function.
+	var sig FuncSig
+	sig.Name = qualifyForCurrentModule(synth.Name)
+	sig.Params = typesOfParams(f.Params)
+	sig.Results = f.Results
+	if len(sig.Results) > 1 {
+		sig.MultiReturnType = makeMultiReturnStructType(sig.Results)
+	}
+	moduleFuncs = slices.Append[FuncSig](moduleFuncs, sig)
+
+	currentTypeParamNames = savedNames
+	currentTypeParamTypes = savedTypes
+	return name
+}
+
+// instantiationAlreadyEmitted reports whether `name` is already in
+// the emittedInstantiations cache for the current module.
+func instantiationAlreadyEmitted(name *[]const char) bool {
+	for i := 0; i < len(emittedInstantiations); i++ {
+		if streq(emittedInstantiations[i], name) { return true }
+	}
+	return false
+}
+
+// stripCurrentModuleQualifier removes the leading `<pkg>.`
+// prefix that qualifyForCurrentModule prepends.  genFunc and
+// downstream re-qualify, so the synthetic decl's Name must be
+// the bare identifier piece.
+func stripCurrentModuleQualifier(qual *[]const char) @[]char {
+	for i := 0; i < len(qual); i++ {
+		if qual[i] == '.' {
+			return buf.CopyStr(qual[i+1:])
+		}
+	}
+	return buf.CopyStr(qual)
+}
+
+// typesOfParams projects an @[]@Param slice to @[]@types.Type
+// for the FuncSig.Params shape used during sig registration.
+func typesOfParams(ps @[]@Param) @[]@types.Type {
+	var out @[]@types.Type
+	for i := 0; i < len(ps); i++ {
+		out = slices.Append[@types.Type](out, ps[i].Typ)
+	}
+	return out
+}
+
+// typeArgExprToType converts a parsed-as-Expr type argument to the
+// IR-layer @types.Type.  Mirrors typeArgFromExpr in the type
+// checker, which the IR gen can't share because it has no
+// Checker — instead we synthesize an ast.TypeExpr matching the
+// expression's shape and feed it through the IR-gen
+// resolveTypeExpr.  Accepts the same forms as Slice 2b's
+// type-arg parsing: EXPR_IDENT and EXPR_UNARY(STAR, X).
+func typeArgExprToType(e @ast.Expr) @types.Type {
+	if e == nil { return types.TypVoid() }
+	var te @ast.TypeExpr = exprToTypeExpr(e)
+	if te == nil { return types.TypVoid() }
+	return resolveTypeExpr(te)
+}
+
+// exprToTypeExpr synthesizes an ast.TypeExpr from an ast.Expr
+// in the type-arg shape.  Returns nil for shapes the IR gen
+// doesn't know how to interpret (the type checker rejected
+// these in Slice 2b already; we mirror the same set).
+func exprToTypeExpr(e @ast.Expr) @ast.TypeExpr {
+	if e == nil { return nil }
+	if e.Kind == ast.EXPR_TYPE {
+		// Parser already produced the TypeExpr (parseBracketTypeArg)
+		// for `@T` / `@[]T` / `*[]T` forms; hand it straight through.
+		return e.TypeRef
+	}
+	if e.Kind == ast.EXPR_IDENT {
+		var te @ast.TypeExpr = make(ast.TypeExpr)
+		te.Kind = ast.TEXPR_NAMED
+		te.Pos = e.Pos
+		te.Name = e.Name
+		return te
+	}
+	if e.Kind == ast.EXPR_UNARY && e.Op == cast(int, token.STAR) {
+		var inner @ast.TypeExpr = exprToTypeExpr(e.X)
+		if inner == nil { return nil }
+		var te @ast.TypeExpr = make(ast.TypeExpr)
+		te.Kind = ast.TEXPR_POINTER
+		te.Pos = e.Pos
+		te.Base = inner
+		return te
+	}
+	return nil
+}
+
+// lookupGenericDecl returns the same-package generic AST decl
+// registered under `name`, or nil if no such decl exists.
+// Defaults to currentModulePkgPath — for cross-package
+// (Slice 7) lookups, call lookupGenericDeclPkg explicitly.
+func lookupGenericDecl(name *[]const char) @ast.Decl {
+	return lookupGenericDeclPkg(currentModulePkgPath, name)
+}
+
+// lookupGenericDeclPkg returns the generic AST decl registered
+// under (pkg, name), or nil.  Slice 7 of plan-generics.md:
+// imported generic decls land in the same registry but pkg
+// disambiguates a local `Id[T]` from an imported `genlib.Id[T]`.
+func lookupGenericDeclPkg(pkg *[]const char,
+		name *[]const char) @ast.Decl {
+	for i := 0; i < len(genericDecls); i++ {
+		if !streq(genericDecls[i].Name, name) { continue }
+		if i < len(genericDeclPkgs) &&
+				!charEq(genericDeclPkgs[i], pkg) {
+			continue
+		}
+		return genericDecls[i]
+	}
+	return nil
+}
+
+// lookupGenericTypeDecl returns the same-package generic struct
+// AST decl registered under `name`, or nil.  Slice 5c
+// counterpart to lookupGenericDecl for the type side.
+func lookupGenericTypeDecl(name *[]const char) @ast.Decl {
+	return lookupGenericTypeDeclPkg(currentModulePkgPath, name)
+}
+
+// lookupGenericTypeDeclPkg is the pkg-aware variant.  Slice 7.
+func lookupGenericTypeDeclPkg(pkg *[]const char,
+		name *[]const char) @ast.Decl {
+	for i := 0; i < len(genericTypeDecls); i++ {
+		if !streq(genericTypeDecls[i].Name, name) { continue }
+		if i < len(genericTypeDeclPkgs) &&
+				!charEq(genericTypeDeclPkgs[i], pkg) {
+			continue
+		}
+		return genericTypeDecls[i]
+	}
+	return nil
+}
+
+// lookupGenericIfaceDecl returns the same-package generic
+// interface AST decl registered under `name`, or nil.
+// Slice 6c counterpart to lookupGenericTypeDecl.
+func lookupGenericIfaceDecl(name *[]const char) @ast.Decl {
+	return lookupGenericIfaceDeclPkg(currentModulePkgPath, name)
+}
+
+// lookupGenericIfaceDeclPkg is the pkg-aware variant.  Slice 7.
+func lookupGenericIfaceDeclPkg(pkg *[]const char,
+		name *[]const char) @ast.Decl {
+	for i := 0; i < len(genericIfaceDecls); i++ {
+		if !streq(genericIfaceDecls[i].Name, name) { continue }
+		if i < len(genericIfaceDeclPkgs) &&
+				!charEq(genericIfaceDeclPkgs[i], pkg) {
+			continue
+		}
+		return genericIfaceDecls[i]
+	}
+	return nil
+}
+
+// ensureInstantiatedInterface materializes a per-(decl, args)
+// ModuleInterface entry under the mangled name (e.g.
+// `Container__bn_inst__int`), substituting the type-params in
+// each method's result type.  Idempotent — repeated calls return
+// the same mangled name and don't double-register.  Pkg on the
+// entry is the current module's pkgShort, since same-package
+// instantiation is all Slice 6c-full handles; cross-package
+// instantiation lands in Slice 7.
+//
+// Method names match the source AST.  Result types are walked
+// with the type-param substitution context active so a `get() T`
+// method on `Container[int]` registers as returning TypInt.
+// Parent / alias info on the ModuleInterface is left empty —
+// generic interfaces don't support `extends` / aliases in the
+// surface yet.
+func ensureInstantiatedInterface(d @ast.Decl,
+		args @[]@types.Type) @[]char {
+	// instantiationMangledName prefixes the pkg
+	// (`test.Container__bn_inst__int`) since it was built for
+	// function symbols; ModuleInterface keeps Name bare with Pkg
+	// stored separately, so strip the qualifier here.
+	var name @[]char = stripCurrentModuleQualifier(
+		instantiationMangledName(d, args))
+	var existing int = lookupModuleInterfaceIndex(
+		currentModulePkgPath, name)
+	if existing >= 0 {
+		return name
+	}
+	// Push type-param substitution context so resolveTypeExpr's
+	// TEXPR_NAMED branch maps T → args[i] when walking method
+	// result types.
+	var savedNames @[]@[]char = currentTypeParamNames
+	var savedTypes @[]@types.Type = currentTypeParamTypes
+	var newNames @[]@[]char
+	var newTypes @[]@types.Type
+	for i := 0; i < len(d.TypeParams); i++ {
+		newNames = slices.Append[@[]char](newNames,
+			d.TypeParams[i].Name)
+		if i < len(args) {
+			newTypes = slices.Append[@types.Type](newTypes, args[i])
+		} else {
+			newTypes = slices.Append[@types.Type](newTypes, types.TypVoid())
+		}
+	}
+	currentTypeParamNames = newNames
+	currentTypeParamTypes = newTypes
+
+	var mi ModuleInterface
+	mi.Pkg = buf.CopyStr(currentModulePkgPath)
+	mi.Name = buf.CopyStr(name)
+	for i := 0; i < len(d.Decls); i++ {
+		var mdecl @ast.Decl = d.Decls[i]
+		if mdecl == nil || mdecl.Kind != ast.DECL_FUNC {
+			continue
+		}
+		mi.MethodNames = slices.Append[@[]char](mi.MethodNames,
+			buf.CopyStr(mdecl.Name))
+		var resultTyp @types.Type = nil
+		if len(mdecl.Results) == 1 {
+			resultTyp = resolveTypeExpr(mdecl.Results[0])
+		}
+		mi.MethodResults = slices.Append[@types.Type](mi.MethodResults,
+			resultTyp)
+	}
+	moduleInterfaces = slices.Append[ModuleInterface](moduleInterfaces, mi)
+
+	currentTypeParamNames = savedNames
+	currentTypeParamTypes = savedTypes
+	return name
+}
+
+// ensureInstantiatedStruct registers the instantiation
+// `(d, args)` as a fresh module-level struct if not already
+// present, with a mangled name (`List__bn_inst__int`) so
+// repeated uses share the same registered struct.  Fields are
+// resolved with the type-param substitution context active so
+// composite-T types like `*T` become `*int` etc.  Returns the
+// instantiated @types.Type.  Per plan-generics.md Slice 5c.
+func ensureInstantiatedStruct(d @ast.Decl,
+		args @[]@types.Type) @types.Type {
+	var name @[]char = instantiationMangledName(d, args)
+	var si int = lookupStructIdx(name)
+	if si >= 0 {
+		return moduleStructs[si].Typ
+	}
+	// Pre-register an empty struct entry so recursive references
+	// inside the body (e.g. `type Node[T any] struct { next
+	// @Node[T] }`) resolve back to this entry instead of looping.
+	var ms ModuleStruct
+	ms.Name = buf.CopyStr(name)
+	var noFields @[]@types.Field
+	ms.Typ = types.MakeStructType(name, noFields)
+	moduleStructs = slices.Append[ModuleStruct](moduleStructs, ms)
+	si = len(moduleStructs) - 1
+
+	// Push the type-param substitution context so resolveTypeExpr's
+	// TEXPR_NAMED branch substitutes T → args[i] when walking
+	// field types.
+	var savedNames @[]@[]char = currentTypeParamNames
+	var savedTypes @[]@types.Type = currentTypeParamTypes
+	var newNames @[]@[]char
+	var newTypes @[]@types.Type
+	for i := 0; i < len(d.TypeParams); i++ {
+		newNames = slices.Append[@[]char](newNames, d.TypeParams[i].Name)
+		if i < len(args) {
+			newTypes = slices.Append[@types.Type](newTypes, args[i])
+		} else {
+			newTypes = slices.Append[@types.Type](newTypes, types.TypVoid())
+		}
+	}
+	currentTypeParamNames = newNames
+	currentTypeParamTypes = newTypes
+
+	var fields @[]@types.Field
+	if d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+		for j := 0; j < len(d.TypeRef.Fields); j++ {
+			var fd @ast.FieldDecl = d.TypeRef.Fields[j]
+			var f @types.Field = make(types.Field)
+			f.Name = fd.Name
+			f.Type = resolveTypeExpr(fd.Type)
+			fields = slices.Append[@types.Field](fields, f)
+		}
+	}
+	currentTypeParamNames = savedNames
+	currentTypeParamTypes = savedTypes
+
+	// Populate the pre-registered entry's fields.
+	var typ @types.Type = moduleStructs[si].Typ
+	typ.Fields = fields
+	moduleStructs[si].Fields = fields
+	return typ
+}
+
+// genCallInstantiate handles the IR-gen for an EXPR_CALL whose
+// callee is an EXPR_INSTANTIATE_OR_INDEX with a generic head
+// (the Slice 2b type-checker validated this; here we emit code).
+// Steps: convert the bracketed exprs to concrete @types.Type,
+// ensure the specialized IR func is emitted, then emit a regular
+// call to the mangled name.  Returns the call's @Instr (the
+// loaded return value if any).
+func genCallInstantiate(ctx @GenContext, b @Block, e @ast.Expr,
+		d @ast.Decl) @Instr {
+	var head @ast.Expr = e.X  // EXPR_INSTANTIATE_OR_INDEX
+	var args @[]@types.Type
+	for i := 0; i < len(head.Args); i++ {
+		args = slices.Append[@types.Type](args, typeArgExprToType(head.Args[i]))
+	}
+	if currentModule == nil { return nil }
+	var name @[]char = ensureInstantiated(currentModule, d, args)
+	// Emit the user-args call.  We piggyback on the regular
+	// direct-call machinery by synthesizing a callee Expr that
+	// looks like a plain identifier with the mangled name.
+	var fakeCallee @ast.Expr = make(ast.Expr)
+	fakeCallee.Kind = ast.EXPR_IDENT
+	fakeCallee.Pos = head.Pos
+	fakeCallee.Name = name
+	var newCall @ast.Expr = make(ast.Expr)
+	newCall.Kind = ast.EXPR_CALL
+	newCall.Pos = e.Pos
+	newCall.X = fakeCallee
+	newCall.Args = e.Args
+	return genExpr(ctx, b, newCall)
+}

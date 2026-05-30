@@ -84,13 +84,13 @@ imported-and-used in another is not flagged — a rare, safe under-warning.
 Lint a single package:
 
 ```
-go run . -root ~/binate/binate cmd/bnlint -- -I ~/binate/binate -L ~/binate/binate pkg/ir
+go run . -root ~/binate/binate cmd/bnlint -- -I ~/binate/binate -L ~/binate/binate pkg/binate/ir
 ```
 
 Lint multiple packages:
 
 ```
-go run . -root ~/binate/binate cmd/bnlint -- -I ~/binate/binate -L ~/binate/binate pkg/ir pkg/binate/types pkg/codegen
+go run . -root ~/binate/binate cmd/bnlint -- -I ~/binate/binate -L ~/binate/binate pkg/binate/ir pkg/binate/types pkg/codegen
 ```
 
 ## Running Tests

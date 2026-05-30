@@ -1,0 +1,177 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// GenModule generates an IR module from a single ast.File — the
+// simple-test / REPL-ish entry that owns both module construction
+// and the full IR-gen sweep.  Multi-package callers go through
+// InitModule + RegisterImport(s) + GeneratePackage in gen_module.bn
+// instead; this wrapper bundles those steps for callers that only
+// have one self-contained file.
+func GenModule(file @ast.File) @Module {
+	var m @Module = InitModule(file.PkgName)
+	// In this single-file path m.Name and file.PkgName agree (the
+	// caller is testing or REPL-ish, where the file IS the module),
+	// so it's safe to source the package path from file.PkgName here.
+	// GeneratePackage sources from m.Name to handle the cmd/* case
+	// where they disagree. Set after InitModule, which clears
+	// currentModulePkgPath for test isolation.
+	currentModulePkgPath = mangle.PkgPathFromQuoted(file.PkgName)
+	resetFuncLitState(m)
+	resetImplState()
+	setCurrentModule(m)
+	var emptyConsts2 @[]ModuleConst
+	moduleConsts = emptyConsts2
+	var emptyStructs2 @[]ModuleStruct
+	moduleStructs = emptyStructs2
+	var emptyGlobals2 @[]ModuleGlobal
+	moduleGlobals = emptyGlobals2
+
+	// First pass: collect constants, globals, type declarations,
+	// and (Slice 2.3a-1) interface method-name lists for impl
+	// vtable wiring downstream.
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if d.Kind == ast.DECL_CONST {
+			genConst(d)
+		}
+		// DECL_GROUP contains grouped const declarations
+		if d.Kind == ast.DECL_GROUP {
+			genConstGroup(d)
+		}
+		// Struct type declarations — register name first (for self-referential types)
+		if d.Kind == ast.DECL_TYPE && d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+			var ms ModuleStruct
+			ms.Name = buf.CopyStr(d.Name)
+			// Register with empty fields first so self-references resolve
+			var noFields3 @[]@types.Field
+			ms.Typ = types.MakeStructType(d.Name, noFields3)
+			moduleStructs = slices.Append[ModuleStruct](moduleStructs, ms)
+		}
+		// Global variable declarations
+		if d.Kind == ast.DECL_VAR {
+			var mg ModuleGlobal
+			mg.Name = buf.CopyStr(d.Name)
+			mg.Typ = resolveGlobalVarType(d)
+			if d.Value != nil && d.Value.Kind == ast.EXPR_INT_LIT {
+				mg.Init = parseIntLit(d.Value.Name)
+			}
+			moduleGlobals = slices.Append[ModuleGlobal](moduleGlobals, mg)
+		}
+		if d.Kind == ast.DECL_INTERFACE {
+			collectInterfaceFromDecl(d, currentModulePkgPath)
+		}
+	}
+	// Impls pass: walk DECL_IMPL entries to populate m.Impls.
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if d.Kind == ast.DECL_IMPL {
+			collectImplsFromDecl(d, currentModulePkgPath, m)
+		}
+	}
+
+	// Second pass: populate struct fields on existing type objects
+	// (must update in-place so self-referential types stay connected)
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if d.Kind == ast.DECL_TYPE && d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+			var si int = lookupStructIdx(d.Name)
+			if si >= 0 {
+				var fields @[]@types.Field
+				for j := 0; j < len(d.TypeRef.Fields); j++ {
+					var fd @ast.FieldDecl = d.TypeRef.Fields[j]
+					var f @types.Field = make(types.Field)
+					f.Name = fd.Name
+					f.Type = resolveTypeExpr(fd.Type)
+					fields = slices.Append[@types.Field](fields, f)
+				}
+				var typ @types.Type = moduleStructs[si].Typ
+				typ.Fields = fields
+				moduleStructs[si].Fields = fields
+			}
+		}
+	}
+
+	// Third pass: register function and method signatures (append to
+	// existing, preserving imports).  Generic decls registered into
+	// genericDecls for lazy monomorphization — see the non-
+	// incremental compileToModule above for the rationale.
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if d.Kind != ast.DECL_FUNC {
+			continue
+		}
+		if len(d.TypeParams) > 0 {
+			genericDecls = slices.Append[@ast.Decl](genericDecls, d)
+			genericDeclPkgs = slices.Append[@[]char](
+				genericDeclPkgs,
+				buf.CopyStr(currentModulePkgPath))
+			continue
+		}
+		if d.Recv != nil {
+			moduleFuncs = slices.Append[FuncSig](moduleFuncs, methodSig(currentModulePkgPath, d))
+			continue
+		}
+		var sig FuncSig
+		sig.Name = qualifyForCurrentModule(buf.CopyStr(d.Name))
+		var sigParams @[]@types.Type
+		for j := 0; j < len(d.Params); j++ {
+			sigParams = slices.Append[@types.Type](sigParams, resolveTypeExpr(d.Params[j].Type))
+		}
+		sig.Params = sigParams
+		var sigResults @[]@types.Type
+		for j := 0; j < len(d.Results); j++ {
+			sigResults = slices.Append[@types.Type](sigResults, resolveTypeExpr(d.Results[j]))
+		}
+		sig.Results = sigResults
+		if len(sigResults) > 1 {
+			sig.MultiReturnType = makeMultiReturnStructType(sigResults)
+		}
+		moduleFuncs = slices.Append[FuncSig](moduleFuncs, sig)
+	}
+
+	// Add globals to module
+	for i := 0; i < len(moduleGlobals); i++ {
+		var g @Global = make(Global)
+		g.Name = moduleGlobals[i].Name
+		g.Typ = moduleGlobals[i].Typ
+		m.AddGlobal(g)
+	}
+
+	// Third pass: generate function and method bodies.  Generic
+	// decls skipped (Slice 4 emits per instantiation).
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if d.Kind != ast.DECL_FUNC {
+			continue
+		}
+		if len(d.TypeParams) > 0 {
+			continue
+		}
+		if d.Recv != nil {
+			m.AddFunc(genMethod(d, currentModulePkgPath))
+		} else {
+			m.AddFunc(genFunc(d))
+		}
+	}
+
+	// Generate the per-package var-initializer function if any
+	// top-level `var x T = expr` decls exist.
+	generatePackageInit(file.Decls, m)
+
+	// Generate destructor functions (after user functions)
+	generateDtors(m)
+
+	// Generate copy functions (symmetric to dtors)
+	generateCopies(m)
+
+	// Generate iv-dispatch receiver thunks for value-receiver
+	// impls (mirrors GeneratePackage above).
+	generateIvDispatchThunks(m)
+
+	return m
+}

@@ -1,0 +1,462 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// ============================================================
+// Refcounting helpers
+// ============================================================
+
+// isManagedPtrType returns true if t is @T (managed pointer).
+func isManagedPtrType(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_MANAGED_PTR
+}
+
+// isManagedSliceType returns true if t is @[]T (managed slice).
+func isManagedSliceType(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_MANAGED_SLICE
+}
+
+// isManagedIfaceValueType returns true if t is @Iface (managed
+// interface value).
+func isManagedIfaceValueType(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_INTERFACE_VALUE_MANAGED
+}
+
+// isSliceType returns true if t is *[]T or @[]T (any slice type).
+func isSliceType(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_SLICE || t.Kind == types.TYP_MANAGED_SLICE
+}
+
+// isCharSliceType returns true if t is *[]const char or @[]char
+// (including const-element variants like *[]const char).
+func isCharSliceType(t @types.Type) bool {
+	if t == nil { return false }
+	if t.Kind != types.TYP_SLICE && t.Kind != types.TYP_MANAGED_SLICE {
+		return false
+	}
+	var elem @types.Type = t.Elem
+	for elem != nil && elem.Kind == types.TYP_CONST { elem = elem.Elem }
+	return elem != nil && elem.Width == 8
+}
+
+// isCharArrayType returns true if t is [N]char or [N]const char
+// (with optional outer const).
+func isCharArrayType(t @types.Type) bool {
+	if t == nil { return false }
+	for t != nil && t.Kind == types.TYP_CONST { t = t.Elem }
+	if t == nil { return false }
+	if t.Kind != types.TYP_ARRAY { return false }
+	var elem @types.Type = t.Elem
+	for elem != nil && elem.Kind == types.TYP_CONST { elem = elem.Elem }
+	return elem != nil && elem.Width == 8
+}
+
+// isNillableType returns true if t can hold nil.
+func isNillableType(t @types.Type) bool {
+	if t == nil { return false }
+	var k int = t.Kind
+	return k == types.TYP_SLICE || k == types.TYP_MANAGED_SLICE ||
+		k == types.TYP_MANAGED_PTR || k == types.TYP_POINTER
+}
+
+// isStructOrArrayAlloc returns true if instr is an alloca for a struct or array.
+func isStructOrArrayAlloc(instr @Instr) bool {
+	if instr.Op != OP_ALLOC { return false }
+	if instr.TypeArg == nil { return false }
+	return instr.TypeArg.Kind == types.TYP_STRUCT || instr.TypeArg.Kind == types.TYP_ARRAY
+}
+
+// isManagedPtrToStruct returns true if t is @T where T is a struct.
+func isManagedPtrToStruct(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_MANAGED_PTR && t.Elem != nil &&
+		t.Elem.Kind == types.TYP_STRUCT
+}
+
+// isRawPtrToStruct returns true if t is *T where T is a struct.
+func isRawPtrToStruct(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_POINTER && t.Elem != nil &&
+		t.Elem.Kind == types.TYP_STRUCT
+}
+
+// isFreshManagedPtr returns true if the instruction creates a new managed
+// pointer (make/box/call), meaning refcount is already 1.
+func isFreshManagedPtr(instr @Instr) bool {
+	if instr == nil { return false }
+	if instr.Op == OP_CONST_NIL { return true }
+	if instr.Op == OP_BOX { return true }
+	if instr.Op == OP_MAKE { return true }
+	if instr.Op == OP_CALL && instr.Typ != nil && isManagedPtrType(instr.Typ) {
+		return true
+	}
+	return false
+}
+
+// isFreshManagedSlice returns true if the instruction creates a new managed
+// slice (make_slice), meaning refcount is already 1.
+func isFreshManagedSlice(instr @Instr) bool {
+	if instr == nil { return false }
+	if instr.Op == OP_CONST_NIL { return true }
+	if instr.Op == OP_MAKE_SLICE { return true }
+	if instr.Op == OP_CALL && instr.Typ != nil && isManagedSliceType(instr.Typ) {
+		return true
+	}
+	return false
+}
+
+// emitStructElemRefcount emits RefInc for managed fields in a new struct value
+// being stored into a slice element, and RefDec for managed fields in the old
+// element being overwritten. This handles types like @[]EnvEntry where EnvEntry
+// has managed-ptr or managed-slice fields.
+func emitStructElemRefcount(ctx @GenContext, b @Block, collection @Instr,
+		index @Instr, elemTyp @types.Type, rhs @Instr) @Block {
+	if elemTyp == nil { return b }
+	if elemTyp.Kind == types.TYP_NAMED && elemTyp.Underlying != nil {
+		elemTyp = elemTyp.Underlying
+	}
+	if elemTyp.Kind != types.TYP_STRUCT { return b }
+	// Read old element (for RefDec of its managed fields)
+	var oldElem @Instr = b.EmitSliceGet(collection, index, elemTyp)
+	// For each field that needs refcounting:
+	for i := 0; i < len(elemTyp.Fields); i++ {
+		var ft @types.Type = elemTyp.Fields[i].Type
+		if isManagedPtrType(ft) {
+			// RefDec old field, RefInc new field
+			var oldField @Instr = b.EmitExtract(oldElem, i, ft)
+			emitManagedPtrRefDec(ctx.Func, b, oldField)
+			var newField @Instr = b.EmitExtract(rhs, i, ft)
+			b.EmitRefInc(newField)
+		}
+		if isManagedSliceType(ft) {
+			var oldField @Instr = b.EmitExtract(oldElem, i, ft)
+			b = emitManagedSliceRefDec(ctx.Func, b, oldField)
+			var newField @Instr = b.EmitExtract(rhs, i, ft)
+			emitManagedSliceRefInc(ctx.Func, b, newField)
+		}
+	}
+	return b
+}
+
+// needsStructCopy returns true if t is a struct or array type that needs a
+// copy function call (i.e., has managed fields/elements that need RefInc on copy).
+// Does NOT return true for @T or @[]T — those are handled inline.
+func needsStructCopy(t @types.Type) bool {
+	if t == nil { return false }
+	t = t.ResolveAlias()
+	if t.Kind == types.TYP_NAMED && t.Underlying != nil {
+		t = t.Underlying
+	}
+	if t.Kind == types.TYP_STRUCT { return t.NeedsDestruction() }
+	if t.Kind == types.TYP_ARRAY { return t.NeedsDestruction() }
+	return false
+}
+
+// emitStructCopy emits a copy function call on a struct/array at the given
+// pointer. This RefInc's all managed fields in the copy.
+func emitStructCopy(f @Func, b @Block, ptr @Instr, typ @types.Type) {
+	typ = typ.ResolveAlias()
+	if typ.Kind == types.TYP_NAMED && typ.Underlying != nil {
+		typ = typ.Underlying
+	}
+	registerPendingStructDtor(typ)
+	var rawPtr @Instr = b.EmitBitCast(ptr, types.MakePointerType(types.TypUint8()))
+	var copyN @[]char = qualifiedCopyNameForType(typ)
+	var copyArgs @[]@Instr = make_slice(@Instr, 1)
+	copyArgs[0] = rawPtr
+	b.EmitCall(copyN, copyArgs, types.TypVoid())
+}
+
+// emitStructDtor emits a destructor call on a struct/array at the given
+// pointer. This RefDec's all managed fields.
+func emitStructDtor(f @Func, b @Block, ptr @Instr, typ @types.Type) {
+	typ = typ.ResolveAlias()
+	if typ.Kind == types.TYP_NAMED && typ.Underlying != nil {
+		typ = typ.Underlying
+	}
+	registerPendingStructDtor(typ)
+	var rawPtr @Instr = b.EmitBitCast(ptr, types.MakePointerType(types.TypUint8()))
+	var dtorN @[]char = qualifiedDtorNameForType(typ)
+	var dtorArgs @[]@Instr = make_slice(@Instr, 1)
+	dtorArgs[0] = rawPtr
+	b.EmitCall(dtorN, dtorArgs, types.TypVoid())
+}
+
+// registerPendingStructDtor records a struct/array type that needs dtor and
+// copy functions generated. This handles types discovered during scope cleanup
+// that aren't in moduleStructs (e.g., array types used as local variables).
+func registerPendingStructDtor(typ @types.Type) {
+	var name @[]char = dtorNameForType(typ)
+	for i := 0; i < len(pendingStructDtors); i++ {
+		if streq(dtorNameForType(pendingStructDtors[i]), name) { return }
+	}
+	pendingStructDtors = slices.Append[@types.Type](pendingStructDtors, typ)
+}
+
+// emitManagedPtrRefDec emits RefDec for a managed pointer value, passing the
+// pointee's struct destructor if the pointee type needs destruction.
+// Uses OP_FUNC_HANDLE (handle pointer end-to-end — the proper Phase 4
+// shape from plan-uniform-native-fnptrs.md, replacing the
+// transitional OP_FUNC_ADDR/idx-form stop-gap):
+//
+//   * Native: lowered to `&__handle.F` cast to i8*.  ZeroRefDestroy
+//     calls _call_dtor(handle, ptr) → OP_CALL_HANDLE dispatches via
+//     handle.vtable.call.
+//   * Bytecode: BC_FUNC_HANDLE returns a *uint8 pointing at the
+//     function's 16-byte {vtable, data} handle.
+//     BC_REFDEC_INLINE_FAST's slow path inspects handle.data:
+//     DATA_KIND_VM_CLOSURE_REC → recover FnIdx and do iterative push
+//     (flat-stack, no host recursion); otherwise → cross-mode shim
+//     call (bounded by the cross-mode chain, not the dtor field
+//     graph).
+//
+// This makes dtor refs interop-correct: a managed value created in
+// native that crosses into a bytecode VM (or vice-versa) can have
+// its dtor resolved through the handle without depending on
+// per-VM-instance function indices.
+func emitManagedPtrRefDec(f @Func, b @Block, ptrVal @Instr) {
+	var elemTyp @types.Type
+	if ptrVal.Typ != nil {
+		elemTyp = ptrVal.Typ.Elem
+	}
+	if elemTyp != nil {
+		if elemTyp.Kind == types.TYP_STRUCT {
+			if elemTyp.NeedsDestruction() {
+				var dtor @Instr = b.EmitFuncHandle(qualifiedDtorName(elemTyp.Name))
+				b.EmitRefDecDtor(ptrVal, dtor)
+				return
+			}
+		}
+	}
+	b.EmitRefDec(ptrVal)
+}
+
+// registerPendingMsDtor records a managed-slice type that needs a dtor.
+func registerPendingMsDtor(msTyp @types.Type) {
+	var name @[]char = dtorNameForType(msTyp)
+	for i := 0; i < len(pendingMsDtors); i++ {
+		if streq(dtorNameForType(pendingMsDtors[i]), name) { return }
+	}
+	pendingMsDtors = slices.Append[@types.Type](pendingMsDtors, msTyp)
+}
+
+// emitManagedSliceRefInc extracts the refptr (field 2) and increments it.
+func emitManagedSliceRefInc(f @Func, b @Block, sliceVal @Instr) {
+	var refptr @Instr = b.EmitExtract(sliceVal, 2, types.MakeManagedPtrType(nil))
+	b.EmitRefInc(refptr)
+}
+
+// emitManagedIfaceValueRefDec cleans up the data slot (field 0) of
+// an @Iface value — pairs with the OP_REFINC emitted at @Iface
+// construction (Slice 2.3b). The dtor extracted from the vtable's
+// slot 0 (Slice 2.5 reserved the slot; Slice 2.5b wires it up here)
+// is passed through OP_REFDEC, so when the receiver's refcount hits
+// zero the receiver type's struct destructor runs and any managed
+// fields inside the receiver get cleaned up. If the receiver has
+// no dtor, slot 0 is null / 0 and OP_REFDEC's slow path falls
+// through to plain rt.Free.
+func emitManagedIfaceValueRefDec(f @Func, b @Block, ivVal @Instr) {
+	var dataPtr @Instr = b.EmitExtract(ivVal, 0,
+		types.MakeManagedPtrType(nil))
+	var dtor @Instr = b.EmitIfaceDtor(ivVal)
+	b.EmitRefDecDtor(dataPtr, dtor)
+}
+
+// emitManagedSliceRefDec cleans up a managed-slice value. If the element type
+// needs destruction, stores the value to a temp alloca and calls the dtor.
+// Otherwise just RefDec's the backing refptr.
+func emitManagedSliceRefDec(f @Func, b @Block, sliceVal @Instr) @Block {
+	var refptr @Instr = b.EmitExtract(sliceVal, 2, types.MakeManagedPtrType(nil))
+
+	var elemTyp @types.Type
+	if sliceVal.Typ != nil {
+		elemTyp = sliceVal.Typ.Elem
+	}
+	if elemTyp == nil || !elemTyp.NeedsDestruction() {
+		b.EmitRefDec(refptr)
+		return b
+	}
+
+	registerPendingMsDtor(sliceVal.Typ)
+	var msSlot @Instr = b.EmitAlloc(sliceVal.Typ)
+	b.EmitStore(msSlot, sliceVal)
+	var rawSlot @Instr = b.EmitBitCast(msSlot, types.MakePointerType(types.TypUint8()))
+	var dtorN @[]char = dtorNameForType(sliceVal.Typ)
+	var dtorArgs @[]@Instr = make_slice(@Instr, 1)
+	dtorArgs[0] = rawSlot
+	b.EmitCall(dtorN, dtorArgs, types.TypVoid())
+	return b
+}
+
+// registerTemp adds a managed temporary for cleanup at end of statement.
+func registerTemp(ctx @GenContext, instr @Instr) {
+	ctx.Temps = slices.Append[@Instr](ctx.Temps, instr)
+}
+
+// noteSPGrowingResult inspects an Emit*-returned Instr and marks the
+// current statement for end-of-statement OP_SP_RESTORE if the op
+// grows vm.SP at runtime. Centralizes the list of SP-growing IR ops
+// so call sites in IR-gen don't each have to know which emitters
+// matter. Aggregate-returning OP_CALL / CALL_INDIRECT / CALL_FUNC_VALUE
+// are handled separately in genCall (the SP growth happens at the
+// callee's BC_RETURN copy-back, keyed off resultTyp shape, not on
+// the call instr's Op).
+func noteSPGrowingResult(ctx @GenContext, instr @Instr) {
+	if instr == nil { return }
+	if instr.Op == OP_MAKE_SLICE { ctx.StmtGrewSP = true; return }
+	if instr.Op == OP_FUNC_VALUE { ctx.StmtGrewSP = true; return }
+	if instr.Op == OP_IFACE_VALUE { ctx.StmtGrewSP = true; return }
+	if instr.Op == OP_RODATA_MSLICE_COPY { ctx.StmtGrewSP = true; return }
+	if instr.Op == OP_RODATA_ARRAY { ctx.StmtGrewSP = true; return }
+}
+
+// consumeTemp removes a specific instruction from the temps list.
+func consumeTemp(ctx @GenContext, instr @Instr) {
+	if len(ctx.Temps) == 0 { return }
+	for i := 0; i < len(ctx.Temps); i++ {
+		if ctx.Temps[i].ID == instr.ID {
+			for j := i; j < len(ctx.Temps) - 1; j++ {
+				ctx.Temps[j] = ctx.Temps[j + 1]
+			}
+			ctx.Temps = ctx.Temps[:len(ctx.Temps) - 1]
+			return
+		}
+	}
+}
+
+// emitTempCleanup emits RefDec for all managed temporaries and clears the list.
+// Also emits OP_SP_RESTORE if the statement set ctx.StmtGrewSP — the
+// bytecode VM uses this to reclaim vm.Stack bytes accumulated during
+// the statement (aggregate-return copy-backs, BC_MAKE_SLICE /
+// BC_STRING_COPY* / BC_FUNC_VALUE pushes). LLVM and native backends
+// treat OP_SP_RESTORE as a no-op. SP_RESTORE is emitted AFTER the
+// RefDec loop because some RefDecs read header bytes that may live
+// on vm.SP; reclaiming those bytes after they're no longer needed
+// is fine.
+//
+// Use emitTempCleanupForReturn at the return-statement cleanup site —
+// SP_RESTORE THERE would truncate the about-to-be-returned aggregate's
+// bytes before BC_RETURN's copy-back has a chance to memcpy them into
+// the caller's region.
+func emitTempCleanup(ctx @GenContext, b @Block) @Block {
+	b = emitTempCleanupBody(ctx, b)
+	if ctx.StmtGrewSP {
+		b.EmitSPRestore()
+		ctx.StmtGrewSP = false
+	}
+	return b
+}
+
+// emitTempCleanupForReturn is the return-path variant: same RefDec
+// loop but never emits OP_SP_RESTORE. The pending vm.SP growth gets
+// reclaimed by BC_RETURN's `vm.SP = callerSP` (which restores back to
+// the caller's SP at the time of the original BC_CALL).
+func emitTempCleanupForReturn(ctx @GenContext, b @Block) @Block {
+	b = emitTempCleanupBody(ctx, b)
+	// Don't emit SP_RESTORE — see fn comment.
+	ctx.StmtGrewSP = false
+	return b
+}
+
+// emitTempCleanupBody is the shared RefDec-temps loop used by both
+// regular and return-path cleanups.
+func emitTempCleanupBody(ctx @GenContext, b @Block) @Block {
+	for i := 0; i < len(ctx.Temps); i++ {
+		var tmp @Instr = ctx.Temps[i]
+		if tmp.Typ == nil { continue }
+		if isManagedPtrType(tmp.Typ) {
+			emitManagedPtrRefDec(ctx.Func, b, tmp)
+		}
+		if isManagedSliceType(tmp.Typ) {
+			b = emitManagedSliceRefDec(ctx.Func, b, tmp)
+		}
+		if needsStructCopy(tmp.Typ) {
+			var tmpSlot @Instr = b.EmitAlloc(tmp.Typ)
+			b.EmitStore(tmpSlot, tmp)
+			emitStructDtor(ctx.Func, b, tmpSlot, tmp.Typ)
+		}
+	}
+	ctx.Temps = ctx.Temps[:0]
+	return b
+}
+
+// emitTempCleanupSince emits RefDec for temps added since savedLen.
+func emitTempCleanupSince(ctx @GenContext, b @Block, savedLen int) @Block {
+	if len(ctx.Temps) == 0 { return b }
+	for i := savedLen; i < len(ctx.Temps); i++ {
+		var tmp @Instr = ctx.Temps[i]
+		if tmp.Typ == nil { continue }
+		if isManagedPtrType(tmp.Typ) {
+			emitManagedPtrRefDec(ctx.Func, b, tmp)
+		}
+		if isManagedSliceType(tmp.Typ) {
+			b = emitManagedSliceRefDec(ctx.Func, b, tmp)
+		}
+		if needsStructCopy(tmp.Typ) {
+			var tmpSlot @Instr = b.EmitAlloc(tmp.Typ)
+			b.EmitStore(tmpSlot, tmp)
+			emitStructDtor(ctx.Func, b, tmpSlot, tmp.Typ)
+		}
+	}
+	ctx.Temps = ctx.Temps[:savedLen]
+	return b
+}
+
+// emitDecForScopeVars emits cleanup for managed vars declared since savedVarLen.
+func emitDecForScopeVars(ctx @GenContext, b @Block, savedVarLen int) @Block {
+	for i := savedVarLen; i < len(ctx.Vars); i++ {
+		var slot VarSlot = ctx.Vars[i]
+		if isManagedPtrType(slot.Typ) {
+			var ptrVal @Instr = b.EmitLoad(slot.Ptr, slot.Typ)
+			emitManagedPtrRefDec(ctx.Func, b, ptrVal)
+		}
+		if isManagedSliceType(slot.Typ) {
+			var sliceVal @Instr = b.EmitLoad(slot.Ptr, slot.Typ)
+			b = emitManagedSliceRefDec(ctx.Func, b, sliceVal)
+		}
+		if isManagedIfaceValueType(slot.Typ) {
+			var ivVal @Instr = b.EmitLoad(slot.Ptr, slot.Typ)
+			emitManagedIfaceValueRefDec(ctx.Func, b, ivVal)
+		}
+		if needsStructCopy(slot.Typ) {
+			emitStructDtor(ctx.Func, b, slot.Ptr, slot.Typ)
+		}
+	}
+	return b
+}
+
+// emitDecForManagedLocals emits cleanup for all managed locals.
+// Axiom 2: always dtor. No skip for returned locals — the return
+// path always RefInc's (axiom 3), so the dtor balances.
+func emitDecForManagedLocals(ctx @GenContext, b @Block, retExprs *[]@ast.Expr) @Block {
+	for i := 0; i < len(ctx.Vars); i++ {
+		var slot VarSlot = ctx.Vars[i]
+		var needsCleanup bool = isManagedPtrType(slot.Typ) ||
+			isManagedSliceType(slot.Typ) ||
+			isManagedIfaceValueType(slot.Typ) ||
+			needsStructCopy(slot.Typ)
+		if !needsCleanup { continue }
+		if isManagedPtrType(slot.Typ) {
+			var ptrVal @Instr = b.EmitLoad(slot.Ptr, slot.Typ)
+			emitManagedPtrRefDec(ctx.Func, b, ptrVal)
+		}
+		if isManagedSliceType(slot.Typ) {
+			var sliceVal @Instr = b.EmitLoad(slot.Ptr, slot.Typ)
+			b = emitManagedSliceRefDec(ctx.Func, b, sliceVal)
+		}
+		if isManagedIfaceValueType(slot.Typ) {
+			var ivVal @Instr = b.EmitLoad(slot.Ptr, slot.Typ)
+			emitManagedIfaceValueRefDec(ctx.Func, b, ivVal)
+		}
+		if needsStructCopy(slot.Typ) {
+			emitStructDtor(ctx.Func, b, slot.Ptr, slot.Typ)
+		}
+	}
+	return b
+}

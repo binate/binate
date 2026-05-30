@@ -1,0 +1,307 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/types"
+
+// ============================================================
+// String/int literal helpers (duplicated from interp since
+// ir cannot import interp)
+// ============================================================
+
+// isBlank reports whether name is the blank identifier ("_").
+func isBlank(name *[]const char) bool {
+	return len(name) == 1 && name[0] == '_'
+}
+
+// streq compares two char slices for equality.
+func streq(a *[]const char, b *[]const char) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] { return false }
+	}
+	return true
+}
+
+// buildQualName builds a qualified name "prefix.suffix" (e.g.,
+// "pkg/binate/ast.File").  The prefix is an import alias at every call site
+// (registration uses the import's alias; references use the
+// selector's package identifier), so it is expanded to the full
+// package path via resolveImportPkg — this is what makes
+// cross-package symbols mangle to the importee's full-path form and
+// stops two packages with the same last segment from colliding
+// (full-path mangling — see pkg/binate/mangle).  Unknown prefixes (not an
+// import alias) pass through unchanged.
+func buildQualName(prefix *[]const char, suffix *[]const char) @[]char {
+	var qn buf.CharBuf = buf.New()
+	qn = qn.WriteStr(resolveImportPkg(prefix))
+	qn = qn.WriteByte('.')
+	qn = qn.WriteStr(suffix)
+	return qn.Freeze()
+}
+
+// charEq compares two char slices for equality (same as streq).
+func charEq(a *[]const char, b *[]const char) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] { return false }
+	}
+	return true
+}
+
+// ============================================================
+// Numeric and character literal parsing
+// ============================================================
+
+// parseIntLit parses an integer literal string (decimal, hex, octal, binary).
+func parseIntLit(s *[]const char) int {
+	if len(s) == 0 { return 0 }
+	// Hex
+	if len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		var val int = 0
+		for i := 2; i < len(s); i++ {
+			val = val * 16 + hexVal(s[i])
+		}
+		return val
+	}
+	// Octal: 0o17
+	if len(s) > 2 && s[0] == '0' && (s[1] == 'o' || s[1] == 'O') {
+		var val int = 0
+		for i := 2; i < len(s); i++ {
+			val = val * 8 + cast(int, s[i]) - cast(int, '0')
+		}
+		return val
+	}
+	// Binary: 0b1010
+	if len(s) > 2 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B') {
+		var val int = 0
+		for i := 2; i < len(s); i++ {
+			val = val * 2 + cast(int, s[i]) - cast(int, '0')
+		}
+		return val
+	}
+	// Decimal
+	var neg bool = false
+	var start int = 0
+	if s[0] == '-' {
+		neg = true
+		start = 1
+	}
+	var val int = 0
+	for i := start; i < len(s); i++ {
+		val = val * 10 + cast(int, s[i]) - cast(int, '0')
+	}
+	if neg { return 0 - val }
+	return val
+}
+
+// bignumToInt converts a (magnitude, sign) pair from a bignum.Num
+// (carried on Type.LitMag / LitSign by the type checker) into the
+// int64 bit pattern for OP_CONST_INT.IntVal.  int64 (not host `int`)
+// so the constant is host-independent — a 32-bit-hosted compiler
+// must still represent a 64-bit program constant.  The
+// two's-complement wrap handles the int64-min boundary correctly:
+// cast(int64, 2^63) wraps to int64-min, and `0 - int64-min` wraps
+// back to int64-min — the same trick formatInt64 uses.  An unsigned
+// magnitude ≥ 2^63 lands as a negative int64 bit pattern, which is
+// the correct pattern for the uint type that reinterprets it.
+func bignumToInt(mag uint64, sign bool) int64 {
+	if sign {
+		return 0 - cast(int64, mag)
+	}
+	return cast(int64, mag)
+}
+
+// exprIntLitValue returns the integer value of an EXPR_INT_LIT
+// expression.  Prefers the type-checker's bignum-folded LitMag /
+// LitSign on the resolved Type (more robust at the int64 /
+// uint64 boundary than parseIntLit's signed-`int` arithmetic);
+// falls back to parseIntLit when the checker isn't available
+// (legacy test paths that skip type-check).
+func exprIntLitValue(e @ast.Expr) int64 {
+	if currentChecker != nil && e.ResolvedTypeID != 0 {
+		var t @types.Type = currentChecker.ExprType(e.ResolvedTypeID)
+		if t != nil && t.HasLitVal {
+			return bignumToInt(t.LitMag, t.LitSign)
+		}
+	}
+	// Fallback for non-type-checked paths (legacy/test scaffolding);
+	// the real compile path takes the bignum branch above.  parseIntLit
+	// stays host-`int`, so this fallback is host-int-limited.
+	return cast(int64, parseIntLit(e.Name))
+}
+
+// tryFoldOversizedConst pre-folds an EXPR_UNARY / EXPR_BINARY whose
+// type-checker bignum-fold (HasLitVal/LitMag/LitSign) has a
+// magnitude that doesn't fit in the target's host-`int` range,
+// emitting a single OP_CONST_INT at int64 instead of recursing
+// into genUnary / genBinary.  The recursive path emits the leaf
+// literal at TypUntypedInt, whose llvmType is `intLL()` = i32
+// under `--target arm32-linux`, silently truncating any magnitude
+// > 2^31 before downstream ops widen it back via sext.
+//
+// Visible without this as e.g. `cast(int64, -9223372036854775807)`
+// evaluating to 1 (after `add i32 9223372036854775807, 0` wraps
+// the literal to -1, `sub i32 0, -1` produces 1, and `sext i32 1
+// to i64` widens 1).  The unary-minus arg path of `cast` doesn't
+// route through `genIntLitWithHint` (which only knows bare
+// EXPR_INT_LIT), so the cast's typed-int hint never reaches the
+// literal — but the bignum-fold on the unary node's resolved type
+// DOES carry the full magnitude, so we can short-circuit emission
+// from there.
+//
+// Smaller-magnitude folds (fit in host int) keep going through
+// the normal path so existing IR shapes and downstream hint-driven
+// narrowing (genIntLitWithHint at uint8/int16/… sites) are
+// unchanged.  No-op on LP64 targets (host int is i64, every fold
+// fits).
+func tryFoldOversizedConst(b @Block, e @ast.Expr) @Instr {
+	if currentChecker == nil { return nil }
+	if e.ResolvedTypeID == 0 { return nil }
+	var t @types.Type = currentChecker.ExprType(e.ResolvedTypeID)
+	if t == nil || !t.HasLitVal { return nil }
+	var targetIntBits int = types.GetTarget().IntSize * 8
+	if targetIntBits >= 64 { return nil }
+	// bound = 2^(targetIntBits - 1) = 2^31 on a 32-bit target.
+	// Signed host-int range is [-bound, bound-1].  Sign=true
+	// (negative-magnitude fold) fits up to and including `bound`;
+	// sign=false fits up to `bound - 1`.
+	var bound uint64 = cast(uint64, 1) <<
+		cast(uint64, targetIntBits - 1)
+	if t.LitSign {
+		if t.LitMag <= bound { return nil }
+	} else {
+		if t.LitMag < bound { return nil }
+	}
+	var v int64 = bignumToInt(t.LitMag, t.LitSign)
+	return b.EmitConstInt64(v, types.TypInt64())
+}
+
+// isTypedInt reports whether t is a concrete signed/unsigned
+// integer type (TYP_INT with a populated Width).
+func isTypedInt(t @types.Type) bool {
+	if t == nil { return false }
+	if t.Kind != types.TYP_INT { return false }
+	if t.Width <= 0 { return false }
+	return true
+}
+
+// needsHintNarrowing reports whether the target type wants the
+// Phase B literal-narrowing path.  Fires for any concrete typed
+// integer that differs in shape (width OR signedness) from the
+// untyped-int default (host's `int` width, signed).  On a 64-bit
+// host, that catches int8/16/32 + uint8/16/32/64; on a 32-bit
+// target, it ALSO catches int64 (needed so `var x int64 = N`
+// with N > 2^31 lands at int64 instead of getting truncated by
+// the implicit i32 width).
+func needsHintNarrowing(t @types.Type) bool {
+	if t == nil { return false }
+	if t.Kind != types.TYP_INT { return false }
+	var targetIntBits int = types.GetTarget().IntSize * 8
+	if t.Width == targetIntBits && t.Signed { return false }
+	return true
+}
+
+// genIntLitWithHint applies the Phase B literal-narrowing rule
+// at a binop operand position.  Returns a freshly emitted
+// OP_CONST_INT at `hint`'s type when:
+//   - `e` is an EXPR_INT_LIT,
+//   - `hint` is a typed integer narrower than the host's `int`,
+//   - the literal's value fits in `hint`'s range.
+// Returns nil otherwise; caller should fall back to the regular
+// genExpr path.  Mirrors the ctx.CurBlock = b sync genExprInner
+// does on entry so callers picking up `b = ctx.CurBlock` after
+// this call land on the same block.
+func genIntLitWithHint(ctx @GenContext, b @Block, e @ast.Expr,
+		hint @types.Type) @Instr {
+	if e == nil || e.Kind != ast.EXPR_INT_LIT { return nil }
+	if !isTypedInt(hint) || !needsHintNarrowing(hint) { return nil }
+	var v int64 = exprIntLitValue(e)
+	if !intFitsInType(v, hint) { return nil }
+	ctx.CurBlock = b
+	return b.EmitConstInt64(v, hint)
+}
+
+// intFitsInType reports whether the value `v` fits in the typed
+// integer t's range.  Caller must verify isTypedInt(t) first.
+func intFitsInType(v int64, t @types.Type) bool {
+	if t.Width == 64 { return true }
+	if t.Signed {
+		if t.Width == 32 { return v >= -2147483648 && v <= 2147483647 }
+		if t.Width == 16 { return v >= -32768 && v <= 32767 }
+		if t.Width == 8 { return v >= -128 && v <= 127 }
+		return false
+	}
+	if t.Width == 32 { return v >= 0 && v <= 4294967295 }
+	if t.Width == 16 { return v >= 0 && v <= 65535 }
+	if t.Width == 8 { return v >= 0 && v <= 255 }
+	return false
+}
+
+// hexVal returns the numeric value of a hex digit character.
+func hexVal(c char) int {
+	if c >= '0' && c <= '9' { return cast(int, c) - cast(int, '0') }
+	if c >= 'a' && c <= 'f' { return cast(int, c) - cast(int, 'a') + 10 }
+	if c >= 'A' && c <= 'F' { return cast(int, c) - cast(int, 'A') + 10 }
+	return 0
+}
+
+// parseCharLit parses a character literal (including escape sequences) to its integer value.
+func parseCharLit(s *[]const char) int {
+	// Strip quotes
+	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+		s = s[1:len(s)-1]
+	}
+	if len(s) == 0 { return 0 }
+	if s[0] == '\\' && len(s) > 1 {
+		if s[1] == 'n' { return 10 }
+		if s[1] == 'r' { return 13 }
+		if s[1] == 't' { return 9 }
+		if s[1] == '\\' { return 92 }
+		if s[1] == '\'' { return 39 }
+		if s[1] == '0' { return 0 }
+		if s[1] == 'x' && len(s) >= 4 {
+			return hexVal(s[2]) * 16 + hexVal(s[3])
+		}
+		return cast(int, s[1])
+	}
+	return cast(int, s[0])
+}
+
+// unescapeStr strips surrounding quotes and processes escape sequences in a string literal.
+func unescapeStr(s *[]const char) @[]char {
+	// Strip quotes
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		s = s[1:len(s)-1]
+	}
+	var cb buf.CharBuf = buf.New()
+	var i int = 0
+	for i < len(s) {
+		if s[i] == '\\' && i+1 < len(s) {
+			i = i + 1
+			if s[i] == 'n' { cb = cb.WriteByte('\n'); i = i + 1; continue }
+			if s[i] == 'r' { cb = cb.WriteByte('\r'); i = i + 1; continue }
+			if s[i] == 't' { cb = cb.WriteByte('\t'); i = i + 1; continue }
+			if s[i] == '\\' { cb = cb.WriteByte('\\'); i = i + 1; continue }
+			if s[i] == '"' { cb = cb.WriteByte('"'); i = i + 1; continue }
+			if s[i] == '0' {
+				cb = cb.WriteByte(cast(char, 0))
+				i = i + 1
+				continue
+			}
+			if s[i] == 'x' && i+2 < len(s) {
+				var hi int = hexVal(s[i+1])
+				var lo int = hexVal(s[i+2])
+				cb = cb.WriteByte(cast(char, hi*16 + lo))
+				i = i + 3
+				continue
+			}
+			cb = cb.WriteByte(s[i])
+			i = i + 1
+		} else {
+			cb = cb.WriteByte(s[i])
+			i = i + 1
+		}
+	}
+	return cb.Bytes()
+}

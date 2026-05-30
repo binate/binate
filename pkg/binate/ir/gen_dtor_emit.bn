@@ -1,0 +1,524 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// ============================================================
+// Destructor generation
+// ============================================================
+
+// generateDtors generates destructor functions for all types that need
+// destruction in the current module. Called after struct fields are populated.
+func generateDtors(m @Module) {
+	// Full package path so it matches the full-path prefix of
+	// qualified struct names (e.g. `pkg/binate/ast`); the local-vs-extern
+	// classification below compares dotPrefix(ms.Name) against it.
+	var modPkg @[]char = mangle.PkgPathFromQuoted(m.Name)
+
+	// Track generated dtor names to avoid duplicates
+	var generated @[]@[]char
+
+	// Pass 1: local struct dtors (unqualified names, including anonymous)
+	for i := 0; i < len(moduleStructs); i++ {
+		var ms ModuleStruct = moduleStructs[i]
+		if ms.Typ == nil { continue }
+		if hasDot(ms.Name) { continue }
+		if !ms.Typ.NeedsDestruction() { continue }
+		var dname @[]char = dtorNameForType(ms.Typ)
+		if !hasName(generated, dname) {
+			var dtorFunc @Func = genStructDtorWithName(dname, ms.Typ)
+			m.AddFunc(dtorFunc)
+			generated = slices.Append[@[]char](generated, dname)
+		}
+	}
+
+	// Pass 2: qualified struct names
+	for i := 0; i < len(moduleStructs); i++ {
+		var ms ModuleStruct = moduleStructs[i]
+		if ms.Typ == nil { continue }
+		if !hasDot(ms.Name) { continue }
+		if !ms.Typ.NeedsDestruction() { continue }
+
+		var pkg *[]const char = dotPrefix(ms.Name)
+		var base *[]const char = dotSuffix(ms.Name)
+
+		if streq(pkg, modPkg) && !hasName(generated, dtorName(base)) {
+			var dname @[]char = dtorName(base)
+			var dtorFunc @Func = genStructDtorWithName(dname, ms.Typ)
+			m.AddFunc(dtorFunc)
+			generated = slices.Append[@[]char](generated, dname)
+		} else if !streq(pkg, modPkg) {
+			declareExternDtor(m, qualifiedDtorName(ms.Name))
+		}
+	}
+
+	// Pass 3: scan all generated dtor functions and local code for
+	// managed-slice and managed-ptr types that need their own dtors.
+	// We collect types from struct fields, then generate dtors for them.
+	generateNonStructDtors(m, modPkg, generated)
+}
+
+// generateNonStructDtors generates dtors for managed-slice types found in
+// struct fields and in pendingMsDtors (collected during function IR gen).
+func generateNonStructDtors(m @Module, modPkg @[]char, generated @[]@[]char) {
+	// From LOCAL struct fields only (skip cross-package structs)
+	for i := 0; i < len(moduleStructs); i++ {
+		var ms ModuleStruct = moduleStructs[i]
+		if ms.Typ == nil { continue }
+		if !ms.Typ.NeedsDestruction() { continue }
+		// Skip cross-package structs — their dtors are in their own package
+		var isLocal bool = !hasDot(ms.Name)
+		if hasDot(ms.Name) {
+			if streq(dotPrefix(ms.Name), modPkg) {
+				isLocal = true
+			}
+		}
+		if !isLocal { continue }
+		for j := 0; j < len(ms.Typ.Fields); j++ {
+			var ft @types.Type = ms.Typ.Fields[j].Type.ResolveAlias()
+			if ft.Kind == types.TYP_MANAGED_SLICE {
+				generated = ensureMsDtor(m, ft, generated)
+			}
+			if ft.Kind == types.TYP_ARRAY && ft.Elem.NeedsDestruction() {
+				generated = ensureArrayDtor(m, ft, generated)
+			}
+		}
+	}
+
+	// From pending registrations (emitManagedSliceRefDec during function gen)
+	for i := 0; i < len(pendingMsDtors); i++ {
+		generated = ensureMsDtor(m, pendingMsDtors[i], generated)
+	}
+
+	// From pending struct/array registrations (scope cleanup during function gen)
+	for i := 0; i < len(pendingStructDtors); i++ {
+		var pst @types.Type = pendingStructDtors[i]
+		if pst.Kind == types.TYP_ARRAY && pst.Elem.NeedsDestruction() {
+			generated = ensureArrayDtor(m, pst, generated)
+		}
+		// Generate struct dtor if not already generated (e.g., anonymous
+		// structs from multi-return that aren't in moduleStructs).
+		if pst.Kind == types.TYP_STRUCT && pst.NeedsDestruction() {
+			// Cross-package struct dtors belong to the defining
+			// package (which already emits them as `pkg/X.__dtor_T`,
+			// mangled `bn_pkg__X____dtor_T`).  Generating a local
+			// duplicate here via `dtorNameForType` would produce
+			// `__dtor_pkg/X.T`, mangled `bn___dtor_pkg__X__T` — a
+			// *different* symbol from the OP_FUNC_HANDLE reference
+			// (which `qualifiedDtorName` aligns with the defining
+			// package's shape).  The mismatch leaves the local
+			// duplicate unused, weak-collides with the defining
+			// package's `__vt` on Mach-O strict-symbol semantics,
+			// and breaks the macOS aa64 self-host lane.  Mirror
+			// the pass-2 (moduleStructs) cross-package gate: declare
+			// the extern, skip generation.  Pass 2 may have already
+			// declared the same extern from a moduleStruct entry —
+			// gate via funcAlreadyDeclared so we don't redefine the
+			// LLVM `declare` line.
+			if hasDot(pst.Name) &&
+					!streq(dotPrefix(pst.Name), modPkg) {
+				var extName @[]char = qualifiedDtorName(pst.Name)
+				if !funcAlreadyDeclared(m, extName) {
+					declareExternDtor(m, extName)
+				}
+				continue
+			}
+			var dname @[]char = dtorNameForType(pst)
+			if !hasName(generated, dname) {
+				var dtorFunc @Func = genStructDtorWithName(dname, pst)
+				m.AddFunc(dtorFunc)
+				generated = slices.Append[@[]char](generated, dname)
+			}
+			for j := 0; j < len(pst.Fields); j++ {
+				var ft @types.Type = pst.Fields[j].Type.ResolveAlias()
+				if ft.Kind == types.TYP_MANAGED_SLICE {
+					generated = ensureMsDtor(m, ft, generated)
+				}
+				if ft.Kind == types.TYP_ARRAY && ft.Elem.NeedsDestruction() {
+					generated = ensureArrayDtor(m, ft, generated)
+				}
+			}
+		}
+	}
+}
+
+// ensureMsDtor ensures a managed-slice dtor exists for the given type,
+// recursively generating dtors for nested managed-slice element types.
+func ensureMsDtor(m @Module, msTyp @types.Type, generated @[]@[]char) @[]@[]char {
+	var name @[]char = dtorNameForType(msTyp)
+	if hasName(generated, name) { return generated }
+	// If element type is also a managed-slice that needs a dtor, generate it first
+	var elemTyp @types.Type = msTyp.Elem
+	if elemTyp != nil && elemTyp.Kind == types.TYP_MANAGED_SLICE {
+		generated = ensureMsDtor(m, elemTyp, generated)
+	}
+	var dtorFunc @Func = genManagedSliceDtor(name, msTyp)
+	m.AddFunc(dtorFunc)
+	generated = slices.Append[@[]char](generated, name)
+	return generated
+}
+
+// ensureArrayDtor ensures an array dtor exists for the given type.
+func ensureArrayDtor(m @Module, arrTyp @types.Type, generated @[]@[]char) @[]@[]char {
+	var name @[]char = dtorNameForType(arrTyp)
+	if hasName(generated, name) { return generated }
+	// If element type needs a dtor too (nested array, managed-slice, etc.), ensure it
+	var elemTyp @types.Type = arrTyp.Elem
+	if elemTyp != nil {
+		if elemTyp.Kind == types.TYP_MANAGED_SLICE {
+			generated = ensureMsDtor(m, elemTyp, generated)
+		}
+		if elemTyp.Kind == types.TYP_ARRAY && elemTyp.Elem.NeedsDestruction() {
+			generated = ensureArrayDtor(m, elemTyp, generated)
+		}
+	}
+	var dtorFunc @Func = genArrayDtor(name, arrTyp)
+	m.AddFunc(dtorFunc)
+	generated = slices.Append[@[]char](generated, name)
+	return generated
+}
+
+// declareExternDtor adds an extern function declaration for a cross-package dtor.
+func declareExternDtor(m @Module, name @[]char) {
+	var ptrParam @Param = make(Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@Param = make_slice(@Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+	var ef @Func = NewExternFunc(name, params, noResults)
+	m.AddFunc(ef)
+}
+
+// ============================================================
+// Struct destructor generation
+// ============================================================
+
+// genStructDtor generates a destructor for a struct type.
+// For each field that NeedsDestruction:
+//   - @T: load managed ptr, RefDec with T's dtor
+//   - @[]T, struct, [N]T: get field pointer, call field type's dtor
+func genStructDtor(structName *[]const char, structTyp @types.Type) @Func {
+	return genStructDtorWithName(dtorName(structName), structTyp)
+}
+
+// genStructDtorWithName generates a destructor function with an explicit name for a struct type.
+func genStructDtorWithName(name @[]char, structTyp @types.Type) @Func {
+	var ptrParam @Param = make(Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@Param = make_slice(@Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+
+	var f @Func = NewFunc(name, params, noResults)
+	f.IsLinkOnce = true
+	var b @Block = AddBlock(f, "entry")
+
+	// Reference to parameter 0
+	var rawPtr @Instr = make(Instr)
+	rawPtr.ID = f.Params[0].ID
+	rawPtr.Typ = f.Params[0].Typ
+	rawPtr.Op = OP_CONST_INT
+
+	// Bitcast to struct pointer
+	var structPtrTyp @types.Type = types.MakePointerType(structTyp)
+	var structPtr @Instr = b.EmitBitCast(rawPtr, structPtrTyp)
+
+	for i := 0; i < len(structTyp.Fields); i++ {
+		var fieldTyp @types.Type = structTyp.Fields[i].Type
+		if !fieldTyp.NeedsDestruction() { continue }
+		fieldTyp = fieldTyp.ResolveAlias()
+
+		if fieldTyp.Kind == types.TYP_MANAGED_PTR {
+			// @T field: load the managed pointer, RefDec with pointee dtor
+			var fieldPtr @Instr = b.EmitGetFieldPtr(structPtr, i, fieldTyp)
+			var fieldVal @Instr = b.EmitLoad(fieldPtr, fieldTyp)
+			emitManagedPtrRefDec(f, b, fieldVal)
+		} else if fieldTyp.Kind == types.TYP_MANAGED_SLICE {
+			// @[]T field: if elements need destruction, call managed-slice dtor;
+			// otherwise just RefDec the backing.
+			var fieldPtr @Instr = b.EmitGetFieldPtr(structPtr, i, fieldTyp)
+			var fieldVal @Instr = b.EmitLoad(fieldPtr, fieldTyp)
+			if fieldTyp.Elem != nil && fieldTyp.Elem.NeedsDestruction() {
+				// Elements need destruction — call managed-slice dtor
+				var fieldRawPtr @Instr = b.EmitBitCast(fieldPtr, types.MakePointerType(types.TypUint8()))
+				var msArgs @[]@Instr = make_slice(@Instr, 1)
+				msArgs[0] = fieldRawPtr
+				b.EmitCall(dtorNameForType(fieldTyp), msArgs, types.TypVoid())
+			} else {
+				// No element destruction needed — just RefDec the backing
+				var refptr @Instr = b.EmitExtract(fieldVal, 2, types.MakeManagedPtrType(nil))
+				b.EmitRefDec(refptr)
+			}
+		} else {
+			// struct, [N]T stored inline: get field pointer, call dtor
+			var fieldPtr @Instr = b.EmitGetFieldPtr(structPtr, i, fieldTyp)
+			var fieldRawPtr @Instr = b.EmitBitCast(fieldPtr, types.MakePointerType(types.TypUint8()))
+			emitDtorOrCopyCall(f, b, qualifiedDtorNameForType(fieldTyp), fieldRawPtr)
+		}
+	}
+
+	var noRetVals @[]@Instr
+	b.EmitReturn(noRetVals)
+	return f
+}
+
+// ============================================================
+// Managed-slice destructor generation
+// ============================================================
+
+// genManagedSliceDtor generates a destructor for a managed-slice type @[]T.
+// It checks if the backing is the last reference, iterates elements to
+// clean them up, then RefDec's the backing allocation.
+func genManagedSliceDtor(name @[]char, msTyp @types.Type) @Func {
+	var ptrParam @Param = make(Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@Param = make_slice(@Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+
+	var f @Func = NewFunc(name, params, noResults)
+	f.IsLinkOnce = true
+	var entry @Block = AddBlock(f, "entry")
+
+	// Reference to parameter 0
+	var rawPtr @Instr = make(Instr)
+	rawPtr.ID = f.Params[0].ID
+	rawPtr.Typ = f.Params[0].Typ
+	rawPtr.Op = OP_CONST_INT
+
+	// Bitcast to managed-slice pointer, load the 4-word value
+	var msPtrTyp @types.Type = types.MakePointerType(msTyp)
+	var msPtr @Instr = entry.EmitBitCast(rawPtr, msPtrTyp)
+	var msVal @Instr = entry.EmitLoad(msPtr, msTyp)
+
+	// Extract backing refptr
+	var refptr @Instr = entry.EmitExtract(msVal, 2, types.MakeManagedPtrType(nil))
+
+	var elemTyp @types.Type = msTyp.Elem
+
+	// If elements don't need destruction, just RefDec the backing and return
+	if !elemTyp.NeedsDestruction() {
+		entry.EmitRefDec(refptr)
+		var noRetVals2 @[]@Instr
+		entry.EmitReturn(noRetVals2)
+		return f
+	}
+
+	var backingLen @Instr = entry.EmitExtract(msVal, 3, types.TypInt())
+	// Use refptr (backing start) for element iteration, not data ptr.
+	// After subslicing, data may point into the middle of the backing.
+	var backingPtr @Instr = entry.EmitBitCast(refptr, types.MakePointerType(types.TypUint8()))
+
+	// Check: refcount == 1 (last reference, safe to clean up elements)
+	var rcArgs @[]@Instr = make_slice(@Instr, 1)
+	rcArgs[0] = refptr
+	var rc @Instr = entry.EmitCall("pkg/rt.Refcount", rcArgs, types.TypInt())
+	var one @Instr = entry.EmitConstInt(1, types.TypInt())
+	var isLast @Instr = entry.EmitBinop(OP_EQ, rc, one, types.TypBool())
+
+	var loopInit @Block = AddBlock(f, "ms_dtor_init")
+	var exitBlock @Block = AddBlock(f, "ms_dtor_exit")
+
+	entry.EmitBranch(isLast, loopInit, exitBlock)
+
+	// Loop counter via alloca
+	var iSlot @Instr = loopInit.EmitAlloc(types.TypInt())
+	var zero @Instr = loopInit.EmitConstInt(0, types.TypInt())
+	loopInit.EmitStore(iSlot, zero)
+
+	var loopCond @Block = AddBlock(f, "ms_dtor_cond")
+	loopInit.EmitJump(loopCond)
+
+	// Loop condition: i < backing_len
+	var iv @Instr = loopCond.EmitLoad(iSlot, types.TypInt())
+	var cmp @Instr = loopCond.EmitBinop(OP_LT, iv, backingLen, types.TypBool())
+	var loopBody @Block = AddBlock(f, "ms_dtor_body")
+	loopCond.EmitBranch(cmp, loopBody, exitBlock)
+
+	// Loop body: compute element address, call element cleanup
+	var elemSize @Instr = loopBody.EmitConstInt(elemTyp.SizeOf(), types.TypInt())
+	var offset @Instr = loopBody.EmitBinop(OP_MUL, iv, elemSize, types.TypInt())
+	var elemAddr @Instr = loopBody.EmitGetElemPtr(backingPtr, offset, types.TypUint8())
+	var elemRawPtr @Instr = loopBody.EmitBitCast(elemAddr, types.MakePointerType(types.TypUint8()))
+
+	if elemTyp.Kind == types.TYP_MANAGED_PTR {
+		// Element is @T — load the pointer, RefDec with pointee dtor
+		var elemPtrTyp @types.Type = types.MakePointerType(elemTyp)
+		var typedElemPtr @Instr = loopBody.EmitBitCast(elemAddr, elemPtrTyp)
+		var elem @Instr = loopBody.EmitLoad(typedElemPtr, elemTyp)
+		emitManagedPtrRefDec(f, loopBody, elem)
+	} else {
+		// Element is struct, @[]T, [N]T — call element type's dtor
+		emitDtorOrCopyCall(f, loopBody, qualifiedDtorNameForType(elemTyp), elemRawPtr)
+	}
+
+	// Increment counter, loop back
+	var iNext @Instr = loopBody.EmitBinop(OP_ADD, iv, one, types.TypInt())
+	loopBody.EmitStore(iSlot, iNext)
+	loopBody.EmitJump(loopCond)
+
+	// Exit: RefDec the backing allocation (no dtor — it's raw memory)
+	exitBlock.EmitRefDec(refptr)
+
+	var noRetVals @[]@Instr
+	exitBlock.EmitReturn(noRetVals)
+	return f
+}
+
+// ============================================================
+// Array destructor generation
+// ============================================================
+
+// genArrayDtor generates a destructor for an array type [N]T.
+// It iterates N elements and calls element cleanup on each.
+func genArrayDtor(name @[]char, arrTyp @types.Type) @Func {
+	var ptrParam @Param = make(Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@Param = make_slice(@Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+
+	var f @Func = NewFunc(name, params, noResults)
+	f.IsLinkOnce = true
+	var entry @Block = AddBlock(f, "entry")
+
+	// Reference to parameter 0
+	var rawPtr @Instr = make(Instr)
+	rawPtr.ID = f.Params[0].ID
+	rawPtr.Typ = f.Params[0].Typ
+	rawPtr.Op = OP_CONST_INT
+
+	var elemTyp @types.Type = arrTyp.Elem
+	var arrLen int = arrTyp.ArrayLen
+
+	// Loop counter via alloca
+	var iSlot @Instr = entry.EmitAlloc(types.TypInt())
+	var zero @Instr = entry.EmitConstInt(0, types.TypInt())
+	entry.EmitStore(iSlot, zero)
+
+	var loopCond @Block = AddBlock(f, "arr_dtor_cond")
+	entry.EmitJump(loopCond)
+
+	// Loop condition: i < N
+	var iv @Instr = loopCond.EmitLoad(iSlot, types.TypInt())
+	var lenConst @Instr = loopCond.EmitConstInt(arrLen, types.TypInt())
+	var cmp @Instr = loopCond.EmitBinop(OP_LT, iv, lenConst, types.TypBool())
+	var loopBody @Block = AddBlock(f, "arr_dtor_body")
+	var exitBlock @Block = AddBlock(f, "arr_dtor_exit")
+	loopCond.EmitBranch(cmp, loopBody, exitBlock)
+
+	// Loop body: compute element address, call element cleanup
+	var one @Instr = loopBody.EmitConstInt(1, types.TypInt())
+	var elemSize @Instr = loopBody.EmitConstInt(elemTyp.SizeOf(), types.TypInt())
+	var offset @Instr = loopBody.EmitBinop(OP_MUL, iv, elemSize, types.TypInt())
+	var elemAddr @Instr = loopBody.EmitGetElemPtr(rawPtr, offset, types.TypUint8())
+	var elemRawPtr @Instr = loopBody.EmitBitCast(elemAddr, types.MakePointerType(types.TypUint8()))
+
+	if elemTyp.Kind == types.TYP_MANAGED_PTR {
+		var elemPtrTyp @types.Type = types.MakePointerType(elemTyp)
+		var typedElemPtr @Instr = loopBody.EmitBitCast(elemAddr, elemPtrTyp)
+		var elem @Instr = loopBody.EmitLoad(typedElemPtr, elemTyp)
+		emitManagedPtrRefDec(f, loopBody, elem)
+	} else {
+		emitDtorOrCopyCall(f, loopBody, qualifiedDtorNameForType(elemTyp), elemRawPtr)
+	}
+
+	// Increment counter, loop back
+	var iNext @Instr = loopBody.EmitBinop(OP_ADD, iv, one, types.TypInt())
+	loopBody.EmitStore(iSlot, iNext)
+	loopBody.EmitJump(loopCond)
+
+	// Exit
+	var noRetVals @[]@Instr
+	exitBlock.EmitReturn(noRetVals)
+	return f
+}
+
+// ============================================================
+// Indirect call helper
+// ============================================================
+
+// emitDtorOrCopyCall emits a direct call to a type-specific dtor or
+// copy function on a field / element pointer: `<name>(arg)`.  Named
+// vague-ly because both gen_dtor_emit.bn and gen_copy_emit.bn share
+// it.  Misleadingly used to be called "emitIndirectCall" and took an
+// OP_FUNC_ADDR instr that the body then unpacked via `.StrVal` —
+// purely as a name carrier — but that produced a dead OP_FUNC_ADDR
+// instr in the IR for every dtor/copy call.  Direct OP_CALL is what
+// every dtor / copy invocation has actually been all along.
+func emitDtorOrCopyCall(f @Func, b @Block, name @[]char, arg @Instr) {
+	var args @[]@Instr = make_slice(@Instr, 1)
+	args[0] = arg
+	b.EmitCall(name, args, types.TypVoid())
+}
+
+// ============================================================
+// Utility functions
+// ============================================================
+
+// shortPkgName extracts the short package name from a quoted path (e.g., "pkg/binate/ir" -> "ir").
+func shortPkgName(name @[]char) @[]char {
+	var start int = 0
+	var end int = len(name)
+	if end > 0 && name[0] == '"' { start = 1 }
+	if end > 1 && name[end-1] == '"' { end = end - 1 }
+	var lastSlash int = -1
+	for i := start; i < end; i++ {
+		if name[i] == '/' { lastSlash = i }
+	}
+	if lastSlash >= 0 {
+		return name[lastSlash+1:end]
+	}
+	return name[start:end]
+}
+
+// dotPrefix returns the substring before the first dot (e.g., "ast.File" -> "ast").
+func dotPrefix(s *[]const char) *[]const char {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '.' { return s[0:i] }
+	}
+	return s
+}
+
+// dotSuffix returns the substring after the first dot (e.g., "ast.File" -> "File").
+func dotSuffix(s *[]const char) *[]const char {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '.' { return s[i+1:len(s)] }
+	}
+	return s
+}
+
+// hasDot returns true if the string contains a dot character.
+func hasDot(s *[]const char) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '.' { return true }
+	}
+	return false
+}
+
+// hasName returns true if the name exists in the given list.
+func hasName(names @[]@[]char, name *[]const char) bool {
+	for i := 0; i < len(names); i++ {
+		if streq(names[i], name) { return true }
+	}
+	return false
+}
+
+// funcAlreadyDeclared reports whether `name` already appears in
+// m.Funcs (as either a defined function or an extern declaration).
+// Used by the cross-package dtor/copy-skip gate to avoid emitting a
+// second `declare void @bn_…(i8*)` line when an earlier pass — or
+// emitManagedSliceRefDec's transitive walk — has already declared
+// the same extern.  LLVM treats a duplicate declaration as an
+// invalid redefinition.
+func funcAlreadyDeclared(m @Module, name *[]const char) bool {
+	for i := 0; i < len(m.Funcs); i++ {
+		if streq(m.Funcs[i].Name, name) { return true }
+	}
+	return false
+}

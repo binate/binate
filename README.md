@@ -37,7 +37,7 @@ BUILDER="$(scripts/fetch-builder.sh)"
 /tmp/bni examples/selftest.bn
 
 # Run unit tests for some packages.
-./scripts/unittest/run.sh builder-comp pkg/types pkg/loader
+./scripts/unittest/run.sh builder-comp pkg/types pkg/binate/loader
 
 # Run conformance tests.
 ./conformance/run.sh builder-comp

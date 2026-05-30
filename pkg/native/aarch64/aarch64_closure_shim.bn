@@ -15,14 +15,18 @@ import "pkg/types"
 // closures are not yet supported):
 //
 //   shim:
-//     <shift user args X1..XM up to X(N+1)..X(N+M)>
-//     <load captures X(N-1) .. X1 from [X0, #off_i]>
+//     <shift user args X1..XM up to X(W+1)..X(W+M)>
+//     <load captures' words X(W-1) .. X1 from [X0, #off_*]>
 //     <load X0 from [X0, #off_0]>  // overwrites base last
 //     B underlying_fn
 //
-// The shift is right-to-left so user args don't overwrite each
-// other; the capture loads are right-to-left so X0 stays valid as
-// the closure-struct base until the last load.
+// W is the TOTAL capture-word count (not the capture *count*) — a
+// multi-word capture (e.g., a managed-slice taking 3 consecutive
+// registers under AAPCS64) is loaded into multiple registers and
+// the user-arg shift accounts for them.  The shift is right-to-
+// left so user args don't overwrite each other; the capture loads
+// are right-to-left so X0 stays valid as the closure-struct base
+// until the last word is loaded.
 
 // lookupClosureFuncAA64 returns the Func with the given name iff
 // it is a capturing-literal closure (IsClosure=true).  Returns nil
@@ -40,51 +44,74 @@ func lookupClosureFuncAA64(mod @ir.Module, name @[]char) @ir.Func {
 // capturing closure.  Caller has already emitted the label and
 // SetWeak; this writes the shim body.
 //
-// Constraints for B.2:
+// Constraints for B.2 / B.3a:
 //   - scalar / void return only (return size ≤ 8 bytes)
-//   - captures fit one word each (CAP_VAL int / CAP_RAW_PTR — what
-//     B.2 supports in the type-checker)
-//   - NumCaptureParams + nUserWords ≤ 8 (must fit in X0..X7)
+//   - captureWords + nUserWords ≤ 8 (must fit in X0..X7).
+//     captureWords is the SUM of common.ArgWords over capture types,
+//     so a single @[]T capture already consumes 3 of the 8 slots.
 //
 // Beyond these the shim falls back to a no-op tail-branch to the
 // underlying — produces wrong code but doesn't crash the assembler;
-// rare in practice (B.2 conformance test stays well within the cap).
+// rare in practice (current conformance tests stay well within
+// the cap).
 func emitClosureShim(a @asm.Assembler, fnLabel @[]char,
 		fvTyp @types.Type, f @ir.Func) {
-	var n int = f.NumCaptureParams
+	var captureWords int = totalCaptureWordsAA64(f)
 	var nUserWords int = 0
 	for pi := 0; pi < len(fvTyp.Params); pi++ {
 		nUserWords = nUserWords +
 			common.ArgWords(fvTyp.Params[pi].Type)
 	}
-	if n + nUserWords > 8 {
+	if captureWords + nUserWords > 8 {
 		// Beyond register-arg budget.  Tail-branch as a fallback —
 		// behavior is wrong but the assembler doesn't blow up.
 		a.SetGlobal(fnLabel)
 		aarch64.B(a, fnLabel)
 		return
 	}
-	// Step 1: shift user args X1..XM → X(N+1)..X(N+M), right-to-left.
-	// User arg at incoming X(j+1) goes to outgoing X(N+j+1-1+1) =
-	// X(N+j+1)... wait let me re-derive: the underlying expects
-	// captures in X0..X(N-1) and user args in X(N)..X(N+M-1).  Our
-	// incoming has data in X0 and user args in X1..XM.  So user
-	// arg j (0-indexed) at X(j+1) must move to X(N+j).
+	// Step 1: shift user args X1..XM → X(W+1)..X(W+M), right-to-left.
+	// The underlying expects capture words in X0..X(W-1) and user-
+	// arg words in X(W)..X(W+M-1).  Our incoming has data in X0
+	// and user-arg words in X1..XM.  So user-arg word j (0-indexed)
+	// at X(j+1) moves to X(W+j).
 	for j := nUserWords - 1; j >= 0; j = j - 1 {
 		var srcReg int = argReg(j + 1)
-		var dstReg int = argReg(n + j)
+		var dstReg int = argReg(captureWords + j)
 		if srcReg != dstReg {
 			aarch64.Mov(a, true, dstReg, aarch64.Reg(srcReg))
 		}
 	}
-	// Step 2: load captures from [X0, #offset_i] into X0..X(N-1).
-	// Right-to-left order: load X0 last because it's the base.
-	for i := n - 1; i >= 0; i = i - 1 {
-		var ofs int = f.ClosureStruct.FieldOffset(i)
-		aarch64.Ldr(a, true, argReg(i),
-			aarch64.MemImm(aarch64.X0, ofs))
+	// Step 2: load capture words from [X0, #offset+k*8] into
+	// X0..X(W-1).  Right-to-left so X0 (the closure-struct base)
+	// stays valid until the last load.  A multi-word capture
+	// (e.g., @[]T = 3 words at AAPCS64) loads `wordCount`
+	// consecutive registers from `wordCount` consecutive 8-byte
+	// slots starting at the field's offset.
+	var w int = captureWords
+	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var wordCount int = common.ArgWords(ft)
+		var baseOfs int = f.ClosureStruct.FieldOffset(i)
+		for k := wordCount - 1; k >= 0; k = k - 1 {
+			w = w - 1
+			aarch64.Ldr(a, true, argReg(w),
+				aarch64.MemImm(aarch64.X0, baseOfs + k * 8))
+		}
 	}
 	// Step 3: tail-branch to underlying.
 	a.SetGlobal(fnLabel)
 	aarch64.B(a, fnLabel)
+}
+
+// totalCaptureWordsAA64 sums the AAPCS64 register-word footprint of
+// each capture-type — scalars / pointers are 1, managed-slice is 3,
+// managed function-value is 2, etc.  Used by emitClosureShim to
+// budget X0..X7 register-arg slots and to compute the user-arg
+// shift target index.
+func totalCaptureWordsAA64(f @ir.Func) int {
+	var w int = 0
+	for i := 0; i < f.NumCaptureParams; i++ {
+		w = w + common.ArgWords(f.ClosureStruct.Fields[i].Type)
+	}
+	return w
 }

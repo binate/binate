@@ -18,16 +18,20 @@ import "pkg/types"
 // closures are not yet supported):
 //
 //   shim:
-//     <shift user args argReg(1..M) up to argReg(N..N+M-1)>
-//     <load captures argReg(N-1)..argReg(1) from [RDI + off_i]>
+//     <shift user args argReg(1..M) up to argReg(W..W+M-1)>
+//     <load capture words argReg(W-1)..argReg(1) from [RDI + off_*]>
 //     <load argReg(0) (= RDI) from [RDI + off_0]>  // overwrites
 //                                                  // base last
 //     JMP underlying_fn
 //
-// The user-arg shift is right-to-left (highest dst first) so source
-// regs are read before being overwritten.  The capture loads are
-// right-to-left so RDI stays valid as the closure-struct base
-// until the last load (which reads [RDI + off_0] then writes RDI).
+// W is the TOTAL capture-word count under the SysV ABI (not the
+// capture *count*) — a multi-word capture (e.g., a managed-slice
+// at 3 consecutive registers) is loaded into multiple registers
+// and the user-arg shift accounts for them.  The user-arg shift
+// is right-to-left (highest dst first) so source regs are read
+// before being overwritten.  The capture loads are right-to-left
+// so RDI stays valid as the closure-struct base until the last
+// word is loaded (which reads [RDI + off_0] then writes RDI).
 
 // lookupClosureFunc_x64 returns the Func with the given name iff
 // it is a capturing-literal closure (IsClosure=true).  Returns nil
@@ -58,49 +62,72 @@ func charsEq_closureshim_x64(a *[]const char, b *[]const char) bool {
 // for a capturing closure.  Caller has already emitted the label
 // and SetWeak; this writes the shim body.
 //
-// Constraints for B.2:
+// Constraints for B.2 / B.3a:
 //   - scalar / void return only (return size ≤ 8 bytes)
-//   - captures fit one word each (CAP_VAL int / CAP_RAW_PTR — what
-//     B.2 supports in the type-checker)
-//   - NumCaptureParams + nUserWords ≤ 6 (must fit in RDI..R9)
+//   - captureWords + nUserWords ≤ 6 (must fit in RDI..R9).
+//     captureWords is the SUM of common.ArgWords over capture
+//     types, so a single @[]T capture already consumes 3 of the 6
+//     slots.
 //
 // Beyond these the shim falls back to a plain tail-jump to the
 // underlying — wrong behavior but doesn't crash the assembler.
 func emitClosureShim_x64(a @asm.Assembler, fnLabel @[]char,
 		fvTyp @types.Type, f @ir.Func) {
-	var n int = f.NumCaptureParams
+	var captureWords int = totalCaptureWords_x64(f)
 	var nUserWords int = 0
 	for pi := 0; pi < len(fvTyp.Params); pi++ {
 		nUserWords = nUserWords +
 			common.ArgWords(fvTyp.Params[pi].Type)
 	}
-	if n + nUserWords > 6 {
+	if captureWords + nUserWords > 6 {
 		// Beyond register-arg budget.  Fall back to plain jump.
 		a.SetGlobal(fnLabel)
 		x64.Jmp(a, fnLabel)
 		return
 	}
-	// Step 1: shift user args at argReg(1..M) to argReg(N..N+M-1).
-	// Right-to-left (j high to low) so each source is read before
-	// being overwritten.  When N == 1 the shift is a no-op (src
-	// == dst at each j).
+	// Step 1: shift user args at argReg(1..M) to
+	// argReg(W..W+M-1).  Right-to-left (j high to low) so each
+	// source is read before being overwritten.  When W == 1 the
+	// shift is a no-op (src == dst at each j).
 	for j := nUserWords - 1; j >= 0; j = j - 1 {
 		var srcReg int = argReg(j + 1)
-		var dstReg int = argReg(n + j)
+		var dstReg int = argReg(captureWords + j)
 		if srcReg != dstReg {
 			x64.Mov(a, x64.Reg(dstReg, x64.SZ64),
 				x64.Reg(srcReg, x64.SZ64))
 		}
 	}
-	// Step 2: load captures from [RDI + off_i] into argReg(i),
-	// right-to-left so RDI stays valid as the base until the last
-	// load (which is the i=0 self-load: RDI <- [RDI + off_0]).
-	for i := n - 1; i >= 0; i = i - 1 {
-		var ofs int = f.ClosureStruct.FieldOffset(i)
-		x64.Mov(a, x64.Reg(argReg(i), x64.SZ64),
-			x64.Mem(x64.RDI, ofs, x64.SZ64))
+	// Step 2: load capture words from [RDI + off+k*8] into
+	// argReg(0..W-1).  Right-to-left so RDI stays valid as the
+	// base until the last load (the i=0,k=0 self-load:
+	// RDI <- [RDI + off_0]).  A multi-word capture (e.g., @[]T)
+	// loads `wordCount` consecutive registers from `wordCount`
+	// consecutive 8-byte slots starting at the field's offset.
+	var w int = captureWords
+	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var wordCount int = common.ArgWords(ft)
+		var baseOfs int = f.ClosureStruct.FieldOffset(i)
+		for k := wordCount - 1; k >= 0; k = k - 1 {
+			w = w - 1
+			x64.Mov(a, x64.Reg(argReg(w), x64.SZ64),
+				x64.Mem(x64.RDI, baseOfs + k * 8, x64.SZ64))
+		}
 	}
 	// Step 3: tail-jump to the underlying lifted function.
 	a.SetGlobal(fnLabel)
 	x64.Jmp(a, fnLabel)
+}
+
+// totalCaptureWords_x64 sums the SysV register-word footprint of
+// each capture-type — scalars / pointers are 1, managed-slice is
+// 3, managed function-value is 2, etc.  Used by emitClosureShim_x64
+// to budget RDI..R9 register-arg slots and to compute the user-arg
+// shift target index.
+func totalCaptureWords_x64(f @ir.Func) int {
+	var w int = 0
+	for i := 0; i < f.NumCaptureParams; i++ {
+		w = w + common.ArgWords(f.ClosureStruct.Fields[i].Type)
+	}
+	return w
 }

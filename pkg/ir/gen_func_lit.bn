@@ -25,10 +25,15 @@ import "pkg/types"
 //      tell backends to emit a shim that reads the captures out of
 //      the data pointer before tail-calling the lifted body.
 //
-// B.2 status: CAP_VAL + CAP_RAW_PTR captures supported; CAP_MANAGED
-// captures are gated to B.3 (need RefInc/RefDec around the closure
-// struct's lifetime).  All literals use the *func (stack-alloc)
-// form; @func heap-allocation also lands in B.3.
+// B.3a status: CAP_MANAGED captures now supported for *func.
+// Closure struct is registered in moduleStructs so generateDtors
+// synthesizes a struct-dtor that RefDec's each managed field, and
+// the closure alloca is registered in ctx.Vars so the frame-end
+// emitDecForManagedLocals pass runs that dtor on it.  At the
+// capture site we RefInc each managed-captured value before
+// storing it into the field, balancing the dtor's later RefDec.
+// All literals still use the *func (stack-alloc) form; @func heap-
+// allocation lands in B.3b.
 
 // resetFuncLitState resets the per-package function-literal state at
 // the start of a GeneratePackage / GenModule call. The Module handle
@@ -56,15 +61,6 @@ func genFuncLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 	}
 
 	var captures @[]@ast.Capture = d.Captures
-	// B.2 supports CAP_VAL + CAP_RAW_PTR only.  CAP_MANAGED captures
-	// need RefInc on capture + RefDec at end-of-scope — that's B.3.
-	for i := 0; i < len(captures); i++ {
-		if captures[i].Kind == ast.CAP_MANAGED {
-			println("ir/gen_func_lit: managed-pointer captures are not yet implemented")
-			println("  (Phase 2 B.3 of plan-function-values-phase-2.md)")
-			bootstrap.Exit(1)
-		}
-	}
 
 	// Allocate a fresh synthetic name.  Counter is per-package; the
 	// `__funclit_` prefix makes lifted names easy to spot in IR /
@@ -120,14 +116,28 @@ func genFuncLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 	// B.2 capturing path: stack-alloc the closure struct in the
 	// enclosing frame, read each capture's current value, store
 	// it into the struct, emit OP_FUNC_VALUE with the struct
-	// pointer as the data arg.
+	// pointer as the data arg.  For B.3a, each CAP_MANAGED capture
+	// also RefInc's the value before the store so the closure
+	// struct owns its own reference; the matching RefDec runs from
+	// the struct dtor we register below.
 	var closurePtr @Instr = b.EmitAlloc(closureStruct)
 	for i := 0; i < len(captures); i++ {
 		var capValue @Instr = genCaptureRead(ctx, b, captures[i],
 			captureTypes[i])
+		emitCaptureRefInc(ctx, b, capValue, captureTypes[i])
 		var fieldPtr @Instr = b.EmitGetFieldPtr(closurePtr, i,
 			captureTypes[i])
 		b.EmitStore(fieldPtr, capValue)
+	}
+	// B.3a: register the closure struct so generateDtors synthesizes
+	// a dtor that RefDec's each managed field, and register the
+	// closure-local in ctx.Vars so emitDecForManagedLocals's frame-
+	// end pass invokes that dtor on it.  Both are guarded on the
+	// struct actually NEEDING destruction (any CAP_MANAGED capture);
+	// pure CAP_VAL / CAP_RAW_PTR closures bypass both.
+	if closureStruct.NeedsDestruction() {
+		registerClosureStructForCleanup(closureStruct)
+		registerClosureLocalForCleanup(ctx, closurePtr, closureStruct, n)
 	}
 	var fv @Instr = b.EmitFuncValueWithData(d.Name, closurePtr, fnValTyp)
 	noteSPGrowingResult(ctx, fv)
@@ -219,6 +229,65 @@ func genCaptureRead(ctx @GenContext, b @Block, cap @ast.Capture,
 		bootstrap.Exit(1)
 	}
 	return b.EmitLoad(slot, typ)
+}
+
+// emitCaptureRefInc emits the refcount-acquire side of a managed
+// capture: RefInc for @T captures, the managed-slice refptr's
+// RefInc for @[]T, etc.  For non-managed captures (CAP_VAL,
+// CAP_RAW_PTR) it's a no-op — the caller can call it
+// unconditionally and rely on the kind switch.  Used by the B.3a
+// path in genFuncLit; the matching RefDec runs from the closure-
+// struct dtor at frame-end cleanup.
+func emitCaptureRefInc(ctx @GenContext, b @Block, val @Instr,
+		t @types.Type) {
+	if t == nil { return }
+	var rt @types.Type = t.ResolveAlias()
+	if rt == nil { return }
+	if rt.Kind == types.TYP_MANAGED_PTR {
+		b.EmitRefInc(val)
+		return
+	}
+	if rt.Kind == types.TYP_MANAGED_SLICE {
+		emitManagedSliceRefInc(ctx.Func, b, val)
+		return
+	}
+	// @Iface captures aren't reachable through the type-checker's
+	// CAP_MANAGED classification today (interface values are not
+	// addressable as plain locals in cmd/bnc's tree); add the
+	// branch here once they are.  See claude-todo.md.
+}
+
+// registerClosureStructForCleanup adds the closure struct type to
+// moduleStructs so generateDtors synthesizes its struct-dtor (which
+// walks the managed fields and emits RefDec for each).  Duplicate
+// registrations are guarded by Name equality — every literal site
+// has a unique `__closure___funclit_<n>` name within a package, but
+// gen_module's later re-entry on imports could otherwise double-
+// register the same struct.
+func registerClosureStructForCleanup(closureStruct @types.Type) {
+	for i := 0; i < len(moduleStructs); i++ {
+		if streq(moduleStructs[i].Name, closureStruct.Name) { return }
+	}
+	var ms ModuleStruct
+	ms.Name = closureStruct.Name
+	ms.Typ = closureStruct
+	ms.Fields = closureStruct.Fields
+	moduleStructs = slices.Append[ModuleStruct](moduleStructs, ms)
+}
+
+// registerClosureLocalForCleanup registers the alloca'd closure
+// struct in the enclosing function's ctx.Vars so the standard
+// frame-end emitDecForManagedLocals pass invokes the struct dtor
+// on it.  The synthetic name `__closure_local_<n>` is per-literal-
+// id (n is the funcLitCounter value from genFuncLit), guaranteed
+// unique within the enclosing function.  defineVar's IsParam=false
+// is what emitStructDtor needs to actually run.
+func registerClosureLocalForCleanup(ctx @GenContext, closurePtr @Instr,
+		closureStruct @types.Type, n int) {
+	var nameBuf buf.CharBuf = buf.New()
+	nameBuf = nameBuf.WriteStr("__closure_local_")
+	nameBuf = nameBuf.WriteStr(intToChars(n))
+	defineVar(ctx, nameBuf.Bytes(), closurePtr, closureStruct)
 }
 
 // synthFuncLitName builds the bare synthetic name for the n-th

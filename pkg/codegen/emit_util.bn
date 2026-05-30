@@ -256,3 +256,152 @@ func isStructElemFromSlice(sliceInstr @ir.Instr) bool {
 	}
 	return false
 }
+
+// isByvalParam reports whether an aggregate-typed parameter should be
+// passed via `ptr byval(<T>) align 8` rather than as a struct value.
+//
+// Threshold = 16 bytes — same as SysV-AMD64's AggregateInRegMax /
+// MEMORY-classification cutoff and AAPCS64's >16-byte indirect
+// threshold.  Aggregates at or below 16 B fit in (up to) 2 registers
+// on both target ABIs; LLVM's IR-level struct-value lowering covers
+// that case fine.  Aggregates above 16 B trigger ABI divergence
+// between LLVM's IR-level "spread" emission and the textbook
+// per-target ABI; emitting `byval` opts into the textbook lowering
+// on both arches.
+//
+// See explorations/plan-codegen-byval.md for the empirical evidence
+// (clang's emission for the same struct shapes) that picked this
+// threshold.
+func isByvalParam(t @types.Type) bool {
+	if t == nil { return false }
+	// Mirror pkg/native/common.IsAggregateTyp without taking a dep on it
+	// (codegen is a sibling of native; both depend on pkg/ir and pkg/types).
+	var k int = t.Kind
+	if k != types.TYP_STRUCT &&
+			k != types.TYP_ARRAY &&
+			k != types.TYP_SLICE &&
+			k != types.TYP_MANAGED_SLICE &&
+			k != types.TYP_FUNC_VALUE &&
+			k != types.TYP_MANAGED_FUNC_VALUE &&
+			k != types.TYP_INTERFACE_VALUE &&
+			k != types.TYP_INTERFACE_VALUE_MANAGED {
+		return false
+	}
+	return t.SizeOf() > 16
+}
+
+// writeParamTypeLLVM emits the LLVM IR type for a function parameter.
+// For aggregates that meet isByvalParam's threshold, this is
+// `ptr byval(<T>) align 8` (LLVM lowers to the target's textbook
+// indirect convention); otherwise the bare LLVM type.
+//
+// The corresponding call-site emitters (in emit_call.bn /
+// emit_call_handle.bn / emit_call_indirect.bn / emit_impls.bn) use
+// writeByvalArgLLVM to emit the matching argument shape.
+func writeParamTypeLLVM(out buf.CharBuf, t @types.Type) buf.CharBuf {
+	if isByvalParam(t) {
+		// Use a plain `ptr` (no `byval` attribute) so LLVM lowers
+		// the param as a regular pointer-in-register on both
+		// targets.  LLVM's `byval` attribute lowers DIFFERENTLY
+		// per arch: on x86_64 it lays the struct on caller's
+		// outgoing stack (`movups` copies into rsp+0); on
+		// AArch64 it ALSO lays the struct on stack via the
+		// AAPCS-byval path (not the "pointer in next X reg"
+		// that clang picks for plain `ptr` at the frontend).
+		// Emitting plain `ptr` everywhere keeps the lowering
+		// uniform — both arches pass the pointer in the next
+		// free GP arg reg, matching the native backends'
+		// IndirectLargeAggregates code path.  Caller is
+		// responsible for the alloca + memcpy at the call site
+		// (handled by writeByvalArgPreamble).
+		return out.WriteStr("ptr")
+	}
+	return out.WriteStr(llvmType(t))
+}
+
+// writeByvalArgPreamble emits the alloca + store that backs a byval
+// argument, BEFORE the call line.  Call sites pass through this in a
+// pre-emit loop (same shape as the existing width-cast pre-emit
+// loop in emitCall).
+//
+// LLVM `byval` semantics: caller has a memory location holding the
+// struct value; pass its pointer as the arg.  Some call-site arg
+// instructions in binate IR already have a backing alloca (the
+// managed-copy pattern: alloca + memcpy + load), but others don't
+// (sret-returning callees produce the struct value via a load
+// from %vN.sret, which is an LLVM-only name with no IR-level
+// Instr).  Always emitting a fresh alloca + store at the call site
+// covers every case uniformly.  At -O2+ LLVM elides the redundant
+// alloca when the source is already a memory location; at -O0 we
+// pay an extra memcpy per byval arg.  Correctness > perf for now.
+//
+// Allocas are named `%v<callID>.bv<i>` so each byval arg of each
+// call has a unique slot.  These allocas are NOT hoisted to the
+// entry block; LLVM AArch64 / x86 frontends tolerate non-entry
+// allocas for byval slots in our codepaths.  If a leak surfaces
+// (loop-body byval args creating heap allocas at each iteration),
+// hoist via the same machinery used for OP_ALLOC.
+func writeByvalArgPreamble(out buf.CharBuf, instr @ir.Instr) buf.CharBuf {
+	for i := 0; i < len(instr.Args); i++ {
+		var arg @ir.Instr = instr.Args[i]
+		if !isByvalParam(arg.Typ) { continue }
+		out = out.WriteStr("%v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".bv")
+		out = out.WriteInt(i)
+		out = out.WriteStr(" = alloca ")
+		out = out.WriteStr(llvmType(arg.Typ))
+		out = out.WriteStr("\n  store ")
+		out = out.WriteStr(llvmType(arg.Typ))
+		out = out.WriteByte(' ')
+		out = emitRef(out, arg.ID)
+		out = out.WriteStr(", ptr %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".bv")
+		out = out.WriteInt(i)
+		out = out.WriteStr("\n  ")
+	}
+	return out
+}
+
+// writeByvalArgLLVM emits one call-site argument for instr.Args[i].
+// Handles the byval branch (`ptr byval(<T>) align 8 %v<callID>.bv<i>`)
+// and the regular branch (`<T> <ref>` with optional width-cast naming),
+// both factored out so emit_call / emit_call_handle / emit_call_indirect /
+// emit_impls share the same arg-emission code.
+//
+// The byval-pointer reference always points at the
+// writeByvalArgPreamble-allocated `%v<callID>.bv<i>` slot, so this
+// function relies on the caller having emitted that preamble.
+func writeByvalArgLLVM(out buf.CharBuf, instr @ir.Instr, i int) buf.CharBuf {
+	var arg @ir.Instr = instr.Args[i]
+	if isByvalParam(arg.Typ) {
+		// Plain `ptr` — see writeParamTypeLLVM for why we don't
+		// emit `byval` here even though the semantics are
+		// byval-style (caller's alloca + memcpy is in the
+		// preamble).
+		out = out.WriteStr("ptr %v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".bv")
+		out = out.WriteInt(i)
+		return out
+	}
+	var argBits int = llvmTypeBits(arg)
+	var declBits int = typeBits(arg.Typ)
+	var targetBits int = declBits
+	var argTyp @[]char = llvmType(arg.Typ)
+	if targetBits != declBits {
+		argTyp = llvmTypeForBits(targetBits)
+	}
+	out = out.WriteStr(argTyp)
+	out = out.WriteByte(' ')
+	if argBits != targetBits && argBits > 0 && targetBits > 0 {
+		out = out.WriteStr("%v")
+		out = out.WriteInt(instr.ID)
+		out = out.WriteStr(".a")
+		out = out.WriteInt(i)
+	} else {
+		out = emitRef(out, arg.ID)
+	}
+	return out
+}

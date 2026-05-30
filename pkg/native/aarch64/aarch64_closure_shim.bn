@@ -4,6 +4,7 @@ import "pkg/asm"
 import "pkg/asm/aarch64"
 import "pkg/ir"
 import "pkg/native/common"
+import "pkg/slices"
 import "pkg/types"
 
 // Native aarch64 emission for the per-(literal, capture-shape) shim
@@ -11,22 +12,30 @@ import "pkg/types"
 // values-phase-2.md).  Split from aarch64.bn to keep that file under
 // the hygiene soft length cap.
 //
-// Closure shim shape (scalar / void return only — aggregate-return
-// closures are not yet supported):
+// Two paths, mirroring pkg/native/x64/x64_closure_shim.bn:
 //
-//   shim:
-//     <shift user args X1..XM up to X(W+1)..X(W+M)>
-//     <load captures' words X(W-1) .. X1 from [X0, #off_*]>
-//     <load X0 from [X0, #off_0]>  // overwrites base last
-//     B underlying_fn
+//   * Fast path — every outgoing arg lands in a GP arg register:
+//       shim:
+//         <shift user args X1..XM up to X(W+1)..X(W+M)>
+//         <load capture words X(W-1)..X1 from [X0, #off_*]>
+//         <load X0 from [X0, #off_0]>   // base clobbered last
+//         B underlying_fn
+//     W is the TOTAL capture-word count.
 //
-// W is the TOTAL capture-word count (not the capture *count*) — a
-// multi-word capture (e.g., a managed-slice taking 3 consecutive
-// registers under AAPCS64) is loaded into multiple registers and
-// the user-arg shift accounts for them.  The shift is right-to-
-// left so user args don't overwrite each other; the capture loads
-// are right-to-left so X0 stays valid as the closure-struct base
-// until the last word is loaded.
+//   * Stack-spill path — any outgoing arg classifies as MEMORY or
+//     gets pushed to the stack by AAPCS64's classifier (no
+//     remaining GP-reg budget):
+//       shim:
+//         SUB sp, sp, #stkBytes        ; stkBytes already 16-aligned
+//                                       ; by CallStackBytes
+//         <spill stack-bound args: [X0+ofs] → X16 → [SP+sof]>
+//         <move user-args incoming → outgoing positions>
+//         <load reg-bound captures: [X0+ofs] → argReg(rs)>
+//         BL underlying_fn
+//         ADD sp, sp, #stkBytes
+//         RET
+//     X16 is the AAPCS64 intra-call scratch (IP0); same role as
+//     RAX in the x64 stack-spill path.
 
 // lookupClosureFuncAA64 returns the Func with the given name iff
 // it is a capturing-literal closure (IsClosure=true).  Returns nil
@@ -42,38 +51,85 @@ func lookupClosureFuncAA64(mod @ir.Module, name @[]char) @ir.Func {
 
 // emitClosureShim emits the per-(literal, capture-shape) shim for a
 // capturing closure.  Caller has already emitted the label and
-// SetWeak; this writes the shim body.
+// SetWeak; this writes the shim body.  Picks fast-path or stack-
+// spill based on the AAPCS64 classifier's output for the outgoing
+// arg list.
 //
-// Constraints for B.2 / B.3a:
+// Constraints (apply to both paths):
 //   - scalar / void return only (return size ≤ 8 bytes)
-//   - captureWords + nUserWords ≤ 8 (must fit in X0..X7).
-//     captureWords is the SUM of common.ArgWords over capture types,
-//     so a single @[]T capture already consumes 3 of the 8 slots.
+//   - all incoming user-args fit in X1..X7 (≤ 7 incoming user-arg
+//     words after the data slot in X0).  Multi-word INCOMING args
+//     via the stack aren't handled yet.
 //
-// Beyond these the shim falls back to a no-op tail-branch to the
-// underlying — produces wrong code but doesn't crash the assembler;
-// rare in practice (current conformance tests stay well within
-// the cap).
+// Outside these constraints the shim falls back to plain `B` to
+// the underlying — wrong behavior but the assembler doesn't blow
+// up.
 func emitClosureShim(a @asm.Assembler, fnLabel @[]char,
 		fvTyp @types.Type, f @ir.Func) {
-	var captureWords int = totalCaptureWordsAA64(f)
+	var cc common.CallConv = common.AAPCS64()
+	var argTypes @[]@types.Type = buildShimArgTypesAA64(fvTyp, f)
 	var nUserWords int = 0
 	for pi := 0; pi < len(fvTyp.Params); pi++ {
 		nUserWords = nUserWords +
 			common.ArgWords(fvTyp.Params[pi].Type)
 	}
-	if captureWords + nUserWords > 8 {
-		// Beyond register-arg budget.  Tail-branch as a fallback —
-		// behavior is wrong but the assembler doesn't blow up.
+	if nUserWords > 7 {
+		// Incoming user-args overflow into the caller's stack —
+		// not yet handled.  Plain branch fallback.
 		a.SetGlobal(fnLabel)
 		aarch64.B(a, fnLabel)
 		return
 	}
-	// Step 1: shift user args X1..XM → X(W+1)..X(W+M), right-to-left.
-	// The underlying expects capture words in X0..X(W-1) and user-
-	// arg words in X(W)..X(W+M-1).  Our incoming has data in X0
-	// and user-arg words in X1..XM.  So user-arg word j (0-indexed)
-	// at X(j+1) moves to X(W+j).
+	if !shimNeedsStackSpillAA64(cc, argTypes) {
+		emitClosureShimFastAA64(a, fnLabel, fvTyp, f, nUserWords)
+		return
+	}
+	emitClosureShimStackSpillAA64(a, fnLabel, fvTyp, f, cc, argTypes,
+		nUserWords)
+}
+
+// buildShimArgTypesAA64 returns the type list for the OUTGOING call
+// the shim performs: captures first (in ClosureStruct field order),
+// then user-args.  Same shape the CallConv classifier expects for a
+// normal direct call.
+func buildShimArgTypesAA64(fvTyp @types.Type,
+		f @ir.Func) @[]@types.Type {
+	var argTypes @[]@types.Type
+	for i := 0; i < f.NumCaptureParams; i++ {
+		argTypes = slices.Append[@types.Type](argTypes,
+			f.ClosureStruct.Fields[i].Type)
+	}
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		argTypes = slices.Append[@types.Type](argTypes,
+			fvTyp.Params[pi].Type)
+	}
+	return argTypes
+}
+
+// shimNeedsStackSpillAA64 reports whether any arg in the outgoing
+// call ends up partially or wholly on the stack
+// (CallArgStackOff >= 0).  If none do, the simpler fast path (B,
+// no SP adjustment) suffices.  Under AAPCS64 (SplitAggregates =
+// true) an aggregate might have BOTH a regStart and a stackOff —
+// the SPLIT case — which still requires the stack-spill path.
+func shimNeedsStackSpillAA64(cc common.CallConv,
+		argTypes @[]@types.Type) bool {
+	for i := 0; i < len(argTypes); i++ {
+		if cc.CallArgStackOff(argTypes, i) >= 0 { return true }
+	}
+	return false
+}
+
+// emitClosureShimFastAA64 is the original register-only path.
+// Requires every outgoing arg to land wholly in a GP arg register.
+func emitClosureShimFastAA64(a @asm.Assembler, fnLabel @[]char,
+		fvTyp @types.Type, f @ir.Func, nUserWords int) {
+	var captureWords int = totalCaptureWordsAA64(f)
+	if captureWords + nUserWords > 8 {
+		a.SetGlobal(fnLabel)
+		aarch64.B(a, fnLabel)
+		return
+	}
 	for j := nUserWords - 1; j >= 0; j = j - 1 {
 		var srcReg int = argReg(j + 1)
 		var dstReg int = argReg(captureWords + j)
@@ -81,12 +137,6 @@ func emitClosureShim(a @asm.Assembler, fnLabel @[]char,
 			aarch64.Mov(a, true, dstReg, aarch64.Reg(srcReg))
 		}
 	}
-	// Step 2: load capture words from [X0, #offset+k*8] into
-	// X0..X(W-1).  Right-to-left so X0 (the closure-struct base)
-	// stays valid until the last load.  A multi-word capture
-	// (e.g., @[]T = 3 words at AAPCS64) loads `wordCount`
-	// consecutive registers from `wordCount` consecutive 8-byte
-	// slots starting at the field's offset.
 	var w int = captureWords
 	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
 		var ft @types.Type = f.ClosureStruct.Fields[i].Type
@@ -98,16 +148,136 @@ func emitClosureShim(a @asm.Assembler, fnLabel @[]char,
 				aarch64.MemImm(aarch64.X0, baseOfs + k * 8))
 		}
 	}
-	// Step 3: tail-branch to underlying.
 	a.SetGlobal(fnLabel)
 	aarch64.B(a, fnLabel)
 }
 
+// emitClosureShimStackSpillAA64 handles the AAPCS64 mixed-or-stack
+// case: at least one outgoing arg has a stack component.  Sets up a
+// proper call frame around BL.  Ordering:
+//   1. SUB sp, sp, #stkBytes  — reserve the outgoing-args area.
+//      stkBytes is already 16-byte-aligned by CallStackBytes, so SP
+//      stays 16-aligned (LR / FP are NOT pushed: the shim is a
+//      leaf-call frame, so the BL itself preserves alignment).
+//   2. Spill stack-bound capture words via X16 (AAPCS intra-call
+//      scratch).  Done first because X0 is the closure-struct base
+//      — steps 3 / 4 may overwrite it.
+//   3. Move user-args from incoming positions to outgoing positions.
+//      Process right-to-left so a forward shift reads each source
+//      before its slot becomes a destination.  Stack-bound outgoing
+//      user-args are written via plain Str (no scratch needed).
+//   4. Load register-bound capture words.  For SPLIT captures, the
+//      reg part loads here; the stack part was spilled in step 2.
+//      Right-to-left over captures so the i=0 case (which may write
+//      X0) runs last.
+//   5. BL underlying, ADD sp + RET.
+func emitClosureShimStackSpillAA64(a @asm.Assembler, fnLabel @[]char,
+		fvTyp @types.Type, f @ir.Func, cc common.CallConv,
+		argTypes @[]@types.Type, nUserWords int) {
+	var stkBytes int = cc.CallStackBytes(argTypes)
+	aarch64.Sub(a, true, aarch64.SP, aarch64.SP,
+		aarch64.Imm(stkBytes))
+
+	// Step 1: spill stack-bound capture words.  For each capture
+	// with stkOff >= 0, write its stack-portion words to
+	// [SP + stkOff + k*8] via X16.  Under AAPCS64's SPLIT rule a
+	// capture may have BOTH a regStart and a stkOff (the first
+	// regWords words go to regs, the rest spill); only the stack
+	// portion is handled here, the reg portion in step 4.
+	for i := 0; i < f.NumCaptureParams; i = i + 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var nWords int = common.ArgWords(ft)
+		var regStart int = cc.CallArgRegStart(argTypes, i)
+		var stkOff int = cc.CallArgStackOff(argTypes, i)
+		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
+		if stkOff < 0 { continue }
+		var firstStackWord int = 0
+		if regStart >= 0 {
+			firstStackWord = cc.NumGpArgRegs - regStart
+		}
+		for k := firstStackWord; k < nWords; k = k + 1 {
+			aarch64.Ldr(a, true, aarch64.X16,
+				aarch64.MemImm(aarch64.X0, fieldOfs + k * 8))
+			aarch64.Str(a, true, aarch64.X16,
+				aarch64.MemImm(aarch64.SP,
+					stkOff + (k - firstStackWord) * 8))
+		}
+	}
+
+	// Step 2: move user-args from incoming positions
+	// (argReg(1)..argReg(nUserWords)) to outgoing positions per
+	// CallConv.  Right-to-left over user-args.
+	var userArgStart int = f.NumCaptureParams
+	var inRegBase int = 1 + nUserWords
+	for ui := len(fvTyp.Params) - 1; ui >= 0; ui = ui - 1 {
+		var ut @types.Type = fvTyp.Params[ui].Type
+		var nUw int = common.ArgWords(ut)
+		inRegBase = inRegBase - nUw
+		var argIdx int = userArgStart + ui
+		var outRegStart int = cc.CallArgRegStart(argTypes, argIdx)
+		var outStkOff int = cc.CallArgStackOff(argTypes, argIdx)
+		if outRegStart >= 0 && outStkOff < 0 {
+			for k := nUw - 1; k >= 0; k = k - 1 {
+				var srcReg int = argReg(inRegBase + k)
+				var dstReg int = argReg(outRegStart + k)
+				if srcReg != dstReg {
+					aarch64.Mov(a, true, dstReg, aarch64.Reg(srcReg))
+				}
+			}
+		} else if outRegStart < 0 && outStkOff >= 0 {
+			for k := 0; k < nUw; k = k + 1 {
+				var srcReg int = argReg(inRegBase + k)
+				aarch64.Str(a, true, srcReg,
+					aarch64.MemImm(aarch64.SP, outStkOff + k * 8))
+			}
+		}
+		// SPLIT for user-args (reg portion + stack portion) isn't
+		// reachable for scalar / pointer user-args under AAPCS64;
+		// the only SPLIT-eligible user-arg shapes are aggregates,
+		// which this shim path doesn't yet flow through.
+	}
+
+	// Step 3: load register-bound capture words.  Iterate captures
+	// right-to-left so the i=0,k=0 case (which writes X0) runs
+	// last, keeping X0 valid as the base for earlier loads.
+	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var nWords int = common.ArgWords(ft)
+		var regStart int = cc.CallArgRegStart(argTypes, i)
+		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
+		if regStart < 0 { continue }
+		var regWords int = nWords
+		if cc.CallArgStackOff(argTypes, i) >= 0 {
+			// SPLIT: only the reg portion here.
+			regWords = cc.NumGpArgRegs - regStart
+		}
+		for k := regWords - 1; k >= 0; k = k - 1 {
+			aarch64.Ldr(a, true, argReg(regStart + k),
+				aarch64.MemImm(aarch64.X0, fieldOfs + k * 8))
+		}
+	}
+
+	// Step 4: BL underlying, unwind the stack frame.  The CALLER's
+	// LR is still in LR (we haven't pushed it — leaf shim), so we
+	// need to preserve it across BL.  BL overwrites LR with the
+	// shim's return address, so before calling we save LR into
+	// X16 (AAPCS intra-call scratch — already used as the shuttle,
+	// but its value has been consumed by step 1 already).  After
+	// BL, restore LR from X16 before RET so the shim returns to
+	// the original caller.
+	aarch64.Mov(a, true, aarch64.X16, aarch64.Reg(aarch64.LR))
+	a.SetGlobal(fnLabel)
+	aarch64.Bl(a, fnLabel)
+	aarch64.Mov(a, true, aarch64.LR, aarch64.Reg(aarch64.X16))
+	aarch64.Add(a, true, aarch64.SP, aarch64.SP,
+		aarch64.Imm(stkBytes))
+	aarch64.Ret(a)
+}
+
 // totalCaptureWordsAA64 sums the AAPCS64 register-word footprint of
-// each capture-type — scalars / pointers are 1, managed-slice is 3,
-// managed function-value is 2, etc.  Used by emitClosureShim to
-// budget X0..X7 register-arg slots and to compute the user-arg
-// shift target index.
+// each capture-type — scalars / pointers are 1, managed-slice is 4,
+// managed function-value is 2, etc.  Used by the fast path to
+// budget X0..X7 and to compute the user-arg shift target index.
 func totalCaptureWordsAA64(f @ir.Func) int {
 	var w int = 0
 	for i := 0; i < f.NumCaptureParams; i++ {

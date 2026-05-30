@@ -44,7 +44,7 @@ Optional arguments filter packages by substring match (e.g. `ir` matches `pkg/ir
 - Test files: `*_test.bn` in the package directory
 - Test functions: `func TestXxx() testing.TestResult`
 - Return `""` for pass, non-empty string for failure message
-- Must `import "pkg/builtin/testing"` for the `TestResult` type
+- Must `import "pkg/builtins/testing"` for the `TestResult` type
 - Test files are excluded from normal builds
 
 ## Expected Failures (xfail)

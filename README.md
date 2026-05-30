@@ -37,7 +37,7 @@ BUILDER="$(scripts/fetch-builder.sh)"
 /tmp/bni examples/selftest.bn
 
 # Run unit tests for some packages.
-./scripts/unittest/run.sh builder-comp pkg/types pkg/binate/loader
+./scripts/unittest/run.sh builder-comp pkg/binate/types pkg/binate/loader
 
 # Run conformance tests.
 ./conformance/run.sh builder-comp
@@ -187,7 +187,7 @@ Each source file has a corresponding `*_test.bn` file with `func TestXxx() testi
 ./scripts/unittest/run.sh builder-comp
 
 # Filter to specific packages.
-./scripts/unittest/run.sh builder-comp pkg/types
+./scripts/unittest/run.sh builder-comp pkg/binate/types
 
 # pkg/vm and cmd/bni need bni (the bytecode VM); use a *-int mode.
 ./scripts/unittest/run.sh builder-comp-int pkg/vm cmd/bni

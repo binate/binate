@@ -1,0 +1,324 @@
+package "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+
+// ============================================================
+// Method-call type checking (Stage 3 of plan-receivers.md)
+// ============================================================
+
+// tryMethodCall handles `obj.M(args)` when M is a method on obj's base
+// named type. Returns the call's result type, or nil if e is not a
+// method call (caller falls back to the regular function-call path).
+//
+// Caller must guarantee e.X is an EXPR_SELECTOR.
+func tryMethodCall(c @Checker, e @ast.Expr) @Type {
+	var sel @ast.Expr = e.X
+	// Skip package-qualified calls (pkg.Func(...)). Detect by looking
+	// up sel.X as an identifier of kind SYM_PKG; we don't evaluate
+	// it as a value expression. Also skip method expressions
+	// (T.M(args)): when sel.X is a type, T.M is a function value
+	// (Slice A.6), and the call goes through the function-value path
+	// in checkCallExpr's fallthrough.
+	if sel.X != nil && sel.X.Kind == ast.EXPR_IDENT {
+		var sym @Symbol = c.Scope.Lookup(sel.X.Name)
+		if sym != nil &&
+			(sym.Kind == SYM_PKG || sym.Kind == SYM_TYPE) {
+			return nil
+		}
+	}
+
+	var recvType @Type = checkExpr(c, sel.X)
+	// Interface-value receiver (Slice 2.3a-3 of plan-interface-syntax-
+	// revision.md): dispatch through the interface's method set, not
+	// the receiver's named-type method set. Interface methods have no
+	// receiver-kind smoothing — the impl-side smoothing was already
+	// validated at impl-satisfies-interface check time.
+	var resolved @Type = recvType.ResolveAlias()
+	if resolved != nil &&
+		(resolved.Kind == TYP_INTERFACE_VALUE ||
+		 resolved.Kind == TYP_INTERFACE_VALUE_MANAGED) {
+		return tryInterfaceMethodCall(c, e, resolved)
+	}
+	// Pointer-to-iface-value receiver: `p.Foo()` where `p` is `**I`,
+	// `*@I`, `@(*I)`, or `@(@I)` smooths through one pointer layer to
+	// the iv and dispatches via the iface method set.  Per plan-
+	// pointers-to-iface-values.md Slice P.3 — pointers to iv's
+	// follow normal pointer-receiver rules.  IR-gen mirrors this:
+	// `isInterfaceMethodCall` / `genInterfaceMethodCall` accept the
+	// pointer-to-iv shape and emit the load before dispatch.
+	if resolved != nil &&
+		(resolved.Kind == TYP_POINTER ||
+		 resolved.Kind == TYP_MANAGED_PTR) &&
+		resolved.Elem != nil {
+		var inner @Type = resolved.Elem.ResolveAlias()
+		if inner != nil &&
+			(inner.Kind == TYP_INTERFACE_VALUE ||
+			 inner.Kind == TYP_INTERFACE_VALUE_MANAGED) {
+			return tryInterfaceMethodCall(c, e, inner)
+		}
+	}
+	// Generic type-parameter receiver (Slice 3 of plan-generics.md):
+	// `t.M(args)` where `t` has TYP_TYPE_PARAM type with a non-nil
+	// constraint interface.  Method-lookup walks the constraint's
+	// method set; Self in the interface signature substitutes to the
+	// type-param itself (so `Compare(other Self)` reads as
+	// `Compare(other T)`).  Unconstrained `any` reaches here with a
+	// nil TpConstraint and falls through to the no-method error.
+	if resolved != nil && resolved.Kind == TYP_TYPE_PARAM &&
+			resolved.TpConstraint != nil {
+		return tryTypeParamMethodCall(c, e, resolved)
+	}
+	var named @Type = recvType.ReceiverBaseNamed()
+	if named == nil {
+		return nil
+	}
+	var m @Method = named.LookupMethod(sel.Name)
+	if m == nil {
+		return nil
+	}
+	return checkResolvedMethodCall(c, e, recvType, m)
+}
+
+// tryTypeParamMethodCall handles `t.M(args)` where t has type
+// TYP_TYPE_PARAM with a constraint interface.  Mirrors
+// tryInterfaceMethodCall, but `Self` in the constraint method
+// signature substitutes to the type-param @Type (recvType
+// here), not to the impl receiver — so chained constraint
+// methods returning Self thread `T` through the body.
+func tryTypeParamMethodCall(c @Checker, e @ast.Expr,
+		recvType @Type) @Type {
+	var iface @Type = recvType.TpConstraint
+	if iface == nil { return nil }
+	var sel @ast.Expr = e.X
+	var m @Method = lookupFullIfaceMethod(iface, sel.Name)
+	if m == nil { return nil }
+	var ft @Type = m.FuncType
+	if ft == nil { return TypVoid() }
+	var numArgs int = len(e.Args)
+	if numArgs != len(ft.Params) {
+		addCheckError(c, e.Pos, "wrong number of arguments")
+	} else {
+		for i := 0; i < numArgs; i++ {
+			var pt @Type = substituteSelf(ft.Params[i].Type, recvType)
+			var at @Type = checkExpr(c, e.Args[i])
+			if !at.AssignableTo(pt) {
+				errCannotAssign(c, e.Args[i].Pos, at, pt)
+			}
+		}
+	}
+	if len(ft.Results) == 0 { return TypVoid() }
+	if len(ft.Results) == 1 {
+		return substituteSelf(ft.Results[0], recvType)
+	}
+	return ft
+}
+
+// tryInterfaceMethodCall handles `iv.M(args)` where iv has type
+// TYP_INTERFACE_VALUE / TYP_INTERFACE_VALUE_MANAGED. Looks M up on
+// the wrapped interface (recvType.Elem.Methods) and validates args
+// against its signature. Returns the call's result type, or nil if
+// the method isn't defined on the interface (caller produces a
+// regular "no method M on type ..." error via the fallthrough
+// path).
+func tryInterfaceMethodCall(c @Checker, e @ast.Expr,
+		ivType @Type) @Type {
+	var iface @Type = ivType.Elem
+	if iface == nil { return nil }
+	var sel @ast.Expr = e.X
+	// plan-interface-embedding.md Slice E.4: when iface extends
+	// other interfaces, the user may call a method declared on a
+	// parent.  Walk the full method set (own + inherited) — own-
+	// only LookupMethod would miss inherited names.
+	var m @Method = lookupFullIfaceMethod(iface, sel.Name)
+	if m == nil { return nil }
+	var ft @Type = m.FuncType
+	if ft == nil { return TypVoid() }
+	// plan-self-type.md Slice S.3: methods whose interface-side
+	// signature uses `Self` are object-unsafe — calling through
+	// an interface value would lose the Self-ness at dispatch.
+	// Such methods are reachable only through a generic
+	// constraint where T is statically known.  Reject the call
+	// with a message that tells the user where to put the call
+	// instead.
+	if funcTypeUsesSelf(ft) {
+		var cb buf.CharBuf = buf.New()
+		cb = cb.WriteStr("method `")
+		cb = cb.WriteStr(m.Name)
+		cb = cb.WriteStr("` uses `Self` and cannot be called ")
+		cb = cb.WriteStr("through an interface value; use a generic ")
+		cb = cb.WriteStr("constraint instead")
+		addCheckError(c, e.Pos, cb.Bytes())
+		// Skip the per-arg check: the params already mention Self
+		// and would otherwise produce confusing follow-up errors.
+		return TypVoid()
+	}
+	var numArgs int = len(e.Args)
+	if numArgs != len(ft.Params) {
+		addCheckError(c, e.Pos, "wrong number of arguments")
+	} else {
+		for i := 0; i < numArgs; i++ {
+			var at @Type = checkExpr(c, e.Args[i])
+			if !at.AssignableTo(ft.Params[i].Type) {
+				errCannotAssign(c, e.Args[i].Pos, at,
+					ft.Params[i].Type)
+			}
+		}
+	}
+	if len(ft.Results) == 0 { return TypVoid() }
+	if len(ft.Results) == 1 { return ft.Results[0] }
+	return ft
+}
+
+// checkResolvedMethodCall validates a method call once the method has
+// been resolved. Checks receiver smoothing and argument types, returns
+// the result type.
+func checkResolvedMethodCall(c @Checker, e @ast.Expr, recvType @Type, m @Method) @Type {
+	if !receiverAssignable(recvType, m.RecvType) {
+		var cb buf.CharBuf = buf.New()
+		cb = cb.WriteStr("cannot call method ")
+		cb = cb.WriteStr(m.Name)
+		cb = cb.WriteStr(": receiver type ")
+		cb = cb.WriteStr(recvType.TypeName())
+		cb = cb.WriteStr(" not assignable to ")
+		cb = cb.WriteStr(m.RecvType.TypeName())
+		addCheckError(c, e.X.Pos, cb.Bytes())
+	}
+
+	// m.FuncType has the receiver as Params[0]; user args correspond to
+	// Params[1:].
+	var ft @Type = m.FuncType
+	var numArgs int = len(e.Args)
+	var numUserParams int = len(ft.Params) - 1
+	if numArgs != numUserParams {
+		addCheckError(c, e.Pos, "wrong number of arguments")
+	} else {
+		for i := 0; i < numArgs; i++ {
+			var at @Type = checkExpr(c, e.Args[i])
+			if !at.AssignableTo(ft.Params[i+1].Type) {
+				errCannotAssign(c, e.Args[i].Pos, at, ft.Params[i+1].Type)
+			}
+		}
+	}
+
+	if len(ft.Results) == 0 {
+		return TypVoid()
+	}
+	if len(ft.Results) == 1 {
+		return ft.Results[0]
+	}
+	// Multiple returns — return the FuncType itself (matches the
+	// regular function-call path's contract for multi-assign detection).
+	return ft
+}
+
+// ============================================================
+// Receiver smoothing
+// ============================================================
+
+// receiverShape reduces a type to (basetype, kind, isConst):
+//   - basetype: the underlying named type (or nil if not a named type)
+//   - kind: 0 = value (T), 1 = raw pointer (*T), 2 = managed pointer (@T)
+//   - isConst: whether any const wrapper was peeled along the way
+//
+// Returns (nil, 0, false) if t isn't (a wrapper around) a named type.
+func receiverShape(t @Type) (@Type, int, bool) {
+	if t == nil {
+		return nil, 0, false
+	}
+	t = t.ResolveAlias()
+	var isConst bool = false
+	if t != nil && t.Kind == TYP_CONST {
+		isConst = true
+		t = t.Elem.ResolveAlias()
+	}
+	if t == nil {
+		return nil, 0, false
+	}
+	if t.Kind == TYP_POINTER {
+		var inner @Type = t.Elem.ResolveAlias()
+		if inner != nil && inner.Kind == TYP_CONST {
+			isConst = true
+			inner = inner.Elem.ResolveAlias()
+		}
+		if inner != nil && receiverBaseKind(inner) {
+			return inner, 1, isConst
+		}
+		return nil, 0, false
+	}
+	if t.Kind == TYP_MANAGED_PTR {
+		var inner @Type = t.Elem.ResolveAlias()
+		if inner != nil && inner.Kind == TYP_CONST {
+			isConst = true
+			inner = inner.Elem.ResolveAlias()
+		}
+		if inner != nil && receiverBaseKind(inner) {
+			return inner, 2, isConst
+		}
+		return nil, 0, false
+	}
+	if receiverBaseKind(t) {
+		return t, 0, isConst
+	}
+	return nil, 0, false
+}
+
+// receiverBaseKind reports whether t is a kind that can serve
+// as a method-receiver base — a declared named type, or (per
+// the stdlib carve-out, plan-primitives-impl-interfaces.md) a
+// universe primitive.  Mirrors the predicate the IR-side
+// receiverBaseTypeName / baseNamedTypeName use.
+func receiverBaseKind(t @Type) bool {
+	if t == nil { return false }
+	if t.Kind == TYP_NAMED { return true }
+	if t.Kind == TYP_INT { return true }
+	if t.Kind == TYP_FLOAT { return true }
+	if t.Kind == TYP_BOOL { return true }
+	return false
+}
+
+// receiverAssignable reports whether an expression of type src can be
+// passed as the receiver of a method declared with receiver type dst,
+// applying the smoothing rules from claude-notes.md:828:
+//
+//   src @T  → dst @T / @const T / *T / *const T / T  (OK; deref allowed)
+//   src *T  → dst *T / *const T / T                  (OK; deref allowed)
+//   src *T  → dst @T / @const T                      (REJECT; never raw → managed)
+//   src T   → dst T / *T / *const T                  (OK; auto-take-address)
+//   src T   → dst @T                                 (REJECT)
+//
+// Const direction: adding const at the receiver position is allowed
+// (more-permissive → more-restrictive). Dropping const is rejected.
+func receiverAssignable(src @Type, dst @Type) bool {
+	var srcBase @Type
+	var srcKind int
+	var srcConst bool
+	srcBase, srcKind, srcConst = receiverShape(src)
+	var dstBase @Type
+	var dstKind int
+	var dstConst bool
+	dstBase, dstKind, dstConst = receiverShape(dst)
+
+	if srcBase == nil || dstBase == nil {
+		return false
+	}
+	if !srcBase.Identical(dstBase) {
+		return false
+	}
+
+	// Adding const is OK; dropping is not.
+	if srcConst && !dstConst {
+		return false
+	}
+
+	// Indirection table:
+	//   srcKind \ dstKind   0 (T)   1 (*T)   2 (@T)
+	//   0 (T)               OK      OK*      REJECT
+	//   1 (*T)              OK      OK       REJECT
+	//   2 (@T)              OK      OK       OK
+	// (* = take-address; allowed for now without addressability check.)
+	if dstKind == 2 && srcKind != 2 {
+		return false
+	}
+	return true
+}

@@ -38,7 +38,7 @@ binate -I <binate-src> -L <binate-src> cmd/bnlint -- -I <binate-src> -L <binate-
 One line per diagnostic:
 
 ```
-pkg/types:17:29: [managed-to-raw-assign] assigning @[]uint8 to *[]uint8 drops managed wrapper
+pkg/binate/types:17:29: [managed-to-raw-assign] assigning @[]uint8 to *[]uint8 drops managed wrapper
 pkg/codegen:41:19: [raw-slice-return] returning @[]uint8 as *[]uint8 drops managed wrapper
 ```
 
@@ -90,7 +90,7 @@ go run . -root ~/binate/binate cmd/bnlint -- -I ~/binate/binate -L ~/binate/bina
 Lint multiple packages:
 
 ```
-go run . -root ~/binate/binate cmd/bnlint -- -I ~/binate/binate -L ~/binate/binate pkg/ir pkg/types pkg/codegen
+go run . -root ~/binate/binate cmd/bnlint -- -I ~/binate/binate -L ~/binate/binate pkg/ir pkg/binate/types pkg/codegen
 ```
 
 ## Running Tests

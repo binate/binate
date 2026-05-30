@@ -1,0 +1,400 @@
+package "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/slices"
+
+// Generic-instantiation type checking.  Slice 2b of
+// plan-generics.md: when `name[args...]` resolves to a generic
+// function symbol, substitute the type-args into the function's
+// signature and return the instantiated FUNC type.  No
+// instantiation cache yet — Slice 4 (IR-gen monomorphization)
+// is what needs cache identity for emit-once-per-shape behavior.
+
+// resolveTypeInstantiation resolves a `Name[T1, T2, ...]` type
+// expression to a concrete @Type by:
+//   1. looking up the generic struct decl via name + package
+//      (unqualified names only for Slice 5b — cross-package
+//      generics land in Slice 7),
+//   2. validating arg count against decl.TypeParams,
+//   3. checking the cache; reusing a prior instantiation when
+//      (decl, args) match by identity,
+//   4. otherwise installing a type-param scope, resolving the
+//      struct body fresh, wrapping in a TYP_NAMED, caching, and
+//      returning.
+// Per plan-generics.md Slice 5b.
+func resolveTypeInstantiation(c @Checker,
+		te @ast.TypeExpr) @Type {
+	var head @ast.TypeExpr = te.Base
+	if head == nil || head.Kind != ast.TEXPR_NAMED {
+		addCheckError(c, te.Pos,
+			"generic instantiation requires a named-type head")
+		return TypVoid()
+	}
+	// Slice 7b/7c: pkg-qualified head — look up in the imported
+	// package's GenericTypeDecls / GenericIfaceDecls collection,
+	// keyed on the import alias.  Same-package falls through to
+	// the empty-pkg default.
+	var headPkg @[]char
+	if len(head.Pkg) > 0 {
+		headPkg = head.Pkg
+	}
+	var d @ast.Decl = lookupGenericTypeDeclPkg(c, headPkg, head.Name)
+	var isIface bool = false
+	if d == nil {
+		d = lookupGenericIfaceDeclPkg(c, headPkg, head.Name)
+		isIface = d != nil
+	}
+	if d == nil {
+		errUndefined(c, head.Pos, head.Name)
+		return TypVoid()
+	}
+	if len(te.TypeArgs) != len(d.TypeParams) {
+		addCheckError(c, te.Pos,
+			"wrong number of type arguments to generic type")
+		return TypVoid()
+	}
+	var argTypes @[]@Type
+	for i := 0; i < len(te.TypeArgs); i++ {
+		var at @Type = resolveTypeExpr(c, te.TypeArgs[i])
+		if at == nil { at = TypVoid() }
+		argTypes = slices.Append[@Type](argTypes, at)
+	}
+	var cached @Type = lookupCachedInstantiation(c, d, argTypes)
+	if cached != nil { return cached }
+	var result @Type
+	if isIface {
+		result = buildInstantiatedInterface(c, d, argTypes)
+	} else {
+		result = buildInstantiatedStruct(c, d, argTypes)
+	}
+	var entry @GenericInstantiation = make(GenericInstantiation)
+	entry.Decl = d
+	entry.TypeArgs = argTypes
+	entry.Result = result
+	c.GenericInstantiations = slices.Append[@GenericInstantiation](
+		c.GenericInstantiations, entry)
+	return result
+}
+
+// lookupGenericIfaceDecl finds a generic interface decl by name
+// in the current (main) package.  Slice 6b counterpart to
+// lookupGenericTypeDecl.  Slice 7c: cross-package lookups go
+// through lookupGenericIfaceDeclPkg.
+func lookupGenericIfaceDecl(c @Checker, name *[]const char) @ast.Decl {
+	var empty @[]char
+	return lookupGenericIfaceDeclPkg(c, empty, name)
+}
+
+// lookupGenericIfaceDeclPkg finds a generic interface decl
+// registered under (pkg, name).  Pkg empty matches same-package
+// entries (where GenericIfaceDeclPkgs has the empty pkg-short
+// reserved for the current module).  Slice 7c.
+func lookupGenericIfaceDeclPkg(c @Checker, pkg @[]char,
+		name *[]const char) @ast.Decl {
+	for i := 0; i < len(c.GenericIfaceDecls); i++ {
+		var d @ast.Decl = c.GenericIfaceDecls[i]
+		if d == nil { continue }
+		if !charEq(d.Name, name) { continue }
+		var declPkg @[]char
+		if i < len(c.GenericIfaceDeclPkgs) {
+			declPkg = c.GenericIfaceDeclPkgs[i]
+		}
+		if !charEq(declPkg, pkg) { continue }
+		return d
+	}
+	return nil
+}
+
+// buildInstantiatedInterface produces a fresh TYP_INTERFACE
+// whose methods have each TYP_TYPE_PARAM substituted for the
+// matching type-arg.  Pushes a per-decl type-param scope so the
+// method-signature resolution sees T bound to its concrete
+// @Type.  Per plan-generics.md Slice 6b.
+func buildInstantiatedInterface(c @Checker, d @ast.Decl,
+		args @[]@Type) @Type {
+	var iface @Type = MakeInterfaceType(currentPkgShort,
+		mangleInstantiatedName(d.Name, args))
+	pushScope(c)
+	for i := 0; i < len(d.TypeParams); i++ {
+		defineType(c.Scope, d.TypeParams[i].Name, args[i])
+	}
+	// Same per-method pattern as collectInterfaceDecl: each
+	// method is a stub DECL_FUNC; resolve its FuncType with the
+	// type-param scope active so T → concrete in params/results.
+	var prevAllowSelf bool = c.AllowSelf
+	c.AllowSelf = true
+	for i := 0; i < len(d.Decls); i++ {
+		var m @ast.Decl = d.Decls[i]
+		if m == nil || m.Kind != ast.DECL_FUNC { continue }
+		var ft @Type = resolveFuncDeclType(c, m)
+		var method @Method = MakeMethod(m.Name, iface, ft)
+		iface.AddMethod(method)
+	}
+	c.AllowSelf = prevAllowSelf
+	popScope(c)
+	return iface
+}
+
+// lookupGenericTypeDecl finds a generic struct decl registered
+// during preRegisterTypeNames by source-text name in the current
+// (main) package.  Returns nil if no such decl exists.  Cross-
+// package lookups go through lookupGenericTypeDeclPkg (Slice 7b).
+func lookupGenericTypeDecl(c @Checker, name *[]const char) @ast.Decl {
+	var empty @[]char
+	return lookupGenericTypeDeclPkg(c, empty, name)
+}
+
+// lookupGenericTypeDeclPkg finds a generic struct decl
+// registered under (pkg, name).  Pkg empty matches same-package
+// entries; an import alias matches a decl stashed by
+// buildScopeFromFile when loading that package's .bni.
+// Slice 7b.
+func lookupGenericTypeDeclPkg(c @Checker, pkg @[]char,
+		name *[]const char) @ast.Decl {
+	for i := 0; i < len(c.GenericTypeDecls); i++ {
+		var d @ast.Decl = c.GenericTypeDecls[i]
+		if d == nil { continue }
+		if !charEq(d.Name, name) { continue }
+		var declPkg @[]char
+		if i < len(c.GenericTypeDeclPkgs) {
+			declPkg = c.GenericTypeDeclPkgs[i]
+		}
+		if !charEq(declPkg, pkg) { continue }
+		return d
+	}
+	return nil
+}
+
+// lookupCachedInstantiation walks c.GenericInstantiations looking
+// for a (Decl, args) match — Decl pointer-equal AND each arg
+// Identical.  Returns the cached Result or nil on miss.
+func lookupCachedInstantiation(c @Checker, d @ast.Decl,
+		args @[]@Type) @Type {
+	for i := 0; i < len(c.GenericInstantiations); i++ {
+		var entry @GenericInstantiation = c.GenericInstantiations[i]
+		if entry == nil || entry.Decl != d { continue }
+		if len(entry.TypeArgs) != len(args) { continue }
+		var match bool = true
+		for j := 0; j < len(args); j++ {
+			if !entry.TypeArgs[j].Identical(args[j]) {
+				match = false
+				continue
+			}
+		}
+		if match { return entry.Result }
+	}
+	return nil
+}
+
+// buildInstantiatedStruct produces a fresh TYP_NAMED whose
+// Underlying is the generic decl's struct body with each
+// TYP_TYPE_PARAM substituted for the matching type-arg.  Pushes
+// a per-decl type-param scope so the field-type resolution sees
+// T bound to its concrete @Type.  Pops on exit.
+func buildInstantiatedStruct(c @Checker, d @ast.Decl,
+		args @[]@Type) @Type {
+	pushScope(c)
+	// Install type-params keyed on names (resolveTypeExpr's
+	// TEXPR_NAMED branch finds them by scope lookup).  Each
+	// type-param's @Type is the substituted concrete arg —
+	// not a TYP_TYPE_PARAM placeholder; substitution happens
+	// in-line during field resolution.
+	for i := 0; i < len(d.TypeParams); i++ {
+		var nm @[]char = d.TypeParams[i].Name
+		defineType(c.Scope, nm, args[i])
+	}
+	var underlying @Type
+	if d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+		underlying = resolveStructType(c, d.TypeRef)
+		underlying.Name = mangleInstantiatedName(d.Name, args)
+	}
+	popScope(c)
+	var named @Type = MakeNamedType(mangleInstantiatedName(d.Name, args))
+	named.Underlying = underlying
+	return named
+}
+
+// mangleInstantiatedName produces a stable name for the
+// instantiated TYP_NAMED — primarily for diagnostics and any
+// downstream identity-by-name comparisons.  Mirrors the IR
+// layer's instantiation mangle so the two layers can match
+// when IR-gen for generic structs lands in Slice 5c.
+func mangleInstantiatedName(base @[]char, args @[]@Type) @[]char {
+	var cb buf.CharBuf = buf.New()
+	cb = cb.WriteStr(base)
+	cb = cb.WriteStr("[")
+	for i := 0; i < len(args); i++ {
+		if i > 0 { cb = cb.WriteStr(",") }
+		if args[i] != nil {
+			cb = cb.WriteStr(args[i].TypeName())
+		}
+	}
+	cb = cb.WriteStr("]")
+	return cb.Bytes()
+}
+
+// instantiateGenericFunc substitutes e.Args (parsed as Expr nodes
+// with type-arg meaning — see typeArgFromExpr) into a generic
+// FUNC type's Params and Results.  Returns the instantiated FUNC
+// type or TypVoid() on error.
+func instantiateGenericFunc(c @Checker, e @ast.Expr, ft @Type) @Type {
+	if len(e.Args) != len(ft.TypeParams) {
+		addCheckError(c, e.Pos,
+			"wrong number of type arguments to generic function")
+		return TypVoid()
+	}
+	var argTypes @[]@Type
+	for i := 0; i < len(e.Args); i++ {
+		var t @Type = typeArgFromExpr(c, e.Args[i])
+		if t == nil { t = TypVoid() }
+		argTypes = slices.Append[@Type](argTypes, t)
+		// Constraint satisfaction (Slice 3 of plan-generics.md):
+		// nil TpConstraint = `any` = no check.  Otherwise the
+		// type-arg must satisfy the constraint interface via an
+		// `impl T : I` declaration.
+		var tparam @Type = ft.TypeParams[i]
+		if tparam != nil && tparam.TpConstraint != nil {
+			if !typeSatisfiesConstraint(c, t, tparam.TpConstraint) {
+				reportConstraintMiss(c, e.Args[i].Pos, t,
+					tparam.TpConstraint)
+			}
+		}
+	}
+	var newParams @[]@Param
+	for i := 0; i < len(ft.Params); i++ {
+		var p @Param = make(Param)
+		p.Name = ft.Params[i].Name
+		p.Type = substituteTypeParams(ft.Params[i].Type, argTypes)
+		newParams = slices.Append[@Param](newParams, p)
+	}
+	var newResults @[]@Type
+	for i := 0; i < len(ft.Results); i++ {
+		newResults = slices.Append[@Type](newResults,
+			substituteTypeParams(ft.Results[i], argTypes))
+	}
+	return MakeFuncType(newParams, newResults)
+}
+
+// typeSatisfiesConstraint reports whether `t` has an `impl t : I`
+// declaration in scope, OR an `impl t : J` where J extends I
+// (interface inheritance — `impl int : Orderable` satisfies a
+// `Comparable` constraint because Orderable extends Comparable).
+// Walks c.Impls; matches via Identical on the receiver type and
+// (Pkg, Name) on the interface, with isDescendantInterface
+// covering the transitive case.  Per Slice 3 of plan-generics.md.
+//
+// Identical-only receiver matching keeps things simple: `f[int]`
+// matches `impl int : I`, not `impl *int : I`.  Receiver-kind
+// smoothing (matching `f[Foo]` against `impl *Foo : I`) is a
+// follow-up when a real use case appears.
+func typeSatisfiesConstraint(c @Checker, t @Type,
+		iface @Type) bool {
+	if t == nil || iface == nil { return false }
+	if iface.Kind != TYP_INTERFACE { return false }
+	for i := 0; i < len(c.Impls); i++ {
+		var rec @Impl = c.Impls[i]
+		if rec == nil { continue }
+		if !t.Identical(rec.RecvType) { continue }
+		if implCoversInterface(rec, iface) { return true }
+		// Walk the impl's interface list looking for any entry
+		// whose chain of parents reaches `iface`.  Per
+		// plan-interface-embedding.md, isDescendantInterface
+		// already implements the transitive check.
+		for j := 0; j < len(rec.Interfaces); j++ {
+			var entry @Type = rec.Interfaces[j]
+			if entry == nil { continue }
+			if isDescendantInterface(entry, iface) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// reportConstraintMiss emits a "T does not satisfy I" error
+// pointing at the offending type-arg site.
+func reportConstraintMiss(c @Checker, pos token.Pos, t @Type,
+		iface @Type) {
+	var cb buf.CharBuf = buf.New()
+	cb = cb.WriteStr("type argument ")
+	cb = cb.WriteStr(t.TypeName())
+	cb = cb.WriteStr(" does not satisfy constraint ")
+	cb = cb.WriteStr(iface.TypeName())
+	addCheckError(c, pos, cb.Bytes())
+}
+
+// typeArgFromExpr interprets an Expr-shape parse node as a type
+// expression.  The parser parses `f[int, *Point]`'s bracketed
+// args as Exprs (the syntactic shape is ambiguous with value
+// indexing), so we convert here.
+//
+// Slice 2b accepts: EXPR_IDENT (named-type lookup) and
+// EXPR_UNARY(STAR, X) (raw-pointer-to-type).  EXPR_TYPE carries a
+// fully-parsed TypeExpr for forms with no expression spelling
+// (`@T`, `@[]T`, `*[]T`) — the parser routes those through
+// parseType (see parseBracketTypeArg) and we resolve the TypeExpr
+// directly here.
+func typeArgFromExpr(c @Checker, e @ast.Expr) @Type {
+	if e == nil { return TypVoid() }
+	if e.Kind == ast.EXPR_TYPE {
+		if e.TypeRef == nil { return TypVoid() }
+		return resolveTypeExpr(c, e.TypeRef)
+	}
+	if e.Kind == ast.EXPR_IDENT {
+		var sym @Symbol = c.Scope.Lookup(e.Name)
+		if sym == nil {
+			errUndefined(c, e.Pos, e.Name)
+			return TypVoid()
+		}
+		if sym.Kind != SYM_TYPE && sym.Kind != SYM_INTERFACE {
+			errNotAType(c, e.Pos, e.Name)
+			return TypVoid()
+		}
+		return sym.Type
+	}
+	if e.Kind == ast.EXPR_UNARY && e.Op == cast(int, token.STAR) {
+		var inner @Type = typeArgFromExpr(c, e.X)
+		return MakePointerType(inner)
+	}
+	addCheckError(c, e.Pos,
+		"unsupported type-argument form (use a named type, *T, @T, @[]T, or *[]T)")
+	return TypVoid()
+}
+
+// substituteTypeParams walks t and replaces TYP_TYPE_PARAM nodes
+// with the args[TpIndex] entry.  Composite types (pointer, slice,
+// array, etc.) are rebuilt with the substituted element type.
+// Other kinds are returned unchanged.
+//
+// Assumes every TYP_TYPE_PARAM encountered is owned by the
+// generic decl being instantiated — i.e., its TpIndex is a valid
+// index into args.  This is true for FUNC types produced by
+// resolveFuncDeclType, which only introduces TYP_TYPE_PARAMs from
+// its own AST decl.
+func substituteTypeParams(t @Type, args @[]@Type) @Type {
+	if t == nil { return nil }
+	if t.Kind == TYP_TYPE_PARAM {
+		if t.TpIndex >= 0 && t.TpIndex < len(args) {
+			return args[t.TpIndex]
+		}
+		return t
+	}
+	if t.Kind == TYP_POINTER {
+		return MakePointerType(substituteTypeParams(t.Elem, args))
+	}
+	if t.Kind == TYP_MANAGED_PTR {
+		return MakeManagedPtrType(substituteTypeParams(t.Elem, args))
+	}
+	if t.Kind == TYP_SLICE {
+		return MakeSliceType(substituteTypeParams(t.Elem, args))
+	}
+	if t.Kind == TYP_MANAGED_SLICE {
+		return MakeManagedSliceType(substituteTypeParams(t.Elem, args))
+	}
+	if t.Kind == TYP_ARRAY {
+		return MakeArrayType(substituteTypeParams(t.Elem, args), t.ArrayLen)
+	}
+	return t
+}

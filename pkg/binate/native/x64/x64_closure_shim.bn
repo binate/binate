@@ -148,12 +148,41 @@ func shimNeedsStackSpill_x64(cc common.CallConv,
 	return false
 }
 
-// emitClosureShimFast_x64 is the original B.2 / B.3a register-only
-// path.  Requires every arg to land in a GP arg register (no MEMORY
-// classification).
+// isIndirectLargeCap_x64 reports whether a capture-type is passed
+// via the IndirectLargeAggregates convention (a single pointer in
+// 1 reg / 1 stack word) at the underlying body's call boundary.
+// Mirrors the classifier path in
+// pkg/binate/native/common/common_callconv.bn's
+// argRegWordsStackWords for the indirect-large branch.
+func isIndirectLargeCap_x64(cc common.CallConv,
+		t @types.Type) bool {
+	return cc.IndirectLargeAggregates &&
+		common.IsAggregateTyp(t) &&
+		t.SizeOf() > cc.AggregateInRegMax
+}
+
+// effectiveCapWords_x64 returns the number of GP arg-reg slots a
+// capture consumes at the underlying body's call boundary — 1 for
+// indirect-large aggregates (pointer-pass), ArgWords for the rest.
+func effectiveCapWords_x64(cc common.CallConv,
+		t @types.Type) int {
+	if isIndirectLargeCap_x64(cc, t) { return 1 }
+	return common.ArgWords(t)
+}
+
+// emitClosureShimFast_x64 is the register-only path: every outgoing
+// arg lands in a GP arg register (no MEMORY classification).
+// Indirect-large captures contribute 1 reg slot (a pointer to the
+// closure-struct field, materialised via LEA); scalar / small-
+// aggregate captures contribute their ArgWords reg slots.
 func emitClosureShimFast_x64(a @asm.Assembler, fnLabel @[]char,
 		fvTyp @types.Type, f @ir.Func, nUserWords int) {
-	var captureWords int = totalCaptureWords_x64(f)
+	var cc common.CallConv = common.SysV_AMD64()
+	var captureWords int = 0
+	for i := 0; i < f.NumCaptureParams; i++ {
+		captureWords = captureWords +
+			effectiveCapWords_x64(cc, f.ClosureStruct.Fields[i].Type)
+	}
 	if captureWords + nUserWords > 6 {
 		a.SetGlobal(fnLabel)
 		x64.Jmp(a, fnLabel)
@@ -167,11 +196,22 @@ func emitClosureShimFast_x64(a @asm.Assembler, fnLabel @[]char,
 				x64.Reg(srcReg, x64.SZ64))
 		}
 	}
+	// Captures right-to-left so RDI (closure-struct base) stays
+	// valid until the final emit.  The i=0 case may clobber RDI
+	// (regStart 0 → LEA RDI, [RDI+ofs] or MOV RDI, [RDI+ofs0]);
+	// placing it last keeps the base alive for earlier captures.
 	var w int = captureWords
 	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
 		var ft @types.Type = f.ClosureStruct.Fields[i].Type
-		var wordCount int = common.ArgWords(ft)
 		var baseOfs int = f.ClosureStruct.FieldOffset(i)
+		if isIndirectLargeCap_x64(cc, ft) {
+			w = w - 1
+			// LEA argReg(w), [RDI + baseOfs] — pointer-pass.
+			x64.Lea(a, x64.Reg(argReg(w), x64.SZ64),
+				x64.Mem(x64.RDI, baseOfs, x64.SZ64))
+			continue
+		}
+		var wordCount int = common.ArgWords(ft)
 		for k := wordCount - 1; k >= 0; k = k - 1 {
 			w = w - 1
 			x64.Mov(a, x64.Reg(argReg(w), x64.SZ64),
@@ -198,23 +238,36 @@ func emitClosureShimStackSpill_x64(a @asm.Assembler, fnLabel @[]char,
 	var rspDelta int = stkBytes + 8
 	x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(rspDelta))
 
-	// Step 1: spill stack-bound captures.  Read from
-	// [RDI + fieldOfs + k*8] via RAX, write to [RSP + stkOff + k*8].
+	// Step 1: spill stack-bound captures.  Two cases:
+	//   * Indirect-large capture overflowed to stack (regStart < 0,
+	//     stackWords=1): LEA RAX, [RDI + fieldOfs]; MOV [RSP+stkOff],
+	//     RAX — pointer-pass on the stack.
+	//   * Per-word capture entirely on stack (SysV MEMORY for
+	//     aggregates ≤ AggregateInRegMax that didn't fit, or scalar
+	//     overflow): shuttle each word via RAX from [RDI+ofs] to
+	//     [RSP+stkOff].
 	// Done first so RDI is still the closure-struct base — step 2
 	// (user-arg shift) and step 3's i=0 reg-capture may overwrite it.
 	for i := 0; i < f.NumCaptureParams; i = i + 1 {
 		var ft @types.Type = f.ClosureStruct.Fields[i].Type
-		var nWords int = common.ArgWords(ft)
 		var regStart int = cc.CallArgRegStart(argTypes, i)
 		var stkOff int = cc.CallArgStackOff(argTypes, i)
 		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
-		if regStart < 0 && stkOff >= 0 {
-			for k := 0; k < nWords; k = k + 1 {
-				x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
-					x64.Mem(x64.RDI, fieldOfs + k * 8, x64.SZ64))
-				x64.Mov(a, x64.Mem(x64.RSP, stkOff + k * 8, x64.SZ64),
-					x64.Reg(x64.RAX, x64.SZ64))
-			}
+		if regStart >= 0 || stkOff < 0 { continue }
+		if isIndirectLargeCap_x64(cc, ft) {
+			// Indirect-large, stack-bound: pointer-pass.
+			x64.Lea(a, x64.Reg(x64.RAX, x64.SZ64),
+				x64.Mem(x64.RDI, fieldOfs, x64.SZ64))
+			x64.Mov(a, x64.Mem(x64.RSP, stkOff, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
+			continue
+		}
+		var nWords int = common.ArgWords(ft)
+		for k := 0; k < nWords; k = k + 1 {
+			x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+				x64.Mem(x64.RDI, fieldOfs + k * 8, x64.SZ64))
+			x64.Mov(a, x64.Mem(x64.RSP, stkOff + k * 8, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
 		}
 	}
 
@@ -250,19 +303,26 @@ func emitClosureShimStackSpill_x64(a @asm.Assembler, fnLabel @[]char,
 		}
 	}
 
-	// Step 3: load register-passed captures.  Iterate captures
-	// right-to-left so the i=0 case (which would clobber RDI when
-	// outRegStart=0) runs last.
+	// Step 3: load register-passed captures.  For indirect-large
+	// captures with regStart >= 0: LEA argReg(regStart),
+	// [RDI + fieldOfs] — pointer-pass in a single reg.  For per-word
+	// captures: MOV each word into argReg(regStart..regStart+nWords-1).
+	// Iterate right-to-left so the i=0 case (which may write RDI
+	// when regStart=0) runs last.
 	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
 		var ft @types.Type = f.ClosureStruct.Fields[i].Type
-		var nWords int = common.ArgWords(ft)
 		var regStart int = cc.CallArgRegStart(argTypes, i)
 		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
-		if regStart >= 0 {
-			for k := nWords - 1; k >= 0; k = k - 1 {
-				x64.Mov(a, x64.Reg(argReg(regStart + k), x64.SZ64),
-					x64.Mem(x64.RDI, fieldOfs + k * 8, x64.SZ64))
-			}
+		if regStart < 0 { continue }
+		if isIndirectLargeCap_x64(cc, ft) {
+			x64.Lea(a, x64.Reg(argReg(regStart), x64.SZ64),
+				x64.Mem(x64.RDI, fieldOfs, x64.SZ64))
+			continue
+		}
+		var nWords int = common.ArgWords(ft)
+		for k := nWords - 1; k >= 0; k = k - 1 {
+			x64.Mov(a, x64.Reg(argReg(regStart + k), x64.SZ64),
+				x64.Mem(x64.RDI, fieldOfs + k * 8, x64.SZ64))
 		}
 	}
 

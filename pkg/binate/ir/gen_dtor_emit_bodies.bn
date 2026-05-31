@@ -1,0 +1,259 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/types"
+
+// Per-type-kind destructor body generators.  Split out of
+// gen_dtor_emit.bn at the natural "// ===" section markers so
+// neither file exceeds the file-length soft cap.  Orchestration
+// (generateDtors, ensureMsDtor, ensureArrayDtor, etc.) and
+// shared utilities (name/path helpers, emitDtorOrCopyCall) live
+// in gen_dtor_emit.bn; the per-type IR emission for each kind
+// lives here.
+
+// ============================================================
+// Struct destructor generation
+// ============================================================
+
+// genStructDtor generates a destructor for a struct type.
+// For each field that NeedsDestruction:
+//   - @T: load managed ptr, RefDec with T's dtor
+//   - @[]T, struct, [N]T: get field pointer, call field type's dtor
+func genStructDtor(structName *[]const char, structTyp @types.Type) @Func {
+	return genStructDtorWithName(dtorName(structName), structTyp)
+}
+
+// genStructDtorWithName generates a destructor function with an explicit name for a struct type.
+func genStructDtorWithName(name @[]char, structTyp @types.Type) @Func {
+	var ptrParam @Param = make(Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@Param = make_slice(@Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+
+	var f @Func = NewFunc(name, params, noResults)
+	f.IsLinkOnce = true
+	var b @Block = AddBlock(f, "entry")
+
+	// Reference to parameter 0
+	var rawPtr @Instr = make(Instr)
+	rawPtr.ID = f.Params[0].ID
+	rawPtr.Typ = f.Params[0].Typ
+	rawPtr.Op = OP_CONST_INT
+
+	// Bitcast to struct pointer
+	var structPtrTyp @types.Type = types.MakePointerType(structTyp)
+	var structPtr @Instr = b.EmitBitCast(rawPtr, structPtrTyp)
+
+	for i := 0; i < len(structTyp.Fields); i++ {
+		var fieldTyp @types.Type = structTyp.Fields[i].Type
+		if !fieldTyp.NeedsDestruction() { continue }
+		fieldTyp = fieldTyp.ResolveAlias()
+
+		if fieldTyp.Kind == types.TYP_MANAGED_PTR {
+			// @T field: load the managed pointer, RefDec with pointee dtor
+			var fieldPtr @Instr = b.EmitGetFieldPtr(structPtr, i, fieldTyp)
+			var fieldVal @Instr = b.EmitLoad(fieldPtr, fieldTyp)
+			emitManagedPtrRefDec(f, b, fieldVal)
+		} else if fieldTyp.Kind == types.TYP_MANAGED_SLICE {
+			// @[]T field: if elements need destruction, call managed-slice dtor;
+			// otherwise just RefDec the backing.
+			var fieldPtr @Instr = b.EmitGetFieldPtr(structPtr, i, fieldTyp)
+			var fieldVal @Instr = b.EmitLoad(fieldPtr, fieldTyp)
+			if fieldTyp.Elem != nil && fieldTyp.Elem.NeedsDestruction() {
+				// Elements need destruction — call managed-slice dtor
+				var fieldRawPtr @Instr = b.EmitBitCast(fieldPtr, types.MakePointerType(types.TypUint8()))
+				var msArgs @[]@Instr = make_slice(@Instr, 1)
+				msArgs[0] = fieldRawPtr
+				b.EmitCall(dtorNameForType(fieldTyp), msArgs, types.TypVoid())
+			} else {
+				// No element destruction needed — just RefDec the backing
+				var refptr @Instr = b.EmitExtract(fieldVal, 2, types.MakeManagedPtrType(nil))
+				b.EmitRefDec(refptr)
+			}
+		} else {
+			// struct, [N]T stored inline: get field pointer, call dtor
+			var fieldPtr @Instr = b.EmitGetFieldPtr(structPtr, i, fieldTyp)
+			var fieldRawPtr @Instr = b.EmitBitCast(fieldPtr, types.MakePointerType(types.TypUint8()))
+			emitDtorOrCopyCall(f, b, qualifiedDtorNameForType(fieldTyp), fieldRawPtr)
+		}
+	}
+
+	var noRetVals @[]@Instr
+	b.EmitReturn(noRetVals)
+	return f
+}
+
+// ============================================================
+// Managed-slice destructor generation
+// ============================================================
+
+// genManagedSliceDtor generates a destructor for a managed-slice type @[]T.
+// It checks if the backing is the last reference, iterates elements to
+// clean them up, then RefDec's the backing allocation.
+func genManagedSliceDtor(name @[]char, msTyp @types.Type) @Func {
+	var ptrParam @Param = make(Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@Param = make_slice(@Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+
+	var f @Func = NewFunc(name, params, noResults)
+	f.IsLinkOnce = true
+	var entry @Block = AddBlock(f, "entry")
+
+	// Reference to parameter 0
+	var rawPtr @Instr = make(Instr)
+	rawPtr.ID = f.Params[0].ID
+	rawPtr.Typ = f.Params[0].Typ
+	rawPtr.Op = OP_CONST_INT
+
+	// Bitcast to managed-slice pointer, load the 4-word value
+	var msPtrTyp @types.Type = types.MakePointerType(msTyp)
+	var msPtr @Instr = entry.EmitBitCast(rawPtr, msPtrTyp)
+	var msVal @Instr = entry.EmitLoad(msPtr, msTyp)
+
+	// Extract backing refptr
+	var refptr @Instr = entry.EmitExtract(msVal, 2, types.MakeManagedPtrType(nil))
+
+	var elemTyp @types.Type = msTyp.Elem
+
+	// If elements don't need destruction, just RefDec the backing and return
+	if !elemTyp.NeedsDestruction() {
+		entry.EmitRefDec(refptr)
+		var noRetVals2 @[]@Instr
+		entry.EmitReturn(noRetVals2)
+		return f
+	}
+
+	var backingLen @Instr = entry.EmitExtract(msVal, 3, types.TypInt())
+	// Use refptr (backing start) for element iteration, not data ptr.
+	// After subslicing, data may point into the middle of the backing.
+	var backingPtr @Instr = entry.EmitBitCast(refptr, types.MakePointerType(types.TypUint8()))
+
+	// Check: refcount == 1 (last reference, safe to clean up elements)
+	var rcArgs @[]@Instr = make_slice(@Instr, 1)
+	rcArgs[0] = refptr
+	var rc @Instr = entry.EmitCall("pkg/rt.Refcount", rcArgs, types.TypInt())
+	var one @Instr = entry.EmitConstInt(1, types.TypInt())
+	var isLast @Instr = entry.EmitBinop(OP_EQ, rc, one, types.TypBool())
+
+	var loopInit @Block = AddBlock(f, "ms_dtor_init")
+	var exitBlock @Block = AddBlock(f, "ms_dtor_exit")
+
+	entry.EmitBranch(isLast, loopInit, exitBlock)
+
+	// Loop counter via alloca
+	var iSlot @Instr = loopInit.EmitAlloc(types.TypInt())
+	var zero @Instr = loopInit.EmitConstInt(0, types.TypInt())
+	loopInit.EmitStore(iSlot, zero)
+
+	var loopCond @Block = AddBlock(f, "ms_dtor_cond")
+	loopInit.EmitJump(loopCond)
+
+	// Loop condition: i < backing_len
+	var iv @Instr = loopCond.EmitLoad(iSlot, types.TypInt())
+	var cmp @Instr = loopCond.EmitBinop(OP_LT, iv, backingLen, types.TypBool())
+	var loopBody @Block = AddBlock(f, "ms_dtor_body")
+	loopCond.EmitBranch(cmp, loopBody, exitBlock)
+
+	// Loop body: compute element address, call element cleanup
+	var elemSize @Instr = loopBody.EmitConstInt(elemTyp.SizeOf(), types.TypInt())
+	var offset @Instr = loopBody.EmitBinop(OP_MUL, iv, elemSize, types.TypInt())
+	var elemAddr @Instr = loopBody.EmitGetElemPtr(backingPtr, offset, types.TypUint8())
+	var elemRawPtr @Instr = loopBody.EmitBitCast(elemAddr, types.MakePointerType(types.TypUint8()))
+
+	if elemTyp.Kind == types.TYP_MANAGED_PTR {
+		// Element is @T — load the pointer, RefDec with pointee dtor
+		var elemPtrTyp @types.Type = types.MakePointerType(elemTyp)
+		var typedElemPtr @Instr = loopBody.EmitBitCast(elemAddr, elemPtrTyp)
+		var elem @Instr = loopBody.EmitLoad(typedElemPtr, elemTyp)
+		emitManagedPtrRefDec(f, loopBody, elem)
+	} else {
+		// Element is struct, @[]T, [N]T — call element type's dtor
+		emitDtorOrCopyCall(f, loopBody, qualifiedDtorNameForType(elemTyp), elemRawPtr)
+	}
+
+	// Increment counter, loop back
+	var iNext @Instr = loopBody.EmitBinop(OP_ADD, iv, one, types.TypInt())
+	loopBody.EmitStore(iSlot, iNext)
+	loopBody.EmitJump(loopCond)
+
+	// Exit: RefDec the backing allocation (no dtor — it's raw memory)
+	exitBlock.EmitRefDec(refptr)
+
+	var noRetVals @[]@Instr
+	exitBlock.EmitReturn(noRetVals)
+	return f
+}
+
+// ============================================================
+// Array destructor generation
+// ============================================================
+
+// genArrayDtor generates a destructor for an array type [N]T.
+// It iterates N elements and calls element cleanup on each.
+func genArrayDtor(name @[]char, arrTyp @types.Type) @Func {
+	var ptrParam @Param = make(Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@Param = make_slice(@Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+
+	var f @Func = NewFunc(name, params, noResults)
+	f.IsLinkOnce = true
+	var entry @Block = AddBlock(f, "entry")
+
+	// Reference to parameter 0
+	var rawPtr @Instr = make(Instr)
+	rawPtr.ID = f.Params[0].ID
+	rawPtr.Typ = f.Params[0].Typ
+	rawPtr.Op = OP_CONST_INT
+
+	var elemTyp @types.Type = arrTyp.Elem
+	var arrLen int = arrTyp.ArrayLen
+
+	// Loop counter via alloca
+	var iSlot @Instr = entry.EmitAlloc(types.TypInt())
+	var zero @Instr = entry.EmitConstInt(0, types.TypInt())
+	entry.EmitStore(iSlot, zero)
+
+	var loopCond @Block = AddBlock(f, "arr_dtor_cond")
+	entry.EmitJump(loopCond)
+
+	// Loop condition: i < N
+	var iv @Instr = loopCond.EmitLoad(iSlot, types.TypInt())
+	var lenConst @Instr = loopCond.EmitConstInt(arrLen, types.TypInt())
+	var cmp @Instr = loopCond.EmitBinop(OP_LT, iv, lenConst, types.TypBool())
+	var loopBody @Block = AddBlock(f, "arr_dtor_body")
+	var exitBlock @Block = AddBlock(f, "arr_dtor_exit")
+	loopCond.EmitBranch(cmp, loopBody, exitBlock)
+
+	// Loop body: compute element address, call element cleanup
+	var one @Instr = loopBody.EmitConstInt(1, types.TypInt())
+	var elemSize @Instr = loopBody.EmitConstInt(elemTyp.SizeOf(), types.TypInt())
+	var offset @Instr = loopBody.EmitBinop(OP_MUL, iv, elemSize, types.TypInt())
+	var elemAddr @Instr = loopBody.EmitGetElemPtr(rawPtr, offset, types.TypUint8())
+	var elemRawPtr @Instr = loopBody.EmitBitCast(elemAddr, types.MakePointerType(types.TypUint8()))
+
+	if elemTyp.Kind == types.TYP_MANAGED_PTR {
+		var elemPtrTyp @types.Type = types.MakePointerType(elemTyp)
+		var typedElemPtr @Instr = loopBody.EmitBitCast(elemAddr, elemPtrTyp)
+		var elem @Instr = loopBody.EmitLoad(typedElemPtr, elemTyp)
+		emitManagedPtrRefDec(f, loopBody, elem)
+	} else {
+		emitDtorOrCopyCall(f, loopBody, qualifiedDtorNameForType(elemTyp), elemRawPtr)
+	}
+
+	// Increment counter, loop back
+	var iNext @Instr = loopBody.EmitBinop(OP_ADD, iv, one, types.TypInt())
+	loopBody.EmitStore(iSlot, iNext)
+	loopBody.EmitJump(loopCond)
+
+	// Exit
+	var noRetVals @[]@Instr
+	exitBlock.EmitReturn(noRetVals)
+	return f
+}

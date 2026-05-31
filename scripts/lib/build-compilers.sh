@@ -59,7 +59,7 @@ build_gen1() {
     # differ from the pinned BUILDER (e.g. a symbol-mangling change
     # not yet in BUILDER_VERSION); gen1's *outputs* (gen2, tests,
     # conformance) are emitted by gen1 and link the checkout runtime.
-    build_out=$("$builder" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" "$BINATE_DIR/cmd/bnc" -- -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib:$blib:$blib/ifaces/core:$blib/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common:$blib:$blib/impls/core/common:$blib/impls/stdlib/common" --runtime "$blib/runtime/binate_runtime.c" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$builder" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" "$BINATE_DIR/cmd/bnc" -- -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib:$blib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common:$blib" --runtime "$blib/runtime/binate_runtime.c" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"

@@ -1,0 +1,360 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/buf"
+import "pkg/binate/types"
+
+// Fieldwise copy / zero-init helpers.
+//
+// LLVM's backend lowers a single aggregate `store <T> %v, ptr %slot`
+// (or `@llvm.memcpy`) for a struct above a target-specific size
+// threshold to a libc-style `memcpy` call.  Under ARM EABI that
+// becomes `__aeabi_memcpy`, a C-library dependency we don't want on
+// bare-metal targets — and more generally, the Binate runtime should
+// not assume any libc memory-bulk-op intrinsics exist.  See
+// `explorations/plan-codegen-c-free-copies.md`.
+//
+// These helpers emit the copy / zero-fill as a sequence of scalar
+// load+store ops, one per "scalar leaf" of the type's layout.  The
+// LLVM backend lowers each scalar store to a single instruction; no
+// memcpy is ever invoked.  For typical small structs (≤ ~32 bytes,
+// ≤ 8 scalar fields), this is the same instruction count LLVM would
+// produce after inlining a small memcpy — just with the unroll
+// pinned at IR-gen time instead of left to backend heuristics.
+//
+// Padding bytes within structs are NOT written by these helpers.
+// That matches what LLVM does for aggregate stores after
+// legalization, and the refcount-aware `__copy_<T>` / `__dtor_<T>`
+// runtime helpers never read padding either, so observability is
+// unchanged.
+
+// emitFieldwiseCopy emits LLVM IR that copies a value of type t from
+// the address `srcRef` to the address `dstRef`, as a sequence of
+// scalar load+store ops via byte-offset GEPs.  Both refs must already
+// be in LLVM-text pointer form (e.g. "%v.slot", "%v.byvalArg", or a
+// global like "@bn_pkg__x__y").
+//
+// idTag is a unique integer (typically the originating instr's ID)
+// used to name the SSA temporaries this helper emits — so multiple
+// `emitFieldwiseCopy` calls in the same LLVM function produce
+// distinct SSA names.
+func emitFieldwiseCopy(
+	out buf.CharBuf,
+	dstRef *[]const char,
+	srcRef *[]const char,
+	t @types.Type,
+	idTag int,
+) buf.CharBuf {
+	var counter int = 0
+	var newOut buf.CharBuf
+	newOut, counter = emitCopyRec(out, dstRef, srcRef, t, 0, idTag, counter)
+	return newOut
+}
+
+// emitFieldwiseZero emits LLVM IR that zero-initializes a value of
+// type t at the address `dstRef`, as a sequence of scalar zero-
+// stores via byte-offset GEPs.  Used in place of
+// `store <Aggregate> zeroinitializer, ...` for types whose aggregate
+// zero-fill the LLVM backend would otherwise lower via `memset` /
+// `__aeabi_memclr`.
+func emitFieldwiseZero(
+	out buf.CharBuf,
+	dstRef *[]const char,
+	t @types.Type,
+	idTag int,
+) buf.CharBuf {
+	var counter int = 0
+	var newOut buf.CharBuf
+	newOut, counter = emitZeroRec(out, dstRef, t, 0, idTag, counter)
+	return newOut
+}
+
+// emitCopyRec is the recursive workhorse for emitFieldwiseCopy.  It
+// walks t's layout and emits one (GEP-dst, GEP-src, load, store)
+// 4-instruction block per scalar leaf, threading `counter` through
+// to keep SSA names unique.  Returns the (updated buf, next counter).
+func emitCopyRec(
+	out buf.CharBuf,
+	dstRef *[]const char,
+	srcRef *[]const char,
+	t @types.Type,
+	offset int,
+	idTag int,
+	counter int,
+) (buf.CharBuf, int) {
+	if t == nil {
+		return out, counter
+	}
+	t = t.ResolveAlias()
+	if t.Kind == types.TYP_CONST {
+		return emitCopyRec(out, dstRef, srcRef, t.Elem, offset, idTag, counter)
+	}
+
+	// Struct: recurse into each field at its computed offset.
+	if t.Kind == types.TYP_STRUCT {
+		var layout @[]types.FieldLayout = t.StructLayout()
+		for i := 0; i < len(layout); i++ {
+			out, counter = emitCopyRec(out, dstRef, srcRef,
+				t.Fields[i].Type, offset + layout[i].Offset,
+				idTag, counter)
+		}
+		return out, counter
+	}
+
+	// Array: recurse into each element at i*elemSize.
+	if t.Kind == types.TYP_ARRAY {
+		if t.Elem == nil || t.ArrayLen == 0 {
+			return out, counter
+		}
+		var elemSize int = t.Elem.SizeOf()
+		for i := 0; i < t.ArrayLen; i++ {
+			out, counter = emitCopyRec(out, dstRef, srcRef,
+				t.Elem, offset + i * elemSize, idTag, counter)
+		}
+		return out, counter
+	}
+
+	// Slice / managed-slice / func-value / interface-value: fixed
+	// scalar layouts.  Emit one ptr-sized store per scalar field,
+	// using ptr as the LLVM type for refcounted/data pointers and
+	// the target's int-sized integer for length fields.
+	if t.Kind == types.TYP_SLICE {
+		// {data ptr, len int}
+		out, counter = emitScalarCopy(out, dstRef, srcRef, offset,
+			"ptr", idTag, counter)
+		out, counter = emitScalarCopy(out, dstRef, srcRef,
+			offset + types.GetTarget().PointerSize,
+			intLL(), idTag, counter)
+		return out, counter
+	}
+	if t.Kind == types.TYP_MANAGED_SLICE {
+		// {data ptr, len int, backing ptr, cap int}
+		var ps int = types.GetTarget().PointerSize
+		out, counter = emitScalarCopy(out, dstRef, srcRef, offset,
+			"ptr", idTag, counter)
+		out, counter = emitScalarCopy(out, dstRef, srcRef,
+			offset + ps, intLL(), idTag, counter)
+		out, counter = emitScalarCopy(out, dstRef, srcRef,
+			offset + 2 * ps, "ptr", idTag, counter)
+		out, counter = emitScalarCopy(out, dstRef, srcRef,
+			offset + 3 * ps, intLL(), idTag, counter)
+		return out, counter
+	}
+	if t.Kind == types.TYP_FUNC_VALUE ||
+		t.Kind == types.TYP_MANAGED_FUNC_VALUE ||
+		t.Kind == types.TYP_INTERFACE_VALUE ||
+		t.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		// {vtable ptr, data ptr}
+		var ps int = types.GetTarget().PointerSize
+		out, counter = emitScalarCopy(out, dstRef, srcRef, offset,
+			"ptr", idTag, counter)
+		out, counter = emitScalarCopy(out, dstRef, srcRef,
+			offset + ps, "ptr", idTag, counter)
+		return out, counter
+	}
+
+	// Scalar: a single load+store of the type's LLVM form.
+	var llvmTyp @[]char = llvmType(t)
+	out, counter = emitScalarCopy(out, dstRef, srcRef, offset,
+		llvmTyp, idTag, counter)
+	return out, counter
+}
+
+// emitZeroRec mirrors emitCopyRec but emits zero-stores instead of
+// load+store pairs (no source pointer).
+func emitZeroRec(
+	out buf.CharBuf,
+	dstRef *[]const char,
+	t @types.Type,
+	offset int,
+	idTag int,
+	counter int,
+) (buf.CharBuf, int) {
+	if t == nil {
+		return out, counter
+	}
+	t = t.ResolveAlias()
+	if t.Kind == types.TYP_CONST {
+		return emitZeroRec(out, dstRef, t.Elem, offset, idTag, counter)
+	}
+
+	if t.Kind == types.TYP_STRUCT {
+		var layout @[]types.FieldLayout = t.StructLayout()
+		for i := 0; i < len(layout); i++ {
+			out, counter = emitZeroRec(out, dstRef, t.Fields[i].Type,
+				offset + layout[i].Offset, idTag, counter)
+		}
+		return out, counter
+	}
+
+	if t.Kind == types.TYP_ARRAY {
+		if t.Elem == nil || t.ArrayLen == 0 {
+			return out, counter
+		}
+		var elemSize int = t.Elem.SizeOf()
+		for i := 0; i < t.ArrayLen; i++ {
+			out, counter = emitZeroRec(out, dstRef, t.Elem,
+				offset + i * elemSize, idTag, counter)
+		}
+		return out, counter
+	}
+
+	if t.Kind == types.TYP_SLICE {
+		out, counter = emitScalarZero(out, dstRef, offset, "ptr",
+			idTag, counter)
+		out, counter = emitScalarZero(out, dstRef,
+			offset + types.GetTarget().PointerSize,
+			intLL(), idTag, counter)
+		return out, counter
+	}
+	if t.Kind == types.TYP_MANAGED_SLICE {
+		var ps int = types.GetTarget().PointerSize
+		out, counter = emitScalarZero(out, dstRef, offset, "ptr",
+			idTag, counter)
+		out, counter = emitScalarZero(out, dstRef, offset + ps,
+			intLL(), idTag, counter)
+		out, counter = emitScalarZero(out, dstRef, offset + 2 * ps,
+			"ptr", idTag, counter)
+		out, counter = emitScalarZero(out, dstRef, offset + 3 * ps,
+			intLL(), idTag, counter)
+		return out, counter
+	}
+	if t.Kind == types.TYP_FUNC_VALUE ||
+		t.Kind == types.TYP_MANAGED_FUNC_VALUE ||
+		t.Kind == types.TYP_INTERFACE_VALUE ||
+		t.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		var ps int = types.GetTarget().PointerSize
+		out, counter = emitScalarZero(out, dstRef, offset, "ptr",
+			idTag, counter)
+		out, counter = emitScalarZero(out, dstRef, offset + ps,
+			"ptr", idTag, counter)
+		return out, counter
+	}
+
+	var llvmTyp @[]char = llvmType(t)
+	out, counter = emitScalarZero(out, dstRef, offset, llvmTyp,
+		idTag, counter)
+	return out, counter
+}
+
+// emitScalarCopy emits one GEP-pair + load + store sequence for a
+// single scalar leaf at byte `offset` within dst/src.  Form:
+//
+//   %vID.fcN_dp = getelementptr i8, ptr <dstRef>, i32 <offset>
+//   %vID.fcN_sp = getelementptr i8, ptr <srcRef>, i32 <offset>
+//   %vID.fcN_v  = load <llvmTyp>, ptr %vID.fcN_sp
+//   store <llvmTyp> %vID.fcN_v, ptr %vID.fcN_dp
+//
+// (For offset == 0 the GEPs degenerate to no-ops but we still emit
+// them — LLVM constant-folds the zero offset away, and the explicit
+// form keeps the codegen path uniform.)
+func emitScalarCopy(
+	out buf.CharBuf,
+	dstRef *[]const char,
+	srcRef *[]const char,
+	offset int,
+	llvmTyp *[]const char,
+	idTag int,
+	counter int,
+) (buf.CharBuf, int) {
+	out = writeGep(out, idTag, counter, "_dp", dstRef, offset)
+	out = writeGep(out, idTag, counter, "_sp", srcRef, offset)
+	// load
+	out = out.WriteStr("  %v")
+	out = out.WriteInt(idTag)
+	out = out.WriteStr(".fc")
+	out = out.WriteInt(counter)
+	out = out.WriteStr("_v = load ")
+	out = out.WriteStr(llvmTyp)
+	out = out.WriteStr(", ptr %v")
+	out = out.WriteInt(idTag)
+	out = out.WriteStr(".fc")
+	out = out.WriteInt(counter)
+	out = out.WriteStr("_sp\n")
+	// store
+	out = out.WriteStr("  store ")
+	out = out.WriteStr(llvmTyp)
+	out = out.WriteStr(" %v")
+	out = out.WriteInt(idTag)
+	out = out.WriteStr(".fc")
+	out = out.WriteInt(counter)
+	out = out.WriteStr("_v, ptr %v")
+	out = out.WriteInt(idTag)
+	out = out.WriteStr(".fc")
+	out = out.WriteInt(counter)
+	out = out.WriteStr("_dp\n")
+	return out, counter + 1
+}
+
+// emitScalarZero emits one GEP + store-zero sequence:
+//
+//   %vID.fzN_dp = getelementptr i8, ptr <dstRef>, i32 <offset>
+//   store <llvmTyp> <zeroLiteral>, ptr %vID.fzN_dp
+//
+// where zeroLiteral is "null" for pointer types and "0" for
+// integer/bool types.
+func emitScalarZero(
+	out buf.CharBuf,
+	dstRef *[]const char,
+	offset int,
+	llvmTyp *[]const char,
+	idTag int,
+	counter int,
+) (buf.CharBuf, int) {
+	out = writeGep(out, idTag, counter, "_dp", dstRef, offset)
+	out = out.WriteStr("  store ")
+	out = out.WriteStr(llvmTyp)
+	out = out.WriteByte(' ')
+	out = out.WriteStr(zeroLiteralForLLVMType(llvmTyp))
+	out = out.WriteStr(", ptr %v")
+	out = out.WriteInt(idTag)
+	out = out.WriteStr(".fc")
+	out = out.WriteInt(counter)
+	out = out.WriteStr("_dp\n")
+	return out, counter + 1
+}
+
+// writeGep emits one byte-offset GEP line:
+//
+//   %vID.fcN<suffix> = getelementptr i8, ptr <ptrRef>, i32 <offset>
+func writeGep(
+	out buf.CharBuf,
+	idTag int,
+	counter int,
+	suffix *[]const char,
+	ptrRef *[]const char,
+	offset int,
+) buf.CharBuf {
+	out = out.WriteStr("  %v")
+	out = out.WriteInt(idTag)
+	out = out.WriteStr(".fc")
+	out = out.WriteInt(counter)
+	out = out.WriteStr(suffix)
+	out = out.WriteStr(" = getelementptr i8, ptr ")
+	out = out.WriteStr(ptrRef)
+	out = out.WriteStr(", i32 ")
+	out = out.WriteInt(offset)
+	out = out.WriteByte('\n')
+	return out
+}
+
+// zeroLiteralForLLVMType returns the LLVM-text literal for a zero
+// value of the given scalar type.  "null" for pointers (both the
+// opaque "ptr" form and the typed-pointer "X*" form that llvmType
+// returns for TYP_POINTER / TYP_MANAGED_PTR), "0" for integers,
+// "0.0" for floats.
+func zeroLiteralForLLVMType(llvmTyp *[]const char) *[]const char {
+	if len(llvmTyp) == 3 && llvmTyp[0] == 'p' && llvmTyp[1] == 't' &&
+		llvmTyp[2] == 'r' {
+		return "null"
+	}
+	// Typed-pointer form: anything ending in '*' is a pointer type.
+	if len(llvmTyp) >= 1 && llvmTyp[len(llvmTyp) - 1] == '*' {
+		return "null"
+	}
+	if len(llvmTyp) >= 1 &&
+		(llvmTyp[0] == 'd' || llvmTyp[0] == 'f') {
+		// "double" or "float"
+		return "0.0"
+	}
+	return "0"
+}

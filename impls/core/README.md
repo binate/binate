@@ -12,5 +12,9 @@ A given package's files come from exactly one platform variant; the
 loader consumes `common/` plus the chosen target via separate `-L`
 entries.
 
-Populated as tier-0 packages migrate (Steps 2-4 of
-[`explorations/pkg-layout-plan.md`](../../explorations/pkg-layout-plan.md)).
+`common/` holds the impls for `pkg/builtins/lang` and the test file
+for `pkg/builtins/testing` (the framework itself has no impl — see
+its `.bni` for the type-alias surface).  `libc/` joins when Step 4
+of [`explorations/pkg-layout-plan.md`](../../explorations/pkg-layout-plan.md)
+resumes and `pkg/builtins/rt` lands with its libc-backed impl
+sibling.

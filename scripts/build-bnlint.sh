@@ -83,26 +83,47 @@ echo
 
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-# The BUILDER emits bnlint's objects with the BUILDER's own mangling/
-# ABI, so link them against the BUILDER bundle's C runtime (--runtime),
-# not the checkout's — the checkout runtime tracks the current tree's
-# mangling, which can differ from the pinned BUILDER (e.g. a
-# symbol-mangling change not yet in BUILDER_VERSION).  Mirrors
-# build_gen1 in scripts/lib/build-compilers.sh.
 BUILDER_RUNTIME="$BUILDER_LIB/runtime/binate_runtime.c"
+
+# Two-step BUILDER → gen1 → final build, so any difference between the
+# BUILDER's compiled-in mangled-symbol literals and current-source's
+# literals can't reach the released binary.  gen1 is a cmd/bnc built
+# by the BUILDER and linked against the BUILDER's C runtime (its OLD
+# self-references resolve there); gen1's compiled-in codegen is
+# CURRENT source's codegen, so its OUTPUTS use the current literals.
+# The final binary is then emitted by gen1 from current source,
+# linked against the checkout's C runtime — fully consistent.
+
+GEN1_DIR="$BUILD_DIR/gen1"
+GEN1_BNC="$GEN1_DIR/bnc"
+mkdir -p "$GEN1_DIR/build"
+
+echo "  Stage 1: BUILDER → gen1 ..."
+"$BUILDER" \
+    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
+    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
+    "$BINATE_DIR/cmd/bnc" -- \
+    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB" \
+    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB" \
+    --runtime "$BUILDER_RUNTIME" \
+    --build-dir "$GEN1_DIR/build" \
+    -o "$GEN1_BNC" \
+    "$BINATE_DIR/cmd/bnc"
+
+echo "  Stage 2: gen1 → bnlint ..."
 if [ -n "$DBG_FLAG" ]; then
-    "$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" "$BINATE_DIR/cmd/bnc" -- \
-        -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB" \
-        --runtime "$BUILDER_RUNTIME" \
+    "$GEN1_BNC" \
+        -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
+        -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         "$DBG_FLAG" \
         -o "$OUT" \
         "$BINATE_DIR/cmd/bnlint"
 else
-    "$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" "$BINATE_DIR/cmd/bnc" -- \
-        -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB" \
-        --runtime "$BUILDER_RUNTIME" \
+    "$GEN1_BNC" \
+        -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
+        -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         -o "$OUT" \

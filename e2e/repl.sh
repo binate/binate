@@ -40,12 +40,40 @@ BUILD_DIR="$TMP/build"
 mkdir -p "$BUILD_DIR"
 FIXTURE="$TMP/fixture.bn"
 
-# ----- Build bni via the resolved BUILDER -----
-echo "Building bni via builder-comp..."
+# ----- Build bni via BUILDER → gen1 → bni -----
+# Two-stage to keep current-source's mangled-symbol literals out of
+# the BUILDER's emit shape; gen1 is BUILDER-built (linked against
+# the BUILDER's C runtime) but its codegen is CURRENT source's, so
+# gen1's bni output uses current literals + the checkout's runtime.
+# See scripts/build-bni.sh for the same pattern.
+echo "Building bni via builder-comp (BUILDER → gen1 → bni)..."
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-build_log=$("$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
+BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
+BUILDER_RUNTIME="$BUILDER_LIB/runtime/binate_runtime.c"
+GEN1_DIR="$BUILD_DIR/gen1"
+GEN1_BNC="$GEN1_DIR/bnc"
+mkdir -p "$GEN1_DIR/build"
+
+gen1_log=$("$BUILDER" \
+    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
+    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
     "$BINATE_DIR/cmd/bnc" -- \
-    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" --build-dir "$BUILD_DIR" \
+    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB" \
+    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB" \
+    --runtime "$BUILDER_RUNTIME" \
+    --build-dir "$GEN1_DIR/build" \
+    -o "$GEN1_BNC" \
+    "$BINATE_DIR/cmd/bnc" 2>&1)
+if [ ! -x "$GEN1_BNC" ]; then
+    echo "FAIL: gen1 build failed:"
+    echo "$gen1_log"
+    exit 1
+fi
+
+build_log=$("$GEN1_BNC" \
+    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
+    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
+    --build-dir "$BUILD_DIR" \
     -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1)
 if [ ! -x "$BNI_BIN" ]; then
     echo "FAIL: bni build failed:"

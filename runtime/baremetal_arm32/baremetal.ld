@@ -21,15 +21,20 @@ ENTRY(_start)
 
 MEMORY
 {
-	/* QEMU virt's default RAM is 1 GiB; we use 8 MiB to give the
-	 * bump allocator (pkg/rt's `var heap [N]uint8`) headroom for
-	 * tests that allocate many managed-slices or refcounted
-	 * objects in a single pass.  At 1 MiB total, CI surfaced
-	 * `rt.RawAlloc: bump heap exhausted` on a handful of tests;
-	 * 8 MiB clears that and leaves room to bump heap size
-	 * further if needed.
+	/* QEMU virt's default RAM is 1 GiB; the
+	 * `builder-comp_arm32_baremetal` runner explicitly launches
+	 * QEMU with `-m 16M`, so use the full 16 MiB here.  Code +
+	 * rodata + .bss (which includes the bump allocator's heap
+	 * `var heap [N]uint8`) all sit in this region; the stack
+	 * grows down from `_stack_top = ORIGIN + LENGTH`.  At 8 MiB,
+	 * `pkg/native/aarch64` and `pkg/native/x64` test binaries
+	 * overflowed `.bss` by 92 KB and 676 KB respectively (the
+	 * native-backend test suites are comprehensive, so each
+	 * binary aggregates many test-data globals).  16 MiB clears
+	 * both with comfortable headroom.  Bumping further would
+	 * require also bumping QEMU's `-m` flag in lockstep.
 	 */
-	RAM (rwx) : ORIGIN = 0x40000000, LENGTH = 8M
+	RAM (rwx) : ORIGIN = 0x40000000, LENGTH = 16M
 }
 
 SECTIONS

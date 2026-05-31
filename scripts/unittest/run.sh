@@ -189,11 +189,27 @@ trap 'runner_cleanup' EXIT
 
 # Discover all packages with _test.bn files
 PACKAGES=""
-for testfile in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" -name '*_test.bn' 2>/dev/null); do
+# Search roots: collocated (pkg/, cmd/) and split-tree impls (impls/<tier>/<platform>/).
+# Each impls/<tier>/<platform>/pkg/X path strips down to pkg/X as the package's
+# logical name — the loader resolves an `import "pkg/X"` against any matching
+# search root, so the canonical package name is the trailing pkg/... portion.
+for testfile in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/impls" -name '*_test.bn' 2>/dev/null); do
     [ -f "$testfile" ] || continue
     dir="$(dirname "$testfile")"
-    # Convert absolute path to package path (e.g. /path/to/binate/pkg/binate/ir -> pkg/binate/ir)
-    pkg="${dir#"$BINATE_DIR"/}"
+    # Convert absolute path to package path:
+    #   /path/to/binate/pkg/binate/ir              -> pkg/binate/ir
+    #   /path/to/binate/cmd/bnc                    -> cmd/bnc
+    #   /path/to/binate/impls/core/common/pkg/builtins/lang -> pkg/builtins/lang
+    relpath="${dir#"$BINATE_DIR"/}"
+    case "$relpath" in
+        impls/*/*/pkg/*)
+            # Strip the impls/<tier>/<platform>/ prefix.
+            pkg="${relpath#impls/*/*/}"
+            ;;
+        *)
+            pkg="$relpath"
+            ;;
+    esac
     # Deduplicate
     case " $PACKAGES " in
         *" $pkg "*) ;;

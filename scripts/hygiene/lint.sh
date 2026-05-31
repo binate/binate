@@ -55,7 +55,7 @@ if [ -z "$BNLINT_BIN" ] || [ ! -x "$BNLINT_BIN" ]; then
     }
 fi
 
-"$BNLINT_BIN" -I "$BINATE_DIR" -L "$BINATE_DIR" $TARGETS
+"$BNLINT_BIN" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" $TARGETS
 rc=$?
 
 if [ "$rc" -ne 0 ]; then

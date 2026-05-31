@@ -91,8 +91,8 @@ BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 # build_gen1 in scripts/lib/build-compilers.sh.
 BUILDER_RUNTIME="$BUILDER_LIB/runtime/binate_runtime.c"
 if [ -n "$DBG_FLAG" ]; then
-    "$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
-        -I "$BINATE_DIR:$BUILDER_LIB" -L "$BINATE_DIR:$BUILDER_LIB" \
+    "$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" "$BINATE_DIR/cmd/bnc" -- \
+        -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB" \
         --runtime "$BUILDER_RUNTIME" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
@@ -100,8 +100,8 @@ if [ -n "$DBG_FLAG" ]; then
         -o "$OUT" \
         "$BINATE_DIR/cmd/bnas"
 else
-    "$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" "$BINATE_DIR/cmd/bnc" -- \
-        -I "$BINATE_DIR:$BUILDER_LIB" -L "$BINATE_DIR:$BUILDER_LIB" \
+    "$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" "$BINATE_DIR/cmd/bnc" -- \
+        -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB" \
         --runtime "$BUILDER_RUNTIME" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \

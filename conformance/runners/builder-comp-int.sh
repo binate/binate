@@ -9,7 +9,7 @@ runner_exec() {
     if [ -n "$root" ]; then
         "$COMPILED_INTERP" -I "$root:$BINATE_DIR" -L "$root:$BINATE_DIR" "$bn" 2>&1 || true
     else
-        "$COMPILED_INTERP" -I "$BINATE_DIR" -L "$BINATE_DIR" "$bn" 2>&1 || true
+        "$COMPILED_INTERP" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" "$bn" 2>&1 || true
     fi
 }
 

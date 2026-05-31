@@ -43,9 +43,9 @@ FIXTURE="$TMP/fixture.bn"
 # ----- Build bni via the resolved BUILDER -----
 echo "Building bni via builder-comp..."
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-build_log=$("$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" \
+build_log=$("$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
     "$BINATE_DIR/cmd/bnc" -- \
-    -I "$BINATE_DIR" -L "$BINATE_DIR" --build-dir "$BUILD_DIR" \
+    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" --build-dir "$BUILD_DIR" \
     -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1)
 if [ ! -x "$BNI_BIN" ]; then
     echo "FAIL: bni build failed:"
@@ -105,7 +105,7 @@ run_repl() {
     input="$2"
     expected="$3"
     actual=$(printf '%s' "$input" | "$BNI_BIN" --repl \
-        -I "$BINATE_DIR" -L "$BINATE_DIR" \
+        -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
         -I "$TMP" -L "$TMP" \
         "$FIXTURE" 2>&1)
     if [ "$actual" = "$expected" ]; then

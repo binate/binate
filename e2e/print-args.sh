@@ -82,9 +82,9 @@ BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 
 # Build a native bni binary up front; (b) and (c) both need it.
 BNI_BIN="$TMP/bni-bin"
-bni_compile_log=$("$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" \
+bni_compile_log=$("$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
     "$BINATE_DIR/cmd/bnc" -- \
-    -I "$BINATE_DIR" -L "$BINATE_DIR" \
+    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
     --runtime "$BINATE_DIR/runtime/binate_runtime.c" \
     --build-dir "$BUILD_DIR" -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1) || true
 if [ ! -x "$BNI_BIN" ]; then
@@ -95,9 +95,9 @@ fi
 
 # ----- (a) native binary ------------------------------------------
 NATIVE_BIN="$TMP/print_args-bin"
-native_compile_log=$("$BUILDER" -I "$BINATE_DIR" -L "$BINATE_DIR" \
+native_compile_log=$("$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
     "$BINATE_DIR/cmd/bnc" -- \
-    -I "$BINATE_DIR" -L "$BINATE_DIR" \
+    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
     --runtime "$BINATE_DIR/runtime/binate_runtime.c" \
     --build-dir "$BUILD_DIR" -o "$NATIVE_BIN" "$TMP/print_args.bn" 2>&1) || true
 if [ -x "$NATIVE_BIN" ]; then
@@ -110,7 +110,7 @@ fi
 check "native" "$actual"
 
 # ----- (b) compiled bni interprets print_args.bn ------------------
-actual=$("$BNI_BIN" -I "$BINATE_DIR" -L "$BINATE_DIR" "$TMP/print_args.bn" -- \
+actual=$("$BNI_BIN" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" "$TMP/print_args.bn" -- \
     alpha beta gamma 2>&1) || true
 check "bni" "$actual"
 

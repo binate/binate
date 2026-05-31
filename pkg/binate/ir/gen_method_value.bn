@@ -111,10 +111,27 @@ func genMethodValue(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 	var methodQName @[]char = buildMethodQualName(
 		currentModulePkgPath, recvBase.Name, e.Name)
 
-	// Synthesize (or reuse) the wrapper Func for this (method,
-	// receiver-shape) pair.
+	// The closure struct holds the receiver in the form the
+	// METHOD declares (not the form `e.X` was written as).  Per
+	// plan-function-values-phase-2.md §"Method values x.M":
+	//   * method takes `*T`, x is `T` → captured `*T = &x`
+	//   * method takes `T`, x is `*T` or `@T` → captured `T` copy
+	//   * method takes `@T`, x is `@T` → captured `@T` (RefInc'd)
+	//   * etc.
+	// `capturedTyp` is the captured form, computed below.  When it
+	// differs from `recvTyp` (smoothing applies), `genCapturedRecv`
+	// emits the appropriate address-of / deref at the construction
+	// site.  Wrapper sig + closure-struct field + dedup key all
+	// reflect the captured form, so two call sites with different
+	// `e.X` types that smooth to the same captured form share one
+	// wrapper.
+	var capturedTyp @types.Type = m.FuncType.Params[0].Type
+
+	// Synthesize (or reuse) the wrapper Func.  Dedup by (method,
+	// captured-form) — two call sites with smoothing into the
+	// same captured form reuse one wrapper.
 	var wrapperName @[]char = methodValueWrapperName(
-		methodQName, recvTyp)
+		methodQName, capturedTyp)
 	var have bool = false
 	for i := 0; i < len(methodValueWrappers); i++ {
 		if streq(methodValueWrappers[i].WrapperName,
@@ -124,7 +141,7 @@ func genMethodValue(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 	}
 	if !have {
 		synthMethodValueWrapper(wrapperName, methodQName,
-			recvTyp, m)
+			capturedTyp, m)
 		var entry methodValueWrapper
 		entry.WrapperName = wrapperName
 		methodValueWrappers = appendMVWrapper(
@@ -142,20 +159,21 @@ func genMethodValue(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 		types.MakeFuncValueType(userParams, m.FuncType.Results)
 
 	// At the selector site: allocate a closure struct {receiver},
-	// store the evaluated receiver into it, emit OP_FUNC_VALUE-
-	// with-data pointing at the wrapper.  For managed receivers
-	// (@T, @[]T) we mirror gen_func_lit's B.3a flow: RefInc the
-	// value before the store so the closure owns its own
-	// reference, then register the closure struct + closure-local
-	// for cleanup so the synthesized struct-dtor RefDec's it at
-	// frame end.
+	// store the evaluated receiver (possibly converted by
+	// smoothing) into it, emit OP_FUNC_VALUE-with-data pointing
+	// at the wrapper.  For managed captured forms (@T, @[]T) we
+	// mirror gen_func_lit's B.3a flow: RefInc the value before
+	// the store so the closure owns its own reference, then
+	// register the closure struct + closure-local for cleanup so
+	// the synthesized struct-dtor RefDec's it at frame end.
 	var closureStruct @types.Type =
-		buildMethodValueClosureStruct(wrapperName, recvTyp)
+		buildMethodValueClosureStruct(wrapperName, capturedTyp)
 	var closurePtr @Instr = b.EmitAlloc(closureStruct)
-	var recvVal @Instr = genExpr(ctx, b, e.X)
-	emitCaptureRefInc(ctx, b, recvVal, recvTyp)
+	var recvVal @Instr =
+		genCapturedRecv(ctx, b, e.X, recvTyp, capturedTyp)
+	emitCaptureRefInc(ctx, b, recvVal, capturedTyp)
 	var fieldPtr @Instr =
-		b.EmitGetFieldPtr(closurePtr, 0, recvTyp)
+		b.EmitGetFieldPtr(closurePtr, 0, capturedTyp)
 	b.EmitStore(fieldPtr, recvVal)
 	if closureStruct.NeedsDestruction() {
 		registerClosureStructForCleanup(closureStruct)
@@ -193,6 +211,80 @@ func registerMethodValueLocalForCleanup(ctx @GenContext,
 	defineVar(ctx, nameBuf.Bytes(), closurePtr, closureStruct)
 }
 
+// genCapturedRecv evaluates the receiver expression `xExpr` and
+// converts the result to the captured form expected by the
+// closure struct's `recv` field.  Smoothing per plan-function-
+// values-phase-2.md §"Method values x.M":
+//
+//   * recvTyp.Identical(capturedTyp) — no conversion, plain
+//     genExpr.  Covers same-shape paths (T+T, *T+*T, @T+@T).
+//   * recvTyp is T, capturedTyp is *T — take address-of x.  For
+//     EXPR_IDENT this is `lookupVar(ctx, x.Name)`, the alloca'd
+//     stack slot itself (Binate's address-of-local pattern;
+//     mirrors genUnary's `&x` path).  Other addressable shapes
+//     (struct field, indexed slot) aren't yet wired here.
+//   * recvTyp is *T or @T, capturedTyp is T — load through the
+//     pointer to materialise the T copy.
+//   * recvTyp is @T, capturedTyp is *T — bitcast managed-ptr to
+//     raw pointer; the @T's refcount is unaffected (raw doesn't
+//     refcount), so the captured raw pointer's lifetime piggy-
+//     backs on the @T variable that produced it.
+//
+// When the smoothing case isn't recognised, fall back to plain
+// genExpr — IR-gen / backend will catch any remaining mismatch
+// downstream.  Type-checker is the gate on which shapes are
+// valid at the source level.
+func genCapturedRecv(ctx @GenContext, b @Block, xExpr @ast.Expr,
+		recvTyp @types.Type, capturedTyp @types.Type) @Instr {
+	if recvTyp.Identical(capturedTyp) {
+		return genExpr(ctx, b, xExpr)
+	}
+	// T → *T: take address.  EXPR_IDENT case — the alloca'd
+	// stack slot for the local IS its *T address.
+	if capturedTyp != nil && capturedTyp.Kind == types.TYP_POINTER &&
+			recvTyp.Identical(capturedTyp.Elem) {
+		if xExpr.Kind == ast.EXPR_IDENT {
+			var slot @Instr = lookupVar(ctx, xExpr.Name)
+			if slot != nil {
+				// The alloca's runtime value IS the pointer; tag
+				// the Instr with *T so downstream uses (the
+				// EmitStore into the closure struct) treat it as
+				// `*T`-typed.
+				var ptr @Instr = make(Instr)
+				ptr.ID = slot.ID
+				ptr.Op = slot.Op
+				ptr.Typ = capturedTyp
+				return ptr
+			}
+		}
+	}
+	// *T → T / @T → T: load through the pointer.  e.X is
+	// pointer-typed; deref produces the value.
+	if capturedTyp != nil && recvTyp != nil &&
+			(recvTyp.Kind == types.TYP_POINTER ||
+				recvTyp.Kind == types.TYP_MANAGED_PTR) &&
+			recvTyp.Elem != nil &&
+			recvTyp.Elem.Identical(capturedTyp) {
+		var ptrVal @Instr = genExpr(ctx, b, xExpr)
+		return b.EmitLoad(ptrVal, capturedTyp)
+	}
+	// @T → *T: bitcast managed-ptr to raw pointer.  Same
+	// underlying address; the captured raw pointer doesn't
+	// participate in refcounting.
+	if capturedTyp != nil && capturedTyp.Kind == types.TYP_POINTER &&
+			recvTyp != nil &&
+			recvTyp.Kind == types.TYP_MANAGED_PTR &&
+			recvTyp.Elem != nil && capturedTyp.Elem != nil &&
+			recvTyp.Elem.Identical(capturedTyp.Elem) {
+		var mptr @Instr = genExpr(ctx, b, xExpr)
+		return b.EmitBitCast(mptr, capturedTyp)
+	}
+	// Unrecognised: fall back to plain genExpr.  Downstream type
+	// mismatch is the user's signal that the shape isn't yet
+	// supported.
+	return genExpr(ctx, b, xExpr)
+}
+
 // isManagedReceiverType reports whether recvTyp is a managed
 // pointer / managed-slice / etc. — these need refcount machinery
 // (B.3) that isn't part of B.4's first cut.
@@ -220,13 +312,16 @@ func methodValueWrapperName(methodQName @[]char,
 }
 
 // receiverShapeTag returns a short tag distinguishing receiver
-// shape — `v` for value, `p` for raw pointer.  Managed shapes
-// are gated to B.3.
+// shape — `v` for value, `p` for raw pointer, `m` for managed
+// pointer.  Drives the per-(method, captured-form) wrapper
+// dedup: two call sites whose smoothings settle on the same
+// captured form share one wrapper.
 func receiverShapeTag(t @types.Type) @[]char {
 	if t == nil { return "v" }
 	var rt @types.Type = t.ResolveAlias()
 	if rt == nil { return "v" }
 	if rt.Kind == types.TYP_POINTER { return "p" }
+	if rt.Kind == types.TYP_MANAGED_PTR { return "m" }
 	return "v"
 }
 

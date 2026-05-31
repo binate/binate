@@ -101,26 +101,43 @@ func genFuncLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 		currentModule.AddFunc(f)
 	}
 
-	// Compute the user-visible function-value type.  Phase 1 always
-	// raw form (`*func(...)`).  Captures are an implementation
-	// detail — the user-visible signature uses only d.Params.
-	var fnValTyp @types.Type = funcValueTypeFromDecl(d)
+	// Compute the user-visible function-value type.  B.3b: the
+	// checker's hint propagation (ExpectedFVType in pkg/binate/types)
+	// resolves the literal as @func(...) when the destination slot
+	// is @func with a matching signature; everywhere else the
+	// literal stays *func(...).  Read the resolved type back off
+	// the literal Expr so the choice flows through to IR-gen.
+	var isManagedFV bool = isManagedFuncValueLit(e)
+	var fnValTyp @types.Type = funcValueTypeFromDecl(d, isManagedFV)
 
 	if len(captures) == 0 {
-		// Phase 1 non-capturing path: data slot is nil.
+		// Phase 1 non-capturing path: data slot is nil regardless
+		// of the *func / @func flavour — the runtime layouts agree
+		// when data is nil, and there's no closure struct to heap-
+		// allocate.
 		var fv @Instr = b.EmitFuncValue(d.Name, fnValTyp)
 		noteSPGrowingResult(ctx, fv)
 		return fv
 	}
 
-	// B.2 capturing path: stack-alloc the closure struct in the
-	// enclosing frame, read each capture's current value, store
-	// it into the struct, emit OP_FUNC_VALUE with the struct
-	// pointer as the data arg.  For B.3a, each CAP_MANAGED capture
-	// also RefInc's the value before the store so the closure
-	// struct owns its own reference; the matching RefDec runs from
-	// the struct dtor we register below.
-	var closurePtr @Instr = b.EmitAlloc(closureStruct)
+	// Capturing path.  Two flavours:
+	//   *func: stack-alloc closure struct in the enclosing frame;
+	//          frame-end emitDecForManagedLocals on the closure-
+	//          local runs the struct dtor.
+	//   @func: heap-alloc closure struct (EmitMake) — refcount-
+	//          managed; the @func value's data slot owns the
+	//          reference, and the standard managed-ptr RefDec on
+	//          the @func variable at frame end runs the closure-
+	//          struct dtor via the vtable's dtor slot.
+	// For B.3a, each CAP_MANAGED capture also RefInc's the value
+	// before the store so the closure struct owns its own
+	// reference; the matching RefDec runs from the struct dtor.
+	var closurePtr @Instr
+	if isManagedFV {
+		closurePtr = b.EmitMake(closureStruct)
+	} else {
+		closurePtr = b.EmitAlloc(closureStruct)
+	}
 	for i := 0; i < len(captures); i++ {
 		var capValue @Instr = genCaptureRead(ctx, b, captures[i],
 			captureTypes[i])
@@ -129,19 +146,41 @@ func genFuncLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 			captureTypes[i])
 		b.EmitStore(fieldPtr, capValue)
 	}
-	// B.3a: register the closure struct so generateDtors synthesizes
-	// a dtor that RefDec's each managed field, and register the
-	// closure-local in ctx.Vars so emitDecForManagedLocals's frame-
-	// end pass invokes that dtor on it.  Both are guarded on the
-	// struct actually NEEDING destruction (any CAP_MANAGED capture);
-	// pure CAP_VAL / CAP_RAW_PTR closures bypass both.
+	// Register the closure struct so generateDtors synthesizes the
+	// dtor; needed for both flavours when the struct has any
+	// managed field (otherwise the dtor would be a no-op and we
+	// can skip).  For *func, also register the closure-local in
+	// ctx.Vars so emitDecForManagedLocals's frame-end pass invokes
+	// that dtor on the stack-alloc'd struct.  For @func, skip the
+	// ctx.Vars registration — the @func variable's own RefDec at
+	// frame end drives the cleanup (via the data slot's managed-
+	// ptr machinery + the vtable's dtor slot).
 	if closureStruct.NeedsDestruction() {
 		registerClosureStructForCleanup(closureStruct)
-		registerClosureLocalForCleanup(ctx, closurePtr, closureStruct, n)
+		if !isManagedFV {
+			registerClosureLocalForCleanup(ctx, closurePtr,
+				closureStruct, n)
+		}
+	}
+	if isManagedFV {
+		f.IsManagedFuncValue = true
 	}
 	var fv @Instr = b.EmitFuncValueWithData(d.Name, closurePtr, fnValTyp)
 	noteSPGrowingResult(ctx, fv)
 	return fv
+}
+
+// isManagedFuncValueLit reports whether the literal Expr `e`
+// resolved (per the checker's ExprType registry) as the managed
+// `@func(...)` form rather than the default raw `*func(...)`.
+// Drives the stack-alloc vs heap-alloc decision at the literal
+// site (B.3b commit 2).
+func isManagedFuncValueLit(e @ast.Expr) bool {
+	if e == nil || currentChecker == nil { return false }
+	if e.ResolvedTypeID == 0 { return false }
+	var t @types.Type = currentChecker.ExprType(e.ResolvedTypeID)
+	if t == nil { return false }
+	return t.Kind == types.TYP_MANAGED_FUNC_VALUE
 }
 
 // resolveCaptureTypes resolves each capture to its IR-gen-canonical
@@ -352,11 +391,14 @@ func registerLiftedFuncSigWithCaptures(d @ast.Decl,
 	moduleFuncs = slices.Append[FuncSig](moduleFuncs, sig)
 }
 
-// funcValueTypeFromDecl builds the *func(...) function-value type
-// matching the literal's user-declared signature.  Captures are an
-// implementation detail and are NOT part of the user-visible
-// function-value type.
-func funcValueTypeFromDecl(d @ast.Decl) @types.Type {
+// funcValueTypeFromDecl builds the function-value type matching the
+// literal's user-declared signature.  Captures are an implementation
+// detail and are NOT part of the user-visible function-value type.
+// `isManaged` picks between `@func(...)` (TYP_MANAGED_FUNC_VALUE)
+// and `*func(...)` (TYP_FUNC_VALUE); B.3b commit 2 — checker's
+// ExpectedFVType hint propagation surfaces here via
+// isManagedFuncValueLit.
+func funcValueTypeFromDecl(d @ast.Decl, isManaged bool) @types.Type {
 	var params @[]@types.Param = make_slice(@types.Param, len(d.Params))
 	for i := 0; i < len(d.Params); i++ {
 		var p @types.Param = make(types.Param)
@@ -367,6 +409,9 @@ func funcValueTypeFromDecl(d @ast.Decl) @types.Type {
 	var results @[]@types.Type
 	for i := 0; i < len(d.Results); i++ {
 		results = slices.Append[@types.Type](results, resolveTypeExpr(d.Results[i]))
+	}
+	if isManaged {
+		return types.MakeManagedFuncValueType(params, results)
 	}
 	return types.MakeFuncValueType(params, results)
 }

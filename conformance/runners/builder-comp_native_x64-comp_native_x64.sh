@@ -2,7 +2,7 @@
 # Runner: builder-comp_native_x64-comp_native_x64 — current-tree
 # cmd/bnc (compiled normally via the BUILDER during runner_setup)
 # compiles each conformance test with `--backend native --target
-# x86_64-linux`.  The result lands in pkg/native/x64.EmitObject,
+# x86_64-linux`.  The result lands in pkg/binate/native/x64.EmitObject,
 # which is a Phase 2 stub returning false — every test currently
 # fails as COMPILE_ERROR, which is the measurable starting point
 # for Phase 3's per-op lowering work.

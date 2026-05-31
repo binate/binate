@@ -1,0 +1,386 @@
+package "pkg/binate/native/x64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+
+// ============================================================
+// emitInstr — instruction selection
+// ============================================================
+//
+// Phase 3a: function frame + ret-void.
+// Phase 3b: integer constants, binary arith, unary, scalar return.
+// Phase 3c: comparisons + control flow (JMP, conditional BRANCH).
+// Phase 3d: memory ops (ALLOC / LOAD / STORE / GET_FIELD_PTR /
+//           GET_ELEM_PTR).
+// Phase 3e: direct CALL + CONST_STRING + global refs.
+// Everything else is silently dropped — fills in Phases 3f / 3g / 3h
+// / 4.
+
+// emitInstr lowers one IR instruction.  pkgName is the short
+// package name used for symbol mangling (globals, CALL targets).
+// funcSym is the mangled function symbol — used for branch
+// targets (per-function block-label prefix).  allFuncs is the
+// module's full function list — used by CallConv.CalleeUsesCSret
+// in Phase 3h.
+func emitInstr(a @asm.Assembler, pkgName *[]const char, funcSym @[]char,
+		rm @common.RegMap, allFuncs @[]@ir.Func,
+		strings @[]ir.StringConst, ins @ir.Instr) {
+	currentEmitOp = ins.Op
+	if ins.Op == ir.OP_CONST_INT {
+		var r int = nextReg(rm, ins.ID)
+		emitConstInt64(a, r, ins.IntVal)
+		return
+	}
+	if ins.Op == ir.OP_CONST_FLOAT {
+		var r int = nextReg(rm, ins.ID)
+		emitConstFloat(a, r, ins)
+		return
+	}
+	if ins.Op == ir.OP_CONST_BOOL {
+		var r int = nextReg(rm, ins.ID)
+		var v int = 0
+		if ins.BoolVal { v = 1 }
+		x64.Mov(a, x64.Reg(r, x64.SZ64), x64.Imm(v))
+		return
+	}
+	if ins.Op == ir.OP_CONST_STRING {
+		var id int = ir.FindStringID(strings, ins.StrVal)
+		if id < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		x64.LeaRipLabel(a, x64.Reg(rd, x64.SZ64), stringLabel(id))
+		return
+	}
+	if ins.Op == ir.OP_ALLOC {
+		emitAlloc(a, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_LOAD {
+		emitLoad(a, pkgName, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_STORE {
+		emitStore(a, pkgName, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_CONST_NIL {
+		emitConstNil(a, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_MAKE {
+		emitMake(a, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_MAKE_SLICE {
+		emitMakeSlice(a, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_BOX {
+		emitBox(a, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_REFINC {
+		emitRefInc(a, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_REFDEC {
+		emitRefDec(a, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_GET_FIELD_PTR {
+		emitGetFieldPtr(a, pkgName, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_GET_ELEM_PTR {
+		emitGetElemPtr(a, pkgName, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_EXTRACT {
+		emitExtract(a, rm, ins)
+		return
+	}
+	if ins.Op == ir.OP_RODATA_MSLICE || ins.Op == ir.OP_RODATA_SLICE {
+		emitRodataMSliceOrSlice(a, rm, strings, ins)
+		return
+	}
+	if ins.Op == ir.OP_RODATA_MSLICE_COPY {
+		emitStringToCharsCopy(a, rm, strings, ins, ins.StrVal)
+		return
+	}
+	if ins.Op == ir.OP_RODATA_ARRAY {
+		emitStringToArray(a, rm, strings, ins)
+		return
+	}
+	if ins.Op == ir.OP_CALL_INDIRECT {
+		emitCallIndirect(a, rm, allFuncs, ins)
+		return
+	}
+	if ins.Op == ir.OP_CALL_FUNC_VALUE {
+		emitCallFuncValue(a, rm, allFuncs, ins)
+		return
+	}
+	if ins.Op == ir.OP_FUNC_HANDLE {
+		// Produce a *uint8 pointing at the static `__handle.<mangled>`
+		// global — a 16-byte {vtable_ptr, data_ptr} aggregate whose
+		// data slot is null (non-capturing).  Consumed by
+		// OP_CALL_HANDLE.  Mirrors arm64 and the LLVM lowering.
+		if len(ins.StrVal) == 0 { return }
+		var label @[]char = handleSymFor_x64(pkgName, ins.StrVal)
+		a.SetGlobal(label)
+		var rd int = nextReg(rm, ins.ID)
+		x64.LeaRipLabel(a, x64.Reg(rd, x64.SZ64), label)
+		return
+	}
+	if ins.Op == ir.OP_CALL_HANDLE {
+		// Identical shape to OP_CALL_FUNC_VALUE — the handle and a
+		// constructed function value have the same {vtable_ptr,
+		// data_ptr} layout and the same "load vtable.call, call(data,
+		// args)" sequence.  Reuse the same emitter.
+		emitCallFuncValue(a, rm, allFuncs, ins)
+		return
+	}
+	if ins.Op == ir.OP_FUNC_VALUE {
+		// Function-value construction.  Builds a 16-byte
+		// {vtable_addr, data} aggregate in the IR-instruction's
+		// pre-allocated data region.  vtable_addr is the address of
+		// the per-function vtable global emitted by
+		// emitFuncValueVtables.  data is null for Phase 1 non-
+		// capturing literals, or the closure-struct pointer
+		// (ins.Args[0]) for B.2 capturing.
+		if len(ins.StrVal) == 0 { return }
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var vtLabel @[]char = vtableSymFor_x64(pkgName, ins.StrVal)
+		a.SetGlobal(vtLabel)
+		// vtable_addr → slot 0 via RAX scratch (RIP-relative LEA).
+		x64.LeaRipLabel(a, x64.Reg(x64.RAX, x64.SZ64), vtLabel)
+		x64.Mov(a, x64.Mem(x64.RSP, dataOff, x64.SZ64),
+			x64.Reg(x64.RAX, x64.SZ64))
+		// data slot: 0 for Phase 1, capture struct pointer for B.2.
+		if len(ins.Args) == 0 {
+			x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8, x64.SZ64),
+				x64.Imm(0))
+		} else {
+			var dataReg int = getOperand(a, rm, ins.Args[0].ID)
+			x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8, x64.SZ64),
+				x64.Reg(dataReg, x64.SZ64))
+		}
+		// Produce the data-region pointer as the result.
+		var rd int = nextReg(rm, ins.ID)
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(x64.RSP, dataOff, x64.SZ64))
+		return
+	}
+	if ins.Op == ir.OP_IFACE_VALUE {
+		// Interface-value construction.  Builds a 16-byte {data,
+		// vtable} aggregate in the IR-instruction's pre-allocated
+		// data region.  StrVal is the bare vtable global name
+		// (e.g. `__ivt.bn_main__T__I`) — symPrefixed adds the
+		// object-format linkage prefix before declaring it global.
+		// Args[0] is the data pointer (already i8*-shaped).
+		// Field 0 = data, field 1 = vtable.  Mirrors the LLVM and
+		// arm64 layouts.
+		if len(ins.StrVal) == 0 || len(ins.Args) < 1 { return }
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var ivtLabel @[]char = symPrefixed(ins.StrVal)
+		a.SetGlobal(ivtLabel)
+		// Data ptr → slot 0.  Materialize a global-ref pointer via
+		// RIP-relative LEA before allocating scratch regs, mirroring
+		// arm64's path.
+		var dataReg int
+		if isGlobalRef(ins.Args[0]) {
+			dataReg = scratchReg(rm)
+			emitGlobalAddr(a, pkgName, dataReg, ins.Args[0])
+		} else {
+			dataReg = getOperand(a, rm, ins.Args[0].ID)
+			if dataReg < 0 { return }
+		}
+		x64.Mov(a, x64.Mem(x64.RSP, dataOff, x64.SZ64),
+			x64.Reg(dataReg, x64.SZ64))
+		// Vtable address → slot 1.  RIP-relative LEA via a scratch.
+		var vtTmp int = scratchReg(rm)
+		x64.LeaRipLabel(a, x64.Reg(vtTmp, x64.SZ64), ivtLabel)
+		x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8, x64.SZ64),
+			x64.Reg(vtTmp, x64.SZ64))
+		// Produce the data-region pointer as the result.
+		var rd int = nextReg(rm, ins.ID)
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(x64.RSP, dataOff, x64.SZ64))
+		return
+	}
+	if ins.Op == ir.OP_IFACE_UPCAST {
+		// Rebuild an interface value with the source's data ptr and
+		// a vtable pointer adjusted to land at the target's nested
+		// sub-vtable within the source's concat-laid-out vtable.
+		// Slot offset is statically known per (srcIface, targetIface)
+		// pair via ir.IfaceParentSlotOffset.  Mirrors arm64's path.
+		if len(ins.Args) < 1 { return }
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var srcPtr int = getOperand(a, rm, ins.Args[0].ID)
+		if srcPtr < 0 { return }
+		var offsetSlots int = 0
+		var srcTyp @types.Type = ins.Args[0].Typ
+		if srcTyp != nil && srcTyp.Elem != nil &&
+				ins.Typ != nil && ins.Typ.Elem != nil {
+			offsetSlots = ir.IfaceParentSlotOffset(
+				srcTyp.Elem.Pkg, srcTyp.Elem.Name,
+				ins.Typ.Elem.Pkg, ins.Typ.Elem.Name)
+		}
+		var byteOff int = offsetSlots * 8
+		// Data ptr copies straight through via RAX scratch.
+		x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+			x64.Mem(srcPtr, 0, x64.SZ64))
+		x64.Mov(a, x64.Mem(x64.RSP, dataOff, x64.SZ64),
+			x64.Reg(x64.RAX, x64.SZ64))
+		// New vtable ptr = source.vtable + byteOff.
+		x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+			x64.Mem(srcPtr, 8, x64.SZ64))
+		if byteOff > 0 {
+			x64.Add(a, x64.Reg(x64.RAX, x64.SZ64),
+				x64.Imm(byteOff))
+		}
+		x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8, x64.SZ64),
+			x64.Reg(x64.RAX, x64.SZ64))
+		var rd int = nextReg(rm, ins.ID)
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(x64.RSP, dataOff, x64.SZ64))
+		return
+	}
+	if ins.Op == ir.OP_IFACE_DTOR {
+		// Load slot 0 (the dtor) of an interface value's vtable.
+		// Args[0] is the iv (16-byte {data, vtable}); read the
+		// vtable pointer from offset 8, then load *(vtable+0).
+		// Result is an opaque function-pointer-shaped i8* the
+		// OP_REFDEC dtor operand path consumes.
+		if len(ins.Args) < 1 { return }
+		var ivPtr int = getOperand(a, rm, ins.Args[0].ID)
+		if ivPtr < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		x64.Mov(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(ivPtr, 8, x64.SZ64))
+		x64.Mov(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(rd, 0, x64.SZ64))
+		return
+	}
+	if ins.Op == ir.OP_CALL_IFACE_METHOD {
+		emitCallIfaceMethod(a, rm, allFuncs, ins)
+		return
+	}
+	if ins.Op == ir.OP_BIT_CAST {
+		// Reinterpret same-size bits — a plain MOV in the 64-bit GP
+		// register file.  Mirrors arm64's emitInstr case.
+		if len(ins.Args) < 1 { return }
+		var src int = getOperand(a, rm, ins.Args[0].ID)
+		if src < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		if rd != src {
+			x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(src, x64.SZ64))
+		}
+		return
+	}
+	if ins.Op == ir.OP_MANAGED_TO_RAW {
+		// @[]T → *[]T: pass the source pointer through; the first 16
+		// bytes of a managed-slice ARE the raw-slice representation.
+		// MOV on the pointer-to-data-region (no copy of the bytes,
+		// since the raw-slice view aliases the managed-slice's first
+		// two eightbytes).
+		if len(ins.Args) < 1 { return }
+		var src int = getOperand(a, rm, ins.Args[0].ID)
+		if src < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		if rd != src {
+			x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(src, x64.SZ64))
+		}
+		return
+	}
+	if ins.Op == ir.OP_BOUNDS_CHECK {
+		// Lower to a call to bn_pkg__rt__BoundsCheck(index, len).  The
+		// runtime aborts with "index out of bounds: %lld (len %lld)\n"
+		// if the unsigned comparison fails — same fast-path the LLVM
+		// backend uses, since pkg/rt provides the implementation.
+		// SysV-AMD64 args: RDI = idx, RSI = len.
+		if len(ins.Args) < 2 { return }
+		var idx int = getOperand(a, rm, ins.Args[0].ID)
+		var ln int = getOperand(a, rm, ins.Args[1].ID)
+		if idx < 0 || ln < 0 { return }
+		// Move ln into RSI FIRST so the idx-to-RDI MOV doesn't
+		// clobber a value sitting in RSI (RSI isn't in regPool but
+		// is an arg register; safe order is RSI ← ln, then
+		// RDI ← idx).
+		if ln != x64.RSI {
+			x64.Mov(a, x64.Reg(x64.RSI, x64.SZ64),
+				x64.Reg(ln, x64.SZ64))
+		}
+		if idx != x64.RDI {
+			x64.Mov(a, x64.Reg(x64.RDI, x64.SZ64),
+				x64.Reg(idx, x64.SZ64))
+		}
+		var callee @[]char = symPrefixed("bn_pkg__rt__BoundsCheck")
+		a.SetGlobal(callee)
+		x64.Call(a, callee)
+		rm.ResetRegs()
+		return
+	}
+	if ins.Op == ir.OP_CAST {
+		// Numeric conversion: amd64 regmap is uniformly 64-bit-wide
+		// (like arm64), so explicit narrowing via SHL+SAR/SHR places
+		// the target's low-w bits in the destination with the correct
+		// sign behavior.  Float casts (either side TYP_FLOAT) route
+		// through emitFloatCast, which lights up an XMM scratch only
+		// for the conversion proper.
+		if len(ins.Args) < 1 || ins.TypeArg == nil { return }
+		var src int = getOperand(a, rm, ins.Args[0].ID)
+		if src < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		if emitFloatCast(a, rd, src, ins.Args[0].Typ, ins.TypeArg) {
+			return
+		}
+		emitCast(a, rd, src, ins.TypeArg)
+		return
+	}
+	if ins.Op == ir.OP_CALL {
+		emitCall(a, pkgName, rm, allFuncs, ins)
+		return
+	}
+	if ins.Op == ir.OP_C_CALL {
+		// __c_call: same arg-dispatch + return-collect as OP_CALL;
+		// emitCall pulls the verbatim C symbol from ins.StrVal (no
+		// Binate mangling).  Stage-1 contract (scalar/pointer args
+		// + return) keeps the sret arm out — CalleeUsesCSret
+		// short-circuits on non-OP_CALL.
+		emitCall(a, pkgName, rm, allFuncs, ins)
+		return
+	}
+	if emitBinop(a, rm, ins) { return }
+	if emitUnop(a, rm, ins) { return }
+	if emitCompare(a, rm, ins) { return }
+	if ins.Op == ir.OP_JUMP {
+		if ins.Block1 == nil { return }
+		x64.Jmp(a, blockLabel(funcSym, ins.Block1.Label))
+		return
+	}
+	if ins.Op == ir.OP_BRANCH {
+		// Args[0] = cond, Block1 = then-block, Block2 = else-block.
+		// Lowering: TEST cond, cond ; JNZ then-label ; JMP else-label.
+		if ins.Block1 == nil || ins.Block2 == nil ||
+				len(ins.Args) < 1 {
+			return
+		}
+		var condReg int = getOperand(a, rm, ins.Args[0].ID)
+		if condReg < 0 { return }
+		var condOp x64.Operand = x64.Reg(condReg, x64.SZ64)
+		x64.Test(a, condOp, condOp)
+		x64.Jcc(a, x64.CC_NZ, blockLabel(funcSym, ins.Block1.Label))
+		x64.Jmp(a, blockLabel(funcSym, ins.Block2.Label))
+		return
+	}
+	if ins.Op == ir.OP_RETURN {
+		emitReturn(a, rm, ins)
+		return
+	}
+	// Anything else is silently dropped.  Phase 3f–3h / 4 fill in
+	// remaining op coverage.
+}

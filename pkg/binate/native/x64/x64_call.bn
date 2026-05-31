@@ -1,0 +1,330 @@
+package "pkg/binate/native/x64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// Direct function call lowering (Phase 3e)
+// ============================================================
+//
+// SysV-AMD64 calling convention scalar-only subset:
+//   - Integer args fill RDI/RSI/RDX/RCX/R8/R9 in order (6 regs).
+//   - Args 7+ go on the stack at [rsp + 0..stackBytes), 16-byte
+//     aligned at the call boundary (PlanFrame's OutgoingArgsSize
+//     covers this).
+//   - Single scalar return in RAX.
+//
+// Aggregate args are passed by emitAggregateArg per the SysV
+// INTEGER-eightbyte / MEMORY classification: ≤ 16 bytes that fit in
+// the remaining GP arg regs land in those regs; > 16 bytes (or ≤ 16
+// bytes that didn't fit) goes wholly on the stack at the outgoing-
+// args offset (no reg/stack split — see CallConv.SplitAggregates).
+// Float args (XMM0..XMM7) are not yet implemented.  Aggregate returns
+// (≤ 16 bytes in RAX/RDX; > 16 via hidden-RDI sret) are handled below.
+
+// emitAggregateArg passes an aggregate-typed argument per the SysV
+// classification produced by CallConv: regStart >= 0 with stackOff < 0
+// means the aggregate fits wholly in INTEGER GP arg regs (≤ 2
+// eightbytes that fit in the remaining budget) — load each eightbyte
+// from the aggregate's storage into argReg(regStart + w); regStart < 0
+// with stackOff >= 0 means MEMORY class (> 16 bytes, or ≤ 16 bytes
+// that didn't fit) — load each word and store it into the outgoing-
+// args area at [rsp + stackOff + 8*w].  `arg` is an aggregate SSA
+// value, which the amd64 backend represents as a pointer to its
+// storage (data-region / alloc form); getOperand materialises that
+// pointer.
+//
+// RAX is the load-shuttle scratch for the MEMORY path: it isn't in
+// regPool (regmap kept it out as the return-value / IMUL/IDIV
+// implicit), isn't a GP arg register, and the CALL hasn't happened
+// yet so RAX is dead.  Mirrors arm64's use of X16 (AAPCS intra-call
+// scratch) in arm64_call.bn's split-aggregate stack half.
+//
+// SysV has no reg/stack split case (CallConv.SplitAggregates = false),
+// so the regStart >= 0 && stackOff >= 0 combination is unreachable;
+// emitAggregateArg ignores it defensively.
+func emitAggregateArg(a @asm.Assembler, rm @common.RegMap, arg @ir.Instr,
+		regStart int, stackOff int) {
+	var ptr int = getOperand(a, rm, arg.ID)
+	if ptr < 0 { return }
+	// Indirect-large: pkg/codegen emits the param as a plain `ptr`,
+	// and LLVM lowers it to "pointer in next free arg reg".  Native
+	// passes the data-region pointer as a single 8-byte arg (in reg
+	// or on stack), NOT the struct contents laid out.
+	if rm.CC.IndirectLargeAggregates &&
+			arg.Typ.SizeOf() > rm.CC.AggregateInRegMax {
+		if regStart >= 0 {
+			var dst int = argReg(regStart)
+			if ptr != dst {
+				x64.Mov(a, x64.Reg(dst, x64.SZ64),
+					x64.Reg(ptr, x64.SZ64))
+			}
+		} else if stackOff >= 0 {
+			x64.Mov(a, x64.Mem(x64.RSP, stackOff, x64.SZ64),
+				x64.Reg(ptr, x64.SZ64))
+		}
+		return
+	}
+	var nWords int = common.ArgWords(arg.Typ)
+	if regStart >= 0 && stackOff < 0 {
+		// All eightbytes in GP arg regs (≤ AggregateInRegMax fits).
+		for w := 0; w < nWords; w++ {
+			x64.Mov(a, x64.Reg(argReg(regStart + w), x64.SZ64),
+				x64.Mem(ptr, 8*w, x64.SZ64))
+		}
+		return
+	}
+	if regStart < 0 && stackOff >= 0 {
+		// MEMORY class for ≤ AggregateInRegMax aggregates that
+		// didn't fit in the remaining GP arg regs: load each
+		// word into RAX, store to [rsp + stackOff + 8*w].
+		for w := 0; w < nWords; w++ {
+			x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+				x64.Mem(ptr, 8*w, x64.SZ64))
+			x64.Mov(a, x64.Mem(x64.RSP, stackOff + 8*w, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
+		}
+		return
+	}
+}
+
+// emitCall lowers OP_CALL.  ins.StrVal is the dot-qualified callee
+// name (already-mangled by symFor); a.SetGlobal declares the
+// callee as an extern so the ELF carries an R_X86_64_PLT32 reloc
+// for cross-translation-unit calls.
+func emitCall(a @asm.Assembler, pkgName *[]const char, rm @common.RegMap,
+		allFuncs @[]@ir.Func, ins @ir.Instr) {
+	// Build the argTypes slice once for the CallConv dispatch.
+	// SysV-AMD64 sret: an aggregate or multi-return tuple bigger
+	// than CallConv.InternalSretBytes (or CExternSretBytes for
+	// C-extern callees) is returned via a hidden buffer pointer
+	// in RDI, shifting every user arg by one register.  We model
+	// the shift by synthesising a pointer-typed leading entry in
+	// argTypes — CallArgRegStart then naturally places user arg i
+	// at register slot i+1.
+	var bigMultiRet bool = ins.ID >= 0 &&
+		rm.CC.CallReturnsBigMultiReturn(ins)
+	var bigRet bool = ins.ID >= 0 &&
+		(rm.CC.CallReturnsBigAggregate(ins) ||
+		 rm.CC.CalleeUsesCSret(allFuncs, ins) ||
+		 bigMultiRet)
+	var nDispatchArgs int = len(ins.Args)
+	if bigRet { nDispatchArgs = nDispatchArgs + 1 }
+	var argTypes @[]@types.Type = make_slice(@types.Type, nDispatchArgs)
+	if bigRet {
+		// First slot is the hidden sret-buffer pointer — a single
+		// 8-byte word that consumes one GP arg register.
+		argTypes[0] = types.TypInt()
+		for i := 0; i < len(ins.Args); i++ {
+			argTypes[i+1] = ins.Args[i].Typ
+		}
+	} else {
+		for i := 0; i < len(ins.Args); i++ {
+			argTypes[i] = ins.Args[i].Typ
+		}
+	}
+
+	// SysV-AMD64 NSRN: float-scalar args go to XMM(NSRN), separate
+	// from the GP NGRN counter that CallArgRegStart tracks.  Capped
+	// at 8 (XMM0..XMM7); beyond that, float args would land on the
+	// stack as 8 bytes, but no conformance test exercises that.
+	var nsrn int = 0
+	for ai := 0; ai < len(ins.Args); ai++ {
+		var arg @ir.Instr = ins.Args[ai]
+		if common.IsFloatScalarTyp(arg.Typ) {
+			var fsrc int = getOperand(a, rm, arg.ID)
+			if fsrc >= 0 && nsrn < 8 {
+				x64.Movq_gp_to_xmm(a, x64.XMM0 + nsrn, fsrc)
+				nsrn = nsrn + 1
+			}
+			rm.ResetRegs()
+			continue
+		}
+		// User arg i lives at dispatch slot i (no sret) or i+1
+		// (sret — the synthesised pointer takes slot 0).
+		var dispatchIdx int = ai
+		if bigRet { dispatchIdx = ai + 1 }
+		var regStart int = rm.CC.CallArgRegStart(argTypes, dispatchIdx)
+		var stackOff int = rm.CC.CallArgStackOff(argTypes, dispatchIdx)
+		if common.IsAggregateTyp(arg.Typ) {
+			emitAggregateArg(a, rm, arg, regStart, stackOff)
+			rm.ResetRegs()
+			continue
+		}
+		var src int = getOperand(a, rm, arg.ID)
+		if src < 0 { continue }
+		if regStart >= 0 {
+			var dst int = argReg(regStart)
+			if src != dst {
+				x64.Mov(a, x64.Reg(dst, x64.SZ64),
+					x64.Reg(src, x64.SZ64))
+			}
+		} else {
+			x64.Mov(a, x64.Mem(x64.RSP, stackOff, x64.SZ64),
+				x64.Reg(src, x64.SZ64))
+		}
+		// Per-arg reset: the source register is dead after the MOV
+		// into argReg/stack.  Without this, a long arg list saturates
+		// the regPool (mirrors arm64's per-arg ResetRegs in
+		// arm64_call.bn).
+		rm.ResetRegs()
+	}
+
+	// sret setup: LEA &returnBuffer into RDI.  Single-aggregate
+	// returns land in the alloc data region; multi-return tuples
+	// land in the spill slot (sized to the full tuple by
+	// PlanFrame).
+	if bigRet {
+		var sretOff int = -1
+		if bigMultiRet {
+			sretOff = rm.LookupSpill(ins.ID)
+		} else {
+			sretOff = rm.LookupAlloc(ins.ID)
+		}
+		if sretOff >= 0 {
+			x64.Lea(a, x64.Reg(x64.RDI, x64.SZ64),
+				x64.Mem(x64.RSP, sretOff, x64.SZ64))
+		}
+	}
+
+	// Emit the CALL.  __c_call carries a verbatim C symbol on
+	// ins.StrVal (no Binate mangling); every other call op routes
+	// through symFor, which handles dot-qualified names (e.g.
+	// "bootstrap.println") and bare names alike.  Both paths still
+	// need symPrefixed for the object-format linkage convention
+	// (Mach-O leading '_' vs ELF bare).  a.SetGlobal declares the
+	// callee for cross-section relocs.
+	var callee @[]char
+	if ins.Op == ir.OP_C_CALL {
+		callee = symPrefixed(ins.StrVal)
+	} else {
+		callee = symFor(pkgName, ins.StrVal)
+	}
+	a.SetGlobal(callee)
+	// Stage 4 WIP: SysV variadic calls require AL = vector-reg count
+	// used by varargs.  We don't emit float-arg passing yet, so for
+	// an int-only variadic call AL = 0.  printf and friends may read
+	// AL defensively; without this the high byte of RAX leaks in.
+	if ins.Op == ir.OP_C_CALL && ins.CFixedArgs < len(ins.Args) {
+		x64.Mov(a, x64.Reg(x64.RAX, x64.SZ8), x64.Imm(0))
+	}
+	x64.Call(a, callee)
+
+	// CALL clobbers all caller-saved regs (RAX/RCX/RDX/RSI/RDI/R8-R11
+	// per SysV); the entire regPool is dead.  Reset before allocating
+	// the return slot.
+	rm.ResetRegs()
+	if ins.ID < 0 { return }
+	if ins.Typ == nil { return }
+
+	// Multi-return tuple: bigRet (sret) wrote the bytes directly
+	// into the spill slot via the hidden RDI buffer pointer — no
+	// register-to-slot copying needed.  ≤ 16 bytes: SysV packs
+	// RAX (first word) + RDX (second word); store each into the
+	// spill slot at the field's offset.
+	if common.IsMultiReturnCall(ins) {
+		if bigMultiRet { return }
+		var spillOff int = rm.LookupSpill(ins.ID)
+		if spillOff < 0 { return }
+		var n int = len(ins.Typ.Fields)
+		if n > 2 { n = 2 }
+		for fi := 0; fi < n; fi++ {
+			var fldTyp @types.Type = ins.Typ.Fields[fi].Type
+			var fldOff int = ins.Typ.FieldOffset(fi)
+			var fldSz int = 8
+			if fldTyp != nil { fldSz = fldTyp.SizeOf() }
+			if fldSz <= 0 { fldSz = 8 }
+			var srcReg int = x64.RAX
+			if fi == 1 { srcReg = x64.RDX }
+			emitScalarStore(a, srcReg, x64.RSP,
+				spillOff + fldOff, fldSz)
+		}
+		return
+	}
+
+	// Single aggregate return.  Three cases:
+	//   - bigRet (> 16 bytes via sret): callee wrote through RDI;
+	//     just LEA the data-region pointer into rd.
+	//   - ≤ 8 bytes: packed into RAX; store RAX into the data
+	//     region; LEA rd.
+	//   - 9..16 bytes: packed into RAX (low 8) + RDX (high 8);
+	//     store both into the data region; LEA rd.
+	if common.IsAggregateTyp(ins.Typ) {
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var sz int = ins.Typ.SizeOf()
+		if sz <= 0 { return }
+		if !bigRet {
+			// ≤ 16 bytes — pack RAX (+ RDX) into the data region.
+			x64.Mov(a, x64.Mem(x64.RSP, dataOff, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
+			if sz > 8 {
+				x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8, x64.SZ64),
+					x64.Reg(x64.RDX, x64.SZ64))
+			}
+		}
+		var rd int = nextReg(rm, ins.ID)
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(x64.RSP, dataOff, x64.SZ64))
+		return
+	}
+	if ins.Typ.Kind == types.TYP_VOID { return }
+	// Single scalar return: RAX → rd → spill, except for float
+	// scalars which arrive in XMM0 per SysV-AMD64.  MOVQ XMM0 →
+	// rd (full 64-bit pattern) parks the bits in the same GP-spill-
+	// slot form every other float-typed value uses.
+	if common.IsFloatScalarTyp(ins.Typ) {
+		var frd int = nextReg(rm, ins.ID)
+		x64.Movq_xmm_to_gp(a, frd, x64.XMM0)
+		return
+	}
+	// For narrow returns (bool / sub-byte int), SysV-AMD64 leaves
+	// the upper bits of RAX *undefined* — LLVM's i1 return from
+	// `ret i1 %v` emits AL with whatever was previously in the
+	// upper 56 bits.  A naïve 64-bit MOV propagates that garbage
+	// and downstream consumers see false bools as non-zero (e.g.
+	// `if !HasTyp(&o)` taking the then-branch when HasTyp returned
+	// true).  Zero-extend the relevant low N bytes to clean the
+	// result.
+	var rd int = nextReg(rm, ins.ID)
+	var retSz int = ins.Typ.SizeOf()
+	if retSz < 0 { retSz = 8 }
+	var signed bool = ins.Typ.Signed
+	if retSz == 1 {
+		if signed {
+			x64.Movsx(a, x64.Reg(rd, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ8))
+		} else {
+			x64.Movzx(a, x64.Reg(rd, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ8))
+		}
+		return
+	}
+	if retSz == 2 {
+		if signed {
+			x64.Movsx(a, x64.Reg(rd, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ16))
+		} else {
+			x64.Movzx(a, x64.Reg(rd, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ16))
+		}
+		return
+	}
+	if retSz == 4 {
+		if signed {
+			x64.Movsxd(a, x64.Reg(rd, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ32))
+		} else {
+			// MOV r32, r32 implicitly zero-extends to 64-bit on x86-64.
+			x64.Mov(a, x64.Reg(rd, x64.SZ32),
+				x64.Reg(x64.RAX, x64.SZ32))
+		}
+		return
+	}
+	if rd != x64.RAX {
+		x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+	}
+}

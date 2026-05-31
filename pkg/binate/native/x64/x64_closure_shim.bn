@@ -1,0 +1,287 @@
+package "pkg/binate/native/x64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// Native x64 emission for the per-(literal, capture-shape) shim
+// that backs a capturing function literal (B.2 of plan-function-
+// values-phase-2.md).  Split from x64_funcvalue.bn to keep that
+// file under the hygiene soft length cap.
+//
+// SysV ABI: integer arg registers are RDI, RSI, RDX, RCX, R8, R9
+// in that order — that's what argReg(0..5) returns.
+//
+// Closure shim shape (scalar / void return only — aggregate-return
+// closures are not yet supported).  Two paths:
+//
+//   * Fast path — when every capture and every user-arg lands in a
+//     GP arg register at the underlying body's calling convention:
+//         shim:
+//           <shift user args argReg(1..M) up to argReg(W..W+M-1)>
+//           <load capture words argReg(W-1)..argReg(1) from [RDI+ofs]>
+//           <load argReg(0) (= RDI) from [RDI + off_0]>
+//           JMP underlying_fn
+//     W is the total capture register-word count.  The user-arg
+//     shift is right-to-left and the capture loads are right-to-
+//     left so RDI stays valid as the closure-struct base until
+//     the final load.
+//
+//   * Stack-spill path — when ANY arg classifies as MEMORY under
+//     SysV (aggregate > AggregateInRegMax = 16 bytes, including a
+//     managed-slice `@[]T` at 32 bytes).  The body's prologue
+//     reads those args from the outgoing-args stack area, so the
+//     shim must reserve that area, write the words, then CALL
+//     rather than JMP (since the stack frame must be undone
+//     before RET):
+//         shim:
+//           SUB RSP, stkBytes + 8        ; +8 compensates for the
+//                                        ; return-address push so
+//                                        ; the outgoing CALL sees
+//                                        ; a 16-byte-aligned RSP.
+//           <spill stack-bound captures: [RDI+ofs] → RAX → [RSP+sof]>
+//           <move user-args incoming → outgoing positions>
+//           <load reg-bound captures: [RDI+ofs] → argReg(rs)>
+//           CALL underlying_fn
+//           ADD RSP, stkBytes + 8
+//           RET
+//     Ordering rationale: step 1 (stack-spill) uses RDI as the
+//     read base, so it must finish before step 2 / 3 can touch
+//     RDI; step 2 (user-arg moves) uses RSI..R9 as sources, so it
+//     must finish before step 3 (which might overwrite those regs
+//     with reg-captures); step 3 (reg-captures) goes right-to-
+//     left so the final iteration's write into RDI happens last.
+
+// lookupClosureFunc_x64 returns the Func with the given name iff
+// it is a capturing-literal closure (IsClosure=true).  Returns nil
+// for non-closure refs and for cross-module references.
+func lookupClosureFunc_x64(mod @ir.Module, name @[]char) @ir.Func {
+	for i := 0; i < len(mod.Funcs); i++ {
+		if !charsEq_closureshim_x64(mod.Funcs[i].Name, name) {
+			continue
+		}
+		if !mod.Funcs[i].IsClosure { return nil }
+		return mod.Funcs[i]
+	}
+	return nil
+}
+
+// charsEq_closureshim_x64 is a local byte-compare for char slices.
+// Distinct name from sibling files' charEq* helpers to avoid
+// duplicate-symbol issues within pkg/binate/native/x64.
+func charsEq_closureshim_x64(a *[]const char, b *[]const char) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] { return false }
+	}
+	return true
+}
+
+// emitClosureShim_x64 emits the per-(literal, capture-shape) shim
+// for a capturing closure.  Caller has already emitted the label
+// and SetWeak; this writes the shim body.  Picks fast-path or
+// stack-spill path based on whether any arg classifies as MEMORY
+// under SysV-AMD64.
+//
+// Constraints (apply to both paths):
+//   - scalar / void return only (return size ≤ 8 bytes)
+//   - all user-args fit in incoming GP arg regs (RSI..R9, i.e.
+//     ≤ 5 user-arg words after the data-slot RDI) — multi-word
+//     INCOMING user-args via the stack aren't handled yet.
+//
+// Anything outside these constraints falls back to a plain JMP
+// to the underlying.  Behavior is wrong, but the assembler
+// doesn't blow up.
+func emitClosureShim_x64(a @asm.Assembler, fnLabel @[]char,
+		fvTyp @types.Type, f @ir.Func) {
+	var cc common.CallConv = common.SysV_AMD64()
+	var argTypes @[]@types.Type = buildShimArgTypes_x64(fvTyp, f)
+	var nUserWords int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		nUserWords = nUserWords +
+			common.ArgWords(fvTyp.Params[pi].Type)
+	}
+	if nUserWords > 5 {
+		// Incoming user-args overflow into stack — not yet
+		// handled.  Plain jump fallback.
+		a.SetGlobal(fnLabel)
+		x64.Jmp(a, fnLabel)
+		return
+	}
+	if !shimNeedsStackSpill_x64(cc, argTypes) {
+		emitClosureShimFast_x64(a, fnLabel, fvTyp, f, nUserWords)
+		return
+	}
+	emitClosureShimStackSpill_x64(a, fnLabel, fvTyp, f, cc, argTypes,
+		nUserWords)
+}
+
+// buildShimArgTypes_x64 returns the type list for the OUTGOING call
+// the shim performs: captures first (in ClosureStruct field order),
+// then user-args.  Same shape the CallConv classifier expects for a
+// normal direct call.
+func buildShimArgTypes_x64(fvTyp @types.Type,
+		f @ir.Func) @[]@types.Type {
+	var argTypes @[]@types.Type
+	for i := 0; i < f.NumCaptureParams; i++ {
+		argTypes = slices.Append[@types.Type](argTypes,
+			f.ClosureStruct.Fields[i].Type)
+	}
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		argTypes = slices.Append[@types.Type](argTypes,
+			fvTyp.Params[pi].Type)
+	}
+	return argTypes
+}
+
+// shimNeedsStackSpill_x64 reports whether any arg in the outgoing
+// call ends up entirely on the stack (CallArgStackOff >= 0).  If
+// none do, the simpler fast path (register-only + JMP) suffices.
+func shimNeedsStackSpill_x64(cc common.CallConv,
+		argTypes @[]@types.Type) bool {
+	for i := 0; i < len(argTypes); i++ {
+		if cc.CallArgStackOff(argTypes, i) >= 0 { return true }
+	}
+	return false
+}
+
+// emitClosureShimFast_x64 is the original B.2 / B.3a register-only
+// path.  Requires every arg to land in a GP arg register (no MEMORY
+// classification).
+func emitClosureShimFast_x64(a @asm.Assembler, fnLabel @[]char,
+		fvTyp @types.Type, f @ir.Func, nUserWords int) {
+	var captureWords int = totalCaptureWords_x64(f)
+	if captureWords + nUserWords > 6 {
+		a.SetGlobal(fnLabel)
+		x64.Jmp(a, fnLabel)
+		return
+	}
+	for j := nUserWords - 1; j >= 0; j = j - 1 {
+		var srcReg int = argReg(j + 1)
+		var dstReg int = argReg(captureWords + j)
+		if srcReg != dstReg {
+			x64.Mov(a, x64.Reg(dstReg, x64.SZ64),
+				x64.Reg(srcReg, x64.SZ64))
+		}
+	}
+	var w int = captureWords
+	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var wordCount int = common.ArgWords(ft)
+		var baseOfs int = f.ClosureStruct.FieldOffset(i)
+		for k := wordCount - 1; k >= 0; k = k - 1 {
+			w = w - 1
+			x64.Mov(a, x64.Reg(argReg(w), x64.SZ64),
+				x64.Mem(x64.RDI, baseOfs + k * 8, x64.SZ64))
+		}
+	}
+	a.SetGlobal(fnLabel)
+	x64.Jmp(a, fnLabel)
+}
+
+// emitClosureShimStackSpill_x64 handles the SysV MEMORY case: one or
+// more args (captures or user-args) classify as fully on the stack,
+// so the shim must reserve outgoing-args stack space and write the
+// words explicitly.  Switches the tail-jump to CALL + cleanup + RET
+// so the stack rewind happens before returning to the caller.
+func emitClosureShimStackSpill_x64(a @asm.Assembler, fnLabel @[]char,
+		fvTyp @types.Type, f @ir.Func, cc common.CallConv,
+		argTypes @[]@types.Type, nUserWords int) {
+	var stkBytes int = cc.CallStackBytes(argTypes)
+	// +8 compensates for the return-address push at shim entry —
+	// at entry RSP is 8-byte aligned, and the outgoing CALL needs
+	// it 16-byte aligned.  stkBytes is already rounded to
+	// StackAlign (16) by CallStackBytes.
+	var rspDelta int = stkBytes + 8
+	x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(rspDelta))
+
+	// Step 1: spill stack-bound captures.  Read from
+	// [RDI + fieldOfs + k*8] via RAX, write to [RSP + stkOff + k*8].
+	// Done first so RDI is still the closure-struct base — step 2
+	// (user-arg shift) and step 3's i=0 reg-capture may overwrite it.
+	for i := 0; i < f.NumCaptureParams; i = i + 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var nWords int = common.ArgWords(ft)
+		var regStart int = cc.CallArgRegStart(argTypes, i)
+		var stkOff int = cc.CallArgStackOff(argTypes, i)
+		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
+		if regStart < 0 && stkOff >= 0 {
+			for k := 0; k < nWords; k = k + 1 {
+				x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+					x64.Mem(x64.RDI, fieldOfs + k * 8, x64.SZ64))
+				x64.Mov(a, x64.Mem(x64.RSP, stkOff + k * 8, x64.SZ64),
+					x64.Reg(x64.RAX, x64.SZ64))
+			}
+		}
+	}
+
+	// Step 2: move user-args from incoming positions
+	// (argReg(1)..argReg(1+nUserWords-1)) to their outgoing
+	// positions per the CallConv.  Process right-to-left over
+	// user-args so a forward shift (low → high reg) reads each
+	// source before its slot becomes a destination.
+	var userArgStart int = f.NumCaptureParams
+	var inRegBase int = 1 + nUserWords
+	for ui := len(fvTyp.Params) - 1; ui >= 0; ui = ui - 1 {
+		var ut @types.Type = fvTyp.Params[ui].Type
+		var nUw int = common.ArgWords(ut)
+		inRegBase = inRegBase - nUw
+		var argIdx int = userArgStart + ui
+		var outRegStart int = cc.CallArgRegStart(argTypes, argIdx)
+		var outStkOff int = cc.CallArgStackOff(argTypes, argIdx)
+		if outRegStart >= 0 {
+			for k := nUw - 1; k >= 0; k = k - 1 {
+				var srcReg int = argReg(inRegBase + k)
+				var dstReg int = argReg(outRegStart + k)
+				if srcReg != dstReg {
+					x64.Mov(a, x64.Reg(dstReg, x64.SZ64),
+						x64.Reg(srcReg, x64.SZ64))
+				}
+			}
+		} else if outStkOff >= 0 {
+			for k := 0; k < nUw; k = k + 1 {
+				var srcReg int = argReg(inRegBase + k)
+				x64.Mov(a, x64.Mem(x64.RSP, outStkOff + k * 8, x64.SZ64),
+					x64.Reg(srcReg, x64.SZ64))
+			}
+		}
+	}
+
+	// Step 3: load register-passed captures.  Iterate captures
+	// right-to-left so the i=0 case (which would clobber RDI when
+	// outRegStart=0) runs last.
+	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var nWords int = common.ArgWords(ft)
+		var regStart int = cc.CallArgRegStart(argTypes, i)
+		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
+		if regStart >= 0 {
+			for k := nWords - 1; k >= 0; k = k - 1 {
+				x64.Mov(a, x64.Reg(argReg(regStart + k), x64.SZ64),
+					x64.Mem(x64.RDI, fieldOfs + k * 8, x64.SZ64))
+			}
+		}
+	}
+
+	// Step 4: CALL underlying and rewind the stack.
+	a.SetGlobal(fnLabel)
+	x64.Call(a, fnLabel)
+	x64.Add(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(rspDelta))
+	x64.Ret(a)
+}
+
+// totalCaptureWords_x64 sums the SysV register-word footprint of
+// each capture-type — scalars / pointers are 1, managed-slice is
+// 4 (under SysV's pure-MEMORY classification), managed function-
+// value is 2, etc.  Used by emitClosureShimFast_x64 to budget the
+// register slots and compute the user-arg shift target index.
+func totalCaptureWords_x64(f @ir.Func) int {
+	var w int = 0
+	for i := 0; i < f.NumCaptureParams; i++ {
+		w = w + common.ArgWords(f.ClosureStruct.Fields[i].Type)
+	}
+	return w
+}

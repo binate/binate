@@ -1,0 +1,159 @@
+package "pkg/binate/native/x64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// Rodata-slice / -array ops — emit_string_to_chars + composites
+// ============================================================
+//
+// OP_RODATA_SLICE / OP_RODATA_MSLICE aliases a static string global
+// as a slice header.  No allocation, no copy — the slice's data
+// pointer addresses the rodata global directly via RIP-relative
+// LEA.  Managed-slice variants pad the header with refptr=0 /
+// backingLen=0 (RefInc/RefDec no-op on null refptr).
+//
+// OP_RODATA_MSLICE_COPY allocates a fresh managed-slice (runtime
+// MakeManagedSlice) and memcpys the string bytes in — used when the
+// destination is mutable.  OP_RODATA_ARRAY initialises a fixed-size
+// stack buffer ([N]uint8) from a string literal.
+//
+// Mirrors arm64's emit_*Rodata / emitStringToCharsCopy /
+// emitStringToArray.  Stays under amd64_emit.bn's soft cap since
+// it doesn't introduce any new emit primitives — just RIP-relative
+// LEA + the existing runtime-call shape from amd64_managed.bn.
+
+// emitRodataMSliceOrSlice writes a slice header pointing at the
+// shared rodata global for the constant bytes in ins.StrVal.  For
+// managed-slice targets the 4-word header is written with refptr=0
+// + backingLen=0; for raw-slice targets only the {data, len} prefix
+// is written.
+func emitRodataMSliceOrSlice(a @asm.Assembler, rm @common.RegMap,
+		strings @[]ir.StringConst, ins @ir.Instr) {
+	emitRodataSliceHeader(a, rm, strings, ins, ins.StrVal, ins.Typ)
+}
+
+// emitRodataSliceHeader is the shared body for OP_RODATA_SLICE /
+// OP_RODATA_MSLICE.  Allocates the slice's data region from rm,
+// LEAs the rodata-global pointer and the constant length into the
+// first two header words, optionally zeroes the managed-slice tail
+// (refptr + backingLen), and finally returns a pointer to the
+// region (LEA rd, [rsp + dataOff]).
+func emitRodataSliceHeader(a @asm.Assembler, rm @common.RegMap,
+		strings @[]ir.StringConst, ins @ir.Instr,
+		bytes @[]char, sliceTyp @types.Type) {
+	var sid int = ir.FindStringID(strings, bytes)
+	if sid < 0 { return }
+	var dataOff int = rm.LookupAlloc(ins.ID)
+	if dataOff < 0 { return }
+	var dataReg int = scratchReg(rm)
+	x64.LeaRipLabel(a, x64.Reg(dataReg, x64.SZ64), stringLabel(sid))
+	x64.Mov(a, x64.Mem(x64.RSP, dataOff, x64.SZ64),
+		x64.Reg(dataReg, x64.SZ64))
+	var lenReg int = scratchReg(rm)
+	emitConstInt64(a, lenReg, cast(int64, len(bytes)))
+	x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8, x64.SZ64),
+		x64.Reg(lenReg, x64.SZ64))
+	if sliceTyp != nil && sliceTyp.Kind == types.TYP_MANAGED_SLICE {
+		x64.Mov(a, x64.Mem(x64.RSP, dataOff + 16, x64.SZ64),
+			x64.Imm(0))
+		x64.Mov(a, x64.Mem(x64.RSP, dataOff + 24, x64.SZ64),
+			x64.Imm(0))
+	}
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	x64.Lea(a, x64.Reg(rd, x64.SZ64),
+		x64.Mem(x64.RSP, dataOff, x64.SZ64))
+}
+
+// emitStringToCharsCopy: OP_RODATA_MSLICE_COPY — `var s @[]char =
+// "..."` allocates a fresh managed-slice header + backing buffer
+// (runtime MakeManagedSlice), then memcpys the string bytes into
+// the buffer.  Result is a pointer to the data region holding the
+// 4-word header.  SysV-AMD64 MakeManagedSlice returns the 32-byte
+// header via the hidden sret-buffer pointer (InternalSretBytes=16),
+// so we pass &dataOff as RDI and the runtime writes directly into
+// our region.
+func emitStringToCharsCopy(a @asm.Assembler, rm @common.RegMap,
+		strings @[]ir.StringConst, ins @ir.Instr, bytes @[]char) {
+	var sid int = ir.FindStringID(strings, bytes)
+	if sid < 0 { return }
+	var dataOff int = rm.LookupAlloc(ins.ID)
+	if dataOff < 0 { return }
+	var strLen int = len(bytes)
+
+	// MakeManagedSlice(elemSize = 1, len = strLen) — sret buffer = our
+	// data region.  RDI = &dataOff, RSI = 1, RDX = strLen.
+	x64.Lea(a, x64.Reg(x64.RDI, x64.SZ64),
+		x64.Mem(x64.RSP, dataOff, x64.SZ64))
+	x64.Mov(a, x64.Reg(x64.RSI, x64.SZ64), x64.Imm(1))
+	x64.Mov(a, x64.Reg(x64.RDX, x64.SZ64), x64.Imm(strLen))
+	var mkSym @[]char = symPrefixed("bn_pkg__rt__MakeManagedSlice")
+	a.SetGlobal(mkSym)
+	x64.Call(a, mkSym)
+	rm.ResetRegs()
+
+	// Memcpy(dst = *(header+0), src = &Lstr_<sid>, n = strLen).
+	// dst pointer is the first eightbyte of the header the runtime
+	// just wrote — reload it from [rsp + dataOff].
+	x64.Mov(a, x64.Reg(x64.RDI, x64.SZ64),
+		x64.Mem(x64.RSP, dataOff, x64.SZ64))
+	x64.LeaRipLabel(a, x64.Reg(x64.RSI, x64.SZ64), stringLabel(sid))
+	x64.Mov(a, x64.Reg(x64.RDX, x64.SZ64), x64.Imm(strLen))
+	var mcpy @[]char = symPrefixed("bn_pkg__libc__Memcpy")
+	a.SetGlobal(mcpy)
+	x64.Call(a, mcpy)
+	rm.ResetRegs()
+
+	var rd int = nextReg(rm, ins.ID)
+	x64.Lea(a, x64.Reg(rd, x64.SZ64),
+		x64.Mem(x64.RSP, dataOff, x64.SZ64))
+}
+
+// emitStringToArray: OP_RODATA_ARRAY — `var s [N]char = "..."`
+// allocates a fresh N-byte buffer in the data region, zeroes it,
+// then memcpys the first strLen bytes from rodata into the head.
+// strLen is enforced ≤ N at IR-gen time.  Result is a pointer to
+// the buffer; downstream OP_STORE-struct-copy memcpys it into the
+// destination alloca.
+func emitStringToArray(a @asm.Assembler, rm @common.RegMap,
+		strings @[]ir.StringConst, ins @ir.Instr) {
+	var bytes @[]char = ins.StrVal
+	var sid int = ir.FindStringID(strings, bytes)
+	if sid < 0 { return }
+	var dataOff int = rm.LookupAlloc(ins.ID)
+	if dataOff < 0 { return }
+	var arrLen int = 0
+	if ins.Typ != nil && ins.Typ.Kind == types.TYP_ARRAY {
+		arrLen = ins.Typ.ArrayLen
+	}
+	if arrLen <= 0 { return }
+	var strLen int = len(bytes)
+	if strLen > arrLen { strLen = arrLen }
+
+	// Zero-fill the reserved buffer (rounded up to 8 bytes by
+	// PlanFrame) in 64-bit chunks — covers the tail past strLen and
+	// keeps any padding bytes deterministic.
+	var bufSz int = rm.LookupAllocSize(ins.ID)
+	for i := 0; i < bufSz; i = i + 8 {
+		x64.Mov(a, x64.Mem(x64.RSP, dataOff + i, x64.SZ64),
+			x64.Imm(0))
+	}
+	if strLen > 0 {
+		x64.Lea(a, x64.Reg(x64.RDI, x64.SZ64),
+			x64.Mem(x64.RSP, dataOff, x64.SZ64))
+		x64.LeaRipLabel(a, x64.Reg(x64.RSI, x64.SZ64),
+			stringLabel(sid))
+		x64.Mov(a, x64.Reg(x64.RDX, x64.SZ64), x64.Imm(strLen))
+		var mcpy @[]char = symPrefixed("bn_pkg__libc__Memcpy")
+		a.SetGlobal(mcpy)
+		x64.Call(a, mcpy)
+		rm.ResetRegs()
+	}
+	var rd int = nextReg(rm, ins.ID)
+	x64.Lea(a, x64.Reg(rd, x64.SZ64),
+		x64.Mem(x64.RSP, dataOff, x64.SZ64))
+}

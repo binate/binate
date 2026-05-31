@@ -1,0 +1,373 @@
+package "pkg/binate/native/x64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Indirect-call lowering: emitCallIndirect (OP_CALL_INDIRECT, dtor /
+// free_fn / cross-mode dispatch, called via CALL r11) and
+// emitCallFuncValue (OP_CALL_FUNC_VALUE / OP_CALL_HANDLE — call
+// through a 2-word {vtable_ptr, data_ptr} value's vtable.call slot,
+// always-shim convention).  Both share the SysV arg-passing machinery
+// emitCall in x64_call.bn uses; only the callee-target load and the
+// final CALL r11 vs CALL <symbol> differ.
+//
+// Mirrors aarch64_call_indirect.bn line for line — only the
+// instructions and the arg-register file (RDI/RSI/.../R9 vs X0..X7)
+// change.
+
+// emitCallIndirect emits an indirect call (CALL r11).  Args[0] is the
+// fn_ptr (stashed in R11 before arg dispatch may clobber its source);
+// Args[1..] are the call args, dispatched via the same SysV machinery
+// emitCall uses.  R11 is caller-saved and not in regPool — safe across
+// MOV + arg-loads since CALL is the only thing that clobbers it, and
+// we haven't CALL'd yet.  Same return-value handling as emitCall.
+func emitCallIndirect(a @asm.Assembler, rm @common.RegMap,
+		allFuncs @[]@ir.Func, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+
+	// Stash fn_ptr in R11 before the arg-dispatch loop.  The arg loop
+	// writes RDI..R9 (and may use RAX as a load temp for MEMORY
+	// aggregates); loading the source register here ensures the value
+	// survives even if the source reg gets reused below.
+	var fnSrc int = getOperand(a, rm, ins.Args[0].ID)
+	if fnSrc < 0 { return }
+	x64.Mov(a, x64.Reg(x64.R11, x64.SZ64), x64.Reg(fnSrc, x64.SZ64))
+	// Spill R11 to a slot so the arg loop's ResetRegs / getOperand
+	// reloads can't clobber it.
+	var fnPtrSlot int = -1
+	if ins.ID >= 0 {
+		fnPtrSlot = rm.LookupSpill(ins.ID)
+		if fnPtrSlot < 0 {
+			fnPtrSlot = rm.LookupAlloc(ins.ID)
+		}
+	}
+	if fnPtrSlot >= 0 {
+		x64.Mov(a, x64.Mem(x64.RSP, fnPtrSlot, x64.SZ64),
+			x64.Reg(x64.R11, x64.SZ64))
+	}
+
+	// SysV arg dispatch on the call args (Args[1..]).
+	var nCallArgs int = len(ins.Args) - 1
+	var argTypes @[]@types.Type = make_slice(@types.Type, nCallArgs)
+	for i := 0; i < nCallArgs; i++ {
+		argTypes[i] = ins.Args[i + 1].Typ
+	}
+	var nsrn int = 0
+	for ai := 0; ai < nCallArgs; ai++ {
+		var arg @ir.Instr = ins.Args[ai + 1]
+		if common.IsFloatScalarTyp(arg.Typ) {
+			var fsrc int = getOperand(a, rm, arg.ID)
+			if fsrc >= 0 && nsrn < 8 {
+				x64.Movq_gp_to_xmm(a, x64.XMM0 + nsrn, fsrc)
+				nsrn = nsrn + 1
+			}
+			rm.ResetRegs()
+			continue
+		}
+		var regStart int = rm.CC.CallArgRegStart(argTypes, ai)
+		var stackOff int = rm.CC.CallArgStackOff(argTypes, ai)
+		if common.IsAggregateTyp(arg.Typ) {
+			emitAggregateArg(a, rm, arg, regStart, stackOff)
+			rm.ResetRegs()
+			continue
+		}
+		var src int = getOperand(a, rm, arg.ID)
+		if src < 0 { continue }
+		if regStart >= 0 {
+			var dst int = argReg(regStart)
+			if src != dst {
+				x64.Mov(a, x64.Reg(dst, x64.SZ64),
+					x64.Reg(src, x64.SZ64))
+			}
+		} else {
+			x64.Mov(a, x64.Mem(x64.RSP, stackOff, x64.SZ64),
+				x64.Reg(src, x64.SZ64))
+		}
+		rm.ResetRegs()
+	}
+
+	// SysV sret: indirect calls have no callee-symbol, so
+	// CalleeUsesCSret never fires — only the (a)/(c) cases from
+	// emitCall (big aggregate / big multi-return) apply.
+	var bigMultiRet bool = ins.ID >= 0 &&
+		rm.CC.CallReturnsBigMultiReturn(ins)
+	var bigRet bool = ins.ID >= 0 &&
+		(rm.CC.CallReturnsBigAggregate(ins) || bigMultiRet)
+	if bigRet {
+		var sretOff int = -1
+		if bigMultiRet {
+			sretOff = rm.LookupSpill(ins.ID)
+		} else {
+			sretOff = rm.LookupAlloc(ins.ID)
+		}
+		if sretOff >= 0 {
+			x64.Lea(a, x64.Reg(x64.RDI, x64.SZ64),
+				x64.Mem(x64.RSP, sretOff, x64.SZ64))
+		}
+	}
+
+	// Reload R11 from the stash slot, then CALL r11.
+	if fnPtrSlot >= 0 {
+		x64.Mov(a, x64.Reg(x64.R11, x64.SZ64),
+			x64.Mem(x64.RSP, fnPtrSlot, x64.SZ64))
+	}
+	x64.CallReg(a, x64.R11)
+
+	rm.ResetRegs()
+	if ins.ID < 0 { return }
+
+	// Aggregate single-return: pack RAX (+RDX) into the alloc region,
+	// then produce its pointer (mirror of emitCall).
+	if ins.Typ != nil && common.IsAggregateTyp(ins.Typ) &&
+			!common.IsMultiReturnCall(ins) {
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var sz int = ins.Typ.SizeOf()
+		if sz <= 0 { return }
+		if !bigRet {
+			x64.Mov(a, x64.Mem(x64.RSP, dataOff, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
+			if sz > 8 {
+				x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8, x64.SZ64),
+					x64.Reg(x64.RDX, x64.SZ64))
+			}
+		}
+		var rd int = nextReg(rm, ins.ID)
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(x64.RSP, dataOff, x64.SZ64))
+		return
+	}
+
+	if ins.Typ != nil && ins.Typ.Kind == types.TYP_VOID { return }
+	if common.IsMultiReturnCall(ins) {
+		if bigMultiRet { return }
+		var spillOff int = rm.LookupSpill(ins.ID)
+		if spillOff < 0 { return }
+		var n int = len(ins.Typ.Fields)
+		if n > 2 { n = 2 }
+		for fi := 0; fi < n; fi++ {
+			var fldTyp @types.Type = ins.Typ.Fields[fi].Type
+			var fldOff int = ins.Typ.FieldOffset(fi)
+			var fldSz int = 8
+			if fldTyp != nil { fldSz = fldTyp.SizeOf() }
+			if fldSz <= 0 { fldSz = 8 }
+			var srcReg int = x64.RAX
+			if fi == 1 { srcReg = x64.RDX }
+			emitScalarStore(a, srcReg, x64.RSP,
+				spillOff + fldOff, fldSz)
+		}
+		return
+	}
+	// Scalar single-return: RAX → rd → spill.  Float scalars arrive
+	// in XMM0 — bring the bits through MOVQ instead.
+	var rd int = nextReg(rm, ins.ID)
+	if common.IsFloatScalarTyp(ins.Typ) {
+		x64.Movq_xmm_to_gp(a, rd, x64.XMM0)
+	} else if rd != x64.RAX {
+		x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+	}
+}
+
+// emitCallFuncValue lowers OP_CALL_FUNC_VALUE / OP_CALL_HANDLE: call
+// through a 2-word function value's vtable.call.  Always-shim
+// convention (Phase 3 of plan-function-values.md).  Two calling
+// conventions for the shim, distinguished by return type:
+//
+//   Scalar / void return: shim signature
+//     `<ret>(*uint8 data, <args>)`.  Caller loads data from the
+//     function value's data slot (offset 8), passes it in RDI, then
+//     puts user args in RSI+.  One synthetic prepended *uint8 slot
+//     shifts SysV register-start by one.
+//
+//   Aggregate return: shim signature
+//     `void(*uint8 retbuf, *uint8 data, <args>)` — retbuf-style.
+//     Caller allocates retbuf (PlanFrame's alloc region for the
+//     instruction), passes retbuf in RDI, data in RSI, user args
+//     in RDX+ (TWO synthetic prepended slots).  After the call the
+//     retbuf alloc region holds the return value — no RAX/RDX
+//     spill required.
+//
+// Mirrors aarch64_call_indirect.bn:emitCallFuncValue.
+func emitCallFuncValue(a @asm.Assembler, rm @common.RegMap,
+		allFuncs @[]@ir.Func, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+
+	// Two-step load through R11 to populate it with vtable.call:
+	//   MOV R11, [fvAddr + 0]   ; R11 = vtable_ptr
+	//   MOV R11, [R11 + 8]      ; R11 = vtable.call (slot 1 = call;
+	//                           ;  slot 0 = dtor — we want call)
+	var fvAddr int = getOperand(a, rm, ins.Args[0].ID)
+	if fvAddr < 0 { return }
+	x64.Mov(a, x64.Reg(x64.R11, x64.SZ64),
+		x64.Mem(fvAddr, 0, x64.SZ64))
+	x64.Mov(a, x64.Reg(x64.R11, x64.SZ64),
+		x64.Mem(x64.R11, 8, x64.SZ64))
+	// Stash R11 in the call-result spill / alloc slot so the arg
+	// loop's getOperand / ResetRegs can't clobber it.
+	var fnPtrSlot int = -1
+	if ins.ID >= 0 {
+		fnPtrSlot = rm.LookupSpill(ins.ID)
+		if fnPtrSlot < 0 {
+			fnPtrSlot = rm.LookupAlloc(ins.ID)
+		}
+	}
+	if fnPtrSlot >= 0 {
+		x64.Mov(a, x64.Mem(x64.RSP, fnPtrSlot, x64.SZ64),
+			x64.Reg(x64.R11, x64.SZ64))
+	}
+
+	// Aggregate-return shim shape: prepend two synthetic *uint8 slots
+	// (retbuf + data) before user args.  Scalar shape: one (data).
+	// `prefixSlots` is also the SysV reg offset for user args.
+	var aggregateRet bool = ins.ID >= 0 && ins.Typ != nil &&
+		common.IsAggregateTyp(ins.Typ) &&
+		!common.IsMultiReturnCall(ins)
+	var prefixSlots int = 1
+	if aggregateRet { prefixSlots = 2 }
+
+	var nCallArgs int = len(ins.Args) - 1
+	var argTypes @[]@types.Type =
+		make_slice(@types.Type, nCallArgs + prefixSlots)
+	for p := 0; p < prefixSlots; p++ {
+		argTypes[p] = types.MakePointerType(types.TypUint8())
+	}
+	for i := 0; i < nCallArgs; i++ {
+		argTypes[i + prefixSlots] = ins.Args[i + 1].Typ
+	}
+
+	// Place user args first (so any user arg whose source happens to
+	// be RDI/RSI is read before we overwrite those for retbuf/data).
+	var nsrn int = 0
+	for ai := 0; ai < nCallArgs; ai++ {
+		var arg @ir.Instr = ins.Args[ai + 1]
+		if common.IsFloatScalarTyp(arg.Typ) {
+			var fsrc int = getOperand(a, rm, arg.ID)
+			if fsrc >= 0 && nsrn < 8 {
+				x64.Movq_gp_to_xmm(a, x64.XMM0 + nsrn, fsrc)
+				nsrn = nsrn + 1
+			}
+			rm.ResetRegs()
+			continue
+		}
+		var regStart int = rm.CC.CallArgRegStart(argTypes,
+			ai + prefixSlots)
+		var stackOff int = rm.CC.CallArgStackOff(argTypes,
+			ai + prefixSlots)
+		if common.IsAggregateTyp(arg.Typ) {
+			emitAggregateArg(a, rm, arg, regStart, stackOff)
+			rm.ResetRegs()
+			continue
+		}
+		var src int = getOperand(a, rm, arg.ID)
+		if src < 0 { continue }
+		if regStart >= 0 {
+			var dst int = argReg(regStart)
+			if src != dst {
+				x64.Mov(a, x64.Reg(dst, x64.SZ64),
+					x64.Reg(src, x64.SZ64))
+			}
+		} else {
+			x64.Mov(a, x64.Mem(x64.RSP, stackOff, x64.SZ64),
+				x64.Reg(src, x64.SZ64))
+		}
+		rm.ResetRegs()
+	}
+
+	// Reload fvAddr — the arg loop's ResetRegs may have stranded it.
+	if nCallArgs > 0 {
+		fvAddr = getOperand(a, rm, ins.Args[0].ID)
+		if fvAddr < 0 { return }
+	}
+	if aggregateRet {
+		var retbufOff int = rm.LookupAlloc(ins.ID)
+		if retbufOff < 0 { return }
+		// RDI = SP + retbufOff (address of pre-allocated retbuf).
+		x64.Lea(a, x64.Reg(x64.RDI, x64.SZ64),
+			x64.Mem(x64.RSP, retbufOff, x64.SZ64))
+		// RSI = [fvAddr + 8] (data).
+		x64.Mov(a, x64.Reg(x64.RSI, x64.SZ64),
+			x64.Mem(fvAddr, 8, x64.SZ64))
+	} else {
+		var dataRegStart int = rm.CC.CallArgRegStart(argTypes, 0)
+		if dataRegStart >= 0 {
+			x64.Mov(a, x64.Reg(argReg(dataRegStart), x64.SZ64),
+				x64.Mem(fvAddr, 8, x64.SZ64))
+		}
+	}
+
+	// SysV sret applies only to multi-return tuples here — single
+	// aggregate returns use the retbuf-in-RDI convention above.
+	var bigMultiRet bool = ins.ID >= 0 &&
+		rm.CC.CallReturnsBigMultiReturn(ins)
+	if bigMultiRet {
+		var sretOff int = rm.LookupSpill(ins.ID)
+		if sretOff >= 0 {
+			x64.Lea(a, x64.Reg(x64.RDI, x64.SZ64),
+				x64.Mem(x64.RSP, sretOff, x64.SZ64))
+		}
+	}
+
+	// Reload R11 and call.  Two paths:
+	//   - ins.ID >= 0: vtable.call was stashed in the result slot
+	//     before args were loaded; reload from there.
+	//   - ins.ID < 0 (void return — no result slot to stash into):
+	//     redo the two-step vtable.call load from the freshly
+	//     reloaded fvAddr.  Without this, R11 holds whatever
+	//     getOperand's scratch-reg use clobbered it with during the
+	//     arg-loading loop, and CallReg(R11) jumps to garbage.
+	if fnPtrSlot >= 0 {
+		x64.Mov(a, x64.Reg(x64.R11, x64.SZ64),
+			x64.Mem(x64.RSP, fnPtrSlot, x64.SZ64))
+	} else {
+		x64.Mov(a, x64.Reg(x64.R11, x64.SZ64),
+			x64.Mem(fvAddr, 0, x64.SZ64))
+		x64.Mov(a, x64.Reg(x64.R11, x64.SZ64),
+			x64.Mem(x64.R11, 8, x64.SZ64))
+	}
+	x64.CallReg(a, x64.R11)
+	rm.ResetRegs()
+	if ins.ID < 0 { return }
+
+	// Aggregate single-return: shim wrote through retbuf we passed
+	// in RDI.  Just produce the alloc-region pointer.
+	if aggregateRet {
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		x64.Lea(a, x64.Reg(rd, x64.SZ64),
+			x64.Mem(x64.RSP, dataOff, x64.SZ64))
+		return
+	}
+
+	if common.IsMultiReturnCall(ins) {
+		if bigMultiRet { return }
+		var spillOff int = rm.LookupSpill(ins.ID)
+		if spillOff < 0 { return }
+		var n int = len(ins.Typ.Fields)
+		if n > 2 { n = 2 }
+		for fi := 0; fi < n; fi++ {
+			var fldTyp @types.Type = ins.Typ.Fields[fi].Type
+			var fldOff int = ins.Typ.FieldOffset(fi)
+			var fldSz int = 8
+			if fldTyp != nil { fldSz = fldTyp.SizeOf() }
+			if fldSz <= 0 { fldSz = 8 }
+			var srcReg int = x64.RAX
+			if fi == 1 { srcReg = x64.RDX }
+			emitScalarStore(a, srcReg, x64.RSP,
+				spillOff + fldOff, fldSz)
+		}
+		return
+	}
+	// Scalar single-return: RAX → rd → spill.  Float scalars arrive
+	// in XMM0 — bring the bits through MOVQ instead.
+	if ins.Typ != nil && ins.Typ.Kind == types.TYP_VOID { return }
+	var rd int = nextReg(rm, ins.ID)
+	if common.IsFloatScalarTyp(ins.Typ) {
+		x64.Movq_xmm_to_gp(a, rd, x64.XMM0)
+	} else if rd != x64.RAX {
+		x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+	}
+}

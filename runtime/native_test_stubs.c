@@ -1,7 +1,7 @@
 // Stub definitions of pkg/rt symbols that runtime/binate_runtime.c
 // references at link time.
 //
-// This file exists so pkg/native/* unit tests that link a minimal
+// This file exists so pkg/binate/native/* unit tests that link a minimal
 // .o + binate_runtime.c (without pkg/rt's compiled body) can resolve
 // the symbols. The stubs are weak so the conformance suite — which
 // always links pkg/rt — uses the real symbols and ignores these.

@@ -1,0 +1,295 @@
+package "pkg/binate/native/x64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// Binary / unary / constant ops (Phase 3b)
+// ============================================================
+
+// emitConstInt64 materialises a 64-bit integer constant into rd.
+// SysV-AMD64 MOV reg64, imm64 (encoded by x64.Mov as 0x48 0xB8+rd
+// imm64) handles the full 64-bit range — no MOVK chain needed
+// (unlike AArch64's 16-bit MOVZ/MOVK pairs).  x64.Mov picks the
+// shortest encoding automatically (imm32-sext for small values,
+// imm64 for full-width).
+func emitConstInt64(a @asm.Assembler, rd int, val int64) {
+	x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Imm64(val))
+}
+
+// emitBinop handles the integer arithmetic, bitwise, and shift ops.
+// Returns true if it matched and emitted code; false otherwise.
+//
+// SysV-AMD64 two-operand encoding: `op dst, src` where dst is read
+// and written.  We emit:
+//   mov rd, lhs    ; rd holds lhs
+//   <op> rd, rhs   ; rd = rd <op> rhs
+// rd is the scratch register newly allocated for ins.ID.
+//
+// Shifts (SHL/SHR/SAR) require the count in CL.  When the rhs is a
+// register, MOV it to CL first, then emit the shift with CL.
+//
+// DIV / REM are deferred — they need RDX:RAX setup (CQO + IDIV) and
+// have register-allocation constraints that don't fit the simple
+// `mov rd, lhs ; op rd, rhs` shape.  Phase 3b lands them as a
+// follow-on micro-step if needed; for now they fall through.
+func emitBinop(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != ir.OP_ADD &&
+		ins.Op != ir.OP_SUB &&
+		ins.Op != ir.OP_MUL &&
+		ins.Op != ir.OP_DIV &&
+		ins.Op != ir.OP_REM &&
+		ins.Op != ir.OP_AND &&
+		ins.Op != ir.OP_OR  &&
+		ins.Op != ir.OP_XOR &&
+		ins.Op != ir.OP_SHL &&
+		ins.Op != ir.OP_SHR &&
+		ins.Op != ir.OP_LAND &&
+		ins.Op != ir.OP_LOR {
+		return false
+	}
+	if len(ins.Args) != 2 { return false }
+
+	// Float arithmetic dispatches to the SSE2 scalar-double path —
+	// keyed on result type so the integer + bitwise ops below run
+	// unchanged for non-float results.
+	if emitFloatBinop(a, rm, ins) { return true }
+
+	// DIV / REM have register-allocation constraints (read RDX:RAX,
+	// write RAX/RDX) that don't fit the simple
+	// `mov rd, lhs ; op rd, rhs` shape — route them through their
+	// own emit.
+	if ins.Op == ir.OP_DIV || ins.Op == ir.OP_REM {
+		return emitDivOrRem(a, rm, ins)
+	}
+
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	var rhs int = getOperand(a, rm, ins.Args[1].ID)
+	if lhs < 0 || rhs < 0 { return false }
+
+	// Shifts: count must be in CL.  Reserve RCX BEFORE allocating rd
+	// so rd doesn't itself land in RCX — regPool's slot-2 default after
+	// two getOperands would otherwise pick RCX, and the subsequent
+	// `MOV RCX, rhs` (shift-amount setup) would clobber the `MOV rd,
+	// lhs` we'd already done.  scratchReg bumps m.Next so the later
+	// nextReg call skips RCX entirely.  rhsOp / rd / rdOp shape below
+	// follows the non-shift binops; shifts diverge after, MOVing the
+	// shamt into RCX and issuing the shift with CL as the count operand.
+	var shamtReg int = -1
+	if ins.Op == ir.OP_SHL || ins.Op == ir.OP_SHR {
+		shamtReg = scratchReg(rm)  // RCX (regPool slot 2 after two getOperands)
+		x64.Mov(a, x64.Reg(shamtReg, x64.SZ64), x64.Reg(rhs, x64.SZ64))
+	}
+
+	var rd int = nextReg(rm, ins.ID)
+	var rdOp x64.Operand = x64.Reg(rd, x64.SZ64)
+	var rhsOp x64.Operand = x64.Reg(rhs, x64.SZ64)
+	x64.Mov(a, rdOp, x64.Reg(lhs, x64.SZ64))
+
+	if ins.Op == ir.OP_ADD { x64.Add(a, rdOp, rhsOp); return true }
+	if ins.Op == ir.OP_SUB { x64.Sub(a, rdOp, rhsOp); return true }
+	if ins.Op == ir.OP_MUL { x64.Imul2(a, rdOp, rhsOp); return true }
+	if ins.Op == ir.OP_AND { x64.And(a, rdOp, rhsOp); return true }
+	if ins.Op == ir.OP_OR  { x64.Or(a, rdOp, rhsOp);  return true }
+	if ins.Op == ir.OP_XOR { x64.Xor(a, rdOp, rhsOp); return true }
+	// OP_LAND / OP_LOR — used by switch case lists (`case 1, 2, 3:`)
+	// where all comparisons are always evaluated.  Plain bitwise on
+	// bool registers gives the right result.  User-level `&&` / `||`
+	// short-circuit through the IR's branch-form lowering and never
+	// reach here.
+	if ins.Op == ir.OP_LAND { x64.And(a, rdOp, rhsOp); return true }
+	if ins.Op == ir.OP_LOR  { x64.Or(a, rdOp, rhsOp);  return true }
+
+	// Shifts: count is already in RCX (reserved + MOV'd above before
+	// rd was allocated).  Unsigned uint values need SHR (logical);
+	// signed values need SAR (arithmetic).
+	var isUnsigned bool = ins.Typ != nil &&
+		ins.Typ.IsInteger() && !ins.Typ.Signed
+	if ins.Op == ir.OP_SHL || ins.Op == ir.OP_SHR {
+		var clOp x64.Operand = x64.Reg(x64.RCX, x64.SZ8)
+		if ins.Op == ir.OP_SHL {
+			x64.Shl(a, rdOp, clOp)
+			return true
+		}
+		// OP_SHR: signedness picks SHR (logical) vs SAR (arithmetic).
+		if isUnsigned {
+			x64.Shr(a, rdOp, clOp)
+		} else {
+			x64.Sar(a, rdOp, clOp)
+		}
+		return true
+	}
+	return false
+}
+
+// emitDivOrRem lowers OP_DIV / OP_REM.  SysV-AMD64 IDIV/DIV reads
+// the 128-bit dividend from RDX:RAX, divides by the source operand,
+// writes quotient → RAX and remainder → RDX.  Signed vs unsigned
+// picks IDIV (with CQO sign-extension into RDX) vs DIV (with RDX
+// zeroed via XOR).
+//
+// Register dance (spill-everything policy):
+//
+//   lhs → RAX                ; dividend low half
+//   rhs → R-something        ; IDIV/DIV source operand (NOT RAX/RDX)
+//   CQO  / xor rdx, rdx      ; set up RDX
+//   IDIV / DIV rhsReg        ; rax = quot, rdx = rem
+//   mov rd, rax-or-rdx       ; pick by op (skipped if rd == src)
+//
+// rhs is moved into a scratch slot allocated AFTER getOperand for
+// lhs and rhs.  Per the regPool order (R10, R11, RCX, RDX, ...),
+// after lhs (slot 0 = R10) and rhs (slot 1 = R11), the next
+// scratch slot is RCX — safely not RAX or RDX, so the source
+// operand to IDIV/DIV survives the RDX clobber.  rd is allocated
+// after that (slot 3 = RDX); for OP_REM the resulting `mov rdx,
+// rdx` is skipped, and for OP_DIV the `mov rdx, rax` lands the
+// quotient into rd's spill destination.
+func emitDivOrRem(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	var rhs int = getOperand(a, rm, ins.Args[1].ID)
+	if lhs < 0 || rhs < 0 { return false }
+
+	// Move rhs into a fresh scratch (not RAX, not RDX).  Per regPool
+	// ordering this is RCX — safe for IDIV's source operand.
+	var divSrc int = scratchReg(rm)
+	x64.Mov(a, x64.Reg(divSrc, x64.SZ64), x64.Reg(rhs, x64.SZ64))
+	// Move lhs into RAX (the dividend low half).
+	x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Reg(lhs, x64.SZ64))
+
+	var isUnsigned bool = ins.Typ != nil &&
+		ins.Typ.IsInteger() && !ins.Typ.Signed
+	if isUnsigned {
+		// XOR RDX, RDX — zero the high half of the dividend.
+		x64.Xor(a, x64.Reg(x64.RDX, x64.SZ64),
+			x64.Reg(x64.RDX, x64.SZ64))
+		x64.Div(a, x64.Reg(divSrc, x64.SZ64))
+	} else {
+		// CQO sign-extends RAX into RDX:RAX.
+		x64.Cqo(a)
+		x64.Idiv(a, x64.Reg(divSrc, x64.SZ64))
+	}
+
+	var rd int = nextReg(rm, ins.ID)
+	var srcReg int = x64.RAX
+	if ins.Op == ir.OP_REM { srcReg = x64.RDX }
+	if rd != srcReg {
+		x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(srcReg, x64.SZ64))
+	}
+	return true
+}
+
+// emitCompare handles OP_EQ/NE/LT/LE/GT/GE.  SysV-AMD64 lowering:
+//
+//   CMP   lhs, rhs           ; set flags
+//   SETcc dst8               ; dst8 = 1 if cc holds else 0
+//   MOVZX rd, dst8           ; zero-extend bool into the full reg
+//
+// Comparison signedness comes from the operand type, not the
+// result type (which is always bool).  Unsigned ints with the high
+// bit set would sort as "negative" under signed condition codes,
+// so we route those through the unsigned cc family (B/AE/BE/A).
+func emitCompare(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != ir.OP_EQ && ins.Op != ir.OP_NE &&
+		ins.Op != ir.OP_LT && ins.Op != ir.OP_LE &&
+		ins.Op != ir.OP_GT && ins.Op != ir.OP_GE {
+		return false
+	}
+	if len(ins.Args) != 2 { return false }
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	var rhs int = getOperand(a, rm, ins.Args[1].ID)
+	if lhs < 0 || rhs < 0 { return false }
+
+	x64.Cmp(a, x64.Reg(lhs, x64.SZ64), x64.Reg(rhs, x64.SZ64))
+
+	var rd int = nextReg(rm, ins.ID)
+	var isUnsigned bool = ins.Args[0].Typ != nil &&
+		ins.Args[0].Typ.IsInteger() && !ins.Args[0].Typ.Signed
+	var cc int = condForOp(ins.Op, isUnsigned)
+	x64.Setcc(a, cc, x64.Reg(rd, x64.SZ8))
+	x64.Movzx(a, x64.Reg(rd, x64.SZ64), x64.Reg(rd, x64.SZ8))
+	return true
+}
+
+// condForOp maps an IR comparison op to the x86-64 condition code
+// that's true exactly when the comparison holds.  isUnsigned picks
+// between the signed (L/LE/G/GE) and unsigned (B/BE/A/AE)
+// condition-code families.  EQ/NE are signedness-independent.
+func condForOp(op int, isUnsigned bool) int {
+	if op == ir.OP_EQ { return x64.CC_E }
+	if op == ir.OP_NE { return x64.CC_NE }
+	if isUnsigned {
+		if op == ir.OP_LT { return x64.CC_B }
+		if op == ir.OP_LE { return x64.CC_BE }
+		if op == ir.OP_GT { return x64.CC_A }
+		if op == ir.OP_GE { return x64.CC_AE }
+	}
+	if op == ir.OP_LT { return x64.CC_L }
+	if op == ir.OP_LE { return x64.CC_LE }
+	if op == ir.OP_GT { return x64.CC_G }
+	return x64.CC_GE
+}
+
+// emitCast lowers OP_CAST for integer→integer width conversions.  Like
+// arm64, the amd64 regmap is uniformly 64-bit-wide; explicit narrowing
+// via SHL + SAR (signed) or SHL + SHR (unsigned) places the target's
+// low-w bits into the destination's full 64 bits with the correct
+// sign behavior.  target.Width == 0 (the predeclared `int`) and ≥ 64
+// pass through unchanged.  Float casts (either side TYP_FLOAT) are
+// deferred along with float-arg passing; emitCast returns without
+// emitting for those so the missing-OP_CAST symptom doesn't
+// silently swap to a wrong-bytes one.
+func emitCast(a @asm.Assembler, rd int, src int, target @types.Type) {
+	var w int = 0
+	if target != nil { w = target.Width }
+	var rdOp x64.Operand = x64.Reg(rd, x64.SZ64)
+	if w == 0 || w >= 64 {
+		x64.Mov(a, rdOp, x64.Reg(src, x64.SZ64))
+		return
+	}
+	var shift int = 64 - w
+	x64.Mov(a, rdOp, x64.Reg(src, x64.SZ64))
+	x64.Shl(a, rdOp, x64.Imm(shift))
+	if target != nil && target.Signed {
+		x64.Sar(a, rdOp, x64.Imm(shift))
+	} else {
+		x64.Shr(a, rdOp, x64.Imm(shift))
+	}
+}
+
+// emitUnop handles unary ops (-, ~, !).  Returns true if matched.
+func emitUnop(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != ir.OP_NEG && ins.Op != ir.OP_BITNOT &&
+			ins.Op != ir.OP_NOT {
+		return false
+	}
+	if len(ins.Args) != 1 { return false }
+
+	// Float negation flips the sign bit in GP — no XMM round trip.
+	// emitFloatNeg only matches OP_NEG with a float result type.
+	if ins.Op == ir.OP_NEG && emitFloatNeg(a, rm, ins) { return true }
+
+	var src int = getOperand(a, rm, ins.Args[0].ID)
+	if src < 0 { return false }
+
+	var rd int = nextReg(rm, ins.ID)
+	var rdOp x64.Operand = x64.Reg(rd, x64.SZ64)
+	x64.Mov(a, rdOp, x64.Reg(src, x64.SZ64))
+
+	if ins.Op == ir.OP_NEG {
+		x64.Neg(a, rdOp)
+		return true
+	}
+	if ins.Op == ir.OP_BITNOT {
+		x64.Not(a, rdOp)
+		return true
+	}
+	// OP_NOT: logical negation on a bool.  Flip bit 0 with XOR 1.
+	if ins.Op == ir.OP_NOT {
+		x64.Xor(a, rdOp, x64.Imm(1))
+		return true
+	}
+	return false
+}

@@ -1,0 +1,444 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/asm"
+import "pkg/asm/aarch64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// emitInstr — instruction selection
+// ============================================================
+
+// emitInstr lowers one IR instruction. Walking-skeleton subset only;
+// instructions outside this set are silently ignored. The big op
+// handlers (MAKE*, STRING_TO_CHARS, LOAD, STORE, EXTRACT, GEP, etc.)
+// live in arm64_emit.bn; this is the dispatcher.
+func emitInstr(a @asm.Assembler, pkgName *[]const char, funcSym @[]char,
+	rm @common.RegMap, strings @[]ir.StringConst,
+	allFuncs @[]@ir.Func, ins @ir.Instr) {
+	currentEmitOp = ins.Op
+	switch ins.Op {
+	case ir.OP_CONST_INT:
+		var r int = nextReg(rm, ins.ID)
+		emitConstInt64(a, r, ins.IntVal)
+		return
+	case ir.OP_CONST_BOOL:
+		var r int = nextReg(rm, ins.ID)
+		var v int = 0
+		if ins.BoolVal { v = 1 }
+		aarch64.Movz(a, true, r, v, 0)
+		return
+	case ir.OP_CONST_NIL:
+		emitConstNil(a, rm, ins)
+		return
+	case ir.OP_CONST_STRING:
+		var id int = ir.FindStringID(strings, ins.StrVal)
+		if id < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		// Strings live in __cstring (cross-section). Mach-O has no
+		// reloc for ADR; use ADRP + ADD for the @PAGE / @PAGEOFF
+		// pair that ld accepts.
+		aarch64.Adrp(a, rd, stringLabel(id))
+		aarch64.AddImmLabel(a, true, rd, rd, stringLabel(id))
+		return
+	case ir.OP_CONST_FLOAT:
+		var rd int = nextReg(rm, ins.ID)
+		emitConstFloat(a, rd, ins)
+		return
+	case ir.OP_RODATA_ARRAY:
+		emitStringToArray(a, rm, strings, ins)
+		return
+	case ir.OP_RODATA_MSLICE, ir.OP_RODATA_SLICE:
+		emitRodataMSliceOrSlice(a, rm, strings, ins)
+		return
+	case ir.OP_RODATA_MSLICE_COPY:
+		emitStringToCharsCopy(a, rm, strings, ins, ins.StrVal)
+		return
+	case ir.OP_CALL:
+		emitCall(a, pkgName, rm, allFuncs, ins)
+		return
+	case ir.OP_C_CALL:
+		// __c_call: same arg-dispatch + return-collect as OP_CALL;
+		// emitCall takes the verbatim C symbol from ins.StrVal (no
+		// Binate mangling).  Stage-1 contract (scalar/pointer args
+		// + return) means no sret arm fires — CalleeUsesCSret
+		// short-circuits on non-OP_CALL.
+		emitCall(a, pkgName, rm, allFuncs, ins)
+		return
+	case ir.OP_CALL_INDIRECT:
+		emitCallIndirect(a, rm, allFuncs, ins)
+		return
+	case ir.OP_CALL_FUNC_VALUE:
+		emitCallFuncValue(a, rm, allFuncs, ins)
+		return
+	case ir.OP_FUNC_HANDLE:
+		// Phase 4 of plan-uniform-native-fnptrs.md: produce a *uint8
+		// pointing at the static `___handle.<mangled>` global — a
+		// 16-byte {vtable_ptr, data_ptr} aggregate whose data slot is
+		// null (non-capturing).  Consumed by OP_CALL_HANDLE.  Mirrors
+		// the LLVM lowering in pkg/binate/codegen/emit_instr.bn.
+		if len(ins.StrVal) == 0 { return }
+		var label @[]char = handleSymFor(pkgName, ins.StrVal)
+		a.SetGlobal(label)
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Adrp(a, rd, label)
+		aarch64.AddImmLabel(a, true, rd, rd, label)
+		return
+	case ir.OP_CALL_HANDLE:
+		// Phase 4 dispatch: call through a 16-byte handle.  Identical
+		// shape to OP_CALL_FUNC_VALUE — the handle and a constructed
+		// function value have the same `{vtable_ptr, data_ptr}` layout
+		// and the same "load vtable.call, call(data, args)" sequence.
+		emitCallFuncValue(a, rm, allFuncs, ins)
+		return
+	case ir.OP_IFACE_VALUE:
+		// Interface-value construction.  Builds a 16-byte {data,
+		// vtable} aggregate in the IR-instruction's pre-allocated
+		// data region.  StrVal is the mangled vtable global name
+		// (e.g. `__ivt.bn_main__T__I`) emitted by emitImplVtables.
+		// Args[0] is the data pointer (already i8*-shaped via earlier
+		// bitcast/movs).  Field 0 = data, field 1 = vtable.  Mirrors
+		// the LLVM layout in emit_impls.bn.
+		if len(ins.StrVal) == 0 || len(ins.Args) < 1 { return }
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var ivtLabel @[]char = symPrefixed(ins.StrVal)
+		a.SetGlobal(ivtLabel)
+		// Data ptr -> slot 0.  Get the source register BEFORE
+		// allocating scratch regs so the regmap doesn't recycle it.
+		// A package-global data ptr (`&g`) is a pseudo-instr with no
+		// register (ID -1); materialize its address via ADRP+ADD,
+		// mirroring emitLoad's global path — otherwise getOperand
+		// returns < 0 and the whole construction is silently dropped.
+		var dataReg int
+		if isGlobalRef(ins.Args[0]) {
+			dataReg = scratchReg(rm)
+			emitGlobalAddr(a, pkgName, dataReg, ins.Args[0])
+		} else {
+			dataReg = getOperand(a, rm, ins.Args[0].ID)
+			if dataReg < 0 { return }
+		}
+		aarch64.Str(a, true, dataReg,
+			aarch64.MemImm(aarch64.SP, dataOff))
+		// Vtable address -> slot 1.
+		var vtTmp int = scratchReg(rm)
+		aarch64.Adrp(a, vtTmp, ivtLabel)
+		aarch64.AddImmLabel(a, true, vtTmp, vtTmp, ivtLabel)
+		aarch64.Str(a, true, vtTmp,
+			aarch64.MemImm(aarch64.SP, dataOff + 8))
+		// Produce the data-region pointer as the result.
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(dataOff))
+		return
+	case ir.OP_CALL_IFACE_METHOD:
+		emitCallIfaceMethod(a, rm, allFuncs, ins)
+		return
+	case ir.OP_IFACE_UPCAST:
+		// Rebuild an interface value with the source's data ptr and
+		// a vtable pointer adjusted to land at the target's nested
+		// sub-vtable within the source's concat-laid-out vtable.
+		// Slot offset is statically known per (srcIface, targetIface)
+		// pair via ir.IfaceParentSlotOffset.  Mirrors the LLVM
+		// lowering in pkg/binate/codegen/emit_iface_upcast.bn.
+		if len(ins.Args) < 1 { return }
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var srcPtr int = getOperand(a, rm, ins.Args[0].ID)
+		if srcPtr < 0 { return }
+		var offsetSlots int = 0
+		var srcTyp @types.Type = ins.Args[0].Typ
+		if srcTyp != nil && srcTyp.Elem != nil &&
+			ins.Typ != nil && ins.Typ.Elem != nil {
+			offsetSlots = ir.IfaceParentSlotOffset(
+				srcTyp.Elem.Pkg, srcTyp.Elem.Name,
+				ins.Typ.Elem.Pkg, ins.Typ.Elem.Name)
+		}
+		var byteOff int = offsetSlots * 8
+		// Data ptr copies straight through.
+		var dataTmp int = scratchReg(rm)
+		aarch64.Ldr(a, true, dataTmp, aarch64.MemImm(srcPtr, 0))
+		aarch64.Str(a, true, dataTmp,
+			aarch64.MemImm(aarch64.SP, dataOff))
+		// New vtable ptr = source.vtable + byteOff.
+		var vtTmp int = scratchReg(rm)
+		aarch64.Ldr(a, true, vtTmp, aarch64.MemImm(srcPtr, 8))
+		if byteOff > 0 {
+			aarch64.Add(a, true, vtTmp, vtTmp,
+				aarch64.Imm(byteOff))
+		}
+		aarch64.Str(a, true, vtTmp,
+			aarch64.MemImm(aarch64.SP, dataOff + 8))
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(dataOff))
+		return
+	case ir.OP_IFACE_DTOR:
+		// Load slot 0 (the dtor) of an interface value's vtable.
+		// Args[0] is the iv (a 16-byte {data, vtable}); we read the
+		// vtable pointer from offset 8, then load *(vtable+0).
+		// Result type matches OP_FUNC_HANDLE — an opaque function-
+		// pointer-shaped i8* — so the OP_REFDEC dtor operand path
+		// can consume it uniformly.
+		if len(ins.Args) < 1 { return }
+		var ivPtr int = getOperand(a, rm, ins.Args[0].ID)
+		if ivPtr < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		// vt = iv[1]
+		aarch64.Ldr(a, true, rd, aarch64.MemImm(ivPtr, 8))
+		// dtor = *(vt + 0)
+		aarch64.Ldr(a, true, rd, aarch64.MemImm(rd, 0))
+		return
+	case ir.OP_FUNC_VALUE:
+		// Function-value construction. Builds a 16-byte
+		// {vtable_addr, data} aggregate in the IR-instruction's
+		// pre-allocated data region (PlanFrame allocated it via
+		// the OP_FUNC_VALUE arm in IsAggregateTyp).
+		// vtable_addr is the address of the per-function vtable
+		// global emitted by emitFuncValueVtables.  data is null
+		// for Phase 1 non-capturing literals, or the closure-
+		// struct pointer (ins.Args[0]) for B.2 capturing.
+		if len(ins.StrVal) == 0 { return }
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var vtLabel @[]char = vtableSymFor(pkgName, ins.StrVal)
+		a.SetGlobal(vtLabel)
+		// Compute vtable address into a scratch reg via ADRP+ADD.
+		var addrTmp int = scratchReg(rm)
+		aarch64.Adrp(a, addrTmp, vtLabel)
+		aarch64.AddImmLabel(a, true, addrTmp, addrTmp, vtLabel)
+		// Store vtable_addr at dataOff+0.
+		aarch64.Str(a, true, addrTmp,
+			aarch64.MemImm(aarch64.SP, dataOff))
+		// Store data at dataOff+8: XZR (null) for Phase 1, the
+		// capture struct pointer for B.2 capturing closures.
+		if len(ins.Args) == 0 {
+			aarch64.Str(a, true, aarch64.XZR,
+				aarch64.MemImm(aarch64.SP, dataOff + 8))
+		} else {
+			var dataReg int = getOperand(a, rm, ins.Args[0].ID)
+			aarch64.Str(a, true, dataReg,
+				aarch64.MemImm(aarch64.SP, dataOff + 8))
+		}
+		// Produce the data-region pointer as the result.
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(dataOff))
+		return
+	case ir.OP_REFINC:
+		emitRefIncInline(a, rm, ins)
+		return
+	case ir.OP_REFDEC:
+		emitRefDecInline(a, rm, ins)
+		return
+	case ir.OP_RETURN:
+		// A single aggregate return: pack into X0..X(N-1) when N≤8
+		// (size ≤ 64 bytes). For sizes > 64 bytes, AAPCS sret —
+		// memcpy through the X8 pointer the caller stashed in
+		// SretSlotOff, then return void.
+		if len(ins.Args) == 1 &&
+			common.IsAggregateTyp(ins.Args[0].Typ) {
+			var ptr int = getOperand(a, rm, ins.Args[0].ID)
+			if ptr >= 0 {
+				var sz int = ins.Args[0].Typ.SizeOf()
+				var nWords int = sz / 8
+				if rm.SretSlotOff >= 0 {
+					var dstPtr int = scratchReg(rm)
+					aarch64.Ldr(a, true, dstPtr,
+						aarch64.MemImm(aarch64.SP,
+							rm.SretSlotOff))
+					var tmp int = scratchReg(rm)
+					for ri := 0; ri < nWords; ri++ {
+						aarch64.Ldr(a, true, tmp,
+							aarch64.MemImm(ptr, 8*ri))
+						aarch64.Str(a, true, tmp,
+							aarch64.MemImm(dstPtr, 8*ri))
+					}
+				} else {
+					for ri := 0; ri < nWords && ri < 8; ri++ {
+						aarch64.Ldr(a, true, argReg(ri),
+							aarch64.MemImm(ptr, 8*ri))
+					}
+				}
+			}
+			emitEpilogueAndRet(a, rm.FrameSize())
+			return
+		}
+		// Multi-return tuple > 64 bytes: AAPCS-style sret. The caller
+		// stashed &tupleBuffer in our SretSlotOff at entry; load it
+		// back, then write each return value through it at the
+		// MultiReturnType field offset. Mirrors the single-aggregate
+		// sret path above, but per-arg.
+		if rm.SretSlotOff >= 0 && rm.MultiReturnType != nil &&
+			len(ins.Args) > 1 {
+			// dstPtr stays live across the loop; reload it from the
+			// sret slot each iteration into a fresh scratch reg so
+			// the per-arg ResetRegs below doesn't strand it.  Reload
+			// is two instructions cheaper than the alternative of
+			// holding a callee-saved reg dedicated to dstPtr.
+			for ai := 0; ai < len(ins.Args); ai++ {
+				var dstPtr int = scratchReg(rm)
+				aarch64.Ldr(a, true, dstPtr,
+					aarch64.MemImm(aarch64.SP, rm.SretSlotOff))
+				var arg @ir.Instr = ins.Args[ai]
+				var fldOff int = rm.MultiReturnType.FieldOffset(ai)
+				if common.IsAggregateTyp(arg.Typ) {
+					var ptr int = getOperand(a, rm, arg.ID)
+					if ptr < 0 {
+						rm.ResetRegs()
+						continue
+					}
+					var sz int = arg.Typ.SizeOf()
+					var nWords int = sz / 8
+					var tmp int = scratchReg(rm)
+					for w := 0; w < nWords; w++ {
+						aarch64.Ldr(a, true, tmp,
+							aarch64.MemImm(ptr, 8*w))
+						aarch64.Str(a, true, tmp,
+							aarch64.MemImm(dstPtr,
+								fldOff + 8*w))
+					}
+				} else {
+					var src int = getOperand(a, rm, arg.ID)
+					if src < 0 {
+						rm.ResetRegs()
+						continue
+					}
+					var sz int = arg.Typ.SizeOf()
+					if sz <= 0 { sz = 8 }
+					emitScalarStore(a, src, dstPtr,
+						fldOff, sz)
+				}
+				// Each arg's scratch regs (dstPtr, ptr/src, tmp) are
+				// dead after the Ldr/Str sequence consumes them into
+				// the sret buffer.  Mirrors emitCall's per-arg reset
+				// (arm64_call.bn) to keep the X9..X15 pool from
+				// saturating on long multi-return signatures.
+				rm.ResetRegs()
+			}
+			emitEpilogueAndRet(a, rm.FrameSize())
+			return
+		}
+		// Multi-return / scalar-tuple return ≤64 bytes: pack values
+		// into X0..X7. Aggregate args (e.g. a struct field of a
+		// multi-return tuple) spread across multiple consecutive
+		// regs — `return st, off` where st is a 5-word StrTab and
+		// off is an int needs X0..X4 = st bytes, X5 = off.
+		var rIdx int = 0
+		for ai := 0; ai < len(ins.Args); ai++ {
+			var arg @ir.Instr = ins.Args[ai]
+			if common.IsAggregateTyp(arg.Typ) {
+				var ptr int = getOperand(a, rm, arg.ID)
+				if ptr < 0 { continue }
+				var sz int = arg.Typ.SizeOf()
+				var nWords int = sz / 8
+				for w := 0; w < nWords && rIdx < 8; w++ {
+					aarch64.Ldr(a, true, argReg(rIdx),
+						aarch64.MemImm(ptr, 8*w))
+					rIdx = rIdx + 1
+				}
+			} else {
+				var src int = getOperand(a, rm, arg.ID)
+				if src < 0 { continue }
+				if rIdx < 8 && src != argReg(rIdx) {
+					aarch64.Mov(a, true, argReg(rIdx),
+						aarch64.Reg(src))
+				}
+				rIdx = rIdx + 1
+			}
+			// Per-arg scratch is dead once consumed into argReg(rIdx).
+			// Mirrors emitCall's per-arg reset (arm64_call.bn) — long
+			// return-arg lists (e.g. 8+ returns or aggregate-loaded
+			// arg slots) otherwise saturate X9..X15.
+			rm.ResetRegs()
+		}
+		emitEpilogueAndRet(a, rm.FrameSize())
+		return
+	case ir.OP_MANAGED_TO_RAW:
+		// @[]T → *[]T: pass the source pointer through; the first 16
+		// bytes of a managed-slice ARE the raw-slice representation.
+		if len(ins.Args) < 1 { return }
+		var src int = getOperand(a, rm, ins.Args[0].ID)
+		if src < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Mov(a, true, rd, aarch64.Reg(src))
+		return
+	case ir.OP_BIT_CAST:
+		// Reinterpret same-size bits — a plain move in a 64-bit file.
+		if len(ins.Args) < 1 { return }
+		var src int = getOperand(a, rm, ins.Args[0].ID)
+		if src < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		aarch64.Mov(a, true, rd, aarch64.Reg(src))
+		return
+	case ir.OP_CAST:
+		// Numeric conversion with explicit LSL+LSR/ASR narrowing; our
+		// regmap is all X-regs, so we can't lean on 32-bit-view
+		// zero-extension. emitFloatCast handles any branch where
+		// either side is float (SCVTF / FCVTZS / float→float move).
+		if len(ins.Args) < 1 || ins.TypeArg == nil { return }
+		var src int = getOperand(a, rm, ins.Args[0].ID)
+		if src < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		if emitFloatCast(a, rd, src, ins.Args[0].Typ, ins.TypeArg) {
+			return
+		}
+		emitCast(a, rd, src, ins.TypeArg)
+		return
+	case ir.OP_BOUNDS_CHECK:
+		// Lower to a call to bn_pkg__rt__BoundsCheck(index, len). The
+		// runtime aborts with "index out of bounds: %lld (len %lld)\n"
+		// if the unsigned comparison fails — same fast-path the LLVM
+		// backend uses, since pkg/rt provides the implementation.
+		if len(ins.Args) < 2 { return }
+		var idx int = getOperand(a, rm, ins.Args[0].ID)
+		var ln int = getOperand(a, rm, ins.Args[1].ID)
+		if idx < 0 || ln < 0 { return }
+		aarch64.Mov(a, true, aarch64.X0, aarch64.Reg(idx))
+		aarch64.Mov(a, true, aarch64.X1, aarch64.Reg(ln))
+		var callee @[]char = symPrefixed("bn_pkg__rt__BoundsCheck")
+		a.SetGlobal(callee)
+		aarch64.Bl(a, callee)
+		rm.ResetRegs()
+		return
+	case ir.OP_JUMP:
+		if ins.Block1 == nil { return }
+		aarch64.B(a, blockLabel(funcSym, ins.Block1.Label))
+		return
+	case ir.OP_BRANCH:
+		// Args[0] = cond, Block1 = then, Block2 = else.
+		if ins.Block1 == nil || ins.Block2 == nil ||
+			len(ins.Args) < 1 {
+			return
+		}
+		var condReg int = getOperand(a, rm, ins.Args[0].ID)
+		if condReg < 0 { return }
+		aarch64.Cbnz(a, true, condReg,
+			blockLabel(funcSym, ins.Block1.Label))
+		aarch64.B(a, blockLabel(funcSym, ins.Block2.Label))
+		return
+	case ir.OP_SP_RESTORE:
+		// Statement-end marker for the bytecode VM. Native-side
+		// no-op: PlanFrame already sized this function's frame at
+		// prologue time, and spill slots are function-scoped (not
+		// statement-scoped) so there's nothing to reclaim mid-
+		// function. See pkg/binate/ir.bni OP_SP_RESTORE comment for the
+		// per-backend semantics.
+		return
+	case ir.OP_EXTRACT:       emitExtract(a, rm, ins);             return
+	case ir.OP_ALLOC:         emitAlloc(a, rm, ins);               return
+	case ir.OP_MAKE:          emitMake(a, rm, ins);                return
+	case ir.OP_BOX:           emitBox(a, rm, ins);                 return
+	case ir.OP_MAKE_SLICE:    emitMakeSlice(a, rm, ins);           return
+	case ir.OP_LOAD:          emitLoad(a, pkgName, rm, ins);       return
+	case ir.OP_STORE:         emitStore(a, pkgName, rm, ins);      return
+	case ir.OP_GET_ELEM_PTR:  emitGetElemPtr(a, pkgName, rm, ins);  return
+	case ir.OP_GET_FIELD_PTR: emitGetFieldPtr(a, pkgName, rm, ins); return
+	}
+
+	// Arithmetic / comparison / unary families are op-RANGES handled
+	// by these guarded delegates, so they sit after the per-op switch.
+	if emitCompare(a, rm, ins) { return }
+	if emitBinop(a, rm, ins) { return }
+	if emitUnop(a, rm, ins) { return }
+
+	// Any other op is a no-op in this skeleton.
+}

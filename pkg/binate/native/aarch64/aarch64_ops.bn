@@ -1,0 +1,463 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/asm"
+import "pkg/asm/aarch64"
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/mangle"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// Binary / unary / compare ops
+// ============================================================
+
+// emitBinop handles the integer arithmetic, bitwise, and shift ops.
+// Returns true if it matched and emitted code; false otherwise.
+func emitBinop(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != ir.OP_ADD &&
+		ins.Op != ir.OP_SUB &&
+		ins.Op != ir.OP_MUL &&
+		ins.Op != ir.OP_DIV &&
+		ins.Op != ir.OP_REM &&
+		ins.Op != ir.OP_AND &&
+		ins.Op != ir.OP_OR  &&
+		ins.Op != ir.OP_XOR &&
+		ins.Op != ir.OP_SHL &&
+		ins.Op != ir.OP_SHR &&
+		ins.Op != ir.OP_LAND &&
+		ins.Op != ir.OP_LOR {
+		return false
+	}
+	if len(ins.Args) != 2 { return false }
+
+	// Float arithmetic: dispatch on result type. emitFloatBinop
+	// only matches OP_ADD/SUB/MUL/DIV; integer ops on floats
+	// don't exist and would fall through to the int path below.
+	if emitFloatBinop(a, rm, ins) { return true }
+
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	var rhs int = getOperand(a, rm, ins.Args[1].ID)
+	if lhs < 0 || rhs < 0 { return false }
+
+	var rd int = nextReg(rm, ins.ID)
+	var rhsOp aarch64.Operand = aarch64.Reg(rhs)
+
+	// Unsigned-int DIV / REM / SHR need their unsigned aa64 forms;
+	// signed Sdiv on a uint with the high bit set gives the wrong
+	// answer (uint64Max / 7 evaluated signed is 0), and Asr would
+	// shift in sign bits on a logically-unsigned right-shift.
+	var isUnsigned bool = ins.Typ != nil &&
+		ins.Typ.IsInteger() && !ins.Typ.Signed
+
+	if ins.Op == ir.OP_ADD { aarch64.Add(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_SUB { aarch64.Sub(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_MUL { aarch64.Mul(a, true, rd, lhs, rhs);   return true }
+	if ins.Op == ir.OP_DIV {
+		if isUnsigned {
+			aarch64.Udiv(a, true, rd, lhs, rhs)
+		} else {
+			aarch64.Sdiv(a, true, rd, lhs, rhs)
+		}
+		return true
+	}
+	// OP_REM: synthesize via DIV + MSUB (rd = lhs - (lhs/rhs)*rhs);
+	// dispatch on signedness for the DIV step.
+	if ins.Op == ir.OP_REM {
+		if isUnsigned {
+			aarch64.Udiv(a, true, rd, lhs, rhs)
+		} else {
+			aarch64.Sdiv(a, true, rd, lhs, rhs)
+		}
+		aarch64.Msub(a, true, rd, rd, rhs, lhs)
+		return true
+	}
+	if ins.Op == ir.OP_AND { aarch64.And(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_OR  { aarch64.Orr(a, true, rd, lhs, rhsOp); return true }
+	// OP_LAND / OP_LOR — used by switch case lists (`case 1, 2, 3:`)
+	// where all comparisons are always evaluated. Plain bitwise on
+	// bool registers gives the right result. User-level `&&` / `||`
+	// short-circuit through the IR's branch-form lowering and never
+	// reach here.
+	if ins.Op == ir.OP_LAND { aarch64.And(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_LOR  { aarch64.Orr(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_XOR { aarch64.Eor(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_SHL { aarch64.Lsl(a, true, rd, lhs, rhsOp); return true }
+	if ins.Op == ir.OP_SHR {
+		if isUnsigned {
+			aarch64.Lsr(a, true, rd, lhs, rhsOp)
+		} else {
+			aarch64.Asr(a, true, rd, lhs, rhsOp)
+		}
+		return true
+	}
+	return false
+}
+
+// emitCompare handles OP_EQ/NE/LT/LE/GT/GE by emitting CMP + CSINC with
+// XZR (the CSET idiom). The assembler doesn't expose CSET directly, but
+// CSET Rd, cond ≡ CSINC Rd, XZR, XZR, invert(cond).
+func emitCompare(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != ir.OP_EQ && ins.Op != ir.OP_NE &&
+		ins.Op != ir.OP_LT && ins.Op != ir.OP_LE &&
+		ins.Op != ir.OP_GT && ins.Op != ir.OP_GE {
+		return false
+	}
+	if len(ins.Args) != 2 { return false }
+	// Float operands need FCMP + ordered-FP condition codes, not
+	// integer CMP — integer CMP would compare bit patterns, which
+	// returns wrong answers for IEEE NaN (two NaNs with the same bit
+	// pattern compare equal), for +0.0 vs -0.0 (different bit
+	// patterns, IEEE-equal), and for Binate's ordered semantics
+	// generally.  Delegate to emitFloatCompare in aarch64_float.bn.
+	if ins.Args[0].Typ != nil && ins.Args[0].Typ.IsFloat() {
+		return emitFloatCompare(a, rm, ins)
+	}
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	var rhs int = getOperand(a, rm, ins.Args[1].ID)
+	if lhs < 0 || rhs < 0 { return false }
+
+	var rd int = nextReg(rm, ins.ID)
+	aarch64.Cmp(a, true, lhs, aarch64.Reg(rhs))
+
+	// Comparison signedness is keyed on operand type (the result is
+	// always bool).  Unsigned uint values with the high bit set
+	// would sort as "negative" under the signed condition codes,
+	// so route those through the AArch64 unsigned forms.
+	var isUnsigned bool = ins.Args[0].Typ != nil &&
+		ins.Args[0].Typ.IsInteger() && !ins.Args[0].Typ.Signed
+	var invCond int = invertCondForOp(ins.Op, isUnsigned)
+	aarch64.Csinc(a, true, rd, aarch64.XZR, aarch64.XZR, invCond)
+	return true
+}
+
+// invertCondForOp returns the AArch64 condition code that is the
+// logical inverse of the IR comparison, so `csinc rd,xzr,xzr,invCond`
+// sets rd=1 exactly when the comparison holds.  `isUnsigned` picks
+// between the signed (LT/LE/GT/GE) and unsigned (LO/LS/HI/HS)
+// condition-code families.
+func invertCondForOp(op int, isUnsigned bool) int {
+	if op == ir.OP_EQ { return aarch64.COND_NE }
+	if op == ir.OP_NE { return aarch64.COND_EQ }
+	if isUnsigned {
+		if op == ir.OP_LT { return aarch64.COND_HS }  // !(a <u b)  ≡  a >=u b
+		if op == ir.OP_LE { return aarch64.COND_HI }  // !(a <=u b) ≡  a >u  b
+		if op == ir.OP_GT { return aarch64.COND_LS }  // !(a >u b)  ≡  a <=u b
+		return aarch64.COND_LO                         // OP_GE: !(a >=u b) ≡ a <u b
+	}
+	if op == ir.OP_LT { return aarch64.COND_GE }  // signed
+	if op == ir.OP_LE { return aarch64.COND_GT }  // signed
+	if op == ir.OP_GT { return aarch64.COND_LE }  // signed
+	return aarch64.COND_LT                         // OP_GE, signed
+}
+
+// emitUnop handles unary ops (-, ~, !). Returns true if matched.
+func emitUnop(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != ir.OP_NEG && ins.Op != ir.OP_BITNOT && ins.Op != ir.OP_NOT {
+		return false
+	}
+	if len(ins.Args) != 1 { return false }
+
+	// Float negation goes through FNEG via D scratch.
+	if ins.Op == ir.OP_NEG && emitFloatNeg(a, rm, ins) { return true }
+
+	var src int = getOperand(a, rm, ins.Args[0].ID)
+	if src < 0 { return false }
+
+	var rd int = nextReg(rm, ins.ID)
+	if ins.Op == ir.OP_NEG {
+		aarch64.Neg(a, true, rd, aarch64.Reg(src))
+		return true
+	}
+	if ins.Op == ir.OP_BITNOT {
+		aarch64.Mvn(a, true, rd, aarch64.Reg(src))
+		return true
+	}
+	// OP_NOT: logical negation on a bool. Flip bit 0.
+	if ins.Op == ir.OP_NOT {
+		aarch64.Eor(a, true, rd, src, aarch64.Imm(1))
+		return true
+	}
+	return false
+}
+
+
+// refincSeq is a module-scoped counter for unique skip labels in
+// emitRefIncInline. Local labels (Lri_skip_<seq>) need to be unique
+// across the entire emitted text section, not just per-function.
+var refincSeq int
+
+// refincSkipLabel formats the per-emission unique skip label.
+func refincSkipLabel(seq int) @[]char {
+	var out buf.CharBuf = buf.New()
+	out = out.WriteStr("Lri_skip_")
+	out = out.WriteInt(seq)
+	return out.Bytes()
+}
+
+// emitRefIncInline lowers OP_REFINC to an inline RefInc fast path:
+// nil-check, then a pre-indexed load that updates ptr to the header
+// address and reads the refcount in one instruction, then add+store.
+//
+//   CBZ  ptrReg, .Lri_skip_<seq>
+//   LDR  refcount, [ptrReg, #-16]!    ; ptrReg = ptr-16; refcount = *ptrReg
+//   ADD  refcount, refcount, #1
+//   STR  refcount, [ptrReg, #0]
+// .Lri_skip_<seq>:
+//
+// Reusing ptrReg as the post-decrement header pointer is safe because
+// spillAndReset clears the regmap after every instruction; subsequent
+// uses of the SSA value reload from its spill slot.
+func emitRefIncInline(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var ptrReg int = getOperand(a, rm, ins.Args[0].ID)
+	if ptrReg < 0 { return }
+	var refcountReg int = scratchReg(rm)
+	var skipLabel @[]char = refincSkipLabel(refincSeq)
+	refincSeq = refincSeq + 1
+	aarch64.Cbz(a, true, ptrReg, skipLabel)
+	aarch64.Ldr(a, true, refcountReg, aarch64.MemPre(ptrReg, -16))
+	aarch64.Add(a, true, refcountReg, refcountReg, aarch64.Imm(1))
+	aarch64.Str(a, true, refcountReg, aarch64.MemImm(ptrReg, 0))
+	a.DefineLabel(skipLabel)
+}
+
+// refdecSeq is a module-scoped counter for unique skip labels in
+// emitRefDecInline (parallel to refincSeq).
+var refdecSeq int
+
+// refdecSkipLabel formats the per-emission unique skip label.
+func refdecSkipLabel(seq int) @[]char {
+	var out buf.CharBuf = buf.New()
+	out = out.WriteStr("Lrd_skip_")
+	out = out.WriteInt(seq)
+	return out.Bytes()
+}
+
+// emitRefDecInline lowers OP_REFDEC: nil-check + inline header
+// load/sub/store, with a slow-path call to bn_pkg__rt__ZeroRefDestroy
+// when the decrement leaves the refcount at zero.
+//
+//   CBZ  ptrReg, .Lrd_skip_<seq>            ; nil → skip
+//   SUB  hdrReg, ptrReg, #16                ; hdrReg = ptr-16
+//   LDR  refcount, [hdrReg, #0]
+//   SUB  refcount, refcount, #1
+//   STR  refcount, [hdrReg, #0]
+//   CBNZ refcount, .Lrd_skip_<seq>          ; refcount > 0 → skip
+//   ; slow path: refcount hit zero
+//   MOV  X0, ptrReg
+//   MOV  X1, dtorReg     (or MOVZ X1, #0 if no dtor)
+//   BL   bn_pkg__rt__ZeroRefDestroy
+// .Lrd_skip_<seq>:
+//
+// Args[1] is the optional destructor; passed via X1 to the runtime
+// helper. The BL clobbers caller-saved registers (X0–X18) but the
+// branch target is the skip label, so no further uses follow within
+// this emission. Computing hdrReg via SUB rather than reusing a pre-
+// indexed addressing trick keeps ptrReg alive for the X0 mov.
+func emitRefDecInline(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var ptrReg int = getOperand(a, rm, ins.Args[0].ID)
+	if ptrReg < 0 { return }
+	var hdrReg int = scratchReg(rm)
+	var refcountReg int = scratchReg(rm)
+	var skipLabel @[]char = refdecSkipLabel(refdecSeq)
+	refdecSeq = refdecSeq + 1
+	aarch64.Cbz(a, true, ptrReg, skipLabel)
+	aarch64.Sub(a, true, hdrReg, ptrReg, aarch64.Imm(16))
+	aarch64.Ldr(a, true, refcountReg, aarch64.MemImm(hdrReg, 0))
+	aarch64.Sub(a, true, refcountReg, refcountReg, aarch64.Imm(1))
+	aarch64.Str(a, true, refcountReg, aarch64.MemImm(hdrReg, 0))
+	aarch64.Cbnz(a, true, refcountReg, skipLabel)
+	// Slow path: refcount hit zero. Set up X0=ptr, X1=dtor, call
+	// bn_pkg__rt__ZeroRefDestroy. ptrReg may be X0 already, but Mov
+	// is a no-op in that case; keep the line for clarity.
+	aarch64.Mov(a, true, aarch64.X0, aarch64.Reg(ptrReg))
+	if len(ins.Args) > 1 {
+		var dtorReg int = getOperand(a, rm, ins.Args[1].ID)
+		if dtorReg < 0 { return }
+		aarch64.Mov(a, true, aarch64.X1, aarch64.Reg(dtorReg))
+	} else {
+		aarch64.Movz(a, true, aarch64.X1, 0, 0)
+	}
+	var callee @[]char = symPrefixed("bn_pkg__rt__ZeroRefDestroy")
+	a.SetGlobal(callee)
+	aarch64.Bl(a, callee)
+	a.DefineLabel(skipLabel)
+}
+
+// emitStructCopy lowers an OP_STORE that is copying a struct (or
+// array) as a byte-for-byte memcpy. Source pointer comes from Args[1]
+// (which, per OP_LOAD's struct handling, is a pointer in a register);
+// dest from Args[0]. Either endpoint may be a package-level global,
+// reached via ADRP+ADD to the __DATA symbol.
+func emitStructCopy(a @asm.Assembler, pkgName *[]const char,
+	rm @common.RegMap, ins @ir.Instr) {
+	var sz int = ins.Args[1].Typ.SizeOf()
+	if sz <= 0 { return }
+
+	var srcPtr int
+	if isGlobalRef(ins.Args[1]) {
+		srcPtr = scratchReg(rm)
+		emitGlobalAddr(a, pkgName, srcPtr, ins.Args[1])
+	} else if common.IsMultiReturnCall(ins.Args[1]) {
+		// Multi-return spill holds the N*8 bytes themselves; we
+		// need the address of those bytes, not their first word.
+		var srcOff int = rm.LookupSpill(ins.Args[1].ID)
+		if srcOff < 0 { return }
+		srcPtr = scratchReg(rm)
+		aarch64.Add(a, true, srcPtr, aarch64.SP, aarch64.Imm(srcOff))
+	} else {
+		srcPtr = getOperand(a, rm, ins.Args[1].ID)
+	}
+	if srcPtr < 0 { return }
+
+	var dstPtr int
+	var allocOff int = rm.LookupAlloc(ins.Args[0].ID)
+	if allocOff >= 0 {
+		dstPtr = scratchReg(rm)
+		aarch64.Add(a, true, dstPtr, aarch64.SP, aarch64.Imm(allocOff))
+	} else if isGlobalRef(ins.Args[0]) {
+		dstPtr = scratchReg(rm)
+		emitGlobalAddr(a, pkgName, dstPtr, ins.Args[0])
+	} else {
+		dstPtr = getOperand(a, rm, ins.Args[0].ID)
+	}
+	if dstPtr < 0 { return }
+
+	var tmp int = scratchReg(rm)
+	for off := 0; off < sz; off = off + 8 {
+		aarch64.Ldr(a, true, tmp, aarch64.MemImm(srcPtr, off))
+		aarch64.Str(a, true, tmp, aarch64.MemImm(dstPtr, off))
+	}
+}
+
+// emitScalarLoad picks the right LDR variant for the given byte size
+// (1/2/4/8) and emits a load into rd from [base, #off].  `signed`
+// selects sign-extending variants (LDRSB/LDRSH/LDRSW) for sizes 1/2/4
+// when the loaded value is a signed narrow int (int8 / int16 /
+// int32); zero-extending variants (LDRB/LDRH/LDR-W) otherwise.  Size
+// 8 loads are full-width so the signed flag is irrelevant.
+//
+// The signed path matters whenever a signed narrow int is loaded
+// into an X register and then operated on with 64-bit arithmetic /
+// comparison.  Without sign extension the high bits stay zero and a
+// negative value compares as a large positive — which broke
+// `int8 < 0` for int8 = -5 (loaded as 251, compares ≥ 0) until this
+// flag was added.  See conformance 416_narrow_int_sign_ext.
+//
+// The aarch64 lib handles oversize offsets internally (materializing
+// via X17), so callers don't need to size-check off.
+func emitScalarLoad(a @asm.Assembler, rd int, base int, off int, sz int,
+		signed bool) {
+	if sz == 1 {
+		if signed {
+			aarch64.Ldrsb(a, true, rd, aarch64.MemImm(base, off))
+		} else {
+			aarch64.Ldrb(a, rd, aarch64.MemImm(base, off))
+		}
+		return
+	}
+	if sz == 2 {
+		if signed {
+			aarch64.Ldrsh(a, true, rd, aarch64.MemImm(base, off))
+		} else {
+			aarch64.Ldrh(a, rd, aarch64.MemImm(base, off))
+		}
+		return
+	}
+	if sz == 4 {
+		if signed {
+			aarch64.Ldrsw(a, rd, aarch64.MemImm(base, off))
+		} else {
+			aarch64.Ldr(a, false, rd, aarch64.MemImm(base, off))
+		}
+		return
+	}
+	aarch64.Ldr(a, true, rd, aarch64.MemImm(base, off))
+}
+
+// emitScalarStore is the symmetric STRB/STRH/STR dispatcher. The
+// aarch64 lib handles oversize offsets internally; callers don't
+// need to size-check off.
+func emitScalarStore(a @asm.Assembler, rt int, base int, off int, sz int) {
+	if sz == 1 {
+		aarch64.Strb(a, rt, aarch64.MemImm(base, off))
+		return
+	}
+	if sz == 2 {
+		aarch64.Strh(a, rt, aarch64.MemImm(base, off))
+		return
+	}
+	if sz == 4 {
+		aarch64.Str(a, false, rt, aarch64.MemImm(base, off))
+		return
+	}
+	aarch64.Str(a, true, rt, aarch64.MemImm(base, off))
+}
+
+// emitConstInt64 loads a 64-bit integer constant into rd using a
+// movz+movk chain — one MOVZ for the first non-zero 16-bit chunk,
+// MOVKs for subsequent non-zero chunks. A single MOVZ suffices for
+// small positives; larger values (e.g. 0x80000000 from test 151)
+// need the chain.
+//
+// Negative values with bit 63 set are NOT handled here — they'd need
+// MOVN. The IR typically emits positive IntVal with OP_NEG for
+// negation, so this covers the common case.
+func emitConstInt64(a @asm.Assembler, rd int, val int64) {
+	if val == 0 {
+		aarch64.Movz(a, true, rd, 0, 0)
+		return
+	}
+	var first bool = true
+	for i := 0; i < 4; i++ {
+		var shift int = 16 * i
+		// val is int64 so the high chunks (shift 32/48) are
+		// addressable even when the compiler's host `int` is 32-bit.
+		var chunk int = cast(int, (val >> cast(int64, shift)) & cast(int64, 0xFFFF))
+		if chunk == 0 { continue }
+		if first {
+			aarch64.Movz(a, true, rd, chunk, shift)
+			first = false
+		} else {
+			aarch64.Movk(a, true, rd, chunk, shift)
+		}
+	}
+	if first {
+		// All chunks were zero but val != 0 — shouldn't happen for
+		// finite values. Defensive fallback.
+		aarch64.Movz(a, true, rd, 0, 0)
+	}
+}
+
+// emitCast truncates src to the width of target (uint32/int32/…),
+// storing the result in rd. For unsigned targets, zero-extend via
+// LSL+LSR; for signed, sign-extend via LSL+ASR. For 64-bit targets
+// (or target.Width == 0, meaning the predeclared `int`), pass
+// through unchanged.
+func emitCast(a @asm.Assembler, rd int, src int, target @types.Type) {
+	var w int = 0
+	if target != nil { w = target.Width }
+	if w == 0 || w >= 64 {
+		aarch64.Mov(a, true, rd, aarch64.Reg(src))
+		return
+	}
+	var shift int = 64 - w
+	aarch64.Lsl(a, true, rd, src, aarch64.Imm(shift))
+	if target != nil && target.Signed {
+		aarch64.Asr(a, true, rd, rd, aarch64.Imm(shift))
+	} else {
+		aarch64.Lsr(a, true, rd, rd, aarch64.Imm(shift))
+	}
+}
+
+// emitEpilogueAndRet tears down the frame.
+func emitEpilogueAndRet(a @asm.Assembler, frameSize int) {
+	if frameSize > 0 {
+		aarch64.Add(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(frameSize))
+	}
+	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR,
+		aarch64.MemPost(aarch64.SP, 16))
+	aarch64.Ret(a)
+}

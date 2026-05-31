@@ -1,0 +1,283 @@
+package "pkg/binate/native/x64"
+
+import "pkg/asm"
+import "pkg/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// Function frame — prologue, body, epilogue
+// ============================================================
+//
+// SysV-AMD64 frame layout (matching what gcc -O0 / clang -O0 emit):
+//
+//   push rbp
+//   mov  rbp, rsp
+//   sub  rsp, <frameSize>
+//   ...body...                ; emitInstr drives this loop
+//   mov  rsp, rbp             ; epilogue (emitted by OP_RETURN
+//   pop  rbp                  ;          via emitReturn, plus an
+//   ret                       ;          unconditional safety-net
+//                             ;          tail at end of emitFunc)
+//
+// Caller arranges the stack so that on entry to the callee, rsp
+// is 8-byte-misaligned (the return address is the only thing pushed
+// after the 16-byte boundary).  The `push rbp` re-aligns rsp to 16
+// for the body; `sub rsp, frameSize` keeps it aligned because
+// PlanFrame rounds frameSize up to a multiple of 16.
+
+// emitFunc lowers one function.  pkgName is the short package
+// name (for symbol mangling of globals and CALL targets); strings
+// is the module's interned string table (for OP_CONST_STRING);
+// allFuncs is the module's full function list (for Phase 3h's
+// CalleeUsesCSret).
+func emitFunc(a @asm.Assembler, pkgName *[]const char, f @ir.Func,
+		strings @[]ir.StringConst, allFuncs @[]@ir.Func) {
+	var sym @[]char = symFor(pkgName, f.Name)
+	a.DefineLabel(sym)
+	// Mach-O's weak-linkage construct (used by IsLinkOnce on aa64)
+	// has an ELF equivalent (STB_WEAK).  pkg/asm/elf's SetWeak
+	// applies that binding when emitting the symbol table; the
+	// Mach-O / ELF emitters share the asm.Assembler symbol record
+	// so SetWeak is the right call here too.
+	if f.IsLinkOnce {
+		a.SetWeak(sym)
+	} else {
+		a.SetGlobal(sym)
+	}
+
+	var rm @common.RegMap = common.NewRegMap(common.SysV_AMD64())
+	var frameSize int = rm.PlanFrame(f)
+
+	emitPrologue(a, frameSize)
+
+	// SysV-AMD64 sret: a function returning an aggregate > 16
+	// bytes (or a multi-return tuple > 16 bytes) receives the
+	// hidden buffer pointer in RDI.  Stash it at SP+SretSlotOff
+	// so emitReturn can read it back when copying the result.
+	// PlanFrame sets SretSlotOff >= 0 iff this function is sret-
+	// returning, per CallConv.FuncReturnsBigAggregate /
+	// FuncReturnsBigMultiReturn.
+	if rm.SretSlotOff >= 0 {
+		x64.Mov(a, x64.Mem(x64.RSP, rm.SretSlotOff, x64.SZ64),
+			x64.Reg(x64.RDI, x64.SZ64))
+	}
+
+	spillIncomingParams(a, rm, f, frameSize)
+
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		// Non-entry blocks get a label defined for branch targets.
+		// (The entry block's start is the function-symbol label
+		// itself, defined above.)
+		if bi > 0 {
+			a.DefineLabel(blockLabel(sym, b.Label))
+		}
+		// Each block starts with a fresh regmap.  Cross-block values
+		// flow through spill slots.
+		rm.ResetRegs()
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			emitInstr(a, pkgName, sym, rm, allFuncs, strings,
+				b.Instrs[ii])
+			spillAndReset(a, rm, b.Instrs[ii])
+		}
+	}
+
+	// Safety net: emit an epilogue + ret if the IR's final
+	// instruction wasn't OP_RETURN (which emits its own epilogue
+	// via emitReturn).  Without the guard, a normal OP_RETURN-
+	// terminated function would carry 5 bytes of unreachable
+	// epilogue dead code in its .text.
+	if !endsWithReturn(f) {
+		emitEpilogueAndRet(a, frameSize)
+	}
+}
+
+// spillIncomingParams writes each function parameter's entry-time
+// value (an arg register or a caller-pushed stack slot) into the
+// param's spill slot — and, for aggregates, into its data region —
+// so later uses going through getOperand → spill-reload see the
+// right bytes.  Mirrors arm64's emitFunc param-spill loop but uses
+// SysV-AMD64 dispatch via the (now-correct) CallConv classifier:
+// SysV has no reg/stack split, so for any aggregate exactly one of
+// regStart >= 0 (all eightbytes in GP arg regs) or stackOff >= 0
+// (MEMORY-class on the stack) is true.
+//
+// Stack args live in the caller's outgoing-args area, which is at
+// [rsp + frameSize + 16] from the callee's perspective: +frameSize
+// undoes our `sub rsp`, +16 undoes the caller's `call` (pushed
+// 8-byte return address) and our `push rbp` (another 8).  RAX is the
+// shuttle for the stack-arg copy (not in regPool, not a GP arg reg,
+// dead pre-body).
+//
+// Float scalar params arrive in XMM(NSRN); we MOVQ them through a
+// GP scratch to the spill slot so getOperand → spill-reload finds
+// them in the same 8-byte-GP form every other float value uses.
+func spillIncomingParams(a @asm.Assembler, rm @common.RegMap,
+		f @ir.Func, frameSize int) {
+	if len(f.Params) == 0 { return }
+	// SysV-AMD64 sret: when the function returns an aggregate via the
+	// hidden RDI buffer (rm.SretSlotOff >= 0), every user param shifts
+	// by one register — `tag` (param 0) arrives in RSI, not RDI.
+	// Model the shift the same way emitCall does: synthesise a
+	// pointer-typed leading entry in paramTypes so CallArgRegStart
+	// returns the user param's actual reg index (i + 1).
+	var sretShift bool = rm.SretSlotOff >= 0
+	var nDispatch int = len(f.Params)
+	if sretShift { nDispatch = nDispatch + 1 }
+	var paramTypes @[]@types.Type = make_slice(@types.Type, nDispatch)
+	if sretShift {
+		paramTypes[0] = types.MakePointerType(types.TypUint8())
+		for pi := 0; pi < len(f.Params); pi++ {
+			paramTypes[pi + 1] = f.Params[pi].Typ
+		}
+	} else {
+		for pi := 0; pi < len(f.Params); pi++ {
+			paramTypes[pi] = f.Params[pi].Typ
+		}
+	}
+	var stackArgsBase int = frameSize + 16
+	// NSRN: float-scalar params arrive in XMM(NSRN), separate from
+	// the GP NGRN budget tracked by CallArgRegStart.  Walk params in
+	// order so NSRN matches the caller's per-call counting.
+	var nsrn int = 0
+	for pi := 0; pi < len(f.Params); pi++ {
+		var p @ir.Param = f.Params[pi]
+		if common.IsFloatScalarTyp(p.Typ) {
+			var spillOff int = rm.LookupSpill(p.ID)
+			if spillOff >= 0 && nsrn < 8 {
+				// MOVQ XMM(nsrn) → RAX (scratch), then store to slot.
+				// RAX is dead pre-body — see the doc-comment above —
+				// so we don't disturb anything else.
+				x64.Movq_xmm_to_gp(a, x64.RAX, x64.XMM0 + nsrn)
+				x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64),
+					x64.Reg(x64.RAX, x64.SZ64))
+			}
+			nsrn = nsrn + 1
+			continue
+		}
+		// User param i lives at dispatch slot i (no sret) or i+1
+		// (sret — the hidden buffer pointer takes slot 0).
+		var dispatchIdx int = pi
+		if sretShift { dispatchIdx = pi + 1 }
+		var regStart int = rm.CC.CallArgRegStart(paramTypes, dispatchIdx)
+		var stackOff int = rm.CC.CallArgStackOff(paramTypes, dispatchIdx)
+		if common.IsAggregateTyp(p.Typ) {
+			var dataOff int = rm.LookupAlloc(p.ID)
+			var sz int = rm.LookupAllocSize(p.ID)
+			if dataOff < 0 || sz <= 0 { continue }
+			var nWords int = sz / 8
+			// Indirect-large: pkg/codegen emits the function param
+			// as plain `ptr`, LLVM hands us a pointer to caller's
+			// struct in the arg reg.  Memcpy from *ptr into the
+			// local data region so downstream `paramSlots[i]`
+			// references (which resolve to RSP + dataOff) read
+			// the right bytes.
+			if rm.CC.IndirectLargeAggregates &&
+					p.Typ.SizeOf() > rm.CC.AggregateInRegMax {
+				// Load the byval pointer into RAX.
+				if regStart >= 0 {
+					x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+						x64.Reg(argReg(regStart), x64.SZ64))
+				} else if stackOff >= 0 {
+					x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+						x64.Mem(x64.RSP,
+							stackArgsBase + stackOff, x64.SZ64))
+				}
+				// Copy struct words from *RAX to RSP+dataOff via R11.
+				for w := 0; w < nWords; w++ {
+					x64.Mov(a, x64.Reg(x64.R11, x64.SZ64),
+						x64.Mem(x64.RAX, 8*w, x64.SZ64))
+					x64.Mov(a,
+						x64.Mem(x64.RSP, dataOff + 8*w, x64.SZ64),
+						x64.Reg(x64.R11, x64.SZ64))
+				}
+				var spillOff int = rm.LookupSpill(p.ID)
+				if spillOff >= 0 {
+					x64.Lea(a, x64.Reg(x64.RAX, x64.SZ64),
+						x64.Mem(x64.RSP, dataOff, x64.SZ64))
+					x64.Mov(a,
+						x64.Mem(x64.RSP, spillOff, x64.SZ64),
+						x64.Reg(x64.RAX, x64.SZ64))
+				}
+				continue
+			}
+			if regStart >= 0 {
+				// All eightbytes in GP arg regs (SysV doesn't split).
+				for w := 0; w < nWords; w++ {
+					x64.Mov(a,
+						x64.Mem(x64.RSP, dataOff + 8*w, x64.SZ64),
+						x64.Reg(argReg(regStart + w), x64.SZ64))
+				}
+			} else if stackOff >= 0 {
+				// MEMORY class: copy from caller's outgoing-args area
+				// to our data region via RAX.
+				for w := 0; w < nWords; w++ {
+					x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+						x64.Mem(x64.RSP,
+							stackArgsBase + stackOff + 8*w, x64.SZ64))
+					x64.Mov(a,
+						x64.Mem(x64.RSP, dataOff + 8*w, x64.SZ64),
+						x64.Reg(x64.RAX, x64.SZ64))
+				}
+			}
+			// Spill slot holds a pointer to the data region — matches
+			// OP_MAKE_SLICE / aggregate-CALL-return form so downstream
+			// OP_STORE / OP_EXTRACT find the bytes uniformly.
+			var spillOff int = rm.LookupSpill(p.ID)
+			if spillOff >= 0 {
+				x64.Lea(a, x64.Reg(x64.RAX, x64.SZ64),
+					x64.Mem(x64.RSP, dataOff, x64.SZ64))
+				x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64),
+					x64.Reg(x64.RAX, x64.SZ64))
+			}
+			continue
+		}
+		// Scalar (or pointer): one 8-byte spill slot.
+		var spillOff int = rm.LookupSpill(p.ID)
+		if spillOff < 0 { continue }
+		if regStart >= 0 {
+			x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64),
+				x64.Reg(argReg(regStart), x64.SZ64))
+		} else if stackOff >= 0 {
+			x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+				x64.Mem(x64.RSP,
+					stackArgsBase + stackOff, x64.SZ64))
+			x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
+		}
+	}
+}
+
+// endsWithReturn reports whether the last instruction in f's last
+// non-empty block is OP_RETURN.
+func endsWithReturn(f @ir.Func) bool {
+	if len(f.Blocks) == 0 { return false }
+	for bi := len(f.Blocks) - 1; bi >= 0; bi-- {
+		var b @ir.Block = f.Blocks[bi]
+		if len(b.Instrs) == 0 { continue }
+		return b.Instrs[len(b.Instrs)-1].Op == ir.OP_RETURN
+	}
+	return false
+}
+
+// emitPrologue writes the standard SysV-AMD64 frame setup.  frameSize
+// is the byte count PlanFrame returned (already 16-aligned).
+func emitPrologue(a @asm.Assembler, frameSize int) {
+	x64.Push(a, x64.Reg(x64.RBP, x64.SZ64))
+	x64.Mov(a, x64.Reg(x64.RBP, x64.SZ64), x64.Reg(x64.RSP, x64.SZ64))
+	if frameSize > 0 {
+		x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frameSize))
+	}
+}
+
+// emitEpilogueAndRet tears down the frame and returns.  Uses the
+// `mov rsp, rbp` form rather than `add rsp, frameSize` so a function
+// that adjusted rsp internally (e.g. a future alloca) still
+// recovers the correct sp.  Matches what gcc -O0 / clang -O0 emit.
+func emitEpilogueAndRet(a @asm.Assembler, frameSize int) {
+	x64.Mov(a, x64.Reg(x64.RSP, x64.SZ64), x64.Reg(x64.RBP, x64.SZ64))
+	x64.Pop(a, x64.Reg(x64.RBP, x64.SZ64))
+	x64.Ret(a)
+}

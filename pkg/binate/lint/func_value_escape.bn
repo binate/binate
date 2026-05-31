@@ -1,0 +1,163 @@
+package "pkg/binate/lint"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/types"
+
+// B.5 of plan-function-values-phase-2.md: two lint rules that flag
+// dangerous patterns around `*func(...)` and `@func(...)`:
+//
+//   * `*func-escape`: a CAPTURING `*func(...)` literal flowing into
+//     a slot that may outlive its enclosing frame — the canonical
+//     case is `return func() { ... }` from a function whose return
+//     type is `*func(...)`.  The closure struct is stack-allocated
+//     in the returning function's frame; once that frame unwinds,
+//     the captures dangle and a later call dereferences freed
+//     storage.  The user should use `@func(...)` for any closure
+//     that needs to outlive the constructing frame.
+//
+//   * `@func-captures-raw-ptr`: an `@func(...)` whose capturing
+//     literal captures a raw pointer (`*T`) — the @func itself is
+//     refcount-managed and can outlive any frame, but the raw
+//     pointer it carries has whatever lifetime the source variable
+//     has.  Same escape-hatch policy as raw pointers in general:
+//     allowed, but a likely-bug pattern worth flagging.  The
+//     CAP_RAW_PTR captures inside the literal's Decl.Captures are
+//     the signal.
+
+// lintFuncValueEscape walks each return statement's expressions
+// looking for a `*func(...)` capturing literal in tail position —
+// the closure's stack-alloc'd capture struct outlives the
+// function's frame.  Pinned by the corresponding `_test.bn`
+// fixtures.
+func lintFuncValueEscape(ctx @lintCtx, s @ast.Stmt) {
+	if len(ctx.FuncRetExprs) == 0 { return }
+	var n int = len(s.Exprs)
+	if n > len(ctx.FuncRetExprs) { n = len(ctx.FuncRetExprs) }
+	for i := 0; i < n; i++ {
+		// Only act when the declared return slot is a
+		// `*func(...)`.  Returning a literal as `@func(...)` is
+		// the safe path B.5 wants users on, so we don't warn
+		// when the slot already calls for managed lifetime.
+		if ctx.FuncRetExprs[i] == nil { continue }
+		if ctx.FuncRetExprs[i].Kind != ast.TEXPR_FUNC_VALUE {
+			continue
+		}
+		lintFuncValueEscapeExpr(ctx, s.Exprs[i])
+	}
+}
+
+// lintFuncValueEscapeExpr emits the `*func-escape` warning when
+// `e` is a CAPTURING function literal whose closure struct is
+// stack-bound to the constructing function's frame.  Non-capturing
+// literals are fine — their data slot is nil and there's nothing
+// to dangle.
+func lintFuncValueEscapeExpr(ctx @lintCtx, e @ast.Expr) {
+	if e == nil { return }
+	if e.Kind != ast.EXPR_FUNC_LIT { return }
+	if e.DeclRef == nil { return }
+	if len(e.DeclRef.Captures) == 0 { return }
+	// Resolved type tells us whether the checker's context-
+	// propagation already lifted this literal to @func — in
+	// which case the closure struct is heap-alloc'd and the
+	// escape is safe.  The default *func resolution is what
+	// we warn on.
+	var t @types.Type = ctx.Checker.ExprType(e.ResolvedTypeID)
+	if t == nil { return }
+	if t.Kind != types.TYP_FUNC_VALUE { return }
+	var cb buf.CharBuf = buf.New()
+	cb = cb.WriteStr(
+		"capturing *func(...) returned from enclosing frame; ")
+	cb = cb.WriteStr(
+		"closure-struct lifetime ends with the frame and ")
+	cb = cb.WriteStr("captures will dangle — use @func(...) ")
+	cb = cb.WriteStr("for closures that must outlive the ")
+	cb = cb.WriteStr("constructing frame")
+	addDiag(ctx, e.Pos, "func-value-escape", cb.Bytes())
+}
+
+// lintManagedFuncRawCapture walks each function literal in a body
+// emitting the `@func-captures-raw-ptr` warning when an @func
+// capturing literal carries a CAP_RAW_PTR capture.  The @func's
+// own refcount machinery keeps the closure struct alive, but the
+// raw-pointer capture's lifetime piggy-backs on whatever the
+// source variable's lifetime was — a likely-bug if the @func
+// outlives that source.
+func lintManagedFuncRawCapture(ctx @lintCtx, e @ast.Expr) {
+	if e == nil || e.Kind != ast.EXPR_FUNC_LIT { return }
+	if e.DeclRef == nil { return }
+	if len(e.DeclRef.Captures) == 0 { return }
+	var t @types.Type = ctx.Checker.ExprType(e.ResolvedTypeID)
+	if t == nil { return }
+	if t.Kind != types.TYP_MANAGED_FUNC_VALUE { return }
+	for i := 0; i < len(e.DeclRef.Captures); i++ {
+		var cap @ast.Capture = e.DeclRef.Captures[i]
+		if cap.Kind != ast.CAP_RAW_PTR { continue }
+		var cb buf.CharBuf = buf.New()
+		cb = cb.WriteStr("@func(...) captures raw pointer `")
+		cb = cb.WriteStr(cap.Name)
+		cb = cb.WriteStr("` — the closure outlives any frame ")
+		cb = cb.WriteStr("via its refcount, but the captured ")
+		cb = cb.WriteStr("*T's lifetime piggy-backs on its ")
+		cb = cb.WriteStr("source; consider @T if the closure ")
+		cb = cb.WriteStr("must outlive the source")
+		addDiag(ctx, cap.Pos, "managed-func-raw-capture", cb.Bytes())
+	}
+}
+
+// walkExprFuncLits walks an Expr subtree invoking the supplied
+// rule callback at every EXPR_FUNC_LIT.  Used by the
+// @func-captures-raw-ptr pass which fires anywhere a managed-
+// flavour capturing literal appears.
+func walkExprFuncLits(ctx @lintCtx, e @ast.Expr,
+		rule *func(@lintCtx, @ast.Expr)) {
+	if e == nil { return }
+	if e.Kind == ast.EXPR_FUNC_LIT {
+		rule(ctx, e)
+		// Continue into the literal's body so nested literals
+		// are reached too.
+		if e.DeclRef != nil && e.DeclRef.Body != nil {
+			walkStmtFuncLits(ctx, e.DeclRef.Body, rule)
+		}
+		return
+	}
+	if e.X != nil { walkExprFuncLits(ctx, e.X, rule) }
+	if e.Y != nil { walkExprFuncLits(ctx, e.Y, rule) }
+	if e.Z != nil { walkExprFuncLits(ctx, e.Z, rule) }
+	for i := 0; i < len(e.Args); i++ {
+		walkExprFuncLits(ctx, e.Args[i], rule)
+	}
+}
+
+// walkStmtFuncLits walks a Stmt subtree invoking `rule` at every
+// EXPR_FUNC_LIT encountered.  Covers if / for / switch / block /
+// decl-init shapes; identical traversal to findFuncLitInStmt in
+// pkg/binate/types/check_func_lit_test.bn.
+func walkStmtFuncLits(ctx @lintCtx, s @ast.Stmt,
+		rule *func(@lintCtx, @ast.Expr)) {
+	if s == nil { return }
+	for i := 0; i < len(s.Stmts); i++ {
+		walkStmtFuncLits(ctx, s.Stmts[i], rule)
+	}
+	for i := 0; i < len(s.Exprs); i++ {
+		walkExprFuncLits(ctx, s.Exprs[i], rule)
+	}
+	for i := 0; i < len(s.Exprs2); i++ {
+		walkExprFuncLits(ctx, s.Exprs2[i], rule)
+	}
+	if s.X != nil { walkExprFuncLits(ctx, s.X, rule) }
+	if s.Init != nil { walkStmtFuncLits(ctx, s.Init, rule) }
+	if s.Body != nil { walkStmtFuncLits(ctx, s.Body, rule) }
+	if s.Else != nil { walkStmtFuncLits(ctx, s.Else, rule) }
+	if s.Post != nil { walkStmtFuncLits(ctx, s.Post, rule) }
+	for i := 0; i < len(s.Cases); i++ {
+		var cc @ast.CaseClause = s.Cases[i]
+		if cc == nil { continue }
+		for j := 0; j < len(cc.Body); j++ {
+			walkStmtFuncLits(ctx, cc.Body[j], rule)
+		}
+	}
+	if s.DeclRef != nil && s.DeclRef.Value != nil {
+		walkExprFuncLits(ctx, s.DeclRef.Value, rule)
+	}
+}

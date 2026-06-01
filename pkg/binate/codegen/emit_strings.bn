@@ -8,16 +8,25 @@ import "pkg/binate/types"
 // Extracted from emit_helpers.bn to keep that file under the 600-line cap.
 
 // emitStringToArrayInstr emits the Stage 2c lowering for
-// `var s [N]char = "..."`. Allocates a temp `[N x i8]` slot,
-// zero-fills it, memcpys `min(strLen, N)` literal bytes from rodata
-// into the head, and loads the result. The caller stores the
-// %BnArray value into the destination array-typed alloca.
+// `var s [N]char = "..."`. Allocates a temp `[N x i8]` slot, writes
+// the literal bytes inline (`store i8 <byte>, ptr <gep>` per byte
+// position) — zero-padding the tail when strLen < arrLen — and
+// loads the result. The caller stores the array-typed result into
+// the destination array-typed alloca.
 //
-// strLen > N is rejected at IR-gen time, so we only ever copy
-// `strLen` bytes here (≤ N).
-func emitStringToArrayInstr(out buf.CharBuf, instr @ir.Instr,
-		strings *[]ir.StringConst) buf.CharBuf {
-	var sid int = ir.FindStringID(strings, instr.StrVal)
+// strLen > N is rejected at IR-gen time, so we only ever write
+// up to `strLen` source bytes here (≤ N).
+//
+// Inline byte-stores instead of `memcpy from rodata` keeps the
+// runtime free of any libc memory primitive (the C-free target;
+// see explorations/plan-codegen-c-free-copies.md).  Since the
+// source is a string LITERAL — known at compile time — there's no
+// need to read from a rodata global at runtime either; the bytes
+// are baked into the IR as i8 constants.  The `sid` / `@.str.<sid>`
+// rodata global still exists for OP_STRING_TO_CHARS-style accesses
+// that genuinely need a runtime-readable buffer; this op no longer
+// references it.
+func emitStringToArrayInstr(out buf.CharBuf, instr @ir.Instr) buf.CharBuf {
 	var strLen int = len(instr.StrVal)
 	var arrLen int = 0
 	if instr.Typ != nil && instr.Typ.Kind == types.TYP_ARRAY {
@@ -30,45 +39,16 @@ func emitStringToArrayInstr(out buf.CharBuf, instr @ir.Instr,
 	out = out.WriteStr(".tmp = alloca [")
 	out = out.WriteInt(arrLen)
 	out = out.WriteStr(" x i8]\n  ")
-	// Zero-fill (covers the tail when strLen < arrLen).
-	out = out.WriteStr("store [")
-	out = out.WriteInt(arrLen)
-	out = out.WriteStr(" x i8] zeroinitializer, [")
-	out = out.WriteInt(arrLen)
-	out = out.WriteStr(" x i8]* %v")
-	out = out.WriteInt(instr.ID)
-	out = out.WriteStr(".tmp\n  ")
-	if strLen > 0 {
-		// %vID.dst = bitcast [arrLen x i8]* %vID.tmp to i8*
-		out = out.WriteStr("%v")
-		out = out.WriteInt(instr.ID)
-		out = out.WriteStr(".dst = bitcast [")
-		out = out.WriteInt(arrLen)
-		out = out.WriteStr(" x i8]* %v")
-		out = out.WriteInt(instr.ID)
-		out = out.WriteStr(".tmp to i8*\n  ")
-		// %vID.src = getelementptr inbounds [strLen x i8], [strLen x i8]* @.str.sid, i64 0, i64 0
-		out = out.WriteStr("%v")
-		out = out.WriteInt(instr.ID)
-		out = out.WriteStr(".src = getelementptr inbounds [")
-		out = out.WriteInt(strLen)
-		out = out.WriteStr(" x i8], [")
-		out = out.WriteInt(strLen)
-		out = out.WriteStr(" x i8]* @.str.")
-		out = out.WriteInt(sid)
-		out = out.WriteStr(", i64 0, i64 0\n  ")
-		// memcpy strLen bytes
-		out = out.WriteStr("call void @bn_pkg__libc__Memcpy(i8* %v")
-		out = out.WriteInt(instr.ID)
-		out = out.WriteStr(".dst, i8* %v")
-		out = out.WriteInt(instr.ID)
-		out = out.WriteStr(".src, ")
-		out = out.WriteStr(intLL())
-		out = out.WriteByte(' ')
-		out = out.WriteInt(strLen)
-		out = out.WriteStr(")\n  ")
-	}
+	// Inline per-byte stores: source bytes for [0..strLen),
+	// zero-pad for [strLen..arrLen).
+	var dstBuf buf.CharBuf = buf.New()
+	dstBuf = dstBuf.WriteStr("%v")
+	dstBuf = dstBuf.WriteInt(instr.ID)
+	dstBuf = dstBuf.WriteStr(".tmp")
+	out = emitInlineByteStores(out, dstBuf.Bytes(), instr.StrVal,
+		arrLen, instr.ID)
 	// %vID = load [arrLen x i8], [arrLen x i8]* %vID.tmp
+	out = out.WriteStr("  ")
 	out = emitRef(out, instr.ID)
 	out = out.WriteStr(" = load [")
 	out = out.WriteInt(arrLen)
@@ -114,19 +94,21 @@ func emitStringToRawSlice(out buf.CharBuf, instr @ir.Instr, sid int) buf.CharBuf
 
 // emitStringToCharsCopy emits the Stage 2b implicit-copy lowering for
 // `@[]char = "..."`. Allocates a fresh managed-slice via
-// bn_pkg__builtins__rt__MakeManagedSlice, memcpys the literal bytes from the
-// `@.str.N` rodata global into the backing, and leaves the result
-// %BnManagedSlice in `%vID`. The caller owns the allocation; its
-// refcount is already 1 (MakeManagedSlice sets it).
+// bn_pkg__builtins__rt__MakeManagedSlice, writes the literal bytes
+// inline (`store i8 <byte>, ptr <gep>` per character) into the
+// backing, and leaves the result %BnManagedSlice in `%vID`. The
+// caller owns the allocation; its refcount is already 1
+// (MakeManagedSlice sets it).
 //
-// strLen == 0: skip the memcpy + source GEP entirely.  The
-// MakeManagedSlice call produces a zero-length slice whose data slot
-// is rt's zero-byte sentinel; there's nothing to copy in.  Skipping
-// the memcpy also avoids referencing @bn_pkg__libc__Memcpy from modules
-// that don't otherwise import pkg/libc — without this guard a
-// `func f() @[]char { return "" }` in such a module emits a
-// `call @bn_pkg__libc__Memcpy(..., 0)` with no matching `declare`.
-func emitStringToCharsCopy(out buf.CharBuf, instr @ir.Instr, sid int, strLen int) buf.CharBuf {
+// strLen == 0: skip the inline byte-store loop.  MakeManagedSlice
+// produces a zero-length slice whose data slot is rt's zero-byte
+// sentinel; there's nothing to write.
+//
+// Inline byte-stores (instead of the previous `memcpy from rodata`)
+// is the C-free-target piece: no libc memory primitive in
+// generated code.  See explorations/plan-codegen-c-free-copies.md.
+func emitStringToCharsCopy(out buf.CharBuf, instr @ir.Instr,
+		strLen int) buf.CharBuf {
 	// MakeManagedSlice now uses sret; allocate a buffer and pass
 	// its address.  The alloca is hoisted to entry by
 	// emitStringToCharsCopyAllocDecl, parallel to OP_MAKE_SLICE's
@@ -154,34 +136,60 @@ func emitStringToCharsCopy(out buf.CharBuf, instr @ir.Instr, sid int, strLen int
 		out = out.WriteStr(".dst = extractvalue %BnManagedSlice %v")
 		out = out.WriteInt(instr.ID)
 		out = out.WriteStr(".raw, 0\n  ")
-		// %vID.src = getelementptr inbounds [N x i8], [N x i8]* @.str.sid, i64 0, i64 0
-		out = out.WriteStr("%v")
-		out = out.WriteInt(instr.ID)
-		out = out.WriteStr(".src = getelementptr inbounds [")
-		out = out.WriteInt(strLen)
-		out = out.WriteStr(" x i8], [")
-		out = out.WriteInt(strLen)
-		out = out.WriteStr(" x i8]* @.str.")
-		out = out.WriteInt(sid)
-		out = out.WriteStr(", i64 0, i64 0\n  ")
-		// call void @bn_pkg__libc__Memcpy(i8* %vID.dst, i8* %vID.src, i64 strLen)
-		out = out.WriteStr("call void @bn_pkg__libc__Memcpy(i8* %v")
-		out = out.WriteInt(instr.ID)
-		out = out.WriteStr(".dst, i8* %v")
-		out = out.WriteInt(instr.ID)
-		out = out.WriteStr(".src, ")
-		out = out.WriteStr(intLL())
-		out = out.WriteByte(' ')
-		out = out.WriteInt(strLen)
-		out = out.WriteStr(")\n  ")
+		// Per-byte stores from the string literal into the
+		// managed-slice backing.
+		var dstBuf buf.CharBuf = buf.New()
+		dstBuf = dstBuf.WriteStr("%v")
+		dstBuf = dstBuf.WriteInt(instr.ID)
+		dstBuf = dstBuf.WriteStr(".dst")
+		out = emitInlineByteStores(out, dstBuf.Bytes(),
+			instr.StrVal, strLen, instr.ID)
 	}
 	// %vID = select i1 true, %BnManagedSlice %vID.raw, %BnManagedSlice %vID.raw
 	// (passthrough — we need a single-SSA-value result named %vID)
+	out = out.WriteStr("  ")
 	out = emitRef(out, instr.ID)
 	out = out.WriteStr(" = select i1 true, %BnManagedSlice %v")
 	out = out.WriteInt(instr.ID)
 	out = out.WriteStr(".raw, %BnManagedSlice %v")
 	out = out.WriteInt(instr.ID)
 	out = out.WriteStr(".raw\n")
+	return out
+}
+
+// emitInlineByteStores writes `count` consecutive `store i8 <V>, ptr <gep>`
+// instructions at byte offsets 0..count-1 from `dstRef`.  Byte values
+// come from `data[0..min(count, len(data))]`; positions beyond
+// `len(data)` are written as zero (used by the array-write zero-pad
+// for `var s [N]char = "...short..."`).
+//
+// Bytes are baked into the IR as i8 constants — no runtime read of a
+// rodata source.  Suitable for short literals (we cap the codebase's
+// longest string at ~90 chars in practice); a future variant could
+// emit an LLVM loop for very long literals.
+func emitInlineByteStores(out buf.CharBuf, dstRef *[]const char,
+		data @[]char, count int, idTag int) buf.CharBuf {
+	for i := 0; i < count; i++ {
+		var b int = 0
+		if i < len(data) { b = cast(int, data[i]) }
+		// gep
+		out = out.WriteStr("  %v")
+		out = out.WriteInt(idTag)
+		out = out.WriteStr(".sb")
+		out = out.WriteInt(i)
+		out = out.WriteStr("_p = getelementptr i8, ptr ")
+		out = out.WriteStr(dstRef)
+		out = out.WriteStr(", i32 ")
+		out = out.WriteInt(i)
+		out = out.WriteByte('\n')
+		// store
+		out = out.WriteStr("  store i8 ")
+		out = out.WriteInt(b)
+		out = out.WriteStr(", ptr %v")
+		out = out.WriteInt(idTag)
+		out = out.WriteStr(".sb")
+		out = out.WriteInt(i)
+		out = out.WriteStr("_p\n")
+	}
 	return out
 }

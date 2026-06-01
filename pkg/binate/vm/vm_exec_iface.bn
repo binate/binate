@@ -1,0 +1,214 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/buf"
+import "pkg/builtins/rt"
+
+// execIfaceOp dispatches the interface-value bytecode ops:
+// BC_IFACE_VALUE (constructs a 16-byte {data, vtable_idx_plus_1} on
+// the VM stack) and BC_IFACE_DTOR (extracts vtable slot 0 — the
+// receiver type's dtor as a 1-based VM func index — for use as
+// BC_REFDEC_INLINE_FAST's Src2 dtor argument). Split out of
+// execFuncRefOp / vm_exec_helpers.bn alongside Slice 2.5b so that
+// file stays close to its soft length limit.
+//
+// iv[1] is 1-based: storing `vtIdx + 1` lets a zero-initialized iv
+// (e.g. `var iv *I` no-init) carry iv[1] == 0 as a "nil interface"
+// sentinel. BC_CALL_IFACE_METHOD / BC_IFACE_DTOR detect it and
+// panic, matching the deterministic-SEGV behavior the compiled
+// path gets from a null vtable load.
+func execIfaceOp(vm @VM, f @VMFunc, regs *int, instr BCInstr) bool {
+	if instr.Op == BC_IFACE_VALUE {
+		// Slice 2.3c of plan-interface-syntax-revision.md.
+		// Aux = name index for the mangled vtable identifier
+		// (`__ivt.<...>`); Src1 = data ptr register; Dst =
+		// result register (will hold the iv stack-slot addr).
+		//
+		// Note: doesn't share f.CallCache. eagerFillCallCache
+		// resolves every entry as a function name — for the
+		// vtable name that's a miss (-1), and a cached -1 would
+		// look indistinguishable from "not found" at lookup
+		// time. Linear scan over vm.IfaceVtables instead;
+		// vtable count is small. (TODO: per-call-site cache if
+		// it becomes hot.)
+		var vtIdx int = findIfaceVtable(vm, f.Names[instr.Aux])
+		if vtIdx < 0 {
+			print("vm: interface vtable not found: ")
+			println(f.Names[instr.Aux])
+			rt.Exit(1)
+		}
+		var ivAddr *int = stackPtr(vm, vm.SP)
+		var ivAddrInt int = bit_cast(int, vm.Stack) + vm.SP
+		vm.SP = vm.SP + 16
+		ivAddr[0] = regs[instr.Src1]   // data ptr
+		ivAddr[1] = vtIdx + 1          // vtable index (1-based; 0 = nil)
+		regs[instr.Dst] = ivAddrInt
+		return true
+	}
+	if instr.Op == BC_IFACE_DTOR {
+		// Slice 2.5b of plan-interface-syntax-revision.md.
+		// Src1 = register holding the iv stack-slot addr; Dst
+		// gets vt.Methods[0] (the dtor as a 1-based VM func
+		// index, or 0 if the receiver has no dtor). Feeds
+		// directly into BC_REFDEC_INLINE_FAST's Src2 slot.
+		var ivAddr int = regs[instr.Src1]
+		if ivAddr == 0 {
+			println("vm: iface_dtor on nil interface value")
+			rt.Exit(1)
+		}
+		var iv *int = bit_cast(*int, ivAddr)
+		var vtIdxPlus int = iv[1]
+		if vtIdxPlus == 0 {
+			// Nil iv (zero-initialized via no-init `var iv @I`).
+			// The dtor extraction is on the scope-exit cleanup
+			// path; for a nil iv there's nothing to clean up.
+			// Returning a 0 dtor index lets BC_REFDEC_INLINE_FAST
+			// skip dispatch (its Src2 == 0 means "no dtor").
+			regs[instr.Dst] = 0
+			return true
+		}
+		var vtIdx int = vtIdxPlus - 1
+		if vtIdx < 0 || vtIdx >= len(vm.IfaceVtables) {
+			println("vm: iface_dtor: vtable index out of range")
+			rt.Exit(1)
+		}
+		var vt @IfaceVtable = vm.IfaceVtables[vtIdx]
+		regs[instr.Dst] = vt.Methods[0]
+		return true
+	}
+	if instr.Op == BC_IFACE_UPCAST {
+		// Slice E.4 part 2b of plan-interface-embedding.md.
+		// Read source iv, swap the iface portion of its vtable
+		// name to the target's, and build a fresh iv with the
+		// same data ptr and the target's vtable index.
+		var srcAddr int = regs[instr.Src1]
+		if srcAddr == 0 {
+			println("vm: iface_upcast on nil interface value")
+			rt.Exit(1)
+		}
+		var srcIv *int = bit_cast(*int, srcAddr)
+		var srcData int = srcIv[0]
+		var srcVtIdxPlus int = srcIv[1]
+		if srcVtIdxPlus == 0 {
+			// Nil source iv — propagate as nil into the new iv.
+			var ivAddr *int = stackPtr(vm, vm.SP)
+			var ivAddrInt int = bit_cast(int, vm.Stack) + vm.SP
+			vm.SP = vm.SP + 16
+			ivAddr[0] = 0
+			ivAddr[1] = 0
+			regs[instr.Dst] = ivAddrInt
+			return true
+		}
+		var srcVtIdx int = srcVtIdxPlus - 1
+		if srcVtIdx < 0 || srcVtIdx >= len(vm.IfaceVtables) {
+			println("vm: iface_upcast: source vtable index out of range")
+			rt.Exit(1)
+		}
+		// Plan §6 iv→universe-`any`: encoded target suffix is
+		// `__any` (empty pkg + name "any"); the upcast reuses the
+		// source's vtable wholesale (offset-0 layout match between
+		// any's `[1 x i8*]` view and the source's any-block).  Skip
+		// the name swap + lookup — those would fail because no
+		// `__ivt.<...>__any` global is registered on the VM side
+		// for iv-source upcasts.
+		var tgtVtPlus int = 0
+		if iface_upcastTargetIsAny(f.Names[instr.Aux]) {
+			tgtVtPlus = srcVtIdxPlus
+		} else {
+			var srcName @[]char = vm.IfaceVtables[srcVtIdx].Name
+			var tgtName @[]char = swapIfaceSuffix(srcName,
+				f.Names[instr.Aux])
+			if len(tgtName) == 0 {
+				print("vm: iface_upcast: cannot compute target vtable for ")
+				println(srcName)
+				rt.Exit(1)
+			}
+			var tgtVtIdx int = findIfaceVtable(vm, tgtName)
+			if tgtVtIdx < 0 {
+				print("vm: iface_upcast: target vtable not found: ")
+				println(tgtName)
+				rt.Exit(1)
+			}
+			tgtVtPlus = tgtVtIdx + 1
+		}
+		var ivAddr *int = stackPtr(vm, vm.SP)
+		var ivAddrInt int = bit_cast(int, vm.Stack) + vm.SP
+		vm.SP = vm.SP + 16
+		ivAddr[0] = srcData
+		ivAddr[1] = tgtVtPlus
+		regs[instr.Dst] = ivAddrInt
+		return true
+	}
+	return false
+}
+
+// swapIfaceSuffix rewrites a vtable name by replacing its source
+// iface suffix with the target's.  Input `srcName` is a full
+// vtable name (e.g. `__ivt.bn_main__F__main__RC`); `suffixes` is
+// the lower-time-encoded `<src_iface_pkg>__<src_iface_name>|<tgt_iface_pkg>__<tgt_iface_name>`
+// pair.  Returns the rewritten name or an empty slice if the
+// source name doesn't end with the expected src-iface suffix.
+func swapIfaceSuffix(srcName @[]char,
+		suffixes @[]char) @[]char {
+	// Split suffixes at '|'.
+	var sepIdx int = -1
+	for i := 0; i < len(suffixes); i++ {
+		if suffixes[i] == '|' { sepIdx = i; break }
+	}
+	if sepIdx < 0 {
+		var empty @[]char
+		return empty
+	}
+	// srcSuffix = "<srcPkg>__<srcName>"; we strip "__<srcSuffix>"
+	// off the end of srcName.  tgtSuffix likewise gets appended
+	// with a leading "__".
+	var srcSuffixLen int = sepIdx
+	var srcIfacePart buf.CharBuf = buf.New()
+	srcIfacePart = srcIfacePart.WriteStr("__")
+	for i := 0; i < srcSuffixLen; i++ {
+		srcIfacePart = srcIfacePart.WriteByte(suffixes[i])
+	}
+	var srcIface @[]char = srcIfacePart.Bytes()
+	if !iface_endsWith(srcName, srcIface) {
+		var empty @[]char
+		return empty
+	}
+	var prefixLen int = len(srcName) - len(srcIface)
+	var out buf.CharBuf = buf.New()
+	for i := 0; i < prefixLen; i++ {
+		out = out.WriteByte(srcName[i])
+	}
+	out = out.WriteStr("__")
+	for i := sepIdx + 1; i < len(suffixes); i++ {
+		out = out.WriteByte(suffixes[i])
+	}
+	return out.Bytes()
+}
+
+// iface_upcastTargetIsAny reports whether the target half of an
+// iface-upcast suffix encoding names the universe `any` interface
+// (empty pkg, name "any" — encoded as the literal string `__any`
+// after the `|` separator).  Plan §6.
+func iface_upcastTargetIsAny(suffixes @[]char) bool {
+	var sepIdx int = -1
+	for i := 0; i < len(suffixes); i++ {
+		if suffixes[i] == '|' { sepIdx = i; break }
+	}
+	if sepIdx < 0 { return false }
+	var tgtLen int = len(suffixes) - sepIdx - 1
+	if tgtLen != 5 { return false }
+	return suffixes[sepIdx + 1] == '_' &&
+		suffixes[sepIdx + 2] == '_' &&
+		suffixes[sepIdx + 3] == 'a' &&
+		suffixes[sepIdx + 4] == 'n' &&
+		suffixes[sepIdx + 5] == 'y'
+}
+
+// iface_endsWith reports whether haystack ends with needle.
+func iface_endsWith(haystack @[]char, needle @[]char) bool {
+	if len(needle) > len(haystack) { return false }
+	var offset int = len(haystack) - len(needle)
+	for i := 0; i < len(needle); i++ {
+		if haystack[offset + i] != needle[i] { return false }
+	}
+	return true
+}

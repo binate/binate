@@ -107,7 +107,7 @@ fi
 check "bnc" "$actual"
 
 # ----- bni (bytecode VM) ------------------------------------------
-# bni is skipped here: cmd/bni imports pkg/vm, which uses float
+# bni is skipped here: cmd/bni imports pkg/binate/vm, which uses float
 # literals that the bootstrap lexer doesn't recognize, so we can't
 # interpret bni via bootstrap. To cover bni we would have to first
 # compile it (via builder-comp) and then invoke the binary against the

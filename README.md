@@ -189,8 +189,8 @@ Each source file has a corresponding `*_test.bn` file with `func TestXxx() testi
 # Filter to specific packages.
 ./scripts/unittest/run.sh builder-comp pkg/binate/types
 
-# pkg/vm and cmd/bni need bni (the bytecode VM); use a *-int mode.
-./scripts/unittest/run.sh builder-comp-int pkg/vm cmd/bni
+# pkg/binate/vm and cmd/bni need bni (the bytecode VM); use a *-int mode.
+./scripts/unittest/run.sh builder-comp-int pkg/binate/vm cmd/bni
 ```
 
 Tests return `""` for pass, or a failure message string.

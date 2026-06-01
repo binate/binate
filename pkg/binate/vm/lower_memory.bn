@@ -1,0 +1,164 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/ir"
+import "pkg/binate/types"
+
+// Memory-instruction lowering helpers (LOAD / STORE / GET_FIELD_PTR).
+// Extracted from lower_instr.bn to keep that file under the hygiene
+// length cap.
+
+// lowerLoad handles OP_LOAD: multi-word types use MOV (pointer),
+// scalars use LOAD64/LOAD8.
+func lowerLoad(instr @ir.Instr, bc BCInstr) BCInstr {
+	if instr.Typ != nil &&
+		(instr.Typ.Kind == types.TYP_STRUCT ||
+			instr.Typ.Kind == types.TYP_SLICE ||
+			instr.Typ.Kind == types.TYP_MANAGED_SLICE ||
+			instr.Typ.Kind == types.TYP_ARRAY ||
+			instr.Typ.Kind == types.TYP_FUNC_VALUE ||
+			instr.Typ.Kind == types.TYP_MANAGED_FUNC_VALUE ||
+			instr.Typ.Kind == types.TYP_INTERFACE_VALUE ||
+			instr.Typ.Kind == types.TYP_INTERFACE_VALUE_MANAGED) {
+		// Multi-word values are passed by pointer in the VM —
+		// "loading" just keeps the alloca pointer; the consumer
+		// (a memcpy store, an element-pointer GEP, etc.) handles
+		// the bytes.
+		bc.Op = BC_MOV
+		bc.Src1 = instr.Args[0].ID
+		return bc
+	}
+	var loadWidth int = 64
+	if instr.Typ != nil && instr.Typ.Width == 8 {
+		loadWidth = 8
+	}
+	if instr.Typ != nil &&
+		instr.Typ.Kind == types.TYP_BOOL {
+		loadWidth = 8
+	}
+	if instr.Typ != nil && instr.Typ.Width > 0 &&
+		instr.Typ.Width < 64 {
+		loadWidth = instr.Typ.Width
+	}
+	if loadWidth == 8 {
+		bc.Op = BC_LOAD8
+	} else if loadWidth < 64 {
+		bc.Op = BC_LOAD8
+		bc.Imm = loadWidth / 8
+	} else if is64BitScalar(instr.Typ) && REG_SLOT < 8 {
+		// Layer 2: int64 / uint64 / float64 occupies a register pair
+		// on a host whose word is < 8 bytes — emit the pair-aware
+		// load (8 bytes into (Dst, Dst+1)).
+		bc.Op = BC_LOAD64_PAIR
+	} else {
+		bc.Op = BC_LOAD64
+	}
+	// Aux = 1 marks signed sub-word loads.  Without this the
+	// executor zero-extends every byte payload, so signed values
+	// with the high bit set come back as their (wrong) unsigned
+	// representation.  Width-64 loads need no flag (the byte
+	// payload is the full register).
+	if bc.Op == BC_LOAD8 && instr.Typ != nil &&
+			instr.Typ.Kind == types.TYP_INT && instr.Typ.Signed {
+		bc.Aux = 1
+	}
+	bc.Src1 = instr.Args[0].ID
+	return bc
+}
+
+// lowerStore handles OP_STORE: multi-word types use MEMCPY,
+// scalars use STORE64/STORE8. Nil stores to multi-word types
+// use MEMSET to avoid memcpy from null pointer.
+func lowerStore(instr @ir.Instr, bc BCInstr) BCInstr {
+	var valTyp @types.Type = instr.Args[1].Typ
+	if valTyp != nil &&
+		(valTyp.Kind == types.TYP_STRUCT ||
+			valTyp.Kind == types.TYP_SLICE ||
+			valTyp.Kind == types.TYP_MANAGED_SLICE ||
+			valTyp.Kind == types.TYP_ARRAY ||
+			valTyp.Kind == types.TYP_FUNC_VALUE ||
+			valTyp.Kind == types.TYP_MANAGED_FUNC_VALUE ||
+			valTyp.Kind == types.TYP_INTERFACE_VALUE ||
+			valTyp.Kind == types.TYP_INTERFACE_VALUE_MANAGED) {
+		// Nil store: zero the destination instead of copying
+		if instr.Args[1].Op == ir.OP_CONST_NIL {
+			bc.Op = BC_MEMSET
+			bc.Src1 = instr.Args[0].ID
+			bc.Imm = valTyp.SizeOf()
+			bc.Dst = -1
+			return bc
+		}
+		bc.Op = BC_MEMCPY
+		bc.Src1 = instr.Args[0].ID
+		bc.Src2 = instr.Args[1].ID
+		bc.Imm = valTyp.SizeOf()
+		bc.Dst = -1
+		return bc
+	}
+	// Determine store width from value type or destination
+	// pointer element type (for sub-word stores like uint8).
+	var storeWidth int = 64
+	if valTyp != nil && valTyp.Width == 8 {
+		storeWidth = 8
+	}
+	if valTyp != nil &&
+		valTyp.Kind == types.TYP_BOOL {
+		storeWidth = 8
+	}
+	// Check destination pointer's element type for width
+	var dstTyp @types.Type = instr.Args[0].Typ
+	if dstTyp != nil && dstTyp.Elem != nil &&
+		dstTyp.Elem.Width > 0 &&
+		dstTyp.Elem.Width < 64 {
+		storeWidth = dstTyp.Elem.Width
+	}
+	if storeWidth == 8 {
+		bc.Op = BC_STORE8
+	} else if storeWidth < 64 {
+		// Sub-word store (16 or 32 bit): use BC_STORE8
+		// with Imm = byte count for the VM to handle
+		bc.Op = BC_STORE8
+		bc.Imm = storeWidth / 8
+	} else if is64BitScalar(valTyp) && REG_SLOT < 8 {
+		// Layer 2: storing an int64/uint64/float64 from a register
+		// pair on a host whose word is < 8 bytes.
+		bc.Op = BC_STORE64_PAIR
+	} else {
+		bc.Op = BC_STORE64
+	}
+	bc.Dst = -1
+	bc.Src1 = instr.Args[0].ID
+	bc.Src2 = instr.Args[1].ID
+	return bc
+}
+
+// lowerGetFieldPtr handles OP_GET_FIELD_PTR with correct offsets
+// for structs, slices, and managed-slices.
+func lowerGetFieldPtr(instr @ir.Instr, bc BCInstr) BCInstr {
+	bc.Op = BC_FIELD_PTR
+	bc.Src1 = instr.Args[0].ID
+	// Get the struct type: try TypeArg, then Typ.Elem.
+	// If the type is a pointer, dereference to get the pointee.
+	var structTyp @types.Type = instr.Args[0].TypeArg
+	if structTyp == nil && instr.Args[0].Typ != nil {
+		structTyp = instr.Args[0].Typ.Elem
+	}
+	// Peel pointer wrappers
+	if structTyp != nil &&
+		structTyp.Kind == types.TYP_POINTER &&
+		structTyp.Elem != nil {
+		structTyp = structTyp.Elem
+	}
+	// Resolve named types to underlying struct
+	if structTyp != nil {
+		structTyp = resolveToStruct(structTyp)
+	}
+	if structTyp != nil {
+		if structTyp.Kind == types.TYP_SLICE ||
+			structTyp.Kind == types.TYP_MANAGED_SLICE {
+			bc.Imm = instr.Index * 8
+		} else {
+			bc.Imm = structTyp.FieldOffset(instr.Index)
+		}
+	}
+	return bc
+}

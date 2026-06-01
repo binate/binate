@@ -2,7 +2,7 @@
 # e2e/repl.sh — End-to-end test for `bni --repl` (Tier 1 PoC).
 #
 # Builds bni via builder-comp (cmd/bni isn't bootstrap-runnable since
-# pkg/vm uses floats), creates a tiny fixture module that defines a
+# pkg/binate/vm uses floats), creates a tiny fixture module that defines a
 # `helper` function, then drives the REPL via piped stdin and
 # compares output byte-for-byte against expectations.
 #

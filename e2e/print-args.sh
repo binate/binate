@@ -117,10 +117,14 @@ if [ ! -x "$BNI_BIN" ]; then
 fi
 
 # ----- (a) native binary ------------------------------------------
+# `--runtime` is explicit because print_args.bn lives in $TMP (not
+# under $BINATE_DIR), so bnc's `findRuntime` walk-up wouldn't reach
+# the checkout's binate_runtime.c on its own.
 NATIVE_BIN="$TMP/print_args-bin"
 native_compile_log=$("$GEN1_BNC" \
     -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
     -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
+    --runtime "$BINATE_DIR/runtime/binate_runtime.c" \
     --build-dir "$BUILD_DIR" -o "$NATIVE_BIN" "$TMP/print_args.bn" 2>&1) || true
 if [ -x "$NATIVE_BIN" ]; then
     # Native binaries see argv[1..] directly — there is no host

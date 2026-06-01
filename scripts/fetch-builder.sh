@@ -7,8 +7,8 @@
 #     BUILDER_LIB="$(scripts/fetch-builder.sh --lib)" # stdlib root
 #     "$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
 #         "$BINATE_DIR/cmd/bnc" -- \
-#         -I "$BINATE_DIR:$BUILDER_LIB" \
-#         -L "$BINATE_DIR:$BUILDER_LIB" ...
+#         -I "$BINATE_DIR:$BUILDER_LIB:$BUILDER_LIB/ifaces/core:$BUILDER_LIB/ifaces/stdlib" \
+#         -L "$BINATE_DIR:$BUILDER_LIB:$BUILDER_LIB/impls/core/common:$BUILDER_LIB/impls/core/libc:$BUILDER_LIB/impls/stdlib/common" ...
 #
 # Modes:
 #   (no flags)             print the default tool's invocation path

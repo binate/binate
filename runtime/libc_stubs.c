@@ -3,7 +3,7 @@
 //
 // pkg/libc is always libc. On a libc-free target, code does NOT
 // substitute a different libc_stubs.c — instead, that target uses
-// a different pkg/rt that doesn't depend on pkg/libc at all.
+// a different pkg/builtins/rt that doesn't depend on pkg/libc at all.
 //
 // Naming: function "Foo" in package "pkg/libc" → symbol
 // "bn_pkg__libc__Foo" (the standard Binate mangling).

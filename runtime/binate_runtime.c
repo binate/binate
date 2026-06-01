@@ -22,7 +22,7 @@ typedef intptr_t bn_int_t;
 // Slice representation: { data*, len }
 //
 // Unmanaged slices (*[]T): { *T data, uint len } — no capacity, append always reallocates.
-// Managed slices (@[]T): { *T data, uint len, @any refptr } — provided by pkg/rt.
+// Managed slices (@[]T): { *T data, uint len, @any refptr } — provided by pkg/builtins/rt.
 // ============================================================
 
 typedef struct {
@@ -38,7 +38,7 @@ typedef struct {
 } BnManagedSlice;
 
 // Managed memory (Alloc, Box, RefInc, RefDec, Free) and bounds checking
-// are provided by pkg/rt. See pkg/rt/rt.bn and runtime/libc_stubs.c
+// are provided by pkg/builtins/rt. See pkg/builtins/rt/rt.bn and runtime/libc_stubs.c
 // (libc bridges).
 
 // ============================================================
@@ -80,7 +80,7 @@ static BnSlice cstr_to_slice(const char *s) {
 // Helper: allocate a managed block (header + payload, refcount=1).
 // Header is 2 * sizeof(bn_int_t) — 16 bytes on LP64, 8 bytes on
 // 32-bit ARM Linux.  Layout: [refcount, free_fn_ptr] both bn_int_t.
-// free_fn_ptr is left as 0 — the sentinel pkg/rt.Free reads as
+// free_fn_ptr is left as 0 — the sentinel pkg/builtins/rt.Free reads as
 // "default = RawFree" and dispatches directly without going through
 // `_call_free_fn`.  Avoids the bootstrap circularity where the C
 // runtime would otherwise need a function-value handle whose layout

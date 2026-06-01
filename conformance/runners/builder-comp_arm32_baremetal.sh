@@ -89,7 +89,7 @@ runner_exec() {
     # compile_root == BINATE_DIR is a no-op.
     OLDIFS=$IFS; IFS='
 '; set -- $(_baremetal_bnc_extra_args); IFS=$OLDIFS
-    compile_out=$("$GEN1_COMPILER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
+    compile_out=$("$GEN1_COMPILER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
         -I "$compile_root" -L "$compile_root" --target arm32-baremetal \
         "$@" \
         --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
@@ -97,7 +97,7 @@ runner_exec() {
         # `-M virt -cpu cortex-a15` matches the linker script's
         # 0x40000000 RAM base.  `-nographic` routes the QEMU
         # console to stdout/stderr; `-semihosting` enables the
-        # SYS_WRITEC + SYS_EXIT_EXTENDED handlers crt0 / pkg/rt
+        # SYS_WRITEC + SYS_EXIT_EXTENDED handlers crt0 / pkg/builtins/rt
         # depend on.  `-kernel <ELF>` loads the binary; QEMU
         # finds the entry from its ELF header.  Wall-clock cap
         # via timeout(1) so a runaway test doesn't wedge the

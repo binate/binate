@@ -10,7 +10,7 @@
 #
 # Each tool resolves the fixture package purely via -I and -L (no
 # extra root flag).  $BINATE_DIR is added on each path so
-# pkg/bootstrap, pkg/rt, etc. resolve normally.
+# pkg/bootstrap, pkg/builtins/rt, etc. resolve normally.
 #
 # Exit 0 on full pass; non-zero with per-tool diagnostics on failure.
 
@@ -94,7 +94,7 @@ check "bootstrap" "$actual"
 # after `--` as its own user args.
 BNC_BIN="$TMP/bnc-bin"
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-bnc_compile_log=$("$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
+bnc_compile_log=$("$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
     "$BINATE_DIR/cmd/bnc" -- \
     -I "$BNI_ROOT:$BINATE_DIR" -L "$IMPL_ROOT:$BINATE_DIR" \
     --runtime "$BINATE_DIR/runtime/binate_runtime.c" \

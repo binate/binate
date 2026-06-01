@@ -6,7 +6,7 @@
 # directory. Whitelisted real packages:
 #
 #   pkg/bootstrap   — system calls (Write, Exit, Args, file I/O)
-#   pkg/rt          — runtime (refcount probes, alloc helpers)
+#   pkg/builtins/rt          — runtime (refcount probes, alloc helpers)
 #
 # A file's "test directory" is the immediate child of conformance/ that
 # contains it. Single-file tests (conformance/NNN_name.bn) have no test
@@ -29,7 +29,7 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONFORMANCE_DIR="$BINATE_DIR/conformance"
 WHITELIST_FILE="$SCRIPT_DIR/conformance-imports.whitelist"
 
-ALLOWED_REAL="pkg/bootstrap pkg/rt"
+ALLOWED_REAL="pkg/bootstrap pkg/builtins/rt"
 
 LIST=$(mktemp -t hygiene-conformance-imports-list.XXXXXX)
 VIOLATIONS=$(mktemp -t hygiene-conformance-imports-out.XXXXXX)

@@ -65,7 +65,7 @@ runner_exec() {
     if [ -n "$root" ]; then
         compile_root="$root"
     fi
-    compile_out=$("$GEN1_COMPILER" -I "$compile_root:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$compile_root:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
+    compile_out=$("$GEN1_COMPILER" -I "$compile_root:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$compile_root:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
         --backend native --target x86_64-darwin --build-dir "$bdir" \
         $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then

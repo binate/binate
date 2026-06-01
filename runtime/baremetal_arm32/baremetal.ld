@@ -46,7 +46,7 @@ SECTIONS
 	} > RAM
 
 	/* ARM unwind tables.  We don't run the unwinder in v1, but
-	 * libgcc.a's bn_pkg__rt__BoundsCheck / __aeabi_* helpers reference
+	 * libgcc.a's bn_pkg__builtins__rt__BoundsCheck / __aeabi_* helpers reference
 	 * `__exidx_start` and `__exidx_end` even when no actual
 	 * unwinding happens — so we must keep the section + define
 	 * the markers (an empty exidx is fine; libgcc just walks

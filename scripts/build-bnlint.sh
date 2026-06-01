@@ -101,10 +101,10 @@ mkdir -p "$GEN1_DIR/build"
 echo "  Stage 1: BUILDER → gen1 ..."
 "$BUILDER" \
     -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
-    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
+    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
     "$BINATE_DIR/cmd/bnc" -- \
     -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB" \
-    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB" \
+    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB" \
     --runtime "$BUILDER_RUNTIME" \
     --build-dir "$GEN1_DIR/build" \
     -o "$GEN1_BNC" \
@@ -114,7 +114,7 @@ echo "  Stage 2: gen1 → bnlint ..."
 if [ -n "$DBG_FLAG" ]; then
     "$GEN1_BNC" \
         -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
-        -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
+        -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         "$DBG_FLAG" \
@@ -123,7 +123,7 @@ if [ -n "$DBG_FLAG" ]; then
 else
     "$GEN1_BNC" \
         -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
-        -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/stdlib/common" \
+        -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         -o "$OUT" \

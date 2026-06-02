@@ -6,11 +6,15 @@
 # claude-todo.md + plan-bni-heap-frames.md): bni's extern-callback
 # path consumes ~3 KB of host stack per cross-VM round-trip, so
 # deeply-recursive interpreted code (type-checker, IR-gen) blows
-# the 8 MiB default stack.  Bump to as much as the host allows so
-# most tests pass while the proper fix is queued.  Linux normally
-# allows `unlimited`; macOS caps at ~64 MiB.  Remove once the
-# heap-frames refactor lands.
-ulimit -s unlimited 2>/dev/null || ulimit -s 65520 2>/dev/null || true
+# the 8 MiB default stack.  Cap at 64 MiB — gives ~8× headroom so
+# most tests pass while preserving fast-crash behavior when an
+# algorithm is pathologically deep.  An earlier attempt at
+# `ulimit -s unlimited` on Linux turned crashes into multi-minute
+# hangs (the type-checker's recursion is O(depth) and never
+# terminated with effectively-infinite headroom), which is worse
+# for CI than the original crash.  Remove this entire bandaid
+# once the heap-frames refactor lands.
+ulimit -s 65520 2>/dev/null || true
 
 runner_setup() { build_interp_boot_comp; }
 

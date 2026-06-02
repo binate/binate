@@ -121,6 +121,22 @@ func Double(x int) int {
 }
 EOF
 
+# ----- Bad fixture: a module with a setup-time type error (a
+# top-level var whose initializer references an undefined name).
+# NewReplSession surfaces this as a ReplError VALUE that the CLI
+# shell prints and exits on, BEFORE the banner — see the
+# setup-type-error case below. ---
+BAD_FIXTURE="$TMP/bad_fixture.bn"
+cat > "$BAD_FIXTURE" <<'EOF'
+package "main"
+
+var bad int = undefinedThing
+
+func main() {
+    println(bad)
+}
+EOF
+
 PASSES=0
 FAILS=0
 FAIL_NAMES=""
@@ -143,6 +159,37 @@ run_repl() {
         echo "FAIL: $label"
         echo "  expected:"
         printf '%s\n' "$expected" | sed 's/^/    /'
+        echo "  actual:"
+        printf '%s\n' "$actual" | sed 's/^/    /'
+        FAILS=$((FAILS + 1))
+        FAIL_NAMES="$FAIL_NAMES $label"
+    fi
+}
+
+# run_repl_setup_error runs the REPL against a fixture with a setup-time
+# error.  Stage 2 makes NewReplSession return such errors as VALUES; the
+# CLI shell prints them and exits non-zero BEFORE the banner.  Assert the
+# error fragment appears, the banner does NOT (proving the prompt was
+# never reached), and the exit status is non-zero.  (loadBuiltinBNIs
+# reads .bni files from disk, so this path can't be reached from a unit
+# test — e2e is its home.)
+run_repl_setup_error() {
+    label="$1"
+    fixture="$2"
+    expect_fragment="$3"
+    actual=$(printf '' | "$BNI_BIN" --repl \
+        -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
+        -I "$TMP" -L "$TMP" \
+        "$fixture" 2>&1)
+    ec=$?
+    if printf '%s' "$actual" | grep -qF "$expect_fragment" \
+            && ! printf '%s' "$actual" | grep -qF "$BANNER" \
+            && [ "$ec" -ne 0 ]; then
+        echo "PASS: $label"
+        PASSES=$((PASSES + 1))
+    else
+        echo "FAIL: $label (exit=$ec)"
+        echo "  expected: output contains '$expect_fragment', no banner, nonzero exit"
         echo "  actual:"
         printf '%s\n' "$actual" | sed 's/^/    /'
         FAILS=$((FAILS + 1))
@@ -952,6 +999,14 @@ println(repldemo.Double(5))
 > package pkg/repldemo loaded
 > 10
 > "
+
+# --- Setup-error case: a type error in the loaded module surfaces
+# (Stage 2) as a NewReplSession error VALUE that the CLI shell prints
+# and exits on, BEFORE the banner/prompt.  Pins errors-as-values
+# end-to-end — unreachable from a unit test since loadBuiltinBNIs
+# reads the builtins from disk. ---
+run_repl_setup_error "setup-type-error" "$BAD_FIXTURE" \
+    "undefined: undefinedThing"
 
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="

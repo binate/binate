@@ -3,10 +3,13 @@
 #
 # Verifies that conformance tests only import from a small whitelist of
 # real packages, or from a test-local fixture inside the same test
-# directory. Whitelisted real packages:
+# directory. Always-allowed real packages:
 #
 #   pkg/bootstrap   — system calls (Write, Exit, Args, file I/O)
-#   pkg/builtins/rt          — runtime (refcount probes, alloc helpers)
+#   pkg/builtins/*  — tier-0 always-available runtime essentials (rt,
+#                     lang, testing, reflect, ...); stable and bundled
+#                     with the toolchain, so any conformance test may use
+#                     them without a per-file exemption.
 #
 # A file's "test directory" is the immediate child of conformance/ that
 # contains it. Single-file tests (conformance/NNN_name.bn) have no test
@@ -29,7 +32,7 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONFORMANCE_DIR="$BINATE_DIR/conformance"
 WHITELIST_FILE="$SCRIPT_DIR/conformance-imports.whitelist"
 
-ALLOWED_REAL="pkg/bootstrap pkg/builtins/rt"
+ALLOWED_REAL="pkg/bootstrap"
 
 LIST=$(mktemp -t hygiene-conformance-imports-list.XXXXXX)
 VIOLATIONS=$(mktemp -t hygiene-conformance-imports-out.XXXXXX)
@@ -82,6 +85,12 @@ while IFS= read -r f; do
     printf '%s\n' "$imports" | while IFS= read -r imp; do
         [ -z "$imp" ] && continue
 
+        # Tier-0 builtins (pkg/builtins/*) are always-available runtime
+        # essentials — allowed for every conformance test.
+        case "$imp" in
+            pkg/builtins/*) continue ;;
+        esac
+
         # Whitelisted real package?
         for w in $ALLOWED_REAL; do
             if [ "$imp" = "$w" ]; then
@@ -113,7 +122,7 @@ if [ -s "$VIOLATIONS" ]; then
     n=$(wc -l < "$VIOLATIONS" | tr -d ' ')
     echo ""
     echo "=== $n conformance import violation(s) ==="
-    echo "Allowed: $ALLOWED_REAL, plus any test-local fixture."
+    echo "Allowed: $ALLOWED_REAL, pkg/builtins/*, plus any test-local fixture."
     echo "See $WHITELIST_FILE for per-file exemptions."
     exit 1
 fi

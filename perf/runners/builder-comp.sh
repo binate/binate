@@ -13,8 +13,12 @@ runner_compile() {
     bn="$1"
     tmpbin="$2"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
-    src_dir="$(dirname "$bn")"
-    out=$("$GEN1_COMPILER" -I "$src_dir" -L "$src_dir" \
+    # Full stdlib search paths (matching the conformance/unit runners):
+    # the bare $BINATE_DIR resolves pkg/bootstrap (println(int) lowers to
+    # bootstrap.formatInt64) + pkg/binate/*; the ifaces/impls entries
+    # resolve the split stdlib.  -I/-L of the test dir alone could not
+    # link these, so every int-printing perf test failed.
+    out=$("$GEN1_COMPILER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
         --build-dir "$bdir" -o "$tmpbin" "$bn" 2>&1)
     rc=$?
     rm -rf "$bdir"

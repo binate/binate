@@ -8,8 +8,9 @@ runner_compile() {
     bn="$1"
     tmpbin="$2"
     bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
-    src_dir="$(dirname "$bn")"
-    out=$("$GEN1_COMPILER" -I "$src_dir" -L "$src_dir" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1)
+    # Full stdlib search paths — see builder-comp.sh for why the test
+    # dir alone can't link println(int) → bootstrap.formatInt64.
+    out=$("$GEN1_COMPILER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1)
     rc=$?
     rm -rf "$bdir"
     [ -n "$out" ] && echo "$out"

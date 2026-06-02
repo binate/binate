@@ -57,9 +57,11 @@ func lookupClosureFuncAA64(mod @ir.Module, name @[]char) @ir.Func {
 //
 // Constraints (apply to both paths):
 //   - scalar / void return only (return size ≤ 8 bytes)
-//   - all incoming user-args fit in X1..X7 (≤ 7 incoming user-arg
-//     words after the data slot in X0).  Multi-word INCOMING args
-//     via the stack aren't handled yet.
+//   - incoming user-args may exceed X1..X7 — overflow words on the
+//     caller's stack are read from [SP + stkBytes + offset] in the
+//     stack-spill path (since the only way nUserWords > 7 is reachable
+//     is when shimNeedsStackSpill is also true, which it is once
+//     captures + 7-reg-user-args > 8 reg words).
 //
 // Outside these constraints the shim falls back to plain `B` to
 // the underlying — wrong behavior but the assembler doesn't blow
@@ -72,13 +74,6 @@ func emitClosureShim(a @asm.Assembler, fnLabel @[]char,
 	for pi := 0; pi < len(fvTyp.Params); pi++ {
 		nUserWords = nUserWords +
 			common.ArgWords(fvTyp.Params[pi].Type)
-	}
-	if nUserWords > 7 {
-		// Incoming user-args overflow into the caller's stack —
-		// not yet handled.  Plain branch fallback.
-		a.SetGlobal(fnLabel)
-		aarch64.B(a, fnLabel)
-		return
 	}
 	if !shimNeedsStackSpillAA64(cc, argTypes) {
 		emitClosureShimFastAA64(a, fnLabel, fvTyp, f, nUserWords)
@@ -257,9 +252,26 @@ func emitClosureShimStackSpillAA64(a @asm.Assembler, fnLabel @[]char,
 		}
 	}
 
-	// Step 2: move user-args from incoming positions
-	// (argReg(1)..argReg(nUserWords)) to outgoing positions per
-	// CallConv.  Right-to-left over user-args.
+	// Step 2: move user-args from incoming positions to outgoing
+	// positions per CallConv.  Right-to-left over user-args so a
+	// forward shift (low → high reg) reads each register source
+	// before its slot becomes a destination.
+	//
+	// Incoming layout: user-arg word with global word-index
+	// inIdx (0..nUserWords-1) is in X(1 + inIdx) if inIdx < 7,
+	// else on the CALLER'S stack at [SP_orig + (inIdx - 7) * 8].
+	// After step 0's `SUB sp, sp, #stkBytes`, the caller's SP is
+	// at [SP + stkBytes], so the stack source address becomes
+	// [SP + stkBytes + (inIdx - 7) * 8].
+	//
+	// Outgoing layout is what the classifier dictates for argIdx.
+	// Four transfer shapes:
+	//   * reg-source → reg-dest:   MOV  dstReg, srcReg
+	//   * reg-source → stack-dest: STR  srcReg, [SP, outStkOff]
+	//   * stack-source → reg-dest: LDR  dstReg, [SP, inStkOff]
+	//   * stack-source → stack-dest: LDR X16, [SP, inStkOff]; STR X16, [SP, outStkOff]
+	// X16 (AAPCS intra-call scratch) is safe here — step 1's
+	// shuttle uses have already been consumed.
 	var userArgStart int = f.NumCaptureParams
 	var inRegBase int = 1 + nUserWords
 	for ui := len(fvTyp.Params) - 1; ui >= 0; ui = ui - 1 {
@@ -269,20 +281,9 @@ func emitClosureShimStackSpillAA64(a @asm.Assembler, fnLabel @[]char,
 		var argIdx int = userArgStart + ui
 		var outRegStart int = cc.CallArgRegStart(argTypes, argIdx)
 		var outStkOff int = cc.CallArgStackOff(argTypes, argIdx)
-		if outRegStart >= 0 && outStkOff < 0 {
-			for k := nUw - 1; k >= 0; k = k - 1 {
-				var srcReg int = argReg(inRegBase + k)
-				var dstReg int = argReg(outRegStart + k)
-				if srcReg != dstReg {
-					aarch64.Mov(a, true, dstReg, aarch64.Reg(srcReg))
-				}
-			}
-		} else if outRegStart < 0 && outStkOff >= 0 {
-			for k := 0; k < nUw; k = k + 1 {
-				var srcReg int = argReg(inRegBase + k)
-				aarch64.Str(a, true, srcReg,
-					aarch64.MemImm(aarch64.SP, outStkOff + k * 8))
-			}
+		for k := nUw - 1; k >= 0; k = k - 1 {
+			emitUserArgWordMoveAA64(a, inRegBase, k, stkBytes,
+				outRegStart, outStkOff)
 		}
 		// SPLIT for user-args (reg portion + stack portion) isn't
 		// reachable for scalar / pointer user-args under AAPCS64;
@@ -347,4 +348,51 @@ func totalCaptureWordsAA64(f @ir.Func) int {
 		w = w + common.ArgWords(f.ClosureStruct.Fields[i].Type)
 	}
 	return w
+}
+
+// emitUserArgWordMoveAA64 emits the single-word transfer for a
+// user-arg word at slot k of the current user-arg, given the user-
+// arg's incoming register base (inRegBase, accumulated by step 2's
+// loop), the post-SUB stkBytes adjustment, and the outgoing reg/
+// stack slot (one of outRegStart >= 0 OR outStkOff >= 0, never
+// both — SPLIT user-args aren't reachable here).
+//
+// The incoming source is determined by the global word index
+// `inIdx = inRegBase + k - 1` (0-based across all user-arg words):
+// reg X(1 + inIdx) if inIdx < 7, else stack [SP + stkBytes +
+// (inIdx - 7) * 8].
+func emitUserArgWordMoveAA64(a @asm.Assembler, inRegBase int,
+		k int, stkBytes int, outRegStart int, outStkOff int) {
+	var inIdx int = inRegBase + k - 1
+	var srcIsReg bool = inIdx < 7
+	var srcReg int
+	var srcStkOff int = 0
+	if srcIsReg {
+		srcReg = argReg(1 + inIdx)
+	} else {
+		srcStkOff = stkBytes + (inIdx - 7) * 8
+	}
+	if outRegStart >= 0 && outStkOff < 0 {
+		var dstReg int = argReg(outRegStart + k)
+		if srcIsReg {
+			if srcReg != dstReg {
+				aarch64.Mov(a, true, dstReg, aarch64.Reg(srcReg))
+			}
+		} else {
+			aarch64.Ldr(a, true, dstReg,
+				aarch64.MemImm(aarch64.SP, srcStkOff))
+		}
+		return
+	}
+	if outRegStart < 0 && outStkOff >= 0 {
+		if srcIsReg {
+			aarch64.Str(a, true, srcReg,
+				aarch64.MemImm(aarch64.SP, outStkOff + k * 8))
+		} else {
+			aarch64.Ldr(a, true, aarch64.X16,
+				aarch64.MemImm(aarch64.SP, srcStkOff))
+			aarch64.Str(a, true, aarch64.X16,
+				aarch64.MemImm(aarch64.SP, outStkOff + k * 8))
+		}
+	}
 }

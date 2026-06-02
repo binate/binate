@@ -247,6 +247,261 @@ func extendIndexPath(existing *[]const char, i int) @[]char {
 	return b.Bytes()
 }
 
+// emitAggregateLoadIntoSSAInstr emits LLVM IR that reads the scalar
+// leaves of an aggregate from the address `srcPtr` and assembles
+// them into the aggregate-typed SSA result of `dst` (an OP_LOAD
+// instr).  Per leaf:
+//
+//   %vID.flN_lp  = getelementptr i8, ptr <srcRef>, i32 <offset>
+//   %vID.flN_v   = load <scalar>, ptr %vID.flN_lp
+//   %vID.flN_acc = insertvalue <T> <previous>, <scalar> %vID.flN_v, <indexPath>
+//
+// The chain accumulates the aggregate into `%vID.fl(N-1)_acc`; the
+// LAST insertvalue is named `%vID` directly so callers see the
+// fully-built aggregate value at the OP_LOAD's instr-ID name.
+//
+// Routed-to from OP_LOAD's aggregate-typed case to avoid the
+// `%vID = load <T>, ptr %p` form, which LLVM's ARM EABI backend
+// may lower to `__aeabi_memcpy` for large aggregates.  The
+// threshold (and whether load-lowering reaches for memcpy at all)
+// depends on LLVM version + target ABI — not pinned by any spec.
+// Decomposing here removes that dependency entirely.
+func emitAggregateLoadIntoSSAInstr(
+	out buf.CharBuf,
+	dst @ir.Instr,
+	srcPtr @ir.Instr,
+) buf.CharBuf {
+	if dst.Typ == nil {
+		return out
+	}
+	var srcBuf buf.CharBuf = buf.New()
+	srcBuf = emitPtrRef(srcBuf, srcPtr)
+	var dstLLTy @[]char = llvmType(dst.Typ)
+	var total int = countAggregateLeaves(dst.Typ)
+	var counter int = 0
+	// First insertvalue's "previous" operand is `undef`; subsequent
+	// inserts thread the accumulator name.
+	var prev @[]char = "undef"
+	var newOut buf.CharBuf
+	newOut, counter, prev = emitLoadSSARec(out, srcBuf.Bytes(),
+		dstLLTy, dst.Typ, 0, "", dst.ID, total, counter, prev)
+	return newOut
+}
+
+// emitLoadSSARec is the recursive workhorse for
+// emitAggregateLoadIntoSSAInstr.  Walks t's layout tracking byte
+// offset (for the GEP), LLVM aggregate-index path (for
+// insertvalue), and the accumulator-SSA-name flowing through the
+// insertvalue chain.  Returns (out, counter, latest-acc-name).
+func emitLoadSSARec(
+	out buf.CharBuf,
+	srcRef *[]const char,
+	dstLLTy *[]const char,
+	t @types.Type,
+	offset int,
+	indexPath *[]const char,
+	dstID int,
+	total int,
+	counter int,
+	prev *[]const char,
+) (buf.CharBuf, int, @[]char) {
+	var prevAcc @[]char
+	prevAcc = buf.CopyStr(prev)
+	if t == nil {
+		return out, counter, prevAcc
+	}
+	t = t.ResolveAlias()
+	if t.Kind == types.TYP_CONST {
+		return emitLoadSSARec(out, srcRef, dstLLTy, t.Elem,
+			offset, indexPath, dstID, total, counter, prev)
+	}
+
+	if t.Kind == types.TYP_STRUCT {
+		var layout @[]types.FieldLayout = t.StructLayout()
+		var named bool = len(t.Name) > 0
+		for i := 0; i < len(layout); i++ {
+			var llvmIdx int = i
+			if named { llvmIdx = structLLVMIndex(t, i) }
+			var sub @[]char = extendIndexPath(indexPath, llvmIdx)
+			out, counter, prevAcc = emitLoadSSARec(out, srcRef, dstLLTy,
+				t.Fields[i].Type, offset + layout[i].Offset,
+				sub, dstID, total, counter, prevAcc)
+		}
+		return out, counter, prevAcc
+	}
+
+	if t.Kind == types.TYP_ARRAY {
+		if t.Elem == nil || t.ArrayLen == 0 {
+			return out, counter, prevAcc
+		}
+		var elemSize int = t.Elem.SizeOf()
+		for i := 0; i < t.ArrayLen; i++ {
+			var sub @[]char = extendIndexPath(indexPath, i)
+			out, counter, prevAcc = emitLoadSSARec(out, srcRef, dstLLTy,
+				t.Elem, offset + i * elemSize, sub,
+				dstID, total, counter, prevAcc)
+		}
+		return out, counter, prevAcc
+	}
+
+	if t.Kind == types.TYP_SLICE {
+		out, counter, prevAcc = emitScalarLoadIntoSSA(out, srcRef,
+			dstLLTy, "ptr", offset, extendIndexPath(indexPath, 0),
+			dstID, total, counter, prevAcc)
+		out, counter, prevAcc = emitScalarLoadIntoSSA(out, srcRef,
+			dstLLTy, intLL(),
+			offset + types.GetTarget().PointerSize,
+			extendIndexPath(indexPath, 1),
+			dstID, total, counter, prevAcc)
+		return out, counter, prevAcc
+	}
+	if t.Kind == types.TYP_MANAGED_SLICE {
+		var ps int = types.GetTarget().PointerSize
+		out, counter, prevAcc = emitScalarLoadIntoSSA(out, srcRef,
+			dstLLTy, "ptr", offset,
+			extendIndexPath(indexPath, 0), dstID, total, counter, prevAcc)
+		out, counter, prevAcc = emitScalarLoadIntoSSA(out, srcRef,
+			dstLLTy, intLL(), offset + ps,
+			extendIndexPath(indexPath, 1), dstID, total, counter, prevAcc)
+		out, counter, prevAcc = emitScalarLoadIntoSSA(out, srcRef,
+			dstLLTy, "ptr", offset + 2 * ps,
+			extendIndexPath(indexPath, 2), dstID, total, counter, prevAcc)
+		out, counter, prevAcc = emitScalarLoadIntoSSA(out, srcRef,
+			dstLLTy, intLL(), offset + 3 * ps,
+			extendIndexPath(indexPath, 3), dstID, total, counter, prevAcc)
+		return out, counter, prevAcc
+	}
+	if t.Kind == types.TYP_FUNC_VALUE ||
+		t.Kind == types.TYP_MANAGED_FUNC_VALUE ||
+		t.Kind == types.TYP_INTERFACE_VALUE ||
+		t.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		var ps int = types.GetTarget().PointerSize
+		out, counter, prevAcc = emitScalarLoadIntoSSA(out, srcRef,
+			dstLLTy, "ptr", offset,
+			extendIndexPath(indexPath, 0), dstID, total, counter, prevAcc)
+		out, counter, prevAcc = emitScalarLoadIntoSSA(out, srcRef,
+			dstLLTy, "ptr", offset + ps,
+			extendIndexPath(indexPath, 1), dstID, total, counter, prevAcc)
+		return out, counter, prevAcc
+	}
+
+	var llvmTyp @[]char = llvmType(t)
+	out, counter, prevAcc = emitScalarLoadIntoSSA(out, srcRef, dstLLTy,
+		llvmTyp, offset, indexPath, dstID, total, counter, prevAcc)
+	return out, counter, prevAcc
+}
+
+// emitScalarLoadIntoSSA emits one GEP + load + insertvalue triple
+// for a single scalar leaf.  The insertvalue's result is named
+// `%vDST` for the LAST leaf (counter == total - 1) and
+// `%vDST.flN_acc` for all others — so the OP_LOAD's instr-ID SSA
+// name carries the fully-assembled aggregate.
+func emitScalarLoadIntoSSA(
+	out buf.CharBuf,
+	srcRef *[]const char,
+	dstLLTy *[]const char,
+	scalarTy *[]const char,
+	offset int,
+	indexPath *[]const char,
+	dstID int,
+	total int,
+	counter int,
+	prev *[]const char,
+) (buf.CharBuf, int, @[]char) {
+	// gep
+	out = out.WriteStr("  %v")
+	out = out.WriteInt(dstID)
+	out = out.WriteStr(".fl")
+	out = out.WriteInt(counter)
+	out = out.WriteStr("_lp = getelementptr i8, ptr ")
+	out = out.WriteStr(srcRef)
+	out = out.WriteStr(", i32 ")
+	out = out.WriteInt(offset)
+	out = out.WriteByte('\n')
+	// load
+	out = out.WriteStr("  %v")
+	out = out.WriteInt(dstID)
+	out = out.WriteStr(".fl")
+	out = out.WriteInt(counter)
+	out = out.WriteStr("_v = load ")
+	out = out.WriteStr(scalarTy)
+	out = out.WriteStr(", ptr %v")
+	out = out.WriteInt(dstID)
+	out = out.WriteStr(".fl")
+	out = out.WriteInt(counter)
+	out = out.WriteStr("_lp\n")
+	// insertvalue — last leaf names %vDST; others name %vDST.flN_acc.
+	var isLast bool = (counter == total - 1)
+	out = out.WriteStr("  ")
+	if isLast {
+		out = out.WriteStr("%v")
+		out = out.WriteInt(dstID)
+	} else {
+		out = out.WriteStr("%v")
+		out = out.WriteInt(dstID)
+		out = out.WriteStr(".fl")
+		out = out.WriteInt(counter)
+		out = out.WriteStr("_acc")
+	}
+	out = out.WriteStr(" = insertvalue ")
+	out = out.WriteStr(dstLLTy)
+	out = out.WriteByte(' ')
+	out = out.WriteStr(prev)
+	out = out.WriteStr(", ")
+	out = out.WriteStr(scalarTy)
+	out = out.WriteStr(" %v")
+	out = out.WriteInt(dstID)
+	out = out.WriteStr(".fl")
+	out = out.WriteInt(counter)
+	out = out.WriteStr("_v")
+	out = out.WriteStr(indexPath)
+	out = out.WriteByte('\n')
+	// Compute the accumulator name for the next leaf.
+	var nextAcc buf.CharBuf = buf.New()
+	if isLast {
+		nextAcc = nextAcc.WriteStr("%v")
+		nextAcc = nextAcc.WriteInt(dstID)
+	} else {
+		nextAcc = nextAcc.WriteStr("%v")
+		nextAcc = nextAcc.WriteInt(dstID)
+		nextAcc = nextAcc.WriteStr(".fl")
+		nextAcc = nextAcc.WriteInt(counter)
+		nextAcc = nextAcc.WriteStr("_acc")
+	}
+	return out, counter + 1, nextAcc.Bytes()
+}
+
+// countAggregateLeaves returns the number of scalar leaves in t's
+// layout.  Used by emitAggregateLoadIntoSSAInstr to know when to
+// name the final insertvalue with the OP_LOAD's instr-ID SSA name.
+func countAggregateLeaves(t @types.Type) int {
+	if t == nil { return 0 }
+	t = t.ResolveAlias()
+	if t.Kind == types.TYP_CONST { return countAggregateLeaves(t.Elem) }
+	if t.Kind == types.TYP_STRUCT {
+		var n int = 0
+		for i := 0; i < len(t.Fields); i++ {
+			n = n + countAggregateLeaves(t.Fields[i].Type)
+		}
+		return n
+	}
+	if t.Kind == types.TYP_ARRAY {
+		if t.Elem == nil || t.ArrayLen == 0 { return 0 }
+		return t.ArrayLen * countAggregateLeaves(t.Elem)
+	}
+	if t.Kind == types.TYP_SLICE { return 2 }
+	if t.Kind == types.TYP_MANAGED_SLICE { return 4 }
+	if t.Kind == types.TYP_FUNC_VALUE ||
+		t.Kind == types.TYP_MANAGED_FUNC_VALUE {
+		return 2
+	}
+	if t.Kind == types.TYP_INTERFACE_VALUE ||
+		t.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		return 2
+	}
+	return 1
+}
+
 // isAggregateForStore reports whether OP_STORE of a value of type t
 // should be lowered to a per-scalar sequence (via
 // emitAggregateStoreFromSSAInstr) rather than a plain

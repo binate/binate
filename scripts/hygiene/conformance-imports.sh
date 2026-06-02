@@ -5,11 +5,10 @@
 # real packages, or from a test-local fixture inside the same test
 # directory. Always-allowed real packages:
 #
-#   pkg/bootstrap   — system calls (Write, Exit, Args, file I/O)
-#   pkg/builtins/*  — tier-0 always-available runtime essentials (rt,
-#                     lang, testing, reflect, ...); stable and bundled
-#                     with the toolchain, so any conformance test may use
-#                     them without a per-file exemption.
+#   pkg/builtins/*  — tier-0 always-available runtime essentials
+#                     (bootstrap, rt, lang, testing, reflect, ...); stable
+#                     and bundled with the toolchain, so any conformance
+#                     test may use them without a per-file exemption.
 #
 # A file's "test directory" is the immediate child of conformance/ that
 # contains it. Single-file tests (conformance/NNN_name.bn) have no test
@@ -32,7 +31,7 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONFORMANCE_DIR="$BINATE_DIR/conformance"
 WHITELIST_FILE="$SCRIPT_DIR/conformance-imports.whitelist"
 
-ALLOWED_REAL="pkg/bootstrap"
+ALLOWED_REAL=""
 
 LIST=$(mktemp -t hygiene-conformance-imports-list.XXXXXX)
 VIOLATIONS=$(mktemp -t hygiene-conformance-imports-out.XXXXXX)

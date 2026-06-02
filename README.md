@@ -152,9 +152,9 @@ func main() {
 }
 ```
 
-### pkg/bootstrap
+### pkg/builtins/bootstrap
 
-The `pkg/bootstrap` package provides the OS-level primitives we lean on while bootstrapping the toolchain. In compiled binaries they're backed by the C runtime in `runtime/binate_runtime.c`; in `bni` (the bytecode VM) they're forwarded by the host process through the extern registry.
+The `pkg/builtins/bootstrap` package provides the OS-level primitives we lean on while bootstrapping the toolchain. In compiled binaries they're backed by the C runtime in `runtime/binate_runtime.c`; in `bni` (the bytecode VM) they're forwarded by the host process through the extern registry.
 
 It's slated for replacement by a proper OS-abstraction package once the stdlib design lands (see [explorations/claude-todo.md](https://github.com/binate/explorations/blob/main/claude-todo.md)). Existing uses are fine until then; **don't extend its surface with new primitives** — wait for the replacement instead.
 

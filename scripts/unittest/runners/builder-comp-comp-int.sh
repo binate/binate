@@ -2,17 +2,6 @@
 # Runner: builder-comp-comp-int — Gen1-compiled bytecode VM runs --test natively.
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
-# Band-aid for the bni VM host-stack-overflow MAJOR (see
-# claude-todo.md + plan-bni-heap-frames.md): bni's extern-callback
-# path consumes ~3 KB of host stack per cross-VM round-trip, so
-# deeply-recursive interpreted code (type-checker, IR-gen) blows
-# the 8 MiB default stack.  Cap at 64 MiB — gives ~8× headroom
-# so most tests pass while preserving fast-crash behavior when an
-# algorithm is pathologically deep (an earlier `ulimit -s unlimited`
-# turned crashes into multi-minute hangs on Linux CI).  Remove
-# this entire bandaid once the heap-frames refactor lands.
-ulimit -s 65520 2>/dev/null || true
-
 runner_setup() { build_gen1; build_interp "$GEN1_COMPILER"; }
 
 runner_test() {

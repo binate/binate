@@ -1,5 +1,7 @@
 package "main"
 
+import "pkg/binate/ast"
+import "pkg/binate/debug"
 import "pkg/binate/ir"
 import "pkg/binate/loader"
 import "pkg/binate/types"
@@ -46,15 +48,103 @@ type ReplSession struct {
 	InitCounter int
 }
 
-// newReplSession assembles a session from the parts runRepl has already
-// constructed (parse → load → typecheck → lower).  The processed-package
-// set is seeded from the initial load order so those packages aren't
-// reprocessed when a later `import` turn pulls in one of their deps.
+// ReplError is one setup-time error surfaced by NewReplSession (a load
+// error or a type-check error).  Returning these as VALUES rather than
+// printing + exiting the process is what lets a non-CLI host (a wasm
+// worker, a test harness) decide how to react.  Just a message for now;
+// position / severity can join it without changing the contract.
+type ReplError struct {
+	Msg @[]char
+}
+
+// NewReplSession builds a session from already-parsed source files: it
+// merges them, loads imports, type-checks (persistently, so the main
+// file's scope stays installed for prompt entries), builds the VM, and
+// lowers every package plus main.  It ends BEFORE invoking main and
+// returns any load / type-check errors as VALUES — the caller (CLI or
+// embedding host) decides whether to abort.
 //
-// Stage 2 of plan-repl-embeddable.md folds the construction itself into
-// this constructor (returning errors as values instead of runRepl's
-// bootstrap.Exit); for now runRepl builds the parts and hands them over.
-func newReplSession(vmInst @vm.VM, mainMod @ir.Module,
+// Inputs are neutral (no CLIArgs): the host parses the files and
+// resolves the root + search paths.  Stage 3/4 of
+// plan-repl-embeddable.md add the I/O sink + the externs-registration
+// callback and move this into pkg/binate/repl; for now it registers
+// the standard + pure-C externs directly.
+func NewReplSession(files @[]@ast.File, root @[]char, bniPaths @[]@[]char,
+		implPaths @[]@[]char) (@ReplSession, @[]ReplError) {
+	var merged @ast.File = loader.MergeFiles(files)
+	debug.Log("parsed and merged source files")
+
+	var ldr @loader.Loader = loader.NewLoader(root)
+	addLoaderPaths(ldr, bniPaths, implPaths)
+	ldr.LoadImports(merged.Imports)
+	ensureBootstrapLoaded(ldr)
+	if len(ldr.Errors) > 0 {
+		return nil, loaderReplErrors(ldr)
+	}
+	debug.Log("imports loaded successfully")
+
+	// Type-check, leaving main file's scope installed on c.Scope.
+	var c @types.Checker = types.NewChecker()
+	loadBuiltinBNIs(c, ldr, root)
+	for i := 0; i < len(ldr.Order); i++ {
+		var pkg @loader.Package = ldr.GetPackage(ldr.Order[i])
+		if pkg == nil || pkg.Builtin { continue }
+		if pkg.BNI != nil {
+			c.LoadPackageInterface(ldr.Order[i], pkg.BNI)
+		}
+		if pkg.Merged != nil {
+			c.CheckPackage(ldr.Order[i], pkg.Merged)
+		}
+	}
+	c.CheckMainPersistent(merged)
+	var errs @[]types.CheckError = c.CheckerErrors()
+	if len(errs) > 0 {
+		return nil, checkerReplErrors(errs)
+	}
+	debug.Log("type checking passed")
+	ir.SetChecker(c)
+
+	// Build VM and lower all packages.  Register the standard externs
+	// (rt + libc + bootstrap) and the pure-C extern table before any
+	// user code runs, so prompt entries that call e.g. println /
+	// bootstrap.Write resolve via the registry rather than crashing
+	// with "extern not found".
+	var vmInst @vm.VM = vm.NewVM(8 * 1024 * 1024)
+	registerStandardExterns(vmInst)
+	registerPureCExterns(vmInst)
+	for i := 0; i < len(ldr.Order); i++ {
+		var pkg @loader.Package = ldr.GetPackage(ldr.Order[i])
+		if pkg == nil || pkg.Builtin { continue }
+		if pkg.Merged == nil { continue }
+		var mod @ir.Module = ir.InitModule(quotePath(ldr.Order[i]))
+		registerPkgImports(ldr, pkg, mod, root, bniPaths)
+		if pkg.BNI != nil {
+			ir.RegisterSelfTypes(pkg.BNI)
+		}
+		ir.GeneratePackage(pkg.Merged, mod)
+		vmInst.LowerModule(mod)
+	}
+
+	// Lower main package.  Keep mainMod around — synthetic REPL
+	// functions are appended to it and routed through LowerOneFunc
+	// against this same module (so their context is main's).
+	var mainMod @ir.Module = ir.InitModule(merged.PkgName)
+	registerMainImports(ldr, merged, mainMod, root, bniPaths)
+	ir.GeneratePackage(merged, mainMod)
+	vmInst.LowerModule(mainMod)
+
+	var s @ReplSession = assembleSession(vmInst, mainMod, c, ldr,
+		root, bniPaths, ldr.Order)
+	var noErrs @[]ReplError
+	return s, noErrs
+}
+
+// assembleSession wires the already-constructed parts onto a session
+// value and seeds the processed-package set from the initial load
+// order, so those packages aren't reprocessed when a later `import`
+// turn pulls in one of their deps.  Split out of NewReplSession so it
+// can be unit-tested without the full load/typecheck/lower pipeline.
+func assembleSession(vmInst @vm.VM, mainMod @ir.Module,
 		c @types.Checker, ldr @loader.Loader, root @[]char,
 		bniPaths @[]@[]char, initialOrder @[]@[]char) @ReplSession {
 	var s @ReplSession = make(ReplSession)
@@ -70,4 +160,34 @@ func newReplSession(vmInst @vm.VM, mainMod @ir.Module,
 	}
 	s.ProcessedPkgs = processed
 	return s
+}
+
+// loaderReplErrors wraps the loader's accumulated error strings as
+// ReplErrors.
+func loaderReplErrors(ldr @loader.Loader) @[]ReplError {
+	var out @[]ReplError
+	for i := 0; i < len(ldr.Errors); i++ {
+		out = appendReplError(out, ldr.Errors[i])
+	}
+	return out
+}
+
+// checkerReplErrors formats each CheckError into a ReplError message.
+func checkerReplErrors(errs @[]types.CheckError) @[]ReplError {
+	var out @[]ReplError
+	for i := 0; i < len(errs); i++ {
+		out = appendReplError(out, types.FormatCheckError(errs[i]))
+	}
+	return out
+}
+
+// appendReplError returns dst with one ReplError carrying msg appended.
+func appendReplError(dst @[]ReplError, msg @[]char) @[]ReplError {
+	var n int = len(dst)
+	var ns @[]ReplError = make_slice(ReplError, n + 1)
+	for i := 0; i < n; i++ { ns[i] = dst[i] }
+	var e ReplError
+	e.Msg = msg
+	ns[n] = e
+	return ns
 }

@@ -9,7 +9,6 @@
 // "bn_pkg__libc__Foo" (the standard Binate mangling).
 
 #include <stdlib.h>
-#include <string.h>
 #include <stdint.h>
 
 // Binate's `int` is target word-sized — see binate_runtime.c for the
@@ -29,14 +28,6 @@ void *bn_pkg__libc__Calloc(bn_int_t count, bn_int_t size) {
 
 void bn_pkg__libc__Free(void *ptr) {
     free(ptr);
-}
-
-void bn_pkg__libc__Memset(void *ptr, bn_int_t val, bn_int_t size) {
-    memset(ptr, (int)val, (size_t)size);
-}
-
-void bn_pkg__libc__Memcpy(void *dst, const void *src, bn_int_t size) {
-    memcpy(dst, src, (size_t)size);
 }
 
 void bn_pkg__libc__Exit(bn_int_t code) {

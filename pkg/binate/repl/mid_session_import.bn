@@ -1,0 +1,169 @@
+package "pkg/binate/repl"
+
+import "pkg/binate/ast"
+import "pkg/binate/ir"
+import "pkg/binate/loader"
+import "pkg/binate/parser"
+import "pkg/binate/types"
+import "pkg/slices"
+
+// REPL Tier 5: mid-session imports.  `import "pkg/foo"` typed
+// at the prompt loads pkg/foo (and any transitive deps not
+// yet in the session), type-checks them, generates IR, lowers
+// to the VM, then defines the package symbol in the session
+// scope so subsequent prompt entries can use `foo.X`.
+//
+// The session's loader / search paths / processed-package set live on
+// @ReplSession (see repl_session.bn); evalReplImport re-enters the
+// initial-load pipeline against them for each `import` prompt entry.
+
+// evalReplImport handles a single or grouped `import` typed at
+// the prompt.  Parses the specs, loads each via the session
+// Loader (which transitively pulls deps), type-checks + IR-gens
+// + lowers any newly-loaded package, then defines the user-typed
+// package symbol(s) in the session scope.
+//
+// Errors at any step (load, parse, type-check) are printed and
+// processing continues for the remaining specs — loaded state
+// is preserved on partial failure.  Caller (`evalReplLine`)
+// passes the parser positioned at the `import` keyword.
+func (s @ReplSession) evalReplImport(p @parser.Parser) {
+	var specs @[]@ast.ImportSpec = p.ParseImportDecl()
+	var perrs @[]parser.ParseError = p.Errors()
+	if len(perrs) > 0 {
+		for i := 0; i < len(perrs); i++ {
+			s.errln(perrs[i].Msg)
+		}
+		return
+	}
+	if len(specs) == 0 { return }
+
+	// Hand specs to the session loader.  LoadImports loads
+	// transitively + recomputes order across the full graph.
+	var preLoadErrs int = len(s.Ldr.Errors)
+	s.Ldr.LoadImports(specs)
+	if len(s.Ldr.Errors) > preLoadErrs {
+		for i := preLoadErrs; i < len(s.Ldr.Errors); i++ {
+			s.errln(s.Ldr.Errors[i])
+		}
+		return
+	}
+
+	// Process any newly-loaded package: type-check, IR-gen, lower.
+	// Walk the post-LoadImports order; skip entries already in
+	// s.ProcessedPkgs (the initial load + previous imports).
+	//
+	// Each per-package InitModule wipes pkg/binate/ir's importAliasNames
+	// /Paths.  Bracket the loop with SaveAliasMapState /
+	// RestoreAliasMapState so the session's main alias map (the
+	// one the REPL prompt's synthetics consult) survives.
+	var aliasSnap ir.AliasMapSnapshot = ir.SaveAliasMapState()
+	var preCheckErrs int = len(s.Chk.CheckerErrors())
+	for i := 0; i < len(s.Ldr.Order); i++ {
+		var path @[]char = s.Ldr.Order[i]
+		if containsPath(s.ProcessedPkgs, path) { continue }
+		var pkg @loader.Package = s.Ldr.GetPackage(path)
+		if pkg == nil { continue }
+		if pkg.Builtin {
+			s.ProcessedPkgs = slices.Append[@[]char](
+				s.ProcessedPkgs, path)
+			continue
+		}
+		if pkg.BNI != nil {
+			s.Chk.LoadPackageInterface(path, pkg.BNI)
+		}
+		if pkg.Merged != nil {
+			s.Chk.CheckPackage(path, pkg.Merged)
+			var pkgMod @ir.Module = ir.InitModule(quotePath(path))
+			registerPkgImports(s.Ldr, pkg, pkgMod,
+				s.Root, s.BniPaths)
+			if pkg.BNI != nil {
+				ir.RegisterSelfTypes(pkg.BNI)
+			}
+			ir.GeneratePackage(pkg.Merged, pkgMod)
+			s.Vm.LowerModule(pkgMod)
+		}
+		s.ProcessedPkgs = slices.Append[@[]char](
+			s.ProcessedPkgs, path)
+	}
+	// Surface check errors from any of the newly-processed
+	// packages.  Loaded state stays.
+	var allErrs @[]types.CheckError = s.Chk.CheckerErrors()
+	if len(allErrs) > preCheckErrs {
+		for i := preCheckErrs; i < len(allErrs); i++ {
+			s.errln(types.FormatCheckError(allErrs[i]))
+		}
+		// Don't return — partial success leaves the working
+		// packages registered.
+	}
+
+	// Restore the session's main alias map and extend it with
+	// the freshly-imported package aliases so subsequent prompt
+	// entries' synthetics resolve `repldemo.X` against the right
+	// full path.  RecordImportPath dedups so a re-import is a
+	// no-op.
+	ir.RestoreAliasMapState(aliasSnap)
+	for i := 0; i < len(specs); i++ {
+		var imp @ast.ImportSpec = specs[i]
+		var path @[]char = stripImportQuotes(imp.Path)
+		var alias @[]char = imp.Alias
+		if len(alias) == 0 {
+			alias = lastSegmentOfPath(path)
+		}
+		ir.RecordImportPath(alias, path)
+	}
+
+	// Define each top-level (user-typed) import in the session
+	// scope so `foo.X` resolves.  Each spec's alias is the
+	// user-written name if present, otherwise the path's last
+	// segment.
+	for i := 0; i < len(specs); i++ {
+		var imp @ast.ImportSpec = specs[i]
+		var path @[]char = stripImportQuotes(imp.Path)
+		var alias @[]char = imp.Alias
+		if len(alias) == 0 {
+			alias = lastSegmentOfPath(path)
+		}
+		if !s.Chk.RegisterReplImport(alias, path) {
+			s.err("error: package not loaded: ")
+			s.errln(path)
+			continue
+		}
+		s.out("package ")
+		s.out(path)
+		s.outln(" loaded")
+	}
+}
+
+// containsPath reports whether `paths` already contains `p`
+// byte-for-byte.  Used by evalReplImport to skip packages
+// already processed.
+func containsPath(paths @[]@[]char, p *[]readonly char) bool {
+	for i := 0; i < len(paths); i++ {
+		if streq(paths[i], p) { return true }
+	}
+	return false
+}
+
+// stripImportQuotes returns the path inside an
+// ast.ImportSpec.Path string literal: `"pkg/foo"` →
+// `pkg/foo`.  Sibling of pkg/binate/types/checker_util.bn's private
+// `stripQuotes` — duplicated here to avoid widening the
+// types-package surface for one helper.
+func stripImportQuotes(s @[]char) @[]char {
+	if len(s) >= 2 && s[0] == '"' && s[len(s) - 1] == '"' {
+		return s[1:len(s) - 1]
+	}
+	return s
+}
+
+// lastSegmentOfPath returns the trailing path component of a
+// slash-delimited path: `pkg/foo` → `foo`, `foo` → `foo`.
+// Mirrors `lastPathSegment` in pkg/binate/types.
+func lastSegmentOfPath(path @[]char) @[]char {
+	var start int = 0
+	for i := 0; i < len(path); i++ {
+		if path[i] == '/' { start = i + 1 }
+	}
+	return path[start:]
+}

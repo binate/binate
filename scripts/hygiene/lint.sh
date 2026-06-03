@@ -10,6 +10,28 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 
+# Targets temporarily skipped because they use a language feature newer
+# than the BUILDER-bundled bnlint can typecheck.  The bundled bnlint
+# (from BUILDER_VERSION) is a snapshot; source that references a feature
+# postdating that snapshot makes it abort at the typecheck pass before any
+# lint rule runs.  Skipped targets stay fully type-checked and compiled by
+# every conformance mode — only bnlint's style rules are paused here.
+#
+# bnlint typechecks dependency BODIES, so the skip must cover the whole
+# transitive importer chain of the offending source, not just the file
+# that names the feature.
+#
+# TODO(remove after next release): pkg/binate/vm's extern_register_std.bn
+# references each package's compiler-synthesized `_Package()` accessor
+# (Phase B of explorations/notes-package-introspection.md) to register it
+# as a VM extern.  The bundled bnlint predates that accessor's typecheck
+# support, so it rejects `_func_handle(rt._Package)` / `@reflect.Package`.
+# pkg/binate/repl imports vm and cmd/bni imports both, so all three abort.
+# Drop this skip once BUILDER_VERSION is bumped to a snapshot that includes
+# the `_Package` selector + `_func_handle` typecheck support (a from-source
+# bnlint already lints all three cleanly).
+LINT_SKIP="pkg/binate/vm pkg/binate/repl cmd/bni"
+
 # Discover targets:
 #   - every directory under pkg/ that has any .bn files (excludes builtin
 #     pkg/bootstrap, which has only the .bni interface)
@@ -24,11 +46,17 @@ for d in "$BINATE_DIR"/pkg/*/; do
     done
     [ "$found" -eq 1 ] || continue
     rel="pkg/$(basename "$d")"
+    case " $LINT_SKIP " in
+        *" $rel "*) continue ;;
+    esac
     TARGETS="$TARGETS $rel"
 done
 for d in "$BINATE_DIR"/cmd/*/; do
     [ -d "$d" ] || continue
     rel="cmd/$(basename "$d")"
+    case " $LINT_SKIP " in
+        *" $rel "*) continue ;;
+    esac
     TARGETS="$TARGETS $rel"
 done
 

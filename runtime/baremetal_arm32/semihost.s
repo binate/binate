@@ -152,7 +152,7 @@ abort:
 
 @ ============================================================
 @ bn_pkg__semihost__SemihostWriteChar(c char) — write one byte to the
-@ debug console via SYS_WRITEC.  pkg/builtins/bootstrap.Write loops over
+@ debug console via SYS_WRITEC.  pkg/bootstrap.Write loops over
 @ the buffer calling this for each byte.  Cheaper than SYS_WRITE0
 @ (which would need a null-terminated copy) or SYS_WRITE (which
 @ would need to open a "console" file handle first).

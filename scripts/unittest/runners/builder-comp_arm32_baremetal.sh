@@ -3,8 +3,8 @@
 # each unit-test package for ARMv7-A bare-metal
 # (--target arm32-baremetal).  The resulting ELF binary boots under
 # `qemu-system-arm -M virt -semihosting`; test output goes through
-# pkg/builtins/bootstrap.Write (semihosting SYS_WRITEC), the binary exits via
-# pkg/builtins/bootstrap.Exit (SYS_EXIT_EXTENDED).
+# pkg/bootstrap.Write (semihosting SYS_WRITEC), the binary exits via
+# pkg/bootstrap.Exit (SYS_EXIT_EXTENDED).
 #
 # The BUILDER is used once during runner_setup to compile current
 # cmd/bnc → GEN1_COMPILER; every per-test compile then goes through

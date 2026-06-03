@@ -41,7 +41,7 @@ mkdir -p "$BUILD_DIR"
 cat > "$TMP/print_args.bn" <<'EOF'
 package "main"
 
-import "pkg/builtins/bootstrap"
+import "pkg/bootstrap"
 
 func main() {
     var args @[]@[]char = bootstrap.Args()

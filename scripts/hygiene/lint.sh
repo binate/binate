@@ -12,12 +12,12 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 
 # Discover targets:
 #   - every directory under pkg/ that has any .bn files (excludes builtin
-#     pkg/builtins/bootstrap, which has only the .bni interface)
+#     pkg/bootstrap, which has only the .bni interface)
 #   - every directory under cmd/
 TARGETS=""
 for d in "$BINATE_DIR"/pkg/*/; do
     [ -d "$d" ] || continue
-    # Skip dirs with no .bn files (defensive; pkg/builtins/bootstrap has no dir at all)
+    # Skip dirs with no .bn files (defensive; pkg/bootstrap has no dir at all)
     found=0
     for bn in "$d"*.bn; do
         [ -f "$bn" ] && found=1 && break

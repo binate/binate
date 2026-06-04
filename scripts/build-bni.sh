@@ -102,12 +102,16 @@ GEN1_BNC="$GEN1_DIR/bnc"
 mkdir -p "$GEN1_DIR/build"
 
 echo "  Stage 1: BUILDER → gen1 ..."
+# Stdlib resolves BUILDER-first (gen1 -I/-L list $BUILDER_LIB stdlib roots
+# ahead of $BINATE_DIR), so stage-1 uses the BUILDER's frozen stdlib bundle;
+# current source is the fallback (the only source while the bundle is empty,
+# pre-bnc-0.0.7 — a no-op then).  Core stays current-first.
 "$BUILDER" \
     -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
     -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
     "$BINATE_DIR/cmd/bnc" -- \
-    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB:$BUILDER_LIB/ifaces/core:$BUILDER_LIB/ifaces/stdlib" \
-    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB:$BUILDER_LIB/impls/core/common:$BUILDER_LIB/impls/core/libc:$BUILDER_LIB/impls/stdlib/common" \
+    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BUILDER_LIB/ifaces/stdlib:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB:$BUILDER_LIB/ifaces/core" \
+    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BUILDER_LIB/impls/stdlib/common:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB:$BUILDER_LIB/impls/core/common:$BUILDER_LIB/impls/core/libc" \
     --runtime "$BUILDER_RUNTIME" \
     --build-dir "$GEN1_DIR/build" \
     -o "$GEN1_BNC" \

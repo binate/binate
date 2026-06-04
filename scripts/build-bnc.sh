@@ -96,6 +96,15 @@ BUILDER_RUNTIME="$BUILDER_LIB/runtime/binate_runtime.c"
 # CURRENT source's codegen, so its OUTPUTS use the current literals.
 # The final binary is then emitted by gen1 from current source,
 # linked against the checkout's C runtime — fully consistent.
+#
+# Stdlib (tier-1) resolves BUILDER-first: the gen1 -I/-L below list the
+# $BUILDER_LIB/{ifaces/stdlib,impls/stdlib/common} roots AHEAD of the
+# $BINATE_DIR copies, so stage-1 compiles cmd/bnc's stdlib deps against the
+# BUILDER's frozen (BUILDER-compilable) bundle rather than current source.
+# Current source stays as the fallback — and is the only source while the
+# BUILDER's stdlib bundle is empty (pre-bnc-0.0.7), so the ordering is a no-op
+# against such a BUILDER.  Core (tier-0) stays current-first: it's compiler-
+# coupled, not a bundled component.
 
 GEN1_DIR="$BUILD_DIR/gen1"
 GEN1_BNC="$GEN1_DIR/bnc"
@@ -106,8 +115,8 @@ echo "  Stage 1: BUILDER → gen1 ..."
     -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
     -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
     "$BINATE_DIR/cmd/bnc" -- \
-    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB:$BUILDER_LIB/ifaces/core:$BUILDER_LIB/ifaces/stdlib" \
-    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB:$BUILDER_LIB/impls/core/common:$BUILDER_LIB/impls/core/libc:$BUILDER_LIB/impls/stdlib/common" \
+    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BUILDER_LIB/ifaces/stdlib:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB:$BUILDER_LIB/ifaces/core" \
+    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BUILDER_LIB/impls/stdlib/common:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB:$BUILDER_LIB/impls/core/common:$BUILDER_LIB/impls/core/libc" \
     --runtime "$BUILDER_RUNTIME" \
     --build-dir "$GEN1_DIR/build" \
     -o "$GEN1_BNC" \

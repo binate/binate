@@ -1,0 +1,370 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/binate/asm"
+import "pkg/binate/ast"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/parser"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Tests for interface-vtable construction and the interface-value /
+// upcast / dtor emit helpers in aarch64_iface.bn: __ivt.<...> impl
+// vtable layout (non-extending / extended / slot-0-is-handle), iface
+// upcast, OP_IFACE_DTOR, and OP_IFACE_VALUE construction (incl. a
+// package-global data ptr).  Lives apart from aarch64_iface_test.bn
+// to keep both files under the length cap.  genFromSrc /
+// dataSectionBytes / findSymbolByNameIface are this group's helpers.
+
+// genFromSrc parses Binate source through the standard
+// parser → ir.GenModule pipeline, which populates the
+// per-module iface/impl registries (moduleInterfaces /
+// ImplInfo entries) — required for emitImplVtables to walk
+// parents / own methods.  Lighter-weight alternative to going
+// through EmitObject + a full link.
+func genFromSrc(src *[]readonly char) @ir.Module {
+	var buf @[]uint8 = make_slice(uint8, len(src))
+	for i := 0; i < len(src); i++ {
+		buf[i] = cast(uint8, src[i])
+	}
+	var p @parser.Parser = parser.New(buf, "test")
+	var file @ast.File = p.ParseFile()
+	return ir.GenModule(file)
+}
+
+// dataSectionBytes returns the byte count of the assembler's
+// "data" section (where impl vtables land).  Helper for the
+// vtable-shape tests below.  Returns 0 if no data section was
+// emitted (the module had no impls).  Iterates `NumSections`
+// (not `len(Sections)`) because the Sections slice is over-
+// allocated by SetSection's growth strategy.
+func dataSectionBytes(a @asm.Assembler) int {
+	for i := 0; i < a.NumSections; i++ {
+		var n *[]readonly char = a.Sections[i].Name
+		if len(n) == 4 &&
+			n[0] == 'd' && n[1] == 'a' &&
+			n[2] == 't' && n[3] == 'a' {
+			return a.Sections[i].Len
+		}
+	}
+	return 0
+}
+
+// emitImplVtables writes one __ivt.<...> global per (R, I) impl
+// pair in the module.  For a non-extending interface, the layout
+// collapses to [dtor, m1, m2, ...] (= 1 + N slots × 8 bytes).
+// `interface I { foo() }; impl *T : I` for a struct T with no
+// managed fields → 2 slots × 8 = 16 bytes.
+func TestEmitImplVtablesNonExtendingShape() testing.TestResult {
+	var src *[]readonly char =
+		"package \"main\"\n"
+		"interface I { foo() }\n"
+		"type T struct { x int }\n"
+		"func (t *T) foo() { }\n"
+		"impl *T : I\n"
+		"func main() { }\n"
+	var mod @ir.Module = genFromSrc(src)
+
+	var a @asm.Assembler = opsMkAssembler()
+	emitImplVtables(a, "main", mod)
+	// 1 slot (dtor=null) + 1 method = 2 slots = 16 bytes.
+	if dataSectionBytes(a) != 16 {
+		return fail("non-extending (T,I) vtable should be 16 bytes (2 slots × 8)")
+	}
+	return ""
+}
+
+// plan-interface-embedding.md Slice E.3: for an extended interface
+// `RC : Closer { Read() int }`, the (T, RC) vtable uses the concat
+// layout — dtor + Closer's full sub-vtable inlined + RC's own
+// methods — for 1 + 2 + 1 = 4 slots × 8 = 32 bytes.  The pre-fix
+// flat layout would have produced 1 + 2 = 3 slots × 8 = 24 bytes
+// (dtor + both methods, no parent any-block).
+//
+// `impl *T : RC` also registers (T, Closer) transitively, so the
+// data section contains BOTH vtables: RC (32 bytes) + Closer
+// (2 slots × 8 = 16 bytes) = 48 bytes total.
+func TestEmitImplVtablesExtendedConcatShape() testing.TestResult {
+	var src *[]readonly char =
+		"package \"main\"\n"
+		"interface Closer { Close() }\n"
+		"interface RC : Closer { Read() int }\n"
+		"type T struct { x int }\n"
+		"func (t *T) Close() { }\n"
+		"func (t *T) Read() int { return 0 }\n"
+		"impl *T : RC\n"
+		"func main() { }\n"
+	var mod @ir.Module = genFromSrc(src)
+
+	var a @asm.Assembler = opsMkAssembler()
+	emitImplVtables(a, "main", mod)
+	// (T,RC) = 4 slots (dtor + Closer's 2-slot sub-block + Read) = 32 bytes
+	// (T,Closer) = 2 slots (dtor + Close) = 16 bytes
+	// Total = 48 bytes.  Pre-fix flat would be 24 + 16 = 40.
+	if dataSectionBytes(a) != 48 {
+		return fail("(T,RC)+(T,Closer) vtables should total 48 bytes; 40 means flat layout regressed")
+	}
+	return ""
+}
+
+// A module with no impls emits no impl vtables — the data section
+// is either empty or never created.  Pins emitImplVtables's early-
+// out path.
+func TestEmitImplVtablesNoImpls() testing.TestResult {
+	var src *[]readonly char =
+		"package \"main\"\n"
+		"func main() { }\n"
+	var mod @ir.Module = genFromSrc(src)
+
+	var a @asm.Assembler = opsMkAssembler()
+	emitImplVtables(a, "main", mod)
+	if dataSectionBytes(a) != 0 {
+		return fail("module with no impls should emit no vtable bytes")
+	}
+	return ""
+}
+
+// Slot 0 of an impl vtable references the dtor HANDLE symbol
+// `___handle.bn_main____dtor_T`, NOT the raw dtor fn symbol
+// `_bn_main____dtor_T`.  Matches the LLVM-side
+// emit_impls.bn:emitImplVtableDtorSlot which emits
+// `@__handle.<mangled-dtor>` here.
+//
+// _call_dtor (the indirect call ZeroRefDestroy makes for the
+// dtor) lowers as OP_CALL_HANDLE and dereferences slot 1 of the
+// value to get the call fn and slot 0 to get the vtable — so
+// passing a raw fn pointer through that path BLR's into garbage.
+// Regression test for conformance/520_iface_dtor_callee_sole_ref,
+// which exercised the iface-dtor cleanup path that the
+// pre-fix raw-fn emission broke.
+func TestEmitImplVtableSlot0IsHandleNotRawFn() testing.TestResult {
+	var src *[]readonly char =
+		"package \"main\"\n"
+		"interface I { foo() int }\n"
+		"type Inner struct { V int }\n"
+		"type T struct { Inner @Inner }\n"
+		"func (t *T) foo() int { return t.Inner.V }\n"
+		"impl *T : I\n"
+		"func main() { }\n"
+	var mod @ir.Module = genFromSrc(src)
+
+	var a @asm.Assembler = opsMkAssembler()
+	emitImplVtables(a, "main", mod)
+
+	if findSymbolByNameIface(a, "___handle.bn_main____dtor_T") < 0 {
+		return fail(
+			"impl vtable slot 0 must reference ___handle.bn_main____dtor_T")
+	}
+	// Pre-fix shape: the raw fn symbol `_bn_main____dtor_T` was
+	// referenced from the impl vtable's slot 0.  Post-fix that
+	// slot points at the handle global instead.  The raw fn may
+	// still appear as the handle's underlying slot, but NOT
+	// directly from emitImplVtables's emission set.
+	//
+	// emitImplVtables doesn't emit the raw dtor symbol —
+	// emitFuncValueHandles does (for the handle global).  In
+	// this test we run ONLY emitImplVtables, so the raw symbol
+	// shouldn't appear in this assembler at all.
+	if findSymbolByNameIface(a, "_bn_main____dtor_T") >= 0 {
+		return fail(
+			"impl vtable slot 0 must NOT reference the raw fn _bn_main____dtor_T directly")
+	}
+	return ""
+}
+
+// findSymbolByNameIface — local copy of aarch64_call_indirect_test's
+// findSymbolByName, kept in this file so iface-test runs are self-
+// contained.  Returns the symbol-table index or -1 if absent.
+func findSymbolByNameIface(a @asm.Assembler, name *[]readonly char) int {
+	for i := 0; i < a.NumSymbols; i++ {
+		var s @[]char = a.Symbols[i].Name
+		if len(s) != len(name) { continue }
+		var match bool = true
+		for j := 0; j < len(name); j++ {
+			if s[j] != name[j] { match = false; break }
+		}
+		if match { return i }
+	}
+	return -1
+}
+
+// emitInstr's OP_IFACE_UPCAST arm rebuilds an interface value with
+// the source's data ptr and a vtable adjusted by `IfaceParentSlotOffset
+// * 8` bytes to land at the target's nested sub-vtable.  When the
+// offset is 0 (or types aren't fully populated for the lookup), the
+// ADD-by-byte-offset step is skipped and the handler emits:
+//   LDR srcPtr, [SP, #...]      ; getOperand reload of the iv pointer
+//   LDR dataTmp, [srcPtr, #0]   ; iv.data
+//   STR dataTmp, [SP, #dataOff]
+//   LDR vtTmp,   [srcPtr, #8]   ; iv.vtable
+//   STR vtTmp,   [SP, #dataOff+8]
+//   ADD rd, SP, #dataOff        ; result = address of the new iv region
+// Six 4-byte AArch64 instructions = 24 bytes.  Pins the handler's
+// presence — a regression that drops the OP_IFACE_UPCAST arm would
+// emit 0 bytes for this instr and produce broken iface upcast
+// dispatch (conformance 387 / 388 catch this but slowly).
+func TestEmitOpIfaceUpcastNoOffset() testing.TestResult {
+	var a @asm.Assembler = opsMkAssembler()
+	var rm @common.RegMap = common.NewRegMap(common.AAPCS64())
+	// Source iv pointer: spill slot at offset 0 (ID=5).
+	rm.SpillIDs = common.AppendInt(rm.SpillIDs, 5)
+	rm.SpillOffsets = common.AppendInt(rm.SpillOffsets, 0)
+	// Destination iv data region: 16 bytes at offset 16 (ID=7).
+	rm.AllocIDs = common.AppendInt(rm.AllocIDs, 7)
+	rm.AllocOffsets = common.AppendInt(rm.AllocOffsets, 16)
+	rm.AllocSizes = common.AppendInt(rm.AllocSizes, 16)
+
+	var src @ir.Instr = make(ir.Instr)
+	src.ID = 5
+	// Typ left nil — the offsetSlots lookup short-circuits and stays
+	// at 0, so no ADD is emitted.  Pins the 6-instruction base case.
+
+	var ins @ir.Instr = make(ir.Instr)
+	ins.ID = 7
+	ins.Op = ir.OP_IFACE_UPCAST
+	ins.Args = make_slice(@ir.Instr, 1)
+	ins.Args[0] = src
+
+	var noStrings @[]ir.StringConst
+	emitInstr(a, "main", "fn", rm, noStrings, nilFuncs(), ins)
+	if opsBytes(a) != 24 {
+		return fail(
+			"OP_IFACE_UPCAST (no offset) should emit 6 instrs (24 bytes); "
+			"0 means the handler regressed")
+	}
+	return ""
+}
+
+// emitInstr's OP_IFACE_UPCAST arm must early-out on a malformed
+// instruction with no Args, never emitting any bytes.  Pins the
+// `len(ins.Args) < 1` guard.
+func TestEmitOpIfaceUpcastEmptyArgsIsNoOp() testing.TestResult {
+	var a @asm.Assembler = opsMkAssembler()
+	var rm @common.RegMap = common.NewRegMap(common.AAPCS64())
+	var ins @ir.Instr = make(ir.Instr)
+	ins.ID = -1
+	ins.Op = ir.OP_IFACE_UPCAST
+	var noStrings @[]ir.StringConst
+	emitInstr(a, "main", "fn", rm, noStrings, nilFuncs(), ins)
+	if opsBytes(a) != 0 {
+		return fail("OP_IFACE_UPCAST with no Args should emit nothing")
+	}
+	return ""
+}
+
+// emitInstr's OP_IFACE_DTOR arm loads slot 0 of an iv's vtable —
+// the receiver's any-block dtor — into a fresh result register.
+// Shape:
+//   LDR ivPtr, [SP, #...]      ; getOperand reload
+//   LDR rd, [ivPtr, #8]        ; iv.vtable
+//   LDR rd, [rd, #0]           ; *(vtable + 0) = dtor
+// Three 4-byte AArch64 instructions = 12 bytes.  Pins the handler
+// (the OP_REFDEC scope-exit path for @Iface depends on it).
+func TestEmitOpIfaceDtorShape() testing.TestResult {
+	var a @asm.Assembler = opsMkAssembler()
+	var rm @common.RegMap = common.NewRegMap(common.AAPCS64())
+	rm.SpillIDs = common.AppendInt(rm.SpillIDs, 5)
+	rm.SpillOffsets = common.AppendInt(rm.SpillOffsets, 0)
+	rm.SpillIDs = common.AppendInt(rm.SpillIDs, 7)
+	rm.SpillOffsets = common.AppendInt(rm.SpillOffsets, 16)
+
+	var iv @ir.Instr = make(ir.Instr)
+	iv.ID = 5
+
+	var ins @ir.Instr = make(ir.Instr)
+	ins.ID = 7
+	ins.Op = ir.OP_IFACE_DTOR
+	ins.Args = make_slice(@ir.Instr, 1)
+	ins.Args[0] = iv
+
+	var noStrings @[]ir.StringConst
+	emitInstr(a, "main", "fn", rm, noStrings, nilFuncs(), ins)
+	if opsBytes(a) != 12 {
+		return fail("OP_IFACE_DTOR should emit 3 instrs (12 bytes)")
+	}
+	return ""
+}
+
+// emitInstr's OP_IFACE_VALUE arm builds a 16-byte {data, vtable} aggregate
+// in the IR-instruction's pre-allocated data region.  Shape:
+//   LDR dataReg, [SP, #...]    ; getOperand reload of data ptr arg
+//   STR dataReg, [SP, #dataOff]
+//   ADRP vtTmp, __ivt....
+//   ADD  vtTmp, vtTmp, #lo12   ; ADRP+ADD pair → absolute vtable addr
+//   STR vtTmp, [SP, #dataOff+8]
+//   ADD rd, SP, #dataOff       ; result = data region pointer
+// Six 4-byte AArch64 instructions = 24 bytes.  Pins the handler;
+// without it OP_IFACE_VALUE would emit 0 bytes and break iface
+// construction.
+func TestEmitOpIfaceValueShape() testing.TestResult {
+	var a @asm.Assembler = opsMkAssembler()
+	var rm @common.RegMap = common.NewRegMap(common.AAPCS64())
+	rm.SpillIDs = common.AppendInt(rm.SpillIDs, 5)
+	rm.SpillOffsets = common.AppendInt(rm.SpillOffsets, 0)
+	rm.AllocIDs = common.AppendInt(rm.AllocIDs, 7)
+	rm.AllocOffsets = common.AppendInt(rm.AllocOffsets, 16)
+	rm.AllocSizes = common.AppendInt(rm.AllocSizes, 16)
+
+	var dataArg @ir.Instr = make(ir.Instr)
+	dataArg.ID = 5
+
+	var ins @ir.Instr = make(ir.Instr)
+	ins.ID = 7
+	ins.Op = ir.OP_IFACE_VALUE
+	ins.StrVal = "__ivt.bn_main__T__main__I"
+	ins.Args = make_slice(@ir.Instr, 1)
+	ins.Args[0] = dataArg
+
+	var noStrings @[]ir.StringConst
+	emitInstr(a, "main", "fn", rm, noStrings, nilFuncs(), ins)
+	if opsBytes(a) != 24 {
+		return fail("OP_IFACE_VALUE should emit 6 instrs (24 bytes)")
+	}
+	return ""
+}
+
+// OP_IFACE_VALUE whose data ptr is a package global (`&g`) must
+// materialize the global's address via ADRP+ADD rather than a
+// register reload — the global pseudo-instr has ID -1 and no spill
+// slot, so the pre-fix getOperand path returned < 0 and dropped the
+// entire construction (0 bytes → empty program output, conformance
+// 495 on native_aa64).  Shape:
+//   ADRP dataTmp, _bn_main__g
+//   ADD  dataTmp, dataTmp, #lo12   ; emitGlobalAddr → data addr
+//   STR  dataTmp, [SP, #dataOff]
+//   ADRP vtTmp, __ivt....
+//   ADD  vtTmp, vtTmp, #lo12
+//   STR  vtTmp, [SP, #dataOff+8]
+//   ADD  rd, SP, #dataOff
+// Seven 4-byte AArch64 instructions = 28 bytes — one more than the
+// local-data case (24) because the data ptr is ADRP+ADD, not a
+// single LDR.
+func TestEmitOpIfaceValueFromGlobalShape() testing.TestResult {
+	var a @asm.Assembler = opsMkAssembler()
+	var rm @common.RegMap = common.NewRegMap(common.AAPCS64())
+	rm.AllocIDs = common.AppendInt(rm.AllocIDs, 7)
+	rm.AllocOffsets = common.AppendInt(rm.AllocOffsets, 16)
+	rm.AllocSizes = common.AppendInt(rm.AllocSizes, 16)
+
+	// Global-ref data ptr: ID -1, no spill/alloc slot, IsGlobalRef.
+	var dataArg @ir.Instr = make(ir.Instr)
+	dataArg.ID = -1
+	dataArg.IsGlobalRef = true
+	dataArg.StrVal = "g"
+
+	var ins @ir.Instr = make(ir.Instr)
+	ins.ID = 7
+	ins.Op = ir.OP_IFACE_VALUE
+	ins.StrVal = "__ivt.bn_main__T__main__I"
+	ins.Args = make_slice(@ir.Instr, 1)
+	ins.Args[0] = dataArg
+
+	var noStrings @[]ir.StringConst
+	emitInstr(a, "main", "fn", rm, noStrings, nilFuncs(), ins)
+	if opsBytes(a) != 28 {
+		return fail(
+			"OP_IFACE_VALUE from a global should emit 7 instrs (28 bytes); "
+			"24 means the global-ref data ptr wasn't materialized via ADRP+ADD")
+	}
+	return ""
+}

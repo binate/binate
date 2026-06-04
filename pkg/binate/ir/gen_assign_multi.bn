@@ -1,0 +1,141 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/types"
+
+// emitIndexStore stores a value into a slice or array element, RefDec'ing
+// the overwritten managed element first (Axiom 5).  Used by multi-return
+// assignment to handle LHS index expressions; the new value's copy-RefInc
+// is the caller's job (emitManagedValueCopyRefInc).  Returns the possibly-
+// updated block.
+func emitIndexStore(ctx @GenContext, b @Block, lhs @ast.Expr,
+		collection @Instr, index @Instr, val @Instr) @Block {
+	emitIndexBoundsCheck(ctx, b, collection, index)
+	if collection.Typ != nil && collection.Typ.Kind == types.TYP_ARRAY {
+		var arrPtr @Instr = nil
+		if lhs.X.Kind == ast.EXPR_IDENT {
+			arrPtr = lookupVar(ctx, lhs.X.Name)
+		}
+		if arrPtr != nil {
+			var elemTyp @types.Type = collection.Typ.Elem
+			if elemTyp == nil { elemTyp = types.TypInt() }
+			var elemPtr @Instr = b.EmitGetElemPtr(arrPtr, index, elemTyp)
+			if isManagedScalarType(elemTyp) {
+				var oldElem @Instr = b.EmitLoad(elemPtr, elemTyp)
+				b = emitManagedValueRefDec(ctx.Func, b, oldElem, elemTyp)
+			}
+			val = ensureWidth(ctx, b, val, elemTyp)
+			b.EmitStore(elemPtr, val)
+		}
+	} else if collection.Typ != nil && collection.Typ.Kind == types.TYP_POINTER {
+		var elemTyp @types.Type = collection.Typ.Elem
+		if elemTyp == nil { elemTyp = types.TypInt() }
+		var elemPtr @Instr = b.EmitGetElemPtr(collection, index, elemTyp)
+		if isManagedScalarType(elemTyp) {
+			var oldElem @Instr = b.EmitLoad(elemPtr, elemTyp)
+			b = emitManagedValueRefDec(ctx.Func, b, oldElem, elemTyp)
+		}
+		val = ensureWidth(ctx, b, val, elemTyp)
+		b.EmitStore(elemPtr, val)
+	} else {
+		// Slice or managed-slice
+		var elemTyp @types.Type = types.TypInt()
+		if collection.Typ != nil && collection.Typ.Elem != nil {
+			elemTyp = collection.Typ.Elem
+		}
+		if isManagedScalarType(elemTyp) {
+			var oldElem @Instr = b.EmitSliceGet(collection, index, elemTyp)
+			b = emitManagedValueRefDec(ctx.Func, b, oldElem, elemTyp)
+		}
+		val = ensureWidth(ctx, b, val, elemTyp)
+		b.EmitSliceSet(collection, index, val, elemTyp)
+	}
+	return b
+}
+
+// genMultiAssign lowers a multi-value assignment `q, r, ... = call(...)`:
+// it evaluates the call once, then for each LHS target extracts its
+// component, copy-RefIncs a managed value for the target, and stores it
+// (RefDec'ing any overwritten managed value, Axiom 5).  A blank `_` target
+// discards its component — the call-result temp's dtor frees it at end of
+// statement.
+func genMultiAssign(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	var val @Instr = genExpr(ctx, b, stmt.Exprs2[0])
+	b = ctx.CurBlock
+	var retTypes @[]@types.Type
+	if val.Op == OP_CALL {
+		retTypes = lookupFuncResults(val.StrVal)
+	}
+	for i := 0; i < len(stmt.Exprs); i++ {
+		var lhs @ast.Expr = stmt.Exprs[i]
+		// A blank-identifier target (`_, n = f()`) discards its
+		// component: nothing owns it, so do NOT copy-retain it.  The
+		// call-result temp's dtor RefDec's the owned ref at end of
+		// statement, freeing it; an Axiom-3 RefInc here would have no
+		// matching RefDec and leak.  (The single-value `_ = g()` path
+		// skips the RefInc the same way, via its nil-ptr guard below.)
+		if lhs.Kind == ast.EXPR_IDENT && isBlank(lhs.Name) {
+			continue
+		}
+		var elemTyp @types.Type = types.TypInt()
+		if len(retTypes) > 0 && i < len(retTypes) {
+			elemTyp = retTypes[i]
+		}
+		var extracted @Instr = b.EmitExtract(val, i, elemTyp)
+		// Axiom 3: the extracted value is a COPY borrowed from the
+		// owned call-result temp (whose dtor RefDec's it at end of
+		// statement), so RefInc it for the target that now co-owns it.
+		// Covers @T / @[]T / @func / @Iface; struct/array aggregates are
+		// RefInc'd by emitStructCopy at the store instead.
+		emitManagedValueCopyRefInc(ctx.Func, b, extracted, elemTyp)
+		if lhs.Kind == ast.EXPR_IDENT {
+			var ptr @Instr = lookupVar(ctx, lhs.Name)
+			if ptr != nil {
+				var varTyp @types.Type = lookupVarType(ctx, lhs.Name)
+				if varTyp != nil && needsStructCopy(varTyp) {
+					// Axiom 5: save-copy-destroy for a managed struct.
+					var tmpSlot @Instr = b.EmitAlloc(varTyp)
+					var oldVal @Instr = b.EmitLoad(ptr, varTyp)
+					b.EmitStore(tmpSlot, oldVal)
+					b.EmitStore(ptr, extracted)
+					emitStructCopy(ctx.Func, b, ptr, varTyp)
+					emitStructDtor(ctx.Func, b, tmpSlot, varTyp)
+				} else {
+					// Axiom 5: RefDec the overwritten managed value
+					// before storing the new one (RefInc'd above).
+					if isManagedScalarType(varTyp) {
+						var oldVal @Instr = b.EmitLoad(ptr, varTyp)
+						b = emitManagedValueRefDec(ctx.Func, b, oldVal,
+							varTyp)
+					}
+					b.EmitStore(ptr, extracted)
+				}
+			}
+		} else if lhs.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+			// s[i] = extracted: slice/array index assignment
+			var collection @Instr = genExpr(ctx, b, lhs.X)
+			b = ctx.CurBlock
+			var index @Instr = genExpr(ctx, b, lhs.Args[0])
+			b = ctx.CurBlock
+			b = emitIndexStore(ctx, b, lhs, collection, index, extracted)
+		} else if lhs.Kind == ast.EXPR_SELECTOR {
+			// s.field = extracted: struct field assignment
+			var fieldPtr @Instr = genSelectorPtr(ctx, b, lhs)
+			b = ctx.CurBlock
+			if fieldPtr != nil {
+				var fieldTyp @types.Type = getSelectorType(ctx, lhs)
+				// Axiom 5: RefDec the overwritten managed field first.
+				if isManagedScalarType(fieldTyp) {
+					var oldVal @Instr = b.EmitLoad(fieldPtr, fieldTyp)
+					b = emitManagedValueRefDec(ctx.Func, b, oldVal,
+						fieldTyp)
+				}
+				if fieldTyp != nil {
+					extracted = ensureWidth(ctx, b, extracted, fieldTyp)
+				}
+				b.EmitStore(fieldPtr, extracted)
+			}
+		}
+	}
+	return b
+}

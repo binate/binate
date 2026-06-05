@@ -223,6 +223,26 @@ def form_assign_index_slice(t):
     return _shape(t, [f'var sl @[]{t["tname"]} = make_slice({t["tname"]}, 2)'], 'sl[0]')
 
 
+# Multi-binding forms destructure a managed component out of a tuple return.
+# `pair` returns its argument as the first component (so `src` flows back) plus
+# a discarded int. Binding the component must acquire it (RefInc / __copy_)
+# exactly as the single forms do.
+def _pair_helper(t):
+    return f"func pair(v {t['tname']}) ({t['tname']}, int) {{\n\treturn v, 5\n}}"
+
+
+def form_multi_assign(t):
+    bind = t["fresh"]("tgt") + ['tgt, _ = pair(src)']
+    drop = t["fresh"]("drp") + ['tgt = drp']
+    return _common(t, bind, drop, _pair_helper(t))
+
+
+def form_multi_short_var(t):
+    bind = ['tgt, _ := pair(src)']
+    drop = t["fresh"]("drp") + ['tgt = drp']
+    return _common(t, bind, drop, _pair_helper(t))
+
+
 FORMS = {
     ("var-init", "ident"): {"build": form_var_init, "helpers": ""},
     ("assign", "ident"): {"build": form_assign, "helpers": ""},
@@ -230,6 +250,8 @@ FORMS = {
     ("assign", "selector"): {"build": form_assign_selector, "helpers": ""},
     ("assign", "index-array"): {"build": form_assign_index_array, "helpers": ""},
     ("assign", "index-slice"): {"build": form_assign_index_slice, "helpers": ""},
+    ("multi-assign", "ident"): {"build": form_multi_assign, "helpers": ""},
+    ("multi-short-var", "ident"): {"build": form_multi_short_var, "helpers": ""},
 }
 
 

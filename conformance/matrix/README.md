@@ -26,10 +26,11 @@ long-tail bugs that aren't a systematic product.
   the correct width (operands chosen to expose dirty-upper-bit defects).
   Generator: `conformance/gen-scalar-matrix.py`. See `scalar/README.md`.
 - **`abi/`** — aggregate & multi-return passing (Class 4). Categories
-  `multi-return` / `struct-return` / `struct-param`; assertion: every field's
-  value survives the call boundary (shapes chosen to hit the non-8-multiple /
-  padding / sub-word / high-arity edges). Generator:
-  `conformance/gen-abi-matrix.py`. See `abi/README.md`.
+  `multi-return` / `struct-return` / `struct-param`, plus the call-shape axis
+  `iface-param` / `funcval-param` (the same struct by value through an indirect
+  call); assertion: every field's value survives the call boundary (shapes
+  chosen to hit the non-8-multiple / padding / sub-word / >16-byte / high-arity
+  edges). Generator: `conformance/gen-abi-matrix.py`. See `abi/README.md`.
 
 Planned (each a new subtree + generator, reusing this infrastructure):
 

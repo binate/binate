@@ -25,33 +25,49 @@ SCALAR_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "matrix", "scalar")
 
 WIDTHS = [8, 16, 32]          # sub-word on the 64-bit host
-OPS = {"add": "+", "mul": "*"}
-SIGN = "unsigned"            # the confirmed case; signed is a planned follow-up
+OPS = {"add": "+", "sub": "-", "mul": "*"}
+SIGNS = ["unsigned", "signed"]
 
 
-def operands(op, width):
-    """Operands whose `op` overflows the width, with a mid-range truncated
-    result (so the shifted value has meaningful bits, not 0)."""
+def operands(op, width, sign):
+    """Operands whose `op` overflows/underflows the width, with a non-trivial
+    truncated result."""
     m = 1 << width
-    if op == "add":
-        v = m - 64                       # a+b = 2m-128, overflows by ~1 bit
-        return v, v
-    if op == "mul":
-        v = (3 * (1 << (width // 2))) // 2   # ~1.5 * 2^(W/2); product ~2.25*2^W
-        return v, v
+    half = m >> 1
+    if sign == "unsigned":
+        if op == "add":
+            return m - 64, m - 64             # overflow
+        if op == "mul":
+            v = (3 * (1 << (width // 2))) // 2
+            return v, v
+        if op == "sub":
+            return m // 4, (3 * m) // 4        # underflow (a < b -> wraps)
+    else:  # signed
+        if op == "add":
+            return half - 8, half - 8          # overflow past max -> negative
+        if op == "mul":
+            v = (3 * (1 << (width // 2))) // 2
+            return v, v
+        if op == "sub":
+            return -half + 4, 100              # overflow below min
     raise ValueError(op)
 
 
-def cell(op, width):
-    a, b = operands(op, width)
+def cell(op, width, sign):
+    a, b = operands(op, width, sign)
     m = 1 << width
+    half = m >> 1
     shift = width // 2
-    raw = (a + b) if op == "add" else (a * b)
-    correct = (raw % m) >> shift          # narrowed, then shifted: fits in uint<W>
+    raw = {"add": a + b, "sub": a - b, "mul": a * b}[op]
+    t = raw % m                              # truncate to width
+    if sign == "signed" and t >= half:
+        t -= m                               # interpret as signed
+    correct = t >> shift                     # Python >> is arithmetic for negative t
     sym = OPS[op]
+    typ = ("int" if sign == "signed" else "uint") + str(width)
     body = [
-        f"var a uint{width} = {a}",
-        f"var b uint{width} = {b}",
+        f"var a {typ} = {a}",
+        f"var b {typ} = {b}",
         # consume (a op b) DIRECTLY — a sized var would re-narrow it.
         f"println(cast(int, (a {sym} b) >> {shift}))",
     ]
@@ -70,9 +86,9 @@ HEADER = """package "main"
 """
 
 
-def render(op, width):
-    body, expected = cell(op, width)
-    out = HEADER.format(op=op, width=width, sign=SIGN)
+def render(op, width, sign):
+    body, expected = cell(op, width, sign)
+    out = HEADER.format(op=op, width=width, sign=sign)
     out += "func main() {\n"
     for ln in body:
         out += "\t" + ln + "\n"
@@ -86,20 +102,22 @@ def main():
     changed = []
     for op in OPS:
         for width in WIDTHS:
-            bn, exp = render(op, width)
-            d = os.path.join(SCALAR_DIR, op, str(width))
-            os.makedirs(d, exist_ok=True)
-            for ext, content in ((".bn", bn), (".expected", exp)):
-                path = os.path.join(d, SIGN + ext)
-                old = None
-                if os.path.exists(path):
-                    with open(path) as f:
-                        old = f.read()
-                if old != content:
-                    changed.append(os.path.relpath(path, os.path.dirname(SCALAR_DIR)))
-                    if not check:
-                        with open(path, "w") as f:
-                            f.write(content)
+            for sign in SIGNS:
+                bn, exp = render(op, width, sign)
+                d = os.path.join(SCALAR_DIR, op, str(width))
+                os.makedirs(d, exist_ok=True)
+                for ext, content in ((".bn", bn), (".expected", exp)):
+                    path = os.path.join(d, sign + ext)
+                    old = None
+                    if os.path.exists(path):
+                        with open(path) as f:
+                            old = f.read()
+                    if old != content:
+                        changed.append(
+                            os.path.relpath(path, os.path.dirname(SCALAR_DIR)))
+                        if not check:
+                            with open(path, "w") as f:
+                                f.write(content)
     if check:
         if changed:
             print("scalar matrix out of date (run conformance/gen-scalar-matrix.py):")
@@ -110,7 +128,7 @@ def main():
         return 0
     for c in changed:
         print("wrote " + c)
-    print(f"{len(OPS)} ops x {len(WIDTHS)} widths ({SIGN})")
+    print(f"{len(OPS)} ops x {len(WIDTHS)} widths x {len(SIGNS)} signs")
     return 0
 
 

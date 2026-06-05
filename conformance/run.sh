@@ -392,6 +392,48 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
     fi
 done
 
+# Nested single-file tests: *.bn under designated subtrees
+# (conformance/matrix/, conformance/regressions/), identified by their
+# path RELATIVE to conformance/ — a stable, collision-free name with no
+# test number, so concurrent additions never collide and nothing ever
+# needs renumbering. See conformance/matrix/README.md. Discovery and run
+# mirror the flat single-file loop above; the only differences are the
+# recursive find and the relative-path name, which makes ${name}.expected
+# and ${name}.xfail.${MODE} resolve to the cell's own siblings. (Paths
+# must not contain spaces — they are word-split here, as elsewhere.)
+for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" -name '*.bn' 2>/dev/null | sort); do
+    [ -f "$bn" ] || continue
+    name="${bn#"$SCRIPT_DIR"/}"
+    name="${name%.bn}"
+
+    # Apply filters
+    if [ $# -gt 0 ]; then
+        match=0
+        for f in "$@"; do
+            case "$name" in *"$f"*) match=1; break;; esac
+        done
+        if [ "$match" -eq 0 ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+    fi
+    expected="$SCRIPT_DIR/${name}.expected"
+    errorfile="$SCRIPT_DIR/${name}.error"
+    if [ -f "$SCRIPT_DIR/${name}.expected.${MODE}" ]; then
+        expected="$SCRIPT_DIR/${name}.expected.${MODE}"
+    fi
+    if [ -f "$SCRIPT_DIR/${name}.error.${MODE}" ]; then
+        errorfile="$SCRIPT_DIR/${name}.error.${MODE}"
+    fi
+    if [ -f "$errorfile" ]; then
+        run_error_test "$name" "$bn" "$errorfile" ""
+    elif [ -f "$expected" ]; then
+        run_test "$name" "$bn" "$expected" ""
+    else
+        echo "SKIP: $name (no .expected or .error file)"
+    fi
+done
+
 # Newline after dots in default mode
 if [ "$VERBOSE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     echo ""

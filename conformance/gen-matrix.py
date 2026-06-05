@@ -249,6 +249,42 @@ def form_assign_index_rawptr(t):
     return _shape(t, decl, 'p[0]')
 
 
+# Multi-assign into a non-ident target: destructure the managed component out
+# of the tuple straight into an element/field. Same balance shape as _shape;
+# the bind is `lv, _ = pair(src)`.
+def _multi_shape(t, decl_lines, lv, extra_decls=""):
+    helper = _pair_helper(t)
+    extra = (extra_decls + "\n\n" + helper) if extra_decls else helper
+    b = t["baseline"]
+    lines = t["construct"]("src")
+    lines.append('println(rt.Refcount(src_po))')
+    lines += decl_lines
+    lines.append(f'{lv}, _ = pair(src)')
+    lines.append('println(rt.Refcount(src_po))')
+    lines.append(f'println({t["use"](lv)})')
+    lines += t["fresh"]("drp")
+    lines.append(f'{lv} = drp')
+    lines.append('println(rt.Refcount(src_po))')
+    return lines, [b, b + 1, t["useval"], b], extra
+
+
+def form_multi_assign_selector(t):
+    return _multi_shape(t, ['var st Holder'], 'st.f',
+                        f"type Holder struct {{\n\tf {t['tname']}\n}}")
+
+
+def form_multi_assign_index_array(t):
+    return _multi_shape(t, [f'var arr [2]{t["tname"]}'], 'arr[0]')
+
+
+def form_multi_assign_index_slice(t):
+    return _multi_shape(t, [f'var sl @[]{t["tname"]} = make_slice({t["tname"]}, 2)'], 'sl[0]')
+
+
+def form_multi_assign_index_rawptr(t):
+    return _multi_shape(t, [f'var arr [2]{t["tname"]}', f'var p *{t["tname"]} = &arr[0]'], 'p[0]')
+
+
 # Forms where the value enters via a single observed slot but the writing
 # construct differs (a return, or a literal element). Same balance shape as
 # _shape; the bind line(s) and any helper/extra-decl vary.
@@ -335,6 +371,10 @@ FORMS = {
     ("mslice-lit", "elem"): {"build": form_mslice_lit, "helpers": ""},
     ("assign", "blank"): {"build": form_assign_blank, "helpers": ""},
     ("param", "arg"): {"build": form_param, "helpers": ""},
+    ("multi-assign", "selector"): {"build": form_multi_assign_selector, "helpers": ""},
+    ("multi-assign", "index-array"): {"build": form_multi_assign_index_array, "helpers": ""},
+    ("multi-assign", "index-slice"): {"build": form_multi_assign_index_slice, "helpers": ""},
+    ("multi-assign", "index-rawptr"): {"build": form_multi_assign_index_rawptr, "helpers": ""},
 }
 
 

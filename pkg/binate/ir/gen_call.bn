@@ -27,6 +27,72 @@ import "pkg/stdx/slices"
 // Method-call lowering lives in gen_method.bn. This file is the
 // generic-call + function-value-call dispatch.
 
+// coerceArg applies the call-argument coercions to an already-evaluated arg
+// against its parameter type, returning the possibly-replaced value.  Shared
+// by every call site that marshals args to a typed signature (genCall,
+// genMethodCall, and interface-method dispatch) so the coercion set stays in
+// one place — divergence here is what let interface dispatch silently skip
+// the managed->raw conversion (and others), shifting later args.  Pure
+// post-evaluation: the caller does the genExpr / genExprOrFuncRef itself, so
+// each site keeps its own evaluation rule.  `paramTyp` is nil for an arg with
+// no matching param (variadic tail / over-supplied) — then it's a no-op.  The
+// coercions emit into `b` without splitting it, so the caller's block stays
+// current.
+func coerceArg(ctx @GenContext, b @Block, arg @Instr,
+		paramTyp @types.Type) @Instr {
+	if paramTyp == nil { return arg }
+	// String literal -> *[]readonly char / @[]char when the param is a slice.
+	if arg.Op == OP_CONST_STRING &&
+			(paramTyp.Kind == types.TYP_SLICE ||
+			 paramTyp.Kind == types.TYP_MANAGED_SLICE) {
+		arg = b.EmitStringToChars(arg, paramTyp)
+		noteSPGrowingResult(ctx, arg)
+	}
+	// nil -> the param's slice type (zeroed BnSlice/BnManagedSlice).
+	if arg.Op == OP_CONST_NIL &&
+			(paramTyp.Kind == types.TYP_SLICE ||
+			 paramTyp.Kind == types.TYP_MANAGED_SLICE) {
+		arg.Typ = paramTyp
+	}
+	// @[]T -> *[]T when the param is a raw slice.  The managed-slice temp
+	// stays in the cleanup list — it's borrowed by the raw slice during the
+	// call and RefDec'd at end of statement.
+	if paramTyp.Kind == types.TYP_SLICE && isManagedSliceType(arg.Typ) {
+		arg = b.EmitManagedToRaw(arg)
+	}
+	// RefInc managed fields for a struct/array arg passed by value, so the
+	// callee's scope cleanup dtor's its own parameter copy without dropping
+	// the caller's.
+	if needsStructCopy(paramTyp) {
+		if isStructOrArrayAlloc(arg) {
+			var tmpPtr @Instr = arg
+			emitStructCopy(ctx.Func, b, tmpPtr, paramTyp)
+			arg = b.EmitLoad(tmpPtr, arg.TypeArg)
+		} else {
+			var tmpSlot @Instr = b.EmitAlloc(paramTyp)
+			b.EmitStore(tmpSlot, arg)
+			emitStructCopy(ctx.Func, b, tmpSlot, paramTyp)
+			arg = b.EmitLoad(tmpSlot, paramTyp)
+		}
+	}
+	// Move model for a managed interface-value argument: the callee param
+	// carries no entry RefInc and RefDec's at scope exit, so the caller hands
+	// it exactly one ref.  A fresh @Iface (a box or call result) is MOVED in
+	// via consumeTemp — its ref transfers and it is NOT cleaned post-call
+	// (which the bytecode VM can't do for a 2-word value on transient vm.SP).
+	// A borrowed @Iface (a load) is RefInc'd so the callee's release doesn't
+	// drop the caller's own reference.
+	if isManagedIfaceValueType(paramTyp) &&
+			isManagedIfaceValueType(arg.Typ) {
+		if isFreshManagedIfaceValue(arg) {
+			consumeTemp(ctx, arg)
+		} else {
+			emitManagedIfaceValueRefInc(ctx.Func, b, arg)
+		}
+	}
+	return arg
+}
+
 // genCall generates IR for a function call, including builtins (println, print, panic).
 func genCall(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 	// Check for print/println builtins
@@ -137,69 +203,7 @@ func genCall(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 		if i < len(paramTypes) { paramTyp = paramTypes[i] }
 		var arg @Instr = genExprOrFuncRef(ctx, b, e.Args[i], paramTyp)
 		b = ctx.CurBlock
-		// Coerce string literal to *[]readonly char or @[]char if function parameter expects a slice
-		if arg.Op == OP_CONST_STRING && i < len(paramTypes) {
-			var pt @types.Type = paramTypes[i]
-			if pt != nil && (pt.Kind == types.TYP_SLICE || pt.Kind == types.TYP_MANAGED_SLICE) {
-				arg = b.EmitStringToChars(arg, pt)
-				noteSPGrowingResult(ctx, arg)
-			}
-		}
-		// Coerce nil to proper slice type if function parameter expects a slice
-		if arg.Op == OP_CONST_NIL && i < len(paramTypes) {
-			var pt @types.Type = paramTypes[i]
-			if pt != nil && (pt.Kind == types.TYP_SLICE || pt.Kind == types.TYP_MANAGED_SLICE) {
-				arg.Typ = pt
-			}
-		}
-		// Coerce @[]T → *[]T if function parameter expects a raw slice.
-		// The managed-slice temp stays in the cleanup list — it's borrowed
-		// by the raw slice during the call and RefDec'd at end of statement.
-		if i < len(paramTypes) {
-			var pt @types.Type = paramTypes[i]
-			if pt != nil && pt.Kind == types.TYP_SLICE {
-				if isManagedSliceType(arg.Typ) {
-					arg = b.EmitManagedToRaw(arg)
-				}
-			}
-		}
-		// RefInc managed fields for struct/array args passed by value.
-		// The callee's scope cleanup will dtor the parameter copy.
-		if i < len(paramTypes) {
-			var pt @types.Type = paramTypes[i]
-			if needsStructCopy(pt) {
-				// Load from alloca if arg is a struct alloca
-				if isStructOrArrayAlloc(arg) {
-					var tmpPtr @Instr = arg
-					emitStructCopy(ctx.Func, b, tmpPtr, pt)
-					arg = b.EmitLoad(tmpPtr, arg.TypeArg)
-				} else {
-					var tmpSlot @Instr = b.EmitAlloc(pt)
-					b.EmitStore(tmpSlot, arg)
-					emitStructCopy(ctx.Func, b, tmpSlot, pt)
-					arg = b.EmitLoad(tmpSlot, pt)
-				}
-			}
-		}
-		// Move model for a managed interface-value argument: the callee
-		// param carries no entry RefInc and RefDec's at scope exit, so
-		// the caller hands it exactly one ref.  A fresh @Iface (a box or
-		// a call result) is MOVED in via consumeTemp — its own ref
-		// transfers and it is NOT cleaned post-call (which the bytecode
-		// VM can't do for a 2-word value on transient vm.SP).  A borrowed
-		// @Iface (a load) is RefInc'd so the callee's release doesn't
-		// drop the caller's own reference.
-		if i < len(paramTypes) {
-			var pt @types.Type = paramTypes[i]
-			if isManagedIfaceValueType(pt) &&
-					isManagedIfaceValueType(arg.Typ) {
-				if isFreshManagedIfaceValue(arg) {
-					consumeTemp(ctx, arg)
-				} else {
-					emitManagedIfaceValueRefInc(ctx.Func, b, arg)
-				}
-			}
-		}
+		arg = coerceArg(ctx, b, arg, paramTyp)
 		args = slices.Append[@Instr](args, arg)
 	}
 

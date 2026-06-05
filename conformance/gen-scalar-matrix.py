@@ -3,17 +3,25 @@
 correctness (Class 5 of the code-red taxonomy; see
 explorations/plan-code-red.md §3.8 / §7.1b).
 
-Each cell computes a sub-word arithmetic op whose true result OVERFLOWS the
-width, then consumes it DIRECTLY with a width-sensitive right shift — no
-intermediate sized variable, which would re-narrow it. On a backend that
-narrows sub-word results to their width (LLVM) the shifted value is correct;
-on one that leaves dirty upper bits in the host register (the bytecode VM and
-the native backends — §3.8) it diverges. The `.expected` is the CORRECT
-(narrowed) value; the buggy modes are xfailed (the fix is P2/P4).
+Three op-categories, each a different way a backend can get a scalar value
+wrong, all asserting the target-independent correct result:
 
-Coordinate-addressed like the refcount matrix: the path is the identity, so
-regeneration is idempotent and `.xfail.<mode>` markers (maintained by hand)
-are never touched. Run: `python3 conformance/gen-scalar-matrix.py [--check]`.
+  - arithmetic (add/sub/mul): the op's true result OVERFLOWS the width and is
+    consumed DIRECTLY by a width-sensitive right shift (no intermediate sized
+    var to re-narrow). A backend that leaves dirty upper bits in the host
+    register (the VM / natives — §3.8) diverges; LLVM is correct. The 64-bit
+    cells are a baseline (a uint64 IS the host word, so no narrowing needed).
+  - div/rem: signed (sdiv/srem) vs unsigned (udiv/urem) dispatch on a value
+    with the high bit set. (A regression net for a previously-fixed VM bug.)
+  - int-to-float: an unsigned int with the top bit set converts to a large
+    POSITIVE float; a backend that uses a SIGNED conversion (§3.8) reads it as
+    negative. Only width 64 triggers it on a 64-bit host (a uint32 is
+    zero-extended, hence positive); width 32 is the baseline.
+
+Coordinate-addressed: conformance/matrix/scalar/<op>/<width>/<sign>.bn; the path
+is the identity, so regeneration is idempotent and `.xfail.<mode>` markers
+(maintained by hand) are never touched. Run:
+`python3 conformance/gen-scalar-matrix.py [--check]`.
 
 Python now; intended to port to Binate (dogfood) later — see ../matrix/README.md.
 """
@@ -24,70 +32,85 @@ import sys
 SCALAR_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "matrix", "scalar")
 
-WIDTHS = [8, 16, 32]          # sub-word on the 64-bit host
-OPS = {"add": "+", "sub": "-", "mul": "*"}
+WIDTHS = [8, 16, 32, 64]
 SIGNS = ["unsigned", "signed"]
+ARITH = {"add": "+", "sub": "-", "mul": "*"}
+DIVREM = {"div": "/", "rem": "%"}
+FLOAT_WIDTHS = [32, 64]
 
 
-def operands(op, width, sign):
-    """Operands whose `op` overflows/underflows the width, with a non-trivial
-    truncated result."""
-    m = 1 << width
-    half = m >> 1
-    if sign == "unsigned":
-        if op == "add":
-            return m - 64, m - 64             # overflow
-        if op == "mul":
-            v = (3 * (1 << (width // 2))) // 2
-            return v, v
-        if op == "sub":
-            return m // 4, (3 * m) // 4        # underflow (a < b -> wraps)
-    else:  # signed
-        if op == "add":
-            return half - 8, half - 8          # overflow past max -> negative
-        if op == "mul":
-            v = (3 * (1 << (width // 2))) // 2
-            return v, v
-        if op == "sub":
-            return -half + 4, 100              # overflow below min
-    raise ValueError(op)
+def typ(width, sign):
+    return ("int" if sign == "signed" else "uint") + str(width)
 
 
-def cell(op, width, sign):
-    a, b = operands(op, width, sign)
+def arith_cell(op, width, sign):
     m = 1 << width
     half = m >> 1
     shift = width // 2
+    if sign == "unsigned":
+        ab = {"add": (m - 64, m - 64),
+              "mul": ((3 * (1 << (width // 2))) // 2,) * 2,
+              "sub": (m // 4, (3 * m) // 4)}[op]
+    else:
+        ab = {"add": (half - 8, half - 8),
+              "mul": ((3 * (1 << (width // 2))) // 2,) * 2,
+              "sub": (-half + 4, 100)}[op]
+    a, b = ab
     raw = {"add": a + b, "sub": a - b, "mul": a * b}[op]
-    t = raw % m                              # truncate to width
+    t = raw % m
     if sign == "signed" and t >= half:
-        t -= m                               # interpret as signed
-    correct = t >> shift                     # Python >> is arithmetic for negative t
-    sym = OPS[op]
-    typ = ("int" if sign == "signed" else "uint") + str(width)
+        t -= m
+    correct = t >> shift
     body = [
-        f"var a {typ} = {a}",
-        f"var b {typ} = {b}",
-        # consume (a op b) DIRECTLY — a sized var would re-narrow it.
-        f"println(cast(int, (a {sym} b) >> {shift}))",
+        f"var a {typ(width, sign)} = {a}",
+        f"var b {typ(width, sign)} = {b}",
+        f"println(cast(int, (a {ARITH[op]} b) >> {shift}))",
     ]
     return body, [correct]
+
+
+def _trunc_div(a, b):
+    q = abs(a) // abs(b)
+    return -q if (a < 0) != (b < 0) else q
+
+
+def divrem_cell(op, width, sign):
+    m = 1 << width
+    half = m >> 1
+    b = 7
+    au = half + 13                      # high bit set
+    a = au if sign == "unsigned" else au - m
+    q = _trunc_div(a, b)
+    correct = q if op == "div" else a - q * b
+    body = [
+        f"var a {typ(width, sign)} = {a}",
+        f"var b {typ(width, sign)} = {b}",
+        f"println(cast(int, a {DIVREM[op]} b))",
+    ]
+    return body, [correct]
+
+
+def int_to_float_cell(width):
+    y = 3 << (width - 2)                # top two bits set -> bit (width-1) set
+    body = [
+        f"var y uint{width} = {y}",
+        "var f float64 = cast(float64, y)",
+        "println(cast(int, f > 0.0))",  # 1 if the unsigned value -> positive float
+    ]
+    return body, [1]
 
 
 HEADER = """package "main"
 
 // GENERATED by conformance/gen-scalar-matrix.py — do not edit by hand.
 // Scalar matrix cell — op={op}, width={width}, sign={sign}.
-// Value correctness for a sub-word op whose true result overflows the width,
-// consumed directly by a width-sensitive shift: a backend that fails to narrow
-// the result leaks dirty upper bits and diverges from the correct value here.
-// See ../../../README.md and plan-code-red.md §3.8.
+// Value correctness for a sub-word / conversion scalar op. See
+// ../../../README.md and plan-code-red.md §3.8.
 
 """
 
 
-def render(op, width, sign):
-    body, expected = cell(op, width, sign)
+def render(op, width, sign, body, expected):
     out = HEADER.format(op=op, width=width, sign=sign)
     out += "func main() {\n"
     for ln in body:
@@ -97,27 +120,43 @@ def render(op, width, sign):
     return out, exp
 
 
+def all_cells():
+    """Yield (op, width, sign, body, expected) for every cell."""
+    for op in ARITH:
+        for width in WIDTHS:
+            for sign in SIGNS:
+                body, exp = arith_cell(op, width, sign)
+                yield op, width, sign, body, exp
+    for op in DIVREM:
+        for width in WIDTHS:
+            for sign in SIGNS:
+                body, exp = divrem_cell(op, width, sign)
+                yield op, width, sign, body, exp
+    for width in FLOAT_WIDTHS:
+        body, exp = int_to_float_cell(width)
+        yield "int-to-float", width, "unsigned", body, exp
+
+
 def main():
     check = "--check" in sys.argv[1:]
     changed = []
-    for op in OPS:
-        for width in WIDTHS:
-            for sign in SIGNS:
-                bn, exp = render(op, width, sign)
-                d = os.path.join(SCALAR_DIR, op, str(width))
-                os.makedirs(d, exist_ok=True)
-                for ext, content in ((".bn", bn), (".expected", exp)):
-                    path = os.path.join(d, sign + ext)
-                    old = None
-                    if os.path.exists(path):
-                        with open(path) as f:
-                            old = f.read()
-                    if old != content:
-                        changed.append(
-                            os.path.relpath(path, os.path.dirname(SCALAR_DIR)))
-                        if not check:
-                            with open(path, "w") as f:
-                                f.write(content)
+    n = 0
+    for op, width, sign, body, exp in all_cells():
+        n += 1
+        bn, expected = render(op, width, sign, body, exp)
+        d = os.path.join(SCALAR_DIR, op, str(width))
+        os.makedirs(d, exist_ok=True)
+        for ext, content in ((".bn", bn), (".expected", expected)):
+            path = os.path.join(d, sign + ext)
+            old = None
+            if os.path.exists(path):
+                with open(path) as f:
+                    old = f.read()
+            if old != content:
+                changed.append(os.path.relpath(path, os.path.dirname(SCALAR_DIR)))
+                if not check:
+                    with open(path, "w") as f:
+                        f.write(content)
     if check:
         if changed:
             print("scalar matrix out of date (run conformance/gen-scalar-matrix.py):")
@@ -128,7 +167,7 @@ def main():
         return 0
     for c in changed:
         print("wrote " + c)
-    print(f"{len(OPS)} ops x {len(WIDTHS)} widths x {len(SIGNS)} signs")
+    print(f"{n} cells")
     return 0
 
 

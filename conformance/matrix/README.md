@@ -21,12 +21,13 @@ long-tail bugs that aren't a systematic product.
   `<form>/<shape>/<type>`; assertion: a mortal value's refcount rises by one per
   live alias and returns to baseline. Generator: `conformance/gen-matrix.py`.
   See `refcount/README.md`.
+- **`scalar/`** — sub-word & 64-on-32 scalar *value correctness* (Class 5). Axes
+  `<op>/<width>/<sign>`; assertion: a sub-word op's result equals the math at
+  the correct width (operands chosen to expose dirty-upper-bit defects).
+  Generator: `conformance/gen-scalar-matrix.py`. See `scalar/README.md`.
 
 Planned (each a new subtree + generator, reusing this infrastructure):
 
-- **`scalar/`** — sub-word & 64-on-32 scalar *value correctness* (Class 5):
-  axes `op × width × signedness`, with operands chosen to expose dirty-upper-bit
-  / sign defects.
 - **`abi/`** — aggregate & multi-return passing (Class 4): the bytes/values of
   an aggregate survive across every call shape and return.
 - **`const/`** — constant materialization: a const's value at every scope and

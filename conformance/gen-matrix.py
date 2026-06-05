@@ -243,6 +243,53 @@ def form_multi_short_var(t):
     return _common(t, bind, drop, _pair_helper(t))
 
 
+def form_assign_index_rawptr(t):
+    decl = [f'var arr [2]{t["tname"]}', f'var p *{t["tname"]} = &arr[0]']
+    return _shape(t, decl, 'p[0]')
+
+
+# Forms where the value enters via a single observed slot but the writing
+# construct differs (a return, or a literal element). Same balance shape as
+# _shape; the bind line(s) and any helper/extra-decl vary.
+def _slot(t, bind_lines, lv, drop_lines, extra_decls=""):
+    b = t["baseline"]
+    lines = t["construct"]("src")
+    lines.append('println(rt.Refcount(src_po))')
+    lines += bind_lines
+    lines.append('println(rt.Refcount(src_po))')
+    lines.append(f'println({t["use"](lv)})')
+    lines += drop_lines
+    lines.append('println(rt.Refcount(src_po))')
+    return lines, [b, b + 1, t["useval"], b], extra_decls
+
+
+def form_return(t):
+    # `wrap` not `box` — box is a reserved builtin keyword.
+    helper = f"func wrap(v {t['tname']}) {t['tname']} {{\n\treturn v\n}}"
+    bind = [f'var tgt {t["tname"]} = wrap(src)']
+    drop = t["fresh"]("drp") + ['tgt = drp']
+    return _slot(t, bind, "tgt", drop, helper)
+
+
+def form_composite_lit(t):
+    extra = f"type Holder struct {{\n\tf {t['tname']}\n}}"
+    bind = ['var h Holder = Holder{f: src}']
+    drop = ['var hz Holder', 'h = hz']
+    return _slot(t, bind, "h.f", drop, extra)
+
+
+def form_array_lit(t):
+    bind = t["fresh"]("oth") + [f'var arr [2]{t["tname"]} = [2]{t["tname"]}{{src, oth}}']
+    drop = t["fresh"]("drp") + ['arr[0] = drp']
+    return _slot(t, bind, "arr[0]", drop)
+
+
+def form_mslice_lit(t):
+    bind = t["fresh"]("oth") + [f'var sl @[]{t["tname"]} = @[]{t["tname"]}{{src, oth}}']
+    drop = t["fresh"]("drp") + ['sl[0] = drp']
+    return _slot(t, bind, "sl[0]", drop)
+
+
 FORMS = {
     ("var-init", "ident"): {"build": form_var_init, "helpers": ""},
     ("assign", "ident"): {"build": form_assign, "helpers": ""},
@@ -252,6 +299,11 @@ FORMS = {
     ("assign", "index-slice"): {"build": form_assign_index_slice, "helpers": ""},
     ("multi-assign", "ident"): {"build": form_multi_assign, "helpers": ""},
     ("multi-short-var", "ident"): {"build": form_multi_short_var, "helpers": ""},
+    ("assign", "index-rawptr"): {"build": form_assign_index_rawptr, "helpers": ""},
+    ("return", "value"): {"build": form_return, "helpers": ""},
+    ("composite-lit", "elem"): {"build": form_composite_lit, "helpers": ""},
+    ("array-lit", "elem"): {"build": form_array_lit, "helpers": ""},
+    ("mslice-lit", "elem"): {"build": form_mslice_lit, "helpers": ""},
 }
 
 

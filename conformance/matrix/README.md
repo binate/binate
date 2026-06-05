@@ -25,11 +25,14 @@ long-tail bugs that aren't a systematic product.
   `<op>/<width>/<sign>`; assertion: a sub-word op's result equals the math at
   the correct width (operands chosen to expose dirty-upper-bit defects).
   Generator: `conformance/gen-scalar-matrix.py`. See `scalar/README.md`.
+- **`abi/`** — aggregate & multi-return passing (Class 4). Categories
+  `multi-return` / `struct-return` / `struct-param`; assertion: every field's
+  value survives the call boundary (shapes chosen to hit the non-8-multiple /
+  padding / sub-word / high-arity edges). Generator:
+  `conformance/gen-abi-matrix.py`. See `abi/README.md`.
 
 Planned (each a new subtree + generator, reusing this infrastructure):
 
-- **`abi/`** — aggregate & multi-return passing (Class 4): the bytes/values of
-  an aggregate survive across every call shape and return.
 - **`const/`** — constant materialization: a const's value at every scope and
   read form.
 

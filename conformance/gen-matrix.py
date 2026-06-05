@@ -29,7 +29,8 @@ test generator must run even when the toolchain is broken.
 import os
 import sys
 
-MATRIX_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matrix")
+MATRIX_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "matrix", "refcount")
 
 
 # --- Type definitions -------------------------------------------------------

@@ -159,7 +159,7 @@ _t(
 # `helpers` (top-level funcs needed by the form, e.g. a pair() for multi forms)
 # is returned per-form via the FORMS table's optional "helpers" entry.
 
-def _common(t, bind_lines, drop_lines):
+def _common(t, bind_lines, drop_lines, extra_decls=""):
     b = t["baseline"]
     lines = []
     lines += t["construct"]("src")
@@ -170,7 +170,7 @@ def _common(t, bind_lines, drop_lines):
     lines += drop_lines
     lines.append('println(rt.Refcount(src_po))')
     expected = [b, b + 1, t["useval"], b]
-    return lines, expected
+    return lines, expected, extra_decls
 
 
 def form_var_init(t):
@@ -191,10 +191,45 @@ def form_short_var(t):
     return _common(t, bind, drop)
 
 
+# Shape variants of single-assign: the target is an element/field `lv` of a
+# container, written `lv = src`. The element starts nil/zero (so the bind's
+# release-old is a no-op); the drop overwrites it with a fresh value
+# (exercising release-old with a real prior occupant). Observation is on src's
+# observable, which the copy into the element RefIncs by one.
+def _shape(t, decl_lines, lv, extra_decls=""):
+    b = t["baseline"]
+    lines = t["construct"]("src")
+    lines.append('println(rt.Refcount(src_po))')
+    lines += decl_lines
+    lines.append(f'{lv} = src')
+    lines.append('println(rt.Refcount(src_po))')
+    lines.append(f'println({t["use"](lv)})')
+    lines += t["fresh"]("drp")
+    lines.append(f'{lv} = drp')
+    lines.append('println(rt.Refcount(src_po))')
+    return lines, [b, b + 1, t["useval"], b], extra_decls
+
+
+def form_assign_selector(t):
+    extra = f"type Holder struct {{\n\tf {t['tname']}\n}}"
+    return _shape(t, ['var st Holder'], 'st.f', extra)
+
+
+def form_assign_index_array(t):
+    return _shape(t, [f'var arr [2]{t["tname"]}'], 'arr[0]')
+
+
+def form_assign_index_slice(t):
+    return _shape(t, [f'var sl @[]{t["tname"]} = make_slice({t["tname"]}, 2)'], 'sl[0]')
+
+
 FORMS = {
     ("var-init", "ident"): {"build": form_var_init, "helpers": ""},
     ("assign", "ident"): {"build": form_assign, "helpers": ""},
     ("short-var", "ident"): {"build": form_short_var, "helpers": ""},
+    ("assign", "selector"): {"build": form_assign_selector, "helpers": ""},
+    ("assign", "index-array"): {"build": form_assign_index_array, "helpers": ""},
+    ("assign", "index-slice"): {"build": form_assign_index_slice, "helpers": ""},
 }
 
 
@@ -214,10 +249,12 @@ import "pkg/builtins/rt"
 
 def render(form, shape, tname, t):
     helpers = FORMS[(form, shape)]["helpers"]
-    body, expected = FORMS[(form, shape)]["build"](t)
+    body, expected, extra_decls = FORMS[(form, shape)]["build"](t)
     out = HEADER.format(form=form, shape=shape, type=tname)
     if t["decls"]:
         out += "\n" + t["decls"] + "\n"
+    if extra_decls:
+        out += "\n" + extra_decls + "\n"
     if helpers:
         out += "\n" + helpers + "\n"
     out += "\nfunc main() {\n"

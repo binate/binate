@@ -83,13 +83,35 @@ const (
 	// Control flow
 	BC_JUMP            // PC = Aux
 	BC_BRANCH          // if Src1 != 0: PC = Imm; else: PC = Aux
-	BC_CALL            // Dst = call FuncID(args...) — Aux = func index
-	BC_CALL_EXTERN     // Dst = call extern — Aux = extern index
+	BC_CALL            // Dst = call result. Aux = NAME-TABLE index into
+	                   //   f.Names / f.CallCache (NOT a func index) — the callee
+	                   //   is resolved by name at first execution and cached.
+	                   //   Src1 = callArgBase; args in [Src1, Src1+Imm-1]. Imm =
+	                   //   packed slot count (a 64-bit arg = 2 slots when
+	                   //   REG_SLOT < 8). A negative cached resolution routes to
+	                   //   execExtern (vm.Externs) — the only extern path
+	                   //   (BC_CALL_EXTERN is dead).
+	BC_CALL_EXTERN     // DEAD: never emitted, no execLoop arm. Extern calls go
+	                   //   through BC_CALL (negative CallCache → execExtern,
+	                   //   vm.Externs). Reserved enum slot — do not add a
+	                   //   handler without an emitter.
 	BC_CALL_INDIRECT   // Dst = call (fnIdx - 1)(args...). Src1 = reg
 	                   //   holding 1-based VM function index, Src2 =
 	                   //   callArgBase, Imm = arg count. fn_ptr in
 	                   //   indirect-call IR maps to a VM function index.
-	BC_RETURN          // return Src1 (or void if Dst == -1)
+	BC_RETURN          // ends the function; delivered values were already
+	                   //   ownership-transferred by IR-gen (backends add/elide
+	                   //   no refcount). Dst is a SHAPE CODE:
+	                   //     -1  : void.
+	                   //      0  : single return, Src1 = value reg. Aux = byte
+	                   //           count to copy back when the value lives in the
+	                   //           callee frame (multi-word aggregate OR 16-byte
+	                   //           address-aggregate — iface value, and per
+	                   //           contract func value); 0 = none.
+	                   //     N>0 : multi-return; Dst = result count, Src1 =
+	                   //           callArgBase, Imm = result count →
+	                   //           packMultiReturn writes each result at
+	                   //           ResultOffsets[i] and copies the struct back.
 	BC_RETURN64        // return the (Src1, Src1+1) pair — int64/uint64/
 	                   // float64 single-return on a host whose word
 	                   // is < 8 bytes (Layer 2 step 2b).
@@ -166,10 +188,21 @@ const (
 	// Managed memory
 	BC_REFINC_INLINE   // inline RefInc(Src1): nil-check + load/add/store
 	                   // on the header at Src1-16. Lowered from OP_REFINC.
-	BC_REFDEC_INLINE_FAST // inline RefDec(Src1, Src2=dtor): nil-check +
-	                   // load/sub/store on header at Src1-16. On zero,
-	                   // calls rt.Free (no-dtor case) or dispatches the
-	                   // dtor iteratively. Lowered from OP_REFDEC.
+	BC_REFDEC_INLINE_FAST // the core managed-refcount RELEASE op. Src1 =
+	                   //   managed ptr (header at Src1-16); nil-check, then
+	                   //   decrement inline; hd[0] < 0 is the immortal static
+	                   //   sentinel and skips. Src2 = a func-value HANDLE ptr
+	                   //   (NOT a dtor func index). On reaching zero, one of
+	                   //   FOUR dtor paths:
+	                   //     Src2 == 0 : rt.Free (no dtor).
+	                   //     Src2 == compiledClosureDtorMark (-1) : Src1 is a
+	                   //        COMPILED_CLOSURE rec — free it, then RefDec + run
+	                   //        the dtor on the heap closure struct it points at.
+	                   //     handle.data is a VM_CLOSURE_REC : iterative dtor-
+	                   //        frame push (no host recursion); freed on pop.
+	                   //     else : refDecCrossModeDispatch via the handle's
+	                   //        vtable.call shim, then rt.Free.
+	                   //   Lowered from OP_REFDEC.
 	BC_ALLOC           // Dst = rt.Alloc(Imm)
 	BC_BOX             // Dst = rt.Box(Src1, Imm=size)
 	BC_MAKE_SLICE      // Dst = rt.MakeManagedSlice(Imm=elemSize, Src1=length)
@@ -184,12 +217,21 @@ const (
 	                   //   the VMFunc's Handle field for vm-local-only
 	                   //   functions.  See plan-uniform-native-fnptrs.md
 	                   //   Phase 4.
-	BC_FUNC_VALUE      // Dst = stack address of a fresh 16-byte
-	                   //   {vtable_addr, closure_rec_addr} pair.
-	                   //   Aux = name index in VMFunc.Names. The
-	                   //   vtable + closure record are lazily
-	                   //   allocated on first execution. See
-	                   //   plan-function-values.md "VM-mode vtables".
+	BC_FUNC_VALUE      // Dst = stack addr of a fresh 16-byte fv
+	                   //   {vtable_addr @ slot0, data_addr @ slot1} —
+	                   //   vtable-FIRST, opposite of iface. Aux = name index in
+	                   //   VMFunc.Names; Src1 = closure-struct reg (capturing)
+	                   //   or -1 (non-capturing). Vtable/ClosureRec lazily built
+	                   //   by ensureHandle on first use.
+	                   //   Non-capturing (Src1==-1): data = the shared per-callee
+	                   //     ClosureRec, RefInc'd here so this fv owns a ref —
+	                   //     without it the shared rec frees on the first copy's
+	                   //     RefDec, dangling survivors.
+	                   //   Capturing (Src1!=-1): data = a fresh heap
+	                   //     COMPILED_CLOSURE rec; released for @func via the
+	                   //     compiledClosureDtorMark arm of BC_REFDEC_INLINE_FAST
+	                   //     (raw *func intentionally leaks, B.2).
+	                   //   See plan-function-values.md "VM-mode vtables".
 	BC_CALL_FUNC_VALUE // Dst = call f(args). Src1 = register holding
 	                   //   the function value's stack address (16-byte
 	                   //   {vtable_addr, closure_rec_addr}). Src2 =
@@ -198,16 +240,16 @@ const (
 	                   //   reads closure_rec[0] (vm_func_idx) directly
 	                   //   and execFuncs into the VM. See plan-function-
 	                   //   values.md "VM-mode vtables — Phase 1".
-	BC_IFACE_VALUE     // Dst = stack address of a fresh 16-byte
-	                   //   {data_ptr, vtable_addr} interface value.
-	                   //   Src1 = register holding the data pointer
-	                   //   (the source's *T / @T cast through int).
-	                   //   Aux = name index for the vtable identifier
-	                   //   (e.g., "<recvType>.<iface>"); the VM
-	                   //   lazily allocates a vtable record holding
-	                   //   the impl method's VM function indices on
-	                   //   first execution. Slice 2.3c of plan-
-	                   //   interface-syntax-revision.md.
+	BC_IFACE_VALUE     // Dst = stack addr of a fresh 16-byte iv
+	                   //   {data_ptr @ slot0, vtIdx+1 @ slot1}. Src1 = data ptr
+	                   //   reg (source's *T / @T cast through int); Aux = name
+	                   //   index of the mangled vtable id ("__ivt.<...>").
+	                   //   slot1 holds a 1-BASED INDEX into vm.IfaceVtables
+	                   //   (0 = nil-interface sentinel), NOT a vtable address.
+	                   //   Vtables are pre-built by LowerModule
+	                   //   (lowerImplVtables); the handler resolves the name to
+	                   //   an index via findIfaceVtable. Slice 2.3c of
+	                   //   plan-interface-syntax-revision.md.
 	BC_CALL_IFACE_METHOD // Dst = result of iv.method(args). Src1 =
 	                   //   register holding the interface value's
 	                   //   stack address. Src2 = callArgBase. Imm =
@@ -217,16 +259,16 @@ const (
 	                   //   slot, indexes into the vtable, and calls
 	                   //   the impl method via execFunc with data_ptr
 	                   //   prepended to the user args.
-	BC_IFACE_DTOR      // Dst = vt.Methods[0] (the receiver type's
-	                   //   dtor as a 1-based VM func index, or 0 if
-	                   //   the type has no dtor). Src1 = register
-	                   //   holding the interface value's stack
-	                   //   address; the handler reads iv[1] as the
-	                   //   vtable index. Used by @Iface scope-exit
-	                   //   cleanup — the int feeds straight into
-	                   //   BC_REFDEC_INLINE_FAST's Src2 dtor slot.
-	                   //   Slice 2.5b of plan-interface-syntax-
-	                   //   revision.md.
+	BC_IFACE_DTOR      // Dst = the receiver type's dtor as a func-value
+	                   //   HANDLE ptr (bit_cast(int, handle)), or 0 if no dtor /
+	                   //   nil iv. Src1 = reg holding the iv stack-slot addr;
+	                   //   the handler reads iv[1] (1-based vtable index, 0=nil),
+	                   //   looks up vt.Methods[0] (the dtor's 1-based VM func
+	                   //   idx), then ensureHandle-builds its handle. Dst feeds
+	                   //   BC_REFDEC_INLINE_FAST's Src2 slot, which derefs it as
+	                   //   a HANDLE (a raw index would bit_cast to a ptr and
+	                   //   crash). @Iface scope-exit cleanup. Slice 2.5b of
+	                   //   plan-interface-syntax-revision.md.
 	BC_FUNC_VALUE_DTOR // Dst = vtable.Dtor of an @func value (0 if
 	                   //   the value has no dtor / nil fv / nil
 	                   //   vtable). Src1 = register holding the
@@ -268,7 +310,16 @@ const (
 	BC_F32_TO_F64      // Dst = float64 bits of float32 in low 4 bytes of Src1
 
 	// Struct
-	BC_EXTRACT         // Dst = *(int64*)(Src1 + Imm*8) — extract field from aggregate
+	BC_EXTRACT         // Dst = field of the aggregate at Src1, by Aux mode:
+	                   //   Aux=0: scalar load *(int*)(Src1 + Imm), Imm =
+	                   //          FieldOffset (NOT *8) — dominant struct path.
+	                   //   Aux=1: POINTER mode, Dst = Src1 + Imm (no load), for
+	                   //          16-byte address-aggregate fields (iface/func)
+	                   //          and multi-word fields (struct/slice/mslice/
+	                   //          array): yields the field's slot ADDRESS so
+	                   //          BOTH words survive. Matches packMultiReturn.
+	                   //   Aux=2: legacy word-indexed load p[Imm] (non-struct
+	                   //          sources, e.g. slice-header fields); Imm = idx.
 
 	// Lifetime
 	BC_SP_RESTORE      // vm.SP = frameStart + frame.totalSize.

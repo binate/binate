@@ -290,6 +290,34 @@ def form_mslice_lit(t):
     return _slot(t, bind, "sl[0]", drop)
 
 
+def form_assign_blank(t):
+    # Discard a managed CALL RESULT via `_`. The call-result temp must be
+    # released at end of statement; if the producer never registered it as a
+    # cleanup temp (the open @func call-result leak), the observable stays
+    # elevated instead of returning to baseline.
+    helper = f"func wrap(v {t['tname']}) {t['tname']} {{\n\treturn v\n}}"
+    b = t["baseline"]
+    lines = t["construct"]("src")
+    lines.append('println(rt.Refcount(src_po))')
+    lines.append('_ = wrap(src)')
+    lines.append('println(rt.Refcount(src_po))')
+    return lines, [b, b], helper
+
+
+def form_param(t):
+    # Pass the value as a call argument; the callee holds a ref for the duration
+    # (borrow: callee RefIncs at entry; move (@Iface): caller acquires) so the
+    # observable reads baseline+1 inside the call and returns to baseline after.
+    helper = (f"func take(v {t['tname']}, po *uint8) int {{\n"
+              f"\treturn rt.Refcount(po)\n}}")
+    b = t["baseline"]
+    lines = t["construct"]("src")
+    lines.append('println(rt.Refcount(src_po))')
+    lines.append('println(take(src, src_po))')
+    lines.append('println(rt.Refcount(src_po))')
+    return lines, [b, b + 1, b], helper
+
+
 FORMS = {
     ("var-init", "ident"): {"build": form_var_init, "helpers": ""},
     ("assign", "ident"): {"build": form_assign, "helpers": ""},
@@ -304,6 +332,8 @@ FORMS = {
     ("composite-lit", "elem"): {"build": form_composite_lit, "helpers": ""},
     ("array-lit", "elem"): {"build": form_array_lit, "helpers": ""},
     ("mslice-lit", "elem"): {"build": form_mslice_lit, "helpers": ""},
+    ("assign", "blank"): {"build": form_assign_blank, "helpers": ""},
+    ("param", "arg"): {"build": form_param, "helpers": ""},
 }
 
 

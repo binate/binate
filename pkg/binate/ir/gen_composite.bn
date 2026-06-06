@@ -97,56 +97,15 @@ func genCompositeLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 		if val.Op == OP_ALLOC && val.TypeArg != nil && val.TypeArg.Kind == types.TYP_STRUCT {
 			val = b.EmitLoad(val, val.TypeArg)
 		}
-		// Axiom 3: RefInc managed fields when copying into the
-		// struct.  Without this, the source value's backing is
-		// freed when its scope ends while the struct (or anything
-		// the struct is later copied into) still holds a dangling
-		// reference.  Mirrors var-decl's RefInc-before-Store
-		// (pkg/binate/ir/gen_stmt.bn:218-223).  For struct-typed fields
-		// with managed inner fields, emitStructCopy below handles
-		// the recursive RefInc.
-		//
-		// Skip on OP_CONST_NIL: zero-init for an unspecified
-		// managed field means there's no source backing to
-		// preserve; emitManagedSliceRefInc here would emit an
-		// OP_EXTRACT on a nil constant, which the bytecode VM
-		// mis-lowers.
-		if val.Op != OP_CONST_NIL {
-			if isManagedPtrType(fields[i].Type) {
-				b.EmitRefInc(val)
-			}
-			if isManagedSliceType(fields[i].Type) {
-				emitManagedSliceRefInc(ctx.Func, b, val)
-			}
-			if isManagedIfaceValueType(fields[i].Type) {
-				if isFreshManagedIfaceValue(val) {
-					consumeTemp(ctx, val)
-				} else {
-					emitManagedIfaceValueRefInc(ctx.Func, b, val)
-				}
-			}
-			// A fresh `@func` field (a capturing closure literal) is not a
-			// cleanup temp, so consumeTemp transfers its ref; a copy of an
-			// existing @func RefInc's.  Without this the closure record is
-			// freed when the source scope ends — a UAF on a later invoke.
-			if isManagedFuncValueType(fields[i].Type) {
-				if isFreshManagedFuncValue(val) {
-					consumeTemp(ctx, val)
-				} else {
-					emitManagedFuncValueRefInc(ctx.Func, b, val)
-				}
-			}
-		}
 		// Narrow an untyped scalar LITERAL field value to the field's
 		// width (e.g. an untyped-float 0.5 into a float32 field fptruncs
 		// to single precision).  No-op for managed / struct / nil values.
 		val = coerceScalarWidth(ctx, b, val, fields[i].Type)
-		b.EmitStore(fieldPtr, val)
-		// Recursively RefInc managed fields of struct-typed fields
-		// (parallels gen_stmt.bn:229-231).
-		if needsStructCopy(fields[i].Type) {
-			emitStructCopy(ctx.Func, b, fieldPtr, fields[i].Type)
-		}
+		// Acquire-and-store through the shared dispatcher.  isInit: a fresh
+		// field slot, no old value to release.  A fresh producer — including
+		// an OP_CONST_NIL zero-init — is moved (consumeTemp), so no RefInc /
+		// OP_EXTRACT runs on a nil constant (which the bytecode VM mis-lowers).
+		b = emitStoreManagedSlot(ctx, b, fieldPtr, val, fields[i].Type, true)
 	}
 
 	return structPtr
@@ -192,42 +151,12 @@ func genArrayLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 				val = b.EmitLoad(val, val.TypeArg)
 			}
 		}
-		// Axiom 3: acquire each managed element — the array co-owns it and
-		// its scope-exit dtor RefDec's it, so without the acquire the source
-		// is freed early (dangling element) / freed twice.  Pure
-		// initialization: the slot was just alloc'd, so there's no old value
-		// to release.  Mirrors genCompositeLit's per-field acquire (struct
-		// literals are the by-value-aggregate sibling of array literals);
-		// @T/@[]T always-RefInc (a fresh make/make_slice IS a cleanup temp,
-		// so the temp's RefDec balances), @func/@Iface consumeTemp-if-fresh
-		// (a fresh closure record / iface box is NOT a temp).  The
-		// OP_CONST_NIL guard skips a zero-init element (no source backing;
-		// an OP_EXTRACT on a nil const mis-lowers in the bytecode VM).
-		if val.Op != OP_CONST_NIL {
-			if isManagedPtrType(elemTyp) {
-				b.EmitRefInc(val)
-			} else if isManagedSliceType(elemTyp) {
-				emitManagedSliceRefInc(ctx.Func, b, val)
-			} else if isManagedFuncValueType(elemTyp) {
-				if isFreshManagedFuncValue(val) {
-					consumeTemp(ctx, val)
-				} else {
-					emitManagedFuncValueRefInc(ctx.Func, b, val)
-				}
-			} else if isManagedIfaceValueType(elemTyp) {
-				if isFreshManagedIfaceValue(val) {
-					consumeTemp(ctx, val)
-				} else {
-					emitManagedIfaceValueRefInc(ctx.Func, b, val)
-				}
-			}
-		}
-		b.EmitStore(elemPtr, val)
-		// A managed-aggregate element RefInc's its managed fields via the
-		// generated __copy_ helper (covers @Iface fields + nested aggregates).
-		if needsStructCopy(elemTyp) {
-			emitStructCopy(ctx.Func, b, elemPtr, elemTyp)
-		}
+		// Acquire-and-store through the shared dispatcher: the array co-owns
+		// each managed element (its scope-exit dtor RefDec's it).  isInit: a
+		// freshly-alloc'd slot, no old value to release.  A fresh producer —
+		// including an OP_CONST_NIL zero-init — is moved (consumeTemp), so no
+		// RefInc / OP_EXTRACT runs on a nil constant.
+		b = emitStoreManagedSlot(ctx, b, elemPtr, val, elemTyp, true)
 	}
 
 	return arrPtr
@@ -324,48 +253,16 @@ func genManagedSliceLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 			val = b.EmitStringToChars(val, elemTyp)
 			noteSPGrowingResult(ctx, val)
 		}
-		// Refcount handoff for managed element types — mirrors
-		// gen_short_var.bn's `var x = ...` path.  Without this, a
-		// fresh managed value from a call (e.g.
-		// `@[]@[]char{copyStr("a"), ...}`) gets RefDec'd by the
-		// end-of-statement temp cleanup, leaving the slot with a
-		// dangling data pointer.  Fresh values transfer ownership
-		// via consumeTemp; shared references RefInc so the slot
-		// owns its own reference.
-		if isManagedPtrType(elemTyp) {
-			if isFreshManagedPtr(val) {
-				consumeTemp(ctx, val)
-			} else {
-				b.EmitRefInc(val)
-			}
-		} else if isManagedSliceType(elemTyp) {
-			if isFreshManagedSlice(val) {
-				consumeTemp(ctx, val)
-			} else {
-				emitManagedSliceRefInc(ctx.Func, b, val)
-			}
-		} else if isManagedIfaceValueType(elemTyp) {
-			if isFreshManagedIfaceValue(val) {
-				consumeTemp(ctx, val)
-			} else {
-				emitManagedIfaceValueRefInc(ctx.Func, b, val)
-			}
-		} else if isManagedFuncValueType(elemTyp) {
-			// Without this, a fresh `@func` element (e.g. a capturing
-			// closure literal) is freed by end-of-statement cleanup, leaving
-			// the slot's data pointer dangling — a UAF on invoke.
-			if isFreshManagedFuncValue(val) {
-				consumeTemp(ctx, val)
-			} else {
-				emitManagedFuncValueRefInc(ctx.Func, b, val)
-			}
+		// Acquire each managed element so the slice owns its reference (its
+		// scope-exit dtor RefDec's it); a fresh producer transfers ownership
+		// via consumeTemp instead.  A managed slice has no persistent slot
+		// pointer, so this can't route through emitStoreManagedSlot like the
+		// array / struct literals — a managed-aggregate element instead copies
+		// into a throwaway slot to RefInc its fields (EmitSliceSet then writes
+		// the same bytes into the element).
+		if isManagedScalarType(elemTyp) {
+			emitAcquireManagedScalar(ctx, b, val, elemTyp)
 		} else if needsStructCopy(elemTyp) {
-			// Managed-aggregate element: RefInc its managed fields via the
-			// generated __copy_ helper (complete for @Iface fields + nested
-			// aggregates).  A slice element has no persistent slot pointer to
-			// copy in place, so apply __copy_ to a throwaway slot holding the
-			// same value; the +1 accounts for the slice element's new co-
-			// ownership (EmitSliceSet writes the bytes).
 			var copySlot @Instr = b.EmitAlloc(elemTyp)
 			b.EmitStore(copySlot, val)
 			emitStructCopy(ctx.Func, b, copySlot, elemTyp)

@@ -134,7 +134,7 @@ def shift_cell(op, width, sign):
         x, expected, sym = -(m >> 1), -1, ">>"  # arithmetic >>: min >> width -> -1
     body = [
         f"var x {t} = {x}",
-        f"var c uint = {count}",
+        f"var c {t} = {count}",   # Binate ties the shift count's type to the operand's
         f"println(cast(int, x {sym} c))",
     ]
     return body, [expected]

@@ -25,6 +25,13 @@ long-tail bugs that aren't a systematic product.
   `<op>/<width>/<sign>`; assertion: a sub-word op's result equals the math at
   the correct width (operands chosen to expose dirty-upper-bit defects).
   Generator: `conformance/gen-scalar-matrix.py`. See `scalar/README.md`.
+- **`scalar-diff/`** — property-based **differential** value-correctness for
+  scalar shifts & conversions (the exhaustive-volume layer beneath `scalar/`).
+  The oracle is the **spec** (computed at full precision), not a backend, so a
+  value wrong on *every* backend is caught too. Each cell sweeps a fixed,
+  seeded value set per coordinate and is self-checking
+  (`println(cast(int, computed == spec_expected))` → `1`) for target-stability.
+  Generator: `conformance/gen-diff-scalar.py`. See `scalar-diff/README.md`.
 - **`abi/`** — aggregate & multi-return passing (Class 4). Categories
   `multi-return` / `struct-return` / `struct-param`, plus the call-shape axis
   `iface-param` / `funcval-param` (the same struct by value through an indirect

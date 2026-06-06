@@ -31,11 +31,12 @@ long-tail bugs that aren't a systematic product.
   call); assertion: every field's value survives the call boundary (shapes
   chosen to hit the non-8-multiple / padding / sub-word / >16-byte / high-arity
   edges). Generator: `conformance/gen-abi-matrix.py`. See `abi/README.md`.
-
-Planned (each a new subtree + generator, reusing this infrastructure):
-
-- **`const/`** — constant materialization: a const's value at every scope and
-  read form.
+- **`const/`** — compile-time constant materialization. Axes
+  `<read-form>/<type>/<value>`; assertion: a constant materializes to the exact
+  bit pattern of its type (printed as target-stable 16-bit lanes). The read-form
+  axis (var-init / named-const / const-group / local-const / call-arg / field /
+  return) is the discriminator — the front-end narrows at some positions but not
+  others. Generator: `conformance/gen-const-matrix.py`. See `const/README.md`.
 
 The runner discovers every `*.bn` under `conformance/matrix/` recursively, so
 adding a matrix needs no runner change.

@@ -35,6 +35,23 @@ func genIndex(ctx @GenContext, b @Block, e @ast.Expr, checked bool) @Instr {
 	// Multi-arg `e.Args` is the instantiation shape — type checker
 	// rejects it for now (Slice 2+ work); reaching genIndex with
 	// len(Args) != 1 would mean a stale AST.
+
+	// Nested-ARRAY base (`a[i][j]`): genExpr(e.X) would load the inner
+	// array `a[i]` as an r-value with no backing pointer, and the
+	// array/slice fallbacks below would then GEP/SliceGet a non-pointer
+	// (invalid IR).  Load through an in-place element pointer instead.
+	// Detected by TYPE so e.X (and its index) isn't generated twice.  A
+	// nested SLICE base needs no special case — its loaded value carries
+	// the backing pointer, so the standard path works.
+	if len(e.Args) == 1 && isNestedArrayBase(ctx, e) {
+		var elemPtr @Instr = genIndexPtr(ctx, b, e)
+		b = ctx.CurBlock
+		if elemPtr != nil && elemPtr.Typ != nil &&
+				elemPtr.Typ.Elem != nil {
+			return b.EmitLoad(elemPtr, elemPtr.Typ.Elem)
+		}
+	}
+
 	var collection @Instr = genExpr(ctx, b, e.X)
 	b = ctx.CurBlock
 	var index @Instr = genExpr(ctx, b, e.Args[0])
@@ -148,6 +165,65 @@ func genIndexPtr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 			return b.EmitSliceElemPtr(sliceVal, index, collSt.Elem)
 		}
 	}
+	// Nested-index base, e.g. `a[i][j]`: recurse for an in-place pointer
+	// to the inner element `a[i]`, then index THAT.  Without this the
+	// outer `&...` falls through and genUnary hands back the loaded inner
+	// r-value as a pointer — a wild pointer (SIGSEGV) or invalid IR.  An
+	// array inner element is stored in place, so GEP its pointer directly;
+	// a slice / raw-pointer inner element is a value carrying its own
+	// backing, so load it first and index through the value.
+	if e.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		var basePtr @Instr = genIndexPtr(ctx, b, e.X)
+		b = ctx.CurBlock
+		if basePtr == nil || basePtr.Typ == nil ||
+				basePtr.Typ.Kind != types.TYP_POINTER ||
+				basePtr.Typ.Elem == nil {
+			return nil
+		}
+		var innerSt @types.Type = peelReadonly(basePtr.Typ.Elem)
+		if innerSt == nil { return nil }
+		if innerSt.Kind == types.TYP_ARRAY {
+			var elemTyp @types.Type = innerSt.Elem
+			if elemTyp == nil { elemTyp = types.TypInt() }
+			var lenInstr @Instr = b.EmitConstInt(innerSt.ArrayLen, types.TypInt())
+			b.EmitBoundsCheck(index, lenInstr)
+			return b.EmitGetElemPtr(basePtr, index, elemTyp)
+		}
+		if isSliceType(innerSt) && innerSt.Elem != nil {
+			var sliceVal @Instr = b.EmitLoad(basePtr, innerSt)
+			var lenInstr @Instr = b.EmitSliceLen(sliceVal)
+			b.EmitBoundsCheck(index, lenInstr)
+			return b.EmitSliceElemPtr(sliceVal, index, innerSt.Elem)
+		}
+		if innerSt.Kind == types.TYP_POINTER && innerSt.Elem != nil {
+			var ptrVal @Instr = b.EmitLoad(basePtr, innerSt)
+			return b.EmitGetElemPtr(ptrVal, index, innerSt.Elem)
+		}
+		return nil
+	}
+	// R-value base that carries its own backing, e.g. `&get()[i]` where
+	// get() returns a slice (or raw pointer): evaluate it and GEP into the
+	// backing.  IDENT / SELECTOR bases are handled above; this is for the
+	// remaining kinds (call results, etc.).  The caller borrows the
+	// backing — for a managed-slice temp the standard end-of-statement
+	// cleanup keeps refcounting honest (the backing must stay live via
+	// another owner, else it is a user use-after-free, not a compiler
+	// bug).  An r-value array has no stable address, so it returns nil.
+	if e.X.Kind != ast.EXPR_IDENT && e.X.Kind != ast.EXPR_SELECTOR {
+		var baseVal @Instr = genExpr(ctx, b, e.X)
+		b = ctx.CurBlock
+		if baseVal != nil && baseVal.Typ != nil {
+			var baseSt @types.Type = peelReadonly(baseVal.Typ)
+			if baseSt != nil && isSliceType(baseVal.Typ) && baseSt.Elem != nil {
+				var lenInstr @Instr = b.EmitSliceLen(baseVal)
+				b.EmitBoundsCheck(index, lenInstr)
+				return b.EmitSliceElemPtr(baseVal, index, baseSt.Elem)
+			}
+			if baseVal.Typ.Kind == types.TYP_POINTER && baseVal.Typ.Elem != nil {
+				return b.EmitGetElemPtr(baseVal, index, baseVal.Typ.Elem)
+			}
+		}
+	}
 	return nil
 }
 
@@ -168,6 +244,37 @@ func getIndexElemType(ctx @GenContext, e @ast.Expr) @types.Type {
 		}
 	}
 	return nil
+}
+
+// indexExprType returns the static type of an expression as used for
+// indexing, WITHOUT generating any code (so callers can classify a base
+// before deciding how to evaluate it — avoiding a genExpr that would both
+// be wasteful and double-evaluate a nested index).  Recurses through
+// nested indices.  Returns nil for bases whose type isn't statically
+// derivable here (e.g. call results) — those fall back to value-based
+// handling at the call site.
+func indexExprType(ctx @GenContext, e @ast.Expr) @types.Type {
+	if e == nil { return nil }
+	if e.Kind == ast.EXPR_IDENT { return lookupVarType(ctx, e.Name) }
+	if e.Kind == ast.EXPR_SELECTOR { return getSelectorType(ctx, e) }
+	if e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		var baseSt @types.Type = peelReadonly(indexExprType(ctx, e.X))
+		if baseSt == nil { return nil }
+		return baseSt.Elem
+	}
+	return nil
+}
+
+// isNestedArrayBase reports whether `e` is `base[idx]` whose base is
+// itself an index expression of ARRAY type — the case whose inner array
+// element has no backing pointer and so must be addressed via an in-place
+// element pointer (genIndexPtr) rather than the value-based load/store
+// fallbacks.
+func isNestedArrayBase(ctx @GenContext, e @ast.Expr) bool {
+	if e == nil || e.X == nil { return false }
+	if e.X.Kind != ast.EXPR_INSTANTIATE_OR_INDEX { return false }
+	var baseSt @types.Type = peelReadonly(indexExprType(ctx, e.X))
+	return baseSt != nil && baseSt.Kind == types.TYP_ARRAY
 }
 
 // genSliceExpr generates IR for a slice expression (s[lo:hi]), including array-to-slice conversion.

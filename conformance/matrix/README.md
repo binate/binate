@@ -51,6 +51,15 @@ long-tail bugs that aren't a systematic product.
   assertion: both words survive the operation (observed by invoking the value →
   42). Generator: `conformance/gen-addr-aggregate-matrix.py`. See
   `addr-aggregate/README.md`.
+- **`aggregate/`** — value-movement correctness for plain (non-managed)
+  values. Axes `<form>/<kind>` where form = decl-init / assign / copy / deref /
+  global / field / param / return and kind = `{scalar,array,struct}-{int,float}`;
+  assertion: every lane (element / field / scalar) reads back its value after the
+  movement (`println(cast(int, access == lit))` → 1). Fills the gap left by
+  `abi` (call-boundary passing), `refcount` (managed lifecycle), and `const`
+  (const materialization): plain var assignment / copy / deref-store / global
+  initializer value correctness. Generator: `conformance/gen-aggregate-matrix.py`.
+  See `aggregate/README.md`.
 
 The runner discovers every `*.bn` under `conformance/matrix/` recursively, so
 adding a matrix needs no runner change.

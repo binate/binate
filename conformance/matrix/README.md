@@ -38,5 +38,12 @@ long-tail bugs that aren't a systematic product.
   return) is the discriminator — the front-end narrows at some positions but not
   others. Generator: `conformance/gen-const-matrix.py`. See `const/README.md`.
 
+- **`addr-aggregate/`** — 16-byte address-aggregate (2-word) value handling
+  (Class 2). Axes `<kind>/<operation>` where kind = `@func` / `@Iface` and
+  operation = direct / copy / return / arg / return-arg / field / array-elem;
+  assertion: both words survive the operation (observed by invoking the value →
+  42). Generator: `conformance/gen-addr-aggregate-matrix.py`. See
+  `addr-aggregate/README.md`.
+
 The runner discovers every `*.bn` under `conformance/matrix/` recursively, so
 adding a matrix needs no runner change.

@@ -341,6 +341,27 @@ def form_assign_blank(t):
     return lines, [b, b], helper
 
 
+def form_for_range_value(t):
+    # `for v in coll` binds each element to a managed scope var (defineVar),
+    # so scope cleanup RefDecs it — the bind must ACQUIRE the borrowed element
+    # or it is 0 acquires / 1 release per iteration (an over-release). The
+    # over-release lands at v's SCOPE END, so it is observed AFTER a helper that
+    # ranges and returns. The value is held by `src` AND `s[0]`, so the
+    # observable reads baseline+1 throughout a balanced loop.
+    helper = (f"func loopOnce(s @[]{t['tname']}) {{\n"
+              f"\tfor v in s {{\n"
+              f"\t\tprintln({t['use']('v')})\n"
+              f"\t}}\n}}")
+    b = t["baseline"]
+    lines = t["construct"]("src")
+    lines.append(f'var s @[]{t["tname"]} = make_slice({t["tname"]}, 1)')
+    lines.append('s[0] = src')
+    lines.append('println(rt.Refcount(src_po))')
+    lines.append('loopOnce(s)')
+    lines.append('println(rt.Refcount(src_po))')
+    return lines, [b + 1, t["useval"], b + 1], helper
+
+
 def form_discard_stmt(t):
     # Discard a managed CALL RESULT as a BARE expression statement (no `_=`).
     # Same leak as assign/blank, but through the expr-statement cleanup path
@@ -385,6 +406,7 @@ FORMS = {
     ("mslice-lit", "elem"): {"build": form_mslice_lit, "helpers": ""},
     ("assign", "blank"): {"build": form_assign_blank, "helpers": ""},
     ("discard", "stmt"): {"build": form_discard_stmt, "helpers": ""},
+    ("for-range-value", "value"): {"build": form_for_range_value, "helpers": ""},
     ("param", "arg"): {"build": form_param, "helpers": ""},
     ("multi-assign", "selector"): {"build": form_multi_assign_selector, "helpers": ""},
     ("multi-assign", "index-array"): {"build": form_multi_assign_index_array, "helpers": ""},

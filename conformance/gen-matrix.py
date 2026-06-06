@@ -342,24 +342,28 @@ def form_assign_blank(t):
 
 
 def form_for_range_value(t):
-    # `for v in coll` binds each element to a managed scope var (defineVar),
-    # so scope cleanup RefDecs it — the bind must ACQUIRE the borrowed element
-    # or it is 0 acquires / 1 release per iteration (an over-release). The
-    # over-release lands at v's SCOPE END, so it is observed AFTER a helper that
-    # ranges and returns. The value is held by `src` AND `s[0]`, so the
-    # observable reads baseline+1 throughout a balanced loop.
+    # `for v in coll` is `var v = coll[i]` each iteration: v copy-OWNS its
+    # element (RefInc on bind), so it must be RefDec'd at the end of EACH
+    # iteration. The collection has N=3 elements all aliasing `src` — a
+    # length-1 collection would mask a per-iteration imbalance (1 RefInc would
+    # cancel 1 release). loopOnce ranges and returns; src is held by `src` plus
+    # the 3 slots, so the observable reads baseline+3 before AND after a
+    # balanced loop. A bind that acquires per-iteration but releases only once
+    # (the N-1 leak) reads baseline+3+(N-1) = baseline+5 after.
     helper = (f"func loopOnce(s @[]{t['tname']}) {{\n"
               f"\tfor v in s {{\n"
               f"\t\tprintln({t['use']('v')})\n"
               f"\t}}\n}}")
     b = t["baseline"]
     lines = t["construct"]("src")
-    lines.append(f'var s @[]{t["tname"]} = make_slice({t["tname"]}, 1)')
+    lines.append(f'var s @[]{t["tname"]} = make_slice({t["tname"]}, 3)')
     lines.append('s[0] = src')
+    lines.append('s[1] = src')
+    lines.append('s[2] = src')
     lines.append('println(rt.Refcount(src_po))')
     lines.append('loopOnce(s)')
     lines.append('println(rt.Refcount(src_po))')
-    return lines, [b + 1, t["useval"], b + 1], helper
+    return lines, [b + 3, t["useval"], t["useval"], t["useval"], b + 3], helper
 
 
 def form_discard_stmt(t):

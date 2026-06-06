@@ -341,6 +341,20 @@ def form_assign_blank(t):
     return lines, [b, b], helper
 
 
+def form_discard_stmt(t):
+    # Discard a managed CALL RESULT as a BARE expression statement (no `_=`).
+    # Same leak as assign/blank, but through the expr-statement cleanup path
+    # rather than the blank-assign path: the call-result temp must be released
+    # at end of statement, or the observable stays elevated.
+    helper = f"func wrap(v {t['tname']}) {t['tname']} {{\n\treturn v\n}}"
+    b = t["baseline"]
+    lines = t["construct"]("src")
+    lines.append('println(rt.Refcount(src_po))')
+    lines.append('wrap(src)')
+    lines.append('println(rt.Refcount(src_po))')
+    return lines, [b, b], helper
+
+
 def form_param(t):
     # Pass the value as a call argument; the callee holds a ref for the duration
     # (borrow: callee RefIncs at entry; move (@Iface): caller acquires) so the
@@ -370,6 +384,7 @@ FORMS = {
     ("array-lit", "elem"): {"build": form_array_lit, "helpers": ""},
     ("mslice-lit", "elem"): {"build": form_mslice_lit, "helpers": ""},
     ("assign", "blank"): {"build": form_assign_blank, "helpers": ""},
+    ("discard", "stmt"): {"build": form_discard_stmt, "helpers": ""},
     ("param", "arg"): {"build": form_param, "helpers": ""},
     ("multi-assign", "selector"): {"build": form_multi_assign_selector, "helpers": ""},
     ("multi-assign", "index-array"): {"build": form_multi_assign_index_array, "helpers": ""},

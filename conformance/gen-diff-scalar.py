@@ -26,7 +26,10 @@ a column of `1`s; a `0` on line N means tuple N (commented in the .bn) diverged.
 DELIBERATELY EXCLUDED (spec says "hardware semantics" -> target-dependent, so
 there is no single target-stable expected to assert; documented, not guessed):
   - out-of-range float->int, and NaN/+-Inf -> int;
-  - f64->f32 narrowing except a few exactly-determined round-to-nearest cases.
+  - f64->f32 narrowing except a few exactly-determined round-to-nearest cases;
+  - signed div/rem of min by -1 (the quotient 2^(w-1) overflows the signed
+    range): x86 `idiv` traps `#DE`, ARM `sdiv` wraps. (Plain division by zero
+    is also never emitted — the spec makes it a runtime trap, not a value.)
 These want a per-target expected or a spec decision; see the README.
 
 Coordinate-addressed (path = identity -> idempotent regeneration; `.xfail.<mode>`
@@ -38,11 +41,16 @@ markers are hand-maintained and never touched):
   matrix/scalar-diff/float-to-int/<width>/<sign>.bn float32/float64 -> int (in-range)
   matrix/scalar-diff/int-cast/<width>/<sign>.bn     int -> every int type
   matrix/scalar-diff/float-cast/roundtrip.bn        float32 <-> float64
+  matrix/scalar-diff/arith/<op>/<width>/<sign>.bn   add/sub/mul/div/rem
+  matrix/scalar-diff/cmp/<width>/<sign>.bn          integer compares (6 relops)
+  matrix/scalar-diff/fcmp/<floatwidth>.bn           float compares (NaN/Inf/-0)
+  matrix/scalar-diff/bitwise/<op>/<width>/<sign>.bn and/or/xor/not
 
 Run: `python3 conformance/gen-diff-scalar.py [--check]`. Python now; intended to
 port to Binate (dogfood) later — see ../matrix/README.md.
 """
 
+import math
 import os
 import sys
 
@@ -128,22 +136,47 @@ def dedup(xs):
 # --- cell builder -------------------------------------------------------------
 
 class Cell:
-    """Accumulates self-checking tuples. Each `.check()` appends its setup
-    statements and a `println(cast(int, <bool>))`; the matching `.expected`
-    line is always `1`."""
+    """Accumulates checks, each emitting one `println(cast(int, <expr>))`.
+
+    - `.check(stmts, boolean, comment)` — a *self-checking* tuple: `boolean` is
+      `computed == spec_expected`, so the printed line is `1` when the backend
+      matches the spec (target-stable: only 0/1 is printed).
+    - `.check_raw(stmts, expr, expected, comment)` — prints `cast(int, expr)`
+      directly with an explicit `expected` (0/1). Used for comparisons, whose
+      result already *is* the 0/1 output (a clean bool, so already
+      target-stable) — and where seeing got-vs-want aids debugging.
+    - `.preamble(stmts)` — shared setup emitted once before all tuples (e.g.
+      the named NaN/Inf/-0.0 values reused across a float-compare cell).
+
+    Each tuple's `{i}` placeholders are filled with its index so per-tuple var
+    names don't collide; preamble statements use fixed names (no `{i}`)."""
 
     def __init__(self):
+        self.pre = []
         self.lines = []
-        self.n = 0
+        self.exps = []
+
+    def preamble(self, stmts):
+        self.pre.extend(stmts)
 
     def check(self, stmts, boolean, comment):
-        i = self.n
+        self._emit(stmts, boolean, comment, 1)
+
+    def check_raw(self, stmts, expr, expected, comment):
+        self._emit(stmts, expr, comment, expected)
+
+    def _emit(self, stmts, expr, comment, expected):
+        i = len(self.exps)
         for s in stmts:
             self.lines.append(s.format(i=i))
         self.lines.append(
-            "\tprintln(cast(int, {b}))\t// {c}".format(
-                b=boolean.format(i=i), c=comment))
-        self.n += 1
+            "\tprintln(cast(int, {e}))\t// {c}".format(
+                e=expr.format(i=i), c=comment))
+        self.exps.append(expected)
+
+    @property
+    def n(self):
+        return len(self.exps)
 
 
 HEADER = '''package "main"
@@ -159,9 +192,11 @@ HEADER = '''package "main"
 def render(title, cell):
     out = HEADER.format(title=title)
     out += "func main() {\n"
+    if cell.pre:
+        out += "\n".join(cell.pre) + "\n"
     out += "\n".join(cell.lines) + "\n"
     out += "}\n"
-    return out, "1\n" * cell.n
+    return out, "".join("%d\n" % e for e in cell.exps)
 
 
 # --- shift cells --------------------------------------------------------------
@@ -344,6 +379,224 @@ def float_cast_cell():
     return cell
 
 
+# --- arithmetic cells (add/sub/mul/div/rem) -----------------------------------
+
+ARITH_BIN = {"add": "+", "sub": "-", "mul": "*"}
+DIVREM = {"div": "/", "rem": "%"}
+
+
+def arith_wrap_expected(op, a, b, w, sign):
+    raw = {"add": a + b, "sub": a - b, "mul": a * b}[op]
+    return reinterp(uval(raw, w), w, sign)
+
+
+def _trunc_div(a, b):
+    q = abs(a) // abs(b)
+    return -q if (a < 0) != (b < 0) else q
+
+
+def divrem_expected(op, a, b, w, sign):
+    q = _trunc_div(a, b)
+    v = q if op == "div" else a - q * b
+    return reinterp(uval(v, w), w, sign)
+
+
+def arith_pairs(op, w, sign, rng):
+    """Operand pairs. For add/sub/mul, pairs whose true result OVERFLOWS the
+    width (so an un-narrowed result has dirty upper bits when consumed by a
+    shift). For div/rem, b != 0, and for signed never the min/-1 overflow —
+    that is target-dependent (x86 `idiv` traps `#DE`, ARM `sdiv` wraps), so it
+    is EXCLUDED like out-of-range float->int (see the module docstring)."""
+    half = 1 << (w // 2)
+    if op in DIVREM:
+        if sign == "unsigned":
+            pairs = [((1 << (w - 1)) + 13, 7), ((1 << (w - 1)) + 13, 3),
+                     ((1 << w) - 1, 2), (5, 7), (0, 9),
+                     (rng.below(1 << w), rng.in_range(1, (1 << w) - 1))]
+        else:
+            mx, mn = (1 << (w - 1)) - 1, -(1 << (w - 1))
+            pairs = [(mn + 13, 7), (mn + 13, -7), (-100, 7), (mx, -3), (7, 11),
+                     (rng.in_range(mn, mx),
+                      rng.in_range(1, mx) * (1 if rng.below(2) else -1))]
+        out = []
+        for a, b in pairs:
+            if b == 0:
+                continue
+            if sign == "signed" and a == -(1 << (w - 1)) and b == -1:
+                continue
+            out.append((a, b))
+        return out
+    if sign == "unsigned":
+        m = (1 << w) - 1
+        return [(m, m), (m, 2), (1 << (w - 1), 1 << (w - 1)),
+                (half + 5, half + 5), (m - 3, 9), (0, 0),
+                (rng.below(1 << w), rng.below(1 << w))]
+    mx, mn = (1 << (w - 1)) - 1, -(1 << (w - 1))
+    return [(mx, mx), (mn, mn), (mx, 2), (mn, -3), (-half + 1, -half + 1),
+            (mx, mn), (rng.in_range(mn, mx), rng.in_range(mn, mx))]
+
+
+def arith_cell(op, w, sign):
+    rng = LCG("arith", op, w, sign)
+    t = typ(w, sign)
+    half = w // 2
+    cell = Cell()
+    for a, b in arith_pairs(op, w, sign, rng):
+        if op in ARITH_BIN:
+            sym = ARITH_BIN[op]
+            e = arith_wrap_expected(op, a, b, w, sign)
+            base = ["\tvar a{i} %s = %d" % (t, a), "\tvar b{i} %s = %d" % (t, b)]
+            cell.check(base + ["\tvar e{i} %s = %d" % (t, e)],
+                       "(a{i} %s b{i}) == e{i}" % sym,
+                       "%d %s %d -> %d" % (a, sym, b, e))
+            # Consume the result through a width-sensitive shift: a backend that
+            # leaves dirty upper bits (the VM/natives sub-word gap) diverges
+            # here even though the direct compare above may re-narrow.
+            es = shr_expected(e, half, w, sign)
+            cell.check(base + ["\tvar s{i} %s = %d" % (t, es)],
+                       "((a{i} %s b{i}) >> %d) == s{i}" % (sym, half),
+                       "(%d %s %d)>>%d -> %d" % (a, sym, b, half, es))
+        else:
+            sym = DIVREM[op]
+            e = divrem_expected(op, a, b, w, sign)
+            cell.check(["\tvar a{i} %s = %d" % (t, a),
+                        "\tvar b{i} %s = %d" % (t, b),
+                        "\tvar e{i} %s = %d" % (t, e)],
+                       "(a{i} %s b{i}) == e{i}" % sym,
+                       "%d %s %d -> %d" % (a, sym, b, e))
+    return cell
+
+
+# --- comparison cells ---------------------------------------------------------
+
+RELOPS = [("==", lambda a, b: a == b), ("!=", lambda a, b: a != b),
+          ("<", lambda a, b: a < b), ("<=", lambda a, b: a <= b),
+          (">", lambda a, b: a > b), (">=", lambda a, b: a >= b)]
+
+
+def cmp_values(w, sign, rng):
+    if sign == "unsigned":
+        vs = [0, 1, (1 << w) - 1, 1 << (w - 1), (1 << (w - 1)) - 1,
+              rng.below(1 << w)]
+    else:
+        vs = [0, 1, -1, (1 << (w - 1)) - 1, -(1 << (w - 1)),
+              rng.in_range(-(1 << (w - 1)), (1 << (w - 1)) - 1)]
+    return dedup(vs)
+
+
+def cmp_cell(w, sign):
+    """Integer comparisons across all six relops. Operands cross the high-bit
+    boundary, where signed and unsigned disagree (a top-bit-set value is a large
+    positive unsigned but a negative signed) — exposing a backend that picks the
+    wrong signed/unsigned compare. The result IS the printed 0/1."""
+    rng = LCG("cmp", w, sign)
+    t = typ(w, sign)
+    vs = cmp_values(w, sign, rng)
+    cell = Cell()
+    for a in vs:
+        for b in vs:
+            for sym, fn in RELOPS:
+                res = 1 if fn(a, b) else 0
+                cell.check_raw(
+                    ["\tvar a{i} %s = %d" % (t, a), "\tvar b{i} %s = %d" % (t, b)],
+                    "a{i} %s b{i}" % sym, res,
+                    "%d %s %d -> %d" % (a, sym, b, res))
+    return cell
+
+
+# Named float values built by bit_cast from their exact IEEE bit patterns, so
+# -0.0 / Inf / NaN are exact and literal-parse-independent. (uint bits, value.)
+FBITS = {
+    64: [("z", 0x0000000000000000, 0.0), ("nz", 0x8000000000000000, -0.0),
+         ("one", 0x3FF0000000000000, 1.0), ("mone", 0xBFF0000000000000, -1.0),
+         ("inf", 0x7FF0000000000000, math.inf),
+         ("ninf", 0xFFF0000000000000, -math.inf),
+         ("nan", 0x7FF8000000000000, math.nan)],
+    32: [("z", 0x00000000, 0.0), ("nz", 0x80000000, -0.0),
+         ("one", 0x3F800000, 1.0), ("mone", 0xBF800000, -1.0),
+         ("inf", 0x7F800000, math.inf), ("ninf", 0xFF800000, -math.inf),
+         ("nan", 0x7FC00000, math.nan)],
+}
+
+
+def fcmp_cell(fw):
+    """Float comparisons across all six relops over {0, -0, +-1, +-Inf, NaN}.
+    Pins the IEEE ordered/unordered semantics (claude-notes: `==` and the
+    relationals are ordered -> false on NaN; `!=` is unordered -> true on NaN;
+    `+0.0 == -0.0`). The `!=`-unordered rule was corrected 2026-06-06, so this
+    guards a fresh fix. Python's float comparisons are IEEE, so they give the
+    spec truth directly."""
+    f = "float%d" % fw
+    ut = "uint%d" % fw
+    vals = FBITS[fw]
+    cell = Cell()
+    pre = []
+    for name, bits, _ in vals:
+        pre.append("\tvar %s_b %s = %d" % (name, ut, bits))
+        pre.append("\tvar %s %s = bit_cast(%s, %s_b)" % (name, f, f, name))
+    cell.preamble(pre)
+    for an, _, av in vals:
+        for bn, _, bv in vals:
+            for sym, fn in RELOPS:
+                res = 1 if fn(av, bv) else 0
+                cell.check_raw([], "%s %s %s" % (an, sym, bn), res,
+                               "%s %s %s -> %d" % (an, sym, bn, res))
+    return cell
+
+
+# --- bitwise cells (and/or/xor/not) -------------------------------------------
+
+BITWISE = {"and": "&", "or": "|", "xor": "^"}
+
+
+def bitwise_expected(op, a, b, w, sign):
+    ua, ub = uval(a, w), uval(b, w)
+    u = {"and": ua & ub, "or": ua | ub, "xor": ua ^ ub}[op]
+    return reinterp(u, w, sign)
+
+
+def bit_values(w, sign, rng):
+    if sign == "unsigned":
+        pat = int(("10" * ((w + 1) // 2))[:w], 2)
+        vs = [0, 1, (1 << w) - 1, 1 << (w - 1), pat, rng.below(1 << w)]
+    else:
+        vs = [0, 1, -1, (1 << (w - 1)) - 1, -(1 << (w - 1)),
+              rng.in_range(-(1 << (w - 1)), (1 << (w - 1)) - 1)]
+    return dedup(vs)
+
+
+def bitwise_cell(op, w, sign):
+    rng = LCG("bit", op, w, sign)
+    t = typ(w, sign)
+    vs = bit_values(w, sign, rng)
+    cell = Cell()
+    if op == "not":
+        half = w // 2
+        for v in vs:
+            e = reinterp(uval(~v, w), w, sign)
+            cell.check(["\tvar v{i} %s = %d" % (t, v),
+                        "\tvar e{i} %s = %d" % (t, e)],
+                       "(~v{i}) == e{i}", "~%d -> %d" % (v, e))
+            # `~` of a sub-word value overflows the width; consume via shift to
+            # expose an un-narrowed (dirty-upper-bit) complement.
+            es = shr_expected(e, half, w, sign)
+            cell.check(["\tvar v{i} %s = %d" % (t, v),
+                        "\tvar s{i} %s = %d" % (t, es)],
+                       "((~v{i}) >> %d) == s{i}" % half,
+                       "(~%d)>>%d -> %d" % (v, half, es))
+        return cell
+    sym = BITWISE[op]
+    for a in vs:
+        for b in vs:
+            e = bitwise_expected(op, a, b, w, sign)
+            cell.check(["\tvar a{i} %s = %d" % (t, a),
+                        "\tvar b{i} %s = %d" % (t, b),
+                        "\tvar e{i} %s = %d" % (t, e)],
+                       "(a{i} %s b{i}) == e{i}" % sym,
+                       "%d %s %d -> %d" % (a, sym, b, e))
+    return cell
+
+
 # --- driver -------------------------------------------------------------------
 
 def all_cells():
@@ -370,6 +623,26 @@ def all_cells():
                    int_cast_cell(w, sign))
     yield ("float-cast/roundtrip", "float32<->float64 roundtrip",
            float_cast_cell())
+    for op in list(ARITH_BIN) + list(DIVREM):
+        for w in WIDTHS:
+            for sign in SIGNS:
+                yield ("arith/%s/%d/%s" % (op, w, sign),
+                       "%s width=%d %s" % (op, w, sign),
+                       arith_cell(op, w, sign))
+    for w in WIDTHS:
+        for sign in SIGNS:
+            yield ("cmp/%d/%s" % (w, sign),
+                   "integer compare width=%d %s" % (w, sign),
+                   cmp_cell(w, sign))
+    for fw in FLOATS:
+        yield ("fcmp/%d" % fw, "float%d compare (NaN/Inf/-0)" % fw,
+               fcmp_cell(fw))
+    for op in list(BITWISE) + ["not"]:
+        for w in WIDTHS:
+            for sign in SIGNS:
+                yield ("bitwise/%s/%d/%s" % (op, w, sign),
+                       "%s width=%d %s" % (op, w, sign),
+                       bitwise_cell(op, w, sign))
 
 
 def main():

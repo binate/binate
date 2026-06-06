@@ -42,7 +42,9 @@ hits the native sub-word print path — the cell's output is target-stable.
 Every `.expected` is therefore a column of `1`s; a `0` on line N means tuple N
 (commented in the `.bn`) diverged from the spec. (The trade-off is that a
 failure shows *which* tuple, not the wrong value; flavor B — a self-checking
-corpus that prints `got…want…` — is a planned v2 for the highest-volume ops.)
+corpus that prints `got…want…` — is a planned future variant for the
+highest-volume ops. The comparison families (`cmp`/`fcmp`) instead print the
+comparison result directly, so a failure already shows got-vs-want.)
 
 ## What each family asserts
 
@@ -67,6 +69,20 @@ corpus that prints `got…want…` — is a planned v2 for the highest-volume op
   signedness; narrowing truncates).
 - **float-cast** — `float32 ⇆ float64`: widening is exact; narrowing rounds to
   nearest-even (two exactly-determined cases).
+- **arith** (`add`/`sub`/`mul`/`div`/`rem`) — the wrapped (two's-complement)
+  result, plus, for add/sub/mul, a second check that consumes the result
+  through a width-sensitive `>>` (a backend leaving dirty upper bits diverges
+  there even where the direct compare re-narrows). `div`/`rem` truncate toward
+  zero with `%`-sign-of-dividend; operands set the high bit (signedness
+  dispatch).
+- **cmp** — all six relops over operands that cross the high-bit boundary,
+  where signed and unsigned disagree; the comparison result *is* the printed
+  0/1.
+- **fcmp** — all six relops over `{0, -0, ±1, ±Inf, NaN}` (built by `bit_cast`
+  from exact IEEE bit patterns), pinning the ordered/unordered semantics (`==`
+  and relationals false on NaN; `!=` true on NaN; `+0 == -0`).
+- **bitwise** (`and`/`or`/`xor`/`not`) — the masked result; `~` also gets the
+  `>>`-consume dirty-bits check (its complement overflows the width).
 
 ## Deliberately excluded (NOT guessed)
 
@@ -79,32 +95,46 @@ decision or per-target expecteds would be needed to cover them):
 - **out-of-range float→int**, and **NaN / ±Inf → int** (x86 yields `INT_MIN`,
   ARM saturates);
 - **float64→float32 narrowing** beyond the two exactly-determined
-  round-to-nearest cases.
+  round-to-nearest cases;
+- **signed `div`/`rem` of min by −1** (the quotient `2^(w-1)` overflows the
+  signed range — x86 `idiv` traps `#DE`, ARM `sdiv` wraps), and division by
+  zero (the spec makes it a runtime trap, not a value).
 
 ## Current state
 
-41 cells / 1707 tuples. The full `all` modeset run discovered **two distinct
-backend defects**; the cell↔mode failures are pinned with `.xfail.<mode>`
-markers (and verified non-stale via `run.sh --check-xpass`).
+123 cells / 5415 tuples. The `all` modeset run found backend defects across
+both build-outs; cell↔mode failures are pinned with `.xfail.<mode>` markers
+(verified non-stale via `run.sh --check-xpass`). One defect it surfaced was a
+*reference*-backend bug, since fixed:
 
-- **LLVM** (`builder-comp`, `-comp-comp`, `-comp-comp-comp`) and **arm32
-  baremetal** (also LLVM codegen, ILP32): all 41 green — the reference.
-- **Bytecode VM** (`builder-comp-int`, `-int-int`, `-comp-comp-int`): the 17
-  float-conversion cells (every `int-to-float`/`float-to-int` + `float-cast`)
-  are xfailed. Root cause is a single defect — **`int → float32` is broken**
-  (every `cast(float32, <int>)` diverges, all widths/signs; the `float64`
-  paths, `float32 → int` truncation, and `float32` literals all work). The
-  cells fail only on their `float32` tuples. See `claude-todo.md`
-  (`vm-int-to-float32`).
-- **native-aa64** (`builder-comp_native_aa64-…`): 17 cells xfailed — the
-  **sub-word** family (`shl`/`shr` 8/16/32 *signed*, all `int-cast`, signed
-  sub-word `float-to-int`/`int-to-float`). A sub-word op's result is not
-  narrowed / sign-extended back to its type width (e.g. `int8(-128) << 1`
-  leaves bit 8 set; `cast(int8, 128:uint8)` is wrong). 64-bit and most unsigned
-  paths are fine. See `claude-todo.md` (`aa64-subword`).
+- **`~` (bitwise complement) — FIXED** (binate `ee7c05ac`): IR-gen hardcoded the
+  `~` result type to `int`, so `~x` on a sub-word int emitted invalid IR
+  (`xor i64 %i8`) and `(~v) >> k` on `uint64` did an arithmetic shift. The
+  `bitwise/not` cells caught it; all are green on LLVM now. See `claude-todo.md`
+  (`bitnot-result-type`).
+
+- **LLVM** (`builder-comp`, `-comp-comp`, `-comp-comp-comp`): all 123 green —
+  the reference.
+- **Bytecode VM** (`builder-comp-int`, `-int-int`, `-comp-comp-int`): 20 cells
+  xfailed each. v1: the 17 float-conversion cells — **`int → float32` is
+  broken** (every `cast(float32, <int>)` diverges; `float64`, `float32→int`
+  truncation, and `float32` literals work). v2: `bitwise/not/{8,16,32}/unsigned`
+  (the sub-word dirty-bit gap reaching `~` — see `sub-word-not-narrowed`). See
+  `vm-int-to-float32`. (`fcmp/32` is *not* xfailed: float32 compare was fixed by
+  binate `fc11d862`. The remaining `float32` *conversion* cells stay xfailed —
+  that gap is separate from compare/arithmetic.)
+- **native-aa64** (`builder-comp_native_aa64-…`): 32 cells xfailed. v1: the
+  sub-word `shl`/`shr` 8/16/32 *signed*, all `int-cast`, signed sub-word
+  conversions. v2: sub-word *signed* `arith/{add,sub,mul}/8`,
+  `bitwise/{and,or,xor}/{8,16}`, `cmp/{8,16,32}`; `bitwise/not/{8,16,32}/
+  unsigned` (native's 64-bit `Mvn` ignores the operand width). A sub-word op's
+  result is not narrowed / sign-extended to its type width. See
+  `claude-todo.md` (`aa64-subword`). (`fcmp/32` fixed by `fc11d862`.)
 - **native-x64**: not evaluable on the current host — the x86_64 C runtime
   headers (`stdio.h`) are absent, so *every* cell `COMPILE_ERROR`s uniformly
   (an environment limitation, not a backend result). No x64 xfails are placed
   (that would mask real x64 bugs in a properly-provisioned CI); re-evaluate on
-  an x64 host — the aa64 sub-word defect likely has an x64 analog.
-- **arm32-linux**: skipped (requires `qemu-arm`).
+  an x64 host — the aa64 sub-word defects likely have x64 analogs.
+- **arm32** (`-linux`, `-baremetal`): not evaluated this run (no `qemu-arm` /
+  `qemu-system-arm`). Both use the LLVM codegen, so the `~` fix applies; the
+  64-bit-width cells exercise 64-on-32 lib calls and want a qemu-equipped host.

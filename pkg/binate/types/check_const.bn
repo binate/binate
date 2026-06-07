@@ -1,6 +1,9 @@
 package "pkg/binate/types"
 
 import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/stdx/slices"
 
 // Constant-declaration checking: forward-registration placeholder typing,
 // single- and grouped-const type checking (including iota), and the
@@ -147,4 +150,183 @@ func checkGroupDecl(c @Checker, d @ast.Decl) {
 	} else {
 		checkDecls(c, d.Decls)
 	}
+}
+
+// ============================================================
+// Pass-1 dependency-ordered resolution (M6)
+// ============================================================
+
+// registerOneConstPlaceholder forward-registers a single top-level const's
+// NAME with a placeholder type (declared type for a typed const; an
+// initializer-literal-inferred placeholder for an untyped one) plus its
+// folded integer value when one is available.  resolveTopLevelConsts (and,
+// on the REPL path, collectDeclsBody) call this so a const value that
+// references another const resolves by name; dependency-ordered resolution
+// then refines each top-level const to its real type+value.
+func registerOneConstPlaceholder(c @Checker, d @ast.Decl) {
+	var ctyp @Type = nil
+	if d.TypeRef != nil {
+		ctyp = resolveTypeExpr(c, d.TypeRef)
+		capturePendingIfSized(c, ctyp)
+	} else {
+		ctyp = untypedConstPlaceholder(d.Value)
+	}
+	var iv int
+	var ok bool
+	iv, ok = evalConstIntValue(c, d.Value)
+	if ctyp != nil && ctyp.IsInteger() && ok {
+		defineConstVal(c.Scope, d.Name, ctyp, iv)
+	} else {
+		defineConst(c.Scope, d.Name, ctyp)
+	}
+}
+
+// registerGroupConstPlaceholder forward-registers a grouped const member's
+// NAME.  A bare iota-continuation member (no explicit type) is always
+// iota-valued (untyped int), so an untyped-int placeholder agrees with the
+// real value checkGroupDecl attaches in pass 2.
+func registerGroupConstPlaceholder(c @Checker, inner @ast.Decl) {
+	if inner.TypeRef != nil {
+		var typ @Type = resolveTypeExpr(c, inner.TypeRef)
+		capturePendingIfSized(c, typ)
+		defineConst(c.Scope, inner.Name, typ)
+	} else {
+		defineConst(c.Scope, inner.Name, TypUntypedInt())
+	}
+}
+
+// registerConstPlaceholders forward-registers every const name (top-level
+// and grouped, recursing nested groups) with a placeholder, so any const
+// initializer referencing another const resolves by name during the
+// dependency walk that follows.
+func registerConstPlaceholders(c @Checker, decls *[]@ast.Decl) {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d.Kind == ast.DECL_CONST && d.Value != nil {
+			registerOneConstPlaceholder(c, d)
+		}
+		if d.Kind == ast.DECL_GROUP {
+			for j := 0; j < len(d.Decls); j++ {
+				if d.Decls[j].Kind == ast.DECL_CONST {
+					registerGroupConstPlaceholder(c, d.Decls[j])
+				}
+			}
+			registerConstPlaceholders(c, d.Decls)
+		}
+	}
+}
+
+// resolveTopLevelConsts resolves every top-level const's real type and
+// value in DEPENDENCY order during pass 1, so a forward reference sees the
+// const's real type — not a value-less untyped-int placeholder that
+// AssignableTo would silently accept against any integer target (the M6
+// false-accept).  Resolving before the rest of collection also makes a
+// const's folded value available when a struct field's array dimension
+// resolves, regardless of source order (the M3-residual struct-before-const
+// case).  Batch path only; the REPL keeps its park/retry resolution.
+func resolveTopLevelConsts(c @Checker, decls *[]@ast.Decl) {
+	var emptyResolving @[]@[]char
+	c.ConstResolving = emptyResolving
+	var emptyResolved @[]@[]char
+	c.ConstResolved = emptyResolved
+	registerConstPlaceholders(c, decls)
+	var names @[]@[]char
+	var cdecls @[]@ast.Decl
+	for i := 0; i < len(decls); i++ {
+		if decls[i].Kind == ast.DECL_CONST && decls[i].Value != nil {
+			names = slices.Append[@[]char](names, decls[i].Name)
+			cdecls = slices.Append[@ast.Decl](cdecls, decls[i])
+		}
+	}
+	for i := 0; i < len(names); i++ {
+		resolveConstByName(c, names[i], names, cdecls)
+	}
+}
+
+// resolveConstByName resolves the top-level const `name` to its real type
+// and value: it first resolves every other local top-level const its
+// initializer references (so they carry real types when checkConstDecl
+// folds this one), then runs checkConstDecl.  c.ConstResolving guards
+// against `const A = B; const B = A` cycles; c.ConstResolved memoizes
+// completed names.
+func resolveConstByName(c @Checker, name @[]char, names @[]@[]char,
+		cdecls @[]@ast.Decl) {
+	if nameInList(c.ConstResolved, name) { return }
+	if nameInList(c.ConstResolving, name) {
+		var cd @ast.Decl = findConstDecl(names, cdecls, name)
+		if cd != nil {
+			errConstCycle(c, cd.Pos, name)
+		}
+		c.ConstResolved = slices.Append[@[]char](c.ConstResolved, name)
+		return
+	}
+	var d @ast.Decl = findConstDecl(names, cdecls, name)
+	if d == nil { return }
+	c.ConstResolving = slices.Append[@[]char](c.ConstResolving, name)
+	var deps @[]@[]char
+	deps = collectConstDeps(d.Value, deps)
+	for i := 0; i < len(deps); i++ {
+		if nameInList(names, deps[i]) {
+			resolveConstByName(c, deps[i], names, cdecls)
+		}
+	}
+	checkConstDecl(c, d)
+	c.ConstResolving = c.ConstResolving[:len(c.ConstResolving) - 1]
+	c.ConstResolved = slices.Append[@[]char](c.ConstResolved, name)
+}
+
+// collectConstDeps appends the identifier names referenced by const-expr
+// `e` to `deps` (recursing through unary / binary operators and builtin /
+// call arguments).  Package-qualified selectors and type arguments are not
+// local consts, so any name collected that isn't a local top-level const is
+// simply ignored by the caller.
+func collectConstDeps(e @ast.Expr, deps @[]@[]char) @[]@[]char {
+	if e == nil { return deps }
+	if e.Kind == ast.EXPR_IDENT {
+		return slices.Append[@[]char](deps, e.Name)
+	}
+	if e.Kind == ast.EXPR_UNARY {
+		return collectConstDeps(e.X, deps)
+	}
+	if e.Kind == ast.EXPR_BINARY {
+		deps = collectConstDeps(e.X, deps)
+		return collectConstDeps(e.Y, deps)
+	}
+	if e.Kind == ast.EXPR_BUILTIN || e.Kind == ast.EXPR_CALL {
+		for i := 0; i < len(e.Args); i++ {
+			deps = collectConstDeps(e.Args[i], deps)
+		}
+		return deps
+	}
+	return deps
+}
+
+// nameInList reports whether `name` is present in `list`.
+func nameInList(list @[]@[]char, name @[]char) bool {
+	for i := 0; i < len(list); i++ {
+		if charEq(list[i], name) { return true }
+	}
+	return false
+}
+
+// findConstDecl returns the decl registered for top-level const `name`, or
+// nil if `name` is not a local top-level const (a builtin, an imported
+// const, a grouped member, or a non-const).
+func findConstDecl(names @[]@[]char, cdecls @[]@ast.Decl,
+		name @[]char) @ast.Decl {
+	for i := 0; i < len(names); i++ {
+		if charEq(names[i], name) { return cdecls[i] }
+	}
+	return nil
+}
+
+// errConstCycle reports a constant-definition cycle (`const A = B;
+// const B = A`).  Resolving such a const would otherwise recurse forever;
+// the cycle is broken at detection and reported here.
+func errConstCycle(c @Checker, pos token.Pos, name @[]char) {
+	var cb buf.CharBuf = buf.New()
+	cb = cb.WriteStr("constant definition cycle involving `")
+	cb = cb.WriteStr(name)
+	cb = cb.WriteStr("`")
+	addCheckError(c, pos, cb.Bytes())
 }

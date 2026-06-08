@@ -60,6 +60,18 @@ long-tail bugs that aren't a systematic product.
   (const materialization): plain var assignment / copy / deref-store / global
   initializer value correctness. Generator: `conformance/gen-aggregate-matrix.py`.
   See `aggregate/README.md`.
+- **`globals/`** — package-level global/static storage materialization across
+  type shapes (Code-Red-2 Class A). Axes `<storage>/<type>` where storage =
+  init / noinit / readonly and type sweeps scalars, aggregates, managed/iface/func
+  values, and the **named-wrapper** forms; assertion: the global compiles and
+  reads back its value on every backend (the named-over-aggregate cells are
+  red on LLVM — the codegen zero-token dispatch never peels `TYP_NAMED`).
+  Generator: `conformance/gen-globals-matrix.py`. See `globals/README.md`.
+- **`readonly/`** — the `readonly` type-modifier as a transparent wrapper
+  (Code-Red-2 Class B). Axes `<operation>/<shape>`; assertion: a readonly view
+  observes the same value / dispatch as the plain value (a missed `TYP_READONLY`
+  peel is a silent literal-0 read or a spurious compile error). Generator:
+  `conformance/gen-readonly-matrix.py`. See `readonly/README.md`.
 
 The runner discovers every `*.bn` under `conformance/matrix/` recursively, so
 adding a matrix needs no runner change.

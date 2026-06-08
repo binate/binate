@@ -597,6 +597,30 @@ def bitwise_cell(op, w, sign):
     return cell
 
 
+def neg_cell(w, sign):
+    # Unary minus `-x` at the operand width: the result type must be the
+    # operand's exact width, not host int (the analog of the `~` bug — see
+    # bitnot/Defect-9 in claude-todo).  Each value is checked directly and,
+    # like `~`, consumed through a `>> half` so an un-narrowed host-width
+    # negation (dirty upper bits) is exposed rather than masked by a re-narrow.
+    rng = LCG("neg", w, sign)
+    t = typ(w, sign)
+    vs = bit_values(w, sign, rng)
+    cell = Cell()
+    half = w // 2
+    for v in vs:
+        e = reinterp(uval(-v, w), w, sign)
+        cell.check(["\tvar v{i} %s = %d" % (t, v),
+                    "\tvar e{i} %s = %d" % (t, e)],
+                   "(-v{i}) == e{i}", "-%d -> %d" % (v, e))
+        es = shr_expected(e, half, w, sign)
+        cell.check(["\tvar v{i} %s = %d" % (t, v),
+                    "\tvar s{i} %s = %d" % (t, es)],
+                   "((-v{i}) >> %d) == s{i}" % half,
+                   "(-%d)>>%d -> %d" % (v, half, es))
+    return cell
+
+
 # --- driver -------------------------------------------------------------------
 
 def all_cells():
@@ -643,6 +667,11 @@ def all_cells():
                 yield ("bitwise/%s/%d/%s" % (op, w, sign),
                        "%s width=%d %s" % (op, w, sign),
                        bitwise_cell(op, w, sign))
+    for w in WIDTHS:
+        for sign in SIGNS:
+            yield ("neg/%d/%s" % (w, sign),
+                   "unary minus width=%d %s" % (w, sign),
+                   neg_cell(w, sign))
 
 
 def main():

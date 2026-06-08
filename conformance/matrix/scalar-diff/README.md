@@ -83,6 +83,9 @@ comparison result directly, so a failure already shows got-vs-want.)
   and relationals false on NaN; `!=` true on NaN; `+0 == -0`).
 - **bitwise** (`and`/`or`/`xor`/`not`) — the masked result; `~` also gets the
   `>>`-consume dirty-bits check (its complement overflows the width).
+- **neg** (unary minus `-x`) — the two's-complement negation at the operand
+  width, plus the `>>`-consume dirty-bits check (a host-width negation leaves
+  dirty upper bits — the unary-minus-result-type bug, the analog of `~`).
 
 ## Deliberately excluded (NOT guessed)
 
@@ -102,7 +105,7 @@ decision or per-target expecteds would be needed to cover them):
 
 ## Current state
 
-123 cells / 5415 tuples. The `all` modeset run found backend defects across
+131 cells / 5511 tuples. The `all` modeset run found backend defects across
 both build-outs; cell↔mode failures are pinned with `.xfail.<mode>` markers
 (verified non-stale via `run.sh --check-xpass`). One defect it surfaced was a
 *reference*-backend bug, since fixed:

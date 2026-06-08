@@ -74,6 +74,17 @@ CELLS = [
     ("noinit/named-managed-ptr", BOX + "\n\ntype P @Box", "var G P", ["0"], [0]),
     ("noinit/named-iface", IFACE_G + "\n\ntype H @Getter", "var G H", ["0"], [0]),
     ("noinit/named-func", "type Fn @func() int", "var G Fn", ["0"], [0]),
+    # named-distinct OVER a struct (TYP_NAMED → TYP_STRUCT — NOT a plain named
+    # struct, which is TYP_STRUCT directly). The one cell exercising BOTH codegen
+    # global fixes at once: discoverStructFromType's TYP_NAMED arm must reach the
+    # underlying struct through the global (no function references it) so
+    # `%bn_main__S` is declared, AND the static-zero dispatch must peel TYP_NAMED
+    # so the `%bn_main__S` slot gets `zeroinitializer`, not the invalid ` 0`.
+    # Compile assertion (read `0`): field access on a named-distinct VALUE is a
+    # separate unratified spec question (claude-todo), so main does not read G's
+    # fields — which also keeps the struct reachable ONLY via the global, the
+    # condition that isolates the discovery path.
+    ("noinit/named-struct", STRUCT_S + "\n\ntype NS S", "var G NS", ["0"], [0]),
 
     # --- readonly global (overlaps Class B readonly field-read) ---
     ("readonly/struct", STRUCT_S, "var G readonly S = S{10, 20}", ["G.a", "G.b"], [10, 20]),

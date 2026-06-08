@@ -17,7 +17,7 @@
 #
 #   <version>-<platform>/
 #     bin/{bnc,bni,bnas,bnlint}   the release binaries
-#     lib/pkg/                    self-host compiler sources
+#     lib/pkg/bootstrap/          pkg/bootstrap — backs print/println
 #     lib/runtime/                C runtime (binate_runtime.c + stubs)
 #     lib/ifaces/{core,stdlib}/   .bni interfaces (builtins + stdlib)
 #     lib/impls/{core,stdlib}/    implementations
@@ -130,7 +130,14 @@ done
 # the source layout intact so a consumer resolves the bundle directly
 # with -I <lib>/ifaces/... -L <lib>/impls/... (see BUNDLE-HOWTO.md).
 echo "==> assembling lib/"
-cp -R "$BINATE_DIR/pkg"     "$dest/lib/pkg"
+# Of pkg/, ship only pkg/bootstrap: it backs print/println (IR-gen emits
+# direct calls into it), so it must resolve against the bundle.  The rest
+# of pkg/ is the compiler's own source (pkg/binate/*); shipping it would
+# make compiler internals importable by every bundle consumer through the
+# bare-root -I entry, so it stays out.
+mkdir -p "$dest/lib/pkg"
+cp -R "$BINATE_DIR/pkg/bootstrap"     "$dest/lib/pkg/bootstrap"
+cp    "$BINATE_DIR/pkg/bootstrap.bni" "$dest/lib/pkg/bootstrap.bni"
 cp -R "$BINATE_DIR/runtime" "$dest/lib/runtime"
 cp -R "$BINATE_DIR/ifaces"  "$dest/lib/ifaces"
 cp -R "$BINATE_DIR/impls"   "$dest/lib/impls"

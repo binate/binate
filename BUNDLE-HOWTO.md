@@ -22,7 +22,7 @@ lib/
   impls/core/       core implementations:  common, libc, baremetal
   impls/stdlib/     stdlib implementations: common, libc
   runtime/          binate_runtime.c (+ baremetal_arm32/ for that target)
-  pkg/              self-host compiler sources (rebuild the toolchain from itself)
+  pkg/bootstrap/    print/println support (pkg/bootstrap)
 ```
 
 Put `bin/` on your `PATH`; everything else is reached through the search paths
@@ -46,8 +46,7 @@ RT="$LIB/runtime/binate_runtime.c"   # bnc only — linked into the executable
 
 What each entry covers:
 
-- `$LIB` (the bare root) — `pkg/bootstrap` (backs `print`/`println`) and the
-  self-host `pkg/binate/*` sources.
+- `$LIB` (the bare root) — `pkg/bootstrap`, which backs `print`/`println`.
 - `ifaces/core` + `impls/core/*` — the builtins (`pkg/builtins/*`).
 - `ifaces/stdlib` + `impls/stdlib/common` — the bundled stdlib
   (`pkg/std/strconv`, `pkg/std/errors`, …).

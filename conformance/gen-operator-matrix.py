@@ -107,10 +107,45 @@ def compound_cells():
             yield (os.path.join("compound", opname, lvname), helpers, body, [expected])
 
 
+def _relop(name, a, b):
+    if name == "lt":
+        return a < b
+    if name == "gt":
+        return a > b
+    if name == "le":
+        return a <= b
+    return a >= b  # ge
+
+
+def binary_rel_cells():
+    """Relational op × operand-POSITION × signed width. The untyped-int literal
+    on the LEFT of a signed operand must use a SIGNED comparison (`5 < x` for
+    `x = -1` is false); the bug `b54c9fdf` fixed made it unsigned. The lit-left
+    cells guard that fix; lit-right is the control. Signed operands only (the
+    signedness is what the literal-position bug turns on)."""
+    LIT = 5
+    X = -1
+    relops = [("lt", "<"), ("gt", ">"), ("le", "<="), ("ge", ">=")]
+    for opname, opsym in relops:
+        for pos in ("lit-left", "lit-right"):
+            for tname in ("int", "int8"):
+                if pos == "lit-left":
+                    expr = f"{LIT} {opsym} x"
+                    res = _relop(opname, LIT, X)
+                else:
+                    expr = f"x {opsym} {LIT}"
+                    res = _relop(opname, X, LIT)
+                body = [f"var x {tname} = {X}", f"println(cast(int, {expr}))"]
+                yield (os.path.join("rel", opname, pos, tname), "", body,
+                       [1 if res else 0])
+
+
 def all_cells():
     for c in cells():
         yield c
     for c in compound_cells():
+        yield c
+    for c in binary_rel_cells():
         yield c
 
 

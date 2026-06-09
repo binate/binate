@@ -83,6 +83,37 @@ def cells():
                 yield (os.path.join(opname, wrapper, tname), helpers, body, expected)
 
 
+def compound_cells():
+    """Compound-assign × lvalue-form: does a guard/fix on the `ident` lvalue
+    (e.g. the overshift guard, `fa265629`) reach the field/index lvalue forms?
+    The overshift cells (`x <<= 40` etc.) are the path-parity-sensitive ones; the
+    `add` cells are controls that the lvalue forms work for compound-assign."""
+    lvals = [
+        ("ident", "", ["var L uint32 = {init}"], "L"),
+        ("field", "type S struct {\n\tf uint32\n}", ["var s S", "s.f = {init}"], "s.f"),
+        ("index", "", ["var a [2]uint32", "a[1] = {init}"], "a[1]"),
+    ]
+    # (opname, opsym, init, operand, spec-result)
+    ops = [
+        ("shl-overshift", "<<=", 1, 40, 0),    # count 40 >= width 32 -> spec 0
+        ("shr-overshift", ">>=", 256, 40, 0),  # logical shift, overshift -> 0
+        ("add", "+=", 10, 5, 15),              # control
+    ]
+    for opname, opsym, init, operand, expected in ops:
+        for lvname, helpers, setup, ref in lvals:
+            body = [s.format(init=init) for s in setup]
+            body.append(f"{ref} {opsym} {operand}")
+            body.append(f"println(cast(int, {ref}))")
+            yield (os.path.join("compound", opname, lvname), helpers, body, [expected])
+
+
+def all_cells():
+    for c in cells():
+        yield c
+    for c in compound_cells():
+        yield c
+
+
 def render(rel, helpers, body):
     out = HEADER.format(desc=rel)
     if helpers:
@@ -98,7 +129,7 @@ def main():
     check = "--check" in sys.argv[1:]
     changed = []
     n = 0
-    for rel, helpers, body, expected in cells():
+    for rel, helpers, body, expected in all_cells():
         n += 1
         bn = render(rel, helpers, body)
         exp = "".join(str(x) + "\n" for x in expected)

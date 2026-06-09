@@ -114,6 +114,33 @@ def all_cells():
         yield c
 
 
+_IFACE_EQ = ("interface G {\n\tget() int\n}\n\n"
+             "type I struct {\n\tv int\n}\n\n"
+             "func (i *I) get() int {\n\treturn i.v\n}\n\n"
+             "impl *I : G")
+
+# (name, helpers, decl-a, decl-b, expected error substring). `==`/`!=` on an
+# aggregate must be REJECTED at the checker (the codegen invalid-`icmp` bug is
+# gone — binate `60719e01`); these `.error` cells regression-guard that reject.
+EQ_TYPES = [
+    ("raw-slice", "", "var a *[]int", "var b *[]int", "slices cannot be compared"),
+    ("managed-slice", "", "var a @[]int", "var b @[]int", "slices cannot be compared"),
+    ("func-value", "func mk() int {\n\treturn 1\n}",
+     "var a @func() int = mk", "var b @func() int = mk",
+     "function values cannot be compared"),
+    ("iface", _IFACE_EQ, "var a @G = make(I)", "var b @G = make(I)",
+     "interface values cannot be compared"),
+    ("struct", "type S struct {\n\tx int\n}", "var a S", "var b S",
+     "comparing struct values"),
+]
+
+
+def error_cells():
+    for name, helpers, da, db, err in EQ_TYPES:
+        body = [da, db, "var c bool = a == b", "println(cast(int, c))"]
+        yield (os.path.join("eq-reject", name), helpers, body, err)
+
+
 def render(rel, helpers, body):
     out = HEADER.format(desc=rel)
     if helpers:
@@ -136,6 +163,22 @@ def main():
         full = os.path.join(DIR, rel)
         os.makedirs(os.path.dirname(full), exist_ok=True)
         for ext, content in ((".bn", bn), (".expected", exp)):
+            path = full + ext
+            old = None
+            if os.path.exists(path):
+                with open(path) as f:
+                    old = f.read()
+            if old != content:
+                changed.append(os.path.relpath(path, os.path.dirname(DIR)))
+                if not check:
+                    with open(path, "w") as f:
+                        f.write(content)
+    for rel, helpers, body, err in error_cells():
+        n += 1
+        bn = render(rel, helpers, body)
+        full = os.path.join(DIR, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        for ext, content in ((".bn", bn), (".error", err + "\n")):
             path = full + ext
             old = None
             if os.path.exists(path):

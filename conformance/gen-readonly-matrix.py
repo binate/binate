@@ -24,6 +24,7 @@ import sys
 DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matrix", "readonly")
 
 STRUCT_S = "type S struct {\n\ta int\n\tb int\n}"
+STRUCT_BIG = "type Big struct {\n\ta int\n\tb int\n\tc int\n}"
 BOX = "type Box struct {\n\tv int\n}"
 BOX_M = BOX + "\n\nfunc (b *Box) getV() int {\n\treturn b.v\n}"
 IFACE_G = ("interface Getter {\n\tget() int\n}\n\n"
@@ -67,6 +68,17 @@ CELLS = [
     # --- pass a value to a readonly parameter, read a field inside ---
     ("pass-arg/value-struct", STRUCT_S + "\n\nfunc readA(s readonly S) int {\n\treturn s.a\n}",
      ["var s S", "s.a = 7", "println(readA(s))"], [7]),
+
+    # --- pass a >16-byte value to a readonly parameter: exercises the
+    #     >16-byte indirect (byval-by-pointer) calling convention.  The
+    #     readonly wrapper must peel in isByvalParam, or the aggregate is
+    #     lowered by value and the callee reads garbage (reads the first
+    #     AND last field so a partial/wrong copy can't slip through). ---
+    ("pass-arg/value-struct-large",
+     STRUCT_BIG + "\n\nfunc readA(s readonly Big) int {\n\treturn s.a\n}"
+     + "\n\nfunc readC(s readonly Big) int {\n\treturn s.c\n}",
+     ["var s Big", "s.a = 7", "s.b = 8", "s.c = 9",
+      "println(readA(s))", "println(readC(s))"], [7, 9]),
 
     # --- wrapper-ORDER: the modifier on the POINTEE (`@readonly Box` / `*readonly
     #     Box`), not the pointer (`readonly @Box`). The inner-pointee variants the

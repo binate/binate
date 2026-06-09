@@ -19,7 +19,9 @@ dropping or swapping a word, so a later dispatch hits a nil/garbage vtable.
 - **`<operation>`** — where the value crosses a boundary before it is invoked:
   `direct` (none) · `copy` (assignment) · `return` (return copy-back) · `arg`
   (arg-marshal) · `return-arg` (returned **then** passed directly) · `field`
-  (struct-field store + extract) · `array-elem` (array-element store + index).
+  (struct-field store + extract) · `array-elem` (array-element store + index) ·
+  `global` (package-level global materialization — the storage must be sized
+  for both words and zero-filled before `__init` stores the value).
 
 Assertion: **both words survive every operation** — observed by INVOKING the
 value (call the func / call the iface method) after it crosses the boundary. A

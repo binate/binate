@@ -17,10 +17,11 @@ expects `42`.
 
 Axes:  conformance/matrix/addr-aggregate/<kind>/<operation>.bn
   kind:      func-value (@func) · iface-value (@Iface)
-  operation: direct · copy · return · arg · return-arg · field · array-elem
+  operation: direct · copy · return · arg · return-arg · field · array-elem ·
+             global
              (where the value crosses: none / assignment / return-copy-back /
               arg-marshal / returned-then-passed / struct-field store+extract /
-              array-element store+index)
+              array-element store+index / package-level global materialization)
 
 Coordinate-addressed (path = identity); regeneration is idempotent and never
 touches `.xfail.<mode>`. Run: `python3 conformance/gen-addr-aggregate-matrix.py`.
@@ -87,11 +88,27 @@ def body(k, op):
     if op == "array-elem":      # stored in an array element, then indexed
         return ["var v %s = %s" % (t, inl), "var arr [1]%s" % t,
                 "arr[0] = v", "println(%s)" % inv("arr[0]")]
+    if op == "global":          # value lives in a package-level global var
+        return ["println(%s)" % inv("gv")]
     raise ValueError(op)
 
 
+def top_decl(k, op):
+    """Extra top-level declarations beyond the kind's shared decls.  Only the
+    `global` operation needs one: a package-level var of the 2-word type,
+    initialized through the producer (mkv).  This exercises the backend's
+    global-materialization path — the storage must be sized for BOTH words
+    (SizeOf peels readonly/named wrappers and reports 2 words for @func/@Iface)
+    and zero-filled before __init stores mkv's result; a global mis-sized to one
+    word (the codegen/VM wrapper-transparency gap) drops a word and faults or
+    returns wrong.  Other operations keep the value in a local."""
+    if op == "global":
+        return "\n\nvar gv %s = mkv()" % k["tname"]
+    return ""
+
+
 OPERATIONS = ["direct", "copy", "return", "arg", "return-arg", "field",
-              "array-elem"]
+              "array-elem", "global"]
 
 HEADER = """package "main"
 
@@ -108,7 +125,7 @@ def all_cells():
     for kind_name, k in KINDS:
         for op in OPERATIONS:
             yield (os.path.join(kind_name, op),
-                   kind_name, op, k["decls"], body(k, op))
+                   kind_name, op, k["decls"] + top_decl(k, op), body(k, op))
 
 
 def render(kind_name, op, decls, lines):

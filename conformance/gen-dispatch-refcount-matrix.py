@@ -84,6 +84,53 @@ CELLS = [
       "println(g.num())",
       "var c2 @Counter = make(Counter)", "var drp @Numbered = c2", "g = drp",
       "println(cast(int, rt.Refcount(po) == before))"]),
+
+    ("iface-dispatch/managed-slice",
+     "interface Maker {\n\tmk() (int, @[]int)\n}\n\n"
+     "type Impl struct {\n\ts @[]int\n}\n\n"
+     "func (im *Impl) mk() (int, @[]int) {\n\treturn 0, im.s\n}\n\n"
+     "impl *Impl : Maker",
+     ["var src @[]int = make_slice(int, 3)", "src[0] = 42",
+      "var hp *int = bit_cast(*int, &src)",
+      "var po *uint8 = bit_cast(*uint8, hp[2])",
+      "var im @Impl = make(Impl)", "im.s = src", "var m @Maker = im",
+      "var before int = rt.Refcount(po)",
+      "var x int", "var g @[]int", "x, g = m.mk()",
+      "println(cast(int, rt.Refcount(po) == before + 1))",
+      "println(g[0])",
+      "var drp @[]int = make_slice(int, 1)", "g = drp",
+      "println(cast(int, rt.Refcount(po) == before))"]),
+
+    # --- funcval producer (a NON-capturing func reading a global — a capturing
+    #     closure returning a multi-return is the separate LLVM bug filed in
+    #     claude-todo CRITICAL). ---
+    ("funcval/managed-ptr",
+     "type Counter struct {\n\tn int\n}\n\n"
+     "var gc @Counter = make(Counter)\n\n"
+     "func produce() (int, @Counter) {\n\treturn 0, gc\n}",
+     ["gc.n = 42",
+      "var po *uint8 = bit_cast(*uint8, gc)",
+      "var before int = rt.Refcount(po)",
+      "var f @func() (int, @Counter) = produce",
+      "var x int", "var g @Counter", "x, g = f()",
+      "println(cast(int, rt.Refcount(po) == before + 1))",
+      "println(g.n)",
+      "var drp @Counter = make(Counter)", "g = drp",
+      "println(cast(int, rt.Refcount(po) == before))"]),
+
+    ("funcval/managed-slice",
+     "var gs @[]int = make_slice(int, 3)\n\n"
+     "func produce() (int, @[]int) {\n\treturn 0, gs\n}",
+     ["gs[0] = 42",
+      "var hp *int = bit_cast(*int, &gs)",
+      "var po *uint8 = bit_cast(*uint8, hp[2])",
+      "var before int = rt.Refcount(po)",
+      "var f @func() (int, @[]int) = produce",
+      "var x int", "var g @[]int", "x, g = f()",
+      "println(cast(int, rt.Refcount(po) == before + 1))",
+      "println(g[0])",
+      "var drp @[]int = make_slice(int, 1)", "g = drp",
+      "println(cast(int, rt.Refcount(po) == before))"]),
 ]
 EXPECTED = [1, 42, 1]
 

@@ -80,6 +80,12 @@ long-tail bugs that aren't a systematic product.
   cells are red — `getIndexElemType` doesn't recurse the nested base, so
   `a[i][j].f` reads 0 / writes nowhere). Generator:
   `conformance/gen-nested-index-matrix.py`. See `nested-index/README.md`.
+- **`operator/`** — operator lowering across the `op × width/sign × wrapper` grid
+  (Code-Red-2 Class C, the targeted layer). Currently the unary sub-grid
+  (`neg`/`bitnot` × widths × plain/named); assertion: the unary result equals the
+  spec value at the operand's width (the named sub-word `neg` cells are red on
+  LLVM — the MINUS arm never peels `TYP_NAMED`). Generator:
+  `conformance/gen-operator-matrix.py`. See `operator/README.md`.
 
 The runner discovers every `*.bn` under `conformance/matrix/` recursively, so
 adding a matrix needs no runner change.

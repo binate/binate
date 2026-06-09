@@ -70,8 +70,16 @@ long-tail bugs that aren't a systematic product.
 - **`readonly/`** — the `readonly` type-modifier as a transparent wrapper
   (Code-Red-2 Class B). Axes `<operation>/<shape>`; assertion: a readonly view
   observes the same value / dispatch as the plain value (a missed `TYP_READONLY`
-  peel is a silent literal-0 read or a spurious compile error). Generator:
+  peel is a silent literal-0 read or a spurious compile error). Includes the
+  Round-2 wrapper-order (`@readonly Box` vs `readonly @Box`), alias-receiver, and
+  readonly-iface-construct sibling axes. Generator:
   `conformance/gen-readonly-matrix.py`. See `readonly/README.md`.
+- **`nested-index/`** — field/element access through a (possibly nested) array
+  index base (Code-Red-2 path-parity family). Axes `<op>/<shape>`; assertion: a
+  field/element reads back its written value (the nested-`[N][M]` × field-selector
+  cells are red — `getIndexElemType` doesn't recurse the nested base, so
+  `a[i][j].f` reads 0 / writes nowhere). Generator:
+  `conformance/gen-nested-index-matrix.py`. See `nested-index/README.md`.
 
 The runner discovers every `*.bn` under `conformance/matrix/` recursively, so
 adding a matrix needs no runner change.

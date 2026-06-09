@@ -41,12 +41,20 @@ ABI_DIR = os.path.join(
 
 
 def _print(t, expr):
-    # Print a field/value of type t as an int (sub-word/unsigned need a cast).
+    # Print a field/value of type t as an int (sub-word/unsigned/float need a cast).
     return f"println({expr})" if t == "int" else f"println(cast(int, {expr}))"
 
 
+def _lit(tname, v):
+    # The Binate literal for a multi-return value.  A float type needs a
+    # float literal (`100.0`) so the return is float-typed and packs into an
+    # FP register (D/XMM); the printed/expected value stays the int form
+    # (each cell prints cast(int, field)).
+    return f"{v}.0" if tname == "f64" else str(v)
+
+
 # --- multi-return: type x arity ---
-MR_TYPES = {"int": "int", "u16": "uint16"}
+MR_TYPES = {"int": "int", "u16": "uint16", "f64": "float64"}
 MR_ARITIES = [2, 3, 4, 5]
 
 
@@ -70,7 +78,7 @@ def mr_cell(tname, arity, form="short"):
     vals = [mr_value(tname, i) for i in range(arity)]
     names = [f"a{i}" for i in range(arity)]
     helper = (f"func mr() ({', '.join([typ] * arity)}) {{\n"
-              f"\treturn {', '.join(str(v) for v in vals)}\n}}")
+              f"\treturn {', '.join(_lit(tname, v) for v in vals)}\n}}")
     body = _bind(typ, names, "mr()", form)
     body += [_print(typ, n) for n in names]
     return helper, body, vals
@@ -188,7 +196,7 @@ def _mr_method_sig(tname, arity):
     typ = MR_TYPES[tname]
     vals = [mr_value(tname, i) for i in range(arity)]
     sig = ", ".join([typ] * arity)
-    ret = ", ".join(str(v) for v in vals)
+    ret = ", ".join(_lit(tname, v) for v in vals)
     return typ, vals, sig, ret
 
 

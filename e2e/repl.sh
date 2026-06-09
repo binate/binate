@@ -1000,6 +1000,24 @@ println(repldemo.Double(5))
 > 10
 > "
 
+# --- Case 48 (Plan-B B3: REPL parked-member iota-repeat).  B0 = M<<iota
+# parks (pending M); the bare B1 repeats B0's M-dependent initializer, so
+# it parks too.  When M=2 arrives both resolve, and B1 must be the
+# REPEATED value 2<<1 = 4 — NOT the plain iota index 1 (the pre-fix bug).
+# Transcript verified by driving a gen1-built bni manually. ---
+run_repl "tier3-pending-const-group-bare-iota-repeat" \
+"const ( B0 int = M << iota; B1 )
+const M int = 2
+println(B1)
+" \
+"$BANNER
+> constant B0 parked (pending: M)
+constant B1 parked (pending: M)
+> constant B0 resolved
+constant B1 resolved
+> 4
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # (Stage 2) as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

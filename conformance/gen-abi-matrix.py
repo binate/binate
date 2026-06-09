@@ -54,13 +54,24 @@ def mr_value(tname, i):
     return (i + 1) * (10 if tname == "int" else 100)
 
 
-def mr_cell(tname, arity):
+def _bind(typ, names, callexpr, form):
+    # The binding statement(s) for a multi-return RHS.  "short" => `:=`;
+    # "assign" => pre-declared vars + `=`.  The `=` form goes through
+    # genMultiAssign, which — for an iface/func-value RHS (no callee name) —
+    # must derive component types from the multi-return tuple struct, else a
+    # non-int component is mistyped (invalid IR / skipped managed RefInc).
+    if form == "short":
+        return [f"{', '.join(names)} := {callexpr}"]
+    return [f"var {n} {typ}" for n in names] + [f"{', '.join(names)} = {callexpr}"]
+
+
+def mr_cell(tname, arity, form="short"):
     typ = MR_TYPES[tname]
     vals = [mr_value(tname, i) for i in range(arity)]
     names = [f"a{i}" for i in range(arity)]
     helper = (f"func mr() ({', '.join([typ] * arity)}) {{\n"
               f"\treturn {', '.join(str(v) for v in vals)}\n}}")
-    body = [f"{', '.join(names)} := mr()"]
+    body = _bind(typ, names, "mr()", form)
     body += [_print(typ, n) for n in names]
     return helper, body, vals
 
@@ -181,7 +192,7 @@ def _mr_method_sig(tname, arity):
     return typ, vals, sig, ret
 
 
-def iface_multi_return_cell(tname, arity):
+def iface_multi_return_cell(tname, arity, form="short"):
     # Return an N-tuple FROM an interface-method dispatch — the empty
     # {indirect call} × {multi-value result} cell that hid the
     # multi-return-dispatch defect.
@@ -190,17 +201,17 @@ def iface_multi_return_cell(tname, arity):
     helper = ("type Impl struct {\n\tn int\n}\n\n"
               + f"func (im *Impl) mr() ({sig}) {{\n\treturn {ret}\n}}\n\n"
               + f"interface Multi {{\n\tmr() ({sig})\n}}\n\nimpl *Impl : Multi")
-    body = ["var m @Multi = make(Impl)", f"{', '.join(names)} := m.mr()"]
+    body = ["var m @Multi = make(Impl)"] + _bind(typ, names, "m.mr()", form)
     body += [_print(typ, n) for n in names]
     return helper, body, vals
 
 
-def funcval_multi_return_cell(tname, arity):
+def funcval_multi_return_cell(tname, arity, form="short"):
     # Return an N-tuple THROUGH a function-value call.
     typ, vals, sig, ret = _mr_method_sig(tname, arity)
     names = [f"a{i}" for i in range(arity)]
     helper = f"func mr() ({sig}) {{\n\treturn {ret}\n}}"
-    body = [f"var f @func() ({sig}) = mr", f"{', '.join(names)} := f()"]
+    body = [f"var f @func() ({sig}) = mr"] + _bind(typ, names, "f()", form)
     body += [_print(typ, n) for n in names]
     return helper, body, vals
 
@@ -230,6 +241,23 @@ def all_cells():
             helper, body, vals = funcval_multi_return_cell(tname, arity)
             yield (os.path.join("funcval-multi-return", tname, str(arity)),
                    f"multi-return via function-value call, type={tname}, arity={arity}",
+                   helper, body, vals)
+            # `=` (assignment) binding form — exercises genMultiAssign (the
+            # `:=` cells above exercise genShortVar).  For an iface/func-value
+            # RHS this is the path that mistyped non-int components before
+            # `f8916b88`; the same-IR property means each cell's per-mode
+            # pass/xfail matches its `:=` sibling (xfail markers mirrored).
+            helper, body, vals = mr_cell(tname, arity, "assign")
+            yield (os.path.join("multi-return-assign", tname, str(arity)),
+                   f"multi-return (= assign form), type={tname}, arity={arity}",
+                   helper, body, vals)
+            helper, body, vals = iface_multi_return_cell(tname, arity, "assign")
+            yield (os.path.join("iface-multi-return-assign", tname, str(arity)),
+                   f"multi-return via interface dispatch (= assign form), type={tname}, arity={arity}",
+                   helper, body, vals)
+            helper, body, vals = funcval_multi_return_cell(tname, arity, "assign")
+            yield (os.path.join("funcval-multi-return-assign", tname, str(arity)),
+                   f"multi-return via function-value call (= assign form), type={tname}, arity={arity}",
                    helper, body, vals)
     for name, fields in STRUCTS:
         helper, body, vals = struct_return_cell(fields)

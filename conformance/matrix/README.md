@@ -86,6 +86,13 @@ long-tail bugs that aren't a systematic product.
   spec value at the operand's width (the named sub-word `neg` cells are red on
   LLVM — the MINUS arm never peels `TYP_NAMED`). Generator:
   `conformance/gen-operator-matrix.py`. See `operator/README.md`.
+- **`dispatch-refcount/`** — refcount BALANCE of a managed multi-return component
+  produced through an indirect call (Code-Red-2 §3.4). Axes `<producer>/<component>`;
+  assertion: the component arrives with one added ref and is released on drop
+  (`after == before+1`, `final == before`), on every backend. Closes the
+  refcount-through-dispatch gap the value-only `abi` matrix can't see (all green —
+  the discipline is sound). Generator:
+  `conformance/gen-dispatch-refcount-matrix.py`. See `dispatch-refcount/README.md`.
 
 The runner discovers every `*.bn` under `conformance/matrix/` recursively, so
 adding a matrix needs no runner change.

@@ -10,8 +10,8 @@ runner_run() {
     # cmd/bni) and inner (cmd/bni interpreting the test) invocations —
     # bare $BINATE_DIR misses the ifaces/impls split (pkg-layout
     # migration), so cmd/bni itself failed to resolve its stdlib imports.
-    ip="$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib"
-    lp="$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common"
+    ip="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
+    lp="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
     "$COMPILED_INTERP" -I "$ip" -L "$lp" "$BINATE_DIR/cmd/bni" -- -I "$ip" -L "$lp" "$bn" 2>&1
 }
 

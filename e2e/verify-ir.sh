@@ -30,8 +30,8 @@ for cmd in bnc bni bnas bnlint; do
     out="$(mktemp -u)"
     echo "=== gen1 --verify-ir: cmd/$cmd (+ transitive deps) ==="
     if "$GEN1_COMPILER" --verify-ir \
-            -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
-            -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
+            -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
+            -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
             --build-dir "$bdir" -o "$out" "$BINATE_DIR/cmd/$cmd"; then
         echo "OK: cmd/$cmd verified clean"
     else

@@ -95,8 +95,8 @@ mkdir -p "$GEN1_DIR/build"
 # Core stays current-first (compiler-coupled, not a bundled component).
 # Mirrors scripts/lib/build-compilers.sh build_gen1; keep them in lockstep.
 gen1_log=$("$BUILDER" \
-    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
-    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
+    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
+    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
     "$BINATE_DIR/cmd/bnc" -- \
     -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BUILDER_LIB/ifaces/stdlib:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB:$BUILDER_LIB/ifaces/core" \
     -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BUILDER_LIB/impls/stdlib/common:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB:$BUILDER_LIB/impls/core/common:$BUILDER_LIB/impls/core/libc" \
@@ -113,8 +113,8 @@ fi
 # Build a native bni binary up front; (b) and (c) both need it.
 BNI_BIN="$TMP/bni-bin"
 bni_compile_log=$("$GEN1_BNC" \
-    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
-    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
+    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
+    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
     --build-dir "$BUILD_DIR" -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1) || true
 if [ ! -x "$BNI_BIN" ]; then
     echo "FAIL: could not build bni:"
@@ -128,8 +128,8 @@ fi
 # the checkout's binate_runtime.c on its own.
 NATIVE_BIN="$TMP/print_args-bin"
 native_compile_log=$("$GEN1_BNC" \
-    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" \
-    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
+    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
+    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
     --runtime "$BINATE_DIR/runtime/binate_runtime.c" \
     --build-dir "$BUILD_DIR" -o "$NATIVE_BIN" "$TMP/print_args.bn" 2>&1) || true
 if [ -x "$NATIVE_BIN" ]; then
@@ -142,7 +142,7 @@ fi
 check "native" "$actual"
 
 # ----- (b) compiled bni interprets print_args.bn ------------------
-actual=$("$BNI_BIN" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" "$TMP/print_args.bn" -- \
+actual=$("$BNI_BIN" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" "$TMP/print_args.bn" -- \
     alpha beta gamma 2>&1) || true
 check "bni" "$actual"
 

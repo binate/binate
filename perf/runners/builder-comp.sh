@@ -18,7 +18,7 @@ runner_compile() {
     # bootstrap.formatInt64) + pkg/binate/*; the ifaces/impls entries
     # resolve the split stdlib.  -I/-L of the test dir alone could not
     # link these, so every int-printing perf test failed.
-    out=$("$GEN1_COMPILER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
+    out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
         --build-dir "$bdir" -o "$tmpbin" "$bn" 2>&1)
     rc=$?
     rm -rf "$bdir"

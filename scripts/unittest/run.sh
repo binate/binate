@@ -221,6 +221,7 @@ passed=0
 failed=0
 xfailed=0
 skipped=0
+pkgskipped=0
 failures=""
 
 # Counter for the shard's modulo selection.  Incremented for every
@@ -265,6 +266,26 @@ for pkg in $PACKAGES; do
             printf "x"
         fi
         xfailed=$((xfailed + 1))
+        continue
+    fi
+
+    # Whole-package skip file: <pkg-key>.skip-pkg.<mode>.  Distinct from
+    # .xfail (which asserts the package FAILS — and XPASS-errors if it
+    # ever passes) and from .skip (which drops individual tests but still
+    # runs the package): .skip-pkg omits the whole package from this mode
+    # because it is too slow to run here (a pathological double-VM blowup
+    # that times out the shard).  It is NOT a failure — the tests pass,
+    # they're just not run in this lane — and it is tracked for re-adding
+    # once the package is optimized.  Contents are a one-line reason.
+    skippkg_file="$SCRIPT_DIR/${xfail_key}.skip-pkg.${MODE}"
+    if [ -f "$skippkg_file" ]; then
+        reason="$(cat "$skippkg_file")"
+        if [ "$VERBOSE" -eq 1 ]; then
+            echo "SKIP-PKG: $pkg ($reason)"
+        elif [ "$QUIET" -eq 0 ]; then
+            printf "s"
+        fi
+        pkgskipped=$((pkgskipped + 1))
         continue
     fi
 
@@ -315,7 +336,7 @@ shard_suffix=""
 if [ "$SHARD_COUNT" -gt 0 ]; then
     shard_suffix=" (shard $SHARD_IDX/$SHARD_COUNT)"
 fi
-echo "=== Summary ($MODE)$shard_suffix: $passed passed, $failed failed, $xfailed xfail, $skipped skipped ==="
+echo "=== Summary ($MODE)$shard_suffix: $passed passed, $failed failed, $xfailed xfail, $skipped skipped, $pkgskipped pkg-skipped ==="
 if [ $failed -gt 0 ]; then
     echo "Failures:$failures"
     exit 1

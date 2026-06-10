@@ -104,6 +104,7 @@ build_list() {   # $1 = iface | impl
             printf '%s\n' "$BASE/impls/core/common"
             printf '%s\n' "$BASE/impls/core/libc"
             printf '%s\n' "$BASE/impls/stdlib/common"
+            printf '%s\n' "$BASE/impls/stdlib/libc"
         fi
         printf '%s' "$APPEND"
     } | join_dedup

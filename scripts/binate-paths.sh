@@ -12,7 +12,7 @@
 #
 # Usage:
 #   binate-paths [--base DIR] [--prepend PATH]... [--append PATH]...
-#                [--iface | --impl | --runtime] [--export]
+#                [--target KEY] [--iface | --impl | --runtime] [--export]
 #
 #   --base DIR     The layout base.  Default: self-locate relative to this
 #                  script — `<dir>/../lib` (a bundle's bin/) or `<dir>/..`
@@ -21,6 +21,12 @@
 #                  A project source root is `--prepend "$root"`.
 #   --append PATH  Append PATH to -I and -L (repeatable) — a fallback for a
 #                  package the base does not ship.
+#   --target KEY   Select the per-target metadata tree (ifaces/targets/KEY)
+#                  for pkg/builtins/build, prepended to -I.  KEY is a bnc
+#                  --target key (e.g. arm32-linux), or "host"/omitted to
+#                  auto-detect the host via uname.  Pass the SAME key you
+#                  pass to `bnc --target` so build.bni matches the codegen
+#                  layout.  No effect on -L or --runtime (build has no impl).
 #   --iface        Print only the -I value.
 #   --impl         Print only the -L value.
 #   --runtime      Print only the --runtime file (ignores --prepend/--append).
@@ -49,6 +55,7 @@ SELECTOR=""          # iface | impl | runtime | "" (eval block)
 EXPORT=""
 PREPEND=""           # newline-terminated entries
 APPEND=""            # newline-terminated entries
+TARGET=""            # bnc --target key, "host", or "" (auto-detect)
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -62,6 +69,8 @@ while [ $# -gt 0 ]; do
 "; shift 2 ;;
         --append=*)  APPEND="$APPEND${1#--append=}
 "; shift ;;
+        --target)    TARGET="$2"; shift 2 ;;
+        --target=*)  TARGET="${1#--target=}"; shift ;;
         --iface)     SELECTOR=iface; shift ;;
         --impl)      SELECTOR=impl; shift ;;
         --runtime)   SELECTOR=runtime; shift ;;
@@ -87,6 +96,40 @@ fi
 [ -d "$BASE/ifaces" ] || {
     echo "$prog: base '$BASE' has no ifaces/ (not a layout base)" >&2; exit 1; }
 
+# Resolve the per-target metadata tree (pkg/builtins/build) into TARGET_DIR,
+# the directory to prepend to -I (empty when none applies).  An explicit
+# --target KEY must name an existing ifaces/targets/KEY (typos are a hard
+# error); "host"/omitted auto-detects via uname and silently yields no tree
+# on an unrecognised host (so a `pkg/builtins/build` import fails with a
+# clear not-found rather than the wrong layout).
+TARGET_DIR=""
+resolve_target() {
+    rt_key="$TARGET"
+    if [ -z "$rt_key" ] || [ "$rt_key" = host ]; then
+        case "$(uname -s 2>/dev/null)" in
+            Darwin) rt_os=darwin ;;
+            Linux)  rt_os=linux ;;
+            *)      rt_os="" ;;
+        esac
+        case "$(uname -m 2>/dev/null)" in
+            arm64|aarch64) rt_arch=aarch64 ;;
+            x86_64|amd64)  rt_arch=x86_64 ;;
+            *)             rt_arch="" ;;
+        esac
+        [ -n "$rt_os" ] && [ -n "$rt_arch" ] || return 0
+        rt_key="$rt_arch-$rt_os"
+        [ -d "$BASE/ifaces/targets/$rt_key" ] && \
+            TARGET_DIR="$BASE/ifaces/targets/$rt_key"
+        return 0
+    fi
+    if [ ! -d "$BASE/ifaces/targets/$rt_key" ]; then
+        echo "$prog: unknown --target '$rt_key' (no $BASE/ifaces/targets/$rt_key)" >&2
+        exit 1
+    fi
+    TARGET_DIR="$BASE/ifaces/targets/$rt_key"
+}
+resolve_target
+
 # join_dedup: one path per line on stdin -> ':'-joined on stdout, blank lines
 # dropped and duplicates removed (first occurrence wins).
 join_dedup() {
@@ -96,6 +139,9 @@ join_dedup() {
 build_list() {   # $1 = iface | impl
     {
         printf '%s' "$PREPEND"
+        if [ "$1" = iface ] && [ -n "$TARGET_DIR" ]; then
+            printf '%s\n' "$TARGET_DIR"
+        fi
         printf '%s\n' "$BASE"
         if [ "$1" = iface ]; then
             printf '%s\n' "$BASE/ifaces/core"

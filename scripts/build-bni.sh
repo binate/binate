@@ -86,7 +86,7 @@ echo
 
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-BUILDER_RUNTIME="$BUILDER_LIB/runtime/binate_runtime.c"
+BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
 
 # Two-step BUILDER → gen1 → final build, so any difference between the
 # BUILDER's compiled-in mangled-symbol literals and current-source's
@@ -102,16 +102,16 @@ GEN1_BNC="$GEN1_DIR/bnc"
 mkdir -p "$GEN1_DIR/build"
 
 echo "  Stage 1: BUILDER → gen1 ..."
-# Stdlib resolves BUILDER-first (gen1 -I/-L list $BUILDER_LIB stdlib roots
-# ahead of $BINATE_DIR), so stage-1 uses the BUILDER's frozen stdlib bundle;
-# current source is the fallback (the only source while the bundle is empty,
-# pre-bnc-0.0.7 — a no-op then).  Core stays current-first.
+# Stage 1's inner -I/-L resolve cmd/bnc's builtin + stdlib deps from the
+# BUILDER's frozen bundle only (--base "$BUILDER_LIB" --prepend "$BINATE_DIR");
+# the bnc source cone may only use features the BUILDER has, so no source
+# fallback.  Full rationale: scripts/lib/build-compilers.sh build_gen1.
 "$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
     "$BINATE_DIR/cmd/bnc" -- \
-    -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BUILDER_LIB/ifaces/stdlib:$BINATE_DIR/ifaces/stdlib:$BUILDER_LIB:$BUILDER_LIB/ifaces/core" \
-    -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BUILDER_LIB/impls/stdlib/common:$BINATE_DIR/impls/stdlib/common:$BUILDER_LIB:$BUILDER_LIB/impls/core/common:$BUILDER_LIB/impls/core/libc" \
+    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
+    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     --runtime "$BUILDER_RUNTIME" \
     --build-dir "$GEN1_DIR/build" \
     -o "$GEN1_BNC" \

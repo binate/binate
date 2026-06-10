@@ -52,19 +52,26 @@ build_gen1() {
     echo "Building gen1 compiler..."
     builder="$(_resolve_builder)"
     blib="$(_resolve_builder_lib)"
-    # gen1 is emitted by the BUILDER, so its objects carry the
-    # BUILDER's mangling/ABI — link them against the BUILDER bundle's
-    # own C runtime (--runtime) rather than the checkout's.  The
-    # checkout runtime tracks the current tree's mangling, which can
-    # differ from the pinned BUILDER (e.g. a symbol-mangling change
-    # not yet in BUILDER_VERSION); gen1's *outputs* (gen2, tests,
-    # conformance) are emitted by gen1 and link the checkout runtime.
-    # Stdlib resolves BUILDER-first (gen1 -I/-L below list $blib stdlib roots
-    # ahead of $BINATE_DIR), so stage-1 compiles cmd/bnc's stdlib deps against
-    # the BUILDER's frozen bundle; current source is the fallback (the only
-    # source while the bundle is empty pre-bnc-0.0.7 — a no-op then).  Core
-    # stays current-first (compiler-coupled, not a bundled component).
-    build_out=$("$builder" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" "$BINATE_DIR/cmd/bnc" -- -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$blib/ifaces/stdlib:$BINATE_DIR/ifaces/stdlib:$blib:$blib/ifaces/core" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$blib/impls/stdlib/common:$BINATE_DIR/impls/stdlib/common:$blib:$blib/impls/core/common:$blib/impls/core/libc" --runtime "$blib/runtime/binate_runtime.c" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    # gen1 = the BUILDER compiling cmd/bnc.  The bnc source cone (cmd/bnc + its
+    # deps) may only use language, core-lib (builtin), and stdlib features that
+    # exist in the BUILDER — the BUILDER-compatibility constraint — so its
+    # builtin + stdlib deps resolve entirely from the BUILDER's frozen bundle
+    # (the inner `--base "$blib"`, which also supplies the linked C runtime).
+    # Pulling those from source instead would let cmd/bnc accidentally use a
+    # not-yet-in-BUILDER feature (e.g. `same` in std/errors, added after
+    # bnc-0.0.7) and fail the build.  Only pkg/binate (the compiler's own code)
+    # and pkg/bootstrap come from source — `--prepend "$BINATE_DIR"`, which is
+    # also the primaryRoot and shadows the stale pkg/binate the bundle ships.
+    # There is deliberately NO source fallback: mixing source and bundle copies
+    # of interdependent packages (source A built against the BUILDER's B) is
+    # incoherent.  If cmd/bnc needs a feature the BUILDER lacks, bump
+    # BUILDER_VERSION.  gen1's objects carry the BUILDER's mangling/ABI; gen1's
+    # OUTPUTS (gen2, tests, conformance) are emitted by gen1 and link the
+    # checkout runtime.  (The OUTER -I/-L, before `--`, is a bootstrap-shape
+    # prefix a bootstrap-* BUILDER consumes; a bnc-* BUILDER's fetch-builder
+    # wrapper strips everything up to `--`, so only the inner paths reach bnc.)
+    # e2e/{repl,print-args}.sh + scripts/build-*.sh: same inner form.
+    build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" "$BINATE_DIR/cmd/bnc" -- -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$blib")" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"

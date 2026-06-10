@@ -2,19 +2,17 @@
 # Runner: builder-comp_native_x64-comp_native_x64 — current-tree
 # cmd/bnc (compiled normally via the BUILDER during runner_setup)
 # compiles each conformance test with `--backend native --target
-# x86_64-linux`.  The result lands in pkg/binate/native/x64.EmitObject,
-# which is a Phase 2 stub returning false — every test currently
-# fails as COMPILE_ERROR, which is the measurable starting point
-# for Phase 3's per-op lowering work.
+# x86_64-linux`, routing through pkg/binate/native/x64.EmitObject
+# (a full SysV-AMD64 / ELF backend), then runs the produced binary
+# (natively on x86_64, else under qemu-x86_64).
 #
 # Note: unlike builder-comp_native_aa64-comp_native_aa64, this
-# runner does NOT pre-build bnc with `--backend native` (which
-# would need to succeed, but the stub backend can't produce a
-# working bnc binary).  Once Phase 3 lowering covers cmd/bnc's
-# transitive deps, switch to the bnc-native-prebuilt shape for
-# the amortization win.
+# runner does NOT pre-build bnc with `--backend native` — it invokes
+# the BUILDER-built gen1 per test.  Switching to the bnc-native-
+# prebuilt shape (as the aa64 runner does) would amortise the
+# per-test compile cost.
 #
-# Required toolchain for the produced binaries (Phase 3+):
+# Required toolchain for the produced binaries:
 #   - clang (host)
 #   - on Linux x86_64: nothing extra (host runs the binary)
 #   - on macOS arm64 / non-x86_64 host: qemu-x86_64 (brew install qemu)

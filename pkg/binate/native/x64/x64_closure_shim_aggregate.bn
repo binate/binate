@@ -1,0 +1,166 @@
+package "pkg/binate/native/x64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Native x86-64 (SysV) emission for the aggregate-return path of a
+// capturing closure shim.  The sibling of
+// pkg/binate/native/aarch64/aarch64_closure_shim_aggregate.bn; split from
+// x64_closure_shim.bn (the scalar / void path) to stay under the hygiene
+// file-length cap.
+//
+// A capturing closure whose function-value type returns a SINGLE
+// aggregate result rides the same retbuf-in-RDI caller convention the
+// non-capturing shim (emitFuncValueShims) and emitCallFuncValue use:
+//
+//     RDI = retbuf   (address of the caller's result buffer)
+//     RSI = data     (the closure-struct pointer)
+//     RDX.. = user args
+//
+// The scalar closure shim cannot serve this: it expects data in RDI and
+// user args in RSI.., and never threads retbuf into the lifted body's
+// result location.  Two aggregate shapes, mirroring emitFuncValueShims:
+//
+//   * Pack-return (retSz 1..16): the lifted body returns the aggregate
+//     packed in RAX (+RDX); no sret arg, so captures occupy argReg(0..)
+//     (RDI..) — capBaseSlot 0.  Frame up, stash retbuf, set up the
+//     underlying args, CALL, then copy RAX (+RDX) back through retbuf.
+//   * Sret-return (retSz > 16): the lifted body takes a hidden SysV sret
+//     pointer in RDI.  retbuf is ALREADY in RDI, so it stays put; captures
+//     occupy argReg(1..) (RSI..) — capBaseSlot 1 — and the user-arg shift
+//     accounts for the consumed RDI slot.  Tail-jump (RDI preserved).
+//
+// Multi-return tuples stay on the scalar path (shimReturnIsAggregate_x64
+// is false for them).
+
+// emitClosureShimAggregate_x64 emits the aggregate-return closure shim.
+// retSz is the single result's SizeOf (> 0; shimReturnIsAggregate_x64
+// already gated this path).  Register-only: the underlying call's args
+// (the sret slot for sret, plus captures + user words) must fit RDI..R9
+// and the incoming user args (RDX..R9) must too — beyond that the shim
+// records a compile error (a.SetError) rather than silently emitting
+// wrong code, since the stack-spill aggregate path isn't implemented yet.
+func emitClosureShimAggregate_x64(a @asm.Assembler, fnLabel @[]char,
+		fvTyp @types.Type, f @ir.Func, retSz int) {
+	var cc common.CallConv = common.SysV_AMD64()
+	var captureWords int = 0
+	for i := 0; i < f.NumCaptureParams; i = i + 1 {
+		captureWords = captureWords +
+			effectiveCapWords_x64(cc, f.ClosureStruct.Fields[i].Type)
+	}
+	var nUserWords int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
+		nUserWords = nUserWords +
+			common.ArgWords(fvTyp.Params[pi].Type)
+	}
+	var useSret bool = retSz > 16
+	var capBaseSlot int = 0
+	if useSret { capBaseSlot = 1 }
+	if capBaseSlot + captureWords + nUserWords > 6 || nUserWords > 4 {
+		a.SetError("native x64: aggregate-return closure shim needs "
+			"the unimplemented stack-spill path (captures + user-arg "
+			"words exceed the register budget)")
+		return
+	}
+	if useSret {
+		// Sret-return: retbuf stays in RDI (the underlying's sret slot),
+		// data RSI -> R11 scratch, captures into argReg(1..captureWords),
+		// user args after them, tail-jump (RDI preserved).
+		x64.Mov(a, x64.Reg(x64.R11, x64.SZ64), x64.Reg(x64.RSI, x64.SZ64))
+		loadClosureAggCallArgs_x64(a, cc, fvTyp, f, captureWords,
+			nUserWords, capBaseSlot)
+		a.SetGlobal(fnLabel)
+		x64.Jmp(a, fnLabel)
+		return
+	}
+	// Pack-return (retSz 1..16): frame of 16 bytes (retbuf save +
+	// alignment), mirroring the non-capturing pack shim.  Stash retbuf,
+	// move data RSI -> R11, set up the underlying args (captures at
+	// argReg(0..)), CALL, reload retbuf into R10, copy the packed return
+	// RAX (+RDX) through it, unwind.
+	x64.Push(a, x64.Reg(x64.RBP, x64.SZ64))
+	x64.Mov(a, x64.Reg(x64.RBP, x64.SZ64), x64.Reg(x64.RSP, x64.SZ64))
+	x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(16))
+	x64.Mov(a, x64.Mem(x64.RSP, 0, x64.SZ64), x64.Reg(x64.RDI, x64.SZ64))
+	x64.Mov(a, x64.Reg(x64.R11, x64.SZ64), x64.Reg(x64.RSI, x64.SZ64))
+	loadClosureAggCallArgs_x64(a, cc, fvTyp, f, captureWords, nUserWords,
+		capBaseSlot)
+	a.SetGlobal(fnLabel)
+	x64.Call(a, fnLabel)
+	x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Mem(x64.RSP, 0, x64.SZ64))
+	x64.Mov(a, x64.Mem(x64.R10, 0, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+	if retSz > 8 {
+		x64.Mov(a, x64.Mem(x64.R10, 8, x64.SZ64),
+			x64.Reg(x64.RDX, x64.SZ64))
+	}
+	x64.Add(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(16))
+	x64.Pop(a, x64.Reg(x64.RBP, x64.SZ64))
+	x64.Ret(a)
+}
+
+// loadClosureAggCallArgs_x64 sets up the underlying lifted-body call's
+// register args for an aggregate-returning closure shim.  The closure-
+// struct pointer is in R11 (a non-arg caller-saved scratch the caller
+// already moved data into).  capBaseSlot is the first arg-reg slot the
+// captures occupy: 0 for pack (captures start at RDI), 1 for sret (RDI is
+// the consumed sret slot, so captures start at RSI).  Two steps, in this
+// order:
+//
+//   1. Move the user args from their incoming slots argReg(2+j) (the
+//      funcval aggregate convention places user args after the
+//      retbuf+data prefix) to their outgoing slots
+//      argReg(capBaseSlot+captureWords+j).  The uniform per-word offset is
+//      capBaseSlot+captureWords-2: when >= 0 (shifting toward higher
+//      registers) the moves go right-to-left so each source is read before
+//      its slot is overwritten; otherwise left-to-right.
+//   2. Load the captures from [R11] into
+//      argReg(capBaseSlot..capBaseSlot+captureWords-1) — after the
+//      user-arg moves, so a capture write can't clobber an unread user
+//      source.  R11 stays live across every load.  Indirect-large captures
+//      pass a pointer (LEA); per-word captures load each word (MOV).
+func loadClosureAggCallArgs_x64(a @asm.Assembler, cc common.CallConv,
+		fvTyp @types.Type, f @ir.Func, captureWords int, nUserWords int,
+		capBaseSlot int) {
+	var outBase int = capBaseSlot + captureWords
+	if outBase >= 2 {
+		for j := nUserWords - 1; j >= 0; j = j - 1 {
+			moveAggUserWord_x64(a, j, outBase)
+		}
+	} else {
+		for j := 0; j < nUserWords; j = j + 1 {
+			moveAggUserWord_x64(a, j, outBase)
+		}
+	}
+	var wi int = 0
+	for i := 0; i < f.NumCaptureParams; i = i + 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var baseOfs int = f.ClosureStruct.FieldOffset(i)
+		if isIndirectLargeCap_x64(cc, ft) {
+			x64.Lea(a, x64.Reg(argReg(capBaseSlot + wi), x64.SZ64),
+				x64.Mem(x64.R11, baseOfs, x64.SZ64))
+			wi = wi + 1
+			continue
+		}
+		var nWords int = common.ArgWords(ft)
+		for k := 0; k < nWords; k = k + 1 {
+			x64.Mov(a, x64.Reg(argReg(capBaseSlot + wi), x64.SZ64),
+				x64.Mem(x64.R11, baseOfs + k * 8, x64.SZ64))
+			wi = wi + 1
+		}
+	}
+}
+
+// moveAggUserWord_x64 moves user-arg word j from its incoming register
+// argReg(2+j) to its outgoing register argReg(outBase+j), skipping the
+// move when source and destination coincide.
+func moveAggUserWord_x64(a @asm.Assembler, j int, outBase int) {
+	var srcReg int = argReg(2 + j)
+	var dstReg int = argReg(outBase + j)
+	if srcReg != dstReg {
+		x64.Mov(a, x64.Reg(dstReg, x64.SZ64),
+			x64.Reg(srcReg, x64.SZ64))
+	}
+}

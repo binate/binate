@@ -1,29 +1,42 @@
 #!/bin/sh
 # Usage: ./scripts/hygiene/file-length.sh
 #
-# Checks non-test .bn files for excessive length.
-# Warns for files over 500 lines, errors for files over 600 lines.
+# Checks non-test source files for excessive length.
+#   .bn  (implementation): warns over 500 lines, errors over 600.
+#   .bni (interface):      warns over 1500 lines, errors over 1800.  Interface
+#        files aggregate a package's whole API and can't be split the way an
+#        impl can, so they get a higher cap — but the cap still flags a
+#        runaway interface (the fix there is splitting into sub-interfaces).
 # Test files (*_test.bn) are excluded — they may be longer.
 #
-# Exit code: 1 if any file exceeds 600 lines, 0 otherwise.
+# TODO: consider lowering the .bni cap toward 1000/1200; ir.bni (~1159 lines)
+# would need refactoring first.  See explorations/claude-todo.md.
+#
+# Exit code: 1 if any file exceeds its error limit, 0 otherwise.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-WARN_LIMIT=500
-ERROR_LIMIT=600
+BN_WARN_LIMIT=500
+BN_ERROR_LIMIT=600
+BNI_WARN_LIMIT=1500
+BNI_ERROR_LIMIT=1800
 
 errors=0
 warns=0
 
-for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" -name '*.bn' -not -name '*_test.bn' 2>/dev/null); do
+for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" \( -name '*.bn' -o -name '*.bni' \) -not -name '*_test.bn' 2>/dev/null); do
     lines=$(wc -l < "$f")
     rel="${f#"$BINATE_DIR"/}"
-    if [ "$lines" -gt "$ERROR_LIMIT" ]; then
-        echo "ERROR: $rel: $lines lines (limit $ERROR_LIMIT)"
+    case "$f" in
+        *.bni) warn=$BNI_WARN_LIMIT; err=$BNI_ERROR_LIMIT ;;
+        *)     warn=$BN_WARN_LIMIT;  err=$BN_ERROR_LIMIT ;;
+    esac
+    if [ "$lines" -gt "$err" ]; then
+        echo "ERROR: $rel: $lines lines (limit $err)"
         errors=$((errors + 1))
-    elif [ "$lines" -gt "$WARN_LIMIT" ]; then
-        echo "WARN:  $rel: $lines lines (soft limit $WARN_LIMIT)"
+    elif [ "$lines" -gt "$warn" ]; then
+        echo "WARN:  $rel: $lines lines (soft limit $warn)"
         warns=$((warns + 1))
     fi
 done

@@ -136,6 +136,71 @@ func shimReturnIsAggregate_x64(fvTyp @types.Type) bool {
 	return common.IsAggregateTyp(fvTyp.Results[0])
 }
 
+// shimReturnIsFloatScalar_x64 reports whether a func value's single result is
+// a float scalar.  Such a return can't ride the scalar tail-jump: the
+// underlying returns it in xmm0, but the all-int shim ABI hands the bits back
+// in rax, so the shim must CALL and movq/movd xmm0 -> rax.
+func shimReturnIsFloatScalar_x64(fvTyp @types.Type) bool {
+	if fvTyp == nil { return false }
+	if len(fvTyp.Results) != 1 { return false }
+	return common.IsFloatScalarTyp(fvTyp.Results[0])
+}
+
+// emitShimArgMarshal_x64 marshals the func-value shim's incoming all-int,
+// positional-GP user args into the SysV layout the underlying function
+// expects.  The shim is entered under the uniform all-int dispatch ABI (the
+// VM's rt._call_shim_scalar and the compiled emitCallFuncValue both place
+// every arg word — float bits included — in a GP register): incoming user-arg
+// word w sits in argReg(srcPrefix + w), where `srcPrefix` is the count of
+// leading GP words to skip (1 = data, for the scalar/void shape; 2 =
+// retbuf + data, for the pack/sret shapes).
+//
+// Each float-scalar param is moved (movq/movd) from its GP slot into the XMM
+// register the underlying reads (xmm[nsrn], an independent FP-register
+// counter); every other param stays in GP at argReg(gpDestBase + ngrn).
+// `gpDestBase` is the first GP arg register the underlying uses: 0 normally,
+// but 1 for the sret shape (RDI holds the sret pointer, so explicit args
+// start at RSI).  This is the native half of the float shim ABI (Design A);
+// the LLVM shim does the same bitcast in IR.
+//
+// Clobber-safety: the GP destination index never exceeds the GP source index
+// (gpDestBase + ngrn <= srcPrefix + srcWord across all shapes), so left-to-
+// right MOVs read each source before it is overwritten; the XMM moves target
+// the disjoint FP register file and never clobber a GP source.
+func emitShimArgMarshal_x64(a @asm.Assembler, fvTyp @types.Type,
+		srcPrefix int, gpDestBase int) {
+	var ngrn int = 0
+	var nsrn int = 0
+	var srcWord int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		var pt @types.Type = fvTyp.Params[pi].Type
+		if common.IsFloatScalarTyp(pt) {
+			if nsrn < 8 {
+				var fsrc int = argReg(srcPrefix + srcWord)
+				if common.FloatScalarIsI32(pt) {
+					x64.Movd_gp_to_xmm(a, x64.XMM0 + nsrn, fsrc)
+				} else {
+					x64.Movq_gp_to_xmm(a, x64.XMM0 + nsrn, fsrc)
+				}
+				nsrn = nsrn + 1
+			}
+			srcWord = srcWord + 1
+			continue
+		}
+		var w int = common.ArgWords(pt)
+		for k := 0; k < w; k++ {
+			var dst int = argReg(gpDestBase + ngrn + k)
+			var src int = argReg(srcPrefix + srcWord + k)
+			if dst != src {
+				x64.Mov(a, x64.Reg(dst, x64.SZ64),
+					x64.Reg(src, x64.SZ64))
+			}
+		}
+		ngrn = ngrn + w
+		srcWord = srcWord + w
+	}
+}
+
 // emitFuncValueShims emits a per-function shim for each OP_FUNC_VALUE
 // / OP_FUNC_HANDLE reference.  Three shapes depending on the function
 // value's return type:
@@ -215,10 +280,10 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 			// Stash retbuf (RDI) at [rsp + 0].
 			x64.Mov(a, x64.Mem(x64.RSP, 0, x64.SZ64),
 				x64.Reg(x64.RDI, x64.SZ64))
-			// Shift user args RDX..R9 → RDI..R8 (two-slot drop:
-			// retbuf at RDI dropped, data at RSI dropped).
-			// Sequence: RDI=RDX, RSI=RCX, RDX=R8, RCX=R9.
-			emitArgShiftLeftBy2_x64(a, nUserWords)
+			// Marshal user args (incoming RDX..) into the underlying's
+			// SysV layout: float scalars -> xmm regs, the rest shifted
+			// down past the stashed retbuf + dropped data (GP base 0).
+			emitShimArgMarshal_x64(a, fvTyp, 2, 0)
 			a.SetGlobal(fnLabel)
 			x64.Call(a, fnLabel)
 			// RAX (+RDX) hold underlying's packed return.  Reload
@@ -238,133 +303,43 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 			x64.Pop(a, x64.Reg(x64.RBP, x64.SZ64))
 			x64.Ret(a)
 		} else if useSret {
-			// Sret-return shim: retbuf stays in RDI (where underlying
-			// expects it).  Drop data slot (RSI), shift user args
-			// RDX..R9 → RSI..R8.  Tail-jump.
-			emitArgShiftLeftBy1ToRSI_x64(a, nUserWords)
+			// Sret-return shim: retbuf stays in RDI (where the underlying
+			// expects the sret pointer).  Drop the data slot (RSI) and
+			// marshal user args (incoming RDX..) into the SysV layout —
+			// float scalars -> xmm regs, GP args start at RSI (gpDestBase
+			// 1, since RDI is the sret pointer).
+			emitShimArgMarshal_x64(a, fvTyp, 2, 1)
 			a.SetGlobal(fnLabel)
 			x64.Jmp(a, fnLabel)
+		} else if shimReturnIsFloatScalar_x64(fvTyp) {
+			// Scalar shim whose result is a float scalar: the all-int
+			// shim ABI returns the bits in rax, but the underlying
+			// returns them in xmm0, so this can't tail-jump.  Build a
+			// frame (push rbp re-aligns rsp to 16 for the CALL), marshal
+			// args (drop data), CALL, movq/movd the result xmm0 -> rax,
+			// tear down, RET.
+			x64.Push(a, x64.Reg(x64.RBP, x64.SZ64))
+			x64.Mov(a, x64.Reg(x64.RBP, x64.SZ64),
+				x64.Reg(x64.RSP, x64.SZ64))
+			emitShimArgMarshal_x64(a, fvTyp, 1, 0)
+			a.SetGlobal(fnLabel)
+			x64.Call(a, fnLabel)
+			if common.FloatScalarIsI32(fvTyp.Results[0]) {
+				x64.Movd_xmm_to_gp(a, x64.RAX, x64.XMM0)
+			} else {
+				x64.Movq_xmm_to_gp(a, x64.RAX, x64.XMM0)
+			}
+			x64.Pop(a, x64.Reg(x64.RBP, x64.SZ64))
+			x64.Ret(a)
 		} else {
-			// Scalar / void shim: data was in RDI; drop it and shift
-			// user args RSI..R9 → RDI..R8.  Tail-jump.
-			emitArgShiftLeftBy1_x64(a, nUserWords)
+			// Scalar / void shim: data was in RDI; drop it and marshal
+			// user args (float scalars -> xmm regs, the rest shifted
+			// RSI..R9 -> RDI..R8), then tail-jump.
+			emitShimArgMarshal_x64(a, fvTyp, 1, 0)
 			a.SetGlobal(fnLabel)
 			x64.Jmp(a, fnLabel)
 		}
 	}
-}
-
-// emitArgShiftLeftBy1_x64 emits the MOV chain RDI=RSI, RSI=RDX,
-// RDX=RCX, RCX=R8, R8=R9 — shifting up to nUserWords user-arg
-// registers one slot left (data was in RDI; the shifts drop it).
-// Left-to-right order preserves correctness: each src is read
-// before its destination is overwritten in the next instruction.
-func emitArgShiftLeftBy1_x64(a @asm.Assembler, nUserWords int) {
-	for ai := 0; ai < nUserWords; ai++ {
-		// Each iteration: argReg(ai) <- argReg(ai + 1).
-		// argReg slot 0 = RDI, 1 = RSI, ..., 5 = R9.
-		// nUserWords ≤ 5 means we shift slots 0..nUserWords-1 from
-		// slots 1..nUserWords.
-		x64.Mov(a, x64.Reg(argReg(ai), x64.SZ64),
-			x64.Reg(argReg(ai + 1), x64.SZ64))
-	}
-}
-
-// emitArgShiftLeftBy1ToRSI_x64 emits the MOV chain RSI=RDX,
-// RDX=RCX, RCX=R8, R8=R9 — for the sret shim, where RDI stays as
-// retbuf (NOT shifted).  Shifts slots 1..nUserWords-1 from slots
-// 2..nUserWords.
-func emitArgShiftLeftBy1ToRSI_x64(a @asm.Assembler, nUserWords int) {
-	for ai := 0; ai < nUserWords; ai++ {
-		x64.Mov(a, x64.Reg(argReg(ai + 1), x64.SZ64),
-			x64.Reg(argReg(ai + 2), x64.SZ64))
-	}
-}
-
-// emitArgShiftLeftBy2_x64 emits the MOV chain RDI=RDX, RSI=RCX,
-// RDX=R8, RCX=R9 — for the pack-return shim, where retbuf in RDI
-// is stashed to the stack and data in RSI is dropped.  Shifts
-// slots 0..nUserWords-1 from slots 2..nUserWords+1.
-func emitArgShiftLeftBy2_x64(a @asm.Assembler, nUserWords int) {
-	for ai := 0; ai < nUserWords; ai++ {
-		x64.Mov(a, x64.Reg(argReg(ai), x64.SZ64),
-			x64.Reg(argReg(ai + 2), x64.SZ64))
-	}
-}
-
-// emitFuncValueVtables walks the module for OP_FUNC_VALUE /
-// OP_FUNC_HANDLE references and emits the per-function backing
-// globals each one needs:
-//
-//   _bn_<pkg>__<fn>__vt           ; vtable, weak.
-//                                ;   .quad 0                ; dtor
-//                                ;   .quad <shim label>     ; call
-//   ___handle.bn_<pkg>__<fn>     ; LLVM-shape handle, weak.
-//                                ;   .quad <vt label>       ; vtable
-//                                ;   .quad 0                ; data
-func emitFuncValueVtables(a @asm.Assembler, pkgName *[]readonly char,
-		mod @ir.Module) {
-	var seen @[]@[]char
-	var ignored @[]@types.Type
-	seen, ignored = collectFuncValueRefs(mod)
-	if len(ignored) > 0 || len(seen) == 0 {
-		// `ignored` silences the unused-var warning; sigs aren't
-		// needed for vtable emit.
-	}
-	if len(seen) == 0 { return }
-	a.SetSection("data", -1)
-	for i := 0; i < len(seen); i++ {
-		var vtLabel @[]char = vtableSymFor_x64(pkgName, seen[i])
-		var shimLabel @[]char = shimSymFor_x64(pkgName, seen[i])
-		a.DefineLabel(vtLabel)
-		a.SetWeak(vtLabel)
-		a.SetGlobal(shimLabel)
-		// dtor slot.  Null for the *func form and non-capturing
-		// literals; for a capturing @func whose closure struct needs
-		// destruction, a pointer to the closure-struct dtor's HANDLE so
-		// the @func variable's scope-end RefDec releases each managed
-		// capture before freeing the struct.  See the aarch64 sibling
-		// (emitFuncValueVtableDtorSlot) for the full rationale and the
-		// symbol-convergence argument.
-		emitFuncValueVtableDtorSlot_x64(a, pkgName, mod, seen[i])
-		// call slot: pointer to shim.
-		emitQuadLabelFV(a, shimLabel)
-
-		// Phase 4 handle global — points at vtable; data slot is
-		// null (non-capturing).  Weak (N_WEAK_DEF on Mach-O,
-		// STB_WEAK on ELF) so an LLVM-emitted dep that exports the
-		// same symbol gets deduped by the linker.
-		var handleLabel @[]char = handleSymFor_x64(pkgName, seen[i])
-		a.DefineLabel(handleLabel)
-		a.SetWeak(handleLabel)
-		emitQuadLabelFV(a, vtLabel)
-		a.Fill(8, cast(uint8, 0))
-	}
-}
-
-// emitFuncValueVtableDtorSlot_x64 writes the 8-byte dtor slot (slot 0)
-// of the function value vtable for `qname`: a pointer to the closure-
-// struct dtor's HANDLE for a capturing @func whose struct needs
-// destruction, else 8 zero bytes.  Slot 0 carries the dtor's HANDLE
-// (not a raw fn pointer) because OP_FUNC_VALUE_DTOR dispatches it via
-// `handle.vtable.call(handle.data, ptr)`.  The referenced
-// `___handle.<dtor>` triple is emitted by collectFuncValueRefs's
-// IsLinkOnce pre-pass; handleSymFor_x64(pkgName, f.ClosureStructDtorName)
-// names exactly that triple (mangle.FuncName folds the same-package
-// qualifier so the unqualified dtor name and the pre-pass's qualified
-// f.Name resolve to one symbol).  Mirrors the aarch64 sibling.
-func emitFuncValueVtableDtorSlot_x64(a @asm.Assembler,
-		pkgName *[]readonly char, mod @ir.Module, qname @[]char) {
-	var f @ir.Func = lookupClosureFunc_x64(mod, qname)
-	if f == nil || !f.IsManagedFuncValue || f.ClosureStruct == nil ||
-			!f.ClosureStruct.NeedsDestruction() ||
-			len(f.ClosureStructDtorName) == 0 {
-		a.Fill(8, cast(uint8, 0))
-		return
-	}
-	var h @[]char = handleSymFor_x64(pkgName, f.ClosureStructDtorName)
-	a.SetGlobal(h)
-	emitQuadLabelFV(a, h)
 }
 
 // shimSymFor_x64 returns the object-format-prefixed label for a

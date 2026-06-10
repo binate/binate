@@ -149,6 +149,67 @@ func shimReturnIsAggregate(fvTyp @types.Type) bool {
 	return common.IsAggregateTyp(fvTyp.Results[0])
 }
 
+// shimReturnIsFloatScalarAA64 reports whether a func value's single result is
+// a float scalar.  Such a return can't ride the scalar tail-branch: the
+// underlying returns it in d0/s0 (the FP register file), but the all-int shim
+// ABI hands the bits back in x0, so the shim must BL and fmov d0/s0 -> x0/w0.
+func shimReturnIsFloatScalarAA64(fvTyp @types.Type) bool {
+	if fvTyp == nil { return false }
+	if len(fvTyp.Results) != 1 { return false }
+	return common.IsFloatScalarTyp(fvTyp.Results[0])
+}
+
+// emitShimArgMarshalAA64 marshals the func-value shim's incoming all-int,
+// positional-GP user args into the AAPCS64 layout the underlying function
+// expects.  The shim is entered under the uniform all-int dispatch ABI (the
+// VM's rt._call_shim_scalar and the compiled emitCallFuncValue both place
+// every arg word — float bits included — in a GP register): incoming user-arg
+// word w sits in argReg(prefix + w), where `prefix` is the count of leading
+// GP words to drop (1 = data, for the scalar/void shape; 2 = retbuf + data,
+// for the pack/sret aggregate shapes).
+//
+// Each float-scalar param is `fmov`'d from its GP slot into the FP register
+// the underlying reads (d/s[nsrn], an independent FP-register counter — the
+// NSRN of AAPCS64); every other param stays in GP and shifts down past the
+// dropped prefix (the NGRN sequence).  This is the native half of the float
+// shim ABI (Design A); the LLVM shim does the same bitcast in IR.
+//
+// Clobber-safety: the GP destination index never exceeds the GP source index
+// (ngrn <= srcWord and prefix >= 1, so dst < src), hence left-to-right MOVs
+// read each source before it is overwritten; FMOVs target the disjoint FP
+// register file, so they never clobber a GP source either.
+func emitShimArgMarshalAA64(a @asm.Assembler, fvTyp @types.Type, prefix int) {
+	var ngrn int = 0
+	var nsrn int = 0
+	var srcWord int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		var pt @types.Type = fvTyp.Params[pi].Type
+		if common.IsFloatScalarTyp(pt) {
+			if nsrn < 8 {
+				var fsrc int = argReg(prefix + srcWord)
+				if common.FloatScalarIsI32(pt) {
+					aarch64.Fmov_w_to_s(a, aarch64.D0 + nsrn, fsrc)
+				} else {
+					aarch64.Fmov_gp_to_fp(a, aarch64.D0 + nsrn, fsrc)
+				}
+				nsrn = nsrn + 1
+			}
+			srcWord = srcWord + 1
+			continue
+		}
+		var w int = common.ArgWords(pt)
+		for k := 0; k < w; k++ {
+			var dst int = argReg(ngrn + k)
+			var src int = argReg(prefix + srcWord + k)
+			if dst != src {
+				aarch64.Mov(a, true, dst, aarch64.Reg(src))
+			}
+		}
+		ngrn = ngrn + w
+		srcWord = srcWord + w
+	}
+}
+
 // emitFuncValueShims emits a per-function shim for each
 // OP_FUNC_VALUE reference.  Three shapes depending on the function
 // value's return type:
@@ -176,11 +237,15 @@ func shimReturnIsAggregate(fvTyp @types.Type) bool {
 //   branches.  Multi-return tuples > 16 bytes go through here too
 //   (sret-via-X8 is universal for big returns).
 //
-// Bootstrap-subset constraint: scalar args only (no floats; no
-// aggregate args).  Pack-return path also requires nUserWords ≤ 6
-// (X2..X7 after retbuf in X0 and dropped data in X1) so all user
-// args fit in registers — stack-arg shuffling for >6 register-
-// words isn't implemented.
+// Float-scalar args are reconciled GP -> FP by emitShimArgMarshalAA64
+// (the all-int dispatch ABI delivers them in GP registers); a float-
+// scalar RETURN takes a fourth shape — BL + fmov d0/s0 -> x0/w0 + RET
+// — because the underlying returns it in the FP file but the all-int
+// shim hands the bits back in x0.  Remaining constraints: no aggregate
+// ARGS, and the pack-return path requires nUserWords ≤ 6 (X2..X7 after
+// retbuf in X0 and dropped data in X1) so all user-arg words fit in
+// registers — stack-arg shuffling for >6 register-words isn't
+// implemented.
 func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 		mod @ir.Module) {
 	var seen @[]@[]char
@@ -244,13 +309,10 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 				aarch64.Reg(aarch64.SP))
 			aarch64.Str(a, true, aarch64.X0,
 				aarch64.MemImm(aarch64.SP, 16))
-			// Shift user args X2..X(N+1) → X0..X(N-1).  Left-to-
-			// right preserves correctness (each src read before
-			// its dest is overwritten).
-			for ai := 0; ai < nUserWords; ai++ {
-				aarch64.Mov(a, true, argReg(ai),
-					aarch64.Reg(argReg(ai + 2)))
-			}
+			// Marshal user args (incoming X2..) into the underlying's
+			// AAPCS64 layout: float scalars -> d/s regs, the rest
+			// shifted down past retbuf + data.
+			emitShimArgMarshalAA64(a, fvTyp, 2)
 			a.SetGlobal(fnLabel)
 			aarch64.Bl(a, fnLabel)
 			// X0..X(retWords-1) hold underlying's packed return.
@@ -278,19 +340,35 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 			// X0 itself is one of the shift sources.
 			aarch64.Mov(a, true, aarch64.X8,
 				aarch64.Reg(aarch64.X0))
-			for ai := 0; ai < nUserWords; ai++ {
-				aarch64.Mov(a, true, argReg(ai),
-					aarch64.Reg(argReg(ai + 2)))
-			}
+			emitShimArgMarshalAA64(a, fvTyp, 2)
 			a.SetGlobal(fnLabel)
 			aarch64.B(a, fnLabel)
-		} else {
-			// Scalar / void shim: data was in X0; drop it and shift
-			// user args X1..XN → X0..X(N-1).
-			for ai := 0; ai < nUserWords; ai++ {
-				aarch64.Mov(a, true, argReg(ai),
-					aarch64.Reg(argReg(ai + 1)))
+		} else if shimReturnIsFloatScalarAA64(fvTyp) {
+			// Scalar shim whose result is a float scalar: the all-int
+			// shim ABI returns the bits in x0, but the underlying
+			// returns them in d0/s0, so this can't tail-branch.  Build
+			// a minimal frame, marshal args (drop data), BL, fmov the
+			// result d0/s0 -> x0/w0, unwind, RET.
+			aarch64.Stp(a, true, aarch64.FP, aarch64.LR,
+				aarch64.MemPre(aarch64.SP, -16))
+			aarch64.Mov(a, true, aarch64.FP,
+				aarch64.Reg(aarch64.SP))
+			emitShimArgMarshalAA64(a, fvTyp, 1)
+			a.SetGlobal(fnLabel)
+			aarch64.Bl(a, fnLabel)
+			if common.FloatScalarIsI32(fvTyp.Results[0]) {
+				aarch64.Fmov_s_to_w(a, aarch64.X0, aarch64.D0)
+			} else {
+				aarch64.Fmov_fp_to_gp(a, aarch64.X0, aarch64.D0)
 			}
+			aarch64.Ldp(a, true, aarch64.FP, aarch64.LR,
+				aarch64.MemPost(aarch64.SP, 16))
+			aarch64.Ret(a)
+		} else {
+			// Scalar / void shim: data was in X0; drop it and marshal
+			// user args (float scalars -> d/s regs, the rest shifted
+			// X1..XN -> X0..X(N-1)), then tail-branch.
+			emitShimArgMarshalAA64(a, fvTyp, 1)
 			a.SetGlobal(fnLabel)
 			aarch64.B(a, fnLabel)
 		}

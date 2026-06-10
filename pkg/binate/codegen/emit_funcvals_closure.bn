@@ -34,8 +34,19 @@ func lookupClosureFunc(m @ir.Module, name @[]char) @ir.Func {
 //
 // CAP_MANAGED captures are gated to B.3; B.2 supports only
 // CAP_VAL + CAP_RAW_PTR, all of which are scalar-loadable.
+//
+// An aggregate return (a multi-return tuple, or a single result wider
+// than a return register) rides the retbuf shim shape via
+// emitClosureShimAggregate — the same shape funcSignatureLLVM stamps
+// into this closure's vtable slot (`void(i8*, i8*, ...)`).  Without that
+// branch the shim returned the aggregate BY VALUE while its vtable
+// advertised retbuf, so emitCallFuncValue read the result from a buffer
+// the shim never wrote — silent garbage / crash on a managed component.
 func emitClosureShim(out buf.CharBuf, mangled @[]char,
-		fvTyp @types.Type, f @ir.Func) buf.CharBuf {
+		fvTyp @types.Type, f @ir.Func, useSret bool) buf.CharBuf {
+	if isAggregateReturn(fvTyp) {
+		return emitClosureShimAggregate(out, mangled, fvTyp, f, useSret)
+	}
 	var isVoid bool = len(fvTyp.Results) == 0
 	var floatRet bool = resultIsFloatScalar(fvTyp)
 	var n int = f.NumCaptureParams
@@ -55,15 +66,53 @@ func emitClosureShim(out buf.CharBuf, mangled @[]char,
 	out = out.WriteStr(") {\n  ")
 	// User-arg aggregates still need the pointer→value load.
 	out = emitShimArgLoads(out, fvTyp)
-	// Bitcast data → closure struct pointer.
+	out = emitClosureCaptureLoads(out, closureMangled, f, n)
+	if !isVoid {
+		out = out.WriteStr("%r = ")
+	}
+	// A scalar-float return bitcasts %r to the int slot after the
+	// call, so it can't be a tail call.
+	if floatRet {
+		out = out.WriteStr("call ")
+	} else {
+		out = out.WriteStr("tail call ")
+	}
+	out = writeFuncResultsLLVM(out, fvTyp)
+	out = out.WriteStr(" @")
+	out = out.WriteStr(mangled)
+	out = out.WriteByte('(')
+	out = writeClosureUnderlyingArgs(out, fvTyp, f, n, false)
+	out = out.WriteStr(")\n  ")
+	if isVoid {
+		out = out.WriteStr("ret void\n}\n")
+	} else if floatRet {
+		out = out.WriteStr("%rf = bitcast ")
+		out = writeFuncResultsLLVM(out, fvTyp)
+		out = out.WriteStr(" %r to ")
+		out = out.WriteStr(shimIntSlotType(fvTyp.Results[0]))
+		out = out.WriteStr("\n  ret ")
+		out = out.WriteStr(shimIntSlotType(fvTyp.Results[0]))
+		out = out.WriteStr(" %rf\n}\n")
+	} else {
+		out = out.WriteStr("ret ")
+		out = writeFuncResultsLLVM(out, fvTyp)
+		out = out.WriteStr(" %r\n}\n")
+	}
+	return out
+}
+
+// emitClosureCaptureLoads bitcasts %data to the closure struct pointer
+// (%ctx) and loads each capture field into %cap<i>.  >16-byte aggregate
+// captures use the IndirectLargeAggregates convention
+// (plan-codegen-byval.md): the underlying function declares the param as
+// `ptr`, so only the GEP (%cap<i>_ptr) is emitted — no struct load — and
+// the call passes that pointer directly.  Scalars and small aggregates
+// load as usual.  Shared by the scalar and aggregate closure shims.
+func emitClosureCaptureLoads(out buf.CharBuf, closureMangled @[]char,
+		f @ir.Func, n int) buf.CharBuf {
 	out = out.WriteStr("%ctx = bitcast i8* %data to %")
 	out = out.WriteStr(closureMangled)
 	out = out.WriteStr("*\n  ")
-	// Load each capture field.  >16-byte aggregates use the
-	// IndirectLargeAggregates convention (plan-codegen-byval.md):
-	// the underlying function declares the param as `ptr`, so the
-	// shim passes the GEP-derived pointer directly without loading
-	// the struct value.  Scalars and small aggregates load as usual.
 	for i := 0; i < n; i++ {
 		var capTyp @types.Type = f.Params[i].Typ
 		var capLL @[]char = llvmType(capTyp)
@@ -89,24 +138,22 @@ func emitClosureShim(out buf.CharBuf, mangled @[]char,
 		out = out.WriteInt(i)
 		out = out.WriteStr("_ptr\n  ")
 	}
-	if !isVoid {
-		out = out.WriteStr("%r = ")
-	}
-	// A scalar-float return bitcasts %r to the int slot after the
-	// call, so it can't be a tail call.
-	if floatRet {
-		out = out.WriteStr("call ")
-	} else {
-		out = out.WriteStr("tail call ")
-	}
-	out = writeFuncResultsLLVM(out, fvTyp)
-	out = out.WriteStr(" @")
-	out = out.WriteStr(mangled)
-	out = out.WriteByte('(')
-	// Pass captures first, then user args.  Byval-passed captures
-	// reuse the GEP pointer (%capN_ptr) directly — no load was emitted.
+	return out
+}
+
+// writeClosureUnderlyingArgs writes the underlying lifted-closure call's
+// argument list: the n captures (prepended) followed by the user args.
+// Byval-passed captures reuse the GEP pointer (%cap<i>_ptr) directly — no
+// load was emitted for them.  leadComma controls whether a comma precedes
+// the very first item (true when a prior arg — e.g. an sret retbuf — has
+// already been written into the list).  Shared by the scalar and
+// aggregate closure shims.
+func writeClosureUnderlyingArgs(out buf.CharBuf, fvTyp @types.Type,
+		f @ir.Func, n int, leadComma bool) buf.CharBuf {
+	var wrote bool = leadComma
 	for i := 0; i < n; i++ {
-		if i > 0 { out = out.WriteStr(", ") }
+		if wrote { out = out.WriteStr(", ") }
+		wrote = true
 		out = writeParamTypeLLVM(out, f.Params[i].Typ)
 		out = out.WriteStr(" %cap")
 		out = out.WriteInt(i)
@@ -115,25 +162,82 @@ func emitClosureShim(out buf.CharBuf, mangled @[]char,
 		}
 	}
 	for i := 0; i < len(fvTyp.Params); i++ {
-		if n > 0 || i > 0 { out = out.WriteStr(", ") }
+		if wrote { out = out.WriteStr(", ") }
+		wrote = true
 		out = writeParamTypeLLVM(out, fvTyp.Params[i].Type)
 		out = writeShimArgRef(out, fvTyp.Params[i].Type, i)
 	}
-	out = out.WriteStr(")\n  ")
-	if isVoid {
-		out = out.WriteStr("ret void\n}\n")
-	} else if floatRet {
-		out = out.WriteStr("%rf = bitcast ")
-		out = writeFuncResultsLLVM(out, fvTyp)
-		out = out.WriteStr(" %r to ")
-		out = out.WriteStr(shimIntSlotType(fvTyp.Results[0]))
-		out = out.WriteStr("\n  ret ")
-		out = out.WriteStr(shimIntSlotType(fvTyp.Results[0]))
-		out = out.WriteStr(" %rf\n}\n")
-	} else {
-		out = out.WriteStr("ret ")
-		out = writeFuncResultsLLVM(out, fvTyp)
-		out = out.WriteStr(" %r\n}\n")
+	return out
+}
+
+// emitClosureShimAggregate emits the retbuf-style shim for a CAPTURING
+// closure whose return is aggregate (a multi-return tuple, or a single
+// result wider than a return register).  It mirrors
+// emitFuncValueShimAggregate (the non-capturing retbuf shim) but loads
+// the captures out of %data and prepends them to the underlying call,
+// exactly as the scalar closure shim does.
+//
+//   define weak_odr void @__shim.<m>(i8* %retbuf, i8* %data, <args>) {
+//     <load user-arg aggregates>
+//     %ctx = bitcast i8* %data to %<closure>*
+//     <load captures>
+//     %rb = bitcast i8* %retbuf to <ret>*
+//     ; useSret: callee writes the result through %rb directly
+//     ;   call void @<m>(ptr sret(<ret>) align 8 %rb, captures, args)
+//     ; else: callee returns by value; shim stores it through %rb
+//     ;   %r = call <ret> @<m>(captures, args); store <ret> %r, <ret>* %rb
+//     ret void
+//   }
+//
+// useSret is true only for a single >register-width aggregate result
+// whose underlying lifted function uses the sret convention (needsSret);
+// a multi-return tuple is always returned by value (register path),
+// matching funcValueUsesSret's `len(Results) != 1` guard.
+func emitClosureShimAggregate(out buf.CharBuf, mangled @[]char,
+		fvTyp @types.Type, f @ir.Func, useSret bool) buf.CharBuf {
+	var n int = f.NumCaptureParams
+	var closureMangled @[]char =
+		mangle.StructName(modulePkgName, f.ClosureStruct.Name).Bytes()
+	out = out.WriteStr("define weak_odr void @__shim.")
+	out = out.WriteStr(mangled)
+	out = out.WriteStr("(i8* %retbuf, i8* %data")
+	for i := 0; i < len(fvTyp.Params); i++ {
+		out = out.WriteStr(", ")
+		out = out.WriteStr(shimParamType(fvTyp.Params[i].Type))
+		out = out.WriteStr(" %a")
+		out = out.WriteInt(i)
 	}
+	out = out.WriteStr(") {\n  ")
+	out = emitShimArgLoads(out, fvTyp)
+	out = emitClosureCaptureLoads(out, closureMangled, f, n)
+	out = out.WriteStr("%rb = bitcast i8* %retbuf to ")
+	out = writeFuncResultsLLVM(out, fvTyp)
+	out = out.WriteStr("*\n  ")
+	if useSret {
+		// Sret call: pass %rb as the callee's sret arg; it writes the
+		// aggregate result through it.
+		out = out.WriteStr("call void @")
+		out = out.WriteStr(mangled)
+		out = out.WriteStr("(ptr sret(")
+		out = writeFuncResultsLLVM(out, fvTyp)
+		out = out.WriteStr(") align 8 %rb")
+		out = writeClosureUnderlyingArgs(out, fvTyp, f, n, true)
+		out = out.WriteStr(")\n  ret void\n}\n")
+		return out
+	}
+	// Register-return path: callee returns the aggregate by value; the
+	// shim stores it through %rb.
+	out = out.WriteStr("%r = call ")
+	out = writeFuncResultsLLVM(out, fvTyp)
+	out = out.WriteStr(" @")
+	out = out.WriteStr(mangled)
+	out = out.WriteByte('(')
+	out = writeClosureUnderlyingArgs(out, fvTyp, f, n, false)
+	out = out.WriteStr(")\n  ")
+	out = out.WriteStr("store ")
+	out = writeFuncResultsLLVM(out, fvTyp)
+	out = out.WriteStr(" %r, ")
+	out = writeFuncResultsLLVM(out, fvTyp)
+	out = out.WriteStr("* %rb\n  ret void\n}\n")
 	return out
 }

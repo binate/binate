@@ -17,6 +17,7 @@
 #
 #   <version>-<platform>/
 #     bin/{bnc,bni,bnas,bnlint}   the release binaries
+#     bin/binate-paths            search-path helper (see BUNDLE-HOWTO.md)
 #     lib/pkg/bootstrap/          pkg/bootstrap — backs print/println
 #     lib/runtime/                C runtime (binate_runtime.c + stubs)
 #     lib/ifaces/{core,stdlib}/   .bni interfaces (builtins + stdlib)
@@ -125,6 +126,16 @@ echo "==> building binaries"
 for b in bnc bni bnas bnlint; do
     test -x "$dest/bin/$b" || { echo "make-bundle: missing binary: $b" >&2; exit 1; }
 done
+
+# Ship the search-path helper next to the binaries (bin/ goes on PATH).  It
+# emits the standard -I/-L/--runtime for the bundle's lib/, self-locating the
+# base as ../lib from bin/, so a consumer never re-derives the layout by hand.
+# Same script the in-tree build/test scripts use, so the formula has one
+# definition.  See BUNDLE-HOWTO.md.
+cp "$SCRIPT_DIR/binate-paths.sh" "$dest/bin/binate-paths"
+chmod +x "$dest/bin/binate-paths"
+test -x "$dest/bin/binate-paths" || {
+    echo "make-bundle: missing binate-paths" >&2; exit 1; }
 
 # Bundle the stdlib + runtime that match these binaries.  cp -R keeps
 # the source layout intact so a consumer resolves the bundle directly

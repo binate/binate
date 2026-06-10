@@ -16,6 +16,7 @@ bin/
   bni      bytecode VM: runs .bn directly; also a REPL and a test runner
   bnas     assembler:   .s → .o
   bnlint   static analyzer: memory-safety lints
+  binate-paths  prints the -I/-L/--runtime search paths for lib/ (see below)
 lib/
   ifaces/core/      .bni for the builtins  (pkg/builtins/*)
   ifaces/stdlib/    .bni for the stdlib    (pkg/std/*: strconv, errors, math/…)
@@ -31,17 +32,26 @@ below.
 ## The search paths (set these once)
 
 Every tool resolves packages from interface directories (`-I`) and
-implementation directories (`-L`). Both are colon-separated and repeatable
-(cc-style), and the first `-I` entry doubles as the "source root". Point them at
-the bundle's `lib/`:
+implementation directories (`-L`); `bnc` also links a C runtime (`--runtime`).
+The bundle ships `bin/binate-paths`, which emits all three for the bundle's
+`lib/` — use it rather than spelling the paths out by hand:
 
 ```sh
-LIB=/path/to/bundle/lib
+# binate-paths self-locates the bundle's lib/ from its own bin/ location.
+I="$(binate-paths --iface)"
+L="$(binate-paths --impl)"
+RT="$(binate-paths --runtime)"      # bnc only — linked into the executable
+```
 
-I="$LIB:$LIB/ifaces/core:$LIB/ifaces/stdlib"
-L="$LIB:$LIB/impls/core/common:$LIB/impls/core/libc:$LIB/impls/stdlib/common"
+(`eval "$(binate-paths)"` instead sets `$BINATE_I` / `$BINATE_L` / `$BINATE_RT`
+in one shot. Pass `--base /path/to/lib` if you invoke `binate-paths` from
+outside the bundle.) It expands to the standard set — paths are colon-separated
+and repeatable (cc-style), and the first `-I` entry doubles as the "source root":
 
-RT="$LIB/runtime/binate_runtime.c"   # bnc only — linked into the executable
+```
+-I  $LIB:$LIB/ifaces/core:$LIB/ifaces/stdlib
+-L  $LIB:$LIB/impls/core/common:$LIB/impls/core/libc:$LIB/impls/stdlib/common
+--runtime  $LIB/runtime/binate_runtime.c
 ```
 
 What each entry covers:
@@ -51,12 +61,9 @@ What each entry covers:
 - `ifaces/stdlib` + `impls/stdlib/common` — the bundled stdlib
   (`pkg/std/strconv`, `pkg/std/errors`, …).
 
-The lib root alone is enough for builtin-only programs, but stdlib imports need
-the `ifaces/stdlib` + `impls/stdlib/common` entries — so just always use the
-full set above.
-
-To build your **own** code, prepend your project root to both `-I` and `-L` so
-your packages resolve alongside the stdlib:
+To build your **own** code, prepend your project root so your packages resolve
+alongside the stdlib (the `$I`/`$L` above are bundle-only; prepend `$ROOT`
+inline at each use, or regenerate them with `binate-paths --prepend "$ROOT"`):
 
 ```sh
 ROOT=/path/to/my/project

@@ -67,7 +67,7 @@ runner_exec() {
         compile_root="$root"
     fi
     compile_out=$("$GEN1_COMPILER" -I "$compile_root:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$compile_root:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
-        --backend native --target x86_64-linux --build-dir "$bdir" \
+        --backend native --target x86_64-linux --runtime "$BINATE_DIR/runtime/binate_runtime.c" --build-dir "$bdir" \
         $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         # Host vs cross: x86_64 host runs natively, anything else

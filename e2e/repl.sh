@@ -79,6 +79,7 @@ fi
 build_log=$("$GEN1_BNC" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
+    --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
     --build-dir "$BUILD_DIR" \
     -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1)
 if [ ! -x "$BNI_BIN" ]; then

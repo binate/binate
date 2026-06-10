@@ -122,6 +122,7 @@ if [ -n "$DBG_FLAG" ]; then
     "$GEN1_BNC" \
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
         -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
+        --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         "$DBG_FLAG" \
@@ -131,6 +132,7 @@ else
     "$GEN1_BNC" \
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
         -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
+        --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         -o "$OUT" \

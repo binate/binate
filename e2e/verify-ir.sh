@@ -32,6 +32,7 @@ for cmd in bnc bni bnas bnlint; do
     if "$GEN1_COMPILER" --verify-ir \
             -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
             -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
+            --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
             --build-dir "$bdir" -o "$out" "$BINATE_DIR/cmd/$cmd"; then
         echo "OK: cmd/$cmd verified clean"
     else

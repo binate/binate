@@ -51,17 +51,12 @@ lands, that cell flips to a value cell.
 
 ## Current state
 
-Green except the **named sub-word negation** cells, which are the live defect
-(xfailed):
-
-- **`neg/named/{int8,uint8,int16,uint16,int32,uint32}` — LLVM only.** Unary minus
-  on a `TYP_NAMED` sub-word int emits `sub i64 0, %i8` → clang rejects (the
-  `gen_expr` MINUS arm gates on `TYP_INT` and never peels `TYP_NAMED`). The matrix
-  pins it as **LLVM-only**: the VM and native backends tolerate the mis-typed IR
-  and produce the correct value (refining the claude-todo "invalid IR" entry).
-  `plan-cr2-1` Round-2 finding 8.
-- **`bitnot/named/*` is green** — the `~` arm passes `TYP_NAMED` straight to
-  `llvmType`, which unwraps it. This asymmetry (named `~` works, named `-` breaks)
-  is exactly why the matrix sweeps the wrapper axis over both ops: the unary-minus
-  fix (`fce07ccd`) was strictly weaker than the `~` fix it claimed to mirror.
-- `neg/named/{int64,uint64}` (host width) and all `*/plain/*` cells are green.
+All green. The **named sub-word negation** cells — `neg/named/{int8,uint8,
+int16,uint16,int32,uint32}` — were the live defect (unary minus on a `TYP_NAMED`
+sub-word int emitted `sub i64 0, %i8`, which clang rejected, because the
+`gen_expr` MINUS arm gated on `TYP_INT` and never peeled `TYP_NAMED`; LLVM-only,
+the VM/native backends tolerated the mis-typed IR). That is now fixed (binate
+`3c609caf`, peel the named wrapper in the MINUS arm like `~` already did), so the
+cells are no longer xfailed. The named `~`/`-` asymmetry the matrix swept the
+wrapper axis to catch (the earlier unary-minus fix `fce07ccd` was strictly weaker
+than the `~` fix it claimed to mirror) is closed.

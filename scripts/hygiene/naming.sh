@@ -27,7 +27,7 @@ WHITELIST="$SCRIPT_DIR/naming.whitelist"
 
 violations=0
 
-for f in $(find "$BINATE_DIR/pkg" -name '*.bni' 2>/dev/null | sort); do
+for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" -name '*.bni' 2>/dev/null | sort); do
     rel=${f#"$BINATE_DIR"/}
     out=$(awk -v rel="$rel" '
         function name_of_func(line,    s) {

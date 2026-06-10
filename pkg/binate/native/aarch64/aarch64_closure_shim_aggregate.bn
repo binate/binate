@@ -1,0 +1,171 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Native aarch64 emission for the aggregate-return path of a capturing
+// closure shim.  Split from aarch64_closure_shim.bn (which keeps the
+// scalar / void path) to stay under the hygiene file-length cap.
+//
+// A capturing closure whose function-value type returns a SINGLE
+// aggregate result rides the same retbuf-in-X0 caller convention the
+// non-capturing shim (emitFuncValueShims) and emitCallFuncValue use:
+//
+//     X0 = retbuf   (address of the caller's result buffer)
+//     X1 = data     (the closure-struct pointer)
+//     X2.. = user args
+//
+// The scalar closure shim cannot serve this: it expects data in X0 and
+// user args in X1.., and never threads retbuf into the lifted body's
+// result location — so a capturing closure returning a struct read the
+// retbuf as its data pointer and (for the sret shape) left X8 null, which
+// the lifted body dereferenced → SIGSEGV.  This file adds the two
+// aggregate shapes, mirroring emitFuncValueShims:
+//
+//   * Pack-return (retSz 1..16): the lifted body returns the aggregate
+//     packed in X0..X(retWords-1).  Frame up, stash retbuf, set up the
+//     underlying args, BL, then copy the packed result back through the
+//     stashed retbuf.
+//   * Sret-return (retSz > 16): the lifted body writes the aggregate
+//     through X8 (AAPCS64 indirect result).  Move retbuf X0 → X8, set up
+//     the underlying args, tail-branch (B preserves X8).
+//
+// Multi-return tuples stay on the scalar path (shimReturnIsAggregate is
+// false for them): the call site keeps data in X0 and sets X8 itself for
+// a >16-byte tuple, so the scalar shim's tail-branch already carries the
+// result correctly.
+
+// emitClosureShimAggregateAA64 emits the aggregate-return closure shim.
+// retSz is the single result's SizeOf (> 0; shimReturnIsAggregate already
+// gated this path).  Register-only: the underlying call's args (captures
+// + user words) must fit X0..X7 and the incoming user args (X2..X7) must
+// too — beyond that the shim records a compile error (a.SetError) rather
+// than silently emitting wrong code, since the stack-spill aggregate path
+// isn't implemented yet.
+func emitClosureShimAggregateAA64(a @asm.Assembler, fnLabel @[]char,
+		fvTyp @types.Type, f @ir.Func, retSz int) {
+	var cc common.CallConv = common.AAPCS64()
+	var captureWords int = 0
+	for i := 0; i < f.NumCaptureParams; i = i + 1 {
+		captureWords = captureWords +
+			effectiveCapWordsAA64(cc, f.ClosureStruct.Fields[i].Type)
+	}
+	var nUserWords int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
+		nUserWords = nUserWords +
+			common.ArgWords(fvTyp.Params[pi].Type)
+	}
+	if captureWords + nUserWords > 8 || nUserWords > 6 {
+		// The underlying call's args don't all fit registers, so it needs
+		// a stack-spill prologue (as the scalar closure shim's
+		// emitClosureShimStackSpillAA64 has) — not implemented for the
+		// aggregate shapes yet.  A silent `B` fallback here would
+		// miscompile (the result would never reach the retbuf, and the
+		// sret shape would leave X8 unset → null deref), so fail the
+		// compile loudly instead.  TODO: a stack-spill aggregate closure
+		// shim lifts this limit.
+		a.SetError("native aa64: aggregate-return closure shim needs "
+			"the unimplemented stack-spill path (captures + user-arg "
+			"words exceed the register budget)")
+		return
+	}
+	if retSz > 16 {
+		// Sret-return: retbuf X0 → X8 (set BEFORE the capture loads
+		// clobber X0), data X1 → X9 scratch, set up the underlying
+		// args, tail-branch.  B preserves X8, so the lifted body writes
+		// the result straight through the caller's retbuf.
+		aarch64.Mov(a, true, aarch64.X8, aarch64.Reg(aarch64.X0))
+		aarch64.Mov(a, true, aarch64.X9, aarch64.Reg(aarch64.X1))
+		loadClosureAggCallArgsAA64(a, cc, fvTyp, f, captureWords,
+			nUserWords)
+		a.SetGlobal(fnLabel)
+		aarch64.B(a, fnLabel)
+		return
+	}
+	// Pack-return (retSz 1..16): frame of 32 bytes (FP/LR + a retbuf save
+	// slot at [SP+16] + alignment pad), mirroring the non-capturing pack
+	// shim.  Stash retbuf, set up the underlying args (data in X9), BL,
+	// reload retbuf into X9, copy the packed return X0..X(retWords-1)
+	// through it, unwind.
+	aarch64.Stp(a, true, aarch64.FP, aarch64.LR,
+		aarch64.MemPre(aarch64.SP, -32))
+	aarch64.Mov(a, true, aarch64.FP, aarch64.Reg(aarch64.SP))
+	aarch64.Str(a, true, aarch64.X0, aarch64.MemImm(aarch64.SP, 16))
+	aarch64.Mov(a, true, aarch64.X9, aarch64.Reg(aarch64.X1))
+	loadClosureAggCallArgsAA64(a, cc, fvTyp, f, captureWords, nUserWords)
+	a.SetGlobal(fnLabel)
+	aarch64.Bl(a, fnLabel)
+	aarch64.Ldr(a, true, aarch64.X9, aarch64.MemImm(aarch64.SP, 16))
+	var retWords int = retSz / 8
+	if retSz % 8 != 0 { retWords = retWords + 1 }
+	for ri := 0; ri < retWords; ri = ri + 1 {
+		aarch64.Str(a, true, argReg(ri),
+			aarch64.MemImm(aarch64.X9, 8 * ri))
+	}
+	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR,
+		aarch64.MemPost(aarch64.SP, 32))
+	aarch64.Ret(a)
+}
+
+// loadClosureAggCallArgsAA64 sets up the underlying lifted-body call's
+// register args for an aggregate-returning closure shim.  The closure-
+// struct pointer is in X9 (a non-arg caller-saved scratch the caller
+// already moved data into).  Two steps, in this order:
+//
+//   1. Move the user args from their incoming slots X(2+j) (the funcval
+//      aggregate convention places user args after the retbuf+data
+//      prefix) to their outgoing slots X(captureWords+j).  Direction
+//      depends on captureWords vs the incoming base 2: a shift toward
+//      higher registers (captureWords >= 2) goes right-to-left so each
+//      source is read before its slot is overwritten; a shift toward
+//      lower registers goes left-to-right.
+//   2. Load the captures from [X9] into X0..X(captureWords-1) — done
+//      AFTER the user-arg moves so a capture write can't clobber an
+//      unread user-arg source.  X9 stays live across every load, so the
+//      base never needs the scalar shim's keep-X0-alive ordering.
+//      Indirect-large captures pass a pointer (ADD), per-word captures
+//      load each word.
+func loadClosureAggCallArgsAA64(a @asm.Assembler, cc common.CallConv,
+		fvTyp @types.Type, f @ir.Func, captureWords int,
+		nUserWords int) {
+	if captureWords >= 2 {
+		for j := nUserWords - 1; j >= 0; j = j - 1 {
+			moveAggUserWordAA64(a, j, captureWords)
+		}
+	} else {
+		for j := 0; j < nUserWords; j = j + 1 {
+			moveAggUserWordAA64(a, j, captureWords)
+		}
+	}
+	var wi int = 0
+	for i := 0; i < f.NumCaptureParams; i = i + 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var baseOfs int = f.ClosureStruct.FieldOffset(i)
+		if isIndirectLargeCapAA64(cc, ft) {
+			aarch64.Add(a, true, argReg(wi), aarch64.X9,
+				aarch64.Imm(baseOfs))
+			wi = wi + 1
+			continue
+		}
+		var nWords int = common.ArgWords(ft)
+		for k := 0; k < nWords; k = k + 1 {
+			aarch64.Ldr(a, true, argReg(wi),
+				aarch64.MemImm(aarch64.X9, baseOfs + k * 8))
+			wi = wi + 1
+		}
+	}
+}
+
+// moveAggUserWordAA64 moves user-arg word j from its incoming register
+// X(2+j) to its outgoing register X(captureWords+j), skipping the move
+// when source and destination coincide (captureWords == 2).
+func moveAggUserWordAA64(a @asm.Assembler, j int, captureWords int) {
+	var srcReg int = argReg(2 + j)
+	var dstReg int = argReg(captureWords + j)
+	if srcReg != dstReg {
+		aarch64.Mov(a, true, dstReg, aarch64.Reg(srcReg))
+	}
+}

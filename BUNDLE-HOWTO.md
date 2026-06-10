@@ -18,12 +18,11 @@ bin/
   bnlint   static analyzer: memory-safety lints
   binate-paths  prints the -I/-L/--runtime search paths for lib/ (see below)
 lib/
-  ifaces/core/      .bni for the builtins  (pkg/builtins/*)
+  ifaces/core/      .bni for the builtins (pkg/builtins/*) + pkg/bootstrap
   ifaces/stdlib/    .bni for the stdlib    (pkg/std/*: strconv, errors, math/…)
-  impls/core/       core implementations:  common, libc, baremetal
+  impls/core/       core impls: common, libc, baremetal (incl. pkg/bootstrap)
   impls/stdlib/     stdlib implementations: common, libc
   runtime/          binate_runtime.c (+ baremetal_arm32/ for that target)
-  pkg/bootstrap/    print/println support (pkg/bootstrap)
 ```
 
 Put `bin/` on your `PATH`; everything else is reached through the search paths
@@ -56,10 +55,12 @@ and repeatable (cc-style), and the first `-I` entry doubles as the "source root"
 
 What each entry covers:
 
-- `$LIB` (the bare root) — `pkg/bootstrap`, which backs `print`/`println`.
-- `ifaces/core` + `impls/core/*` — the builtins (`pkg/builtins/*`).
+- `ifaces/core` + `impls/core/*` — the builtins (`pkg/builtins/*`) and
+  `pkg/bootstrap` (which backs `print`/`println`).
 - `ifaces/stdlib` + `impls/stdlib/common` — the bundled stdlib
   (`pkg/std/strconv`, `pkg/std/errors`, …).
+- `$LIB` (the bare root) — resolves nothing in a bundle (it's there for the
+  source tree, where `pkg/binate/*` lives at the root); harmless to keep.
 
 To build your **own** code, prepend your project root so your packages resolve
 alongside the stdlib (the `$I`/`$L` above are bundle-only; prepend `$ROOT`

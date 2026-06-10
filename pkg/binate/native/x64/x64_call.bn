@@ -91,65 +91,64 @@ func emitAggregateArg(a @asm.Assembler, rm @common.RegMap, arg @ir.Instr,
 	}
 }
 
-// multiReturnEightbyteIsSSE reports whether eightbyte k of a multi-return
-// tuple is an SSE eightbyte per SysV-AMD64: every field overlapping bytes
-// [8k, 8k+8) is a float scalar, so LLVM returns that eightbyte in an XMM
-// register (XMM0/XMM1), not RAX/RDX.  Any integer/aggregate overlap makes
-// the eightbyte INTEGER.  Float fields sit at 8-aligned offsets (one per
-// eightbyte) for the (int,float64)/(float64,float64) shapes; the overlap
-// test also handles a coalesced pair of float32s in one eightbyte.
-func multiReturnEightbyteIsSSE(t @types.Type, k int) bool {
-	var lo int = 8 * k
-	var hi int = lo + 8
-	var any bool = false
-	for fi := 0; fi < len(t.Fields); fi++ {
-		var fo int = t.FieldOffset(fi)
-		var fsz int = t.Fields[fi].Type.SizeOf()
-		if fsz <= 0 { fsz = 8 }
-		if fo < hi && fo + fsz > lo {
-			any = true
-			if !common.IsFloatScalarTyp(t.Fields[fi].Type) { return false }
-		}
-	}
-	return any
+// retGpReg maps the i-th GP-class return slot to its register under LLVM's
+// x86-64 first-class-struct return lowering: RAX, RDX, RCX (3 GP return regs;
+// a 4th GP word routes the whole tuple to sret — see multiReturnTupleNeedsSret).
+func retGpReg(i int) int {
+	if i == 0 { return x64.RAX }
+	if i == 1 { return x64.RDX }
+	return x64.RCX
 }
 
-// collectMultiReturnTuple stores a ≤16-byte multi-return tuple from its SysV
-// return registers into the spill slot.  An INTEGER eightbyte (RAX/RDX) is
-// stored raw at its byte offset so each OP_EXTRACT reads its component there;
-// an SSE eightbyte (XMM0/XMM1, all-float) is MOVQ'd through a GP scratch to the
-// same slot — see multiReturnEightbyteIsSSE.  Shared by the direct and every
-// indirect (iface / func-value / call-indirect) collect so the scheme can't
-// drift back to a per-field-register split (which drops fields ≥ 2 and
-// mis-reads a coalesced sub-word field 1 out of RDX).  Callers must already
-// have returned for a > 16-byte tuple (sret).
+// collectMultiReturnTuple stores an in-register multi-return tuple from its
+// return registers into the call result's spill slot, FIELD-PER-REGISTER —
+// matching LLVM's x86-64 first-class-struct return lowering (no eightbyte
+// coalescing): a non-float field's words come from RAX,RDX,RCX (retGp), a
+// float-scalar field from XMM0,XMM1 (retFp, via a GP scratch since native
+// values live in GP spill slots).  Each field lands at its tuple offset so
+// OP_EXTRACT reads its component there.  So `(float32,float32)` collects
+// XMM0,XMM1 (not one coalesced XMM0), `(float32,int32)` collects XMM0 + EAX,
+// `(i32,i32)` RAX + RDX — each its own register, matching the LLVM-compiled
+// callee at the native↔LLVM boundary (claude-todo #112).  Shared by the direct
+// and every indirect (iface / func-value / call-indirect) collect; the
+// register-count sret threshold routed > 3-GP / > 2-FP tuples to sret already.
+// Symmetric mirror of emitMultiReturnPack + aa64's collectMultiReturnFields.
 func collectMultiReturnTuple(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
 	var spillOff int = rm.LookupSpill(ins.ID)
 	if spillOff < 0 { return }
-	// Per-eightbyte register-class collect: an SSE eightbyte (all-float)
-	// arrives in XMM0../XMM1 per SysV-AMD64 + LLVM legalization, an INTEGER
-	// eightbyte in RAX/RDX.  So `(int, float64)` collects RAX + XMM0 (not
-	// RAX + RDX) and `(float64, float64)` collects XMM0 + XMM1.  Reading a
-	// float eightbyte from RDX (the old raw RAX/RDX store) reads a GP reg
-	// the callee never wrote → 0 (conformance/683).  Each eightbyte lands
-	// at its byte offset so OP_EXTRACT reads its component as before.
-	var sz int = ins.Typ.SizeOf()
-	var nEb int = (sz + 7) / 8
-	var nInt int = 0
-	var nSse int = 0
-	for k := 0; k < nEb && k < 2; k++ {
-		if multiReturnEightbyteIsSSE(ins.Typ, k) {
-			var tmp int = scratchReg(rm)
-			x64.Movq_xmm_to_gp(a, tmp, x64.XMM0 + nSse)
-			x64.Mov(a, x64.Mem(x64.RSP, spillOff + 8*k, x64.SZ64),
-				x64.Reg(tmp, x64.SZ64))
-			nSse = nSse + 1
+	var retGp int = 0
+	var retFp int = 0
+	for fi := 0; fi < len(ins.Typ.Fields); fi++ {
+		var fldTyp @types.Type = ins.Typ.Fields[fi].Type
+		var fldOff int = ins.Typ.FieldOffset(fi)
+		if common.IsFloatScalarTyp(fldTyp) {
+			if retFp < 2 {
+				var tmp int = scratchReg(rm)
+				var fldSz int = fldTyp.SizeOf()
+				if common.FloatScalarIsI32(fldTyp) {
+					x64.Movd_xmm_to_gp(a, tmp, x64.XMM0 + retFp)
+				} else {
+					x64.Movq_xmm_to_gp(a, tmp, x64.XMM0 + retFp)
+					fldSz = 8
+				}
+				emitScalarStore(a, tmp, x64.RSP, spillOff + fldOff, fldSz)
+			}
+			retFp = retFp + 1
+		} else if common.IsAggregateTyp(fldTyp) {
+			var fldSz int = fldTyp.SizeOf()
+			for w := 0; w * 8 < fldSz && retGp < 3; w++ {
+				x64.Mov(a, x64.Mem(x64.RSP, spillOff + fldOff + 8*w,
+					x64.SZ64), x64.Reg(retGpReg(retGp), x64.SZ64))
+				retGp = retGp + 1
+			}
 		} else {
-			var gp int = x64.RAX
-			if nInt == 1 { gp = x64.RDX }
-			x64.Mov(a, x64.Mem(x64.RSP, spillOff + 8*k, x64.SZ64),
-				x64.Reg(gp, x64.SZ64))
-			nInt = nInt + 1
+			if retGp < 3 {
+				var fldSz int = fldTyp.SizeOf()
+				if fldSz <= 0 { fldSz = 8 }
+				emitScalarStore(a, retGpReg(retGp), x64.RSP,
+					spillOff + fldOff, fldSz)
+				retGp = retGp + 1
+			}
 		}
 	}
 }

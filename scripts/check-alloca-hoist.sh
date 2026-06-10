@@ -23,8 +23,8 @@ if [ -z "$BNC" ]; then
     BNC="$GEN1_COMPILER"
 fi
 
-IFLAGS="-I $BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib"
-LFLAGS="-L $BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common"
+IFLAGS="-I $("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
+LFLAGS="-L $("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
 
 if [ "$#" -gt 0 ]; then
     FILES="$*"

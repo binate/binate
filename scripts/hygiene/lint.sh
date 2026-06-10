@@ -83,7 +83,7 @@ if [ -z "$BNLINT_BIN" ] || [ ! -x "$BNLINT_BIN" ]; then
     }
 fi
 
-"$BNLINT_BIN" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" $TARGETS
+"$BNLINT_BIN" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" $TARGETS
 rc=$?
 
 if [ "$rc" -ne 0 ]; then

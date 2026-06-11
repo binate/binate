@@ -46,8 +46,9 @@ TMP="$(mktemp -d -t binate-fetch-builder-smoke.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 BIN="$TMP/hello"
 build_log="$("$BUILDER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" "$BINATE_DIR/cmd/bnc" -- \
-    -I "$BUILDER_LIB" -L "$BUILDER_LIB" \
-    --runtime "$BUILDER_LIB/runtime/binate_runtime.c" \
+    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB")" \
+    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB")" \
+    --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")" \
     --build-dir "$TMP" -o "$BIN" \
     "$BINATE_DIR/conformance/001_hello.bn" 2>&1)" || true
 if [ ! -x "$BIN" ]; then

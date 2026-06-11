@@ -89,8 +89,9 @@ runner_exec() {
     # compile_root == BINATE_DIR is a no-op.
     OLDIFS=$IFS; IFS='
 '; set -- $(_baremetal_bnc_extra_args); IFS=$OLDIFS
-    compile_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target arm32-baremetal)" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
+    compile_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target arm32-baremetal)" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --target arm32-baremetal)" \
         -I "$compile_root" -L "$compile_root" --target arm32-baremetal \
+        --runtime "$BINATE_DIR/runtime/baremetal_arm32/crt0.s" \
         "$@" \
         --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then

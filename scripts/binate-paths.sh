@@ -103,6 +103,23 @@ fi
 # on an unrecognised host (so a `pkg/builtins/build` import fails with a
 # clear not-found rather than the wrong layout).
 TARGET_DIR=""
+TARGET_EXTRA=""   # newline-list of dirs prepended to BOTH -I and -L
+
+# set_target_extras adds any per-target impl/interface search dirs BEYOND the
+# generic ifaces/targets/<key> build.bni tree — prepended to both -I and -L so
+# they win over the libc-host defaults (first-match-wins in the loader).
+# arm32-baremetal needs its bootstrap/rt impls (impls/core/baremetal) and its
+# semihost interface + link-file dir (runtime/baremetal_arm32) ahead of the
+# default impls/core/libc.  bnc no longer synthesizes these (it has no notion
+# of a binate root); binate-paths is the single source of these paths.
+set_target_extras() {
+    case "$1" in
+        arm32-baremetal)
+            TARGET_EXTRA="$BASE/impls/core/baremetal
+$BASE/runtime/baremetal_arm32" ;;
+    esac
+}
+
 resolve_target() {
     rt_key="$TARGET"
     if [ -z "$rt_key" ] || [ "$rt_key" = host ]; then
@@ -120,6 +137,7 @@ resolve_target() {
         rt_key="$rt_arch-$rt_os"
         [ -d "$BASE/ifaces/targets/$rt_key" ] && \
             TARGET_DIR="$BASE/ifaces/targets/$rt_key"
+        set_target_extras "$rt_key"
         return 0
     fi
     if [ ! -d "$BASE/ifaces/targets/$rt_key" ]; then
@@ -127,6 +145,7 @@ resolve_target() {
         exit 1
     fi
     TARGET_DIR="$BASE/ifaces/targets/$rt_key"
+    set_target_extras "$rt_key"
 }
 resolve_target
 
@@ -142,6 +161,7 @@ build_list() {   # $1 = iface | impl
         if [ "$1" = iface ] && [ -n "$TARGET_DIR" ]; then
             printf '%s\n' "$TARGET_DIR"
         fi
+        [ -n "$TARGET_EXTRA" ] && printf '%s\n' "$TARGET_EXTRA"
         printf '%s\n' "$BASE"
         if [ "$1" = iface ]; then
             printf '%s\n' "$BASE/ifaces/core"

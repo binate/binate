@@ -1,0 +1,183 @@
+package "pkg/binate/native/x64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Float-aware closure shim for the x64 (SysV-AMD64) native backend
+// (claude-todo #121).  A capturing closure with a float-scalar CAPTURE,
+// float-scalar PARAM, or float-scalar RETURN cannot ride the GP-only fast /
+// stack-spill paths: those move every capture/user-arg word through RDI..R9,
+// but the lifted body reads a float leaf from XMM0..XMM7 (the SysV SSE
+// sequence) and returns a float scalar in XMM0.  The shim is entered under the
+// all-int dispatch ABI (closure-struct ptr in RDI, user args as GP bits in
+// RSI..), so it must place each float leaf in its XMM register and hand the
+// bits back in RAX on a float return.  Sibling of #120's func-value float shim
+// and the aarch64 emitClosureShimFloatAA64.
+
+// closureHasFloatParts_x64 reports whether a capturing closure's underlying
+// call or return involves a float scalar — a float capture, a float user-arg
+// param, or a float-scalar single result — so it needs the float-aware shim
+// rather than the GP-only fast / stack-spill paths.
+func closureHasFloatParts_x64(fvTyp @types.Type, f @ir.Func) bool {
+	if f.ClosureStruct != nil {
+		for i := 0; i < f.NumCaptureParams; i++ {
+			if common.IsFloatScalarTyp(f.ClosureStruct.Fields[i].Type) {
+				return true
+			}
+		}
+	}
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		if common.IsFloatScalarTyp(fvTyp.Params[pi].Type) { return true }
+	}
+	return shimReturnIsFloatScalar_x64(fvTyp)
+}
+
+// emitClosureShimFloat_x64 emits the float-aware closure shim.  It moves the
+// closure-struct base to R10, spills the incoming user-arg GP registers to a
+// stack scratch area, then loads every underlying-call argument — captures
+// (from [R10 + field offset], the lifted body's leading params) then user args
+// (from the spill) — into its SysV register by CLASS: a float-scalar leaf via
+// movq/movd into xmm[NSRN], every other leaf into the GP arg reg[NGRN].
+// Sourcing everything from memory (R10 struct / stack spill) makes the marshal
+// order clobber-free (dests are RDI..R9 / XMM0..7, neither R10, RSP, nor the
+// RAX scratch).  After the CALL a float-scalar return is movq/movd'd
+// xmm0 -> rax for the all-int shim.  Register-only: the underlying call must
+// fit RDI..R9 + XMM0..7 and the incoming user args must fit RSI..R9; beyond
+// that the shim records a.SetError (the stack-overflow float path isn't
+// implemented — rare, untested).
+func emitClosureShimFloat_x64(a @asm.Assembler, fnLabel @[]char,
+		fvTyp @types.Type, f @ir.Func) {
+	// A multi-return RESULT alongside float captures/params would need the
+	// field-per-register multi-return pack combined with FP-arg marshalling —
+	// not yet implemented.  Fail loudly rather than mis-handle (claude-todo
+	// #121); a void or single-scalar (incl. float) return is handled below.
+	if len(fvTyp.Results) > 1 {
+		a.SetError("native x64: float closure with a multi-return result is "
+			"not yet handled")
+		return
+	}
+	var cc common.CallConv = common.SysV_AMD64()
+	// Walk 1: outgoing GP/FP register counts + incoming user-arg GP words.
+	var ngrn int = 0
+	var nsrn int = 0
+	for i := 0; i < f.NumCaptureParams; i++ {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		if common.IsFloatScalarTyp(ft) {
+			nsrn = nsrn + 1
+		} else if isIndirectLargeCap_x64(cc, ft) {
+			ngrn = ngrn + 1
+		} else {
+			ngrn = ngrn + common.ArgWords(ft)
+		}
+	}
+	var nUserWords int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		var pt @types.Type = fvTyp.Params[pi].Type
+		if common.IsFloatScalarTyp(pt) {
+			nsrn = nsrn + 1
+		} else {
+			ngrn = ngrn + common.ArgWords(pt)
+		}
+		nUserWords = nUserWords + common.ArgWords(pt)
+	}
+	// Outgoing GP fits RDI..R9 (6); FP fits XMM0..7 (8); incoming user args fit
+	// RSI..R9 (5, since RDI is the closure ptr).
+	if ngrn > 6 || nsrn > 8 || nUserWords > 5 {
+		a.SetError("native x64: float closure shim needs the unimplemented "
+			"stack-overflow path (captures/args exceed the register budget)")
+		return
+	}
+	// Frame: push rbp / mov rbp,rsp re-aligns rsp to 16; sub rsp by the spill
+	// area (16-aligned) keeps it aligned for the CALL.
+	var spillBytes int = nUserWords * 8
+	if spillBytes % 16 != 0 { spillBytes = spillBytes + 8 }
+	x64.Push(a, x64.Reg(x64.RBP, x64.SZ64))
+	x64.Mov(a, x64.Reg(x64.RBP, x64.SZ64), x64.Reg(x64.RSP, x64.SZ64))
+	if spillBytes > 0 {
+		x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(spillBytes))
+	}
+	// R10 = closure-struct base (RDI holds it on entry).  R10 is caller-saved
+	// and never an outgoing arg register, so it survives the marshal.
+	x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Reg(x64.RDI, x64.SZ64))
+	// Spill incoming user-arg words argReg(1..nUserWords) (RSI..) to [RSP+w*8].
+	for w := 0; w < nUserWords; w++ {
+		x64.Mov(a, x64.Mem(x64.RSP, w * 8, x64.SZ64),
+			x64.Reg(argReg(1 + w), x64.SZ64))
+	}
+	// Walk 2: emit.  Order is free — captures source [R10 + ofs], user args the
+	// spill; dests are RDI..R9 / XMM0..7.  ngrn/nsrn re-counted in param order.
+	ngrn = 0
+	nsrn = 0
+	for i := 0; i < f.NumCaptureParams; i++ {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var ofs int = f.ClosureStruct.FieldOffset(i)
+		if common.IsFloatScalarTyp(ft) {
+			emitFloatLoadToXmm_x64(a, x64.XMM0 + nsrn, x64.R10, ofs, ft)
+			nsrn = nsrn + 1
+		} else if isIndirectLargeCap_x64(cc, ft) {
+			x64.Lea(a, x64.Reg(argReg(ngrn), x64.SZ64),
+				x64.Mem(x64.R10, ofs, x64.SZ64))
+			ngrn = ngrn + 1
+		} else {
+			var nw int = common.ArgWords(ft)
+			for k := 0; k < nw; k++ {
+				x64.Mov(a, x64.Reg(argReg(ngrn), x64.SZ64),
+					x64.Mem(x64.R10, ofs + k * 8, x64.SZ64))
+				ngrn = ngrn + 1
+			}
+		}
+	}
+	var inWord int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		var pt @types.Type = fvTyp.Params[pi].Type
+		if common.IsFloatScalarTyp(pt) {
+			emitFloatLoadToXmm_x64(a, x64.XMM0 + nsrn, x64.RSP,
+				inWord * 8, pt)
+			nsrn = nsrn + 1
+			inWord = inWord + 1
+		} else {
+			var nw int = common.ArgWords(pt)
+			for k := 0; k < nw; k++ {
+				x64.Mov(a, x64.Reg(argReg(ngrn), x64.SZ64),
+					x64.Mem(x64.RSP, (inWord + k) * 8, x64.SZ64))
+				ngrn = ngrn + 1
+			}
+			inWord = inWord + nw
+		}
+	}
+	a.SetGlobal(fnLabel)
+	x64.Call(a, fnLabel)
+	// Float-scalar return: the lifted body returns it in xmm0; the all-int
+	// shim hands the bits back in rax.
+	if shimReturnIsFloatScalar_x64(fvTyp) {
+		if common.FloatScalarIsI32(fvTyp.Results[0]) {
+			x64.Movd_xmm_to_gp(a, x64.RAX, x64.XMM0)
+		} else {
+			x64.Movq_xmm_to_gp(a, x64.RAX, x64.XMM0)
+		}
+	}
+	if spillBytes > 0 {
+		x64.Add(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(spillBytes))
+	}
+	x64.Pop(a, x64.Reg(x64.RBP, x64.SZ64))
+	x64.Ret(a)
+}
+
+// emitFloatLoadToXmm_x64 loads a float-scalar value at [base + ofs] into XMM
+// register xmm through the RAX scratch (the closure shim has no direct mem->xmm
+// here): a float64 via a 64-bit MOV + MOVQ; a float32 via a 32-bit MOV + MOVD,
+// so neither the high bits of the GP word nor any bytes past a 4-byte field
+// reach the XMM register.
+func emitFloatLoadToXmm_x64(a @asm.Assembler, xmm int, base int, ofs int,
+		ft @types.Type) {
+	if common.FloatScalarIsI32(ft) {
+		x64.Mov(a, x64.Reg(x64.RAX, x64.SZ32), x64.Mem(base, ofs, x64.SZ32))
+		x64.Movd_gp_to_xmm(a, xmm, x64.RAX)
+	} else {
+		x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(base, ofs, x64.SZ64))
+		x64.Movq_gp_to_xmm(a, xmm, x64.RAX)
+	}
+}

@@ -86,6 +86,13 @@ long-tail bugs that aren't a systematic product.
   spec value at the operand's width (the named sub-word `neg` cells are red on
   LLVM — the MINUS arm never peels `TYP_NAMED`). Generator:
   `conformance/gen-operator-matrix.py`. See `operator/README.md`.
+- **`shift-typepair/`** — cross-type shifts: a shift's count type is independent
+  of its value type, and the result type is the value's. Axes `<op>/<value-type>`
+  with the count-type swept in-cell (the full value×count product); assertion:
+  the shift is permitted for every count type, the result binds to the value's
+  type with no cast, and the value is correct at the value's width (incl. an
+  overshift width-pin). Generator: `conformance/gen-shift-typepair-matrix.py`.
+  See `shift-typepair/README.md`.
 - **`dispatch-refcount/`** — refcount BALANCE of a managed multi-return component
   produced through an indirect call (Code-Red-2 §3.4). Axes `<producer>/<component>`;
   assertion: the component arrives with one added ref and is released on drop

@@ -48,6 +48,13 @@ CELLS = [
     ("init/float32", "", "var G float32 = 2.5", ["cast(int, G * 2.0)"], [5]),
     ("init/struct", STRUCT_S, "var G S = S{10, 20}", ["G.a", "G.b"], [10, 20]),
     ("init/array", "", "var G [3]int = [3]int{10, 20, 30}", ["G[0]", "G[2]"], [10, 30]),
+    # Named-distinct fixed-array global. The initializer uses the unnamed
+    # `[3]int{...}` literal (which the unnamed→named array assignability of
+    # named-distinct transparency accepts) rather than `Row{...}`: a composite
+    # literal written with a NAMED type name (`Row{...}`) is silently
+    # miscompiled to a const-0 — genCompositeLit dispatches on TypeRef.Kind and
+    # never peels TYP_NAMED, so it drops the initializer (filed in claude-todo).
+    ("init/named-array", "type Row [3]int", "var G Row = [3]int{10, 20, 30}", ["G[0]", "G[2]"], [10, 30]),
     ("init/named-scalar", "type Count int", "var G Count = 42", ["cast(int, G)"], [42]),
     ("init/named-float", "type Temp float64", "var G Temp = 2.5", ["cast(int, G * 2.0)"], [5]),
 
@@ -55,6 +62,10 @@ CELLS = [
     ("noinit/int", "", "var G int", ["G"], [0]),
     ("noinit/struct", STRUCT_S, "var G S", ["G.a", "G.b"], [0, 0]),
     ("noinit/array", "", "var G [3]int", ["G[0]", "G[2]"], [0, 0]),
+    # Named-distinct fixed-array, no init: index + len peel TYP_NAMED
+    # (named-distinct transparency), so element 0 is the zero value and
+    # len is the static array length.
+    ("noinit/named-array", "type Row [3]int", "var G Row", ["G[0]", "cast(int, len(G))"], [0, 3]),
     ("noinit/nested-array", "", "var G [2][2]int", ["G[1][0]"], [0]),
     ("noinit/managed-slice", "", "var G @[]int", ["cast(int, len(G))"], [0]),
     ("noinit/iface", IFACE_G, "var G @Getter", ["cast(int, present(G))"], [0]),
@@ -66,11 +77,12 @@ CELLS = [
     #     CONTROL; the wrapper bug is over managed-slice / managed-ptr / iface /
     #     func, where the dispatch's missing TYP_NAMED peel emits an invalid zero
     #     token against a struct/pointer LLVM type). These are COMPILE assertions
-    #     (read `0`): a green cell compiles, a red one fails at the global emit.
-    #     (`named-array` is omitted — `type X [N]T` is unparseable, a separate
-    #     parser-disambiguation gap; see claude-todo.) ---
+    #     (read `0`): a green cell compiles, a red one fails at the global emit. ---
     ("noinit/named-scalar0", "type Count int", "var G Count", ["cast(int, G)"], [0]),
-    ("noinit/named-managed-slice", "type Buf @[]int", "var G Buf", ["0"], [0]),
+    # Named-distinct managed-slice, no init: `len` peels TYP_NAMED
+    # (named-distinct transparency), so a nil slice reads len 0 — mirrors
+    # the non-named noinit/managed-slice cell.
+    ("noinit/named-managed-slice", "type Buf @[]int", "var G Buf", ["cast(int, len(G))"], [0]),
     ("noinit/named-managed-ptr", BOX + "\n\ntype P @Box", "var G P", ["0"], [0]),
     ("noinit/named-iface", IFACE_G + "\n\ntype H @Getter", "var G H", ["0"], [0]),
     ("noinit/named-func", "type Fn @func() int", "var G Fn", ["0"], [0]),

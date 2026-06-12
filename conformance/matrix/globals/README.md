@@ -25,27 +25,39 @@ type* / *use of undefined type*) and the global reads back its initialized value
 ## Current state
 
 The default coordinate (plain int / direct value) and the value-type controls are
-green on every backend. Red cells (xfailed + filed):
+green on every backend, as are the named-over-non-struct globals (see "Resolved"
+below). Red cells (xfailed + filed):
 
-- **named-over-non-struct globals — LLVM only.** `named-{managed-slice,managed-ptr,
-  iface,func}` emit an invalid LLVM zero token (`global %BnIfaceValue 0`, …)
-  because the codegen static-zero dispatch (`emit.bn`) peels only `TYP_READONLY`,
-  never `TYP_NAMED`. **VM and native lower globals via separate paths and pass** —
-  so this is purely LLVM-codegen (plan-cr2-2 Defect 1). `named-{scalar,float}` pass
-  (the int else-arm / `IsFloat` peel are incidentally correct). A *named struct*
-  (`type S struct{…}`) is `TYP_STRUCT`, not a wrapper, so it is a control.
 - **`readonly/struct` — all backends.** A `readonly` struct global reads its
   fields as 0 — the shared `gen_selector` IR-gen literal-0 bug (Class B;
   plan-cr2-1 Defect 1), surfacing in global position (the `io.EOF` shape).
 
+### Resolved
+
+- **named-over-non-struct globals — LLVM** (was red, now green on every backend).
+  `named-{managed-slice,managed-ptr,iface,func}` globals used to emit an invalid
+  LLVM zero token (`global %BnIfaceValue 0`, …) because the codegen static-zero
+  dispatch peeled only `TYP_READONLY`, never `TYP_NAMED`. Binate `f2ebaca1`
+  extended that dispatch to peel `TYP_NAMED`, so these cells now pass on every
+  mode (no xfail markers remain). `named-{scalar,float}` were already green (the
+  int else-arm / `IsFloat` peel are incidentally correct); a *named struct*
+  (`type S struct{…}`) is `TYP_STRUCT`, not a wrapper, so it is a control.
+
+Named-array and named-managed-slice transparency are now implemented, so those
+cells test their real behavior: `type X [N]T` parses (grammar D11), `len()`/index
+peel `TYP_NAMED`, and the `named-array` global cell exists (init + noinit). The
+`named-managed-slice` cell reads its real `len(G)` (0 for the noinit nil slice),
+no longer a compile-only `0`.
+
+The `init/named-array` cell initializes with the *unnamed* `[3]int{...}` literal
+(accepted via unnamed→named array assignability), NOT `Row{...}`: a composite
+literal written with a named type name is silently miscompiled — `genCompositeLit`
+(`pkg/binate/ir/gen_composite.bn`) dispatches on `TypeRef.Kind` and never peels
+`TYP_NAMED`, so it drops the initializer and emits const-0. (Not exercised here as
+a cell — see claude-todo for the named-composite-literal IR-gen defect.)
+
 ## Known gaps (not cells here)
 
-- **`type X [N]T` is unparseable** — `type` + `[` is greedily read as generic
-  type-params, so a named *fixed-array* type can't be declared (filed in
-  claude-todo). The `named-array` global cell is therefore omitted.
-- **`len()` on a named-managed-slice** is rejected by the checker (named not
-  peeled) — a separate wrapper-transparency bug; the `named-managed-slice` cell
-  reads `0` (compile-only) to isolate the global zero-token defect.
 - Cross-package globals (the `access` axis) are not yet built — they need
   multi-package directories; the cross-module struct-type-discovery defect
   (plan-cr2-2 Defect 2) is pinned by a point-test until then.

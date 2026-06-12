@@ -1,0 +1,202 @@
+package "pkg/binate/native/x64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/x64"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Genuine-overflow stack-spill path for the non-closure func-value shims
+// (amd64 / SysV).  Reached from emitFuncValueShims when a func value's
+// EFFECTIVE user-arg words exceed the register budget the tail-jump /
+// register-only shapes can serve.  Mirrors emitClosureShimStackSpill_x64
+// (the capturing-closure analogue), specialized to the no-captures case
+// plus the func-value return shapes (scalar/void, sret, pack, float-ret).
+//
+// The shim is entered under the uniform all-int dispatch ABI: dispatch
+// word g (g=0 is the leading data slot, or retbuf+data for the aggregate
+// shapes) is in argReg(g) if g < 6, else on the dispatch CALLER's stack —
+// at shim entry [rsp + 8 + (g-6)*8] (rsp+0 is the return address the
+// dispatch caller's CALL pushed).  The shim re-marshals the user words
+// into the underlying's real SysV layout (reg words shifted down by the
+// dropped prefix; overflow words written to a reserved outgoing-args
+// area), then CALLs (NOT tail-jumps — the frame must be torn down before
+// RET) and tears the frame down.
+//
+// Clobber-safety of the reg shifts: every word shifts DOWN by a constant
+// (srcPrefix - gpDestBase), so an outgoing reg R is read as an incoming
+// source only at a strictly lower word index, already consumed when the
+// marshal runs left-to-right.  RAX is the spill scratch (never an arg /
+// sret / return-input reg during marshalling).
+
+// emitFuncvalSpillShim_x64 emits the over-budget func-value shim.  retSz
+// is the single-result SizeOf (0 for void / multi-return scalar).  The
+// shape flags are mutually consistent with emitFuncValueShims: at most
+// one of usePack / useSret is set; isFloatRet only with neither.
+func emitFuncvalSpillShim_x64(a @asm.Assembler, cc common.CallConv,
+		fnLabel @[]char, fvTyp @types.Type, retSz int,
+		usePack bool, useSret bool, isFloatRet bool) {
+	var userTypes @[]@types.Type = shimUserTypes_x64(fvTyp)
+	// Incoming prefix words to skip: 1 (data) for scalar/void/float, 2
+	// (retbuf + data) for the aggregate shapes.
+	var srcPrefix int = 1
+	if usePack || useSret { srcPrefix = 2 }
+	// Outgoing GP base: 0 normally; 1 for sret, where RDI holds the sret
+	// pointer and user args start at RSI.  The classifier runs with a
+	// correspondingly reduced GP-reg file so overflow lands on the stack.
+	var gpDestBase int = 0
+	if useSret { gpDestBase = 1 }
+	var ccOut common.CallConv = cc
+	if gpDestBase > 0 {
+		ccOut.NumGpArgRegs = cc.NumGpArgRegs - gpDestBase
+	}
+	var outBytes int = ccOut.CallStackBytes(userTypes)
+	// frameDelta keeps rsp ≡ 0 mod 16 at the outgoing CALL: entry rsp ≡ 8
+	// (post return-address push), outBytes ≡ 0 mod 16, so +8 re-aligns.
+	// The top 8 bytes double as the retbuf save slot for the pack shape.
+	var frameDelta int = outBytes + 8
+	var retbufOff int = outBytes
+
+	x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frameDelta))
+	if usePack {
+		// Stash retbuf (RDI) above the outgoing-args area; the marshal
+		// (gpDestBase 0) will overwrite RDI.
+		x64.Mov(a, x64.Mem(x64.RSP, retbufOff, x64.SZ64),
+			x64.Reg(x64.RDI, x64.SZ64))
+	}
+	emitSpillMarshal_x64(a, cc, ccOut, userTypes, srcPrefix, gpDestBase,
+		frameDelta)
+	a.SetGlobal(fnLabel)
+	x64.Call(a, fnLabel)
+	if usePack {
+		// RAX (+RDX) hold the packed return; copy through the stashed
+		// retbuf (reloaded into R10, outside the return regs).
+		x64.Mov(a, x64.Reg(x64.R10, x64.SZ64),
+			x64.Mem(x64.RSP, retbufOff, x64.SZ64))
+		x64.Mov(a, x64.Mem(x64.R10, 0, x64.SZ64),
+			x64.Reg(x64.RAX, x64.SZ64))
+		if retSz > 8 {
+			x64.Mov(a, x64.Mem(x64.R10, 8, x64.SZ64),
+				x64.Reg(x64.RDX, x64.SZ64))
+		}
+	} else if isFloatRet {
+		// The underlying returns the float in xmm0; the all-int dispatch
+		// ABI expects the bits in rax.
+		if common.FloatScalarIsI32(fvTyp.Results[0]) {
+			x64.Movd_xmm_to_gp(a, x64.RAX, x64.XMM0)
+		} else {
+			x64.Movq_xmm_to_gp(a, x64.RAX, x64.XMM0)
+		}
+	}
+	// sret: the underlying wrote the result through RDI=retbuf already.
+	// scalar/void: the result is in RAX, preserved across the rewind.
+	x64.Add(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frameDelta))
+	x64.Ret(a)
+}
+
+// shimUserTypes_x64 extracts the func-value's parameter types into a
+// @[]@types.Type the CallConv classifier consumes.
+func shimUserTypes_x64(fvTyp @types.Type) @[]@types.Type {
+	var ts @[]@types.Type
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		ts = appendTypePtr(ts, fvTyp.Params[pi].Type)
+	}
+	return ts
+}
+
+// emitSpillMarshal_x64 moves the user args from their incoming all-int
+// dispatch positions into the underlying's SysV layout.  Incoming uses
+// the FULL GP-reg file (cc); outgoing placement uses ccOut (reduced for
+// sret) plus gpDestBase.  Float scalars peel to xmm[nsrn]; every other
+// arg's effective words go to the classifier's reg / stack slots.
+func emitSpillMarshal_x64(a @asm.Assembler, cc common.CallConv,
+		ccOut common.CallConv, userTypes @[]@types.Type, srcPrefix int,
+		gpDestBase int, frameDelta int) {
+	var nsrn int = 0
+	var inWord int = 0
+	for i := 0; i < len(userTypes); i++ {
+		var pt @types.Type = userTypes[i]
+		if common.IsFloatScalarTyp(pt) {
+			if nsrn < 8 {
+				emitSpillSrcToXmm_x64(a, cc, srcPrefix + inWord,
+					frameDelta, x64.XMM0 + nsrn,
+					common.FloatScalarIsI32(pt))
+				nsrn = nsrn + 1
+			}
+			inWord = inWord + 1
+			continue
+		}
+		var w int = cc.EffectiveArgWords(pt)
+		var rs int = ccOut.CallArgRegStart(userTypes, i)
+		var so int = ccOut.CallArgStackOff(userTypes, i)
+		var regWords int = 0
+		if rs >= 0 {
+			if so >= 0 {
+				regWords = ccOut.NumGpArgRegs - rs
+			} else {
+				regWords = w
+			}
+		}
+		for k := 0; k < regWords; k++ {
+			emitSpillSrcToReg_x64(a, cc, srcPrefix + inWord + k,
+				frameDelta, argReg(gpDestBase + rs + k))
+		}
+		for k := regWords; k < w; k++ {
+			emitSpillSrcToMem_x64(a, cc, srcPrefix + inWord + k,
+				frameDelta, so + (k - regWords) * 8)
+		}
+		inWord = inWord + w
+	}
+}
+
+// emitSpillSrcToReg_x64 moves incoming dispatch word g into dstReg.  The
+// source is argReg(g) if g < cc.NumGpArgRegs, else the dispatch caller's
+// stack at [rsp + frameDelta + 8 + (g - NumGpArgRegs)*8].
+func emitSpillSrcToReg_x64(a @asm.Assembler, cc common.CallConv, g int,
+		frameDelta int, dstReg int) {
+	if g < cc.NumGpArgRegs {
+		var src int = argReg(g)
+		if src != dstReg {
+			x64.Mov(a, x64.Reg(dstReg, x64.SZ64),
+				x64.Reg(src, x64.SZ64))
+		}
+		return
+	}
+	var off int = frameDelta + 8 + (g - cc.NumGpArgRegs) * 8
+	x64.Mov(a, x64.Reg(dstReg, x64.SZ64), x64.Mem(x64.RSP, off, x64.SZ64))
+}
+
+// emitSpillSrcToMem_x64 moves incoming dispatch word g to the outgoing-
+// args stack at [rsp + dstOff].  A reg source stores directly; a stack
+// source shuttles through RAX.
+func emitSpillSrcToMem_x64(a @asm.Assembler, cc common.CallConv, g int,
+		frameDelta int, dstOff int) {
+	if g < cc.NumGpArgRegs {
+		x64.Mov(a, x64.Mem(x64.RSP, dstOff, x64.SZ64),
+			x64.Reg(argReg(g), x64.SZ64))
+		return
+	}
+	var off int = frameDelta + 8 + (g - cc.NumGpArgRegs) * 8
+	x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.RSP, off, x64.SZ64))
+	x64.Mov(a, x64.Mem(x64.RSP, dstOff, x64.SZ64),
+		x64.Reg(x64.RAX, x64.SZ64))
+}
+
+// emitSpillSrcToXmm_x64 moves incoming dispatch word g (float bits in a
+// GP slot under the all-int dispatch ABI) into xmm.  A stack source is
+// first loaded into RAX, since movq/movd take a GP register source.
+func emitSpillSrcToXmm_x64(a @asm.Assembler, cc common.CallConv, g int,
+		frameDelta int, xmm int, isI32 bool) {
+	var gp int = x64.RAX
+	if g < cc.NumGpArgRegs {
+		gp = argReg(g)
+	} else {
+		var off int = frameDelta + 8 + (g - cc.NumGpArgRegs) * 8
+		x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+			x64.Mem(x64.RSP, off, x64.SZ64))
+	}
+	if isI32 {
+		x64.Movd_gp_to_xmm(a, xmm, gp)
+	} else {
+		x64.Movq_gp_to_xmm(a, xmm, gp)
+	}
+}

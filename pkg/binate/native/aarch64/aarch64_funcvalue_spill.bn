@@ -1,0 +1,219 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Genuine-overflow stack-spill path for the non-closure func-value shims
+// (AArch64 / AAPCS64).  Reached from emitFuncValueShims when a func
+// value's EFFECTIVE user-arg words exceed the register budget the tail-
+// branch / register-only shapes can serve.  Mirrors
+// emitClosureShimStackSpillAA64 (the capturing-closure analogue),
+// specialized to the no-captures case plus the func-value return shapes
+// (scalar/void, sret, pack, float-ret).
+//
+// The shim is entered under the uniform all-int dispatch ABI: dispatch
+// word g (g=0 is the leading data slot, or retbuf+data for the aggregate
+// shapes) is in argReg(g) if g < 8, else on the dispatch CALLER's stack
+// at [sp_entry + (g-8)*8] (AAPCS64's BL pushes no return address).  The
+// shim re-marshals the user words into the underlying's real AAPCS64
+// layout — reg words shifted down by the dropped prefix, AAPCS SPLIT
+// honored, overflow words written to a reserved outgoing-args area —
+// then BLs (NOT tail-branches: LR must be preserved and the frame torn
+// down before RET) and unwinds.
+//
+// Frame: STP FP,LR,[sp,#-16]! preserves LR across the BL and lays a frame
+// record; the outgoing-args area (+ a retbuf save slot for pack) is
+// carved below with a further SUB.  X16 (the AAPCS intra-call scratch) is
+// the spill shuttle.  Reg-shift clobber-safety matches the x64 path: each
+// word shifts down by a constant, so an outgoing reg is read as a source
+// only at a strictly lower, already-consumed word index (left-to-right).
+
+// emitFuncvalSpillShimAA64 emits the over-budget func-value shim.  retSz
+// is the single-result SizeOf (0 for void / multi-return scalar).  At
+// most one of usePack / useSret is set; isFloatRet only with neither.  A
+// big multi-return tuple takes the scalar shape here (the dispatch caller
+// set X8, which passes through the BL untouched), so it arrives with
+// usePack = useSret = false.
+func emitFuncvalSpillShimAA64(a @asm.Assembler, cc common.CallConv,
+		fnLabel @[]char, fvTyp @types.Type, retSz int,
+		usePack bool, useSret bool, isFloatRet bool) {
+	var userTypes @[]@types.Type = shimUserTypesAA64(fvTyp)
+	// Incoming prefix words to drop: 1 (data) for scalar/void/float, 2
+	// (retbuf + data) for the aggregate shapes.  The sret pointer rides
+	// X8 (not a GP arg reg), so user args always start at X0 — no
+	// gpDestBase, ccOut == cc.
+	var srcPrefix int = 1
+	if usePack || useSret { srcPrefix = 2 }
+	var outBytes int = cc.CallStackBytes(userTypes)
+	var innerBytes int = outBytes
+	var retbufOff int = outBytes
+	if usePack { innerBytes = outBytes + 16 }
+	// frameDelta = the total sp decrement from shim entry (16 for the
+	// FP/LR record + the inner area), used to address incoming caller-
+	// stack words after the frame is set up.
+	var frameDelta int = 16 + innerBytes
+
+	aarch64.Stp(a, true, aarch64.FP, aarch64.LR,
+		aarch64.MemPre(aarch64.SP, -16))
+	if innerBytes > 0 {
+		aarch64.Sub(a, true, aarch64.SP, aarch64.SP,
+			aarch64.Imm(innerBytes))
+	}
+	if useSret {
+		// retbuf X0 → X8 (the AAPCS indirect-result reg) BEFORE the
+		// marshal overwrites X0; survives the BL, so the underlying
+		// writes the result straight through the caller's buffer.
+		aarch64.Mov(a, true, aarch64.X8, aarch64.Reg(aarch64.X0))
+	}
+	if usePack {
+		// Stash retbuf (X0) above the outgoing-args area.
+		aarch64.Str(a, true, aarch64.X0,
+			aarch64.MemImm(aarch64.SP, retbufOff))
+	}
+	emitSpillMarshalAA64(a, cc, userTypes, srcPrefix, frameDelta)
+	a.SetGlobal(fnLabel)
+	aarch64.Bl(a, fnLabel)
+	if usePack {
+		// X0..X(retWords-1) hold the packed return; copy through the
+		// stashed retbuf (reloaded into X9, outside the return regs).
+		aarch64.Ldr(a, true, aarch64.X9,
+			aarch64.MemImm(aarch64.SP, retbufOff))
+		var retWords int = retSz / 8
+		if retSz % 8 != 0 { retWords = retWords + 1 }
+		for ri := 0; ri < retWords; ri++ {
+			aarch64.Str(a, true, argReg(ri),
+				aarch64.MemImm(aarch64.X9, 8 * ri))
+		}
+	} else if isFloatRet {
+		// The underlying returns the float in d0/s0; the all-int dispatch
+		// ABI expects the bits in x0/w0.
+		if common.FloatScalarIsI32(fvTyp.Results[0]) {
+			aarch64.Fmov_s_to_w(a, aarch64.X0, aarch64.D0)
+		} else {
+			aarch64.Fmov_fp_to_gp(a, aarch64.X0, aarch64.D0)
+		}
+	}
+	if innerBytes > 0 {
+		aarch64.Add(a, true, aarch64.SP, aarch64.SP,
+			aarch64.Imm(innerBytes))
+	}
+	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR,
+		aarch64.MemPost(aarch64.SP, 16))
+	aarch64.Ret(a)
+}
+
+// shimUserTypesAA64 extracts the func-value's parameter types into a
+// @[]@types.Type the CallConv classifier consumes.
+func shimUserTypesAA64(fvTyp @types.Type) @[]@types.Type {
+	var ts @[]@types.Type
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		ts = appendShimType(ts, fvTyp.Params[pi].Type)
+	}
+	return ts
+}
+
+// appendShimType appends a @types.Type to a @[]@types.Type.
+func appendShimType(dst @[]@types.Type, v @types.Type) @[]@types.Type {
+	var n int = len(dst)
+	var ns @[]@types.Type = make_slice(@types.Type, n + 1)
+	for i := 0; i < n; i++ { ns[i] = dst[i] }
+	ns[n] = v
+	return ns
+}
+
+// emitSpillMarshalAA64 moves the user args from their incoming all-int
+// dispatch positions into the underlying's AAPCS64 layout.  Float scalars
+// peel to d/s[nsrn]; every other arg's effective words go to the
+// classifier's reg / stack slots, honoring AAPCS SPLIT (an aggregate may
+// straddle the last GP regs and the stack).
+func emitSpillMarshalAA64(a @asm.Assembler, cc common.CallConv,
+		userTypes @[]@types.Type, srcPrefix int, frameDelta int) {
+	var nsrn int = 0
+	var inWord int = 0
+	for i := 0; i < len(userTypes); i++ {
+		var pt @types.Type = userTypes[i]
+		if common.IsFloatScalarTyp(pt) {
+			if nsrn < 8 {
+				emitSpillSrcToFpAA64(a, cc, srcPrefix + inWord,
+					frameDelta, aarch64.D0 + nsrn,
+					common.FloatScalarIsI32(pt))
+				nsrn = nsrn + 1
+			}
+			inWord = inWord + 1
+			continue
+		}
+		var w int = cc.EffectiveArgWords(pt)
+		var rs int = cc.CallArgRegStart(userTypes, i)
+		var so int = cc.CallArgStackOff(userTypes, i)
+		var regWords int = 0
+		if rs >= 0 {
+			if so >= 0 {
+				regWords = cc.NumGpArgRegs - rs
+			} else {
+				regWords = w
+			}
+		}
+		for k := 0; k < regWords; k++ {
+			emitSpillSrcToRegAA64(a, cc, srcPrefix + inWord + k,
+				frameDelta, argReg(rs + k))
+		}
+		for k := regWords; k < w; k++ {
+			emitSpillSrcToMemAA64(a, cc, srcPrefix + inWord + k,
+				frameDelta, so + (k - regWords) * 8)
+		}
+		inWord = inWord + w
+	}
+}
+
+// emitSpillSrcToRegAA64 moves incoming dispatch word g into dstReg.  The
+// source is argReg(g) if g < cc.NumGpArgRegs, else the dispatch caller's
+// stack at [sp + frameDelta + (g - NumGpArgRegs)*8].
+func emitSpillSrcToRegAA64(a @asm.Assembler, cc common.CallConv, g int,
+		frameDelta int, dstReg int) {
+	if g < cc.NumGpArgRegs {
+		var src int = argReg(g)
+		if src != dstReg {
+			aarch64.Mov(a, true, dstReg, aarch64.Reg(src))
+		}
+		return
+	}
+	var off int = frameDelta + (g - cc.NumGpArgRegs) * 8
+	aarch64.Ldr(a, true, dstReg, aarch64.MemImm(aarch64.SP, off))
+}
+
+// emitSpillSrcToMemAA64 moves incoming dispatch word g to the outgoing-
+// args stack at [sp + dstOff].  A reg source stores directly; a stack
+// source shuttles through X16 (the AAPCS intra-call scratch).
+func emitSpillSrcToMemAA64(a @asm.Assembler, cc common.CallConv, g int,
+		frameDelta int, dstOff int) {
+	if g < cc.NumGpArgRegs {
+		aarch64.Str(a, true, argReg(g),
+			aarch64.MemImm(aarch64.SP, dstOff))
+		return
+	}
+	var off int = frameDelta + (g - cc.NumGpArgRegs) * 8
+	aarch64.Ldr(a, true, aarch64.X16, aarch64.MemImm(aarch64.SP, off))
+	aarch64.Str(a, true, aarch64.X16, aarch64.MemImm(aarch64.SP, dstOff))
+}
+
+// emitSpillSrcToFpAA64 moves incoming dispatch word g (float bits in a GP
+// slot under the all-int dispatch ABI) into the FP register fpReg.  A
+// stack source is first loaded into X16, since fmov takes a GP source.
+func emitSpillSrcToFpAA64(a @asm.Assembler, cc common.CallConv, g int,
+		frameDelta int, fpReg int, isI32 bool) {
+	var gp int = aarch64.X16
+	if g < cc.NumGpArgRegs {
+		gp = argReg(g)
+	} else {
+		var off int = frameDelta + (g - cc.NumGpArgRegs) * 8
+		aarch64.Ldr(a, true, aarch64.X16,
+			aarch64.MemImm(aarch64.SP, off))
+	}
+	if isI32 {
+		aarch64.Fmov_w_to_s(a, fpReg, gp)
+	} else {
+		aarch64.Fmov_gp_to_fp(a, fpReg, gp)
+	}
+}

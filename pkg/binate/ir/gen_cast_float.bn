@@ -1,0 +1,125 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/types"
+
+// Float -> int conversion with SATURATION to the target type's range + NaN->0,
+// per the ratified contract (plan-float-int-saturation.md):
+//
+//   in-range f       -> truncate toward zero (the raw hardware convert)
+//   f > T_MAX / +Inf -> T_MAX
+//   f < T_MIN / -Inf -> T_MIN  (0 for an unsigned T)
+//   NaN              -> 0
+//
+// The hardware truncating-converts DISAGREE on out-of-range / NaN inputs
+// (arm64 FCVTZS saturates, x86-64 CVTTSD2SI yields INT_MIN, an LLVM `fptosi`
+// is poison), so — exactly like emitGuardedShift for shift-overshift — this is
+// normalized ONCE here, branchlessly and from existing ops, and every backend
+// AND the bytecode VM inherits it with no per-backend float->int logic.
+
+// isFloatToIntCast reports whether a `cast(D, s)` converts a float source to an
+// integer target (peeling named/readonly/alias on both sides), i.e. the cast
+// that must saturate.
+func isFloatToIntCast(srcTyp @types.Type, dstTyp @types.Type) bool {
+	var s @types.Type = peelTransparent(srcTyp)
+	var d @types.Type = peelTransparent(dstTyp)
+	if s == nil || d == nil { return false }
+	var srcFloat bool = s.Kind == types.TYP_FLOAT ||
+		s.Kind == types.TYP_UNTYPED_FLOAT
+	return srcFloat && d.Kind == types.TYP_INT
+}
+
+// emitGuardedFloatToInt lowers `cast(dstTyp, x)` (x float, dstTyp integer):
+//
+//   raw   = cast(x, T)                       // in-range correct
+//   tooHi = x >= 2^(N-1) [signed] / 2^N [unsigned]   (ORDERED >=: false for NaN)
+//   tooLo = x <  -2^(N-1) [signed] / 0   [unsigned]  (ORDERED  <: false for NaN)
+//   isNaN = x != x                           (UNORDERED !=: true ONLY for NaN)
+//   result = isNaN ? 0 : tooLo ? MIN : tooHi ? MAX : raw
+//
+// The boundary 2^(N-1) / 2^N is the classic fptosi.sat threshold: an exact
+// power of two (so float-representable) that catches every overflow even though
+// T_MAX itself is not exactly representable for wide N.  The select is over
+// INTEGERS, reusing emitGuardedShift's mask idiom, so no float select is used.
+func emitGuardedFloatToInt(b @Block, x @Instr, dstTyp @types.Type) @Instr {
+	var raw @Instr = b.EmitCast(x, dstTyp)
+	var n int = typeWidth(dstTyp)
+	var signed bool = typeIsSigned(dstTyp)
+
+	// Saturation limits as the target type's bit patterns.
+	var minVal int64 = 0
+	var maxVal int64 = 0
+	if signed {
+		// 2^(N-1): the shift count N-1 <= 63 is always in range.
+		var p int64 = cast(int64, 1) << cast(int64, n - 1)
+		minVal = 0 - p        // -2^(N-1)  (two's-complement; wraps to itself for N=64)
+		maxVal = p - 1        // 2^(N-1)-1
+	} else if n >= 64 {
+		maxVal = 0 - 1        // 2^64-1 (all ones) — avoids a width-wide `1 << 64`
+	} else {
+		maxVal = (cast(int64, 1) << cast(int64, n)) - 1   // 2^N-1, N <= 32
+	}
+	var minInt @Instr = b.EmitConstInt64(minVal, dstTyp)
+	var maxInt @Instr = b.EmitConstInt64(maxVal, dstTyp)
+	var zeroInt @Instr = b.EmitConstInt(0, dstTyp)
+
+	// Boundary float constants in the SOURCE precision.
+	var fTyp @types.Type = types.TypFloat64()
+	if typeWidth(x.Typ) == 32 { fTyp = types.TypFloat32() }
+	var maxBnd @Instr = b.EmitConstFloat(satMaxBoundText(n, signed), fTyp)
+	var minBnd @Instr = b.EmitConstFloat(satMinBoundText(n, signed), fTyp)
+
+	var tooHi @Instr = b.EmitBinop(OP_GE, x, maxBnd, types.TypBool())
+	var tooLo @Instr = b.EmitBinop(OP_LT, x, minBnd, types.TypBool())
+	var isNaN @Instr = b.EmitBinop(OP_NE, x, x, types.TypBool())
+
+	var r1 @Instr = emitMaskSelect(b, tooHi, maxInt, raw, dstTyp)
+	var r2 @Instr = emitMaskSelect(b, tooLo, minInt, r1, dstTyp)
+	return emitMaskSelect(b, isNaN, zeroInt, r2, dstTyp)
+}
+
+// emitMaskSelect returns `cond ? a : alt`, branchlessly, as
+// (a & m) | (alt & ~m) where m is all-ones iff cond else all-zeros — the
+// emitGuardedShift mask idiom (`0 - (cast(cond) & 1)`, robust to the bool->int
+// zext/sext choice).
+func emitMaskSelect(b @Block, cond @Instr, a @Instr, alt @Instr,
+		typ @types.Type) @Instr {
+	var condInt @Instr = b.EmitCast(cond, typ)
+	var one @Instr = b.EmitConstInt(1, typ)
+	var bit @Instr = b.EmitBinop(OP_AND, condInt, one, typ)
+	var zero @Instr = b.EmitConstInt(0, typ)
+	var mask @Instr = b.EmitBinop(OP_SUB, zero, bit, typ)        // all-ones iff cond
+	var allOnes @Instr = b.EmitConstInt(0 - 1, typ)
+	var notMask @Instr = b.EmitBinop(OP_XOR, mask, allOnes, typ)
+	var hi @Instr = b.EmitBinop(OP_AND, a, mask, typ)
+	var lo @Instr = b.EmitBinop(OP_AND, alt, notMask, typ)
+	return b.EmitBinop(OP_OR, hi, lo, typ)
+}
+
+// satMaxBoundText returns the `>=` saturation threshold as decimal text for
+// EmitConstFloat: 2^(N-1) for a signed target, 2^N for unsigned (both exact
+// powers of two, so float-representable in either precision).
+func satMaxBoundText(n int, signed bool) @[]char {
+	if signed {
+		if n == 8 { var s @[]char = "128.0"; return s }
+		if n == 16 { var s @[]char = "32768.0"; return s }
+		if n == 32 { var s @[]char = "2147483648.0"; return s }
+		var s @[]char = "9223372036854775808.0"
+		return s
+	}
+	if n == 8 { var s @[]char = "256.0"; return s }
+	if n == 16 { var s @[]char = "65536.0"; return s }
+	if n == 32 { var s @[]char = "4294967296.0"; return s }
+	var s @[]char = "18446744073709551616.0"
+	return s
+}
+
+// satMinBoundText returns the `<` saturation threshold as decimal text:
+// -2^(N-1) for a signed target (== T_MIN), 0 for unsigned.
+func satMinBoundText(n int, signed bool) @[]char {
+	if !signed { var s @[]char = "0.0"; return s }
+	if n == 8 { var s @[]char = "-128.0"; return s }
+	if n == 16 { var s @[]char = "-32768.0"; return s }
+	if n == 32 { var s @[]char = "-2147483648.0"; return s }
+	var s @[]char = "-9223372036854775808.0"
+	return s
+}

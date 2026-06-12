@@ -143,12 +143,14 @@ func emitSretReturn(a @asm.Assembler, pkgName *[]readonly char,
 }
 
 // emitMultiReturnPack packs an in-register multi-return tuple (the
-// register-count sret threshold routed the > 3-GP / > 2-FP cases to sret).
+// register-count sret threshold routed the > 3-GP / > 4-FP cases to sret).
 // It matches LLVM's x86-64 first-class-struct return lowering, which is
 // FIELD-PER-REGISTER with NO eightbyte coalescing: a non-float field's words
-// fill RAX,RDX,RCX and a float-scalar field fills XMM0,XMM1, each independent.
+// fill RAX,RDX,RCX; the 1st/2nd float-scalar field fills XMM0,XMM1 and the
+// 3rd/4th overflows to x87 ST0,ST1, each class counter independent.
 // (u16,u16,u16) → AX,DX,CX; (float32,float32) → XMM0,XMM1; (float32,int32) →
-// XMM0,EAX — NOT coalesced into one register.  Materialize the tuple's byte
+// XMM0,EAX; (f64,f64,f64) → XMM0,XMM1,ST0 — NOT coalesced into one register.
+// Materialize the tuple's byte
 // image in the SysV red zone (leaf scratch the epilogue never touches), laying
 // each field at its MultiReturnType offset, then load each field into its
 // class register from that offset.  The image avoids the clobber a direct
@@ -162,7 +164,8 @@ func emitMultiReturnPack(a @asm.Assembler, pkgName *[]readonly char,
 	// Lay the image in the SysV red zone ([RSP-128, RSP) leaf scratch the
 	// epilogue never touches), low end far enough below RSP to hold the whole
 	// tuple: the register-count sret threshold caps an in-register multi-return
-	// at 3 GP + 2 FP regs (40 bytes), so a 16-byte base no longer suffices.
+	// at 3 GP + 4 FP regs (XMM0,XMM1 + x87 ST0,ST1 — up to 56 bytes), so a
+	// 16-byte base no longer suffices.
 	var imgSz int = rm.MultiReturnType.SizeOf()
 	var imgBytes int = (imgSz + 15) / 16 * 16
 	if imgBytes < 16 { imgBytes = 16 }
@@ -208,18 +211,29 @@ func emitMultiReturnPack(a @asm.Assembler, pkgName *[]readonly char,
 	// Load the image into return registers FIELD-PER-REGISTER, matching LLVM's
 	// x86-64 first-class-struct return lowering (no eightbyte coalescing): a
 	// non-float field's words → RAX,RDX,RCX (retGp); a float-scalar field →
-	// XMM0,XMM1 (retFp, via a GP scratch since the image lives in memory); each
-	// read from its field offset.  The register-count sret threshold
-	// (CallConv.multiReturnTupleNeedsSret) caps this at 3 GP + 2 FP regs, so the
-	// guards never silently drop a live field.  Symmetric mirror of
-	// collectMultiReturnTuple.
+	// XMM0,XMM1 then x87 ST0,ST1 (retFp, via a GP scratch / FLD since the image
+	// lives in memory); each read from its field offset.  The register-count
+	// sret threshold (CallConv.MultiReturnTupleNeedsSret) caps this at 3 GP +
+	// 2 XMM + 2 x87 regs, so the guards never silently drop a live field.
+	// Symmetric mirror of collectMultiReturnTuple.
+	//
+	// The 3rd/4th float overflow to x87 ST0/ST1.  FLD is a push (it lands on
+	// ST0, demoting the rest), so to leave field N on ST0 and field N+1 on ST1
+	// the FLDs must run in REVERSE field order — clang dumps `fldl <field N+1>
+	// ; fldl <field N>`.  Record each overflow float's image offset + width
+	// during the forward walk, then emit the FLDs below.
+	var x87Off0 int = 0
+	var x87IsI32_0 bool = false
+	var x87Off1 int = 0
+	var x87IsI32_1 bool = false
+	var nX87 int = 0
 	var retGp int = 0
 	var retFp int = 0
 	for fi := 0; fi < len(ins.Args); fi++ {
 		var fldTyp @types.Type = ins.Args[fi].Typ
 		var fldOff int = rm.MultiReturnType.FieldOffset(fi)
 		if common.IsFloatScalarTyp(fldTyp) {
-			if retFp < 2 {
+			if retFp < rm.CC.NumFpRetRegs {
 				var tmp int = scratchReg(rm)
 				if common.FloatScalarIsI32(fldTyp) {
 					x64.Mov(a, x64.Reg(tmp, x64.SZ32),
@@ -230,6 +244,17 @@ func emitMultiReturnPack(a @asm.Assembler, pkgName *[]readonly char,
 						x64.Mem(x64.RSP, base + fldOff, x64.SZ64))
 					x64.Movq_gp_to_xmm(a, x64.XMM0 + retFp, tmp)
 				}
+			} else {
+				// x87 overflow slot k (0 → ST0, 1 → ST1).
+				var k int = retFp - rm.CC.NumFpRetRegs
+				if k == 0 {
+					x87Off0 = base + fldOff
+					x87IsI32_0 = common.FloatScalarIsI32(fldTyp)
+				} else {
+					x87Off1 = base + fldOff
+					x87IsI32_1 = common.FloatScalarIsI32(fldTyp)
+				}
+				if k + 1 > nX87 { nX87 = k + 1 }
 			}
 			retFp = retFp + 1
 		} else if common.IsAggregateTyp(fldTyp) {
@@ -248,6 +273,20 @@ func emitMultiReturnPack(a @asm.Assembler, pkgName *[]readonly char,
 				retGp = retGp + 1
 			}
 		}
+	}
+	// Push the overflow floats onto the x87 stack in reverse field order
+	// (field N+1 first, so field N ends on ST0).  See the note above.
+	if nX87 >= 2 { emitX87Push(a, x87Off1, x87IsI32_1) }
+	if nX87 >= 1 { emitX87Push(a, x87Off0, x87IsI32_0) }
+}
+
+// emitX87Push pushes one float from the red-zone tuple image (at RSP+off)
+// onto the x87 stack (ST0), FLDS for a 32-bit float, FLDL for a 64-bit one.
+func emitX87Push(a @asm.Assembler, off int, isI32 bool) {
+	if isI32 {
+		x64.Flds(a, x64.Mem(x64.RSP, off, x64.SZ32))
+	} else {
+		x64.Fldl(a, x64.Mem(x64.RSP, off, x64.SZ64))
 	}
 }
 

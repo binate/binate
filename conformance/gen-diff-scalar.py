@@ -25,7 +25,6 @@ a column of `1`s; a `0` on line N means tuple N (commented in the .bn) diverged.
 
 DELIBERATELY EXCLUDED (spec says "hardware semantics" -> target-dependent, so
 there is no single target-stable expected to assert; documented, not guessed):
-  - out-of-range float->int, and NaN/+-Inf -> int;
   - f64->f32 narrowing except a few exactly-determined round-to-nearest cases;
   - signed div/rem of min by -1 (the quotient 2^(w-1) overflows the signed
     range): x86 `idiv` traps `#DE`, ARM `sdiv` wraps. (Plain division by zero
@@ -38,7 +37,7 @@ markers are hand-maintained and never touched):
   matrix/scalar-diff/shl/<width>/<sign>.bn          left shift
   matrix/scalar-diff/shr/<width>/<sign>.bn          right shift (arith if signed)
   matrix/scalar-diff/int-to-float/<width>/<sign>.bn int -> float32/float64
-  matrix/scalar-diff/float-to-int/<width>/<sign>.bn float32/float64 -> int (in-range)
+  matrix/scalar-diff/float-to-int/<width>/<sign>.bn float32/float64 -> int (saturating)
   matrix/scalar-diff/int-cast/<width>/<sign>.bn     int -> every int type
   matrix/scalar-diff/float-cast/roundtrip.bn        float32 <-> float64
   matrix/scalar-diff/arith/<op>/<width>/<sign>.bn   add/sub/mul/div/rem
@@ -283,6 +282,25 @@ def trunc_toward_zero(x):
     return int(x)                       # Python int() truncates toward zero
 
 
+def saturate_to_int(x, w, sign):
+    """The spec oracle for float->int: in-range truncates toward zero; out of
+    [MIN, MAX] (incl. +-Inf) saturates to that bound; NaN -> 0."""
+    if sign == "unsigned":
+        lo, hi = 0, (1 << w) - 1
+    else:
+        lo, hi = -(1 << (w - 1)), (1 << (w - 1)) - 1
+    if math.isnan(x):
+        return 0
+    if math.isinf(x):
+        return hi if x > 0 else lo
+    t = int(x)                          # truncate toward zero (finite)
+    if t < lo:
+        return lo
+    if t > hi:
+        return hi
+    return t
+
+
 def float_to_int_cell(w, sign):
     t = typ(w, sign)
     cell = Cell()
@@ -311,6 +329,39 @@ def float_to_int_cell(w, sign):
              "\tvar b{i} %s = cast(%s, f{i})" % (t, t)],
             "b{i} == y{i}",
             "highbit roundtrip %d via %s" % (y, f))
+    # Saturation + NaN: out-of-range finite values, +-Inf, and NaN clamp to
+    # [MIN, MAX] (NaN -> 0).  The thresholds 2^(w-1) / 2^w (and their doubles
+    # / negations) are exact powers of two, so identical in float32 and
+    # float64; +-Inf / NaN come from exact IEEE bit patterns.  -2^(w-1) for a
+    # signed dest is MIN itself (in range) — pinning the `< MIN` strict
+    # boundary.
+    thr = (1 << (w - 1)) if sign == "signed" else (1 << w)
+    if sign == "signed":
+        finite = [thr, 2 * thr, -thr, -2 * thr]
+    else:
+        finite = [thr, 2 * thr, -1, -thr]
+    for fw in FLOATS:
+        f = "float%d" % fw
+        ut = "uint%d" % fw
+        for v in finite:
+            e = saturate_to_int(float(v), w, sign)
+            cell.check(
+                ["\tvar f{i} %s = %s" % (f, fmt_float(float(v))),
+                 "\tvar n{i} %s = cast(%s, f{i})" % (t, t),
+                 "\tvar e{i} %s = %d" % (t, e)],
+                "n{i} == e{i}",
+                "saturate %s(%s) -> %d" % (f, fmt_float(float(v)), e))
+        for name, bits, fv in FBITS[fw]:
+            if name not in ("inf", "ninf", "nan"):
+                continue
+            e = saturate_to_int(fv, w, sign)
+            cell.check(
+                ["\tvar fb{i} %s = %d" % (ut, bits),
+                 "\tvar f{i} %s = bit_cast(%s, fb{i})" % (f, f),
+                 "\tvar n{i} %s = cast(%s, f{i})" % (t, t),
+                 "\tvar e{i} %s = %d" % (t, e)],
+                "n{i} == e{i}",
+                "saturate %s(%s) -> %d" % (f, name, e))
     return cell
 
 

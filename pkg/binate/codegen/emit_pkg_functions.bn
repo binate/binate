@@ -1,0 +1,177 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+
+// FunctionInfo-table emission for the per-package reflect descriptor — B0
+// step 3b-ii of plan-package-introspection-phase-b.md.  For each
+// `.bni`-exported, non-extern function (the same set codegen's
+// addExportedFuncsToSeen force-emits a func-value triple for), this emits an
+// immortal static-managed `reflect.FunctionInfo` node, then an array of
+// pointers to those nodes' payloads — the backing store for
+// `reflect.Package.Functions` (a `*[]@FunctionInfo` raw slice).  The
+// descriptor node (emit_pkg_descriptor.bn) points Functions.{data,len} at this
+// array.  The hand-encoded `FunctionInfo` payload layout here MUST agree with
+// reflect.bni and the native emitter (common_pkg_functions.bn).
+
+// fnInfoPayloadTy returns the flattened LLVM type of a reflect.FunctionInfo
+// payload: { Pkg(@Package=ptr), Name(*[]char=ptr+int), Value(*uint8=ptr),
+// ResultSize(int), ParamSlots(int), Sig(*[]char=ptr+int) }.
+func fnInfoPayloadTy() @[]char {
+	var cb buf.CharBuf = buf.New()
+	cb = cb.WriteStr("{ ptr, ptr, ")
+	cb = cb.WriteStr(intLL())
+	cb = cb.WriteStr(", ptr, ")
+	cb = cb.WriteStr(intLL())
+	cb = cb.WriteStr(", ")
+	cb = cb.WriteStr(intLL())
+	cb = cb.WriteStr(", ptr, ")
+	cb = cb.WriteStr(intLL())
+	cb = cb.WriteStr(" }")
+	return cb.Bytes()
+}
+
+// emitPackageFunctions emits the exported-function FunctionInfo nodes and the
+// `funcsArraySym` pointer array for module `m`, and returns the buffer plus the
+// entry count.  `infoSym` is the package descriptor node's symbol (each
+// FunctionInfo's Pkg back-points at its payload), `pkgPayloadTy` the package
+// payload's LLVM type (for that GEP).  The caller wires Functions = {
+// @funcsArraySym, count }.  Emits nothing and returns 0 when the module has no
+// exported functions (the array symbol is then unreferenced and Functions
+// stays {null, 0}).
+func emitPackageFunctions(out buf.CharBuf, m @ir.Module,
+		infoSym *[]readonly char, pkgPayloadTy *[]readonly char,
+		funcsArraySym *[]readonly char) (buf.CharBuf, int) {
+	var fiTy @[]char = fnInfoPayloadTy()
+	// The package node's payload pointer (the @Package the Pkg field holds).
+	var pkgPtr @[]char =
+		staticManagedPayloadPtr(buf.New(), infoSym, pkgPayloadTy).Bytes()
+
+	var nodeSyms @[]@[]char
+	for i := 0; i < len(m.Funcs); i++ {
+		var f @ir.Func = m.Funcs[i]
+		if f.IsExtern { continue }
+		if !f.Exported { continue }
+		var fv @types.Type = lookupFuncValueType(m, f.Name)
+		if fv == nil { continue }
+
+		var mangled @[]char = mangle.FuncName(modulePkgName, f.Name).Bytes()
+		var nameSym @[]char = appendStr(mangled, "__fnname")
+		var sigSym @[]char = appendStr(mangled, "__fnsig")
+		var nodeSym @[]char = appendStr(mangled, "__fninfo")
+		// f.Name is already the FULLY-QUALIFIED "pkg/path.Func" (NewFunc
+		// applies mangle.QualifyName), which is exactly the form the VM
+		// binder keys on — use it verbatim, do NOT re-qualify.
+		var sig @[]char = fv.SigString()
+
+		out = emitFnRodata(out, nameSym, f.Name)
+		out = emitFnRodata(out, sigSym, sig)
+
+		// FunctionInfo payload init: { Pkg, Name.data, Name.len, Value,
+		// ResultSize, ParamSlots, Sig.data, Sig.len }.
+		var init buf.CharBuf = buf.New()
+		init = init.WriteStr("{ ptr ")
+		init = init.WriteStr(pkgPtr)
+		init = init.WriteStr(", ptr @")
+		init = init.WriteStr(nameSym)
+		init = init.WriteStr(", ")
+		init = init.WriteStr(intLL())
+		init = init.WriteByte(' ')
+		init = init.WriteInt(len(f.Name))
+		init = init.WriteStr(", ptr @__handle.")
+		init = init.WriteStr(mangled)
+		init = init.WriteStr(", ")
+		init = init.WriteStr(intLL())
+		init = init.WriteByte(' ')
+		init = init.WriteInt(functionResultSize(fv))
+		init = init.WriteStr(", ")
+		init = init.WriteStr(intLL())
+		init = init.WriteByte(' ')
+		init = init.WriteInt(len(fv.Params))
+		init = init.WriteStr(", ptr @")
+		init = init.WriteStr(sigSym)
+		init = init.WriteStr(", ")
+		init = init.WriteStr(intLL())
+		init = init.WriteByte(' ')
+		init = init.WriteInt(len(sig))
+		init = init.WriteStr(" }")
+		out = emitStaticManagedGlobal(out, nodeSym, fiTy, init.Bytes())
+
+		nodeSyms = appendCharSliceFV(nodeSyms, nodeSym)
+	}
+
+	var count int = len(nodeSyms)
+	if count == 0 { return out, 0 }
+
+	// The funcs array: [count x ptr] of pointers to each node's payload.
+	out = out.WriteStr("@")
+	out = out.WriteStr(funcsArraySym)
+	out = out.WriteStr(" = weak_odr constant [")
+	out = out.WriteInt(count)
+	out = out.WriteStr(" x ptr] [")
+	for i := 0; i < count; i++ {
+		if i > 0 { out = out.WriteStr(",") }
+		out = out.WriteStr(" ptr ")
+		out = staticManagedPayloadPtr(out, nodeSyms[i], fiTy)
+	}
+	out = out.WriteStr(" ]\n")
+	return out, count
+}
+
+// functionResultSize returns the VM-dispatch ResultSize of a func-value type:
+// 0 for void / no result, SizeOf the single result, or the multi-return tuple
+// SizeOf.  This is the load-bearing scalar(<=8)/aggregate(>8) discriminator.
+func functionResultSize(fv @types.Type) int {
+	if fv == nil { return 0 }
+	if len(fv.Results) == 0 { return 0 }
+	if len(fv.Results) == 1 {
+		if fv.Results[0] == nil { return 0 }
+		return fv.Results[0].SizeOf()
+	}
+	var fields @[]@types.Field = make_slice(@types.Field, len(fv.Results))
+	for i := 0; i < len(fv.Results); i++ {
+		var fld @types.Field = make(types.Field)
+		fld.Type = fv.Results[i]
+		fields[i] = fld
+	}
+	return types.MakeStructType("", fields).SizeOf()
+}
+
+// emitFnRodata emits a private rodata byte array `@<sym> = ... [N x i8]
+// c"..."` for a FunctionInfo string field (qualified name / signature).
+func emitFnRodata(out buf.CharBuf, sym *[]readonly char,
+		bytes *[]readonly char) buf.CharBuf {
+	out = out.WriteStr("@")
+	out = out.WriteStr(sym)
+	out = out.WriteStr(" = private unnamed_addr constant [")
+	out = out.WriteInt(len(bytes))
+	out = out.WriteStr(" x i8] ")
+	if len(bytes) == 0 {
+		out = out.WriteStr("zeroinitializer")
+	} else {
+		out = out.WriteStr("c\"")
+		out = emitStringBytes(out, bytes)
+		out = out.WriteStr("\"")
+	}
+	out = out.WriteStr(", align 1\n")
+	return out
+}
+
+// appendStr concatenates a suffix onto a @[]char, returning a fresh slice.
+func appendStr(prefix @[]char, suffix *[]readonly char) @[]char {
+	var cb buf.CharBuf = buf.New()
+	cb = cb.WriteStr(prefix)
+	cb = cb.WriteStr(suffix)
+	return cb.Bytes()
+}
+
+// appendCharSliceFV appends a @[]char to a @[]@[]char.
+func appendCharSliceFV(dst @[]@[]char, v @[]char) @[]@[]char {
+	var n int = len(dst)
+	var ns @[]@[]char = make_slice(@[]char, n + 1)
+	for i := 0; i < n; i++ { ns[i] = dst[i] }
+	ns[n] = v
+	return ns
+}

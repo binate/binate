@@ -3,6 +3,101 @@ package "pkg/binate/vm"
 import "pkg/builtins/rt"
 import "pkg/std/strings"
 
+// ifaceVtIsNative reports whether an interface value's vtable word (iv[1])
+// is a NATIVE @__ivt pointer rather than a 1-based index into
+// vm.IfaceVtables.  An interface returned by an injected COMPILED package
+// (e.g. an @errors.Error from pkg/std/os) carries the compiled vtable's
+// address there; a VM-built iface carries a 1-based index.  Legal VM
+// indices are exactly [1, len(IfaceVtables)] (0 is the nil sentinel,
+// handled before this is reached), so anything outside that range is a
+// native vtable address.  Using the RANGE (not a magnitude floor) makes it
+// exact — it can't false-positive on a low-mapped native vtable.  Both
+// representations share the {data, vtable_word} layout and diverge only in
+// what vtable_word holds, so the discrimination is per-VALUE: one iface
+// site can legitimately see both a VM-index iv and a native-pointer iv.
+func ifaceVtIsNative(vm @VM, vtIdxPlus int) bool {
+	return vtIdxPlus < 1 || vtIdxPlus > len(vm.IfaceVtables)
+}
+
+// dispatchCompiledIfaceMethod calls an interface method whose vtable is a
+// NATIVE @__ivt pointer (the iface value came from an injected COMPILED
+// package — see ifaceVtIsNative).  iv[1] IS the native vtable address;
+// natVt[slot] is the method's RAW native function pointer (not a shim — the
+// @__ivt slots hold the impl method addresses directly), with the receiver
+// (iv[0]) riding the implicit data/first argument.  The method's result
+// byte-size (carried in instr.Aux's high bits — see lower_call.bn) selects
+// the calling primitive, because a raw fn returns by the native ABI rather
+// than the retbuf-shim convention dispatchExternBinding relies on:
+//   - ≤ 8 bytes  → rt._call_shim_scalar     (result in X0).
+//   - 9–16 bytes → rt._call_shim_pair        (by-value pair in X0:X1; copied
+//                  into a VM-stack retbuf whose address becomes the result).
+//   - > 16 bytes → sret (X8); no primitive captures that yet, so fail loudly
+//                  rather than mis-dispatch through the wrong-shape shim.
+// Writes regs[instr.Dst] in place; the caller `continue`s (no VM frame is
+// pushed).
+func dispatchCompiledIfaceMethod(vm @VM, regs *int, instr BCInstr, iv *int) {
+	var natVt *int = bit_cast(*int, iv[1])
+	var slot int = instr.Aux & 65535
+	var resultSize int = (instr.Aux >> 16) & 65535
+	var fnPtr *uint8 = bit_cast(*uint8, natVt[slot])
+	var dataPtr *uint8 = bit_cast(*uint8, iv[0])
+	var n int = instr.Imm
+	if n > 7 {
+		// The shim primitives carry 7 user-arg slots (a0..a6); the
+		// receiver rides the data slot.  A wider compiled iface method
+		// can't be VM-dispatched until those helpers widen — fail loudly
+		// rather than silently drop arguments.
+		println("vm: compiled iface method has >7 arg slots (unsupported)")
+		rt.Exit(1)
+	}
+	var a0 int = 0
+	var a1 int = 0
+	var a2 int = 0
+	var a3 int = 0
+	var a4 int = 0
+	var a5 int = 0
+	var a6 int = 0
+	if n > 0 { a0 = regs[instr.Src2 + 0] }
+	if n > 1 { a1 = regs[instr.Src2 + 1] }
+	if n > 2 { a2 = regs[instr.Src2 + 2] }
+	if n > 3 { a3 = regs[instr.Src2 + 3] }
+	if n > 4 { a4 = regs[instr.Src2 + 4] }
+	if n > 5 { a5 = regs[instr.Src2 + 5] }
+	if n > 6 { a6 = regs[instr.Src2 + 6] }
+	if resultSize > 16 {
+		// A raw compiled method returning >16 bytes uses the sret (X8)
+		// convention — the callee writes through a caller-passed buffer.
+		// That needs an sret-style primitive (pass the buffer in X8, call
+		// fn(data, args)); `_call_shim_aggregate` is the WRONG shape here
+		// (it targets a retbuf-FIRST shim, not a raw fn), so dispatching
+		// through it would silently wrong-code.  Fail loudly until that
+		// primitive exists.  (errors.Error.Error() — a 32-byte managed-
+		// slice — is the first such method; reached only if user bytecode
+		// calls it directly on a compiled iface value.)
+		println("vm: compiled iface method returns >16 bytes (sret path unimplemented)")
+		rt.Exit(1)
+	}
+	if resultSize > 8 {
+		// 9–16 bytes: the raw method fn returns the aggregate BY VALUE in
+		// the X0:X1 register pair (sret is only for >16).  `_call_shim_pair`
+		// captures that pair; copy it into a stable retbuf on the VM stack
+		// and hand the bytecode a pointer to it, matching the aggregate-
+		// return convention the BC consumer reads multi-word values from.
+		var pair rt.ShimPair = rt._call_shim_pair(fnPtr, dataPtr,
+			a0, a1, a2, a3, a4, a5, a6)
+		var retbuf *int = bit_cast(*int,
+			bit_cast(int, vm.Stack) + vm.SP)
+		vm.SP = vm.SP + 16
+		retbuf[0] = pair.Lo
+		retbuf[1] = pair.Hi
+		if instr.Dst >= 0 { regs[instr.Dst] = bit_cast(int, retbuf) }
+		return
+	}
+	var result int = rt._call_shim_scalar(fnPtr, dataPtr,
+		a0, a1, a2, a3, a4, a5, a6)
+	if instr.Dst >= 0 { regs[instr.Dst] = result }
+}
+
 // execIfaceOp dispatches the interface-value bytecode ops:
 // BC_IFACE_VALUE (constructs a 16-byte {data, vtable_idx_plus_1} on
 // the VM stack) and BC_IFACE_DTOR (extracts vtable slot 0 — the
@@ -64,6 +159,19 @@ func execIfaceOp(vm @VM, f @VMFunc, regs *int, instr BCInstr) bool {
 			// Returning a 0 dtor index lets BC_REFDEC_INLINE_FAST
 			// skip dispatch (its Src2 == 0 means "no dtor").
 			regs[instr.Dst] = 0
+			return true
+		}
+		if ifaceVtIsNative(vm, vtIdxPlus) {
+			// The iface value came from an injected COMPILED package
+			// (e.g. an @errors.Error returned by pkg/std/os): iv[1] is a
+			// native @__ivt pointer, not a 1-based vm.IfaceVtables index.
+			// Slot 0 of that native vtable is the receiver-dtor's
+			// %BnFuncValue HANDLE pointer (or null for a no-managed-field
+			// receiver) — exactly the form BC_REFDEC_INLINE_FAST's
+			// cross-mode arm (refDecCrossModeDispatch) consumes — so hand it
+			// straight through.  natVt[0] == 0 yields the no-dtor 0.
+			var natVt *int = bit_cast(*int, vtIdxPlus)
+			regs[instr.Dst] = natVt[0]
 			return true
 		}
 		var vtIdx int = vtIdxPlus - 1

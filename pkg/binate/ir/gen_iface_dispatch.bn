@@ -1,0 +1,224 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// IR-gen lowering for interface-method DISPATCH (`iv.method(args)`):
+// detecting an interface-value receiver at a SELECTOR call site and
+// emitting the vtable-dispatch call (including the pointer-to-iface-value
+// smoothing loads), plus the interface method-table lookups.  Resolution
+// of `*X` / `@X` to interface-value types and the lifting of `*T` / `@T`
+// into interface values live in gen_iface.bn; the module-build-time
+// interface registry / impl-collection live in gen_impl.bn.
+
+// isInterfaceMethodCall reports whether sel.X resolves to an
+// interface value at IR-gen time — peeks at the receiver
+// expression's type via getSelectorType / lookupVarType without
+// re-evaluating it. Used by genCall to route SELECTOR callees with
+// interface-value receivers to the vtable-dispatch path. Slice
+// 2.3a-3 of plan-interface-syntax-revision.md.
+//
+// Pointer-to-iv smoothing (plan-pointers-to-iface-values.md Slice
+// P.3): a receiver of kind `**I` / `*@I` / `@(*I)` / `@(@I)` also
+// routes here.  `genInterfaceMethodCall` emits the load to recover
+// the iv before dispatching.  The type-checker accepts the same
+// shape via the smoothing rule in `tryMethodCall`.
+func isInterfaceMethodCall(ctx @GenContext, sel @ast.Expr) bool {
+	if sel == nil || sel.X == nil { return false }
+	var recvTyp @types.Type = nil
+	if sel.X.Kind == ast.EXPR_IDENT {
+		recvTyp = lookupVarType(ctx, sel.X.Name)
+	} else if sel.X.Kind == ast.EXPR_SELECTOR ||
+		sel.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX ||
+		sel.X.Kind == ast.EXPR_UNARY {
+		recvTyp = getSelectorType(ctx, sel.X)
+	}
+	if recvTyp == nil { return false }
+	// Peel IR-transparent wrappers so a `readonly @Iface` receiver still
+	// routes through interface dispatch (the checker accepts it via
+	// resolveAliasAndConst in tryMethodCall); otherwise recvTyp.Kind ==
+	// TYP_READONLY misses both arms and the call falls to the regular
+	// method path, which mangles a bogus `bn_pkg____method` symbol.
+	recvTyp = peelTransparent(recvTyp)
+	if recvTyp == nil { return false }
+	if recvTyp.Kind == types.TYP_INTERFACE_VALUE ||
+			recvTyp.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		return true
+	}
+	if (recvTyp.Kind == types.TYP_POINTER ||
+			recvTyp.Kind == types.TYP_MANAGED_PTR) &&
+			recvTyp.Elem != nil {
+		var inner @types.Type = peelTransparent(recvTyp.Elem)
+		if inner != nil &&
+				(inner.Kind == types.TYP_INTERFACE_VALUE ||
+				 inner.Kind == types.TYP_INTERFACE_VALUE_MANAGED) {
+			return true
+		}
+	}
+	return false
+}
+
+// genInterfaceMethodCall lowers `iv.method(args)` where iv is a
+// TYP_INTERFACE_VALUE / TYP_INTERFACE_VALUE_MANAGED to an
+// OP_CALL_IFACE_METHOD instruction. Looks up the method's slot
+// index + return type via the per-module interface registry.
+// Slice 2.3a-3 of plan-interface-syntax-revision.md.
+//
+// Pointer-to-iv smoothing (Slice P.3): when sel.X produces a
+// pointer-to-iv value, emit the load to recover the iv before
+// dispatch.  The type-checker's smoothing rule guarantees this
+// only fires when the user wrote `p.M()` for a pointer-to-iv `p`.
+func genInterfaceMethodCall(ctx @GenContext, b @Block,
+		e @ast.Expr) @Instr {
+	var sel @ast.Expr = e.X
+	var iv @Instr = genExpr(ctx, b, sel.X)
+	b = ctx.CurBlock
+	if iv != nil && iv.Typ != nil &&
+			(iv.Typ.Kind == types.TYP_POINTER ||
+			 iv.Typ.Kind == types.TYP_MANAGED_PTR) &&
+			iv.Typ.Elem != nil &&
+			(iv.Typ.Elem.Kind == types.TYP_INTERFACE_VALUE ||
+			 iv.Typ.Elem.Kind == types.TYP_INTERFACE_VALUE_MANAGED) {
+		iv = b.EmitLoad(iv, iv.Typ.Elem)
+	}
+	// Peel any IR-transparent wrapper (readonly/named/alias) before reading
+	// the interface name: for a `readonly @Iface` receiver iv.Typ.Elem is the
+	// wrapper's inner @Iface (whose Name is empty), so the dispatch would
+	// mangle to `bn_pkg____method`; peelTransparent(iv.Typ).Elem is the
+	// interface type that carries the name.
+	var ifaceTyp @types.Type = peelTransparent(iv.Typ)
+	if iv == nil || ifaceTyp == nil || ifaceTyp.Elem == nil {
+		return b.EmitConstInt(0, types.TypInt())
+	}
+	var ifacePkg @[]char = ifaceTyp.Elem.Pkg
+	var ifaceName @[]char = ifaceTyp.Elem.Name
+	var idx int
+	var resultTypes @[]@types.Type
+	var paramTypes @[]@types.Type
+	idx, resultTypes, paramTypes = findInterfaceMethod(ifacePkg, ifaceName,
+		sel.Name)
+	if idx < 0 {
+		return b.EmitConstInt(0, types.TypInt())
+	}
+	// Build the dispatch result type from the full result list: 0 -> void,
+	// 1 -> the single type, >=2 -> the multi-return tuple struct (so a
+	// downstream multi-assign `extractvalue`s against a real struct, not the
+	// void a single-result store produced for a >=2-result method).  Mirrors
+	// the direct multi-return call in gen_call.bn.
+	var resultTyp @types.Type = types.TypVoid()
+	if len(resultTypes) == 1 {
+		resultTyp = resultTypes[0]
+	} else if len(resultTypes) >= 2 {
+		resultTyp = makeMultiReturnStructType(resultTypes)
+	}
+	var args @[]@Instr
+	for i := 0; i < len(e.Args); i++ {
+		// Marshal args exactly like the regular call path: genExprOrFuncRef
+		// (func-value lifting, typed-int narrowing, iface wrapping) against
+		// the param type, then coerceArg (managed->raw slice, string->chars,
+		// nil->slice, struct-copy RefInc, iface move/RefInc).  Without this
+		// a managed-slice arg to a raw-slice param is passed at the wrong
+		// width, shifting later args (the repl `Step(line, eof)` bug).
+		var paramTyp @types.Type = nil
+		if i < len(paramTypes) { paramTyp = paramTypes[i] }
+		var arg @Instr = genExprOrFuncRef(ctx, b, e.Args[i], paramTyp)
+		b = ctx.CurBlock
+		arg = coerceArg(ctx, b, arg, paramTyp)
+		args = slices.Append[@Instr](args, arg)
+	}
+	var result @Instr = b.EmitCallIfaceMethod(iv, args, idx,
+		resultTyp)
+	registerManagedCallResult(ctx, result, resultTyp)
+	return result
+}
+
+// findInterfaceMethod returns the (absolute vtable slot, result
+// types, param types) of the named method on (ifacePkg, ifaceName), or
+// (-1, empty, empty) if not found.  For an inherited method the result +
+// param types come from the parent that owns it (the recursion carries
+// them up).  Results are a LIST so a 0- or >=2-result method dispatches
+// correctly (the caller builds void / single / tuple from it).  The slot
+// is 0-based into the canonical (R, I)
+// vtable layout: slot 0 = dtor (any-block), slots 1.. populated by
+// the concat layout (each parent's full vtable inlined, then own
+// methods).  For a non-extended interface, slot = j + 1 where j is
+// the method's 0-based position in MethodNames — exactly what the
+// pre-E.4 callers assumed once you account for the dtor at slot 0.
+// For an extended interface, the slot may land inside a nested
+// parent sub-vtable; the recursive walk computes that statically.
+//
+// plan-interface-embedding.md Slice E.4.  Follows alias chains
+// (Slice 2.4); cross-package lookups (Slice 2.7) require ifacePkg
+// to be the canonical package.
+func findInterfaceMethod(ifacePkg *[]readonly char,
+		ifaceName *[]readonly char,
+		methodName *[]readonly char) (int, @[]@types.Type, @[]@types.Type) {
+	// Bootstrap rejects `return f(...)` for a multi-return outer
+	// (see bootstrap-subset.md); destructure explicitly.
+	var slot int
+	var results @[]@types.Type
+	var params @[]@types.Type
+	slot, results, params = findInterfaceMethodFromBase(ifacePkg, ifaceName,
+		methodName, 0)
+	return slot, results, params
+}
+
+// findInterfaceMethodFromBase walks the recursive vtable structure
+// of (ifacePkg, ifaceName), treating `base` as the offset where
+// this interface's full vtable starts.  Returns the absolute slot
+// index (in the outermost vtable) of the matching method, plus
+// the method's declared result types and param types.
+func findInterfaceMethodFromBase(ifacePkg *[]readonly char,
+		ifaceName *[]readonly char,
+		methodName *[]readonly char,
+		base int) (int, @[]@types.Type, @[]@types.Type) {
+	var noTypes @[]@types.Type
+	var idx int = resolveModuleInterface(ifacePkg, ifaceName)
+	if idx < 0 { return -1, noTypes, noTypes }
+	var mi ModuleInterface = moduleInterfaces[idx]
+	// Slot `base` is this interface's any-block (dtor).  Parent
+	// sub-vtables follow, then own methods.  Result + param types come
+	// from whichever interface in the chain OWNS the method (a parent for
+	// an inherited method), so the recursion carries them up.
+	var cursor int = base + 1
+	for i := 0; i < len(mi.ParentPkgs); i++ {
+		var pSlot int
+		var pResults @[]@types.Type
+		var pParams @[]@types.Type
+		pSlot, pResults, pParams = findInterfaceMethodFromBase(mi.ParentPkgs[i],
+			mi.ParentNames[i], methodName, cursor)
+		if pSlot >= 0 { return pSlot, pResults, pParams }
+		cursor = cursor + IfaceFullVtableSize(mi.ParentPkgs[i],
+			mi.ParentNames[i])
+	}
+	// rOffset / pOffset walk the flat result / param stores in lockstep with
+	// j, so method j's results are MethodResultsFlat[rOffset .. rOffset+rCount]
+	// and its params MethodParamsFlat[pOffset .. pOffset+pCount].
+	var rOffset int = 0
+	var pOffset int = 0
+	for j := 0; j < len(mi.MethodNames); j++ {
+		var rCount int = 0
+		if j < len(mi.MethodResultCounts) {
+			rCount = mi.MethodResultCounts[j]
+		}
+		var pCount int = 0
+		if j < len(mi.MethodParamCounts) {
+			pCount = mi.MethodParamCounts[j]
+		}
+		if charEq(mi.MethodNames[j], methodName) {
+			var results @[]@types.Type
+			if rOffset + rCount <= len(mi.MethodResultsFlat) {
+				results = mi.MethodResultsFlat[rOffset : rOffset + rCount]
+			}
+			var params @[]@types.Type
+			if pOffset + pCount <= len(mi.MethodParamsFlat) {
+				params = mi.MethodParamsFlat[pOffset : pOffset + pCount]
+			}
+			return cursor + j, results, params
+		}
+		rOffset = rOffset + rCount
+		pOffset = pOffset + pCount
+	}
+	return -1, noTypes, noTypes
+}

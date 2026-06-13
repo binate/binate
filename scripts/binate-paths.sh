@@ -21,14 +21,14 @@
 #                  A project source root is `--prepend "$root"`.
 #   --append PATH  Append PATH to -I and -L (repeatable) — a fallback for a
 #                  package the base does not ship.
-#   --target KEY   Select the per-target trees for KEY: ifaces/targets/KEY
-#                  (e.g. pkg/builtins/build) prepended to -I, and
-#                  impls/targets/KEY (per-target package impls, when present)
-#                  prepended to -L.  KEY is a bnc --target key (e.g.
-#                  arm32-linux), or "host"/omitted to auto-detect the host via
-#                  uname.  Pass the SAME key you pass to `bnc --target` so the
-#                  per-target trees match the codegen layout.  --runtime is
-#                  unaffected.
+#   --target KEY   Select the per-target interface tree for KEY:
+#                  ifaces/targets/KEY (e.g. pkg/builtins/build) prepended to
+#                  -I.  KEY is a bnc --target key (e.g. arm32-linux), or
+#                  "host"/omitted to auto-detect the host via uname.  Pass the
+#                  SAME key you pass to `bnc --target` so the per-target tree
+#                  matches the codegen layout.  Per-target package *impls* are
+#                  now expressed via #[build(...)] in the common tree, not a
+#                  separate impls/targets dir.  --runtime is unaffected.
 #   --iface        Print only the -I value.
 #   --impl         Print only the -L value.
 #   --runtime      Print only the --runtime file (ignores --prepend/--append).
@@ -105,17 +105,16 @@ fi
 # on an unrecognised host (so a `pkg/builtins/build` import fails with a
 # clear not-found rather than the wrong layout).
 TARGET_DIR=""        # ifaces/targets/<key>, prepended to -I
-TARGET_IMPL_DIR=""   # impls/targets/<key>, prepended to -L
 TARGET_EXTRA=""      # newline-list of dirs prepended to BOTH -I and -L
 
 # set_target_extras adds any per-target impl/interface search dirs BEYOND the
-# generic ifaces/targets/<key> and impls/targets/<key> trees — prepended to
-# both -I and -L so they win over the libc-host defaults (first-match-wins in
-# the loader).
-# arm32-baremetal needs its bootstrap/rt impls (impls/core/baremetal) and its
-# semihost interface + link-file dir (runtime/baremetal_arm32) ahead of the
-# default impls/core/libc.  bnc no longer synthesizes these (it has no notion
-# of a binate root); binate-paths is the single source of these paths.
+# generic ifaces/targets/<key> interface tree — prepended to both -I and -L so
+# they win over the libc-host defaults (first-match-wins in the loader).
+# arm32-baremetal needs its bootstrap impl (impls/core/baremetal — bootstrap is
+# still path-selected, not #[build]-gated) and its semihost interface +
+# link-file dir (runtime/baremetal_arm32) ahead of the default impls/core/libc.
+# bnc no longer synthesizes these (it has no notion of a binate root);
+# binate-paths is the single source of these paths.
 set_target_extras() {
     case "$1" in
         arm32-baremetal)
@@ -141,8 +140,6 @@ resolve_target() {
         rt_key="$rt_arch-$rt_os"
         [ -d "$BASE/ifaces/targets/$rt_key" ] && \
             TARGET_DIR="$BASE/ifaces/targets/$rt_key"
-        [ -d "$BASE/impls/targets/$rt_key" ] && \
-            TARGET_IMPL_DIR="$BASE/impls/targets/$rt_key"
         set_target_extras "$rt_key"
         return 0
     fi
@@ -151,8 +148,6 @@ resolve_target() {
         exit 1
     fi
     TARGET_DIR="$BASE/ifaces/targets/$rt_key"
-    [ -d "$BASE/impls/targets/$rt_key" ] && \
-        TARGET_IMPL_DIR="$BASE/impls/targets/$rt_key"
     set_target_extras "$rt_key"
 }
 resolve_target
@@ -169,9 +164,6 @@ build_list() {   # $1 = iface | impl
         if [ "$1" = iface ] && [ -n "$TARGET_DIR" ]; then
             printf '%s\n' "$TARGET_DIR"
         fi
-        if [ "$1" = impl ] && [ -n "$TARGET_IMPL_DIR" ]; then
-            printf '%s\n' "$TARGET_IMPL_DIR"
-        fi
         [ -n "$TARGET_EXTRA" ] && printf '%s\n' "$TARGET_EXTRA"
         printf '%s\n' "$BASE"
         if [ "$1" = iface ]; then
@@ -181,7 +173,6 @@ build_list() {   # $1 = iface | impl
             printf '%s\n' "$BASE/impls/core/common"
             printf '%s\n' "$BASE/impls/core/libc"
             printf '%s\n' "$BASE/impls/stdlib/common"
-            printf '%s\n' "$BASE/impls/stdlib/libc"
         fi
         printf '%s' "$APPEND"
     } | join_dedup

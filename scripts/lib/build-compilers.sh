@@ -2,19 +2,39 @@
 # Shared helpers for building gen1/gen2 compilers and compiled interpreters.
 # Source this from runner scripts.
 #
-# Each helper allocates its own --build-dir under /tmp via mktemp so
-# concurrent test runs don't clobber each other's intermediate .ll/.o
-# files. The dirs are tracked in BUILD_DIRS and removed by
-# cleanup_compilers.
+# All compiler binaries and build directories for one runner_setup live
+# under a single unique session directory (mktemp -d).  This keeps
+# concurrent test runs in different worker sessions from colliding in the
+# shared /tmp namespace: no PID-reuse clashes on the old
+# `/tmp/binate_*_$$` names, and no `ls /tmp/binate_*` ambiguity when a
+# session needs to find ITS OWN compiler.  cleanup_compilers removes the
+# whole session dir.
+
+# _COMPILERS_DIR is the per-runner_setup session directory; lazily created
+# on first use and reused for every gen1/gen2/interp binary + build dir.
+#
+# _ensure_compilers_dir must be called DIRECTLY (never inside a $(...)
+# command substitution): the `_COMPILERS_DIR=...` assignment has to land in
+# the caller's shell.  In a subshell it would set a throwaway copy, leaving
+# the real _COMPILERS_DIR empty — so each use would spawn a fresh dir and
+# cleanup_compilers would never find them.
+_COMPILERS_DIR=""
+_ensure_compilers_dir() {
+    if [ -z "$_COMPILERS_DIR" ]; then
+        _COMPILERS_DIR=$(mktemp -d "/tmp/binate_compilers_XXXXXX")
+    fi
+}
 
 # BUILD_DIRS holds the per-helper build directories created during this
-# runner_setup; cleanup_compilers tears them down.
+# runner_setup; cleanup_compilers tears them down (removing the session
+# dir would too, but the list is kept for explicitness).
 BUILD_DIRS=""
 
-# _new_build_dir prints a fresh build dir under /tmp (caller is
+# _new_build_dir prints a fresh build dir inside the session dir (caller is
 # responsible for tracking + removing it via cleanup_compilers).
 _new_build_dir() {
-    d=$(mktemp -d "/tmp/binate_build_XXXXXX")
+    _ensure_compilers_dir
+    d=$(mktemp -d "$_COMPILERS_DIR/build_XXXXXX")
     BUILD_DIRS="$BUILD_DIRS $d"
     echo "$d"
 }
@@ -47,7 +67,8 @@ _resolve_builder_lib() {
 # Build gen1 compiler (builder-comp compiles cmd/bnc → gen1 binary)
 # Sets GEN1_COMPILER to the path.
 build_gen1() {
-    GEN1_COMPILER="/tmp/binate_gen1_compiler_$$"
+    _ensure_compilers_dir
+    GEN1_COMPILER="$_COMPILERS_DIR/gen1_compiler"
     GEN1_BUILD_DIR="$(_new_build_dir)"
     echo "Building gen1 compiler..."
     builder="$(_resolve_builder)"
@@ -84,7 +105,8 @@ build_gen1() {
 # Requires GEN1_COMPILER to be set (call build_gen1 first).
 # Sets GEN2_COMPILER to the path.
 build_gen2() {
-    GEN2_COMPILER="/tmp/binate_gen2_compiler_$$"
+    _ensure_compilers_dir
+    GEN2_COMPILER="$_COMPILERS_DIR/gen2_compiler"
     GEN2_BUILD_DIR="$(_new_build_dir)"
     echo "Building gen2 compiler..."
     build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$GEN2_BUILD_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
@@ -111,7 +133,8 @@ build_gen2() {
 # Sets BNC_NATIVE to the path.
 build_bnc_native_aa64() {
     if [ -z "$GEN1_COMPILER" ]; then build_gen1; fi
-    BNC_NATIVE="/tmp/binate_bnc_native_aa64_$$"
+    _ensure_compilers_dir
+    BNC_NATIVE="$_COMPILERS_DIR/bnc_native_aa64"
     BNC_NATIVE_BUILD_DIR="$(_new_build_dir)"
     echo "Building bnc with native aarch64 backend..."
     build_out=$("$GEN1_COMPILER" --backend native -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
@@ -138,7 +161,8 @@ build_interp_boot_comp() {
 # Sets COMPILED_INTERP to the path.
 build_interp() {
     local compiler="$1"
-    COMPILED_INTERP="/tmp/binate_compiled_interp_$$"
+    _ensure_compilers_dir
+    COMPILED_INTERP="$_COMPILERS_DIR/compiled_interp"
     INTERP_BUILD_DIR="$(_new_build_dir)"
     echo "Building compiled interpreter..."
     build_out=$("$compiler" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
@@ -150,11 +174,18 @@ build_interp() {
     echo "Compiled interpreter ready: $COMPILED_INTERP"
 }
 
-# Cleanup helper — removes all temp binaries and build dirs.
+# Cleanup helper — removes the session dir (which holds every compiler
+# binary + build dir).  The explicit BUILD_DIRS / binary removals are
+# redundant with the session-dir rm but kept as a belt-and-suspenders in
+# case a caller pointed a path elsewhere.
 cleanup_compilers() {
     rm -f "$GEN1_COMPILER" "$GEN2_COMPILER" "$COMPILED_INTERP" "$BNC_NATIVE"
     for d in $BUILD_DIRS; do
         rm -rf "$d"
     done
     BUILD_DIRS=""
+    if [ -n "$_COMPILERS_DIR" ]; then
+        rm -rf "$_COMPILERS_DIR"
+        _COMPILERS_DIR=""
+    fi
 }

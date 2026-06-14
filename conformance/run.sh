@@ -166,6 +166,19 @@ if [ -z "$HOST_ARCH" ]; then
 fi
 export HOST_ARCH
 
+# Host OS in Binate's naming (matches `#[build(is(os, ...))]` tokens / build.OS).
+# Same role as HOST_ARCH but for tests whose output tracks the build's OS on
+# non-cross modes (e.g. one printing os=darwin / os=linux). Honors a pre-set
+# value for cross-checking another OS's expected.<os> resolution.
+if [ -z "$HOST_OS" ]; then
+    case "$(uname -s)" in
+        Darwin) HOST_OS=darwin ;;
+        Linux)  HOST_OS=linux ;;
+        *) HOST_OS=unknown ;;
+    esac
+fi
+export HOST_OS
+
 # Load the runner
 RUNNER="$SCRIPT_DIR/runners/${MODE}.sh"
 if [ ! -f "$RUNNER" ]; then
@@ -351,11 +364,15 @@ for bn in "$SCRIPT_DIR"/*.bn; do
     # Per-mode overrides: NNN_name.{expected,error}.<MODE> takes
     # precedence over the generic NNN_name.{expected,error} when
     # present.  Used for tests whose canonical .expected is target-
-    # specific (e.g. LP64-pinned sizeof output on arm32 ILP32).  A host-arch
-    # tier (NNN_name.expected.<arch>) sits below the per-mode override for
-    # tests whose output tracks the build's arch on non-cross modes.
+    # specific (e.g. LP64-pinned sizeof output on arm32 ILP32).  Host-arch and
+    # host-os tiers (NNN_name.expected.<arch> / .<os>) sit below the per-mode
+    # override for tests whose output tracks the build's arch/OS on non-cross
+    # modes (target == host).
     if [ -f "$SCRIPT_DIR/${name}.expected.${HOST_ARCH}" ]; then
         expected="$SCRIPT_DIR/${name}.expected.${HOST_ARCH}"
+    fi
+    if [ -f "$SCRIPT_DIR/${name}.expected.${HOST_OS}" ]; then
+        expected="$SCRIPT_DIR/${name}.expected.${HOST_OS}"
     fi
     if [ -f "$SCRIPT_DIR/${name}.expected.${MODE}" ]; then
         expected="$SCRIPT_DIR/${name}.expected.${MODE}"
@@ -393,11 +410,14 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
     main_bn="$dir/main.bn"
     expected="$dir/expected"
     errorfile="$dir/error"
-    # Host-arch tier then per-mode override (mode wins): $dir/expected.<arch>
-    # covers NON-cross modes (target==host) where output tracks the build's
-    # arch; $dir/expected.<MODE> pins cross modes and takes precedence.
+    # Host-arch/host-os tiers then per-mode override (mode wins):
+    # $dir/expected.<arch> / .<os> cover NON-cross modes (target==host) where
+    # output tracks the build's arch/OS; $dir/expected.<MODE> pins cross modes.
     if [ -f "$dir/expected.${HOST_ARCH}" ]; then
         expected="$dir/expected.${HOST_ARCH}"
+    fi
+    if [ -f "$dir/expected.${HOST_OS}" ]; then
+        expected="$dir/expected.${HOST_OS}"
     fi
     if [ -f "$dir/expected.${MODE}" ]; then
         expected="$dir/expected.${MODE}"
@@ -448,6 +468,9 @@ for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" -name '*.bn' 2>/
     errorfile="$SCRIPT_DIR/${name}.error"
     if [ -f "$SCRIPT_DIR/${name}.expected.${HOST_ARCH}" ]; then
         expected="$SCRIPT_DIR/${name}.expected.${HOST_ARCH}"
+    fi
+    if [ -f "$SCRIPT_DIR/${name}.expected.${HOST_OS}" ]; then
+        expected="$SCRIPT_DIR/${name}.expected.${HOST_OS}"
     fi
     if [ -f "$SCRIPT_DIR/${name}.expected.${MODE}" ]; then
         expected="$SCRIPT_DIR/${name}.expected.${MODE}"

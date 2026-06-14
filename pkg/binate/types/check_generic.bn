@@ -72,22 +72,63 @@ func resolveTypeInstantiation(c @Checker,
 // (re-instantiating a `Vec[T]`-shaped signature type when a generic
 // function is instantiated), so both routes land on the same cached
 // @Type and thus the same name-based identity.
+//
+// The result @Type (with its final mangled name + InstDecl/InstArgs)
+// is created and registered in the cache BEFORE its body / parents are
+// resolved, so a recursive reference to the SAME (decl, args) during
+// that resolution — `type Node[T] struct { next @Node[T] }` (legit,
+// behind a pointer) or `interface N[T] : N[T]` (illegal, caught by the
+// self-extension guard) — resolves to this in-progress type instead of
+// re-entering and overflowing the stack.  An infinitely-GROWING chain
+// (`type Box[T] struct { inner @Box[Wrap[T]] }`) instead has different
+// args at every level, so the cache never hits; the GenericInstDepth
+// bound rejects it with a clean diagnostic.
 func instantiateGenericDeclWithArgs(c @Checker, d @ast.Decl,
 		isIface bool, argTypes @[]@Type) @Type {
 	var cached @Type = lookupCachedInstantiation(c, d, argTypes)
 	if cached != nil { return cached }
+	// Bound well below the native stack budget: each level adds several
+	// resolver frames, so a high cap (e.g. 1024) overflows the stack
+	// before the diagnostic fires.  128 is far above any realistic
+	// hand-written generic nesting.
+	if c.GenericInstDepth >= 128 {
+		addCheckError(c, d.Pos,
+			"generic instantiation nested too deeply (cyclic or unbounded type argument?)")
+		return TypVoid()
+	}
+	// Create the result shell with its final identity, then register it
+	// before populating (see the doc comment above for why).
 	var result @Type
 	if isIface {
-		result = buildInstantiatedInterface(c, d, argTypes)
+		result = MakeInterfaceType(currentPkgShort,
+			mangleInstantiatedName(d.Name, argTypes))
 	} else {
-		result = buildInstantiatedStruct(c, d, argTypes)
+		result = MakeNamedType(mangleInstantiatedName(
+			QualifyName(currentPkgPath, d.Name), argTypes))
 	}
+	result.InstDecl = bit_cast(*uint8, d)
+	result.InstArgs = argTypes
 	var entry @GenericInstantiation = make(GenericInstantiation)
 	entry.Decl = d
 	entry.TypeArgs = argTypes
 	entry.Result = result
 	c.GenericInstantiations = slices.Append[@GenericInstantiation](
 		c.GenericInstantiations, entry)
+
+	c.GenericInstDepth = c.GenericInstDepth + 1
+	if isIface {
+		// Mark this instantiated interface as in-progress so a parent
+		// reference that loops back to it (an inheritance cycle across
+		// distinct instantiations) is detected in resolveInterfaceExtension.
+		c.GenericIfacePopulating = slices.Append[@Type](
+			c.GenericIfacePopulating, result)
+		populateInstantiatedInterface(c, d, argTypes, result)
+		c.GenericIfacePopulating =
+			c.GenericIfacePopulating[0:len(c.GenericIfacePopulating) - 1]
+	} else {
+		populateInstantiatedStruct(c, d, argTypes, result)
+	}
+	c.GenericInstDepth = c.GenericInstDepth - 1
 	return result
 }
 
@@ -120,11 +161,15 @@ func lookupGenericIfaceDeclPkg(c @Checker, pkg @[]char,
 	return nil
 }
 
-// buildInstantiatedInterface produces a fresh TYP_INTERFACE
-// whose methods AND parent interfaces have each TYP_TYPE_PARAM
-// substituted for the matching type-arg.  Pushes a per-decl
-// type-param scope so the method-signature and parent resolution
-// see T bound to its concrete @Type.  Per plan-generics.md Slice 6b.
+// populateInstantiatedInterface fills the pre-created (and already
+// cache-registered) instantiated TYP_INTERFACE `iface` with its methods
+// AND parent interfaces, each TYP_TYPE_PARAM substituted for the
+// matching type-arg.  Pushes a per-decl type-param scope so the
+// method-signature and parent resolution see T bound to its concrete
+// @Type.  Per plan-generics.md Slice 6b.  `iface` is created and
+// registered by instantiateGenericDeclWithArgs first so a recursive
+// `interface N[T] : N[T]` resolves its parent back to this in-progress
+// iface (and the self-extension guard rejects it) instead of looping.
 //
 // Generic interface decls are deferred at collectInterfaceDecl (no
 // stable TYP_INTERFACE at decl time), so this is the sole place a
@@ -134,12 +179,8 @@ func lookupGenericIfaceDeclPkg(c @Checker, pkg @[]char,
 // Parents, so isDescendantInterface would report it as extending
 // nothing — wrongly rejecting a valid `@WideBox[int]` → `@Box[int]`
 // upcast / constraint-satisfaction.
-func buildInstantiatedInterface(c @Checker, d @ast.Decl,
-		args @[]@Type) @Type {
-	var iface @Type = MakeInterfaceType(currentPkgShort,
-		mangleInstantiatedName(d.Name, args))
-	iface.InstDecl = bit_cast(*uint8, d)
-	iface.InstArgs = args
+func populateInstantiatedInterface(c @Checker, d @ast.Decl,
+		args @[]@Type, iface @Type) {
 	pushScope(c)
 	for i := 0; i < len(d.TypeParams); i++ {
 		defineType(c.Scope, d.TypeParams[i].Name, args[i])
@@ -163,7 +204,6 @@ func buildInstantiatedInterface(c @Checker, d @ast.Decl,
 	// method-conflict checks as the non-generic path).
 	resolveInterfaceExtension(c, d, iface)
 	popScope(c)
-	return iface
 }
 
 // lookupGenericTypeDecl finds a generic struct decl registered
@@ -217,13 +257,18 @@ func lookupCachedInstantiation(c @Checker, d @ast.Decl,
 	return nil
 }
 
-// buildInstantiatedStruct produces a fresh TYP_NAMED whose
-// Underlying is the generic decl's struct body with each
-// TYP_TYPE_PARAM substituted for the matching type-arg.  Pushes
-// a per-decl type-param scope so the field-type resolution sees
-// T bound to its concrete @Type.  Pops on exit.
-func buildInstantiatedStruct(c @Checker, d @ast.Decl,
-		args @[]@Type) @Type {
+// populateInstantiatedStruct fills the pre-created (and already
+// cache-registered) instantiated TYP_NAMED `named` with the generic
+// decl's struct body, each TYP_TYPE_PARAM substituted for the matching
+// type-arg.  Pushes a per-decl type-param scope so the field-type
+// resolution sees T bound to its concrete @Type.  `named` is created
+// and registered by instantiateGenericDeclWithArgs first, so a
+// recursive field `next @Node[T]` (behind a managed pointer, hence
+// size-stable) resolves back to this in-progress `named` instead of
+// looping; its Underlying is nil during field resolution and filled in
+// below.
+func populateInstantiatedStruct(c @Checker, d @ast.Decl,
+		args @[]@Type, named @Type) {
 	pushScope(c)
 	// Install type-params keyed on names (resolveTypeExpr's
 	// TEXPR_NAMED branch finds them by scope lookup).  Each
@@ -234,18 +279,12 @@ func buildInstantiatedStruct(c @Checker, d @ast.Decl,
 		var nm @[]char = d.TypeParams[i].Name
 		defineType(c.Scope, nm, args[i])
 	}
-	var underlying @Type
-	var qbase @[]char = QualifyName(currentPkgPath, d.Name)
 	if d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
-		underlying = resolveStructType(c, d.TypeRef)
-		underlying.Name = mangleInstantiatedName(qbase, args)
+		var underlying @Type = resolveStructType(c, d.TypeRef)
+		underlying.Name = named.Name
+		named.Underlying = underlying
 	}
 	popScope(c)
-	var named @Type = MakeNamedType(mangleInstantiatedName(qbase, args))
-	named.Underlying = underlying
-	named.InstDecl = bit_cast(*uint8, d)
-	named.InstArgs = args
-	return named
 }
 
 // mangleInstantiatedName produces a stable name for the

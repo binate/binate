@@ -98,13 +98,14 @@ fi
 [ -d "$BASE/ifaces" ] || {
     echo "$prog: base '$BASE' has no ifaces/ (not a layout base)" >&2; exit 1; }
 
-# Resolve the per-target metadata tree (pkg/builtins/build) into TARGET_DIR,
-# the directory to prepend to -I (empty when none applies).  An explicit
-# --target KEY must name an existing ifaces/targets/KEY (typos are a hard
-# error); "host"/omitted auto-detects via uname and silently yields no tree
-# on an unrecognised host (so a `pkg/builtins/build` import fails with a
-# clear not-found rather than the wrong layout).
-TARGET_DIR=""        # ifaces/targets/<key>, prepended to -I
+# In the current tree pkg/builtins/build is one #[build]-gated file in
+# ifaces/core (not a per-target tree).  A prebuilt BUILDER bundle still ships
+# the old per-target ifaces/targets/<key>/pkg/builtins/build.bni, so the lookup
+# below stays [ -d ]-guarded: it finds the bundle's copy when run with
+# --base <bundle-lib>, and is a silent no-op against the current tree (where
+# ifaces/targets was removed).  Drop it once BUILDER ships build in ifaces/core.
+# Unknown keys are not validated here (bnc rejects them via applyTarget).
+TARGET_DIR=""        # ifaces/targets/<key> if it exists (bundle only), -I
 TARGET_EXTRA=""      # newline-list of dirs prepended to BOTH -I and -L
 
 # set_target_extras adds any per-target impl/interface search dirs BEYOND the
@@ -138,16 +139,9 @@ resolve_target() {
         esac
         [ -n "$rt_os" ] && [ -n "$rt_arch" ] || return 0
         rt_key="$rt_arch-$rt_os"
-        [ -d "$BASE/ifaces/targets/$rt_key" ] && \
-            TARGET_DIR="$BASE/ifaces/targets/$rt_key"
-        set_target_extras "$rt_key"
-        return 0
     fi
-    if [ ! -d "$BASE/ifaces/targets/$rt_key" ]; then
-        echo "$prog: unknown --target '$rt_key' (no $BASE/ifaces/targets/$rt_key)" >&2
-        exit 1
-    fi
-    TARGET_DIR="$BASE/ifaces/targets/$rt_key"
+    [ -d "$BASE/ifaces/targets/$rt_key" ] && \
+        TARGET_DIR="$BASE/ifaces/targets/$rt_key"
     set_target_extras "$rt_key"
 }
 resolve_target

@@ -43,6 +43,10 @@ for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" -name
         # Doc comment line: opens or extends a doc block.
         /^[\t ]*\/\// { doc_pending = 1; next }
 
+        # Annotation on a top-level decl (e.g. #[build(...)]): neutral, so the
+        # doc comment above it carries through to the annotated decl.
+        /^#\[/ { next }
+
         # Blank line: neutral.
         NF == 0 { next }
 

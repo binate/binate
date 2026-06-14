@@ -83,7 +83,34 @@ if [ -z "$BNLINT_BIN" ] || [ ! -x "$BNLINT_BIN" ]; then
     }
 fi
 
-"$BNLINT_BIN" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" $TARGETS
+# TEMPORARY shim for the bundled bnlint: pkg/builtins/build is now one
+# #[build(...)]-gated file (ifaces/core), and buildcfg imports it, so it is in
+# this lint's dependency closure — but the bundled bnlint (bnc-0.0.8) predates
+# #[build] parsing and chokes on it.  bnlint only needs build's *interface*
+# (the const names/types) to typecheck, not its gated values, so shadow the
+# real file with an UNGATED build.bni shim on -I (prepended, first-match-wins).
+# Drop this once BUILDER_VERSION ships a bnc whose parser handles #[build].
+BUILD_SHIM_DIR="$(mktemp -d -t binate-build-shim.XXXXXX)"
+trap 'rm -f "$BNLINT_BIN"; rm -rf "$BUILD_SHIM_DIR"' EXIT
+mkdir -p "$BUILD_SHIM_DIR/pkg/builtins"
+cat > "$BUILD_SHIM_DIR/pkg/builtins/build.bni" <<'SHIM'
+// Ungated stand-in for pkg/builtins/build, used ONLY to let the pre-#[build]
+// bundled bnlint typecheck buildcfg's use of build.* (see scripts/hygiene/
+// lint.sh).  Values are irrelevant to linting; the real gated file lives in
+// ifaces/core/pkg/builtins/build.bni.
+package "pkg/builtins/build"
+type OSType int
+const ( OS_LINUX OSType = iota; OS_DARWIN; OS_BAREMETAL )
+type ArchType int
+const ( ARCH_X64 ArchType = iota; ARCH_AARCH64; ARCH_ARM32 )
+const ARCH_ARM64 ArchType = ARCH_AARCH64
+const OS OSType = OS_DARWIN
+const Arch ArchType = ARCH_AARCH64
+const PtrSize int = 8
+const IntSize int = 8
+SHIM
+
+"$BNLINT_BIN" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$BUILD_SHIM_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" $TARGETS
 rc=$?
 
 if [ "$rc" -ne 0 ]; then

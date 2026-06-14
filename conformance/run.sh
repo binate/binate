@@ -148,6 +148,24 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 export SCRIPT_DIR BINATE_DIR BOOTSTRAP_DIR
 
+# Host CPU arch in Binate's naming (matches `#[build(is(arch, ...))]` tokens).
+# Used as an `expected.<arch>` resolution tier for tests whose output tracks
+# the build's arch on NON-cross modes (where target == host) — e.g. a test
+# printing the selected arch passes on both an aarch64 dev box and an x64 CI
+# runner. Cross-compile modes pin the target via `expected.<MODE>` (higher
+# precedence), so this tier never overrides them.
+# Honor a pre-set HOST_ARCH (lets a developer cross-check another arch's
+# expected.<arch> resolution without that hardware); otherwise derive it.
+if [ -z "$HOST_ARCH" ]; then
+    case "$(uname -m)" in
+        arm64|aarch64) HOST_ARCH=aarch64 ;;
+        x86_64|amd64)  HOST_ARCH=x64 ;;
+        armv7*|armv6*|arm) HOST_ARCH=arm32 ;;
+        *) HOST_ARCH=unknown ;;
+    esac
+fi
+export HOST_ARCH
+
 # Load the runner
 RUNNER="$SCRIPT_DIR/runners/${MODE}.sh"
 if [ ! -f "$RUNNER" ]; then
@@ -333,7 +351,12 @@ for bn in "$SCRIPT_DIR"/*.bn; do
     # Per-mode overrides: NNN_name.{expected,error}.<MODE> takes
     # precedence over the generic NNN_name.{expected,error} when
     # present.  Used for tests whose canonical .expected is target-
-    # specific (e.g. LP64-pinned sizeof output on arm32 ILP32).
+    # specific (e.g. LP64-pinned sizeof output on arm32 ILP32).  A host-arch
+    # tier (NNN_name.expected.<arch>) sits below the per-mode override for
+    # tests whose output tracks the build's arch on non-cross modes.
+    if [ -f "$SCRIPT_DIR/${name}.expected.${HOST_ARCH}" ]; then
+        expected="$SCRIPT_DIR/${name}.expected.${HOST_ARCH}"
+    fi
     if [ -f "$SCRIPT_DIR/${name}.expected.${MODE}" ]; then
         expected="$SCRIPT_DIR/${name}.expected.${MODE}"
     fi
@@ -370,8 +393,12 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
     main_bn="$dir/main.bn"
     expected="$dir/expected"
     errorfile="$dir/error"
-    # Per-mode overrides: $dir/{expected,error}.<MODE> takes
-    # precedence when present.  Mirrors the single-file convention.
+    # Host-arch tier then per-mode override (mode wins): $dir/expected.<arch>
+    # covers NON-cross modes (target==host) where output tracks the build's
+    # arch; $dir/expected.<MODE> pins cross modes and takes precedence.
+    if [ -f "$dir/expected.${HOST_ARCH}" ]; then
+        expected="$dir/expected.${HOST_ARCH}"
+    fi
     if [ -f "$dir/expected.${MODE}" ]; then
         expected="$dir/expected.${MODE}"
     fi
@@ -419,6 +446,9 @@ for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" -name '*.bn' 2>/
     fi
     expected="$SCRIPT_DIR/${name}.expected"
     errorfile="$SCRIPT_DIR/${name}.error"
+    if [ -f "$SCRIPT_DIR/${name}.expected.${HOST_ARCH}" ]; then
+        expected="$SCRIPT_DIR/${name}.expected.${HOST_ARCH}"
+    fi
     if [ -f "$SCRIPT_DIR/${name}.expected.${MODE}" ]; then
         expected="$SCRIPT_DIR/${name}.expected.${MODE}"
     fi

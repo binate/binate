@@ -38,6 +38,14 @@ func emitImplVtables(out *buf.Builder, m @ir.Module) {
 	}
 	for i := 0; i < len(m.Impls); i++ {
 		emitImplVtable(out, m, m.Impls[i])
+		// Parallel shim vtable (method slots hold @__handle handles) so the
+		// bytecode VM can dispatch this package's iface methods through their
+		// marshaling shims when the package is injected native-only.  Gated to
+		// non-generic impls — the same set the descriptor's Vtables table lists
+		// (generic instantiations re-lower at the bytecode importer).
+		if !recvTypeIsGenericInst(m.Impls[i].RecvTypeName) {
+			emitImplShimVtable(out, m, m.Impls[i])
+		}
 	}
 	// Slice 2.8: declare imported vtables as external so this TU's
 	// references resolve at link time. The vtable's actual definition
@@ -163,9 +171,48 @@ func emitImplVtable(out *buf.Builder, m @ir.Module,
 	buf.WriteInt(out, nSlots)
 	out.Write(" x i8*] [")
 	emitImplVtableLayout(out, m, info, info.IfacePkg,
-		info.IfaceName, true)
+		info.IfaceName, true, false)
 	out.Write("]\n")
 	return
+}
+
+// emitImplShimVtable emits the parallel `@__ivtshim.<mangled>` vtable for an
+// `(R, I)` impl: the same slot layout as @__ivt, but every method slot holds the
+// method's function-value HANDLE (@__handle.<m>) instead of the raw fn.  The
+// bytecode VM resolves this from the raw @__ivt address (descriptor's
+// VtableInfo.ShimAddr -> registerVtableAddr) and dispatches an injected native-
+// only package's iface methods through the handle's marshaling shim, so it never
+// replicates the native arg/return ABI.  Native-to-native dispatch keeps using
+// the raw @__ivt directly; this is consumed only by the cross-mode VM path.
+func emitImplShimVtable(out *buf.Builder, m @ir.Module,
+		info @ir.ImplInfo) {
+	var nSlots int = vtableSlotCountForInfo(info)
+	var shimName @[]char = implShimVtableName(info)
+	out.Write("@")
+	out.Write(shimName)
+	out.Write(" = weak_odr constant [")
+	buf.WriteInt(out, nSlots)
+	out.Write(" x i8*] [")
+	emitImplVtableLayout(out, m, info, info.IfacePkg,
+		info.IfaceName, true, true)
+	out.Write("]\n")
+	return
+}
+
+// implShimVtableName builds the LLVM symbol for an impl's parallel shim vtable:
+// `__ivtshim.bn_<recv_pkg>__<recv_name>__<iface_pkg>__<iface_name>` (the @__ivt
+// name with the `__ivt` prefix replaced by `__ivtshim`).
+func implShimVtableName(info @ir.ImplInfo) @[]char {
+	var b @buf.Builder = buf.NewBuilder()
+	b.Write("__ivtshim.bn_")
+	writePkgIdent(b, info.RecvPkg)
+	b.Write("__")
+	b.Write(info.RecvTypeName)
+	b.Write("__")
+	writePkgIdent(b, info.IfacePkg)
+	b.Write("__")
+	b.Write(info.IfaceName)
+	return buf.CopyStr(b.String())
 }
 
 // emitImplVtableLayout writes the slot values for a single
@@ -180,7 +227,7 @@ func emitImplVtable(out *buf.Builder, m @ir.Module,
 // emit just `[dtor, m1, m2, ...]`.
 func emitImplVtableLayout(out *buf.Builder, m @ir.Module,
 		info @ir.ImplInfo, ifacePkg *[]readonly char,
-		ifaceName *[]readonly char, isFirst bool) {
+		ifaceName *[]readonly char, isFirst bool, useHandles bool) {
 	if !isFirst {
 		out.Write(", ")
 	}
@@ -192,7 +239,7 @@ func emitImplVtableLayout(out *buf.Builder, m @ir.Module,
 		ifaceName)
 	for i := 0; i < len(parentPkgs); i++ {
 		emitImplVtableLayout(out, m, info, parentPkgs[i],
-			parentNames[i], false)
+			parentNames[i], false, useHandles)
 	}
 	// Own methods of this level, in declaration order.
 	var ownMethods @[]@[]char = ir.IfaceOwnMethodNames(ifacePkg,
@@ -209,7 +256,7 @@ func emitImplVtableLayout(out *buf.Builder, m @ir.Module,
 		// underlying method).  Pointer-receiver methods need no
 		// thunk; LookupVtableSlotName returns the original name.
 		var slotName @[]char = ir.LookupVtableSlotName(m, qualified)
-		emitImplVtableSlot(out, m, slotName)
+		emitImplVtableSlot(out, m, slotName, useHandles)
 	}
 	return
 }
@@ -304,15 +351,26 @@ func writePkgIdent(b *buf.Builder, pkg *[]readonly char) {
 	return
 }
 
-// emitImplVtableSlot emits a single `i8* bitcast (<sig>* @<func> to
-// i8*)` slot. Looks up the impl method in m.Funcs to recover its
-// signature; emits an `i8* null` slot if not found (defensive — the
-// satisfaction check should have validated method presence).
+// emitImplVtableSlot emits a single method slot.  For the raw `@__ivt` vtable
+// (useHandles=false) it emits `i8* bitcast (<sig>* @<func> to i8*)` — the raw
+// method fn, which native-to-native dispatch calls directly.  For the parallel
+// `@__ivtshim` vtable (useHandles=true) it emits `i8* bitcast (%BnFuncValue*
+// @__handle.<func> to i8*)` — the method's function-value HANDLE, the same form
+// the dtor slot uses; the bytecode VM dispatches through it (handle.vtable.call
+// is the marshaling shim) so it never has to replicate the native arg ABI.
+// Looks up the impl method in m.Funcs; emits `i8* null` if not found (defensive
+// — the satisfaction check should have validated method presence).
 func emitImplVtableSlot(out *buf.Builder, m @ir.Module,
-		funcName @[]char) {
+		funcName @[]char, useHandles bool) {
 	var f @ir.Func = lookupModuleFunc(m, funcName)
 	if f == nil {
 		out.Write("i8* null")
+		return
+	}
+	if useHandles {
+		out.Write("i8* bitcast (%BnFuncValue* @__handle.")
+		out.Write(mangle.FuncName(modulePkgName, funcName))
+		out.Write(" to i8*)")
 		return
 	}
 	out.Write("i8* bitcast (")

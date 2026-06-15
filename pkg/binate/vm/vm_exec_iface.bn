@@ -20,90 +20,70 @@ func ifaceVtIsNative(vm @VM, vtIdxPlus int) bool {
 }
 
 // dispatchCompiledIfaceMethod calls an interface method whose vtable is a
-// NATIVE @__ivt pointer (the iface value came from an injected COMPILED
-// package — see ifaceVtIsNative).  iv[1] IS the native vtable address;
-// natVt[slot] is the method's RAW native function pointer (not a shim — the
-// @__ivt slots hold the impl method addresses directly), with the receiver
-// (iv[0]) riding the implicit data/first argument.  The method's result
-// byte-size (carried in instr.Aux's high bits — see lower_call.bn) selects
-// the calling primitive, because a raw fn returns by the native ABI rather
-// than the retbuf-shim convention dispatchExternBinding relies on:
-//   - ≤ 8 bytes  → rt._call_shim_scalar     (result in X0).
-//   - 9–16 bytes → rt._call_shim_pair        (by-value pair in X0:X1; copied
-//                  into a VM-stack retbuf whose address becomes the result).
-//   - > 16 bytes → sret (X8); no primitive captures that yet, so fail loudly
-//                  rather than mis-dispatch through the wrong-shape shim.
-// Writes regs[instr.Dst] in place; the caller `continue`s (no VM frame is
-// pushed).
+// NATIVE @__ivt pointer (the iface value came from an injected COMPILED package,
+// or a bytecode BC_IFACE_VALUE over a native-only package's struct — see
+// ifaceVtIsNative).  It does NOT call the raw @__ivt method fn directly: an
+// arg/return marshaling that matches the native ABI (floats→FP regs, ≤16-byte
+// aggregates by value, >16-byte by pointer, stack overflow) is exactly the work
+// the per-function SHIM already does correctly, so replicating it here from byte
+// sizes is unsound (it would miscompile floats, HFAs, and 32-bit targets).
+// Instead it resolves the PARALLEL shim vtable (registered raw-@__ivt-addr →
+// @__ivtshim-addr by RegisterPackageVtables), reads the method's function-value
+// HANDLE from slot, and dispatches through the handle's marshaling shim — the
+// same retbuf-style convention dispatchExternBinding uses.  The shim takes the
+// receiver as its first arg (a0); user args ride a1.. as the by-address slots
+// the bytecode already packs.  Writes regs[instr.Dst] in place; the caller
+// `continue`s (no VM frame is pushed).
 func dispatchCompiledIfaceMethod(vm @VM, regs *int, instr BCInstr, iv *int) {
-	var natVt *int = bit_cast(*int, iv[1])
-	var slot int = instr.Aux & 65535
-	var resultSize int = (instr.Aux >> 16) & 65535
-	var fnPtr *uint8 = bit_cast(*uint8, natVt[slot])
-	var dataPtr *uint8 = bit_cast(*uint8, iv[0])
-	var n int = instr.Imm
-	if n > 7 {
-		// The shim primitives carry 7 user-arg slots (a0..a6); the
-		// receiver rides the data slot.  A wider compiled iface method
-		// can't be VM-dispatched until those helpers widen — fail loudly
-		// rather than silently drop arguments.
-		println("vm: compiled iface method has >7 arg slots (unsupported)")
+	var shimVtAddr int = lookupShimVtable(iv[1])
+	if shimVtAddr == 0 {
+		// The iface value carries a native @__ivt with no registered shim
+		// vtable — RegisterPackageVtables should have bound both for every
+		// injected native-only package.  Fail loudly rather than mis-dispatch.
+		println("vm: no shim vtable for native interface method dispatch")
 		rt.Exit(1)
 	}
-	var a0 int = 0
+	var shimVt *int = bit_cast(*int, shimVtAddr)
+	var slot int = instr.Aux & 65535
+	var resultSize int = (instr.Aux >> 16) & 65535
+	// Slot holds the method's @__handle ({vtable, data}); the marshaling shim is
+	// vtable.call, exactly as a function-value / extern dispatch reads it.
+	var handle *int = bit_cast(*int, shimVt[slot])
+	var vtable *int = bit_cast(*int, handle[0])
+	var fnPtr *uint8 = bit_cast(*uint8, vtable[1])
+	var dataPtr *uint8 = bit_cast(*uint8, handle[1])
+	var n int = instr.Imm
+	if n > 6 {
+		// The shim primitives carry 7 arg slots (a0..a6); the receiver takes
+		// a0, leaving 6 for user args.  A wider method can't be dispatched
+		// until the primitives widen — fail loudly rather than drop args.
+		println("vm: compiled iface method has >6 user arg slots (unsupported)")
+		rt.Exit(1)
+	}
+	// a0 = receiver (the iv data ptr); a1.. = user args (1 by-address slot each;
+	// the shim marshals each to the native ABI).
+	var a0 int = iv[0]
 	var a1 int = 0
 	var a2 int = 0
 	var a3 int = 0
 	var a4 int = 0
 	var a5 int = 0
 	var a6 int = 0
-	if n > 0 { a0 = regs[instr.Src2 + 0] }
-	if n > 1 { a1 = regs[instr.Src2 + 1] }
-	if n > 2 { a2 = regs[instr.Src2 + 2] }
-	if n > 3 { a3 = regs[instr.Src2 + 3] }
-	if n > 4 { a4 = regs[instr.Src2 + 4] }
-	if n > 5 { a5 = regs[instr.Src2 + 5] }
-	if n > 6 { a6 = regs[instr.Src2 + 6] }
-	if resultSize > 32 {
-		// A raw compiled method returning >32 bytes uses sret (X8) like the
-		// 17–32 case, but no fixed-size capture primitive covers it yet (the
-		// VM has no variable-size sret-from-raw-fn helper).  Fail loudly
-		// rather than mis-dispatch; widen with another fixed-size shim (or a
-		// true sret primitive) if a >32-byte iface method return appears.
-		println("vm: compiled iface method returns >32 bytes (unsupported)")
-		rt.Exit(1)
-	}
-	if resultSize > 16 {
-		// 17–32 bytes: the raw method fn returns the aggregate through the X8
-		// sret buffer (the AAPCS64 / SysV convention for >16-byte returns).
-		// `_call_shim_quad` captures the four words; copy them into a stable
-		// retbuf on the VM stack and hand the bytecode a pointer to it, like
-		// the pair path (e.g. errors.Error.Error() -> a 32-byte managed-slice).
-		var quad rt.ShimQuad = rt._call_shim_quad(fnPtr, dataPtr,
-			a0, a1, a2, a3, a4, a5, a6)
-		var qbuf *int = bit_cast(*int,
-			bit_cast(int, vm.Stack) + vm.SP)
-		vm.SP = vm.SP + 32
-		qbuf[0] = quad.A
-		qbuf[1] = quad.B
-		qbuf[2] = quad.C
-		qbuf[3] = quad.D
-		if instr.Dst >= 0 { regs[instr.Dst] = bit_cast(int, qbuf) }
-		return
-	}
+	if n > 0 { a1 = regs[instr.Src2 + 0] }
+	if n > 1 { a2 = regs[instr.Src2 + 1] }
+	if n > 2 { a3 = regs[instr.Src2 + 2] }
+	if n > 3 { a4 = regs[instr.Src2 + 3] }
+	if n > 4 { a5 = regs[instr.Src2 + 4] }
+	if n > 5 { a6 = regs[instr.Src2 + 5] }
 	if resultSize > 8 {
-		// 9–16 bytes: the raw method fn returns the aggregate BY VALUE in
-		// the X0:X1 register pair (sret is only for >16).  `_call_shim_pair`
-		// captures that pair; copy it into a stable retbuf on the VM stack
-		// and hand the bytecode a pointer to it, matching the aggregate-
-		// return convention the BC consumer reads multi-word values from.
-		var pair rt.ShimPair = rt._call_shim_pair(fnPtr, dataPtr,
-			a0, a1, a2, a3, a4, a5, a6)
-		var retbuf *int = bit_cast(*int,
+		// Aggregate return: the shim writes the result through a retbuf (its
+		// first param), the same convention dispatchExternBinding's >8 branch
+		// and the BC aggregate-return consumer use.
+		var retbuf *uint8 = bit_cast(*uint8,
 			bit_cast(int, vm.Stack) + vm.SP)
-		vm.SP = vm.SP + 16
-		retbuf[0] = pair.Lo
-		retbuf[1] = pair.Hi
+		vm.SP = vm.SP + resultSize
+		rt._call_shim_aggregate(fnPtr, retbuf, dataPtr,
+			a0, a1, a2, a3, a4, a5, a6)
 		if instr.Dst >= 0 { regs[instr.Dst] = bit_cast(int, retbuf) }
 		return
 	}
@@ -141,6 +121,22 @@ func execIfaceOp(vm @VM, f @VMFunc, regs *int, instr BCInstr) bool {
 		// it becomes hot.)
 		var vtIdx int = findIfaceVtable(vm, f.Names[instr.Aux])
 		if vtIdx < 0 {
+			// Not in vm.IfaceVtables — which is expected when the receiver's
+			// package is native-only (its impls were never lowered).  Fall back
+			// to the injected native-vtable registry (RegisterPackageVtables): a
+			// hit stores the raw `@__ivt` address, which ifaceVtIsNative routes
+			// to dispatchCompiledIfaceMethod / the native dtor path — the same
+			// way an iface value returned BY native code is dispatched.
+			var natAddr int = lookupVtableAddr(f.Names[instr.Aux])
+			if natAddr != 0 {
+				var natIv *int = stackPtr(vm, vm.SP)
+				var natIvInt int = bit_cast(int, vm.Stack) + vm.SP
+				vm.SP = vm.SP + 16
+				natIv[0] = regs[instr.Src1]   // data ptr
+				natIv[1] = natAddr            // native @__ivt addr (ifaceVtIsNative)
+				regs[instr.Dst] = natIvInt
+				return true
+			}
 			print("vm: interface vtable not found: ")
 			println(f.Names[instr.Aux])
 			rt.Exit(1)

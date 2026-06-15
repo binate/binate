@@ -1,0 +1,271 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Parallel-assignment target kinds: how a single resolved left-hand target of
+// `a, b = e1, e2` is stored in phase 2.  Each target is resolved (its slot
+// pointer, or slice value + index, computed) in phase 1 — alongside
+// evaluating and acquiring its right-hand value — so every old value is read
+// BEFORE any slot is written.  That ordering is what makes the swap idiom
+// `a, b = b, a` correct instead of a use-after-free.
+const (
+	PA_BLANK = 0  // `_` target: RHS evaluated for effect, nothing stored
+	PA_SLOT  = 1  // store through a slot pointer (ident / *p / p.f / array&ptr index)
+	PA_SLICE = 2  // store via the runtime slice set (s[i] on a slice s)
+)
+
+// PAEntry is one resolved left-hand target of a parallel assignment paired
+// with its acquired right-hand value, captured in phase 1 before any store.
+type PAEntry struct {
+	Kind     int          // PA_BLANK / PA_SLOT / PA_SLICE
+	Slot     @Instr       // PA_SLOT: the slot pointer; PA_SLICE: the slice value
+	Index    @Instr       // PA_SLICE: the element index
+	Typ      @types.Type  // slot / element type
+	Val      @Instr       // acquired RHS value; for a struct, a pointer to an
+	                       // acquired temp copy (see IsStruct)
+	IsStruct bool          // managed struct/array: phase 2 MOVES Val's bits into
+	                       // the slot (no re-copy), then dtors the old occupant
+}
+
+// genParallelAssign lowers a matched-arity multi-expression assignment
+// `a, b = e1, e2` (notably the swap idiom `a, b = b, a`).  Go-style
+// semantics: ALL right-hand expressions are evaluated, and their managed
+// values acquired, BEFORE any left-hand slot is written.  Without the
+// up-front acquire, `a, b = b, a` of two solely-owned @T would RefDec a's old
+// value to zero — freeing it — before the second store reads it (a UAF); and
+// without evaluating both sides first the swap would read an already-
+// overwritten slot.  Phase 1 resolves each target and evaluates+acquires its
+// value into a PAEntry; phase 2 stores, releasing each old occupant (Axiom 5)
+// without re-acquiring.
+func genParallelAssign(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	var n int = len(stmt.Exprs)
+	var entries @[]PAEntry
+	// Phase 1: resolve targets + evaluate and acquire RHS values.
+	for i := 0; i < n; i++ {
+		// Re-sync after a prior entry split the block: genSelectorPtr (below)
+		// reads `b` back from ctx.CurBlock but does not itself sync it, so the
+		// current block must be live before this entry runs (mirrors
+		// genMultiAssign's per-iteration re-sync).
+		ctx.CurBlock = b
+		var e PAEntry
+		e, b = resolveParallelEntry(ctx, b, stmt.Exprs[i], stmt.Exprs2[i])
+		entries = slices.Append[PAEntry](entries, e)
+	}
+	// Phase 2: store each acquired value into its target.
+	for i := 0; i < len(entries); i++ {
+		ctx.CurBlock = b
+		b = storeParallelEntry(ctx, b, entries[i])
+	}
+	return b
+}
+
+// resolveParallelEntry resolves one LHS target of a parallel assignment and
+// evaluates+acquires its RHS, returning the PAEntry and the (possibly split)
+// current block.  This entry's LHS operands (index / pointer subexpressions)
+// and its RHS are all evaluated here in phase 1 — every value is read and
+// acquired before any store happens in phase 2, which is what makes the swap
+// idiom correct.  (Go additionally fixes that all LHS operands are evaluated
+// before all RHS; here each entry's operands and RHS are interleaved, which
+// differs only when one entry's RHS side-effects another's index/pointer
+// operand — a pathological case.)  A target that cannot be resolved to a store
+// location (blank `_`, or an unsupported lvalue shape) still has its RHS
+// evaluated for side effects but stores nothing and is NOT acquired (so the
+// up-front RefInc can't leak).
+func resolveParallelEntry(ctx @GenContext, b @Block, lhs @ast.Expr,
+		rhs @ast.Expr) (PAEntry, @Block) {
+	var e PAEntry
+	if lhs.Kind == ast.EXPR_IDENT && isBlank(lhs.Name) {
+		genExpr(ctx, b, rhs)
+		b = ctx.CurBlock
+		e.Kind = PA_BLANK
+		return e, b
+	}
+	// Resolve the store target (slot pointer / slice+index) and slot type.
+	if lhs.Kind == ast.EXPR_IDENT {
+		e.Kind = PA_SLOT
+		e.Slot = lookupVar(ctx, lhs.Name)
+		e.Typ = lookupVarType(ctx, lhs.Name)
+	} else if lhs.Kind == ast.EXPR_UNARY && lhs.Op == cast(int, token.STAR) {
+		var ptrVal @Instr = genExpr(ctx, b, lhs.X)
+		b = ctx.CurBlock
+		e.Kind = PA_SLOT
+		e.Slot = ptrVal
+		if ptrVal != nil && ptrVal.Typ != nil &&
+				ptrVal.Typ.Kind == types.TYP_POINTER {
+			e.Typ = ptrVal.Typ.Elem
+		}
+	} else if lhs.Kind == ast.EXPR_SELECTOR {
+		e.Slot = genSelectorPtr(ctx, b, lhs)
+		b = ctx.CurBlock
+		e.Kind = PA_SLOT
+		e.Typ = getSelectorType(ctx, lhs)
+	} else if lhs.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		e, b = resolveParallelIndexTarget(ctx, b, lhs, e)
+	}
+	// A target that resolved to a real store location is acquirable; anything
+	// else evaluates the RHS for effect only.
+	var storable bool = (e.Kind == PA_SLOT && e.Slot != nil) ||
+		e.Kind == PA_SLICE
+	if !storable {
+		genExpr(ctx, b, rhs)
+		b = ctx.CurBlock
+		e.Kind = PA_BLANK
+		return e, b
+	}
+	var v @Instr = genExprOrFuncRef(ctx, b, rhs, e.Typ)
+	b = ctx.CurBlock
+	v = coerceParallelRHS(ctx, b, v, e.Typ)
+	if needsStructCopy(e.Typ) {
+		// Acquire a managed struct/array up front: snapshot into a temp and
+		// copy (RefInc) its managed fields, so a later store of another target
+		// can't free a field this value still references.  Phase 2 MOVES the
+		// temp's bits into the slot.
+		var tmp @Instr = b.EmitAlloc(e.Typ)
+		b.EmitStore(tmp, v)
+		emitStructCopy(ctx.Func, b, tmp, e.Typ)
+		e.Val = tmp
+		e.IsStruct = true
+	} else {
+		emitManagedValueCopyRefInc(ctx.Func, b, v, e.Typ)
+		e.Val = v
+	}
+	return e, b
+}
+
+// resolveParallelIndexTarget resolves a `coll[i]` LHS into either a slot
+// pointer (array / pointer element) or a slice value + index (runtime set),
+// filling e and returning it with the updated block.
+func resolveParallelIndexTarget(ctx @GenContext, b @Block, lhs @ast.Expr,
+		e PAEntry) (PAEntry, @Block) {
+	var collection @Instr = genExpr(ctx, b, lhs.X)
+	b = ctx.CurBlock
+	var index @Instr = genExpr(ctx, b, lhs.Args[0])
+	b = ctx.CurBlock
+	emitIndexBoundsCheck(ctx, b, collection, index)
+	var collSt @types.Type = nil
+	if collection.Typ != nil { collSt = peelTransparent(collection.Typ) }
+	if collSt != nil && collSt.Kind == types.TYP_ARRAY {
+		// Array element: GEP off the array's backing pointer.
+		var arrPtr @Instr = nil
+		if lhs.X.Kind == ast.EXPR_IDENT {
+			arrPtr = lookupVar(ctx, lhs.X.Name)
+		} else if lhs.X.Kind == ast.EXPR_SELECTOR {
+			arrPtr = genSelectorPtr(ctx, b, lhs.X)
+			b = ctx.CurBlock
+		} else if lhs.X.Kind == ast.EXPR_UNARY &&
+				lhs.X.Op == cast(int, token.STAR) {
+			// `(*p)[i] = v`: p is the array's backing address — GEP through it.
+			arrPtr = genExpr(ctx, b, lhs.X.X)
+			b = ctx.CurBlock
+		}
+		var elemTyp @types.Type = collSt.Elem
+		if elemTyp == nil { elemTyp = types.TypInt() }
+		if arrPtr != nil {
+			e.Kind = PA_SLOT
+			e.Slot = b.EmitGetElemPtr(arrPtr, index, elemTyp)
+			e.Typ = elemTyp
+		}
+		return e, b
+	}
+	if collection.Typ != nil && collection.Typ.Kind == types.TYP_POINTER {
+		var elemTyp @types.Type = collection.Typ.Elem
+		if elemTyp == nil { elemTyp = types.TypInt() }
+		e.Kind = PA_SLOT
+		e.Slot = b.EmitGetElemPtr(collection, index, elemTyp)
+		e.Typ = elemTyp
+		return e, b
+	}
+	// Slice (or managed-slice): store via the runtime set, which has no
+	// element pointer.
+	var selemTyp @types.Type = types.TypInt()
+	if collection.Typ != nil && collection.Typ.Elem != nil {
+		selemTyp = collection.Typ.Elem
+	}
+	e.Kind = PA_SLICE
+	e.Slot = collection
+	e.Index = index
+	e.Typ = selemTyp
+	return e, b
+}
+
+// coerceParallelRHS applies the value coercions the single-assign path does
+// before a store: string literal → chars, nil → typed nil slice/ptr,
+// managed-slice → raw slice, and an aggregate composite-literal alloca → its
+// loaded value.  Width adjustment for plain scalars happens at the store.
+func coerceParallelRHS(ctx @GenContext, b @Block, v @Instr,
+		slotTyp @types.Type) @Instr {
+	if slotTyp == nil { return v }
+	if isCharSliceType(slotTyp) && v.Op == OP_CONST_STRING {
+		v = b.EmitStringToChars(v, slotTyp)
+		noteSPGrowingResult(ctx, v)
+		return v
+	}
+	if v.Typ != nil && v.Typ.Kind == types.TYP_NIL {
+		if slotTyp.Kind == types.TYP_SLICE ||
+				slotTyp.Kind == types.TYP_MANAGED_SLICE ||
+				isManagedPtrType(slotTyp) {
+			return b.EmitConstNil(slotTyp)
+		}
+	}
+	if slotTyp.Kind == types.TYP_SLICE && v.Typ != nil &&
+			v.Typ.Kind == types.TYP_MANAGED_SLICE {
+		return b.EmitManagedToRaw(v)
+	}
+	if isAggregateAllocToLoad(v, slotTyp) {
+		return b.EmitLoad(v, v.TypeArg)
+	}
+	return v
+}
+
+// storeParallelEntry stores an acquired parallel-assignment value into its
+// resolved target, releasing the old occupant (Axiom 5) WITHOUT re-acquiring
+// (the value was already acquired in phase 1).
+func storeParallelEntry(ctx @GenContext, b @Block, e PAEntry) @Block {
+	if e.Kind == PA_BLANK { return b }
+	if e.Kind == PA_SLICE { return storeParallelSliceElem(ctx, b, e) }
+	if e.IsStruct {
+		// Move the acquired temp copy into the slot: save the old occupant,
+		// copy the temp's bits in, then dtor the saved old.  No emitStructCopy
+		// here — the temp was already RefInc'd in phase 1.
+		var oldSlot @Instr = b.EmitAlloc(e.Typ)
+		b.EmitStore(oldSlot, b.EmitLoad(e.Slot, e.Typ))
+		b.EmitStore(e.Slot, b.EmitLoad(e.Val, e.Typ))
+		emitStructDtor(ctx.Func, b, oldSlot, e.Typ)
+		return b
+	}
+	if isManagedScalarType(e.Typ) {
+		var oldVal @Instr = b.EmitLoad(e.Slot, e.Typ)
+		b = emitManagedValueRefDec(ctx.Func, b, oldVal, e.Typ)
+		b.EmitStore(e.Slot, e.Val)
+		return b
+	}
+	var v @Instr = e.Val
+	if e.Typ != nil { v = ensureWidth(ctx, b, v, e.Typ) }
+	b.EmitStore(e.Slot, v)
+	return b
+}
+
+// storeParallelSliceElem stores an acquired value into a slice element via the
+// runtime set, releasing the overwritten element (Axiom 5).
+func storeParallelSliceElem(ctx @GenContext, b @Block, e PAEntry) @Block {
+	if e.IsStruct {
+		var oldSlot @Instr = b.EmitAlloc(e.Typ)
+		b.EmitStore(oldSlot, b.EmitSliceGet(e.Slot, e.Index, e.Typ))
+		b.EmitSliceSet(e.Slot, e.Index, b.EmitLoad(e.Val, e.Typ), e.Typ)
+		emitStructDtor(ctx.Func, b, oldSlot, e.Typ)
+		return b
+	}
+	if isManagedScalarType(e.Typ) {
+		var oldElem @Instr = b.EmitSliceGet(e.Slot, e.Index, e.Typ)
+		b = emitManagedValueRefDec(ctx.Func, b, oldElem, e.Typ)
+		b.EmitSliceSet(e.Slot, e.Index, e.Val, e.Typ)
+		return b
+	}
+	var v @Instr = e.Val
+	if e.Typ != nil { v = ensureWidth(ctx, b, v, e.Typ) }
+	b.EmitSliceSet(e.Slot, e.Index, v, e.Typ)
+	return b
+}

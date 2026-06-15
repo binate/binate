@@ -36,15 +36,36 @@
 VERBOSE=0
 QUIET=0
 CHECK_XPASS=0
+EXACT=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -v|--verbose)     VERBOSE=1; shift ;;
         -q|--quiet)       QUIET=1; shift ;;
         --check-xpass)    CHECK_XPASS=1; shift ;;
+        --exact)          EXACT=1; shift ;;
         *)                break ;;
     esac
 done
-export VERBOSE QUIET CHECK_XPASS
+export VERBOSE QUIET CHECK_XPASS EXACT
+
+# filter_match NAME FILTER... — return 0 if NAME passes the filter set.
+# Substring match (NAME contains FILTER) by default; exact (NAME = FILTER)
+# under --exact.  Exact is for callers that pass full test names and must NOT
+# pull in longer siblings — e.g. `value-struct` substring-matching
+# `value-struct-large`, which would run an unintended (possibly unmarked) test.
+filter_match() {
+    local name="$1"
+    shift
+    local f
+    for f in "$@"; do
+        if [ "$EXACT" -eq 1 ]; then
+            [ "$name" = "$f" ] && return 0
+        else
+            case "$name" in *"$f"*) return 0 ;; esac
+        fi
+    done
+    return 1
+}
 
 MODE="$1"
 if [ -z "$MODE" ]; then
@@ -58,9 +79,13 @@ if [ -z "$MODE" ]; then
     echo "  --check-xpass   Run xfailed tests anyway; if any passes, fail"
     echo "                  the run (XPASS). Default is to skip xfailed tests"
     echo "                  without running them (they may hang or be slow)."
+    echo "  --exact         Match filters by exact test name, not substring"
+    echo "                  (so 'value-struct' does not also pull in"
+    echo "                  'value-struct-large')."
     echo "  (default)       Show failures in detail, passes as dots"
     echo ""
-    echo "Filters select tests by substring match on the test name."
+    echo "Filters select tests by substring match on the test name"
+    echo "(exact match under --exact)."
     echo "Multiple filters are OR'd: any match includes the test."
     echo ""
     echo "Examples:"
@@ -349,15 +374,9 @@ for bn in "$SCRIPT_DIR"/*.bn; do
     name="$(basename "$bn" .bn)"
 
     # Apply filters
-    if [ $# -gt 0 ]; then
-        match=0
-        for f in "$@"; do
-            case "$name" in *"$f"*) match=1; break;; esac
-        done
-        if [ "$match" -eq 0 ]; then
-            skipped=$((skipped + 1))
-            continue
-        fi
+    if [ $# -gt 0 ] && ! filter_match "$name" "$@"; then
+        skipped=$((skipped + 1))
+        continue
     fi
     expected="$SCRIPT_DIR/${name}.expected"
     errorfile="$SCRIPT_DIR/${name}.error"
@@ -396,15 +415,9 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
     name="$(basename "$dir")"
 
     # Apply filters
-    if [ $# -gt 0 ]; then
-        match=0
-        for f in "$@"; do
-            case "$name" in *"$f"*) match=1; break;; esac
-        done
-        if [ "$match" -eq 0 ]; then
-            skipped=$((skipped + 1))
-            continue
-        fi
+    if [ $# -gt 0 ] && ! filter_match "$name" "$@"; then
+        skipped=$((skipped + 1))
+        continue
     fi
 
     main_bn="$dir/main.bn"
@@ -454,15 +467,9 @@ for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" -name '*.bn' 2>/
     name="${name%.bn}"
 
     # Apply filters
-    if [ $# -gt 0 ]; then
-        match=0
-        for f in "$@"; do
-            case "$name" in *"$f"*) match=1; break;; esac
-        done
-        if [ "$match" -eq 0 ]; then
-            skipped=$((skipped + 1))
-            continue
-        fi
+    if [ $# -gt 0 ] && ! filter_match "$name" "$@"; then
+        skipped=$((skipped + 1))
+        continue
     fi
     expected="$SCRIPT_DIR/${name}.expected"
     errorfile="$SCRIPT_DIR/${name}.error"

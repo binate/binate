@@ -194,22 +194,26 @@ trap 'runner_cleanup' EXIT
 
 # Discover all packages with _test.bn files
 PACKAGES=""
-# Search roots: collocated (pkg/, cmd/) and split-tree impls (impls/<tier>/<platform>/).
-# Each impls/<tier>/<platform>/pkg/X path strips down to pkg/X as the package's
-# logical name — the loader resolves an `import "pkg/X"` against any matching
-# search root, so the canonical package name is the trailing pkg/... portion.
+# Search roots: collocated (pkg/, cmd/) and split-tree impls. Each impls/.../pkg/X
+# path strips down to pkg/X as the package's logical name — the loader resolves
+# an `import "pkg/X"` against any matching search root, so the canonical package
+# name is the trailing pkg/... portion.
 for testfile in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/impls" -name '*_test.bn' 2>/dev/null); do
     [ -f "$testfile" ] || continue
     dir="$(dirname "$testfile")"
     # Convert absolute path to package path:
-    #   /path/to/binate/pkg/binate/ir              -> pkg/binate/ir
-    #   /path/to/binate/cmd/bnc                    -> cmd/bnc
+    #   /path/to/binate/pkg/binate/ir                       -> pkg/binate/ir
+    #   /path/to/binate/cmd/bnc                             -> cmd/bnc
     #   /path/to/binate/impls/core/common/pkg/builtins/lang -> pkg/builtins/lang
+    #   /path/to/binate/impls/stdlib/pkg/std/strings        -> pkg/std/strings
     relpath="${dir#"$BINATE_DIR"/}"
     case "$relpath" in
-        impls/*/*/pkg/*)
-            # Strip the impls/<tier>/<platform>/ prefix.
-            pkg="${relpath#impls/*/*/}"
+        impls/*/pkg/*)
+            # Strip everything up to the logical pkg/... name.  Handles both the
+            # per-platform layout (impls/<tier>/<platform>/pkg/..., e.g.
+            # impls/core/common) and the flattened layout (impls/<tier>/pkg/...,
+            # e.g. impls/stdlib).
+            pkg="pkg/${relpath#*/pkg/}"
             ;;
         *)
             pkg="$relpath"

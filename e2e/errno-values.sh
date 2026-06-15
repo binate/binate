@@ -7,7 +7,7 @@
 # their numeric values.  Instead we:
 #   1. Compile + run a tiny C program that prints each errno's REAL value
 #      (from <errno.h>) — the ground truth for whatever OS is compiling.
-#   2. Extract the values pkg/std/os CLAIMS (impls/stdlib/common/pkg/std/os/
+#   2. Extract the values pkg/std/os CLAIMS (impls/stdlib/pkg/std/os/
 #      os_errno.bn) for that OS — os_errno.bn stays the single source, so this
 #      cannot pass against a stale mirror.
 #   3. diff.  Any mismatch fails the test.
@@ -23,7 +23,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(dirname "$SCRIPT_DIR")"
-ERRNO_BN="$BINATE_DIR/impls/stdlib/common/pkg/std/os/os_errno.bn"
+ERRNO_BN="$BINATE_DIR/impls/stdlib/pkg/std/os/os_errno.bn"
 
 [ -f "$ERRNO_BN" ] || { echo "FAIL: not found: $ERRNO_BN" >&2; exit 1; }
 

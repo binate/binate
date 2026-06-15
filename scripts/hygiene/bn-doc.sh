@@ -44,6 +44,12 @@ for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/ifaces" "$BINAT
         # Blank line: neutral.
         NF == 0 { next }
 
+        # A `#[...]` annotation line (e.g. `#[build(is(arch, "arm32"))]`) is
+        # part of the declaration it precedes, so it is neutral: it must not
+        # reset the doc context, or a doc comment written above the annotation
+        # would not be credited to the annotated decl below.
+        /^#\[/ { next }
+
         # Top-level declarations: check, then reset doc_pending.
         # (.bn does not get the sibling-carry that .bni does.)
         # Note: package-level doc comments are not required in .bn; the

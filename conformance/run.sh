@@ -118,6 +118,8 @@ if [ -z "$MODE" ]; then
     echo "  NNN_name/ directory        Multi-package test (main.bn + pkg/)"
     echo ""
     echo "Xfail: NNN_name.xfail.<mode> marks a test as expected failure."
+    echo "       NNN_name.xfail.all marks it failing in EVERY mode (one"
+    echo "       marker, not one per mode); a .xfail.<mode> overrides it."
     echo "Per-mode .expected / .error: NNN_name.{expected,error}.<mode>"
     echo "                             overrides the generic file for that mode"
     echo "                             (e.g. LP64-vs-ILP32 size output)."
@@ -236,6 +238,12 @@ run_test() {
     root="$4"        # root dir for multi-pkg (empty for single-file)
 
     known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
+    # A mode-independent ${name}.xfail.all marks a test expected to fail in
+    # EVERY mode (e.g. a backend-independent front-end gap) — one marker
+    # instead of one per mode. A mode-specific .xfail.<mode> takes precedence
+    # (its reason text is more specific). NB: "all" here means every mode, not
+    # the scripts/modesets/all set (which omits native_x64_darwin).
+    [ -f "$known_fail" ] || known_fail="$SCRIPT_DIR/${name}.xfail.all"
 
     # Default: skip xfailed tests without running them — they may hang
     # or be very slow. With --check-xpass, run them anyway so we can
@@ -300,6 +308,7 @@ run_error_test() {
     root="$4"       # root dir for multi-pkg (empty for single-file)
 
     known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
+    [ -f "$known_fail" ] || known_fail="$SCRIPT_DIR/${name}.xfail.all"  # see run_test
 
     # Default: skip xfailed tests without running them. See run_test.
     if [ -f "$known_fail" ] && [ "$CHECK_XPASS" -eq 0 ]; then

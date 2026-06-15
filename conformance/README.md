@@ -65,6 +65,15 @@ Optional arguments filter tests by substring match against the test name. Multip
 
 Example: `042_foo.xfail.builder-comp-int` with contents `requires bit_cast (compiled mode only)`.
 
+`NNN_name.xfail.all` marks a test as expected to fail in **every** mode — one
+marker instead of one `.xfail.<mode>` per mode. Use it for backend-independent
+failures (e.g. a front-end / type-checker gap a test documents). A
+mode-specific `.xfail.<mode>` takes precedence over `.xfail.all` (its reason is
+more specific). ("all" here means every mode, not the `scripts/modesets/all`
+set, which omits `native_x64_darwin`.) The stale-xfail (XPASS) sweep checks
+`.xfail.all` tests on every mode, so a marker that becomes obsolete is still
+caught.
+
 ## Environment
 
 | Variable | Description |
@@ -78,4 +87,5 @@ Example: `042_foo.xfail.builder-comp-int` with contents `requires bit_cast (comp
 3. For negative tests, create `NNN_name.error` instead with `grep -E` regex patterns
 4. For multi-package tests, create `NNN_name/` with `main.bn`, `expected`, and `pkg/`
 5. Add `.xfail.<mode>` files for any modes where the test is expected to fail
+   (or a single `.xfail.all` if it is expected to fail in every mode)
 6. Run against all modes: `./conformance/run.sh basic`

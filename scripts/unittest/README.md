@@ -53,6 +53,8 @@ Optional arguments filter packages by substring match (e.g. `ir` matches `pkg/bi
 
 Example: `scripts/unittest/pkg-vm.xfail.builder-comp-comp-int` with contents describing the reason.
 
+`scripts/unittest/<pkg-path>.xfail.all` marks a package as expected to fail in **every** mode — one marker instead of one `.xfail.<mode>` per mode. A mode-specific `.xfail.<mode>` takes precedence. ("all" here means every mode, not the `scripts/modesets/all` set, which omits `native_x64_darwin`.)
+
 ## Package Discovery
 
 The runner automatically discovers all packages with `*_test.bn` files under `pkg/` and `cmd/`. No manual registration needed.

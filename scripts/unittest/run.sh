@@ -123,6 +123,8 @@ if [ -z "$MODE" ]; then
     echo "Xfail: scripts/unittest/<pkg-path>.xfail.<mode>"
     echo "  e.g. scripts/unittest/pkg-vm.xfail.builder-comp-comp-int"
     echo "  (slashes in package path replaced with dashes)"
+    echo "  scripts/unittest/<pkg-path>.xfail.all marks it failing in EVERY"
+    echo "  mode (one marker, not one per mode); a .xfail.<mode> overrides it."
     echo ""
     echo "Per-test skip: scripts/unittest/<pkg-path>.skip.<mode>"
     echo "  Contents are a name substring; matching Test*"
@@ -268,6 +270,11 @@ for pkg in $PACKAGES; do
     # the result handler can interpret pass/fail as XPASS/XFAIL.
     xfail_key="$(echo "$pkg" | tr '/' '-')"
     xfail_file="$SCRIPT_DIR/${xfail_key}.xfail.${MODE}"
+    # A mode-independent <pkg>.xfail.all marks a package expected to fail in
+    # EVERY mode — one marker instead of one per mode. A mode-specific
+    # .xfail.<mode> takes precedence (more specific reason). ("all" = every
+    # mode, not the scripts/modesets/all set, which omits native_x64_darwin.)
+    [ -f "$xfail_file" ] || xfail_file="$SCRIPT_DIR/${xfail_key}.xfail.all"
     is_xfail=0
     if [ -f "$xfail_file" ]; then
         reason="$(cat "$xfail_file")"

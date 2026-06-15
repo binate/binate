@@ -36,12 +36,14 @@
 # Parse flags
 VERBOSE=0
 QUIET=0
+CHECK_XPASS=0
 SHARD_IDX=0
 SHARD_COUNT=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -v|--verbose) VERBOSE=1; shift ;;
         -q|--quiet)   QUIET=1; shift ;;
+        --check-xpass) CHECK_XPASS=1; shift ;;
         --shard)
             # Expect `i/n` (1-based shard index out of count).
             if [ -z "$2" ]; then
@@ -72,7 +74,7 @@ while [ $# -gt 0 ]; do
         *)            break ;;
     esac
 done
-export VERBOSE QUIET SHARD_IDX SHARD_COUNT
+export VERBOSE QUIET CHECK_XPASS SHARD_IDX SHARD_COUNT
 
 MODE="$1"
 if [ -z "$MODE" ]; then
@@ -84,6 +86,8 @@ if [ -z "$MODE" ]; then
     echo "Flags:"
     echo "  -v, --verbose   Show per-test PASS/FAIL output"
     echo "  -q, --quiet     Show only failures and summary"
+    echo "  --check-xpass   Run xfailed packages anyway; if one passes, fail"
+    echo "                  the run (XPASS = stale xfail). Default skips them."
     echo "  --shard i/n     Run only this shard's packages (1-based: shard"
     echo "                  i of n, by 0-based position in the discovered"
     echo "                  package list modulo n)"
@@ -153,6 +157,7 @@ MODES="$(expand_set "$MODE" 2>/dev/null)" || {
         flags=""
         [ "$VERBOSE" -eq 1 ] && flags="-v"
         [ "$QUIET" -eq 1 ] && flags="-q"
+        [ "$CHECK_XPASS" -eq 1 ] && flags="$flags --check-xpass"
         [ "$SHARD_COUNT" -gt 0 ] && \
             flags="$flags --shard $SHARD_IDX/$SHARD_COUNT"
         "$0" $flags "$m" "$@"
@@ -255,24 +260,34 @@ for pkg in $PACKAGES; do
     fi
     shard_pos=$((shard_pos + 1))
 
-    # Check for xfail
+    # Check for xfail.  is_xfail records that this package carries a marker so
+    # the result handler can interpret pass/fail as XPASS/XFAIL.
     xfail_key="$(echo "$pkg" | tr '/' '-')"
     xfail_file="$SCRIPT_DIR/${xfail_key}.xfail.${MODE}"
+    is_xfail=0
     if [ -f "$xfail_file" ]; then
         reason="$(cat "$xfail_file")"
-        if [ "$VERBOSE" -eq 1 ]; then
-            echo "XFAIL: $pkg ($reason)"
-        elif [ "$QUIET" -eq 0 ]; then
-            printf "x"
+        if [ "$CHECK_XPASS" -eq 0 ]; then
+            # Default: skip the xfailed package without running it (it may
+            # hang or be slow).
+            if [ "$VERBOSE" -eq 1 ]; then
+                echo "XFAIL: $pkg ($reason)"
+            elif [ "$QUIET" -eq 0 ]; then
+                printf "x"
+            fi
+            xfailed=$((xfailed + 1))
+            continue
         fi
-        xfailed=$((xfailed + 1))
-        continue
+        # --check-xpass: run it anyway so a now-passing package surfaces as an
+        # XPASS (stale marker) below.
+        is_xfail=1
     fi
 
     # Whole-package skip file: <pkg-key>.skip-pkg.<mode>.  Distinct from
-    # .xfail (which asserts the package FAILS — and XPASS-errors if it
-    # ever passes) and from .skip (which drops individual tests but still
-    # runs the package): .skip-pkg omits the whole package from this mode
+    # .xfail (which asserts the package FAILS — skipped by default, but run
+    # under --check-xpass, which XPASS-errors if it now passes) and from
+    # .skip (which drops individual tests but still runs the package):
+    # .skip-pkg omits the whole package from this mode
     # because it is too slow to run here (a pathological double-VM blowup
     # that times out the shard).  It is NOT a failure — the tests pass,
     # they're just not run in this lane — and it is tracked for re-adding
@@ -310,21 +325,41 @@ for pkg in $PACKAGES; do
     elapsed=$((end_time - start_time))
 
     if [ $rc -eq 0 ]; then
-        count=$(echo "$output" | grep -o '[0-9]* passed' | head -1)
-        if [ "$VERBOSE" -eq 1 ]; then
-            echo "PASS: $pkg ($count) [${elapsed}s]"
-        elif [ "$QUIET" -eq 0 ]; then
-            printf "."
+        if [ "$is_xfail" -eq 1 ]; then
+            # --check-xpass: an xfailed package passed — stale marker.
+            if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
+                echo ""
+                echo "XPASS: $pkg [${elapsed}s] (passed despite xfail marker — stale xfail?)"
+            fi
+            failed=$((failed + 1))
+            failures="$failures $pkg(XPASS)"
+        else
+            count=$(echo "$output" | grep -o '[0-9]* passed' | head -1)
+            if [ "$VERBOSE" -eq 1 ]; then
+                echo "PASS: $pkg ($count) [${elapsed}s]"
+            elif [ "$QUIET" -eq 0 ]; then
+                printf "."
+            fi
+            passed=$((passed + 1))
         fi
-        passed=$((passed + 1))
     else
-        if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
-            echo ""
-            echo "FAIL: $pkg [${elapsed}s]"
-            echo "$output" | sed 's/^/  /'
+        if [ "$is_xfail" -eq 1 ]; then
+            # --check-xpass: an xfailed package failed as expected.
+            if [ "$VERBOSE" -eq 1 ]; then
+                echo "XFAIL: $pkg ($reason) [${elapsed}s]"
+            elif [ "$QUIET" -eq 0 ]; then
+                printf "x"
+            fi
+            xfailed=$((xfailed + 1))
+        else
+            if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
+                echo ""
+                echo "FAIL: $pkg [${elapsed}s]"
+                echo "$output" | sed 's/^/  /'
+            fi
+            failed=$((failed + 1))
+            failures="$failures $pkg"
         fi
-        failed=$((failed + 1))
-        failures="$failures $pkg"
     fi
 done
 

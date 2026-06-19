@@ -462,18 +462,27 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
 done
 
 # Nested single-file tests: *.bn under designated subtrees
-# (conformance/matrix/, conformance/regressions/), identified by their
-# path RELATIVE to conformance/ — a stable, collision-free name with no
-# test number, so concurrent additions never collide and nothing ever
-# needs renumbering. See conformance/matrix/README.md. Discovery and run
-# mirror the flat single-file loop above; the only differences are the
-# recursive find and the relative-path name, which makes ${name}.expected
-# and ${name}.xfail.${MODE} resolve to the cell's own siblings. (Paths
-# must not contain spaces — they are word-split here, as elsewhere.)
-for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" -name '*.bn' 2>/dev/null | sort); do
+# (conformance/matrix/, conformance/regressions/, conformance/spec/),
+# identified by their path RELATIVE to conformance/ — a stable,
+# collision-free name with no test number, so concurrent additions never
+# collide and nothing ever needs renumbering. See conformance/matrix/README.md.
+# Discovery and run mirror the flat single-file loop above; the only
+# differences are the recursive find and the relative-path name, which makes
+# ${name}.expected and ${name}.xfail.${MODE} resolve to the cell's own
+# siblings. (Paths must not contain spaces — they are word-split here.)
+#
+# conformance/spec/ (the rule-ID-cited spec-conformance tests, plan-spec-
+# tests.md) is OPT-IN: it is discovered here but runs only when explicitly
+# targeted by a filter (e.g. `run.sh <mode> spec`), NOT in the default
+# unfiltered suite — so it is not yet wired into the default conformance CI
+# job. Registering it in the default suite is a separate decision.
+for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DIR/spec" -name '*.bn' 2>/dev/null | sort); do
     [ -f "$bn" ] || continue
     name="${bn#"$SCRIPT_DIR"/}"
     name="${name%.bn}"
+
+    # Spec tests are opt-in: skip them unless a filter was given (see above).
+    case "$name" in spec/*) [ $# -eq 0 ] && continue ;; esac
 
     # Apply filters
     if [ $# -gt 0 ] && ! filter_match "$name" "$@"; then

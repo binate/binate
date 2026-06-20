@@ -474,8 +474,26 @@ done
 # conformance/spec/ holds the rule-ID-cited spec-conformance tests
 # (plan-spec-tests.md); like matrix/ and regressions/ it runs in the default
 # suite, and thus in the conformance CI matrix.
+#
+# A nested directory holding a main.bn is a multi-package test (same form as the
+# top-level NNN_name/ tests) — those are run by the loop further below; their
+# .bn files (main.bn + the pkg/ subtree) are excluded here via in_multipkg.
+
+# in_multipkg: true if a .bn belongs to a multi-package test — it is a main.bn,
+# or some ancestor directory (below conformance/) holds a main.bn.
+in_multipkg() {
+    case "$1" in */main.bn) return 0 ;; esac
+    _d=$(dirname "$1")
+    while [ "$_d" != "$SCRIPT_DIR" ] && [ "$_d" != "/" ] && [ -n "$_d" ]; do
+        [ -f "$_d/main.bn" ] && return 0
+        _d=$(dirname "$_d")
+    done
+    return 1
+}
+
 for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DIR/spec" -name '*.bn' 2>/dev/null | sort); do
     [ -f "$bn" ] || continue
+    in_multipkg "$bn" && continue   # part of a multi-package test (handled below)
     name="${bn#"$SCRIPT_DIR"/}"
     name="${name%.bn}"
 
@@ -504,6 +522,36 @@ for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DIR/spe
         run_test "$name" "$bn" "$expected" ""
     else
         echo "SKIP: $name (no .expected or .error file)"
+    fi
+done
+
+# Nested multi-package tests: a directory under the designated subtrees holding
+# a main.bn (same form as the top-level NNN_name/ multi-package tests, but with
+# the relative-path name). Lets conformance/spec/ chapters carry multi-package
+# tests — most pkg.* rules (and the import-scoping defects) need >=2 packages.
+# Per-mode expected/error/xfail markers are siblings of the directory, exactly
+# as for the relative-path single-file tests above.
+for main_bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DIR/spec" -name main.bn 2>/dev/null | sort); do
+    [ -f "$main_bn" ] || continue
+    dir="$(dirname "$main_bn")"
+    name="${dir#"$SCRIPT_DIR"/}"
+
+    if [ $# -gt 0 ] && ! filter_match "$name" "$@"; then
+        skipped=$((skipped + 1))
+        continue
+    fi
+    expected="$dir/expected"
+    errorfile="$dir/error"
+    if [ -f "$dir/expected.${HOST_ARCH}" ]; then expected="$dir/expected.${HOST_ARCH}"; fi
+    if [ -f "$dir/expected.${HOST_OS}" ]; then expected="$dir/expected.${HOST_OS}"; fi
+    if [ -f "$dir/expected.${MODE}" ]; then expected="$dir/expected.${MODE}"; fi
+    if [ -f "$dir/error.${MODE}" ]; then errorfile="$dir/error.${MODE}"; fi
+    if [ -f "$errorfile" ]; then
+        run_error_test "$name" "$main_bn" "$errorfile" "$dir"
+    elif [ -f "$expected" ]; then
+        run_test "$name" "$main_bn" "$expected" "$dir"
+    else
+        echo "SKIP: $name (no expected or error file)"
     fi
 done
 

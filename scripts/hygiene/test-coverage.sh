@@ -13,7 +13,7 @@ WHITELIST="$SCRIPT_DIR/test-coverage.whitelist"
 
 missing=0
 
-for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" -name '*.bn' -not -name '*_test.bn' 2>/dev/null); do
+for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/impls" -name '*.bn' -not -name '*_test.bn' 2>/dev/null); do
     testf="${f%.bn}_test.bn"
     if [ -f "$testf" ]; then
         continue

@@ -53,12 +53,17 @@ is_exempt() {
 while IFS= read -r f; do
     rel_conf="${f#$CONFORMANCE_DIR/}"
     rel_repo="${f#$BINATE_DIR/}"
-    first="${rel_conf%%/*}"
-    if [ "$first" = "$rel_conf" ]; then
-        test_root=""
-    else
-        test_root="$CONFORMANCE_DIR/$first"
-    fi
+    # A file's test directory is the nearest ancestor (up to conformance/)
+    # holding a main.bn — the multi-package test it belongs to. This covers
+    # both top-level (conformance/NNN_name/) and nested (conformance/spec/
+    # <chapter>/NNN_name/) multi-package tests. A file with no such ancestor
+    # is a single-file test and may use only whitelisted imports.
+    test_root=""
+    _d="$(dirname "$f")"
+    while [ "$_d" != "$CONFORMANCE_DIR" ] && [ "$_d" != "/" ] && [ -n "$_d" ]; do
+        if [ -f "$_d/main.bn" ]; then test_root="$_d"; break; fi
+        _d="$(dirname "$_d")"
+    done
 
     # Extract every imported path of the form "pkg/...". Handles both
     # the single-line form `import "pkg/X"` and the grouped form

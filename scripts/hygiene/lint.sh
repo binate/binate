@@ -18,16 +18,18 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 # feature.  Skipped targets stay fully type-checked and compiled by every
 # conformance mode — only bnlint's style rules are paused.
 #
-# Currently skipped, for two distinct reasons (both tracked in claude-todo.md):
-#  (1) BUILDER-lag: the void __c_call spelling (`__c_call("free", "void", ptr)`)
-#      in pkg/builtins/rt's Exit/RawFree is a parser feature newer than the
-#      BUILDER-bundled bnlint (bnc-0.0.9), which aborts at the typecheck pass on
-#      it.  Skip pkg/builtins/rt itself AND the importer chain whose bodies
-#      bnlint typechecks (pkg/binate/vm -> pkg/binate/repl, cmd/bni).  Remove
-#      once BUILDER_VERSION ships a bnlint that parses the "void" spelling.
-#  (2) pkg/std/os hits the open free-function-vs-same-named-method .bni-loader
-#      bug ("Stat: .bn has 1 parameters but .bni declares 0").  Remove once it
-#      is fixed.
+# Both current skips are BUILDER-lag (the bundled bnlint, bnc-0.0.9, predates a
+# feature/fix that is already in the tree) and clear at the next BUILDER bump
+# (tracked in claude-todo.md):
+#  - pkg/builtins/rt: its Exit/RawFree use the void __c_call spelling
+#    (`__c_call("free", "void", ptr)`), a parser feature newer than bnc-0.0.9.
+#    Covers rt itself AND the importer chain bnlint also typechecks
+#    (pkg/binate/vm -> pkg/binate/repl, cmd/bni).
+#  - pkg/std/os: depends on the .bni free-function-vs-same-named-method fix
+#    (796effc7, the os.Stat / File.Stat case) which postdates bnc-0.0.9, so the
+#    bundled bnlint still fails it ("Stat: .bn has 1 parameters but .bni
+#    declares 0") — the same BUILDER-lag that makes e2e/stat-values.sh build
+#    gen1 from the tree.
 LINT_SKIP="pkg/builtins/rt pkg/binate/vm pkg/binate/repl cmd/bni pkg/std/os"
 
 # Discover targets:

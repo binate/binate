@@ -96,6 +96,19 @@ while IFS= read -r f; do
             pkg/builtins/*) continue ;;
         esac
 
+        # Stdlib conformance subtree (conformance/stdlib/*) exercises the
+        # stdlib end-to-end, so it may import pkg/std/*.  This is scoped to
+        # the subtree by the rel_conf prefix — the MAIN language conformance
+        # set (conformance/NNN_*, conformance/spec/*) stays core-only.  See
+        # claude-todo.md "Stdlib conformance tests".
+        case "$rel_conf" in
+            stdlib/*)
+                case "$imp" in
+                    pkg/std/*) continue ;;
+                esac
+                ;;
+        esac
+
         # Whitelisted real package?
         for w in $ALLOWED_REAL; do
             if [ "$imp" = "$w" ]; then

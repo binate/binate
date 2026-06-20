@@ -491,7 +491,7 @@ in_multipkg() {
     return 1
 }
 
-for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DIR/spec" -name '*.bn' 2>/dev/null | sort); do
+for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DIR/spec" "$SCRIPT_DIR/stdlib" -name '*.bn' 2>/dev/null | sort); do
     [ -f "$bn" ] || continue
     in_multipkg "$bn" && continue   # part of a multi-package test (handled below)
     name="${bn#"$SCRIPT_DIR"/}"
@@ -531,7 +531,7 @@ done
 # tests — most pkg.* rules (and the import-scoping defects) need >=2 packages.
 # Per-mode expected/error/xfail markers are siblings of the directory, exactly
 # as for the relative-path single-file tests above.
-for main_bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DIR/spec" -name main.bn 2>/dev/null | sort); do
+for main_bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DIR/spec" "$SCRIPT_DIR/stdlib" -name main.bn 2>/dev/null | sort); do
     [ -f "$main_bn" ] || continue
     dir="$(dirname "$main_bn")"
     name="${dir#"$SCRIPT_DIR"/}"

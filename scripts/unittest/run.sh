@@ -266,6 +266,30 @@ for pkg in $PACKAGES; do
     fi
     shard_pos=$((shard_pos + 1))
 
+    # Stdlib is ALWAYS injected (native) in production — the bytecode VM never
+    # interprets it.  Unit-testing a pkg/std package under an interpreter mode
+    # lowers the package itself to bytecode, a configuration that never ships
+    # (and that can't even run for a __c_call package like pkg/std/os, whose
+    # methods need the native impl).  Skip pkg/std/* under the int modes; their
+    # cross-mode coverage is the conformance/stdlib suite (run.sh under
+    # conformance/, where the stdlib is INJECTED).  This is a by-design
+    # exclusion, NOT a perf .skip-pkg nor a failure .xfail.
+    case "$MODE" in
+        *int*)
+            case "$pkg" in
+                pkg/std/*)
+                    if [ "$VERBOSE" -eq 1 ]; then
+                        echo "SKIP-STDLIB-INT: $pkg (stdlib is injected, not interpreted)"
+                    elif [ "$QUIET" -eq 0 ]; then
+                        printf "s"
+                    fi
+                    pkgskipped=$((pkgskipped + 1))
+                    continue
+                    ;;
+            esac
+            ;;
+    esac
+
     # Check for xfail.  is_xfail records that this package carries a marker so
     # the result handler can interpret pass/fail as XPASS/XFAIL.
     xfail_key="$(echo "$pkg" | tr '/' '-')"

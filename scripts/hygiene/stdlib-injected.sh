@@ -8,7 +8,7 @@
 # cross-mode-identity hazards (errors.Is / io.IsEOF sentinel identity, interface
 # dispatch over a native-only type's vtable) that the inject-all effort closed.
 #
-# A package is injected by listing it in stdPkgs() in cmd/bni/externs.bn — that
+# A package is injected by listing it in stdPkgs() in pkg/binate/interp/externs.bn — that
 # ONE table drives both the lowering skip (isNativeOnlyInVM) and the injection
 # (injectStdlibExterns), so the package runs as its single compiled instance
 # (functions + globals + impl vtables), never as a separately-lowered bytecode
@@ -31,7 +31,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-EXTERNS="$BINATE_DIR/cmd/bni/externs.bn"
+EXTERNS="$BINATE_DIR/pkg/binate/interp/externs.bn"
 IFACE_STD="$BINATE_DIR/ifaces/stdlib/pkg/std"
 
 missing=0
@@ -56,6 +56,6 @@ if [ "$missing" -gt 0 ]; then
     echo ""
     echo "=== $missing pkg/std package(s) not injected into the VM ==="
     echo "Inject it: add a stdPkg{ path: \"<pkg>\", descriptor: <alias>._Package }"
-    echo "entry to stdPkgs() in cmd/bni/externs.bn."
+    echo "entry to stdPkgs() in pkg/binate/interp/externs.bn."
     exit 1
 fi

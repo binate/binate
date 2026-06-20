@@ -1,0 +1,142 @@
+package "pkg/binate/vm"
+
+import "pkg/builtins/reflect"
+
+// This file holds the VM's extern-registration MECHANISM — the
+// package-level injection primitives (RegisterPackageFunctions /
+// RegisterPackageGlobals / RegisterPackageVtables) and the VM's own
+// cross-mode dispatch trampolines (RegisterVmTrampolines).  It does NOT
+// decide WHICH packages a host registers: that policy (rt, reflect,
+// bootstrap, the pkg/std set, and the standard-set bundling) lives in the
+// host layer (pkg/binate/interp), so the VM stays an execution engine and
+// does not bake in a standard library.  pkg/binate/vm's own unit tests get
+// their externs from a test-local helper (extern_test_helpers_test.bn),
+// since vm cannot import interp.
+
+// scalarResult is the conventional ResultSize for scalar/pointer/void
+// returns — the dispatcher's ≤ 8 branch.  The auto-enumerated package
+// functions take their ResultSize from FunctionInfo.ResultSize instead;
+// the hand-bound trampolines below use this constant.
+const scalarResult int = 8
+
+// RegisterPackageFunctions auto-enumerates a package's exported
+// functions from its `_Package().Functions` table (the reflect
+// FunctionInfo array B0 emits per module) and binds each into the VM's
+// extern registry: one entry per `.bni`-exported func, keyed by the
+// fully-qualified `FunctionInfo.Name`, with the func value taken from
+// `FunctionInfo.Value` and the scalar/aggregate dispatch discriminator
+// from `FunctionInfo.ResultSize`.  This is the package-level injection
+// primitive a host uses to bind a native package's whole exported
+// surface (e.g. pkg/builtins/rt, or a native-only pkg/std package the VM
+// can't interpret).
+//
+// `FunctionInfo.Value` is the static `&@__handle.<mangled>` {vtable,
+// data} block (force-emitted per B0), so fvAddr and rawFnAddr below
+// both point at the SAME block: RegisterExtern reads the vtable/data
+// slots from fvAddr and copies the binding's owned handle from
+// rawFnAddr, which are identical for a static handle.
+//
+// The table excludes extern (pure-C) functions — emit_pkg_functions
+// skips IsExtern — so a package whose surface is extern (e.g.
+// pkg/bootstrap's C-shaped I/O) is NOT fully covered by this and needs
+// its externs hand-bound separately.
+//
+// Some rt entries (_call_shim_scalar / _call_shim_aggregate /
+// _call_dtor / _call_free_fn) are IR-magic intrinsics the compiler
+// lowers directly to BC_CALL_INDIRECT / BC_CALL_FUNC_VALUE (see
+// lower_call.bn) — they are NEVER dispatched by name through the
+// registry, so registering them here (even with their >7-word raw
+// shapes, which the registry dispatch can't carry) is inert: the
+// binding for those names is simply never consulted.
+func RegisterPackageFunctions(vmInst @VM, p @reflect.Package) {
+	var fns *[]@reflect.FunctionInfo = p.Functions
+	for i := 0; i < len(fns); i++ {
+		var fi @reflect.FunctionInfo = fns[i]
+		vmInst.RegisterExtern(fi.Name, fi.Value, fi.ResultSize,
+			bit_cast(int, fi.Value))
+	}
+}
+
+// RegisterPackageGlobals binds an injected COMPILED package's exported globals
+// to their native storage cells, so a bytecode cross-package read of a sentinel
+// (e.g. `errors.NotFound`) resolves to the single native instance the package's
+// own code roots in — the pointer identity `errors.Is` matches on.  Counterpart
+// to RegisterPackageFunctions, called alongside it for every native-only
+// injected package.  The global table it writes (via registerGlobalAddr) lives
+// on `vmInst` (the VM's per-instance global registry).
+func RegisterPackageGlobals(vmInst @VM, p @reflect.Package) {
+	var gs *[]@reflect.GlobalInfo = p.Globals
+	for i := 0; i < len(gs); i++ {
+		var gi @reflect.GlobalInfo = gs[i]
+		registerGlobalAddr(vmInst, gi.Name, bit_cast(int, gi.Addr))
+	}
+}
+
+// RegisterPackageVtables binds each of a native-only injected package's
+// interface-impl vtables (the descriptor's VtableInfo table) to its native
+// `@__ivt` address via registerVtableAddr, so a bytecode-built interface value
+// over the package's struct (BC_IFACE_VALUE) resolves the vtable instead of
+// fatally missing the un-lowered vm.IfaceVtables (conformance 726).  Counterpart
+// to RegisterPackageFunctions / RegisterPackageGlobals, called alongside them
+// for every native-only injected package.  The registry it writes
+// (registerVtableAddr) lives on `vmInst` (the VM's per-instance vtable registry).
+func RegisterPackageVtables(vmInst @VM, p @reflect.Package) {
+	var vts *[]@reflect.VtableInfo = p.Vtables
+	for i := 0; i < len(vts); i++ {
+		var vi @reflect.VtableInfo = vts[i]
+		registerVtableAddr(vmInst, vi.Name, bit_cast(int, vi.Addr),
+			bit_cast(int, vi.ShimAddr))
+	}
+}
+
+// RegisterVmTrampolines binds the universal cross-mode dispatch
+// trampolines (TrampolineScalar / TrampolineAggregate) into the
+// registry.  They are the VM's OWN functions (defined in this package),
+// required for cross-mode dispatch by any host, so registering them is
+// part of VM setup rather than host stdlib policy — the host calls this
+// alongside its package registrations.
+//
+// Although both ARE `.bni`-exported (they live in pkg/binate/vm's own
+// Functions table), they are NOT auto-enumerated via
+// RegisterPackageFunctions: doing so would mean enumerating the ENTIRE
+// pkg/binate/vm API as externs (the VM's whole exported surface), which
+// is wrong — only these two functions are meant to be cross-mode
+// dispatch targets.  So they stay hand-bound by name.
+//
+// Their `vtable.call` slot needs to hold the trampoline's NATIVE
+// FUNCTION address — NOT its per-function shim — because the shim
+// convention strips the implicit `data` parameter before calling the
+// underlying function (correct for ordinary captured closures, but the
+// trampolines need `data` as their closure-record argument; stripping
+// it routes the user's first arg into the slot the trampoline expects
+// the closure record at).  bnc emits __vt.<trampoline>.call directly at
+// the function symbol (bypassing __shim) — see isUniversalTrampoline in
+// pkg/binate/codegen/emit_funcvals.bn — so the standard registration
+// below produces a binding whose vtable.call slot is the actual
+// function, not __shim.*.  See `explorations/plan-uniform-native-fnptrs.md`.
+//
+// Two paths populate the binding correctly depending on whether
+// RegisterVmTrampolines runs natively or as bytecode:
+//
+//   (a) Native — `_raw_func_addr` resolves to the function symbol; we
+//       hand-build the binding directly with that address.
+//   (b) Bytecode — `_raw_func_addr` lowers to BC_FUNC_ADDR which
+//       returns a 1-based vm idx (wrong), so we instead use the
+//       standard `var ts *func(...) = TrampolineScalar;
+//       RegisterExtern(...)` form.  At bytecode level that goes through
+//       BC_FUNC_VALUE's Path B, which reads the executing vm's Externs
+//       registry — already populated by the outermost native startup
+//       via (a).  Net effect: the same native address propagates
+//       downward via the standard Externs-copy mechanism.
+func RegisterVmTrampolines(vmInst @VM) {
+	var ts *func(*uint8, int, int, int, int, int, int, int) int =
+		TrampolineScalar
+	vmInst.RegisterExtern("pkg/binate/vm.TrampolineScalar",
+		bit_cast(*uint8, &ts), scalarResult,
+		bit_cast(int, _raw_func_addr(TrampolineScalar)))
+	var ta *func(*uint8, *uint8,
+		int, int, int, int, int, int, int) = TrampolineAggregate
+	vmInst.RegisterExtern("pkg/binate/vm.TrampolineAggregate",
+		bit_cast(*uint8, &ta), scalarResult,
+		bit_cast(int, _raw_func_addr(TrampolineAggregate)))
+}

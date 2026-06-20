@@ -18,12 +18,13 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 # feature.  Skipped targets stay fully type-checked and compiled by every
 # conformance mode — only bnlint's style rules are paused.
 #
-# Currently empty: the previous skip (pkg/binate/vm + its importers
-# pkg/binate/repl, cmd/bni) was for the `_Package()` accessor /
-# `_func_handle(rt._Package)` / `@reflect.Package`, which the bundled bnlint
-# now typechecks as of BUILDER_VERSION bnc-0.0.9 (verified: it lints all three
-# cleanly).
-LINT_SKIP=""
+# Currently skipping pkg/binate/vm + its importers (pkg/binate/repl, cmd/bni):
+# vm imports pkg/builtins/rt, whose Exit/RawFree call C exit/free via the void
+# __c_call spelling (e.g. `__c_call("free", "void", ptr)`) — a parser feature
+# newer than the BUILDER-bundled bnlint (bnc-0.0.9), which aborts at the
+# typecheck pass on it.  Remove once BUILDER_VERSION ships a bnlint that parses
+# the "void" __c_call return spelling (tracked in claude-todo.md).
+LINT_SKIP="pkg/binate/vm pkg/binate/repl cmd/bni"
 
 # Discover targets:
 #   - every directory under pkg/ that has any .bn files (excludes builtin

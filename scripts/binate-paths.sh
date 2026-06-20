@@ -21,14 +21,13 @@
 #                  A project source root is `--prepend "$root"`.
 #   --append PATH  Append PATH to -I and -L (repeatable) — a fallback for a
 #                  package the base does not ship.
-#   --target KEY   Select the per-target interface tree for KEY:
-#                  ifaces/targets/KEY (e.g. pkg/builtins/build) prepended to
-#                  -I.  KEY is a bnc --target key (e.g. arm32-linux), or
+#   --target KEY   Select per-target search extras for KEY (currently only
+#                  arm32-baremetal's bootstrap impl + semihost interface/link
+#                  dirs).  KEY is a bnc --target key (e.g. arm32-linux), or
 #                  "host"/omitted to auto-detect the host via uname.  Pass the
-#                  SAME key you pass to `bnc --target` so the per-target tree
-#                  matches the codegen layout.  Per-target package *impls* are
-#                  now expressed via #[build(...)] in the common tree, not a
-#                  separate impls/targets dir.  --runtime is unaffected.
+#                  SAME key you pass to `bnc --target`.  Per-target package
+#                  *impls* are expressed via #[build(...)] in the common tree,
+#                  not a separate impls/targets dir.  --runtime is unaffected.
 #   --iface        Print only the -I value.
 #   --impl         Print only the -L value.
 #   --runtime      Print only the --runtime file (ignores --prepend/--append).
@@ -98,19 +97,12 @@ fi
 [ -d "$BASE/ifaces" ] || {
     echo "$prog: base '$BASE' has no ifaces/ (not a layout base)" >&2; exit 1; }
 
-# In the current tree pkg/builtins/build is one #[build]-gated file in
-# ifaces/core (not a per-target tree).  A prebuilt BUILDER bundle still ships
-# the old per-target ifaces/targets/<key>/pkg/builtins/build.bni, so the lookup
-# below stays [ -d ]-guarded: it finds the bundle's copy when run with
-# --base <bundle-lib>, and is a silent no-op against the current tree (where
-# ifaces/targets was removed).  Drop it once BUILDER ships build in ifaces/core.
 # Unknown keys are not validated here (bnc rejects them via applyTarget).
-TARGET_DIR=""        # ifaces/targets/<key> if it exists (bundle only), -I
 TARGET_EXTRA=""      # newline-list of dirs prepended to BOTH -I and -L
 
-# set_target_extras adds any per-target impl/interface search dirs BEYOND the
-# generic ifaces/targets/<key> interface tree — prepended to both -I and -L so
-# they win over the libc-host defaults (first-match-wins in the loader).
+# set_target_extras adds any per-target impl/interface search dirs — prepended to
+# both -I and -L so they win over the libc-host defaults (first-match-wins in the
+# loader).
 # arm32-baremetal needs its bootstrap impl (impls/core/baremetal — bootstrap is
 # still path-selected, not #[build]-gated) and its semihost interface +
 # link-file dir (runtime/baremetal_arm32) ahead of the default impls/core/libc.
@@ -140,8 +132,6 @@ resolve_target() {
         [ -n "$rt_os" ] && [ -n "$rt_arch" ] || return 0
         rt_key="$rt_arch-$rt_os"
     fi
-    [ -d "$BASE/ifaces/targets/$rt_key" ] && \
-        TARGET_DIR="$BASE/ifaces/targets/$rt_key"
     set_target_extras "$rt_key"
 }
 resolve_target
@@ -155,9 +145,6 @@ join_dedup() {
 build_list() {   # $1 = iface | impl
     {
         printf '%s' "$PREPEND"
-        if [ "$1" = iface ] && [ -n "$TARGET_DIR" ]; then
-            printf '%s\n' "$TARGET_DIR"
-        fi
         [ -n "$TARGET_EXTRA" ] && printf '%s\n' "$TARGET_EXTRA"
         printf '%s\n' "$BASE"
         if [ "$1" = iface ]; then

@@ -18,13 +18,17 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 # feature.  Skipped targets stay fully type-checked and compiled by every
 # conformance mode — only bnlint's style rules are paused.
 #
-# Currently skipping pkg/binate/vm + its importers (pkg/binate/repl, cmd/bni):
-# vm imports pkg/builtins/rt, whose Exit/RawFree call C exit/free via the void
-# __c_call spelling (e.g. `__c_call("free", "void", ptr)`) — a parser feature
-# newer than the BUILDER-bundled bnlint (bnc-0.0.9), which aborts at the
-# typecheck pass on it.  Remove once BUILDER_VERSION ships a bnlint that parses
-# the "void" __c_call return spelling (tracked in claude-todo.md).
-LINT_SKIP="pkg/binate/vm pkg/binate/repl cmd/bni"
+# Currently skipped, for two distinct reasons (both tracked in claude-todo.md):
+#  (1) BUILDER-lag: the void __c_call spelling (`__c_call("free", "void", ptr)`)
+#      in pkg/builtins/rt's Exit/RawFree is a parser feature newer than the
+#      BUILDER-bundled bnlint (bnc-0.0.9), which aborts at the typecheck pass on
+#      it.  Skip pkg/builtins/rt itself AND the importer chain whose bodies
+#      bnlint typechecks (pkg/binate/vm -> pkg/binate/repl, cmd/bni).  Remove
+#      once BUILDER_VERSION ships a bnlint that parses the "void" spelling.
+#  (2) pkg/std/os hits the open free-function-vs-same-named-method .bni-loader
+#      bug ("Stat: .bn has 1 parameters but .bni declares 0").  Remove once it
+#      is fixed.
+LINT_SKIP="pkg/builtins/rt pkg/binate/vm pkg/binate/repl cmd/bni pkg/std/os"
 
 # Discover targets:
 #   - every directory under pkg/ that has any .bn files (excludes builtin
@@ -52,6 +56,24 @@ for d in "$BINATE_DIR"/cmd/*/; do
         *" $rel "*) continue ;;
     esac
     TARGETS="$TARGETS $rel"
+done
+
+# Stdlib + runtime packages live under impls/ + ifaces/ addressed by package
+# PATH, not under the pkg/ filesystem dir, so the pkg/* loop above misses them.
+# Discover every such package from the `package "..."` clause of its files
+# (impl .bn, interface .bni, or test .bn — interface-only packages and
+# test-only packages both need to be found) and lint each by path (bnlint
+# resolves the right impl variant via -L).
+for pp in $(find "$BINATE_DIR/impls" "$BINATE_DIR/ifaces" \( -name '*.bn' -o -name '*.bni' \) 2>/dev/null \
+        | xargs grep -hE '^package "' 2>/dev/null \
+        | sed -E 's/^package "([^"]+)".*/\1/' | sort -u); do
+    case " $LINT_SKIP " in
+        *" $pp "*) continue ;;
+    esac
+    case " $TARGETS " in
+        *" $pp "*) continue ;;
+    esac
+    TARGETS="$TARGETS $pp"
 done
 
 # Trim leading whitespace

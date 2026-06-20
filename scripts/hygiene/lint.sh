@@ -29,8 +29,9 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 #    (796effc7, the os.Stat / File.Stat case) which postdates bnc-0.0.9, so the
 #    bundled bnlint still fails it ("Stat: .bn has 1 parameters but .bni
 #    declares 0") — the same BUILDER-lag that makes e2e/stat-values.sh build
-#    gen1 from the tree.
-LINT_SKIP="pkg/builtins/rt pkg/binate/vm pkg/binate/repl cmd/bni pkg/std/os"
+#    gen1 from the tree.  Covers os AND its importer chain that bnlint also
+#    typechecks: cmd/bni (already above), cmd/bnas, cmd/bnlint — all call os.Exit.
+LINT_SKIP="pkg/builtins/rt pkg/binate/vm pkg/binate/repl cmd/bni cmd/bnas cmd/bnlint pkg/std/os"
 
 # Discover targets:
 #   - every directory under pkg/ that has any .bn files (excludes builtin

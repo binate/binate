@@ -1,0 +1,159 @@
+package "pkg/binate/interp"
+
+import "pkg/binate/ast"
+import "pkg/binate/buildcfg"
+import "pkg/binate/ir"
+import "pkg/binate/loader"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/binate/vm"
+
+// Interp is an embeddable whole-program interpreter: a VM plus a loader, set up
+// once via New, configured with search paths, then driven with LoadProgram +
+// RunMain / RunFunc.  All state lives on the struct (no process-globals), so
+// multiple @Interp instances run independently in one process (the inc-5 / 5d-4
+// reentrancy work makes this sound at the loader / types / ir / vm layers).
+// Errors are returned as values; nothing here calls os.Exit — the host decides.
+type Interp struct {
+	Vm  @vm.VM
+	Ldr @loader.Loader
+}
+
+// New creates an interpreter with a stackSize-byte VM, the host stdlib externs
+// registered (rt + bootstrap C surface + injected native-only pkg/std), and a
+// loader gated by the host build config.  Add search paths with AddRoot /
+// AddBniPath / AddImplPath before LoadProgram.
+func New(stackSize int) @Interp {
+	var it @Interp = make(Interp)
+	it.Vm = vm.NewVM(stackSize)
+	RegisterStandardExterns(it.Vm)
+	RegisterPureCExterns(it.Vm)
+	// Run path: no --test targets, so inject every native-only pkg/std wholesale.
+	var noTargets @[]@[]char
+	InjectStdlibExterns(it.Vm, noTargets)
+	it.Ldr = loader.NewLoader(".")
+	// The interpreter runs on (and for) the host, so gate #[build(...)] by the
+	// host config.  An embedder targeting a cross config is a later increment.
+	it.Ldr.BuildConfig = buildcfg.ConfigForTarget("")
+	return it
+}
+
+// AddRoot adds a project root to BOTH the interface and impl search paths
+// (the NewLoader(root) shape) — the embedder's "where to load stuff".
+func (it @Interp) AddRoot(dir @[]char) {
+	it.Ldr.AddRoot(dir)
+}
+
+// AddBniPath adds an interface (.bni) search directory.
+func (it @Interp) AddBniPath(dir @[]char) {
+	it.Ldr.AddBniPath(dir)
+}
+
+// AddImplPath adds an implementation (.bn) search directory.
+func (it @Interp) AddImplPath(dir @[]char) {
+	it.Ldr.AddImplPath(dir)
+}
+
+// LoadProgram loads, type-checks, IR-generates, and lowers a whole program
+// (the parsed source files of `main` + its transitive imports) into the VM,
+// ending BEFORE main runs.  Returns any load / type-check errors as a bundle
+// (empty = ok); on a non-empty result the VM is left partially populated and
+// the caller should not Run.
+func (it @Interp) LoadProgram(files @[]@ast.File) @[]@[]char {
+	var merged @ast.File = loader.MergeFiles(files)
+	it.Ldr.LoadImports(merged.Imports)
+	EnsureBootstrapLoaded(it.Ldr)
+	EnsureLangLoaded(it.Ldr)
+	if len(it.Ldr.Errors) > 0 {
+		var lerrs @[]@[]char
+		for i := 0; i < len(it.Ldr.Errors); i++ {
+			lerrs = appendCharSlice(lerrs, it.Ldr.Errors[i])
+		}
+		return lerrs
+	}
+
+	var checker @types.Checker
+	var tcErrs @[]@[]char
+	checker, tcErrs = TypecheckAll(it.Ldr, merged)
+	if len(tcErrs) > 0 {
+		return tcErrs
+	}
+
+	// Lower every loaded package (skipping the native-only ones, which run as
+	// injected compiled externs), tracking which emit a `<pkg>.__init` so the
+	// main module's init dispatcher lists them in dep order.
+	var initPkgNames @[]@[]char
+	for i := 0; i < len(it.Ldr.Order); i++ {
+		var pkg @loader.Package = it.Ldr.GetPackage(it.Ldr.Order[i])
+		if pkg == nil { continue }
+		if pkg.Merged == nil { continue }
+		if IsNativeOnlyInVM(it.Ldr.Order[i]) { continue }
+		var mod @ir.Module = ir.InitModule(quotePath(it.Ldr.Order[i]))
+		mod.Checker = checker
+		var gc @ir.GenCtx = ir.NewGenCtx(mod)
+		RegisterPkgImports(it.Ldr, pkg, gc)
+		if pkg.BNI != nil {
+			ir.RegisterSelfTypes(checker, pkg.BNI, gc)
+		}
+		ir.GeneratePackage(checker, pkg.Merged, gc, pkg.Files)
+		if mod.HasPackageInit() {
+			initPkgNames = appendCharSlice(initPkgNames,
+				ir.PackageInitName(mangle.PkgPathFromQuoted(
+					quotePath(it.Ldr.Order[i]))))
+		}
+		it.Vm.LowerModule(mod)
+	}
+
+	// Lower the main package, then emit + lower the init dispatcher and entry
+	// wrapper.  GeneratePackage may add `main.__init` to mainMod, so check
+	// HasPackageInit BEFORE emitting the dispatcher.
+	var mainMod @ir.Module = ir.InitModule(merged.PkgName)
+	mainMod.Checker = checker
+	var mainGc @ir.GenCtx = ir.NewGenCtx(mainMod)
+	RegisterMainImports(it.Ldr, merged, mainGc)
+	ir.GeneratePackage(checker, merged, mainGc, make_slice(@ast.File, 0))
+	if mainMod.HasPackageInit() {
+		initPkgNames = appendCharSlice(initPkgNames,
+			ir.PackageInitName(mangle.PkgPathFromQuoted(merged.PkgName)))
+	}
+	mainMod.EmitInitDispatcher(initPkgNames)
+	mainMod.EmitMainEntry()
+	it.Vm.LowerModule(mainMod)
+
+	var noErrs @[]@[]char
+	return noErrs
+}
+
+// RunMain runs the loaded program's entry sequence — `main.__entry`, which
+// runs the package-init dispatcher and then calls main.main — returning its
+// result code.  Errors are returned as values (empty = ok); a missing
+// main.__entry (LoadProgram not run, or no main) is reported rather than
+// crashing.
+func (it @Interp) RunMain() (int, @[]@[]char) {
+	if it.Vm.LookupFunc("main.__entry") < 0 {
+		var e @[]@[]char
+		e = appendCharSlice(e, "interp: main.__entry not found (LoadProgram not run, or no main package)")
+		return 0, e
+	}
+	var noArgs @[]int
+	var noErrs @[]@[]char
+	return it.Vm.CallFunc("main.__entry", noArgs), noErrs
+}
+
+// RunFunc runs the package-init dispatcher once, then calls the named function
+// (a fully-qualified `pkg.Func` name) with the given int args, returning its
+// result code.  Alternative to RunMain — call one, not both (RunMain already
+// runs init).  A missing function is reported as an error.
+func (it @Interp) RunFunc(qualName @[]char, args @[]int) (int, @[]@[]char) {
+	if it.Vm.LookupFunc(qualName) < 0 {
+		var e @[]@[]char
+		e = appendCharSlice(e, "interp: function not found")
+		return 0, e
+	}
+	if it.Vm.LookupFunc("main.__init_all") >= 0 {
+		var noInitArgs @[]int
+		it.Vm.CallFunc("main.__init_all", noInitArgs)
+	}
+	var noErrs @[]@[]char
+	return it.Vm.CallFunc(qualName, args), noErrs
+}

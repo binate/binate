@@ -1,0 +1,445 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/ir"
+import "pkg/binate/stringutils"
+import "pkg/binate/types"
+import "pkg/std/strings"
+
+// ============================================================
+// In-register aggregate ABI coercion ([N x i64])
+// ============================================================
+//
+// cmd/bnc compiles the MAIN module with the chosen backend (native on
+// aa64/x64) but EVERY dependency package goes through LLVM/clang.  A
+// cross-package call is therefore a native-caller -> LLVM-callee (or the
+// reverse) boundary, and the two sides must agree byte-for-byte on how a
+// <=16-byte aggregate travels by value.
+//
+// The native backends pack such an aggregate into N = ceil(SizeOf/8)
+// consecutive GP registers -- the textbook AAPCS64 / SysV `[N x i64]`
+// lowering.  But emitting the LLVM function with a FIRST-CLASS struct
+// param/return makes LLVM's target lowering EXPAND the struct
+// field-per-register (an explicit padding leaf `[K x i8]` becomes K
+// separate i8 regs; a sub-word `i32` field takes its own reg), so a
+// `<{ i64, i32, [4 x i8] }>` eats 6 registers instead of 2 and the
+// second struct arg lands in the wrong register.  Native and LLVM then
+// disagree -> silent struct corruption.
+//
+// The fix: at the LLVM boundary, pass/return an in-register aggregate as
+// the coerced ABI type `[N x i64]` (matching the native packing) instead
+// of the first-class struct.  The function BODY is untouched -- it still
+// computes/consumes the `%S` SSA value via extractvalue/insertvalue --
+// so coercion is local to three boundaries (param entry, return, call
+// site), each implemented with the alloca/store/load idiom: the struct
+// and the `[N x i64]` share the same N*8-byte stack slot, viewed under
+// two LLVM types through one opaque pointer.  Both the caller half and
+// the callee half are emitted by this same codegen, so they always agree
+// regardless of target (on ILP32 there is no native side, but the
+// LLVM-to-LLVM call stays self-consistent).
+//
+// Scope: structs and arrays.  Slices (`%BnSlice = {i8*, i64}`),
+// func-values and interface-values (`{i8*, i8*}`) have word-sized fields
+// only, so their first-class form already lowers to exactly N word
+// registers -- identical to `[N x i64]` -- and they keep their existing
+// (separately-consistent) conventions.  The >16-byte byval (params) /
+// sret (returns) paths are unchanged.
+
+// aggInRegCoercedKind reports whether t's representation kind is one
+// whose first-class LLVM form can diverge from the native `[N x i64]`
+// packing -- i.e. a NAMED struct or an array.  Transparent wrappers
+// (readonly / named / alias) are peeled first, matching llvmType /
+// IsByvalParam.
+//
+// An ANONYMOUS struct (Name == "") is EXCLUDED: that is the IR's
+// multi-return encoding (an `{T1, T2, ...}` result for a function with
+// several return values), which has its own `multiReturnType` `{...}`
+// convention on BOTH the def/declare/funcRetTypes side and the call
+// site -- it is never a single by-value aggregate result/param, so it
+// must not be coerced (doing so would type-mismatch the call's
+// `{...}` result against a `[N x i64]` bind).  A real struct passed /
+// returned by value is always a named struct (e.g. `time.Point`).
+func aggInRegCoercedKind(t @types.Type) bool {
+	if t == nil { return false }
+	var s @types.Type = stripWrappers(t)
+	if s == nil { return false }
+	if s.Kind == types.TYP_ARRAY { return true }
+	if s.Kind == types.TYP_STRUCT { return len(s.Name) > 0 }
+	return false
+}
+
+// aggParamCoerced reports whether a parameter of type t is passed using
+// the `[N x i64]` coerced ABI: a struct/array that fits in registers
+// (NOT IsByvalParam, i.e. SizeOf <= 16).  Empty (zero-size) aggregates
+// are excluded -- N would be 0, and there is nothing to pass.
+func aggParamCoerced(t @types.Type) bool {
+	if !aggInRegCoercedKind(t) { return false }
+	if t.SizeOf() < 1 { return false }
+	return !t.IsByvalParam()
+}
+
+// aggRetCoerced reports whether a single result of type t is returned
+// using the `[N x i64]` coerced ABI: a struct/array that fits in the
+// return registers (NOT needsSret).  The return threshold is
+// target-specific (needsSret), distinct from the param threshold
+// (IsByvalParam) on ILP32.
+func aggRetCoerced(t @types.Type) bool {
+	if !aggInRegCoercedKind(t) { return false }
+	if t.SizeOf() < 1 { return false }
+	return !needsSret(t)
+}
+
+// aggCoerceWords returns N = ceil(SizeOf(t)/8): the number of i64 words
+// the coerced ABI type occupies.
+func aggCoerceWords(t @types.Type) int {
+	var sz int = t.SizeOf()
+	return (sz + 7) / 8
+}
+
+// aggCoerceLLTy writes the coerced ABI LLVM type `[N x i64]` for t.
+func aggCoerceLLTy(out *strings.Builder, t @types.Type) {
+	out.Write("[")
+	stringutils.WriteInt(out, aggCoerceWords(t))
+	out.Write(" x i64]")
+	return
+}
+
+// writeAggParamRef writes the coerced incoming-param reference `%vID.ag`
+// for an in-register-aggregate param on the define-line, in place of the
+// plain `%vID` (which is taken by the reconstructed struct value the body
+// references).  Used only when aggParamCoerced(t) holds.
+func writeAggParamRef(out *strings.Builder, id int) {
+	emitRef(out, id)
+	out.Write(".ag")
+	return
+}
+
+// writeAggParamPrologue emits, for ONE in-register-aggregate param, the
+// entry-block reconstruction of the `%S` value the body expects.  The
+// incoming param is declared as `[N x i64] %vID.ag` on the define-line
+// (writeAggParamRef); here we spill those words and load them back as the
+// struct, naming the loaded value `%vID` -- exactly the name every body
+// extractvalue / GEP reference already uses, so the body needs no rewrite:
+//
+//	store [N x i64] %vID.ag, ptr %vID.agp ; spill the coerced words
+//	%vID = load %S, ptr %vID.agp          ; struct view of same bytes
+//
+// The `%vID.agp` alloca is `[N x i64]`-typed (N*8 >= SizeOf), so neither
+// the `[N x i64]` store nor the `%S` load over-runs the slot.
+//
+// The alloca line is emitted separately by writeAggParamAllocaDecl
+// (entry-hoisted); this writes only the store + load, at the top of the
+// entry block.
+func writeAggParamPrologue(out *strings.Builder, id int, t @types.Type) {
+	out.Write("store ")
+	aggCoerceLLTy(out, t)
+	out.Write(" ")
+	emitRef(out, id)
+	out.Write(".ag, ptr ")
+	emitRef(out, id)
+	out.Write(".agp\n  ")
+	emitRef(out, id)
+	out.Write(" = load ")
+	out.Write(llvmType(t))
+	out.Write(", ptr ")
+	emitRef(out, id)
+	out.Write(".agp\n  ")
+	return
+}
+
+// writeAggParamAllocaDecl emits the entry-hoisted `alloca [N x i64]` for
+// one coerced aggregate param (named `%vID.agp`).  Placed in the entry
+// block by the alloca-hoist pre-pass (a function-entry, once-per-call
+// slot regardless of loops in the body).
+func writeAggParamAllocaDecl(out *strings.Builder, id int, t @types.Type) {
+	emitRef(out, id)
+	out.Write(".agp = alloca ")
+	aggCoerceLLTy(out, t)
+	out.WriteByte('\n')
+	return
+}
+
+// emitAggParamCoercion emits, at the top of f's entry block (after the
+// hoisted allocas, before any body instruction), the `[N x i64]` alloca
+// plus the store/load reconstruction for every in-register-aggregate
+// param.  After this runs, each coerced param's `%vID` holds the
+// struct value the body's later store-into-slot / field copies consume,
+// exactly as a non-coerced first-class struct param would have.
+func emitAggParamCoercion(out *strings.Builder, f @ir.Func) {
+	for i := 0; i < len(f.Params); i++ {
+		if !aggParamCoerced(f.Params[i].Typ) {
+			continue
+		}
+		writeAggParamAllocaDecl(out, f.Params[i].ID, f.Params[i].Typ)
+		out.Write("  ")
+		writeAggParamPrologue(out, f.Params[i].ID, f.Params[i].Typ)
+	}
+	return
+}
+
+// emitReturnAggAllocaDecl emits the entry-hoisted `[N x i64]` slot
+// `%v<retID>.agrp` for an OP_RETURN whose single result is an
+// in-register aggregate (aggRetCoerced).  emitReturn stores the `%S`
+// result into this slot and loads it back as `[N x i64]` to return.  A
+// `ret` can live in a non-entry block, so the slot MUST be hoisted (the
+// alloca-hoist invariant) -- done by the OP_RETURN case in
+// emitEntryAllocaDecls.  No-op for a void / scalar / sret return.
+func emitReturnAggAllocaDecl(out *strings.Builder, instr @ir.Instr) {
+	if len(instr.Args) != 1 {
+		return
+	}
+	if !aggRetCoerced(instr.Args[0].Typ) {
+		return
+	}
+	emitRef(out, instr.ID)
+	out.Write(".agrp = alloca ")
+	aggCoerceLLTy(out, instr.Args[0].Typ)
+	out.WriteByte('\n')
+	return
+}
+
+// emitAggReturn emits the OP_RETURN body for a single in-register
+// aggregate result (aggRetCoerced): coerce the `%S` result value to the
+// `[N x i64]` ABI type through the entry-hoisted `.agrp` slot
+// (emitReturnAggAllocaDecl) and `ret [N x i64]`, so the return registers
+// agree with a native caller.  The struct and the `[N x i64]` share the
+// same N*8-byte slot.  Called from emitReturn (emit_helpers.bn).
+func emitAggReturn(out *strings.Builder, instr @ir.Instr) {
+	out.Write("store ")
+	out.Write(llvmType(instr.Args[0].Typ))
+	out.WriteByte(' ')
+	emitValRef(out, instr.Args[0])
+	out.Write(", ptr ")
+	emitRef(out, instr.ID)
+	out.Write(".agrp\n  ")
+	emitRef(out, instr.ID)
+	out.Write(".agr = load ")
+	aggCoerceLLTy(out, instr.Args[0].Typ)
+	out.Write(", ptr ")
+	emitRef(out, instr.ID)
+	out.Write(".agrp\n  ret ")
+	aggCoerceLLTy(out, instr.Args[0].Typ)
+	out.WriteByte(' ')
+	emitRef(out, instr.ID)
+	out.Write(".agr\n")
+	return
+}
+
+// ------------------------------------------------------------
+// Call-site coercion (LLVM caller half)
+// ------------------------------------------------------------
+//
+// For each in-register-aggregate ARG, the struct value is coerced to
+// `[N x i64]` (store -> load) before the call and passed as the coerced
+// type; for an in-register-aggregate RESULT, the call yields `[N x i64]`
+// which is stored to a slot and loaded back as `%S` to bind `%v<callID>`.
+// Both halves use entry-hoisted `[N x i64]` slots named off the call
+// instr.ID (stable between the hoist pass and the call site).
+
+// aggCallArgCoerced reports whether call arg i is an in-register
+// aggregate that must be coerced to `[N x i64]` at the call site.
+func aggCallArgCoerced(instr @ir.Instr, i int) bool {
+	return aggParamCoerced(instr.Args[i].Typ)
+}
+
+// aggCallResultCoerced reports whether the call's single result is an
+// in-register aggregate returned as `[N x i64]` (so the call site binds
+// the result through a coercion).  An sret call (>16 result) is NOT
+// coerced.
+func aggCallResultCoerced(instr @ir.Instr) bool {
+	if instr.Typ == nil {
+		return false
+	}
+	return aggRetCoerced(instr.Typ)
+}
+
+// emitAggCallArgPreamble emits, BEFORE the call line, the store/load that
+// coerces each in-register-aggregate arg `%S` -> `[N x i64]`:
+//
+//	store %S <argref>, ptr %v<callID>.agA<i>
+//	%v<callID>.agL<i> = load [N x i64], ptr %v<callID>.agA<i>
+//
+// The call args list then passes `%v<callID>.agL<i>` (writeAggCallArg).
+// The `.agA<i>` slot is entry-hoisted (emitAggCallAllocaDecls).
+func emitAggCallArgPreamble(out *strings.Builder, instr @ir.Instr) {
+	for i := 0; i < len(instr.Args); i++ {
+		if !aggCallArgCoerced(instr, i) {
+			continue
+		}
+		out.Write("store ")
+		out.Write(llvmType(instr.Args[i].Typ))
+		out.WriteByte(' ')
+		emitValRef(out, instr.Args[i])
+		out.Write(", ptr %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agA")
+		stringutils.WriteInt(out, i)
+		out.Write("\n  %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agL")
+		stringutils.WriteInt(out, i)
+		out.Write(" = load ")
+		aggCoerceLLTy(out, instr.Args[i].Typ)
+		out.Write(", ptr %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agA")
+		stringutils.WriteInt(out, i)
+		out.Write("\n  ")
+	}
+	return
+}
+
+// writeAggCallArg writes ONE coerced-aggregate call arg in the call's
+// argument list: `[N x i64] %v<callID>.agL<i>` (the value loaded by
+// emitAggCallArgPreamble).  Called from writeByvalArgLLVM's coerced
+// branch.
+func writeAggCallArg(out *strings.Builder, instr @ir.Instr, i int) {
+	aggCoerceLLTy(out, instr.Args[i].Typ)
+	out.Write(" %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".agL")
+	stringutils.WriteInt(out, i)
+	return
+}
+
+// emitAggCallResultBind emits, AFTER the call line, the bind of an
+// in-register-aggregate result.  The call value is captured as
+// `%v<callID>.agR` ([N x i64]); store it to the `.agRB` slot and load it
+// back as `%S` to define `%v<callID>` (the struct value the rest of the
+// IR consumes):
+//
+//	store [N x i64] %v<callID>.agR, ptr %v<callID>.agRB
+//	%v<callID> = load %S, ptr %v<callID>.agRB
+//
+// The `.agRB` slot is entry-hoisted (emitAggCallAllocaDecls).
+func emitAggCallResultBind(out *strings.Builder, instr @ir.Instr) {
+	out.Write("  store ")
+	aggCoerceLLTy(out, instr.Typ)
+	out.Write(" %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".agR, ptr %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".agRB\n  ")
+	emitRef(out, instr.ID)
+	out.Write(" = load ")
+	out.Write(llvmType(instr.Typ))
+	out.Write(", ptr %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".agRB\n")
+	return
+}
+
+// emitAggCallAllocaDecls emits the entry-hoisted `[N x i64]` slots for a
+// call's coerced-aggregate args (`.agA<i>`) and coerced-aggregate result
+// (`.agRB`).  Called from the OP_CALL case of emitEntryAllocaDecls
+// alongside the byval / sret slot decls.  No-op when the call has none.
+func emitAggCallAllocaDecls(out *strings.Builder, instr @ir.Instr) {
+	for i := 0; i < len(instr.Args); i++ {
+		if !aggCallArgCoerced(instr, i) {
+			continue
+		}
+		out.Write("%v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agA")
+		stringutils.WriteInt(out, i)
+		out.Write(" = alloca ")
+		aggCoerceLLTy(out, instr.Args[i].Typ)
+		out.WriteByte('\n')
+	}
+	if aggCallResultCoerced(instr) {
+		out.Write("%v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agRB = alloca ")
+		aggCoerceLLTy(out, instr.Typ)
+		out.WriteByte('\n')
+	}
+	return
+}
+
+// ------------------------------------------------------------
+// Iface-dispatch coercion (caller half)
+// ------------------------------------------------------------
+//
+// Mirrors the OP_CALL coercion for OP_CALL_IFACE_METHOD, whose args
+// begin at instr.Args[1] (Args[0] is the interface value).  The thunk
+// the dispatch bitcasts to is the impl method (its signature is coerced
+// via writeFuncPtrType -> writeParamTypeLLVM / writeFuncResultLLVM), so
+// the dispatch site must pass `[N x i64]` args and bind a `[N x i64]`
+// result.  argIdx i corresponds to instr.Args[i+1].
+
+// aggIfaceArgCoerced reports whether iface-call positional arg i
+// (instr.Args[i+1]) is an in-register aggregate to coerce.
+func aggIfaceArgCoerced(instr @ir.Instr, i int) bool {
+	return aggParamCoerced(instr.Args[i + 1].Typ)
+}
+
+// emitAggIfaceArgPreamble emits the per-arg `%S` -> `[N x i64]` coercion
+// (store/load via the `.agA<i>` slot) for each in-register-aggregate
+// positional arg of an iface-method call, BEFORE the call line.
+func emitAggIfaceArgPreamble(out *strings.Builder, instr @ir.Instr,
+		nArgs int) {
+	for i := 0; i < nArgs; i++ {
+		if !aggIfaceArgCoerced(instr, i) {
+			continue
+		}
+		var at @types.Type = instr.Args[i + 1].Typ
+		out.Write("store ")
+		out.Write(llvmType(at))
+		out.WriteByte(' ')
+		emitValRef(out, instr.Args[i + 1])
+		out.Write(", ptr %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agA")
+		stringutils.WriteInt(out, i)
+		out.Write("\n  %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agL")
+		stringutils.WriteInt(out, i)
+		out.Write(" = load ")
+		aggCoerceLLTy(out, at)
+		out.Write(", ptr %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agA")
+		stringutils.WriteInt(out, i)
+		out.Write("\n  ")
+	}
+	return
+}
+
+// writeAggIfaceArg writes ONE coerced iface positional arg in the call
+// list: `[N x i64] %v<callID>.agL<i>`.
+func writeAggIfaceArg(out *strings.Builder, instr @ir.Instr, i int) {
+	aggCoerceLLTy(out, instr.Args[i + 1].Typ)
+	out.Write(" %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".agL")
+	stringutils.WriteInt(out, i)
+	return
+}
+
+// emitAggIfaceAllocaDecls emits the entry-hoisted `[N x i64]` slots for
+// an iface-method call's coerced positional args (`.agA<i>`) and (when
+// the single result is coerced) the result slot (`.agRB`).  Called from
+// the OP_CALL_IFACE_METHOD case of emitEntryAllocaDecls.
+func emitAggIfaceAllocaDecls(out *strings.Builder, instr @ir.Instr) {
+	var nArgs int = len(instr.Args) - 1
+	for i := 0; i < nArgs; i++ {
+		if !aggIfaceArgCoerced(instr, i) {
+			continue
+		}
+		out.Write("%v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agA")
+		stringutils.WriteInt(out, i)
+		out.Write(" = alloca ")
+		aggCoerceLLTy(out, instr.Args[i + 1].Typ)
+		out.WriteByte('\n')
+	}
+	if aggCallResultCoerced(instr) {
+		out.Write("%v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agRB = alloca ")
+		aggCoerceLLTy(out, instr.Typ)
+		out.WriteByte('\n')
+	}
+	return
+}

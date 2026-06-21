@@ -18,35 +18,42 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 # feature.  Skipped targets stay fully type-checked and compiled by every
 # conformance mode — only bnlint's style rules are paused.
 #
-# Both current skips are BUILDER-lag (the bundled bnlint, bnc-0.0.9, predates a
-# feature/fix that is already in the tree) and clear at the next BUILDER bump
-# (tracked in claude-todo.md):
-#  - pkg/builtins/rt: its Exit/RawFree use the void __c_call spelling
-#    (`__c_call("free", "void", ptr)`), a parser feature newer than bnc-0.0.9.
-#    Covers rt itself AND the importer chain bnlint also typechecks
-#    (pkg/binate/vm -> pkg/binate/repl, cmd/bni).
-#  - pkg/std/os: depends on the .bni free-function-vs-same-named-method fix
-#    (796effc7, the os.Stat / File.Stat case) which postdates bnc-0.0.9, so the
-#    bundled bnlint still fails it ("Stat: .bn has 1 parameters but .bni
-#    declares 0") — the same BUILDER-lag that makes e2e/stat-values.sh build
-#    gen1 from the tree.  Covers os AND its importer chain that bnlint also
-#    typechecks: cmd/bni (already above), cmd/bnas, cmd/bnlint — all call os.Exit.
-LINT_SKIP="pkg/builtins/rt pkg/binate/vm pkg/binate/repl cmd/bni cmd/bnas cmd/bnlint pkg/std/os"
+# The skips fall in two groups (all tracked in claude-todo.md):
+#
+# (A) BUILDER-lag — the bundled bnlint (bnc-0.0.9) predates a feature/fix that
+#     is already in the tree, so it aborts at the typecheck pass.  Clears at the
+#     next BUILDER bump.
+#   - pkg/builtins/rt: its Exit/RawFree use the void __c_call spelling
+#     (`__c_call("free", "void", ptr)`), a parser feature newer than bnc-0.0.9.
+#     bnlint typechecks dependency BODIES, so this also covers rt's importer
+#     chain: pkg/binate/{vm,repl,interp} and cmd/bni.
+#   - pkg/std/os: depends on the .bni free-function-vs-same-named-method fix
+#     (796effc7, os.Stat / File.Stat) which postdates bnc-0.0.9 ("Stat: .bn has
+#     1 parameters but .bni declares 0").  Covers os + its importers cmd/bni
+#     (above), cmd/bnas, cmd/bnlint (all call os.Exit).
+#
+# (B) Pending real lint findings — uncovered until the recursive pkg/ discovery
+#     below was added (the old one-level `pkg/*/` glob never reached the
+#     compiler at pkg/binate/<pkg>).  These asm subpackages trip
+#     [managed-to-raw-assign] (`var data *[]uint8 = sec.Data` — a borrow of a
+#     held @[]uint8); each needs a per-site judgement (real UAF risk vs a safe
+#     borrow the rule over-flags) before un-skipping.  Tracked in claude-todo.md.
+LINT_SKIP="pkg/builtins/rt pkg/binate/vm pkg/binate/repl pkg/binate/interp cmd/bni cmd/bnas cmd/bnlint pkg/std/os pkg/binate/asm/arm32 pkg/binate/asm/elf pkg/binate/asm/macho pkg/binate/asm/parse pkg/binate/asm/x64"
 
 # Discover targets:
-#   - every directory under pkg/ that has any .bn files (excludes builtin
-#     pkg/bootstrap, which has only the .bni interface)
+#   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so
+#     the compiler (which lives at pkg/binate/<pkg>, two levels deep) is covered;
+#     a one-level `pkg/*/` glob misses it (pkg/ holds only pkg/binate/, which has
+#     no direct .bn).  Excludes pkg/bootstrap (only a .bni interface, no dir).
 #   - every directory under cmd/
 TARGETS=""
-for d in "$BINATE_DIR"/pkg/*/; do
-    [ -d "$d" ] || continue
-    # Skip dirs with no .bn files (defensive; pkg/bootstrap has no dir at all)
+for d in $(find "$BINATE_DIR/pkg" -type d 2>/dev/null | sort); do
     found=0
-    for bn in "$d"*.bn; do
+    for bn in "$d"/*.bn; do
         [ -f "$bn" ] && found=1 && break
     done
     [ "$found" -eq 1 ] || continue
-    rel="pkg/$(basename "$d")"
+    rel=$(echo "$d" | sed "s|^$BINATE_DIR/||")
     case " $LINT_SKIP " in
         *" $rel "*) continue ;;
     esac

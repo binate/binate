@@ -1,0 +1,397 @@
+package "pkg/binate/mangle"
+
+import "pkg/binate/buf"
+
+// Demangler for the length-prefix mangling scheme — the exact inverse of
+// the encoders in mangle_lp.bn.  See that file's header for the grammar.
+// Demangle reads a BARE `bn_` symbol back into a structured
+// DemangledName; the literal "bn_entry" is the reserved entry sentinel.
+
+// Kind tags carried by a DemangledName — the symbol-class enumeration.
+// Each value names one mangled-symbol class (and selects which
+// DemangledName fields are populated); ENTRY is the reserved bn_entry
+// sentinel.  They are a single closed enum, so one doc covers the group.
+const (
+	KIND_FUNC int = 0
+	KIND_GLOBAL int = 1
+	KIND_STRUCT int = 2
+	KIND_INST_FUNC int = 3
+	KIND_INST_STRUCT int = 4
+	KIND_IMPL_VTABLE int = 5
+	KIND_IMPL_SHIM int = 6
+	KIND_ENTRY int = 7
+)
+
+// DemangledName is the structured recovery of a mangled symbol — the
+// exact inverse of the encoder inputs.  Which fields are populated
+// depends on Kind:
+//   FUNC/GLOBAL/STRUCT:        Pkg, Members
+//   INST_FUNC/INST_STRUCT:     Pkg, Decl, Args (verbatim TypeArg strings)
+//   IMPL_VTABLE/IMPL_SHIM:     Pkg (recv), RecvType, IfacePkg, IfaceName
+//   ENTRY:                     (none)
+type DemangledName struct {
+	Kind int
+	// Pkg holds the "/"-split package segments.  For the impl-vtable
+	// kinds it holds the RECEIVER package; the interface package is in
+	// IfacePkg.
+	Pkg @[]@[]char
+	// Members holds the "."-split member chain for FUNC/GLOBAL/STRUCT
+	// (e.g. method `Point.M` -> [Point, M]).
+	Members @[]@[]char
+	// Decl is the generic decl name for the INST kinds.
+	Decl @[]char
+	// Args holds the verbatim, pre-encoded TypeArg strings for the INST
+	// kinds (recovered byte-for-byte so re-encoding is the identity).
+	Args @[]@[]char
+	// RecvType / IfacePkg / IfaceName carry the four impl-vtable
+	// components (Pkg holds the receiver package).
+	RecvType @[]char
+	IfacePkg @[]@[]char
+	IfaceName @[]char
+}
+
+// lpCursor is a forward read position into a symbol's bytes.  ok stays
+// true until a malformed byte is hit, after which every read is a no-op
+// and the overall parse fails.
+type lpCursor struct {
+	s @[]char
+	pos int
+	ok bool
+}
+
+// lpNewCursor starts a cursor at the beginning of s.
+func lpNewCursor(s *[]readonly char) @lpCursor {
+	var c @lpCursor = make(lpCursor)
+	c.s = buf.CopyStr(s)
+	c.pos = 0
+	c.ok = true
+	return c
+}
+
+// lpAtEnd reports whether the cursor has consumed the whole symbol.
+func lpAtEnd(c @lpCursor) bool {
+	return c.pos >= len(c.s)
+}
+
+// lpExpect consumes the single byte want, failing the cursor if the
+// current byte differs or the input is exhausted.
+func lpExpect(c @lpCursor, want char) {
+	if !c.ok {
+		return
+	}
+	if c.pos >= len(c.s) || c.s[c.pos] != want {
+		c.ok = false
+		return
+	}
+	c.pos = c.pos + 1
+}
+
+// lpReadCount reads a decimal count terminated by "_" and consumes the
+// "_".  Rejects a leading zero unless the count is exactly "0" (the
+// canonical zero), so the encoding stays injective.  Returns 0 on
+// failure (with c.ok cleared).
+func lpReadCount(c @lpCursor) int {
+	if !c.ok {
+		return 0
+	}
+	var start int = c.pos
+	var n int = 0
+	var digits int = 0
+	for c.pos < len(c.s) {
+		var ch char = c.s[c.pos]
+		if ch < '0' || ch > '9' {
+			break
+		}
+		n = n * 10 + cast(int, ch - '0')
+		// Cap at the total symbol length.  Every count read here is an
+		// INDEXING count (an Ident byte-length, a segment/member/arg/param
+		// count) — none can validly exceed the input length, so a larger
+		// value is malformed.  Capping here keeps `n` bounded (no integer
+		// overflow turning the bounds checks unsound, no oversized make_slice)
+		// and closes the "accepts a count outside the encoder's image" hole.
+		// (An array LENGTH is a magnitude that may exceed the symbol length;
+		// it is skipped via lpSkipCount, never read here.)
+		if n > len(c.s) {
+			c.ok = false
+			return 0
+		}
+		digits = digits + 1
+		c.pos = c.pos + 1
+	}
+	if digits == 0 {
+		c.ok = false
+		return 0
+	}
+	// Reject non-canonical forms: leading zero (e.g. "00", "01") is not
+	// produced by the encoder, so it must not parse.
+	if digits > 1 && c.s[start] == '0' {
+		c.ok = false
+		return 0
+	}
+	lpExpect(c, '_')
+	if !c.ok {
+		return 0
+	}
+	return n
+}
+
+// lpSkipCount advances past a decimal count and its "_" delimiter WITHOUT
+// computing the value.  Used for an ARRAY LENGTH — a magnitude that may exceed
+// the symbol length (e.g. `[1000000]int`), so it must NOT be capped like an
+// indexing count, and its value isn't needed when only the byte extent of the
+// TypeArg matters.  Rejects a non-canonical leading zero (same injectivity rule
+// as lpReadCount) and a missing digit/`_`.
+func lpSkipCount(c @lpCursor) {
+	if !c.ok {
+		return
+	}
+	var start int = c.pos
+	var digits int = 0
+	for c.pos < len(c.s) {
+		var ch char = c.s[c.pos]
+		if ch < '0' || ch > '9' {
+			break
+		}
+		digits = digits + 1
+		c.pos = c.pos + 1
+	}
+	if digits == 0 {
+		c.ok = false
+		return
+	}
+	if digits > 1 && c.s[start] == '0' {
+		c.ok = false
+		return
+	}
+	lpExpect(c, '_')
+}
+
+// lpReadIdent reads an Ident (`<len> "_" <bytes>`) and returns the bytes
+// as a fresh slice.
+func lpReadIdent(c @lpCursor) @[]char {
+	var n int = lpReadCount(c)
+	if !c.ok {
+		var empty @[]char
+		return empty
+	}
+	// Overflow-safe remaining-bytes check (n is already capped at len(c.s) by
+	// lpReadCount, but phrase it as a subtraction so it stays sound regardless).
+	if n > len(c.s) - c.pos {
+		c.ok = false
+		var empty @[]char
+		return empty
+	}
+	var out @[]char = buf.CopyStr(c.s[c.pos:c.pos + n])
+	c.pos = c.pos + n
+	return out
+}
+
+// lpReadPkgPath reads a PkgPath (`<segcount> "_" Ident{segcount}`) into
+// its segments.
+func lpReadPkgPath(c @lpCursor) @[]@[]char {
+	var segc int = lpReadCount(c)
+	if !c.ok {
+		var empty @[]@[]char
+		return empty
+	}
+	var segs @[]@[]char = make_slice(@[]char, segc)
+	for i := 0; i < segc; i++ {
+		segs[i] = lpReadIdent(c)
+		if !c.ok {
+			var empty @[]@[]char
+			return empty
+		}
+	}
+	return segs
+}
+
+// lpReadMembers reads a member list (`<memcount> "_" Ident{memcount}`).
+func lpReadMembers(c @lpCursor) @[]@[]char {
+	var memc int = lpReadCount(c)
+	if !c.ok {
+		var empty @[]@[]char
+		return empty
+	}
+	var members @[]@[]char = make_slice(@[]char, memc)
+	for i := 0; i < memc; i++ {
+		members[i] = lpReadIdent(c)
+		if !c.ok {
+			var empty @[]@[]char
+			return empty
+		}
+	}
+	return members
+}
+
+// lpReadArgList reads an ArgList (`<argcount> "_" TypeArg{argcount}`),
+// recovering each TypeArg as its verbatim substring so re-encoding is the
+// identity.
+func lpReadArgList(c @lpCursor) @[]@[]char {
+	var argc int = lpReadCount(c)
+	if !c.ok {
+		var empty @[]@[]char
+		return empty
+	}
+	var args @[]@[]char = make_slice(@[]char, argc)
+	for i := 0; i < argc; i++ {
+		var begin int = c.pos
+		lpSkipTypeArg(c)
+		if !c.ok {
+			var empty @[]@[]char
+			return empty
+		}
+		args[i] = buf.CopyStr(c.s[begin:c.pos])
+	}
+	return args
+}
+
+// lpSkipTypeArg advances the cursor past exactly one TypeArg, validating
+// its structure (so a malformed arg fails the parse).  It does not build
+// anything — lpReadArgList slices out the verbatim substring afterward.
+func lpSkipTypeArg(c @lpCursor) {
+	if !c.ok {
+		return
+	}
+	if c.pos >= len(c.s) {
+		c.ok = false
+		return
+	}
+	var tag char = c.s[c.pos]
+	c.pos = c.pos + 1
+	if tag == 'p' || tag == 'm' || tag == 's' || tag == 'M' ||
+			tag == 'r' || tag == 'i' || tag == 'j' {
+		// Unary constructor: one nested TypeArg.
+		lpSkipTypeArg(c)
+		return
+	}
+	if tag == 'a' {
+		// Array: <len> "_" TypeArg.  The length is a magnitude (may exceed the
+		// symbol length) and is not needed here — skip it via lpSkipCount
+		// (NOT lpReadCount, which caps indexing counts at len(c.s)).
+		lpSkipCount(c)
+		lpSkipTypeArg(c)
+		return
+	}
+	if tag == 'f' || tag == 'F' || tag == 'g' {
+		lpSkipSig(c)
+		return
+	}
+	if tag == 'N' {
+		// Named leaf: PkgPath Ident.  Both readers run only to advance
+		// the cursor; their structured results are discarded here (the
+		// verbatim substring is sliced out by lpReadArgList).
+		lpReadPkgPath(c)
+		lpReadIdent(c)
+		return
+	}
+	c.ok = false
+}
+
+// lpSkipSig advances past a Sig (`p <pc> "_" TypeArg{pc} r <rc> "_"
+// TypeArg{rc}`).
+func lpSkipSig(c @lpCursor) {
+	lpExpect(c, 'p')
+	var pc int = lpReadCount(c)
+	if !c.ok {
+		return
+	}
+	for i := 0; i < pc; i++ {
+		lpSkipTypeArg(c)
+		if !c.ok {
+			return
+		}
+	}
+	lpExpect(c, 'r')
+	var rc int = lpReadCount(c)
+	if !c.ok {
+		return
+	}
+	for i := 0; i < rc; i++ {
+		lpSkipTypeArg(c)
+		if !c.ok {
+			return
+		}
+	}
+}
+
+// Demangle is the exact inverse of the encoders.  It operates on the
+// BARE `bn_` symbol (no object-file prefix is stripped).  It returns
+// ok=false on any malformed input.  The literal "bn_entry" is the
+// reserved entry sentinel (KIND_ENTRY, no components).
+func Demangle(sym *[]readonly char) (@DemangledName, bool) {
+	var out @DemangledName = make(DemangledName)
+	if charsEqual(sym, "bn_entry") {
+		out.Kind = KIND_ENTRY
+		return out, true
+	}
+	var c @lpCursor = lpNewCursor(sym)
+	lpExpect(c, 'b')
+	lpExpect(c, 'n')
+	lpExpect(c, '_')
+	if !c.ok || lpAtEnd(c) {
+		return out, false
+	}
+	var kind char = c.s[c.pos]
+	c.pos = c.pos + 1
+	if kind == 'F' || kind == 'G' || kind == 'S' {
+		return demangleFGS(c, kind, out)
+	}
+	if kind == 'I' || kind == 'T' {
+		return demangleInst(c, kind, out)
+	}
+	if kind == 'V' || kind == 'W' {
+		return demangleVtable(c, kind, out)
+	}
+	return out, false
+}
+
+// demangleFGS parses the F/G/S body (PkgPath + member list).
+func demangleFGS(c @lpCursor, kind char, out @DemangledName) (@DemangledName, bool) {
+	if kind == 'F' {
+		out.Kind = KIND_FUNC
+	} else if kind == 'G' {
+		out.Kind = KIND_GLOBAL
+	} else {
+		out.Kind = KIND_STRUCT
+	}
+	out.Pkg = lpReadPkgPath(c)
+	out.Members = lpReadMembers(c)
+	if !c.ok || !lpAtEnd(c) {
+		return out, false
+	}
+	return out, true
+}
+
+// demangleInst parses the I/T body (PkgPath, decl Ident, ArgList).
+func demangleInst(c @lpCursor, kind char, out @DemangledName) (@DemangledName, bool) {
+	if kind == 'I' {
+		out.Kind = KIND_INST_FUNC
+	} else {
+		out.Kind = KIND_INST_STRUCT
+	}
+	out.Pkg = lpReadPkgPath(c)
+	out.Decl = lpReadIdent(c)
+	out.Args = lpReadArgList(c)
+	if !c.ok || !lpAtEnd(c) {
+		return out, false
+	}
+	return out, true
+}
+
+// demangleVtable parses the V/W body (recvPkg, recvType, ifacePkg,
+// ifaceName).
+func demangleVtable(c @lpCursor, kind char, out @DemangledName) (@DemangledName, bool) {
+	if kind == 'V' {
+		out.Kind = KIND_IMPL_VTABLE
+	} else {
+		out.Kind = KIND_IMPL_SHIM
+	}
+	out.Pkg = lpReadPkgPath(c)
+	out.RecvType = lpReadIdent(c)
+	out.IfacePkg = lpReadPkgPath(c)
+	out.IfaceName = lpReadIdent(c)
+	if !c.ok || !lpAtEnd(c) {
+		return out, false
+	}
+	return out, true
+}

@@ -1,0 +1,269 @@
+package "pkg/binate/mangle"
+
+import "pkg/binate/buf"
+import "pkg/binate/stringutils"
+import "pkg/std/strings"
+
+// Length-prefix mangling (the invertible scheme).
+//
+// Every mangled symbol is `bn_<kind><body>`; output stays within
+// [A-Za-z0-9_].  Counts are decimal with no leading zero (`0` is the
+// single char "0").  The scheme is INJECTIVE — distinct structured
+// inputs always yield distinct symbols — and Demangle is its exact
+// inverse.  Injectivity comes from length-prefixing every variable-
+// length component (so no separator can be confused with content) and
+// from introducing a named/primitive type ONLY via the `N` leaf (so a
+// type literally named "ptr"/"slc"/"arr" can never be read as a
+// constructor — that was the old scheme's Finding A).
+//
+// Core productions:
+//   Ident   = <len> "_" <bytes:len>
+//   PkgPath = <segcount> "_" Ident{segcount}   (segments are "/"-split)
+//
+// Kind bodies (the kind letter is the char after "bn_"):
+//   bn_F PkgPath <memcount> "_" Ident{memcount}   free func / method / dtor
+//   bn_G ...   global var          (same body shape as F)
+//   bn_S ...   struct type         (same body shape as F)
+//   bn_I PkgPath Ident ArgList     generic-inst function
+//   bn_T PkgPath Ident ArgList     generic-inst struct
+//   bn_V PkgPath Ident PkgPath Ident   interface-impl vtable (__ivt)
+//   bn_W ...   interface-impl shim vtable (__ivtshim) (same as V)
+//     ArgList = <argcount> "_" TypeArg{argcount}
+//
+// TypeArg sub-language (see lpTypeArg* encoders):
+//   "p"/"m"/"s"/"M"/"r"/"i"/"j" TypeArg   unary type constructors
+//   "a" <len> "_" TypeArg                  array
+//   "f"/"F"/"g" Sig                        func type / *func / @func
+//   "N" PkgPath Ident                      named/primitive leaf
+//     Sig = "p" <pc> "_" TypeArg{pc} "r" <rc> "_" TypeArg{rc}
+//
+// The literal string "bn_entry" is RESERVED (the source main.__entry);
+// the encoders never produce it and Demangle treats it as a sentinel.
+//
+// The kind consts (KIND_*), the DemangledName recovery struct, and
+// Demangle itself live in mangle_lp_demangle.bn (the inverse half).
+
+// ===========================================================================
+// Encoders: building blocks
+// ===========================================================================
+
+// lpWriteIdent appends an Ident production: `<len> "_" <bytes>`.  The
+// length prefix makes the bytes self-delimiting, so the identifier may
+// itself contain "_" (e.g. "__entry") without ambiguity.
+func lpWriteIdent(b *strings.Builder, s *[]readonly char) {
+	stringutils.WriteInt(b, len(s))
+	b.WriteByte('_')
+	b.Write(s)
+}
+
+// lpWriteMembers appends a member list: `<memcount> "_" Ident{memcount}`.
+func lpWriteMembers(b *strings.Builder, members @[]@[]char) {
+	stringutils.WriteInt(b, len(members))
+	b.WriteByte('_')
+	for i := 0; i < len(members); i++ {
+		lpWriteIdent(b, members[i])
+	}
+}
+
+// ===========================================================================
+// Encoders: one per kind
+// ===========================================================================
+
+// lpFGS is the shared body for the F/G/S kinds (PkgPath + member list),
+// parameterized by the kind letter.
+func lpFGS(kind char, pkgPath @[]@[]char, members @[]@[]char) @[]char {
+	var b @strings.Builder = strings.NewBuilder()
+	b.Write("bn_")
+	b.WriteByte(kind)
+	lpWritePkgPathSegs(b, pkgPath)
+	lpWriteMembers(b, members)
+	return buf.CopyStr(b.String())
+}
+
+// lpFunc encodes a free function / method / dtor as `bn_F`.  members is
+// the "."-split member chain (e.g. [parseExpr] or [Point, M]).
+func lpFunc(pkgPath @[]@[]char, members @[]@[]char) @[]char {
+	return lpFGS('F', pkgPath, members)
+}
+
+// lpGlobal encodes a global variable as `bn_G` (same body shape as F).
+func lpGlobal(pkgPath @[]@[]char, members @[]@[]char) @[]char {
+	return lpFGS('G', pkgPath, members)
+}
+
+// lpStruct encodes a struct type as `bn_S` (same body shape as F).
+func lpStruct(pkgPath @[]@[]char, members @[]@[]char) @[]char {
+	return lpFGS('S', pkgPath, members)
+}
+
+// lpInstFGT is the shared body for the I/T inst kinds: PkgPath, the
+// decl-name Ident, then an ArgList of pre-encoded TypeArg strings.
+func lpInstFGT(kind char, pkgPath @[]@[]char, decl *[]readonly char,
+		args @[]@[]char) @[]char {
+	var b @strings.Builder = strings.NewBuilder()
+	b.Write("bn_")
+	b.WriteByte(kind)
+	lpWritePkgPathSegs(b, pkgPath)
+	lpWriteIdent(b, decl)
+	lpWriteArgList(b, args)
+	return buf.CopyStr(b.String())
+}
+
+// lpInstFunc encodes a generic-instantiation FUNCTION as `bn_I`.  args
+// are pre-encoded TypeArg strings (from the lpTypeArg* encoders).
+func lpInstFunc(pkgPath @[]@[]char, decl *[]readonly char,
+		args @[]@[]char) @[]char {
+	return lpInstFGT('I', pkgPath, decl, args)
+}
+
+// lpInstStruct encodes a generic-instantiation STRUCT as `bn_T`.
+func lpInstStruct(pkgPath @[]@[]char, decl *[]readonly char,
+		args @[]@[]char) @[]char {
+	return lpInstFGT('T', pkgPath, decl, args)
+}
+
+// lpWriteArgList appends an ArgList: `<argcount> "_" TypeArg{argcount}`.
+// Each arg is already a complete, self-delimiting TypeArg string, so it
+// is written verbatim.
+func lpWriteArgList(b *strings.Builder, args @[]@[]char) {
+	stringutils.WriteInt(b, len(args))
+	b.WriteByte('_')
+	for i := 0; i < len(args); i++ {
+		b.Write(args[i])
+	}
+}
+
+// lpImplVtableCore is the shared body for V/W: recvPkg, recvType,
+// ifacePkg, ifaceName.
+func lpImplVtableCore(kind char, recvPkg @[]@[]char, recvType *[]readonly char,
+		ifacePkg @[]@[]char, ifaceName *[]readonly char) @[]char {
+	var b @strings.Builder = strings.NewBuilder()
+	b.Write("bn_")
+	b.WriteByte(kind)
+	lpWritePkgPathSegs(b, recvPkg)
+	lpWriteIdent(b, recvType)
+	lpWritePkgPathSegs(b, ifacePkg)
+	lpWriteIdent(b, ifaceName)
+	return buf.CopyStr(b.String())
+}
+
+// lpImplVtable encodes an interface-impl `__ivt` vtable as `bn_V`.
+func lpImplVtable(recvPkg @[]@[]char, recvType *[]readonly char,
+		ifacePkg @[]@[]char, ifaceName *[]readonly char) @[]char {
+	return lpImplVtableCore('V', recvPkg, recvType, ifacePkg, ifaceName)
+}
+
+// lpImplShimVtable encodes an interface-impl `__ivtshim` vtable as `bn_W`.
+func lpImplShimVtable(recvPkg @[]@[]char, recvType *[]readonly char,
+		ifacePkg @[]@[]char, ifaceName *[]readonly char) @[]char {
+	return lpImplVtableCore('W', recvPkg, recvType, ifacePkg, ifaceName)
+}
+
+// lpWritePkgPathSegs appends a pre-split PkgPath (`<segcount> "_"
+// Ident{segcount}`) directly from segments — the encoders receive
+// package paths already split (the structured-input contract of 4a).
+func lpWritePkgPathSegs(b *strings.Builder, segs @[]@[]char) {
+	stringutils.WriteInt(b, len(segs))
+	b.WriteByte('_')
+	for i := 0; i < len(segs); i++ {
+		lpWriteIdent(b, segs[i])
+	}
+}
+
+// ===========================================================================
+// Encoders: TypeArg sub-language
+// ===========================================================================
+
+// lpUnary prefixes a one-char type constructor onto an inner TypeArg.
+func lpUnary(tag char, inner *[]readonly char) @[]char {
+	var b @strings.Builder = strings.NewBuilder()
+	b.WriteByte(tag)
+	b.Write(inner)
+	return buf.CopyStr(b.String())
+}
+
+// lpTypeArgPtr encodes `*T` (raw pointer): "p" + inner.
+func lpTypeArgPtr(inner *[]readonly char) @[]char { return lpUnary('p', inner) }
+
+// lpTypeArgMptr encodes `@T` (managed pointer): "m" + inner.
+func lpTypeArgMptr(inner *[]readonly char) @[]char { return lpUnary('m', inner) }
+
+// lpTypeArgSlice encodes `*[]T` (raw slice): "s" + inner.
+func lpTypeArgSlice(inner *[]readonly char) @[]char { return lpUnary('s', inner) }
+
+// lpTypeArgMslice encodes `@[]T` (managed-slice): "M" + inner.
+func lpTypeArgMslice(inner *[]readonly char) @[]char { return lpUnary('M', inner) }
+
+// lpTypeArgReadonly encodes `readonly T`: "r" + inner.
+func lpTypeArgReadonly(inner *[]readonly char) @[]char {
+	return lpUnary('r', inner)
+}
+
+// lpTypeArgIfaceVal encodes `*Iface` (interface-value): "i" + inner.
+func lpTypeArgIfaceVal(inner *[]readonly char) @[]char {
+	return lpUnary('i', inner)
+}
+
+// lpTypeArgMIfaceVal encodes `@Iface` (managed interface-value): "j" + inner.
+func lpTypeArgMIfaceVal(inner *[]readonly char) @[]char {
+	return lpUnary('j', inner)
+}
+
+// lpTypeArgArray encodes `[len]T`: "a" <len> "_" inner.  `length` MUST be
+// >= 0 (an array length is non-negative by the type system); a negative value
+// would emit a leading '-' from WriteInt — not identifier-safe and not
+// demanglable.  Callers pass types.Type.ArrayLen, which is always >= 0.
+func lpTypeArgArray(length int, inner *[]readonly char) @[]char {
+	var b @strings.Builder = strings.NewBuilder()
+	b.WriteByte('a')
+	stringutils.WriteInt(b, length)
+	b.WriteByte('_')
+	b.Write(inner)
+	return buf.CopyStr(b.String())
+}
+
+// lpTypeArgNamed encodes a named/primitive leaf: "N" PkgPath Ident.  A
+// primitive like `int` is `N0_3_int` (empty package).  This is the ONLY
+// production that introduces a named type, so a type whose name collides
+// with a constructor tag (e.g. "ptr") can never be misread.
+func lpTypeArgNamed(pkgPath @[]@[]char, typeName *[]readonly char) @[]char {
+	var b @strings.Builder = strings.NewBuilder()
+	b.WriteByte('N')
+	lpWritePkgPathSegs(b, pkgPath)
+	lpWriteIdent(b, typeName)
+	return buf.CopyStr(b.String())
+}
+
+// lpFuncSig builds a Sig body from pre-encoded param/result TypeArgs:
+// `p <pc> "_" params r <rc> "_" results`.
+func lpFuncSig(params @[]@[]char, results @[]@[]char) @[]char {
+	var b @strings.Builder = strings.NewBuilder()
+	b.WriteByte('p')
+	stringutils.WriteInt(b, len(params))
+	b.WriteByte('_')
+	for i := 0; i < len(params); i++ {
+		b.Write(params[i])
+	}
+	b.WriteByte('r')
+	stringutils.WriteInt(b, len(results))
+	b.WriteByte('_')
+	for i := 0; i < len(results); i++ {
+		b.Write(results[i])
+	}
+	return buf.CopyStr(b.String())
+}
+
+// lpTypeArgFunc encodes a func TYPE: "f" + Sig.
+func lpTypeArgFunc(params @[]@[]char, results @[]@[]char) @[]char {
+	return buf.Concat("f", lpFuncSig(params, results))
+}
+
+// lpTypeArgFuncVal encodes a `*func` value: "F" + Sig.
+func lpTypeArgFuncVal(params @[]@[]char, results @[]@[]char) @[]char {
+	return buf.Concat("F", lpFuncSig(params, results))
+}
+
+// lpTypeArgMFuncVal encodes an `@func` value: "g" + Sig.
+func lpTypeArgMFuncVal(params @[]@[]char, results @[]@[]char) @[]char {
+	return buf.Concat("g", lpFuncSig(params, results))
+}

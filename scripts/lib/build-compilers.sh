@@ -21,7 +21,7 @@
 _COMPILERS_DIR=""
 _ensure_compilers_dir() {
     if [ -z "$_COMPILERS_DIR" ]; then
-        _COMPILERS_DIR=$(mktemp -d "/tmp/binate_compilers_XXXXXX")
+        _COMPILERS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/binate_compilers_XXXXXX")
     fi
 }
 

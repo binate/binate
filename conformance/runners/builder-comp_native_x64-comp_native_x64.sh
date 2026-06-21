@@ -58,8 +58,8 @@ runner_exec() {
     bn="$1"
     root="$2"
     name="$(basename "$bn" .bn)"
-    tmpbin="/tmp/binate_conform_${name}_$$"
-    bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
+    tmpbin="$(mktemp "${TMPDIR:-/tmp}/binate_conform_${name}_XXXXXX")"
+    bdir="$(mktemp -d "${TMPDIR:-/tmp}/binate_build_XXXXXX")"
     compile_root="$BINATE_DIR"
     if [ -n "$root" ]; then
         compile_root="$root"

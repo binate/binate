@@ -11,6 +11,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONFORMANCE_DIR="$BINATE_DIR/conformance"
 
+# A unique-per-run scratch file (mktemp, not a PID-based name) so concurrent
+# hygiene runs in different worker sessions can't clobber each other's temp.
+NUMS_TMP="$(mktemp "${TMPDIR:-/tmp}/conformance-numbers.XXXXXX")"
+
 # Collect one entry per test:
 #   single-file: NNN_<name>.bn (with a sibling .expected or .error)
 #   multi-file:  NNN_<name>/ directory
@@ -31,7 +35,7 @@ CONFORMANCE_DIR="$BINATE_DIR/conformance"
         num="$(echo "$name" | cut -c1-3)"
         printf "%s %s\n" "$num" "$name"
     done
-} | sort > /tmp/conformance-numbers.$$
+} | sort > "$NUMS_TMP"
 
 dups=0
 prev_num=""
@@ -53,12 +57,12 @@ while IFS=' ' read -r num name; do
         prev_num="$num"
         prev_name="$name"
     fi
-done < /tmp/conformance-numbers.$$
+done < "$NUMS_TMP"
 if [ -n "$group" ]; then
     echo "DUPLICATE: $prev_num used by: $group"
     dups=$((dups + 1))
 fi
-rm -f /tmp/conformance-numbers.$$
+rm -f "$NUMS_TMP"
 
 if [ "$dups" -gt 0 ]; then
     echo ""

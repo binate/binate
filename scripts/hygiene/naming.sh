@@ -74,7 +74,10 @@ for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" -name
 
     # Apply whitelist: filter out lines whose <path>:<name> is whitelisted.
     if [ -f "$WHITELIST" ]; then
-        filtered=""
+        # Unique-per-run scratch file (mktemp, not a PID-based name) — the
+        # `while` runs in a pipe subshell, so its filtered output is captured
+        # via a file; that file must not collide with a concurrent run's.
+        naming_tmp="$(mktemp "${TMPDIR:-/tmp}/naming-out.XXXXXX")"
         echo "$out" | while IFS= read -r line; do
             # Extract identifier: last word of the line.
             name=$(echo "$line" | awk '{print $NF}')
@@ -82,9 +85,9 @@ for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" -name
             if ! grep -qxF "$key" "$WHITELIST" 2>/dev/null; then
                 echo "$line"
             fi
-        done > /tmp/naming-out.$$
-        out=$(cat /tmp/naming-out.$$)
-        rm -f /tmp/naming-out.$$
+        done > "$naming_tmp"
+        out=$(cat "$naming_tmp")
+        rm -f "$naming_tmp"
     fi
 
     if [ -n "$out" ]; then

@@ -147,7 +147,7 @@ for bn in "$SCRIPT_DIR"/*.bn; do
     fi
     expected_content="$(cat "$expected")"
 
-    tmpbin="/tmp/perf_${MODE}_${name}_$$"
+    tmpbin="$(mktemp "${TMPDIR:-/tmp}/perf_${MODE}_${name}_XXXXXX")"
 
     if [ "$has_compile" -eq 1 ]; then
         t0=$(now)

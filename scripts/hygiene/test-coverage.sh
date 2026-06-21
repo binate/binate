@@ -19,6 +19,13 @@ for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/impls" -name '*
         continue
     fi
 
+    # A file with no function definitions (pure type / const ABI data — e.g. a
+    # per-(os,arch) struct layout) has nothing to unit-test, so it needs neither
+    # a _test.bn nor a whitelist entry.
+    if ! grep -qE '^func ' "$f"; then
+        continue
+    fi
+
     rel="${f#"$BINATE_DIR"/}"
 
     # Check whitelist

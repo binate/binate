@@ -29,7 +29,7 @@ if [ ! -d "$BOOTSTRAP_DIR" ]; then
     exit 1
 fi
 
-TMP="$(mktemp -d /tmp/binate_e2e_split_paths.XXXXXX)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/binate_e2e_split_paths.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 BNI_ROOT="$TMP/bni-root"

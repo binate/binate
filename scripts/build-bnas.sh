@@ -62,7 +62,7 @@ if [ ! -d "$BOOTSTRAP_DIR" ]; then
     exit 1
 fi
 
-BUILD_DIR="$(mktemp -d "/tmp/binate_build_XXXXXX")"
+BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/binate_build_XXXXXX")"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
 if [ "$DEBUG" = 1 ]; then

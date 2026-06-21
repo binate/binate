@@ -12,7 +12,7 @@ runner_setup() { build_gen1; }
 runner_compile() {
     bn="$1"
     tmpbin="$2"
-    bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
+    bdir="$(mktemp -d "${TMPDIR:-/tmp}/binate_build_XXXXXX")"
     # Full stdlib search paths (matching the conformance/unit runners):
     # the bare $BINATE_DIR resolves pkg/bootstrap (println(int) lowers to
     # bootstrap.formatInt64) + pkg/binate/*; the ifaces/impls entries

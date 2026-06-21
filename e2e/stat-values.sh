@@ -36,7 +36,7 @@ case "$(uname -s)" in
 esac
 
 CC="${CC:-$(command -v cc || command -v clang || command -v gcc || echo cc)}"
-TMP="$(mktemp -d /tmp/binate_e2e_stat.XXXXXX)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/binate_e2e_stat.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 # A fixed file (known size via known content) and a fixed directory, created

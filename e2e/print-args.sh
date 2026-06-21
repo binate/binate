@@ -32,7 +32,7 @@ if [ ! -d "$BOOTSTRAP_DIR" ]; then
     exit 1
 fi
 
-TMP="$(mktemp -d /tmp/binate_e2e_print_args.XXXXXX)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/binate_e2e_print_args.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 BUILD_DIR="$TMP/build"

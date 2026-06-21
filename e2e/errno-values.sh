@@ -34,7 +34,7 @@ case "$(uname -s)" in
 esac
 
 CC="${CC:-$(command -v cc || command -v clang || command -v gcc || echo cc)}"
-TMP="$(mktemp -d /tmp/binate_e2e_errno.XXXXXX)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/binate_e2e_errno.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
 # ---- 1. Ground truth: the real <errno.h> value of each errno os classifies.

@@ -63,7 +63,7 @@ _baremetal_bnc_extra_args() {
 
 runner_test() {
     pkg="$1"
-    bdir="$(mktemp -d /tmp/binate_build_XXXXXX)"
+    bdir="$(mktemp -d "${TMPDIR:-/tmp}/binate_build_XXXXXX")"
     # Read the extra args (one per line) into positional params.
     OLDIFS=$IFS; IFS='
 '; set -- $(_baremetal_bnc_extra_args); IFS=$OLDIFS

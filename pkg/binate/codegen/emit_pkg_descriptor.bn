@@ -3,54 +3,44 @@ package "pkg/binate/codegen"
 import "pkg/binate/buf"
 import "pkg/binate/ir"
 import "pkg/binate/mangle"
+import "pkg/binate/types"
 import "pkg/std/strings"
+import "pkg/stdx/slices"
 
-// emitPackageDescriptor emits the per-package reflect descriptor — an
-// immortal static-managed `reflect.Package` node holding the package name
-// plus its Functions/Globals/Vtables tables, and the generated `_Package()`
-// accessor that returns it.  Phase B of notes-package-introspection.md.
+// emitPackageDescriptor emits the per-package reflect descriptor — an immortal
+// static-managed `reflect.Package` node holding the package name plus its
+// Functions/Globals/Vtables tables (each a row of static-managed info nodes +
+// a backing pointer array), and the generated `_Package()` accessor that
+// returns it.  Phase B of notes-package-introspection.md.
 //
-// The descriptor NODE and the package-name bytes are built once by
-// ir.BuildPackageDescriptor (the single source of truth for that layout) and
-// lowered through the shared emitDataGlobal — the SAME terms the native
-// backend lowers, so the two backends cannot drift (the bound this replaces:
-// the old hand-rolled node layout duplicated here and in
-// native/common/common_pkg_descriptor.bn).  The per-entry info-node tables +
-// their backing arrays are still emitted by the per-kind emitters below; the
-// node references the array symbols by name.
+// The ENTIRE descriptor's byte layout — every rodata blob, info node, backing
+// array, the descriptor node, and the name bytes — is built once by
+// ir.BuildPackageDescriptors (the single source of truth) and lowered through
+// the shared emitDataGlobal, the SAME terms the native backend lowers, so the
+// two backends cannot drift.  This LLVM gather only resolves the symbol names
+// + payload scalars per row; it knows nothing of the byte layout.
 //
-// Emitted for every module; an unreferenced `_Package` (and its node + name)
-// is dead-stripped by the linker, so unconditional emission is free.
+// Emitted for every module; an unreferenced `_Package` (and its nodes + arrays
+// + name) is dead-stripped by the linker, so unconditional emission is free.
 func emitPackageDescriptor(out *strings.Builder, m @ir.Module) {
 	var nameSym @[]char = mangle.GlobalName(modulePkgName, "_pkgname")
 	var infoSym @[]char = mangle.GlobalName(modulePkgName, "_pkg_info")
 	var funcSym @[]char = mangle.FuncName(modulePkgName, "_Package")
-	var funcsArraySym @[]char =
-		mangle.GlobalName(modulePkgName, "_pkg_funcs")
+	var funcsArraySym @[]char = mangle.GlobalName(modulePkgName, "_pkg_funcs")
 	var globalsArraySym @[]char =
 		mangle.GlobalName(modulePkgName, "_pkg_globals")
 	var vtablesArraySym @[]char =
 		mangle.GlobalName(modulePkgName, "_pkg_vtables")
 
-	// reflect.Package payload LLVM type — { Name, Functions, Globals, Vtables }
-	// as four flattened raw slices — used by the per-kind info-node emitters'
-	// Pkg back-pointer GEP and by the _Package() accessor's payload GEP.
-	var payloadTyStr @[]char = packagePayloadTy()
+	// Gather the table rows (LLVM-mangled symbol names + payload scalars), then
+	// lay the whole descriptor through the shared builder + emitter.
+	var funcs @[]@ir.PkgFuncEntry = collectPackageFuncs(m, infoSym)
+	var globals @[]@ir.PkgGlobalEntry = collectPackageGlobals(m)
+	var vtables @[]@ir.PkgVtableEntry = collectPackageVtables(m)
 
-	// Info-node tables + their backing arrays (still per-kind emitters); the
-	// descriptor node references the array symbols by name.  A zero count
-	// emits nothing and leaves that descriptor table slice { null, 0 }.
-	var funcCount int = emitPackageFunctions(out, m, infoSym, payloadTyStr,
-		funcsArraySym)
-	var globalCount int = emitPackageGlobals(out, m, globalsArraySym)
-	var vtableCount int = emitPackageVtables(out, m, vtablesArraySym)
-
-	// The descriptor node + the package-name bytes, built once and lowered
-	// through the shared emitDataGlobal.
-	var dgs @[]@ir.DataGlobal = ir.BuildPackageDescriptor(
+	var dgs @[]@ir.DataGlobal = ir.BuildPackageDescriptors(
 		STATIC_MANAGED_REFCOUNT, infoSym, nameSym, buf.CopyStr(modulePkgName),
-		funcsArraySym, funcCount, globalsArraySym, globalCount,
-		vtablesArraySym, vtableCount)
+		funcsArraySym, funcs, globalsArraySym, globals, vtablesArraySym, vtables)
 	for i := 0; i < len(dgs); i++ {
 		emitDataGlobal(out, dgs[i])
 	}
@@ -60,13 +50,122 @@ func emitPackageDescriptor(out *strings.Builder, m @ir.Module) {
 	out.Write("define ptr @")
 	out.Write(funcSym)
 	out.Write("() {\nentry:\n  ret ptr ")
-	staticManagedPayloadPtr(out, infoSym, payloadTyStr)
+	staticManagedPayloadPtr(out, infoSym, packagePayloadTy())
 	out.Write("\n}\n")
 	return
 }
 
+// collectPackageFuncs gathers the reflect.FunctionInfo rows: one per
+// `.bni`-exported, non-extern function (the same set codegen force-emits a
+// func-value `__handle` for, so Value resolves) plus own-package struct dtors,
+// and — last, when reflect was loaded (PackageAccessorSig set) — the
+// compiler-synthesized `_Package` accessor itself, so reflection on any package
+// surfaces its own `_Package`.  `infoSym` is the package node (each
+// FunctionInfo's Pkg back-points at its payload).
+func collectPackageFuncs(m @ir.Module, infoSym @[]char) @[]@ir.PkgFuncEntry {
+	var funcs @[]@ir.PkgFuncEntry
+	for i := 0; i < len(m.Funcs); i++ {
+		var f @ir.Func = m.Funcs[i]
+		if f.IsExtern { continue }
+		// + own-package struct dtors (IsStructDtor), injectable when native-only.
+		if !f.Exported && !f.IsStructDtor { continue }
+		var fv @types.Type = lookupFuncValueType(m, f.Name)
+		if fv == nil { continue }
+		var mangled @[]char = mangle.FuncName(modulePkgName, f.Name)
+		// f.Name is already the FULLY-QUALIFIED "pkg/path.Func" (NewFunc applies
+		// mangle.QualifyName), the form the VM binder keys on — use it verbatim.
+		funcs = slices.Append[@ir.PkgFuncEntry](funcs,
+			funcEntry(infoSym, mangled, f.Name, fv))
+	}
+	// Self-list the `_Package` accessor (mirrors the native gather).  Name is
+	// the FQ `<pkg>._Package` (the VM lookup key); the mangled symbol routes the
+	// same dotted name through FuncName to the descriptor funcSym.  Its
+	// func-value triple is force-emitted by addPackageAccessorToSeen.
+	if m.PackageAccessorSig != nil {
+		var fvP @types.Type = m.PackageAccessorSig
+		var nameP @[]char = mangle.QualifyName(modulePkgName, "_Package")
+		var mangledP @[]char = mangle.FuncName(modulePkgName, nameP)
+		funcs = slices.Append[@ir.PkgFuncEntry](funcs,
+			funcEntry(infoSym, mangledP, nameP, fvP))
+	}
+	return funcs
+}
+
+// funcEntry builds one FunctionInfo row from a func-value type: the
+// __fninfo/__fnname/__fnsig symbols off `mangled`, the @__handle.<mangled>
+// Value target, and the VM-dispatch RetbufSize (the aggregate retbuf size, or
+// 0 for a scalar/void return) + ParamSlots.
+func funcEntry(infoSym @[]char, mangled @[]char, name *[]readonly char,
+		fv @types.Type) @ir.PkgFuncEntry {
+	return ir.NewPkgFuncEntry(catSym(mangled, "__fninfo"),
+		catSym(mangled, "__fnname"), buf.CopyStr(name),
+		catSym(mangled, "__fnsig"), buf.CopyStr(fv.SigString()),
+		catSym("__handle.", mangled), types.AggregateReturnSize(fv.Results),
+		len(fv.Params))
+}
+
+// collectPackageGlobals gathers the reflect.GlobalInfo rows: one per
+// `.bni`-exported, non-extern package-level global.  A package's OWN global
+// carries a BARE g.Name; the VM keys lookupGlobalAddr on the FULLY-QUALIFIED
+// form (what materializeGlobals stores), so the Name is qualified.  Addr is the
+// global's own storage cell (a `var` cell — no managed header).
+func collectPackageGlobals(m @ir.Module) @[]@ir.PkgGlobalEntry {
+	var globals @[]@ir.PkgGlobalEntry
+	for i := 0; i < len(m.Globals); i++ {
+		var g @ir.Global = m.Globals[i]
+		// Imported extern vars are owned by their defining package.
+		if g.IsExtern { continue }
+		if !g.Exported { continue }
+		var fqName @[]char = mangle.QualifyName(modulePkgName, g.Name)
+		var globalSym @[]char = mangle.GlobalName(modulePkgName, g.Name)
+		globals = slices.Append[@ir.PkgGlobalEntry](globals,
+			ir.NewPkgGlobalEntry(catSym(globalSym, "__glinfo"),
+				catSym(globalSym, "__glname"), fqName, globalSym))
+	}
+	return globals
+}
+
+// collectPackageVtables gathers the reflect.VtableInfo rows: one per NON-generic
+// `impl` this package compiles.  Generic-impl instantiations are excluded
+// (recvTypeIsGenericInst) — a bytecode importer re-lowers its own copy, so the
+// native one is never consulted by name.  Name is the BARE canonical vtable
+// name (the VM's findIfaceVtable / BC_IFACE_VALUE key); Addr/ShimAddr target the
+// `@__ivt` / `@__ivtshim` globals directly (constant arrays, no header).
+func collectPackageVtables(m @ir.Module) @[]@ir.PkgVtableEntry {
+	var vtables @[]@ir.PkgVtableEntry
+	for i := 0; i < len(m.Impls); i++ {
+		var info @ir.ImplInfo = m.Impls[i]
+		if info == nil { continue }
+		if recvTypeIsGenericInst(info.RecvTypeName) { continue }
+		var vtName @[]char = implVtableName(info)
+		var shimName @[]char = implShimVtableName(info)
+		vtables = slices.Append[@ir.PkgVtableEntry](vtables,
+			ir.NewPkgVtableEntry(catSym(vtName, "__vtinfo"),
+				catSym(vtName, "__vtname"), vtName, vtName, shimName))
+	}
+	return vtables
+}
+
+// recvTypeIsGenericInst reports whether an impl's receiver type name is a
+// monomorphized generic instantiation (the `__bn_inst__` marker).  Delegates to
+// mangle.IsInstantiationName — the single source shared with the native gather.
+func recvTypeIsGenericInst(recvName *[]readonly char) bool {
+	return mangle.IsInstantiationName(recvName)
+}
+
+// catSym concatenates two (borrowed) name fragments into a fresh owned symbol —
+// e.g. catSym(mangled, "__fninfo") or catSym("__handle.", mangled).
+func catSym(a *[]readonly char, b *[]readonly char) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(a)
+	cb.Write(b)
+	return buf.CopyStr(cb.String())
+}
+
 // packagePayloadTy returns the reflect.Package payload LLVM type:
-// { Name, Functions, Globals, Vtables } = four raw slices { ptr, <int> }.
+// { Name, Functions, Globals, Vtables } = four raw slices { ptr, <int> }.  Used
+// by the _Package() accessor's payload GEP (the descriptor's byte layout itself
+// lives in ir.BuildPackageDescriptors).
 func packagePayloadTy() @[]char {
 	var b @strings.Builder = strings.NewBuilder()
 	b.Write("{ ptr, ")

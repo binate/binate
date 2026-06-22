@@ -112,7 +112,7 @@ static BnManagedSlice cstr_to_managed_slice(const char *s) {
 }
 
 // Open(path *[]char, flags int) int
-bn_int_t bn_pkg__bootstrap__Open(BnSlice path, bn_int_t flags) {
+bn_int_t bn_F2_3_pkg9_bootstrap1_4_Open(BnSlice path, bn_int_t flags) {
     char *cpath = slice_to_cstr(path);
     int oflags = 0;
     int mode = flags & 3;  // low 2 bits: 0=RDONLY, 1=WRONLY, 2=RDWR
@@ -129,26 +129,26 @@ bn_int_t bn_pkg__bootstrap__Open(BnSlice path, bn_int_t flags) {
 }
 
 // Read(fd int, buf *[]uint8) int — reads up to len(buf) bytes
-bn_int_t bn_pkg__bootstrap__Read(bn_int_t fd, BnSlice buf) {
+bn_int_t bn_F2_3_pkg9_bootstrap1_4_Read(bn_int_t fd, BnSlice buf) {
     if (!buf.data || buf.len <= 0) return 0;
     ssize_t r = read((int)fd, buf.data, (size_t)buf.len);
     return (bn_int_t)r;
 }
 
 // Write(fd int, buf *[]uint8) int — writes len(buf) bytes
-bn_int_t bn_pkg__bootstrap__Write(bn_int_t fd, BnSlice buf) {
+bn_int_t bn_F2_3_pkg9_bootstrap1_5_Write(bn_int_t fd, BnSlice buf) {
     if (!buf.data || buf.len <= 0) return 0;
     ssize_t w = write((int)fd, buf.data, (size_t)buf.len);
     return (bn_int_t)w;
 }
 
 // Close(fd int) int
-bn_int_t bn_pkg__bootstrap__Close(bn_int_t fd) {
+bn_int_t bn_F2_3_pkg9_bootstrap1_5_Close(bn_int_t fd) {
     return (bn_int_t)close((int)fd);
 }
 
 // ReadDir(path *[]char) @[]@[]char
-BnManagedSlice bn_pkg__bootstrap__ReadDir(BnSlice path) {
+BnManagedSlice bn_F2_3_pkg9_bootstrap1_7_ReadDir(BnSlice path) {
     char *cpath = slice_to_cstr(path);
     DIR *dir = opendir(cpath);
     free(cpath);
@@ -195,7 +195,7 @@ BnManagedSlice bn_pkg__bootstrap__ReadDir(BnSlice path) {
 }
 
 // Stat(path *[]char) int  — returns 0=not found, 1=file, 2=directory
-bn_int_t bn_pkg__bootstrap__Stat(BnSlice path) {
+bn_int_t bn_F2_3_pkg9_bootstrap1_4_Stat(BnSlice path) {
     char *cpath = slice_to_cstr(path);
     struct stat st;
     if (stat(cpath, &st) != 0) {
@@ -208,7 +208,7 @@ bn_int_t bn_pkg__bootstrap__Stat(BnSlice path) {
 }
 
 // Exit(code int)
-void bn_pkg__bootstrap__Exit(bn_int_t code) {
+void bn_F2_3_pkg9_bootstrap1_4_Exit(bn_int_t code) {
     exit((int)code);
 }
 
@@ -217,7 +217,7 @@ static int bn_argc = 0;
 static char **bn_argv = NULL;
 
 // Args() @[]@[]char
-BnManagedSlice bn_pkg__bootstrap__Args(void) {
+BnManagedSlice bn_F2_3_pkg9_bootstrap1_4_Args(void) {
     BnManagedSlice result;
     bn_int_t count = bn_argc > 1 ? bn_argc - 1 : 0;
     if (count == 0) {
@@ -241,7 +241,7 @@ BnManagedSlice bn_pkg__bootstrap__Args(void) {
 }
 
 // Exec(program *[]char, args *[]*[]char) int
-bn_int_t bn_pkg__bootstrap__Exec(BnSlice program, BnSlice args) {
+bn_int_t bn_F2_3_pkg9_bootstrap1_4_Exec(BnSlice program, BnSlice args) {
     char *prog = slice_to_cstr(program);
 
     // Build argv: [program, args..., NULL]

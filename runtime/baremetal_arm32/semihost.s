@@ -130,15 +130,16 @@ abort:
 	.size   abort, . - abort
 
 @ ============================================================
-@ bn_pkg__semihost__SemihostWriteChar(c char) — write one byte to the
-@ debug console via SYS_WRITEC.  pkg/bootstrap.Write loops over
-@ the buffer calling this for each byte.  Cheaper than SYS_WRITE0
-@ (which would need a null-terminated copy) or SYS_WRITE (which
-@ would need to open a "console" file handle first).
+@ semihost.SemihostWriteChar(c char) — write one byte to the debug
+@ console via SYS_WRITEC.  pkg/bootstrap.Write loops over the buffer
+@ calling this for each byte.  Cheaper than SYS_WRITE0 (which would
+@ need a null-terminated copy) or SYS_WRITE (which would need to open
+@ a "console" file handle first).  The symbol is the length-prefix
+@ mangling of (pkg "pkg/semihost", func "SemihostWriteChar").
 @ ============================================================
-	.globl bn_pkg__semihost__SemihostWriteChar
-	.type  bn_pkg__semihost__SemihostWriteChar, %function
-bn_pkg__semihost__SemihostWriteChar:
+	.globl bn_F2_3_pkg8_semihost1_17_SemihostWriteChar
+	.type  bn_F2_3_pkg8_semihost1_17_SemihostWriteChar, %function
+bn_F2_3_pkg8_semihost1_17_SemihostWriteChar:
 	@ r0 (param) holds the byte to write — AAPCS zero-extends
 	@ a `char` arg into the full 32-bit register.
 	push    {r0}            @ stack: [byte]
@@ -147,19 +148,20 @@ bn_pkg__semihost__SemihostWriteChar:
 	svc     #0x123456
 	add     sp, sp, #4      @ pop the byte we pushed
 	bx      lr
-	.size   bn_pkg__semihost__SemihostWriteChar, . - bn_pkg__semihost__SemihostWriteChar
+	.size   bn_F2_3_pkg8_semihost1_17_SemihostWriteChar, . - bn_F2_3_pkg8_semihost1_17_SemihostWriteChar
 
 @ ============================================================
-@ bn_pkg__semihost__SemihostExit(code int) — exit the program with
-@ the given exit code via SYS_EXIT_EXTENDED.  Does not return.
+@ semihost.SemihostExit(code int) — exit the program with the given
+@ exit code via SYS_EXIT_EXTENDED.  Does not return.  The symbol is the
+@ length-prefix mangling of (pkg "pkg/semihost", func "SemihostExit").
 @
 @ Per the semihosting ABI, SYS_EXIT_EXTENDED takes a {reason,
 @ exit_status} parameter block.  reason = 0x20026 = ADP_Stopped_
 @ ApplicationExit signals a clean application exit (vs a fault).
 @ ============================================================
-	.globl bn_pkg__semihost__SemihostExit
-	.type  bn_pkg__semihost__SemihostExit, %function
-bn_pkg__semihost__SemihostExit:
+	.globl bn_F2_3_pkg8_semihost1_12_SemihostExit
+	.type  bn_F2_3_pkg8_semihost1_12_SemihostExit, %function
+bn_F2_3_pkg8_semihost1_12_SemihostExit:
 	@ r0 (param) holds the exit code on entry.
 	push    {r0}            @ stack: [exit_status]
 	movw    r0, #0x0026
@@ -171,4 +173,4 @@ bn_pkg__semihost__SemihostExit:
 	@ Should not return.  Spin defensively in case the host doesn't
 	@ honor SYS_EXIT_EXTENDED — gives the program a stable halt point.
 1:	b       1b
-	.size   bn_pkg__semihost__SemihostExit, . - bn_pkg__semihost__SemihostExit
+	.size   bn_F2_3_pkg8_semihost1_12_SemihostExit, . - bn_F2_3_pkg8_semihost1_12_SemihostExit

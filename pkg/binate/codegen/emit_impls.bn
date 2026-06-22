@@ -6,6 +6,7 @@ import "pkg/binate/mangle"
 import "pkg/binate/stringutils"
 import "pkg/binate/types"
 import "pkg/std/strings"
+import "pkg/stdx/slices"
 
 // ============================================================
 // Interface vtable emission
@@ -146,35 +147,23 @@ func vtableSlotCountForInfo(m @ir.Module, info @ir.ImplInfo) int {
 	return ir.IfaceFullVtableSize(m, info.IfacePkg, info.IfaceName)
 }
 
-// emitImplVtable emits one vtable global for the `(R, I)` pair on
-// `info`, with the concat layout from
-// plan-interface-embedding.md:
+// emitImplVtable emits the raw `@__ivt.<R>__<I>` vtable for the `(R, I)` pair
+// on `info`, with the concat layout from plan-interface-embedding.md:
 //   [any-block: R's dtor]
-//   for each parent P (declaration order): full vtable of (R, P)
-//                                          (recursive)
+//   for each parent P (declaration order): full vtable of (R, P) (recursive)
 //   R's methods for I's own methods
-// For non-extending interfaces this reduces to slot 0 = dtor +
-// slots 1..N+1 = own methods — the original Slice 2.5 layout.
-//
-// The recursive structure is materialized inline: when emitting
-// (R, Child), we re-emit the parent's slot values (same `i8*
-// bitcast (... @method to i8*)` expressions) at the right offsets,
-// rather than referencing the parent's symbol via GEP — this is
-// what makes `*Child → *Parent` upcast work as a fixed pointer
-// offset (Slice E.4).  The parent's symbol is still emitted
-// separately for direct `*Parent` use.
+// For non-extending interfaces this reduces to slot 0 = dtor + slots 1..N =
+// own methods.  The recursive structure is materialized INLINE (the parent's
+// slot values re-appear at the right offsets, not a GEP reference) — that is
+// what makes `*Child → *Parent` upcast a fixed pointer offset (Slice E.4); the
+// parent's own symbol is still emitted separately for direct `*Parent` use.
+// The slot byte layout is laid by the shared ir.BuildImplVtable; this gathers
+// the ordered raw method-fn slot symbols (useHandles=false).
 func emitImplVtable(out *strings.Builder, m @ir.Module,
 		info @ir.ImplInfo) {
-	var nSlots int = vtableSlotCountForInfo(m, info)
-	var vtName @[]char = implVtableName(info)
-	out.Write("@")
-	out.Write(vtName)
-	out.Write(" = weak_odr constant [")
-	stringutils.WriteInt(out, nSlots)
-	out.Write(" x i8*] [")
-	emitImplVtableLayout(out, m, info, info.IfacePkg,
-		info.IfaceName, true, false)
-	out.Write("]\n")
+	var slots @[]@[]char =
+		collectImplVtableSlots(m, info, info.IfacePkg, info.IfaceName, false)
+	emitDataGlobal(out, ir.BuildImplVtable(implVtableName(info), slots))
 	return
 }
 
@@ -188,16 +177,9 @@ func emitImplVtable(out *strings.Builder, m @ir.Module,
 // the raw @__ivt directly; this is consumed only by the cross-mode VM path.
 func emitImplShimVtable(out *strings.Builder, m @ir.Module,
 		info @ir.ImplInfo) {
-	var nSlots int = vtableSlotCountForInfo(m, info)
-	var shimName @[]char = implShimVtableName(info)
-	out.Write("@")
-	out.Write(shimName)
-	out.Write(" = weak_odr constant [")
-	stringutils.WriteInt(out, nSlots)
-	out.Write(" x i8*] [")
-	emitImplVtableLayout(out, m, info, info.IfacePkg,
-		info.IfaceName, true, true)
-	out.Write("]\n")
+	var slots @[]@[]char =
+		collectImplVtableSlots(m, info, info.IfacePkg, info.IfaceName, true)
+	emitDataGlobal(out, ir.BuildImplVtable(implShimVtableName(info), slots))
 	return
 }
 
@@ -209,50 +191,47 @@ func implShimVtableName(info @ir.ImplInfo) @[]char {
 		info.IfacePkg, info.IfaceName)
 }
 
-// emitImplVtableLayout writes the slot values for a single
-// `(R, X)` block (where X is identified by ifacePkg / ifaceName)
-// into a vtable constant initializer.  `isFirst` indicates
-// whether the caller has already written a leading comma — false
-// means a leading ", " is emitted before the dtor slot.
-//
-// The layout written is: dtor, then for each parent P of X a
-// nested layout (recursive), then X's own method slots.  The
-// recursion bottoms out at interfaces with no parents — those
-// emit just `[dtor, m1, m2, ...]`.
-func emitImplVtableLayout(out *strings.Builder, m @ir.Module,
-		info @ir.ImplInfo, ifacePkg *[]readonly char,
-		ifaceName *[]readonly char, isFirst bool, useHandles bool) {
-	if !isFirst {
-		out.Write(", ")
-	}
-	emitImplVtableDtorSlot(out, m, info.DtorFuncName)
-	// Recurse into each parent's full vtable.
-	var parentPkgs @[]@[]char = ir.IfaceParentPkgs(m, ifacePkg,
-		ifaceName)
-	var parentNames @[]@[]char = ir.IfaceParentNames(m, ifacePkg,
-		ifaceName)
+// collectImplVtableSlots returns the ordered slot symbols for a single
+// `(R, X)` block (X identified by ifacePkg / ifaceName): the receiver's dtor
+// HANDLE (slot 0 of the level), then — for each parent P of X — that parent's
+// full sub-vtable slots (recursive, materialized INLINE so a `*X → *P` upcast
+// is a fixed offset), then X's own method slots in declaration order.  The
+// recursion bottoms out at parentless interfaces (`[dtor, m1, m2, ...]`).  An
+// empty slot symbol denotes a null pointer.  ir.BuildImplVtable lays the bytes.
+func collectImplVtableSlots(m @ir.Module, info @ir.ImplInfo,
+		ifacePkg *[]readonly char, ifaceName *[]readonly char,
+		useHandles bool) @[]@[]char {
+	var slots @[]@[]char
+	slots = appendSlotSym(slots, implDtorSlotSym(m, info.DtorFuncName))
+	var parentPkgs @[]@[]char = ir.IfaceParentPkgs(m, ifacePkg, ifaceName)
+	var parentNames @[]@[]char = ir.IfaceParentNames(m, ifacePkg, ifaceName)
 	for i := 0; i < len(parentPkgs); i++ {
-		emitImplVtableLayout(out, m, info, parentPkgs[i],
-			parentNames[i], false, useHandles)
+		var ps @[]@[]char = collectImplVtableSlots(m, info, parentPkgs[i],
+			parentNames[i], useHandles)
+		for j := 0; j < len(ps); j++ {
+			slots = appendSlotSym(slots, ps[j])
+		}
 	}
 	// Own methods of this level, in declaration order.
-	var ownMethods @[]@[]char = ir.IfaceOwnMethodNames(m, ifacePkg,
-		ifaceName)
+	var ownMethods @[]@[]char = ir.IfaceOwnMethodNames(m, ifacePkg, ifaceName)
 	for i := 0; i < len(ownMethods); i++ {
-		out.Write(", ")
 		var qualified @[]char = buildMethodFuncName(info.RecvPkg,
 			info.RecvTypeName, ownMethods[i])
-		// plan-primitives-impl-interfaces.md § "Interface-value
-		// dispatch and value receivers": value-receiver methods get
-		// their iv vtable slot pointed at a generated *readonly T-
-		// receiver thunk (the dispatch path passes the iv data
-		// pointer, which the thunk derefs before tail-calling the
-		// underlying method).  Pointer-receiver methods need no
-		// thunk; LookupVtableSlotName returns the original name.
+		// plan-primitives-impl-interfaces.md § "Interface-value dispatch and
+		// value receivers": a value-receiver method's slot points at a
+		// generated *readonly T-receiver thunk (the dispatch path passes the iv
+		// data pointer, which the thunk derefs before tail-calling the
+		// underlying method); pointer-receiver methods need no thunk, so
+		// LookupVtableSlotName returns the original name.
 		var slotName @[]char = ir.LookupVtableSlotName(m, qualified)
-		emitImplVtableSlot(out, m, slotName, useHandles)
+		slots = appendSlotSym(slots, implMethodSlotSym(m, slotName, useHandles))
 	}
-	return
+	return slots
+}
+
+// appendSlotSym appends one vtable slot symbol (empty = a null slot).
+func appendSlotSym(dst @[]@[]char, s @[]char) @[]@[]char {
+	return slices.Append[@[]char](dst, s)
 }
 
 // buildMethodFuncName builds `<recvPkg>.<recvName>.<methodName>`
@@ -272,38 +251,23 @@ func buildMethodFuncName(recvPkg *[]readonly char,
 	return buf.CopyStr(b.String())
 }
 
-// emitImplVtableDtorSlot emits slot 0 of the @__ivt.<R>__<I>
-// vtable: the address of the receiver type's dtor HANDLE (or i8*
-// null if no dtor was emitted — the type has no managed fields, so
-// plain rt.Free suffices at refcount-zero).
+// implDtorSlotSym returns the slot-0 symbol of the @__ivt.<R>__<I> vtable: the
+// receiver type's dtor HANDLE (`@__handle.<dtor>`), or empty (a null slot) when
+// no dtor was emitted (the type has no managed fields, so plain rt.Free
+// suffices at refcount-zero).
 //
-// Slot 0 holds a HANDLE POINTER (`*BnFuncValue`), not the raw dtor
-// fn pointer.  An @Iface value's scope-end cleanup extracts this
-// slot via `EmitIfaceDtor` and passes it as the `dtor` argument to
-// `rt.ZeroRefDestroy`, which calls `_call_dtor(dtor, ptr)` —
-// lowered as `OP_CALL_HANDLE` (`handle.vtable.call(handle.data,
-// ptr)`).  With a raw fn pointer the OP_CALL_HANDLE dispatch would
-// byte-pun-read the dtor's own machine code as if it were a
-// {vtable, data} struct.  The per-dtor triple (shim, vt, handle)
-// the slot references is emitted by emitFuncValueVtables via
-// addImplDtorsToSeen above; the same triple shape is used for the
-// @T-with-dtor cleanup path (which feeds the seen list via
-// emitManagedPtrRefDec's EmitFuncHandle).
-func emitImplVtableDtorSlot(out *strings.Builder, m @ir.Module,
-		dtorName @[]char) {
-	if len(dtorName) == 0 {
-		out.Write("i8* null")
-		return
-	}
-	var f @ir.Func = lookupModuleFunc(m, dtorName)
-	if f == nil {
-		out.Write("i8* null")
-		return
-	}
-	out.Write("i8* bitcast (%BnFuncValue* @__handle.")
-	out.Write(mangle.FuncName(modulePkgName, dtorName))
-	out.Write(" to i8*)")
-	return
+// Slot 0 holds a HANDLE pointer, not the raw dtor fn pointer.  An @Iface
+// value's scope-end cleanup extracts this slot via `EmitIfaceDtor` and passes
+// it as `dtor` to `rt.ZeroRefDestroy`, which calls `_call_dtor(dtor, ptr)` —
+// lowered as `OP_CALL_HANDLE` (`handle.vtable.call(handle.data, ptr)`).  A raw
+// fn pointer would byte-pun-read the dtor's machine code as a {vtable, data}
+// struct.  The per-dtor (shim, vt, handle) triple the slot references is
+// emitted by emitFuncValueVtables via addImplDtorsToSeen.
+func implDtorSlotSym(m @ir.Module, dtorName @[]char) @[]char {
+	var none @[]char
+	if len(dtorName) == 0 { return none }
+	if lookupModuleFunc(m, dtorName) == nil { return none }
+	return catSym("__handle.", mangle.FuncName(modulePkgName, dtorName))
 }
 
 // implVtableName builds the LLVM symbol name for an impl vtable in
@@ -320,34 +284,23 @@ func implVtableName(info @ir.ImplInfo) @[]char {
 		info.IfacePkg, info.IfaceName)
 }
 
-// emitImplVtableSlot emits a single method slot.  For the raw `@__ivt` vtable
-// (useHandles=false) it emits `i8* bitcast (<sig>* @<func> to i8*)` — the raw
-// method fn, which native-to-native dispatch calls directly.  For the parallel
-// `@__ivtshim` vtable (useHandles=true) it emits `i8* bitcast (%BnFuncValue*
-// @__handle.<func> to i8*)` — the method's function-value HANDLE, the same form
-// the dtor slot uses; the bytecode VM dispatches through it (handle.vtable.call
-// is the marshaling shim) so it never has to replicate the native arg ABI.
-// Looks up the impl method in m.Funcs; emits `i8* null` if not found (defensive
-// — the satisfaction check should have validated method presence).
-func emitImplVtableSlot(out *strings.Builder, m @ir.Module,
-		funcName @[]char, useHandles bool) {
-	var f @ir.Func = lookupModuleFunc(m, funcName)
-	if f == nil {
-		out.Write("i8* null")
-		return
-	}
+// implMethodSlotSym returns a single method slot's symbol.  For the raw `@__ivt`
+// vtable (useHandles=false) it is the raw method fn symbol (`@<func>`), which
+// native-to-native dispatch calls directly.  For the parallel `@__ivtshim`
+// vtable (useHandles=true) it is the method's function-value HANDLE
+// (`@__handle.<func>`, the same form the dtor slot uses) — the bytecode VM
+// dispatches through it (handle.vtable.call is the marshaling shim) so it never
+// replicates the native arg ABI.  Looks up the impl method in m.Funcs; returns
+// empty (a null slot) if not found (defensive — the satisfaction check should
+// have validated method presence).
+func implMethodSlotSym(m @ir.Module, funcName @[]char, useHandles bool) @[]char {
+	var none @[]char
+	if lookupModuleFunc(m, funcName) == nil { return none }
+	var mangled @[]char = mangle.FuncName(modulePkgName, funcName)
 	if useHandles {
-		out.Write("i8* bitcast (%BnFuncValue* @__handle.")
-		out.Write(mangle.FuncName(modulePkgName, funcName))
-		out.Write(" to i8*)")
-		return
+		return catSym("__handle.", mangled)
 	}
-	out.Write("i8* bitcast (")
-	writeFuncPtrType(out, f)
-	out.Write(" @")
-	out.Write(mangle.FuncName(modulePkgName, funcName))
-	out.Write(" to i8*)")
-	return
+	return mangled
 }
 
 // lookupModuleFunc returns the ir.Func with the given canonical
@@ -359,44 +312,4 @@ func lookupModuleFunc(m @ir.Module, name @[]char) @ir.Func {
 		}
 	}
 	return nil
-}
-
-// writeFuncPtrType writes the LLVM function-pointer type for an
-// ir.Func — receiver and other params spelled out so the bitcast
-// at the vtable slot is well-formed.
-func writeFuncPtrType(out *strings.Builder, f @ir.Func) {
-	writeFuncResultLLVM(out, f)
-	out.WriteByte('(')
-	for i := 0; i < len(f.Params); i++ {
-		if i > 0 { out.Write(", ") }
-		writeParamTypeLLVM(out, f.Params[i].Typ)
-	}
-	out.Write(")*")
-	return
-}
-
-// writeFuncResultLLVM writes an ir.Func's result-type form: void /
-// single-type / multi-return-struct. Mirrors writeFuncResultsLLVM
-// in emit_funcvals.bn but takes an ir.Func instead of a func-value
-// types.Type.
-func writeFuncResultLLVM(out *strings.Builder, f @ir.Func) {
-	if len(f.Results) == 0 {
-		out.Write("void")
-		return
-	}
-	if len(f.Results) == 1 {
-		out.Write(llvmType(f.Results[0]))
-		return
-	}
-	if f.MultiReturnType != nil {
-		out.Write(llvmType(f.MultiReturnType))
-		return
-	}
-	out.Write("{")
-	for i := 0; i < len(f.Results); i++ {
-		if i > 0 { out.Write(", ") }
-		out.Write(llvmType(f.Results[i]))
-	}
-	out.Write("}")
-		return
 }

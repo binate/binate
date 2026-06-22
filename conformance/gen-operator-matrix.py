@@ -34,15 +34,24 @@ TYPES = [
 X = 5  # operand
 
 
-def cast_int(raw, width, signed):
-    """The value `cast(int, v)` yields for a width-bit pattern `raw`.
-    int is 64-bit: a 64-bit source reinterprets; a narrower source sign- or
-    zero-extends per its signedness."""
-    if width == 64:
-        return raw - (1 << 64) if raw >= (1 << 63) else raw
-    if signed:
-        return raw - (1 << width) if raw >= (1 << (width - 1)) else raw
-    return raw  # unsigned narrow: zero-extend, fits a positive int
+# Modes whose `int` is 32-bit (ILP32).  A cell whose `cast(int, …)` print differs
+# from the LP64 (64-bit-int) value gets a per-mode `.expected.<mode>` override.
+ILP32_MODES = ["builder-comp_arm32_linux", "builder-comp_arm32_baremetal"]
+
+
+def cast_int(raw, width, signed, int_width):
+    """The value `println(cast(int, v))` yields, where v is a width-bit value with
+    two's-complement pattern `raw` (0 <= raw < 2^width) and the given signedness,
+    cast to a signed `int` of int_width bits.  A source at least as wide as int
+    truncates to the low int_width bits; a narrower source sign- or zero-extends
+    per its signedness.  The result is then read as a signed int_width integer."""
+    if width >= int_width:
+        pat = raw & ((1 << int_width) - 1)
+    elif signed and raw >= (1 << (width - 1)):
+        pat = (raw - (1 << width)) & ((1 << int_width) - 1)
+    else:
+        pat = raw
+    return pat - (1 << int_width) if pat >= (1 << (int_width - 1)) else pat
 
 
 def neg_raw(width):
@@ -79,8 +88,11 @@ def cells():
                     typ = tname
                 body = [f"var x {typ} = {X}", f"var y {typ} = {opsym}x",
                         "println(cast(int, y))"]
-                expected = [cast_int(rawfn(width), width, signed)]
-                yield (os.path.join(opname, wrapper, tname), helpers, body, expected)
+                raw = rawfn(width)
+                exp64 = [cast_int(raw, width, signed, 64)]
+                exp32 = [cast_int(raw, width, signed, 32)]
+                yield (os.path.join(opname, wrapper, tname), helpers, body,
+                       exp64, exp32)
 
 
 def compound_cells():
@@ -104,7 +116,8 @@ def compound_cells():
             body = [s.format(init=init) for s in setup]
             body.append(f"{ref} {opsym} {operand}")
             body.append(f"println(cast(int, {ref}))")
-            yield (os.path.join("compound", opname, lvname), helpers, body, [expected])
+            yield (os.path.join("compound", opname, lvname), helpers, body,
+                   [expected], [expected])
 
 
 def _relop(name, a, b):
@@ -136,8 +149,8 @@ def binary_rel_cells():
                     expr = f"x {opsym} {LIT}"
                     res = _relop(opname, X, LIT)
                 body = [f"var x {tname} = {X}", f"println(cast(int, {expr}))"]
-                yield (os.path.join("rel", opname, pos, tname), "", body,
-                       [1 if res else 0])
+                rv = [1 if res else 0]
+                yield (os.path.join("rel", opname, pos, tname), "", body, rv, rv)
 
 
 def all_cells():
@@ -187,27 +200,44 @@ def render(rel, helpers, body):
     return out
 
 
+def _sync(path, content, changed, check):
+    """Reconcile `path` to `content`; `content is None` means it must not exist.
+    Records the relpath in `changed` when the on-disk state differs (for --check)."""
+    old = None
+    if os.path.exists(path):
+        with open(path) as f:
+            old = f.read()
+    if content is None:
+        if old is not None:
+            changed.append(os.path.relpath(path, os.path.dirname(DIR)))
+            if not check:
+                os.remove(path)
+        return
+    if old != content:
+        changed.append(os.path.relpath(path, os.path.dirname(DIR)))
+        if not check:
+            with open(path, "w") as f:
+                f.write(content)
+
+
 def main():
     check = "--check" in sys.argv[1:]
     changed = []
     n = 0
-    for rel, helpers, body, expected in all_cells():
+    for rel, helpers, body, exp64, exp32 in all_cells():
         n += 1
         bn = render(rel, helpers, body)
-        exp = "".join(str(x) + "\n" for x in expected)
+        s64 = "".join(str(x) + "\n" for x in exp64)
+        s32 = "".join(str(x) + "\n" for x in exp32)
         full = os.path.join(DIR, rel)
         os.makedirs(os.path.dirname(full), exist_ok=True)
-        for ext, content in ((".bn", bn), (".expected", exp)):
-            path = full + ext
-            old = None
-            if os.path.exists(path):
-                with open(path) as f:
-                    old = f.read()
-            if old != content:
-                changed.append(os.path.relpath(path, os.path.dirname(DIR)))
-                if not check:
-                    with open(path, "w") as f:
-                        f.write(content)
+        _sync(full + ".bn", bn, changed, check)
+        _sync(full + ".expected", s64, changed, check)
+        # An ILP32 (arm32) override only where the 32-bit `int` print differs;
+        # otherwise ensure no stale override lingers.
+        override = s32 if s32 != s64 else None
+        for mode in ILP32_MODES:
+            _sync(full + ".expected." + mode, override, changed, check)
     for rel, helpers, body, err in error_cells():
         n += 1
         bn = render(rel, helpers, body)

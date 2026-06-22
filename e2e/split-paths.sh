@@ -94,11 +94,19 @@ check "bootstrap" "$actual"
 # after `--` as its own user args.
 BNC_BIN="$TMP/bnc-bin"
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
+# The fixture is compiled by the BUILDER directly, so it is emitted with
+# the BUILDER's mangling scheme. Link the BUILDER's OWN bundled runtime
+# (same scheme) rather than the checkout runtime/binate_runtime.c, which
+# tracks current-source mangling and can name its symbols differently
+# from the BUILDER (e.g. across a mangle-scheme change) — pairing a
+# BUILDER-scheme compile against the checkout runtime then fails to link
+# with undefined runtime symbols (bn_..._Write, etc.).
+BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 bnc_compile_log=$("$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
     "$BINATE_DIR/cmd/bnc" -- \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$BNI_ROOT")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$IMPL_ROOT")" \
-    --runtime "$BINATE_DIR/runtime/binate_runtime.c" \
+    --runtime "$BUILDER_LIB/runtime/binate_runtime.c" \
     --build-dir "$BUILD_DIR" -o "$BNC_BIN" "$TMP/main.bn" 2>&1) || true
 if [ -x "$BNC_BIN" ]; then
     actual=$("$BNC_BIN" 2>&1) || true

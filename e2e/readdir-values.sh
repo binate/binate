@@ -18,8 +18,11 @@
 # Finding an entry by name requires d_name to read correctly; reporting its kind
 # requires d_type to read correctly; the count check pins ".",".." exclusion and
 # dotfile inclusion.  The layout differs per (OS, arch), so the check is
-# host-specific (run on x86_64 Linux it verifies that column, on arm64 macOS the
-# Darwin column, etc.); under CI it runs on each e2e matrix host.
+# host-specific: it verifies whichever column the host is — x86_64 Linux or arm64
+# macOS, the two 64-bit hosts the e2e CI matrix runs.  It does NOT cover the
+# 32-bit-Linux (arm32) column (no 32-bit e2e host; the C reference here also uses
+# plain readdir, which on a 32-bit host would itself differ from os.ReadDir's
+# readdir64) — arm32 ReadDir is covered by the qemu conformance run (006_readdir).
 #
 # Exit 0 on full agreement; non-zero with a diff on any mismatch.
 

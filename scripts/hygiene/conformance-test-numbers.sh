@@ -5,6 +5,12 @@
 # prefix that maps to more than one test (single-file *.bn, or
 # multi-file NNN_*/ directory). Each test number must be unique.
 #
+# Numbering is per-directory: the top-level conformance/ suite and each
+# spec/<chapter>/ directory are independent namespaces (every chapter
+# restarts at 001), so uniqueness is enforced WITHIN each directory, not
+# across them. A 137 in spec/14-statements and a 137 in spec/07-types is
+# fine; two 137s in spec/14-statements is not.
+#
 # Exit code: 1 if any duplicates found, 0 otherwise.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -15,34 +21,45 @@ CONFORMANCE_DIR="$BINATE_DIR/conformance"
 # hygiene runs in different worker sessions can't clobber each other's temp.
 NUMS_TMP="$(mktemp "${TMPDIR:-/tmp}/conformance-numbers.XXXXXX")"
 
-# Collect one entry per test:
-#   single-file: NNN_<name>.bn (with a sibling .expected or .error)
-#   multi-file:  NNN_<name>/ directory
-# Print "<NNN> <test-name>" lines, one per test.
-{
-    for bn in "$CONFORMANCE_DIR"/[0-9][0-9][0-9]_*.bn; do
+# Emit "<namespace>:<NNN> <test-name>" for every test directly in $1.
+#   $1 = directory to scan; $2 = namespace label (space-free) for the key.
+# Collects both single-file tests (NNN_<name>.bn with a sibling .expected
+# or .error) and multi-file tests (NNN_<name>/ directory). The namespace is
+# part of the key so duplicate detection is per-directory.
+emit_test_numbers() {
+    emit_dir="$1"
+    emit_ns="$2"
+    for bn in "$emit_dir"/[0-9][0-9][0-9]_*.bn; do
         [ -f "$bn" ] || continue
         name="$(basename "$bn" .bn)"
-        if [ -f "$CONFORMANCE_DIR/${name}.expected" ] || \
-           [ -f "$CONFORMANCE_DIR/${name}.error" ]; then
+        if [ -f "$emit_dir/${name}.expected" ] || \
+           [ -f "$emit_dir/${name}.error" ]; then
             num="$(echo "$name" | cut -c1-3)"
-            printf "%s %s\n" "$num" "$name"
+            printf "%s:%s %s\n" "$emit_ns" "$num" "$name"
         fi
     done
-    for dir in "$CONFORMANCE_DIR"/[0-9][0-9][0-9]_*/; do
+    for dir in "$emit_dir"/[0-9][0-9][0-9]_*/; do
         [ -d "$dir" ] || continue
         name="$(basename "$dir")"
         num="$(echo "$name" | cut -c1-3)"
-        printf "%s %s\n" "$num" "$name"
+        printf "%s:%s %s\n" "$emit_ns" "$num" "$name"
+    done
+}
+
+{
+    emit_test_numbers "$CONFORMANCE_DIR" "conformance"
+    for specdir in "$CONFORMANCE_DIR"/spec/*/; do
+        [ -d "$specdir" ] || continue
+        emit_test_numbers "${specdir%/}" "spec/$(basename "$specdir")"
     done
 } | sort > "$NUMS_TMP"
 
 dups=0
-prev_num=""
+prev_key=""
 prev_name=""
 group=""
-while IFS=' ' read -r num name; do
-    if [ "$num" = "$prev_num" ]; then
+while IFS=' ' read -r key name; do
+    if [ "$key" = "$prev_key" ]; then
         if [ -z "$group" ]; then
             group="$prev_name $name"
         else
@@ -50,16 +67,16 @@ while IFS=' ' read -r num name; do
         fi
     else
         if [ -n "$group" ]; then
-            echo "DUPLICATE: $prev_num used by: $group"
+            echo "DUPLICATE: $prev_key used by: $group"
             dups=$((dups + 1))
             group=""
         fi
-        prev_num="$num"
+        prev_key="$key"
         prev_name="$name"
     fi
 done < "$NUMS_TMP"
 if [ -n "$group" ]; then
-    echo "DUPLICATE: $prev_num used by: $group"
+    echo "DUPLICATE: $prev_key used by: $group"
     dups=$((dups + 1))
 fi
 rm -f "$NUMS_TMP"

@@ -115,11 +115,6 @@ bn_int_t bn_F2_3_pkg9_bootstrap1_5_Write(bn_int_t fd, BnSlice buf) {
     return (bn_int_t)w;
 }
 
-// Exit(code int)
-void bn_F2_3_pkg9_bootstrap1_4_Exit(bn_int_t code) {
-    exit((int)code);
-}
-
 // Store argc/argv for Args()
 static int bn_argc = 0;
 static char **bn_argv = NULL;

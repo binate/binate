@@ -55,7 +55,7 @@ done
 if [ "$missing" -gt 0 ]; then
     echo ""
     echo "=== $missing pkg/std package(s) not injected into the VM ==="
-    echo "Inject it: add a stdPkg{ path: \"<pkg>\", descriptor: <alias>._Package }"
+    echo "Inject it: add a stdPkg{ path: \"<pkg>\", descriptor: <alias>.__Package }"
     echo "entry to stdPkgs() in pkg/binate/interp/externs.bn."
     exit 1
 fi

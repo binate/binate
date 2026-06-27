@@ -2,10 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include <fcntl.h>
 #include <unistd.h>
-#include <sys/stat.h>
-#include <dirent.h>
 #include <sys/wait.h>
 
 // Binate runtime library
@@ -111,100 +108,11 @@ static BnManagedSlice cstr_to_managed_slice(const char *s) {
     return r;
 }
 
-// Open(path *[]char, flags int) int
-bn_int_t bn_F2_3_pkg9_bootstrap1_4_Open(BnSlice path, bn_int_t flags) {
-    char *cpath = slice_to_cstr(path);
-    int oflags = 0;
-    int mode = flags & 3;  // low 2 bits: 0=RDONLY, 1=WRONLY, 2=RDWR
-    if (mode == 0) oflags = O_RDONLY;
-    else if (mode == 1) oflags = O_WRONLY;
-    else if (mode == 2) oflags = O_RDWR;
-    // Handle combined flags
-    if (flags & 64)  oflags |= O_CREAT;
-    if (flags & 512) oflags |= O_TRUNC;
-    if (flags & 1024) oflags |= O_APPEND;
-    int fd = open(cpath, oflags, 0644);
-    free(cpath);
-    return (bn_int_t)fd;
-}
-
-// Read(fd int, buf *[]uint8) int — reads up to len(buf) bytes
-bn_int_t bn_F2_3_pkg9_bootstrap1_4_Read(bn_int_t fd, BnSlice buf) {
-    if (!buf.data || buf.len <= 0) return 0;
-    ssize_t r = read((int)fd, buf.data, (size_t)buf.len);
-    return (bn_int_t)r;
-}
-
 // Write(fd int, buf *[]uint8) int — writes len(buf) bytes
 bn_int_t bn_F2_3_pkg9_bootstrap1_5_Write(bn_int_t fd, BnSlice buf) {
     if (!buf.data || buf.len <= 0) return 0;
     ssize_t w = write((int)fd, buf.data, (size_t)buf.len);
     return (bn_int_t)w;
-}
-
-// Close(fd int) int
-bn_int_t bn_F2_3_pkg9_bootstrap1_5_Close(bn_int_t fd) {
-    return (bn_int_t)close((int)fd);
-}
-
-// ReadDir(path *[]char) @[]@[]char
-BnManagedSlice bn_F2_3_pkg9_bootstrap1_7_ReadDir(BnSlice path) {
-    char *cpath = slice_to_cstr(path);
-    DIR *dir = opendir(cpath);
-    free(cpath);
-
-    BnManagedSlice result;
-    result.data = NULL;
-    result.len = 0;
-    result.backing = NULL;
-    result.backing_len = 0;
-
-    if (!dir) return result;
-
-    // First pass: count entries
-    bn_int_t count = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        count++;
-    }
-    if (count == 0) { closedir(dir); return result; }
-
-    // Allocate managed backing for the outer slice
-    size_t elem_size = sizeof(BnManagedSlice);
-    void *backing = managed_alloc(count * elem_size);
-    BnManagedSlice *elems = (BnManagedSlice *)backing;
-
-    // Second pass: fill entries
-    rewinddir(dir);
-    bn_int_t idx = 0;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        if (idx < count) {
-            elems[idx] = cstr_to_managed_slice(entry->d_name);
-            idx++;
-        }
-    }
-    closedir(dir);
-
-    result.data = backing;
-    result.len = idx;
-    result.backing = backing;
-    result.backing_len = idx;
-    return result;
-}
-
-// Stat(path *[]char) int  — returns 0=not found, 1=file, 2=directory
-bn_int_t bn_F2_3_pkg9_bootstrap1_4_Stat(BnSlice path) {
-    char *cpath = slice_to_cstr(path);
-    struct stat st;
-    if (stat(cpath, &st) != 0) {
-        free(cpath);
-        return 0;
-    }
-    free(cpath);
-    if (S_ISDIR(st.st_mode)) return 2;
-    return 1;
 }
 
 // Exit(code int)

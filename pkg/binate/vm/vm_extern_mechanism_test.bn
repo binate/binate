@@ -1,0 +1,163 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/ast"
+import "pkg/binate/ir"
+import "pkg/binate/parser"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+import "pkg/stdx/slices"
+
+// VM↔native extern-mechanism regression tests.  These exercise the
+// `BC_CALL` -> `execExtern` branch (taken when `calleeFuncIdx < 0`: the
+// callee is a registered native extern with no compiled bytecode body) using
+// purpose-built TEST externs registered here — not `pkg/bootstrap`.  They
+// replace conformance tests 343 (`extern_call_loop`) and 142
+// (`read_slice_mutation`), which used `bootstrap.Close`/`bootstrap.Read` only
+// as convenient registered externs; the file-IO was incidental, and these
+// belong as VM unit tests so the coverage no longer depends on the
+// (being-deprecated) bootstrap file-IO surface.  See
+// explorations/plan-bootstrap-fileio-deprecation.md.
+
+// --- custom test externs (native funcs the VM dispatches via execExtern) ---
+
+// vmExternNoop is a cheap, scalar-arg, non-allocating extern (returns its
+// arg) — the VM-mechanism counterpart to the `bootstrap.Close(-1)` that 343
+// used to isolate the extern-call path.
+func vmExternNoop(x int) int {
+	return x
+}
+
+// vmExternFill writes `val`'s low byte into every element of buf, returning
+// the count — a native extern that mutates the CALLER's slice backing (343's
+// vehicle was bootstrap.Read).
+func vmExternFill(buf *[]uint8, val int) int {
+	for i := 0; i < len(buf); i++ {
+		buf[i] = cast(uint8, val)
+	}
+	return len(buf)
+}
+
+// vmExternGet reads buf[idx] back, so a SEPARATE extern call observes what
+// vmExternFill wrote into the same backing.
+func vmExternGet(buf *[]uint8, idx int) int {
+	if idx < 0 || idx >= len(buf) {
+		return -1
+	}
+	return cast(int, buf[idx])
+}
+
+// registerMechExterns binds the three test externs above under the names the
+// merged-module call sites resolve to (`test.<name>`), so a bytecode
+// `BC_CALL` to one reaches execExtern -> the registered native address.
+func registerMechExterns(vmInst @VM) {
+	var fnNoop *func(int) int = vmExternNoop
+	vmInst.RegisterExtern("test.vmExternNoop", bit_cast(*uint8, &fnNoop),
+		scalarResult, bit_cast(int, _raw_func_addr(vmExternNoop)))
+	var fnFill *func(*[]uint8, int) int = vmExternFill
+	vmInst.RegisterExtern("test.vmExternFill", bit_cast(*uint8, &fnFill),
+		scalarResult, bit_cast(int, _raw_func_addr(vmExternFill)))
+	var fnGet *func(*[]uint8, int) int = vmExternGet
+	vmInst.RegisterExtern("test.vmExternGet", bit_cast(*uint8, &fnGet),
+		scalarResult, bit_cast(int, _raw_func_addr(vmExternGet)))
+}
+
+// runMechModule compiles + runs `implSrc` (a `package "test"` source whose
+// main() may call the three test externs), returning main's result.  The
+// externs are declared via a bodyless `.bni` snippet merged into the impl
+// file (as the loader merges `.bni` decls), so the checker resolves the
+// calls while the VM leaves them un-compiled -> execExtern dispatch.
+func runMechModule(implSrc *[]readonly char) int {
+	var externDecls *[]readonly char =
+		"package \"test\"\n"
+		"func vmExternNoop(x int) int\n"
+		"func vmExternFill(buf *[]uint8, val int) int\n"
+		"func vmExternGet(buf *[]uint8, idx int) int\n"
+	var bniP @parser.Parser = parser.NewInterface(toBytes(externDecls), "test.bni")
+	var bniFile @ast.File = bniP.ParseFile()
+	var implP @parser.Parser = parser.New(toBytes(implSrc), "test.bn")
+	var implFile @ast.File = implP.ParseFile()
+
+	// Merge: prepend the extern decls into the impl file (loader-style).
+	var merged @[]@ast.Decl
+	for i := 0; i < len(bniFile.Decls); i++ {
+		bniFile.Decls[i].FromBNI = true
+		merged = slices.Append[@ast.Decl](merged, bniFile.Decls[i])
+	}
+	for i := 0; i < len(implFile.Decls); i++ {
+		merged = slices.Append[@ast.Decl](merged, implFile.Decls[i])
+	}
+	implFile.Decls = merged
+
+	var c @types.Checker = types.NewChecker()
+	c.Check(implFile)
+
+	var m @ir.Module = ir.GenModule(nil, implFile)
+	var vm @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm)
+	registerMechExterns(vm)
+	vm.LowerModule(m)
+	var idx int = vm.LookupFunc("test.main")
+	if idx < 0 {
+		return -999
+	}
+	var noArgs @[]int
+	return execFunc(vm, idx, noArgs)
+}
+
+// Probe: a single call to a custom scalar extern goes through execExtern and
+// returns its argument.  Validates the merge + registration mechanism the two
+// regression tests below rely on.
+func TestMechExternProbe() testing.TestResult {
+	var r int = runMechModule(
+		"package \"test\"\nfunc main() int { return vmExternNoop(42) }\n")
+	if r != 42 {
+		return "expected custom extern call to return 42"
+	}
+	return ""
+}
+
+// TestExternCallLoopNoHostStackLeak guards against a host-stack leak in
+// execLoop's BC_CALL extern branch (the per-call `callArgs` buffer must stay
+// hoisted out of the loop in vm_exec.bn).  Pre-fix, every BC_CALL extern grew
+// the host stack and ~262K calls overflowed it; 1,000,000 >> that, so a
+// regression fails fast (SIGSEGV) while the fixed VM finishes well under a
+// second.  vmExternNoop is the cheap scalar extern that isolates the path —
+// the role conformance 343 gave bootstrap.Close(-1) before the bootstrap
+// file-IO migration.
+func TestExternCallLoopNoHostStackLeak() testing.TestResult {
+	var src @[]char
+	src = concatStr(src, "package \"test\"\n")
+	src = concatStr(src, "func main() int {\n")
+	src = concatStr(src, "  var i int = 0\n")
+	src = concatStr(src, "  for i < 1000000 {\n")
+	src = concatStr(src, "    vmExternNoop(-1)\n")
+	src = concatStr(src, "    i = i + 1\n")
+	src = concatStr(src, "  }\n")
+	src = concatStr(src, "  return 0\n")
+	src = concatStr(src, "}\n")
+	if runMechModule(src) != 0 {
+		return "expected the 1M-extern-call loop to complete (no host-stack leak)"
+	}
+	return ""
+}
+
+// TestExternMutatesCallerSliceBacking verifies a native extern receiving a
+// Binate slice writes into the CALLER's backing memory and the mutation is
+// observable: vmExternFill writes 65 into every byte of the caller's slice,
+// then a SEPARATE vmExternGet call reads element 2 back as 65 — proving both
+// externs operate on the same backing the caller holds (a copy would read
+// back 0).  This is the slice-across-extern-ABI property conformance 142
+// exercised via bootstrap.Read.
+func TestExternMutatesCallerSliceBacking() testing.TestResult {
+	var src @[]char
+	src = concatStr(src, "package \"test\"\n")
+	src = concatStr(src, "func main() int {\n")
+	src = concatStr(src, "  var s @[]uint8 = make_slice(uint8, 5)\n")
+	src = concatStr(src, "  vmExternFill(s, 65)\n")
+	src = concatStr(src, "  return vmExternGet(s, 2)\n")
+	src = concatStr(src, "}\n")
+	if runMechModule(src) != 65 {
+		return "extern did not mutate the caller's slice backing"
+	}
+	return ""
+}

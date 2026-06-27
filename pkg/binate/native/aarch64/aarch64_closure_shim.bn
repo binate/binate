@@ -26,16 +26,20 @@ import "pkg/stdx/slices"
 //     gets pushed to the stack by AAPCS64's classifier (no
 //     remaining GP-reg budget):
 //       shim:
-//         SUB sp, sp, #stkBytes        ; stkBytes already 16-aligned
+//         STP fp,lr,[sp,#-16]!          ; LR survives the BL on the stack
+//         MOV fp,sp
+//         SUB sp, sp, #stkBytes         ; stkBytes already 16-aligned
 //                                       ; by CallStackBytes
 //         <spill stack-bound args: [X0+ofs] → X16 → [SP+sof]>
 //         <move user-args incoming → outgoing positions>
 //         <load reg-bound captures: [X0+ofs] → argReg(rs)>
 //         BL underlying_fn
 //         ADD sp, sp, #stkBytes
+//         LDP fp,lr,[sp],#16
 //         RET
-//     X16 is the AAPCS64 intra-call scratch (IP0); same role as
-//     RAX in the x64 stack-spill path.
+//     X16 is the AAPCS64 intra-call scratch (IP0) used only as the
+//     intra-shim spill shuttle (consumed before the BL); the framed
+//     prologue keeps LR off X16, since the callee may clobber IP0.
 
 // lookupClosureFuncAA64 returns the Func with the given name iff
 // it is a capturing-literal closure (IsClosure=true).  Returns nil
@@ -225,10 +229,11 @@ func emitClosureShimFastAA64(a @asm.Assembler, fnLabel @[]char,
 // emitClosureShimStackSpillAA64 handles the AAPCS64 mixed-or-stack
 // case: at least one outgoing arg has a stack component.  Sets up a
 // proper call frame around BL.  Ordering:
-//   1. SUB sp, sp, #stkBytes  — reserve the outgoing-args area.
-//      stkBytes is already 16-byte-aligned by CallStackBytes, so SP
-//      stays 16-aligned (LR / FP are NOT pushed: the shim is a
-//      leaf-call frame, so the BL itself preserves alignment).
+//   1. STP FP,LR,[sp,#-16]! ; SUB sp, sp, #stkBytes — save the frame
+//      record (so LR survives the BL on the stack, NOT in the caller-
+//      clobbered X16 a non-leaf BL would otherwise need) and reserve
+//      the outgoing-args area.  stkBytes is 16-aligned by
+//      CallStackBytes, so SP stays 16-aligned.
 //   2. Spill stack-bound capture words via X16 (AAPCS intra-call
 //      scratch).  Done first because X0 is the closure-struct base
 //      — steps 3 / 4 may overwrite it.
@@ -240,13 +245,25 @@ func emitClosureShimFastAA64(a @asm.Assembler, fnLabel @[]char,
 //      reg part loads here; the stack part was spilled in step 2.
 //      Right-to-left over captures so the i=0 case (which may write
 //      X0) runs last.
-//   5. BL underlying, ADD sp + RET.
+//   5. BL underlying, ADD sp, LDP FP,LR + RET.
 func emitClosureShimStackSpillAA64(a @asm.Assembler, fnLabel @[]char,
 		fvTyp @types.Type, f @ir.Func, cc common.CallConv,
 		argTypes @[]@types.Type, nUserWords int) {
 	var stkBytes int = cc.CallStackBytes(argTypes)
+	// Framed prologue: STP saves FP/LR so the caller's LR survives the BL
+	// ON THE STACK, not in caller-clobbered X16 (IP0) — the lifted body may
+	// trash X16 (e.g. dereferencing an indirect-large user-arg pointer), so
+	// the old leaf-shim "stash LR in X16 across the BL" corrupted the return.
+	// Then reserve the outgoing-args area below.  stkBytes is 16-aligned by
+	// CallStackBytes, so SP stays 16-aligned.  The caller's incoming stack
+	// args sit at [SP + frameDelta], frameDelta = 16 (the frame record) +
+	// stkBytes.
+	aarch64.Stp(a, true, aarch64.FP, aarch64.LR,
+		aarch64.MemPre(aarch64.SP, -16))
+	aarch64.Mov(a, true, aarch64.FP, aarch64.Reg(aarch64.SP))
 	aarch64.Sub(a, true, aarch64.SP, aarch64.SP,
 		aarch64.Imm(stkBytes))
+	var frameDelta int = 16 + stkBytes
 
 	// Step 1: spill stack-bound capture portions from the closure-struct
 	// base (X0, still live here — steps 2/3 may overwrite it).
@@ -260,9 +277,9 @@ func emitClosureShimStackSpillAA64(a @asm.Assembler, fnLabel @[]char,
 	// Incoming layout: user-arg word with global word-index
 	// inIdx (0..nUserWords-1) is in X(1 + inIdx) if inIdx < 7,
 	// else on the CALLER'S stack at [SP_orig + (inIdx - 7) * 8].
-	// After step 0's `SUB sp, sp, #stkBytes`, the caller's SP is
-	// at [SP + stkBytes], so the stack source address becomes
-	// [SP + stkBytes + (inIdx - 7) * 8].
+	// After the framed prologue (STP + SUB), the caller's SP is at
+	// [SP + frameDelta], so the stack source address becomes
+	// [SP + frameDelta + (inIdx - 7) * 8].
 	//
 	// Outgoing layout is what the classifier dictates for argIdx.
 	// Four transfer shapes:
@@ -288,9 +305,9 @@ func emitClosureShimStackSpillAA64(a @asm.Assembler, fnLabel @[]char,
 		var outStkOff int = cc.CallArgStackOff(argTypes, argIdx)
 		var storeSize int = cc.StackArgStoreSize(ut, false)
 		for k := nUw - 1; k >= 0; k = k - 1 {
-			// Incoming prefix is 1 (data in X0); the post-SUB caller stack
-			// sits at [SP + stkBytes].
-			emitUserArgWordMoveAA64(a, inRegBase, k, 1, stkBytes,
+			// Incoming prefix is 1 (data in X0); the caller stack sits at
+			// [SP + frameDelta] (the framed prologue's record + outgoing area).
+			emitUserArgWordMoveAA64(a, inRegBase, k, 1, frameDelta,
 				outRegStart, outStkOff, storeSize)
 		}
 	}
@@ -300,20 +317,16 @@ func emitClosureShimStackSpillAA64(a @asm.Assembler, fnLabel @[]char,
 	// regStart==0) runs last, keeping X0 live as the base.
 	emitClosureCaptureRegLoadAA64(a, cc, f, argTypes, aarch64.X0)
 
-	// Step 4: BL underlying, unwind the stack frame.  The CALLER's
-	// LR is still in LR (we haven't pushed it — leaf shim), so we
-	// need to preserve it across BL.  BL overwrites LR with the
-	// shim's return address, so before calling we save LR into
-	// X16 (AAPCS intra-call scratch — already used as the shuttle,
-	// but its value has been consumed by step 1 already).  After
-	// BL, restore LR from X16 before RET so the shim returns to
-	// the original caller.
-	aarch64.Mov(a, true, aarch64.X16, aarch64.Reg(aarch64.LR))
+	// Step 4: BL underlying, then unwind.  LR was saved on the stack by the
+	// prologue's STP, so tear down the outgoing-args area and restore FP/LR
+	// with the matching LDP before RET.  (BL clobbers LR, and the lifted
+	// body may clobber X16 — neither matters now that LR lives on the stack.)
 	a.SetGlobal(fnLabel)
 	aarch64.Bl(a, fnLabel)
-	aarch64.Mov(a, true, aarch64.LR, aarch64.Reg(aarch64.X16))
 	aarch64.Add(a, true, aarch64.SP, aarch64.SP,
 		aarch64.Imm(stkBytes))
+	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR,
+		aarch64.MemPost(aarch64.SP, 16))
 	aarch64.Ret(a)
 }
 
@@ -344,8 +357,9 @@ func totalCaptureWordsAA64(f @ir.Func) int {
 // the scalar/void shim where data rides X0, so args start at X1; 2 for
 // the aggregate shim where retbuf+data ride X0/X1 and args start at X2).
 // frameDelta is the byte distance from the current SP to the caller's
-// incoming stack-arg base (the post-SUB stkBytes for the leaf scalar
-// shim; STP(16) + inner area for the aggregate shim's framed prologue).
+// incoming stack-arg base — STP(16) for the frame record + the inner
+// outgoing-args area, the framed-prologue form both the scalar and
+// aggregate stack-spill shims use.
 //
 // The incoming source is the global word index `inIdx = inRegBase + k - 1`
 // (0-based across all user-arg words): reg X(prefixRegs + inIdx) when it

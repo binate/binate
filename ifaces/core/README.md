@@ -8,4 +8,4 @@ Holds `pkg/builtins/lang.bni` and `pkg/builtins/testing.bni` today.
 `pkg/builtins/rt.bni` joins when Step 4 of
 [`explorations/pkg-layout-plan.md`](../../explorations/pkg-layout-plan.md)
 resumes (after a new BUILDER tarball ships with the
-`bn_pkg__builtins__rt__…` symbol prefix baked in).
+length-prefix mangling scheme baked in).

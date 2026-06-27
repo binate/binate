@@ -90,8 +90,8 @@ CELLS = [
     # struct, which is TYP_STRUCT directly). The one cell exercising BOTH codegen
     # global fixes at once: discoverStructFromType's TYP_NAMED arm must reach the
     # underlying struct through the global (no function references it) so
-    # `%bn_main__S` is declared, AND the static-zero dispatch must peel TYP_NAMED
-    # so the `%bn_main__S` slot gets `zeroinitializer`, not the invalid ` 0`.
+    # `%bn_S...` is declared, AND the static-zero dispatch must peel TYP_NAMED
+    # so the `%bn_S...` slot gets `zeroinitializer`, not the invalid ` 0`.
     # Compile assertion (read `0`): field access on a named-distinct VALUE is a
     # separate unratified spec question (claude-todo), so main does not read G's
     # fields — which also keeps the struct reachable ONLY via the global, the

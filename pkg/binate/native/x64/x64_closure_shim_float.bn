@@ -5,6 +5,7 @@ import "pkg/binate/asm/x64"
 import "pkg/binate/ir"
 import "pkg/binate/native/common"
 import "pkg/binate/types"
+import "pkg/stdx/slices"
 
 // Float-aware closure shim for the x64 (SysV-AMD64) native backend
 // (claude-todo #121).  A capturing closure with a float-scalar CAPTURE,
@@ -44,10 +45,10 @@ func closureHasFloatParts_x64(fvTyp @types.Type, f @ir.Func) bool {
 // Sourcing everything from memory (R10 struct / stack spill) makes the marshal
 // order clobber-free (dests are RDI..R9 / XMM0..7, neither R10, RSP, nor the
 // RAX scratch).  After the CALL a float-scalar return is movq/movd'd
-// xmm0 -> rax for the all-int shim.  Register-only: the underlying call must
-// fit RDI..R9 + XMM0..7 and the incoming user args must fit RSI..R9; beyond
-// that the shim records a.SetError (the stack-overflow float path isn't
-// implemented — rare, untested).
+// xmm0 -> rax for the all-int shim.  GP / FP / incoming overflow is handled: the
+// classifier sizes an outgoing-args area at [RSP+0..] where the marshaller places
+// overflow words, and the spill draws incoming user args from RSI..R9 plus the
+// caller's stack.
 func emitClosureShimFloat_x64(a @asm.Assembler, fnLabel @[]char,
 		fvTyp @types.Type, f @ir.Func) {
 	// A SMALL multi-return RESULT (in-register, not sret) alongside float
@@ -60,48 +61,17 @@ func emitClosureShimFloat_x64(a @asm.Assembler, fnLabel @[]char,
 	// leaves a multi-return untouched.  A BIG (sret) float multi-return is
 	// routed to the SetError in emitClosureShim_x64 before reaching here.
 	var cc common.CallConv = common.SysV_AMD64()
-	// Walk 1: outgoing GP/FP register counts + incoming user-arg GP words.
-	var ngrn int = 0
-	var nsrn int = 0
-	for i := 0; i < f.NumCaptureParams; i++ {
-		var ft @types.Type = f.ClosureStruct.Fields[i].Type
-		if common.IsFloatScalarTyp(ft) {
-			nsrn = nsrn + 1
-		} else if isIndirectLargeCap_x64(cc, ft) {
-			ngrn = ngrn + 1
-		} else {
-			ngrn = ngrn + common.ArgWords(ft)
-		}
-	}
-	var nUserWords int = 0
-	for pi := 0; pi < len(fvTyp.Params); pi++ {
-		var pt @types.Type = fvTyp.Params[pi].Type
-		// EffectiveArgWords: an indirect-large aggregate user arg is one
-		// pointer word (in a GP reg / the spill), not its full ArgWords.
-		if common.IsFloatScalarTyp(pt) {
-			nsrn = nsrn + 1
-		} else {
-			ngrn = ngrn + cc.EffectiveArgWords(pt)
-		}
-		nUserWords = nUserWords + cc.EffectiveArgWords(pt)
-	}
-	// Outgoing GP fits RDI..R9 (6); incoming user args fit RSI..R9 (5, since RDI
-	// is the closure ptr).  Float captures/params beyond the 8 FP arg registers
-	// overflow to the outgoing-args stack (handled below); GP / incoming-arg
-	// overflow stays the unimplemented stack-spill path.
-	if ngrn > 6 || nUserWords > 5 {
-		a.SetError("native x64: float closure shim needs the unimplemented "
-			"stack-overflow path (captures/args exceed the register budget)")
-		return
-	}
-	// Frame: an outgoing-args area for the FP-overflow floats (the 9th+ float
-	// capture/param — sequential 8-byte slots, since GP args stay in regs so
-	// floats are the only stack args) sits at [RSP+0..]; the incoming user-arg
-	// spill sits above it.  push rbp / mov rbp,rsp re-aligns rsp to 16; the
-	// 16-aligned sub keeps it aligned for the CALL.
-	var fpOverflow int = 0
-	if nsrn > cc.NumFpArgRegs { fpOverflow = nsrn - cc.NumFpArgRegs }
-	var outBytes int = fpOverflow * 8
+	// Outgoing-args area (GP + FP overflow) sized by the classifier, and the
+	// incoming user-arg word count (EffectiveArgWords: an indirect-large user
+	// arg is one pointer word).
+	var argTypes @[]@types.Type = buildShimArgTypes_x64(fvTyp, f)
+	var nUserWords int = userWords_x64(cc, fvTyp)
+	var outBytes int = cc.CallStackBytes(argTypes)
+	// Frame: push rbp re-aligns rsp to 16 (the entry return-address push left it
+	// at 8); the 16-rounded sub keeps it aligned for the CALL.  The outgoing-args
+	// overflow area is at [RSP+0..outBytes) (where the callee reads its GP/FP
+	// overflow stack args); the incoming user-arg spill sits above it at
+	// [RSP+outBytes..].
 	var frameBytes int = outBytes + nUserWords * 8
 	if frameBytes % 16 != 0 { frameBytes = frameBytes + 8 }
 	x64.Push(a, x64.Reg(x64.RBP, x64.SZ64))
@@ -112,18 +82,25 @@ func emitClosureShimFloat_x64(a @asm.Assembler, fnLabel @[]char,
 	// R10 = closure-struct base (RDI holds it on entry).  R10 is caller-saved
 	// and never an outgoing arg register, so it survives the marshal.
 	x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Reg(x64.RDI, x64.SZ64))
-	// Spill incoming user-arg words argReg(1..nUserWords) (RSI..) above the
-	// outgoing-args area, at [RSP + outBytes + w*8].
-	for w := 0; w < nUserWords; w++ {
-		x64.Mov(a, x64.Mem(x64.RSP, outBytes + w * 8, x64.SZ64),
-			x64.Reg(argReg(1 + w), x64.SZ64))
+	// Spill the incoming user-arg words to [RSP + outBytes + w*8]: RSI..R9 hold
+	// the first 5 (RDI is the closure ptr); any beyond arrive on the caller's
+	// stack at [RBP + 16 + (w-5)*8] (RBP+0 saved rbp, +8 return addr, +16 first
+	// incoming stack arg).
+	for w := 0; w < nUserWords; w = w + 1 {
+		if w < 5 {
+			x64.Mov(a, x64.Mem(x64.RSP, outBytes + w * 8, x64.SZ64),
+				x64.Reg(argReg(1 + w), x64.SZ64))
+		} else {
+			x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+				x64.Mem(x64.RBP, 16 + (w - 5) * 8, x64.SZ64))
+			x64.Mov(a, x64.Mem(x64.RSP, outBytes + w * 8, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
+		}
 	}
-	// Marshal the underlying call's args from memory into their SysV registers
-	// by class: captures from [R10 + ofs], user args from the spill at
-	// [RSP + outBytes + w*8]; an FP-overflow float goes to the outgoing-args
-	// area at [RSP + 0..].  gpDestBase 0 — the scalar/void underlying's GP args
-	// start at RDI.
-	loadClosureFloatCallArgs_x64(a, cc, fvTyp, f, x64.R10, outBytes, 0)
+	// Marshal from memory by class: captures from [R10 + ofs], user args from the
+	// spill at [RSP + outBytes + w*8]; GP/FP overflow to the outgoing-args area at
+	// [RSP+0..].  capBaseIdx 0 — the scalar/void underlying's args start at RDI.
+	loadClosureFloatCallArgs_x64(a, cc, fvTyp, f, argTypes, 0, x64.R10, outBytes)
 	a.SetGlobal(fnLabel)
 	x64.Call(a, fnLabel)
 	// Float-scalar return: the lifted body returns it in xmm0; the all-int
@@ -158,96 +135,105 @@ func emitFloatLoadToXmm_x64(a @asm.Assembler, xmm int, base int, ofs int,
 	}
 }
 
-// emitFloatToOverflowStack_x64 moves an FP-overflow float-scalar value at
-// [base + ofs] to the underlying call's outgoing-args stack at [RSP + dstOff]
-// (an 8-byte slot, matching the callee prologue's read).  Shuttles through RAX
-// (never an arg register here): a float32 via a 32-bit MOV (which zero-extends
-// RAX) so the slot's high 4 bytes are clean; a float64 via a 64-bit MOV.
-func emitFloatToOverflowStack_x64(a @asm.Assembler, base int, ofs int,
-		dstOff int, ft @types.Type) {
-	if common.FloatScalarIsI32(ft) {
-		x64.Mov(a, x64.Reg(x64.RAX, x64.SZ32), x64.Mem(base, ofs, x64.SZ32))
-	} else {
-		x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(base, ofs, x64.SZ64))
+// marshalFloatShimArg_x64 places one underlying-call arg (type t, classified at
+// argTypes[argIdx]) from [srcBase + srcOfs] into its SysV register/stack slot,
+// returning the XMM cursor nsrn advanced past a float scalar.  isCapture selects
+// the indirect-large form: a capture is pointer-passed from the struct (LEA), a
+// user arg's pointer is already in the spill (MOV).  Overflow (a float past
+// XMM0..7, or a GP word past the arg regs) goes to the outgoing-args area at the
+// classifier's CallArgStackOff in an 8-byte slot (SysV pads narrow stack args, so
+// no narrow store; a float32 is loaded 32-bit to zero the slot's high half).
+// SysV never SPLITs an aggregate — a GP arg is wholly in regs (regStart >= 0) or
+// wholly on the stack.  RAX is the shuttle scratch (never an arg register).
+func marshalFloatShimArg_x64(a @asm.Assembler, cc common.CallConv,
+		argTypes @[]@types.Type, argIdx int, t @types.Type, srcBase int,
+		srcOfs int, isCapture bool, nsrn int) int {
+	if common.IsFloatScalarTyp(t) {
+		if nsrn < cc.NumFpArgRegs {
+			emitFloatLoadToXmm_x64(a, x64.XMM0 + nsrn, srcBase, srcOfs, t)
+		} else {
+			if common.FloatScalarIsI32(t) {
+				x64.Mov(a, x64.Reg(x64.RAX, x64.SZ32),
+					x64.Mem(srcBase, srcOfs, x64.SZ32))
+			} else {
+				x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+					x64.Mem(srcBase, srcOfs, x64.SZ64))
+			}
+			x64.Mov(a, x64.Mem(x64.RSP,
+				cc.CallArgStackOff(argTypes, argIdx), x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
+		}
+		return nsrn + 1
 	}
-	x64.Mov(a, x64.Mem(x64.RSP, dstOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+	var regStart int = cc.CallArgRegStart(argTypes, argIdx)
+	var stackOff int = cc.CallArgStackOff(argTypes, argIdx)
+	if isIndirectLargeCap_x64(cc, t) {
+		// A single pointer word: LEA from the struct for a capture, or load the
+		// dispatch-materialized pointer from the spill for a user arg.
+		if regStart >= 0 {
+			if isCapture {
+				x64.Lea(a, x64.Reg(argReg(regStart), x64.SZ64),
+					x64.Mem(srcBase, srcOfs, x64.SZ64))
+			} else {
+				x64.Mov(a, x64.Reg(argReg(regStart), x64.SZ64),
+					x64.Mem(srcBase, srcOfs, x64.SZ64))
+			}
+			return nsrn
+		}
+		if isCapture {
+			x64.Lea(a, x64.Reg(x64.RAX, x64.SZ64),
+				x64.Mem(srcBase, srcOfs, x64.SZ64))
+		} else {
+			x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+				x64.Mem(srcBase, srcOfs, x64.SZ64))
+		}
+		x64.Mov(a, x64.Mem(x64.RSP, stackOff, x64.SZ64),
+			x64.Reg(x64.RAX, x64.SZ64))
+		return nsrn
+	}
+	// Plain GP arg: nw words, wholly in regs or wholly on the stack.
+	var nw int = common.ArgWords(t)
+	for k := 0; k < nw; k = k + 1 {
+		if regStart >= 0 {
+			x64.Mov(a, x64.Reg(argReg(regStart + k), x64.SZ64),
+				x64.Mem(srcBase, srcOfs + k * 8, x64.SZ64))
+		} else {
+			x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+				x64.Mem(srcBase, srcOfs + k * 8, x64.SZ64))
+			x64.Mov(a, x64.Mem(x64.RSP, stackOff + k * 8, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
+		}
+	}
+	return nsrn
 }
 
-// loadClosureFloatCallArgs_x64 loads the underlying lifted-body call's args
-// into their SysV registers BY CLASS: a float-scalar capture/param into
-// xmm[nsrn], every other word into argReg(gpDestBase + ngrn).  Captures source
-// [structPtr + fieldOfs]; user args source the spill area
-// [RSP + spillBaseOff + word*8] (the caller spilled the incoming positional-GP
-// user-arg words there).  Every source is memory and every GP/XMM dest is
-// disjoint from the GP sources, so the loads are order-independent and
-// clobber-free (RAX, the emitFloatLoadToXmm_x64 scratch, is never an arg
-// register).  gpDestBase is the first GP arg slot the underlying uses: 0 for
-// the scalar/void and pack shapes (args at RDI..), 1 for the sret shape (RDI is
-// the sret pointer, so args start at RSI).  Shared by the float-scalar
-// (emitClosureShimFloat_x64) and float-aggregate (emitClosureShimFloatAggregate_x64)
-// closure shims.
+// loadClosureFloatCallArgs_x64 marshals the underlying lifted-body call's args
+// into their SysV slots BY CLASS, classifier-driven so every overflow word lands
+// where the lifted body's prologue reads it.  Captures source [structPtr + ofs]
+// (an indirect-large capture is LEA'd); user args source the spill at
+// [RSP + spillBaseOff + word*8].  argTypes is the classifier list and capBaseIdx
+// the index where the captures begin in it: 0 for the scalar/void and pack shapes
+// (args from RDI), 1 for the sret shape (argTypes leads with a synthetic sret-slot
+// pointer occupying RDI, so the classifier starts captures at RSI).  Every source
+// is memory and every dest disjoint from the GP/XMM sources, so the loads are
+// clobber-free.  Shared by the float-scalar (emitClosureShimFloat_x64) and
+// float-aggregate (emitClosureShimFloatAggregate_x64) shims.
 func loadClosureFloatCallArgs_x64(a @asm.Assembler, cc common.CallConv,
-		fvTyp @types.Type, f @ir.Func, structPtr int, spillBaseOff int,
-		gpDestBase int) {
-	var ngrn int = 0
+		fvTyp @types.Type, f @ir.Func, argTypes @[]@types.Type,
+		capBaseIdx int, structPtr int, spillBaseOff int) {
 	var nsrn int = 0
-	// FP-overflow floats (the 9th+ float) go to the outgoing-args area at
-	// [RSP + fpOverflowOff], sequential 8-byte slots — the scalar shim reserved
-	// the space (the aggregate shim gates nsrn > NumFpArgRegs to SetError, so it
-	// never reaches this path).
-	var fpOverflowOff int = 0
-	for i := 0; i < f.NumCaptureParams; i++ {
+	for i := 0; i < f.NumCaptureParams; i = i + 1 {
 		var ft @types.Type = f.ClosureStruct.Fields[i].Type
-		var ofs int = f.ClosureStruct.FieldOffset(i)
-		if common.IsFloatScalarTyp(ft) {
-			if nsrn < cc.NumFpArgRegs {
-				emitFloatLoadToXmm_x64(a, x64.XMM0 + nsrn, structPtr, ofs, ft)
-			} else {
-				emitFloatToOverflowStack_x64(a, structPtr, ofs, fpOverflowOff,
-					ft)
-				fpOverflowOff = fpOverflowOff + 8
-			}
-			nsrn = nsrn + 1
-		} else if isIndirectLargeCap_x64(cc, ft) {
-			x64.Lea(a, x64.Reg(argReg(gpDestBase + ngrn), x64.SZ64),
-				x64.Mem(structPtr, ofs, x64.SZ64))
-			ngrn = ngrn + 1
-		} else {
-			var nw int = common.ArgWords(ft)
-			for k := 0; k < nw; k++ {
-				x64.Mov(a, x64.Reg(argReg(gpDestBase + ngrn), x64.SZ64),
-					x64.Mem(structPtr, ofs + k * 8, x64.SZ64))
-				ngrn = ngrn + 1
-			}
-		}
+		nsrn = marshalFloatShimArg_x64(a, cc, argTypes, capBaseIdx + i, ft,
+			structPtr, f.ClosureStruct.FieldOffset(i), true, nsrn)
 	}
 	var inWord int = 0
-	for pi := 0; pi < len(fvTyp.Params); pi++ {
+	for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
 		var pt @types.Type = fvTyp.Params[pi].Type
-		if common.IsFloatScalarTyp(pt) {
-			if nsrn < cc.NumFpArgRegs {
-				emitFloatLoadToXmm_x64(a, x64.XMM0 + nsrn, x64.RSP,
-					spillBaseOff + inWord * 8, pt)
-			} else {
-				emitFloatToOverflowStack_x64(a, x64.RSP,
-					spillBaseOff + inWord * 8, fpOverflowOff, pt)
-				fpOverflowOff = fpOverflowOff + 8
-			}
-			nsrn = nsrn + 1
-			inWord = inWord + 1
-		} else {
-			// EffectiveArgWords (not ArgWords): an indirect-large aggregate
-			// user arg is a single pointer word in the spill and one outgoing
-			// reg; ArgWords would over-read the spill and over-shift ngrn.
-			var nw int = cc.EffectiveArgWords(pt)
-			for k := 0; k < nw; k++ {
-				x64.Mov(a, x64.Reg(argReg(gpDestBase + ngrn), x64.SZ64),
-					x64.Mem(x64.RSP, spillBaseOff + (inWord + k) * 8,
-						x64.SZ64))
-				ngrn = ngrn + 1
-			}
-			inWord = inWord + nw
-		}
+		nsrn = marshalFloatShimArg_x64(a, cc, argTypes,
+			capBaseIdx + f.NumCaptureParams + pi, pt, x64.RSP,
+			spillBaseOff + inWord * 8, false, nsrn)
+		inWord = inWord + cc.EffectiveArgWords(pt)
 	}
 }
 
@@ -261,110 +247,96 @@ func loadClosureFloatCallArgs_x64(a @asm.Assembler, cc common.CallConv,
 //   * Pack (retSz 1..16): the lifted body packs the aggregate into RAX (+RDX)
 //     REGARDLESS of field class — emitAggregateReturnPack is all-GP — so the
 //     shim copies RAX (+RDX) straight through the stashed retbuf with no FP
-//     result handling.  Captures + user args start at RDI (gpDestBase 0).
-//   * Sret (retSz > 16): retbuf is the underlying's SysV sret pointer in RDI,
-//     so it stays put and captures + user args start at RSI (gpDestBase 1); the
-//     lifted body writes the result through it.
+//     result handling.  The classifier places captures + user args from RDI
+//     (capBaseIdx 0).
+//   * Sret (retSz > 16): retbuf is the underlying's SysV sret pointer in RDI, so
+//     it stays put; a synthetic sret-slot pointer prepended to argTypes makes the
+//     classifier place captures + user args from RSI (capBaseIdx 1).  The lifted
+//     body writes the result through RDI.
 //
-// Register-only: GP outgoing must fit RDI..R9, FP must fit XMM0..7, and the
-// incoming user words must fit RDX..R9 (≤ 4) — beyond that the shim records a
-// compile error (the stack-overflow float path is claude-todo #121's reg-
-// overflow case, not yet implemented).
+// GP / FP / incoming overflow is handled (mirroring emitClosureShimFloat_x64):
+// the frame reserves the classifier-sized outgoing-args area at [RSP+0..] where
+// the marshaller places overflow words, and the spill draws incoming user args
+// from RDX..R9 plus the caller's stack.
 func emitClosureShimFloatAggregate_x64(a @asm.Assembler, fnLabel @[]char,
 		fvTyp @types.Type, f @ir.Func, retSz int) {
 	var cc common.CallConv = common.SysV_AMD64()
 	var useSret bool = retSz > 16
-	var gpDestBase int = 0
-	if useSret { gpDestBase = 1 }
-	// Outgoing GP/FP budget + incoming user-word count (all user words, float
-	// bits included, arrive in GP slots and are spilled).
-	var ngrn int = 0
-	var nsrn int = 0
-	for i := 0; i < f.NumCaptureParams; i++ {
-		var ft @types.Type = f.ClosureStruct.Fields[i].Type
-		if common.IsFloatScalarTyp(ft) {
-			nsrn = nsrn + 1
-		} else if isIndirectLargeCap_x64(cc, ft) {
-			ngrn = ngrn + 1
-		} else {
-			ngrn = ngrn + common.ArgWords(ft)
-		}
-	}
-	var nUserWords int = 0
-	for pi := 0; pi < len(fvTyp.Params); pi++ {
-		var pt @types.Type = fvTyp.Params[pi].Type
-		// EffectiveArgWords: an indirect-large aggregate user arg is one
-		// pointer word, not its full ArgWords.
-		if common.IsFloatScalarTyp(pt) {
-			nsrn = nsrn + 1
-		} else {
-			ngrn = ngrn + cc.EffectiveArgWords(pt)
-		}
-		nUserWords = nUserWords + cc.EffectiveArgWords(pt)
-	}
-	// The nsrn > NumFpArgRegs (FP overflow) arm of this guard is load-bearing:
-	// the shared marshaller routes an overflow float to the outgoing-args area at
-	// [RSP+0..], but THIS shim's frame puts the retbuf save slot / user-arg spill
-	// there (not a reserved overflow area).  Do NOT relax the FP-overflow arm
-	// without first restructuring this frame to reserve [RSP+0..] for outgoing
-	// args (as emitClosureShimFloat_x64 does), or the overflow store corrupts the
-	// retbuf/spill.
-	if gpDestBase + ngrn > 6 || nsrn > cc.NumFpArgRegs || nUserWords > 4 {
-		a.SetError("native x64: float closure with an aggregate return needs "
-			"the unimplemented stack-overflow path (captures/args exceed the "
-			"register budget)")
-		return
-	}
+	// argTypes for the classifier: captures ++ params, with a synthetic sret-slot
+	// pointer prepended for the sret shape so the classifier accounts for the
+	// retbuf consuming RDI (captures then start at RSI, the overflow boundary one
+	// register earlier).  capBaseIdx is where the captures begin in argTypes.
+	var capBaseIdx int = 0
+	var argTypes @[]@types.Type
 	if useSret {
-		// Sret: retbuf stays in RDI (the underlying's sret slot, gpDestBase 1).
-		// Frame + spill the incoming user args, marshal captures/args into
-		// RSI.., CALL, tear down — the underlying wrote the result through RDI.
-		var frameBytes int = nUserWords * 8
-		if frameBytes % 16 != 0 { frameBytes = frameBytes + 8 }
-		x64.Push(a, x64.Reg(x64.RBP, x64.SZ64))
-		x64.Mov(a, x64.Reg(x64.RBP, x64.SZ64), x64.Reg(x64.RSP, x64.SZ64))
-		if frameBytes > 0 {
-			x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frameBytes))
-		}
-		x64.Mov(a, x64.Reg(x64.R11, x64.SZ64), x64.Reg(x64.RSI, x64.SZ64))
-		for w := 0; w < nUserWords; w++ {
-			x64.Mov(a, x64.Mem(x64.RSP, w * 8, x64.SZ64),
-				x64.Reg(argReg(2 + w), x64.SZ64))
-		}
-		loadClosureFloatCallArgs_x64(a, cc, fvTyp, f, x64.R11, 0, gpDestBase)
-		a.SetGlobal(fnLabel)
-		x64.Call(a, fnLabel)
-		if frameBytes > 0 {
-			x64.Add(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frameBytes))
-		}
-		x64.Pop(a, x64.Reg(x64.RBP, x64.SZ64))
-		x64.Ret(a)
-		return
+		capBaseIdx = 1
+		argTypes = slices.Append[@types.Type](argTypes,
+			types.MakePointerType(types.TypUint8()))
 	}
-	// Pack (retSz 1..16): the frame holds the retbuf save slot ([RSP+0]) and the
-	// incoming user-arg spill ([RSP+8 + w*8]).  Stash retbuf, move data RSI ->
-	// R11, spill user args, marshal (captures/args at RDI.., gpDestBase 0),
-	// CALL, reload retbuf into R10, copy the all-GP packed return through it.
-	var frameBytes int = 8 + nUserWords * 8
+	for i := 0; i < f.NumCaptureParams; i = i + 1 {
+		argTypes = slices.Append[@types.Type](argTypes,
+			f.ClosureStruct.Fields[i].Type)
+	}
+	for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
+		argTypes = slices.Append[@types.Type](argTypes, fvTyp.Params[pi].Type)
+	}
+	var nUserWords int = userWords_x64(cc, fvTyp)
+	var outBytes int = cc.CallStackBytes(argTypes)
+	// Frame (low -> high): the outgoing-args overflow area [RSP+0..outBytes)
+	// (where the callee reads its GP/FP overflow stack args at the CALL), the
+	// incoming user-arg spill [RSP+outBytes..], and (pack only) a retbuf save slot
+	// above that.  push rbp re-aligns rsp to 16; the 16-rounded sub keeps it
+	// aligned for the CALL.  Sret keeps the retbuf in RDI (no save slot).
+	var retbufOff int = outBytes + nUserWords * 8
+	var frameBytes int = retbufOff
+	if !useSret { frameBytes = retbufOff + 8 }
 	if frameBytes % 16 != 0 { frameBytes = frameBytes + 8 }
 	x64.Push(a, x64.Reg(x64.RBP, x64.SZ64))
 	x64.Mov(a, x64.Reg(x64.RBP, x64.SZ64), x64.Reg(x64.RSP, x64.SZ64))
-	x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frameBytes))
-	x64.Mov(a, x64.Mem(x64.RSP, 0, x64.SZ64), x64.Reg(x64.RDI, x64.SZ64))
-	x64.Mov(a, x64.Reg(x64.R11, x64.SZ64), x64.Reg(x64.RSI, x64.SZ64))
-	for w := 0; w < nUserWords; w++ {
-		x64.Mov(a, x64.Mem(x64.RSP, 8 + w * 8, x64.SZ64),
-			x64.Reg(argReg(2 + w), x64.SZ64))
+	if frameBytes > 0 {
+		x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frameBytes))
 	}
-	loadClosureFloatCallArgs_x64(a, cc, fvTyp, f, x64.R11, 8, gpDestBase)
+	// Stash retbuf + data before the marshal clobbers RDI/RSI.  Sret keeps the
+	// retbuf in RDI (argTypes[0] is the never-marshalled sret slot, so no arg ever
+	// writes RDI); pack saves it above the spill.  Data RSI -> R11 (caller-saved,
+	// never an arg register, survives the marshal).
+	if !useSret {
+		x64.Mov(a, x64.Mem(x64.RSP, retbufOff, x64.SZ64),
+			x64.Reg(x64.RDI, x64.SZ64))
+	}
+	x64.Mov(a, x64.Reg(x64.R11, x64.SZ64), x64.Reg(x64.RSI, x64.SZ64))
+	// Spill the incoming user-arg words to [RSP + outBytes + w*8]: RDX..R9 hold the
+	// first 4 (RDI/RSI are retbuf/data); any beyond arrive on the caller's stack at
+	// [RBP + 16 + (w-4)*8].
+	for w := 0; w < nUserWords; w = w + 1 {
+		if w < 4 {
+			x64.Mov(a, x64.Mem(x64.RSP, outBytes + w * 8, x64.SZ64),
+				x64.Reg(argReg(2 + w), x64.SZ64))
+		} else {
+			x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+				x64.Mem(x64.RBP, 16 + (w - 4) * 8, x64.SZ64))
+			x64.Mov(a, x64.Mem(x64.RSP, outBytes + w * 8, x64.SZ64),
+				x64.Reg(x64.RAX, x64.SZ64))
+		}
+	}
+	loadClosureFloatCallArgs_x64(a, cc, fvTyp, f, argTypes, capBaseIdx, x64.R11,
+		outBytes)
 	a.SetGlobal(fnLabel)
 	x64.Call(a, fnLabel)
-	x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Mem(x64.RSP, 0, x64.SZ64))
-	x64.Mov(a, x64.Mem(x64.R10, 0, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
-	if retSz > 8 {
-		x64.Mov(a, x64.Mem(x64.R10, 8, x64.SZ64), x64.Reg(x64.RDX, x64.SZ64))
+	if !useSret {
+		// Pack: copy the all-GP packed return RAX (+RDX) through the saved retbuf,
+		// reloaded into R10 (outside the return registers).
+		x64.Mov(a, x64.Reg(x64.R10, x64.SZ64),
+			x64.Mem(x64.RSP, retbufOff, x64.SZ64))
+		x64.Mov(a, x64.Mem(x64.R10, 0, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+		if retSz > 8 {
+			x64.Mov(a, x64.Mem(x64.R10, 8, x64.SZ64),
+				x64.Reg(x64.RDX, x64.SZ64))
+		}
 	}
-	x64.Add(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frameBytes))
+	if frameBytes > 0 {
+		x64.Add(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frameBytes))
+	}
 	x64.Pop(a, x64.Reg(x64.RBP, x64.SZ64))
 	x64.Ret(a)
 }

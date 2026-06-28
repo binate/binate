@@ -5,11 +5,17 @@
 # prefix that maps to more than one test (single-file *.bn, or
 # multi-file NNN_*/ directory). Each test number must be unique.
 #
-# Numbering is per-directory: the top-level conformance/ suite and each
-# spec/<chapter>/ directory are independent namespaces (every chapter
-# restarts at 001), so uniqueness is enforced WITHIN each directory, not
-# across them. A 137 in spec/14-statements and a 137 in spec/07-types is
-# fine; two 137s in spec/14-statements is not.
+# Numbering is per-directory: every directory that holds numbered tests is an
+# independent namespace (the top-level conformance/ suite and each
+# spec/<chapter>/ and stdlib/<chapter>/ restart at 001), so uniqueness is
+# enforced WITHIN each directory, not across them. A 137 in spec/14-statements
+# and a 137 in spec/07-types is fine; two 137s in one directory is not.
+#
+# The namespace set is DISCOVERED, not hard-coded: every directory that
+# directly holds a numbered test is scanned, EXCEPT the internals of a
+# multi-file NNN_<name>/ test (that is one test, not a namespace, so it is
+# pruned). This tracks the same numbered subtrees the runner discovers and
+# covers any future one automatically (avoiding a hand-maintained whitelist).
 #
 # Exit code: 1 if any duplicates found, 0 otherwise.
 
@@ -46,11 +52,19 @@ emit_test_numbers() {
     done
 }
 
+# Scan every directory holding numbered tests, but PRUNE multi-file NNN_<name>/
+# test directories so their internal files (package sources, a numbered .rules)
+# are never mistaken for a namespace. The namespace is the directory's path
+# relative to conformance/ (the top-level itself is "conformance").
 {
-    emit_test_numbers "$CONFORMANCE_DIR" "conformance"
-    for specdir in "$CONFORMANCE_DIR"/spec/*/; do
-        [ -d "$specdir" ] || continue
-        emit_test_numbers "${specdir%/}" "spec/$(basename "$specdir")"
+    find "$CONFORMANCE_DIR" -type d -name '[0-9][0-9][0-9]_*' -prune -o -type d -print |
+    while IFS= read -r d; do
+        if [ "$d" = "$CONFORMANCE_DIR" ]; then
+            ns="conformance"
+        else
+            ns="${d#"$CONFORMANCE_DIR"/}"
+        fi
+        emit_test_numbers "$d" "$ns"
     done
 } | sort > "$NUMS_TMP"
 

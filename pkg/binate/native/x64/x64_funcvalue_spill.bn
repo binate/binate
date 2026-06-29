@@ -27,6 +27,17 @@ import "pkg/binate/types"
 // source only at a strictly lower word index, already consumed when the
 // marshal runs left-to-right.  RAX is the spill scratch (never an arg /
 // sret / return-input reg during marshalling).
+//
+// A coerced-in-register struct/array (common.AggCoercedInReg) is the one
+// arg whose words do NOT come from the incoming dispatch regs: it arrives
+// as a SINGLE by-address pointer word (EffectiveArgWords == 1), and its
+// common.ArgWords value-words are loaded from [pointer] into the outgoing
+// coerced regs the underlying reads.  The pointer is copied to R10 (a
+// caller-saved scratch, not a SysV arg / sret / return reg, and distinct
+// from the RAX spill shuttle) before the value-word loads, so they can't
+// clobber the base.  This is why the incoming and outgoing word counts
+// DIVERGE for such an arg: the incoming cursor advances by 1 (one pointer
+// word) while the outgoing placement consumes ArgWords coerced words.
 
 // emitFuncvalSpillShim_x64 emits the over-budget func-value shim.  retSz
 // is the single-result SizeOf (0 for void / multi-return scalar).  The
@@ -50,13 +61,26 @@ func emitFuncvalSpillShim_x64(a @asm.Assembler, cc common.CallConv,
 		ccOut.NumGpArgRegs = cc.NumGpArgRegs - gpDestBase
 	}
 	var outBytes int = ccOut.CallStackBytes(userTypes)
-	// frameDelta keeps rsp ≡ 0 mod 16 at the outgoing CALL: entry rsp ≡ 8
-	// (post return-address push), outBytes ≡ 0 mod 16, so +8 re-aligns.
-	// The top 8 bytes double as the retbuf save slot for the pack shape.
-	var frameDelta int = outBytes + 8
+	// Frame layout (low→high): [0, outBytes) outgoing-args; [retbufOff] the
+	// pack-shape retbuf save (8); [stageOff, +NumGpArgRegs*8) the clobber-safe
+	// staging area for the incoming GP dispatch regs.  Staging is REQUIRED: a
+	// coerced aggregate makes the outgoing cursor (ArgWords) outrun the incoming
+	// by-address cursor (1 pointer), so an outgoing reg write can land in a
+	// later param's not-yet-read incoming reg.  Saving every incoming GP arg
+	// reg to the frame first, then marshalling from the frame, removes the
+	// hazard regardless of order.  frameDelta keeps rsp ≡ 0 mod 16 at the CALL:
+	// entry rsp ≡ 8, outBytes ≡ 0 mod 16, and 8 + NumGpArgRegs*8 (= 56) ≡ 8.
 	var retbufOff int = outBytes
+	var stageOff int = outBytes + 8
+	var frameDelta int = outBytes + 8 + cc.NumGpArgRegs * 8
 
 	x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frameDelta))
+	// Stage every incoming GP dispatch reg before any outgoing write (the
+	// marshal helpers read register-source words from [rsp + stageOff + 8*g]).
+	for g := 0; g < cc.NumGpArgRegs; g++ {
+		x64.Mov(a, x64.Mem(x64.RSP, stageOff + 8 * g, x64.SZ64),
+			x64.Reg(argReg(g), x64.SZ64))
+	}
 	if usePack {
 		// Stash retbuf (RDI) above the outgoing-args area; the marshal
 		// (gpDestBase 0) will overwrite RDI.
@@ -64,7 +88,7 @@ func emitFuncvalSpillShim_x64(a @asm.Assembler, cc common.CallConv,
 			x64.Reg(x64.RDI, x64.SZ64))
 	}
 	emitSpillMarshal_x64(a, cc, ccOut, userTypes, srcPrefix, gpDestBase,
-		frameDelta)
+		frameDelta, stageOff)
 	a.SetGlobal(fnLabel)
 	x64.Call(a, fnLabel)
 	if usePack {
@@ -110,7 +134,7 @@ func shimUserTypes_x64(fvTyp @types.Type) @[]@types.Type {
 // arg's effective words go to the classifier's reg / stack slots.
 func emitSpillMarshal_x64(a @asm.Assembler, cc common.CallConv,
 		ccOut common.CallConv, userTypes @[]@types.Type, srcPrefix int,
-		gpDestBase int, frameDelta int) {
+		gpDestBase int, frameDelta int, stageOff int) {
 	var nsrn int = 0
 	var inWord int = 0
 	for i := 0; i < len(userTypes); i++ {
@@ -118,16 +142,26 @@ func emitSpillMarshal_x64(a @asm.Assembler, cc common.CallConv,
 		if common.IsFloatScalarTyp(pt) {
 			if nsrn < cc.NumFpArgRegs {
 				emitSpillSrcToXmm_x64(a, cc, srcPrefix + inWord,
-					frameDelta, x64.XMM0 + nsrn,
+					frameDelta, stageOff, x64.XMM0 + nsrn,
 					common.FloatScalarIsI32(pt))
 			} else {
 				// FP arg registers exhausted: the float overflows to the
 				// underlying's outgoing-args stack (outBytes already reserved
 				// the slot, since CallStackBytes now counts overflow floats).
 				emitSpillSrcToMem_x64(a, cc, srcPrefix + inWord, frameDelta,
-					ccOut.CallArgStackOff(userTypes, i))
+					stageOff, ccOut.CallArgStackOff(userTypes, i))
 			}
 			nsrn = nsrn + 1
+			inWord = inWord + 1
+			continue
+		}
+		if common.AggCoercedInReg(pt) {
+			emitSpillCoercedAgg_x64(a, cc, ccOut, userTypes, i, pt,
+				srcPrefix + inWord, gpDestBase, frameDelta, stageOff)
+			// Incoming consumed ONE by-address pointer word; outgoing
+			// placement advanced common.ArgWords coerced words inside the
+			// helper.  These now DIVERGE, so the incoming cursor advances by
+			// 1 even though the underlying read ArgWords value-words.
 			inWord = inWord + 1
 			continue
 		}
@@ -144,27 +178,67 @@ func emitSpillMarshal_x64(a @asm.Assembler, cc common.CallConv,
 		}
 		for k := 0; k < regWords; k++ {
 			emitSpillSrcToReg_x64(a, cc, srcPrefix + inWord + k,
-				frameDelta, argReg(gpDestBase + rs + k))
+				frameDelta, stageOff, argReg(gpDestBase + rs + k))
 		}
 		for k := regWords; k < w; k++ {
 			emitSpillSrcToMem_x64(a, cc, srcPrefix + inWord + k,
-				frameDelta, so + (k - regWords) * 8)
+				frameDelta, stageOff, so + (k - regWords) * 8)
 		}
 		inWord = inWord + w
 	}
 }
 
-// emitSpillSrcToReg_x64 moves incoming dispatch word g into dstReg.  The
-// source is argReg(g) if g < cc.NumGpArgRegs, else the dispatch caller's
-// stack at [rsp + frameDelta + 8 + (g - NumGpArgRegs)*8].
-func emitSpillSrcToReg_x64(a @asm.Assembler, cc common.CallConv, g int,
-		frameDelta int, dstReg int) {
-	if g < cc.NumGpArgRegs {
-		var src int = argReg(g)
-		if src != dstReg {
-			x64.Mov(a, x64.Reg(dstReg, x64.SZ64),
-				x64.Reg(src, x64.SZ64))
+// emitSpillCoercedAgg_x64 marshals one coerced-in-register struct/array
+// arg (common.AggCoercedInReg) from its incoming BY-ADDRESS representation
+// into the underlying's real SysV layout.  Under the func-value dispatch
+// convention such an arg arrives as a SINGLE pointer word (its
+// EffectiveArgWords is 1) at incoming dispatch word `srcG`; the underlying
+// reads common.ArgWords value-words coerced into consecutive GP regs (and,
+// when the reg file is exhausted, the SysV MEMORY tail).  The helper loads
+// the pointer into R10 — a caller-saved scratch that is neither a SysV arg
+// reg (RDI/RSI/RDX/RCX/R8/R9) nor the sret/return reg nor the RAX spill
+// shuttle, so the value-word loads can't clobber the base before the last
+// word is read — then loads [R10 + 8*k] into the destinations ccOut's real-
+// ABI classifier reports for arg i (regWords into argReg(gpDestBase+rs+k),
+// the remainder to the outgoing-args stack via RAX).
+func emitSpillCoercedAgg_x64(a @asm.Assembler, cc common.CallConv,
+		ccOut common.CallConv, userTypes @[]@types.Type, i int,
+		pt @types.Type, srcG int, gpDestBase int, frameDelta int,
+		stageOff int) {
+	var n int = common.ArgWords(pt)
+	emitSpillSrcToReg_x64(a, cc, srcG, frameDelta, stageOff, x64.R10)
+	var rs int = ccOut.CallArgRegStart(userTypes, i)
+	var so int = ccOut.CallArgStackOff(userTypes, i)
+	var regWords int = 0
+	if rs >= 0 {
+		if so >= 0 {
+			regWords = ccOut.NumGpArgRegs - rs
+		} else {
+			regWords = n
 		}
+	}
+	for k := 0; k < regWords; k++ {
+		x64.Mov(a, x64.Reg(argReg(gpDestBase + rs + k), x64.SZ64),
+			x64.Mem(x64.R10, 8 * k, x64.SZ64))
+	}
+	for k := regWords; k < n; k++ {
+		x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+			x64.Mem(x64.R10, 8 * k, x64.SZ64))
+		x64.Mov(a, x64.Mem(x64.RSP, so + (k - regWords) * 8, x64.SZ64),
+			x64.Reg(x64.RAX, x64.SZ64))
+	}
+}
+
+// emitSpillSrcToReg_x64 moves incoming dispatch word g into dstReg.  A
+// register-passed word (g < cc.NumGpArgRegs) is read from its CLOBBER-SAFE
+// staging slot [rsp + stageOff + 8*g] (not argReg(g), which an earlier
+// outgoing write may already have overwritten); an overflow word is read
+// from the dispatch caller's stack at [rsp + frameDelta + 8 + (g-NumGpArgRegs)*8].
+func emitSpillSrcToReg_x64(a @asm.Assembler, cc common.CallConv, g int,
+		frameDelta int, stageOff int, dstReg int) {
+	if g < cc.NumGpArgRegs {
+		x64.Mov(a, x64.Reg(dstReg, x64.SZ64),
+			x64.Mem(x64.RSP, stageOff + 8 * g, x64.SZ64))
 		return
 	}
 	var off int = frameDelta + 8 + (g - cc.NumGpArgRegs) * 8
@@ -172,37 +246,33 @@ func emitSpillSrcToReg_x64(a @asm.Assembler, cc common.CallConv, g int,
 }
 
 // emitSpillSrcToMem_x64 moves incoming dispatch word g to the outgoing-
-// args stack at [rsp + dstOff].  A reg source stores directly; a stack
-// source shuttles through RAX.
+// args stack at [rsp + dstOff], shuttling through RAX.  A register-passed
+// word is read from its staging slot (see emitSpillSrcToReg_x64).
 func emitSpillSrcToMem_x64(a @asm.Assembler, cc common.CallConv, g int,
-		frameDelta int, dstOff int) {
-	if g < cc.NumGpArgRegs {
-		x64.Mov(a, x64.Mem(x64.RSP, dstOff, x64.SZ64),
-			x64.Reg(argReg(g), x64.SZ64))
-		return
-	}
+		frameDelta int, stageOff int, dstOff int) {
 	var off int = frameDelta + 8 + (g - cc.NumGpArgRegs) * 8
+	if g < cc.NumGpArgRegs {
+		off = stageOff + 8 * g
+	}
 	x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.RSP, off, x64.SZ64))
 	x64.Mov(a, x64.Mem(x64.RSP, dstOff, x64.SZ64),
 		x64.Reg(x64.RAX, x64.SZ64))
 }
 
 // emitSpillSrcToXmm_x64 moves incoming dispatch word g (float bits in a
-// GP slot under the all-int dispatch ABI) into xmm.  A stack source is
-// first loaded into RAX, since movq/movd take a GP register source.
+// GP slot under the all-int dispatch ABI) into xmm.  The word is loaded
+// into RAX first (movq/movd take a GP source) — from the staging slot for a
+// register-passed word, else the dispatch caller's stack.
 func emitSpillSrcToXmm_x64(a @asm.Assembler, cc common.CallConv, g int,
-		frameDelta int, xmm int, isI32 bool) {
-	var gp int = x64.RAX
+		frameDelta int, stageOff int, xmm int, isI32 bool) {
+	var off int = frameDelta + 8 + (g - cc.NumGpArgRegs) * 8
 	if g < cc.NumGpArgRegs {
-		gp = argReg(g)
-	} else {
-		var off int = frameDelta + 8 + (g - cc.NumGpArgRegs) * 8
-		x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
-			x64.Mem(x64.RSP, off, x64.SZ64))
+		off = stageOff + 8 * g
 	}
+	x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.RSP, off, x64.SZ64))
 	if isI32 {
-		x64.Movd_gp_to_xmm(a, xmm, gp)
+		x64.Movd_gp_to_xmm(a, xmm, x64.RAX)
 	} else {
-		x64.Movq_gp_to_xmm(a, xmm, gp)
+		x64.Movq_gp_to_xmm(a, xmm, x64.RAX)
 	}
 }

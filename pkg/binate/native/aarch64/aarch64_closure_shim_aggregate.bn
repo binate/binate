@@ -54,9 +54,17 @@ func emitClosureShimAggregateAA64(a @asm.Assembler, fnLabel @[]char,
 			effectiveCapWordsAA64(cc, f.ClosureStruct.Fields[i].Type)
 	}
 	var nUserWords int = userWordsAA64(cc, fvTyp)
-	if captureWords + nUserWords > 8 || nUserWords > 6 {
+	// Register-fit budget counts the OUTGOING (real-ABI) GP words: a coerced
+	// in-register struct/array arrives as ONE by-address pointer word
+	// (EffectiveArgWords == 1, counted by nUserWords) but the shim expands it
+	// into ArgWords coerced regs, so the register-fit test must use the
+	// outgoing count or it would undercount and wrongly keep a wide call on the
+	// register-only path.  The incoming-fit test (X2..X7) stays on nUserWords —
+	// the dispatch caller really does place the by-address arg as one word.
+	var nUserOutWords int = userOutWordsAggAA64(cc, fvTyp)
+	if captureWords + nUserOutWords > 8 || nUserWords > 6 {
 		// The underlying call's args don't all fit registers (captures +
-		// user words exceed X0..X7, or the incoming user words exceed
+		// outgoing user words exceed X0..X7, or the incoming user words exceed
 		// X2..X7), so it needs a stack-spill prologue.
 		var argTypes @[]@types.Type = buildShimArgTypesAA64(fvTyp, f)
 		emitClosureShimAggregateStackSpillAA64(a, fnLabel, fvTyp, f,
@@ -106,13 +114,17 @@ func emitClosureShimAggregateAA64(a @asm.Assembler, fnLabel @[]char,
 // struct pointer is in X9 (a non-arg caller-saved scratch the caller
 // already moved data into).  Two steps, in this order:
 //
-//   1. Move the user args from their incoming slots X(2+j) (the funcval
-//      aggregate convention places user args after the retbuf+data
-//      prefix) to their outgoing slots X(captureWords+j).  Direction
-//      depends on captureWords vs the incoming base 2: a shift toward
-//      higher registers (captureWords >= 2) goes right-to-left so each
-//      source is read before its slot is overwritten; a shift toward
-//      lower registers goes left-to-right.
+//   1. Move the user args from their incoming slots X(2 + inWord) (the funcval
+//      aggregate convention places user args after the retbuf+data prefix) to
+//      their outgoing slots X(captureWords + outWord), per param.  The incoming
+//      and outgoing word cursors usually advance together, but DIVERGE for a
+//      coerced in-register struct/array, which arrives as ONE by-address
+//      pointer word (incoming) yet must be expanded into its ArgWords value-
+//      words across the outgoing coerced regs the underlying reads.  Direction
+//      depends on captureWords vs the incoming base 2: a shift toward higher
+//      registers (captureWords >= 2) goes right-to-left so each source is read
+//      before its slot is overwritten; a shift toward lower registers goes
+//      left-to-right.
 //   2. Load the captures from [X9] into X0..X(captureWords-1) — done
 //      AFTER the user-arg moves so a capture write can't clobber an
 //      unread user-arg source.  X9 stays live across every load, so the
@@ -123,12 +135,29 @@ func loadClosureAggCallArgsAA64(a @asm.Assembler, cc common.CallConv,
 		fvTyp @types.Type, f @ir.Func, captureWords int,
 		nUserWords int) {
 	if captureWords >= 2 {
-		for j := nUserWords - 1; j >= 0; j = j - 1 {
-			moveAggUserWordAA64(a, j, captureWords)
+		// Shift toward higher regs: process params high-to-low (and words
+		// within a param high-to-low) so each source is read before its slot
+		// is overwritten.  Walk both cursors forward to find each param's
+		// bases, then emit in reverse.
+		var inWord int = nUserWords
+		var outWord int = userOutWordsAggAA64(cc, fvTyp)
+		for pi := len(fvTyp.Params) - 1; pi >= 0; pi = pi - 1 {
+			var pt @types.Type = fvTyp.Params[pi].Type
+			inWord = inWord - cc.EffectiveArgWords(pt)
+			outWord = outWord - userOutWordsOneAA64(cc, pt)
+			moveAggUserArgAA64(a, cc, pt, inWord, outWord, captureWords,
+				false)
 		}
 	} else {
-		for j := 0; j < nUserWords; j = j + 1 {
-			moveAggUserWordAA64(a, j, captureWords)
+		// Shift toward lower regs: process params low-to-high, words low-first.
+		var inWord int = 0
+		var outWord int = 0
+		for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
+			var pt @types.Type = fvTyp.Params[pi].Type
+			moveAggUserArgAA64(a, cc, pt, inWord, outWord, captureWords,
+				true)
+			inWord = inWord + cc.EffectiveArgWords(pt)
+			outWord = outWord + userOutWordsOneAA64(cc, pt)
 		}
 	}
 	var wi int = 0
@@ -150,12 +179,57 @@ func loadClosureAggCallArgsAA64(a @asm.Assembler, cc common.CallConv,
 	}
 }
 
-// moveAggUserWordAA64 moves user-arg word j from its incoming register
-// X(2+j) to its outgoing register X(captureWords+j), skipping the move
-// when source and destination coincide (captureWords == 2).
-func moveAggUserWordAA64(a @asm.Assembler, j int, captureWords int) {
-	var srcReg int = argReg(2 + j)
-	var dstReg int = argReg(captureWords + j)
+// userOutWordsOneAA64 is the OUTGOING (real-ABI) GP-reg-word count for a single
+// user param — ArgWords for a coerced in-register struct/array (expanded from
+// its single by-address dispatch word), EffectiveArgWords otherwise.  The
+// per-arg counterpart of userOutWordsAggAA64's sum.
+func userOutWordsOneAA64(cc common.CallConv, pt @types.Type) int {
+	if common.AggCoercedInReg(pt) { return common.ArgWords(pt) }
+	return cc.EffectiveArgWords(pt)
+}
+
+// moveAggUserArgAA64 moves one user param from its incoming slots
+// X(2 + inWord).. to its outgoing slots X(captureWords + outWord)..  A coerced
+// in-register struct/array arrives as ONE by-address pointer word: copy that
+// pointer to X16 (a scratch, not an arg reg, so the loads can't clobber it),
+// then load its ArgWords value-words into the consecutive outgoing regs the
+// underlying's coerced ABI reads.  Every other param keeps its
+// incoming-word-count == outgoing-word-count and is moved word-by-word.
+// lowFirst selects the within-arg word order for the plain case: a downward
+// shift (captureWords < 2) moves words low-first so word k's outgoing slot —
+// which can coincide with word (k-1)'s incoming — is written only after that
+// source is read; an upward shift moves high-first.
+func moveAggUserArgAA64(a @asm.Assembler, cc common.CallConv, pt @types.Type,
+		inWord int, outWord int, captureWords int, lowFirst bool) {
+	if common.AggCoercedInReg(pt) {
+		var n int = common.ArgWords(pt)
+		var ptrReg int = argReg(2 + inWord)
+		aarch64.Mov(a, true, aarch64.X16, aarch64.Reg(ptrReg))
+		for k := 0; k < n; k = k + 1 {
+			aarch64.Ldr(a, true, argReg(captureWords + outWord + k),
+				aarch64.MemImm(aarch64.X16, 8 * k))
+		}
+		return
+	}
+	var w int = cc.EffectiveArgWords(pt)
+	if lowFirst {
+		for k := 0; k < w; k = k + 1 {
+			moveAggUserWordAA64(a, inWord + k, outWord + k, captureWords)
+		}
+		return
+	}
+	for k := w - 1; k >= 0; k = k - 1 {
+		moveAggUserWordAA64(a, inWord + k, outWord + k, captureWords)
+	}
+}
+
+// moveAggUserWordAA64 moves one plain user-arg word from its incoming register
+// X(2 + inWord) to its outgoing register X(captureWords + outWord), skipping the
+// move when source and destination coincide.
+func moveAggUserWordAA64(a @asm.Assembler, inWord int, outWord int,
+		captureWords int) {
+	var srcReg int = argReg(2 + inWord)
+	var dstReg int = argReg(captureWords + outWord)
 	if srcReg != dstReg {
 		aarch64.Mov(a, true, dstReg, aarch64.Reg(srcReg))
 	}
@@ -271,6 +345,26 @@ func captureWordsAggAA64(cc common.CallConv, f @ir.Func) int {
 	return n
 }
 
+// userOutWordsAggAA64 sums the OUTGOING (real-ABI) GP-reg-word footprint of a
+// closure's user params — ArgWords for a coerced in-register struct/array
+// (which the shim expands from its single by-address dispatch word into that
+// many coerced regs), EffectiveArgWords otherwise.  This is the count for the
+// register-fit budget (captures + outgoing user words <= X0..X7); the INCOMING
+// dispatch-word count (userWordsAA64, EffectiveArgWords throughout) governs the
+// incoming-fit budget instead, since the two now diverge for coerced aggregates.
+func userOutWordsAggAA64(cc common.CallConv, fvTyp @types.Type) int {
+	var n int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
+		var pt @types.Type = fvTyp.Params[pi].Type
+		if common.AggCoercedInReg(pt) {
+			n = n + common.ArgWords(pt)
+		} else {
+			n = n + cc.EffectiveArgWords(pt)
+		}
+	}
+	return n
+}
+
 // emitAggUserArgAA64 moves user arg ui (all its words) from its incoming
 // aggregate slots (X2.., then the caller stack) to its outgoing classifier
 // slots, at the natural store width for an overflow narrow scalar.  inRegBase
@@ -284,13 +378,22 @@ func emitAggUserArgAA64(a @asm.Assembler, cc common.CallConv,
 		fvTyp @types.Type, argTypes @[]@types.Type, ui int, inRegBase int,
 		userArgStart int, frameDelta int, lowFirst bool) {
 	var ut @types.Type = fvTyp.Params[ui].Type
+	var argIdx int = userArgStart + ui
+	var outRegStart int = cc.CallArgRegStart(argTypes, argIdx)
+	var outStkOff int = cc.CallArgStackOff(argTypes, argIdx)
+	if common.AggCoercedInReg(ut) {
+		// Coerced in-register struct/array: arrives as ONE by-address pointer
+		// word (EffectiveArgWords == 1, so inRegBase already advanced by 1) but
+		// the classifier placed its ArgWords value-words across outRegStart /
+		// outStkOff.  Load the pointer once, then expand it into those slots.
+		emitAggCoercedUserArgAA64(a, cc, ut, inRegBase, frameDelta,
+			outRegStart, outStkOff)
+		return
+	}
 	// EffectiveArgWords: an indirect-large aggregate user arg is one pointer
 	// word in and out (matching the dispatch + classifier); ArgWords would
 	// over-loop and clobber the neighbor.  A SPLIT is handled per word below.
 	var nUw int = cc.EffectiveArgWords(ut)
-	var argIdx int = userArgStart + ui
-	var outRegStart int = cc.CallArgRegStart(argTypes, argIdx)
-	var outStkOff int = cc.CallArgStackOff(argTypes, argIdx)
 	var storeSize int = cc.StackArgStoreSize(ut, false)
 	if lowFirst {
 		for k := 0; k < nUw; k = k + 1 {
@@ -302,5 +405,43 @@ func emitAggUserArgAA64(a @asm.Assembler, cc common.CallConv,
 	for k := nUw - 1; k >= 0; k = k - 1 {
 		emitUserArgWordMoveAA64(a, inRegBase, k, 2, frameDelta,
 			outRegStart, outStkOff, storeSize)
+	}
+}
+
+// emitAggCoercedUserArgAA64 expands a coerced in-register struct/array user arg
+// from its single by-address incoming pointer word into the ArgWords value-words
+// the underlying's coerced ABI reads.  The incoming pointer is global word
+// inRegBase - 1: reg X(2 + inIdx) when it fits the 6 incoming user-arg regs
+// (X2..X7), else the caller stack at [SP + frameDelta + (inIdx - 6) * 8].  It is
+// copied to X16 (a scratch, not an arg reg) so the value-word loads can't clobber
+// it.  Value word k goes to reg argReg(outRegStart + k) when that word is a reg
+// word, else (the SPLIT / overflow tail) is shuttled through X17 to its outgoing
+// stack slot at outStkOff + (k - regWords) * 8 — a full 8-byte store, since an
+// aggregate word is never a narrow natural-size slot.
+func emitAggCoercedUserArgAA64(a @asm.Assembler, cc common.CallConv,
+		ut @types.Type, inRegBase int, frameDelta int, outRegStart int,
+		outStkOff int) {
+	var inIdx int = inRegBase - 1
+	if inIdx < 6 {
+		aarch64.Mov(a, true, aarch64.X16, aarch64.Reg(argReg(2 + inIdx)))
+	} else {
+		aarch64.Ldr(a, true, aarch64.X16,
+			aarch64.MemImm(aarch64.SP, frameDelta + (inIdx - 6) * 8))
+	}
+	var n int = common.ArgWords(ut)
+	var regWords int = 0
+	if outRegStart >= 0 {
+		regWords = 8 - outRegStart
+		if regWords > n { regWords = n }
+	}
+	for k := 0; k < n; k = k + 1 {
+		if k < regWords {
+			aarch64.Ldr(a, true, argReg(outRegStart + k),
+				aarch64.MemImm(aarch64.X16, 8 * k))
+			continue
+		}
+		aarch64.Ldr(a, true, aarch64.X17, aarch64.MemImm(aarch64.X16, 8 * k))
+		aarch64.Str(a, true, aarch64.X17,
+			aarch64.MemImm(aarch64.SP, outStkOff + (k - regWords) * 8))
 	}
 }

@@ -72,15 +72,57 @@ func shimReturnIsFloatScalar_x64(fvTyp @types.Type) bool {
 // start at RSI).  This is the native half of the float shim ABI (Design A);
 // the LLVM shim does the same bitcast in IR.
 //
-// Clobber-safety: the GP destination index never exceeds the GP source index
-// (gpDestBase + ngrn <= srcPrefix + srcWord across all shapes), so left-to-
-// right MOVs read each source before it is overwritten; the XMM moves target
-// the disjoint FP register file and never clobber a GP source.
+// A coerced in-register struct/array (named ≤ 16 B) arrives as ONE by-address
+// pointer word (EffectiveArgWords == 1); the shim copies that pointer to R10 (a
+// scratch — not a SysV arg reg nor the return reg) and loads its ArgWords value-
+// words from [R10 + 8k] into the consecutive outgoing GP regs the underlying's
+// coerced ABI reads.  The incoming cursor (srcWord) advances by 1 word but the
+// outgoing cursor (ngrn) by ArgWords — the two DIVERGE here (elsewhere they move
+// in lockstep).  Slices / managed-slices / iface- / func-values / > 16 B byval
+// aggregates are NOT coerced-in-reg and keep the generic register-shift path.
+//
+// Clobber-safety: for the register-shift path the GP destination index never
+// exceeds the GP source index (gpDestBase + ngrn <= srcPrefix + srcWord), so
+// left-to-right MOVs read each source before it is overwritten; the coerced path
+// reads only through R10 (loads from memory, distinct from any arg reg), so it
+// can't clobber a not-yet-consumed source either; the XMM moves target the
+// disjoint FP register file and never clobber a GP source.
 //
 // This path assumes everything fits in registers — callers gate it on the
 // register budget and route genuine overflow to emitShimArgSpill_x64.
 func emitShimArgMarshal_x64(a @asm.Assembler, cc common.CallConv,
 		fvTyp @types.Type, srcPrefix int, gpDestBase int) {
+	// Clobber-safe staging, ONLY when a coerced aggregate is present.  Such an
+	// arg makes the OUTGOING register cursor (ArgWords words) advance faster than
+	// the INCOMING by-address cursor (one pointer word), so an outgoing write can
+	// land in a LATER param's not-yet-read incoming arg register (a register-
+	// permutation hazard).  Without one, incoming and outgoing advance in
+	// lockstep (a constant down-shift), already clobber-safe, so we skip staging.
+	// When staging: x86-64 has too few caller-saved scratch regs to stage in
+	// registers (cf. aarch64's X9..X15), so stage the incoming dispatch words to
+	// a scratch stack frame (balanced Sub/Add, so the caller shape's RSP-relative
+	// slots are untouched) and read each from the frame.  R10 is the transient
+	// value-load scratch.
+	var needStage bool = false
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		if common.AggCoercedInReg(fvTyp.Params[pi].Type) { needStage = true }
+	}
+	var frame int = 0
+	if needStage {
+		var nIn int = 0
+		for pi := 0; pi < len(fvTyp.Params); pi++ {
+			nIn = nIn + cc.EffectiveArgWords(fvTyp.Params[pi].Type)
+		}
+		frame = nIn * 8
+		if frame % 16 != 0 { frame = frame + 8 }
+		if frame > 0 {
+			x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frame))
+			for w := 0; w < nIn; w++ {
+				x64.Mov(a, x64.Mem(x64.RSP, 8 * w, x64.SZ64),
+					x64.Reg(argReg(srcPrefix + w), x64.SZ64))
+			}
+		}
+	}
 	var ngrn int = 0
 	var nsrn int = 0
 	var srcWord int = 0
@@ -89,6 +131,11 @@ func emitShimArgMarshal_x64(a @asm.Assembler, cc common.CallConv,
 		if common.IsFloatScalarTyp(pt) {
 			if nsrn < 8 {
 				var fsrc int = argReg(srcPrefix + srcWord)
+				if needStage {
+					x64.Mov(a, x64.Reg(x64.R10, x64.SZ64),
+						x64.Mem(x64.RSP, 8 * srcWord, x64.SZ64))
+					fsrc = x64.R10
+				}
 				if common.FloatScalarIsI32(pt) {
 					x64.Movd_gp_to_xmm(a, x64.XMM0 + nsrn, fsrc)
 				} else {
@@ -99,19 +146,44 @@ func emitShimArgMarshal_x64(a @asm.Assembler, cc common.CallConv,
 			srcWord = srcWord + 1
 			continue
 		}
+		if common.AggCoercedInReg(pt) {
+			// Coerced in-register struct/array: the staged word at
+			// [RSP + 8*srcWord] is its by-address pointer (needStage is true
+			// here); load its ArgWords value-words into the consecutive GP regs
+			// the underlying's coerced ABI reads.  Incoming consumed ONE pointer
+			// word; outgoing advanced n coerced regs (the cursors DIVERGE).
+			var n int = common.ArgWords(pt)
+			x64.Mov(a, x64.Reg(x64.R10, x64.SZ64),
+				x64.Mem(x64.RSP, 8 * srcWord, x64.SZ64))
+			for k := 0; k < n; k++ {
+				x64.Mov(a, x64.Reg(argReg(gpDestBase + ngrn + k), x64.SZ64),
+					x64.Mem(x64.R10, 8 * k, x64.SZ64))
+			}
+			ngrn = ngrn + n
+			srcWord = srcWord + 1
+			continue
+		}
 		// Effective words: an indirect-large aggregate is 1 pointer word
 		// (the dispatch caller placed it as one), NOT its ArgWords expansion.
 		var w int = cc.EffectiveArgWords(pt)
 		for k := 0; k < w; k++ {
 			var dst int = argReg(gpDestBase + ngrn + k)
-			var src int = argReg(srcPrefix + srcWord + k)
-			if dst != src {
+			if needStage {
 				x64.Mov(a, x64.Reg(dst, x64.SZ64),
-					x64.Reg(src, x64.SZ64))
+					x64.Mem(x64.RSP, 8 * (srcWord + k), x64.SZ64))
+			} else {
+				var src int = argReg(srcPrefix + srcWord + k)
+				if dst != src {
+					x64.Mov(a, x64.Reg(dst, x64.SZ64),
+						x64.Reg(src, x64.SZ64))
+				}
 			}
 		}
 		ngrn = ngrn + w
 		srcWord = srcWord + w
+	}
+	if frame > 0 {
+		x64.Add(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frame))
 	}
 }
 
@@ -210,8 +282,18 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 		}
 		var nUserWords int = 0
 		for pi := 0; pi < len(fvTyp.Params); pi++ {
-			nUserWords = nUserWords +
-				cc.EffectiveArgWords(fvTyp.Params[pi].Type)
+			var pt @types.Type = fvTyp.Params[pi].Type
+			// Budget the SHIM's register/spill routing on the OUTGOING (real
+			// ABI) GP word count: a coerced in-register struct/array arrives as
+			// ONE by-address pointer word (EffectiveArgWords == 1) but the shim
+			// expands it into ArgWords coerced regs, so counting it via
+			// EffectiveArgWords would undercount the outgoing register pressure
+			// and wrongly keep a wide call on the register-only path.
+			if common.AggCoercedInReg(pt) {
+				nUserWords = nUserWords + common.ArgWords(pt)
+			} else {
+				nUserWords = nUserWords + cc.EffectiveArgWords(pt)
+			}
 		}
 		var retSz int = shimReturnSize_x64(fvTyp)
 		var retIsAgg bool = shimReturnIsAggregate_x64(fvTyp)

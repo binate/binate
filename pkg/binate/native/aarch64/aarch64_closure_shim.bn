@@ -179,6 +179,13 @@ func userWordsAA64(cc common.CallConv, fvTyp @types.Type) int {
 // contribute 1 reg slot (a pointer to the closure-struct field);
 // scalar / small-aggregate captures contribute their ArgWords reg
 // slots (per-word loads from the closure struct).
+//
+// nUserWords is the INCOMING dispatch-word footprint (EffectiveArgWords
+// per user param — 1 for a by-address aggregate).  The OUTGOING register
+// footprint diverges for a coerced in-register struct/array: it arrives
+// as ONE by-address pointer word but the underlying's coerced ABI reads
+// its ArgWords value-words, so the shift below loads those words from the
+// pointer into consecutive outgoing regs and the budget counts ArgWords.
 func emitClosureShimFastAA64(a @asm.Assembler, fnLabel @[]char,
 		fvTyp @types.Type, f @ir.Func, nUserWords int) {
 	var cc common.CallConv = common.AAPCS64_Darwin()
@@ -187,16 +194,59 @@ func emitClosureShimFastAA64(a @asm.Assembler, fnLabel @[]char,
 		captureWords = captureWords +
 			effectiveCapWordsAA64(cc, f.ClosureStruct.Fields[i].Type)
 	}
-	if captureWords + nUserWords > 8 {
+	// Budget the register-only routing on the OUTGOING (real ABI) GP word
+	// count: a coerced in-register struct/array expands from its single
+	// by-address dispatch word into ArgWords coerced regs, so counting it
+	// via EffectiveArgWords (== 1) would undercount the outgoing register
+	// pressure and wrongly keep a wide call on the tail-branch path.
+	var outUserWords int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		var pt @types.Type = fvTyp.Params[pi].Type
+		if common.AggCoercedInReg(pt) {
+			outUserWords = outUserWords + common.ArgWords(pt)
+		} else {
+			outUserWords = outUserWords + cc.EffectiveArgWords(pt)
+		}
+	}
+	if captureWords + outUserWords > 8 {
 		a.SetGlobal(fnLabel)
 		aarch64.B(a, fnLabel)
 		return
 	}
-	for j := nUserWords - 1; j >= 0; j = j - 1 {
-		var srcReg int = argReg(j + 1)
-		var dstReg int = argReg(captureWords + j)
-		if srcReg != dstReg {
-			aarch64.Mov(a, true, dstReg, aarch64.Reg(srcReg))
+	// Shift user args from their incoming dispatch slots (X1.., prefix 1
+	// for the dropped data word) to their outgoing slots (X(captureWords)..).
+	// Right-to-left over params — and high-word-first within a multi-word
+	// arg — so each source register is read before its slot becomes a
+	// destination (captures prepend an upward shift; the coerced expansion
+	// only widens the outgoing side, keeping outgoing >= incoming).
+	var inCursor int = nUserWords
+	var outCursor int = outUserWords
+	for pi := len(fvTyp.Params) - 1; pi >= 0; pi = pi - 1 {
+		var pt @types.Type = fvTyp.Params[pi].Type
+		var ew int = cc.EffectiveArgWords(pt)
+		inCursor = inCursor - ew
+		if common.AggCoercedInReg(pt) {
+			// Coerced in-register struct/array: ONE incoming pointer word
+			// expands to ArgWords outgoing value-words.  Copy the pointer to
+			// X16 (a scratch, not an arg reg) first so the loads can't clobber
+			// it, then load each value-word into its outgoing reg.
+			var n int = common.ArgWords(pt)
+			outCursor = outCursor - n
+			aarch64.Mov(a, true, aarch64.X16,
+				aarch64.Reg(argReg(1 + inCursor)))
+			for k := 0; k < n; k = k + 1 {
+				aarch64.Ldr(a, true, argReg(captureWords + outCursor + k),
+					aarch64.MemImm(aarch64.X16, 8 * k))
+			}
+			continue
+		}
+		outCursor = outCursor - ew
+		for k := ew - 1; k >= 0; k = k - 1 {
+			var srcReg int = argReg(1 + inCursor + k)
+			var dstReg int = argReg(captureWords + outCursor + k)
+			if srcReg != dstReg {
+				aarch64.Mov(a, true, dstReg, aarch64.Reg(srcReg))
+			}
 		}
 	}
 	// Captures right-to-left so X0 (the closure-struct base) stays
@@ -224,110 +274,6 @@ func emitClosureShimFastAA64(a @asm.Assembler, fnLabel @[]char,
 	}
 	a.SetGlobal(fnLabel)
 	aarch64.B(a, fnLabel)
-}
-
-// emitClosureShimStackSpillAA64 handles the AAPCS64 mixed-or-stack
-// case: at least one outgoing arg has a stack component.  Sets up a
-// proper call frame around BL.  Ordering:
-//   1. STP FP,LR,[sp,#-16]! ; SUB sp, sp, #stkBytes — save the frame
-//      record (so LR survives the BL on the stack, NOT in the caller-
-//      clobbered X16 a non-leaf BL would otherwise need) and reserve
-//      the outgoing-args area.  stkBytes is 16-aligned by
-//      CallStackBytes, so SP stays 16-aligned.
-//   2. Spill stack-bound capture words via X16 (AAPCS intra-call
-//      scratch).  Done first because X0 is the closure-struct base
-//      — steps 3 / 4 may overwrite it.
-//   3. Move user-args from incoming positions to outgoing positions.
-//      Process right-to-left so a forward shift reads each source
-//      before its slot becomes a destination.  Stack-bound outgoing
-//      user-args are written via plain Str (no scratch needed).
-//   4. Load register-bound capture words.  For SPLIT captures, the
-//      reg part loads here; the stack part was spilled in step 2.
-//      Right-to-left over captures so the i=0 case (which may write
-//      X0) runs last.
-//   5. BL underlying, ADD sp, LDP FP,LR + RET.
-func emitClosureShimStackSpillAA64(a @asm.Assembler, fnLabel @[]char,
-		fvTyp @types.Type, f @ir.Func, cc common.CallConv,
-		argTypes @[]@types.Type, nUserWords int) {
-	var stkBytes int = cc.CallStackBytes(argTypes)
-	// Framed prologue: STP saves FP/LR so the caller's LR survives the BL
-	// ON THE STACK, not in caller-clobbered X16 (IP0) — the lifted body may
-	// trash X16 (e.g. dereferencing an indirect-large user-arg pointer), so
-	// the old leaf-shim "stash LR in X16 across the BL" corrupted the return.
-	// Then reserve the outgoing-args area below.  stkBytes is 16-aligned by
-	// CallStackBytes, so SP stays 16-aligned.  The caller's incoming stack
-	// args sit at [SP + frameDelta], frameDelta = 16 (the frame record) +
-	// stkBytes.
-	aarch64.Stp(a, true, aarch64.FP, aarch64.LR,
-		aarch64.MemPre(aarch64.SP, -16))
-	aarch64.Mov(a, true, aarch64.FP, aarch64.Reg(aarch64.SP))
-	aarch64.Sub(a, true, aarch64.SP, aarch64.SP,
-		aarch64.Imm(stkBytes))
-	var frameDelta int = 16 + stkBytes
-
-	// Step 1: spill stack-bound capture portions from the closure-struct
-	// base (X0, still live here — steps 2/3 may overwrite it).
-	emitClosureCaptureSpillAA64(a, cc, f, argTypes, aarch64.X0)
-
-	// Step 2: move user-args from incoming positions to outgoing
-	// positions per CallConv.  Right-to-left over user-args so a
-	// forward shift (low → high reg) reads each register source
-	// before its slot becomes a destination.
-	//
-	// Incoming layout: user-arg word with global word-index
-	// inIdx (0..nUserWords-1) is in X(1 + inIdx) if inIdx < 7,
-	// else on the CALLER'S stack at [SP_orig + (inIdx - 7) * 8].
-	// After the framed prologue (STP + SUB), the caller's SP is at
-	// [SP + frameDelta], so the stack source address becomes
-	// [SP + frameDelta + (inIdx - 7) * 8].
-	//
-	// Outgoing layout is what the classifier dictates for argIdx.
-	// Four transfer shapes:
-	//   * reg-source → reg-dest:   MOV  dstReg, srcReg
-	//   * reg-source → stack-dest: STR  srcReg, [SP, outStkOff]
-	//   * stack-source → reg-dest: LDR  dstReg, [SP, inStkOff]
-	//   * stack-source → stack-dest: LDR X16, [SP, inStkOff]; STR X16, [SP, outStkOff]
-	// X16 (AAPCS intra-call scratch) is safe here — step 1's
-	// shuttle uses have already been consumed.
-	var userArgStart int = f.NumCaptureParams
-	var inRegBase int = 1 + nUserWords
-	for ui := len(fvTyp.Params) - 1; ui >= 0; ui = ui - 1 {
-		var ut @types.Type = fvTyp.Params[ui].Type
-		// EffectiveArgWords (not ArgWords): an indirect-large aggregate
-		// user arg travels as a single pointer word both in and out, so
-		// counting its full ArgWords would over-read incoming regs and
-		// overwrite the neighboring arg.  A SPLIT (small aggregate
-		// straddling reg/stack) is handled per word by the move helper.
-		var nUw int = cc.EffectiveArgWords(ut)
-		inRegBase = inRegBase - nUw
-		var argIdx int = userArgStart + ui
-		var outRegStart int = cc.CallArgRegStart(argTypes, argIdx)
-		var outStkOff int = cc.CallArgStackOff(argTypes, argIdx)
-		var storeSize int = cc.StackArgStoreSize(ut, false)
-		for k := nUw - 1; k >= 0; k = k - 1 {
-			// Incoming prefix is 1 (data in X0); the caller stack sits at
-			// [SP + frameDelta] (the framed prologue's record + outgoing area).
-			emitUserArgWordMoveAA64(a, inRegBase, k, 1, frameDelta,
-				outRegStart, outStkOff, storeSize)
-		}
-	}
-
-	// Step 3: load register-bound capture portions from the closure-struct
-	// base (X0); right-to-left so the i==0 case (which may write X0 when
-	// regStart==0) runs last, keeping X0 live as the base.
-	emitClosureCaptureRegLoadAA64(a, cc, f, argTypes, aarch64.X0)
-
-	// Step 4: BL underlying, then unwind.  LR was saved on the stack by the
-	// prologue's STP, so tear down the outgoing-args area and restore FP/LR
-	// with the matching LDP before RET.  (BL clobbers LR, and the lifted
-	// body may clobber X16 — neither matters now that LR lives on the stack.)
-	a.SetGlobal(fnLabel)
-	aarch64.Bl(a, fnLabel)
-	aarch64.Add(a, true, aarch64.SP, aarch64.SP,
-		aarch64.Imm(stkBytes))
-	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR,
-		aarch64.MemPost(aarch64.SP, 16))
-	aarch64.Ret(a)
 }
 
 // totalCaptureWordsAA64 sums the AAPCS64 register-word footprint of

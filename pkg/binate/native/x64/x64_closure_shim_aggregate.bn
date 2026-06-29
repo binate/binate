@@ -53,10 +53,20 @@ func emitClosureShimAggregate_x64(a @asm.Assembler, fnLabel @[]char,
 			effectiveCapWords_x64(cc, f.ClosureStruct.Fields[i].Type)
 	}
 	var nUserWords int = userWords_x64(cc, fvTyp)
+	// Outgoing (real-ABI) user-word count: a coerced in-register struct/array
+	// arrives as ONE by-address pointer word (EffectiveArgWords == 1, counted by
+	// nUserWords) but the shim expands it into ArgWords coerced regs, so the
+	// total-register budget must count the OUTGOING words — counting it via
+	// EffectiveArgWords would undercount the outgoing register pressure and
+	// wrongly keep a wide call on the register-only path.
+	var outUserWords int = outgoingUserWords_x64(cc, fvTyp)
 	var useSret bool = retSz > 16
 	var capBaseSlot int = 0
 	if useSret { capBaseSlot = 1 }
-	if capBaseSlot + captureWords + nUserWords > 6 || nUserWords > 4 {
+	// Two limits: nUserWords (incoming dispatch words) must fit the 4 incoming
+	// user slots (RDX..R9); the OUTGOING total (captures + outUserWords) must fit
+	// the 6 GP arg regs.  These diverge once a coerced aggregate is present.
+	if capBaseSlot + captureWords + outUserWords > 6 || nUserWords > 4 {
 		emitClosureShimAggregateStackSpill_x64(a, fnLabel, fvTyp, f,
 			retSz, cc)
 		return
@@ -105,13 +115,17 @@ func emitClosureShimAggregate_x64(a @asm.Assembler, fnLabel @[]char,
 // the consumed sret slot, so captures start at RSI).  Two steps, in this
 // order:
 //
-//   1. Move the user args from their incoming slots argReg(2+j) (the
-//      funcval aggregate convention places user args after the
-//      retbuf+data prefix) to their outgoing slots
-//      argReg(capBaseSlot+captureWords+j).  The uniform per-word offset is
-//      capBaseSlot+captureWords-2: when >= 0 (shifting toward higher
-//      registers) the moves go right-to-left so each source is read before
-//      its slot is overwritten; otherwise left-to-right.
+//   1. Marshal the user args from their incoming slots (the funcval aggregate
+//      convention places user args after the retbuf+data prefix, so word w of
+//      the incoming dispatch sequence is argReg(2+w)) to their outgoing real-ABI
+//      slots starting at outBase = capBaseSlot+captureWords.  Most params shift
+//      word-for-word; a coerced in-register struct/array DIVERGES — it arrives as
+//      ONE by-address pointer word but expands into ArgWords outgoing regs (see
+//      marshalAggUserArg_x64).  Because outgoing positions never fall below
+//      incoming ones once outBase >= 2 (dest >= source pointwise), those moves go
+//      right-to-left so each source is read before its slot is overwritten;
+//      otherwise (outBase < 2, i.e. the pack shape with a single capture word)
+//      dest <= source, so they go left-to-right.
 //   2. Load the captures from [R11] into
 //      argReg(capBaseSlot..capBaseSlot+captureWords-1) — after the
 //      user-arg moves, so a capture write can't clobber an unread user
@@ -122,12 +136,12 @@ func loadClosureAggCallArgs_x64(a @asm.Assembler, cc common.CallConv,
 		capBaseSlot int) {
 	var outBase int = capBaseSlot + captureWords
 	if outBase >= 2 {
-		for j := nUserWords - 1; j >= 0; j = j - 1 {
-			moveAggUserWord_x64(a, j, outBase)
+		for pi := len(fvTyp.Params) - 1; pi >= 0; pi = pi - 1 {
+			marshalAggUserArg_x64(a, cc, fvTyp, pi, outBase, true)
 		}
 	} else {
-		for j := 0; j < nUserWords; j = j + 1 {
-			moveAggUserWord_x64(a, j, outBase)
+		for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
+			marshalAggUserArg_x64(a, cc, fvTyp, pi, outBase, false)
 		}
 	}
 	var wi int = 0
@@ -149,12 +163,93 @@ func loadClosureAggCallArgs_x64(a @asm.Assembler, cc common.CallConv,
 	}
 }
 
-// moveAggUserWord_x64 moves user-arg word j from its incoming register
-// argReg(2+j) to its outgoing register argReg(outBase+j), skipping the
-// move when source and destination coincide.
-func moveAggUserWord_x64(a @asm.Assembler, j int, outBase int) {
-	var srcReg int = argReg(2 + j)
-	var dstReg int = argReg(outBase + j)
+// outgoingUserWords_x64 sums the OUTGOING (real-ABI) GP-word footprint of a
+// closure's user params — the count the register/spill routing budgets on.  A
+// coerced in-register struct/array contributes its ArgWords coerced regs (the
+// shim expands the one by-address pointer word into them), every other param its
+// EffectiveArgWords.  This diverges from userWords_x64 (which counts the INCOMING
+// dispatch words, where a coerced aggregate is a single pointer) exactly when a
+// coerced aggregate is present.
+func outgoingUserWords_x64(cc common.CallConv, fvTyp @types.Type) int {
+	var n int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
+		var pt @types.Type = fvTyp.Params[pi].Type
+		if common.AggCoercedInReg(pt) {
+			n = n + common.ArgWords(pt)
+		} else {
+			n = n + cc.EffectiveArgWords(pt)
+		}
+	}
+	return n
+}
+
+// marshalAggUserArg_x64 marshals one user param (index pi) of the register-only
+// aggregate shim from its incoming dispatch slots to its outgoing real-ABI
+// argReg slots.  The incoming dispatch sequence places user word w at argReg(2+w)
+// (after the retbuf+data prefix); incoming/outgoing cursors are recovered by
+// summing the prior params' EffectiveArgWords (incoming) and outgoing words.
+//
+// Most params shift word-for-word.  A coerced in-register struct/array DIVERGES:
+// it arrives as ONE by-address pointer word (EffectiveArgWords == 1) but the
+// underlying's coerced ABI reads its ArgWords value-words in consecutive regs, so
+// the shim copies the pointer to R10 (a scratch — not a SysV arg reg, not the
+// return reg, and NOT R11, which holds the live closure-struct pointer) and loads
+// [R10 + 8k] into argReg(outBase + outWord + k).  Copying to R10 first keeps the
+// pointer safe from a write to its own incoming slot.
+//
+// hiToLo selects the within-param word order so a write can't clobber an unread
+// source: high-to-low when outgoing slots sit at/above incoming (outBase >= 2,
+// dest >= source), low-to-high otherwise (the caller picks the matching param
+// order — descending vs ascending — for the same reason).
+func marshalAggUserArg_x64(a @asm.Assembler, cc common.CallConv,
+		fvTyp @types.Type, pi int, outBase int, hiToLo bool) {
+	var inWord int = 0
+	var outWord int = 0
+	for q := 0; q < pi; q = q + 1 {
+		var qt @types.Type = fvTyp.Params[q].Type
+		inWord = inWord + cc.EffectiveArgWords(qt)
+		if common.AggCoercedInReg(qt) {
+			outWord = outWord + common.ArgWords(qt)
+		} else {
+			outWord = outWord + cc.EffectiveArgWords(qt)
+		}
+	}
+	var pt @types.Type = fvTyp.Params[pi].Type
+	if common.AggCoercedInReg(pt) {
+		var n int = common.ArgWords(pt)
+		var ptrReg int = argReg(2 + inWord)
+		x64.Mov(a, x64.Reg(x64.R10, x64.SZ64),
+			x64.Reg(ptrReg, x64.SZ64))
+		if hiToLo {
+			for k := n - 1; k >= 0; k = k - 1 {
+				x64.Mov(a, x64.Reg(argReg(outBase + outWord + k), x64.SZ64),
+					x64.Mem(x64.R10, 8 * k, x64.SZ64))
+			}
+		} else {
+			for k := 0; k < n; k = k + 1 {
+				x64.Mov(a, x64.Reg(argReg(outBase + outWord + k), x64.SZ64),
+					x64.Mem(x64.R10, 8 * k, x64.SZ64))
+			}
+		}
+		return
+	}
+	var w int = cc.EffectiveArgWords(pt)
+	if hiToLo {
+		for k := w - 1; k >= 0; k = k - 1 {
+			moveAggUserWord_x64(a, 2 + inWord + k, outBase + outWord + k)
+		}
+	} else {
+		for k := 0; k < w; k = k + 1 {
+			moveAggUserWord_x64(a, 2 + inWord + k, outBase + outWord + k)
+		}
+	}
+}
+
+// moveAggUserWord_x64 moves a user-arg word from incoming register argReg(srcSlot)
+// to outgoing register argReg(dstSlot), skipping the move when they coincide.
+func moveAggUserWord_x64(a @asm.Assembler, srcSlot int, dstSlot int) {
+	var srcReg int = argReg(srcSlot)
+	var dstReg int = argReg(dstSlot)
 	if srcReg != dstReg {
 		x64.Mov(a, x64.Reg(dstReg, x64.SZ64),
 			x64.Reg(srcReg, x64.SZ64))
@@ -238,14 +333,19 @@ func emitClosureShimAggregateStackSpill_x64(a @asm.Assembler,
 	}
 
 	// Step 2: move user args from their incoming slots (prefix 2: retbuf
-	// RDI, data RSI, args RDX..) to the classifier's outgoing slots.  Every
-	// user word shifts by outBase - 2 (outBase = capBaseSlot + captureWords,
-	// the first outgoing user-arg slot).  When that shift is >= 0 (toward
-	// higher regs, or none) the words move HIGH-word-first / right-to-left so
-	// each source is read before its slot is overwritten; for the pack shape
-	// with a single capture word the shift is -1 (toward lower regs), so they
-	// move LOW-word-first / left-to-right instead — otherwise a move would
-	// overwrite the next word's source (outgoing(k) == incoming(k-1)).
+	// RDI, data RSI, args RDX..) to the classifier's outgoing slots.  The
+	// incoming cursor advances by EffectiveArgWords (the dispatch-word count: a
+	// coerced in-register struct/array is ONE by-address pointer word there); the
+	// outgoing slots come from the classifier over marshalArgTypes (the REAL
+	// types), so a coerced aggregate's ArgWords value-words land in their proper
+	// reg/stack slots — see emitSpillAggUserArg_x64, which dereferences the
+	// pointer for that case.  When the first outgoing user slot sits at/above the
+	// incoming base (capBaseSlot + captureWords >= 2) the params/words move
+	// HIGH-first / right-to-left so each source is read before its slot is
+	// overwritten; for the pack shape with a single capture word the first
+	// outgoing slot is below the incoming base, so they move LOW-first /
+	// left-to-right instead — otherwise a move would overwrite the next word's
+	// source.
 	var captureWords int = 0
 	for i := 0; i < f.NumCaptureParams; i = i + 1 {
 		captureWords = captureWords +
@@ -256,27 +356,15 @@ func emitClosureShimAggregateStackSpill_x64(a @asm.Assembler,
 		for ui := len(fvTyp.Params) - 1; ui >= 0; ui = ui - 1 {
 			var nUw int = cc.EffectiveArgWords(fvTyp.Params[ui].Type)
 			inRegBase = inRegBase - nUw
-			var outRegStart int = cc.CallArgRegStart(marshalArgTypes,
-				userArgBase + ui)
-			var outStkOff int = cc.CallArgStackOff(marshalArgTypes,
-				userArgBase + ui)
-			for k := nUw - 1; k >= 0; k = k - 1 {
-				emitUserArgWordMove_x64(a, inRegBase, k, 2, stkBytes,
-					outRegStart, outStkOff)
-			}
+			emitSpillAggUserArg_x64(a, cc, fvTyp, marshalArgTypes,
+				userArgBase, ui, inRegBase, stkBytes, true)
 		}
 	} else {
 		var inRegBase int = 1
 		for ui := 0; ui < len(fvTyp.Params); ui = ui + 1 {
 			var nUw int = cc.EffectiveArgWords(fvTyp.Params[ui].Type)
-			var outRegStart int = cc.CallArgRegStart(marshalArgTypes,
-				userArgBase + ui)
-			var outStkOff int = cc.CallArgStackOff(marshalArgTypes,
-				userArgBase + ui)
-			for k := 0; k < nUw; k = k + 1 {
-				emitUserArgWordMove_x64(a, inRegBase, k, 2, stkBytes,
-					outRegStart, outStkOff)
-			}
+			emitSpillAggUserArg_x64(a, cc, fvTyp, marshalArgTypes,
+				userArgBase, ui, inRegBase, stkBytes, false)
 			inRegBase = inRegBase + nUw
 		}
 	}
@@ -318,4 +406,81 @@ func emitClosureShimAggregateStackSpill_x64(a @asm.Assembler,
 	}
 	x64.Add(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(rspDelta))
 	x64.Ret(a)
+}
+
+// emitSpillAggUserArg_x64 marshals one user param (index ui) of the stack-spill
+// aggregate shim from its incoming dispatch slots to the classifier's outgoing
+// reg/stack slots.  inRegBase is the param's incoming dispatch-word cursor (the
+// running 1-based count the caller maintains, matching emitUserArgWordMove_x64);
+// outgoing positions come from CallArgRegStart/CallArgStackOff over the REAL
+// marshalArgTypes.
+//
+// Most params shift word-for-word via emitUserArgWordMove_x64.  A coerced
+// in-register struct/array DIVERGES: it arrives as ONE by-address pointer word
+// (EffectiveArgWords == 1, so the caller's incoming cursor advanced by 1) but the
+// underlying's coerced ABI reads its ArgWords value-words; so the shim loads the
+// incoming pointer into R10 (a scratch — not a SysV arg reg, not the return reg,
+// and NOT R11, which holds the live closure-struct pointer) and copies
+// [R10 + 8k] into each outgoing slot.  SysV does not split a <=16 B aggregate, so
+// the outgoing slots are EITHER all registers (outRegStart >= 0) OR all stack
+// (outStkOff >= 0); the stack case shuttles each word through RAX.  hiToLo orders
+// the value-word writes high-first / low-first to match the caller's param
+// direction (so a write can't clobber an unread source).
+func emitSpillAggUserArg_x64(a @asm.Assembler, cc common.CallConv,
+		fvTyp @types.Type, marshalArgTypes @[]@types.Type, userArgBase int,
+		ui int, inRegBase int, stkBytes int, hiToLo bool) {
+	var ut @types.Type = fvTyp.Params[ui].Type
+	var outRegStart int = cc.CallArgRegStart(marshalArgTypes, userArgBase + ui)
+	var outStkOff int = cc.CallArgStackOff(marshalArgTypes, userArgBase + ui)
+	if !common.AggCoercedInReg(ut) {
+		var nUw int = cc.EffectiveArgWords(ut)
+		if hiToLo {
+			for k := nUw - 1; k >= 0; k = k - 1 {
+				emitUserArgWordMove_x64(a, inRegBase, k, 2, stkBytes,
+					outRegStart, outStkOff)
+			}
+		} else {
+			for k := 0; k < nUw; k = k + 1 {
+				emitUserArgWordMove_x64(a, inRegBase, k, 2, stkBytes,
+					outRegStart, outStkOff)
+			}
+		}
+		return
+	}
+	// Load the incoming by-address pointer (one word at incoming index
+	// inRegBase - 1; prefix 2 = retbuf + data) into R10.
+	var inIdx int = inRegBase - 1
+	if inIdx < 4 {
+		x64.Mov(a, x64.Reg(x64.R10, x64.SZ64),
+			x64.Reg(argReg(2 + inIdx), x64.SZ64))
+	} else {
+		x64.Mov(a, x64.Reg(x64.R10, x64.SZ64),
+			x64.Mem(x64.RSP, stkBytes + 16 + (inIdx - 4) * 8, x64.SZ64))
+	}
+	var n int = common.ArgWords(ut)
+	if hiToLo {
+		for k := n - 1; k >= 0; k = k - 1 {
+			emitCoercedValueWord_x64(a, k, outRegStart, outStkOff)
+		}
+	} else {
+		for k := 0; k < n; k = k + 1 {
+			emitCoercedValueWord_x64(a, k, outRegStart, outStkOff)
+		}
+	}
+}
+
+// emitCoercedValueWord_x64 copies value-word k of a by-address coerced aggregate
+// (whose pointer is in R10) to its outgoing slot: into argReg(outRegStart + k)
+// when the aggregate is register-passed (outRegStart >= 0), else shuttled through
+// RAX to the outgoing stack slot [RSP + outStkOff + 8k].
+func emitCoercedValueWord_x64(a @asm.Assembler, k int, outRegStart int,
+		outStkOff int) {
+	if outRegStart >= 0 {
+		x64.Mov(a, x64.Reg(argReg(outRegStart + k), x64.SZ64),
+			x64.Mem(x64.R10, 8 * k, x64.SZ64))
+		return
+	}
+	x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.R10, 8 * k, x64.SZ64))
+	x64.Mov(a, x64.Mem(x64.RSP, outStkOff + 8 * k, x64.SZ64),
+		x64.Reg(x64.RAX, x64.SZ64))
 }

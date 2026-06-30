@@ -1,0 +1,124 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// ============================================================
+// Aggregate (struct / array) == / != lowering
+// ============================================================
+//
+// A struct / array == / != is compared field/element-wise: it lowers to a
+// conjunction (OP_LAND) of per-field / per-element OP_EQ comparisons,
+// recursing into nested aggregates, negated for !=.  The checker
+// (aggregateComparable) has already verified the operand type is transitively
+// comparable, so every leaf is a scalar or pointer that OP_EQ handles.
+//
+// The walk mirrors the proven genStructCopy / genArrayCopy machinery
+// (EmitGetFieldPtr for struct fields; byte-offset EmitGetElemPtr for array
+// elements) — but compares and conjoins instead of RefInc-ing.  It is fully
+// unrolled and straight-line (no new blocks), so it needs no block threading.
+//
+// TODO: a very large array `[N]T` unrolls to N comparisons; a loop form
+// (mirroring genArrayCopy's counted loop, with a bool accumulator slot) would
+// keep the IR compact for big N.  Deferred — correctness first; the common
+// case is small aggregates.
+
+// aggregateEqType returns the peeled struct / array type when `t` is a struct
+// or array (the operand kinds whose == / != is compared field/element-wise),
+// else nil.  Transparent wrappers (named-distinct / readonly / alias) are
+// peeled so a `type Row [3]int` reaches the array path.
+func aggregateEqType(t @types.Type) @types.Type {
+	if t == nil { return nil }
+	var p @types.Type = peelTransparent(t)
+	if p == nil { return nil }
+	if p.Kind == types.TYP_STRUCT || p.Kind == types.TYP_ARRAY {
+		return p
+	}
+	return nil
+}
+
+// genAggregateEq lowers a struct / array == / != by materializing both
+// operands to stack scratch and walking them (emitAggregateEq).  `op` is
+// OP_EQ or OP_NE; `aggTyp` is the peeled aggregate type.  The result is the
+// structural-equality bool, negated for OP_NE.  Each operand is materialized
+// with a plain alloc+store — a bitwise scratch copy, no refcount traffic:
+// managed fields stay owned by the original temporaries, which the normal
+// end-of-statement cleanup handles, and the scratch alloca is an unmanaged
+// raw slot (never registered for destruction).
+func genAggregateEq(ctx @GenContext, b @Block, op int, lhs @Instr, rhs @Instr,
+		aggTyp @types.Type) @Instr {
+	var pa @Instr = b.EmitAlloc(lhs.Typ)
+	b.EmitStore(pa, lhs)
+	var pb @Instr = b.EmitAlloc(rhs.Typ)
+	b.EmitStore(pb, rhs)
+	var u8ptr @types.Type = types.MakePointerType(types.TypUint8())
+	var rawA @Instr = b.EmitBitCast(pa, u8ptr)
+	var rawB @Instr = b.EmitBitCast(pb, u8ptr)
+	var eq @Instr = emitAggregateEq(b, rawA, rawB, aggTyp)
+	if op == iropcode.OP_NE {
+		return b.EmitUnary(iropcode.OP_NOT, eq, types.TypBool())
+	}
+	return eq
+}
+
+// emitAggregateEq emits the field/element-wise equality of two aggregate
+// values, each given as a pointer to a value of (peeled) aggregate type `t`,
+// and returns the conjoined-equality bool.  Recurses for nested struct /
+// array fields/elements via emitFieldEq.  An empty struct / zero-length
+// array compares equal (const true).
+func emitAggregateEq(b @Block, ptrA @Instr, ptrB @Instr, t @types.Type) @Instr {
+	if t.Kind == types.TYP_STRUCT {
+		// A typed struct pointer is required for EmitGetFieldPtr to compute
+		// the field offsets from the struct layout (cf. genStructCopy).
+		var pa @Instr = b.EmitBitCast(ptrA, types.MakePointerType(t))
+		var pb @Instr = b.EmitBitCast(ptrB, types.MakePointerType(t))
+		var acc @Instr = nil
+		for i := 0; i < len(t.Fields); i++ {
+			var ft @types.Type = t.Fields[i].Type
+			var fpa @Instr = b.EmitGetFieldPtr(pa, i, ft)
+			var fpb @Instr = b.EmitGetFieldPtr(pb, i, ft)
+			acc = conjoinEq(b, acc, emitFieldEq(b, fpa, fpb, ft))
+		}
+		if acc == nil { return b.EmitConstBool(true) }
+		return acc
+	}
+	// Array: walk N elements at byte offsets i*sizeof(elem).  EmitGetElemPtr
+	// scales the index by its third argument (here uint8 = 1 byte), treating
+	// the base as a raw address — the genArrayCopy addressing form, valid
+	// regardless of the base pointer's declared pointee type.
+	var elemTyp @types.Type = t.Elem
+	var elemSize int = elemTyp.SizeOf()
+	var acc @Instr = nil
+	for i := 0; i < t.ArrayLen; i++ {
+		var off @Instr = b.EmitConstInt(i * elemSize, types.TypInt())
+		var ea @Instr = b.EmitGetElemPtr(ptrA, off, types.TypUint8())
+		var eb @Instr = b.EmitGetElemPtr(ptrB, off, types.TypUint8())
+		acc = conjoinEq(b, acc, emitFieldEq(b, ea, eb, elemTyp))
+	}
+	if acc == nil { return b.EmitConstBool(true) }
+	return acc
+}
+
+// emitFieldEq compares one field / element of type `ft`, given pointers to it
+// in both copies.  A nested struct / array recurses through emitAggregateEq;
+// a scalar / pointer is loaded through a typed pointer and compared with a
+// single OP_EQ.
+func emitFieldEq(b @Block, ptrA @Instr, ptrB @Instr, ft @types.Type) @Instr {
+	var fp @types.Type = peelTransparent(ft)
+	if fp != nil && (fp.Kind == types.TYP_STRUCT || fp.Kind == types.TYP_ARRAY) {
+		return emitAggregateEq(b, ptrA, ptrB, fp)
+	}
+	var pa @Instr = b.EmitBitCast(ptrA, types.MakePointerType(ft))
+	var pb @Instr = b.EmitBitCast(ptrB, types.MakePointerType(ft))
+	var va @Instr = b.EmitLoad(pa, ft)
+	var vb @Instr = b.EmitLoad(pb, ft)
+	return b.EmitBinop(iropcode.OP_EQ, va, vb, types.TypBool())
+}
+
+// conjoinEq ANDs feq into the running accumulator (nil → first term).  OP_LAND
+// is the non-short-circuiting bitwise-on-bool conjunction (both operands are
+// already evaluated 0/1 bools — OP_EQ / EmitConstBool results).
+func conjoinEq(b @Block, acc @Instr, feq @Instr) @Instr {
+	if acc == nil { return feq }
+	return b.EmitBinop(iropcode.OP_LAND, acc, feq, types.TypBool())
+}

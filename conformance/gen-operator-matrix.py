@@ -167,9 +167,12 @@ _IFACE_EQ = ("interface G {\n\tget() int\n}\n\n"
              "func (i *I) get() int {\n\treturn i.v\n}\n\n"
              "impl *I : G")
 
-# (name, helpers, decl-a, decl-b, expected error substring). `==`/`!=` on an
-# aggregate must be REJECTED at the checker (the codegen invalid-`icmp` bug is
-# gone — binate `60719e01`); these `.error` cells regression-guard that reject.
+# (name, helpers, decl-a, decl-b, expected error substring). These types are
+# NEVER comparable with `==`/`!=`; the cells regression-guard the reject.  A
+# plain struct / array of comparable fields IS now comparable (lowered
+# field/element-wise — see conformance/spec/13-expressions/015,016 and
+# 07-types/044), so the aggregate reject cells use a struct / array that
+# transitively CONTAINS a non-comparable (slice) field.
 EQ_TYPES = [
     ("raw-slice", "", "var a *[]int", "var b *[]int", "slices cannot be compared"),
     ("managed-slice", "", "var a @[]int", "var b @[]int", "slices cannot be compared"),
@@ -178,8 +181,10 @@ EQ_TYPES = [
      "function values cannot be compared"),
     ("iface", _IFACE_EQ, "var a @G = make(I)", "var b @G = make(I)",
      "interface values cannot be compared"),
-    ("struct", "type S struct {\n\tx int\n}", "var a S", "var b S",
-     "comparing struct values"),
+    ("struct", "type S struct {\n\tn int\n\tv @[]int\n}", "var a S", "var b S",
+     "this struct is not comparable"),
+    ("array", "", "var a [2]@[]int", "var b [2]@[]int",
+     "this array is not comparable"),
 ]
 
 

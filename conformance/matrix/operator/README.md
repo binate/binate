@@ -42,12 +42,15 @@ confirm compound-assign works through field/index. A pure regression net.
 
 ### eq-reject sub-grid (`.error` cells)
 
-`==` on each aggregate operand `{raw-slice, managed-slice, func-value, iface,
-struct}` must be REJECTED at the checker (the codegen invalid-`icmp` bug is gone —
-`60719e01`). These are negative (`.error`) cells: green = the checker correctly
-rejects. **All green** on every backend (front-end reject). The `struct` cell
-asserts "comparing struct values … is not yet implemented" — when struct `==`
-lands, that cell flips to a value cell.
+`==` on each NON-comparable operand `{raw-slice, managed-slice, func-value,
+iface, struct, array}` must be REJECTED at the checker.  These are negative
+(`.error`) cells: green = the checker correctly rejects.  **All green** on every
+backend (front-end reject).  Slices, interface values, and function values are
+never comparable.  A plain struct / array of comparable fields IS now comparable
+(lowered field/element-wise — see `spec/13-expressions/015,016` and
+`spec/07-types/044`), so the `struct` / `array` cells use an aggregate that
+transitively CONTAINS a slice field (e.g. `struct { n int; v @[]int }`), which
+stays rejected ("this struct/array is not comparable").
 
 ## Current state
 

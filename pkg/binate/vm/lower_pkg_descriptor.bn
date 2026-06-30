@@ -1,0 +1,221 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/builtins/rt"
+import "pkg/stdx/slices"
+
+// Per-package bytecode reflect descriptor: the VM equivalent of
+// codegen/emit_pkg_descriptor.bn and native/*/_pkg_descriptor.bn.  A
+// package compiled to bytecode has no native `__Package` symbol, so without
+// this its `__Package()` call falls through to the extern registry and fails
+// ("extern not found: <pkg>.__Package").  Here the VM builds the immortal
+// static-managed `reflect.Package` descriptor in its own runtime memory and
+// synthesizes a leaf bytecode `__Package()` accessor that returns it.
+//
+// The descriptor's byte layout is NOT re-implemented here: it is built once
+// by ir.BuildPackageDescriptors (the single source of truth the LLVM and
+// native backends also lower), and lowerDataGlobals lays the resulting term
+// list into memory — the VM's runtime equivalent of the native EmitDataGlobal
+// + linker fixups, so the three backends cannot drift on the layout.
+
+// lowerDataGlobals lays a built ir.DataGlobal list into immortal VM memory,
+// resolving symrefs to runtime addresses (the runtime analog of the native
+// assembler's symbol table + absolute relocations).  Two passes: pass 1
+// allocates each block and records its name -> base address; pass 2 writes
+// every term, turning a DT_SYMREF into the resolved (target base + addend)
+// word.  Two passes are required because a term can reference a symbol whose
+// block is allocated later in the list (the descriptor node, emitted last,
+// points back at its tables).  Returns parallel name/addr slices so the
+// caller can find a particular blob's address (e.g. the descriptor node).
+//
+// The blocks are never freed: like the native backend's static data they are
+// package-lifetime immortal.  A node carrying a managed header gets its
+// negative rt.STATIC_REFCOUNT sentinel from its own DataInt term, so every
+// later RefInc/RefDec on it is a no-op rather than a heap free — no leak.
+func lowerDataGlobals(dgs @[]@ir.DataGlobal) (@[]@[]char, @[]int) {
+	var names @[]@[]char = make_slice(@[]char, 0)
+	var addrs @[]int = make_slice(int, 0)
+	for i := 0; i < len(dgs); i++ {
+		var dg @ir.DataGlobal = dgs[i]
+		var sz int = dataGlobalByteLen(dg)
+		if sz < 1 { sz = 1 }
+		var p *uint8 = rt.RawAllocZero(sz)
+		names = slices.Append[@[]char](names, dg.Name)
+		addrs = slices.Append[int](addrs, bit_cast(int, p))
+	}
+	for i := 0; i < len(dgs); i++ {
+		fillDataGlobal(dgs[i], addrs[i], names, addrs)
+	}
+	return names, addrs
+}
+
+// dataGlobalByteLen sums a DataGlobal's contiguous term widths: DT_INT /
+// DT_ZERO carry an explicit Width, DT_BYTES is its byte count, and a DT_SYMREF
+// is one target pointer.  Mirrors how emitDataTerm lays each term, so the
+// allocated block is exactly the size the fill pass writes.
+func dataGlobalByteLen(dg @ir.DataGlobal) int {
+	var n int = 0
+	for i := 0; i < len(dg.Init); i++ {
+		var t @ir.DataTerm = dg.Init[i]
+		if t.Kind == ir.DT_INT {
+			n = n + t.Width
+		} else if t.Kind == ir.DT_BYTES {
+			n = n + len(t.Bytes)
+		} else if t.Kind == ir.DT_SYMREF {
+			n = n + types.GetTarget().PointerSize
+		} else {
+			n = n + t.Width
+		}
+	}
+	return n
+}
+
+// fillDataGlobal writes dg's terms contiguously into its allocated block at
+// `base`, resolving each DT_SYMREF via the (names, addrs) table — the runtime
+// equivalent of emitDataTerm.  An empty-Sym symref lays a null word (an empty
+// table slice's data pointer); DT_ZERO is left as the RawAllocZero zero-fill.
+func fillDataGlobal(dg @ir.DataGlobal, base int, names @[]@[]char,
+		addrs @[]int) {
+	var off int = 0
+	for i := 0; i < len(dg.Init); i++ {
+		var t @ir.DataTerm = dg.Init[i]
+		if t.Kind == ir.DT_INT {
+			writeLE(base + off, t.IntVal, t.Width)
+			off = off + t.Width
+		} else if t.Kind == ir.DT_BYTES {
+			var dst *uint8 = bit_cast(*uint8, base + off)
+			for j := 0; j < len(t.Bytes); j++ {
+				dst[j] = t.Bytes[j]
+			}
+			off = off + len(t.Bytes)
+		} else if t.Kind == ir.DT_SYMREF {
+			var w int = types.GetTarget().PointerSize
+			var val int = 0
+			if len(t.Sym) > 0 {
+				val = resolveSym(names, addrs, t.Sym) + t.Addend
+			}
+			writeLE(base + off, bit_cast(uint64, cast(int64, val)), w)
+			off = off + w
+		} else {
+			off = off + t.Width
+		}
+	}
+	return
+}
+
+// writeLE stores `val`'s low `width` bytes little-endian at `addr`.  The
+// target byte order is written explicitly rather than relying on the host's,
+// so a descriptor laid on one host is read correctly per the target ABI.
+func writeLE(addr int, val uint64, width int) {
+	var p *uint8 = bit_cast(*uint8, addr)
+	var v uint64 = val
+	for i := 0; i < width; i++ {
+		p[i] = cast(uint8, v & cast(uint64, 0xFF))
+		v = v >> cast(uint64, 8)
+	}
+	return
+}
+
+// resolveSym returns the allocated base address recorded for `sym` during
+// pass 1, or 0 if absent.  Linear scan: a descriptor's symbol set is tiny
+// (a handful of blobs per package), so a hash would not pay for itself.
+func resolveSym(names @[]@[]char, addrs @[]int, sym @[]char) int {
+	for i := 0; i < len(names); i++ {
+		if streq2(names[i], sym) { return addrs[i] }
+	}
+	return 0
+}
+
+// emitPackageDescriptorVM builds the just-lowered module m's immortal
+// reflect.Package descriptor in VM memory and registers a bytecode
+// __Package() accessor returning it.  The caller gates this on
+// m.PackageAccessorSig (set only when reflect was loaded), matching the
+// LLVM/native emitters' gate.
+//
+// MIN milestone: the Functions/Globals/Vtables tables are emitted EMPTY
+// ({nil, 0}); only the descriptor node + package-name bytes are laid, so
+// `<pkg>.__Package().Name` resolves.  Populating the tables (with callable
+// FunctionInfo.Value handles) is the follow-up that the table-reading
+// conformance tests pin.
+func emitPackageDescriptorVM(vm @VM, m @ir.Module) {
+	var pkgName @[]char = vm.modulePkgName
+	var nameSym @[]char = mangle.GlobalName(pkgName, "_pkgname")
+	var infoSym @[]char = mangle.GlobalName(pkgName, "_pkg_info")
+	var funcsSym @[]char = mangle.GlobalName(pkgName, "_pkg_funcs")
+	var globalsSym @[]char = mangle.GlobalName(pkgName, "_pkg_globals")
+	var vtablesSym @[]char = mangle.GlobalName(pkgName, "_pkg_vtables")
+
+	var funcs @[]@ir.PkgFuncEntry = make_slice(@ir.PkgFuncEntry, 0)
+	var globals @[]@ir.PkgGlobalEntry = make_slice(@ir.PkgGlobalEntry, 0)
+	var vtables @[]@ir.PkgVtableEntry = make_slice(@ir.PkgVtableEntry, 0)
+
+	var dgs @[]@ir.DataGlobal = ir.BuildPackageDescriptors(
+		rt.STATIC_REFCOUNT, infoSym, nameSym, buf.CopyStr(pkgName),
+		funcsSym, funcs, globalsSym, globals, vtablesSym, vtables)
+
+	var names @[]@[]char
+	var addrs @[]int
+	names, addrs = lowerDataGlobals(dgs)
+
+	// The accessor returns the node's PAYLOAD pointer — past the 2-word
+	// managed header — i.e. the @reflect.Package value (matching the native
+	// accessor's `lea node; add hdr; ret`).  hdr = 2*IntSize assumes
+	// PointerSize == IntSize, the same assumption BuildPackageDescriptor makes.
+	var infoAddr int = resolveSym(names, addrs, infoSym)
+	var hdr int = 2 * types.GetTarget().IntSize
+	registerPackageAccessor(vm, infoAddr + hdr)
+	return
+}
+
+// registerPackageAccessor synthesizes and installs the bytecode __Package()
+// accessor for the current module: a leaf VMFunc with no params and a single
+// scalar (pointer) result that loads the immortal descriptor's payload address
+// and returns it.  The returned @reflect.Package is static-managed, so the
+// caller's end-of-statement RefDec sees the negative header and no-ops.
+//
+// Two instructions suffice — BC_LOAD_IMM bakes the runtime payload address
+// (known now, since the VM lowers at runtime, exactly as global refs bake
+// their storage address), then BC_RETURN returns it as a scalar.  Only
+// register 0 is used (a pointer, never a 64-bit-scalar pair), so no slot
+// remapping is needed and NumRegs is 1 on every host.
+func registerPackageAccessor(vm @VM, payloadAddr int) {
+	var vmf @VMFunc = make(VMFunc)
+	vmf.Name = qualifyCallName(vm, "__Package")
+	vmf.NumParams = 0
+	vmf.NumParamSlots = 0
+	vmf.NumResults = 1
+	vmf.ResultSizes = make_slice(int, 1)
+	vmf.ResultOffsets = make_slice(int, 1)
+	vmf.ResultMultiWord = make_slice(bool, 1)
+	vmf.ResultSizes[0] = types.GetTarget().PointerSize
+	vmf.ResultOffsets[0] = 0
+	vmf.ResultMultiWord[0] = false
+	vmf.NumRegs = 1
+	vmf.FrameSize = 0
+
+	var code @[]BCInstr = make_slice(BCInstr, 2)
+	var load BCInstr
+	load.Op = BC_LOAD_IMM
+	load.Dst = 0
+	load.Imm = payloadAddr
+	code[0] = load
+	var ret BCInstr
+	ret.Op = BC_RETURN
+	ret.Dst = 0
+	ret.Src1 = 0
+	ret.Aux = 0
+	code[1] = ret
+	vmf.Code = code
+
+	vmf.Names = make_slice(@[]char, 0)
+	vmf.CallCache = make_slice(int, 0)
+	vmf.Strings = vm.moduleStrings
+
+	var newIdx int = len(vm.Funcs)
+	vm.Funcs = slices.Append[@VMFunc](vm.Funcs, vmf)
+	funcIndexSet(vm, vmf.Name, newIdx)
+	return
+}

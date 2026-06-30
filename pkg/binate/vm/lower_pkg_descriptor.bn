@@ -5,6 +5,7 @@ import "pkg/binate/ir"
 import "pkg/binate/mangle"
 import "pkg/binate/types"
 import "pkg/builtins/rt"
+import "pkg/std/strings"
 import "pkg/stdx/slices"
 
 // Per-package bytecode reflect descriptor: the VM equivalent of
@@ -135,11 +136,18 @@ func resolveSym(names @[]@[]char, addrs @[]int, sym @[]char) int {
 // m.PackageAccessorSig (set only when reflect was loaded), matching the
 // LLVM/native emitters' gate.
 //
-// MIN milestone: the Functions/Globals/Vtables tables are emitted EMPTY
-// ({nil, 0}); only the descriptor node + package-name bytes are laid, so
-// `<pkg>.__Package().Name` resolves.  Populating the tables (with callable
-// FunctionInfo.Value handles) is the follow-up that the table-reading
-// conformance tests pin.
+// The Functions table is populated (one reflect.FunctionInfo per
+// `.bni`-exported / struct-dtor function + the self-listed __Package
+// accessor), mirroring codegen's collectPackageFuncs.  Each entry's Value is
+// lowered as a null word (an empty HandleSym) and then back-patched with the
+// function's callable VM func-value handle (patchFuncValueHandles) — a
+// bytecode function has no static `@__handle` symbol the descriptor could
+// symref, so the handle (a runtime heap block) is resolved post-lowering.
+//
+// The Globals/Vtables tables are emitted EMPTY ({nil,0}): a bytecode package's
+// own globals/vtables have no descriptor consumer (those tables drive
+// cross-mode injection of a NATIVE package's surface — RegisterPackageGlobals/
+// Vtables — which never enumerates a bytecode package's descriptor).
 func emitPackageDescriptorVM(vm @VM, m @ir.Module) {
 	var pkgName @[]char = vm.modulePkgName
 	var nameSym @[]char = mangle.GlobalName(pkgName, "_pkgname")
@@ -148,7 +156,7 @@ func emitPackageDescriptorVM(vm @VM, m @ir.Module) {
 	var globalsSym @[]char = mangle.GlobalName(pkgName, "_pkg_globals")
 	var vtablesSym @[]char = mangle.GlobalName(pkgName, "_pkg_vtables")
 
-	var funcs @[]@ir.PkgFuncEntry = make_slice(@ir.PkgFuncEntry, 0)
+	var funcs @[]@ir.PkgFuncEntry = gatherPackageFuncs(m, pkgName)
 	var globals @[]@ir.PkgGlobalEntry = make_slice(@ir.PkgGlobalEntry, 0)
 	var vtables @[]@ir.PkgVtableEntry = make_slice(@ir.PkgVtableEntry, 0)
 
@@ -167,7 +175,107 @@ func emitPackageDescriptorVM(vm @VM, m @ir.Module) {
 	var infoAddr int = resolveSym(names, addrs, infoSym)
 	var hdr int = 2 * types.GetTarget().IntSize
 	registerPackageAccessor(vm, infoAddr + hdr)
+
+	// Fill each FunctionInfo.Value with the function's callable VM func-value
+	// handle (now that the accessor — the __Package self-entry's target — is
+	// registered too).
+	patchFuncValueHandles(vm, funcs, names, addrs)
 	return
+}
+
+// gatherPackageFuncs builds the reflect.FunctionInfo rows for module m's
+// descriptor: one per `.bni`-exported, non-extern function (plus own-package
+// struct dtors, which are injectable when native-only) and — last — the
+// compiler-synthesized __Package accessor itself, so a package is reflectable
+// through its own table.  Mirrors codegen's collectPackageFuncs; each entry's
+// HandleSym is EMPTY (the Value is back-patched with the runtime handle, since
+// a bytecode function has no static handle symbol).
+func gatherPackageFuncs(m @ir.Module, pkgName @[]char) @[]@ir.PkgFuncEntry {
+	var funcs @[]@ir.PkgFuncEntry = make_slice(@ir.PkgFuncEntry, 0)
+	for i := 0; i < len(m.Funcs); i++ {
+		var f @ir.Func = m.Funcs[i]
+		if f.IsExtern { continue }
+		if !f.Exported && !f.IsStructDtor { continue }
+		var fv @types.Type = funcValueTypeOf(f)
+		if fv == nil { continue }
+		funcs = slices.Append[@ir.PkgFuncEntry](funcs,
+			pkgFuncEntry(pkgName, f.Name, fv))
+	}
+	// Self-list __Package (the accessor is not in m.Funcs — it is
+	// backend-synthesized).  Name is the FQ `<pkg>.__Package`; the func-value
+	// type is the one IR-gen stashed for the backends to share.
+	if m.PackageAccessorSig != nil {
+		var nameP @[]char = mangle.QualifyName(pkgName, "__Package")
+		funcs = slices.Append[@ir.PkgFuncEntry](funcs,
+			pkgFuncEntry(pkgName, nameP, m.PackageAccessorSig))
+	}
+	return funcs
+}
+
+// pkgFuncEntry builds one reflect.FunctionInfo row.  The node/name/sig symbols
+// are unique transient keys (the VM has no linker — they only key the
+// pass-local relocation table); HandleSym is empty so Value lowers to null and
+// is back-patched.  RetbufSize / ParamSlots come from the same shared helpers
+// the LLVM and native gathers use, so the row metadata is identical.
+func pkgFuncEntry(pkgName @[]char, name @[]char, fv @types.Type) @ir.PkgFuncEntry {
+	var mangled @[]char = mangle.FuncName(pkgName, name)
+	return ir.NewPkgFuncEntry(catSym(mangled, "__fninfo"),
+		catSym(mangled, "__fnname"), buf.CopyStr(name),
+		catSym(mangled, "__fnsig"), buf.CopyStr(fv.SigString()),
+		"", types.AggregateReturnSize(fv.Results), len(fv.Params))
+}
+
+// funcValueTypeOf synthesizes a TYP_FUNC_VALUE from a function's param/result
+// signature (ir.Param and types.Param share a shape but are distinct nominal
+// types, so the params are copied field-by-field).  Mirrors codegen's
+// lookupFuncValueType.
+func funcValueTypeOf(f @ir.Func) @types.Type {
+	var params @[]@types.Param = make_slice(@types.Param, 0)
+	for j := 0; j < len(f.Params); j++ {
+		var p @types.Param = make(types.Param)
+		p.Name = f.Params[j].Name
+		p.Type = f.Params[j].Typ
+		params = slices.Append[@types.Param](params, p)
+	}
+	return types.MakeFuncValueType(params, f.Results)
+}
+
+// patchFuncValueHandles writes each FunctionInfo node's Value word with the
+// callable VM func-value handle of the function it describes.  The native
+// descriptor symrefs a static `@__handle.<mangled>` block; the VM has no such
+// symbol, so ensureHandle builds the function's runtime {vtable,data} handle
+// (kept alive by the VMFunc, which lives for the VM's lifetime — so the
+// immortal descriptor's raw Value pointer never dangles) and the handle's
+// address is written into the node.  A function not lowered as a VM function
+// (idx < 0) keeps a null Value.
+//
+// Value sits at byte offset 5w in the node — past the 2-word header, the Pkg
+// symref, and the Name {data,len} pair (buildFuncInfoNode's term order).
+func patchFuncValueHandles(vm @VM, funcs @[]@ir.PkgFuncEntry,
+		names @[]@[]char, addrs @[]int) {
+	var w int = types.GetTarget().IntSize
+	var psz int = types.GetTarget().PointerSize
+	for i := 0; i < len(funcs); i++ {
+		var e @ir.PkgFuncEntry = funcs[i]
+		var idx int = funcIndexLookup(vm, e.Name)
+		if idx < 0 { continue }
+		var callee @VMFunc = vm.Funcs[idx]
+		ensureHandle(vm, callee, idx)
+		var nodeAddr int = resolveSym(names, addrs, e.NodeSym)
+		if nodeAddr == 0 { continue }
+		writeLE(nodeAddr + 5 * w,
+			bit_cast(uint64, cast(int64, bit_cast(int, callee.Handle))), psz)
+	}
+	return
+}
+
+// catSym concatenates two name fragments into a fresh owned symbol — e.g.
+// catSym(mangled, "__fninfo").
+func catSym(a @[]char, b *[]readonly char) @[]char {
+	var sb @strings.Builder = strings.NewBuilder()
+	sb.Write(a)
+	sb.Write(b)
+	return buf.CopyStr(sb.String())
 }
 
 // registerPackageAccessor synthesizes and installs the bytecode __Package()

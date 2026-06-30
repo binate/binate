@@ -20,17 +20,16 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 #
 # The skips fall in two groups (all tracked in claude-todo.md):
 #
-# (A) BUILDER-lag — the bundled bnlint (bnc-0.0.9) predates a feature/fix that
+# (A) BUILDER-lag — the bundled bnlint (bnc-0.0.10) predates a feature/fix that
 #     is already in the tree, so it aborts at the typecheck pass.  Clears at the
-#     next BUILDER bump.
-#   - pkg/builtins/rt: its Exit/RawFree use the void __c_call spelling
-#     (`__c_call("free", "void", ptr)`), a parser feature newer than bnc-0.0.9.
-#     bnlint typechecks dependency BODIES, so this also covers rt's importer
-#     chain: pkg/binate/{vm,repl,interp} and cmd/bni.
-#   - pkg/std/os: depends on the .bni free-function-vs-same-named-method fix
-#     (796effc7, os.Stat / File.Stat) which postdates bnc-0.0.9 ("Stat: .bn has
-#     1 parameters but .bni declares 0").  Covers os + its importers cmd/bni
-#     (above), cmd/bnas, cmd/bnlint (all call os.Exit).
+#     next BUILDER bump (verified: a current-source bnlint accepts it).
+#   - pkg/binate/interp: its extern-registration enumerates `rt.__Package()` and
+#     wraps each entry via `_func_handle` (the embeddable-interp work), a usage
+#     newer than bnc-0.0.10 — the bundled bnlint aborts with `undefined:
+#     __Package` / `_func_handle argument must be a named function`.
+#     (The earlier bnc-0.0.9 lag — pkg/builtins/rt's void `__c_call` spelling and
+#     pkg/std/os's .bni method fix `796effc7`, plus their vm/repl/cmd-bni/bnas/
+#     bnlint importer chain — cleared at the bnc-0.0.10 bump and is now linted.)
 #
 # (B) Pending real lint findings — uncovered until the recursive pkg/ discovery
 #     below was added (the old one-level `pkg/*/` glob never reached the
@@ -38,7 +37,7 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 #     [managed-to-raw-assign] (`var data *[]uint8 = sec.Data` — a borrow of a
 #     held @[]uint8); each needs a per-site judgement (real UAF risk vs a safe
 #     borrow the rule over-flags) before un-skipping.  Tracked in claude-todo.md.
-LINT_SKIP="pkg/builtins/rt pkg/binate/vm pkg/binate/repl pkg/binate/interp cmd/bni cmd/bnas cmd/bnlint pkg/std/os pkg/binate/asm/arm32 pkg/binate/asm/elf pkg/binate/asm/macho pkg/binate/asm/parse pkg/binate/asm/x64"
+LINT_SKIP="pkg/binate/interp pkg/binate/asm/arm32 pkg/binate/asm/elf pkg/binate/asm/macho pkg/binate/asm/parse pkg/binate/asm/x64"
 
 # Discover targets:
 #   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so

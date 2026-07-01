@@ -29,6 +29,7 @@ func AAPCS64() CallConv {
 	cc.StackAlign = 16
 	cc.SplitAggregates = true
 	cc.IndirectLargeAggregates = true
+	cc.WordBytes = 8
 	return cc
 }
 
@@ -77,6 +78,47 @@ func SysV_AMD64() CallConv {
 	// consistent with how the LLVM-side code generation now
 	// emits these calls.
 	cc.IndirectLargeAggregates = true
+	cc.WordBytes = 8
+	return cc
+}
+
+// AAPCS32 returns the base (soft-float) 32-bit ARM AAPCS/EABI CallConv
+// used by the arm32-baremetal target.  Key differences from AAPCS64:
+//
+//   - WordBytes = 4 (ILP32): a 64-bit scalar is 2 GP words, a 16-byte
+//     managed-slice is 4.
+//   - 4 GP arg registers (r0-r3) and 4 GP return registers — LLVM
+//     returns a first-class-aggregate multi-return in r0-r3.
+//   - Soft-float: NumFpArgRegs / NumFpRetRegs = 0, so a float rides the GP
+//     registers (classified as an ordinary GP value of its size) and a
+//     float tuple field counts toward the GP return budget.
+//   - A composite larger than 4 bytes is returned via an sret pointer
+//     (InternalSretBytes / CExternSretBytes = 4), unlike AAPCS64's 16.
+//   - SplitAggregates = true (aggregates straddle r0-r3 and the stack);
+//     IndirectLargeAggregates = false (base AAPCS passes aggregates by
+//     value, not by reference).
+//   - 8-byte-aligned arguments obey the even-register-pair / 8-aligned
+//     stack-slot rule via argNeeds8Align (AAPCS §6.5 stage C.3), handled
+//     in argRegWordsStackWords / stackArgFootprint.
+//
+// The register-count / sret-threshold numbers should be pinned to how
+// clang -target arm-none-eabi lowers the corresponding shapes at the
+// native↔LLVM boundary; verify against clang before relying on them for a
+// new shape.  A hard-float VFP variant (arm32-linux) is a later addition.
+func AAPCS32() CallConv {
+	var cc CallConv
+	cc.NumGpArgRegs = 4
+	cc.NumFpArgRegs = 0
+	cc.NumGpRetRegs = 4
+	cc.NumFpRetRegs = 0
+	cc.NumX87RetRegs = 0
+	cc.InternalSretBytes = 4
+	cc.CExternSretBytes = 4
+	cc.AggregateInRegMax = 16
+	cc.StackAlign = 8
+	cc.SplitAggregates = true
+	cc.IndirectLargeAggregates = false
+	cc.WordBytes = 4
 	return cc
 }
 
@@ -162,20 +204,32 @@ func (cc CallConv) EffectiveArgWords(t @types.Type) int {
 // (-1, 0, 1), one 8-byte stack word.  The caller is responsible for tracking
 // NSRN and passing it in (the walkers below do).
 func (cc CallConv) argRegWordsStackWords(t @types.Type, ngrn int, nsrn int) (int, int, int) {
-	if IsFloatScalarTyp(t) {
+	// Hard-float only: a float scalar rides the FP register file (NSRN),
+	// never a GP register.  Under soft-float (NumFpArgRegs == 0, e.g.
+	// AAPCS32-baremetal) a float is an ordinary GP value of its size, so it
+	// falls through to the GP path below.
+	if IsFloatScalarTyp(t) && cc.NumFpArgRegs > 0 {
 		if nsrn < cc.NumFpArgRegs { return -1, 0, 0 }
 		return -1, 0, 1
 	}
-	var w int = ArgWords(t)
+	var w int = cc.ArgWords(t)
 	var agg bool = IsAggregateTyp(t)
+	// ILP32 double-word alignment (AAPCS §6.5 stage C.3): an 8-byte-aligned
+	// argument starts on an EVEN core register — round NCRN up, wasting the
+	// odd register.  Inert on LP64 (WordBytes 8, nothing 8-aligned relative
+	// to an 8-byte word), so the register start below stays `ngrn` there.
+	var start int = ngrn
+	if cc.WordBytes < 8 && argNeeds8Align(t) && start % 2 != 0 {
+		start = start + 1
+	}
 	// Indirect-large path (AAPCS64 / LLVM byval on aa64): aggregates
 	// above AggregateInRegMax are passed as a SINGLE pointer arg.
 	// Pointer fits in 1 GP arg reg if available; otherwise 1 stack
 	// word.  Caller is responsible for placing the struct in its
 	// own frame and emitting the LEA / store of the pointer.
 	if cc.IndirectLargeAggregates && agg && t.SizeOf() > cc.AggregateInRegMax {
-		if ngrn < cc.NumGpArgRegs {
-			return ngrn, 1, 0
+		if start < cc.NumGpArgRegs {
+			return start, 1, 0
 		}
 		return -1, 0, 1
 	}
@@ -184,25 +238,48 @@ func (cc CallConv) argRegWordsStackWords(t @types.Type, ngrn int, nsrn int) (int
 	if !cc.SplitAggregates && agg && t.SizeOf() > cc.AggregateInRegMax {
 		return -1, 0, w
 	}
-	// Fits wholly in remaining GP regs.
-	if ngrn + w <= cc.NumGpArgRegs {
-		return ngrn, w, 0
+	// Fits wholly in remaining GP regs (from the padded start).
+	if start + w <= cc.NumGpArgRegs {
+		return start, w, 0
 	}
 	// Doesn't fit.  Three sub-cases:
 	//   - AAPCS SPLIT: aggregate straddles regs + stack.
 	//   - SysV non-split aggregate: whole aggregate to MEMORY (stack),
 	//     NGRN unchanged so later (smaller) args can still take any
 	//     remaining regs.
-	//   - Scalar overflow (w = 1 with ngrn already at NumGpArgRegs):
-	//     single stack word; common to both ABIs.
-	if cc.SplitAggregates && agg && ngrn < cc.NumGpArgRegs {
-		var regWords int = cc.NumGpArgRegs - ngrn
-		return ngrn, regWords, w - regWords
+	//   - Scalar overflow (w words with start already at NumGpArgRegs,
+	//     including an 8-aligned pair pushed past r4 by the pad):
+	//     stack words; common to both ABIs.
+	if cc.SplitAggregates && agg && start < cc.NumGpArgRegs {
+		var regWords int = cc.NumGpArgRegs - start
+		return start, regWords, w - regWords
 	}
 	if !cc.SplitAggregates && agg {
 		return -1, 0, w
 	}
 	return -1, 0, w
+}
+
+// advanceNgrn returns the running NCRN after arg k, given its
+// classification (rs, rw, sw) and type.  Under an AAPCS-family convention
+// (SplitAggregates) a GP-class argument with ANY stack portion saturates
+// NCRN to NumGpArgRegs: once an argument spills, every later argument
+// spills too (AAPCS §6.5 stage C.6), and any even-pair pad register is
+// thereby consumed.  A hard-float float overflowing to the stack does NOT
+// consume GP registers, so it is excluded from saturation.  Otherwise the
+// NCRN advances past the (possibly pad-shifted) register span rs+rw, or —
+// for a value with no GP register (rs < 0) — is left unchanged.  On SysV
+// (no split) this reduces to the historical `ngrn + rw`, and on LP64 the
+// pad never applies, so both existing backends see identical NCRN walks.
+func (cc CallConv) advanceNgrn(t @types.Type, ngrn int, rs int, rw int, sw int) int {
+	if sw > 0 && cc.SplitAggregates &&
+			!(IsFloatScalarTyp(t) && cc.NumFpArgRegs > 0) {
+		return cc.NumGpArgRegs
+	}
+	if rs >= 0 {
+		return rs + rw
+	}
+	return ngrn + rw
 }
 
 // argRegWordsStackWordsV applies the darwin variadic rule on top of
@@ -231,9 +308,9 @@ func (cc CallConv) CallArgRegStart(argTypes @[]@types.Type, i int) int {
 	var ngrn int = 0
 	var nsrn int = 0
 	for k := 0; k <= i; k++ {
-		rs, rw, _ := cc.argRegWordsStackWords(argTypes[k], ngrn, nsrn)
+		rs, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn, nsrn)
 		if k == i { return rs }
-		ngrn = ngrn + rw
+		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
 		if IsFloatScalarTyp(argTypes[k]) { nsrn = nsrn + 1 }
 	}
 	return -1
@@ -290,7 +367,16 @@ func (cc CallConv) stackArgFootprint(t @types.Type, sw int, isVariadic bool) (in
 	if n > 0 {
 		return n, n
 	}
-	return 8, sw * 8
+	// A regular stack argument occupies sw WordBytes-sized words at
+	// WordBytes alignment; on ILP32 an 8-byte-aligned argument (int64 /
+	// double / 8-aligned aggregate) re-aligns its stack offset to 8
+	// (AAPCS §6.5 stage C.7).  On LP64 (WordBytes 8) this is the original
+	// (8, sw*8).
+	var align int = cc.WordBytes
+	if cc.WordBytes < 8 && argNeeds8Align(t) {
+		align = 8
+	}
+	return align, sw * cc.WordBytes
 }
 
 // alignUpStack rounds n up to the next multiple of a (a power of two >= 1).
@@ -311,7 +397,7 @@ func (cc CallConv) CallArgStackOff(argTypes @[]@types.Type, i int) int {
 	var nsrn int = 0
 	var soff int = 0
 	for k := 0; k <= i; k++ {
-		_, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn, nsrn)
+		rs, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn, nsrn)
 		align, bytes := cc.stackArgFootprint(argTypes[k], sw, false)
 		if sw > 0 {
 			soff = alignUpStack(soff, align)
@@ -320,7 +406,7 @@ func (cc CallConv) CallArgStackOff(argTypes @[]@types.Type, i int) int {
 		} else if k == i {
 			return -1
 		}
-		ngrn = ngrn + rw
+		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
 		if IsFloatScalarTyp(argTypes[k]) { nsrn = nsrn + 1 }
 	}
 	return -1
@@ -337,206 +423,16 @@ func (cc CallConv) CallStackBytes(argTypes @[]@types.Type) int {
 	var nsrn int = 0
 	var soff int = 0
 	for k := 0; k < len(argTypes); k++ {
-		_, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn, nsrn)
+		rs, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn, nsrn)
 		if sw > 0 {
 			align, bytes := cc.stackArgFootprint(argTypes[k], sw, false)
 			soff = alignUpStack(soff, align) + bytes
 		}
-		ngrn = ngrn + rw
+		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
 		if IsFloatScalarTyp(argTypes[k]) { nsrn = nsrn + 1 }
 	}
 	if cc.StackAlign > 1 && soff % cc.StackAlign != 0 {
 		soff = soff + (cc.StackAlign - soff % cc.StackAlign)
 	}
 	return soff
-}
-
-// ============================================================
-// Variadic-aware dispatch (V-variants) — Stage 4 of plan-c-call.md
-// ============================================================
-//
-// Mathematically identical to the non-V helpers when fixedCount =
-// len(argTypes) (k == fixedCount never holds during the k <= i / k <
-// len loop), so non-variadic callers see no behavior change.  The
-// arm64 backend instantiates AAPCS64_Darwin() (VariadicStackOnly =
-// true) and routes OP_C_CALL through these helpers with fixedCount =
-// ins.CFixedArgs, so a variadic arg at value-index >= CFixedArgs is
-// forced to the stack per Apple's rule.  Verified green on the
-// native lanes by conformance/498 (non-variadic) + 500 (single
-// vararg) + 526 (multi-vararg), on both aa64 and x64.
-
-// CallArgRegStartV: see CallArgRegStart.  fixedCount marks the
-// fixed/variadic split.
-func (cc CallConv) CallArgRegStartV(argTypes @[]@types.Type, i int, fixedCount int) int {
-	var ngrn int = 0
-	var nsrn int = 0
-	for k := 0; k <= i; k++ {
-		if k == fixedCount && cc.VariadicStackOnly {
-			ngrn = cc.NumGpArgRegs
-		}
-		rs, rw, _ := cc.argRegWordsStackWordsV(argTypes[k], ngrn, nsrn,
-			k >= fixedCount)
-		if k == i { return rs }
-		ngrn = ngrn + rw
-		if IsFloatScalarTyp(argTypes[k]) { nsrn = nsrn + 1 }
-	}
-	return -1
-}
-
-// CallArgStackOffV: see CallArgStackOff.  fixedCount marks the
-// fixed/variadic split.
-func (cc CallConv) CallArgStackOffV(argTypes @[]@types.Type, i int, fixedCount int) int {
-	var ngrn int = 0
-	var nsrn int = 0
-	var soff int = 0
-	for k := 0; k <= i; k++ {
-		if k == fixedCount && cc.VariadicStackOnly {
-			ngrn = cc.NumGpArgRegs
-		}
-		_, rw, sw := cc.argRegWordsStackWordsV(argTypes[k], ngrn, nsrn,
-			k >= fixedCount)
-		align, bytes := cc.stackArgFootprint(argTypes[k], sw, k >= fixedCount)
-		if sw > 0 {
-			soff = alignUpStack(soff, align)
-			if k == i { return soff }
-			soff = soff + bytes
-		} else if k == i {
-			return -1
-		}
-		ngrn = ngrn + rw
-		if IsFloatScalarTyp(argTypes[k]) { nsrn = nsrn + 1 }
-	}
-	return -1
-}
-
-// CallStackBytesV: see CallStackBytes.  fixedCount marks the
-// fixed/variadic split.
-func (cc CallConv) CallStackBytesV(argTypes @[]@types.Type, fixedCount int) int {
-	var ngrn int = 0
-	var nsrn int = 0
-	var soff int = 0
-	for k := 0; k < len(argTypes); k++ {
-		if k == fixedCount && cc.VariadicStackOnly {
-			ngrn = cc.NumGpArgRegs
-		}
-		_, rw, sw := cc.argRegWordsStackWordsV(argTypes[k], ngrn, nsrn,
-			k >= fixedCount)
-		if sw > 0 {
-			align, bytes := cc.stackArgFootprint(argTypes[k], sw, k >= fixedCount)
-			soff = alignUpStack(soff, align) + bytes
-		}
-		ngrn = ngrn + rw
-		if IsFloatScalarTyp(argTypes[k]) { nsrn = nsrn + 1 }
-	}
-	if cc.StackAlign > 1 && soff % cc.StackAlign != 0 {
-		soff = soff + (cc.StackAlign - soff % cc.StackAlign)
-	}
-	return soff
-}
-
-// ============================================================
-// Return classification (parameterised by CallConv)
-// ============================================================
-
-// FuncReturnsBigAggregate reports whether f returns a single aggregate
-// value larger than cc.InternalSretBytes — the threshold at which the
-// calling convention switches from register-packing to sret indirection.
-func (cc CallConv) FuncReturnsBigAggregate(f @ir.Func) bool {
-	if len(f.Results) != 1 { return false }
-	if !IsAggregateTyp(f.Results[0]) { return false }
-	return f.Results[0].SizeOf() > cc.InternalSretBytes
-}
-
-// CallReturnsBigAggregate is the symmetric predicate for an OP_CALL.
-// True when the callee returns a single aggregate above the internal
-// sret threshold — the caller must pass the return-buffer pointer in
-// the sret register before the call and skip the in-reg return-collect
-// afterwards.
-func (cc CallConv) CallReturnsBigAggregate(ins @ir.Instr) bool {
-	if ins == nil || ins.Typ == nil { return false }
-	if IsMultiReturnCall(ins) { return false }
-	if !IsAggregateTyp(ins.Typ) { return false }
-	return ins.Typ.SizeOf() > cc.InternalSretBytes
-}
-
-// MultiReturnTupleNeedsSret applies the target's register-vs-sret rule to a
-// multi-return tuple type, matching how the LLVM-compiled callees (the deps at
-// the native↔LLVM boundary) lower a first-class IR aggregate return.  LLVM
-// lowers such a return PURELY FIELD-PER-REGISTER-BY-CLASS, with no eightbyte
-// coalescing and NOT by the 16-byte single-aggregate rule: each non-float
-// field's words fill the GP return regs (X0..X7 / RAX,RDX,RCX), each
-// float-scalar field fills the FP return regs (D0..D7 / XMM0,XMM1), the two
-// counters independent; when EITHER class overflows its register budget, the
-// whole tuple goes sret.  So the rule is register-COUNT, not size:
-//
-//   * AAPCS64 / aa64: 8 GP + 8 FP — `(int,@errors.Error)` is 24 bytes (3 GP
-//     words) yet comes back in X0,X1,X2 (conformance/526), and `{i64 x 9}` is
-//     the first GP shape that sret's.  (The old SizeOf>16 rule wrongly sret'd
-//     every 17..64-byte tuple, disagreeing with the LLVM-compiled callee.)
-//
-//   * SysV-AMD64 / x64: 3 GP + 2 FP (XMM0,XMM1) + 2 x87 (ST0,ST1) —
-//     `(i64,i64,i64)` is in-register (RAX,RDX,RCX) while `(u16,u16,u16,u16)`
-//     is 8 bytes yet sret (4 GP regs); a 3rd/4th float comes back in x87
-//     ST0/ST1 (the native x64 pack/collect emits FLD/FSTP), so the FP-class
-//     capacity is NumFpRetRegs + NumX87RetRegs (= 4) and a tuple sret's only
-//     at fpCount>4.
-//
-// Register counts (NumGpRetRegs / NumFpRetRegs / NumX87RetRegs) are
-// per-target.  Empirically dumped via clang on hand-written .ll.
-func (cc CallConv) MultiReturnTupleNeedsSret(t @types.Type) bool {
-	var gpWords int = 0
-	var fpCount int = 0
-	for fi := 0; fi < len(t.Fields); fi++ {
-		var ft @types.Type = t.Fields[fi].Type
-		if IsFloatScalarTyp(ft) {
-			fpCount = fpCount + 1
-		} else {
-			gpWords = gpWords + ArgWords(ft)
-		}
-	}
-	return gpWords > cc.NumGpRetRegs ||
-		fpCount > cc.NumFpRetRegs + cc.NumX87RetRegs
-}
-
-// FuncReturnsBigMultiReturn reports whether f's multi-return tuple is returned
-// via sret (a hidden buffer pointer the caller passes and the callee writes
-// each field through at FieldOffset) rather than in registers — per the
-// target's register-vs-sret rule (see MultiReturnTupleNeedsSret).
-func (cc CallConv) FuncReturnsBigMultiReturn(f @ir.Func) bool {
-	if len(f.Results) <= 1 { return false }
-	if f.MultiReturnType == nil { return false }
-	return cc.MultiReturnTupleNeedsSret(f.MultiReturnType)
-}
-
-// CallReturnsBigMultiReturn is the symmetric predicate for an OP_CALL whose
-// result is a multi-return tuple returned via sret.
-func (cc CallConv) CallReturnsBigMultiReturn(ins @ir.Instr) bool {
-	if ins == nil || ins.Typ == nil { return false }
-	if !IsMultiReturnCall(ins) { return false }
-	return cc.MultiReturnTupleNeedsSret(ins.Typ)
-}
-
-// CalleeUsesCSret reports whether ins (an OP_CALL) targets a C-extern
-// callee whose return type triggers the C sret convention (aggregate >
-// cc.CExternSretBytes). pkg/binate/codegen emits the LLVM declaration with
-// `sret(...)` for these — clang lowers the corresponding C definition
-// to take a hidden return-buffer pointer, write the result through it,
-// and return void. The native backend must mirror that convention when
-// calling into bootstrap.* / libc / etc.
-//
-// Returns false for internal Binate calls — they use the
-// InternalSretBytes threshold via CallReturnsBigAggregate instead.
-func (cc CallConv) CalleeUsesCSret(funcs @[]@ir.Func, ins @ir.Instr) bool {
-	if ins == nil || ins.Typ == nil { return false }
-	if ins.Op != iropcode.OP_CALL { return false }
-	if IsMultiReturnCall(ins) { return false }
-	if !IsAggregateTyp(ins.Typ) { return false }
-	if ins.Typ.SizeOf() <= cc.CExternSretBytes { return false }
-	for i := 0; i < len(funcs); i++ {
-		var f @ir.Func = funcs[i]
-		if f == nil { continue }
-		if !f.IsCExtern { continue }
-		if charSliceEq(f.Name, ins.StrVal) { return true }
-	}
-	return false
 }

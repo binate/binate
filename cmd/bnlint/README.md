@@ -79,6 +79,30 @@ Because a package is linted as its merged AST and imports are deduplicated by
 (alias, path) at merge time, a path imported-and-unused in one file but
 imported-and-used in another is not flagged — a rare, safe under-warning.
 
+## Suppressing diagnostics
+
+A `// bnlint:allow <rulespec>` comment suppresses a rule's finding. `<rulespec>`
+is a comma-separated list of rule names, or `*` for every rule; at least one is
+required — a bare `// bnlint:allow` is itself an error (`bnlint-allow`). Placement
+is inferred from the comment:
+
+- **Trailing** (code precedes the `//`) suppresses findings on the **same** line:
+
+  ```
+  var data *[]uint8 = sec.Data  // bnlint:allow managed-to-raw-assign — sec outlives the borrow
+  ```
+
+- **Own-line** (only whitespace precedes the `//`) suppresses the **following** line:
+
+  ```
+  // bnlint:allow unused-import
+  import "pkg/foo"
+  ```
+
+Multiple rules: `// bnlint:allow managed-to-raw-assign,unused-import`. A trailing
+reason after the rulespec is conventional and ignored by the tool. The mechanism
+is generic — every rule can be suppressed by name (or `*`).
+
 ## Examples
 
 Lint a single package:

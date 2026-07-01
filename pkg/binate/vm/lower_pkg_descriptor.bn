@@ -144,10 +144,14 @@ func resolveSym(names @[]@[]char, addrs @[]int, sym @[]char) int {
 // bytecode function has no static `@__handle` symbol the descriptor could
 // symref, so the handle (a runtime heap block) is resolved post-lowering.
 //
-// The Globals/Vtables tables are emitted EMPTY ({nil,0}): a bytecode package's
-// own globals/vtables have no descriptor consumer (those tables drive
-// cross-mode injection of a NATIVE package's surface — RegisterPackageGlobals/
-// Vtables — which never enumerates a bytecode package's descriptor).
+// The Globals table is populated (one reflect.GlobalInfo per `.bni`-exported
+// package-level global), with each Addr back-patched to the global's runtime
+// storage cell (patchGlobalAddrs) — the VM analog of the native descriptor's
+// `&<global>`.  The Vtables table is populated by Name (one per non-generic
+// impl), but its Addr/ShimAddr are left null: a bytecode impl has no native
+// `@__ivt`/`@__ivtshim` array — dispatch over its own interface values goes
+// through vm.IfaceVtables by name — so there is no environment-equivalent
+// address, and the Name is the portable reflective info.
 func emitPackageDescriptorVM(vm @VM, m @ir.Module) {
 	var pkgName @[]char = vm.modulePkgName
 	var nameSym @[]char = mangle.GlobalName(pkgName, "_pkgname")
@@ -157,8 +161,10 @@ func emitPackageDescriptorVM(vm @VM, m @ir.Module) {
 	var vtablesSym @[]char = mangle.GlobalName(pkgName, "_pkg_vtables")
 
 	var funcs @[]@ir.PkgFuncEntry = gatherPackageFuncs(m, pkgName)
-	var globals @[]@ir.PkgGlobalEntry = make_slice(@ir.PkgGlobalEntry, 0)
-	var vtables @[]@ir.PkgVtableEntry = make_slice(@ir.PkgVtableEntry, 0)
+	var globals @[]@ir.PkgGlobalEntry
+	var gAddrs @[]int
+	globals, gAddrs = gatherPackageGlobals(vm, m, pkgName)
+	var vtables @[]@ir.PkgVtableEntry = gatherPackageVtables(m, pkgName)
 
 	var dgs @[]@ir.DataGlobal = ir.BuildPackageDescriptors(
 		rt.STATIC_REFCOUNT, infoSym, nameSym, buf.CopyStr(pkgName),
@@ -178,8 +184,9 @@ func emitPackageDescriptorVM(vm @VM, m @ir.Module) {
 
 	// Fill each FunctionInfo.Value with the function's callable VM func-value
 	// handle (now that the accessor — the __Package self-entry's target — is
-	// registered too).
+	// registered too), and each GlobalInfo.Addr with the global's runtime cell.
 	patchFuncValueHandles(vm, funcs, names, addrs)
+	patchGlobalAddrs(globals, gAddrs, names, addrs)
 	return
 }
 
@@ -238,6 +245,71 @@ func funcValueTypeOf(f @ir.Func) @types.Type {
 		params = slices.Append[@types.Param](params, p)
 	}
 	return types.MakeFuncValueType(params, f.Results)
+}
+
+// gatherPackageGlobals builds the reflect.GlobalInfo rows for module m's
+// descriptor — one per `.bni`-exported, non-extern package-level global,
+// mirroring codegen's collectPackageGlobals.  Each entry's StorageSym is EMPTY
+// (Addr lowers null and is back-patched), and the parallel returned int is the
+// global's RUNTIME storage address (materializeGlobals ran earlier in
+// LowerModule, so lookupGlobalAddr resolves the bare name here).
+func gatherPackageGlobals(vm @VM, m @ir.Module,
+		pkgName @[]char) (@[]@ir.PkgGlobalEntry, @[]int) {
+	var globals @[]@ir.PkgGlobalEntry = make_slice(@ir.PkgGlobalEntry, 0)
+	var gAddrs @[]int = make_slice(int, 0)
+	for i := 0; i < len(m.Globals); i++ {
+		var g @ir.Global = m.Globals[i]
+		if g.IsExtern { continue }
+		if !g.Exported { continue }
+		var fqName @[]char = mangle.QualifyName(pkgName, g.Name)
+		var glSym @[]char = mangle.GlobalName(pkgName, g.Name)
+		globals = slices.Append[@ir.PkgGlobalEntry](globals,
+			ir.NewPkgGlobalEntry(catSym(glSym, "__glinfo"),
+				catSym(glSym, "__glname"), fqName, ""))
+		gAddrs = slices.Append[int](gAddrs, lookupGlobalAddr(vm, g.Name))
+	}
+	return globals, gAddrs
+}
+
+// gatherPackageVtables builds the reflect.VtableInfo rows for module m's
+// descriptor — one per NON-generic impl (generic instantiations re-lower at the
+// importer, so they are excluded), mirroring codegen's collectPackageVtables.
+// Both symbol fields are EMPTY, so Addr/ShimAddr lower NULL: a bytecode impl has
+// no native `@__ivt`/`@__ivtshim` array (its interface-value dispatch runs
+// through vm.IfaceVtables by name), so there is no environment-equivalent
+// address — only the (portable) mangled vtable Name is reflected.
+func gatherPackageVtables(m @ir.Module, pkgName @[]char) @[]@ir.PkgVtableEntry {
+	var vtables @[]@ir.PkgVtableEntry = make_slice(@ir.PkgVtableEntry, 0)
+	for i := 0; i < len(m.Impls); i++ {
+		var info @ir.ImplInfo = m.Impls[i]
+		if info == nil { continue }
+		if mangle.IsInstantiationName(info.RecvTypeName) { continue }
+		var vtName @[]char = mangle.ImplVtableName(info.RecvPkg,
+			info.RecvTypeName, info.IfacePkg, info.IfaceName)
+		vtables = slices.Append[@ir.PkgVtableEntry](vtables,
+			ir.NewPkgVtableEntry(catSym(vtName, "__vtinfo"),
+				catSym(vtName, "__vtname"), buf.CopyStr(vtName), "", ""))
+	}
+	return vtables
+}
+
+// patchGlobalAddrs writes each GlobalInfo node's Addr word with the global's
+// runtime storage address (gathered alongside the entry).  Addr sits at byte
+// offset 4w — past the 2-word header and the Name {data,len} pair
+// (buildGlobalInfoNode's term order).  An unresolved global (addr 0) keeps a
+// null Addr.
+func patchGlobalAddrs(globals @[]@ir.PkgGlobalEntry, gAddrs @[]int,
+		names @[]@[]char, addrs @[]int) {
+	var w int = types.GetTarget().IntSize
+	var psz int = types.GetTarget().PointerSize
+	for i := 0; i < len(globals); i++ {
+		if gAddrs[i] == 0 { continue }
+		var nodeAddr int = resolveSym(names, addrs, globals[i].NodeSym)
+		if nodeAddr == 0 { continue }
+		writeLE(nodeAddr + 4 * w,
+			bit_cast(uint64, cast(int64, gAddrs[i])), psz)
+	}
+	return
 }
 
 // patchFuncValueHandles writes each FunctionInfo node's Value word with the

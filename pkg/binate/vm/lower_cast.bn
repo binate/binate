@@ -96,19 +96,23 @@ func lowerCast(instr @ir.Instr, bc BCInstr) BCInstr {
 			bc.Op = BC_MOV
 		}
 	} else {
-		// Integer ↔ integer.  Layer 2: pair ↔ single-slot crossings
-		// must widen or narrow rather than MOV.
+		// Integer ↔ integer.  A cast's result register must hold the DEST
+		// type's canonical form — sign-extended for a signed type,
+		// zero-extended for an unsigned one — the SAME form loads and arith
+		// produce, so a direct-use (unstored) cast result compares and orders
+		// correctly (matching LLVM/native), not just after a store/reload.
+		//
+		// Layer 2: on a host whose word is < 8 bytes, int64/uint64 occupies a
+		// register pair, so a crossing between pair and single-slot narrows or
+		// widens rather than MOV.
 		var srcIs64 bool = is64BitScalar(srcTyp) && REG_SLOT < 8
 		var dstIs64 bool = is64BitScalar(dstTyp) && REG_SLOT < 8
 		if srcIs64 && !dstIs64 {
-			if dstTyp != nil && dstTyp.Width == 8 {
-				// BC_TRUNC8 reads regs[Src1] (the low slot of the
-				// pair) and masks to 8 bits — correct, since the
-				// low byte of a little-endian int64 lives there.
-				bc.Op = BC_TRUNC8
-			} else {
-				bc.Op = BC_NARROW64
-			}
+			// Pair → single-slot narrow (32-bit host).  The value's low bits
+			// live in the pair's low slot (regs[Src1]), which BC_SEXT/BC_ZEXT
+			// read, so canonicalize a sub-word dst from that slot per its
+			// signedness (or copy the slot verbatim for a full-word int32 dst).
+			bc.Op, bc.Imm = pairToSingleNarrowOp(dstTyp)
 		} else if !srcIs64 && dstIs64 {
 			// Single slot → pair.  Sign- or zero-extend based on the
 			// *source* signedness (the dst's signedness only
@@ -120,45 +124,59 @@ func lowerCast(instr @ir.Instr, bc BCInstr) BCInstr {
 				bc.Op = BC_WIDEN64_S
 			}
 		} else {
-			// Single-slot ↔ single-slot.  Widths may still differ
-			// in bits — on a 64-bit host this covers int↔int32
-			// (TRUNC32 / SEXT|ZEXT 32-bit); on any host this covers
-			// the int8/int16 narrow-int family.  Without proper
-			// narrow/widen here, `cast(int64, cast(int32, x))` (the
-			// widen64Signed idiom) silently leaves the upper bits
-			// as they were rather than sign-extending bit 31.
-			bc.Op = pickSingleSlotIntCastOp(srcTyp, dstTyp)
-			if bc.Op == BC_SEXT || bc.Op == BC_ZEXT {
-				bc.Imm = intBitWidth(srcTyp)
-			}
+			// Single-slot ↔ single-slot: canonicalize to the dst form (covers
+			// narrowing, same-width signedness reinterpret, and widening — the
+			// widen64Signed idiom `cast(int64, cast(int32, x))` included).
+			bc.Op, bc.Imm = pickSingleSlotIntCastOp(srcTyp, dstTyp)
 		}
 	}
 	bc.Src1 = instr.Args[0].ID
 	return bc
 }
 
-// pickSingleSlotIntCastOp chooses the bytecode for an int↔int cast
-// that doesn't cross the pair boundary.  When widths match, BC_MOV
-// (no-op reinterpret — same bit pattern, possibly different sign
-// interpretation, which the consumer's op handles).  When narrowing,
-// BC_TRUNC8 / BC_TRUNC32 mask the low bits (upper zero-filled).
-// When widening, BC_SEXT (signed src) / BC_ZEXT (unsigned src) fill
-// the upper bits per the source's sign — the destination's
-// signedness only governs how downstream consumers read the result.
-// 16-bit narrowing isn't exercised today and falls back to BC_MOV.
+// pickSingleSlotIntCastOp chooses the (op, Imm) for a single-slot int↔int cast
+// so the result register holds the DEST type's canonical form.
+//
+//   - Sub-word dst (dstW < host word): BC_ZEXT/BC_SEXT Imm=dstW per the DEST's
+//     signedness — narrowToWidth masks to dstW then extends, which is the
+//     canonical form for narrowing, same-width signedness reinterpret (e.g.
+//     int32→uint32), AND widening into a sub-word type (the source is already
+//     canonical in its slot, so re-extending from dstW yields the right value).
+//   - Full-word dst, widening from a sub-word source: BC_ZEXT/BC_SEXT Imm=srcW
+//     per the SOURCE's signedness (the value fits the wider type; the dst
+//     signedness is irrelevant).  Covers the widen64Signed idiom on a 64-bit
+//     host (int32→int).
+//   - Full-word dst, same width (int↔uint / int64↔uint64): BC_MOV — the bit
+//     pattern is the value; there is no sub-word form to normalize.
 func pickSingleSlotIntCastOp(srcTyp @types.Type,
-		dstTyp @types.Type) int {
-	if srcTyp == nil || dstTyp == nil { return BC_MOV }
+		dstTyp @types.Type) (int, int) {
+	if srcTyp == nil || dstTyp == nil { return BC_MOV, 0 }
 	var srcW int = intBitWidth(srcTyp)
 	var dstW int = intBitWidth(dstTyp)
-	if srcW == dstW { return BC_MOV }
-	if srcW > dstW {
-		if dstW == 8 { return BC_TRUNC8 }
-		if dstW == 32 { return BC_TRUNC32 }
-		return BC_MOV
+	if dstW < REG_SLOT * 8 {
+		if common.IsUnsignedIntType(dstTyp) { return BC_ZEXT, dstW }
+		return BC_SEXT, dstW
 	}
-	if srcTyp.IsInteger() && !srcTyp.Signed { return BC_ZEXT }
-	return BC_SEXT
+	if srcW < dstW {
+		if common.IsUnsignedIntType(srcTyp) { return BC_ZEXT, srcW }
+		return BC_SEXT, srcW
+	}
+	return BC_MOV, 0
+}
+
+// pairToSingleNarrowOp chooses the (op, Imm) for narrowing an int64/uint64
+// register PAIR (32-bit host) to a single-slot integer dst.  The value's low
+// bits are in the pair's low slot (regs[Src1]) — which BC_SEXT/BC_ZEXT read —
+// so a sub-word dst canonicalizes from that slot per its signedness; a
+// full-word single-slot dst (int32 on a 32-bit host, which IS the whole
+// register) copies the low slot verbatim via BC_NARROW64.
+func pairToSingleNarrowOp(dstTyp @types.Type) (int, int) {
+	var dstW int = intBitWidth(dstTyp)
+	if dstW < REG_SLOT * 8 {
+		if common.IsUnsignedIntType(dstTyp) { return BC_ZEXT, dstW }
+		return BC_SEXT, dstW
+	}
+	return BC_NARROW64, 0
 }
 
 // intBitWidth returns the effective bit width of an integer type.

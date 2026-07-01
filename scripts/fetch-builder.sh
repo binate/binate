@@ -5,10 +5,10 @@
 #
 #     BUILDER="$(scripts/fetch-builder.sh)"           # binary path
 #     BUILDER_LIB="$(scripts/fetch-builder.sh --lib)" # stdlib root
-#     "$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
+#     "$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib" \
 #         "$BINATE_DIR/cmd/bnc" -- \
 #         -I "$BINATE_DIR:$BUILDER_LIB:$BUILDER_LIB/ifaces/core:$BUILDER_LIB/ifaces/stdlib" \
-#         -L "$BINATE_DIR:$BUILDER_LIB:$BUILDER_LIB/impls/core/common:$BUILDER_LIB/impls/core/libc:$BUILDER_LIB/impls/stdlib/common" ...
+#         -L "$BINATE_DIR:$BUILDER_LIB:$BUILDER_LIB/impls/core/common:$BUILDER_LIB/impls/core/libc:$BUILDER_LIB/impls/stdlib" ...
 #
 # Modes:
 #   (no flags)             print the default tool's invocation path
@@ -29,7 +29,7 @@
 #
 # Calling-shape compatibility (bnc-*):
 # Builder-link callers invoke the resolved BUILDER as
-#   "$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib/common" \
+#   "$BUILDER" -I "$BINATE_DIR:$BINATE_DIR/ifaces/core:$BINATE_DIR/ifaces/stdlib" -L "$BINATE_DIR:$BINATE_DIR/impls/core/common:$BINATE_DIR/impls/core/libc:$BINATE_DIR/impls/stdlib" \
 #       "$BINATE_DIR/cmd/bnc" -- <bnc-args>
 # because under bootstrap-* mode BUILDER is the bootstrap interpreter
 # and that prefix tells bootstrap to load cmd/bnc from $BINATE_DIR.

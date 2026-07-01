@@ -153,7 +153,7 @@ build_list() {   # $1 = iface | impl
         else
             printf '%s\n' "$BASE/impls/core/common"
             printf '%s\n' "$BASE/impls/core/libc"
-            printf '%s\n' "$BASE/impls/stdlib/common"
+            printf '%s\n' "$BASE/impls/stdlib"
         fi
         printf '%s' "$APPEND"
     } | join_dedup

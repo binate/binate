@@ -49,7 +49,7 @@ and repeatable (cc-style), and the first `-I` entry doubles as the "source root"
 
 ```
 -I  $LIB:$LIB/ifaces/core:$LIB/ifaces/stdlib
--L  $LIB:$LIB/impls/core/common:$LIB/impls/core/libc:$LIB/impls/stdlib/common
+-L  $LIB:$LIB/impls/core/common:$LIB/impls/core/libc:$LIB/impls/stdlib
 --runtime  $LIB/runtime/binate_runtime.c
 ```
 
@@ -57,7 +57,7 @@ What each entry covers:
 
 - `ifaces/core` + `impls/core/*` — the builtins (`pkg/builtins/*`) and
   `pkg/bootstrap` (which backs `print`/`println`).
-- `ifaces/stdlib` + `impls/stdlib/common` — the bundled stdlib
+- `ifaces/stdlib` + `impls/stdlib` — the bundled stdlib
   (`pkg/std/strconv`, `pkg/std/errors`, …).
 - `$LIB` (the bare root) — resolves nothing in a bundle (it's there for the
   source tree, where `pkg/binate/*` lives at the root); harmless to keep.
@@ -82,7 +82,7 @@ bnc -I "$ROOT:$I" -L "$ROOT:$L" --runtime "$RT" -o app "$ROOT/cmd/app"
 ```
 
 The bundled stdlib is used automatically once `ifaces/stdlib` +
-`impls/stdlib/common` are on the paths — just import and call it:
+`impls/stdlib` are on the paths — just import and call it:
 
 ```
 package "main"

@@ -269,9 +269,9 @@ for pkg in $PACKAGES; do
     # Native-only packages are ALWAYS injected (native) in production — the
     # bytecode VM never interprets them.  Unit-testing one under an interpreter
     # mode lowers the package itself to bytecode, a configuration that never
-    # ships (and that can't even run for a __c_call package, whose OP_C_CALL the
-    # VM cannot lower: it would hit lower_instr's default arm — a hard abort —
-    # since --test's typecheck does not set Checker.Interpreted).  The set:
+    # ships (and for a __c_call package like pkg/std/os the --test runner rejects
+    # it at the frontend — TypecheckPackages sets Checker.Interpreted — as a clean
+    # "cannot be interpreted" error rather than running).  The set:
     # pkg/std/* (the injected stdlib) plus pkg/builtins/rt (the runtime — native
     # substrate, uses __c_call for malloc/free/exit/…).  Skip them under the int
     # modes; the stdlib's cross-mode coverage is the conformance/stdlib suite

@@ -1,0 +1,136 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// emitFunc — prologue, body, epilogue
+// ============================================================
+
+// SAVED_LOW is the callee-saved register set pushed on entry and restored on
+// exit: r4-r12 (the callee-saved scratch pool + frame pointer, plus r12/IP).
+// r4..r12 = bits 4..12 = 0x1FF0.  r12 rounds the pushed count to an EVEN 10
+// registers so SP stays 8-aligned at every call boundary — see SAVED_BYTES.
+const SAVED_LOW int = 0x1FF0
+
+// PUSH_REGMASK adds LR (r14, bit 14 = 0x4000) to the saved-low set, so the
+// prologue's `push {r4-r12, lr}` stores the return address alongside the
+// callee-saved registers.
+const PUSH_REGMASK int = 0x5FF0
+
+// POP_REGMASK adds PC (r15, bit 15 = 0x8000) to the saved-low set, so the
+// epilogue's `pop {r4-r12, pc}` reloads the saved registers AND jumps to the
+// saved return address in one instruction (writing PC from the stack returns).
+const POP_REGMASK int = 0x9FF0
+
+// SAVED_BYTES is the size (in bytes) that the entry `push` reserves: 10
+// registers (r4-r12 + lr) × 4 = 40.  The count is deliberately EVEN so that
+// SAVED_BYTES % 8 == 0 (the AAPCS32 8-byte stack alignment invariant): since
+// PlanFrame returns a 16-aligned frameSize, an even 40-byte push keeps SP
+// 8-aligned across the `sub sp` — a 9-register (36-byte) push would leave SP
+// 4-misaligned at every call boundary, violating AAPCS32.  Incoming stack args
+// sit above it, at [sp + frameSize + SAVED_BYTES + i*4] from the callee's
+// perspective.
+const SAVED_BYTES int = 40
+
+// emitFunc lowers one function.  The prologue saves the callee-saved
+// registers + LR and allocates the local stack frame; the epilogue reverses
+// (popping PC to return).  Mirrors aarch64_emit_func.bn but with the AAPCS32
+// register set and 4-byte word.
+func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func,
+	strings @[]ir.StringConst, allFuncs @[]@ir.Func) {
+	// f.Name is dot-qualified ("pkg.Func", "main.main", "main.__entry");
+	// symFor → mangle.FuncName treats dotted names as pre-qualified, so the
+	// pkgName arg is ignored.  main.__entry folds to the reserved bn_entry.
+	var sym @[]char = symFor(pkgName, f.Name)
+	a.DefineLabel(sym)
+	// IsLinkOnce (dtors / copy helpers, emitted into every module that needs
+	// them) gets a weak definition so the linker deduplicates across the
+	// linked .o set.  LLVM uses linkonce_odr for the same role.
+	if f.IsLinkOnce {
+		a.SetWeak(sym)
+	} else {
+		a.SetGlobal(sym)
+	}
+
+	// AAPCS32 (soft-float): 4 GP arg registers, 64-bit args in even-aligned
+	// register pairs, 8-byte stack alignment, floats in GP registers.
+	var rm @common.RegMap = common.NewRegMap(common.AAPCS32())
+	var frameSize int = rm.PlanFrame(f)
+
+	// Prologue:
+	//   push {r4-r12, lr}      ; STMDB sp!, {r4-r12, lr}
+	//   sub  sp, sp, #frameSize
+	arm32.Push(a, arm32.COND_AL, PUSH_REGMASK)
+	if frameSize > 0 {
+		emitSpAdjust(a, false, frameSize)
+	}
+
+	// Spill incoming parameter registers (and read incoming stack args) to
+	// their stack slots so later uses — which go through getOperand → spill
+	// reload — see them.  Mirrors the AAPCS32 arg dispatch: the same
+	// regStart/stackOff per param.  The trivial skeleton has no params, so
+	// this loop is empty for main.__entry / main.__init_all / main.main.
+	//
+	// Incoming stack args sit in the caller's outgoing-args area, now at
+	// [sp + frameSize + SAVED_BYTES + i*4] from the callee's perspective:
+	// +frameSize undoes our `sub sp`, +SAVED_BYTES undoes the entry push.
+	var paramTypes @[]@types.Type = make_slice(@types.Type, len(f.Params))
+	for pi := 0; pi < len(f.Params); pi++ {
+		paramTypes[pi] = f.Params[pi].Typ
+	}
+	var stackArgsBase int = frameSize + SAVED_BYTES
+	for pi := 0; pi < len(f.Params); pi++ {
+		emitSpillParam(a, rm, f.Params[pi], paramTypes, pi, stackArgsBase)
+	}
+
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		if bi > 0 {
+			a.DefineLabel(blockLabel(sym, b.Label))
+		}
+		// Each block starts with a fresh regmap.  Cross-block values flow
+		// through spill slots.
+		rm.ResetRegs()
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			emitInstr(a, pkgName, sym, rm, strings, allFuncs, b.Instrs[ii])
+			spillAndReset(a, rm, b.Instrs[ii])
+		}
+	}
+
+	// Safety net: emit an epilogue if the IR didn't end with OP_RETURN.
+	emitEpilogueAndRet(a, frameSize)
+}
+
+// emitSpillParam stores one incoming scalar parameter to its spill slot.  The
+// walking skeleton handles scalars only (an aggregate param would need the
+// spread/copy machinery in P3).  A parameter with no spill slot (unused) is
+// skipped.  An aggregate/float param fails LOUDLY: silently not spilling it
+// would leave its later uses reading an un-initialized slot (garbage).
+func emitSpillParam(a @asm.Assembler, rm @common.RegMap, p @ir.Param,
+	paramTypes @[]@types.Type, pi int, stackArgsBase int) {
+	if common.IsAggregateTyp(p.Typ) || common.IsFloatScalarTyp(p.Typ) {
+		// P3 territory (aggregate spread, float pairing).  Fail LOUDLY rather
+		// than silently leaving the incoming value unspilled.
+		a.SetError("native arm32: aggregate/float parameter not implemented "
+			"(P3)")
+		return
+	}
+	var off int = rm.LookupSpill(p.ID)
+	if off < 0 { return }
+	var regStart int = rm.CC.CallArgRegStart(paramTypes, pi)
+	var stackOff int = rm.CC.CallArgStackOff(paramTypes, pi)
+	if regStart >= 0 {
+		arm32.Str(a, arm32.COND_AL, argReg(regStart),
+			arm32.MemImm(arm32.SP, off))
+	} else if stackOff >= 0 {
+		var tmp int = scratchReg(rm)
+		arm32.Ldr(a, arm32.COND_AL, tmp,
+			arm32.MemImm(arm32.SP, stackArgsBase + stackOff))
+		arm32.Str(a, arm32.COND_AL, tmp, arm32.MemImm(arm32.SP, off))
+		rm.ResetRegs()
+	}
+}

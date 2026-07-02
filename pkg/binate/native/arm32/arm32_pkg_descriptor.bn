@@ -1,0 +1,205 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/mangle"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// emitPackageDescriptor emits this module's reflect.Package descriptor — its
+// FunctionInfo / GlobalInfo / VtableInfo tables, the descriptor node + name,
+// and the generated `__Package() @reflect.Package` accessor.  The ENTIRE
+// descriptor byte layout is built once by ir.BuildPackageDescriptors (the
+// single source of truth all backends lower through EmitDataGlobal — they
+// cannot drift), so this gather only resolves the arm32 symbol names + payload
+// scalars per row and emits the accessor's instructions.  Mirrors
+// aarch64_pkg_descriptor.bn.  Emitted for every module; the linker
+// dead-strips an unreferenced `__Package`.
+func emitPackageDescriptor(a @asm.Assembler, pkgName *[]readonly char,
+		mod @ir.Module) {
+	var pkgInfoSym @[]char = globalSymFor(pkgName, "_pkg_info")
+	var pkgNameSym @[]char = globalSymFor(pkgName, "_pkgname")
+	var funcSym @[]char = symFor(pkgName, "__Package")
+	var funcsArraySym @[]char = globalSymFor(pkgName, "_pkg_funcs")
+	var globalsArraySym @[]char = globalSymFor(pkgName, "_pkg_globals")
+	var vtablesArraySym @[]char = globalSymFor(pkgName, "_pkg_vtables")
+
+	var funcs @[]@ir.PkgFuncEntry = collectFuncsArm32(pkgInfoSym, pkgName, mod)
+	var globals @[]@ir.PkgGlobalEntry = collectGlobalsArm32(pkgName, mod)
+	var vtables @[]@ir.PkgVtableEntry = collectVtablesArm32(pkgName, mod)
+
+	var dgs @[]@ir.DataGlobal = ir.BuildPackageDescriptors(
+		common.STATIC_MANAGED_REFCOUNT, pkgInfoSym, pkgNameSym,
+		buf.CopyStr(pkgName), funcsArraySym, funcs, globalsArraySym, globals,
+		vtablesArraySym, vtables)
+	for i := 0; i < len(dgs); i++ {
+		common.EmitDataGlobal(a, dgs[i])
+	}
+
+	// The accessor returns the payload pointer (node + the managed header, 2
+	// pointer-sized words) in R0.  Uses ManagedHeaderSize (the canonical
+	// 2*ptrSize helper); the header is POINTER-sized (== int on every shipping
+	// ABI), so this agrees with the data side's node-payload offset.  A leaf
+	// with no frame — materialize node address (MOVW/MOVT), += header, `bx lr`.
+	var hdr int = types.ManagedHeaderSize()
+	a.SetSection("text", -1)
+	a.DefineLabel(funcSym)
+	a.SetGlobal(funcSym)
+	emitSymAddr(a, arm32.R0, pkgInfoSym)                    // R0 = &node
+	arm32.Add(a, arm32.COND_AL, false, arm32.R0, arm32.R0,  // R0 += header
+		arm32.Imm(hdr))
+	arm32.Bx(a, arm32.COND_AL, arm32.LR)                    // return
+}
+
+// collectFuncsArm32 gathers the FunctionInfo rows: one per .bni-exported,
+// non-extern func plus own-package struct dtors, then — when reflect was
+// loaded — the synthesized `__Package` accessor itself (LAST).  Symbols are
+// arm32-mangled via symFor / handleSymFor; the Name field is f.Name verbatim
+// (the FQ VM lookup key).  Mirrors collectFuncsAA64.
+func collectFuncsArm32(pkgInfoSym @[]char, pkgName *[]readonly char,
+		mod @ir.Module) @[]@ir.PkgFuncEntry {
+	var funcs @[]@ir.PkgFuncEntry
+	for i := 0; i < len(mod.Funcs); i++ {
+		var f @ir.Func = mod.Funcs[i]
+		if f.IsExtern { continue }
+		if !f.Exported && !f.IsStructDtor { continue }
+		var fv @types.Type = lookupFuncValueTypeArm32(mod, f.Name)
+		if fv == nil { continue }
+		funcs = slices.Append[@ir.PkgFuncEntry](funcs,
+			funcEntryArm32(pkgName, f.Name, fv))
+	}
+	if mod.PackageAccessorSig != nil {
+		var nameP @[]char = mangle.QualifyName(pkgName, "__Package")
+		funcs = slices.Append[@ir.PkgFuncEntry](funcs,
+			funcEntryArm32(pkgName, nameP, mod.PackageAccessorSig))
+	}
+	return funcs
+}
+
+// funcEntryArm32 builds one FunctionInfo row from a func-value type: the
+// __fninfo/__fnname/__fnsig symbols off symFor, the @__handle.<mangled> Value
+// target, and the VM-dispatch RetbufSize + ParamSlots.
+func funcEntryArm32(pkgName *[]readonly char, name *[]readonly char,
+		fv @types.Type) @ir.PkgFuncEntry {
+	var base @[]char = symFor(pkgName, name)
+	return ir.NewPkgFuncEntry(catSymArm32(base, "__fninfo"),
+		catSymArm32(base, "__fnname"), buf.CopyStr(name),
+		catSymArm32(base, "__fnsig"), buf.CopyStr(fv.SigString()),
+		handleSymFor(pkgName, name), common.FuncRetbufSize(fv), len(fv.Params))
+}
+
+// collectGlobalsArm32 gathers the GlobalInfo rows: one per .bni-exported,
+// non-extern global.  Name is the FULLY-QUALIFIED form; Addr is the storage
+// cell symbol.  Mirrors collectGlobalsAA64.
+func collectGlobalsArm32(pkgName *[]readonly char,
+		mod @ir.Module) @[]@ir.PkgGlobalEntry {
+	var globals @[]@ir.PkgGlobalEntry
+	for i := 0; i < len(mod.Globals); i++ {
+		var g @ir.Global = mod.Globals[i]
+		if g.IsExtern { continue }
+		if !g.Exported { continue }
+		var storageSym @[]char = globalSymFor(pkgName, g.Name)
+		globals = slices.Append[@ir.PkgGlobalEntry](globals,
+			ir.NewPkgGlobalEntry(catSymArm32(storageSym, "__glinfo"),
+				catSymArm32(storageSym, "__glname"),
+				mangle.QualifyName(pkgName, g.Name), storageSym))
+	}
+	return globals
+}
+
+// collectVtablesArm32 gathers the VtableInfo rows: one per NON-generic impl
+// this package defines.  Name is the BARE canonical vtable name; Addr/ShimAddr
+// target the format-prefixed @__ivt / @__ivtshim globals.  Mirrors
+// collectVtablesAA64.  (The P2 skeleton panics before reaching here if the
+// module has any impl — see emitImplVtables — but the gather stays faithful.)
+func collectVtablesArm32(pkgName *[]readonly char,
+		mod @ir.Module) @[]@ir.PkgVtableEntry {
+	var vtables @[]@ir.PkgVtableEntry
+	for i := 0; i < len(mod.Impls); i++ {
+		var info @ir.ImplInfo = mod.Impls[i]
+		if info == nil { continue }
+		if common.RecvTypeIsGenericInst(info.RecvTypeName) { continue }
+		var bareName @[]char = common.ImplVtableBareName(info.RecvPkg,
+			info.RecvTypeName, info.IfacePkg, info.IfaceName)
+		var vtableSym @[]char = implVtableNameArm32(info)
+		vtables = slices.Append[@ir.PkgVtableEntry](vtables,
+			ir.NewPkgVtableEntry(catSymArm32(vtableSym, "__vtinfo"),
+				catSymArm32(vtableSym, "__vtname"), bareName, vtableSym,
+				implShimVtableNameArm32(info)))
+	}
+	return vtables
+}
+
+// implVtableNameArm32 builds the bare ELF symbol for an (R, I) impl vtable via
+// mangle.ImplVtableName (the single source of truth shared with IR-gen /
+// codegen / VM).
+func implVtableNameArm32(info @ir.ImplInfo) @[]char {
+	return symPrefixed(mangle.ImplVtableName(info.RecvPkg, info.RecvTypeName,
+		info.IfacePkg, info.IfaceName))
+}
+
+// implShimVtableNameArm32 builds the bare ELF symbol for an (R, I) impl's
+// parallel shim vtable via mangle.ImplVtableShimName.
+func implShimVtableNameArm32(info @ir.ImplInfo) @[]char {
+	return symPrefixed(mangle.ImplVtableShimName(info.RecvPkg,
+		info.RecvTypeName, info.IfacePkg, info.IfaceName))
+}
+
+// lookupFuncValueTypeArm32 builds a func-value type from the module function
+// with the given canonical name (params copied field-by-field, results
+// carried through), or nil if absent.  Mirrors lookupFuncValueTypeAA64.
+func lookupFuncValueTypeArm32(mod @ir.Module, qname @[]char) @types.Type {
+	for i := 0; i < len(mod.Funcs); i++ {
+		var f @ir.Func = mod.Funcs[i]
+		if !charEqArm32(f.Name, qname) { continue }
+		var params @[]@types.Param
+		for j := 0; j < len(f.Params); j++ {
+			var p @types.Param = make(types.Param)
+			p.Name = f.Params[j].Name
+			p.Type = f.Params[j].Typ
+			params = slices.Append[@types.Param](params, p)
+		}
+		return types.MakeFuncValueType(params, f.Results)
+	}
+	return nil
+}
+
+// handleSymFor returns the LLVM-shape handle global `__handle.<mangled-fn>`,
+// matching the @__handle.<mangled> globals pkg/binate/codegen (the ELF/x64
+// reference) emits so cross-mode function-value handle references resolve to a
+// single weak_odr definition at link.  The BARE form has TWO leading
+// underscores; it is routed through symPrefixed exactly like x64's
+// handleSymFor_x64 — identity on ELF (arm32 is ELF-only), so the emitted symbol
+// stays `__handle.<mangled>`.  (Three underscores would be the Mach-O-decorated
+// form, where the object format prepends a further '_'; using it on ELF would
+// mismatch LLVM/x64-compiled deps and fail to link.)
+func handleSymFor(pkgName *[]readonly char, funcName *[]readonly char) @[]char {
+	var mangled @[]char = mangle.FuncName(pkgName, funcName)
+	var out @strings.Builder = strings.NewBuilder()
+	out.Write("__handle.")
+	out.Write(mangled)
+	return symPrefixed(out.String())
+}
+
+// catSymArm32 concatenates a suffix onto a symbol name, returning a fresh
+// slice (for the per-entry __fnname / __fninfo / __glname / __vtname symbols).
+func catSymArm32(base @[]char, suffix *[]readonly char) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(base)
+	cb.Write(suffix)
+	return buf.CopyStr(cb.String())
+}
+
+// charEqArm32 compares two char slices for equality.  Local helper (the arm32
+// backend doesn't pull in pkg/binate/buf's full set).
+func charEqArm32(a *[]readonly char, b *[]readonly char) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] { return false }
+	}
+	return true
+}

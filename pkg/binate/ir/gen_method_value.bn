@@ -163,17 +163,19 @@ func genMethodValue(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 			capturedTyp != nil && capturedTyp.Kind == types.TYP_POINTER &&
 			capturedTyp.Elem != nil && recvTyp != nil &&
 			recvTyp.Identical(capturedTyp.Elem) &&
-			!types.NeedsSret(recvTyp) && !recvTyp.NeedsDestruction() {
-		// Gated to a BY-VALUE (register-returned), non-managed struct.  Two
-		// exclusions, both because the closure store is a plain scalar store:
-		//   * sret (by-address, > 16-byte) struct call-results come back as a
-		//     POINTER, so storing into the by-value closure field would need a
-		//     struct COPY, not a scalar store (`store %S %ptr` is invalid IR);
-		//   * a struct with MANAGED fields would need the copy's fields RefInc'd
-		//     (and RefDec'd at the closure dtor) — a struct-value capture the
-		//     current path doesn't refcount.
-		// Both stay the old behavior for now (exotic) — xfail-tracked by 948; the
-		// proper fix is an sret-/refcount-aware struct-copy into the closure field.
+			!types.NeedsSret(recvTyp) {
+		// Capture a REGISTER-returned value receiver by value — managed-field or
+		// not.  The closure store below copies the receiver's bytes into the field
+		// (loading first if it arrived as an aggregate alloca) and, for a struct
+		// with MANAGED fields, RefInc's the copy's fields (emitStructCopy) so the
+		// closure owns its own reference — balanced by the closure dtor's RefDec.
+		//
+		// SRET (> 16-byte, by-address) receivers stay EXCLUDED: their call result
+		// is backend-represented as a POINTER to the sret buffer (an OP_CALL, not
+		// an OP_ALLOC, so it can't be load-then-stored), and EmitStore of that
+		// pointer into the by-value field mistypes it (`store %S %ptr`).  A proper
+		// fix needs sret destination-forwarding (write the call result straight
+		// into the closure field) or a backend-aware struct-copy — xfail (948).
 		capturedTyp = recvTyp
 	}
 
@@ -208,20 +210,42 @@ func genMethodValue(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 	// At the selector site: allocate a closure struct {receiver},
 	// store the evaluated receiver (possibly converted by
 	// smoothing) into it, emit OP_FUNC_VALUE-with-data pointing
-	// at the wrapper.  For managed captured forms (@T, @[]T) we
-	// mirror gen_func_lit's B.3a flow: RefInc the value before
-	// the store so the closure owns its own reference, then
-	// register the closure struct + closure-local for cleanup so
-	// the synthesized struct-dtor RefDec's it at frame end.
+	// at the wrapper.  A managed captured form (@T, @[]T) is RefInc'd
+	// before the store (emitCaptureRefInc, mirroring gen_func_lit's B.3a
+	// flow); a by-value struct with MANAGED fields is stored then RefInc'd
+	// in place (emitStructCopy); either way the closure owns its own
+	// reference, and the closure struct + closure-local are registered for
+	// cleanup so the synthesized struct-dtor RefDec's it at frame end.
 	var closureStruct @types.Type =
 		buildMethodValueClosureStruct(ctx.Gc.PkgPath, wrapperName, capturedTyp)
 	var closurePtr @Instr = b.EmitAlloc(closureStruct)
 	var recvVal @Instr =
 		genCapturedRecv(ctx, b, e.X, recvTyp, capturedTyp)
-	emitCaptureRefInc(ctx, b, recvVal, capturedTyp)
 	var fieldPtr @Instr =
 		b.EmitGetFieldPtr(closurePtr, 0, capturedTyp)
-	b.EmitStore(fieldPtr, recvVal)
+	if needsStructCopy(capturedTyp) {
+		// By-value capture of a struct with managed fields (949): copy the
+		// bytes, then RefInc the copy's managed fields so the closure owns its
+		// own reference (the closure dtor RefDec's them at frame end).  The
+		// mkX() call-result temp is itself registered for end-of-statement
+		// RefDec (registerManagedCallResult's needsStructCopy branch), so the
+		// net effect is +1 ref for the closure — the same acquire discipline
+		// emitStoreManagedSlot's isInit aggregate path uses for var-init.
+		b.EmitStore(fieldPtr, recvVal)
+		emitStructCopy(ctx.Func, b, fieldPtr, capturedTyp)
+	} else {
+		// A plain register struct that arrived as an aggregate alloca (a
+		// composite-literal temp, `Pt{...}.M`) must be LOADED to a value before
+		// the store — EmitStore of the alloca POINTER would mistype the field
+		// (`store %S %ptr`).  (A call-result / field value receiver arrives as a
+		// register value, so this is a no-op there.)  Mirrors gen_call's
+		// isAggregateAllocToLoad arg path.  Sret receivers are gated out above.
+		if isAggregateAllocToLoad(recvVal, capturedTyp) {
+			recvVal = b.EmitLoad(recvVal, capturedTyp)
+		}
+		emitCaptureRefInc(ctx, b, recvVal, capturedTyp)
+		b.EmitStore(fieldPtr, recvVal)
+	}
 	if closureStruct.NeedsDestruction() {
 		registerClosureStructForCleanup(ctx.Gc, closureStruct)
 		// method-value wrappers are dedup'd by wrapper name,

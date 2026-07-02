@@ -1,0 +1,196 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// 64-bit casts (widen to / narrow from int64) and compares
+// ============================================================
+
+// emitCast64 lowers OP_CAST where either endpoint is 64-bit:
+//   - widen (source < 64, target int64/uint64): lo = source; hi = sign-fill
+//     (ASR src,#31 for a signed source) or 0 (unsigned source / bool).
+//   - identity (source and target both 64-bit): copy the pair.
+//   - narrow (source int64/uint64, target < 64): take the lo word, then
+//     re-canonicalize to the target's sub-word width (emitCast).
+// A float endpoint is rejected in emitCastOp before this is reached.
+func emitCast64(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr) {
+	if len(ins.Args) != 1 || ins.TypeArg == nil { return }
+	var srcTyp @types.Type = ins.Args[0].Typ
+	if is64Typ(ins.TypeArg) {
+		if is64Typ(srcTyp) {
+			emitCast64Identity(a, rm, ins)
+		} else {
+			emitCast64Widen(a, pkgName, rm, ins)
+		}
+		return
+	}
+	// Narrow: source is int64, target is 32-bit-or-narrower.
+	emitCast64Narrow(a, rm, ins)
+}
+
+// emitCast64Identity copies a 64-bit pair unchanged (int64 <-> uint64, or a
+// named-64 to its underlying), storing it into the result slot.
+func emitCast64Identity(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	var lo int
+	var hi int
+	lo, hi = load64(a, rm, ins.Args[0])
+	if lo < 0 { return }
+	store64(a, rm, ins, lo, hi)
+}
+
+// emitCast64Widen sign-/zero-extends a sub-64-bit source into a 64-bit pair.
+// The lo word is the source value (re-established to its own width first via
+// emitCast so a sub-word source is canonical); the hi word is `ASR lo,#31`
+// (arithmetic, replicating the sign bit) for a SIGNED source, else 0.  The
+// bool->int64 widen (guarded-shift maskIn) hits the unsigned branch (hi=0).
+func emitCast64Widen(a @asm.Assembler, pkgName *[]readonly char,
+		rm @common.RegMap, ins @ir.Instr) {
+	var src int = emitValOperand(a, pkgName, rm, ins.Args[0])
+	if src < 0 { return }
+	var lo int = scratchReg(rm)
+	// Canonicalize the source to its own width in `lo` (a plain MOV for a
+	// 32-bit source; SXTB/SXTH/UXTB/UXTH for a sub-word source), so the
+	// sign-replication below reads a clean value.
+	emitCast(a, lo, src, ins.Args[0].Typ, srcCanonTarget(ins.Args[0].Typ))
+	var hi int = scratchReg(rm)
+	var uSrc @types.Type = common.UnwrapNamed(ins.Args[0].Typ)
+	var signed bool = uSrc != nil && uSrc.IsInteger() && uSrc.Signed
+	if signed {
+		arm32.Mov(a, arm32.COND_AL, false, hi,
+			arm32.RegShift(lo, arm32.ASR, 31))
+	} else {
+		arm32.Mov(a, arm32.COND_AL, false, hi, arm32.Imm(0))
+	}
+	store64(a, rm, ins, lo, hi)
+}
+
+// srcCanonTarget returns the 32-bit-host canonicalization target for a source
+// type: the type itself when it is a plain 32-bit int (so emitCast is a MOV),
+// else a 32-bit int of the source's signedness so a sub-word source is
+// re-extended to a full clean word before the hi-word sign replication.  For a
+// bool source (1-bit) the value is already 0/1, so any 32-bit target is a MOV.
+func srcCanonTarget(t @types.Type) @types.Type {
+	var u @types.Type = common.UnwrapNamed(t)
+	if u != nil && u.IsInteger() && u.Signed {
+		return types.TypInt()
+	}
+	return types.TypUint()
+}
+
+// emitCast64Narrow takes the LO word of a 64-bit source as the narrowed value,
+// then re-canonicalizes it to the target's sub-word width.  A same-host-width
+// (int32/int/uint32) target is just the lo word; an int8/int16 target gets a
+// sub-word extend.  The result is an ordinary 32-bit value registered via
+// nextReg, so the standard spillAndReset stores it.
+func emitCast64Narrow(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	var lo int
+	var hi int
+	lo, hi = load64(a, rm, ins.Args[0])
+	if lo < 0 { return }
+	var rd int = nextReg(rm, ins.ID)
+	// Narrow from a 32-bit source (the lo word, already a full int32) to the
+	// target width; emitCast MOVs for a 32-bit target and SXT/UXT for sub-word.
+	emitCast(a, rd, lo, types.TypInt(), ins.TypeArg)
+}
+
+// emitCompare64 lowers a 64-bit OP_EQ/NE/LT/LE/GT/GE to a bool (0/1) result.
+// EQ/NE fold the two words with EOR then OR and test against zero; the ordered
+// comparisons use the SUBS/SBCS full-width-subtract idiom (clang -O1) — a scratch
+// subtract sets N,Z,C,V exactly as a 64-bit compare, and a single conditional
+// MOV reads the signed (LT/GE) or unsigned (LO/HS) condition.  GT/LE are
+// realized by swapping the operands into LT/GE (a>b == b<a, a<=b == b>=a).
+func emitCompare64(a @asm.Assembler, pkgName *[]readonly char,
+		rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) != 2 { return }
+	var lo1 int
+	var hi1 int
+	lo1, hi1 = load64(a, rm, ins.Args[0])
+	if lo1 < 0 { return }
+	var lo2 int
+	var hi2 int
+	lo2, hi2 = load64(a, rm, ins.Args[1])
+	if lo2 < 0 { return }
+	var rd int = nextReg(rm, ins.ID)
+	if ins.Op == iropcode.OP_EQ || ins.Op == iropcode.OP_NE {
+		emitCompare64Eq(a, rm, rd, lo1, hi1, lo2, hi2, ins.Op)
+		return
+	}
+	emitCompare64Ordered(a, rm, rd, lo1, hi1, lo2, hi2, ins)
+}
+
+// emitCompare64Eq realizes OP_EQ / OP_NE: EOR the low words, EOR the high
+// words, OR the two differences (zero iff the 64-bit values are equal), then set
+// rd from the EQ (OP_EQ) or NE (OP_NE) condition.  The final ORRS sets Z on the
+// combined difference, which a single-word SUBS/SBCS chain cannot (SBCS's Z
+// reflects only the high-word subtract).
+func emitCompare64Eq(a @asm.Assembler, rm @common.RegMap, rd int,
+		lo1 int, hi1 int, lo2 int, hi2 int, op int) {
+	var dlo int = scratchReg(rm)
+	arm32.Eor(a, arm32.COND_AL, false, dlo, lo1, arm32.Reg(lo2))
+	var dhi int = scratchReg(rm)
+	arm32.Eor(a, arm32.COND_AL, false, dhi, hi1, arm32.Reg(hi2))
+	arm32.Orr(a, arm32.COND_AL, true, dlo, dlo, arm32.Reg(dhi))
+	arm32.Mov(a, arm32.COND_AL, false, rd, arm32.Imm(0))
+	var cond int = arm32.COND_EQ
+	if op == iropcode.OP_NE { cond = arm32.COND_NE }
+	arm32.Mov(a, cond, false, rd, arm32.Imm(1))
+}
+
+// emitCompare64Ordered realizes the four ordered comparisons via a full-width
+// SUBS/SBCS into a discard scratch, then a conditional MOV.  For GT / LE the
+// operands are swapped (GT(a,b)=LT(b,a); LE(a,b)=GE(b,a)) so only the LT / GE
+// (signed) or LO / HS (unsigned) conditions are ever emitted.  This is provably
+// correct for all four, signed and unsigned: SUBS then SBCS produces the same
+// NZCV a hypothetical 64-bit CMP would, and the signed (N!=V / N==V) and
+// unsigned (C / !C) conditions selected below are the textbook post-compare
+// results.
+func emitCompare64Ordered(a @asm.Assembler, rm @common.RegMap, rd int,
+		lo1 int, hi1 int, lo2 int, hi2 int, ins @ir.Instr) {
+	var uns bool = isUnsigned64(ins.Args[0].Typ)
+	// Decide operand order and the surviving condition (LT/GE families only).
+	// xLo/xHi - yLo/yHi sets the flags; cond reads them.
+	var xLo int = lo1
+	var xHi int = hi1
+	var yLo int = lo2
+	var yHi int = hi2
+	var wantGe bool = false  // false => LT/LO condition, true => GE/HS
+	if ins.Op == iropcode.OP_LT {
+		// a < b : x=a, y=b, LT/LO
+		wantGe = false
+	} else if ins.Op == iropcode.OP_GE {
+		// a >= b : x=a, y=b, GE/HS
+		wantGe = true
+	} else if ins.Op == iropcode.OP_GT {
+		// a > b  == b < a : x=b, y=a, LT/LO
+		xLo = lo2; xHi = hi2; yLo = lo1; yHi = hi1
+		wantGe = false
+	} else {
+		// OP_LE: a <= b == b >= a : x=b, y=a, GE/HS
+		xLo = lo2; xHi = hi2; yLo = lo1; yHi = hi1
+		wantGe = true
+	}
+	var tmp int = scratchReg(rm)
+	arm32.Sub(a, arm32.COND_AL, true, tmp, xLo, arm32.Reg(yLo))
+	arm32.Sbc(a, arm32.COND_AL, true, tmp, xHi, arm32.Reg(yHi))
+	arm32.Mov(a, arm32.COND_AL, false, rd, arm32.Imm(0))
+	var cond int = cmp64Cond(uns, wantGe)
+	arm32.Mov(a, cond, false, rd, arm32.Imm(1))
+}
+
+// cmp64Cond returns the arm32 condition that is TRUE for the surviving
+// (LT/LO or GE/HS) comparison after the SUBS/SBCS full-width subtract: the
+// unsigned family (LO/HS) when `uns`, the signed family (LT/GE) otherwise.
+func cmp64Cond(uns bool, wantGe bool) int {
+	if uns {
+		if wantGe { return arm32.COND_HS }
+		return arm32.COND_LO
+	}
+	if wantGe { return arm32.COND_GE }
+	return arm32.COND_LT
+}

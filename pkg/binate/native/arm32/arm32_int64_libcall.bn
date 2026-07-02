@@ -1,0 +1,142 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/common"
+
+// ============================================================
+// 64-bit multiply / divide / remainder / shift via __aeabi helpers
+// ============================================================
+//
+// These ops have no compact open-coded form, so — like clang -O1 — they call
+// the ARM run-time ABI (AEABI) helpers linked from libgcc.a (the baremetal
+// runner passes it via --link-after-objs).  Register conventions, confirmed
+// against clang output and the AEABI (IHI0043) spec:
+//   __aeabi_lmul(a=r0:r1, b=r2:r3)        -> r0:r1
+//   __aeabi_ldivmod(n=r0:r1, d=r2:r3)     -> quotient r0:r1, remainder r2:r3
+//   __aeabi_uldivmod(n=r0:r1, d=r2:r3)    -> quotient r0:r1, remainder r2:r3
+//   __aeabi_llsl(v=r0:r1, count=r2)       -> r0:r1   (logical shift left)
+//   __aeabi_llsr(v=r0:r1, count=r2)       -> r0:r1   (logical shift right)
+//   __aeabi_lasr(v=r0:r1, count=r2)       -> r0:r1   (arithmetic shift right)
+//
+// The scratch operand registers (R4..R10) are callee-saved, so they survive the
+// BL; we marshal them into the r0:r1 / r2:r3 arg pairs just before the branch.
+
+// emitAeabiCall emits `BL <name>` to a bare (unmangled) AEABI runtime symbol,
+// marking it global so the relocation resolves against libgcc.  Does NOT reset
+// the register pool — the caller sequences the arg marshaling / result read
+// around it (BL clobbers R0-R3 and R12; the pool scratches survive).
+func emitAeabiCall(a @asm.Assembler, name *[]readonly char) {
+	var callee @[]char = symPrefixed(name)
+	a.SetGlobal(callee)
+	arm32.Bl(a, arm32.COND_AL, callee)
+}
+
+// marshalPairArgs loads two 64-bit operands into the AAPCS32 arg pairs
+// r0:r1 (operand a) and r2:r3 (operand b), reading each from its spill slot /
+// const via load64.  Used by the two-operand libcalls (lmul, [u]ldivmod).  The
+// scratch regs load64 hands back are moved into r0..r3 last, so an operand that
+// already sits in a scratch isn't clobbered before it is placed.
+func marshalPairArgs(a @asm.Assembler, rm @common.RegMap,
+		argA @ir.Instr, argB @ir.Instr) bool {
+	var alo int
+	var ahi int
+	alo, ahi = load64(a, rm, argA)
+	if alo < 0 { return false }
+	var blo int
+	var bhi int
+	blo, bhi = load64(a, rm, argB)
+	if blo < 0 { return false }
+	// Place b into r2:r3 first, then a into r0:r1: a's scratches might be
+	// r4/r5 and b's r6/r7 (never r0-r3, which are not in the pool), so the
+	// moves don't clobber a source before it's read.  Move a last since r0/r1
+	// are the lowest arg regs.
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R2, arm32.Reg(blo))
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R3, arm32.Reg(bhi))
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R0, arm32.Reg(alo))
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R1, arm32.Reg(ahi))
+	return true
+}
+
+// emitMul64 lowers OP_MUL on int64/uint64 to __aeabi_lmul (sign-agnostic: the
+// low 64 bits of a 64x64 product are identical for signed and unsigned).
+func emitMul64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) != 2 { return }
+	if !marshalPairArgs(a, rm, ins.Args[0], ins.Args[1]) { return }
+	emitAeabiCall(a, "__aeabi_lmul")
+	rm.ResetRegs()
+	// Result in r0:r1; move into fresh scratches before storing so the store's
+	// large-offset materialization (which may use r0-relative addressing? no —
+	// emitFrameStore uses SP/IP) can't disturb it.  A plain store from r0/r1 is
+	// also fine; use scratches for uniformity with the pair store helper.
+	var rlo int = scratchReg(rm)
+	arm32.Mov(a, arm32.COND_AL, false, rlo, arm32.Reg(arm32.R0))
+	var rhi int = scratchReg(rm)
+	arm32.Mov(a, arm32.COND_AL, false, rhi, arm32.Reg(arm32.R1))
+	store64(a, rm, ins, rlo, rhi)
+}
+
+// emitDivRem64 lowers OP_DIV / OP_REM on int64/uint64 to __aeabi_ldivmod
+// (signed) / __aeabi_uldivmod (unsigned).  Both return quotient in r0:r1 and
+// remainder in r2:r3, so DIV reads r0:r1 and REM reads r2:r3 from the SAME
+// helper — no separate remainder call.  The IR emits an OP_DIV_CHECK guard call
+// before this (zero-divisor / INT64_MIN/-1 trap in the runtime), mirroring the
+// hardware-divide path for int32.
+func emitDivRem64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) != 2 { return }
+	if !marshalPairArgs(a, rm, ins.Args[0], ins.Args[1]) { return }
+	if isUnsigned64(ins.Typ) {
+		emitAeabiCall(a, "__aeabi_uldivmod")
+	} else {
+		emitAeabiCall(a, "__aeabi_ldivmod")
+	}
+	rm.ResetRegs()
+	var rlo int = scratchReg(rm)
+	var rhi int = scratchReg(rm)
+	if ins.Op == iropcode.OP_DIV {
+		arm32.Mov(a, arm32.COND_AL, false, rlo, arm32.Reg(arm32.R0))
+		arm32.Mov(a, arm32.COND_AL, false, rhi, arm32.Reg(arm32.R1))
+	} else {
+		arm32.Mov(a, arm32.COND_AL, false, rlo, arm32.Reg(arm32.R2))
+		arm32.Mov(a, arm32.COND_AL, false, rhi, arm32.Reg(arm32.R3))
+	}
+	store64(a, rm, ins, rlo, rhi)
+}
+
+// emitShift64 lowers OP_SHL / OP_SHR on a 64-bit value.  The value goes in
+// r0:r1 and the shift count (the low word of the count operand) in r2, then
+// __aeabi_l{lsl,lsr,asr} returns the shifted pair in r0:r1.  The IR has already
+// masked the count into [0, 63] and applied the overshift-to-0 / sign-fill
+// (emitGuardedShift), so the helper only sees in-range counts.  SHR selects
+// lasr (arithmetic) for a signed value and llsr (logical) for unsigned.
+func emitShift64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) != 2 { return }
+	var vlo int
+	var vhi int
+	vlo, vhi = load64(a, rm, ins.Args[0])
+	if vlo < 0 { return }
+	// The count operand is width-reconciled to the value's type (int64), so it
+	// too is a 64-bit pair; only the low word feeds r2 (counts are 0..63).
+	var clo int
+	var chi int
+	clo, chi = load64(a, rm, ins.Args[1])
+	if clo < 0 { return }
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R2, arm32.Reg(clo))
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R0, arm32.Reg(vlo))
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R1, arm32.Reg(vhi))
+	if ins.Op == iropcode.OP_SHL {
+		emitAeabiCall(a, "__aeabi_llsl")
+	} else if isUnsigned64(ins.Typ) {
+		emitAeabiCall(a, "__aeabi_llsr")
+	} else {
+		emitAeabiCall(a, "__aeabi_lasr")
+	}
+	rm.ResetRegs()
+	var rlo int = scratchReg(rm)
+	arm32.Mov(a, arm32.COND_AL, false, rlo, arm32.Reg(arm32.R0))
+	var rhi int = scratchReg(rm)
+	arm32.Mov(a, arm32.COND_AL, false, rhi, arm32.Reg(arm32.R1))
+	store64(a, rm, ins, rlo, rhi)
+}

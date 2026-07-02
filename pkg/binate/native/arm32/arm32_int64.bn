@@ -1,0 +1,244 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// 64-bit (int64 / uint64) support as ARM register PAIRS on ILP32
+// ============================================================
+//
+// A 64-bit SSA value occupies a LO word + a HI word (little-endian ARM: lo
+// first).  Under the spill-everything model each 64-bit value lives in its
+// 8-byte frame slot — lo at [slot+0], hi at [slot+4] — and is reloaded into two
+// scratch registers on each use (they need NOT be consecutive; adc/sbc take
+// explicit regs, and only the r0:r1 / r2:r3 ABI pairs at call/return boundaries
+// require adjacency).  Producers write both words to the slot DIRECTLY (they do
+// not call nextReg/AssignReg for the result), so the single-register
+// spillAndReset that follows every instruction is a no-op for them (LookupReg
+// misses) — the pair is already in memory.  This is novel arm32 codegen: aarch64
+// and x64 are LP64, so their int64 is a single register with no pair handling.
+//
+// The lowerings mirror `clang -target arm-none-eabi -mfloat-abi=soft -O1`:
+//   add   ADDS lo ; ADC hi          sub   SUBS lo ; SBC hi
+//   neg   RSBS lo,#0 ; RSC hi,#0    not   MVN lo ; MVN hi
+//   and/or/xor  per-word            mul   __aeabi_lmul (r0:r1,r2:r3 -> r0:r1)
+//   div/rem  __aeabi_[u]ldivmod (n=r0:r1, d=r2:r3 -> q r0:r1, rem r2:r3)
+//   shl/shr  __aeabi_l{lsl,lsr,asr} (val r0:r1, count r2 -> r0:r1)
+//   compare  SUBS lo ; SBCS hi ; conditional MOV (see emitCompare64)
+
+// is64Typ reports whether t is a 64-bit fundamental integer scalar
+// (int64 / uint64) — the register-pair value class this file handles.  Alias of
+// isReg64Scalar (arm32_call.bn), named for readability at the int64 call sites.
+func is64Typ(t @types.Type) bool {
+	return isReg64Scalar(t)
+}
+
+// isUnsigned64 reports whether t is uint64 (drives the unsigned div / shift /
+// compare families).  Peels TYP_NAMED so a named distinct uint64 classifies by
+// its underlying signedness.
+func isUnsigned64(t @types.Type) bool {
+	var u @types.Type = common.UnwrapNamed(t)
+	return u != nil && u.Kind == types.TYP_INT && u.Width == 64 && !u.Signed
+}
+
+// instrIs64 reports whether ins should be lowered by the 64-bit register-pair
+// path rather than the 32-bit path.  True when the RESULT is a 64-bit scalar
+// (const / arithmetic / bitwise / shift / unary / widening cast), OR when the
+// operands are 64-bit even though the result is not (a compare -> bool, or a
+// NARROWING cast int64 -> int32).  emitInstr64 dispatches these.
+func instrIs64(ins @ir.Instr) bool {
+	if is64Typ(ins.Typ) { return true }
+	// Compare: result is bool, operands may be int64.
+	if ins.Op == iropcode.OP_EQ || ins.Op == iropcode.OP_NE ||
+			ins.Op == iropcode.OP_LT || ins.Op == iropcode.OP_LE ||
+			ins.Op == iropcode.OP_GT || ins.Op == iropcode.OP_GE {
+		if len(ins.Args) == 2 && is64Typ(ins.Args[0].Typ) { return true }
+	}
+	// Narrowing cast int64 -> smaller: result is 32-bit, source is 64-bit.
+	if ins.Op == iropcode.OP_CAST && len(ins.Args) == 1 &&
+			is64Typ(ins.Args[0].Typ) {
+		return true
+	}
+	return false
+}
+
+// emitInstr64 lowers one 64-bit-involving IR instruction.  Returns true if it
+// matched and emitted (or SetError'd loudly); false to fall through to the
+// 32-bit dispatcher.  Only ops instrIs64 recognizes reach here.
+func emitInstr64(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr) bool {
+	switch ins.Op {
+	case iropcode.OP_CONST_INT:
+		emitConst64(a, rm, ins)
+		return true
+	case iropcode.OP_ADD, iropcode.OP_SUB, iropcode.OP_AND, iropcode.OP_OR,
+			iropcode.OP_XOR:
+		emitBinop64Simple(a, rm, ins)
+		return true
+	case iropcode.OP_MUL:
+		emitMul64(a, rm, ins)
+		return true
+	case iropcode.OP_DIV, iropcode.OP_REM:
+		emitDivRem64(a, rm, ins)
+		return true
+	case iropcode.OP_SHL, iropcode.OP_SHR:
+		emitShift64(a, rm, ins)
+		return true
+	case iropcode.OP_NEG, iropcode.OP_BITNOT:
+		emitUnop64(a, rm, ins)
+		return true
+	case iropcode.OP_CAST:
+		emitCast64(a, pkgName, rm, ins)
+		return true
+	case iropcode.OP_BIT_CAST:
+		// A bit_cast is a same-size bit reinterpret, so a 64-bit-result
+		// bit_cast (int64<->uint64, and the int64<->float64 bit views) is
+		// bit-identical to its 64-bit operand — a two-word pass-through,
+		// exactly emitCast64Identity.  Without this case emitInstr64 would
+		// fall through to the 32-bit OP_BIT_CAST path (a single-word MOV),
+		// silently dropping the high word.  (A 32-bit-result bit_cast never
+		// reaches here — instrIs64 keys on the result being 64-bit, and
+		// bit_cast is same-size, so a 64-bit result implies a 64-bit source.)
+		emitCast64Identity(a, rm, ins)
+		return true
+	case iropcode.OP_EQ, iropcode.OP_NE, iropcode.OP_LT, iropcode.OP_LE,
+			iropcode.OP_GT, iropcode.OP_GE:
+		emitCompare64(a, pkgName, rm, ins)
+		return true
+	}
+	return false
+}
+
+// ============================================================
+// Value-model helpers: load / store a 64-bit pair
+// ============================================================
+
+// load64 reloads the 64-bit operand `arg` into two fresh scratch registers
+// (lo, hi).  A spilled SSA value reloads lo from [slot+0] and hi from [slot+4];
+// a bare OP_CONST_INT operand (not yet spilled) materializes its two words.
+// Returns (-1, -1) if the operand can't be resolved (fail-loud upstream).  The
+// two registers are distinct pool scratches — safe to feed adc/sbc/mvn etc.
+func load64(a @asm.Assembler, rm @common.RegMap, arg @ir.Instr) (int, int) {
+	if arg == nil { return -1, -1 }
+	var off int = rm.LookupSpill(arg.ID)
+	if off >= 0 {
+		var lo int = scratchReg(rm)
+		emitFrameLoad(a, lo, off)
+		var hi int = scratchReg(rm)
+		emitFrameLoad(a, hi, off + 4)
+		return lo, hi
+	}
+	// A const int64 operand used inline (rare — usually it is its own spilled
+	// OP_CONST_INT).  Materialize both words directly.
+	if arg.Op == iropcode.OP_CONST_INT {
+		var lo int = scratchReg(rm)
+		materializeWord(a, lo, cast(int, arg.IntVal & cast(int64, 0xFFFFFFFF)))
+		var hi int = scratchReg(rm)
+		materializeWord(a, hi,
+			cast(int, (arg.IntVal >> cast(int64, 32)) & cast(int64, 0xFFFFFFFF)))
+		return lo, hi
+	}
+	return -1, -1
+}
+
+// store64 writes a 64-bit result (lo, hi) into ins's spill slot: lo at
+// [slot+0], hi at [slot+4].  The 64-bit producers call this instead of
+// registering a single result register, so the following spillAndReset (which
+// only stores a nextReg-recorded register) is inert for them.
+func store64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr,
+		lo int, hi int) {
+	if ins.ID < 0 { return }
+	var off int = rm.LookupSpill(ins.ID)
+	if off < 0 { return }
+	emitFrameStore(a, lo, off)
+	emitFrameStore(a, hi, off + 4)
+}
+
+// materializeWord loads a single 32-bit word constant into rd.  Mirrors
+// emitConstInt32's MOV / MOVW+MOVT selection but takes an already-masked 32-bit
+// value; the lo/hi words of a 64-bit constant each pass through here.
+func materializeWord(a @asm.Assembler, rd int, val int) {
+	emitConstInt32(a, rd, val)
+}
+
+// ============================================================
+// Constant
+// ============================================================
+
+// emitConst64 lowers OP_CONST_INT for a 64-bit result: materialize lo and hi
+// words into scratch registers and store the pair to the value's slot.
+func emitConst64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	var lo int = scratchReg(rm)
+	materializeWord(a, lo, cast(int, ins.IntVal & cast(int64, 0xFFFFFFFF)))
+	var hi int = scratchReg(rm)
+	materializeWord(a, hi,
+		cast(int, (ins.IntVal >> cast(int64, 32)) & cast(int64, 0xFFFFFFFF)))
+	store64(a, rm, ins, lo, hi)
+}
+
+// ============================================================
+// Add / Sub / And / Or / Xor  (per-word, add/sub carry-chained)
+// ============================================================
+
+// emitBinop64Simple lowers the per-word 64-bit binops: ADD (ADDS+ADC),
+// SUB (SUBS+SBC), and the bitwise AND / OR / XOR (two independent ops).  ADD /
+// SUB carry-chain through the flags, so the low word MUST set flags (s=true) and
+// the high word consume them (ADC/SBC); the bitwise ops are word-independent.
+func emitBinop64Simple(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) != 2 { return }
+	var lo1 int
+	var hi1 int
+	lo1, hi1 = load64(a, rm, ins.Args[0])
+	if lo1 < 0 { return }
+	var lo2 int
+	var hi2 int
+	lo2, hi2 = load64(a, rm, ins.Args[1])
+	if lo2 < 0 { return }
+	var rlo int = scratchReg(rm)
+	var rhi int = scratchReg(rm)
+	if ins.Op == iropcode.OP_ADD {
+		arm32.Add(a, arm32.COND_AL, true, rlo, lo1, arm32.Reg(lo2))
+		arm32.Adc(a, arm32.COND_AL, false, rhi, hi1, arm32.Reg(hi2))
+	} else if ins.Op == iropcode.OP_SUB {
+		arm32.Sub(a, arm32.COND_AL, true, rlo, lo1, arm32.Reg(lo2))
+		arm32.Sbc(a, arm32.COND_AL, false, rhi, hi1, arm32.Reg(hi2))
+	} else if ins.Op == iropcode.OP_AND {
+		arm32.And(a, arm32.COND_AL, false, rlo, lo1, arm32.Reg(lo2))
+		arm32.And(a, arm32.COND_AL, false, rhi, hi1, arm32.Reg(hi2))
+	} else if ins.Op == iropcode.OP_OR {
+		arm32.Orr(a, arm32.COND_AL, false, rlo, lo1, arm32.Reg(lo2))
+		arm32.Orr(a, arm32.COND_AL, false, rhi, hi1, arm32.Reg(hi2))
+	} else {
+		arm32.Eor(a, arm32.COND_AL, false, rlo, lo1, arm32.Reg(lo2))
+		arm32.Eor(a, arm32.COND_AL, false, rhi, hi1, arm32.Reg(hi2))
+	}
+	store64(a, rm, ins, rlo, rhi)
+}
+
+// ============================================================
+// Unary: negate / bitwise-not
+// ============================================================
+
+// emitUnop64 lowers OP_NEG (RSBS lo,#0 ; RSC hi,#0 — 0 minus the pair with
+// borrow) and OP_BITNOT (MVN lo ; MVN hi — per-word complement).
+func emitUnop64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) != 1 { return }
+	var lo int
+	var hi int
+	lo, hi = load64(a, rm, ins.Args[0])
+	if lo < 0 { return }
+	var rlo int = scratchReg(rm)
+	var rhi int = scratchReg(rm)
+	if ins.Op == iropcode.OP_NEG {
+		arm32.Rsb(a, arm32.COND_AL, true, rlo, lo, arm32.Imm(0))
+		arm32.Rsc(a, arm32.COND_AL, false, rhi, hi, arm32.Imm(0))
+	} else {
+		arm32.Mvn(a, arm32.COND_AL, false, rlo, arm32.Reg(lo))
+		arm32.Mvn(a, arm32.COND_AL, false, rhi, arm32.Reg(hi))
+	}
+	store64(a, rm, ins, rlo, rhi)
+}

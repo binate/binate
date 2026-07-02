@@ -266,20 +266,24 @@ for pkg in $PACKAGES; do
     fi
     shard_pos=$((shard_pos + 1))
 
-    # Stdlib is ALWAYS injected (native) in production — the bytecode VM never
-    # interprets it.  Unit-testing a pkg/std package under an interpreter mode
-    # lowers the package itself to bytecode, a configuration that never ships
-    # (and that can't even run for a __c_call package like pkg/std/os, whose
-    # methods need the native impl).  Skip pkg/std/* under the int modes; their
-    # cross-mode coverage is the conformance/stdlib suite (run.sh under
-    # conformance/, where the stdlib is INJECTED).  This is a by-design
-    # exclusion, NOT a perf .skip-pkg nor a failure .xfail.
+    # Native-only packages are ALWAYS injected (native) in production — the
+    # bytecode VM never interprets them.  Unit-testing one under an interpreter
+    # mode lowers the package itself to bytecode, a configuration that never
+    # ships (and that can't even run for a __c_call package, whose OP_C_CALL the
+    # VM cannot lower: it would hit lower_instr's default arm — a hard abort —
+    # since --test's typecheck does not set Checker.Interpreted).  The set:
+    # pkg/std/* (the injected stdlib) plus pkg/builtins/rt (the runtime — native
+    # substrate, uses __c_call for malloc/free/exit/…).  Skip them under the int
+    # modes; the stdlib's cross-mode coverage is the conformance/stdlib suite
+    # (run.sh under conformance/, where the stdlib is INJECTED), and rt's logic
+    # is covered by its compiled-mode unit tests.  This is a by-design exclusion,
+    # NOT a perf .skip-pkg nor a failure .xfail.
     case "$MODE" in
         *int*)
             case "$pkg" in
-                pkg/std/*)
+                pkg/std/*|pkg/builtins/rt)
                     if [ "$VERBOSE" -eq 1 ]; then
-                        echo "SKIP-STDLIB-INT: $pkg (stdlib is injected, not interpreted)"
+                        echo "SKIP-NATIVE-INT: $pkg (native-only, injected not interpreted)"
                     elif [ "$QUIET" -eq 0 ]; then
                         printf "s"
                     fi

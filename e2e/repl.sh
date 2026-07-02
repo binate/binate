@@ -204,6 +204,34 @@ run_repl_setup_error() {
     fi
 }
 
+# run_repl_import_rejected drives a mid-session `import` of a package the VM
+# cannot interpret (a __c_call package like pkg/std/os).  The import must surface
+# the clean frontend type error (err_fragment) WITHOUT aborting the session — a
+# follow-up turn still evaluates (survive_fragment).  Fragment-based (not exact)
+# because the error enumerates every os __c_call site with absolute .bn paths.
+run_repl_import_rejected() {
+    label="$1"
+    input="$2"
+    err_fragment="$3"
+    survive_fragment="$4"
+    actual=$(printf '%s' "$input" | "$BNI_BIN" --repl \
+        -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
+        -I "$TMP" -L "$TMP" \
+        "$FIXTURE" 2>&1)
+    if printf '%s' "$actual" | grep -qF "$err_fragment" \
+            && printf '%s' "$actual" | grep -qF "$survive_fragment"; then
+        echo "PASS: $label"
+        PASSES=$((PASSES + 1))
+    else
+        echo "FAIL: $label"
+        echo "  expected: output contains '$err_fragment' AND '$survive_fragment'"
+        echo "  actual:"
+        printf '%s\n' "$actual" | sed 's/^/    /'
+        FAILS=$((FAILS + 1))
+        FAIL_NAMES="$FAIL_NAMES $label"
+    fi
+}
+
 # Banner + trailing prompt are constant across cases.  REPL emits
 # "> " before each line read; on EOF it prints a final newline and
 # exits, so every transcript ends with `> \n`.
@@ -1006,6 +1034,21 @@ println(repldemo.Double(5))
 > package pkg/repldemo loaded
 > 10
 > "
+
+# --- Case 47a (Tier 5: mid-session import of a __c_call package is rejected
+# cleanly, WITHOUT killing the session).  pkg/std/os uses native-only __c_call,
+# which the VM cannot interpret; importing it at the prompt must surface the
+# frontend "cannot be interpreted" type error and leave the session alive so a
+# follow-up turn still evaluates (helper(7) -> 14).  Regression guard: the
+# frontend check records the error on the persisted checker, but the import loop
+# must skip lowering the erroring package — else IR-gen's unconditional OP_C_CALL
+# reaches lower_instr's default arm and aborts the whole session. ---
+run_repl_import_rejected "tier5-mid-session-import-ccall-rejected" \
+'import "pkg/std/os"
+println(helper(7))
+' \
+    "__c_call cannot be interpreted" \
+    "14"
 
 # --- Case 48 (Plan-B B3: REPL parked-member iota-repeat).  B0 = M<<iota
 # parks (pending M); the bare B1 repeats B0's M-dependent initializer, so

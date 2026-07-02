@@ -1,0 +1,342 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Memory / aggregate op handlers extracted from the dispatcher.  Each function
+// corresponds to one IR opcode; emitInstr matches ins.Op and delegates.
+// Mirrors aarch64_emit.bn, adapted to the ILP32 word size (4 bytes) — the
+// aarch64 backend's word-stride constants (8) and slice-field flat offsets
+// (8 * Index) become the target pointer size here, read from types.GetTarget().
+
+// wordBytes returns the target pointer/word size (4 on arm32).  The whole
+// compiler runs with types configured for the arm32 target during a native
+// arm32 build, so GetTarget().PointerSize is 4; slice fields, aggregate word
+// copies, and register-word strides all use it rather than a hardcoded 8 (the
+// aarch64 constant).
+func wordBytes() int {
+	return types.GetTarget().PointerSize
+}
+
+// emitAlloc: OP_ALLOC — an aggregate alloca zero-inits its storage to match the
+// LLVM `store ... zeroinitializer`.  Scalar allocas are left uninitialized; the
+// following STORE fills them.  Zeroing runs word-by-word (STR of a zeroed
+// scratch); the data region is a multiple of the word size (PlanFrame rounds up).
+func emitAlloc(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if !common.IsAggregateTyp(ins.TypeArg) { return }
+	var off int = rm.LookupAlloc(ins.ID)
+	var sz int = rm.LookupAllocSize(ins.ID)
+	if off < 0 || sz <= 0 { return }
+	var zero int = scratchReg(rm)
+	arm32.Mov(a, arm32.COND_AL, false, zero, arm32.Imm(0))
+	var w int = wordBytes()
+	for bo := 0; bo < sz; bo = bo + w {
+		emitFrameStore(a, zero, off + bo)
+	}
+}
+
+// emitConstNil: OP_CONST_NIL — an aggregate nil (nil slice, zero struct) zero-
+// inits its data region and produces a pointer to it.  A scalar nil is simply 0.
+func emitConstNil(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if common.IsAggregateTyp(ins.Typ) {
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		var sz int = rm.LookupAllocSize(ins.ID)
+		if dataOff >= 0 && sz > 0 {
+			var zero int = scratchReg(rm)
+			arm32.Mov(a, arm32.COND_AL, false, zero, arm32.Imm(0))
+			var w int = wordBytes()
+			for bo := 0; bo < sz; bo = bo + w {
+				emitFrameStore(a, zero, dataOff + bo)
+			}
+			var rd int = nextReg(rm, ins.ID)
+			emitFrameAddr(a, rd, dataOff)
+			return
+		}
+	}
+	var rd int = nextReg(rm, ins.ID)
+	arm32.Mov(a, arm32.COND_AL, false, rd, arm32.Imm(0))
+}
+
+// emitExtract: OP_EXTRACT — read ins.Index-th field of an aggregate SSA value.
+// Multi-return calls keep the tuple bytes directly in the spill slot; every
+// other aggregate keeps a pointer in the spill slot and indirects through it.
+// The field offset is tuple.FieldOffset(Index) for a real struct — NOT a flat
+// word*Index — because tuple fields can themselves be aggregates.  Scalar fields
+// size-dispatch through emitScalarLoad; aggregate fields pass through as an
+// address (ADD).  Mirrors aarch64_emit.bn's emitExtract with word=4.
+func emitExtract(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var src @ir.Instr = ins.Args[0]
+	var rd int = nextReg(rm, ins.ID)
+	var fieldOff int = wordBytes() * ins.Index
+	var exTyp @types.Type = common.UnwrapNamed(src.Typ)
+	if exTyp != nil && exTyp.Kind == types.TYP_STRUCT {
+		fieldOff = exTyp.FieldOffset(ins.Index)
+	}
+	var sz int = wordBytes()
+	if ins.Typ != nil { sz = ins.Typ.SizeOf() }
+	if sz <= 0 { sz = wordBytes() }
+	var sgnTyp @types.Type = common.UnwrapNamed(ins.Typ)
+	var signed bool = sgnTyp != nil && sgnTyp.Signed
+	if common.SpillHoldsAggregatePointer(src) {
+		var ptr int = getOperand(a, rm, src.ID)
+		if ptr < 0 { return }
+		if common.IsAggregateTyp(ins.Typ) {
+			emitAddImm(a, rd, ptr, fieldOff, arm32.IP)
+		} else {
+			emitScalarLoad(a, rd, ptr, fieldOff, sz, signed)
+		}
+		return
+	}
+	var srcSlot int = rm.LookupSpill(src.ID)
+	if srcSlot < 0 { return }
+	if common.IsAggregateTyp(ins.Typ) {
+		emitFrameAddr(a, rd, srcSlot + fieldOff)
+	} else {
+		emitFrameScalarLoad(a, rd, srcSlot + fieldOff, sz, signed)
+	}
+}
+
+// emitMakeSlice: OP_MAKE_SLICE — call `rt.MakeManagedSlice(elemSize, len)`.  The
+// LLVM-compiled runtime materializes the ManagedSlice return through the AAPCS32
+// sret pointer (a 16-byte managed-slice on ILP32 is > CExternSretBytes, so it is
+// returned via a hidden pointer arg in R0).  We hand it the data region reserved
+// by PlanFrame and produce a pointer to that region.  AAPCS32 shifts the real
+// args right by one for the sret pointer: elemSize → R1, len → R2, sret → R0.
+func emitMakeSlice(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 || ins.TypeArg == nil { return }
+	var dataOff int = rm.LookupAlloc(ins.ID)
+	if dataOff < 0 { return }
+	var lenReg int = getOperand(a, rm, ins.Args[0].ID)
+	if lenReg < 0 { return }
+	// Move len before clobbering the arg registers: len → R2, elemSize → R1.
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R2, arm32.Reg(lenReg))
+	emitConstInt32(a, arm32.R1, ins.TypeArg.SizeOf())
+	// sret pointer to the data region → R0.  emitFrameAddr uses IP as its
+	// large-offset scratch, which is safe here: R1/R2 (already set) and R0 are
+	// untouched by it.
+	emitFrameAddr(a, arm32.R0, dataOff)
+	var callee @[]char =
+		symPrefixed(mangleRtFunc("MakeManagedSlice"))
+	a.SetGlobal(callee)
+	arm32.Bl(a, arm32.COND_AL, callee)
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	emitFrameAddr(a, rd, dataOff)
+}
+
+// emitAggLoad materializes an aggregate OP_LOAD into the load's OWN data region
+// (reserved by PlanFrame), leaving rd pointing at it.  A bare pointer pass-
+// through would alias the source object, which dangles when the source is a
+// local the function's cleanup RefDecs before the loaded value is consumed.
+// Materializing at the load point (before any cleanup) gives the value its own
+// storage.  Mirrors aarch64_emit.bn's emitAggLoad with word=4.
+func emitAggLoad(a @asm.Assembler, pkgName *[]readonly char,
+	rm @common.RegMap, ins @ir.Instr, arg @ir.Instr) {
+	var rd int = nextReg(rm, ins.ID)
+	var srcPtr int
+	var srcAlloc int = rm.LookupAlloc(arg.ID)
+	if srcAlloc >= 0 {
+		srcPtr = scratchReg(rm)
+		emitFrameAddr(a, srcPtr, srcAlloc)
+	} else if isGlobalRef(arg) {
+		srcPtr = scratchReg(rm)
+		emitGlobalAddr(a, pkgName, srcPtr, arg)
+	} else {
+		srcPtr = getOperand(a, rm, arg.ID)
+	}
+	if srcPtr < 0 { return }
+	var myAlloc int = rm.LookupAlloc(ins.ID)
+	if myAlloc < 0 {
+		arm32.Mov(a, arm32.COND_AL, false, rd, arm32.Reg(srcPtr))
+		return
+	}
+	emitFrameAddr(a, rd, myAlloc)
+	var sz int = ins.Typ.SizeOf()
+	var tmp int = scratchReg(rm)
+	var w int = wordBytes()
+	for off := 0; off < sz; off = off + w {
+		arm32.Ldr(a, arm32.COND_AL, tmp, arm32.MemImm(srcPtr, off))
+		arm32.Str(a, arm32.COND_AL, tmp, arm32.MemImm(rd, off))
+	}
+}
+
+// emitLoad: OP_LOAD — aggregate loads materialize into their own region
+// (emitAggLoad); scalar loads size-dispatch to LDRB/LDRH/LDR so a char read
+// doesn't pull in neighbors.  Package-level globals are reached via MOVW/MOVT.
+func emitLoad(a @asm.Assembler, pkgName *[]readonly char,
+	rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var arg @ir.Instr = ins.Args[0]
+	if common.IsAggregateTyp(ins.Typ) {
+		emitAggLoad(a, pkgName, rm, ins, arg)
+		return
+	}
+	var sz int = wordBytes()
+	if ins.Typ != nil { sz = ins.Typ.SizeOf() }
+	if sz <= 0 { sz = wordBytes() }
+	var sgnTyp @types.Type = common.UnwrapNamed(ins.Typ)
+	var signed bool = sgnTyp != nil && sgnTyp.Signed
+	var off int = rm.LookupAlloc(arg.ID)
+	if off >= 0 {
+		var rd int = nextReg(rm, ins.ID)
+		emitFrameScalarLoad(a, rd, off, sz, signed)
+		return
+	}
+	if isGlobalRef(arg) {
+		var addr int = scratchReg(rm)
+		emitGlobalAddr(a, pkgName, addr, arg)
+		var rd int = nextReg(rm, ins.ID)
+		emitScalarLoad(a, rd, addr, 0, sz, signed)
+		return
+	}
+	var ptr int = getOperand(a, rm, arg.ID)
+	if ptr < 0 { return }
+	var rd int = nextReg(rm, ins.ID)
+	emitScalarLoad(a, rd, ptr, 0, sz, signed)
+}
+
+// emitStore: OP_STORE — aggregate stores memcpy via emitStructCopy; scalar
+// stores size-dispatch to STRB/STRH/STR.  A global destination is reached via
+// MOVW/MOVT first.
+func emitStore(a @asm.Assembler, pkgName *[]readonly char,
+	rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 2 { return }
+	if common.IsAggregateTyp(ins.Args[1].Typ) {
+		emitStructCopy(a, pkgName, rm, ins)
+		return
+	}
+	var sz int = wordBytes()
+	if ins.Args[1].Typ != nil { sz = ins.Args[1].Typ.SizeOf() }
+	if sz <= 0 { sz = wordBytes() }
+	var off int = rm.LookupAlloc(ins.Args[0].ID)
+	var valReg int = emitValOperand(a, pkgName, rm, ins.Args[1])
+	if valReg < 0 { return }
+	if off >= 0 {
+		emitFrameScalarStore(a, valReg, off, sz)
+		return
+	}
+	if isGlobalRef(ins.Args[0]) {
+		var addr int = scratchReg(rm)
+		emitGlobalAddr(a, pkgName, addr, ins.Args[0])
+		emitScalarStore(a, valReg, addr, 0, sz)
+		return
+	}
+	var ptr int = getOperand(a, rm, ins.Args[0].ID)
+	if ptr < 0 { return }
+	emitScalarStore(a, valReg, ptr, 0, sz)
+}
+
+// emitStructCopy lowers an OP_STORE that copies a struct / array / slice as a
+// word-by-word memcpy.  Source pointer from Args[1], dest from Args[0]; either
+// endpoint may be a package-level global (MOVW/MOVT) or a multi-return spill
+// (whose bytes live directly in the slot).  Mirrors aarch64_refcount.bn's
+// emitStructCopy with word=4.
+func emitStructCopy(a @asm.Assembler, pkgName *[]readonly char,
+	rm @common.RegMap, ins @ir.Instr) {
+	var sz int = ins.Args[1].Typ.SizeOf()
+	if sz <= 0 { return }
+	var srcPtr int
+	if isGlobalRef(ins.Args[1]) {
+		srcPtr = scratchReg(rm)
+		emitGlobalAddr(a, pkgName, srcPtr, ins.Args[1])
+	} else if common.IsMultiReturnCall(ins.Args[1]) {
+		var srcOff int = rm.LookupSpill(ins.Args[1].ID)
+		if srcOff < 0 { return }
+		srcPtr = scratchReg(rm)
+		emitFrameAddr(a, srcPtr, srcOff)
+	} else {
+		srcPtr = getOperand(a, rm, ins.Args[1].ID)
+	}
+	if srcPtr < 0 { return }
+	var dstPtr int
+	var allocOff int = rm.LookupAlloc(ins.Args[0].ID)
+	if allocOff >= 0 {
+		dstPtr = scratchReg(rm)
+		emitFrameAddr(a, dstPtr, allocOff)
+	} else if isGlobalRef(ins.Args[0]) {
+		dstPtr = scratchReg(rm)
+		emitGlobalAddr(a, pkgName, dstPtr, ins.Args[0])
+	} else {
+		dstPtr = getOperand(a, rm, ins.Args[0].ID)
+	}
+	if dstPtr < 0 { return }
+	var tmp int = scratchReg(rm)
+	var w int = wordBytes()
+	for off := 0; off < sz; off = off + w {
+		arm32.Ldr(a, arm32.COND_AL, tmp, arm32.MemImm(srcPtr, off))
+		arm32.Str(a, arm32.COND_AL, tmp, arm32.MemImm(dstPtr, off))
+	}
+}
+
+// emitGetElemPtr: OP_GET_ELEM_PTR — compute base + idx*elemSize.  A package-
+// level global base is reached via MOVW/MOVT.  Mirrors aarch64_emit.bn.
+func emitGetElemPtr(a @asm.Assembler, pkgName *[]readonly char,
+	rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 2 { return }
+	var elemSize int = common.ElemSizeOf(ins)
+	if elemSize <= 0 { return }
+	var idx int = getOperand(a, rm, ins.Args[1].ID)
+	if idx < 0 { return }
+
+	var sizeTmp int = scratchReg(rm)
+	emitConstInt32(a, sizeTmp, elemSize)
+	var byteOff int = scratchReg(rm)
+	arm32.Mul(a, arm32.COND_AL, false, byteOff, idx, sizeTmp)
+
+	var rd int = nextReg(rm, ins.ID)
+	var allocOff int = rm.LookupAlloc(ins.Args[0].ID)
+	if allocOff >= 0 {
+		emitFrameAddr(a, rd, allocOff)
+		arm32.Add(a, arm32.COND_AL, false, rd, rd, arm32.Reg(byteOff))
+		return
+	}
+	if isGlobalRef(ins.Args[0]) {
+		emitGlobalAddr(a, pkgName, rd, ins.Args[0])
+		arm32.Add(a, arm32.COND_AL, false, rd, rd, arm32.Reg(byteOff))
+		return
+	}
+	var base int = getOperand(a, rm, ins.Args[0].ID)
+	if base < 0 { return }
+	arm32.Add(a, arm32.COND_AL, false, rd, base, arm32.Reg(byteOff))
+}
+
+// emitGetFieldPtr: OP_GET_FIELD_PTR — compute base + FieldOffset.  A slice base
+// (raw or managed) gets a flat wordBytes*Index offset — its fields are
+// data / len / [refptr / backingLen] in pointer-sized slots, matching
+// types.SliceDataOffset / MSliceDataOffset (both ptrSize-strided).  A real
+// struct base uses the struct's FieldOffset.  A package-level global base is
+// reached via MOVW/MOVT.  Mirrors aarch64_emit.bn's emitGetFieldPtr with word=4.
+func emitGetFieldPtr(a @asm.Assembler, pkgName *[]readonly char,
+	rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var fieldOff int
+	var baseTyp @types.Type = common.StructTypeOf(ins.Args[0])
+	if baseTyp != nil {
+		fieldOff = baseTyp.FieldOffset(ins.Index)
+	} else if common.IsSliceFieldBase(ins.Args[0]) {
+		fieldOff = wordBytes() * ins.Index
+	} else {
+		return
+	}
+	var rd int = nextReg(rm, ins.ID)
+	var allocOff int = rm.LookupAlloc(ins.Args[0].ID)
+	if allocOff >= 0 {
+		emitFrameAddr(a, rd, allocOff + fieldOff)
+		return
+	}
+	if isGlobalRef(ins.Args[0]) {
+		emitGlobalAddr(a, pkgName, rd, ins.Args[0])
+		if fieldOff != 0 {
+			emitAddImm(a, rd, rd, fieldOff, arm32.IP)
+		}
+		return
+	}
+	var ptr int = getOperand(a, rm, ins.Args[0].ID)
+	if ptr < 0 { return }
+	emitAddImm(a, rd, ptr, fieldOff, arm32.IP)
+}

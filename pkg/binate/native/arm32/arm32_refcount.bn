@@ -1,0 +1,164 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/stringutils"
+import "pkg/binate/types"
+import "pkg/std/strings"
+
+// Inline refcount op handlers (OP_REFINC / OP_REFDEC).  Mirror
+// aarch64_refcount.bn, but arm32 has no CBZ/CBNZ/TBNZ — the nil-check, the
+// immortal-static sentinel test, and the refcount==0 test all become CMP/TST
+// (flag-setting) followed by a conditional B to the skip label.  The managed
+// header layout is target-derived (types.ManagedHeaderSize() = 2 * ptrSize),
+// so on ILP32 it is an 8-byte header with a 32-bit refcount whose immortal
+// sentinel is bit 31 — the same source the aarch64 handler reads, giving the
+// correct ILP32 sizing without a hardcoded constant.
+
+// refincSeq is a module-scoped counter for unique skip labels in
+// emitRefIncInline.  Local labels must be unique across the whole text section.
+var refincSeq int
+
+// refincSkipLabel formats the per-emission unique refinc skip label.
+func refincSkipLabel(seq int) @[]char {
+	var out @strings.Builder = strings.NewBuilder()
+	out.Write("Lri_skip_")
+	stringutils.WriteInt(out, seq)
+	return buf.CopyStr(out.String())
+}
+
+// emitRefIncInline lowers OP_REFINC to an inline RefInc fast path:
+//
+//   CMP  ptrReg, #0
+//   BEQ  .Lri_skip_<seq>                 ; nil → skip
+//   SUB  hdrReg, ptrReg, #hdrBytes       ; hdrReg = ptr - header
+//   LDR  refcount, [hdrReg, #0]
+//   TST  refcount, #(1 << signBit)       ; sign bit set → immortal static
+//   BNE  .Lri_skip_<seq>
+//   ADD  refcount, refcount, #1
+//   STR  refcount, [hdrReg, #0]
+// .Lri_skip_<seq>:
+//
+// A negative refcount marks immortal static-managed data (rt.STATIC_REFCOUNT):
+// TST on the sign bit skips the mutation.  On ILP32 the refcount is a 32-bit
+// word, so its sign bit is 31 and a 32-bit TST immediate `1 << 31` (0x80000000)
+// is a single rotated immediate.  spillAndReset clears the regmap after every
+// instruction, so reusing scratch registers here is safe.
+func emitRefIncInline(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var ptrReg int = getOperand(a, rm, ins.Args[0].ID)
+	if ptrReg < 0 {
+		// A RefInc whose operand can't be materialized must fail loud, not
+		// silently vanish — a dropped RefInc under-counts and yields a
+		// premature free / use-after-free.  Nothing emitted yet, no dangling
+		// label.
+		a.SetError("native arm32: refinc operand not materializable")
+		return
+	}
+	var hdrBytes int = types.ManagedHeaderSize()
+	var wordBits int = (hdrBytes / 2) * 8
+	var signMask int = 1 << (wordBits - 1)
+	var hdrReg int = scratchReg(rm)
+	var refcountReg int = scratchReg(rm)
+	var skipLabel @[]char = refincSkipLabel(refincSeq)
+	refincSeq = refincSeq + 1
+	arm32.Cmp(a, arm32.COND_AL, ptrReg, arm32.Imm(0))
+	arm32.B(a, arm32.COND_EQ, skipLabel)
+	arm32.Sub(a, arm32.COND_AL, false, hdrReg, ptrReg, arm32.Imm(hdrBytes))
+	arm32.Ldr(a, arm32.COND_AL, refcountReg, arm32.MemImm(hdrReg, 0))
+	arm32.Tst(a, arm32.COND_AL, refcountReg, arm32.Imm(signMask))
+	arm32.B(a, arm32.COND_NE, skipLabel)
+	arm32.Add(a, arm32.COND_AL, false, refcountReg, refcountReg, arm32.Imm(1))
+	arm32.Str(a, arm32.COND_AL, refcountReg, arm32.MemImm(hdrReg, 0))
+	a.DefineLabel(skipLabel)
+}
+
+// refdecSeq is a module-scoped counter for unique skip labels in
+// emitRefDecInline (parallel to refincSeq).
+var refdecSeq int
+
+// refdecSkipLabel formats the per-emission unique refdec skip label.
+func refdecSkipLabel(seq int) @[]char {
+	var out @strings.Builder = strings.NewBuilder()
+	out.Write("Lrd_skip_")
+	stringutils.WriteInt(out, seq)
+	return buf.CopyStr(out.String())
+}
+
+// emitRefDecInline lowers OP_REFDEC: nil-check + inline header load/sub/store,
+// with a slow-path call to `rt.ZeroRefDestroy` when the decrement leaves the
+// refcount at zero:
+//
+//   CMP  ptrReg, #0
+//   BEQ  .Lrd_skip_<seq>                 ; nil → skip
+//   SUB  hdrReg, ptrReg, #hdrBytes
+//   LDR  refcount, [hdrReg, #0]
+//   TST  refcount, #(1 << signBit)       ; immortal static → skip
+//   BNE  .Lrd_skip_<seq>
+//   SUB  refcount, refcount, #1
+//   STR  refcount, [hdrReg, #0]
+//   CMP  refcount, #0
+//   BNE  .Lrd_skip_<seq>                 ; refcount > 0 → skip
+//   ; slow path: refcount hit zero
+//   MOV  R0, ptrReg
+//   MOV  R1, dtorReg   (or #0 if no dtor)
+//   BL   <rt.ZeroRefDestroy>
+// .Lrd_skip_<seq>:
+//
+// The BL clobbers R0-R3/R12, but the fall-through target is the skip label so
+// no pool register is read afterward within this emission.  Computing hdrReg via
+// an explicit SUB keeps ptrReg live for the R0 mov on the slow path.
+func emitRefDecInline(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var ptrReg int = getOperand(a, rm, ins.Args[0].ID)
+	if ptrReg < 0 {
+		// A RefDec whose operand can't be materialized must fail loud, not
+		// silently vanish — a dropped RefDec leaks.  Nothing emitted yet.
+		a.SetError("native arm32: refdec pointer operand not materializable")
+		return
+	}
+	var hdrBytes int = types.ManagedHeaderSize()
+	var wordBits int = (hdrBytes / 2) * 8
+	var signMask int = 1 << (wordBits - 1)
+	var hdrReg int = scratchReg(rm)
+	var refcountReg int = scratchReg(rm)
+	var skipLabel @[]char = refdecSkipLabel(refdecSeq)
+	refdecSeq = refdecSeq + 1
+	arm32.Cmp(a, arm32.COND_AL, ptrReg, arm32.Imm(0))
+	arm32.B(a, arm32.COND_EQ, skipLabel)
+	arm32.Sub(a, arm32.COND_AL, false, hdrReg, ptrReg, arm32.Imm(hdrBytes))
+	arm32.Ldr(a, arm32.COND_AL, refcountReg, arm32.MemImm(hdrReg, 0))
+	arm32.Tst(a, arm32.COND_AL, refcountReg, arm32.Imm(signMask))
+	arm32.B(a, arm32.COND_NE, skipLabel)
+	arm32.Sub(a, arm32.COND_AL, false, refcountReg, refcountReg, arm32.Imm(1))
+	arm32.Str(a, arm32.COND_AL, refcountReg, arm32.MemImm(hdrReg, 0))
+	arm32.Cmp(a, arm32.COND_AL, refcountReg, arm32.Imm(0))
+	arm32.B(a, arm32.COND_NE, skipLabel)
+	// Slow path: refcount hit zero.  Set up R0=ptr, R1=dtor, call
+	// rt.ZeroRefDestroy.  ptrReg may already be R0 (Mov is a no-op then).
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R0, arm32.Reg(ptrReg))
+	if len(ins.Args) > 1 {
+		var dtorReg int = getOperand(a, rm, ins.Args[1].ID)
+		if dtorReg < 0 {
+			// Fail loud instead of abandoning the slow path: a bare return
+			// here would leave the three conditional branches above pointing
+			// at an UNDEFINED skipLabel (a dangling same-section reference
+			// ResolveFixups would choke on before the HasError guard) and
+			// silently drop the RefDec.  Define the label so the branch graph
+			// stays well-formed, then SetError so EmitObject discards it.
+			a.SetError("native arm32: refdec dtor operand not materializable")
+			a.DefineLabel(skipLabel)
+			return
+		}
+		arm32.Mov(a, arm32.COND_AL, false, arm32.R1, arm32.Reg(dtorReg))
+	} else {
+		arm32.Mov(a, arm32.COND_AL, false, arm32.R1, arm32.Imm(0))
+	}
+	var callee @[]char = symPrefixed(mangleRtFunc("ZeroRefDestroy"))
+	a.SetGlobal(callee)
+	arm32.Bl(a, arm32.COND_AL, callee)
+	a.DefineLabel(skipLabel)
+}

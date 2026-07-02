@@ -8,60 +8,50 @@ import "pkg/binate/native/common"
 import "pkg/binate/types"
 
 // ============================================================
-// Direct function call lowering (walking-skeleton subset)
+// Direct function call lowering
 // ============================================================
 //
 // emitCall handles OP_CALL / OP_C_CALL — a known callee resolved by name and
-// reached via `BL <symbol>`.  The skeleton supports scalar / pointer args
-// (R0..R3, then stack) and a single scalar / void return; aggregate args,
-// 64-bit register pairs, sret, and multi-return collection are P3 territory.
-// A shape outside that subset (an aggregate/float arg or return, or an arg
-// operand that can't be materialized) fails LOUDLY via a.SetError rather than
-// being silently dropped / split into the wrong registers.  Mirrors the
-// reduced shape of aarch64_call.bn.
+// reached via `BL <symbol>`.  It supports scalar / pointer args (R0..R3, then
+// stack) and aggregate args that fit AAPCS32's ≤16-byte-in-regs / split rules
+// (a raw slice is 8 bytes = 2 words, a managed-slice is 16 bytes = 4 words),
+// plus a single scalar / pointer return and a small-aggregate-in-regs return.
+// Shapes still outside the increment's scope — a float arg/return (soft-float
+// is a later increment) or a 64-bit-pair scalar arg — fail LOUDLY via
+// a.SetError rather than being silently dropped / mis-registered.  Mirrors
+// aarch64_call.bn adapted to the AAPCS32 register model (WordBytes 4).
 
-// emitCall moves scalar args into R0..R3 (overflow to the outgoing-args stack
-// area) and branches to the callee symbol.  ins.StrVal is the Binate-level
-// call name (mangled via symFor) for OP_CALL, or a verbatim C symbol for
-// OP_C_CALL.  Declares the callee global so Finalize emits a relocation.
+// emitCall dispatches args per AAPCS32, sets up the sret pointer if the callee
+// returns a big aggregate, branches to the callee, then collects the return
+// value.  ins.StrVal is the Binate call name (mangled via symFor) for OP_CALL,
+// or a verbatim C symbol for OP_C_CALL.
 func emitCall(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
 	allFuncs @[]@ir.Func, ins @ir.Instr) {
+	// A call returning an aggregate (a slice / struct > InternalSretBytes) uses
+	// AAPCS32 sret with an R0 arg-register shift this increment defers — reject
+	// it BEFORE placing any args (which would go in R0..) so no half-marshaled
+	// call is emitted.  Multi-return collection is likewise deferred.
+	if ins.ID >= 0 && ins.Typ != nil && common.IsAggregateTyp(ins.Typ) {
+		if common.IsMultiReturnCall(ins) {
+			a.SetError("native arm32: multi-return call collection not "
+				"implemented (P3)")
+			return
+		}
+		a.SetError("native arm32: aggregate-return call uses AAPCS32 sret with "
+			"an unresolved arg-register-shift for the R0 buffer pointer "
+			"(P3, deferred)")
+		return
+	}
+
 	var argTypes @[]@types.Type = make_slice(@types.Type, len(ins.Args))
 	for i := 0; i < len(ins.Args); i++ {
 		argTypes[i] = ins.Args[i].Typ
 	}
 	for ai := 0; ai < len(ins.Args); ai++ {
-		var arg @ir.Instr = ins.Args[ai]
-		if common.IsAggregateTyp(arg.Typ) || common.IsFloatScalarTyp(arg.Typ) {
-			// P3: aggregate spread / float pairing.  Silently dropping such an
-			// arg would leave a live value unmarshaled and miscompile the call,
-			// so fail LOUDLY instead of emitting a wrong binary.
-			a.SetError("native arm32: call with aggregate/float arg not "
-				"implemented (P3)")
-			return
-		}
-		var regStart int = rm.CC.CallArgRegStart(argTypes, ai)
-		var stackOff int = rm.CC.CallArgStackOff(argTypes, ai)
-		var src int = emitValOperand(a, pkgName, rm, arg)
-		if src < 0 {
-			// The arg operand couldn't be materialized (an unsupported value
-			// shape); dropping it would pass garbage in its register, so fail
-			// LOUDLY rather than continue.
-			a.SetError("native arm32: call arg operand not materializable "
-				"(P3/P4)")
-			return
-		}
-		if regStart >= 0 {
-			if src != argReg(regStart) {
-				arm32.Mov(a, arm32.COND_AL, false, argReg(regStart),
-					arm32.Reg(src))
-			}
-		} else if stackOff >= 0 {
-			arm32.Str(a, arm32.COND_AL, src,
-				arm32.MemImm(arm32.SP, stackOff))
-		}
-		// Each arg's scratch reg is dead once consumed into argReg / the
-		// stack slot; reset so a long arg list doesn't saturate the pool.
+		emitCallArg(a, pkgName, rm, argTypes, ins.Args[ai], ai)
+		if a.HasError { return }
+		// Each arg's scratch reg is dead once consumed into argReg / the stack
+		// slot; reset so a long arg list doesn't saturate the pool.
 		rm.ResetRegs()
 	}
 
@@ -76,25 +66,132 @@ func emitCall(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
 	a.SetGlobal(callee)
 	arm32.Bl(a, arm32.COND_AL, callee)
 
-	// BL clobbers R0-R3 and R12.  Reset the pool, then spill this call's
-	// return value (a single scalar in R0) so later uses can reload.
+	// BL clobbers R0-R3 and R12.  Reset the pool, then collect this call's
+	// return value(s) so later uses can reload.
 	rm.ResetRegs()
-	if ins.ID < 0 { return }
-	if ins.Typ != nil && common.IsAggregateTyp(ins.Typ) {
-		// P3: aggregate return collection (data region / sret).  The call
-		// produces a live aggregate result that we can't yet collect; dropping
-		// it would spill garbage, so fail LOUDLY.
-		a.SetError("native arm32: call with aggregate return not implemented "
-			"(P3)")
+	emitCallReturn(a, rm, allFuncs, ins)
+}
+
+// emitCallArg marshals one argument into its AAPCS32 register(s) / stack slot.
+// A float arg (soft-float lowering is a later increment) and a 64-bit-pair
+// scalar arg fail LOUDLY.  A scalar/pointer goes into argReg(regStart) or a
+// stack slot; an aggregate (raw / managed slice) spreads its words across
+// argReg(regStart..) and, on overflow, into the outgoing-args area.
+func emitCallArg(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+	argTypes @[]@types.Type, arg @ir.Instr, ai int) {
+	if common.IsFloatScalarTyp(arg.Typ) {
+		a.SetError("native arm32: call with float arg not implemented (P5)")
 		return
 	}
+	// A same-width 64-bit scalar (int64 / uint64) needs a register PAIR — a
+	// known ABI subtlety DEFERRED to a later increment.  Do not pass its low
+	// word alone (that silently miscompiles the call).
+	if isReg64Scalar(arg.Typ) {
+		a.SetError("native arm32: call with 64-bit scalar arg needs register "
+			"pair (P3, deferred)")
+		return
+	}
+	var regStart int = rm.CC.CallArgRegStart(argTypes, ai)
+	var stackOff int = rm.CC.CallArgStackOff(argTypes, ai)
+	if common.IsAggregateTyp(arg.Typ) {
+		emitAggregateArg(a, rm, arg, regStart, stackOff)
+		return
+	}
+	var src int = emitValOperand(a, pkgName, rm, arg)
+	if src < 0 {
+		a.SetError("native arm32: call arg operand not materializable (P3/P4)")
+		return
+	}
+	if regStart >= 0 {
+		if src != argReg(regStart) {
+			arm32.Mov(a, arm32.COND_AL, false, argReg(regStart),
+				arm32.Reg(src))
+		}
+	} else if stackOff >= 0 {
+		arm32.Str(a, arm32.COND_AL, src, arm32.MemImm(arm32.SP, stackOff))
+	}
+}
+
+// emitAggregateArg spreads an aggregate arg's words across its AAPCS32 arg
+// registers and stack overflow.  The value already lives contiguously in a
+// data region (getOperand returns a pointer to it); we load word w to
+// argReg(regStart+w) for the in-reg words and copy the rest into the outgoing-
+// args area.  AAPCS32 (SplitAggregates) allows straddling the R0..R3 boundary.
+// An indirect-large aggregate (> AggregateInRegMax) is passed as a single
+// pointer word instead.  Mirrors aarch64_call.bn's aggregate arm with word=4
+// and R12 (IP) as the stack-copy temp.
+func emitAggregateArg(a @asm.Assembler, rm @common.RegMap, arg @ir.Instr,
+	regStart int, stackOff int) {
+	var ptr int = getOperand(a, rm, arg.ID)
+	if ptr < 0 {
+		a.SetError("native arm32: aggregate call arg not materializable (P3)")
+		return
+	}
+	if rm.CC.IndirectLargeAggregates &&
+			arg.Typ.SizeOf() > rm.CC.AggregateInRegMax {
+		if regStart >= 0 {
+			if ptr != argReg(regStart) {
+				arm32.Mov(a, arm32.COND_AL, false, argReg(regStart),
+					arm32.Reg(ptr))
+			}
+		} else if stackOff >= 0 {
+			arm32.Str(a, arm32.COND_AL, ptr, arm32.MemImm(arm32.SP, stackOff))
+		}
+		return
+	}
+	var w int = wordBytes()
+	var nWords int = rm.CC.ArgWords(arg.Typ)
+	var regWords int = 0
+	if regStart >= 0 {
+		regWords = nWords
+		if stackOff >= 0 { regWords = rm.CC.NumGpArgRegs - regStart }
+		for wi := 0; wi < regWords; wi++ {
+			arm32.Ldr(a, arm32.COND_AL, argReg(regStart + wi),
+				arm32.MemImm(ptr, w * wi))
+		}
+	}
+	if stackOff >= 0 {
+		for wi := regWords; wi < nWords; wi++ {
+			arm32.Ldr(a, arm32.COND_AL, arm32.IP, arm32.MemImm(ptr, w * wi))
+			arm32.Str(a, arm32.COND_AL, arm32.IP,
+				arm32.MemImm(arm32.SP, stackOff + w * (wi - regWords)))
+		}
+	}
+}
+
+// emitCallReturn collects the call's result after the BL.  Aggregate and multi-
+// return results were already rejected (fail-loud) up front in emitCall, so here
+// the result is a scalar / pointer.  A void call, or one whose result has no
+// spill slot, returns nothing; a float return and a 64-bit-pair scalar return
+// fail LOUDLY; otherwise R0 spills to the result's slot.  `allFuncs` is accepted
+// for signature parity with the other backends' collect (unused here now that
+// the aggregate/sret collect is deferred).
+func emitCallReturn(a @asm.Assembler, rm @common.RegMap, allFuncs @[]@ir.Func,
+	ins @ir.Instr) {
+	if ins.ID < 0 { return }
 	if common.IsFloatScalarTyp(ins.Typ) {
-		// P3: a float scalar return arrives in a different location under
-		// hard-float; collecting R0 here would be wrong.  Fail LOUDLY.
-		a.SetError("native arm32: call with float return not implemented (P3)")
+		a.SetError("native arm32: call with float return not implemented (P5)")
+		return
+	}
+	if isReg64Scalar(ins.Typ) {
+		a.SetError("native arm32: call with 64-bit scalar return needs "
+			"register pair (P3, deferred)")
 		return
 	}
 	var spillOff int = rm.LookupSpill(ins.ID)
 	if spillOff < 0 { return }
-	arm32.Str(a, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.SP, spillOff))
+	emitFrameStore(a, arm32.R0, spillOff)
+}
+
+// isReg64Scalar reports whether t is a 64-bit fundamental integer scalar
+// (int64 / uint64) — a value that AAPCS32 passes / returns in a register PAIR,
+// which this increment DEFERS (a known ABI subtlety).  Slices and other
+// aggregates are NOT this (they are handled by the aggregate paths); a nil or
+// sub-64-bit type is not this either.
+func isReg64Scalar(t @types.Type) bool {
+	if t == nil { return false }
+	var u @types.Type = common.UnwrapNamed(t)
+	if u == nil { return false }
+	if u.Kind != types.TYP_INT { return false }
+	return u.Width == 64
 }

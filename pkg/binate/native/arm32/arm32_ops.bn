@@ -2,6 +2,10 @@ package "pkg/binate/native/arm32"
 
 import "pkg/binate/asm"
 import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
 
 // ============================================================
 // Constant materialization + frame-adjust helpers
@@ -56,6 +60,94 @@ func emitSpAdjust(a @asm.Assembler, grow bool, amount int) {
 	}
 }
 
+// emitAddImm emits `ADD rd, rn, #imm` for an ARBITRARY 32-bit immediate,
+// materializing it via a scratch register when it doesn't fit the ARM rotated-
+// immediate form.  The bare `arm32.Add(..., arm32.Imm(imm))` SILENTLY encodes a
+// non-fitting immediate as #0 (encodeOperand2's documented "caller must
+// validate" fallback), so a frame offset like 1268 (not an 8-bit-rotated value)
+// would compute `rd = rn + 0` — a wrong address that corrupts every SP-relative
+// alloca / slice-header access in a large frame.  This helper is the single safe
+// SP/base-plus-offset ADD every native emitter routes through.  `tmp` is the
+// scratch used for the fallback materialization (IP for the ADD-SP frame cases,
+// where IP is the AAPCS intra-procedure scratch, dead across a single op).
+func emitAddImm(a @asm.Assembler, rd int, rn int, imm int, tmp int) {
+	var ri arm32.RotImmResult = arm32.EncodeRotImm(imm)
+	if ri.Ok {
+		arm32.Add(a, arm32.COND_AL, false, rd, rn, arm32.Imm(imm))
+		return
+	}
+	emitConstInt32(a, tmp, imm)
+	arm32.Add(a, arm32.COND_AL, false, rd, rn, arm32.Reg(tmp))
+}
+
+// emitFrameAddr emits `rd = SP + off` for an arbitrary frame offset, using IP
+// (r12) as the fallback scratch — the AAPCS intra-procedure register, dead
+// across this single address computation, and never a pool-allocated value.
+// The one insertion point for "address of a frame slot" in the native emitters.
+func emitFrameAddr(a @asm.Assembler, rd int, off int) {
+	emitAddImm(a, rd, arm32.SP, off, arm32.IP)
+}
+
+// emitFrameLoad emits `LDR rd, [SP, #off]` for an arbitrary frame offset.  The
+// LDR immediate offset is a 12-bit unsigned field (max 4095); a larger frame
+// offset would trip imm12Offset's loud range error, so materialize the address
+// in IP first and load `[IP]`.  Keeps a large frame's spill reloads correct
+// rather than either wrapping (silent) or aborting (loud) on a > 4095 offset.
+func emitFrameLoad(a @asm.Assembler, rd int, off int) {
+	if off <= 0xfff {
+		arm32.Ldr(a, arm32.COND_AL, rd, arm32.MemImm(arm32.SP, off))
+		return
+	}
+	emitConstInt32(a, arm32.IP, off)
+	arm32.Ldr(a, arm32.COND_AL, rd, arm32.MemReg(arm32.SP, arm32.IP))
+}
+
+// emitFrameStore emits `STR rt, [SP, #off]` for an arbitrary frame offset,
+// materializing the address in IP for offsets past the 12-bit LDR/STR field.
+// rt must not be IP (the address-materialization scratch); no native caller
+// stores IP itself, so this holds.
+func emitFrameStore(a @asm.Assembler, rt int, off int) {
+	if off <= 0xfff {
+		arm32.Str(a, arm32.COND_AL, rt, arm32.MemImm(arm32.SP, off))
+		return
+	}
+	emitConstInt32(a, arm32.IP, off)
+	arm32.Str(a, arm32.COND_AL, rt, arm32.MemReg(arm32.SP, arm32.IP))
+}
+
+// emitFrameScalarLoad emits a size-dispatched scalar load from `SP + off`,
+// materializing the base in IP for offsets past the extra-load 8-bit field
+// (LDRB/LDRH use an 8-bit offset, max 255; LDR uses 12-bit, max 4095), so a
+// large frame's sub-word field reads stay correct.  For a fitting offset it
+// loads `[SP, #off]` directly.
+func emitFrameScalarLoad(a @asm.Assembler, rd int, off int, sz int,
+		signed bool) {
+	var maxImm int = 0xfff
+	if sz == 1 || sz == 2 { maxImm = 0xff }
+	if off <= maxImm {
+		emitScalarLoad(a, rd, arm32.SP, off, sz, signed)
+		return
+	}
+	emitConstInt32(a, arm32.IP, off)
+	arm32.Add(a, arm32.COND_AL, false, arm32.IP, arm32.SP, arm32.Reg(arm32.IP))
+	emitScalarLoad(a, rd, arm32.IP, 0, sz, signed)
+}
+
+// emitFrameScalarStore is the symmetric size-dispatched scalar store to
+// `SP + off`, materializing the base in IP for large offsets.  rt must not be
+// IP (the address scratch); no native caller stores IP itself.
+func emitFrameScalarStore(a @asm.Assembler, rt int, off int, sz int) {
+	var maxImm int = 0xfff
+	if sz == 1 || sz == 2 { maxImm = 0xff }
+	if off <= maxImm {
+		emitScalarStore(a, rt, arm32.SP, off, sz)
+		return
+	}
+	emitConstInt32(a, arm32.IP, off)
+	arm32.Add(a, arm32.COND_AL, false, arm32.IP, arm32.SP, arm32.Reg(arm32.IP))
+	emitScalarStore(a, rt, arm32.IP, 0, sz)
+}
+
 // emitEpilogueAndRet tears down the frame and returns:
 //   add sp, sp, #frameSize
 //   pop {r4-r12, pc}          ; LDM sp!, {r4-r12, pc} — loading PC returns
@@ -64,4 +156,288 @@ func emitEpilogueAndRet(a @asm.Assembler, frameSize int) {
 		emitSpAdjust(a, true, frameSize)
 	}
 	arm32.Pop(a, arm32.COND_AL, POP_REGMASK)
+}
+
+// emitSubWordNarrow re-reduces rd to t's value range after a width-agnostic op
+// computed it in a full 32-bit register: sign-extend (signed) or zero-extend
+// (unsigned) from the type's width.  A no-op for host-word-wide (32-bit) or
+// non-integer types.  common.SubWordNarrow is the one classifier shared with
+// the VM and the other native backends; here wordBits is 32 (the arm32 GP
+// register width), so int32/uint32/int (all 32-bit) narrow to nothing and only
+// int8/int16 (and their unsigned forms) get an SXTB/SXTH/UXTB/UXTH.  Mirrors
+// aarch64_ops.bn's emitSubWordNarrow at wordBits=32.
+func emitSubWordNarrow(a @asm.Assembler, rd int, t @types.Type) {
+	var w int
+	var signed bool
+	w, signed = common.SubWordNarrow(t, 32)
+	if w == 0 { return }
+	if signed {
+		if w == 8 { arm32.Sxtb(a, arm32.COND_AL, rd, rd); return }
+		arm32.Sxth(a, arm32.COND_AL, rd, rd)
+		return
+	}
+	if w == 8 { arm32.Uxtb(a, arm32.COND_AL, rd, rd); return }
+	arm32.Uxth(a, arm32.COND_AL, rd, rd)
+}
+
+// emitBinop handles the 32-bit integer arithmetic, bitwise, and shift ops.
+// Returns true if it matched and emitted code; false otherwise.  Mirrors
+// aarch64_ops.bn's emitBinop for the integer subset — 64-bit register-pair
+// operands (int64 / uint64) are NOT handled here: they arrive as aggregate/pair
+// values the dispatcher's fail-loud tail rejects, so a same-width read never
+// reaches this with a 64-bit type.  Divide / remainder use the ARMv7-A hardware
+// SDIV/UDIV the assembler provides (cortex-a15 has integer divide); the IR
+// emits an OP_DIV_CHECK guard call before the DIV so a zero / INT_MIN/-1
+// divisor traps in the runtime, exactly as on aarch64.
+func emitBinop(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != iropcode.OP_ADD &&
+		ins.Op != iropcode.OP_SUB &&
+		ins.Op != iropcode.OP_MUL &&
+		ins.Op != iropcode.OP_DIV &&
+		ins.Op != iropcode.OP_REM &&
+		ins.Op != iropcode.OP_AND &&
+		ins.Op != iropcode.OP_OR  &&
+		ins.Op != iropcode.OP_XOR &&
+		ins.Op != iropcode.OP_SHL &&
+		ins.Op != iropcode.OP_SHR &&
+		ins.Op != iropcode.OP_LAND &&
+		ins.Op != iropcode.OP_LOR {
+		return false
+	}
+	if len(ins.Args) != 2 { return false }
+
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	var rhs int = getOperand(a, rm, ins.Args[1].ID)
+	if lhs < 0 || rhs < 0 { return false }
+
+	var rd int = nextReg(rm, ins.ID)
+
+	// Unsigned-int DIV / REM / SHR need their unsigned arm32 forms; a signed
+	// SDIV on a uint with the high bit set gives the wrong answer, and ASR
+	// would shift in sign bits on a logically-unsigned right-shift.
+	var uTyp @types.Type = common.UnwrapNamed(ins.Typ)
+	var isUnsigned bool = uTyp != nil &&
+		uTyp.IsInteger() && !uTyp.Signed
+
+	var matched bool = emitBinopArith(a, rd, lhs, rhs, ins.Op, isUnsigned)
+	if !matched { return false }
+	// Re-narrow a sub-word result so its dirty upper bits can't corrupt a
+	// later shift, unsigned compare, division, or widening read.  rd is
+	// spilled to its slot after this returns, so the narrowed value is what
+	// every later reload sees.  The VM and LLVM hold the same invariant.
+	emitSubWordNarrow(a, rd, ins.Typ)
+	return true
+}
+
+// emitBinopArith emits the register-form arm32 instruction for op, writing the
+// result to rd from operands lhs / rhs.  `isUnsigned` selects UDIV vs SDIV and
+// LSR vs ASR for the sign-sensitive ops.  Returns whether op was one of the
+// binary-arithmetic opcodes (false leaves rd untouched).  Split out of emitBinop
+// so that function stays short and the opcode→instruction mapping is one table.
+func emitBinopArith(a @asm.Assembler, rd int, lhs int, rhs int, op int,
+	isUnsigned bool) bool {
+	if op == iropcode.OP_ADD {
+		arm32.Add(a, arm32.COND_AL, false, rd, lhs, arm32.Reg(rhs)); return true
+	}
+	if op == iropcode.OP_SUB {
+		arm32.Sub(a, arm32.COND_AL, false, rd, lhs, arm32.Reg(rhs)); return true
+	}
+	if op == iropcode.OP_MUL {
+		arm32.Mul(a, arm32.COND_AL, false, rd, lhs, rhs); return true
+	}
+	if op == iropcode.OP_DIV {
+		emitDiv(a, rd, lhs, rhs, isUnsigned); return true
+	}
+	// OP_REM: synthesize via DIV + MLS-equivalent (rd = lhs - (lhs/rhs)*rhs).
+	// arm32 has no MLS in the current assembler, so compute the quotient in a
+	// scratch, MUL it back, and SUB.  Uses IP (r12) as the quotient scratch —
+	// caller-saved, dead after this op, and not a pool register.
+	if op == iropcode.OP_REM {
+		emitDiv(a, arm32.IP, lhs, rhs, isUnsigned)
+		arm32.Mul(a, arm32.COND_AL, false, arm32.IP, arm32.IP, rhs)
+		arm32.Sub(a, arm32.COND_AL, false, rd, lhs, arm32.Reg(arm32.IP))
+		return true
+	}
+	if op == iropcode.OP_AND || op == iropcode.OP_LAND {
+		// OP_LAND / OP_LOR feed switch case-lists where all comparisons are
+		// evaluated; plain bitwise on 0/1 bool registers is correct.  User `&&`
+		// / `||` short-circuit through branch-form lowering and never reach here.
+		arm32.And(a, arm32.COND_AL, false, rd, lhs, arm32.Reg(rhs)); return true
+	}
+	if op == iropcode.OP_OR || op == iropcode.OP_LOR {
+		arm32.Orr(a, arm32.COND_AL, false, rd, lhs, arm32.Reg(rhs)); return true
+	}
+	if op == iropcode.OP_XOR {
+		arm32.Eor(a, arm32.COND_AL, false, rd, lhs, arm32.Reg(rhs)); return true
+	}
+	if op == iropcode.OP_SHL {
+		arm32.Mov(a, arm32.COND_AL, false, rd,
+			arm32.RegSReg(lhs, arm32.LSL, rhs)); return true
+	}
+	if op == iropcode.OP_SHR {
+		var sh int = arm32.ASR
+		if isUnsigned { sh = arm32.LSR }
+		arm32.Mov(a, arm32.COND_AL, false, rd,
+			arm32.RegSReg(lhs, sh, rhs)); return true
+	}
+	return false
+}
+
+// emitDiv emits the ARMv7-A hardware divide into rd (UDIV for unsigned, SDIV
+// for signed).  The IR guards every DIV/REM with a preceding OP_DIV_CHECK call
+// (rt.DivCheck), so divide-by-zero and INT_MIN/-1 overflow trap in the runtime
+// before we reach the hardware instruction — matching aarch64.
+func emitDiv(a @asm.Assembler, rd int, lhs int, rhs int, isUnsigned bool) {
+	if isUnsigned {
+		arm32.Udiv(a, arm32.COND_AL, rd, lhs, rhs)
+	} else {
+		arm32.Sdiv(a, arm32.COND_AL, rd, lhs, rhs)
+	}
+}
+
+// emitUnop handles unary ops (-, ~, !).  Returns true if matched.  Negation is
+// RSB rd, src, #0 (0 - src); bitwise-not is MVN; boolean-not flips bit 0 with
+// EOR #1.  Mirrors aarch64_ops.bn's emitUnop; 64-bit-pair operands don't reach
+// here (they fail loud upstream).
+func emitUnop(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != iropcode.OP_NEG && ins.Op != iropcode.OP_BITNOT &&
+		ins.Op != iropcode.OP_NOT {
+		return false
+	}
+	if len(ins.Args) != 1 { return false }
+
+	var src int = getOperand(a, rm, ins.Args[0].ID)
+	if src < 0 { return false }
+
+	var rd int = nextReg(rm, ins.ID)
+	// NEG / BITNOT run at host width, so a sub-word result keeps dirty upper
+	// bits that would corrupt a later shift / unsigned compare / widening read.
+	// emitSubWordNarrow is a no-op for 32-bit and non-integer results.  NOT is
+	// exempt — it already produces a 0/1 bool.
+	if ins.Op == iropcode.OP_NEG {
+		arm32.Rsb(a, arm32.COND_AL, false, rd, src, arm32.Imm(0))
+		emitSubWordNarrow(a, rd, ins.Typ)
+		return true
+	}
+	if ins.Op == iropcode.OP_BITNOT {
+		arm32.Mvn(a, arm32.COND_AL, false, rd, arm32.Reg(src))
+		emitSubWordNarrow(a, rd, ins.Typ)
+		return true
+	}
+	// OP_NOT: logical negation on a bool.  Flip bit 0.
+	arm32.Eor(a, arm32.COND_AL, false, rd, src, arm32.Imm(1))
+	return true
+}
+
+// emitCast narrows/widens src to target's width, storing the result in rd.  For
+// a sub-word target the value is re-canonicalized to the target's signedness by
+// SXTB/SXTH (signed) or UXTB/UXTH (unsigned); a 32-bit (or width-0 predeclared
+// `int`) target passes through unchanged.  For a widening cast the value is
+// re-established from the SOURCE width per the source's signedness (a bit_cast
+// result may be a bare reinterpret MOV whose high bits aren't canonical), so
+// e.g. bit_cast(int32, <negative float32>) then cast(int, …) sign-extends
+// correctly.  On arm32 both source and host word are 32-bit, so a 32→32 widen
+// is a no-op; only an 8/16-bit source needs re-extension.  Mirrors the shape of
+// aarch64_ops.bn's emitCast but uses the P1 extend encoders (no LSL/ASR pair,
+// since the arm32 sub-word widths line up exactly with SXTB/SXTH/UXTB/UXTH).
+func emitCast(a @asm.Assembler, rd int, src int, srcTyp @types.Type,
+		target @types.Type) {
+	srcTyp = common.UnwrapNamed(srcTyp)
+	target = common.UnwrapNamed(target)
+	var tw int = 0
+	if target != nil { tw = target.Width }
+	if tw == 8 || tw == 16 {
+		var tsigned bool = target != nil && target.Signed
+		emitWidthExtend(a, rd, src, tw, tsigned)
+		return
+	}
+	if tw == 32 || tw == 0 {
+		// Target is exactly the 32-bit host word (or the width-0 predeclared
+		// `int`, which is 32-bit here): re-establish the value from the SOURCE
+		// width per the source's signedness.  A 32-bit source is already
+		// canonical, so this is a plain MOV; an 8/16-bit source gets re-extended
+		// (a bit_cast source may have non-canonical high bits).
+		var sw int = 0
+		if srcTyp != nil { sw = srcTyp.Width }
+		if sw == 8 || sw == 16 {
+			var ssigned bool = srcTyp != nil && srcTyp.Signed
+			emitWidthExtend(a, rd, src, sw, ssigned)
+			return
+		}
+		if rd != src {
+			arm32.Mov(a, arm32.COND_AL, false, rd, arm32.Reg(src))
+		}
+		return
+	}
+	// A >32-bit target (int64 / uint64, tw == 64) would need a register pair;
+	// such a cast is DEFERRED and must not silently truncate.  Fail loud rather
+	// than emit a wrong MOV that drops the high word.
+	a.SetError("native arm32: cast to 64-bit target needs register pair "
+		"(P3, deferred)")
+}
+
+// emitWidthExtend re-canonicalizes src to a w-bit (8 or 16) value in rd, sign-
+// extending when signed and zero-extending otherwise.  The single insertion
+// point for the sub-word extend encoders so emitCast and any future caller
+// agree on the SXTB/SXTH/UXTB/UXTH selection.
+func emitWidthExtend(a @asm.Assembler, rd int, src int, w int, signed bool) {
+	if signed {
+		if w == 8 { arm32.Sxtb(a, arm32.COND_AL, rd, src); return }
+		arm32.Sxth(a, arm32.COND_AL, rd, src)
+		return
+	}
+	if w == 8 { arm32.Uxtb(a, arm32.COND_AL, rd, src); return }
+	arm32.Uxth(a, arm32.COND_AL, rd, src)
+}
+
+// emitScalarLoad picks the right LDR variant for the given byte size (1/2/4)
+// and emits a load into rd from [base, #off].  `signed` selects sign-extending
+// variants (LDRSB/LDRSH) for sizes 1/2 when the loaded value is a signed narrow
+// int; zero-extending variants (LDRB/LDRH) otherwise.  Size-4 loads are full
+// word (LDR), where the signed flag is irrelevant.  A size of 8 (a 64-bit
+// scalar) is NOT loadable in a single arm32 register — it needs a pair, which
+// is DEFERRED — so fail loud rather than truncate to the low word.  Mirrors
+// aarch64_ops.bn's emitScalarLoad minus the size-8 word case.
+func emitScalarLoad(a @asm.Assembler, rd int, base int, off int, sz int,
+		signed bool) {
+	if sz == 1 {
+		if signed {
+			arm32.Ldrsb(a, arm32.COND_AL, rd, arm32.MemImm(base, off))
+		} else {
+			arm32.Ldrb(a, arm32.COND_AL, rd, arm32.MemImm(base, off))
+		}
+		return
+	}
+	if sz == 2 {
+		if signed {
+			arm32.Ldrsh(a, arm32.COND_AL, rd, arm32.MemImm(base, off))
+		} else {
+			arm32.Ldrh(a, arm32.COND_AL, rd, arm32.MemImm(base, off))
+		}
+		return
+	}
+	if sz == 4 {
+		arm32.Ldr(a, arm32.COND_AL, rd, arm32.MemImm(base, off))
+		return
+	}
+	a.SetError("native arm32: 8-byte scalar load needs register pair (P3+)")
+}
+
+// emitScalarStore is the symmetric STRB/STRH/STR dispatcher.  A size-8 store
+// (64-bit scalar) needs a register pair (DEFERRED); fail loud rather than write
+// only the low word and leave the high word of the destination stale.
+func emitScalarStore(a @asm.Assembler, rt int, base int, off int, sz int) {
+	if sz == 1 {
+		arm32.Strb(a, arm32.COND_AL, rt, arm32.MemImm(base, off))
+		return
+	}
+	if sz == 2 {
+		arm32.Strh(a, arm32.COND_AL, rt, arm32.MemImm(base, off))
+		return
+	}
+	if sz == 4 {
+		arm32.Str(a, arm32.COND_AL, rt, arm32.MemImm(base, off))
+		return
+	}
+	a.SetError("native arm32: 8-byte scalar store needs register pair (P3+)")
 }

@@ -105,32 +105,112 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func,
 	emitEpilogueAndRet(a, frameSize)
 }
 
-// emitSpillParam stores one incoming scalar parameter to its spill slot.  The
-// walking skeleton handles scalars only (an aggregate param would need the
-// spread/copy machinery in P3).  A parameter with no spill slot (unused) is
-// skipped.  An aggregate/float param fails LOUDLY: silently not spilling it
-// would leave its later uses reading an un-initialized slot (garbage).
+// emitSpillParam stores one incoming parameter to its frame slot so later uses
+// (which reload via getOperand) see it.  A scalar param spills its register (or
+// reloads its incoming stack slot); an aggregate param (raw / managed slice) is
+// reconstructed into its data region and a pointer to that region is written to
+// the spill slot.  A float param (soft-float lowering is a later increment) and
+// a 64-bit-pair scalar param fail LOUDLY: silently not spilling them would leave
+// later uses reading an uninitialized slot (garbage).
 func emitSpillParam(a @asm.Assembler, rm @common.RegMap, p @ir.Param,
 	paramTypes @[]@types.Type, pi int, stackArgsBase int) {
-	if common.IsAggregateTyp(p.Typ) || common.IsFloatScalarTyp(p.Typ) {
-		// P3 territory (aggregate spread, float pairing).  Fail LOUDLY rather
-		// than silently leaving the incoming value unspilled.
-		a.SetError("native arm32: aggregate/float parameter not implemented "
-			"(P3)")
+	if common.IsFloatScalarTyp(p.Typ) {
+		a.SetError("native arm32: float parameter not implemented (P5)")
+		return
+	}
+	if isReg64Scalar(p.Typ) {
+		a.SetError("native arm32: 64-bit scalar parameter needs register pair "
+			"(P3, deferred)")
+		return
+	}
+	var regStart int = rm.CC.CallArgRegStart(paramTypes, pi)
+	var stackOff int = rm.CC.CallArgStackOff(paramTypes, pi)
+	if common.IsAggregateTyp(p.Typ) {
+		emitSpillAggregateParam(a, rm, p, regStart, stackOff, stackArgsBase)
 		return
 	}
 	var off int = rm.LookupSpill(p.ID)
 	if off < 0 { return }
-	var regStart int = rm.CC.CallArgRegStart(paramTypes, pi)
-	var stackOff int = rm.CC.CallArgStackOff(paramTypes, pi)
 	if regStart >= 0 {
-		arm32.Str(a, arm32.COND_AL, argReg(regStart),
-			arm32.MemImm(arm32.SP, off))
+		emitFrameStore(a, argReg(regStart), off)
 	} else if stackOff >= 0 {
 		var tmp int = scratchReg(rm)
-		arm32.Ldr(a, arm32.COND_AL, tmp,
-			arm32.MemImm(arm32.SP, stackArgsBase + stackOff))
-		arm32.Str(a, arm32.COND_AL, tmp, arm32.MemImm(arm32.SP, off))
+		emitFrameLoad(a, tmp, stackArgsBase + stackOff)
+		emitFrameStore(a, tmp, off)
 		rm.ResetRegs()
 	}
+}
+
+// emitSpillAggregateParam reconstructs an incoming aggregate parameter into its
+// data region and writes a pointer to that region into its spill slot, so
+// downstream uses see a uniform pointer.  In-reg words come from argReg(regStart
+// + w); overflow words are copied from the caller's outgoing-args area.  An
+// indirect-large aggregate (> AggregateInRegMax) arrives as a single pointer,
+// whose pointee is memcpy'd into the local region (AAPCS byval gives the callee
+// its own copy).  Mirrors aarch64_emit_func.bn's aggregate param arm with word=4
+// and R12 (IP) as the marshaling temp.
+func emitSpillAggregateParam(a @asm.Assembler, rm @common.RegMap, p @ir.Param,
+	regStart int, stackOff int, stackArgsBase int) {
+	var dataOff int = rm.LookupAlloc(p.ID)
+	var allocSz int = rm.LookupAllocSize(p.ID)
+	if dataOff < 0 || allocSz <= 0 { return }
+	var w int = wordBytes()
+	var nWords int = rm.CC.ArgWords(p.Typ)
+	if rm.CC.IndirectLargeAggregates &&
+			p.Typ.SizeOf() > rm.CC.AggregateInRegMax {
+		// Get the byval pointer into IP, then memcpy *IP → sp+dataOff.
+		if regStart >= 0 {
+			if argReg(regStart) != arm32.IP {
+				arm32.Mov(a, arm32.COND_AL, false, arm32.IP,
+					arm32.Reg(argReg(regStart)))
+			}
+		} else if stackOff >= 0 {
+			arm32.Ldr(a, arm32.COND_AL, arm32.IP,
+				arm32.MemImm(arm32.SP, stackArgsBase + stackOff))
+		}
+		var tmp int = scratchReg(rm)
+		for wi := 0; wi < nWords; wi++ {
+			arm32.Ldr(a, arm32.COND_AL, tmp, arm32.MemImm(arm32.IP, w * wi))
+			arm32.Str(a, arm32.COND_AL, tmp,
+				arm32.MemImm(arm32.SP, dataOff + w * wi))
+		}
+		writeAggParamSpillPtr(a, rm, p, dataOff)
+		rm.ResetRegs()
+		return
+	}
+	// ≤ AggregateInRegMax: store in-reg words to the region, then copy any
+	// overflow words from the caller's outgoing-args area.
+	var regWords int = 0
+	if regStart >= 0 {
+		regWords = nWords
+		if stackOff >= 0 { regWords = rm.CC.NumGpArgRegs - regStart }
+		for wi := 0; wi < regWords; wi++ {
+			arm32.Str(a, arm32.COND_AL, argReg(regStart + wi),
+				arm32.MemImm(arm32.SP, dataOff + w * wi))
+		}
+	}
+	if stackOff >= 0 {
+		var tmp int = scratchReg(rm)
+		for wi := regWords; wi < nWords; wi++ {
+			arm32.Ldr(a, arm32.COND_AL, tmp,
+				arm32.MemImm(arm32.SP,
+					stackArgsBase + stackOff + w * (wi - regWords)))
+			arm32.Str(a, arm32.COND_AL, tmp,
+				arm32.MemImm(arm32.SP, dataOff + w * wi))
+		}
+	}
+	writeAggParamSpillPtr(a, rm, p, dataOff)
+	rm.ResetRegs()
+}
+
+// writeAggParamSpillPtr stores a pointer to an aggregate param's data region
+// (sp + dataOff) into its spill slot, so downstream getOperand reloads a uniform
+// pointer for the value.
+func writeAggParamSpillPtr(a @asm.Assembler, rm @common.RegMap, p @ir.Param,
+	dataOff int) {
+	var spillOff int = rm.LookupSpill(p.ID)
+	if spillOff < 0 { return }
+	var tmp int = scratchReg(rm)
+	emitFrameAddr(a, tmp, dataOff)
+	emitFrameStore(a, tmp, spillOff)
 }

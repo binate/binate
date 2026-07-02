@@ -206,6 +206,19 @@ if [ -z "$HOST_OS" ]; then
 fi
 export HOST_OS
 
+# OVERRIDE_MODE: a native-arm32 mode shares the exact ILP32 layout and the
+# baremetal/linux environment of its LLVM sibling
+# (builder-comp_native_arm32_baremetal -> builder-comp_arm32_baremetal), so it
+# inherits that sibling's per-mode .expected / .error / .xfail overrides when it
+# has no native-specific one of its own.  Without this the native mode ignores
+# the sibling's ILP32 .expected overrides (e.g. an ILP32 sizeof / -2^31 output)
+# and its xfails (e.g. libc-on-baremetal tests), producing false failures.
+# Empty for every other mode, where the OVERRIDE_MODE tiers below are no-ops.
+OVERRIDE_MODE=""
+case "$MODE" in
+    *_native_arm32_*) OVERRIDE_MODE=$(printf '%s' "$MODE" | sed 's/_native_arm32_/_arm32_/') ;;
+esac
+
 # Load the runner
 RUNNER="$SCRIPT_DIR/runners/${MODE}.sh"
 if [ ! -f "$RUNNER" ]; then
@@ -238,6 +251,9 @@ run_test() {
     root="$4"        # root dir for multi-pkg (empty for single-file)
 
     known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
+    if [ ! -f "$known_fail" ] && [ -n "$OVERRIDE_MODE" ]; then
+        known_fail="$SCRIPT_DIR/${name}.xfail.${OVERRIDE_MODE}"
+    fi
     # A mode-independent ${name}.xfail.all marks a test expected to fail in
     # EVERY mode (e.g. a backend-independent front-end gap) — one marker
     # instead of one per mode. A mode-specific .xfail.<mode> takes precedence
@@ -308,6 +324,9 @@ run_error_test() {
     root="$4"       # root dir for multi-pkg (empty for single-file)
 
     known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
+    if [ ! -f "$known_fail" ] && [ -n "$OVERRIDE_MODE" ]; then
+        known_fail="$SCRIPT_DIR/${name}.xfail.${OVERRIDE_MODE}"
+    fi
     [ -f "$known_fail" ] || known_fail="$SCRIPT_DIR/${name}.xfail.all"  # see run_test
 
     # Default: skip xfailed tests without running them. See run_test.
@@ -402,8 +421,14 @@ for bn in "$SCRIPT_DIR"/*.bn; do
     if [ -f "$SCRIPT_DIR/${name}.expected.${HOST_OS}" ]; then
         expected="$SCRIPT_DIR/${name}.expected.${HOST_OS}"
     fi
+    if [ -n "$OVERRIDE_MODE" ] && [ -f "$SCRIPT_DIR/${name}.expected.${OVERRIDE_MODE}" ]; then
+        expected="$SCRIPT_DIR/${name}.expected.${OVERRIDE_MODE}"
+    fi
     if [ -f "$SCRIPT_DIR/${name}.expected.${MODE}" ]; then
         expected="$SCRIPT_DIR/${name}.expected.${MODE}"
+    fi
+    if [ -n "$OVERRIDE_MODE" ] && [ -f "$SCRIPT_DIR/${name}.error.${OVERRIDE_MODE}" ]; then
+        errorfile="$SCRIPT_DIR/${name}.error.${OVERRIDE_MODE}"
     fi
     if [ -f "$SCRIPT_DIR/${name}.error.${MODE}" ]; then
         errorfile="$SCRIPT_DIR/${name}.error.${MODE}"
@@ -441,8 +466,14 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
     if [ -f "$dir/expected.${HOST_OS}" ]; then
         expected="$dir/expected.${HOST_OS}"
     fi
+    if [ -n "$OVERRIDE_MODE" ] && [ -f "$dir/expected.${OVERRIDE_MODE}" ]; then
+        expected="$dir/expected.${OVERRIDE_MODE}"
+    fi
     if [ -f "$dir/expected.${MODE}" ]; then
         expected="$dir/expected.${MODE}"
+    fi
+    if [ -n "$OVERRIDE_MODE" ] && [ -f "$dir/error.${OVERRIDE_MODE}" ]; then
+        errorfile="$dir/error.${OVERRIDE_MODE}"
     fi
     if [ -f "$dir/error.${MODE}" ]; then
         errorfile="$dir/error.${MODE}"
@@ -510,8 +541,14 @@ for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DIR/spe
     if [ -f "$SCRIPT_DIR/${name}.expected.${HOST_OS}" ]; then
         expected="$SCRIPT_DIR/${name}.expected.${HOST_OS}"
     fi
+    if [ -n "$OVERRIDE_MODE" ] && [ -f "$SCRIPT_DIR/${name}.expected.${OVERRIDE_MODE}" ]; then
+        expected="$SCRIPT_DIR/${name}.expected.${OVERRIDE_MODE}"
+    fi
     if [ -f "$SCRIPT_DIR/${name}.expected.${MODE}" ]; then
         expected="$SCRIPT_DIR/${name}.expected.${MODE}"
+    fi
+    if [ -n "$OVERRIDE_MODE" ] && [ -f "$SCRIPT_DIR/${name}.error.${OVERRIDE_MODE}" ]; then
+        errorfile="$SCRIPT_DIR/${name}.error.${OVERRIDE_MODE}"
     fi
     if [ -f "$SCRIPT_DIR/${name}.error.${MODE}" ]; then
         errorfile="$SCRIPT_DIR/${name}.error.${MODE}"
@@ -544,7 +581,9 @@ for main_bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DI
     errorfile="$dir/error"
     if [ -f "$dir/expected.${HOST_ARCH}" ]; then expected="$dir/expected.${HOST_ARCH}"; fi
     if [ -f "$dir/expected.${HOST_OS}" ]; then expected="$dir/expected.${HOST_OS}"; fi
+    if [ -n "$OVERRIDE_MODE" ] && [ -f "$dir/expected.${OVERRIDE_MODE}" ]; then expected="$dir/expected.${OVERRIDE_MODE}"; fi
     if [ -f "$dir/expected.${MODE}" ]; then expected="$dir/expected.${MODE}"; fi
+    if [ -n "$OVERRIDE_MODE" ] && [ -f "$dir/error.${OVERRIDE_MODE}" ]; then errorfile="$dir/error.${OVERRIDE_MODE}"; fi
     if [ -f "$dir/error.${MODE}" ]; then errorfile="$dir/error.${MODE}"; fi
     if [ -f "$errorfile" ]; then
         run_error_test "$name" "$main_bn" "$errorfile" "$dir"

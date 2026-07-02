@@ -1,0 +1,179 @@
+package "pkg/binate/lint"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/std/strings"
+
+// ============================================================
+// Rule: unused-func
+// ============================================================
+//
+// Flags an unexported top-level function unreachable from any "root":
+// an exported function, `main`, a method, or a package-level `var`/
+// `const` initializer.  REACHABILITY (not mere reference-presence) is
+// used so a dead-code ISLAND — mutually-recursive private funcs that
+// reference only each other but no root — is still flagged.
+//
+// Methods are excluded (dispatched via vtable/selector, not a bare name
+// — flagging them risks false positives on interface impls).  A local
+// or param that shadows a func name over-counts it as reachable, so the
+// rule only ever UNDER-warns.  References come from the value-name set
+// of each decl (calls, bare function values, generic-call heads).
+
+// funcReach holds the reachability worklist state for one package.
+type funcReach struct {
+	CNames @[]@[]char    // candidate func names
+	CDecls @[]@ast.Decl  // parallel: candidate func decls
+	NC     int
+	Work   @[]@[]char    // names still to process
+	NW     int
+	Reach  @[]@[]char    // candidate names proven reachable
+	NR     int
+}
+
+// newFuncReach returns an empty reachability state for one package.
+func newFuncReach() @funcReach {
+	var s @funcReach = make(funcReach)
+	s.CNames = make_slice(@[]char, 16)
+	s.CDecls = make_slice(@ast.Decl, 16)
+	s.Work = make_slice(@[]char, 32)
+	s.Reach = make_slice(@[]char, 16)
+	return s
+}
+
+// addCand records a candidate func (name + parallel decl), growing storage.
+func (s @funcReach) addCand(name @[]char, d @ast.Decl) {
+	if s.NC >= len(s.CNames) {
+		var nn @[]@[]char = make_slice(@[]char, len(s.CNames) * 2)
+		var nd @[]@ast.Decl = make_slice(@ast.Decl, len(s.CDecls) * 2)
+		for i := 0; i < s.NC; i++ {
+			nn[i] = s.CNames[i]
+			nd[i] = s.CDecls[i]
+		}
+		s.CNames = nn
+		s.CDecls = nd
+	}
+	s.CNames[s.NC] = name
+	s.CDecls[s.NC] = d
+	s.NC = s.NC + 1
+}
+
+// pushWork enqueues a name to process; empty names are skipped.
+func (s @funcReach) pushWork(name @[]char) {
+	if len(name) == 0 { return }
+	s.Work = growNames(s.Work, s.NW)
+	s.Work[s.NW] = name
+	s.NW = s.NW + 1
+}
+
+// markReach records candidate name as reachable.
+func (s @funcReach) markReach(name @[]char) {
+	s.Reach = growNames(s.Reach, s.NR)
+	s.Reach[s.NR] = name
+	s.NR = s.NR + 1
+}
+
+// isReach reports whether candidate name was proven reachable.
+func (s @funcReach) isReach(name @[]char) bool {
+	for i := 0; i < s.NR; i++ {
+		if streq(s.Reach[i], name) { return true }
+	}
+	return false
+}
+
+// candIndex returns the index of candidate name, or -1 if not a candidate.
+func (s @funcReach) candIndex(name @[]char) int {
+	for i := 0; i < s.NC; i++ {
+		if streq(s.CNames[i], name) { return i }
+	}
+	return -1
+}
+
+// isUnusedFuncCandidate reports whether `d` is an unexported top-level
+// function eligible for the unused-func check.
+func isUnusedFuncCandidate(d @ast.Decl) bool {
+	if d == nil || d.Kind != ast.DECL_FUNC { return false }
+	if d.Recv != nil { return false }     // methods dispatched by vtable
+	if d.Exported { return false }        // part of the package contract
+	if d.Body == nil { return false }     // extern / forward declaration
+	if streq(d.Name, "main") { return false }
+	return true
+}
+
+// pushDeclValRefs adds every value name referenced within decl `d` to
+// the worklist (`d`'s signature, body, initializer, nested decls).
+func pushDeclValRefs(s @funcReach, d @ast.Decl) {
+	var idx @refIndex = newRefIndex()
+	walkDeclRefs(idx, d)
+	for j := 0; j < idx.NVal; j++ {
+		s.pushWork(idx.ValNames[j])
+	}
+}
+
+// collectCandidates records candidate funcs (recursing groups).
+func collectCandidates(s @funcReach, decls @[]@ast.Decl) {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d == nil { continue }
+		if d.Kind == ast.DECL_GROUP {
+			collectCandidates(s, d.Decls)
+			continue
+		}
+		if isUnusedFuncCandidate(d) {
+			s.addCand(d.Name, d)
+		}
+	}
+}
+
+// seedRoots seeds the worklist with the value refs of every ROOT decl —
+// anything that is NOT a candidate func (exported funcs, methods, main,
+// package-level var/const/type decls).  Recurses groups.
+func seedRoots(s @funcReach, decls @[]@ast.Decl) {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d == nil { continue }
+		if d.Kind == ast.DECL_GROUP {
+			seedRoots(s, d.Decls)
+			continue
+		}
+		if isUnusedFuncCandidate(d) { continue }
+		pushDeclValRefs(s, d)
+	}
+}
+
+// lintUnusedFuncs flags unexported top-level funcs unreachable from a root.
+func lintUnusedFuncs(ctx @lintCtx, merged @ast.File) {
+	if merged == nil { return }
+	var s @funcReach = newFuncReach()
+	collectCandidates(s, merged.Decls)
+	if s.NC == 0 { return }
+	seedRoots(s, merged.Decls)
+
+	// Reachability closure: a candidate referenced from a root (or from
+	// an already-reachable candidate) is reachable; process its refs too.
+	var qi int = 0
+	for qi < s.NW {
+		var name @[]char = s.Work[qi]
+		qi = qi + 1
+		if s.isReach(name) { continue }
+		var ci int = s.candIndex(name)
+		if ci < 0 { continue }
+		s.markReach(name)
+		pushDeclValRefs(s, s.CDecls[ci])
+	}
+
+	// Flag candidates never reached.
+	for i := 0; i < s.NC; i++ {
+		if !s.isReach(s.CNames[i]) {
+			addDiag(ctx, s.CDecls[i].Pos, "unused-func", unusedFuncMsg(s.CNames[i]))
+		}
+	}
+}
+
+// unusedFuncMsg builds the diagnostic message for an unused function.
+func unusedFuncMsg(name @[]char) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("unused function: ")
+	cb.Write(name)
+	return buf.CopyStr(cb.String())
+}

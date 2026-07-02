@@ -141,6 +141,25 @@ func (n *Chain) AVal() int
 func (n *Chain) BVal() int
 func (n *Chain) CVal() int
 impl *Chain : C1
+
+// (g) A VALUE-receiver PARENT method dispatched at offset>0: combines the
+// iv-dispatch-thunk path (a value receiver's shim slot holds the generated thunk
+// handle, which derefs a0 to recover the receiver — case (a)) with the offset>0
+// range lookup (case (e)).  The parent method's shim slot is the one the range
+// lookup selects at the advanced word, so this proves the thunk resolves through
+// the interior mapping, not just a direct handle.
+interface VBase {
+	VBaseVal() int
+}
+interface VExt : VBase {
+	VExtVal() int
+}
+type VNode struct {
+	V int
+}
+func (n VNode) VBaseVal() int
+func (n VNode) VExtVal() int
+impl VNode : VExt
 EOF
 
 cat > "$L_ROOT/pkg/xmiface/xmiface.bn" <<'EOF'
@@ -180,6 +199,14 @@ func (n *Chain) BVal() int {
 
 func (n *Chain) CVal() int {
 	return n.V * 3
+}
+
+func (n VNode) VBaseVal() int {
+	return n.V
+}
+
+func (n VNode) VExtVal() int {
+	return n.V * 100
 }
 EOF
 
@@ -366,6 +393,14 @@ func main() {
 	println(c.CVal())           // 15
 	var a *xmiface.A1 = c
 	println(a.AVal())           // 5
+
+	// Value-receiver PARENT method at offset>0: the iv-dispatch thunk resolves
+	// through the range-lookup-selected shim slot.
+	var vn xmiface.VNode = xmiface.VNode{V: 8}
+	var ve *xmiface.VExt = &vn
+	println(ve.VExtVal())       // 800
+	var vb *xmiface.VBase = ve
+	println(vb.VBaseVal())      // 8
 }
 EOF
 
@@ -417,7 +452,9 @@ up_out=$("$HOST_BIN" "$TMP/prog_upcast.bn" "$IFACES" "$IMPLS" 2>&1) || true
 check_eq "cross-mode-iface-parent-upcast" "$up_out" "70
 7
 15
-5"
+5
+800
+8"
 
 # ----- negative shape (d): >6 user args must trip the loud overflow guard -----
 # This guard lives ONLY on the native cross-mode path (dispatchCompiledIfaceMethod

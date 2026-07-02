@@ -1,0 +1,332 @@
+package "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// Dependency-ordered package-level variable initialization
+// (plan-var-init-dependency-order.md).  A package's top-level
+// `var x T = expr` initializers run inside the synthetic `<pkg>.__init`
+// function.  Naively that is source order — alphabetical by filename across
+// the package's files, top-to-bottom within a file — so a cross-file or
+// forward reference to another package var silently reads its zero value, and
+// the observed value depends on filenames.  resolveTopLevelVarOrder computes a
+// STABLE dependency order (Go-style: a var initializes after every package var
+// its initializer reads), which IR-gen's buildInitBody then emits in.  A
+// self / mutual / transitive cycle (`var a = b; var b = a`) is reported as a
+// "variable initialization cycle" error.
+//
+// Only SYNTACTIC edges are collected: an initializer that directly names
+// another package var, plus a direct-call IIFE's body.  Transitive edges
+// THROUGH same-package function calls (`var a = f()` where `f` reads package
+// var `b`) are a documented follow-up — safe for the current tree because no
+// init-time callee reads a package var.  The collection deliberately
+// over-approximates within an expression (it can produce a spurious edge —
+// e.g. an IIFE-local name that shadows a package var, or an IIFE assignment
+// TARGET) but never misses a read: a missed read would be a silent
+// wrong-value miscompile, whereas a spurious edge is at worst a loud
+// (over-eager) cycle error.
+
+// resolveTopLevelVarOrder computes the dependency order of the package's
+// top-level init-vars and records it under c.curPkgPath for IR-gen's
+// buildInitBody.  Batch path only — the REPL initializes one var at a time,
+// so there is no batch to order (its caller gates on !c.ReplDeclMode).  A
+// package with fewer than two init-vars is skipped: dependency order then
+// equals source order, which buildInitBody already falls back to.
+func resolveTopLevelVarOrder(c @Checker, decls *[]@ast.Decl) {
+	var names @[]@[]char
+	var vdecls @[]@ast.Decl
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d.Kind != ast.DECL_VAR { continue }
+		if d.Value == nil { continue }
+		if isBlank(d.Name) { continue }
+		names = slices.Append[@[]char](names, d.Name)
+		vdecls = slices.Append[@ast.Decl](vdecls, d)
+	}
+	// A lone init-var still needs the sweep — `var a int = a + 1` is a
+	// self-cycle — so only an empty package is skipped.  (The recorded order
+	// for a single var equals source order; buildInitBody would fall back to
+	// it anyway, but the DFS is what reports the self-cycle.)
+	if len(names) == 0 { return }
+	var emptyVisiting @[]@[]char
+	c.VarVisiting = emptyVisiting
+	var emptyOrdered @[]@[]char
+	c.VarOrdered = emptyOrdered
+	for i := 0; i < len(names); i++ {
+		visitVarByName(c, names[i], names, vdecls)
+	}
+	recordVarInitOrder(c, c.curPkgPath, c.VarOrdered)
+}
+
+// visitVarByName is the post-order DFS that appends `name` to c.VarOrdered
+// after every package-var its initializer references (collectVarDeps,
+// restricted to this package's init-var set).  c.VarVisiting is the active
+// path stack: a back-edge into it is an initialization cycle, reported via
+// errVarCycle; the walk then returns WITHOUT re-descending, so recursion
+// terminates.  The back-edge does NOT append to c.VarOrdered — the ancestor
+// still on the stack for `name` appends it exactly once when it unwinds, so
+// the order list carries no duplicate (unlike resolveConstByName's
+// ConstResolved, which is a pure done-SET where a duplicate is harmless).
+func visitVarByName(c @Checker, name @[]char, names @[]@[]char,
+		vdecls @[]@ast.Decl) {
+	if nameInList(c.VarOrdered, name) { return }
+	if nameInList(c.VarVisiting, name) {
+		var cd @ast.Decl = findVarDecl(names, vdecls, name)
+		if cd != nil {
+			errVarCycle(c, cd.Pos, name)
+		}
+		return
+	}
+	var d @ast.Decl = findVarDecl(names, vdecls, name)
+	if d == nil { return }
+	c.VarVisiting = slices.Append[@[]char](c.VarVisiting, name)
+	var deps @[]@[]char
+	deps = collectVarDeps(d.Value, deps)
+	for i := 0; i < len(deps); i++ {
+		if nameInList(names, deps[i]) {
+			visitVarByName(c, deps[i], names, vdecls)
+		}
+	}
+	c.VarVisiting = c.VarVisiting[:len(c.VarVisiting) - 1]
+	c.VarOrdered = slices.Append[@[]char](c.VarOrdered, name)
+}
+
+// recordVarInitOrder stores `order` for package `pkgPath` in the checker's
+// per-package parallel arrays.  Overwrites an existing entry in place rather
+// than appending a second one, so a decls-only dependency pre-check of the
+// same path (which would carry an empty/partial order) can't shadow the full
+// package check via VarInitOrder's first-match lookup.
+func recordVarInitOrder(c @Checker, pkgPath @[]char, order @[]@[]char) {
+	for i := 0; i < len(c.VarInitOrderPaths); i++ {
+		if charEq(c.VarInitOrderPaths[i], pkgPath) {
+			c.VarInitOrders[i] = order
+			return
+		}
+	}
+	c.VarInitOrderPaths = slices.Append[@[]char](c.VarInitOrderPaths,
+		buf.CopyStr(pkgPath))
+	c.VarInitOrders = slices.Append[@[]@[]char](c.VarInitOrders, order)
+}
+
+// VarInitOrder returns the recorded dependency order for `pkgPath`'s top-level
+// init-vars, or an empty slice when none was recorded (see the .bni doc).
+func (c @Checker) VarInitOrder(pkgPath *[]readonly char) @[]@[]char {
+	for i := 0; i < len(c.VarInitOrderPaths); i++ {
+		if charEq(c.VarInitOrderPaths[i], pkgPath) {
+			return c.VarInitOrders[i]
+		}
+	}
+	var empty @[]@[]char
+	return empty
+}
+
+// findVarDecl returns the decl registered for top-level init-var `name`, or
+// nil if `name` is not one of this package's init-vars (a const, func, type,
+// import alias, or a non-initialized / grouped var).
+func findVarDecl(names @[]@[]char, vdecls @[]@ast.Decl,
+		name @[]char) @ast.Decl {
+	for i := 0; i < len(names); i++ {
+		if charEq(names[i], name) { return vdecls[i] }
+	}
+	return nil
+}
+
+// collectVarDeps appends the bare identifier names referenced by initializer
+// expression `e` to `deps`, walking every value sub-expression.  TypeRefs
+// (array dimensions are consts; composite / builtin type operands) are NOT
+// walked, and a function-literal body is skipped (a closure isn't run at
+// init) EXCEPT a direct-call IIFE, whose body IS run — see collectVarDeps-
+// FuncLitBody.  The caller filters the collected names to the package's own
+// init-var set, so consts, funcs, types, and cross-package `pkg.X` selectors
+// (whose head `pkg` is an import alias) drop out naturally.
+func collectVarDeps(e @ast.Expr, deps @[]@[]char) @[]@[]char {
+	if e == nil { return deps }
+	if e.Kind == ast.EXPR_IDENT {
+		return slices.Append[@[]char](deps, e.Name)
+	}
+	if e.Kind == ast.EXPR_UNARY {
+		return collectVarDeps(e.X, deps)
+	}
+	if e.Kind == ast.EXPR_BINARY {
+		deps = collectVarDeps(e.X, deps)
+		return collectVarDeps(e.Y, deps)
+	}
+	if e.Kind == ast.EXPR_SELECTOR {
+		// Recurse the head only; the field/selector Name is not an init-var.
+		// `pkg.X` collects the import alias `pkg` (filtered out); `v.field`
+		// collects the receiver `v`.
+		return collectVarDeps(e.X, deps)
+	}
+	if e.Kind == ast.EXPR_SLICE {
+		deps = collectVarDeps(e.X, deps)
+		deps = collectVarDeps(e.Y, deps)
+		return collectVarDeps(e.Z, deps)
+	}
+	if e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		deps = collectVarDeps(e.X, deps)
+		for i := 0; i < len(e.Args); i++ {
+			deps = collectVarDeps(e.Args[i], deps)
+		}
+		return deps
+	}
+	if e.Kind == ast.EXPR_CALL {
+		if e.X != nil && e.X.Kind == ast.EXPR_FUNC_LIT {
+			// Immediately-invoked function literal: its body runs at init.
+			deps = collectVarDepsFuncLitBody(e.X, deps)
+		} else {
+			deps = collectVarDeps(e.X, deps)
+		}
+		for i := 0; i < len(e.Args); i++ {
+			deps = collectVarDeps(e.Args[i], deps)
+		}
+		return deps
+	}
+	if e.Kind == ast.EXPR_BUILTIN {
+		for i := 0; i < len(e.Args); i++ {
+			deps = collectVarDeps(e.Args[i], deps)
+		}
+		return deps
+	}
+	if e.Kind == ast.EXPR_COMPOSITE {
+		// Only the element VALUES are value-position reads.  An element Key is
+		// never a package-var read: a struct-literal key is a field NAME, and
+		// an array-literal key is a constant index (Binate has no maps).
+		// Collecting keys would misread a field name that happens to match a
+		// package var as a dependency — a false cycle on valid code.
+		for i := 0; i < len(e.Elems); i++ {
+			deps = collectVarDeps(e.Elems[i].Value, deps)
+		}
+		return deps
+	}
+	// EXPR_FUNC_LIT (non-IIFE closure — not run at init), EXPR_TYPE, and all
+	// literals contribute no init-time package-var reads.
+	return deps
+}
+
+// collectVarDepsFuncLitBody walks the body of an immediately-invoked function
+// literal, collecting package-var reads (the body runs at init).  A nested
+// NAMED-function call is not followed (the deferred transitive-through-
+// functions case) and a stored (non-invoked) nested closure is skipped, but a
+// nested direct-call IIFE body IS descended — collectVarDeps re-recognizes it
+// and walks it, which is correct (its body runs) and at worst over-approximates.
+// An IIFE-local name that shadows a package var is collected as a spurious
+// edge — a documented limitation that only ever over-constrains the order (or
+// raises a loud cycle error), never silently drops a read.
+func collectVarDepsFuncLitBody(lit @ast.Expr, deps @[]@[]char) @[]@[]char {
+	if lit == nil || lit.DeclRef == nil { return deps }
+	return collectVarDepsStmt(lit.DeclRef.Body, deps)
+}
+
+// collectVarDepsStmt collects package-var reads from statement `s` and its
+// sub-statements / sub-expressions.  New bindings (`:=` LHS, for-in loop vars,
+// a nested `var`/`const`'s name) are NOT collected — they are writes, not
+// reads.  Assignment LHS exprs ARE collected: an op-assign reads the target,
+// and an indexed target (`a[i] = ...`) reads `a`/`i`; over-collecting a plain
+// `=` target is a benign spurious edge (never a missed read).
+func collectVarDepsStmt(s @ast.Stmt, deps @[]@[]char) @[]@[]char {
+	if s == nil { return deps }
+	if s.Kind == ast.STMT_BLOCK {
+		for i := 0; i < len(s.Stmts); i++ {
+			deps = collectVarDepsStmt(s.Stmts[i], deps)
+		}
+		return deps
+	}
+	if s.Kind == ast.STMT_EXPR || s.Kind == ast.STMT_INC_DEC {
+		return collectVarDeps(s.X, deps)
+	}
+	if s.Kind == ast.STMT_ASSIGN {
+		for i := 0; i < len(s.Exprs); i++ {
+			deps = collectVarDeps(s.Exprs[i], deps)
+		}
+		for i := 0; i < len(s.Exprs2); i++ {
+			deps = collectVarDeps(s.Exprs2[i], deps)
+		}
+		return deps
+	}
+	if s.Kind == ast.STMT_SHORT_VAR {
+		// LHS names are fresh locals (writes); only the RHS reads.
+		for i := 0; i < len(s.Exprs2); i++ {
+			deps = collectVarDeps(s.Exprs2[i], deps)
+		}
+		return deps
+	}
+	if s.Kind == ast.STMT_RETURN {
+		for i := 0; i < len(s.Exprs); i++ {
+			deps = collectVarDeps(s.Exprs[i], deps)
+		}
+		return deps
+	}
+	if s.Kind == ast.STMT_IF {
+		deps = collectVarDepsStmt(s.Init, deps)
+		deps = collectVarDeps(s.X, deps)
+		deps = collectVarDepsStmt(s.Body, deps)
+		return collectVarDepsStmt(s.Else, deps)
+	}
+	if s.Kind == ast.STMT_FOR {
+		// For-in loop vars (ForKey / ForVal) are fresh bindings — skip them;
+		// the iterable is s.X.
+		deps = collectVarDepsStmt(s.Init, deps)
+		deps = collectVarDeps(s.X, deps)
+		deps = collectVarDepsStmt(s.Post, deps)
+		return collectVarDepsStmt(s.Body, deps)
+	}
+	if s.Kind == ast.STMT_SWITCH {
+		deps = collectVarDeps(s.X, deps)
+		for i := 0; i < len(s.Cases); i++ {
+			deps = collectVarDepsCase(s.Cases[i], deps)
+		}
+		return deps
+	}
+	if s.Kind == ast.STMT_DECL {
+		return collectVarDepsDecl(s.DeclRef, deps)
+	}
+	// STMT_EMPTY / STMT_BREAK / STMT_CONTINUE: no package-var reads.
+	return deps
+}
+
+// collectVarDepsDecl collects package-var reads from a local declaration.  A
+// GROUPED decl (`var ( ... )` / `const ( ... )`) parses to DECL_GROUP with a
+// nil Value and its member specs in Decls (a single-member group collapses to
+// the bare member), so recurse each member — mirroring registerConstPlaceholders
+// in check_const_resolve.bn.  A plain var/const decl's initializer is its
+// Value.  Missing the group case would DROP a read (`var ( x = pkgVar )` inside
+// an IIFE body), which is a silent wrong-value miscompile — the exact failure
+// the walk's "never miss a read" invariant forbids.
+func collectVarDepsDecl(d @ast.Decl, deps @[]@[]char) @[]@[]char {
+	if d == nil { return deps }
+	if d.Kind == ast.DECL_GROUP {
+		for i := 0; i < len(d.Decls); i++ {
+			deps = collectVarDepsDecl(d.Decls[i], deps)
+		}
+		return deps
+	}
+	return collectVarDeps(d.Value, deps)
+}
+
+// collectVarDepsCase collects package-var reads from a switch case clause's
+// guard expressions and body statements.
+func collectVarDepsCase(cc @ast.CaseClause, deps @[]@[]char) @[]@[]char {
+	if cc == nil { return deps }
+	for i := 0; i < len(cc.Exprs); i++ {
+		deps = collectVarDeps(cc.Exprs[i], deps)
+	}
+	for i := 0; i < len(cc.Body); i++ {
+		deps = collectVarDepsStmt(cc.Body[i], deps)
+	}
+	return deps
+}
+
+// errVarCycle reports a package-var initialization cycle (`var a = b;
+// var b = a`, or a self / transitive chain).  Such a cycle has no valid
+// initialization order; it is broken at detection (mirroring errConstCycle)
+// and reported here.
+func errVarCycle(c @Checker, pos token.Pos, name @[]char) {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("variable initialization cycle involving `")
+	cb.Write(name)
+	cb.Write("`")
+	addCheckError(c, pos, buf.CopyStr(cb.String()))
+}

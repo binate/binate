@@ -100,6 +100,47 @@ type Summer struct {
 }
 func (s *Summer) Sum7(a int, b int, c int, d int, e int, f int, g int) int
 impl *Summer : Many
+
+// (e) An interface that EXTENDS another (interface embedding): the impl's concat
+// vtable lays the PARENT (Base) sub-block at a NON-ZERO slot offset
+// (IfaceParentSlotOffset > 0).  A bytecode main upcasts a native-injected @Ext to
+// @Base and dispatches a parent method through that view — so the dispatch reads
+// the vtable word ADVANCED by offset*8, an address interior to the registered
+// @__ivt.  Exercises the shim-vtable RANGE lookup (an exact-match lookup misses
+// the adjusted address and aborts "no shim vtable").
+interface Base {
+	BaseVal() int
+}
+interface Ext : Base {
+	ExtVal() int
+}
+type Node struct {
+	V int
+}
+func (n *Node) BaseVal() int
+func (n *Node) ExtVal() int
+impl *Node : Ext
+
+// (f) A MULTI-LEVEL chain (C1 : B1 : A1): a transitive upcast @C1 -> @A1 places
+// A1's sub-block at offset>1 in C1's nested concat vtable, so the cross-mode
+// dispatch reads a word advanced by more than one slot — exercising the
+// offset-chain arithmetic end-to-end (not just the one-level offset from (e)).
+interface A1 {
+	AVal() int
+}
+interface B1 : A1 {
+	BVal() int
+}
+interface C1 : B1 {
+	CVal() int
+}
+type Chain struct {
+	V int
+}
+func (n *Chain) AVal() int
+func (n *Chain) BVal() int
+func (n *Chain) CVal() int
+impl *Chain : C1
 EOF
 
 cat > "$L_ROOT/pkg/xmiface/xmiface.bn" <<'EOF'
@@ -119,6 +160,26 @@ func (m *Mult) Scale(f float64) int {
 
 func (s *Summer) Sum7(a int, b int, c int, d int, e int, f int, g int) int {
 	return s.Tag + a + b + c + d + e + f + g
+}
+
+func (n *Node) BaseVal() int {
+	return n.V
+}
+
+func (n *Node) ExtVal() int {
+	return n.V * 10
+}
+
+func (n *Chain) AVal() int {
+	return n.V
+}
+
+func (n *Chain) BVal() int {
+	return n.V * 2
+}
+
+func (n *Chain) CVal() int {
+	return n.V * 3
 }
 EOF
 
@@ -283,6 +344,31 @@ func main() {
 }
 EOF
 
+cat > "$TMP/prog_upcast.bn" <<'EOF'
+package "main"
+
+import "pkg/xmiface"
+
+func main() {
+	var node xmiface.Node = xmiface.Node{V: 7}
+	var e *xmiface.Ext = &node
+	// Child-interface dispatch (offset 0 — resolves the registered base).
+	println(e.ExtVal())         // 70
+	// Upcast Ext -> Base (offset>0), then dispatch the PARENT method through
+	// the upcast view: the vtable word is advanced by offset*8, so the shim
+	// lookup must RANGE-resolve the interior address (exact-match aborts).
+	var b *xmiface.Base = e
+	println(b.BaseVal())        // 7
+
+	// Multi-level: transitive upcast C1 -> A1 (grandparent), offset>1.
+	var ch xmiface.Chain = xmiface.Chain{V: 5}
+	var c *xmiface.C1 = &ch
+	println(c.CVal())           // 15
+	var a *xmiface.A1 = c
+	println(a.AVal())           // 5
+}
+EOF
+
 # ---- build gen1, then the host (with the fixture on the search paths) ----
 build_gen1
 IFACES="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$I_ROOT")"
@@ -321,6 +407,17 @@ ok_out=$("$HOST_BIN" "$TMP/prog_ok.bn" "$IFACES" "$IMPLS" 2>&1) || true
 check_eq "cross-mode-iface-dispatch" "$ok_out" "42
 110
 20"
+
+# ----- (e) offset>0 parent upcast: child dispatch=70, upcast+parent dispatch=7 --
+# The parent method is dispatched through an Ext->Base upcast whose vtable word is
+# advanced by offset*8; the native cross-mode path must RANGE-resolve that interior
+# address to the parent sub-block of the shim vtable (a plain exact-match lookup
+# aborts "no shim vtable for native interface method dispatch").
+up_out=$("$HOST_BIN" "$TMP/prog_upcast.bn" "$IFACES" "$IMPLS" 2>&1) || true
+check_eq "cross-mode-iface-parent-upcast" "$up_out" "70
+7
+15
+5"
 
 # ----- negative shape (d): >6 user args must trip the loud overflow guard -----
 # This guard lives ONLY on the native cross-mode path (dispatchCompiledIfaceMethod

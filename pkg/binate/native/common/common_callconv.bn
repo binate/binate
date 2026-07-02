@@ -29,6 +29,13 @@ func AAPCS64() CallConv {
 	cc.StackAlign = 16
 	cc.SplitAggregates = true
 	cc.IndirectLargeAggregates = true
+	// AAPCS64 §6.4.2: a Homogeneous Floating-point Aggregate (a struct/array
+	// folding to 1-4 same-type float members) is passed in consecutive SIMD
+	// argument registers, not as a GP aggregate.  The classifier (HfaClassify
+	// + the NSRN walkers) and the aa64 caller/callee emitters place/read the
+	// members in v0..v7 accordingly.  Enabling this makes native HFA passing
+	// ABI-conformant with C/clang and LLVM at a cross-ABI boundary.
+	cc.HfaAggregates = true
 	cc.WordBytes = 8
 	return cc
 }
@@ -213,6 +220,60 @@ func (cc CallConv) EffectiveArgWords(t @types.Type) int {
 	return cc.ArgWords(t)
 }
 
+// hfaMemberCount returns the AAPCS64 Homogeneous Floating-point Aggregate member
+// count for t — 1-4 when t folds to that many members ALL of the same fundamental
+// float type (all float32 xor all float64) — else 0.  Nested structs / arrays of
+// float are folded flat; any non-float leaf, a mixed float width, or >4 members
+// disqualifies.  Only consulted when cc.HfaAggregates (aa64).
+func hfaMemberCount(t @types.Type) int {
+	n, _ := HfaClassify(t)
+	return n
+}
+
+// HfaClassify returns (memberCount, memberByteWidth) for an AAPCS64 Homogeneous
+// Floating-point Aggregate — 1-4 same-type float members — else (0, 0).
+// memberByteWidth is 4 (a float32 HFA) or 8 (a float64 HFA).  Exported for the
+// backend emitters, which place/read the members in memberCount consecutive FP
+// registers of memberByteWidth each.
+func HfaClassify(t @types.Type) (int, int) {
+	n, w := hfaFold(t)
+	if n >= 1 && n <= 4 && w > 0 { return n, w / 8 }
+	return 0, 0
+}
+
+// hfaFold folds a composite into (memberCount, memberWidth): memberWidth is the
+// shared float width (32 or 64) if every leaf is that float type, or -1 if any
+// leaf is a non-float / the leaves mix widths (disqualifying).  A bare float is
+// (1, width); an empty aggregate is (0, -1).
+func hfaFold(t @types.Type) (int, int) {
+	if t == nil { return 0, -1 }
+	t = peelTransparent(t)
+	if t.Kind == types.TYP_FLOAT { return 1, t.Width }
+	if t.Kind == types.TYP_STRUCT {
+		var total int = 0
+		var w int = 0
+		for i := 0; i < len(t.Fields); i++ {
+			cn, cw := hfaFold(t.Fields[i].Type)
+			if cn == 0 || cw < 0 { return total + cn, -1 }
+			if w == 0 { w = cw } else if w != cw { return total + cn, -1 }
+			total = total + cn
+			if total > 4 { return total, w }
+		}
+		if total == 0 { return 0, -1 }
+		return total, w
+	}
+	if t.Kind == types.TYP_ARRAY {
+		if t.Elem == nil { return 0, -1 }
+		var esz int = t.Elem.SizeOf()
+		if esz <= 0 { return 0, -1 }
+		var alen int = t.SizeOf() / esz
+		cn, cw := hfaFold(t.Elem)
+		if cn == 0 || cw < 0 || alen <= 0 { return 0, -1 }
+		return cn * alen, cw
+	}
+	return 0, -1
+}
+
 // Float scalars are passed in FP arg registers tracked by a separate NSRN
 // counter, so they never take a GP reg.  While the FP file has room
 // (nsrn < NumFpArgRegs) a float reports (-1, 0, 0) — no GP, no stack.  Once the
@@ -227,6 +288,20 @@ func (cc CallConv) argRegWordsStackWords(t @types.Type, ngrn int, nsrn int) (int
 	if IsFloatScalarTyp(t) && cc.NumFpArgRegs > 0 {
 		if nsrn < cc.NumFpArgRegs { return -1, 0, 0 }
 		return -1, 0, 1
+	}
+	// Homogeneous Floating-point Aggregate (AAPCS64 §5.9.5 / §6.4.2): a struct
+	// or array folding to 1-4 members ALL of the same float type rides
+	// consecutive FP arg registers (v[nsrn]..v[nsrn+n-1]).  All-or-nothing: if
+	// the whole HFA does not fit in the remaining FP file it goes ENTIRELY on
+	// the stack (never split), and the FP file is closed for later args (the
+	// walkers set nsrn = NumFpArgRegs on overflow).  Like a float scalar it
+	// reports regStart -1 / no GP; the FP register index comes from NSRN.
+	if cc.HfaAggregates && cc.NumFpArgRegs > 0 {
+		var hn int = hfaMemberCount(t)
+		if hn > 0 {
+			if nsrn + hn <= cc.NumFpArgRegs { return -1, 0, 0 }
+			return -1, 0, cc.ArgWords(t)
+		}
 	}
 	var w int = cc.ArgWords(t)
 	var agg bool = IsAggregateTyp(t)
@@ -289,13 +364,30 @@ func (cc CallConv) argRegWordsStackWords(t @types.Type, ngrn int, nsrn int) (int
 // pad never applies, so both existing backends see identical NCRN walks.
 func (cc CallConv) advanceNgrn(t @types.Type, ngrn int, rs int, rw int, sw int) int {
 	if sw > 0 && cc.SplitAggregates &&
-			!(IsFloatScalarTyp(t) && cc.NumFpArgRegs > 0) {
+			!(IsFloatScalarTyp(t) && cc.NumFpArgRegs > 0) &&
+			!(cc.HfaAggregates && cc.NumFpArgRegs > 0 && hfaMemberCount(t) > 0) {
 		return cc.NumGpArgRegs
 	}
 	if rs >= 0 {
 		return rs + rw
 	}
 	return ngrn + rw
+}
+
+// advanceNsrn returns the NSRN (next FP arg register index) after arg t.  A
+// float scalar consumes one FP register; an HFA consumes its member count and,
+// on overflow, closes the FP file (AAPCS64: NSRN is set to NumFpArgRegs so a
+// later HFA / float scalar cannot use the leftover registers).
+func (cc CallConv) advanceNsrn(t @types.Type, nsrn int) int {
+	if IsFloatScalarTyp(t) { return nsrn + 1 }
+	if cc.HfaAggregates && cc.NumFpArgRegs > 0 {
+		var hn int = hfaMemberCount(t)
+		if hn > 0 {
+			if nsrn + hn <= cc.NumFpArgRegs { return nsrn + hn }
+			return cc.NumFpArgRegs
+		}
+	}
+	return nsrn
 }
 
 // argRegWordsStackWordsV applies the darwin variadic rule on top of
@@ -327,7 +419,7 @@ func (cc CallConv) CallArgRegStart(argTypes @[]@types.Type, i int) int {
 		rs, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn, nsrn)
 		if k == i { return rs }
 		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
-		if IsFloatScalarTyp(argTypes[k]) { nsrn = nsrn + 1 }
+		nsrn = cc.advanceNsrn(argTypes[k], nsrn)
 	}
 	return -1
 }
@@ -423,7 +515,7 @@ func (cc CallConv) CallArgStackOff(argTypes @[]@types.Type, i int) int {
 			return -1
 		}
 		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
-		if IsFloatScalarTyp(argTypes[k]) { nsrn = nsrn + 1 }
+		nsrn = cc.advanceNsrn(argTypes[k], nsrn)
 	}
 	return -1
 }
@@ -445,7 +537,7 @@ func (cc CallConv) CallStackBytes(argTypes @[]@types.Type) int {
 			soff = alignUpStack(soff, align) + bytes
 		}
 		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
-		if IsFloatScalarTyp(argTypes[k]) { nsrn = nsrn + 1 }
+		nsrn = cc.advanceNsrn(argTypes[k], nsrn)
 	}
 	if cc.StackAlign > 1 && soff % cc.StackAlign != 0 {
 		soff = soff + (cc.StackAlign - soff % cc.StackAlign)

@@ -6,19 +6,20 @@ import "pkg/binate/types"
 import "pkg/std/strings"
 
 // ============================================================
-// In-register aggregate ABI coercion ([N x i64])
+// In-register aggregate ABI coercion ([N x iW], W = pointer size)
 // ============================================================
 //
 // cmd/bnc compiles the MAIN module with the chosen backend (native on
-// aa64/x64) but EVERY dependency package goes through LLVM/clang.  A
-// cross-package call is therefore a native-caller -> LLVM-callee (or the
-// reverse) boundary, and the two sides must agree byte-for-byte on how a
-// <=16-byte aggregate travels by value.
+// aa64/x64/arm32) but EVERY dependency package goes through LLVM/clang.
+// A cross-package call is therefore a native-caller -> LLVM-callee (or
+// the reverse) boundary, and the two sides must agree byte-for-byte on
+// how a <=16-byte aggregate travels by value.
 //
-// The native backends pack such an aggregate into N = ceil(SizeOf/8)
-// consecutive GP registers -- the textbook AAPCS64 / SysV `[N x i64]`
-// lowering.  But emitting the LLVM function with a FIRST-CLASS struct
-// param/return makes LLVM's target lowering EXPAND the struct
+// The native backends pack such an aggregate into consecutive GP
+// registers as pointer-sized words -- the textbook AAPCS64 / SysV
+// `[N x i64]` lowering on LP64, and AAPCS32's 4-aligned `[N x i32]`
+// lowering on ILP32.  But emitting the LLVM function with a FIRST-CLASS
+// struct param/return makes LLVM's target lowering EXPAND the struct
 // field-per-register (an explicit padding leaf `[K x i8]` becomes K
 // separate i8 regs; a sub-word `i32` field takes its own reg), so a
 // `<{ i64, i32, [4 x i8] }>` eats 6 registers instead of 2 and the
@@ -26,21 +27,30 @@ import "pkg/std/strings"
 // disagree -> silent struct corruption.
 //
 // The fix: at the LLVM boundary, pass/return an in-register aggregate as
-// the coerced ABI type `[N x i64]` (matching the native packing) instead
-// of the first-class struct.  The function BODY is untouched -- it still
-// computes/consumes the `%S` SSA value via extractvalue/insertvalue --
-// so coercion is local to three boundaries (param entry, return, call
-// site), each implemented with the alloca/store/load idiom: the struct
-// and the `[N x i64]` share the same N*8-byte stack slot, viewed under
-// two LLVM types through one opaque pointer.  Both the caller half and
-// the callee half are emitted by this same codegen, so they always agree
-// regardless of target (on ILP32 there is no native side, but the
-// LLVM-to-LLVM call stays self-consistent).
+// the target's coerced ABI type -- `[N x i64]` (N = ceil(SizeOf/8)) on
+// LP64, `[N x i32]` (N = ceil(SizeOf/4)) on ILP32 -- matching the native
+// packing AND what clang emits for the same target (verified: clang
+// -target arm-none-eabi -mfloat-abi=soft coerces a <=16-byte struct to
+// `[N x i32]`, 4-aligned).  This target choice MATTERS on ILP32: an
+// `i64` element is 8-aligned, so a `[N x i64]` aggregate triggers LLVM's
+// AAPCS §6.5 C.3 even-register bump (it skips an odd GP register),
+// whereas the 4-aligned `[N x i32]` does not -- a native arm32 caller
+// packs a naturally-<8-aligned struct after a leading scalar at (e.g.)
+// r1:r2, and a `[N x i64]` callee would read r2:r3 -> corruption.
+//
+// The function BODY is untouched -- it still computes/consumes the `%S`
+// SSA value via extractvalue/insertvalue -- so coercion is local to
+// three boundaries (param entry, return, call site), each implemented
+// with the alloca/store/load idiom: the struct and the `[N x iW]` share
+// the same slot (N * elementBytes >= SizeOf), viewed under two LLVM
+// types through one opaque pointer.  Both the caller half and the callee
+// half are emitted by this same codegen, so they always agree regardless
+// of target.
 //
 // Scope: structs and arrays.  Slices (`%BnSlice = {i8*, i64}`),
 // func-values and interface-values (`{i8*, i8*}`) have word-sized fields
 // only, so their first-class form already lowers to exactly N word
-// registers -- identical to `[N x i64]` -- and they keep their existing
+// registers -- identical to `[N x iW]` -- and they keep their existing
 // (separately-consistent) conventions.  The >16-byte byval (params) /
 // sret (returns) paths are unchanged.
 
@@ -79,18 +89,37 @@ func aggRetCoerced(t @types.Type) bool {
 	return types.AggRetCoerced(t)
 }
 
-// aggCoerceWords returns N = ceil(SizeOf(t)/8): the number of i64 words
-// the coerced ABI type occupies.
-func aggCoerceWords(t @types.Type) int {
-	var sz int = t.SizeOf()
-	return (sz + 7) / 8
+// aggCoerceElemBytes is the byte width of ONE element of the coerced ABI
+// aggregate type: 8 (i64) on LP64, 4 (i32) on ILP32.  ILP32 is the
+// pointer-size-4 target (AAPCS32 arm32), matching types.NeedsSret's
+// predicate — see pkg/binate/types/abi_return.bn.  The 4-aligned i32
+// element on ILP32 is what clang emits for a <=16-byte struct, and it
+// avoids the 8-aligned-i64 even-register bump the native side never
+// performs for a naturally-4-aligned aggregate.
+func aggCoerceElemBytes() int {
+	if types.GetTarget().PointerSize == 4 {
+		return 4
+	}
+	return 8
 }
 
-// aggCoerceLLTy writes the coerced ABI LLVM type for t: normally `[N x i64]`
-// (the GP register packing native and LLVM agree on), but for an HFA aggregate
-// when HfaInSimd() is on it writes the SIMD form `[M x float]` / `[M x double]`
-// (M = member count, byte-identical layout to the struct / [N x i64] over the
-// shared coercion slot) so LLVM places it in consecutive v-registers, matching
+// aggCoerceWords returns N = ceil(SizeOf(t)/elementBytes): the number of
+// elements of the coerced ABI aggregate type (i64 words on LP64, i32
+// words on ILP32).  N * aggCoerceElemBytes() >= SizeOf(t), so the shared
+// alloca/store/load slot never over-runs.
+func aggCoerceWords(t @types.Type) int {
+	var sz int = t.SizeOf()
+	var w int = aggCoerceElemBytes()
+	return (sz + w - 1) / w
+}
+
+// aggCoerceLLTy writes the coerced ABI LLVM type for t: the GP register
+// packing native and LLVM agree on — `[N x i64]` (N = ceil(SizeOf/8)) on
+// LP64, `[N x i32]` (N = ceil(SizeOf/4)) on ILP32 (AAPCS32 arm32, the
+// 4-aligned form clang emits) — but for an HFA aggregate when HfaInSimd()
+// is on it writes the SIMD form `[M x float]` / `[M x double]` (M = member
+// count, byte-identical layout to the struct / GP aggregate over the shared
+// coercion slot) so LLVM places it in consecutive v-registers, matching
 // AAPCS64.  Both the caller and callee halves emit this same type, so
 // LLVM<->LLVM stays self-consistent regardless of which registers LLVM picks.
 func aggCoerceLLTy(out *strings.Builder, t @types.Type) {
@@ -99,7 +128,8 @@ func aggCoerceLLTy(out *strings.Builder, t @types.Type) {
 	// set hfaSimdAggregate exempts from NeedsSret/IsByvalParam, so the spelling
 	// and the byval/sret exemption decide on ONE set by construction, not by
 	// caller discipline.  aggInRegCoercedKind excludes the anonymous multi-return
-	// tuple, which hfaFold would otherwise count as an HFA.
+	// tuple, which hfaFold would otherwise count as an HFA.  (HFA-in-SIMD is
+	// aa64/LP64-only and dormant; ILP32 never reaches it.)
 	if types.HfaInSimd() && n > 0 && aggInRegCoercedKind(t) {
 		out.Write("[")
 		stringutils.WriteInt(out, n)
@@ -112,7 +142,11 @@ func aggCoerceLLTy(out *strings.Builder, t @types.Type) {
 	}
 	out.Write("[")
 	stringutils.WriteInt(out, aggCoerceWords(t))
-	out.Write(" x i64]")
+	if aggCoerceElemBytes() == 4 {
+		out.Write(" x i32]")
+	} else {
+		out.Write(" x i64]")
+	}
 	return
 }
 
@@ -136,8 +170,8 @@ func writeAggParamRef(out *strings.Builder, id int) {
 //	store [N x i64] %vID.ag, ptr %vID.agp ; spill the coerced words
 //	%vID = load %S, ptr %vID.agp          ; struct view of same bytes
 //
-// The `%vID.agp` alloca is `[N x i64]`-typed (N*8 >= SizeOf), so neither
-// the `[N x i64]` store nor the `%S` load over-runs the slot.
+// The `%vID.agp` alloca is `[N x iW]`-typed (N * elementBytes >= SizeOf),
+// so neither the `[N x iW]` store nor the `%S` load over-runs the slot.
 //
 // The alloca line is emitted separately by writeAggParamAllocaDecl
 // (entry-hoisted); this writes only the store + load, at the top of the
@@ -212,10 +246,10 @@ func emitReturnAggAllocaDecl(out *strings.Builder, instr @ir.Instr) {
 
 // emitAggReturn emits the OP_RETURN body for a single in-register
 // aggregate result (aggRetCoerced): coerce the `%S` result value to the
-// `[N x i64]` ABI type through the entry-hoisted `.agrp` slot
-// (emitReturnAggAllocaDecl) and `ret [N x i64]`, so the return registers
-// agree with a native caller.  The struct and the `[N x i64]` share the
-// same N*8-byte slot.  Called from emitReturn (emit_helpers.bn).
+// `[N x iW]` ABI type (aggCoerceLLTy) through the entry-hoisted `.agrp`
+// slot (emitReturnAggAllocaDecl) and `ret [N x iW]`, so the return
+// registers agree with a native caller.  The struct and the `[N x iW]`
+// share the same slot.  Called from emitReturn (emit_helpers.bn).
 func emitAggReturn(out *strings.Builder, instr @ir.Instr) {
 	out.Write("store ")
 	out.Write(llvmType(instr.Args[0].Typ))

@@ -15,11 +15,13 @@ import "pkg/binate/types"
 // reached via `BL <symbol>`.  It supports scalar / pointer args (R0..R3, then
 // stack) and aggregate args that fit AAPCS32's ≤16-byte-in-regs / split rules
 // (a raw slice is 8 bytes = 2 words, a managed-slice is 16 bytes = 4 words),
-// plus a single scalar / pointer return and a small-aggregate-in-regs return.
-// Shapes still outside the increment's scope — a float arg/return (soft-float
-// is a later increment) or a 64-bit-pair scalar arg — fail LOUDLY via
-// a.SetError rather than being silently dropped / mis-registered.  Mirrors
-// aarch64_call.bn adapted to the AAPCS32 register model (WordBytes 4).
+// plus a single scalar / pointer return and a BIG single-aggregate return
+// (SizeOf > InternalSretBytes = 4) via AAPCS32 sret.  Shapes still outside the
+// increment's scope — a float arg/return (soft-float is a later increment), a
+// 64-bit-pair scalar arg, and a SMALL (SizeOf <= 4) aggregate return that comes
+// back by value in R0 (its in-register collection isn't implemented) — fail
+// LOUDLY via a.SetError rather than being silently dropped / mis-registered.
+// Mirrors aarch64_call.bn adapted to the AAPCS32 register model (WordBytes 4).
 
 // emitCall dispatches args per AAPCS32, sets up the sret pointer if the callee
 // returns a big aggregate, branches to the callee, then collects the return
@@ -27,32 +29,70 @@ import "pkg/binate/types"
 // or a verbatim C symbol for OP_C_CALL.
 func emitCall(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
 	allFuncs @[]@ir.Func, ins @ir.Instr) {
-	// A call returning an aggregate (a slice / struct > InternalSretBytes) uses
-	// AAPCS32 sret with an R0 arg-register shift this increment defers — reject
-	// it BEFORE placing any args (which would go in R0..) so no half-marshaled
-	// call is emitted.  Multi-return collection is likewise deferred.
-	if ins.ID >= 0 && ins.Typ != nil && common.IsAggregateTyp(ins.Typ) {
-		if common.IsMultiReturnCall(ins) {
-			a.SetError("native arm32: multi-return call collection not "
-				"implemented (P3)")
-			return
-		}
-		a.SetError("native arm32: aggregate-return call uses AAPCS32 sret with "
-			"an unresolved arg-register-shift for the R0 buffer pointer "
-			"(P3, deferred)")
+	// A multi-return call collects its result tuple from the return registers
+	// (or, for a big tuple, an sret buffer) — neither of those shapes is
+	// implemented yet, so reject it BEFORE placing any args (which would go in
+	// R0..) so no half-marshaled call is emitted.  This guard fires ahead of
+	// the single-aggregate-sret path below, which handles only a single-value
+	// aggregate return.
+	if ins.ID >= 0 && common.IsMultiReturnCall(ins) {
+		a.SetError("native arm32: multi-return call collection not "
+			"implemented (P4)")
 		return
 	}
 
-	var argTypes @[]@types.Type = make_slice(@types.Type, len(ins.Args))
-	for i := 0; i < len(ins.Args); i++ {
-		argTypes[i] = ins.Args[i].Typ
+	// AAPCS32 sret: a call returning a single aggregate larger than
+	// InternalSretBytes (4) — on ILP32 that is EVERY slice / struct — passes a
+	// hidden buffer pointer in R0 (the first GP arg register), shifting every
+	// user arg up by one register.  Model the shift by synthesising a
+	// pointer-typed leading entry in argTypes, so CallArgRegStart places user
+	// arg i at register slot i+1 (matching x64_call.bn's RDI-shift).  A
+	// C-extern callee whose >CExternSretBytes aggregate return uses the same
+	// hidden-pointer sret is covered by CalleeUsesCSret.
+	var bigRet bool = ins.ID >= 0 &&
+		(rm.CC.CallReturnsBigAggregate(ins) ||
+		 rm.CC.CalleeUsesCSret(allFuncs, ins))
+
+	var nDispatchArgs int = len(ins.Args)
+	if bigRet { nDispatchArgs = nDispatchArgs + 1 }
+	var argTypes @[]@types.Type = make_slice(@types.Type, nDispatchArgs)
+	if bigRet {
+		// First slot is the hidden sret-buffer pointer — a single word that
+		// consumes R0.  Going through the classifier (rather than hand-adding 1
+		// to a raw reg index) keeps the ILP32 even-align pad correct: after the
+		// 1-word prepend ngrn=1 is odd, so a following int64 pads to R2:R3.
+		argTypes[0] = types.TypInt()
+		for i := 0; i < len(ins.Args); i++ {
+			argTypes[i+1] = ins.Args[i].Typ
+		}
+	} else {
+		for i := 0; i < len(ins.Args); i++ {
+			argTypes[i] = ins.Args[i].Typ
+		}
 	}
+
 	for ai := 0; ai < len(ins.Args); ai++ {
-		emitCallArg(a, pkgName, rm, argTypes, ins.Args[ai], ai)
+		// User arg ai lives at dispatch slot ai (no sret) or ai+1 (sret — the
+		// synthesised pointer takes slot 0).
+		var dispatchIdx int = ai
+		if bigRet { dispatchIdx = ai + 1 }
+		emitCallArg(a, pkgName, rm, argTypes, ins.Args[ai], dispatchIdx)
 		if a.HasError { return }
 		// Each arg's scratch reg is dead once consumed into argReg / the stack
 		// slot; reset so a long arg list doesn't saturate the pool.
 		rm.ResetRegs()
+	}
+
+	// sret setup: materialize &returnBuffer into R0 AFTER placing args (which
+	// occupy R1..) and while IP is free — emitFrameAddr uses IP as its address
+	// scratch.  A single-aggregate return lands in the call result's own alloc
+	// data region (LookupAlloc); the callee writes the bytes through R0.  This
+	// is the R0 analogue of x64's `Lea RDI, [RSP + sretOff]`.
+	if bigRet {
+		var sretOff int = rm.LookupAlloc(ins.ID)
+		if sretOff >= 0 {
+			emitFrameAddr(a, arm32.R0, sretOff)
+		}
 	}
 
 	// __c_call carries a verbatim C symbol (no Binate mangling); every other
@@ -73,18 +113,21 @@ func emitCall(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
 }
 
 // emitCallArg marshals one argument into its AAPCS32 register(s) / stack slot.
-// A float arg (soft-float lowering is a later increment) and a 64-bit-pair
-// scalar arg fail LOUDLY.  A scalar/pointer goes into argReg(regStart) or a
-// stack slot; an aggregate (raw / managed slice) spreads its words across
-// argReg(regStart..) and, on overflow, into the outgoing-args area.
+// dispatchIdx is the arg's position in argTypes, which — for a big-aggregate-
+// return call — carries a synthesised leading sret-pointer slot, so the user
+// arg's dispatchIdx is one past its positional index.  A float arg (soft-float
+// lowering is a later increment) and a 64-bit-pair scalar arg fail LOUDLY.  A
+// scalar/pointer goes into argReg(regStart) or a stack slot; an aggregate (raw /
+// managed slice) spreads its words across argReg(regStart..) and, on overflow,
+// into the outgoing-args area.
 func emitCallArg(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
-	argTypes @[]@types.Type, arg @ir.Instr, ai int) {
+	argTypes @[]@types.Type, arg @ir.Instr, dispatchIdx int) {
 	if common.IsFloatScalarTyp(arg.Typ) {
 		a.SetError("native arm32: call with float arg not implemented (P5)")
 		return
 	}
-	var regStart int = rm.CC.CallArgRegStart(argTypes, ai)
-	var stackOff int = rm.CC.CallArgStackOff(argTypes, ai)
+	var regStart int = rm.CC.CallArgRegStart(argTypes, dispatchIdx)
+	var stackOff int = rm.CC.CallArgStackOff(argTypes, dispatchIdx)
 	// A 64-bit scalar (int64 / uint64) is a register PAIR (even-aligned r0:r1 /
 	// r2:r3) or an 8-byte stack slot — the CallConv walkers already give the low
 	// reg / stack offset; place both words.
@@ -165,18 +208,45 @@ func emitAggregateArg(a @asm.Assembler, rm @common.RegMap, arg @ir.Instr,
 	}
 }
 
-// emitCallReturn collects the call's result after the BL.  Aggregate and multi-
-// return results were already rejected (fail-loud) up front in emitCall, so here
-// the result is a scalar / pointer.  A void call, or one whose result has no
-// spill slot, returns nothing; a float return and a 64-bit-pair scalar return
-// fail LOUDLY; otherwise R0 spills to the result's slot.  `allFuncs` is accepted
-// for signature parity with the other backends' collect (unused here now that
-// the aggregate/sret collect is deferred).
+// emitCallReturn collects the call's result after the BL.  A multi-return
+// result was already rejected (fail-loud) up front in emitCall.  A BIG single
+// aggregate return (SizeOf > InternalSretBytes = 4 — every slice, most structs)
+// arrived via AAPCS32 sret: the callee wrote its bytes through the R0 buffer
+// pointer directly into the call result's alloc data region, so there is no
+// post-call byte copy — the data region IS the result; LEA a pointer to it into
+// the result register (matching x64's `Lea rd, [RSP + dataOff]`) so downstream
+// consumers see a pointer to the bytes.  A SMALL aggregate (SizeOf <= 4) is NOT
+// sret — AAPCS32 returns it by value in R0 — so its in-register collection is a
+// different shape, not implemented yet, and fails LOUDLY (LEAing the buffer
+// would hand downstream a pointer to an UNWRITTEN data region).  Otherwise the
+// result is a scalar / pointer; a float return fails LOUDLY, a 64-bit-pair
+// scalar returns in r0:r1, and every other scalar returns in R0 and spills to
+// the result's slot.
 func emitCallReturn(a @asm.Assembler, rm @common.RegMap, allFuncs @[]@ir.Func,
 	ins @ir.Instr) {
 	if ins.ID < 0 { return }
 	if common.IsFloatScalarTyp(ins.Typ) {
 		a.SetError("native arm32: call with float return not implemented (P5)")
+		return
+	}
+	if ins.Typ != nil && common.IsAggregateTyp(ins.Typ) {
+		// A big aggregate came back via AAPCS32 sret (the callee wrote through
+		// the R0 buffer into the call result's alloc data region); LEA the
+		// data-region pointer into the result reg.  A small (<=4-byte) aggregate
+		// is returned by value in R0 instead — collecting that into the data
+		// region isn't implemented, so fail LOUDLY rather than LEA an unwritten
+		// region (the callee likewise fails loud; see arm32_return.bn / P4).
+		var bigRet bool = rm.CC.CallReturnsBigAggregate(ins) ||
+			rm.CC.CalleeUsesCSret(allFuncs, ins)
+		if !bigRet {
+			a.SetError("native arm32: small (<=4-byte) in-register aggregate "
+				"call return not implemented (P4)")
+			return
+		}
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		emitFrameAddr(a, rd, dataOff)
 		return
 	}
 	var spillOff int = rm.LookupSpill(ins.ID)

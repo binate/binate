@@ -5,15 +5,32 @@ import "pkg/binate/asm/arm32"
 import "pkg/binate/ir"
 import "pkg/binate/native/common"
 
-// emitReturn lowers OP_RETURN on ARM32.  A void return just tears down the
-// frame.  A single integer/pointer scalar returns in R0.  A single SMALL
-// aggregate (≤ NumGpRetRegs words — a raw slice is 2 words, a managed-slice is
-// 4) is packed into R0..R(N-1).  Shapes still deferred fail LOUDLY: a
-// multi-value tuple return, a BIG aggregate needing sret (the prologue doesn't
-// yet stash the R0 sret pointer), a 64-bit-pair scalar, and a float scalar
-// (soft-float).  Mirrors aarch64_return.bn's shape at the implemented op set.
+// emitReturn lowers OP_RETURN on ARM32.  Sret-returning functions come FIRST:
+// when PlanFrame set SretSlotOff >= 0, the callee received a hidden buffer
+// pointer in R0 (stashed at SP+SretSlotOff by emitFunc) and must write the
+// result through it, then return the pointer in R0 per AAPCS32.  Only a single
+// aggregate return is implemented (emitSretReturn); a big MULTI-return that also
+// set SretSlotOff fails LOUDLY (P4).  For non-sret returns: a void return tears
+// down the frame; a single integer/pointer scalar returns in R0; a 64-bit-pair
+// scalar returns in r0:r1; a float scalar (soft-float) fails LOUDLY; and a SMALL
+// aggregate (SizeOf <= InternalSretBytes = 4 — e.g. a 4-byte struct, returned by
+// value in R0, not via sret) fails LOUDLY because its in-register pack isn't
+// implemented yet (P4).  Mirrors x64_return.bn's shape (WordBytes = 4).
 func emitReturn(a @asm.Assembler, pkgName *[]readonly char,
 	rm @common.RegMap, ins @ir.Instr) {
+	// Sret-returning function: the callee writes the result through the hidden
+	// R0 buffer (stashed by emitFunc at SretSlotOff), then returns the buffer
+	// pointer in R0.  Only a single-aggregate return is handled; a big
+	// multi-return tuple (which also sets SretSlotOff) is deferred (P4).
+	if rm.SretSlotOff >= 0 {
+		if len(ins.Args) == 1 && common.IsAggregateTyp(ins.Args[0].Typ) {
+			emitSretReturn(a, rm, ins)
+			emitEpilogueAndRet(a, rm.FrameSize())
+			return
+		}
+		a.SetError("native arm32: multi-return sret not implemented (P4)")
+		return
+	}
 	if len(ins.Args) == 0 {
 		// Void return: just tear down the frame.
 		emitEpilogueAndRet(a, rm.FrameSize())
@@ -22,24 +39,7 @@ func emitReturn(a @asm.Assembler, pkgName *[]readonly char,
 	if len(ins.Args) != 1 {
 		// Multi-value tuple return (needs the return-marshaling / sret
 		// machinery).  Falling through would return garbage R0, so fail LOUDLY.
-		a.SetError("native arm32: multi-value return not implemented (P3)")
-		return
-	}
-	if common.IsAggregateTyp(ins.Args[0].Typ) {
-		// AAPCS32 returns any aggregate larger than InternalSretBytes (4) via
-		// sret, which on ILP32 is EVERY slice / struct return (a raw slice is 8
-		// bytes, a managed-slice 16).  The sret path has an unresolved arg-
-		// register-shift subtlety — the sret buffer pointer takes R0, so a
-		// function's own params must shift to R1.. and the caller-side
-		// arg dispatch must reserve R0 for the sret pointer — which
-		// CallArgRegStart does NOT yet model for internal sret callees.
-		// Emitting it now would silently miscompile a slice-returning function
-		// that also takes args (the sret pointer clobbers arg 0), so fail
-		// LOUDLY and defer the whole single-aggregate-sret path.  See
-		// claude-todo.md (arm32 single-aggregate-sret arg shift).
-		a.SetError("native arm32: aggregate return uses AAPCS32 sret with an "
-			"unresolved arg-register-shift for the R0 buffer pointer "
-			"(P3, deferred)")
+		a.SetError("native arm32: multi-value return not implemented (P4)")
 		return
 	}
 	if common.IsFloatScalarTyp(ins.Args[0].Typ) {
@@ -62,10 +62,48 @@ func emitReturn(a @asm.Assembler, pkgName *[]readonly char,
 		emitEpilogueAndRet(a, rm.FrameSize())
 		return
 	}
+	// A SMALL single aggregate (SizeOf <= InternalSretBytes = 4 — a struct that
+	// is NOT sret, so SretSlotOff stayed -1 above) is returned by value in R0
+	// per AAPCS32.  Packing the data-region bytes into R0 isn't implemented yet
+	// (and the caller-side collection isn't either — see arm32_call.bn), so fail
+	// LOUDLY: the scalar fall-through below would return a POINTER to the
+	// frame-local (about-to-dangle) data region instead of the value bytes.
+	if common.IsAggregateTyp(ins.Args[0].Typ) {
+		a.SetError("native arm32: small (<=4-byte) in-register aggregate "
+			"return not implemented (P4)")
+		return
+	}
 	// Single scalar / pointer return: AAPCS32 returns it in R0.
 	var src int = emitValOperand(a, pkgName, rm, ins.Args[0])
 	if src >= 0 && src != arm32.R0 {
 		arm32.Mov(a, arm32.COND_AL, false, arm32.R0, arm32.Reg(src))
 	}
 	emitEpilogueAndRet(a, rm.FrameSize())
+}
+
+// emitSretReturn copies a single-aggregate result into the caller's sret buffer
+// and reloads R0 with the buffer pointer per AAPCS32.  The buffer pointer was
+// stashed at SP+SretSlotOff by emitFunc; load it into a scratch, then memcpy the
+// argument's data region into it in 4-byte words (the WordBytes analogue of
+// x64's 8-byte-MOV loop).  R0 is reloaded LAST — after the copy — so the memcpy
+// scratches (R4.., never R0) can't clobber the returned pointer.
+func emitSretReturn(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	// Load the saved sret-buffer pointer into a scratch reg (R4..).
+	var dstPtr int = scratchReg(rm)
+	emitFrameLoad(a, dstPtr, rm.SretSlotOff)
+	// Source data pointer: an aggregate operand resolves to a pointer to its
+	// bytes (getOperand → the alloc data region / spilled pointer).
+	var srcPtr int = getOperand(a, rm, ins.Args[0].ID)
+	if srcPtr >= 0 {
+		var sz int = ins.Args[0].Typ.SizeOf()
+		var w int = wordBytes()
+		var tmp int = scratchReg(rm)
+		for off := 0; off < sz; off = off + w {
+			arm32.Ldr(a, arm32.COND_AL, tmp, arm32.MemImm(srcPtr, off))
+			arm32.Str(a, arm32.COND_AL, tmp, arm32.MemImm(dstPtr, off))
+		}
+	}
+	// AAPCS32 requires an sret-returning function to return the buffer pointer
+	// in R0.  Reload it (the memcpy scratches never touched R0).
+	emitFrameLoad(a, arm32.R0, rm.SretSlotOff)
 }

@@ -71,7 +71,8 @@ func TestCallFloatArgSetsError() testing.TestResult {
 
 // A call returning a FLOAT scalar is a later increment (soft-float): the R0
 // collection path would read the wrong location, so it must fail LOUDLY.
-// (An aggregate return also fails loud — see TestCallAggregateReturnSetsError.)
+// (An aggregate return is lowered via AAPCS32 sret — see
+// TestCallAggregateReturnMaterializesSretBuffer.)
 func TestCallFloatReturnSetsError() testing.TestResult {
 	var a @asm.Assembler = asm.New(4)
 	a.SetSection("text", -1)
@@ -92,14 +93,24 @@ func TestCallFloatReturnSetsError() testing.TestResult {
 }
 
 // A call returning an aggregate (a 16-byte managed-slice > the ILP32 sret
-// threshold) uses AAPCS32 sret, whose R0 arg-register shift this increment
-// defers — so emitCall must fail LOUDLY rather than silently miscompile a call
-// whose args would collide with the sret pointer in R0.  (rt.MakeManagedSlice
-// is unaffected: it's lowered by emitMakeSlice, not emitCall.)
-func TestCallAggregateReturnSetsError() testing.TestResult {
+// threshold — on ILP32 EVERY slice / struct is sret) uses AAPCS32 sret: the
+// caller materializes a pointer to the result's alloc data region into R0 (the
+// hidden buffer pointer), the callee writes through it, and after the BL the
+// caller LEAs that data-region pointer into the result register.  Pin that the
+// call lowers (no error), registers the callee, and emits an epilogue-free
+// stream ending in the LEA (an ADD, not a BL).  A zero-arg call keeps R0 free
+// for the sret pointer with no arg collision to test here (the shift itself is
+// exercised by the common-layer classifier tests + conformance).
+func TestCallAggregateReturnMaterializesSretBuffer() testing.TestResult {
 	var a @asm.Assembler = asm.New(4)
 	a.SetSection("text", -1)
 	var rm @common.RegMap = common.NewRegMap(common.AAPCS32())
+	// The call result's own data region (16-byte managed-slice) + pointer spill.
+	rm.AllocIDs = common.AppendInt(rm.AllocIDs, 0)
+	rm.AllocOffsets = common.AppendInt(rm.AllocOffsets, 0)
+	rm.AllocSizes = common.AppendInt(rm.AllocSizes, 16)
+	rm.SpillIDs = common.AppendInt(rm.SpillIDs, 0)
+	rm.SpillOffsets = common.AppendInt(rm.SpillOffsets, 16)
 	var noArgs2 @[]@ir.Instr
 	var ins @ir.Instr = make(ir.Instr)
 	ins.ID = 0
@@ -109,8 +120,24 @@ func TestCallAggregateReturnSetsError() testing.TestResult {
 	ins.Typ = types.MakeManagedSliceType(types.TypInt())
 	var allFuncs @[]@ir.Func
 	emitCall(a, "main", rm, allFuncs, ins)
-	if !a.HasError {
-		return fail("aggregate-return call must set a compile error (deferred)")
+	if a.HasError {
+		return fail("aggregate-return call must lower via sret, not error")
+	}
+	// First instruction is emitFrameAddr into R0 (`add r0, sp, #0` — DP ADD
+	// opcode 0x4, Rd = R0, Rn = SP): the hidden sret buffer pointer.
+	if dpOpcodeAt(a, 0) != cast(uint32, 0x4) || rdAt(a, 0) != cast(uint32, arm32.R0) {
+		return fail("aggregate-return call must materialize sret buffer into R0")
+	}
+	if rnAt(a, 0) != cast(uint32, arm32.SP) {
+		return fail("sret buffer materialization must be SP-relative")
+	}
+	// Setup ADD (@0), BL (@4), result-register LEA ADD (@8): three words.
+	if a.Sections[0].Len < 12 {
+		return fail("aggregate-return sret call should emit setup + BL + LEA")
+	}
+	// The BL branch-with-link opcode is 0b1011 in bits [27:24].
+	if (word32(a, 4) >> 24) & cast(uint32, 0xf) != cast(uint32, 0xB) {
+		return fail("aggregate-return sret call must emit the BL to the callee")
 	}
 	return ""
 }
@@ -234,6 +261,88 @@ func TestCCallVerbatimSymbol() testing.TestResult {
 	emitCall(a, "main", rm, allFuncs, ins)
 	if a.LookupSymbol("abort") < 0 {
 		return fail("OP_C_CALL should target the verbatim C symbol 'abort'")
+	}
+	return ""
+}
+
+// A call whose result is a SMALL aggregate (SizeOf <= InternalSretBytes = 4) is
+// NOT sret — AAPCS32 returns it by value in R0 — so bigRet is false and no sret
+// buffer is set up.  Collecting an in-register aggregate result isn't implemented
+// yet (P4); emitCallReturn must fail LOUDLY rather than LEA the (unwritten) alloc
+// data region.  The alloc region is registered so that, were the guard missing,
+// the buggy path would silently LEA it — the test would then wrongly pass; the
+// fail-loud assertion is what pins the fix.  [4]uint8 is 4 bytes on any target.
+func TestCallSmallAggregateReturnSetsError() testing.TestResult {
+	var a @asm.Assembler = asm.New(4)
+	a.SetSection("text", -1)
+	var rm @common.RegMap = common.NewRegMap(common.AAPCS32())
+	rm.AllocIDs = common.AppendInt(rm.AllocIDs, 0)
+	rm.AllocOffsets = common.AppendInt(rm.AllocOffsets, 0)
+	rm.AllocSizes = common.AppendInt(rm.AllocSizes, 4)
+	var noArgs2 @[]@ir.Instr
+	var ins @ir.Instr = make(ir.Instr)
+	ins.ID = 0
+	ins.Op = iropcode.OP_CALL
+	ins.StrVal = "main.f"
+	ins.Args = noArgs2
+	ins.Typ = types.MakeArrayType(types.TypUint8(), 4)
+	var allFuncs @[]@ir.Func
+	emitCall(a, "main", rm, allFuncs, ins)
+	if !a.HasError {
+		return fail("small (<=4-byte) in-register aggregate call return must "
+			"fail loud (P4)")
+	}
+	return ""
+}
+
+// A call returning a BIG aggregate (sret) with one int32 user arg: the hidden
+// sret buffer pointer occupies R0, so the user arg shifts to R1.  emitCall must
+// place it in R1 (not R0), driven by the ai+1 dispatch index through the CallConv
+// (which, after the 1-word sret prepend, returns R1).  Pins the caller-side arg
+// shift end-to-end — a classifier-only test can't catch a wrong dispatchIdx in
+// emitCall.  (TypInt32, not TypInt, for the user arg: a host unit test locks
+// `int` to the LP64 64-bit width, which would be a register pair, not the
+// single-word arg here.  setArm32Target likewise pins ILP32 so emitCall's
+// synthesised TypInt sret slot is a SINGLE word — under the LP64 host default it
+// would be 2 words, consuming R0:R1 and shifting the user arg to R2, not R1.)
+func TestCallSretReturnShiftsArgToR1() testing.TestResult {
+	setArm32Target()
+	var a @asm.Assembler = asm.New(4)
+	a.SetSection("text", -1)
+	var rm @common.RegMap = common.NewRegMap(common.AAPCS32())
+	// Big-aggregate result: alloc data region (16-byte managed-slice) + arg spill.
+	rm.AllocIDs = common.AppendInt(rm.AllocIDs, 0)
+	rm.AllocOffsets = common.AppendInt(rm.AllocOffsets, 0)
+	rm.AllocSizes = common.AppendInt(rm.AllocSizes, 16)
+	rm.SpillIDs = common.AppendInt(rm.SpillIDs, 10)
+	rm.SpillOffsets = common.AppendInt(rm.SpillOffsets, 16)
+	var args @[]@ir.Instr
+	args = appendInstrPtr_arm32calltest(args, callArg(10, types.TypInt32()))
+	var ins @ir.Instr = make(ir.Instr)
+	ins.ID = 0
+	ins.Op = iropcode.OP_CALL
+	ins.StrVal = "main.f"
+	ins.Args = args
+	ins.Typ = types.MakeManagedSliceType(types.TypInt())
+	var allFuncs @[]@ir.Func
+	emitCall(a, "main", rm, allFuncs, ins)
+	if a.HasError {
+		return fail("sret-return call with an int32 arg must lower, not error")
+	}
+	// int32 arg: LDR @0 reloads the spilled value; MOV r1 @4 places it (shifted
+	// off R0, which the sret buffer pointer occupies) — DP MOV opcode 0xD.
+	if dpOpcodeAt(a, 4) != cast(uint32, 0xD) ||
+			rdAt(a, 4) != cast(uint32, arm32.R1) {
+		return fail("sret call's user arg 0 must shift to R1, not R0")
+	}
+	// The CallConv the emitter drives must agree: with the 1-word sret prepend,
+	// user arg 0 (dispatch index 1) starts at R1.
+	var at @[]@types.Type = make_slice(@types.Type, 2)
+	at[0] = types.TypInt()
+	at[1] = types.TypInt32()
+	if rm.CC.CallArgRegStart(at, 1) != 1 {
+		return fail("AAPCS32 CallArgRegStart must place user arg 0 at R1 after "
+			"the sret prepend")
 	}
 	return ""
 }

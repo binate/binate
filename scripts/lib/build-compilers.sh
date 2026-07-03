@@ -174,6 +174,29 @@ build_interp() {
     echo "Compiled interpreter ready: $COMPILED_INTERP"
 }
 
+# Build the compiled interpreter (bni) CROSS-COMPILED for arm32-linux, using
+# current-tree cmd/bnc (GEN1_COMPILER) with --target arm32-linux.  The result is
+# a 32-bit-HOST bytecode VM (host int == 4 bytes); because cmd/bni bakes in
+# ConfigForTarget("") it interprets 32-bit-target bytecode — so running it (under
+# qemu-arm) exercises the VM's 32-bit-host paths.  Requires the arm32 cross-
+# toolchain (clang -target arm-linux-gnueabihf); NOT buildable on macOS.  Run it
+# via conformance/runners/builder-comp_arm32_linux_int.sh.
+# Sets ARM32_INTERP to the path.
+build_interp_arm32() {
+    if [ -z "$GEN1_COMPILER" ]; then build_gen1; fi
+    _ensure_compilers_dir
+    ARM32_INTERP="$_COMPILERS_DIR/arm32_interp"
+    ARM32_INTERP_BUILD_DIR="$(_new_build_dir)"
+    echo "Cross-building compiled interpreter (bni) for arm32-linux..."
+    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target arm32-linux)" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --target arm32-linux --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$ARM32_INTERP_BUILD_DIR" -o "$ARM32_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    if [ ! -x "$ARM32_INTERP" ]; then
+        echo "ERROR: Failed to cross-build arm32 compiled interpreter:"
+        echo "$build_out"
+        exit 1
+    fi
+    echo "arm32 compiled interpreter ready: $ARM32_INTERP"
+}
+
 # Cleanup helper — removes the session dir (which holds every compiler
 # binary + build dir).  The explicit BUILD_DIRS / binary removals are
 # redundant with the session-dir rm but kept as a belt-and-suspenders in

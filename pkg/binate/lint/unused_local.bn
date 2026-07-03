@@ -1,0 +1,252 @@
+package "pkg/binate/lint"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/std/strings"
+
+// ============================================================
+// Rule: unused-local
+// ============================================================
+//
+// Flags a function-local VARIABLE that is never referenced anywhere in
+// its function.  Reads AND writes both count as a reference, so the rule
+// is CONSERVATIVE — it flags only a truly-never-referenced local and can
+// never false-positive.  Parameters, the blank identifier `_`, and local
+// consts / types are never flagged.  A func-literal body is walked as part
+// of its enclosing function: a capture marks the outer local used, and the
+// literal's own locals are collected and flagged too.
+//
+// Scope handling is FLAT (per function, not per block): a local that
+// shadows another local of the same name records the name as referenced,
+// so shadowing can only UNDER-warn, never false-flag — the same
+// over-counting-is-safe stance as the shared reference index (refs.bn).
+// (Unused-locals is a checker-independent LINT — Binate emits no compiler
+// warnings for unused entities; that is bnlint's job.)
+
+// localUsage accumulates one function's local-var declarations and the set
+// of names referenced anywhere in its body (including nested func literals).
+type localUsage struct {
+	Names @[]@[]char    // declared local-var names
+	Poss  @[]token.Pos  // parallel declaration positions
+	NDecl int
+	Refs  @[]@[]char    // names referenced (read or write)
+	NRef  int
+}
+
+// newLocalUsage returns an empty accumulator with initial capacity.
+func newLocalUsage() @localUsage {
+	var lu @localUsage = make(localUsage)
+	lu.Names = make_slice(@[]char, 8)
+	lu.Poss = make_slice(token.Pos, 8)
+	lu.Refs = make_slice(@[]char, 16)
+	return lu
+}
+
+// recordDecl adds a declared local (the blank identifier is skipped).
+func (lu @localUsage) recordDecl(name @[]char, pos token.Pos) {
+	if len(name) == 0 || streq(name, "_") { return }
+	if lu.NDecl >= len(lu.Names) {
+		var nn @[]@[]char = make_slice(@[]char, len(lu.Names) * 2)
+		var np @[]token.Pos = make_slice(token.Pos, len(lu.Poss) * 2)
+		for i := 0; i < lu.NDecl; i++ {
+			nn[i] = lu.Names[i]
+			np[i] = lu.Poss[i]
+		}
+		lu.Names = nn
+		lu.Poss = np
+	}
+	lu.Names[lu.NDecl] = name
+	lu.Poss[lu.NDecl] = pos
+	lu.NDecl = lu.NDecl + 1
+}
+
+// recordRef notes that `name` was referenced (the blank identifier is skipped).
+func (lu @localUsage) recordRef(name @[]char) {
+	if len(name) == 0 || streq(name, "_") { return }
+	lu.Refs = growNames(lu.Refs, lu.NRef)
+	lu.Refs[lu.NRef] = name
+	lu.NRef = lu.NRef + 1
+}
+
+// isRefd reports whether `name` was referenced anywhere in the function.
+func (lu @localUsage) isRefd(name @[]char) bool {
+	for i := 0; i < lu.NRef; i++ {
+		if streq(lu.Refs[i], name) { return true }
+	}
+	return false
+}
+
+// luExpr records every identifier reference in an expression, descending
+// into a func literal's body (its captures + own locals).
+func luExpr(lu @localUsage, e @ast.Expr) {
+	if e == nil { return }
+	if e.Kind == ast.EXPR_IDENT {
+		lu.recordRef(e.Name)
+		return
+	}
+	luExpr(lu, e.X)
+	luExpr(lu, e.Y)
+	luExpr(lu, e.Z)
+	for i := 0; i < len(e.Args); i++ {
+		luExpr(lu, e.Args[i])
+	}
+	for i := 0; i < len(e.Elems); i++ {
+		luExpr(lu, e.Elems[i].Key)
+		luExpr(lu, e.Elems[i].Value)
+	}
+	// A func literal (EXPR_FUNC_LIT) carries its body via DeclRef.  Walk it
+	// in the SAME flat usage: a reference to an outer local is a capture
+	// (marks it used); the literal's own local vars are collected too.  Its
+	// parameters are NOT recorded, so an unused closure param is never
+	// flagged (params are contract-bound).  Type expressions are not walked:
+	// a local variable cannot appear in one — array dimensions must be const,
+	// and every builtin RUNTIME operand (make size, cast/bit_cast/len value,
+	// …) lives in e.Args (walked), not the type expr.  bnlint runs LintFile
+	// only on an error-free type-checked package, so a local var wrongly used
+	// as a dimension (a hard type error) never reaches this walk.
+	if e.DeclRef != nil {
+		luStmt(lu, e.DeclRef.Body)
+	}
+}
+
+// luStmt records local declarations and references in a statement.
+func luStmt(lu @localUsage, s @ast.Stmt) {
+	if s == nil { return }
+	if s.Kind == ast.STMT_SHORT_VAR {
+		// Exprs = LHS name idents (declarations), Exprs2 = RHS (references).
+		for i := 0; i < len(s.Exprs); i++ {
+			if s.Exprs[i] != nil && s.Exprs[i].Kind == ast.EXPR_IDENT {
+				lu.recordDecl(s.Exprs[i].Name, s.Exprs[i].Pos)
+			}
+		}
+		for i := 0; i < len(s.Exprs2); i++ {
+			luExpr(lu, s.Exprs2[i])
+		}
+		return
+	}
+	if s.Kind == ast.STMT_ASSIGN {
+		// Both sides are references — a write to a bare-identifier target
+		// counts as a use (conservative; write-only detection is a possible
+		// later refinement).
+		for i := 0; i < len(s.Exprs); i++ {
+			luExpr(lu, s.Exprs[i])
+		}
+		for i := 0; i < len(s.Exprs2); i++ {
+			luExpr(lu, s.Exprs2[i])
+		}
+		return
+	}
+	if s.Kind == ast.STMT_FOR {
+		if s.ForVal != nil {
+			// for-in: ForKey / ForVal are loop-variable declarations.
+			if s.ForKey != nil && s.ForKey.Kind == ast.EXPR_IDENT {
+				lu.recordDecl(s.ForKey.Name, s.ForKey.Pos)
+			}
+			if s.ForVal.Kind == ast.EXPR_IDENT {
+				lu.recordDecl(s.ForVal.Name, s.ForVal.Pos)
+			}
+			luExpr(lu, s.X)
+		} else {
+			// C-style: init may declare, cond / post are references.
+			luStmt(lu, s.Init)
+			luExpr(lu, s.X)
+			luStmt(lu, s.Post)
+		}
+		luStmt(lu, s.Body)
+		return
+	}
+	if s.Kind == ast.STMT_DECL {
+		luDecl(lu, s.DeclRef)
+		return
+	}
+	// Everything else contains references only (no declarations).
+	for i := 0; i < len(s.Stmts); i++ {
+		luStmt(lu, s.Stmts[i])
+	}
+	for i := 0; i < len(s.Exprs); i++ {
+		luExpr(lu, s.Exprs[i])
+	}
+	for i := 0; i < len(s.Exprs2); i++ {
+		luExpr(lu, s.Exprs2[i])
+	}
+	luExpr(lu, s.X)
+	luStmt(lu, s.Body)
+	luStmt(lu, s.Else)
+	luStmt(lu, s.Init)
+	luStmt(lu, s.Post)
+	luExpr(lu, s.ForKey)
+	luExpr(lu, s.ForVal)
+	for i := 0; i < len(s.Cases); i++ {
+		var cc @ast.CaseClause = s.Cases[i]
+		for j := 0; j < len(cc.Exprs); j++ {
+			luExpr(lu, cc.Exprs[j])
+		}
+		for j := 0; j < len(cc.Body); j++ {
+			luStmt(lu, cc.Body[j])
+		}
+	}
+}
+
+// luDecl records a function-local `var` declaration (and the references in
+// its initializer), recursing grouped decls.  Local consts and types are
+// not recorded as flaggable locals, but their initializers are still
+// walked for references.
+func luDecl(lu @localUsage, d @ast.Decl) {
+	if d == nil { return }
+	if d.Kind == ast.DECL_VAR {
+		lu.recordDecl(d.Name, d.Pos)
+		luExpr(lu, d.Value)
+		return
+	}
+	if d.Kind == ast.DECL_CONST {
+		luExpr(lu, d.Value)
+		return
+	}
+	if d.Kind == ast.DECL_GROUP {
+		for i := 0; i < len(d.Decls); i++ {
+			luDecl(lu, d.Decls[i])
+		}
+		return
+	}
+}
+
+// lintUnusedLocals flags never-referenced local variables in every
+// top-level function (and method) of the merged file.
+func lintUnusedLocals(ctx @lintCtx, file @ast.File) {
+	if file == nil { return }
+	for i := 0; i < len(file.Decls); i++ {
+		lintUnusedLocalsDecl(ctx, file.Decls[i])
+	}
+}
+
+// lintUnusedLocalsDecl walks one function's body and flags its unused
+// local variables; recurses grouped decls; ignores non-functions and
+// bodiless (extern / forward) declarations.
+func lintUnusedLocalsDecl(ctx @lintCtx, d @ast.Decl) {
+	if d == nil { return }
+	if d.Kind == ast.DECL_GROUP {
+		for i := 0; i < len(d.Decls); i++ {
+			lintUnusedLocalsDecl(ctx, d.Decls[i])
+		}
+		return
+	}
+	if d.Kind != ast.DECL_FUNC { return }
+	if d.Body == nil { return }
+	var lu @localUsage = newLocalUsage()
+	luStmt(lu, d.Body)
+	for i := 0; i < lu.NDecl; i++ {
+		if !lu.isRefd(lu.Names[i]) {
+			addDiag(ctx, lu.Poss[i], "unused-local",
+				unusedLocalMsg(lu.Names[i]))
+		}
+	}
+}
+
+// unusedLocalMsg builds the diagnostic message for an unused local.
+func unusedLocalMsg(name @[]char) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("unused local variable: ")
+	cb.Write(name)
+	return buf.CopyStr(cb.String())
+}

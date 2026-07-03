@@ -57,6 +57,18 @@ func shimReturnIsFloatScalarAA64(fvTyp @types.Type) bool {
 	return common.IsFloatScalarTyp(fvTyp.Results[0])
 }
 
+// funcValHasHfaArgAA64 reports whether any param of fvTyp is an HFA passed in
+// SIMD registers (isHfaAggregate is HfaInSimd-gated, so false while dormant).
+// Used to fail loud on the stack-spill func-value shim, which does not yet
+// marshal HFA members.
+func funcValHasHfaArgAA64(fvTyp @types.Type) bool {
+	if fvTyp == nil { return false }
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		if isHfaAggregate(fvTyp.Params[pi].Type) { return true }
+	}
+	return false
+}
+
 // emitShimArgMarshalAA64 marshals the func-value shim's incoming all-int,
 // positional-GP user args into the AAPCS64 layout the underlying function
 // expects, FOR THE REGISTER-ONLY CASE (every word in a GP/FP register).  The
@@ -122,6 +134,25 @@ func emitShimArgMarshalAA64(a @asm.Assembler, cc common.CallConv,
 				}
 				nsrn = nsrn + 1
 			}
+			srcWord = srcWord + 1
+			continue
+		}
+		hn, hw := types.HfaClassify(pt)
+		if cc.HfaAggregates && hn > 0 && common.AggCoercedInReg(pt) {
+			// HFA arg: arrives as ONE by-address pointer word (staged in
+			// X9+srcWord like any coerced aggregate), but the underlying reads
+			// its members from the FP file — load member m into D[nsrn+m].
+			// Must precede the AggCoercedInReg GP-expansion below (an HFA is
+			// also AggCoercedInReg).  The register-only shim path only reaches
+			// here within the FP budget (a single HFA is <=4 members); wider FP
+			// arg lists route to the stack-spill shim.
+			var ptrReg int = argReg(prefix + srcWord)
+			if needStage { ptrReg = aarch64.X9 + srcWord }
+			for m := 0; m < hn; m++ {
+				hfaMemberLoadToFp(a, aarch64.D0 + nsrn + m, ptrReg,
+					m * hw, hw)
+			}
+			nsrn = nsrn + hn
 			srcWord = srcWord + 1
 			continue
 		}
@@ -228,6 +259,7 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 		// underlying AAPCS64.  Counting it via raw ArgWords would
 		// over-count and spuriously trip the budget guard.
 		var nUserWords int = 0
+		var nUserFpRegs int = 0
 		for pi := 0; pi < len(fvTyp.Params); pi++ {
 			var pt @types.Type = fvTyp.Params[pi].Type
 			// Budget the SHIM's register/spill routing on the OUTGOING (real
@@ -236,21 +268,45 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 			// expands it into ArgWords coerced regs, so counting it via
 			// EffectiveArgWords would undercount the outgoing register pressure
 			// and wrongly keep a wide call on the register-only path.
-			if common.AggCoercedInReg(pt) {
+			//
+			// An HFA rides the FP file, not GP: it must be checked BEFORE
+			// AggCoercedInReg (an HFA is also AggCoercedInReg) and counted toward
+			// nUserFpRegs (its member count), NOT the GP-word budget — counting it
+			// as ArgWords would both over-count GP (spuriously spilling a
+			// register-fittable call) and, worse, MISS an FP-file overflow (a
+			// multi-f32 HFA is 2 ArgWords but 4 FP regs), letting the register
+			// path place members past v7 into the callee-saved v8+.  It still
+			// consumes one INCOMING dispatch word (its by-address pointer), so it
+			// adds EffectiveArgWords (== 1) to nUserWords for the incoming budget.
+			// A float scalar likewise rides one FP register.
+			if isHfaAggregate(pt) {
+				nUserFpRegs = nUserFpRegs + types.HfaMemberCount(pt)
+				nUserWords = nUserWords + cc.EffectiveArgWords(pt)
+			} else if common.AggCoercedInReg(pt) {
 				nUserWords = nUserWords + common.ArgWords(pt)
 			} else {
+				if common.IsFloatScalarTyp(pt) && cc.NumFpArgRegs > 0 {
+					nUserFpRegs = nUserFpRegs + 1
+				}
 				nUserWords = nUserWords + cc.EffectiveArgWords(pt)
 			}
 		}
 		var retSz int = shimReturnSize(fvTyp)
 		var retIsAgg bool = shimReturnIsAggregate(fvTyp)
-		var useSret bool = retSz > 16
+		// An HFA result comes back from the underlying in D0..D3, not GP-packed
+		// and not sret — even a >16-byte one (3x/4x f64).  It still travels to
+		// the shim's caller through the retbuf (aggregate dispatch shape), so it
+		// uses the pack frame but FMOVs the members into the retbuf.
+		var retIsHfa bool = len(fvTyp.Results) == 1 &&
+			cc.ReturnsHfaInRegs(fvTyp.Results[0])
+		var useSret bool = retSz > 16 && !retIsHfa
 		// An aggregate result of 1..16 bytes is returned to the caller through
 		// the retbuf it passed in X0 — INCLUDING a ≤ 8-byte aggregate, which is
 		// packed into one word.  (A scalar result is also ≤ 8 bytes but is NOT
 		// an aggregate, so it stays on the tail-branch scalar shape — hence the
 		// retIsAgg gate rather than a bare size floor.)
-		var usePack bool = retIsAgg && retSz >= 1 && retSz <= 16
+		var usePack bool = retIsAgg && retSz >= 1 && retSz <= 16 &&
+			!retIsHfa
 		// Register budget for the tail-branch / register-only shapes below:
 		// they can't read stack-passed incoming user args nor write stack-
 		// passed outgoing ones.  The pack/sret shapes consume X0+X1 for
@@ -260,15 +316,54 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 		// reads/writes the overflow words there.  (Replaces the old silent
 		// `nUserWords > 8` clamp, which miscompiled wide funcvals.)
 		var userBudget int = 7
-		if usePack || useSret {
+		if usePack || useSret || retIsHfa {
 			userBudget = 6
 		}
-		if nUserWords > userBudget {
+		// Route to the stack-spill shim when EITHER the incoming/outgoing GP
+		// words exceed the register budget OR the FP arg registers overflow (a
+		// multi-HFA / float-heavy call whose members would spill past v7).  The
+		// register-only path below has no outgoing frame, so it cannot place any
+		// stack arg; both overflows must go to the spill shim.
+		if nUserWords > userBudget || nUserFpRegs > cc.NumFpArgRegs {
+			if retIsHfa || funcValHasHfaArgAA64(fvTyp) {
+				// A WIDE-arg func-value whose args or result include an HFA
+				// would route to the stack-spill shim, which does not yet
+				// marshal HFA members — fail loud rather than silently
+				// miscompile.  The common (narrow-arg) HFA func-values use the
+				// register path above.  Inert until the HFA gate flips
+				// (isHfaAggregate is HfaInSimd-gated); tracked as a Stage 2b
+				// spill follow-up in explorations/plan-hfa-crossbackend.md.
+				a.SetError("native aa64: HFA in a stack-spill func-value shim is unsupported")
+				continue
+			}
 			emitFuncvalSpillShimAA64(a, cc, fnLabel, fvTyp, retSz,
 				usePack, useSret, shimReturnIsFloatScalarAA64(fvTyp))
 			continue
 		}
-		if usePack {
+		if retIsHfa {
+			// HFA-return shim: same retbuf frame as the pack path, but the
+			// underlying returns the 1-4 float members in D0..D(n-1), so FMOV
+			// each into the retbuf rather than Str'ing GP words.  Covers every
+			// HFA size (a 32-byte 4x f64 HFA still rides v0..v3, never sret).
+			aarch64.Stp(a, true, aarch64.FP, aarch64.LR,
+				aarch64.MemPre(aarch64.SP, -32))
+			aarch64.Mov(a, true, aarch64.FP, aarch64.Reg(aarch64.SP))
+			aarch64.Str(a, true, aarch64.X0,
+				aarch64.MemImm(aarch64.SP, 16))
+			emitShimArgMarshalAA64(a, cc, fvTyp, 2)
+			a.SetGlobal(fnLabel)
+			aarch64.Bl(a, fnLabel)
+			aarch64.Ldr(a, true, aarch64.X9,
+				aarch64.MemImm(aarch64.SP, 16))
+			hn, hw := types.HfaClassify(fvTyp.Results[0])
+			for m := 0; m < hn; m++ {
+				hfaMemberStoreFromFp(a, aarch64.D0 + m, aarch64.X9,
+					m * hw, hw)
+			}
+			aarch64.Ldp(a, true, aarch64.FP, aarch64.LR,
+				aarch64.MemPost(aarch64.SP, 32))
+			aarch64.Ret(a)
+		} else if usePack {
 			// Pack-return aggregate shim — see top of function.
 			// Frame: 32 bytes (16 for FP/LR, 16 for the retbuf save
 			// slot + alignment pad).  Saves retbuf at [SP+16];

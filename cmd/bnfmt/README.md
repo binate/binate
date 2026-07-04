@@ -1,6 +1,6 @@
 # bnfmt — Binate source formatter
 
-Formats Binate source (`.bn` / `.bni`) files.
+Formats Binate source (`.bn` / `.bni`) files to a canonical form.
 
     bnfmt <file>            format to stdout (default)
     bnfmt -w <file>         rewrite the file in place
@@ -9,13 +9,29 @@ Formats Binate source (`.bn` / `.bni`) files.
 
 Build with `scripts/build-bnfmt.sh -o <path>`.
 
-**Status:** scaffolding. Formatting is not yet implemented — `formatSource` is
-currently the identity, so bnfmt round-trips a file byte-for-byte. This step
-wires up the build, the CLI, and the I/O modes; the AST-driven printer, comment
-attachment, alignment, and line-wrapping land in subsequent steps. See
-`explorations/plan-bnfmt.md`.
+## What it does
 
-Known follow-up: `-w` is a direct (non-atomic) truncate+write, which is safe
-only while output equals input; before formatting output can diverge it must
-become crash-safe (temp file + rename), which needs an `os.Rename` (absent from
-the stdlib today).
+`bnfmt` parses the file (a `.bni` in interface mode, else ordinary mode) with
+comment collection and re-prints it via `pkg/binate/format`: canonical
+operator/comma spacing and indentation (tabs), sorted per-run imports, normalized
+blank lines, single-line-vs-multi-line layout preserved from the source (with a
+100-column force-expand), gofmt-style column alignment (struct field types,
+single-line case bodies, grouped-decl trailing comments), and width-aware
+fill-wrapping of argument / parameter / element / type-argument lists and binary
+operator chains — all while preserving every comment. A line marked
+`// LONG-LINE ALLOWED` is never reflowed.
+
+The formatter is a fixpoint: `bnfmt` on already-formatted output is a no-op.
+
+## Behavior
+
+- **Parse errors:** on any syntax error `bnfmt` prints the diagnostics to stderr,
+  exits non-zero, and leaves the file untouched (never a partial rewrite).
+- **`--check`:** exits non-zero (without writing) iff the file is not already in
+  canonical form.
+
+## Known follow-up
+
+`-w` is a direct (non-atomic) truncate+write. It should become crash-safe (write
+to a temp file in the same directory, then rename over the original), which needs
+an `os.Rename` (absent from the stdlib today).

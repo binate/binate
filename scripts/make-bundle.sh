@@ -16,16 +16,17 @@
 # --strip-components=1:
 #
 #   <version>-<platform>/
-#     bin/{bnc,bni,bnas,bnlint}   the release binaries
+#     bin/{bnc,bni,bnas,bnlint,bnfmt}   the release binaries
 #     bin/binate-paths            search-path helper (see BUNDLE-HOWTO.md)
 #     lib/runtime/                C runtime (binate_runtime.c + stubs)
 #     lib/ifaces/{core,stdlib}/   .bni interfaces (builtins, pkg/bootstrap, stdlib)
 #     lib/impls/{core,stdlib}/    implementations (incl. pkg/bootstrap under core)
 #
 # The lib/ tree is what bnc/bni/bnas/bnlint resolve against; see
-# BUNDLE-HOWTO.md for how a consumer points -I/-L/--runtime at it.
+# BUNDLE-HOWTO.md for how a consumer points -I/-L/--runtime at it.  bnfmt is
+# self-contained (it parses and re-prints source syntax), so it needs no lib/.
 #
-# Building each binary goes through scripts/build-{bnc,bni,bnas,bnlint}.sh,
+# Building each binary goes through scripts/build-{bnc,bni,bnas,bnlint,bnfmt}.sh,
 # which resolve a BUILDER via scripts/fetch-builder.sh — so the bootstrap
 # repo must be a sibling checkout when BUILDER_VERSION is a bootstrap-*
 # (the build scripts enforce this).
@@ -36,7 +37,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/make-bundle.sh [--version <ver>] [--platform <plat>] [--out-dir <dir>]
 
-Build a release bundle tarball (bin/{bnc,bni,bnas,bnlint} + lib/) for one
+Build a release bundle tarball (bin/{bnc,bni,bnas,bnlint,bnfmt} + lib/) for one
 platform, writing <out-dir>/<version>-<platform>.tar.gz (+ .sha256).
 
 Options:
@@ -122,7 +123,8 @@ echo "==> building binaries"
 "$SCRIPT_DIR/build-bni.sh"    -o "$dest/bin/bni"
 "$SCRIPT_DIR/build-bnas.sh"   -o "$dest/bin/bnas"
 "$SCRIPT_DIR/build-bnlint.sh" -o "$dest/bin/bnlint"
-for b in bnc bni bnas bnlint; do
+"$SCRIPT_DIR/build-bnfmt.sh"  -o "$dest/bin/bnfmt"
+for b in bnc bni bnas bnlint bnfmt; do
     test -x "$dest/bin/$b" || { echo "make-bundle: missing binary: $b" >&2; exit 1; }
 done
 

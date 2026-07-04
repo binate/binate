@@ -16,6 +16,7 @@ bin/
   bni      bytecode VM: runs .bn directly; also a REPL and a test runner
   bnas     assembler:   .s → .o
   bnlint   static analyzer: memory-safety lints
+  bnfmt    formatter:   canonically re-prints .bn / .bni source (self-contained)
   binate-paths  prints the -I/-L/--runtime search paths for lib/ (see below)
 lib/
   ifaces/core/      .bni for the builtins (pkg/builtins/*) + pkg/bootstrap
@@ -153,6 +154,20 @@ bnlint -I "$ROOT:$I" -L "$ROOT:$L" pkg/demo pkg/other
 
 Each finding is one line, `package:line:col: [rule] message`. Exit code is 1 if
 any diagnostics are found, 0 otherwise.
+
+## bnfmt — format
+
+bnfmt canonically re-prints a `.bn` / `.bni` source file (spacing, sorted
+imports, blank-line normalization, alignment, width-aware wrapping) while
+preserving comments. It parses only syntax, so it needs no `-I`/`-L`/`lib/`:
+
+```sh
+bnfmt path/to/file.bn         # format to stdout
+bnfmt -w path/to/file.bn      # rewrite in place (crash-safe)
+bnfmt --check path/to/file.bn # exit non-zero if not already formatted
+```
+
+On a parse error bnfmt reports it to stderr and exits non-zero without writing.
 
 ## bnas — assemble
 

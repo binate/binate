@@ -200,7 +200,7 @@ PACKAGES=""
 # path strips down to pkg/X as the package's logical name — the loader resolves
 # an `import "pkg/X"` against any matching search root, so the canonical package
 # name is the trailing pkg/... portion.
-for testfile in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/impls" -name '*_test.bn' 2>/dev/null); do
+for testfile in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/impls" -name '*_test.bn' -not -path '*/testdata/*' 2>/dev/null); do
     [ -f "$testfile" ] || continue
     dir="$(dirname "$testfile")"
     # Convert absolute path to package path:

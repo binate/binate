@@ -46,7 +46,7 @@ LINT_SKIP="pkg/binate/interp pkg/binate/asm/arm32 pkg/binate/asm/elf pkg/binate/
 #     no direct .bn).  Excludes pkg/bootstrap (only a .bni interface, no dir).
 #   - every directory under cmd/
 TARGETS=""
-for d in $(find "$BINATE_DIR/pkg" -type d 2>/dev/null | sort); do
+for d in $(find "$BINATE_DIR/pkg" -type d -not -path '*/testdata/*' 2>/dev/null | sort); do
     found=0
     for bn in "$d"/*.bn; do
         [ -f "$bn" ] && found=1 && break

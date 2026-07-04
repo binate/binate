@@ -25,7 +25,7 @@ violations=0
 LIST=$(mktemp -t hygiene-file-format.XXXXXX)
 trap 'rm -f "$LIST"' EXIT
 find "$BINATE_DIR" \
-    \( -path "$BINATE_DIR/.git" -o -path "$BINATE_DIR/conformance" \) -prune \
+    \( -path "$BINATE_DIR/.git" -o -path "$BINATE_DIR/conformance" -o -path '*/testdata' \) -prune \
     -o -type f \( -name '*.bn' -o -name '*.bni' -o -name '*.sh' \
                   -o -name '*.md' -o -name '*.yml' \) -print \
     | sort > "$LIST"

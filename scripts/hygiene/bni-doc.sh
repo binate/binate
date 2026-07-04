@@ -25,7 +25,7 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 violations=0
 
-for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" -name '*.bni' 2>/dev/null | sort); do
+for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" -name '*.bni' -not -path '*/testdata/*' 2>/dev/null | sort); do
     out=$(awk '
         function flag(kind) {
             rel = FILENAME

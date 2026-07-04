@@ -18,7 +18,7 @@ LINE_LIMIT=100
 
 count=0
 
-for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" \( -name '*.bn' -o -name '*.bni' \) 2>/dev/null); do
+for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" \( -name '*.bn' -o -name '*.bni' \) -not -path '*/testdata/*' 2>/dev/null); do
     rel="${f#"$BINATE_DIR"/}"
     awk -v limit="$LINE_LIMIT" -v file="$rel" \
         'length > limit && index($0, "// LONG-LINE ALLOWED") == 0 {

@@ -25,7 +25,7 @@ BNI_ERROR_LIMIT=1800
 errors=0
 warns=0
 
-for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" \( -name '*.bn' -o -name '*.bni' \) -not -name '*_test.bn' 2>/dev/null); do
+for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" \( -name '*.bn' -o -name '*.bni' \) -not -name '*_test.bn' -not -path '*/testdata/*' 2>/dev/null); do
     lines=$(wc -l < "$f")
     rel="${f#"$BINATE_DIR"/}"
     case "$f" in

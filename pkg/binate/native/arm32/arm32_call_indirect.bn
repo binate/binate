@@ -1,0 +1,224 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// Indirect-call lowering
+// ============================================================
+//
+// emitCallIndirect (OP_CALL_INDIRECT — dtor / free_fn / cross-mode dispatch,
+// reached via `BLX IP`) and emitCallFuncValue (OP_CALL_FUNC_VALUE /
+// OP_CALL_HANDLE — call through a 2-word {vtable, data} function value's
+// vtable.call, always-shim convention).  Both reuse the direct-call machinery
+// (emitCallArg for AAPCS32 arg placement, emitCallReturn for return collection);
+// only the callee-target load and the final `BLX IP` (vs `BL <symbol>`) differ.
+//
+// Unlike AArch64 — which holds the call target in the intra-call scratch X17
+// across the whole arg loop — arm32's only intra-call scratch is IP (R12), which
+// emitAggregateArg (arm32_call.bn) and emitFrameAddr both clobber.  So the target
+// is NOT held live across the arg loop: it is reloaded from its operand's spill
+// slot AFTER the args are placed and materialized into IP as the last step before
+// `BLX` (this also covers a void call, which has no result slot to stash into).
+// Mirrors x64_call_indirect.bn, which likewise cannot hold the target in a
+// regPool register across the loop.
+
+// emitCallIndirect lowers OP_CALL_INDIRECT.  Args[0] is the function pointer;
+// Args[1..] are the call args, dispatched via the same AAPCS32 machinery emitCall
+// uses (no sret prefix — matches callDispatchArgTypesAnyOp's OP_CALL_INDIRECT
+// sizing).  The target is reloaded into IP after the arg loop, then `BLX IP`.
+// A scalar / void / 64-bit-pair return is collected by emitCallReturn; an
+// aggregate or multi-return (which OP_CALL_INDIRECT never carries — it is emitted
+// only for dtors / free_fn / cross-mode trampolines) fails LOUDLY rather than
+// mishandling silently.
+func emitCallIndirect(a @asm.Assembler, pkgName *[]readonly char,
+	rm @common.RegMap, allFuncs @[]@ir.Func, ins @ir.Instr) {
+	if len(ins.Args) < 1 {
+		a.SetError("native arm32: indirect call with no target (P4)")
+		return
+	}
+	// Reject shapes the return collection can't handle BEFORE placing any args,
+	// so no half-marshaled call is emitted.  OP_CALL_INDIRECT never carries a
+	// multi-return or aggregate return today; guard anyway (fail-loud, not
+	// silent-wrong).
+	if ins.ID >= 0 && common.IsMultiReturnCall(ins) {
+		a.SetError("native arm32: multi-return indirect call collection not "
+			"implemented (P4)")
+		return
+	}
+	if ins.ID >= 0 && ins.Typ != nil && common.IsAggregateTyp(ins.Typ) {
+		a.SetError("native arm32: indirect call with aggregate return not "
+			"implemented (P4)")
+		return
+	}
+
+	// AAPCS32 arg dispatch on the call args (Args[1..]).  emitCallArg handles the
+	// scalar / pointer / aggregate / 64-bit-pair cases and fail-louds float args.
+	var nCallArgs int = len(ins.Args) - 1
+	var argTypes @[]@types.Type = make_slice(@types.Type, nCallArgs)
+	for i := 0; i < nCallArgs; i++ {
+		argTypes[i] = ins.Args[i + 1].Typ
+	}
+	for ai := 0; ai < nCallArgs; ai++ {
+		emitCallArg(a, pkgName, rm, argTypes, ins.Args[ai + 1], ai)
+		if a.HasError { return }
+		// Each arg's scratch reg is dead once consumed; reset so a long arg list
+		// doesn't saturate the (tighter than aarch64) R4..R10 pool.
+		rm.ResetRegs()
+	}
+
+	// Reload the function pointer into IP as the LAST step before the branch:
+	// getOperand reloads from the operand's spill slot (valid across the arg
+	// loop), and IP would have been clobbered by emitAggregateArg / emitFrameAddr
+	// during dispatch.  Covers a void call (no result slot to stash into) too.
+	var fnReg int = getOperand(a, rm, ins.Args[0].ID)
+	if fnReg < 0 {
+		a.SetError("native arm32: indirect call target not materializable (P4)")
+		return
+	}
+	if fnReg != arm32.IP {
+		arm32.Mov(a, arm32.COND_AL, false, arm32.IP, arm32.Reg(fnReg))
+	}
+	arm32.Blx(a, arm32.COND_AL, arm32.IP)
+
+	// BLX clobbers R0-R3 and IP.  Reset the pool, then collect the return value.
+	rm.ResetRegs()
+	emitCallReturn(a, rm, allFuncs, ins)
+}
+
+// emitCallFuncValue lowers OP_CALL_FUNC_VALUE (and, via dispatch, OP_CALL_HANDLE:
+// a handle and a constructed func value share the {vtable, data} layout).  The
+// call goes through vtable.call — always the marshaling shim (Phase 3 of
+// plan-function-values.md).  Two shim shapes, by return type:
+//
+//   Scalar / void return: shim `<ret>(*uint8 data, <args>)` — data in R0, user
+//   args in R1.. (one synthetic prepended slot shifts AAPCS register-start by
+//   one).  The result rides back in R0 / r0:r1.
+//
+//   Big-aggregate return: shim `void(*uint8 retbuf, *uint8 data, <args>)` —
+//   retbuf in R0 (the AAPCS32 sret pointer), data in R1, user args in R2.. (two
+//   synthetic prepended slots).  After the call the retbuf alloc region holds the
+//   result, so it is produced as a region pointer with no register spill.
+//
+// A SMALL (<=InternalSretBytes = 4) in-register aggregate return comes back by
+// value in R0 (needing the in-register pack the direct-call path defers, P4-b)
+// and fails LOUDLY here — the shim rejects it too.  A multi-return likewise fails
+// LOUDLY (P4).  Mirrors x64_call_indirect.bn with WordBytes = 4 and IP as the
+// call-target scratch.
+func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char,
+	rm @common.RegMap, allFuncs @[]@ir.Func, ins @ir.Instr) {
+	if len(ins.Args) < 1 {
+		a.SetError("native arm32: func-value call with no target (P4)")
+		return
+	}
+	if ins.ID >= 0 && common.IsMultiReturnCall(ins) {
+		a.SetError("native arm32: multi-return func-value call collection not "
+			"implemented (P4)")
+		return
+	}
+	// A big (>4-byte) aggregate return rides the retbuf-in-R0 convention; a small
+	// (<=4-byte) one comes back by value in R0 and needs the in-register pack
+	// (P4-b) — reject it before emitting a half-call, matching the direct-call
+	// path (arm32_call.bn) and the shim (arm32_funcvalue.bn).
+	var aggregateRet bool = ins.ID >= 0 && ins.Typ != nil &&
+		common.IsAggregateTyp(ins.Typ) && !common.IsMultiReturnCall(ins)
+	if aggregateRet && !rm.CC.CallReturnsBigAggregate(ins) {
+		a.SetError("native arm32: small (<=4-byte) in-register aggregate "
+			"func-value call return not implemented (P4-b)")
+		return
+	}
+
+	// Prepend synthetic slots for the shim's leading args: 1 (data) for a scalar
+	// return, 2 (retbuf + data) for a big-aggregate return.  prefixSlots is also
+	// the AAPCS32 reg offset for user args.
+	var prefixSlots int = 1
+	if aggregateRet { prefixSlots = 2 }
+
+	var nCallArgs int = len(ins.Args) - 1
+	var argTypes @[]@types.Type =
+		make_slice(@types.Type, nCallArgs + prefixSlots)
+	for p := 0; p < prefixSlots; p++ {
+		argTypes[p] = types.MakePointerType(types.TypUint8())
+	}
+	for i := 0; i < nCallArgs; i++ {
+		var at @types.Type = ins.Args[i + 1].Typ
+		// Match callDispatchArgTypesAnyOp's shim-ABI substitution so arg
+		// placement agrees with PlanFrame's outgoing-args sizing.  AAPCS32 does
+		// not set NaturalSizeStackArgs, so only a float scalar is substituted to
+		// a 1-word pointer (and a float arg fails loud in emitCallArg anyway —
+		// P5); a narrow scalar keeps its type, and an aggregate arg rides
+		// emitCallArg's aggregate path (the shim then fail-louds it — P4).
+		if common.IsFloatScalarTyp(at) {
+			at = types.MakePointerType(types.TypUint8())
+		}
+		argTypes[i + prefixSlots] = at
+	}
+
+	// Place user args first (dispatchIdx offset by prefixSlots), so a user arg
+	// whose source reg is R0 / R1 is read before the retbuf / data loads
+	// overwrite those registers.
+	for ai := 0; ai < nCallArgs; ai++ {
+		emitCallArg(a, pkgName, rm, argTypes, ins.Args[ai + 1], ai + prefixSlots)
+		if a.HasError { return }
+		rm.ResetRegs()
+	}
+
+	// Reload the func-value pointer (the arg loop's ResetRegs stranded it): its
+	// data slot feeds R0/R1 and its vtable.call slot feeds IP.
+	var fvAddr int = getOperand(a, rm, ins.Args[0].ID)
+	if fvAddr < 0 {
+		a.SetError("native arm32: func-value pointer not materializable (P4)")
+		return
+	}
+
+	// Place the shim's leading args into R0/R1.  emitFrameAddr uses IP as its
+	// scratch, so do this BEFORE loading the call target into IP.
+	if aggregateRet {
+		var retbufOff int = rm.LookupAlloc(ins.ID)
+		if retbufOff < 0 { return }
+		// R0 = &retbuf (the AAPCS32 sret pointer the shim writes through).
+		emitFrameAddr(a, arm32.R0, retbufOff)
+		// R1 = data.
+		arm32.Ldr(a, arm32.COND_AL, arm32.R1,
+			arm32.MemImm(fvAddr, types.FuncValueDataOffset()))
+	} else {
+		var dataRegStart int = rm.CC.CallArgRegStart(argTypes, 0)
+		if dataRegStart >= 0 {
+			arm32.Ldr(a, arm32.COND_AL, argReg(dataRegStart),
+				arm32.MemImm(fvAddr, types.FuncValueDataOffset()))
+		}
+	}
+
+	// Two-step load of vtable.call into IP, LAST (emitFrameAddr above clobbered
+	// IP):
+	//   IP = [fvAddr + FuncValueVtableOffset()]  ; vtable ptr
+	//   IP = [IP + WordBytes]                     ; slot 1 = call (slot 0 = dtor)
+	// The second offset is WordBytes (4), NOT the literal 8 — the {vtable, data}
+	// value is 8 bytes on ILP32, so slot 1 is at offset 4.
+	arm32.Ldr(a, arm32.COND_AL, arm32.IP,
+		arm32.MemImm(fvAddr, types.FuncValueVtableOffset()))
+	arm32.Ldr(a, arm32.COND_AL, arm32.IP, arm32.MemImm(arm32.IP, wordBytes()))
+	arm32.Blx(a, arm32.COND_AL, arm32.IP)
+
+	rm.ResetRegs()
+	if ins.ID < 0 { return }
+
+	// Big-aggregate return: the shim wrote the result through the retbuf we
+	// passed in R0, so just produce the alloc-region pointer as the result.
+	if aggregateRet {
+		var dataOff int = rm.LookupAlloc(ins.ID)
+		if dataOff < 0 { return }
+		var rd int = nextReg(rm, ins.ID)
+		emitFrameAddr(a, rd, dataOff)
+		return
+	}
+	// Scalar / void / 64-bit-pair return: the all-int shim ABI returns the value
+	// in R0 / r0:r1 (a float result would come back in R0 too, but float returns
+	// fail loud upstream), so emitCallReturn's R0 / r0:r1 store is exactly right.
+	// The aggregate return was handled above, so emitCallReturn sees only the
+	// scalar shapes here.
+	emitCallReturn(a, rm, allFuncs, ins)
+}

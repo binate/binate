@@ -29,9 +29,5 @@ The formatter is a fixpoint: `bnfmt` on already-formatted output is a no-op.
   exits non-zero, and leaves the file untouched (never a partial rewrite).
 - **`--check`:** exits non-zero (without writing) iff the file is not already in
   canonical form.
-
-## Known follow-up
-
-`-w` is a direct (non-atomic) truncate+write. It should become crash-safe (write
-to a temp file in the same directory, then rename over the original), which needs
-an `os.Rename` (absent from the stdlib today).
+- **`-w`:** crash-safe — writes to a temp file in the same directory and renames
+  it over the original, so a crash mid-write leaves the original intact.

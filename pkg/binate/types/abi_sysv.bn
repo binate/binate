@@ -129,3 +129,172 @@ func SysVInSse(t @Type) bool {
 	}
 	return false
 }
+
+// ------------------------------------------------------------
+// Per-eightbyte FORM (the exact register/LLVM shape of one eightbyte)
+// ------------------------------------------------------------
+//
+// SysVClassify says only SSE-vs-INTEGER per eightbyte; the LLVM backend and the
+// native x64 backend also need the FORM — how many bytes an eightbyte carries
+// and in what shape — to spell the coerced ABI type / choose the move width.
+// This is a language-level ABI/layout fact (shared, so it lives here in
+// pkg/types), verified against clang x86_64:
+//   - SSE  : a lone f64 -> `double`; two packed f32 -> `<2 x float>`; a lone f32
+//            (4-byte half, e.g. an f32 followed by padding, or the 4-byte tail of
+//            a 12-byte aggregate) -> `float`.
+//   - INTEGER: a SINGLE scalar leaf starting at the eightbyte base takes that
+//            leaf's own width — char/bool -> i8, short -> i16, int -> i32,
+//            long/pointer -> i64 (this is clang's getIntegerTypeAtOffset: it uses
+//            the field, not the padded 8-byte span, so `{double,char}` is
+//            `{double,i8}` not `{double,i64}`).  Any OTHER shape (two leaves, an
+//            int+float merge, an array, a leaf not at the base) collapses to i64.
+//
+// The forms are an enum consumed by the codegen speller (form -> LLVM string) and
+// by the native backend (form -> move width / register class).
+
+// SysV eightbyte forms.  SEB_NONE is the zero value (no such eightbyte).
+const (
+	SEB_NONE   int = iota
+	SEB_FLOAT      // one f32 (4 bytes)      -> LLVM `float`
+	SEB_2FLOAT     // two packed f32 (8 b)   -> LLVM `<2 x float>`
+	SEB_DOUBLE     // one f64 (8 bytes)      -> LLVM `double`
+	SEB_I8         // 1-byte integer leaf    -> LLVM `i8`
+	SEB_I16        // 2-byte integer leaf    -> LLVM `i16`
+	SEB_I32        // 4-byte integer leaf    -> LLVM `i32`
+	SEB_I64        // full/merged eightbyte  -> LLVM `i64`
+)
+
+// sysvFloatBits returns a bitmask of the float shapes that intersect the
+// eightbyte at byte offset ebOff (relative to the aggregate base): bit 1 = an
+// f64 covering the eightbyte, bit 2 = an f32 in the low half [ebOff, ebOff+4),
+// bit 4 = an f32 in the high half [ebOff+4, ebOff+8).  Under natural alignment a
+// leaf never straddles the eightbyte boundary or a 4-byte half boundary, so each
+// float contributes exactly one bit.  Walks nested structs/arrays like
+// sysvMarkNonFloat.
+func sysvFloatBits(t @Type, baseOff int, ebOff int) int {
+	t = sysvPeel(t)
+	if t == nil { return 0 }
+	if t.Kind == TYP_FLOAT {
+		var sz int = t.SizeOf()
+		if baseOff + sz <= ebOff { return 0 }
+		if baseOff >= ebOff + 8 { return 0 }
+		if sz == 8 { return 1 }
+		if baseOff - ebOff < 4 { return 2 }
+		return 4
+	}
+	if t.Kind == TYP_STRUCT {
+		var bits int = 0
+		for i := 0; i < len(t.Fields); i++ {
+			bits = bits | sysvFloatBits(t.Fields[i].Type,
+				baseOff + t.FieldOffset(i), ebOff)
+		}
+		return bits
+	}
+	if t.Kind == TYP_ARRAY {
+		if t.Elem == nil { return 0 }
+		var esz int = t.Elem.SizeOf()
+		if esz <= 0 { return 0 }
+		var n int = t.SizeOf() / esz
+		var bits int = 0
+		for i := 0; i < n; i++ {
+			bits = bits | sysvFloatBits(t.Elem, baseOff + i * esz, ebOff)
+		}
+		return bits
+	}
+	return 0
+}
+
+// sysvLeafCount returns the number of scalar leaves (float or non-float) whose
+// byte span intersects the eightbyte at byte offset ebOff.  Used to detect the
+// clang "single clean leaf" case for INTEGER-eightbyte width.
+func sysvLeafCount(t @Type, baseOff int, ebOff int) int {
+	t = sysvPeel(t)
+	if t == nil { return 0 }
+	if t.Kind == TYP_STRUCT {
+		var c int = 0
+		for i := 0; i < len(t.Fields); i++ {
+			c = c + sysvLeafCount(t.Fields[i].Type,
+				baseOff + t.FieldOffset(i), ebOff)
+		}
+		return c
+	}
+	if t.Kind == TYP_ARRAY {
+		if t.Elem == nil { return 0 }
+		var esz int = t.Elem.SizeOf()
+		if esz <= 0 { return 0 }
+		var n int = t.SizeOf() / esz
+		var c int = 0
+		for i := 0; i < n; i++ {
+			c = c + sysvLeafCount(t.Elem, baseOff + i * esz, ebOff)
+		}
+		return c
+	}
+	var sz int = t.SizeOf()
+	if sz < 1 { sz = 1 }
+	if baseOff + sz <= ebOff { return 0 }
+	if baseOff >= ebOff + 8 { return 0 }
+	return 1
+}
+
+// sysvLeafWidthAtBase returns the byte width of the scalar leaf that STARTS
+// exactly at byte offset ebOff (0 if none does).  Combined with a leaf count of
+// 1, this is clang's single-field INTEGER-eightbyte width.
+func sysvLeafWidthAtBase(t @Type, baseOff int, ebOff int) int {
+	t = sysvPeel(t)
+	if t == nil { return 0 }
+	if t.Kind == TYP_STRUCT {
+		for i := 0; i < len(t.Fields); i++ {
+			var w int = sysvLeafWidthAtBase(t.Fields[i].Type,
+				baseOff + t.FieldOffset(i), ebOff)
+			if w > 0 { return w }
+		}
+		return 0
+	}
+	if t.Kind == TYP_ARRAY {
+		if t.Elem == nil { return 0 }
+		var esz int = t.Elem.SizeOf()
+		if esz <= 0 { return 0 }
+		var n int = t.SizeOf() / esz
+		for i := 0; i < n; i++ {
+			var w int = sysvLeafWidthAtBase(t.Elem, baseOff + i * esz, ebOff)
+			if w > 0 { return w }
+		}
+		return 0
+	}
+	if baseOff == ebOff { return t.SizeOf() }
+	return 0
+}
+
+// SysVNumEightbytes returns the number of eightbytes t occupies under SysV
+// register passing (1 or 2), or 0 when t is not a register-passed aggregate
+// (MEMORY / scalar / not a struct-array).  Equals len(SysVClassify(t)).
+func SysVNumEightbytes(t @Type) int {
+	return len(SysVClassify(t))
+}
+
+// SysVEightbyteForm returns the SEB_* form of eightbyte eb of aggregate t (see
+// the form-enum comment above).  SEB_NONE if eb is out of range.  Matches clang
+// x86_64's per-eightbyte coerced type exactly for the shapes SysVInSse covers.
+func SysVEightbyteForm(t @Type, eb int) int {
+	var cl @[]int = SysVClassify(t)
+	if eb < 0 || eb >= len(cl) { return SEB_NONE }
+	var pt @Type = sysvPeel(t)
+	if pt == nil { return SEB_NONE }
+	var ebOff int = eb * 8
+	if cl[eb] == EB_SSE {
+		var bits int = sysvFloatBits(pt, 0, ebOff)
+		if (bits & 1) != 0 { return SEB_DOUBLE }
+		if ((bits & 2) != 0) && ((bits & 4) != 0) { return SEB_2FLOAT }
+		return SEB_FLOAT
+	}
+	// INTEGER: a single scalar leaf at the base takes its own width; any other
+	// shape (multiple leaves, int+float merge, array, off-base leaf) is i64.
+	if sysvLeafCount(pt, 0, ebOff) == 1 {
+		var w int = sysvLeafWidthAtBase(pt, 0, ebOff)
+		if w == 1 { return SEB_I8 }
+		if w == 2 { return SEB_I16 }
+		if w == 4 { return SEB_I32 }
+		if w == 8 { return SEB_I64 }
+	}
+	return SEB_I64
+}

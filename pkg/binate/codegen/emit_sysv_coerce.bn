@@ -1,0 +1,276 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/stringutils"
+import "pkg/binate/types"
+import "pkg/std/strings"
+
+// ============================================================
+// x86-64 SysV SSE-eightbyte aggregate coercion (LLVM boundary)
+// ============================================================
+//
+// The GP coercion in emit_agg_coerce.bn passes/returns a <=16-byte aggregate as
+// one `[N x iW]` value — a single LLVM entity for the param, the arg, AND the
+// return.  x86-64 SysV is ROLE-DIVERGENT and needs a DIFFERENT shape (verified
+// against clang x86_64):
+//
+//   - a RETURN/RESULT is one first-class aggregate whose fields are the per-
+//     eightbyte types: `{ double, double }`, `{ double, i32 }`, `{ <2 x float>,
+//     float }`, or the bare eightbyte type for a single eightbyte (`<2 x float>`,
+//     `double`).  clang: `mD2()->{double,double}`, `mF2()-><2 x float>`.
+//   - an ARG/PARAM is SPLIT into one LLVM param PER EIGHTBYTE: `sumD2(double,
+//     double)`, `sumFD(float, double)`, `sumDI(double, i64)`.  clang splits args;
+//     matching it keeps the LLVM side 1:1 with the N registers the native x64
+//     backend uses (an SSE eightbyte -> XMM, an INTEGER eightbyte -> GP), rather
+//     than betting on LLVM's first-class-aggregate classification.
+//
+// The per-eightbyte LLVM type comes from types.SysVEightbyteForm (SEB_*).  Both
+// halves (caller and callee) are emitted by this same codegen, so an LLVM<->LLVM
+// call stays self-consistent, and a native<->LLVM call agrees because the split
+// maps to exactly the SysV registers.
+//
+// The reconstruction slot stays the GP `[N x i64]` (aggCoerceLLTy on x64 folds to
+// it — N = ceil(SizeOf/8) = the eightbyte count), so the alloca-decl emitters are
+// UNCHANGED; only the value types stored/loaded and the param/arg COUNT differ.
+// A struct value and the split eightbytes share the slot through one opaque
+// pointer, exactly like the GP path.  All of this is dormant while
+// types.SysVSseInRegs() is off (SysVInSse gates every branch here).
+
+// sysvEbLLTy writes the LLVM type of eightbyte `eb` of aggregate t, from its
+// SysVEightbyteForm: `float` / `<2 x float>` / `double` for the SSE shapes and
+// `i8` / `i16` / `i32` / `i64` for the INTEGER widths.
+func sysvEbLLTy(out *strings.Builder, t @types.Type, eb int) {
+	var form int = types.SysVEightbyteForm(t, eb)
+	if form == types.SEB_FLOAT { out.Write("float"); return }
+	if form == types.SEB_2FLOAT { out.Write("<2 x float>"); return }
+	if form == types.SEB_DOUBLE { out.Write("double"); return }
+	if form == types.SEB_I8 { out.Write("i8"); return }
+	if form == types.SEB_I16 { out.Write("i16"); return }
+	if form == types.SEB_I32 { out.Write("i32"); return }
+	out.Write("i64")
+	return
+}
+
+// sysvReturnLLTy writes the RETURN/RESULT LLVM type of an x64 SSE aggregate: the
+// bare eightbyte type for one eightbyte, `{ eb0, eb1 }` for two.  Used for the
+// define-line return type, the extern-declare return type, the funcRetTypes
+// entry (so call sites spell `call { .. } @f`), and the return / call-result
+// store-load types.
+func sysvReturnLLTy(out *strings.Builder, t @types.Type) {
+	var n int = types.SysVNumEightbytes(t)
+	if n <= 1 {
+		sysvEbLLTy(out, t, 0)
+		return
+	}
+	out.Write("{ ")
+	for i := 0; i < n; i++ {
+		if i > 0 { out.Write(", ") }
+		sysvEbLLTy(out, t, i)
+	}
+	out.Write(" }")
+	return
+}
+
+// sysvSlotBase builds the `%v<id><suffix>` slot base name (the eightbyte-0
+// pointer) that sysvEmitEbGep / sysvWriteEbPtr address into.
+func sysvSlotBase(id int, suffix *[]readonly char) @[]char {
+	var b @strings.Builder = strings.NewBuilder()
+	b.Write("%v")
+	stringutils.WriteInt(b, id)
+	b.Write(suffix)
+	return buf.CopyStr(b.String())
+}
+
+// sysvCallArgSlotBase builds the per-call-arg `%v<id>.agA<i>` slot base name
+// (the caller-side coercion slot for aggregate arg i).
+func sysvCallArgSlotBase(id int, i int) @[]char {
+	var b @strings.Builder = strings.NewBuilder()
+	b.Write("%v")
+	stringutils.WriteInt(b, id)
+	b.Write(".agA")
+	stringutils.WriteInt(b, i)
+	return buf.CopyStr(b.String())
+}
+
+// sysvEmitEbGep emits `<base>.e<eb> = getelementptr i8, ptr <base>, i64 <eb*8>`
+// so a later store/load can address eightbyte `eb` of the slot; a no-op for eb 0
+// (the slot base IS eightbyte 0's pointer).
+func sysvEmitEbGep(out *strings.Builder, base *[]readonly char, eb int) {
+	if eb == 0 { return }
+	out.Write(base)
+	out.Write(".e")
+	stringutils.WriteInt(out, eb)
+	out.Write(" = getelementptr i8, ptr ")
+	out.Write(base)
+	out.Write(", i64 ")
+	stringutils.WriteInt(out, eb * 8)
+	out.Write("\n  ")
+	return
+}
+
+// sysvWriteEbPtr writes the pointer operand for eightbyte `eb` of the slot:
+// `<base>` for eb 0, `<base>.e<eb>` (from sysvEmitEbGep) otherwise.
+func sysvWriteEbPtr(out *strings.Builder, base *[]readonly char, eb int) {
+	out.Write(base)
+	if eb > 0 {
+		out.Write(".e")
+		stringutils.WriteInt(out, eb)
+	}
+	return
+}
+
+// sysvWriteDefineParams writes the split LLVM params for one x64 SSE aggregate
+// param on a define line — `<eb0> %vID.ag0, <eb1> %vID.ag1` (one param per
+// eightbyte, the reconstructed struct being `%vID`, built by sysvParamPrologue).
+// The caller emits the leading ", " that separates this from the previous param;
+// this writes the internal comma between the split params.
+func sysvWriteDefineParams(out *strings.Builder, id int, t @types.Type) {
+	var n int = types.SysVNumEightbytes(t)
+	for eb := 0; eb < n; eb++ {
+		if eb > 0 { out.Write(", ") }
+		sysvEbLLTy(out, t, eb)
+		out.Write(" ")
+		emitRef(out, id)
+		out.Write(".ag")
+		stringutils.WriteInt(out, eb)
+	}
+	return
+}
+
+// sysvWriteDeclareParamTypes writes the split param TYPES (no names) for one x64
+// SSE aggregate param on an extern declare: `<eb0>, <eb1>`.
+func sysvWriteDeclareParamTypes(out *strings.Builder, t @types.Type) {
+	var n int = types.SysVNumEightbytes(t)
+	for eb := 0; eb < n; eb++ {
+		if eb > 0 { out.Write(", ") }
+		sysvEbLLTy(out, t, eb)
+	}
+	return
+}
+
+// sysvParamPrologue emits the entry-block reconstruction of the `%S` value for
+// one x64 SSE aggregate param: store each incoming eightbyte param
+// `%vID.ag<eb>` into the shared `[N x i64]` slot `%vID.agp` at its byte offset,
+// then load the struct as `%vID`.  The `.agp` alloca is the SAME
+// writeAggParamAllocaDecl slot as the GP path (`[N x i64]`, entry-hoisted).
+func sysvParamPrologue(out *strings.Builder, id int, t @types.Type) {
+	var base @[]char = sysvSlotBase(id, ".agp")
+	var n int = types.SysVNumEightbytes(t)
+	for eb := 0; eb < n; eb++ {
+		sysvEmitEbGep(out, base, eb)
+		out.Write("store ")
+		sysvEbLLTy(out, t, eb)
+		out.Write(" ")
+		emitRef(out, id)
+		out.Write(".ag")
+		stringutils.WriteInt(out, eb)
+		out.Write(", ptr ")
+		sysvWriteEbPtr(out, base, eb)
+		out.Write("\n  ")
+	}
+	emitRef(out, id)
+	out.Write(" = load ")
+	out.Write(llvmType(t))
+	out.Write(", ptr ")
+	out.Write(base)
+	out.Write("\n  ")
+	return
+}
+
+// sysvEmitReturn emits OP_RETURN for a single x64 SSE aggregate result: store the
+// `%S` value into the entry-hoisted `[N x i64]` `.agrp` slot, then load and
+// return the coerced aggregate.  Mirror of emitAggReturn with the SSE spelling.
+func sysvEmitReturn(out *strings.Builder, instr @ir.Instr) {
+	out.Write("store ")
+	out.Write(llvmType(instr.Args[0].Typ))
+	out.Write(" ")
+	emitValRef(out, instr.Args[0])
+	out.Write(", ptr ")
+	emitRef(out, instr.ID)
+	out.Write(".agrp\n  ")
+	emitRef(out, instr.ID)
+	out.Write(".agr = load ")
+	sysvReturnLLTy(out, instr.Args[0].Typ)
+	out.Write(", ptr ")
+	emitRef(out, instr.ID)
+	out.Write(".agrp\n  ret ")
+	sysvReturnLLTy(out, instr.Args[0].Typ)
+	out.Write(" ")
+	emitRef(out, instr.ID)
+	out.Write(".agr\n")
+	return
+}
+
+// sysvEmitCallArgPreamble emits, BEFORE a call line, the split coercion of one
+// x64 SSE aggregate arg: store `%S` into the `[N x i64]` `.agA<i>` slot, then
+// load each eightbyte from its offset as `%v<callID>.agL<i>e<eb>` (passed by
+// sysvWriteCallArg).
+func sysvEmitCallArgPreamble(out *strings.Builder, instr @ir.Instr, i int) {
+	var at @types.Type = instr.Args[i].Typ
+	var base @[]char = sysvCallArgSlotBase(instr.ID, i)
+	out.Write("store ")
+	out.Write(llvmType(at))
+	out.Write(" ")
+	emitValRef(out, instr.Args[i])
+	out.Write(", ptr ")
+	out.Write(base)
+	out.Write("\n  ")
+	var n int = types.SysVNumEightbytes(at)
+	for eb := 0; eb < n; eb++ {
+		sysvEmitEbGep(out, base, eb)
+		out.Write("%v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agL")
+		stringutils.WriteInt(out, i)
+		out.Write("e")
+		stringutils.WriteInt(out, eb)
+		out.Write(" = load ")
+		sysvEbLLTy(out, at, eb)
+		out.Write(", ptr ")
+		sysvWriteEbPtr(out, base, eb)
+		out.Write("\n  ")
+	}
+	return
+}
+
+// sysvWriteCallArg writes the split coerced-aggregate call args in the call's
+// argument list: `<eb0> %v<callID>.agL<i>e0, <eb1> %v<callID>.agL<i>e1` (the
+// values loaded by sysvEmitCallArgPreamble).  The outer call-arg loop emits the
+// leading ", " before this arg; the internal comma separates the split entries.
+func sysvWriteCallArg(out *strings.Builder, instr @ir.Instr, i int) {
+	var at @types.Type = instr.Args[i].Typ
+	var n int = types.SysVNumEightbytes(at)
+	for eb := 0; eb < n; eb++ {
+		if eb > 0 { out.Write(", ") }
+		sysvEbLLTy(out, at, eb)
+		out.Write(" %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".agL")
+		stringutils.WriteInt(out, i)
+		out.Write("e")
+		stringutils.WriteInt(out, eb)
+	}
+	return
+}
+
+// sysvEmitCallResultBind emits, AFTER a call line, the bind of an x64 SSE
+// aggregate result: store the call's `{ .. }` value `%v<callID>.agR` into the
+// `.agRB` slot and load `%S` back as `%v<callID>`.  Mirror of
+// emitAggCallResultBind with the SSE spelling.
+func sysvEmitCallResultBind(out *strings.Builder, instr @ir.Instr) {
+	out.Write("  store ")
+	sysvReturnLLTy(out, instr.Typ)
+	out.Write(" %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".agR, ptr %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".agRB\n  ")
+	emitRef(out, instr.ID)
+	out.Write(" = load ")
+	out.Write(llvmType(instr.Typ))
+	out.Write(", ptr %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".agRB\n")
+	return
+}

@@ -25,15 +25,17 @@ import "pkg/stdx/slices"
 //
 // The backend emits the vtable/handle data (shared ir.BuildFuncValue) for every
 // collected reference, and a marshaling SHIM for the return shapes it supports:
-// SCALAR/VOID (drop the leading data word, shift user args down, tail-branch) and
+// SCALAR/VOID (drop the leading data word, shift user args down, tail-branch),
 // big-aggregate SRET (a >4-byte result returns through a hidden R0 buffer, which
 // — unlike AAPCS64's dedicated X8 — stays in R0 across the shim, so the shim
-// keeps R0, drops data, shifts user args down, and tail-branches).  Shapes it
-// can't yet marshal — closures (P4-d), float args/returns (P5), a 64-bit
-// register-pair scalar arg, a SMALL (<=4-byte) in-register aggregate return
-// (P4-b), or arg words beyond the register budget — fail LOUDLY via a.SetError
-// rather than emitting a wrong shim.  Mirrors aarch64_funcvalue{,_shim}.bn at the
-// reduced surface, with AAPCS32's R0-sret in place of X8.
+// keeps R0, drops data, shifts user args down, and tail-branches), and small
+// (<=4-byte) aggregate PACK (a by-value R0 result: the shim saves the retbuf,
+// calls the underlying, and stores the returned R0 word through the retbuf).
+// Shapes it can't yet marshal — closures (P4-d), float args/returns (P5), a
+// 64-bit register-pair scalar arg, or arg words beyond the register budget — fail
+// LOUDLY via a.SetError rather than emitting a wrong shim.  Mirrors
+// aarch64_funcvalue{,_shim}.bn at the reduced surface, with AAPCS32's R0-sret in
+// place of X8.
 
 // SHIM_ARG_REG_BUDGET is the number of user-arg words a scalar/void shim can
 // re-marshal in the register-only fast path: R0 carries the dropped `data`
@@ -296,26 +298,27 @@ func shimUserArgWords(a @asm.Assembler, cc common.CallConv,
 	return nWords
 }
 
-// shimShiftArgsDown shifts nWords user-arg words down by one register: the word
-// in argReg(dropIdx+1+w) moves to argReg(dropIdx+w), for w in 0..nWords.  The
-// leading dropIdx registers are left untouched — dropIdx=0 (scalar/void) drops
-// the data word in R0; dropIdx=1 (sret) keeps the retbuf pointer in R0 and drops
-// the data word in R1.  Left-to-right is clobber-safe (each dst index is one
-// below its src).
-func shimShiftArgsDown(a @asm.Assembler, nWords int, dropIdx int) {
+// shimShiftArgsDown moves nWords user-arg words from their incoming registers
+// argReg(srcBase + w) down into argReg(dstBase + w), for w in 0..nWords.  Callers
+// pass srcBase > dstBase (a downward shift), so left-to-right is clobber-safe
+// (each dst index is below every not-yet-read src).  The shapes: scalar/void
+// drops the data word (dstBase=0, srcBase=1); sret keeps the retbuf in R0 and
+// drops data (dstBase=1, srcBase=2); the pack shim first saves retbuf out of R0,
+// then drops both retbuf and data (dstBase=0, srcBase=2).
+func shimShiftArgsDown(a @asm.Assembler, nWords int, dstBase int, srcBase int) {
 	for w := 0; w < nWords; w++ {
-		arm32.Mov(a, arm32.COND_AL, false, argReg(dropIdx + w),
-			arm32.Reg(argReg(dropIdx + 1 + w)))
+		arm32.Mov(a, arm32.COND_AL, false, argReg(dstBase + w),
+			arm32.Reg(argReg(srcBase + w)))
 	}
 }
 
 // emitFuncValueShimBody classifies the func value's return shape and emits the
 // matching shim.  A big (>InternalSretBytes = 4) aggregate return goes through
-// the AAPCS32 R0-sret path (emitSretShim); void, a scalar/pointer, or a 64-bit
-// pair return (r0:r1) — none of which the shim touches — go through
-// emitScalarVoidShim.  A float-scalar return (P5) or a SMALL (<=4-byte)
-// in-register aggregate return (P4-b — it comes back by value in R0, needing the
-// in-register pack the direct-call path also defers) fails LOUDLY.
+// the AAPCS32 R0-sret path (emitSretShim); a SMALL (<=4-byte) aggregate return
+// goes through the pack shim (emitPackShim — it comes back by value in R0, which
+// the shim stores through the retbuf); void, a scalar/pointer, or a 64-bit pair
+// return (r0:r1) — none of which the shim touches — go through emitScalarVoidShim.
+// Only a float-scalar return (P5) still fails LOUDLY.
 func emitFuncValueShimBody(a @asm.Assembler, fnLabel @[]char,
 		fvTyp @types.Type) {
 	if len(fvTyp.Results) == 1 && fvTyp.Results[0] != nil {
@@ -327,13 +330,16 @@ func emitFuncValueShimBody(a @asm.Assembler, fnLabel @[]char,
 		}
 		if common.IsAggregateTyp(rt) {
 			var cc common.CallConv = common.AAPCS32()
-			if rt.SizeOf() <= cc.InternalSretBytes {
-				a.SetError("native arm32: func-value shim with a small "
-					"(<=4-byte) in-register aggregate return not implemented "
-					"(P4-b)")
-				return
+			if rt.SizeOf() > cc.InternalSretBytes {
+				// Big aggregate (>4 bytes): returned through the R0 sret buffer —
+				// tail-branch shim (retbuf stays in R0).
+				emitSretShim(a, fnLabel, fvTyp)
+			} else {
+				// Small aggregate (<=4 bytes): returned BY VALUE in R0 — the pack
+				// shim calls the underlying and stores the returned word through
+				// the retbuf.
+				emitPackShim(a, fnLabel, fvTyp)
 			}
-			emitSretShim(a, fnLabel, fvTyp)
 			return
 		}
 	}
@@ -357,7 +363,7 @@ func emitScalarVoidShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 			"stack spill (P4)")
 		return
 	}
-	shimShiftArgsDown(a, nWords, 0)
+	shimShiftArgsDown(a, nWords, 0, 1)
 	a.SetGlobal(fnLabel)
 	arm32.B(a, arm32.COND_AL, fnLabel)
 }
@@ -380,9 +386,58 @@ func emitSretShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 			"needs stack spill (P4)")
 		return
 	}
-	shimShiftArgsDown(a, nWords, 1)
+	shimShiftArgsDown(a, nWords, 1, 2)
 	a.SetGlobal(fnLabel)
 	arm32.B(a, arm32.COND_AL, fnLabel)
+}
+
+// emitPackShim emits the small (<=InternalSretBytes = 4) in-register aggregate
+// return shim.  Unlike the tail-branch scalar/sret shims, a packed return needs
+// a real call: the underlying function returns the aggregate BY VALUE in R0 (one
+// word for a <=4-byte result), which the shim must then store through the retbuf.
+// It is entered under the aggregate-return dispatch ABI as
+// `void(retbuf=R0, data=R1, args=R2..)`; it saves retbuf in R4 (callee-saved, so
+// the underlying call preserves it — and the push restores the caller's R4),
+// drops retbuf + data by shifting user args R2.. down to R0.., BLs the
+// underlying, stores the returned R0 word through retbuf, and returns.  Mirrors
+// x64/aarch64's usePack shim, with arm32's explicit push/pop frame (no red zone).
+// Over-budget arg counts (needing a stack-spill shim) fail LOUDLY (P4).
+func emitPackShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
+	var cc common.CallConv = common.AAPCS32()
+	var nWords int = shimUserArgWords(a, cc, fvTyp)
+	if nWords < 0 { return }
+	if nWords > SHIM_ARG_REG_BUDGET - 1 {
+		a.SetError("native arm32: func-value pack shim with too many arg words "
+			"needs stack spill (P4)")
+		return
+	}
+	// push {r4, lr}: save the caller's R4 (reused for retbuf) and LR (the BL
+	// clobbers it).  Two registers keep SP 8-aligned across the call (AAPCS32).
+	arm32.Push(a, arm32.COND_AL, packShimPushMask())
+	// retbuf (R0) -> R4: survives the BL (R4 is callee-saved).
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R4, arm32.Reg(arm32.R0))
+	// Drop retbuf + data; shift user args R2.. down to R0.. (the underlying is a
+	// small-aggregate function — it returns by value, so it has no sret arg).
+	shimShiftArgsDown(a, nWords, 0, 2)
+	a.SetGlobal(fnLabel)
+	arm32.Bl(a, arm32.COND_AL, fnLabel)
+	// The underlying returned the <=4-byte aggregate by value in R0 (one word);
+	// store it through the retbuf.
+	arm32.Str(a, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R4, 0))
+	// pop {r4, pc}: restore the caller's R4 and return (writing PC).
+	arm32.Pop(a, arm32.COND_AL, packShimPopMask())
+}
+
+// packShimPushMask is the {r4, lr} register mask (bit i = register i) for the
+// pack shim's entry push: save the caller's R4 (reused to hold the retbuf) and LR.
+func packShimPushMask() int {
+	return (1 << arm32.R4) | (1 << arm32.LR)
+}
+
+// packShimPopMask is the {r4, pc} register mask for the pack shim's exit pop:
+// restore the caller's R4 and load the saved LR into PC to return.
+func packShimPopMask() int {
+	return (1 << arm32.R4) | (1 << arm32.PC)
 }
 
 // emitFuncValue lowers OP_FUNC_VALUE — function-value construction.  It builds

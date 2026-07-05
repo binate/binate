@@ -98,16 +98,22 @@ func emitCallIndirect(a @asm.Assembler, pkgName *[]readonly char,
 //   args in R1.. (one synthetic prepended slot shifts AAPCS register-start by
 //   one).  The result rides back in R0 / r0:r1.
 //
-//   Big-aggregate return: shim `void(*uint8 retbuf, *uint8 data, <args>)` —
-//   retbuf in R0 (the AAPCS32 sret pointer), data in R1, user args in R2.. (two
-//   synthetic prepended slots).  After the call the retbuf alloc region holds the
-//   result, so it is produced as a region pointer with no register spill.
+//   Aggregate return (big OR small): shim `void(*uint8 retbuf, *uint8 data,
+//   <args>)` — retbuf in R0, data in R1, user args in R2.. (two synthetic
+//   prepended slots).  After the call the retbuf alloc region holds the result
+//   (a big return via the R0 sret buffer; a small one via the pack shim's
+//   store-through-retbuf), so it is produced as a region pointer.
 //
-// A SMALL (<=InternalSretBytes = 4) in-register aggregate return comes back by
-// value in R0 (needing the in-register pack the direct-call path defers, P4-b)
-// and fails LOUDLY here — the shim rejects it too.  A multi-return likewise fails
-// LOUDLY (P4).  Mirrors x64_call_indirect.bn with WordBytes = 4 and IP as the
-// call-target scratch.
+// User args follow the all-int shim ABI: a coerced in-register struct/array
+// (common.AggCoercedInReg) and an indirect-large aggregate both ride BY-ADDRESS
+// as ONE pointer word (the shim re-expands / dereferences it), matching the
+// LLVM-emitted shim of a cross-package func value.  A NON-coerced in-register
+// aggregate (slice / iface-value / managed-slice / func-value) also rides
+// by-address in the shim ABI, but marshaling it that way is not implemented — it
+// fails LOUDLY (a KNOWN pre-existing gap shared with x64/aarch64; see
+// claude-todo.md).  A multi-return, and any SAME-package aggregate/int64-pair arg
+// (fail-loud at SHIM emission), also fail LOUDLY.  Mirrors x64_call_indirect.bn
+// with WordBytes = 4 and IP as the call-target scratch.
 func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char,
 	rm @common.RegMap, allFuncs @[]@ir.Func, ins @ir.Instr) {
 	if len(ins.Args) < 1 {
@@ -119,21 +125,19 @@ func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char,
 			"implemented (P4)")
 		return
 	}
-	// A big (>4-byte) aggregate return rides the retbuf-in-R0 convention; a small
-	// (<=4-byte) one comes back by value in R0 and needs the in-register pack
-	// (P4-b) — reject it before emitting a half-call, matching the direct-call
-	// path (arm32_call.bn) and the shim (arm32_funcvalue.bn).
+	// Both a big (>4-byte) and a small (<=4-byte) aggregate return ride the
+	// retbuf-in-R0 convention on the CONSUMER side: pass a retbuf in R0 and read
+	// the result from the retbuf region post-call.  The SHIM differs by size (a
+	// big return tail-branches through the R0 sret buffer; a small return's pack
+	// shim stores the by-value R0 word through the retbuf), but the consumer is
+	// identical.  Mirrors x64/aarch64, which also treat both aggregate sizes
+	// uniformly here.
 	var aggregateRet bool = ins.ID >= 0 && ins.Typ != nil &&
 		common.IsAggregateTyp(ins.Typ) && !common.IsMultiReturnCall(ins)
-	if aggregateRet && !rm.CC.CallReturnsBigAggregate(ins) {
-		a.SetError("native arm32: small (<=4-byte) in-register aggregate "
-			"func-value call return not implemented (P4-b)")
-		return
-	}
 
 	// Prepend synthetic slots for the shim's leading args: 1 (data) for a scalar
-	// return, 2 (retbuf + data) for a big-aggregate return.  prefixSlots is also
-	// the AAPCS32 reg offset for user args.
+	// return, 2 (retbuf + data) for an aggregate return.  prefixSlots is also the
+	// AAPCS32 reg offset for user args.
 	var prefixSlots int = 1
 	if aggregateRet { prefixSlots = 2 }
 
@@ -145,13 +149,19 @@ func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char,
 	}
 	for i := 0; i < nCallArgs; i++ {
 		var at @types.Type = ins.Args[i + 1].Typ
-		// Match callDispatchArgTypesAnyOp's shim-ABI substitution so arg
-		// placement agrees with PlanFrame's outgoing-args sizing.  AAPCS32 does
-		// not set NaturalSizeStackArgs, so only a float scalar is substituted to
-		// a 1-word pointer (and a float arg fails loud in emitCallArg anyway —
-		// P5); a narrow scalar keeps its type, and an aggregate arg rides
-		// emitCallArg's aggregate path (the shim then fail-louds it — P4).
-		if common.IsFloatScalarTyp(at) {
+		// All-int shim-ABI substitution.  A float scalar rides a GP dispatch word
+		// (the shim re-marshals it into the FP file — but a float arg fails loud in
+		// emitCallArg anyway, P5).  A coerced in-register struct/array rides the
+		// dispatch BY-ADDRESS as ONE pointer word (the shim loads + re-expands it),
+		// so its slot is a single *uint8 — NOT its ArgWords value-word expansion.
+		// This is common.EffectiveArgWords's rule; it makes CallArgRegStart place
+		// the by-address pointer at the right register.  (A narrow scalar keeps its
+		// type — AAPCS32 does not set NaturalSizeStackArgs.  An indirect-large
+		// aggregate keeps its type and rides emitAggregateArg below, which passes
+		// it as one pointer — matching the shim.  A non-coerced in-register
+		// aggregate — slice / iface-value / managed-slice — is fail-louded in the
+		// arg loop below, so it never reaches a mismatched spread here.)
+		if common.IsFloatScalarTyp(at) || common.AggCoercedInReg(at) {
 			at = types.MakePointerType(types.TypUint8())
 		}
 		argTypes[i + prefixSlots] = at
@@ -161,7 +171,53 @@ func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char,
 	// whose source reg is R0 / R1 is read before the retbuf / data loads
 	// overwrite those registers.
 	for ai := 0; ai < nCallArgs; ai++ {
-		emitCallArg(a, pkgName, rm, argTypes, ins.Args[ai + 1], ai + prefixSlots)
+		var arg @ir.Instr = ins.Args[ai + 1]
+		if common.IsAggregateTyp(arg.Typ) {
+			// A coerced in-register struct/array rides the shim ABI BY-ADDRESS:
+			// pass its data-region pointer in ONE dispatch word (reg or stack) —
+			// NOT its inline value-words (emitCallArg's direct-call marshaling,
+			// which the shim would mis-read as a pointer).
+			if common.AggCoercedInReg(arg.Typ) {
+				var regStart int = rm.CC.CallArgRegStart(argTypes,
+					ai + prefixSlots)
+				var stackOff int = rm.CC.CallArgStackOff(argTypes,
+					ai + prefixSlots)
+				var ptr int = getOperand(a, rm, arg.ID)
+				if ptr < 0 {
+					a.SetError("native arm32: func-value aggregate arg not "
+						"materializable (P4)")
+					return
+				}
+				if regStart >= 0 {
+					if ptr != argReg(regStart) {
+						arm32.Mov(a, arm32.COND_AL, false, argReg(regStart),
+							arm32.Reg(ptr))
+					}
+				} else if stackOff >= 0 {
+					arm32.Str(a, arm32.COND_AL, ptr,
+						arm32.MemImm(arm32.SP, stackOff))
+				}
+				rm.ResetRegs()
+				continue
+			}
+			// A NON-coerced in-register aggregate (slice / managed-slice /
+			// iface-value / func-value / anon struct, SizeOf <= AggregateInRegMax)
+			// also rides the shim ABI by-address (the LLVM cross-pkg shim declares
+			// it i8* and dereferences it), but emitCallArg would SPREAD its inline
+			// words — a mismatch that silently miscompiles a cross-package call.
+			// Marshaling these by-address is deferred (a KNOWN pre-existing gap
+			// shared with x64/aarch64 — see claude-todo.md), so fail LOUDLY rather
+			// than emit the wrong (spread) marshaling.  An indirect-large aggregate
+			// (> AggregateInRegMax) is exempt: emitCallArg -> emitAggregateArg
+			// passes it as one pointer, which DOES match the shim.
+			if arg.Typ.SizeOf() <= rm.CC.AggregateInRegMax {
+				a.SetError("native arm32: func-value call with a non-coerced "
+					"in-register aggregate arg (slice / iface-value / "
+					"managed-slice) not implemented (P4)")
+				return
+			}
+		}
+		emitCallArg(a, pkgName, rm, argTypes, arg, ai + prefixSlots)
 		if a.HasError { return }
 		rm.ResetRegs()
 	}

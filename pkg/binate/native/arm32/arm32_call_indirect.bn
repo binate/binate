@@ -92,17 +92,20 @@ func emitCallIndirect(a @asm.Assembler, pkgName *[]readonly char,
 // emitCallFuncValue lowers OP_CALL_FUNC_VALUE (and, via dispatch, OP_CALL_HANDLE:
 // a handle and a constructed func value share the {vtable, data} layout).  The
 // call goes through vtable.call — always the marshaling shim (Phase 3 of
-// plan-function-values.md).  Two shim shapes, by return type:
+// plan-function-values.md).  The shim shape depends on the return type:
 //
-//   Scalar / void return: shim `<ret>(*uint8 data, <args>)` — data in R0, user
-//   args in R1.. (one synthetic prepended slot shifts AAPCS register-start by
-//   one).  The result rides back in R0 / r0:r1.
+//   Scalar / void / SMALL multi-return: shim `<ret>(*uint8 data, <args>)` — data
+//   in R0, user args in R1.. (one synthetic prepended slot shifts AAPCS
+//   register-start by one).  A scalar result rides back in R0 / r0:r1; a small
+//   multi-return tuple comes back field-per-register in r0..r3 and is collected
+//   into the spill slot (collectMultiReturnFields).
 //
-//   Aggregate return (big OR small): shim `void(*uint8 retbuf, *uint8 data,
-//   <args>)` — retbuf in R0, data in R1, user args in R2.. (two synthetic
-//   prepended slots).  After the call the retbuf alloc region holds the result
-//   (a big return via the R0 sret buffer; a small one via the pack shim's
-//   store-through-retbuf), so it is produced as a region pointer.
+//   Single aggregate return (big OR small) / BIG multi-return: shim `void(*uint8
+//   retbuf, *uint8 data, <args>)` — retbuf in R0, data in R1, user args in R2..
+//   (two synthetic prepended slots).  After the call the retbuf region holds the
+//   result (a single big return / big multi-return via the R0 sret buffer; a
+//   small single aggregate via the pack shim's store-through-retbuf), so it is
+//   produced as a region pointer / spill slot.
 //
 // User args follow the all-int shim ABI: a coerced in-register struct/array
 // (common.AggCoercedInReg) and an indirect-large aggregate both ride BY-ADDRESS
@@ -111,35 +114,37 @@ func emitCallIndirect(a @asm.Assembler, pkgName *[]readonly char,
 // aggregate (slice / iface-value / managed-slice / func-value) also rides
 // by-address in the shim ABI, but marshaling it that way is not implemented — it
 // fails LOUDLY (a KNOWN pre-existing gap shared with x64/aarch64; see
-// claude-todo.md).  A multi-return, and any SAME-package aggregate/int64-pair arg
-// (fail-loud at SHIM emission), also fail LOUDLY.  Mirrors x64_call_indirect.bn
-// with WordBytes = 4 and IP as the call-target scratch.
+// claude-todo.md).  Any SAME-package aggregate/int64-pair arg (fail-loud at SHIM
+// emission) fails LOUDLY.  Mirrors x64_call_indirect.bn with WordBytes = 4 and IP
+// as the call-target scratch.
 func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char,
 	rm @common.RegMap, allFuncs @[]@ir.Func, ins @ir.Instr) {
 	if len(ins.Args) < 1 {
 		a.SetError("native arm32: func-value call with no target (P4)")
 		return
 	}
-	if ins.ID >= 0 && common.IsMultiReturnCall(ins) {
-		a.SetError("native arm32: multi-return func-value call collection not "
-			"implemented (P4)")
-		return
-	}
-	// Both a big (>4-byte) and a small (<=4-byte) aggregate return ride the
-	// retbuf-in-R0 convention on the CONSUMER side: pass a retbuf in R0 and read
-	// the result from the retbuf region post-call.  The SHIM differs by size (a
-	// big return tail-branches through the R0 sret buffer; a small return's pack
-	// shim stores the by-value R0 word through the retbuf), but the consumer is
-	// identical.  Mirrors x64/aarch64, which also treat both aggregate sizes
+	// Both a big (>4-byte) and a small (<=4-byte) single aggregate return ride
+	// the retbuf-in-R0 convention on the CONSUMER side: pass a retbuf in R0 and
+	// read the result from the retbuf region post-call.  The SHIM differs by size
+	// (a big return tail-branches through the R0 sret buffer; a small return's
+	// pack shim stores the by-value R0 word through the retbuf), but the consumer
+	// is identical.  Mirrors x64/aarch64, which also treat both aggregate sizes
 	// uniformly here.
 	var aggregateRet bool = ins.ID >= 0 && ins.Typ != nil &&
 		common.IsAggregateTyp(ins.Typ) && !common.IsMultiReturnCall(ins)
+	// A BIG multi-return tuple (gpWords > 4) also rides the retbuf-in-R0
+	// convention: the shim tail-branches with the retbuf in R0 (AAPCS32 sret),
+	// the underlying writes each field through it, and the consumer produces the
+	// spill-slot pointer post-call.  A SMALL multi-return needs no retbuf — it
+	// comes back field-per-register in r0..r3 (collectMultiReturnFields).
+	var bigMultiRet bool = ins.ID >= 0 && rm.CC.CallReturnsBigMultiReturn(ins)
 
 	// Prepend synthetic slots for the shim's leading args: 1 (data) for a scalar
-	// return, 2 (retbuf + data) for an aggregate return.  prefixSlots is also the
-	// AAPCS32 reg offset for user args.
+	// / small-multi-return, 2 (retbuf + data) for a single aggregate OR big
+	// multi-return.  prefixSlots is also the AAPCS32 reg offset for user args.
+	var useRetbuf bool = aggregateRet || bigMultiRet
 	var prefixSlots int = 1
-	if aggregateRet { prefixSlots = 2 }
+	if useRetbuf { prefixSlots = 2 }
 
 	var nCallArgs int = len(ins.Args) - 1
 	var argTypes @[]@types.Type =
@@ -232,8 +237,15 @@ func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char,
 
 	// Place the shim's leading args into R0/R1.  emitFrameAddr uses IP as its
 	// scratch, so do this BEFORE loading the call target into IP.
-	if aggregateRet {
-		var retbufOff int = rm.LookupAlloc(ins.ID)
+	if useRetbuf {
+		// A single aggregate lands in the alloc data region; a big multi-return
+		// tuple lands in the spill slot (PlanFrame sized it to the full tuple).
+		var retbufOff int = -1
+		if bigMultiRet {
+			retbufOff = rm.LookupSpill(ins.ID)
+		} else {
+			retbufOff = rm.LookupAlloc(ins.ID)
+		}
 		if retbufOff < 0 { return }
 		// R0 = &retbuf (the AAPCS32 sret pointer the shim writes through).
 		emitFrameAddr(a, arm32.R0, retbufOff)
@@ -262,7 +274,7 @@ func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char,
 	rm.ResetRegs()
 	if ins.ID < 0 { return }
 
-	// Big-aggregate return: the shim wrote the result through the retbuf we
+	// Single-aggregate return: the shim wrote the result through the retbuf we
 	// passed in R0, so just produce the alloc-region pointer as the result.
 	if aggregateRet {
 		var dataOff int = rm.LookupAlloc(ins.ID)
@@ -271,10 +283,20 @@ func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char,
 		emitFrameAddr(a, rd, dataOff)
 		return
 	}
+	// Multi-return tuple: a big tuple was already written through the R0 retbuf
+	// into its spill slot (nothing to collect — just leave the slot as the
+	// result); a small tuple comes back field-per-register in r0..r3.
+	if ins.ID >= 0 && common.IsMultiReturnCall(ins) {
+		if bigMultiRet { return }
+		var spillOff int = rm.LookupSpill(ins.ID)
+		if spillOff < 0 { return }
+		collectMultiReturnFields(a, rm, ins, spillOff)
+		return
+	}
 	// Scalar / void / 64-bit-pair return: the all-int shim ABI returns the value
 	// in R0 / r0:r1 (a float result would come back in R0 too, but float returns
 	// fail loud upstream), so emitCallReturn's R0 / r0:r1 store is exactly right.
-	// The aggregate return was handled above, so emitCallReturn sees only the
-	// scalar shapes here.
+	// The aggregate / multi-return shapes were handled above, so emitCallReturn
+	// sees only the scalar shapes here.
 	emitCallReturn(a, rm, allFuncs, ins)
 }

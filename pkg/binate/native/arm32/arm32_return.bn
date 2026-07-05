@@ -8,28 +8,36 @@ import "pkg/binate/native/common"
 // emitReturn lowers OP_RETURN on ARM32.  Sret-returning functions come FIRST:
 // when PlanFrame set SretSlotOff >= 0, the callee received a hidden buffer
 // pointer in R0 (stashed at SP+SretSlotOff by emitFunc) and must write the
-// result through it, then return the pointer in R0 per AAPCS32.  Only a single
-// aggregate return is implemented (emitSretReturn); a big MULTI-return that also
-// set SretSlotOff fails LOUDLY (P4).  For non-sret returns: a void return tears
-// down the frame; a single integer/pointer scalar returns in R0; a 64-bit-pair
-// scalar returns in r0:r1; a float scalar (soft-float) fails LOUDLY; and a SMALL
-// aggregate (SizeOf <= InternalSretBytes = 4 — e.g. a 4-byte struct) is returned
-// BY VALUE in R0 via a one-word pack load (the AAPCS32 in-register return, the
-// analogue of x64's emitAggregateReturnPack).  Mirrors x64_return.bn's shape
-// (WordBytes = 4).
+// result through it, then return the pointer in R0 per AAPCS32.  A single
+// aggregate return uses emitSretReturn; a BIG multi-return tuple (gpWords > 4)
+// that also set SretSlotOff uses emitMultiReturnSret (per-field write-through at
+// the tuple's FieldOffsets).  For non-sret returns: a void return tears down the
+// frame; an IN-REGISTER multi-return (gpWords <= 4) packs its fields field-per-
+// register into r0..r3 (emitMultiReturnPack); a single integer/pointer scalar
+// returns in R0; a 64-bit-pair scalar returns in r0:r1; a float scalar
+// (soft-float) fails LOUDLY; and a SMALL aggregate (SizeOf <= InternalSretBytes =
+// 4 — e.g. a 4-byte struct) is returned BY VALUE in R0 via a one-word pack load
+// (the AAPCS32 in-register return, the analogue of x64's emitAggregateReturnPack).
+// Mirrors aarch64_return.bn's shape (WordBytes = 4, NumGpRetRegs = 4, no FP file).
 func emitReturn(a @asm.Assembler, pkgName *[]readonly char,
 	rm @common.RegMap, ins @ir.Instr) {
 	// Sret-returning function: the callee writes the result through the hidden
 	// R0 buffer (stashed by emitFunc at SretSlotOff), then returns the buffer
-	// pointer in R0.  Only a single-aggregate return is handled; a big
-	// multi-return tuple (which also sets SretSlotOff) is deferred (P4).
+	// pointer in R0.  A single-aggregate return writes contiguously; a big
+	// multi-return tuple (which also sets SretSlotOff) writes each field at its
+	// tuple FieldOffset.
 	if rm.SretSlotOff >= 0 {
 		if len(ins.Args) == 1 && common.IsAggregateTyp(ins.Args[0].Typ) {
 			emitSretReturn(a, rm, ins)
 			emitEpilogueAndRet(a, rm.FrameSize())
 			return
 		}
-		a.SetError("native arm32: multi-return sret not implemented (P4)")
+		if rm.MultiReturnType != nil && len(ins.Args) > 1 {
+			emitMultiReturnSret(a, pkgName, rm, ins)
+			emitEpilogueAndRet(a, rm.FrameSize())
+			return
+		}
+		a.SetError("native arm32: sret return shape not implemented (P4)")
 		return
 	}
 	if len(ins.Args) == 0 {
@@ -38,9 +46,10 @@ func emitReturn(a @asm.Assembler, pkgName *[]readonly char,
 		return
 	}
 	if len(ins.Args) != 1 {
-		// Multi-value tuple return (needs the return-marshaling / sret
-		// machinery).  Falling through would return garbage R0, so fail LOUDLY.
-		a.SetError("native arm32: multi-value return not implemented (P4)")
+		// In-register multi-return tuple (gpWords <= 4, so it was NOT given an
+		// sret slot above): pack each field field-per-register into r0..r3.
+		emitMultiReturnPack(a, pkgName, rm, ins)
+		emitEpilogueAndRet(a, rm.FrameSize())
 		return
 	}
 	if common.IsFloatScalarTyp(ins.Args[0].Typ) {
@@ -109,5 +118,107 @@ func emitSretReturn(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
 	}
 	// AAPCS32 requires an sret-returning function to return the buffer pointer
 	// in R0.  Reload it (the memcpy scratches never touched R0).
+	emitFrameLoad(a, arm32.R0, rm.SretSlotOff)
+}
+
+// emitMultiReturnPack packs an IN-REGISTER multi-return tuple (gpWords <= 4)
+// into r0..r3 field-per-register, per the AAPCS32 convention LLVM lowers a
+// first-class-struct return by: each field's words fill consecutive GP return
+// registers in field order (soft-float folds float fields into GP too — there is
+// no FP file, so unlike aarch64's ngrn/nsrn split this uses a single retGp
+// counter).  An aggregate field spreads its ArgWords words to argReg(retGp)++ (
+// loaded from its data region at WordBytes*w); a ONE-WORD scalar / pointer /
+// float32-bits field loads into argReg(retGp), retGp++.  The retGp < NumGpRetRegs
+// (4) guard matches MultiReturnTupleNeedsSret's budget: an over-budget tuple was
+// routed to sret (emitMultiReturnSret) instead, so the guard never drops a live
+// field.  A MULTI-WORD scalar field — an int64, or a soft-float float64, each an
+// even-aligned register PAIR whose AAPCS32 placement in the return sequence is
+// not pinned by conformance / the register-count predicate — fails LOUDLY rather
+// than guess (native<->LLVM parity), matching the caller-collect + sret paths
+// (which fail-loud it via emitScalarStore's sz==8 guard).  Mirrors
+// aarch64_return.bn's small-multi-return pack (WordBytes = 4).
+func emitMultiReturnPack(a @asm.Assembler, pkgName *[]readonly char,
+		rm @common.RegMap, ins @ir.Instr) {
+	var w int = wordBytes()
+	var retGp int = 0
+	for ai := 0; ai < len(ins.Args); ai++ {
+		var arg @ir.Instr = ins.Args[ai]
+		if common.IsAggregateTyp(arg.Typ) {
+			var ptr int = getOperand(a, rm, arg.ID)
+			if ptr >= 0 {
+				var nWords int = rm.CC.ArgWords(arg.Typ)
+				for wi := 0; wi < nWords && retGp < rm.CC.NumGpRetRegs; wi++ {
+					arm32.Ldr(a, arm32.COND_AL, argReg(retGp),
+						arm32.MemImm(ptr, w * wi))
+					retGp = retGp + 1
+				}
+			}
+		} else if rm.CC.ArgWords(arg.Typ) != 1 {
+			// A MULTI-WORD scalar field — an int64, or (on soft-float) a float64,
+			// each a register PAIR on ILP32 — needs an even-aligned pair whose
+			// placement in the return-register sequence is NOT pinned by
+			// conformance / MultiReturnTupleNeedsSret (a word-count rule); fail
+			// LOUDLY rather than guess (native<->LLVM parity).  A 1-word scalar
+			// (int32 / bool / pointer / float32 bits) takes the plain-Mov else.
+			a.SetError("native arm32: in-register multi-return with a multi-word "
+				"(int64 / float64) scalar field not implemented (P4)")
+			return
+		} else {
+			var src int = emitValOperand(a, pkgName, rm, arg)
+			if src >= 0 && retGp < rm.CC.NumGpRetRegs {
+				if src != argReg(retGp) {
+					arm32.Mov(a, arm32.COND_AL, false, argReg(retGp),
+						arm32.Reg(src))
+				}
+				retGp = retGp + 1
+			}
+		}
+		// Each field's scratch regs are dead once loaded into their return
+		// register; reset so a long tuple doesn't saturate the R4..R10 pool.
+		rm.ResetRegs()
+	}
+}
+
+// emitMultiReturnSret writes a BIG multi-return tuple (gpWords > 4) through the
+// hidden sret buffer pointer the caller stashed at SP+SretSlotOff (emitFunc saved
+// the incoming R0 there), placing each field at its tuple FieldOffset, then
+// reloads R0 = buffer pointer LAST (AAPCS32 returns the sret ptr in R0).  Within
+// an aggregate field the words stride by WordBytes = 4; a scalar field uses a
+// sized store so a sub-word field (uint16 / bool) doesn't clobber its neighbor.
+// The buffer pointer is reloaded from the sret slot each iteration into a fresh
+// scratch (the per-field ResetRegs would otherwise strand it), mirroring
+// aarch64_return.bn's sret multi-return arm (WordBytes = 4).  A multi-word
+// (int64) scalar field fails LOUDLY via emitScalarStore's sized-store guard.
+func emitMultiReturnSret(a @asm.Assembler, pkgName *[]readonly char,
+		rm @common.RegMap, ins @ir.Instr) {
+	var w int = wordBytes()
+	for ai := 0; ai < len(ins.Args); ai++ {
+		var dstPtr int = scratchReg(rm)
+		emitFrameLoad(a, dstPtr, rm.SretSlotOff)
+		var arg @ir.Instr = ins.Args[ai]
+		var fldOff int = rm.MultiReturnType.FieldOffset(ai)
+		if common.IsAggregateTyp(arg.Typ) {
+			var ptr int = getOperand(a, rm, arg.ID)
+			if ptr >= 0 {
+				var nWords int = rm.CC.ArgWords(arg.Typ)
+				var tmp int = scratchReg(rm)
+				for wi := 0; wi < nWords; wi++ {
+					arm32.Ldr(a, arm32.COND_AL, tmp, arm32.MemImm(ptr, w * wi))
+					arm32.Str(a, arm32.COND_AL, tmp,
+						arm32.MemImm(dstPtr, fldOff + w * wi))
+				}
+			}
+		} else {
+			var src int = emitValOperand(a, pkgName, rm, arg)
+			if src >= 0 {
+				var sz int = arg.Typ.SizeOf()
+				if sz <= 0 { sz = w }
+				emitScalarStore(a, src, dstPtr, fldOff, sz)
+			}
+		}
+		// Reload R0 = buffer pointer LAST (after every field is written), so the
+		// per-field scratches (dstPtr, ptr/src, tmp — all R4..) never clobber it.
+		rm.ResetRegs()
+	}
 	emitFrameLoad(a, arm32.R0, rm.SretSlotOff)
 }

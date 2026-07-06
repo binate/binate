@@ -1,6 +1,10 @@
 package "pkg/binate/ir"
 
 import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/types"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
 
 // IR generation for methods on generic types (`gen.method.generic-recv`) and
 // parameterized-receiver impls (`gen.impl.generic-recv`).  A method whose
@@ -39,4 +43,146 @@ func receiverGenericInstBase(te @ast.TypeExpr) @ast.TypeExpr {
 // the declaration-time concrete-method passes and emitted per instantiation.
 func isGenericReceiverMethod(d @ast.Decl) bool {
 	return d.Recv != nil && receiverGenericInstBase(d.Recv.Type) != nil
+}
+
+// genericMethodRecvName returns the generic base type name of a generic-receiver
+// method (`func (it *Cursor[T]) ...` → "Cursor"), used to match a method against
+// the struct instantiation whose methods are being emitted.  Empty if d is not a
+// generic-receiver method.
+func genericMethodRecvName(d @ast.Decl) @[]char {
+	var inst @ast.TypeExpr = receiverGenericInstBase(d.Recv.Type)
+	if inst == nil || inst.Base == nil {
+		var empty @[]char
+		return empty
+	}
+	return inst.Base.Name
+}
+
+// stashGenericMethodDecl records a generic-receiver method decl (with its
+// defining package and file) for later per-instantiation emission.
+func stashGenericMethodDecl(gc @GenCtx, d @ast.Decl, pkg @[]char, file @ast.File) {
+	gc.GenericMethodDecls = slices.Append[@ast.Decl](gc.GenericMethodDecls, d)
+	gc.GenericMethodDeclPkgs = slices.Append[@[]char](gc.GenericMethodDeclPkgs, buf.CopyStr(pkg))
+	gc.GenericMethodDeclFiles = slices.Append[@ast.File](gc.GenericMethodDeclFiles, file)
+}
+
+// joinMethodName builds the IR-level qualified method name for an instantiation:
+// `<struct-inst-name>.<method>` (e.g. `main.Box__bn_inst__int.Get`).  This is
+// exactly the key the direct-call site derives (baseNamedTypeName of the
+// instantiated receiver + "." + method), so the emitted body and the call agree.
+func joinMethodName(structInstName @[]char, methodName @[]char) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(structInstName)
+	cb.Write(".")
+	cb.Write(methodName)
+	return buf.CopyStr(cb.String())
+}
+
+// ensureInstantiatedMethods emits the monomorphized bodies of every method whose
+// receiver is the generic type `structDecl`, for the instantiation `args`, if not
+// already emitted.  Called from ensureInstantiatedStruct once the instantiated
+// struct is registered, so any use of `Cursor[int]` pulls in its methods (deduped
+// via EmittedInstantiations, IsLinkOnce so every consumer's copy merges).
+func ensureInstantiatedMethods(gc @GenCtx, structDecl @ast.Decl, definingPkg @[]char,
+		args @[]@types.Type) {
+	var structInstName @[]char = instantiationMangledName(gc, structDecl, definingPkg, args)
+	for i := 0; i < len(gc.GenericMethodDecls); i++ {
+		if !streq(gc.GenericMethodDeclPkgs[i], definingPkg) {
+			continue
+		}
+		var mdecl @ast.Decl = gc.GenericMethodDecls[i]
+		if !streq(genericMethodRecvName(mdecl), structDecl.Name) {
+			continue
+		}
+		emitInstantiatedMethod(gc, mdecl, structDecl, structInstName, definingPkg, args,
+				gc.GenericMethodDeclFiles[i])
+	}
+}
+
+// emitInstantiatedMethod lowers one generic-receiver method for a concrete
+// instantiation.  It mirrors ensureInstantiated (generic functions): push the
+// type-param substitution context (the receiver binders → concrete args), build a
+// synthetic free-function Decl with the receiver PROMOTED to Params[0] (genFunc
+// ignores Recv), emit via genFunc under the defining file's imports, then override
+// the symbol to the defining-package-qualified `<struct-inst>.<method>` name and
+// register its FuncSig so call sites resolve it.
+func emitInstantiatedMethod(gc @GenCtx, mdecl @ast.Decl, structDecl @ast.Decl,
+		structInstName @[]char, definingPkg @[]char, args @[]@types.Type,
+		defFile @ast.File) {
+	var methodInstName @[]char = joinMethodName(structInstName, mdecl.Name)
+	if instantiationAlreadyEmitted(gc, methodInstName) {
+		return
+	}
+	gc.EmittedInstantiations = slices.Append[@[]char](gc.EmittedInstantiations, methodInstName)
+
+	// Substitution context from the generic TYPE's params (the receiver binders),
+	// not the method's own (methods carry none) — mirror ensureInstantiatedStruct.
+	var savedNames @[]@[]char = gc.CurrentTypeParamNames
+	var savedTypes @[]@types.Type = gc.CurrentTypeParamTypes
+	var newNames @[]@[]char
+	var newTypes @[]@types.Type
+	for i := 0; i < len(structDecl.TypeParams); i++ {
+		newNames = slices.Append[@[]char](newNames, structDecl.TypeParams[i].Name)
+		if i < len(args) {
+			newTypes = slices.Append[@types.Type](newTypes, args[i])
+		} else {
+			newTypes = slices.Append[@types.Type](newTypes, types.TypVoid())
+		}
+	}
+	gc.CurrentTypeParamNames = newNames
+	gc.CurrentTypeParamTypes = newTypes
+
+	// Promote the receiver to Params[0] (genFunc ignores Recv), as genMethod does.
+	var synth @ast.Decl = make(ast.Decl)
+	synth.Kind = ast.DECL_FUNC
+	synth.Pos = mdecl.Pos
+	synth.Name = stripCurrentModuleQualifier(methodInstName)
+	var prepended @[]@ast.ParamDecl = make_slice(@ast.ParamDecl, len(mdecl.Params) + 1)
+	prepended[0] = mdecl.Recv
+	for i := 0; i < len(mdecl.Params); i++ {
+		prepended[i + 1] = mdecl.Params[i]
+	}
+	synth.Params = prepended
+	synth.Results = mdecl.Results
+	synth.Body = mdecl.Body
+
+	// Resolve the body against the defining file's imports + package (empty alias
+	// for a same-package generic, mirroring genCallInstantiate's convention).
+	var savedImportAlias @[]char = gc.Mod.CurrentImportAlias
+	var aliasSnap AliasMapSnapshot = SaveAliasMapState(gc.Mod)
+	if defFile != nil {
+		overlayFileImports(gc.Mod, aliasSnap, defFile)
+	}
+	gc.Mod.CurrentImportAlias = definingAliasFor(gc, definingPkg)
+	var f @Func = genFunc(gc, gc.Mod.Checker, synth)
+	RestoreAliasMapState(gc.Mod, aliasSnap)
+	gc.Mod.CurrentImportAlias = savedImportAlias
+
+	f.Name = buf.CopyStr(methodInstName)
+	f.IsLinkOnce = true
+	gc.Mod.AddFunc(f)
+
+	var sig FuncSig
+	sig.Name = buf.CopyStr(methodInstName)
+	sig.Params = typesOfParams(f.Params)
+	sig.Results = f.Results
+	sig.IsVariadic = declIsVariadic(mdecl)
+	if len(sig.Results) > 1 {
+		sig.MultiReturnType = makeMultiReturnStructType(sig.Results)
+	}
+	gc.Mod.FuncSigs = slices.Append[FuncSig](gc.Mod.FuncSigs, sig)
+
+	gc.CurrentTypeParamNames = savedNames
+	gc.CurrentTypeParamTypes = savedTypes
+}
+
+// definingAliasFor returns the CurrentImportAlias a monomorphized body should
+// resolve unqualified references against: empty for a same-package (local)
+// generic, else the defining package.  Mirrors genCallInstantiate's convention.
+func definingAliasFor(gc @GenCtx, definingPkg @[]char) @[]char {
+	if streq(definingPkg, gc.PkgPath) {
+		var empty @[]char
+		return empty
+	}
+	return definingPkg
 }

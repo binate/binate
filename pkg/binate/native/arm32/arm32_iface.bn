@@ -1,9 +1,11 @@
 package "pkg/binate/native/arm32"
 
 import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
 import "pkg/binate/ir"
 import "pkg/binate/mangle"
 import "pkg/binate/native/common"
+import "pkg/binate/types"
 import "pkg/stdx/slices"
 
 // ============================================================
@@ -230,4 +232,101 @@ func charEqIface(a *[]readonly char, b *[]readonly char) bool {
 		if a[i] != b[i] { return false }
 	}
 	return true
+}
+
+// ============================================================
+// Interface-VALUE construction — emitIfaceValue, emitIfaceUpcast (P4-c.2)
+// ============================================================
+//
+// The pure construction ops: build / rebuild the two-word {data, vtable}
+// interface value in the instruction's pre-allocated alloc region.  Method
+// DISPATCH (OP_CALL_IFACE_METHOD) and the @Iface scope-exit dtor load
+// (OP_IFACE_DTOR) are P4-c.3/.4 and still fail loud in the dispatch tail.
+//
+// The two-word layout is the SHARED types-layer contract (IfaceValueDataOffset =
+// 0, IfaceValueVtableOffset = ptrSize() = 4 on this ILP32 target) so it matches
+// the LLVM backend an arm32-native main links against — do NOT hardcode 8.
+
+// emitIfaceValue lowers OP_IFACE_VALUE — interface-value construction.  Builds
+// the two-word {data, vtable} aggregate (8 bytes on ILP32) in the instruction's
+// pre-allocated data region (PlanFrame reserved it): the data pointer at
+// IfaceValueDataOffset (0), and the vtable global's address at
+// IfaceValueVtableOffset (ptrSize() = 4).  StrVal is the mangled vtable symbol
+// (e.g. `__ivt.bn_V...`) emitImplVtables emits; Args[0] is the data pointer.  The
+// result is a pointer to the data region.  Mirrors aarch64_dispatch.bn's
+// OP_IFACE_VALUE arm with WordBytes = 4 and MOVW/MOVT-ABS (no ADRP) address
+// materialization.
+func emitIfaceValue(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.StrVal) == 0 || len(ins.Args) < 1 { return }
+	var dataOff int = rm.LookupAlloc(ins.ID)
+	if dataOff < 0 { return }
+	var ivtLabel @[]char = symPrefixed(ins.StrVal)
+	// Data ptr -> slot 0.  Read the source register BEFORE allocating scratch
+	// regs so the regmap doesn't recycle it.  A package-global data ptr (`&g`)
+	// is a pseudo-instr with no register (ID -1); materialize its address via
+	// MOVW/MOVT (emitGlobalAddr) — otherwise getOperand returns < 0 and the whole
+	// construction is silently dropped (cf. the aa64 global-ref path).
+	var dataReg int
+	if isGlobalRef(ins.Args[0]) {
+		dataReg = scratchReg(rm)
+		emitGlobalAddr(a, pkgName, dataReg, ins.Args[0])
+	} else {
+		dataReg = getOperand(a, rm, ins.Args[0].ID)
+		if dataReg < 0 { return }
+	}
+	emitBaseStore(a, dataReg, arm32.SP, dataOff + types.IfaceValueDataOffset(), arm32.IP)
+	// Vtable address -> slot 1.  emitSymAddr marks the symbol global and emits the
+	// MOVW/MOVT-ABS reloc pair (arm32's ADRP+ADD analog).
+	var vtTmp int = scratchReg(rm)
+	emitSymAddr(a, vtTmp, ivtLabel)
+	emitBaseStore(a, vtTmp, arm32.SP, dataOff + types.IfaceValueVtableOffset(), arm32.IP)
+	// Produce the data-region pointer as the result.
+	var rd int = nextReg(rm, ins.ID)
+	emitFrameAddr(a, rd, dataOff)
+}
+
+// emitIfaceUpcast lowers OP_IFACE_UPCAST — rebuild an interface value with the
+// source's data pointer and a vtable pointer adjusted to land at the target's
+// nested sub-vtable within the source's concat-laid-out vtable.  The slot offset
+// is statically known per (srcIface, targetIface) pair, precomputed on the instr
+// at IR-gen time (EmitIfaceUpcast); byte offset = offsetSlots * wordBytes() (each
+// vtable slot is one target word = 4 bytes on ILP32, matching the LLVM GEP over
+// i8* elements).  Mirrors aarch64_dispatch.bn's OP_IFACE_UPCAST pointer
+// arithmetic with WordBytes = 4.
+//
+// An INVALID upcast (offsetSlots < 0 — target is not an ancestor of source; the
+// checker should never produce this) fails LOUD via a.SetError, per this
+// backend's fail-loud discipline: adjusting the vtable by a negative slot would
+// walk the pointer one slot BEFORE its base (silent vtable corruption / SIGSEGV).
+// (aa64 panics here; arm32 SetErrors so EmitObject returns false and bnc reports
+// a compile error rather than aborting the compiler.)
+func emitIfaceUpcast(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var dataOff int = rm.LookupAlloc(ins.ID)
+	if dataOff < 0 { return }
+	var srcPtr int = getOperand(a, rm, ins.Args[0].ID)
+	if srcPtr < 0 { return }
+	var offsetSlots int = ins.IfaceUpcastSlotOffset
+	if offsetSlots < 0 {
+		a.SetError(
+				"native arm32: invalid iface upcast (negative vtable slot offset — "
+						"target not an ancestor of source)")
+		return
+	}
+	var byteOff int = offsetSlots * wordBytes()
+	// Data ptr copies straight through: load iv.data (offset 0) from the source,
+	// store it into the result region's data slot.
+	var dataTmp int = scratchReg(rm)
+	arm32.Ldr(a, arm32.COND_AL, dataTmp, arm32.MemImm(srcPtr, types.IfaceValueDataOffset()))
+	emitBaseStore(a, dataTmp, arm32.SP, dataOff + types.IfaceValueDataOffset(), arm32.IP)
+	// New vtable ptr = source.vtable + byteOff.
+	var vtTmp int = scratchReg(rm)
+	arm32.Ldr(a, arm32.COND_AL, vtTmp, arm32.MemImm(srcPtr, types.IfaceValueVtableOffset()))
+	if byteOff > 0 {
+		emitAddImm(a, vtTmp, vtTmp, byteOff, arm32.IP)
+	}
+	emitBaseStore(a, vtTmp, arm32.SP, dataOff + types.IfaceValueVtableOffset(), arm32.IP)
+	// Produce the data-region pointer as the result.
+	var rd int = nextReg(rm, ins.ID)
+	emitFrameAddr(a, rd, dataOff)
 }

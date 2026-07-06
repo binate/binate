@@ -83,6 +83,48 @@ func (cc CallConv) EffectiveArgWords(t @types.Type) int {
 // language-level ABI decision shared by the LLVM backend and the native backends,
 // so both consult one source of truth (see explorations/ir-backend-guidelines.md).
 
+// PassesSseInRegs reports whether t is a SysV-AMD64 <=16-byte SSE aggregate
+// passed with its eightbytes split across the two register files by class — each
+// SSE eightbyte in an XMM arg reg, each INTEGER eightbyte in a GP arg reg.  The
+// arg-side analogue of ReturnsSseInRegs, used by the native x64 arg emitter to
+// pick the SSE placement over the plain GP one.  Gated on cc.SseAggregates
+// (= types.SysVSseInRegs()), so dormant until the x64 SSE gate flips.
+func (cc CallConv) PassesSseInRegs(t @types.Type) bool {
+	return cc.SseAggregates && cc.NumFpArgRegs > 0 && types.SysVAggHasSse(t)
+}
+
+// sysvSseAggEightbyteCounts returns (intCount, sseCount): how many of SysV-SSE
+// aggregate t's eightbytes are INTEGER-class (GP arg reg) vs SSE-class (XMM arg
+// reg).  Since t is <=16 B (at most 2 eightbytes) with at least one SSE eightbyte,
+// intCount is 0 or 1 and sseCount is 1 or 2.
+func sysvSseAggEightbyteCounts(t @types.Type) (int, int) {
+	var cl @[]int = types.SysVClassify(t)
+	var intCount int = 0
+	var sseCount int = 0
+	for i := 0; i < len(cl); i++ {
+		if cl[i] == types.EB_SSE {
+			sseCount = sseCount + 1
+		} else {
+			intCount = intCount + 1
+		}
+	}
+	return intCount, sseCount
+}
+
+// sysvSseAggFitsInRegs reports whether SysV-SSE aggregate t rides registers given
+// the running GP/FP cursors.  SysV passes a <=16 B aggregate in registers only if
+// ALL its eightbytes fit — enough GP regs for the INTEGER eightbytes AND enough
+// XMM regs for the SSE eightbytes; otherwise the WHOLE aggregate goes to MEMORY
+// and NEITHER cursor advances (later, smaller args can still take the leftover
+// registers).  The classifier (argRegWordsStackWords) and the FP-cursor advance
+// (advanceNsrn) both consult this ONE predicate so their all-or-nothing decisions
+// — which span both files and so cannot be re-derived from a single cursor — never
+// diverge.
+func (cc CallConv) sysvSseAggFitsInRegs(t @types.Type, ngrn int, nsrn int) bool {
+	intCount, sseCount := sysvSseAggEightbyteCounts(t)
+	return ngrn + intCount <= cc.NumGpArgRegs && nsrn + sseCount <= cc.NumFpArgRegs
+}
+
 // Float scalars are passed in FP arg registers tracked by a separate NSRN
 // counter, so they never take a GP reg.  While the FP file has room
 // (nsrn < NumFpArgRegs) a float reports (-1, 0, 0) — no GP, no stack.  Once the
@@ -111,6 +153,23 @@ func (cc CallConv) argRegWordsStackWords(t @types.Type, ngrn int, nsrn int) (int
 			if nsrn + hn <= cc.NumFpArgRegs { return -1, 0, 0 }
 			return -1, 0, cc.ArgWords(t)
 		}
+	}
+	// SysV-AMD64 SSE aggregate (§3.2.3): a <=16 B float aggregate whose
+	// eightbytes ride registers by class — each INTEGER eightbyte a GP arg reg
+	// (from ngrn), each SSE eightbyte an XMM arg reg (from nsrn, advanced
+	// separately).  All-or-nothing: when every eightbyte fits its file the
+	// aggregate is in-register (the INTEGER eightbytes consume intCount GP regs
+	// at ngrn — reported here; the SSE eightbytes are accounted by advanceNsrn,
+	// no stack); otherwise the WHOLE aggregate goes to MEMORY like a >16 B one,
+	// ngrn/nsrn unchanged.  On LP64 (x64) no even-pair pad applies, so the GP
+	// span starts at ngrn.  Dormant while cc.SseAggregates is off.
+	if cc.PassesSseInRegs(t) {
+		intCount, _ := sysvSseAggEightbyteCounts(t)
+		if cc.sysvSseAggFitsInRegs(t, ngrn, nsrn) {
+			if intCount > 0 { return ngrn, intCount, 0 }
+			return -1, 0, 0
+		}
+		return -1, 0, cc.ArgWords(t)
 	}
 	var w int = cc.ArgWords(t)
 	var agg bool = IsAggregateTyp(t)
@@ -183,11 +242,16 @@ func (cc CallConv) advanceNgrn(t @types.Type, ngrn int, rs int, rw int, sw int) 
 	return ngrn + rw
 }
 
-// advanceNsrn returns the NSRN (next FP arg register index) after arg t.  A
+// advanceNsrn returns the NSRN (next FP arg register index) after arg t, given
+// the running ngrn (needed for the SysV-SSE both-files fit decision below).  A
 // float scalar consumes one FP register; an HFA consumes its member count and,
 // on overflow, closes the FP file (AAPCS64: NSRN is set to NumFpArgRegs so a
-// later HFA / float scalar cannot use the leftover registers).
-func (cc CallConv) advanceNsrn(t @types.Type, nsrn int) int {
+// later HFA / float scalar cannot use the leftover registers).  A SysV-SSE
+// aggregate consumes its SSE-eightbyte count when it fits (per the SAME
+// sysvSseAggFitsInRegs predicate argRegWordsStackWords uses, so the two agree);
+// on MEMORY overflow SysV leaves NSRN unchanged (it does NOT close the file —
+// later args may still use the leftover XMM registers), unlike an AAPCS64 HFA.
+func (cc CallConv) advanceNsrn(t @types.Type, ngrn int, nsrn int) int {
 	if IsFloatScalarTyp(t) { return nsrn + 1 }
 	if cc.HfaAggregates && cc.NumFpArgRegs > 0 {
 		var hn int = types.HfaMemberCount(t)
@@ -195,6 +259,11 @@ func (cc CallConv) advanceNsrn(t @types.Type, nsrn int) int {
 			if nsrn + hn <= cc.NumFpArgRegs { return nsrn + hn }
 			return cc.NumFpArgRegs
 		}
+	}
+	if cc.PassesSseInRegs(t) {
+		_, sseCount := sysvSseAggEightbyteCounts(t)
+		if cc.sysvSseAggFitsInRegs(t, ngrn, nsrn) { return nsrn + sseCount }
+		return nsrn
 	}
 	return nsrn
 }
@@ -227,8 +296,8 @@ func (cc CallConv) CallArgRegStart(argTypes @[]@types.Type, i int) int {
 	for k := 0; k <= i; k++ {
 		rs, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn, nsrn)
 		if k == i { return rs }
+		nsrn = cc.advanceNsrn(argTypes[k], ngrn, nsrn)
 		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
-		nsrn = cc.advanceNsrn(argTypes[k], nsrn)
 	}
 	return -1
 }
@@ -323,8 +392,8 @@ func (cc CallConv) CallArgStackOff(argTypes @[]@types.Type, i int) int {
 		} else if k == i {
 			return -1
 		}
+		nsrn = cc.advanceNsrn(argTypes[k], ngrn, nsrn)
 		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
-		nsrn = cc.advanceNsrn(argTypes[k], nsrn)
 	}
 	return -1
 }
@@ -345,8 +414,8 @@ func (cc CallConv) CallStackBytes(argTypes @[]@types.Type) int {
 			align, bytes := cc.stackArgFootprint(argTypes[k], sw, false)
 			soff = alignUpStack(soff, align) + bytes
 		}
+		nsrn = cc.advanceNsrn(argTypes[k], ngrn, nsrn)
 		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
-		nsrn = cc.advanceNsrn(argTypes[k], nsrn)
 	}
 	if cc.StackAlign > 1 && soff % cc.StackAlign != 0 {
 		soff = soff + (cc.StackAlign - soff % cc.StackAlign)

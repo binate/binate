@@ -2,21 +2,232 @@ package "pkg/binate/native/arm32"
 
 import "pkg/binate/asm"
 import "pkg/binate/ir"
+import "pkg/binate/mangle"
+import "pkg/binate/native/common"
+import "pkg/stdx/slices"
 
 // ============================================================
-// Interface-impl vtables (P4 — stubbed in the P2 skeleton)
+// Interface-impl vtables + RTTI records (P4-c.1 — the DATA side)
 // ============================================================
 //
-// Interface support (impl vtable emission, iface-value construction, method
-// dispatch) is P4 work in plan-native-arm32.md.  The walking skeleton does
-// not use interfaces, so this pass emits nothing.  It panics LOUDLY if the
-// module defines any impl — a silent no-op there would drop a vtable that
-// iface dispatch / the package descriptor references.
+// Mirrors the LLVM lowering in pkg/binate/codegen/emit_impls.bn and the
+// aarch64 backend (pkg/binate/native/aarch64/aarch64_iface.bn): each
+// `impl R : I` declaration produces one `__ivt.<...>` global containing
+// [dtor, *TypeInfo, m1, m2, ...] pointers (parent sub-vtables inlined for
+// extended interfaces), a parallel `__ivtshim.<...>` whose method slots hold
+// the method HANDLES (for bytecode-VM dispatch of injected native packages),
+// and the per-type / per-iface / per-(type,iface) RTTI records emitted by
+// arm32_typeinfo.bn.  Method DISPATCH (OP_IFACE_VALUE, OP_CALL_IFACE_METHOD,
+// OP_IFACE_UPCAST, OP_IFACE_DTOR) is P4-c.2/.3/.4 and still fails loud in the
+// dispatch tail — this pass only emits the data so a module with impls LINKS
+// its vtables.
+//
+// The slot byte layout is laid by the SHARED ir.BuildImplVtable (each slot is
+// one target word — `types.GetTarget().IntSize`, 4 bytes on this ILP32 target,
+// vs 8 on aarch64/x64), so it cannot drift from the LLVM backend that arm32
+// native main links against.  Do NOT reorder the slots here.
 
-// emitImplVtables is the P4 impl-vtable pass; a no-op in the skeleton
-// (panics if the module defines any impl).
+// emitImplVtables emits one `__ivt.<...>` constant for each (impl, iface) pair
+// the module defines, plus the parallel `__ivtshim.<...>` shim vtable and the
+// TypeInfo / IfaceId / satisfaction-entry RTTI records.  Layout matches the
+// LLVM backend's emit_impls.bn and aarch64_iface.bn:
+//   slot 0:        dtor HANDLE pointer (or 0 if the type has no dtor)
+//   slot 1:        *TypeInfo (RTTI; §7.13.8 / §7.13.14)
+//   slots 2..N+1:  method pointers in interface-declaration order (parent
+//                  sub-vtables inlined for an extended interface)
+// Each slot is one target word (4 bytes on ILP32); a symref term becomes a
+// word-sized absolute relocation the linker fixes up.
+//
+// The vtables live in the relocatable-read-only section (rodata_relro → ELF
+// `.data.rel.ro`) with global visibility so cross-TU OP_IFACE_VALUE sites can
+// reach them through a single shared symbol.
 func emitImplVtables(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Module) {
 	if len(mod.Impls) == 0 { return }
-	panic("native arm32: impl vtables not implemented (P4); "
-			"module defines an interface impl")
+	for i := 0; i < len(mod.Impls); i++ {
+		var info @ir.ImplInfo = mod.Impls[i]
+		if info == nil { continue }
+		// Generic-impl instantiations re-lower at the bytecode importer and are
+		// not yet supported on this backend; fail LOUD rather than emit a wrong
+		// / partial vtable (a silent-miscompile at the cross-TU link boundary).
+		// See plan-native-arm32.md P4-c (non-generic only for now).
+		if common.RecvTypeIsGenericInst(info.RecvTypeName) {
+			a.SetError(
+					"native arm32: generic-impl vtable emission not implemented "
+							"(P4-c is non-generic only); see plan-native-arm32.md")
+			return
+		}
+		emitOneImplVtable(a, pkgName, mod, info)
+		// Parallel shim vtable (method slots hold @__handle handles) so the
+		// bytecode VM can dispatch this package's iface methods through their
+		// marshaling shims when the package is injected native-only.
+		emitOneImplShimVtable(a, pkgName, mod, info)
+	}
+	emitTypeInfosNative(a, pkgName, mod)
+	emitIfaceIdsNative(a, mod)
+	emitSatEntriesNative(a, mod)
+}
+
+// dtorSlotSymNative returns the destructor-handle slot symbol for receiver dtor
+// `dtorName` — the object-format-prefixed `__handle.<dtor>` — or empty (a null
+// slot) when the type needs no destruction (empty name) or the dtor is not
+// present in this module.  Used for BOTH the vtable any-block slot 0 and the
+// TypeInfo record's word 0, so the two agree by construction.
+func dtorSlotSymNative(pkgName *[]readonly char, mod @ir.Module,
+		dtorName *[]readonly char) @[]char {
+	var none @[]char
+	if len(dtorName) == 0 { return none }
+	if lookupModuleFunc(mod, dtorName) == nil { return none }
+	return handleSymFor(pkgName, dtorName)
+}
+
+// emitOneImplVtable writes a single __ivt.<...> array of pointers with the
+// concat-recursive layout from plan-interface-embedding.md Slice E.3:
+//   slots 0-1:               R's any-block (dtor, then *TypeInfo)
+//   per parent P, recursively: full vtable of (R, P)
+//   per own method m:         R's mangled <m> function pointer
+// For non-extending interfaces this collapses to [dtor, *TypeInfo, m1, m2, ...]
+// — the original Slice 2.5 layout.  The recursion supports Slice E.4 upcasts:
+// `*Child → *Parent` becomes a pointer +offset that lands at the parent's
+// any-block, where the parent-typed dispatch path expects to find a dtor + the
+// parent's full layout.
+func emitOneImplVtable(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Module,
+		info @ir.ImplInfo) {
+	var slots @[]@[]char = collectImplVtableSlotsNative(pkgName, mod, info, info.IfacePkg,
+			info.IfaceName, false)
+	markImplSlotsGlobalNative(a, slots)
+	common.EmitDataGlobal(a, ir.BuildImplVtable(implVtableNameNative(info), slots))
+}
+
+// emitOneImplShimVtable writes the parallel `__ivtshim.<...>` array for an
+// (R, I) impl: the same byte-identical slot layout as emitOneImplVtable, but
+// each METHOD slot holds the method's function-value HANDLE
+// (`@__handle.<mangled>`, the same form the dtor slot already uses) instead of
+// the raw method fn.  The bytecode VM resolves this from the raw `@__ivt`
+// address (descriptor's VtableInfo.ShimAddr) and dispatches an injected native-
+// only package's iface methods through the handle's marshaling shim, so it
+// never replicates the native arg/return ABI.  Mirrors
+// pkg/binate/codegen/emit_impls.bn:emitImplShimVtable.
+func emitOneImplShimVtable(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Module,
+		info @ir.ImplInfo) {
+	var slots @[]@[]char = collectImplVtableSlotsNative(pkgName, mod, info, info.IfacePkg,
+			info.IfaceName, true)
+	markImplSlotsGlobalNative(a, slots)
+	common.EmitDataGlobal(a, ir.BuildImplVtable(implShimVtableNameNative(info), slots))
+}
+
+// collectImplVtableSlotsNative returns the ordered slot symbols for one (R, X)
+// sub-block of the recursive layout: dtor, then each parent's nested layout
+// (inline), then X's own methods on R.  Mirrors the aarch64 / x64 backends and
+// the LLVM collectImplVtableSlots.  An empty slot symbol is a null pointer;
+// ir.BuildImplVtable lays the bytes.
+//
+// useHandles=false gives the raw `@__ivt` layout (method slots hold the raw
+// method fn symbol); useHandles=true gives the parallel `@__ivtshim` layout
+// (method slots hold the method's `@__handle`), threaded through the parent
+// recursion so every nested sub-block uses the same form.
+func collectImplVtableSlotsNative(pkgName *[]readonly char, mod @ir.Module, info @ir.ImplInfo,
+		ifacePkg *[]readonly char, ifaceName *[]readonly char, useHandles bool) @[]@[]char {
+	var slots @[]@[]char
+	// Slot 0: dtor HANDLE pointer (or empty = null).  _call_dtor (invoked by
+	// ZeroRefDestroy) lowers as OP_CALL_HANDLE and expects a BnFuncValue handle,
+	// not a raw fn pointer (binate dc46ac7f; conformance/520).
+	slots = slices.Append[@[]char](slots, dtorSlotSymNative(pkgName, mod, info.DtorFuncName))
+	// Slot 1: the concrete type's *TypeInfo (two-word any-block, RTTI —
+	// spec §7.13.8/§7.13.14) — the `__typeinfo.<T>` record emitted weak by
+	// emitTypeInfosNative.  Keyed on the receiver type so every nested
+	// sub-vtable carries the SAME leaf-type record.
+	var typeInfoSlot @[]char = symPrefixed(
+			mangle.TypeInfoName(info.RecvPkg, info.RecvTypeName))
+	slots = slices.Append[@[]char](slots, typeInfoSlot)
+	var parentPkgs @[]@[]char = ir.IfaceParentPkgs(mod, ifacePkg, ifaceName)
+	var parentNames @[]@[]char = ir.IfaceParentNames(mod, ifacePkg, ifaceName)
+	for i := 0; i < len(parentPkgs); i++ {
+		var ps @[]@[]char = collectImplVtableSlotsNative(pkgName, mod, info, parentPkgs[i],
+				parentNames[i], useHandles)
+		for j := 0; j < len(ps); j++ {
+			slots = slices.Append[@[]char](slots, ps[j])
+		}
+	}
+	// X's own methods on R, in interface-declaration order.  The slot is the
+	// iv-dispatch thunk for value-receiver methods (LookupVtableSlotName) —
+	// without it a `*Iface`-reached value-receiver impl reads the iv-data
+	// pointer as the receiver value (conformance 410_iface_value_recv_dispatch).
+	var ownMethods @[]@[]char = ir.IfaceOwnMethodNames(mod, ifacePkg, ifaceName)
+	for mi := 0; mi < len(ownMethods); mi++ {
+		var qualified @[]char = buildMethodFuncNameNative(info.RecvPkg, info.RecvTypeName, ownMethods[mi])
+		var slotName @[]char = ir.LookupVtableSlotName(mod, qualified)
+		var mLabel @[]char = symFor(pkgName, slotName)
+		if useHandles {
+			mLabel = handleSymFor(pkgName, slotName)
+		}
+		slots = slices.Append[@[]char](slots, mLabel)
+	}
+	return slots
+}
+
+// markImplSlotsGlobalNative marks each non-empty slot target (a dtor handle / a
+// method fn or handle) global so its relocation resolves; a null slot needs no
+// symbol.
+func markImplSlotsGlobalNative(a @asm.Assembler, slots @[]@[]char) {
+	for i := 0; i < len(slots); i++ {
+		if len(slots[i]) > 0 {
+			a.SetGlobal(slots[i])
+		}
+	}
+}
+
+// implVtableNameNative builds the bare ELF symbol for an (R, I) impl vtable via
+// mangle.ImplVtableName (the single source of truth shared with IR-gen / codegen
+// / VM).  symPrefixed is the identity on ELF, so the emitted symbol is exactly
+// the `__ivt.bn_V...` core — byte-identical to the LLVM backend's cross-TU
+// reference.
+func implVtableNameNative(info @ir.ImplInfo) @[]char {
+	return symPrefixed(
+			mangle.ImplVtableName(info.RecvPkg, info.RecvTypeName, info.IfacePkg, info.IfaceName))
+}
+
+// implShimVtableNameNative builds the bare ELF symbol for an (R, I) impl's
+// parallel shim vtable via mangle.ImplVtableShimName, so the descriptor's
+// ShimAddr fixup names exactly the symbol this backend defines and the
+// cross-mode VM lookup matches.
+func implShimVtableNameNative(info @ir.ImplInfo) @[]char {
+	return symPrefixed(
+			mangle.ImplVtableShimName(info.RecvPkg, info.RecvTypeName, info.IfacePkg, info.IfaceName))
+}
+
+// buildMethodFuncNameNative mirrors the LLVM
+// emit_impls.bn:buildMethodFuncName — `<recvPkg>.<recvName>.<methodName>`.
+// Duplicated here so the native path doesn't reach into pkg/binate/codegen.
+func buildMethodFuncNameNative(recvPkg *[]readonly char, recvName *[]readonly char,
+		methodName *[]readonly char) @[]char {
+	var b @[]char
+	b = common.AppendStr(b, recvPkg)
+	b = common.AppendStr(b, ".")
+	b = common.AppendStr(b, recvName)
+	b = common.AppendStr(b, ".")
+	b = common.AppendStr(b, methodName)
+	return b
+}
+
+// lookupModuleFunc returns the ir.Func with the given canonical name in
+// mod.Funcs, or nil if absent.  Used by the vtable dtor slot to fall back to a
+// null pointer when the dtor function wasn't emitted in this translation unit
+// (e.g. the receiver has no managed fields).
+func lookupModuleFunc(mod @ir.Module, name *[]readonly char) @ir.Func {
+	for i := 0; i < len(mod.Funcs); i++ {
+		var f @ir.Func = mod.Funcs[i]
+		if f == nil { continue }
+		if charEqIface(f.Name, name) { return f }
+	}
+	return nil
+}
+
+// charEqIface is a local byte-compare for char slices, kept inside this file so
+// the iface module stays self-contained.
+func charEqIface(a *[]readonly char, b *[]readonly char) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] { return false }
+	}
+	return true
 }

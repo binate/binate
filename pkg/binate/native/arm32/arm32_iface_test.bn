@@ -1,18 +1,248 @@
 package "pkg/binate/native/arm32"
 
 import "pkg/binate/asm"
+import "pkg/binate/ast"
 import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/parser"
+import "pkg/binate/types"
 import "pkg/builtins/testing"
 
-// emitImplVtables is a no-op for a module with no impls (the walking-skeleton
-// case).  It emits nothing rather than crashing.
-func TestEmitImplVtablesNoImplsIsNoOp() testing.TestResult {
+// Tests for the interface-impl vtable + RTTI DATA emission in arm32_iface.bn /
+// arm32_typeinfo.bn (P4-c.1).  These pin the pure helpers (name mangling) and
+// the emitted vtable slot COUNT + ORDER (dtor@0, *TypeInfo@1, methods@2+, parent
+// sub-vtables inlined) against the shared ir.BuildImplVtable / mangle.* — so any
+// DRIFT from the LLVM backend (which arm32 native main links against) is caught
+// at unit-test time, not at link time.  End-to-end emission is exercised by the
+// conformance suite under builder-comp_arm32_baremetal.  Method DISPATCH is
+// P4-c.2/.3/.4 and still fails loud, so there are no dispatch shape tests here.
+//
+// The slot stride is one target word — 4 bytes on this ILP32 target (vs 8 on
+// aarch64/x64), so the byte counts below are half the aarch64 equivalents.
+
+// setArm32TargetIface pins the ILP32 layout (int / pointer = 4 bytes) so
+// ir.BuildImplVtable lays 4-byte vtable slots — the real arm32 target width, not
+// the LP64 host default.  Local to this file (setArm32Target lives in
+// arm32_funcvalue_test.bn); duplicated so an iface-only test run is
+// self-contained.
+func setArm32TargetIface() {
+	var t types.TargetInfo
+	t.PointerSize = 4
+	t.IntSize = 4
+	t.MaxAlign = 8
+	types.SetTarget(t)
+}
+
+// ifaceMkAssembler builds a fresh ELF32 assembler (4-byte word) with a text
+// section selected, mirroring the arm32 test convention (asm.New(4)).
+func ifaceMkAssembler() @asm.Assembler {
 	var a @asm.Assembler = asm.New(4)
 	a.SetSection("text", -1)
+	return a
+}
+
+// genFromSrcIface parses Binate source through the standard parser → ir.GenModule
+// pipeline, which populates the per-module iface/impl registries (Interfaces /
+// ImplInfo) that emitImplVtables walks for parents / own methods.  Lighter-weight
+// than a full EmitObject + link.
+func genFromSrcIface(src *[]readonly char) @ir.Module {
+	var b @[]uint8 = make_slice(uint8, len(src))
+	for i := 0; i < len(src); i++ {
+		b[i] = cast(uint8, src[i])
+	}
+	var p @parser.Parser = parser.New(b, "test")
+	var file @ast.File = p.ParseFile()
+	return ir.GenModule(nil, file)
+}
+
+// relroSectionBytesIface returns the byte count of the assembler's
+// "rodata_relro" section (where impl vtables + RTTI records land — read-only but
+// bearing relocations to dtor / method / TypeInfo symbols).  Returns 0 if no
+// relro section was emitted.  Iterates NumSections (the Sections slice is
+// over-allocated by SetSection's growth strategy).
+func relroSectionBytesIface(a @asm.Assembler) int {
+	for i := 0; i < a.NumSections; i++ {
+		if charEqArm32(a.Sections[i].Name, "rodata_relro") {
+			return a.Sections[i].Len
+		}
+	}
+	return 0
+}
+
+// emitImplVtablesOnlyIface emits just the per-(R, I) __ivt / __ivtshim vtables
+// for each impl in mod (mirroring emitImplVtables' loop) — WITHOUT the TypeInfo /
+// IfaceId / satisfaction-entry globals emitImplVtables also emits.  The shape
+// tests use it to measure vtable bytes in isolation, so they stay immune to
+// growth in those RTTI satellites (which land in the same relro).
+func emitImplVtablesOnlyIface(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Module) {
+	for i := 0; i < len(mod.Impls); i++ {
+		var info @ir.ImplInfo = mod.Impls[i]
+		if info == nil { continue }
+		emitOneImplVtable(a, pkgName, mod, info)
+		if !common.RecvTypeIsGenericInst(info.RecvTypeName) {
+			emitOneImplShimVtable(a, pkgName, mod, info)
+		}
+	}
+}
+
+// TestImplVtableNameNative pins the bare ELF symbol for an (R, I) impl vtable:
+// the `__ivt.`-decorated bn_V core (recvPkg, recvType, ifacePkg, ifaceName) from
+// mangle.ImplVtableName.  On arm32 (ELF) there is NO leading '_' Mach-O prefix,
+// so the name has exactly TWO leading underscores (`__ivt.`), not three like the
+// aarch64 Mach-O form.
+func TestImplVtableNameNative() testing.TestResult {
+	var info @ir.ImplInfo = make(ir.ImplInfo)
+	info.RecvPkg = "main"
+	info.RecvTypeName = "T"
+	info.IfacePkg = "main"
+	info.IfaceName = "I"
+	var got @[]char = implVtableNameNative(info)
+	if !charEq(got, "__ivt.bn_V1_4_main1_T1_4_main1_I") {
+		return fail("expected __ivt.bn_V1_4_main1_T1_4_main1_I")
+	}
+	return ""
+}
+
+// TestImplVtableNameNativeCrossPkg covers the cross-package shape (Slice 2.6 of
+// plan-cross-package-interfaces.md): the iface's own package name appears between
+// RecvName and IfaceName even when impl and iface live in different packages.
+func TestImplVtableNameNativeCrossPkg() testing.TestResult {
+	var info @ir.ImplInfo = make(ir.ImplInfo)
+	info.RecvPkg = "geom"
+	info.RecvTypeName = "Point"
+	info.IfacePkg = "fmt"
+	info.IfaceName = "Stringer"
+	var got @[]char = implVtableNameNative(info)
+	if !charEq(got, "__ivt.bn_V1_4_geom5_Point1_3_fmt8_Stringer") {
+		return fail("expected __ivt.bn_V1_4_geom5_Point1_3_fmt8_Stringer")
+	}
+	return ""
+}
+
+// TestImplShimVtableNameNative pins the parallel shim-vtable symbol
+// (`__ivtshim.` on a bn_W core) via mangle.ImplVtableShimName — bare on ELF.
+func TestImplShimVtableNameNative() testing.TestResult {
+	var info @ir.ImplInfo = make(ir.ImplInfo)
+	info.RecvPkg = "main"
+	info.RecvTypeName = "T"
+	info.IfacePkg = "main"
+	info.IfaceName = "I"
+	var got @[]char = implShimVtableNameNative(info)
+	if !charEq(got, "__ivtshim.bn_W1_4_main1_T1_4_main1_I") {
+		return fail("expected __ivtshim.bn_W1_4_main1_T1_4_main1_I")
+	}
+	return ""
+}
+
+// TestBuildMethodFuncNameNative pins the dotted-name format used when looking up
+// a method's mangled function symbol from a vtable slot.  Format:
+// `<recvPkg>.<recvName>.<methodName>` — matches
+// pkg/binate/codegen/emit_impls.bn:buildMethodFuncName.
+func TestBuildMethodFuncNameNative() testing.TestResult {
+	var got @[]char = buildMethodFuncNameNative("geom", "Point", "String")
+	if !charEq(got, "geom.Point.String") {
+		return fail("expected geom.Point.String")
+	}
+	return ""
+}
+
+// TestEmitImplVtablesNoImplsIsNoOp: emitImplVtables emits nothing for a module
+// with no impls (the walking-skeleton case).
+func TestEmitImplVtablesNoImplsIsNoOp() testing.TestResult {
+	setArm32TargetIface()
+	var a @asm.Assembler = ifaceMkAssembler()
 	var m @ir.Module = ir.NewModule("\"main\"")
 	emitImplVtables(a, "main", m)
-	if a.Sections[0].Len != 0 {
+	if relroSectionBytesIface(a) != 0 {
 		return fail("emitImplVtables should emit nothing when there are no impls")
+	}
+	return ""
+}
+
+// TestEmitImplVtablesNonExtendingShape: for a non-extending interface, each
+// vtable layout collapses to [dtor, *TypeInfo, m1, m2, ...] = (2 any-block + N
+// method) slots × 4 bytes (ILP32).  `interface I { foo() }; impl *T : I` for a
+// struct T with no managed fields → 3 slots × 4 = 12 bytes raw; the parallel
+// __ivtshim is the same layout = 12 bytes.  Total = 24 bytes (half the aarch64
+// 48-byte count because slots are 4 bytes, not 8).
+func TestEmitImplVtablesNonExtendingShape() testing.TestResult {
+	setArm32TargetIface()
+	var src *[]readonly char = "package \"main\"\n"
+			"interface I { foo() }\n"
+			"type T struct { x int }\n"
+			"func (t *T) foo() { }\n"
+			"impl *T : I\n"
+			"func main() { }\n"
+	var mod @ir.Module = genFromSrcIface(src)
+
+	var a @asm.Assembler = ifaceMkAssembler()
+	emitImplVtablesOnlyIface(a, "main", mod)
+	if relroSectionBytesIface(a) != 24 {
+		return fail("non-extending (T,I) raw+shim vtables should be 24 bytes (2×3 slots × 4)")
+	}
+	if a.LookupSymbol("__ivt.bn_V1_4_main1_T1_4_main1_I") < 0 {
+		return fail("non-extending impl should define the __ivt vtable symbol")
+	}
+	if a.LookupSymbol("__ivtshim.bn_W1_4_main1_T1_4_main1_I") < 0 {
+		return fail("non-extending impl should define the __ivtshim shim vtable symbol")
+	}
+	return ""
+}
+
+// TestEmitImplVtablesExtendedConcatShape: plan-interface-embedding.md Slice E.3.
+// For an extended interface `RC : Closer { Read() int }`, the (T, RC) vtable uses
+// the concat layout — RC's two-word any-block + Closer's full sub-vtable inlined
+// + RC's own methods — for 2 + 3 + 1 = 6 slots × 4 = 24 bytes.  `impl *T : RC`
+// also registers (T, Closer) transitively, so the relro contains BOTH vtables:
+// RC (24 bytes) + Closer (3 slots × 4 = 12 bytes) = 36 bytes — and each gets a
+// byte-identical-layout shim vtable → 36 × 2 = 72 bytes total.
+func TestEmitImplVtablesExtendedConcatShape() testing.TestResult {
+	setArm32TargetIface()
+	var src *[]readonly char = "package \"main\"\n"
+			"interface Closer { Close() }\n"
+			"interface RC : Closer { Read() int }\n"
+			"type T struct { x int }\n"
+			"func (t *T) Close() { }\n"
+			"func (t *T) Read() int { return 0 }\n"
+			"impl *T : RC\n"
+			"func main() { }\n"
+	var mod @ir.Module = genFromSrcIface(src)
+
+	var a @asm.Assembler = ifaceMkAssembler()
+	emitImplVtablesOnlyIface(a, "main", mod)
+	if relroSectionBytesIface(a) != 72 {
+		return fail("(T,RC)+(T,Closer) raw+shim vtables should total 72 bytes (ILP32)")
+	}
+	return ""
+}
+
+// TestEmitImplVtableSlot0IsHandleNotRawFn: slot 0 of an impl vtable references
+// the dtor HANDLE symbol `__handle.bn_F1_4_main1_8___dtor_T`, NOT the raw dtor fn
+// symbol `bn_F1_4_main1_8___dtor_T`.  _call_dtor (the indirect call
+// ZeroRefDestroy makes) lowers as OP_CALL_HANDLE and dereferences the value as a
+// {vtable, data} handle — a raw fn pointer there would call into garbage
+// (conformance/520).  emitImplVtables does not emit the raw dtor symbol (the
+// handle global's emitter does), so running only emitImplVtables here, the raw
+// symbol must be absent.
+func TestEmitImplVtableSlot0IsHandleNotRawFn() testing.TestResult {
+	setArm32TargetIface()
+	var src *[]readonly char = "package \"main\"\n"
+			"interface I { foo() int }\n"
+			"type Inner struct { V int }\n"
+			"type T struct { Inner @Inner }\n"
+			"func (t *T) foo() int { return t.Inner.V }\n"
+			"impl *T : I\n"
+			"func main() { }\n"
+	var mod @ir.Module = genFromSrcIface(src)
+
+	var a @asm.Assembler = ifaceMkAssembler()
+	emitImplVtables(a, "main", mod)
+
+	if a.LookupSymbol("__handle.bn_F1_4_main1_8___dtor_T") < 0 {
+		return fail("impl vtable slot 0 must reference __handle.bn_F1_4_main1_8___dtor_T")
+	}
+	if a.LookupSymbol("bn_F1_4_main1_8___dtor_T") >= 0 {
+		return fail("impl vtable slot 0 must NOT reference the raw fn bn_F1_4_main1_8___dtor_T directly")
 	}
 	return ""
 }

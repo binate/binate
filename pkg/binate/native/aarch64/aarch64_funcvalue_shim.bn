@@ -288,6 +288,19 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 		var retIsHfa bool = len(fvTyp.Results) == 1 &&
 			cc.ReturnsHfaInRegs(fvTyp.Results[0])
 		var useSret bool = retSz > 16 && !retIsHfa
+		// Multi-return classification.  aa64 has no SretInGpArgReg, so under
+		// retbuf-for-any-multi-return the caller passes the retbuf in X0 (data in
+		// X1) for EVERY multi-return.  A BIG tuple (MultiReturnTupleNeedsSret) is
+		// written by the callee through X8, so the shim moves retbuf X0 → X8
+		// internally and tail-branches (useSretMulti).  A SMALL tuple comes back
+		// field-per-register (X0../D0..), so the shim CALLs, then stores the fields
+		// through retbuf (usePackMulti).  Both consume X0+X1, so both carry a
+		// 2-slot prefix and userBudget 6.  (Pre-fix, EVERY multi-return fell
+		// through to the scalar tail-branch — never setting X8 for a big tuple, and
+		// reading retbuf as data — the 971 crash.)
+		var isMultiRet bool = len(fvTyp.Results) > 1
+		var useSretMulti bool = isMultiRet && isBigMultiReturnAA64(fvTyp)
+		var usePackMulti bool = isMultiRet && !useSretMulti
 		// An aggregate result of 1..16 bytes is returned to the caller through
 		// the retbuf it passed in X0 — INCLUDING a ≤ 8-byte aggregate, which is
 		// packed into one word.  (A scalar result is also ≤ 8 bytes but is NOT
@@ -297,14 +310,14 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 			!retIsHfa
 		// Register budget for the tail-branch / register-only shapes below:
 		// they can't read stack-passed incoming user args nor write stack-
-		// passed outgoing ones.  The pack/sret shapes consume X0+X1 for
-		// retbuf+data, leaving X2..X7 = 6 user words; the scalar/float
-		// shapes consume only X0 (data), leaving 7.  Beyond that, route to
-		// the stack-spill shim, which reserves an outgoing-args frame and
+		// passed outgoing ones.  The pack/sret and both multi-return shapes
+		// consume X0+X1 for retbuf+data, leaving X2..X7 = 6 user words; the
+		// scalar/float shapes consume only X0 (data), leaving 7.  Beyond that,
+		// route to the stack-spill shim, which reserves an outgoing-args frame and
 		// reads/writes the overflow words there.  (Replaces the old silent
 		// `nUserWords > 8` clamp, which miscompiled wide funcvals.)
 		var userBudget int = 7
-		if usePack || useSret || retIsHfa {
+		if usePack || useSret || retIsHfa || useSretMulti || usePackMulti {
 			userBudget = 6
 		}
 		// Route to the stack-spill shim when EITHER the incoming/outgoing GP
@@ -315,7 +328,7 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 		if nUserWords > userBudget || nUserFpRegs > cc.NumFpArgRegs {
 			emitFuncvalSpillShimAA64(a, cc, fnLabel, fvTyp, retSz,
 				usePack, useSret, shimReturnIsFloatScalarAA64(fvTyp),
-				retIsHfa)
+				retIsHfa, usePackMulti, useSretMulti)
 			continue
 		}
 		if retIsHfa {
@@ -389,6 +402,43 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char,
 			emitShimArgMarshalAA64(a, cc, fvTyp, 2)
 			a.SetGlobal(fnLabel)
 			aarch64.B(a, fnLabel)
+		} else if useSretMulti {
+			// Big multi-return tuple: the callee writes it through X8 (AAPCS64
+			// indirect result).  Same shape as a > 16-byte single aggregate —
+			// move retbuf X0 → X8 BEFORE the arg shift (X0 is a shift source),
+			// drop data, tail-branch (B preserves X8).
+			aarch64.Mov(a, true, aarch64.X8,
+				aarch64.Reg(aarch64.X0))
+			emitShimArgMarshalAA64(a, cc, fvTyp, 2)
+			a.SetGlobal(fnLabel)
+			aarch64.B(a, fnLabel)
+		} else if usePackMulti {
+			// Small multi-return tuple: the callee returns it FIELD-PER-REGISTER
+			// (X0../D0..), so the shim CALLs (a frame preserves LR), stashes
+			// retbuf, marshals user args, then stores the fields THROUGH retbuf.
+			// Same retbuf-save frame as the single-aggregate pack path, but the
+			// store is the field-per-class helper (NOT a whole-word X0..X(N-1)
+			// dump — that would read GP regs the callee never wrote for a float
+			// field and ignore sub-word field sizing).
+			aarch64.Stp(a, true, aarch64.FP, aarch64.LR,
+				aarch64.MemPre(aarch64.SP, -32))
+			aarch64.Mov(a, true, aarch64.FP,
+				aarch64.Reg(aarch64.SP))
+			aarch64.Str(a, true, aarch64.X0,
+				aarch64.MemImm(aarch64.SP, 16))
+			emitShimArgMarshalAA64(a, cc, fvTyp, 2)
+			a.SetGlobal(fnLabel)
+			aarch64.Bl(a, fnLabel)
+			// Reload retbuf into X9 (outside the arg + return register banks),
+			// then store the field-per-register tuple through it.  X10 is the
+			// field float→GP scratch (outside the return regs and X9 the base).
+			aarch64.Ldr(a, true, aarch64.X9,
+				aarch64.MemImm(aarch64.SP, 16))
+			storeMultiReturnTupleFieldsAA64(a, funcValMultiReturnTupleAA64(fvTyp),
+				aarch64.X9, 0, aarch64.X10)
+			aarch64.Ldp(a, true, aarch64.FP, aarch64.LR,
+				aarch64.MemPost(aarch64.SP, 32))
+			aarch64.Ret(a)
 		} else if shimReturnIsFloatScalarAA64(fvTyp) {
 			// Scalar shim whose result is a float scalar: the all-int
 			// shim ABI returns the bits in x0, but the underlying

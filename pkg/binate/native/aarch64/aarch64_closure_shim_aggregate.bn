@@ -46,7 +46,7 @@ import "pkg/binate/types"
 // than silently emitting wrong code, since the stack-spill aggregate path
 // isn't implemented yet.
 func emitClosureShimAggregateAA64(a @asm.Assembler, fnLabel @[]char,
-		fvTyp @types.Type, f @ir.Func, retSz int) {
+		fvTyp @types.Type, f @ir.Func, retSz int, multiRetTuple @types.Type) {
 	var cc common.CallConv = common.AAPCS64_Darwin()
 	var captureWords int = 0
 	for i := 0; i < f.NumCaptureParams; i = i + 1 {
@@ -68,10 +68,14 @@ func emitClosureShimAggregateAA64(a @asm.Assembler, fnLabel @[]char,
 		// X2..X7), so it needs a stack-spill prologue.
 		var argTypes @[]@types.Type = buildShimArgTypesAA64(fvTyp, f)
 		emitClosureShimAggregateStackSpillAA64(a, fnLabel, fvTyp, f,
-			retSz, cc, argTypes, nUserWords)
+			retSz, cc, argTypes, nUserWords, multiRetTuple)
 		return
 	}
-	if retSz > 16 {
+	// A single aggregate srets by SIZE (> 16 B).  A SMALL multi-return
+	// (multiRetTuple != nil) always packs regardless of size — e.g.
+	// (i64 x5) is 40 B but 5 GP words (≤ 8), so the callee returns it field-per-
+	// register (NOT via X8 sret); the SIZE rule would wrongly route it to sret.
+	if retSz > 16 && multiRetTuple == nil {
 		// Sret-return: retbuf X0 → X8 (set BEFORE the capture loads
 		// clobber X0), data X1 → X9 scratch, set up the underlying
 		// args, tail-branch.  B preserves X8, so the lifted body writes
@@ -84,11 +88,14 @@ func emitClosureShimAggregateAA64(a @asm.Assembler, fnLabel @[]char,
 		aarch64.B(a, fnLabel)
 		return
 	}
-	// Pack-return (retSz 1..16): frame of 32 bytes (FP/LR + a retbuf save
-	// slot at [SP+16] + alignment pad), mirroring the non-capturing pack
-	// shim.  Stash retbuf, set up the underlying args (data in X9), BL,
-	// reload retbuf into X9, copy the packed return X0..X(retWords-1)
-	// through it, unwind.
+	// Pack-return (single aggregate retSz 1..16, OR any small multi-return):
+	// frame of 32 bytes (FP/LR + a retbuf save slot at [SP+16] + alignment pad),
+	// mirroring the non-capturing pack shim.  Stash retbuf, set up the underlying
+	// args (data in X9), BL, reload retbuf into X9, copy the return through it,
+	// unwind.  A single aggregate copies the packed X0..X(retWords-1); a small
+	// multi-return stores the callee's field-per-register result via the field-
+	// per-class helper (a whole-word dump would read GP regs the callee never
+	// wrote for a float field and ignore sub-word field sizing).
 	aarch64.Stp(a, true, aarch64.FP, aarch64.LR,
 		aarch64.MemPre(aarch64.SP, -32))
 	aarch64.Mov(a, true, aarch64.FP, aarch64.Reg(aarch64.SP))
@@ -98,15 +105,38 @@ func emitClosureShimAggregateAA64(a @asm.Assembler, fnLabel @[]char,
 	a.SetGlobal(fnLabel)
 	aarch64.Bl(a, fnLabel)
 	aarch64.Ldr(a, true, aarch64.X9, aarch64.MemImm(aarch64.SP, 16))
-	var retWords int = retSz / 8
-	if retSz % 8 != 0 { retWords = retWords + 1 }
-	for ri := 0; ri < retWords; ri = ri + 1 {
-		aarch64.Str(a, true, argReg(ri),
-			aarch64.MemImm(aarch64.X9, 8 * ri))
+	if multiRetTuple != nil {
+		// X10 is the field float→GP scratch (outside the return regs and X9 base).
+		storeMultiReturnTupleFieldsAA64(a, multiRetTuple, aarch64.X9, 0,
+			aarch64.X10)
+	} else {
+		var retWords int = retSz / 8
+		if retSz % 8 != 0 { retWords = retWords + 1 }
+		for ri := 0; ri < retWords; ri = ri + 1 {
+			aarch64.Str(a, true, argReg(ri),
+				aarch64.MemImm(aarch64.X9, 8 * ri))
+		}
 	}
 	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR,
 		aarch64.MemPost(aarch64.SP, 32))
 	aarch64.Ret(a)
+}
+
+// emitClosureShimMultiRetAA64 emits the multi-return closure shim (retbuf-for-
+// any-multi-return).  A BIG tuple (isBigMultiReturnAA64) rides the sret shape —
+// retbuf X0 → X8, the callee writes through it (multiRetTuple nil).  A SMALL tuple
+// rides the pack shape — the callee returns it field-per-register, which the shim
+// stores THROUGH retbuf via the field-per-class helper (multiRetTuple selects
+// that store).  Reuses emitClosureShimAggregateAA64's frame + marshalling; float-
+// containing multi-return closures are fail-loud upstream (emitClosureShim).
+func emitClosureShimMultiRetAA64(a @asm.Assembler, fnLabel @[]char,
+		fvTyp @types.Type, f @ir.Func) {
+	var t @types.Type = funcValMultiReturnTupleAA64(fvTyp)
+	if isBigMultiReturnAA64(fvTyp) {
+		emitClosureShimAggregateAA64(a, fnLabel, fvTyp, f, t.SizeOf(), nil)
+		return
+	}
+	emitClosureShimAggregateAA64(a, fnLabel, fvTyp, f, t.SizeOf(), t)
 }
 
 // loadClosureAggCallArgsAA64 sets up the underlying lifted-body call's
@@ -252,8 +282,11 @@ func moveAggUserWordAA64(a @asm.Assembler, inWord int, outWord int,
 // must be undone before RET, and pack must copy the result back.
 func emitClosureShimAggregateStackSpillAA64(a @asm.Assembler, fnLabel @[]char,
 		fvTyp @types.Type, f @ir.Func, retSz int, cc common.CallConv,
-		argTypes @[]@types.Type, nUserWords int) {
-	var useSret bool = retSz > 16
+		argTypes @[]@types.Type, nUserWords int, multiRetTuple @types.Type) {
+	// A small multi-return (multiRetTuple != nil) always packs (field-per-
+	// register callee return), regardless of size; only a single aggregate srets
+	// by size.  See emitClosureShimAggregateAA64.
+	var useSret bool = retSz > 16 && multiRetTuple == nil
 	var stkBytes int = cc.CallStackBytes(argTypes)
 	var retbufOff int = stkBytes
 	var inner int = stkBytes
@@ -314,15 +347,22 @@ func emitClosureShimAggregateStackSpillAA64(a @asm.Assembler, fnLabel @[]char,
 	aarch64.Bl(a, fnLabel)
 
 	if !useSret {
-		// Pack: copy the packed return (X0..X(retWords-1)) through the
-		// stashed retbuf, reloaded into X9 (outside the return registers).
+		// Pack: copy the return through the stashed retbuf, reloaded into X9
+		// (outside the return registers).  A small multi-return uses the field-
+		// per-class store (X10 the float→GP scratch); a single aggregate copies
+		// the packed X0..X(retWords-1).
 		aarch64.Ldr(a, true, aarch64.X9,
 			aarch64.MemImm(aarch64.SP, retbufOff))
-		var retWords int = retSz / 8
-		if retSz % 8 != 0 { retWords = retWords + 1 }
-		for ri := 0; ri < retWords; ri = ri + 1 {
-			aarch64.Str(a, true, argReg(ri),
-				aarch64.MemImm(aarch64.X9, 8 * ri))
+		if multiRetTuple != nil {
+			storeMultiReturnTupleFieldsAA64(a, multiRetTuple, aarch64.X9, 0,
+				aarch64.X10)
+		} else {
+			var retWords int = retSz / 8
+			if retSz % 8 != 0 { retWords = retWords + 1 }
+			for ri := 0; ri < retWords; ri = ri + 1 {
+				aarch64.Str(a, true, argReg(ri),
+					aarch64.MemImm(aarch64.X9, 8 * ri))
+			}
 		}
 	}
 

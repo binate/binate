@@ -14,11 +14,12 @@ import "pkg/builtins/testing"
 // impl-vtable + RTTI DATA emission (P4-c.1) pinned against the shared
 // ir.BuildImplVtable / mangle.* (so any DRIFT from the LLVM backend that arm32
 // native main links against is caught at unit-test time, not at link time), the
-// iface-value construction ops (P4-c.2), and method DISPATCH shape (P4-c.3:
-// OP_CALL_IFACE_METHOD).  End-to-end emission is exercised by the conformance
-// suite under builder-comp_native_arm32_baremetal (the NATIVE mode; the non-native
+// iface-value construction ops (P4-c.2), method DISPATCH shape (P4-c.3:
+// OP_CALL_IFACE_METHOD), and the managed-iface scope-exit dtor load (P4-c.4:
+// OP_IFACE_DTOR).  End-to-end emission is exercised by the conformance suite under
+// builder-comp_native_arm32_baremetal (the NATIVE mode; the non-native
 // builder-comp_arm32_baremetal is the LLVM cross-compile and does not run this
-// backend).  OP_IFACE_DTOR (P4-c.4) still fails loud.
+// backend).
 //
 // The slot stride is one target word — 4 bytes on this ILP32 target (vs 8 on
 // aarch64/x64), so the byte counts below are half the aarch64 equivalents.
@@ -805,21 +806,137 @@ func TestEmitCallIfaceMethodSmallMultiReturnCollect() testing.TestResult {
 	return ""
 }
 
-// TestDispatchIfaceDtorStillFailsLoud: OP_IFACE_DTOR (the @Iface scope-exit dtor
-// load) remains OUT OF SCOPE for P4-c.2 — it must still fail LOUD in the dispatch
-// tail.  P4-c.4 wires it up.
-func TestDispatchIfaceDtorStillFailsLoud() testing.TestResult {
+// nthLdrImm returns the #imm of the k-th (0-based) `LDR Rd, [Rn, #imm]`
+// (positive-offset word load, cond=AL) in the text stream, or -1 if there are
+// fewer than k+1.  LDR (imm, P=1 U=1 W=0, load, word) = 0xE59R_R000 | (Rn<<16) |
+// (Rd<<12) | imm12; the fixed bits (0xFFF00000 mask) are 0xE5900000.  The dtor's
+// two-step vtable walk emits two such LDRs in order — vtable ptr, then slot 0 —
+// so k=0 is the iv.vtable read and k=1 is the dtor-slot read.
+func nthLdrImm(a @asm.Assembler, k int) int {
+	var n int = a.Sections[0].Len
+	var c int = 0
+	for i := 0; i + 3 < n; i = i + 4 {
+		var w uint32 = word32(a, i)
+		if (w & cast(uint32, 0xFFF00000)) != cast(uint32, 0xE5900000) { continue }
+		if c == k { return cast(int, w & cast(uint32, 0xFFF)) }
+		c = c + 1
+	}
+	return -1
+}
+
+// countLdr returns how many `LDR Rd, [Rn, #imm]` (positive-imm word loads,
+// cond=AL) the text stream contains — used to pin the dtor's two-step vtable walk
+// (the getOperand iv reload is an ADD, not an LDR, so it does not inflate this).
+func countLdr(a @asm.Assembler) int {
+	var n int = a.Sections[0].Len
+	var c int = 0
+	for i := 0; i + 3 < n; i = i + 4 {
+		var w uint32 = word32(a, i)
+		if (w & cast(uint32, 0xFFF00000)) == cast(uint32, 0xE5900000) { c = c + 1 }
+	}
+	return c
+}
+
+// TestEmitOpIfaceDtorShape: OP_IFACE_DTOR (P4-c.4 — the managed-iface-value
+// scope-exit dtor load) is NOT a call; it LOADS slot 0 (the dtor HANDLE) of the
+// iv's vtable, producing the value the later OP_REFDEC dtor-operand path invokes.
+// Shape (iv held in an alloc region here, so getOperand materializes its address
+// with one ADD):
+//   ADD  rd, SP, #ivOff           ; getOperand(iv) — pointer to the iv aggregate
+//   LDR  rd, [rd, #IfaceValueVtableOffset]  ; vt = iv.vtable  (offset 4 on ILP32)
+//   LDR  rd, [rd, #0]                        ; dtor = *(vt + 0)
+// Three 4-byte ARM instructions = 12 bytes, mirroring the aa64 OP_IFACE_DTOR
+// shape.  Pins: exactly the two vtable-walk LDRs, the first reading
+// IfaceValueVtableOffset() (NOT the LP64 8), and a result register assigned so the
+// OP_REFDEC scope-exit path has an operand.  No BLX — this op never calls.
+func TestEmitOpIfaceDtorShape() testing.TestResult {
 	setArm32TargetIface()
 	var a @asm.Assembler = ifaceMkAssembler()
 	var rm @common.RegMap = common.NewRegMap(common.AAPCS32())
+	// iv arg (ID 1): its {data, vtable} aggregate lives in an alloc region, so
+	// getOperand yields a pointer to it via a single ADD.
+	rm.AllocIDs = common.AppendInt(rm.AllocIDs, 1)
+	rm.AllocOffsets = common.AppendInt(rm.AllocOffsets, 8)
+	rm.AllocSizes = common.AppendInt(rm.AllocSizes, 8)
+
+	var iv @ir.Instr = make(ir.Instr)
+	iv.ID = 1
+	iv.Typ = types.MakePointerType(types.TypUint8())
 	var ins @ir.Instr = make(ir.Instr)
-	ins.ID = -1
+	ins.ID = 2
 	ins.Op = iropcode.OP_IFACE_DTOR
+	ins.Typ = types.MakePointerType(types.TypUint8())
+	ins.Args = make_slice(@ir.Instr, 1)
+	ins.Args[0] = iv
+
 	var strings @[]ir.StringConst
 	var allFuncs @[]@ir.Func
 	emitInstr(a, "main", "bn_entry", rm, strings, allFuncs, ins)
-	if !a.HasError {
-		return fail("OP_IFACE_DTOR must still fail loud (P4-c.4, not this phase)")
+	if a.HasError {
+		return fail("OP_IFACE_DTOR should lower without error (P4-c.4)")
+	}
+	if a.Sections[0].Len != 12 {
+		return fail("OP_IFACE_DTOR should emit ADD + 2 LDR (12 bytes): 1 iv-addr + vtable walk")
+	}
+	if countLdr(a) != 2 {
+		return fail("OP_IFACE_DTOR should emit exactly two LDRs (vtable ptr, then dtor slot 0)")
+	}
+	if rm.LookupReg(2) < 0 {
+		return fail("OP_IFACE_DTOR should assign the loaded dtor handle a result register")
+	}
+	// The two-step walk: LDR #0 reads iv.vtable at IfaceValueVtableOffset() (4 on
+	// ILP32, NOT the LP64 8); LDR #1 reads the dtor at vtable slot 0 (offset 0).
+	if nthLdrImm(a, 0) != types.IfaceValueVtableOffset() {
+		return fail(
+				"OP_IFACE_DTOR first LDR must read iv.vtable at IfaceValueVtableOffset() (4 on ILP32)")
+	}
+	if nthLdrImm(a, 1) != 0 {
+		return fail("OP_IFACE_DTOR second LDR must read the dtor at vtable slot 0 (offset 0)")
+	}
+	return ""
+}
+
+// TestEmitOpIfaceDtorNullSlotIsRuntimeNoOp documents that a NULL dtor slot (a
+// concrete type with no destructor — dtorSlotSymNative emitted an empty slot 0)
+// is handled at RUNTIME, not here: OP_IFACE_DTOR unconditionally loads slot 0
+// (which is a null handle for such a type), and the no-op is enforced by
+// rt.ZeroRefDestroy (reached only when the refcount hits zero), which guards a
+// null dtor handle before dispatching.  So the lowering is byte-identical
+// regardless of whether the concrete type has a dtor — it always emits the two
+// vtable-walk LDRs and never a null-check or a call.  This pins that OP_IFACE_DTOR
+// does NOT branch on the slot value (a spurious null-check here would be dead code
+// and could mask a real null the runtime must see).
+func TestEmitOpIfaceDtorNullSlotIsRuntimeNoOp() testing.TestResult {
+	setArm32TargetIface()
+	var a @asm.Assembler = ifaceMkAssembler()
+	var rm @common.RegMap = common.NewRegMap(common.AAPCS32())
+	rm.AllocIDs = common.AppendInt(rm.AllocIDs, 1)
+	rm.AllocOffsets = common.AppendInt(rm.AllocOffsets, 8)
+	rm.AllocSizes = common.AppendInt(rm.AllocSizes, 8)
+
+	var iv @ir.Instr = make(ir.Instr)
+	iv.ID = 1
+	iv.Typ = types.MakePointerType(types.TypUint8())
+	var ins @ir.Instr = make(ir.Instr)
+	ins.ID = 2
+	ins.Op = iropcode.OP_IFACE_DTOR
+	ins.Typ = types.MakePointerType(types.TypUint8())
+	ins.Args = make_slice(@ir.Instr, 1)
+	ins.Args[0] = iv
+
+	var strings @[]ir.StringConst
+	var allFuncs @[]@ir.Func
+	emitInstr(a, "main", "bn_entry", rm, strings, allFuncs, ins)
+	if a.HasError {
+		return fail("OP_IFACE_DTOR must lower unconditionally (the null-slot no-op is a runtime concern)")
+	}
+	// No conditional branch (no CMP / Bcc) — the walk is straight-line.  BLX absence
+	// also holds (never a call).  ADD + 2 LDR only.
+	if scanForBlxIp(a) {
+		return fail("OP_IFACE_DTOR must not emit a call (BLX) — it only LOADS the dtor handle")
+	}
+	if a.Sections[0].Len != 12 {
+		return fail("OP_IFACE_DTOR null-slot lowering must be identical (ADD + 2 LDR, 12 bytes)")
 	}
 	return ""
 }

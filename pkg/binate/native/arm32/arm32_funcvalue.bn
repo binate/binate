@@ -25,23 +25,22 @@ import "pkg/stdx/slices"
 //
 // The backend emits the vtable/handle data (shared ir.BuildFuncValue) for every
 // collected reference, and a marshaling SHIM for the return shapes it supports:
-// SCALAR/VOID (drop the leading data word, shift user args down, tail-branch),
+// SCALAR/VOID (drop the leading data word, marshal user args down, tail-branch),
 // big-aggregate SRET (a >4-byte result returns through a hidden R0 buffer, which
 // — unlike AAPCS64's dedicated X8 — stays in R0 across the shim, so the shim
-// keeps R0, drops data, shifts user args down, and tail-branches), and small
+// keeps R0, drops data, marshals user args down, and tail-branches), and small
 // (<=4-byte) aggregate PACK (a by-value R0 result: the shim saves the retbuf,
-// calls the underlying, and stores the returned R0 word through the retbuf).
-// Shapes it can't yet marshal — closures (P4-d), float args/returns (P5), a
-// 64-bit register-pair scalar arg, or arg words beyond the register budget — fail
-// LOUDLY via a.SetError rather than emitting a wrong shim.  Mirrors
-// aarch64_funcvalue{,_shim}.bn at the reduced surface, with AAPCS32's R0-sret in
-// place of X8.
-
-// SHIM_ARG_REG_BUDGET is the number of user-arg words a scalar/void shim can
-// re-marshal in the register-only fast path: R0 carries the dropped `data`
-// prefix, leaving R1..R3 = 3 words for user args.  The sret shim has one fewer
-// (SHIM_ARG_REG_BUDGET - 1 = 2: R0 = retbuf, R1 = data, R2..R3 = user args).
-const SHIM_ARG_REG_BUDGET int = 3
+// calls the underlying, and stores the returned R0 word through the retbuf).  The
+// arg marshal (emitShimArgMarshalArm32 in arm32_funcvalue_marshal.bn) re-expands a
+// coerced in-register named struct/array ARG from its by-address dispatch pointer
+// into the underlying's AAPCS32 coerced GP regs (GP-only — arm32 is soft-float, so
+// no HFA/FP path).  Shapes it can't yet marshal — closures (P4-d), float args /
+// returns (P5), a non-coerced in-register aggregate arg (a pre-existing shared
+// gap), a 64-bit register-pair scalar arg, or arg words beyond the register budget
+// (stack spill, P2) — fail LOUDLY via a.SetError rather than emitting a wrong shim.
+// Mirrors aarch64_funcvalue{,_shim}.bn / x64_funcvalue_shim.bn at the reduced
+// surface, with AAPCS32's R0-sret-stays convention (like x64's RDI-stays) in place
+// of AAPCS64's X0->X8 move.
 
 // shimSymFor returns the bare ELF label for a function's per-function shim
 // global: "<mangled-fn>__shim".
@@ -262,47 +261,6 @@ func lookupClosureFuncArm32(mod @ir.Module, name @[]char) @ir.Func {
 	return nil
 }
 
-// shimUserArgWords validates the shim's user args and returns their total GP
-// word count, or -1 (after a.SetError) for a shape the register-shift can't
-// marshal.  The shift can only re-place single-word scalar/pointer args: an
-// aggregate or float arg (P4-b / P5), or a 2-word register-pair scalar (a 64-bit
-// int on ILP32 — neither aggregate nor float, so it slips the other guards but
-// needs a register pair the single-word shift can't place), fails LOUDLY.
-// Shared by the scalar/void and sret shim shapes.
-func shimUserArgWords(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type) int {
-	var nWords int = 0
-	for pi := 0; pi < len(fvTyp.Params); pi++ {
-		var pt @types.Type = fvTyp.Params[pi].Type
-		if common.IsAggregateTyp(pt) || common.IsFloatScalarTyp(pt) {
-			a.SetError("native arm32: func-value shim with aggregate/float arg "
-					"not implemented (P4)")
-			return -1
-		}
-		var pw int = cc.ArgWords(pt)
-		if pw != 1 {
-			a.SetError(
-					"native arm32: func-value shim with a multi-word "
-							"(register-pair) scalar arg not implemented (P4)")
-			return -1
-		}
-		nWords = nWords + pw
-	}
-	return nWords
-}
-
-// shimShiftArgsDown moves nWords user-arg words from their incoming registers
-// argReg(srcBase + w) down into argReg(dstBase + w), for w in 0..nWords.  Callers
-// pass srcBase > dstBase (a downward shift), so left-to-right is clobber-safe
-// (each dst index is below every not-yet-read src).  The shapes: scalar/void
-// drops the data word (dstBase=0, srcBase=1); sret keeps the retbuf in R0 and
-// drops data (dstBase=1, srcBase=2); the pack shim first saves retbuf out of R0,
-// then drops both retbuf and data (dstBase=0, srcBase=2).
-func shimShiftArgsDown(a @asm.Assembler, nWords int, dstBase int, srcBase int) {
-	for w := 0; w < nWords; w++ {
-		arm32.Mov(a, arm32.COND_AL, false, argReg(dstBase + w), arm32.Reg(argReg(srcBase + w)))
-	}
-}
-
 // emitFuncValueShimBody classifies the func value's return shape and emits the
 // matching shim.  A big (>InternalSretBytes = 4) aggregate return goes through
 // the AAPCS32 R0-sret path (emitSretShim); a SMALL (<=4-byte) aggregate return
@@ -357,23 +315,23 @@ func emitFuncValueShimBody(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type)
 }
 
 // emitScalarVoidShim emits the scalar/void shim body: drop the data word (R0),
-// shift user args R1..RN down to R0..R(N-1), tail-branch to fnLabel.  A void or
-// scalar/pointer return (incl. a 64-bit-pair return in r0:r1) rides straight
-// back through the tail-branch — the shim never touches the return value.  Fails
-// LOUDLY on arg shapes the single-word shift can't marshal (shimUserArgWords) or
-// on more user-arg words than R1..R3 hold (a stack-spill shim is a later
-// increment).  Callers reach it via emitFuncValueShimBody, which has already
-// ruled out the aggregate/float return shapes.
+// marshal user args (incoming R1..) down into R0.. — a plain down-shift for
+// scalars/pointers, plus by-address re-expansion of any coerced in-register
+// aggregate (emitShimArgMarshalArm32) — then tail-branch to fnLabel.  A void or
+// scalar/pointer return (incl. a 64-bit-pair return in r0:r1) rides straight back
+// through the tail-branch — the shim never touches the return value; the marshal's
+// staging (present only for a coerced aggregate) is a BALANCED SP scratch, freed
+// before the branch, so the tail-branch stays frameless.  Fails LOUDLY on arg
+// shapes the register-only marshal can't place (shimOutRegs) or on more
+// user-arg words than the register budget holds (a stack-spill shim is a later
+// increment).  Callers reach it via emitFuncValueShimBody, which has already ruled
+// out the aggregate/float return shapes.
 func emitScalarVoidShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 	var cc common.CallConv = common.AAPCS32()
-	var nWords int = shimUserArgWords(a, cc, fvTyp)
-	if nWords < 0 { return }
-	if nWords > SHIM_ARG_REG_BUDGET {
-		a.SetError("native arm32: func-value shim with too many arg words needs "
-				"stack spill (P4)")
-		return
-	}
-	shimShiftArgsDown(a, nWords, 0, 1)
+	var nOut int = shimOutRegs(a, cc, fvTyp, 0)
+	if nOut < 0 { return }
+	if !shimArgsFitRegisters(a, cc, fvTyp, 1, 0, nOut) { return }
+	emitShimArgMarshalArm32(a, cc, fvTyp, 1, 0)
 	a.SetGlobal(fnLabel)
 	arm32.B(a, arm32.COND_AL, fnLabel)
 }
@@ -389,15 +347,12 @@ func emitScalarVoidShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 // retbuf + data prefix leaves one fewer arg register than the scalar shape.
 func emitSretShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 	var cc common.CallConv = common.AAPCS32()
-	var nWords int = shimUserArgWords(a, cc, fvTyp)
-	if nWords < 0 { return }
-	if nWords > SHIM_ARG_REG_BUDGET - 1 {
-		a.SetError(
-				"native arm32: func-value sret shim with too many arg words "
-						"needs stack spill (P4)")
-		return
-	}
-	shimShiftArgsDown(a, nWords, 1, 2)
+	// R0 = retbuf stays; the user args start at R1 (gpDestBase 1), and the incoming
+	// dispatch drops retbuf + data (srcPrefix 2 — R0 = retbuf, R1 = data).
+	var nOut int = shimOutRegs(a, cc, fvTyp, 1)
+	if nOut < 0 { return }
+	if !shimArgsFitRegisters(a, cc, fvTyp, 2, 1, nOut) { return }
+	emitShimArgMarshalArm32(a, cc, fvTyp, 2, 1)
 	a.SetGlobal(fnLabel)
 	arm32.B(a, arm32.COND_AL, fnLabel)
 }
@@ -415,22 +370,22 @@ func emitSretShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 // Over-budget arg counts (needing a stack-spill shim) fail LOUDLY (P4).
 func emitPackShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 	var cc common.CallConv = common.AAPCS32()
-	var nWords int = shimUserArgWords(a, cc, fvTyp)
-	if nWords < 0 { return }
-	if nWords > SHIM_ARG_REG_BUDGET - 1 {
-		a.SetError(
-				"native arm32: func-value pack shim with too many arg words "
-						"needs stack spill (P4)")
-		return
-	}
+	// The underlying is a small-aggregate function (returns by value, no sret arg),
+	// so its user args start at R0 (gpDestBase 0); the incoming dispatch drops
+	// retbuf + data (srcPrefix 2).
+	var nOut int = shimOutRegs(a, cc, fvTyp, 0)
+	if nOut < 0 { return }
+	if !shimArgsFitRegisters(a, cc, fvTyp, 2, 0, nOut) { return }
 	// push {r4, lr}: save the caller's R4 (reused for retbuf) and LR (the BL
 	// clobbers it).  Two registers keep SP 8-aligned across the call (AAPCS32).
 	arm32.Push(a, arm32.COND_AL, packShimPushMask())
 	// retbuf (R0) -> R4: survives the BL (R4 is callee-saved).
 	arm32.Mov(a, arm32.COND_AL, false, arm32.R4, arm32.Reg(arm32.R0))
-	// Drop retbuf + data; shift user args R2.. down to R0.. (the underlying is a
-	// small-aggregate function — it returns by value, so it has no sret arg).
-	shimShiftArgsDown(a, nWords, 0, 2)
+	// Drop retbuf + data; marshal user args (incoming R2..) down to R0.., re-
+	// expanding any coerced in-register aggregate by-address (emitShimArgMarshalArm32,
+	// which stages to a balanced SP scratch when one is present — freed before the BL,
+	// so it composes with this frame; R4 is untouched).
+	emitShimArgMarshalArm32(a, cc, fvTyp, 2, 0)
 	a.SetGlobal(fnLabel)
 	arm32.Bl(a, arm32.COND_AL, fnLabel)
 	// The underlying returned the <=4-byte aggregate by value in R0 (one word);

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build the self-hosted formatter (bnfmt).
 #
-# Convenience wrapper around the bootstrap → bnc → cmd/bnfmt pipeline.
+# Convenience wrapper around the BUILDER → gen1 bnc → cmd/bnfmt build
+# (fetch-builder.sh downloads the BUILDER bnc; no bootstrap/Go needed).
 # Not used by the test/conformance harness; those have their own
 # build helpers in scripts/lib/build-compilers.sh.
 #
@@ -23,7 +24,6 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 
 OUT=""
 DEBUG=0
@@ -57,13 +57,6 @@ if [ -z "$OUT" ]; then
     exit 1
 fi
 
-if [ ! -d "$BOOTSTRAP_DIR" ]; then
-    echo "ERROR: bootstrap dir not found at $BOOTSTRAP_DIR" >&2
-    echo "(Expected sibling of $BINATE_DIR; the workspace layout has the" >&2
-    echo " bootstrap and binate repos as sibling directories.)" >&2
-    exit 1
-fi
-
 BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/binate_build_XXXXXX")"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
@@ -79,7 +72,6 @@ fi
 
 echo "Building bnfmt: $MODE_DESC → $OUT"
 echo "  source root:    $BINATE_DIR"
-echo "  bootstrap:      $BOOTSTRAP_DIR"
 echo "  build scratch:  $BUILD_DIR"
 echo
 

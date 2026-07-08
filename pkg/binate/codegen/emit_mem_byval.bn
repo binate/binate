@@ -1,0 +1,235 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/ir"
+import "pkg/binate/stringutils"
+import "pkg/binate/types"
+import "pkg/std/strings"
+
+// ============================================================
+// SysV-AMD64 memory-class aggregate args (true LLVM `byval`)
+// ============================================================
+//
+// A ≤16-byte aggregate ARGUMENT that does not fully fit in the remaining
+// SysV-AMD64 argument registers (given its position) is MEMORY-classified: the
+// WHOLE aggregate is passed by value on the outgoing stack, all-or-nothing
+// (types.SysVArgInMemory / native argRegWordsStackWords).  The native x64
+// backend already does this; clang emits a `byval(<T>)` parameter for it.
+//
+// The historical LLVM lowering coerced such an aggregate to a SPLITTABLE form
+// (`[N x i64]` for a struct/array, the first-class `{i8*,i64}` / `{i8*,i8*}` for
+// a slice / iface-value / func-value), which LLVM splits at a straddle — the
+// first eightbyte in the last free GP reg, the rest on the stack — diverging
+// from native (and the C ABI) at the native↔LLVM boundary.  For a memory-class
+// argument codegen instead emits a TRUE `byval(<T>) align A` parameter, so LLVM
+// lays the whole aggregate on the outgoing stack exactly as native + clang do.
+//
+// This is SysV-AMD64-only: AAPCS64 / AAPCS32 SPLIT a straddling aggregate and
+// LLVM's coerced/first-class form splits the same way, so native and LLVM
+// already agree there — codegen keeps coercing on those targets and consults the
+// memory-class predicate only for the x64 target (aggMemClass gates on it).
+
+// targetIsX64 reports whether the current target is x86-64 (SysV-AMD64), the
+// only target where a straddling ≤16-byte aggregate is MEMORY-classified
+// (all-or-nothing) rather than split.
+func targetIsX64() bool {
+	return types.GetTarget().Arch == types.ARCH_X64
+}
+
+// aggMemClass reports whether the aggregate at position `pos` of `argTypes`
+// (which must already include any synthetic sret / data-ptr prefix, so the
+// register positions match the native x64 walk) is a SysV memory-class NAMED
+// STRUCT / ARRAY on x64 — passed wholly on the stack by value.  False off x64.
+//
+// Scope: for now only AggInRegCoercedKind aggregates (named struct / array —
+// the ones already coerced to `[N x iW]`) are byval'd for the memory-class case;
+// slices / iface-values / func-values (2-word GP aggregates that ALSO straddle,
+// still passed first-class) keep their existing lowering.  The predicate's
+// register-budget walk (types.SysVArgInMemory) still models THOSE as memory
+// (all-or-nothing), the most generous GP budget — so a struct this reports as
+// memory-class is memory-class under any interpretation of a preceding first-
+// class aggregate, and byval'ing it agrees with both native and all-LLVM.  The
+// slice / iface- / func-value memory-class case is a tracked follow-up (see
+// claude-todo.md); doing it needs the first-class call-site + alloca-hoist paths,
+// which this commit does not touch, so restricting here keeps every byval site
+// (define, call, iface, shim, closure) consistently struct/array-only.
+func aggMemClass(argTypes @[]@types.Type, pos int) bool {
+	if !targetIsX64() { return false }
+	if pos < 0 || pos >= len(argTypes) { return false }
+	if !types.AggInRegCoercedKind(argTypes[pos]) { return false }
+	return types.SysVArgInMemory(argTypes, pos)
+}
+
+// defineArgTypes builds the SysV argTypes list for f's DEFINE line: a leading
+// pointer entry when f returns via sret (the sret buffer pointer rides RDI on
+// SysV), then each declared param type.  Mirrors the native x64 callee walk
+// (spillIncomingParams' paramTypes) so the register positions — and thus the
+// memory-class decisions — agree.
+func defineArgTypes(f @ir.Func, useSret bool) @[]@types.Type {
+	var off int = 0
+	if useSret { off = 1 }
+	var ts @[]@types.Type = make_slice(@types.Type, len(f.Params) + off)
+	if useSret { ts[0] = types.MakePointerType(types.TypUint8()) }
+	for i := 0; i < len(f.Params); i++ {
+		ts[i + off] = f.Params[i].Typ
+	}
+	return ts
+}
+
+// callArgTypes builds the SysV argTypes list for a direct OP_CALL: a leading
+// pointer entry when the call passes an sret buffer in RDI (hasSretPrefix), then
+// each argument's declared type.  Mirrors the native x64 caller walk
+// (x64_call.bn emitCall's bigRet branch).
+func callArgTypes(instr @ir.Instr, hasSretPrefix bool) @[]@types.Type {
+	var off int = 0
+	if hasSretPrefix { off = 1 }
+	var ts @[]@types.Type = make_slice(@types.Type, len(instr.Args) + off)
+	if hasSretPrefix { ts[0] = types.MakePointerType(types.TypUint8()) }
+	for i := 0; i < len(instr.Args); i++ {
+		ts[i + off] = instr.Args[i].Typ
+	}
+	return ts
+}
+
+// ifaceArgTypes builds the SysV argTypes list for an OP_CALL_IFACE_METHOD
+// dispatch: a leading pointer when the call returns via sret (RDI), then the
+// receiver data pointer (i8*), then the positional args (instr.Args[1..]).
+// Mirrors the native x64 iface dispatch prefix (x64_iface.bn / x64_call_indirect
+// prefixSlots), so a positional arg's register position matches.
+func ifaceArgTypes(instr @ir.Instr, useSret bool) @[]@types.Type {
+	var off int = 1 // the receiver data pointer
+	if useSret { off = 2 }
+	var nArgs int = len(instr.Args) - 1
+	var ts @[]@types.Type = make_slice(@types.Type, nArgs + off)
+	for p := 0; p < off; p++ {
+		ts[p] = types.MakePointerType(types.TypUint8())
+	}
+	for i := 0; i < nArgs; i++ {
+		ts[i + off] = instr.Args[i + 1].Typ
+	}
+	return ts
+}
+
+// shimParamInMemory reports whether the func-value underlying's param i is a
+// SysV memory-class aggregate, given whether the underlying call prepends an
+// sret buffer pointer (sretPrefix — the aggregate-return C-sret shim does).  The
+// shim receives every aggregate arg BY-ADDRESS, so a memory-class param is
+// passed straight through to the underlying as `ptr byval(<T>) align 8` on the
+// incoming pointer — no load, no split.
+func shimParamInMemory(fvTyp @types.Type, sretPrefix bool, i int) bool {
+	var off int = 0
+	if sretPrefix {
+		off = 1
+	}
+	var ts @[]@types.Type = make_slice(@types.Type, len(fvTyp.Params) + off)
+	if sretPrefix {
+		ts[0] = types.MakePointerType(types.TypUint8())
+	}
+	for k := 0; k < len(fvTyp.Params); k++ {
+		ts[k + off] = fvTyp.Params[k].Type
+	}
+	return aggMemClass(ts, i + off)
+}
+
+// shimInMemFlags returns, per func-value user arg, whether it is a SysV
+// memory-class aggregate for a NON-capturing shim's underlying call (argTypes =
+// [sret ptr?] + fvTyp.Params).  Passing a precomputed flag array to
+// emitShimArgLoads / the underlying-arg loop decouples the shared shim emitters
+// from the closure-vs-non-closure position math.
+func shimInMemFlags(fvTyp @types.Type, sretPrefix bool) @[]bool {
+	var flags @[]bool = make_slice(bool, len(fvTyp.Params))
+	for i := 0; i < len(fvTyp.Params); i++ {
+		flags[i] = shimParamInMemory(fvTyp, sretPrefix, i)
+	}
+	return flags
+}
+
+// closureInMemFlags returns the same per-user-arg memory-class flags for a
+// CAPTURING closure shim.  The lifted underlying @<m>'s params are [captures...,
+// user-args...], and its define-line (emitFuncDbg / defineArgTypes) byval's each
+// memory-class one, so the shim must use the SAME positions: user arg i sits at
+// f.Params[nCap + i] (nCap = the capture count = len(f.Params) - len(fvTyp.Params)).
+func closureInMemFlags(f @ir.Func, fvTyp @types.Type, sretPrefix bool) @[]bool {
+	var nCap int = len(f.Params) - len(fvTyp.Params)
+	var argTypes @[]@types.Type = defineArgTypes(f, sretPrefix)
+	var off int = 0
+	if sretPrefix {
+		off = 1
+	}
+	var flags @[]bool = make_slice(bool, len(fvTyp.Params))
+	for i := 0; i < len(fvTyp.Params); i++ {
+		flags[i] = aggMemClass(argTypes, nCap + i + off)
+	}
+	return flags
+}
+
+// writeByvalMemType writes the LLVM by-value memory-class parameter/argument
+// TYPE `ptr byval(<T>) align 8` for a memory-class aggregate t — LLVM lays the
+// whole aggregate on the outgoing stack (matching native + clang) rather than
+// splitting a coerced `[N x i64]` / first-class value.  The alignment is 8, the
+// SysV outgoing-args word alignment the native x64 backend uses for a ≤16-byte
+// aggregate (stackArgFootprint's WordBytes) and what clang emits for the common
+// two-eightbyte case — so the LLVM stack slot and the native stack slot agree.
+func writeByvalMemType(out *strings.Builder, t @types.Type) {
+	out.Write("ptr byval(")
+	out.Write(llvmType(t))
+	out.Write(") align 8")
+	return
+}
+
+// writeMemByvalParamDefine writes a memory-class aggregate PARAM on a define
+// line: `ptr byval(<T>) align 8 %vID.bv`.  The body's `%vID` (the aggregate
+// value) is reconstructed from the byval pointer in the entry-block prologue
+// (emitMemByvalParamReconstruct).
+func writeMemByvalParamDefine(out *strings.Builder, id int, t @types.Type) {
+	writeByvalMemType(out, t)
+	out.WriteByte(' ')
+	emitRef(out, id)
+	out.Write(".bv")
+	return
+}
+
+// emitMemByvalParamReconstruct emits the entry-block reconstruction of a
+// memory-class aggregate param's `%S` value: the byval parameter `%vID.bv` is a
+// pointer to the caller's on-stack copy, so `%vID = load <T>, ptr %vID.bv` binds
+// the value the body references.  No alloca — the byval pointer IS the storage.
+func emitMemByvalParamReconstruct(out *strings.Builder, id int, t @types.Type) {
+	emitRef(out, id)
+	out.Write(" = load ")
+	out.Write(llvmType(t))
+	out.Write(", ptr ")
+	emitRef(out, id)
+	out.Write(".bv\n  ")
+	return
+}
+
+// emitMemByvalArgStore emits, BEFORE a call line, the store that fills a
+// memory-class aggregate arg's byval copy: `store <T> <argval>, ptr
+// %v<callID>.agA<i>`.  It reuses the same `.agA<i>` slot the coerced path
+// allocates (an `[N x iW]` alloca of the same size — big enough and 8-aligned to
+// hold the aggregate), so the alloca-hoist pass is unchanged; only what is
+// stored and how the arg is spelled differ.  `arg` is the argument value SSA.
+func emitMemByvalArgStore(out *strings.Builder, callID int, arg @ir.Instr, i int) {
+	out.Write("store ")
+	out.Write(llvmType(arg.Typ))
+	out.WriteByte(' ')
+	emitValRef(out, arg)
+	out.Write(", ptr %v")
+	stringutils.WriteInt(out, callID)
+	out.Write(".agA")
+	stringutils.WriteInt(out, i)
+	out.Write("\n  ")
+	return
+}
+
+// writeMemByvalArg writes a memory-class aggregate arg in a call's argument
+// list: `ptr byval(<T>) align 8 %v<callID>.agA<i>` (the slot filled by
+// emitMemByvalArgStore).  LLVM copies the pointee onto the outgoing stack,
+// matching the native caller's memory placement.
+func writeMemByvalArg(out *strings.Builder, callID int, t @types.Type, i int) {
+	writeByvalMemType(out, t)
+	out.Write(" %v")
+	stringutils.WriteInt(out, callID)
+	out.Write(".agA")
+	stringutils.WriteInt(out, i)
+	return
+}

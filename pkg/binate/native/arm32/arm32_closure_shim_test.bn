@@ -1,0 +1,339 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Byte-level tests for the arm32 capturing-closure / method-value FAST shim
+// (arm32_closure_shim.bn, P4-d Phase A).  Each shape is compared byte-for-byte
+// against a hand-built reference so the exact placement — user-arg UP-shift to the
+// post-capture registers (with the AAPCS §6.5 C.3 even-pair pad at its ABSOLUTE
+// post-capture parity) and the right-to-left capture loads from the R0 data
+// pointer — is pinned.  End-to-end behavior is covered by conformance
+// 501/503/505/506/509/511/555 in builder-comp_native_arm32_baremetal; these pin
+// the register-level correctness a smoke run cannot see.
+//
+// setArm32Target (arm32_funcvalue_test.bn) pins the ILP32 layout so `int` is one
+// GP word, as on the real target.
+
+// closureFvType builds the func-value TYPE the shim is entered under (the user
+// params + results; the captures are NOT part of it — they ride the data slot).
+func closureFvType(params @[]@types.Param, results @[]@types.Type) @types.Type {
+	return types.MakeFuncValueType(params, results)
+}
+
+// mkIntCaptureClosure builds an IsClosure Func with nCap single-word int captures
+// and the given user params.  The ClosureStruct's field i sits at offset i*4
+// (ILP32 int).  fvTyp is the user-facing func-value type (no captures).
+func mkIntCaptureClosure(nCap int, userParams @[]@types.Param) @ir.Func {
+	var fields @[]@types.Field = make_slice(@types.Field, nCap)
+	for i := 0; i < nCap; i++ {
+		fields[i] = make(types.Field)
+		fields[i].Name = "c"
+		fields[i].Type = types.TypInt()
+	}
+	var f @ir.Func = make(ir.Func)
+	f.Name = "main.__funclit_x"
+	f.IsClosure = true
+	f.NumCaptureParams = nCap
+	f.ClosureStruct = types.MakeStructType("__closure_x", fields)
+	// The underlying's Params = captures ++ user params, but the shim only reads
+	// NumCaptureParams / ClosureStruct / the fvTyp user params, so a minimal Params
+	// slice suffices.
+	var noP @[]@ir.Param
+	f.Params = noP
+	var noR @[]@types.Type
+	f.Results = noR
+	return f
+}
+
+// intParams builds n int user params.
+func intParams(n int) @[]@types.Param {
+	var params @[]@types.Param = make_slice(@types.Param, n)
+	for i := 0; i < n; i++ {
+		params[i] = make(types.Param)
+		params[i].Type = types.TypInt()
+	}
+	return params
+}
+
+// A 1-capture / 0-user-arg closure returning int is the minimal shape:
+//   LDR R0, [R0, #0]   ; capture0 self-load (i=0 last keeps R0 base)
+//   B underlying       ; tail-branch
+// No user-arg marshal (no user args), so 2 instrs = 8 bytes.
+func TestClosureShim1Cap0UserByteRef() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(1, intParams(0))
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = types.TypInt()
+	var noParams @[]@types.Param
+	var fv @types.Type = closureFvType(noParams, results)
+
+	var got @asm.Assembler = asm.New(4)
+	got.SetSection("text", -1)
+	emitClosureShimArm32(got, "bn_ul", fv, f)
+	if got.HasError { return fail("1-cap/0-user closure shim must not error") }
+
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R0, 0)) // capture0 -> R0
+	ref.SetGlobal("bn_ul")
+	arm32.B(ref, arm32.COND_AL, "bn_ul")
+
+	if !asmTextEqMarshal(got, ref) {
+		return fail("1-cap/0-user closure shim bytes must match (LDR R0,[R0,#0]; B)")
+	}
+	return ""
+}
+
+// A 2-capture / 2-int-user closure UP-shifts the users into R2:R3 (past the two
+// captures at R0:R1) and loads the captures right-to-left.  gpDestBase = 2:
+//   ; marshal (forceStage): stage the 2 incoming user words, UP-shift to R2:R3
+//   SUB SP, SP, #8
+//   STR R1, [SP, #0]     ; stage user0 (incoming R1)
+//   STR R2, [SP, #4]     ; stage user1 (incoming R2)
+//   LDR R2, [SP, #0]     ; user0 -> R2 (post-capture)
+//   LDR R3, [SP, #4]     ; user1 -> R3
+//   ADD SP, SP, #8
+//   ; captures right-to-left (i=1 then i=0 so R0 base survives)
+//   LDR R1, [R0, #4]     ; capture1 -> R1
+//   LDR R0, [R0, #0]     ; capture0 -> R0 (last)
+//   B underlying
+// MUTATION-VERIFY: gpDestBase=0 (dense-pack ignoring captures) would place the
+// users at R0:R1 — clobbering the capture registers — a different byte sequence.
+func TestClosureShim2Cap2UserByteRef() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(2, intParams(2))
+	var noResults @[]@types.Type
+	var fv @types.Type = closureFvType(intParams(2), noResults)
+
+	var got @asm.Assembler = asm.New(4)
+	got.SetSection("text", -1)
+	emitClosureShimArm32(got, "bn_ul", fv, f)
+	if got.HasError { return fail("2-cap/2-user closure shim must not error") }
+
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	emitSpAdjust(ref, false, 8) // SUB allocates 2-word stage
+	arm32.Str(ref, arm32.COND_AL, arm32.R1, arm32.MemImm(arm32.SP, 0)) // stage user0
+	arm32.Str(ref, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.SP, 4)) // stage user1
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.SP, 0)) // user0 -> R2
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.SP, 4)) // user1 -> R3
+	emitSpAdjust(ref, true, 8) // ADD frees
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R1, arm32.MemImm(arm32.R0, 4)) // capture1 -> R1
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R0, 0)) // capture0 -> R0 (last)
+	ref.SetGlobal("bn_ul")
+	arm32.B(ref, arm32.COND_AL, "bn_ul")
+
+	if !asmTextEqMarshal(got, ref) {
+		return fail(
+				"2-cap/2-user closure shim bytes must match the UP-shift-to-R2:R3 + "
+						"right-to-left capture-load reference")
+	}
+	return ""
+}
+
+// EVEN-PAIR MUTATION-VERIFY: a 1-int-capture closure with a single int64 user arg.
+// The underlying ABI is (int capture, int64) — the int64 is 8-aligned and follows
+// the capture at reg 0, so AAPCS §6.5 C.3 pads reg 1 and places the int64 at the
+// ABSOLUTE post-capture pair R2:R3.  The incoming dispatch keeps the int64's real
+// type, so it is padded to R2:R3 incoming too (data R0, pad R1, int64 R2:R3).
+// With forceStage the marshal stages the 3 incoming words (pad word included) and
+// reads the int64 back into R2:R3:
+//   SUB SP, SP, #16      ; 3 words -> 12 -> StackAlign 8 -> 16
+//   STR R1, [SP, #0]     ; stage incoming word 0 (the padded slot's reg)
+//   STR R2, [SP, #4]     ; stage int64.lo (incoming R2)
+//   STR R3, [SP, #8]     ; stage int64.hi (incoming R3)
+//   LDR R2, [SP, #4]     ; int64.lo -> R2 (post-capture even pair, pad R1)
+//   LDR R3, [SP, #8]     ; int64.hi -> R3
+//   ADD SP, SP, #16
+//   LDR R0, [R0, #0]     ; capture0 -> R0
+//   B underlying
+// If gpDestBase were 0 (or the classify ran over users only), the int64 would land
+// at the EVEN R0:R1 (no pad) — clobbering the capture reg and reading the wrong
+// incoming slots.  This byte reference (int64 at R2:R3, keyed on the ABSOLUTE
+// post-capture parity gpDestBase=captureWords=1) FAILS under that mutation.
+func TestClosureShim1CapInt64UserEvenPairByteRef() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(1, int64OneParam())
+	var noResults @[]@types.Type
+	var fv @types.Type = closureFvType(int64OneParam(), noResults)
+
+	var got @asm.Assembler = asm.New(4)
+	got.SetSection("text", -1)
+	emitClosureShimArm32(got, "bn_ul", fv, f)
+	if got.HasError { return fail("1-cap/int64-user closure shim must not error") }
+
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	emitSpAdjust(ref, false, 16) // 3 staged words -> 16 (8-aligned)
+	arm32.Str(ref, arm32.COND_AL, arm32.R1, arm32.MemImm(arm32.SP, 0)) // incoming word 0
+	arm32.Str(ref, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.SP, 4)) // int64.lo (R2)
+	arm32.Str(ref, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.SP, 8)) // int64.hi (R3)
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.SP, 4)) // int64.lo -> R2 (pad R1)
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.SP, 8)) // int64.hi -> R3
+	emitSpAdjust(ref, true, 16)
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R0, 0)) // capture0 -> R0
+	ref.SetGlobal("bn_ul")
+	arm32.B(ref, arm32.COND_AL, "bn_ul")
+
+	if !asmTextEqMarshal(got, ref) {
+		return fail(
+				"1-cap/int64-user closure shim must even-pair-pad the int64 to the "
+						"ABSOLUTE post-capture R2:R3 (gpDestBase=captureWords) — R0:R1 is the "
+						"gpDestBase=0 / classify-over-users-only miscompile this pins")
+	}
+	return ""
+}
+
+// int64OneParam builds a single int64 user param.
+func int64OneParam() @[]@types.Param {
+	var params @[]@types.Param = make_slice(@types.Param, 1)
+	params[0] = make(types.Param)
+	params[0].Type = types.TypInt64()
+	return params
+}
+
+// A managed (@T) capture rides the SAME single-word path as an int capture — the
+// capture struct field is a managed pointer (one word), loaded from [R0, #0].  This
+// pins that a managed capture (the 509/511 dtor-path shape) needs no special shim
+// handling: the dtor slot, not the shim, carries the release.
+func TestClosureShimManagedCaptureByteRef() testing.TestResult {
+	setArm32Target()
+	var fields @[]@types.Field = make_slice(@types.Field, 1)
+	fields[0] = make(types.Field)
+	fields[0].Name = "b"
+	fields[0].Type = types.MakeManagedPtrType(types.TypInt())
+	var f @ir.Func = make(ir.Func)
+	f.Name = "main.__mv_x"
+	f.IsClosure = true
+	f.NumCaptureParams = 1
+	f.ClosureStruct = types.MakeStructType("__closure_mv", fields)
+	var noP @[]@ir.Param
+	f.Params = noP
+	var noR @[]@types.Type
+	f.Results = noR
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = types.TypInt()
+	var noParams @[]@types.Param
+	var fv @types.Type = closureFvType(noParams, results)
+
+	var got @asm.Assembler = asm.New(4)
+	got.SetSection("text", -1)
+	emitClosureShimArm32(got, "bn_ul", fv, f)
+	if got.HasError { return fail("managed-capture closure shim must not error") }
+
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R0, 0)) // @capture -> R0
+	ref.SetGlobal("bn_ul")
+	arm32.B(ref, arm32.COND_AL, "bn_ul")
+
+	if !asmTextEqMarshal(got, ref) {
+		return fail(
+				"managed-capture closure shim bytes must match the single-word "
+						"capture-load reference (LDR R0,[R0,#0]; B)")
+	}
+	return ""
+}
+
+// A float user param routes to the P5 fail-loud (arm32 is soft-float).
+func TestClosureShimFloatParamSetsError() testing.TestResult {
+	setArm32Target()
+	var params @[]@types.Param = make_slice(@types.Param, 1)
+	params[0] = make(types.Param)
+	params[0].Type = types.TypFloat32()
+	var f @ir.Func = mkIntCaptureClosure(1, params)
+	var noResults @[]@types.Type
+	var fv @types.Type = closureFvType(params, noResults)
+
+	var a @asm.Assembler = asm.New(4)
+	a.SetSection("text", -1)
+	emitClosureShimArm32(a, "bn_ul", fv, f)
+	if !a.HasError {
+		return fail("a float-param closure shim must fail loud (P5)")
+	}
+	return ""
+}
+
+// A float CAPTURE routes to the P5 fail-loud too.
+func TestClosureShimFloatCaptureSetsError() testing.TestResult {
+	setArm32Target()
+	var fields @[]@types.Field = make_slice(@types.Field, 1)
+	fields[0] = make(types.Field)
+	fields[0].Type = types.TypFloat32()
+	var f @ir.Func = make(ir.Func)
+	f.Name = "main.__funclit_f"
+	f.IsClosure = true
+	f.NumCaptureParams = 1
+	f.ClosureStruct = types.MakeStructType("__closure_f", fields)
+	var noP @[]@ir.Param
+	f.Params = noP
+	var noResults @[]@types.Type
+	var noParams @[]@types.Param
+	var fv @types.Type = closureFvType(noParams, noResults)
+
+	var a @asm.Assembler = asm.New(4)
+	a.SetSection("text", -1)
+	emitClosureShimArm32(a, "bn_ul", fv, f)
+	if !a.HasError {
+		return fail("a float-capture closure shim must fail loud (P5)")
+	}
+	return ""
+}
+
+// An AGGREGATE-returning closure routes to the Phase C fail-loud.
+func TestClosureShimAggregateReturnSetsError() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(1, intParams(0))
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = aggPairType() // 8-byte struct -> aggregate return
+	var noParams @[]@types.Param
+	var fv @types.Type = closureFvType(noParams, results)
+
+	var a @asm.Assembler = asm.New(4)
+	a.SetSection("text", -1)
+	emitClosureShimArm32(a, "bn_ul", fv, f)
+	if !a.HasError {
+		return fail("an aggregate-return closure shim must fail loud (Phase C)")
+	}
+	return ""
+}
+
+// A multi-return closure routes to the Phase C fail-loud.
+func TestClosureShimMultiReturnSetsError() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(1, intParams(0))
+	var results @[]@types.Type = make_slice(@types.Type, 2)
+	results[0] = types.TypInt()
+	results[1] = types.TypInt()
+	var noParams @[]@types.Param
+	var fv @types.Type = closureFvType(noParams, results)
+
+	var a @asm.Assembler = asm.New(4)
+	a.SetSection("text", -1)
+	emitClosureShimArm32(a, "bn_ul", fv, f)
+	if !a.HasError {
+		return fail("a multi-return closure shim must fail loud (Phase C)")
+	}
+	return ""
+}
+
+// A closure whose captures + user args overflow R0..R3 routes to the Phase B
+// (stack-spill) fail-loud.  3 int captures + 2 int users = 5 words > 4 GP regs.
+func TestClosureShimRegisterOverflowSetsError() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(3, intParams(2))
+	var noResults @[]@types.Type
+	var fv @types.Type = closureFvType(intParams(2), noResults)
+
+	var a @asm.Assembler = asm.New(4)
+	a.SetSection("text", -1)
+	emitClosureShimArm32(a, "bn_ul", fv, f)
+	if !a.HasError {
+		return fail("a register-overflowing closure shim must fail loud (Phase B)")
+	}
+	return ""
+}

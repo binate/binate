@@ -1,0 +1,240 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Native arm32 emission for the per-(literal, capture-shape) shim backing a
+// CAPTURING function literal or a METHOD VALUE (B.2 / B.4 of plan-function-
+// values-phase-2.md); P4-d Phase A of plan-native-arm32.md.  Split from
+// arm32_funcvalue.bn to keep each file under the hygiene length cap.
+//
+// A method value rides this path FREE: gen_method_value.bn marks the wrapper
+// IsClosure=true with one capture (the bound receiver), so lookupClosureFuncArm32
+// matches it and the same shim serves it — no method-value-specific code, exactly
+// as on aarch64 / x64.
+//
+// The shim is entered under the uniform all-int dispatch ABI `<ret>(data, user
+// args…)` — the capture-struct pointer in R0, user args in R1..  The underlying
+// lifted function's REAL ABI PREPENDS the captures as leading params
+// (`underlying(captures…, user_args…)`), unpacked field-by-field into the leading
+// GP arg registers.  So the fast (register-only) shim:
+//
+//   1. UP-shifts the incoming user args (R1..) into their post-capture outgoing
+//      slots R(captureWords).. — via emitShimArgMarshalArm32 with
+//      gpDestBase = captureWords and forceStage (an UP-shift needs staging for
+//      clobber-safety; see that function's forceStage note).
+//   2. Loads each capture word from [R0 + FieldOffset] into R0..R(captureWords-1),
+//      RIGHT-TO-LEFT (capture i=0, at offset 0, loads LAST so the R0 base survives
+//      until the final load).
+//   3. Tail-branches (B) to the underlying.
+//
+// Only the SCALAR / void-return, non-float, register-fitting shape is handled in
+// Phase A.  Everything else routes to a CLEAN a.SetError (never a silent
+// miscompile):
+//   - a float capture / param / return           -> P5
+//   - an aggregate or multi-return result         -> Phase C
+//   - captures + users overflowing R0..R3 (spill) -> Phase B
+//   - a capture whose even-pair pad shifts the user args off dense packing
+//     (gpDestBase != captureWords) -> Phase B
+// Mirrors aarch64_closure_shim.bn's emitClosureShim at the reduced Phase-A
+// surface, with AAPCS32's 4-GP-arg-reg budget and IP (R12) as the intra-shim
+// scratch.
+
+// funcValueDtorHandleSymArm32 returns the closure-struct dtor's HANDLE symbol
+// (`__handle.<dtor>`) for a capturing @func whose closure struct needs
+// destruction — marking it global so its relocation resolves — else an empty
+// slice (the vtable's dtor slot is then a null pointer).  Mirrors aarch64's
+// funcValueDtorHandleSym.
+//
+// Slot 0 carries the dtor's HANDLE pointer, not a raw fn pointer, because
+// OP_FUNC_VALUE_DTOR -> rt.ZeroRefDestroy dispatches it as
+// `handle.vtable.call(handle.data, ptr)` (an OP_CALL_HANDLE) — the same
+// convention the LLVM / aarch64 / x64 backends use.  The referenced
+// `__handle.<dtor>` triple is already emitted by emitFuncValueVtables' IsLinkOnce
+// pre-pass (collectFuncValueRefs adds every local IsLinkOnce func — closure-struct
+// dtors among them — to `seen`), so handleSymFor(pkgName, f.ClosureStructDtorName)
+// names an already-defined symbol — no new global, no dangling reference.
+//
+// A NULL dtor slot on a managed capturing @func would silently LEAK its capture
+// block: OP_FUNC_VALUE_DTOR loads vtable slot 0 -> rt.ZeroRefDestroy, which no-ops
+// on a null slot, so the capture struct (and its RefInc'd managed captures) is
+// never released.  This is why construction (the data-slot store, emitFuncValue)
+// and this dtor emission must land together.
+func funcValueDtorHandleSymArm32(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Module,
+		qname @[]char) @[]char {
+	var f @ir.Func = lookupClosureFuncArm32(mod, qname)
+	if f == nil || !f.IsManagedFuncValue || f.ClosureStruct == nil ||
+			!f.ClosureStruct.NeedsDestruction() || len(f.ClosureStructDtorName) == 0 {
+		var none @[]char
+		return none
+	}
+	var h @[]char = handleSymFor(pkgName, f.ClosureStructDtorName)
+	a.SetGlobal(h)
+	return h
+}
+
+// emitClosureShimArm32 emits the per-(literal, capture-shape) shim for a
+// capturing closure or method value.  The caller (emitFuncValueShims) has already
+// defined the label and marked it weak; this writes the shim body or fails LOUDLY
+// on an out-of-Phase-A shape.
+func emitClosureShimArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type, f @ir.Func) {
+	// A float capture / param / return needs FP marshalling (P5) — the GP-only path
+	// below would mis-place it.
+	if closureHasFloatPartsArm32(fvTyp, f) {
+		a.SetError("native arm32: float-containing closure func value not "
+				"implemented (P5)")
+		return
+	}
+	// An aggregate or multi-return result rides a retbuf convention the Phase-A
+	// scalar/void tail-branch does not implement — Phase C.
+	if shimReturnIsNonScalarArm32(fvTyp) {
+		a.SetError(
+				"native arm32: closure func value with an aggregate or "
+						"multi-return result not implemented (P4-d Phase C)")
+		return
+	}
+	var cc common.CallConv = common.AAPCS32()
+	var argTypes @[]@types.Type = buildShimArgTypesArm32(fvTyp, f)
+	// Any arg (capture or user) that spills to the outgoing stack needs the framed-BL
+	// stack-spill shim — Phase B.  On AAPCS32's 4 GP arg regs this triggers far sooner
+	// than on aa64's 8.
+	if shimClosureNeedsSpillArm32(cc, argTypes) {
+		a.SetError(
+				"native arm32: closure func value whose captures + args exceed "
+						"R0..R3 not implemented (P4-d Phase B)")
+		return
+	}
+	// captureWords is the dense GP-word footprint of the captures (Σ ArgWords).  The
+	// user args start at gpDestBase = captureWords ONLY when the captures pack densely
+	// — i.e. no capture took an AAPCS §6.5 C.3 even-pair pad that would shift the
+	// user-arg base off captureWords.  Verify each capture's authoritative classifier
+	// position (CallArgRegStart over captures++users) equals its running DENSE cursor;
+	// a padded-capture layout (e.g. an int64 capture at an odd boundary) is deferred to
+	// Phase B rather than silently miscompiled by a wrong gpDestBase.  This checks the
+	// captures ONLY — a user arg's OWN even-pair pad (e.g. a leading int64 user arg)
+	// is legitimate and handled by the marshal at its absolute post-capture parity, so
+	// it must not trip this gate.
+	var captureWords int = 0
+	for i := 0; i < f.NumCaptureParams; i++ {
+		if cc.CallArgRegStart(argTypes, i) != captureWords {
+			a.SetError(
+					"native arm32: closure func value whose captures need an "
+							"even-pair pad not implemented (P4-d Phase B)")
+			return
+		}
+		captureWords = captureWords + cc.ArgWords(f.ClosureStruct.Fields[i].Type)
+	}
+	// Classify the user args over the FULL captures++users register parity via
+	// gpDestBase = captureWords: shimOutRegs applies the same even-pair pads the
+	// callee does, keyed on the ABSOLUTE (post-capture) register index, and
+	// fails LOUDLY on an unmodeled user-arg shape.
+	var nOut int = shimOutRegs(a, cc, fvTyp, captureWords)
+	if nOut < 0 { return }
+	if !shimArgsFitRegisters(cc, fvTyp, 1, captureWords, nOut) {
+		a.SetError(
+				"native arm32: closure func value whose captures + args exceed "
+						"R0..R3 not implemented (P4-d Phase B)")
+		return
+	}
+	// Step 1: UP-shift the user args (incoming R1.., srcPrefix 1 drops the data word)
+	// to their post-capture outgoing slots R(captureWords)..  forceStage makes this
+	// clobber-safe for the UP-shift (gpDestBase = captureWords > srcPrefix = 1).  The
+	// balanced SP scratch is freed before the capture loads, and the marshal never
+	// touches R0 (gpDestBase >= 1) — so R0 stays live as the capture base.
+	emitShimArgMarshalArm32(a, cc, fvTyp, 1, captureWords, true)
+	// Step 2: load each capture word from [R0 + FieldOffset] into R0..R(captureWords
+	// -1), RIGHT-TO-LEFT (i=0 loads last so R0 stays a valid base until the final
+	// load, whose destination may be R0 itself).
+	emitClosureCaptureRegLoadArm32(a, cc, f, argTypes, captureWords)
+	// Step 3: tail-branch to the underlying.
+	a.SetGlobal(fnLabel)
+	arm32.B(a, arm32.COND_AL, fnLabel)
+}
+
+// closureHasFloatPartsArm32 reports whether any capture, user param, or return of
+// the closure is a float scalar.  arm32 is soft-float with no HFA register file,
+// so — unlike aarch64 — there is no aggregate-HFA case: a float part is exactly a
+// float SCALAR anywhere in the signature.  A float part routes to the P5
+// fail-loud (the same gate the non-capturing arm32 shim applies to float returns).
+func closureHasFloatPartsArm32(fvTyp @types.Type, f @ir.Func) bool {
+	if f.ClosureStruct != nil {
+		for i := 0; i < f.NumCaptureParams; i++ {
+			if common.IsFloatScalarTyp(f.ClosureStruct.Fields[i].Type) { return true }
+		}
+	}
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		if common.IsFloatScalarTyp(fvTyp.Params[pi].Type) { return true }
+	}
+	if len(fvTyp.Results) == 1 && fvTyp.Results[0] != nil {
+		return common.IsFloatScalarTyp(fvTyp.Results[0])
+	}
+	return false
+}
+
+// shimReturnIsNonScalarArm32 reports whether the closure's result is an aggregate
+// (any size) or a multi-return tuple — the shapes that ride a retbuf convention
+// the Phase-A scalar/void tail-branch shim does not implement (deferred to
+// Phase C).  A single non-aggregate scalar / pointer (incl. a 64-bit register-pair
+// int64 / uint64) or void is Phase-A.
+func shimReturnIsNonScalarArm32(fvTyp @types.Type) bool {
+	if len(fvTyp.Results) > 1 { return true }
+	if len(fvTyp.Results) == 1 && fvTyp.Results[0] != nil {
+		return common.IsAggregateTyp(fvTyp.Results[0])
+	}
+	return false
+}
+
+// buildShimArgTypesArm32 returns the type list for the OUTGOING call the shim
+// performs: captures first (in ClosureStruct field order), then user args — the
+// same shape the AAPCS32 classifier expects for a direct call to the underlying.
+// Mirrors buildShimArgTypesAA64.
+func buildShimArgTypesArm32(fvTyp @types.Type, f @ir.Func) @[]@types.Type {
+	var argTypes @[]@types.Type
+	for i := 0; i < f.NumCaptureParams; i++ {
+		argTypes = slices.Append[@types.Type](argTypes, f.ClosureStruct.Fields[i].Type)
+	}
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		argTypes = slices.Append[@types.Type](argTypes, fvTyp.Params[pi].Type)
+	}
+	return argTypes
+}
+
+// shimClosureNeedsSpillArm32 reports whether any arg in the outgoing captures++
+// users call lands (partially or wholly) on the stack (CallArgStackOff >= 0).
+// On AAPCS32's 4 GP arg regs this triggers far sooner than on aa64's 8; the
+// framed-BL stack-spill shim is Phase B, so Phase A fails LOUDLY here.  Mirrors
+// shimNeedsStackSpillAA64.
+func shimClosureNeedsSpillArm32(cc common.CallConv, argTypes @[]@types.Type) bool {
+	for i := 0; i < len(argTypes); i++ {
+		if cc.CallArgStackOff(argTypes, i) >= 0 { return true }
+	}
+	return false
+}
+
+// emitClosureCaptureRegLoadArm32 loads every register-bound capture word into its
+// outgoing GP arg register from [R0 + FieldOffset(i)], iterating captures RIGHT-TO-
+// LEFT and, within a multi-word capture, high word first.  Right-to-left keeps R0
+// (the closure-struct base) live until the final load: capture i=0 sits at
+// FieldOffset 0 / register R0, so loading it last means every earlier capture load
+// still reads a valid base.  captureWords is the dense capture footprint the caller
+// verified equals CallArgRegStart(argTypes, NumCaptureParams) — so capture i
+// occupies the registers [regStart(i), regStart(i)+ArgWords) with no even-pair pad.
+// Mirrors emitClosureCaptureRegLoadAA64 at the Phase-A register-only surface (no
+// indirect-large / SPLIT capture — those spill, and the spill shape is Phase B).
+func emitClosureCaptureRegLoadArm32(a @asm.Assembler, cc common.CallConv, f @ir.Func,
+		argTypes @[]@types.Type, captureWords int) {
+	var w int = captureWords
+	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
+		var nWords int = cc.ArgWords(ft)
+		for k := nWords - 1; k >= 0; k = k - 1 {
+			w = w - 1
+			arm32.Ldr(a, arm32.COND_AL, argReg(w), arm32.MemImm(arm32.R0, fieldOfs + k * cc.WordBytes))
+		}
+	}
+}

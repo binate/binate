@@ -206,8 +206,9 @@ func seenContains(seen @[]@[]char, name *[]readonly char) bool {
 // emitFuncValueVtables emits the per-function { dtor, call } vtable and
 // { vtable, data=null } handle for every collected reference, via the shared
 // irdata.BuildFuncValue (byte layout can't drift from the LLVM / aarch64 / x64
-// backends).  Mirrors aarch64_funcvalue.bn's emitFuncValueVtables (skeleton:
-// non-capturing only, so the dtor slot is always a null pointer).
+// backends).  Mirrors aarch64_funcvalue.bn's emitFuncValueVtables: the dtor slot
+// is the closure-struct dtor's HANDLE for a capturing @func whose struct needs
+// destruction (funcValueDtorHandleSymArm32), else a null pointer.
 func emitFuncValueVtables(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Module) {
 	var seen @[]@[]char
 	seen, _ = collectFuncValueRefs(mod)
@@ -217,8 +218,8 @@ func emitFuncValueVtables(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Mo
 		var shimLabel @[]char = shimSymFor(pkgName, seen[i])
 		var handleLabel @[]char = handleSymFor(pkgName, seen[i])
 		a.SetGlobal(shimLabel)
-		var emptyDtor @[]char
-		var dgs @[]@irdata.DataGlobal = irdata.BuildFuncValue(vtLabel, emptyDtor, shimLabel, handleLabel)
+		var dtorSym @[]char = funcValueDtorHandleSymArm32(a, pkgName, mod, seen[i])
+		var dgs @[]@irdata.DataGlobal = irdata.BuildFuncValue(vtLabel, dtorSym, shimLabel, handleLabel)
 		for j := 0; j < len(dgs); j++ {
 			common.EmitDataGlobal(a, dgs[j])
 		}
@@ -228,11 +229,10 @@ func emitFuncValueVtables(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Mo
 // emitFuncValueShims emits a per-function marshaling shim for every collected
 // reference (see emitFuncValueShimBody for the per-return-shape lowering: a
 // scalar/void tail-branch, or the big-aggregate R0-sret shim).  A CAPTURING
-// closure is rejected LOUDLY up front — its data pointer carries the captures,
-// which the shim's data-drop would discard (a silent miscompile); rejecting it
-// before vtable emission also makes the null-dtor-slot moot, since a managed
-// closure's captures never reach the force-nulled dtor path.  Mirrors aarch64's
-// emitFuncValueShims at the reduced surface.
+// closure (or method value) routes to emitClosureShimArm32, which UP-shifts the
+// user args past the prepended captures and unpacks the capture-struct fields
+// from the R0 data pointer (P4-d Phase A); out-of-Phase-A closure shapes fail
+// LOUDLY there.  Mirrors aarch64's emitFuncValueShims.
 func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Module) {
 	var seen @[]@[]char
 	var sigs @[]@types.Type
@@ -245,12 +245,11 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Modu
 		var fvTyp @types.Type = sigs[i]
 		a.DefineLabel(shimLabel)
 		a.SetWeak(shimLabel)
-		// A capturing closure func value carries its capture/data pointer in R0;
-		// the scalar shim drops R0, so reject it LOUDLY rather than silently
-		// miscompiling the capture away.
-		if lookupClosureFuncArm32(mod, seen[i]) != nil {
-			a.SetError("native arm32: closure func value not implemented (P4)")
-			return
+		var closureFunc @ir.Func = lookupClosureFuncArm32(mod, seen[i])
+		if closureFunc != nil {
+			emitClosureShimArm32(a, fnLabel, fvTyp, closureFunc)
+			if a.HasError { return }
+			continue
 		}
 		emitFuncValueShimBody(a, fnLabel, fvTyp)
 		if a.HasError { return }
@@ -346,7 +345,7 @@ func emitScalarVoidShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 		emitFuncvalSpillShimArm32(a, cc, fnLabel, fvTyp, 0, false, false, false, false)
 		return
 	}
-	emitShimArgMarshalArm32(a, cc, fvTyp, 1, 0)
+	emitShimArgMarshalArm32(a, cc, fvTyp, 1, 0, false)
 	a.SetGlobal(fnLabel)
 	arm32.B(a, arm32.COND_AL, fnLabel)
 }
@@ -376,7 +375,7 @@ func emitSretShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 		emitFuncvalSpillShimArm32(a, cc, fnLabel, fvTyp, 0, false, !useSretMulti, false, useSretMulti)
 		return
 	}
-	emitShimArgMarshalArm32(a, cc, fvTyp, 2, 1)
+	emitShimArgMarshalArm32(a, cc, fvTyp, 2, 1, false)
 	a.SetGlobal(fnLabel)
 	arm32.B(a, arm32.COND_AL, fnLabel)
 }
@@ -416,7 +415,7 @@ func emitPackShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 	// expanding any coerced in-register aggregate by-address (emitShimArgMarshalArm32,
 	// which stages to a balanced SP scratch when one is present — freed before the BL,
 	// so it composes with this frame; R4 is untouched).
-	emitShimArgMarshalArm32(a, cc, fvTyp, 2, 0)
+	emitShimArgMarshalArm32(a, cc, fvTyp, 2, 0, false)
 	a.SetGlobal(fnLabel)
 	arm32.Bl(a, arm32.COND_AL, fnLabel)
 	// The underlying returned the <=4-byte aggregate by value in R0 (one word);
@@ -442,19 +441,13 @@ func packShimPopMask() int {
 // the 8-byte {vtable_addr, data} aggregate (ILP32) in the instruction's
 // pre-allocated data region (PlanFrame reserved it for OP_FUNC_VALUE): the vtable
 // global's address (emitFuncValueVtables emitted it) goes at
-// FuncValueVtableOffset, and a null data pointer at FuncValueDataOffset for a
-// non-capturing Phase-1 literal.  The result is a pointer to the data region.  A
-// CAPTURING closure (Args[0] carries the capture-struct pointer) is P4-d and
-// fails LOUDLY — the shim rejects it too, so the null-dtor slot stays sound.
-// Mirrors aarch64_dispatch.bn's OP_FUNC_VALUE arm with WordBytes = 4 and
-// MOVW/MOVT-ABS (no ADRP) address materialization.
+// FuncValueVtableOffset, and the data slot at FuncValueDataOffset holds a null
+// pointer for a non-capturing Phase-1 literal (len(ins.Args) == 0) or the
+// capture-struct pointer (ins.Args[0]) for a B.2 capturing closure.  The result
+// is a pointer to the data region.  Mirrors aarch64_dispatch.bn's OP_FUNC_VALUE
+// arm with WordBytes = 4 and MOVW/MOVT-ABS (no ADRP) address materialization.
 func emitFuncValue(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins @ir.Instr) {
 	if len(ins.StrVal) == 0 { return }
-	if len(ins.Args) > 0 {
-		a.SetError("native arm32: capturing closure func value not implemented "
-				"(P4-d)")
-		return
-	}
 	var dataOff int = rm.LookupAlloc(ins.ID)
 	if dataOff < 0 { return }
 	var vtLabel @[]char = vtableSymFor(pkgName, ins.StrVal)
@@ -463,11 +456,17 @@ func emitFuncValue(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap
 	var addrTmp int = scratchReg(rm)
 	emitSymAddr(a, addrTmp, vtLabel)
 	emitFrameStore(a, addrTmp, dataOff + types.FuncValueVtableOffset())
-	// Slot 1 = null data (non-capturing literal).  arm32 has no zero register, so
-	// materialize 0 in a scratch and store it.
-	var zeroTmp int = scratchReg(rm)
-	emitConstInt32(a, zeroTmp, 0)
-	emitFrameStore(a, zeroTmp, dataOff + types.FuncValueDataOffset())
+	// Slot 1 = data: null for a non-capturing literal, else the capture-struct
+	// pointer carried in ins.Args[0] (a B.2 capturing closure).  arm32 has no zero
+	// register, so materialize 0 in a scratch for the null case.
+	if len(ins.Args) == 0 {
+		var zeroTmp int = scratchReg(rm)
+		emitConstInt32(a, zeroTmp, 0)
+		emitFrameStore(a, zeroTmp, dataOff + types.FuncValueDataOffset())
+	} else {
+		var dataReg int = getOperand(a, rm, ins.Args[0].ID)
+		emitFrameStore(a, dataReg, dataOff + types.FuncValueDataOffset())
+	}
 	// Produce the data-region pointer as the result.
 	var rd int = nextReg(rm, ins.ID)
 	emitFrameAddr(a, rd, dataOff)

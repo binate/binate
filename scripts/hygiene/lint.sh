@@ -111,12 +111,15 @@ if [ -z "$TARGETS" ]; then
     exit 1
 fi
 
-# Prefer the bundled bnlint from BUILDER_VERSION when available
+# Prefer the bundled bnlint from CHECK_TOOLS_VERSION when available
 # (bnc-* mode) — saves the per-invocation cost of compiling bnlint
-# from source.  Falls back to building from current source under
-# bootstrap-* (no toolchain bundle exists) or when the fetcher
-# doesn't return a usable path.
-BNLINT_BIN="$("$BINATE_DIR/scripts/fetch-builder.sh" --tool bnlint 2>/dev/null || true)"
+# from source.  --check-tools resolves the CHECK-TOOLS release (which may
+# be a pre-release ahead of the BUILDER, carrying newer language support
+# like methods-on-generics — see plan-check-tools-version.md), NOT the
+# BUILDER the tree builds with.  Falls back to building from current
+# source under bootstrap-* (no toolchain bundle exists) or when the
+# fetcher doesn't return a usable path.
+BNLINT_BIN="$("$BINATE_DIR/scripts/fetch-builder.sh" --check-tools --tool bnlint 2>/dev/null || true)"
 if [ -z "$BNLINT_BIN" ] || [ ! -x "$BNLINT_BIN" ]; then
     BNLINT_BIN="$(mktemp -t binate-lint.XXXXXX)"
     trap 'rm -f "$BNLINT_BIN"' EXIT

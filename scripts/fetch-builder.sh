@@ -16,16 +16,25 @@
 #                          that hides the bootstrap-vs-bnc calling-
 #                          shape difference; for bootstrap-* this is
 #                          the bootstrap binary directly.
-#   --tool <bnc|bni|bnas|bnlint>
+#   --tool <bnc|bni|bnas|bnlint|bnfmt>
 #                          print that tool's invocation path.  For
 #                          bootstrap-*, only `bnc` is meaningful
 #                          (there is one Go binary) and other names
-#                          are an error.
+#                          are an error.  Exits non-zero if the resolved
+#                          bundle doesn't ship the tool (e.g. bnfmt in
+#                          bundles cut before release.yml added it) — so
+#                          callers can fall back to a source build.
 #   --lib                  print the stdlib root.  For bnc-* this is
 #                          the bundle's `lib/`; for bootstrap-* this
 #                          is the binate checkout (since bootstrap
 #                          interprets bnc directly against current
 #                          sources — there is no pinned bundle).
+#   --check-tools          resolve CHECK_TOOLS_VERSION instead of
+#                          BUILDER_VERSION: the release whose bundled
+#                          HYGIENE tools (bnlint / bnfmt) we use, which
+#                          may be a pre-release AHEAD of the BUILDER the
+#                          tree builds with.  See
+#                          explorations/plan-check-tools-version.md.
 #
 # Calling-shape compatibility (bnc-*):
 # Builder-link callers invoke the resolved BUILDER as
@@ -54,8 +63,9 @@
 #                     and extract it.  Asset name follows the release
 #                     workflow's convention:
 #                     `bnc-X.Y.Z-<host-os>-<host-arch>.tar.gz`,
-#                     containing `bin/{bnc,bni,bnas,bnlint}` and
-#                     `lib/{pkg,runtime}`.  Verifies sha256 against
+#                     containing `bin/{bnc,bni,bnas,bnlint,bnfmt}` (bnfmt
+#                     in bundles cut after make-bundle.sh added it) and
+#                     `lib/`.  Verifies sha256 against
 #                     the release's SHA256SUMS manifest before
 #                     extracting.  Cache hits skip the download (and
 #                     the re-verify — the cache is trusted on hit).
@@ -66,19 +76,21 @@ set -e
 
 mode=bin
 tool=bnc
+version_file=BUILDER_VERSION
 while [ $# -gt 0 ]; do
     case "$1" in
-        --lib)        mode=lib; shift ;;
-        --tool)       tool="$2"; shift 2 ;;
-        --tool=*)     tool="${1#--tool=}"; shift ;;
-        --)           shift; break ;;
-        -*)           echo "fetch-builder: unknown flag: $1" >&2; exit 2 ;;
-        *)            echo "fetch-builder: unexpected arg: $1" >&2; exit 2 ;;
+        --lib)          mode=lib; shift ;;
+        --tool)         tool="$2"; shift 2 ;;
+        --tool=*)       tool="${1#--tool=}"; shift ;;
+        --check-tools)  version_file=CHECK_TOOLS_VERSION; shift ;;
+        --)             shift; break ;;
+        -*)             echo "fetch-builder: unknown flag: $1" >&2; exit 2 ;;
+        *)              echo "fetch-builder: unexpected arg: $1" >&2; exit 2 ;;
     esac
 done
 
 case "$tool" in
-    bnc|bni|bnas|bnlint) ;;
+    bnc|bni|bnas|bnlint|bnfmt) ;;
     *) echo "fetch-builder: unknown --tool: $tool" >&2; exit 2 ;;
 esac
 
@@ -87,19 +99,23 @@ esac
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-VERSION_FILE="$BINATE_DIR/BUILDER_VERSION"
+# Which version to resolve: BUILDER_VERSION (the stable release the tree BUILDS
+# with — a build-ladder rung) by default, or CHECK_TOOLS_VERSION (the release whose
+# bundled hygiene tools we use — may be a pre-release AHEAD of the BUILDER) under
+# --check-tools.  See explorations/plan-check-tools-version.md.
+VERSION_FILE="$BINATE_DIR/$version_file"
 if [ ! -f "$VERSION_FILE" ]; then
     echo "fetch-builder: $VERSION_FILE not found" >&2
     exit 1
 fi
 
-BUILDER_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
-if [ -z "$BUILDER_VERSION" ]; then
-    echo "fetch-builder: BUILDER_VERSION is empty" >&2
+RESOLVED_VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+if [ -z "$RESOLVED_VERSION" ]; then
+    echo "fetch-builder: $version_file is empty" >&2
     exit 1
 fi
 
-CACHE_DIR="${BINATE_CACHE_DIR:-$HOME/.cache/binate/builders}/$BUILDER_VERSION"
+CACHE_DIR="${BINATE_CACHE_DIR:-$HOME/.cache/binate/builders}/$RESOLVED_VERSION"
 mkdir -p "$CACHE_DIR"
 
 # Detect host platform — used in the cache key so multi-OS dev
@@ -117,7 +133,7 @@ esac
 
 PLATFORM_DIR="$CACHE_DIR/$HOST_OS-$HOST_ARCH"
 
-case "$BUILDER_VERSION" in
+case "$RESOLVED_VERSION" in
     bootstrap-*)
         BOOTSTRAP_DIR="$BINATE_DIR/../bootstrap"
         if [ ! -d "$BOOTSTRAP_DIR" ]; then
@@ -133,7 +149,7 @@ case "$BUILDER_VERSION" in
             exit 0
         fi
         if [ "$tool" != bnc ]; then
-            echo "fetch-builder: BUILDER_VERSION=$BUILDER_VERSION has no '$tool' binary" >&2
+            echo "fetch-builder: BUILDER_VERSION=$RESOLVED_VERSION has no '$tool' binary" >&2
             echo "fetch-builder: (bootstrap mode ships a single Go binary; use bnc-* for the full toolchain)" >&2
             exit 1
         fi
@@ -166,8 +182,8 @@ case "$BUILDER_VERSION" in
         BUNDLE_DIR="$PLATFORM_DIR/bundle"
         MARKER="$BUNDLE_DIR/.fetched"
         if [ ! -f "$MARKER" ]; then
-            asset="$BUILDER_VERSION-$HOST_OS-$HOST_ARCH.tar.gz"
-            release_url="${BINATE_RELEASE_URL:-https://github.com/binate/binate/releases/download}/$BUILDER_VERSION"
+            asset="$RESOLVED_VERSION-$HOST_OS-$HOST_ARCH.tar.gz"
+            release_url="${BINATE_RELEASE_URL:-https://github.com/binate/binate/releases/download}/$RESOLVED_VERSION"
             tmpdir="$(mktemp -d)"
             trap 'rm -rf "$tmpdir"' EXIT INT TERM
             if ! curl -fL --retry 3 --retry-delay 2 \
@@ -180,7 +196,7 @@ case "$BUILDER_VERSION" in
             expected_sha="$(awk -v a="$asset" '$2 == a { print $1; exit }' \
                 "$tmpdir/SHA256SUMS")"
             if [ -z "$expected_sha" ]; then
-                echo "fetch-builder: no SHA256SUMS entry for $asset in $BUILDER_VERSION" >&2
+                echo "fetch-builder: no SHA256SUMS entry for $asset in $RESOLVED_VERSION" >&2
                 echo "fetch-builder: (manifest may be missing this platform's build)" >&2
                 exit 1
             fi
@@ -224,6 +240,14 @@ case "$BUILDER_VERSION" in
             # before exec'ing the bundled bnc / bni / etc.  Direct
             # callers (no prefix) pass through unchanged.
             REAL_BIN="$BUNDLE_DIR/bin/$tool"
+            if [ ! -x "$REAL_BIN" ]; then
+                # This version's bundle doesn't ship this tool (e.g. bnfmt is
+                # absent from bundles cut before release.yml added it).  Signal
+                # non-zero so callers (lint.sh / bnfmt-format.sh) fall back to
+                # building the tool from source.
+                echo "fetch-builder: $RESOLVED_VERSION bundle has no '$tool' binary" >&2
+                exit 1
+            fi
             WRAPPER="$PLATFORM_DIR/wrappers/$tool"
             # Always regenerate: the wrapper template lives in
             # this script, so a script update needs to invalidate
@@ -256,7 +280,7 @@ EOF
         fi
         ;;
     *)
-        echo "fetch-builder: unrecognized BUILDER_VERSION prefix: $BUILDER_VERSION" >&2
+        echo "fetch-builder: unrecognized BUILDER_VERSION prefix: $RESOLVED_VERSION" >&2
         exit 1
         ;;
 esac

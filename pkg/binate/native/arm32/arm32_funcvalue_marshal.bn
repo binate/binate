@@ -29,8 +29,17 @@ import "pkg/binate/types"
 // pad, so the shim MUST place the aggregate on the same even register — via the
 // SHARED cc.NeedsEvenReg predicate argRegWordsStackWords uses — or the callee
 // would read it from the next register.  The INCOMING dispatch cursor does NOT
-// bump: emitCallFuncValue substitutes a *uint8 (4-aligned) for each coerced
-// aggregate before placing it, so the by-address pointer rides ONE 4-aligned word.
+// bump for a by-address aggregate: emitCallFuncValue substitutes a *uint8
+// (4-aligned) for each coerced / non-coerced-small aggregate before placing it, so
+// the by-address pointer rides ONE 4-aligned word.
+//
+// An arg that KEEPS its real type in the dispatch (paddedKeepsTypeArm32 — an int64 /
+// uint64 register-pair scalar OR an 8-aligned INDIRECT-LARGE >16-byte aggregate, which
+// emitCallFuncValue does NOT substitute) is the opposite: the dispatch caller sees the
+// real 8-aligned type, so it even-pair-pads the INCOMING cursor too.  The shim must
+// then apply the even-pair pad on BOTH cursors (a by-address aggregate pads only the
+// outgoing one) — see paddedKeepsTypeArm32 and its gate sites in shimInWordsArm32 /
+// shimOutRegs / emitShimArgMarshalArm32 (and emitSpillMarshalArm32 for the spill path).
 
 // isIndirectLargeArm32 reports whether pt is a >16-byte aggregate the AAPCS32
 // convention passes INDIRECTLY as a single pointer arg (IndirectLargeAggregates):
@@ -84,6 +93,33 @@ func shimInWordsForTypeArm32(cc common.CallConv, pt @types.Type) int {
 	return cc.EffectiveArgWords(pt)
 }
 
+// paddedKeepsTypeArm32 reports whether pt is an arg that (1) obeys the AAPCS §6.5
+// C.3 even-register-pair rule (cc.NeedsEvenReg) AND (2) KEEPS its real type in the
+// shim dispatch's argTypes — i.e. is NOT substituted to a 4-aligned *uint8 by
+// emitCallFuncValue.  emitCallFuncValue substitutes *uint8 for exactly a float
+// scalar OR a by-address aggregate (isByAddressAggArm32); every OTHER type keeps its
+// real type.  So the set this predicate selects — a NeedsEvenReg type that is
+// neither float nor by-address — is exactly the args the DISPATCH caller and the
+// CALLEE both even-pair-pad (their classifier sees the real 8-aligned type), so the
+// SHIM's incoming AND outgoing cursors must apply the SAME pad or place/read the
+// value one register off (a silent miscompile).  On ILP32 that set is two shapes:
+//   - a 64-bit register-pair SCALAR (int64 / uint64, isReg64Scalar) — placed inline
+//     as its 2 value-words on both cursors; and
+//   - an 8-ALIGNED INDIRECT-LARGE (>16-byte, AlignOf 8) aggregate — e.g.
+//     struct{int64,int64,int64} (24 bytes): SizeOf > AggregateInRegMax so it is NOT
+//     by-address (isByAddressAggArm32 false) and rides ONE pointer word through the
+//     generic branch, but NeedsEvenReg is true, so its pointer takes the even-pair
+//     pad just like an int64.
+// A by-address aggregate is EXCLUDED (its dispatch slot is a 4-aligned *uint8, which
+// takes no even-pair pad — its own outgoing pad comes from the isByAddressAggArm32
+// branch, not this predicate, so it is never double-padded).  A float scalar is
+// EXCLUDED (fails loud, P5).  This is the single source of truth for the shim
+// even-pair pad on args that keep their type; it is a SUPERSET of the isReg64Scalar
+// case, so the int64 placements stay unchanged.
+func paddedKeepsTypeArm32(cc common.CallConv, pt @types.Type) bool {
+	return cc.NeedsEvenReg(pt) && !isByAddressAggArm32(cc, pt) && !common.IsFloatScalarTyp(pt)
+}
+
 // shimOutRegs walks the shim's user args exactly as emitShimArgMarshalArm32 does
 // and returns the final OUTGOING GP register count (RELATIVE to gpDestBase),
 // INCLUDING any AAPCS §6.5 C.3 even-register-pair pad words, or -1 (after
@@ -97,11 +133,13 @@ func shimInWordsForTypeArm32(cc common.CallConv, pt @types.Type) int {
 // first-arg 8-aligned aggregate that would sit at an even relative index can still
 // need a pad when gpDestBase makes the absolute index odd.
 //
-// Fails LOUDLY on a float arg (P5 soft-float) and a multi-word register-pair SCALAR
-// (a 64-bit int on ILP32 — its own even-pair dispatch placement isn't modeled by the
-// plain down-shift).  A coerced (P1) OR non-coerced small in-register aggregate
-// (P2, option B) is ACCEPTED: both ride by-address and re-expand their ArgWords
-// value-words into the outgoing GP regs.
+// Fails LOUDLY on a float arg (P5 soft-float).  A 64-bit register-pair SCALAR (an
+// int64 / uint64 on ILP32, 2 words) is ACCEPTED: it takes the same AAPCS §6.5 C.3
+// even-pair bump as an 8-aligned aggregate, then advances 2 outgoing words.  A
+// coerced (P1) OR non-coerced small in-register aggregate (P2, option B) is
+// ACCEPTED too: both ride by-address and re-expand their ArgWords value-words into
+// the outgoing GP regs.  Any OTHER multi-word non-aggregate scalar (none exists
+// today) stays fail-loud — an unmodeled shape must not be silently accepted.
 func shimOutRegs(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type, gpDestBase int) int {
 	var ngrn int = 0
 	for pi := 0; pi < len(fvTyp.Params); pi++ {
@@ -131,18 +169,42 @@ func shimOutRegs(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type, gpDest
 		}
 		// An indirect-large (>16-byte) aggregate and every scalar / pointer keep the
 		// generic down-shift.  cc.EffectiveArgWords counts an indirect-large aggregate
-		// as ONE pointer word, so the pw != 1 rejection below fires ONLY on a genuine
-		// multi-word register-pair SCALAR (a 64-bit int on ILP32), never on an
-		// aggregate — a slice's 2 words go through the by-address branch above, so
-		// they never reach here.
+		// as ONE pointer word, so pw == 1 for it and every 32-bit scalar / pointer.
+		// The multi-word case that reaches here is a 64-bit register-pair SCALAR (an
+		// int64 / uint64 on ILP32, 2 words) — a slice's 2 words go through the
+		// by-address branch above, so they never reach here.
 		var pw int = cc.EffectiveArgWords(pt)
-		if pw != 1 {
-			a.SetError(
-					"native arm32: func-value shim with a multi-word "
-							"(register-pair) scalar arg not implemented (P4)")
-			return -1
+		if pw == 1 {
+			// An 8-aligned indirect-large aggregate (>16-byte, AlignOf 8) is a
+			// paddedKeepsTypeArm32 arg that rides ONE pointer word: the dispatch caller
+			// and callee even-pair-pad its pointer, so shimOutRegs must count that pad —
+			// else nOut under-counts and shimArgsFitRegisters mis-routes the shape (this
+			// budget MUST match emitShimArgMarshalArm32's generic-branch pad).  A 32-bit
+			// scalar / pointer is NOT paddedKeepsType (align 4), so it never pads here.
+			if paddedKeepsTypeArm32(cc, pt) && (gpDestBase + ngrn) % 2 != 0 {
+				ngrn = ngrn + 1
+			}
+			ngrn = ngrn + pw
+			continue
 		}
-		ngrn = ngrn + pw
+		if pw == 2 && isReg64Scalar(pt) {
+			// A 64-bit register-pair scalar (int64 / uint64): AAPCS §6.5 C.3 places it
+			// on an EVEN outgoing core register pair.  When the ABSOLUTE index
+			// gpDestBase + ngrn is odd, waste the odd register (a pad, left unwritten).
+			// Byte-identical to the by-address branch's bump and argRegWordsStackWords.
+			if cc.NeedsEvenReg(pt) && (gpDestBase + ngrn) % 2 != 0 {
+				ngrn = ngrn + 1
+			}
+			ngrn = ngrn + pw
+			continue
+		}
+		// Any other multi-word non-aggregate scalar is unmodeled (none exists today —
+		// only int64 / uint64 are 2-word non-aggregate scalars on ILP32).  Fail LOUDLY
+		// rather than silently accept an unhandled shape.
+		a.SetError(
+				"native arm32: func-value shim with a multi-word "
+						"(register-pair) scalar arg not implemented (P4)")
+		return -1
 	}
 	return ngrn
 }
@@ -151,9 +213,10 @@ func shimOutRegs(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type, gpDest
 // marshal (both the INCOMING dispatch words and the OUTGOING coerced/shifted/pad
 // words stay within R0..R3).  A false result routes the shape to the framed-BL
 // stack-spill shim (emitFuncvalSpillShimArm32); the caller has already run
-// shimOutRegs, which fails LOUDLY on the shapes that stay unsupported even under
-// spill (float arg / non-coerced in-register aggregate / 64-bit register-pair
-// scalar).  srcPrefix is the leading GP words the shape drops before the user args
+// shimOutRegs, which fails LOUDLY only on the shapes that stay unsupported even
+// under spill (a float arg, or an unmodeled multi-word non-aggregate scalar — a
+// 64-bit register-pair int64 / uint64 is now supported, placed by-value).
+// srcPrefix is the leading GP words the shape drops before the user args
 // (1 = data; 2 = retbuf + data); gpDestBase is the first GP reg the underlying uses
 // (0 normally; 1 for sret, where R0 holds the sret buffer).  nOut is shimOutRegs's
 // outgoing register count RELATIVE to gpDestBase, already including any even-pair
@@ -161,7 +224,7 @@ func shimOutRegs(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type, gpDest
 // rather than being marshaled to a nonexistent register.
 func shimArgsFitRegisters(cc common.CallConv, fvTyp @types.Type, srcPrefix int, gpDestBase int,
 		nOut int) bool {
-	var nIn int = shimInWordsArm32(cc, fvTyp)
+	var nIn int = shimInWordsArm32(cc, fvTyp, srcPrefix)
 	if nIn > cc.NumGpArgRegs - srcPrefix || nOut + gpDestBase > cc.NumGpArgRegs {
 		return false
 	}
@@ -184,15 +247,33 @@ func shimNeedStageArm32(cc common.CallConv, fvTyp @types.Type) bool {
 }
 
 // shimInWordsArm32 returns the total INCOMING dispatch words the shim's user args
-// occupy (each by-address aggregate is ONE pointer word — shimInWordsForTypeArm32 —
-// not its ArgWords expansion; and NO even-pair bump, because the dispatch caller
-// places the by-address pointer as a 4-aligned *uint8).  This is the incoming-
-// register pressure the shim reads from R(prefix)..; callers gate it against
-// R(prefix)..R3.
-func shimInWordsArm32(cc common.CallConv, fvTyp @types.Type) int {
+// occupy, INCLUDING any AAPCS §6.5 C.3 even-register-pair pad word.  A by-address
+// aggregate is ONE pointer word (shimInWordsForTypeArm32 — not its ArgWords
+// expansion, and it takes NO even-pair bump, because the dispatch caller places the
+// by-address pointer as a 4-aligned *uint8).  An arg that keeps its real type on the
+// incoming side (a 64-bit register-pair scalar int64 / uint64, OR an 8-aligned
+// indirect-large aggregate — paddedKeepsTypeArm32), by contrast, IS even-aligned by
+// the dispatch caller (emitCallFuncValue -> CallArgRegStart): when the running
+// ABSOLUTE incoming cursor srcPrefix + n is odd, it wastes a pad word first.  This
+// walk MUST count that pad, or the staged-frame size and the incoming-register
+// pressure gate under-count and desync a mixed (padded, aggregate) list.  srcPrefix
+// (1 = data; 2 = retbuf + data) sets the absolute-parity origin.  This is the
+// incoming-register pressure the shim reads from R(prefix)..; callers gate it
+// against R(prefix)..R3.
+func shimInWordsArm32(cc common.CallConv, fvTyp @types.Type, srcPrefix int) int {
 	var n int = 0
 	for pi := 0; pi < len(fvTyp.Params); pi++ {
-		n = n + shimInWordsForTypeArm32(cc, fvTyp.Params[pi].Type)
+		var pt @types.Type = fvTyp.Params[pi].Type
+		// Incoming even-pair pad: an arg that keeps its real type in the dispatch's
+		// argTypes (an int64 / uint64 register-pair scalar OR an 8-aligned
+		// indirect-large aggregate — paddedKeepsTypeArm32) makes CallArgRegStart
+		// even-align it, so mirror that here on the absolute incoming cursor
+		// srcPrefix + n.  A by-address aggregate rides a 4-aligned *uint8 and takes no
+		// pad, so paddedKeepsTypeArm32 excludes it.
+		if paddedKeepsTypeArm32(cc, pt) && (srcPrefix + n) % 2 != 0 {
+			n = n + 1
+		}
+		n = n + shimInWordsForTypeArm32(cc, pt)
 	}
 	return n
 }
@@ -215,7 +296,17 @@ func shimInWordsArm32(cc common.CallConv, fvTyp @types.Type) int {
 // undefined), matching the callee's argRegWordsStackWords placement.  The incoming
 // cursor (srcWord) advances by 1 word and takes NO even-pair bump (the dispatch
 // caller placed the by-address pointer as a 4-aligned *uint8), so the two cursors
-// DIVERGE at each by-address aggregate.  Non-by-address args (scalars, indirect-large
+// DIVERGE at each by-address aggregate.
+//
+// A 64-bit register-pair scalar (int64 / uint64) arrives INLINE as its two
+// value-words — NOT by-address — even-aligned on BOTH sides: the dispatch caller
+// keeps its real type, so it even-aligns the incoming pair too (unlike the by-address
+// pointer above).  So the int64 branch bumps BOTH cursors: OUTGOING on gpDestBase+ngrn
+// and INCOMING on srcPrefix+srcWord.  Omitting the incoming bump would read the value
+// from the wrong (pre-pad) registers — a silent miscompile.  A scalar int64 never
+// SPLITs (the classifier sends an over-budget one whole to the 8-aligned stack, not
+// straddling), so a register-only int64 is always a full even pair; an over-budget one
+// routes to the spill path.  Other non-by-address args (32-bit scalars, indirect-large
 // single pointers) keep the generic register down-shift.
 //
 // Clobber-safety: when a by-address aggregate is present (shimNeedStageArm32) the
@@ -228,13 +319,15 @@ func shimInWordsArm32(cc common.CallConv, fvTyp @types.Type) int {
 // the transient pointer/load scratch (an intra-call scratch, not an AAPCS32 arg or
 // return reg, so it can't clobber an outgoing arg reg or the return).  Without a
 // by-address aggregate the GP destination index never exceeds the source index, so
-// left-to-right MOVs read each source before it is overwritten — no staging needed.
+// left-to-right MOVs read each source before it is overwritten — no staging needed
+// (an int64's two even-aligned pair endpoints are IDENTICAL or disjoint by >= 2, never
+// overlapping by one, so its two moves are order-independent too).
 func emitShimArgMarshalArm32(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type, srcPrefix int,
 		gpDestBase int) {
 	var needStage bool = shimNeedStageArm32(cc, fvTyp)
 	var frame int = 0
 	if needStage {
-		var nIn int = shimInWordsArm32(cc, fvTyp)
+		var nIn int = shimInWordsArm32(cc, fvTyp, srcPrefix)
 		frame = nIn * cc.WordBytes
 		// Keep SP 8-aligned across the marshal (AAPCS32 stack alignment); the
 		// staged area is a private scratch, freed before the branch/BL.
@@ -264,6 +357,73 @@ func emitShimArgMarshalArm32(a @asm.Assembler, cc common.CallConv, fvTyp @types.
 			ngrn = ngrn + cc.ArgWords(pt)
 			srcWord = srcWord + 1
 			continue
+		}
+		if isReg64Scalar(pt) {
+			// A 64-bit register-pair scalar (int64 / uint64) arrives INLINE as its two
+			// value-words (NOT by-address), even-aligned on BOTH the incoming dispatch
+			// side and the outgoing AAPCS32 side.  Apply the AAPCS §6.5 C.3 even-pair
+			// pad on each cursor at its own absolute parity: OUTGOING keys on
+			// gpDestBase + ngrn, INCOMING on srcPrefix + srcWord.  Missing the INCOMING
+			// pad would read the value-words from the wrong (pre-pad) registers — a
+			// silent miscompile — because the dispatch caller (emitCallFuncValue keeps
+			// the real int64 type -> CallArgRegStart) even-aligns the incoming int64
+			// too.  A scalar int64 never SPLITs (the classifier even-rounds first, then
+			// either fits the whole pair in regs or sends it whole to the 8-aligned
+			// stack — argRegWordsStackWords' SPLIT branch is aggregate-gated), so a
+			// register-only int64 always lands as a full even-aligned pair; an
+			// over-budget one routes to the spill path via shimArgsFitRegisters, never
+			// here.
+			if cc.NeedsEvenReg(pt) && (gpDestBase + ngrn) % 2 != 0 {
+				ngrn = ngrn + 1
+			}
+			if cc.NeedsEvenReg(pt) && (srcPrefix + srcWord) % 2 != 0 {
+				srcWord = srcWord + 1
+			}
+			// Move the 2 inline value-words to argReg(gpDestBase+ngrn){,+1}.  Both pads
+			// round their cursor UP to an even absolute index, so the outgoing pair
+			// start (gpDestBase+ngrn) and the incoming pair start (srcPrefix+srcWord) are
+			// BOTH even.  Their difference is therefore even, and the register-only path
+			// only ever DOWN-shifts (gpDestBase <= srcPrefix), so the two pairs are
+			// either IDENTICAL (both moves are no-ops) or disjoint by >= 2 registers —
+			// they can never overlap by exactly ONE register.  So neither move can
+			// clobber the other's not-yet-read source, and the order is immaterial
+			// (lo then hi).  With staging both reads come from the frame, likewise safe.
+			var loDst int = argReg(gpDestBase + ngrn)
+			var hiDst int = argReg(gpDestBase + ngrn + 1)
+			if frame > 0 {
+				arm32.Ldr(a, arm32.COND_AL, loDst, arm32.MemImm(arm32.SP, cc.WordBytes * srcWord))
+				arm32.Ldr(a, arm32.COND_AL, hiDst, arm32.MemImm(arm32.SP, cc.WordBytes * (srcWord + 1)))
+			} else {
+				var loSrc int = argReg(srcPrefix + srcWord)
+				var hiSrc int = argReg(srcPrefix + srcWord + 1)
+				if loDst != loSrc {
+					arm32.Mov(a, arm32.COND_AL, false, loDst, arm32.Reg(loSrc))
+				}
+				if hiDst != hiSrc {
+					arm32.Mov(a, arm32.COND_AL, false, hiDst, arm32.Reg(hiSrc))
+				}
+			}
+			ngrn = ngrn + 2
+			srcWord = srcWord + 2
+			continue
+		}
+		// AAPCS §6.5 C.3 even-pair pad on BOTH cursors for an arg that keeps its real
+		// type in the dispatch (paddedKeepsTypeArm32).  The int64 / uint64 branch is
+		// peeled off above, so the ONLY paddedKeepsType arg that reaches here is an
+		// 8-ALIGNED INDIRECT-LARGE aggregate (>16 bytes, AlignOf 8 — e.g.
+		// struct{int64,int64,int64}), which rides ONE pointer word through the generic
+		// loop below.  The DISPATCH caller and the CALLEE both even-pair-pad its pointer
+		// (their classifier sees the real 8-aligned type), so the shim must pad the
+		// OUTGOING cursor (gpDestBase + ngrn) — else it writes the pointer one register
+		// below where the callee reads it — AND the INCOMING cursor (srcPrefix + srcWord)
+		// — else it reads the pointer one register above where the dispatch caller placed
+		// it.  Both are silent miscompiles.  (A by-address aggregate rides a 4-aligned
+		// *uint8 and is excluded by paddedKeepsTypeArm32, so it is not double-padded.)
+		if paddedKeepsTypeArm32(cc, pt) && (gpDestBase + ngrn) % 2 != 0 {
+			ngrn = ngrn + 1
+		}
+		if paddedKeepsTypeArm32(cc, pt) && (srcPrefix + srcWord) % 2 != 0 {
+			srcWord = srcWord + 1
 		}
 		// Effective words: an indirect-large aggregate is 1 pointer word (the
 		// dispatch caller placed it as one), NOT its ArgWords expansion.  (A

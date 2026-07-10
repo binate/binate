@@ -43,8 +43,10 @@ platform, writing <out-dir>/<version>-<platform>.tar.gz (+ .sha256).
 Options:
   --version <ver>    bundle version label, e.g. bnc-0.0.7
                      (default: contents of the VERSION file)
-  --platform <plat>  platform tag, e.g. macos-arm64 / linux-x64
-                     (default: detected from the host)
+  --platform <plat>  platform tag, e.g. macos-arm64 / linux-x64 / linux-arm64
+                     (default: detected from the host).  A non-host platform
+                     cross-compiles the binaries (needs a matching cross-
+                     toolchain); lib/ is source, so it is platform-independent.
   --out-dir <dir>    directory to write the tarball into
                      (default: ./dist; created if absent)
   -h, --help         show this help
@@ -81,21 +83,46 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
-# Default the platform from the host — same os/arch mapping the cache
-# key in fetch-builder.sh uses, so a locally-built bundle lands under
-# the platform name the fetcher would look for.
+# Host os/arch — same os/arch mapping the cache key in fetch-builder.sh uses,
+# so a locally-built host bundle lands under the platform name the fetcher
+# would look for.  Also the reference point for cross detection below.
+case "$(uname -s)" in
+    Darwin) host_os=macos ;;
+    Linux)  host_os=linux ;;
+    *)      host_os="$(uname -s | tr '[:upper:]' '[:lower:]')" ;;
+esac
+case "$(uname -m)" in
+    arm64|aarch64) host_arch=arm64 ;;
+    x86_64|amd64)  host_arch=x64 ;;
+    *)             host_arch="$(uname -m)" ;;
+esac
+
+# Default the platform to the host when not given.
 if [ -z "$PLATFORM" ]; then
-    case "$(uname -s)" in
-        Darwin) host_os=macos ;;
-        Linux)  host_os=linux ;;
-        *)      host_os="$(uname -s | tr '[:upper:]' '[:lower:]')" ;;
-    esac
-    case "$(uname -m)" in
-        arm64|aarch64) host_arch=arm64 ;;
-        x86_64|amd64)  host_arch=x64 ;;
-        *)             host_arch="$(uname -m)" ;;
-    esac
     PLATFORM="$host_os-$host_arch"
+fi
+
+# Cross-compile detection: a platform whose arch/os differs from the host must
+# be cross-built — derive the bnc --target key and pass it to the build-*.sh
+# scripts, which cross-EMIT Stage 2 (gen1 stays a host binary).  Binaries built
+# for a foreign platform on a host lacking the matching cross-toolchain fail
+# loudly at link — strictly better than the old behavior here, which silently
+# produced HOST binaries mislabeled with --platform.  lib/ is source, hence
+# platform-independent, and is staged unchanged either way.
+BUILD_TARGET_OPT=""
+if [ "$PLATFORM" != "$host_os-$host_arch" ]; then
+    case "$PLATFORM" in
+        linux-x64)   xtarget=x86_64-linux ;;
+        linux-arm64) xtarget=aarch64-linux ;;
+        macos-x64)   xtarget=x86_64-darwin ;;
+        *)
+            echo "make-bundle: no cross-compile target for --platform $PLATFORM" >&2
+            echo "  (host is $host_os-$host_arch; cross-buildable: linux-x64," >&2
+            echo "   linux-arm64, macos-x64)" >&2
+            exit 1 ;;
+    esac
+    BUILD_TARGET_OPT="--target $xtarget"
+    echo "make-bundle: cross-compiling for $PLATFORM (bnc --target $xtarget)"
 fi
 
 bundle="$VERSION-$PLATFORM"
@@ -119,11 +146,13 @@ echo
 # script manages its own mktemp scratch and writes only to its -o path,
 # so this is safe to run concurrently with other work / worktrees.
 echo "==> building binaries"
-"$SCRIPT_DIR/build-bnc.sh"    -o "$dest/bin/bnc"
-"$SCRIPT_DIR/build-bni.sh"    -o "$dest/bin/bni"
-"$SCRIPT_DIR/build-bnas.sh"   -o "$dest/bin/bnas"
-"$SCRIPT_DIR/build-bnlint.sh" -o "$dest/bin/bnlint"
-"$SCRIPT_DIR/build-bnfmt.sh"  -o "$dest/bin/bnfmt"
+# $BUILD_TARGET_OPT is empty for a host build (unchanged) or `--target <key>`
+# for a cross build; unquoted so it word-splits into two args (or none).
+"$SCRIPT_DIR/build-bnc.sh"    -o "$dest/bin/bnc"    $BUILD_TARGET_OPT
+"$SCRIPT_DIR/build-bni.sh"    -o "$dest/bin/bni"    $BUILD_TARGET_OPT
+"$SCRIPT_DIR/build-bnas.sh"   -o "$dest/bin/bnas"   $BUILD_TARGET_OPT
+"$SCRIPT_DIR/build-bnlint.sh" -o "$dest/bin/bnlint" $BUILD_TARGET_OPT
+"$SCRIPT_DIR/build-bnfmt.sh"  -o "$dest/bin/bnfmt"  $BUILD_TARGET_OPT
 for b in bnc bni bnas bnlint bnfmt; do
     test -x "$dest/bin/$b" || { echo "make-bundle: missing binary: $b" >&2; exit 1; }
 done

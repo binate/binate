@@ -15,6 +15,9 @@
 #   ./scripts/build-bnfmt.sh -o <path> --debug # -O0 -g (slower, debuggable)
 #   ./scripts/build-bnfmt.sh -h                # help
 #
+# --target <key> cross-compiles Stage 2 for a bnc --target key (e.g.
+# aarch64-linux, x86_64-darwin); omitted builds for the host arch.
+#
 # After building:
 #   <path> <file.bn>          format to stdout
 #   <path> -w <file.bn>       rewrite the file in place
@@ -27,6 +30,7 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 OUT=""
 DEBUG=0
+TARGET=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -36,6 +40,14 @@ while [ $# -gt 0 ]; do
             ;;
         --debug)
             DEBUG=1
+            shift
+            ;;
+        --target)
+            TARGET="$2"
+            shift 2
+            ;;
+        --target=*)
+            TARGET="${1#--target=}"
             shift
             ;;
         -h|--help)
@@ -109,23 +121,35 @@ echo "  Stage 1: BUILDER → gen1 ..."
     "$BINATE_DIR/cmd/bnc"
 
 echo "  Stage 2: gen1 → bnfmt ..."
+# Cross-compile: when --target names a non-host target, gen1 (a host binary,
+# built above) cross-EMITS the final bnfmt for that target.  The one key drives
+# both bnc's #[build(...)] stdlib gating (target-specific impls, e.g. os's
+# syscalls) and its clang cross-triple/flags (appendTargetFlags).  Passed to
+# binate-paths too so any per-target search extras apply (a no-op for the hosted
+# linux/macos targets, which #[build]-gate impls in place; matters for
+# baremetal).  Empty --target = host build, byte-identical to before.
+# Stage 1 is NOT cross-targeted: gen1 must run on THIS host.
+TARGET_OPT=""
+[ -n "$TARGET" ] && TARGET_OPT="--target $TARGET"
 if [ -n "$DBG_FLAG" ]; then
     "$GEN1_BNC" \
-        -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
-        -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
+        -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $TARGET_OPT)" \
+        -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $TARGET_OPT)" \
         --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
+        $TARGET_OPT \
         "$DBG_FLAG" \
         -o "$OUT" \
         "$BINATE_DIR/cmd/bnfmt"
 else
     "$GEN1_BNC" \
-        -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
-        -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
+        -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $TARGET_OPT)" \
+        -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $TARGET_OPT)" \
         --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
+        $TARGET_OPT \
         -o "$OUT" \
         "$BINATE_DIR/cmd/bnfmt"
 fi

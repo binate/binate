@@ -1,0 +1,144 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/iropcode"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+
+// Interface-target type-assertion lowering (`x.(*J)` / `x.(@J)`, spec §11.12).
+// Unlike a CONCRETE target — a pointer compare of the dynamic `*TypeInfo`
+// against a static `&__typeinfo.<T>` (gen_assert.genTypeAssert) — an interface
+// target does a runtime satisfaction lookup: does the scrutinee's dynamic type
+// implement J?  It reads the dynamic `*TypeInfo` (vtable slot 1), calls
+// `rt.SatLookup(ti, &__ifaceid.<J>)` (the native itab-hash reader), and on a HIT
+// assembles the recovered interface value `{data, subvtable}` with the dynamic
+// vtable the lookup returned (EmitIfaceValueDyn).  A MISS is a null vtable
+// (unset scrutinee) OR a null lookup result (type doesn't implement J).
+//
+// The `rt.SatLookup` call materializes `&__ifaceid.<J>` via OP_DATA_SYM_ADDR,
+// which the VM does not yet lower — so interface-target assertions loud-fail in
+// the VM (xfail'd on the -int modes) until Slice 5b's d-i work, exactly as the
+// concrete forms do.
+
+// isInterfaceValueRecovery reports whether a recovered assert-target type is an
+// interface value (`*J` / `@J`) rather than a concrete pointer (`*T` / `@T`).
+func isInterfaceValueRecovery(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_INTERFACE_VALUE || t.Kind == types.TYP_INTERFACE_VALUE_MANAGED
+}
+
+// ifaceIdSymFor derives the `__ifaceid.<J>` symbol for the target interface,
+// keyed on its `(Pkg, Name)` exactly as the boxing side (gen_iface) and the
+// emit side (CollectSatEntries: IfaceIdName(IfacePkg, IfaceName)) do, so the
+// assertion's `&__ifaceid.<J>` matches the emitted marker.
+func ifaceIdSymFor(jType @types.Type) @[]char {
+	return mangle.IfaceIdName(jType.Pkg, jType.Name)
+}
+
+// genInterfaceAssert lowers an EXPRESSION-form interface-target assertion.
+// Returns the recovered interface value (`*J` borrow / `@J` retain), leaving
+// IR-gen positioned in the HIT block (the MISS paths abort — no merge).
+func genInterfaceAssert(ctx @GenContext, b @Block, e @ast.Expr, recoveredTyp @types.Type) @Instr {
+	var rawPtr @types.Type = types.MakePointerType(types.TypUint8())
+	var jType @types.Type = recoveredTyp.Elem
+
+	var iv @Instr = genExpr(ctx, b, e.X)
+	b = ctx.CurBlock
+	var f @Func = ctx.Func
+
+	// vtable null (unset scrutinee, spec iface.assert.absent) → guaranteed miss.
+	var vtable @Instr = b.EmitExtract(iv, types.IfaceValueVtableIndex(), rawPtr)
+	var vtNull @Instr = b.EmitBinop(iropcode.OP_EQ, vtable, b.EmitConstNil(rawPtr), types.TypBool())
+	var unsetBlk @Block = AddBlock(f, "iassert.unset")
+	var lookupBlk @Block = AddBlock(f, "iassert.lookup")
+	b.EmitBranch(vtNull, unsetBlk, lookupBlk)
+
+	// lookupBlk: dynamic `*TypeInfo` (vtable slot 1) + `rt.SatLookup(ti,
+	// &__ifaceid.<J>)` → sub-vtable or null.
+	var slot1 @Instr = loadVtableSlot(lookupBlk, vtable, 1, rawPtr)
+	var ifaceIdAddr @Instr = lookupBlk.EmitDataSymAddr(ifaceIdSymFor(jType), types.TypUint8())
+	var subvt @Instr = lookupBlk.EmitCall("pkg/builtins/rt.SatLookup", makeArgs2(slot1, ifaceIdAddr),
+			rawPtr)
+	var subNull @Instr = lookupBlk.EmitBinop(iropcode.OP_EQ, subvt, lookupBlk.EmitConstNil(rawPtr),
+			types.TypBool())
+	var wrongBlk @Block = AddBlock(f, "iassert.wrong")
+	var hitBlk @Block = AddBlock(f, "iassert.hit")
+	lookupBlk.EmitBranch(subNull, wrongBlk, hitBlk)
+
+	var targetName @[]char = jType.QualifiedTypeName()
+
+	// unsetBlk: no dynamic type → `<unset>`.  wrongBlk: the dynamic type's own name.
+	emitAssertFail(ctx, unsetBlk, assertNameConst(ctx, unsetBlk, "<unset>"), targetName)
+	unsetBlk.EmitUnreachable()
+	emitAssertFail(ctx, wrongBlk, readTypeInfoName(ctx, wrongBlk, slot1), targetName)
+	wrongBlk.EmitUnreachable()
+
+	// hitBlk: assemble {data, subvtable}.  `@J` retains the boxed data (RefInc +
+	// end-of-statement release, mirroring recoverPointer); `*J` borrows.
+	ctx.CurBlock = hitBlk
+	return recoverInterfaceValue(ctx, hitBlk, iv, subvt, recoveredTyp)
+}
+
+// recoverInterfaceValue assembles the recovered `{data, subvtable}` interface
+// value in `b`.  For `@J`, RefInc the boxed data and register it for release at
+// end of statement (the assignment then copy-retains — net +1, like `@T`).
+func recoverInterfaceValue(ctx @GenContext, b @Block, iv @Instr, subvt @Instr,
+		recoveredTyp @types.Type) @Instr {
+	var rawPtr @types.Type = types.MakePointerType(types.TypUint8())
+	var data @Instr = b.EmitExtract(iv, types.IfaceValueDataIndex(), rawPtr)
+	if recoveredTyp.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		b.EmitRefInc(data)
+		registerTemp(ctx, data)
+	}
+	return b.EmitIfaceValueDyn(data, subvt, recoveredTyp)
+}
+
+// genInterfaceAssertCommaOk lowers a comma-ok interface-target assertion to a
+// {recovered, ok} struct (the alloca-merge idiom, like the concrete comma-ok):
+// HIT → {iface value, true}; any MISS → {nil interface value, false}.  Borrow
+// model — no RefInc in the hit block; the destructure copy-retains the target.
+func genInterfaceAssertCommaOk(ctx @GenContext, b @Block, e @ast.Expr,
+		recoveredTyp @types.Type) @Instr {
+	var rawPtr @types.Type = types.MakePointerType(types.TypUint8())
+	var jType @types.Type = recoveredTyp.Elem
+	var structTyp @types.Type = commaOkAssertStructType(recoveredTyp)
+
+	var iv @Instr = genExpr(ctx, b, e.X)
+	b = ctx.CurBlock
+	var f @Func = ctx.Func
+	var slot @Instr = b.EmitAlloc(structTyp)
+
+	var vtable @Instr = b.EmitExtract(iv, types.IfaceValueVtableIndex(), rawPtr)
+	var vtNull @Instr = b.EmitBinop(iropcode.OP_EQ, vtable, b.EmitConstNil(rawPtr), types.TypBool())
+	var missBlk @Block = AddBlock(f, "iassert.ok.miss")
+	var lookupBlk @Block = AddBlock(f, "iassert.ok.lookup")
+	b.EmitBranch(vtNull, missBlk, lookupBlk)
+
+	var slot1 @Instr = loadVtableSlot(lookupBlk, vtable, 1, rawPtr)
+	var ifaceIdAddr @Instr = lookupBlk.EmitDataSymAddr(ifaceIdSymFor(jType), types.TypUint8())
+	var subvt @Instr = lookupBlk.EmitCall("pkg/builtins/rt.SatLookup", makeArgs2(slot1, ifaceIdAddr),
+			rawPtr)
+	var subNull @Instr = lookupBlk.EmitBinop(iropcode.OP_EQ, subvt, lookupBlk.EmitConstNil(rawPtr),
+			types.TypBool())
+	var hitBlk @Block = AddBlock(f, "iassert.ok.hit")
+	lookupBlk.EmitBranch(subNull, missBlk, hitBlk)
+
+	var mergeBlk @Block = AddBlock(f, "iassert.ok.merge")
+
+	// missBlk: a nil interface value {nil, nil} + false.  Assembled via the
+	// dynamic constructor (EmitConstNil does not build a 2-word iface value).
+	var nilData @Instr = missBlk.EmitConstNil(rawPtr)
+	var nilVt @Instr = missBlk.EmitConstNil(rawPtr)
+	var nilIface @Instr = missBlk.EmitIfaceValueDyn(nilData, nilVt, recoveredTyp)
+	storeCommaOkResult(missBlk, slot, recoveredTyp, nilIface, missBlk.EmitConstBool(false))
+	missBlk.EmitJump(mergeBlk)
+
+	// hitBlk: {data, subvtable} + true.  Borrow — no RefInc (the destructure copies).
+	var data @Instr = hitBlk.EmitExtract(iv, types.IfaceValueDataIndex(), rawPtr)
+	var ivResult @Instr = hitBlk.EmitIfaceValueDyn(data, subvt, recoveredTyp)
+	storeCommaOkResult(hitBlk, slot, recoveredTyp, ivResult, hitBlk.EmitConstBool(true))
+	hitBlk.EmitJump(mergeBlk)
+
+	ctx.CurBlock = mergeBlk
+	return mergeBlk.EmitLoad(slot, structTyp)
+}

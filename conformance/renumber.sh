@@ -15,8 +15,8 @@
 # .expected.<mode> sidecar, and (multi-file) the directory itself.
 #
 # <target-number> is the destination NNN.  Default: the next free number
-# (./conformance/next-number.sh).  An explicit target must be a free
-# 3-digit number.
+# (./conformance/next-number.sh).  An explicit target must be a free number
+# of at least 3 digits (4-digit numbers are allowed past 999).
 #
 # Primary use: resolving the duplicate-number collisions that
 # scripts/hygiene/conformance-test-numbers.sh flags when two branches
@@ -39,7 +39,7 @@ INPUT="${INPUT%/}"
 
 # Enumerate the stems (NNN_<name>) of all real tests.
 test_stems() {
-    for bn in "$CONFORMANCE_DIR"/[0-9][0-9][0-9]_*.bn; do
+    for bn in "$CONFORMANCE_DIR"/[0-9][0-9][0-9]*_*.bn; do
         [ -f "$bn" ] || continue
         name="$(basename "$bn" .bn)"
         if [ -f "$CONFORMANCE_DIR/${name}.expected" ] || \
@@ -47,23 +47,28 @@ test_stems() {
             echo "$name"
         fi
     done
-    for dir in "$CONFORMANCE_DIR"/[0-9][0-9][0-9]_*/; do
+    for dir in "$CONFORMANCE_DIR"/[0-9][0-9][0-9]*_*/; do
         [ -d "$dir" ] || continue
         basename "$dir"
     done
 }
 
-# Resolve INPUT to exactly one stem.
+# Resolve INPUT to exactly one stem.  A stem carries an underscore; a bare
+# number does not.  Both accept 3-or-more digits so tests numbered >=1000 work.
 case "$INPUT" in
-    [0-9][0-9][0-9])
-        # Number alone — find the matching stem(s).
-        MATCHES="$(test_stems | grep "^${INPUT}_" | sort -u)"
-        ;;
-    [0-9][0-9][0-9]_*)
+    *_*)
+        # Contains an underscore — a full stem (NNN_name).
         MATCHES="$(test_stems | grep -x "$INPUT" | sort -u)"
         ;;
-    *)
+    *[!0-9]*)
         die "<test> must be a number (532) or a stem (532_name): got '$INPUT'"
+        ;;
+    [0-9][0-9][0-9]*)
+        # 3+ digits, no underscore — a number alone; find the matching stem(s).
+        MATCHES="$(test_stems | grep "^${INPUT}_" | sort -u)"
+        ;;
+    *)
+        die "<test> number must be at least 3 digits: got '$INPUT'"
         ;;
 esac
 
@@ -75,16 +80,17 @@ if [ "$count" -gt 1 ]; then
     die "pass the full stem to pick one"
 fi
 STEM="$MATCHES"
-SRC_NUM="$(echo "$STEM" | cut -c1-3)"
-NAME="$(echo "$STEM" | cut -c5-)"
+SRC_NUM="${STEM%%_*}"
+NAME="${STEM#*_}"
 
 # Determine the target number.
 if [ -z "$TARGET" ]; then
     TARGET="$(sh "$CONFORMANCE_DIR/next-number.sh")" || die "next-number.sh failed"
 fi
 case "$TARGET" in
-    [0-9][0-9][0-9]) ;;
-    *) die "<target-number> must be a 3-digit number: got '$TARGET'" ;;
+    *[!0-9]*) die "<target-number> must be numeric: got '$TARGET'" ;;
+    [0-9][0-9][0-9]*) ;;
+    *) die "<target-number> must be at least 3 digits: got '$TARGET'" ;;
 esac
 if [ "$TARGET" = "$SRC_NUM" ]; then
     die "$STEM already has number $TARGET"

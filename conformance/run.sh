@@ -443,8 +443,10 @@ for bn in "$SCRIPT_DIR"/*.bn; do
     fi
 done
 
-# Multi-package tests: NNN_name/ directories
-for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*/; do
+# Multi-package tests: NNN_name/ directories.  The `[0-9][0-9][0-9]*_` glob
+# admits 4-digit (and wider) numbers, so a directory test numbered >=1000 is
+# still discovered — a plain three-digit-class glob would silently skip it.
+for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]*_*/; do
     [ -d "$dir" ] || continue
     name="$(basename "$dir")"
 

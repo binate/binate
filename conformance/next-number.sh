@@ -1,7 +1,8 @@
 #!/bin/sh
 # Usage: ./conformance/next-number.sh [--gap]
 #
-# Print the next free conformance test number (a 3-digit NNN prefix).
+# Print the next free conformance test number (an NNN prefix, zero-padded to
+# at least 3 digits; naturally 4 digits once the suite passes 999).
 #
 # A "test" is either a single-file test (NNN_<name>.bn with a sibling
 # .expected or .error) or a multi-file test (NNN_<name>/ directory).
@@ -15,7 +16,7 @@
 #   --gap    the lowest unused number instead (compact numbering — reuses
 #            gaps).  Use when you deliberately want to fill a hole.
 #
-# Exit code: 1 on error (e.g. numbers exhausted past 999), 0 otherwise.
+# Exit code: 1 on error (e.g. numbers exhausted past 9999), 0 otherwise.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFORMANCE_DIR="$SCRIPT_DIR"
@@ -32,19 +33,20 @@ fi
 # Collect the set of in-use numbers (one per line), sorted & unique.
 used_numbers() {
     {
-        for bn in "$CONFORMANCE_DIR"/[0-9][0-9][0-9]_*.bn; do
+        for bn in "$CONFORMANCE_DIR"/[0-9][0-9][0-9]*_*.bn; do
             [ -f "$bn" ] || continue
             name="$(basename "$bn" .bn)"
             if [ -f "$CONFORMANCE_DIR/${name}.expected" ] || \
                [ -f "$CONFORMANCE_DIR/${name}.error" ]; then
-                echo "$name" | cut -c1-3
+                echo "${name%%_*}"
             fi
         done
-        for dir in "$CONFORMANCE_DIR"/[0-9][0-9][0-9]_*/; do
+        for dir in "$CONFORMANCE_DIR"/[0-9][0-9][0-9]*_*/; do
             [ -d "$dir" ] || continue
-            basename "$dir" | cut -c1-3
+            name="$(basename "$dir")"
+            echo "${name%%_*}"
         done
-    } | sort -u
+    } | sort -nu   # numeric: 1000 must sort ABOVE 999, not lexically below it
 }
 
 NUMS="$(used_numbers)"
@@ -73,9 +75,11 @@ else
     done
 fi
 
-if [ "$next" -gt 999 ]; then
-    echo "next-number.sh: no free 3-digit number available (next would be $next)" >&2
+if [ "$next" -gt 9999 ]; then
+    echo "next-number.sh: no free number available (next would be $next)" >&2
     exit 1
 fi
 
+# %03d gives a minimum width of 3 (so 42 -> 042) while letting 4-digit numbers
+# print at their natural width (1000 -> 1000).
 printf "%03d\n" "$next"

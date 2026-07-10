@@ -5,6 +5,12 @@
 # prefix that maps to more than one test (single-file *.bn, or
 # multi-file NNN_*/ directory). Each test number must be unique.
 #
+# ALSO enforces discovery-completeness: every on-disk numbered test must be
+# enumerable by the NNN-prefix globs.  The number NNN is any run of >=3 leading
+# digits (4-digit numbers appear once the suite passes 999), so this guards
+# against the enumeration globs silently narrowing back to exactly-3-digits —
+# the defect that let 1001_xpkg_iface_assert run in zero modes.
+#
 # Numbering is per-directory: every directory that holds numbered tests is an
 # independent namespace (the top-level conformance/ suite and each
 # spec/<chapter>/ and stdlib/<chapter>/ restart at 001), so uniqueness is
@@ -17,7 +23,7 @@
 # pruned). This tracks the same numbered subtrees the runner discovers and
 # covers any future one automatically (avoiding a hand-maintained whitelist).
 #
-# Exit code: 1 if any duplicates found, 0 otherwise.
+# Exit code: 1 if any duplicates or undiscovered numbered tests found, 0 otherwise.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -35,19 +41,19 @@ NUMS_TMP="$(mktemp "${TMPDIR:-/tmp}/conformance-numbers.XXXXXX")"
 emit_test_numbers() {
     emit_dir="$1"
     emit_ns="$2"
-    for bn in "$emit_dir"/[0-9][0-9][0-9]_*.bn; do
+    for bn in "$emit_dir"/[0-9][0-9][0-9]*_*.bn; do
         [ -f "$bn" ] || continue
         name="$(basename "$bn" .bn)"
         if [ -f "$emit_dir/${name}.expected" ] || \
            [ -f "$emit_dir/${name}.error" ]; then
-            num="$(echo "$name" | cut -c1-3)"
+            num="${name%%_*}"
             printf "%s:%s %s\n" "$emit_ns" "$num" "$name"
         fi
     done
-    for dir in "$emit_dir"/[0-9][0-9][0-9]_*/; do
+    for dir in "$emit_dir"/[0-9][0-9][0-9]*_*/; do
         [ -d "$dir" ] || continue
         name="$(basename "$dir")"
-        num="$(echo "$name" | cut -c1-3)"
+        num="${name%%_*}"
         printf "%s:%s %s\n" "$emit_ns" "$num" "$name"
     done
 }
@@ -57,7 +63,7 @@ emit_test_numbers() {
 # are never mistaken for a namespace. The namespace is the directory's path
 # relative to conformance/ (the top-level itself is "conformance").
 {
-    find "$CONFORMANCE_DIR" -type d -name '[0-9][0-9][0-9]_*' -prune -o -type d -print |
+    find "$CONFORMANCE_DIR" -type d -name '[0-9][0-9][0-9]*_*' -prune -o -type d -print |
     while IFS= read -r d; do
         if [ "$d" = "$CONFORMANCE_DIR" ]; then
             ns="conformance"
@@ -93,10 +99,52 @@ if [ -n "$group" ]; then
     echo "DUPLICATE: $prev_key used by: $group"
     dups=$((dups + 1))
 fi
-rm -f "$NUMS_TMP"
 
-if [ "$dups" -gt 0 ]; then
+# Discovery-completeness guard.  Independent of the enumeration globs above:
+# walk every entry (via `*`, digit-agnostic) and classify "numbered test" by a
+# >=3-leading-digit prefix — NOT by the `[0-9][0-9][0-9]*_` glob emit uses.  Any
+# such stem that emit_test_numbers did not record (i.e. is absent from
+# NUMS_TMP) means the enumeration glob is too narrow and dropped a real test.
+MISS_TMP="$(mktemp "${TMPDIR:-/tmp}/conformance-missing.XXXXXX")"
+find "$CONFORMANCE_DIR" -type d -name '[0-9][0-9][0-9]*_*' -prune -o -type d -print |
+while IFS= read -r d; do
+    if [ "$d" = "$CONFORMANCE_DIR" ]; then
+        ns="conformance"
+    else
+        ns="${d#"$CONFORMANCE_DIR"/}"
+    fi
+    for e in "$d"/*; do
+        [ -e "$e" ] || continue
+        b="$(basename "$e")"
+        # A numbered test starts with >=3 digits.  This classification does not
+        # care where the underscore falls, so a 4-digit stem still qualifies.
+        case "$b" in [0-9][0-9][0-9]*) ;; *) continue ;; esac
+        if [ -d "$e" ]; then
+            stem="$b"
+        else
+            stem="${b%%.*}"   # strip the sidecar suffix (.bn/.expected/.xfail...)
+        fi
+        case "$stem" in *_*) ;; *) continue ;; esac
+        # Single-file stems count only with a .expected/.error sibling (mirrors
+        # emit_test_numbers; skips package sources and other support files).
+        if [ ! -d "$e" ]; then
+            [ -f "$d/${stem}.expected" ] || [ -f "$d/${stem}.error" ] || continue
+        fi
+        if ! grep -qxF "${ns}:${stem%%_*} ${stem}" "$NUMS_TMP"; then
+            printf "%s/%s\n" "$ns" "$stem" >> "$MISS_TMP"
+        fi
+    done
+done
+missing="$(sort -u "$MISS_TMP" | wc -l | tr -d ' ')"
+if [ "$missing" -gt 0 ]; then
+    echo "UNDISCOVERED (enumeration glob too narrow to see these numbered tests):"
+    sort -u "$MISS_TMP" | sed 's/^/  /'
+fi
+rm -f "$NUMS_TMP" "$MISS_TMP"
+
+if [ "$dups" -gt 0 ] || [ "$missing" -gt 0 ]; then
     echo ""
-    echo "=== $dups duplicate test number(s) ==="
+    [ "$dups" -gt 0 ] && echo "=== $dups duplicate test number(s) ==="
+    [ "$missing" -gt 0 ] && echo "=== $missing undiscovered numbered test(s) ==="
     exit 1
 fi

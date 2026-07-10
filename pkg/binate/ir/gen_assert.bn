@@ -1,0 +1,131 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/iropcode"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+
+// Expression-form concrete type-assertion lowering (`x.(*T)` / `x.(@T)`, spec
+// §11.12 `iface.assert`).  The interface value's vtable-slot-1 `*TypeInfo` is
+// compared against the static `&__typeinfo.<T>`: a HIT recovers the boxed data
+// pointer per the recovery kind, a MISS aborts via `rt.AssertFail` (the
+// expression form has no comma-ok escape).  CONCRETE targets only; interface
+// targets and value-recovery are checker-rejected pending later work.
+
+// genTypeAssert lowers an EXPR_TYPE_ASSERT.  Returns the recovered value (typed
+// `*T` or `@T`), leaving IR-gen positioned in the HIT continuation block (the
+// MISS paths abort, so there is no merge / phi).
+func genTypeAssert(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	var recoveredTyp @types.Type = resolveTypeExpr(ctx.Gc, e.TypeRef)
+	var rawPtr @types.Type = types.MakePointerType(types.TypUint8())
+
+	var iv @Instr = genExpr(ctx, b, e.X)
+	b = ctx.CurBlock
+	var f @Func = ctx.Func
+
+	// The vtable word (interface value index 1).  A null vtable is the `unset`
+	// state (spec iface.assert.absent — test the vtable word FIRST): no dynamic
+	// type, a guaranteed miss.
+	var vtable @Instr = b.EmitExtract(iv, types.IfaceValueVtableIndex(), rawPtr)
+	var vtNull @Instr = b.EmitBinop(iropcode.OP_EQ, vtable, b.EmitConstNil(rawPtr), types.TypBool())
+	var unsetBlk @Block = AddBlock(f, "assert.unset")
+	var checkBlk @Block = AddBlock(f, "assert.checktype")
+	b.EmitBranch(vtNull, unsetBlk, checkBlk)
+
+	// The asserted type's `__typeinfo.<T>` symbol — derived EXACTLY as the
+	// boxing side does (gen_iface.wrapAsIfaceValue: receiverBaseTypeName →
+	// splitQualName, same-package names defaulting to the module path) so the
+	// assertion's `&__typeinfo.<T>` matches the vtable slot-1 pointer the box
+	// carries.  The qualified name is the panic message's `<T>`.
+	var recvPkg @[]char
+	var recvName @[]char
+	recvPkg, recvName = splitQualName(receiverBaseTypeName(recoveredTyp))
+	if len(recvPkg) == 0 {
+		recvPkg = ctx.Gc.PkgPath
+	}
+	var tiSym @[]char = mangle.TypeInfoName(recvPkg, recvName)
+	var targetName @[]char = assertBaseType(recoveredTyp).QualifiedTypeName()
+
+	// checkBlk: load vtable slot 1 (the dynamic `*TypeInfo`) and compare it
+	// against `&__typeinfo.<T>` — a nominal identity compare (§11.12: exact type).
+	var slot1 @Instr = loadVtableSlot(checkBlk, vtable, 1, rawPtr)
+	var want @Instr = checkBlk.EmitDataSymAddr(tiSym, types.TypUint8())
+	var wrong @Instr = checkBlk.EmitBinop(iropcode.OP_NE, slot1, want, types.TypBool())
+	var wrongBlk @Block = AddBlock(f, "assert.wrong")
+	var hitBlk @Block = AddBlock(f, "assert.hit")
+	checkBlk.EmitBranch(wrong, wrongBlk, hitBlk)
+
+	// unsetBlk: no dynamic type → the panic's `<dyn>` is the literal "<unset>".
+	emitAssertFail(ctx, unsetBlk, assertNameConst(ctx, unsetBlk, "<unset>"), targetName)
+	unsetBlk.EmitUnreachable()
+
+	// wrongBlk: read the dynamic type's own name from its TypeInfo record.
+	emitAssertFail(ctx, wrongBlk, readTypeInfoName(ctx, wrongBlk, slot1), targetName)
+	wrongBlk.EmitUnreachable()
+
+	// hitBlk: recover the boxed pointer and continue here.
+	ctx.CurBlock = hitBlk
+	return recoverPointer(ctx, hitBlk, iv, recoveredTyp)
+}
+
+// assertBaseType peels the recovery kind (`*`/`@`) and any element `readonly`
+// off the recovered type to reach the asserted named base T.
+func assertBaseType(t @types.Type) @types.Type {
+	var b @types.Type = t
+	if b.Kind == types.TYP_POINTER || b.Kind == types.TYP_MANAGED_PTR {
+		b = b.Elem
+	}
+	if b != nil && b.Kind == types.TYP_READONLY {
+		b = b.Elem
+	}
+	return b
+}
+
+// loadVtableSlot loads word `slot` of a vtable (a raw `*uint8`): the slot is a
+// pointer-sized word, so GEP the vtable by word index `slot` and load it.
+func loadVtableSlot(b @Block, vtable @Instr, slot int, wordTyp @types.Type) @Instr {
+	var idx @Instr = b.EmitConstInt(slot, types.TypInt())
+	var slotPtr @Instr = b.EmitGetElemPtr(vtable, idx, wordTyp)
+	return b.EmitLoad(slotPtr, wordTyp)
+}
+
+// readTypeInfoName reads the dynamic type's name out of its TypeInfo record
+// (`ti`, a raw `*uint8`): word 3 is the name pointer, word 4 the byte length
+// (irdata.BuildTypeInfo layout).  Builds a `*[]readonly char` slice from them.
+func readTypeInfoName(ctx @GenContext, b @Block, ti @Instr) @Instr {
+	var rawPtr @types.Type = types.MakePointerType(types.TypUint8())
+	var namePtr @Instr = b.EmitLoad(
+			b.EmitGetElemPtr(ti, b.EmitConstInt(3, types.TypInt()), rawPtr), rawPtr)
+	var nameLen @Instr = b.EmitLoad(
+			b.EmitGetElemPtr(ti, b.EmitConstInt(4, types.TypInt()), types.TypInt()), types.TypInt())
+	var charSlice @types.Type = types.MakeSliceType(types.MakeReadonlyType(types.TypChar()))
+	return emitMakeRawSlice(ctx, b, charSlice, namePtr, nameLen)
+}
+
+// assertNameConst materializes a compile-time name string as a `*[]readonly char`
+// slice value (the panic message's `<dyn>` for the unset case, or a `<T>`).
+func assertNameConst(ctx @GenContext, b @Block, name @[]char) @Instr {
+	var charSlice @types.Type = types.MakeSliceType(types.MakeReadonlyType(types.TypChar()))
+	return coerceArg(ctx, b, b.EmitConstString(name), charSlice)
+}
+
+// emitAssertFail emits `rt.AssertFail(dyn, "<targetName>")` — the failed-assertion
+// panic.  `dyn` is an already-built `*[]readonly char` slice; the target name is
+// a compile-time string.  Caller adds the trailing unreachable.
+func emitAssertFail(ctx @GenContext, b @Block, dyn @Instr, targetName @[]char) {
+	var target @Instr = assertNameConst(ctx, b, targetName)
+	b.EmitCall("pkg/builtins/rt.AssertFail", makeArgs2(dyn, target), types.TypVoid())
+}
+
+// recoverPointer recovers the boxed data pointer as the asserted pointer type.
+// `*T`: a raw borrow — the data pointer verbatim, no refcount, no temp.  `@T`:
+// a retained reference — RefInc + register for end-of-statement release, so the
+// recovered `@T` owns its own reference (`@`-hit = +1 then released).
+func recoverPointer(ctx @GenContext, b @Block, iv @Instr, recoveredTyp @types.Type) @Instr {
+	var dataPtr @Instr = b.EmitExtract(iv, types.IfaceValueDataIndex(), recoveredTyp)
+	if recoveredTyp.Kind == types.TYP_MANAGED_PTR {
+		b.EmitRefInc(dataPtr)
+		registerTemp(ctx, dataPtr)
+	}
+	return dataPtr
+}

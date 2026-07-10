@@ -35,10 +35,13 @@ import "pkg/stdx/slices"
 // arg marshal (emitShimArgMarshalArm32 in arm32_funcvalue_marshal.bn) re-expands a
 // coerced in-register named struct/array ARG from its by-address dispatch pointer
 // into the underlying's AAPCS32 coerced GP regs (GP-only — arm32 is soft-float, so
-// no HFA/FP path).  Shapes it can't yet marshal — closures (P4-d), float args /
-// returns (P5), a non-coerced in-register aggregate arg (a pre-existing shared
-// gap), a 64-bit register-pair scalar arg, or arg words beyond the register budget
-// (stack spill, P2) — fail LOUDLY via a.SetError rather than emitting a wrong shim.
+// no HFA/FP path).  Arg words beyond the register budget route to the framed-BL
+// stack-spill shim (emitFuncvalSpillShimArm32 in arm32_funcvalue_spill.bn), which
+// reserves an outgoing-args area, marshals the overflow words into it, BLs the
+// underlying, and tears the frame down.  Shapes it still can't marshal — closures
+// (P4-d), float args / returns (P5), a non-coerced in-register aggregate arg (a
+// pre-existing shared gap), a 64-bit register-pair scalar arg — fail LOUDLY via
+// a.SetError rather than emitting a wrong shim.
 // Mirrors aarch64_funcvalue{,_shim}.bn / x64_funcvalue_shim.bn at the reduced
 // surface, with AAPCS32's R0-sret-stays convention (like x64's RDI-stays) in place
 // of AAPCS64's X0->X8 move.
@@ -323,15 +326,22 @@ func emitFuncValueShimBody(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type)
 // through the tail-branch — the shim never touches the return value; the marshal's
 // staging (present only for a coerced aggregate) is a BALANCED SP scratch, freed
 // before the branch, so the tail-branch stays frameless.  Fails LOUDLY on arg
-// shapes the register-only marshal can't place (shimOutRegs) or on more
-// user-arg words than the register budget holds (a stack-spill shim is a later
-// increment).  Callers reach it via emitFuncValueShimBody, which has already ruled
-// out the aggregate/float return shapes.
+// shapes the register-only marshal can't place (shimOutRegs); when the user-arg
+// words exceed the register budget it routes to the framed-BL stack-spill shim
+// (emitFuncvalSpillShimArm32).  Callers reach it via emitFuncValueShimBody, which
+// has already ruled out the aggregate/float return shapes.
 func emitScalarVoidShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 	var cc common.CallConv = common.AAPCS32()
+	// shimOutRegs rules out the shapes that stay fail-loud even under spill (float
+	// arg / non-coerced in-register aggregate / 64-bit register-pair scalar), so a
+	// genuine register-budget overflow (nOut fits the checks below but the args
+	// don't fit R0..R3) is what routes to the framed-BL stack-spill shim.
 	var nOut int = shimOutRegs(a, cc, fvTyp, 0)
 	if nOut < 0 { return }
-	if !shimArgsFitRegisters(a, cc, fvTyp, 1, 0, nOut) { return }
+	if !shimArgsFitRegisters(cc, fvTyp, 1, 0, nOut) {
+		emitFuncvalSpillShimArm32(a, cc, fnLabel, fvTyp, 0, false, false, false, false)
+		return
+	}
 	emitShimArgMarshalArm32(a, cc, fvTyp, 1, 0)
 	a.SetGlobal(fnLabel)
 	arm32.B(a, arm32.COND_AL, fnLabel)
@@ -344,15 +354,24 @@ func emitScalarVoidShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 // so, unlike AAPCS64's `Mov X8, X0`, the retbuf simply STAYS in R0 across the
 // shim: keep R0, drop the data word (R1), shift user args R2.. down to R1.., and
 // tail-branch (the underlying writes the result through R0).  Fails LOUDLY on the
-// same arg shapes as the scalar shim, and when the user args exceed R2..R3 — the
-// retbuf + data prefix leaves one fewer arg register than the scalar shape.
+// same arg shapes as the scalar shim; when the user args exceed R2..R3 (the
+// retbuf + data prefix leaves one fewer arg register than the scalar shape) it
+// routes to the framed-BL sret stack-spill shim (retbuf stays in R0 there too).
 func emitSretShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 	var cc common.CallConv = common.AAPCS32()
 	// R0 = retbuf stays; the user args start at R1 (gpDestBase 1), and the incoming
 	// dispatch drops retbuf + data (srcPrefix 2 — R0 = retbuf, R1 = data).
 	var nOut int = shimOutRegs(a, cc, fvTyp, 1)
 	if nOut < 0 { return }
-	if !shimArgsFitRegisters(a, cc, fvTyp, 2, 1, nOut) { return }
+	if !shimArgsFitRegisters(cc, fvTyp, 2, 1, nOut) {
+		// Over-budget: the framed-BL sret spill (retbuf stays in R0 across the
+		// marshal + BL — useSret; the underlying writes the result through R0).  It
+		// covers both a big single aggregate and a big multi-return tuple, since
+		// emitFuncValueShimBody routes both here.
+		var useSretMulti bool = len(fvTyp.Results) > 1
+		emitFuncvalSpillShimArm32(a, cc, fnLabel, fvTyp, 0, false, !useSretMulti, false, useSretMulti)
+		return
+	}
 	emitShimArgMarshalArm32(a, cc, fvTyp, 2, 1)
 	a.SetGlobal(fnLabel)
 	arm32.B(a, arm32.COND_AL, fnLabel)
@@ -368,7 +387,7 @@ func emitSretShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 // drops retbuf + data by shifting user args R2.. down to R0.., BLs the
 // underlying, stores the returned R0 word through retbuf, and returns.  Mirrors
 // x64/aarch64's usePack shim, with arm32's explicit push/pop frame (no red zone).
-// Over-budget arg counts (needing a stack-spill shim) fail LOUDLY (P4).
+// Over-budget arg counts route to the framed-BL pack stack-spill shim.
 func emitPackShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 	var cc common.CallConv = common.AAPCS32()
 	// The underlying is a small-aggregate function (returns by value, no sret arg),
@@ -376,7 +395,14 @@ func emitPackShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
 	// retbuf + data (srcPrefix 2).
 	var nOut int = shimOutRegs(a, cc, fvTyp, 0)
 	if nOut < 0 { return }
-	if !shimArgsFitRegisters(a, cc, fvTyp, 2, 0, nOut) { return }
+	if !shimArgsFitRegisters(cc, fvTyp, 2, 0, nOut) {
+		// Over-budget: the framed-BL pack spill (retbuf stashed to the frame; the
+		// underlying returns the <=4-byte aggregate by value in R0, which the spill
+		// stores through the reloaded retbuf — usePack).
+		var retSz int = fvTyp.Results[0].SizeOf()
+		emitFuncvalSpillShimArm32(a, cc, fnLabel, fvTyp, retSz, true, false, false, false)
+		return
+	}
 	// push {r4, lr}: save the caller's R4 (reused for retbuf) and LR (the BL
 	// clobbers it).  Two registers keep SP 8-aligned across the call (AAPCS32).
 	arm32.Push(a, arm32.COND_AL, packShimPushMask())

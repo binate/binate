@@ -1,0 +1,392 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Genuine-overflow stack-spill path for the non-closure func-value shims
+// (arm32 / AAPCS32, soft-float).  Reached from the four shape emitters
+// (emitScalarVoidShim / emitSretShim / emitPackShim / emitMultiRetPackShim)
+// when a func value's EFFECTIVE user-arg words exceed the register budget the
+// tail-branch / register-only shapes can serve.  Mirrors emitFuncvalSpillShim_x64
+// (the R0-sret-stays == RDI-stays twin), reduced to the GP-only surface (arm32
+// is soft-float — no HFA/FP register file), and with the aarch64 no-`+8`
+// incoming-overflow formula (arm enters the shim via Blx, which puts the return
+// address in LR and pushes nothing — unlike x64's CALL, which pushes a return
+// address).
+//
+// The shim is entered under the uniform all-int dispatch ABI: dispatch word g
+// (g=0 is the leading data slot, or retbuf+data for the aggregate / multi-return
+// shapes) is in argReg(g) if g < NumGpArgRegs (R0..R3), else on the dispatch
+// CALLER's stack at [sp_entry + (g-NumGpArgRegs)*WordBytes].  The shim re-marshals
+// the user words into the underlying's real AAPCS32 layout — reg words shifted
+// down by the dropped prefix, AAPCS §6.5 SPLIT honored, overflow words written to
+// a reserved outgoing-args area — then BLs (NOT a tail-branch: LR must be
+// preserved and the frame torn down before RET) and unwinds.
+//
+// The frameless tail-branch shapes (scalar/void, sret) become FRAMED-BL shapes
+// when they spill: a tail-branch has no reserved outgoing-args area (PlanFrame
+// never runs for a hand-emitted shim) and no return path to tear a frame down,
+// so a shim that must place outgoing stack args has to own a real frame.
+//
+// Clobber-safety of the reg shifts: without a coerced aggregate every word shifts
+// DOWN — the outgoing register index (the classifier's ABSOLUTE reg number over the
+// sret-prefixed type list) never exceeds the incoming dispatch word index (which
+// carries the same retbuf/data prefix ahead of the user words), so an outgoing reg R
+// is read as an incoming source only at a word index >= R, already consumed when the
+// marshal runs left-to-right.  A coerced in-register struct/array breaks that
+// symmetry — it arrives as ONE by-address dispatch word (EffectiveArgWords == 1)
+// yet the real ABI reads its ArgWords value-words from that buffer — so the
+// incoming and outgoing cursors DIVERGE and an outgoing write could clobber a
+// LATER param's not-yet-read incoming reg.  Staging every incoming GP dispatch reg
+// to the frame first (needStage) removes that hazard (see shimHasCoercedAggArm32).
+//
+// The scratch shortage: arm32 has only IP (R12) as a free intra-procedure scratch
+// (R0..R3 are args, R0/R0:R1 the return, R4..R11 callee-saved).  IP holds the
+// coerced-aggregate pointer base while its value-words are loaded, so a SPLIT
+// value-word that must go memory→memory (from [IP+4k] to an outgoing STACK slot)
+// needs a SECOND temp.  R4 is saved in the frame (and restored in teardown) to
+// serve as that memory→memory shuttle, mirroring how the pack shape already
+// borrows R4 for the retbuf.
+
+// emitFuncvalSpillShimArm32 emits the over-budget func-value shim.  retSz is the
+// single-result SizeOf (0 for void / multi-return scalar).  The shape flags are
+// mutually consistent with the four shape emitters: at most one of usePack /
+// useSret / usePackMulti / useSretMulti is set.  Float returns stay fail-loud
+// (P5), so there is no isFloatRet param.  A usePackMulti (small multi-return)
+// takes the same retbuf-save frame as usePack (retbuf stashed, user args
+// classified at classifyBase 0 — no sret prefix), but the post-BL store through retbuf is the
+// field-per-register helper (the callee returns the tuple field-per-register, not
+// packed R0).  A useSretMulti (big multi-return) folds into the useSret arm
+// (retbuf stays in R0, no post-BL routing — the underlying wrote through R0).
+func emitFuncvalSpillShimArm32(a @asm.Assembler, cc common.CallConv, fnLabel @[]char,
+		fvTyp @types.Type, retSz int, usePack bool, useSret bool, usePackMulti bool, useSretMulti bool) {
+	var userTypes @[]@types.Type = shimUserTypesArm32(fvTyp)
+	// A big multi-return (useSretMulti) shares the sret shape (retbuf stays in
+	// R0, R0 = retbuf, user args start at R1); a small multi-return (usePackMulti)
+	// shares the retbuf-save pack shape (retbuf stashed to the frame, callee
+	// returns field-per-register, store through retbuf post-BL).
+	var sretShape bool = useSret || useSretMulti
+	var saveRetbuf bool = usePack || usePackMulti
+	// Incoming prefix words to drop: 1 (data) for scalar/void, 2 (retbuf + data)
+	// for the aggregate / multi-return shapes.
+	var srcPrefix int = 1
+	if usePack || useSret || usePackMulti || useSretMulti { srcPrefix = 2 }
+	// Outgoing classification: the sret shape's underlying receives the hidden
+	// buffer pointer in R0 (SretInGpArgReg) — so its user args are classified over
+	// a type list that PREPENDS a *uint8 sret-pointer slot and starts at classify
+	// index classifyBase = 1, EXACTLY as the callee does (arm32_emit_func.bn's
+	// emitSpillParam builds paramTypes[0] = MakePointerType(TypUint8()) and
+	// classifies user param pi at dispatchIdx pi + 1).  Prepending the real R0
+	// occupant — rather than reducing the GP-reg file — is what reproduces the
+	// AAPCS §6.5 C.3 even-register-pair PARITY the retbuf forces: the classifier's
+	// running NGRN reaches the first user arg at ABSOLUTE index 1 (odd), so an
+	// 8-aligned aggregate pads to an even register just as it does in the callee.
+	// A reduced GP-reg file shifts the cursor ORIGIN but leaves NGRN even at the
+	// first user arg, dropping that pad and misplacing every value word.  The
+	// non-sret shapes (scalar/void, pack, small multi-return; the underlying's
+	// user args start at R0) classify over userTypes at classifyBase 0 with the
+	// full cc — byte-identical to the pre-prefix walk.
+	var classifyTypes @[]@types.Type = userTypes
+	var classifyBase int = 0
+	if sretShape {
+		classifyTypes = prependSretPtrArm32(userTypes)
+		classifyBase = 1
+	}
+	var outBytes int = cc.CallStackBytes(classifyTypes)
+	// Stage the incoming GP dispatch regs to the frame ONLY when a coerced
+	// aggregate is present (mirrors the x64 / aarch64 twins and the register-only
+	// emitShimArgMarshalArm32's needStage).
+	var needStage bool = shimHasCoercedAggArm32(userTypes)
+
+	// Frame (low→high, all below shim entry-SP):
+	//   push {r4, lr}          -- savedBytes = 8, keeps SP 8-aligned (AAPCS32)
+	//   sub sp, sp, #innerBytes -- the inner area:
+	//     [0, outBytes)                       outgoing-args (8-rounded already)
+	//     [retbufOff, +WordBytes)             retbuf save   (pack / packMulti only)
+	//     [stageOff, +NumGpArgRegs*WordBytes) clobber-safe staging (needStage only)
+	//
+	// 8-ALIGNMENT (AAPCS32 public-boundary — SP MUST be 8-aligned at the BL):
+	// entry SP is 8-aligned; `push {r4,lr}` decrements by 8 (still 8-aligned);
+	// innerBytes is rounded UP to StackAlign (8) below, so the SUB keeps SP
+	// 8-aligned at the BL.  outBytes is already 8-rounded by CallStackBytes; the
+	// retbuf slot is 4 and NumGpArgRegs*WordBytes is 16, so the pre-round inner
+	// size can be a 4-multiple — the explicit alignUpStack is what guarantees the
+	// public-boundary alignment.  Getting this wrong is a silent-miscompile ABI
+	// violation (works until the callee does an 8-aligned spill or a libcall).
+	var savedBytes int = 8
+	var retbufOff int = outBytes
+	var stageOff int = outBytes
+	if saveRetbuf { stageOff = outBytes + cc.WordBytes }
+	var innerBytes int = stageOff
+	if needStage { innerBytes = stageOff + cc.NumGpArgRegs * cc.WordBytes }
+	if innerBytes % cc.StackAlign != 0 {
+		innerBytes = innerBytes + (cc.StackAlign - innerBytes % cc.StackAlign)
+	}
+	// frameDelta = the total SP decrement from shim entry (the {r4,lr} save + the
+	// inner area), used to address the dispatch caller's incoming-overflow words.
+	var frameDelta int = savedBytes + innerBytes
+
+	// push {r4, lr}: save the caller's R4 (the memory→memory shuttle) and LR (the
+	// BL clobbers it).  Two registers keep SP 8-aligned (AAPCS32).
+	arm32.Push(a, arm32.COND_AL, packShimPushMask())
+	if innerBytes > 0 {
+		emitSpAdjust(a, false, innerBytes)
+	}
+	if needStage {
+		// Stage every incoming GP dispatch reg before any outgoing write (the
+		// marshal helpers then read register-source words from
+		// [sp + stageOff + WordBytes*g]).
+		for g := 0; g < cc.NumGpArgRegs; g++ {
+			arm32.Str(a, arm32.COND_AL, argReg(g), arm32.MemImm(arm32.SP, stageOff + cc.WordBytes * g))
+		}
+	}
+	if saveRetbuf {
+		// Stash retbuf (R0) above the outgoing-args area; the pack shape classifies
+		// user args at classifyBase 0 (no sret prefix), so the marshal overwrites R0.
+		arm32.Str(a, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.SP, retbufOff))
+	}
+	// sret shape (useSret / useSretMulti): R0 = retbuf STAYS across the marshal +
+	// BL (the prepended sret-ptr slot keeps user args off R0), so the underlying
+	// writes the result straight through the caller's buffer — no post-BL routing.
+	emitSpillMarshalArm32(a, cc, classifyTypes, classifyBase, userTypes, srcPrefix, frameDelta,
+			stageOff, needStage)
+	a.SetGlobal(fnLabel)
+	arm32.Bl(a, arm32.COND_AL, fnLabel)
+	if usePack {
+		// The underlying returned the <=WordBytes aggregate BY VALUE in R0 (one
+		// word); reload the stashed retbuf into R4 and store R0 through it.
+		arm32.Ldr(a, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, retbufOff))
+		arm32.Str(a, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R4, 0))
+	} else if usePackMulti {
+		// The callee returned the tuple FIELD-PER-REGISTER in r0..r3; reload the
+		// stashed retbuf into R4 and store the fields through it.  IP is the
+		// large-offset scratch (unused — a tuple's own field offsets fit the STR
+		// immediate).
+		arm32.Ldr(a, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, retbufOff))
+		storeMultiReturnTupleFieldsArm32(a, funcValMultiReturnTupleArm32(fvTyp), arm32.R4, 0,
+				cc.NumGpRetRegs, cc.WordBytes, arm32.IP)
+	}
+	// sret / big-multiret: the underlying wrote the result through R0 = retbuf
+	// already.  scalar/void: the result rides back in R0 / R0:R1, untouched by the
+	// rewind.
+	if innerBytes > 0 {
+		emitSpAdjust(a, true, innerBytes)
+	}
+	// pop {r4, pc}: restore the caller's R4 and return (loading the saved LR into
+	// PC).
+	arm32.Pop(a, arm32.COND_AL, packShimPopMask())
+}
+
+// shimUserTypesArm32 extracts the func-value's parameter types into a
+// @[]@types.Type the CallConv classifier consumes.
+func shimUserTypesArm32(fvTyp @types.Type) @[]@types.Type {
+	var ts @[]@types.Type
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		ts = appendShimTypeArm32(ts, fvTyp.Params[pi].Type)
+	}
+	return ts
+}
+
+// appendShimTypeArm32 appends a @types.Type to a @[]@types.Type.
+func appendShimTypeArm32(dst @[]@types.Type, v @types.Type) @[]@types.Type {
+	var n int = len(dst)
+	var ns @[]@types.Type = make_slice(@types.Type, n + 1)
+	for i := 0; i < n; i++ { ns[i] = dst[i] }
+	ns[n] = v
+	return ns
+}
+
+// prependSretPtrArm32 builds the sret-shape CLASSIFY type list: a leading
+// *uint8 sret-buffer-pointer slot followed by the user types.  It mirrors the
+// callee's paramTypes construction (arm32_emit_func.bn emitFunc, sretShift arm:
+// paramTypes[0] = types.MakePointerType(types.TypUint8())), so the shim's
+// outgoing classification walks the SAME NGRN sequence the callee's incoming
+// classification does — the leading pointer occupies R0 and forces the AAPCS
+// §6.5 C.3 even-register-pair parity on the following args (a *uint8 is a
+// 1-word, 4-aligned GP scalar: 1 GP reg, no even-pair pad of its own, matching
+// the callee's leading slot).
+func prependSretPtrArm32(userTypes @[]@types.Type) @[]@types.Type {
+	var n int = len(userTypes)
+	var ns @[]@types.Type = make_slice(@types.Type, n + 1)
+	ns[0] = types.MakePointerType(types.TypUint8())
+	for i := 0; i < n; i++ { ns[i + 1] = userTypes[i] }
+	return ns
+}
+
+// shimHasCoercedAggArm32 reports whether any user param is a coerced in-register
+// struct/array — the only arg shape whose incoming (by-address, 1 word) and
+// outgoing (ArgWords value-words) cursors diverge, which is what forces the spill
+// marshal to stage the incoming GP regs (see emitFuncvalSpillShimArm32).
+func shimHasCoercedAggArm32(userTypes @[]@types.Type) bool {
+	for i := 0; i < len(userTypes); i++ {
+		if common.AggCoercedInReg(userTypes[i]) { return true }
+	}
+	return false
+}
+
+// emitSpillMarshalArm32 moves the user args from their incoming all-int dispatch
+// positions into the underlying's AAPCS32 layout.  Classification runs over
+// classifyTypes with the FULL cc: user arg i is classifier index i + classifyBase,
+// where classifyBase (and the leading prepended sret-pointer slot in classifyTypes)
+// is 1 for the sret shape (R0 = retbuf) and 0 otherwise.  This is EXACTLY the
+// callee's own classification (emitSpillParam classifies user param pi over a list
+// that prepends a *uint8 sret pointer, at dispatchIdx pi + 1), so the shim's
+// outgoing register/stack placement — including the AAPCS §6.5 C.3 even-register-
+// pair pad and the §6.5 SPLIT tail — agrees with the callee at any GP-reg-file
+// origin: the prepended slot supplies the R0 occupation the reduced-file model
+// only approximated, and CallArgRegStart's returned index is ABSOLUTE (the reg
+// number the callee reads), so the value words go to argReg(rs + k) directly with
+// no separate base offset.  A coerced in-register struct/array arrives as ONE
+// by-address dispatch word and its ArgWords value-words are loaded from that buffer
+// to the classifier's reg / stack slots (emitSpillCoercedAggArm32); every other
+// arg's effective words shift directly.  inWord (the incoming-dispatch cursor)
+// advances by the EFFECTIVE word count (1 for a by-address coerced aggregate),
+// which diverges from the OUTGOING word count the classifier places.  arm32 is
+// soft-float, so there is no float-scalar peel — a float arg fails loud upstream
+// (shimOutRegs).
+func emitSpillMarshalArm32(a @asm.Assembler, cc common.CallConv, classifyTypes @[]@types.Type,
+		classifyBase int, userTypes @[]@types.Type, srcPrefix int, frameDelta int, stageOff int,
+		staged bool) {
+	var inWord int = 0
+	for i := 0; i < len(userTypes); i++ {
+		var pt @types.Type = userTypes[i]
+		if common.AggCoercedInReg(pt) {
+			// Coerced in-register struct/array: arrives as ONE by-address dispatch
+			// word (EffectiveArgWords == 1, so inWord advances by 1), but the
+			// underlying's real ABI reads its ArgWords value-words from that buffer,
+			// spread across the classifier's reg/stack slots (CallArgRegStart /
+			// CallArgStackOff, computed from raw ArgWords) — possibly straddling the
+			// last GP regs and the outgoing-args stack.
+			emitSpillCoercedAggArm32(a, cc, classifyTypes, i + classifyBase, pt, srcPrefix + inWord,
+					frameDelta, stageOff, staged)
+			inWord = inWord + 1
+			continue
+		}
+		var w int = cc.EffectiveArgWords(pt)
+		var rs int = cc.CallArgRegStart(classifyTypes, i + classifyBase)
+		var so int = cc.CallArgStackOff(classifyTypes, i + classifyBase)
+		var regWords int = 0
+		if rs >= 0 {
+			if so >= 0 {
+				regWords = cc.NumGpArgRegs - rs
+			} else {
+				regWords = w
+			}
+		}
+		for k := 0; k < regWords; k++ {
+			emitSpillSrcToRegArm32(a, cc, srcPrefix + inWord + k, frameDelta, stageOff, argReg(rs + k),
+					staged)
+		}
+		for k := regWords; k < w; k++ {
+			emitSpillSrcToMemArm32(a, cc, srcPrefix + inWord + k, frameDelta, stageOff,
+					so + (k - regWords) * cc.WordBytes, staged)
+		}
+		inWord = inWord + w
+	}
+}
+
+// emitSpillCoercedAggArm32 marshals one coerced in-register struct/array
+// (AggCoercedInReg) that arrives as a SINGLE by-address dispatch word.  The
+// dispatch word srcG (translated by emitSpillSrcToRegArm32: an arg reg if
+// srcG < NumGpArgRegs, else the dispatch caller's stack at frameDelta) holds the
+// pointer to the value buffer; the underlying's real ABI reads ArgWords value-
+// words from that buffer.  classifyIdx is the aggregate's ABSOLUTE index in
+// classifyTypes (i + classifyBase — past the prepended sret-pointer slot for the
+// sret shape), so the classifier (over the FULL cc) returns the aggregate's real
+// AAPCS32 placement — the same even-pair-padded, possibly-SPLIT slots the callee
+// reads.  The pointer is parked in IP (the AAPCS intra-procedure scratch, not an
+// arg/return reg) first, so the value-word loads can't clobber it; then each
+// value-word is loaded from [IP, WordBytes*k] and placed at its outgoing slot per
+// the classifier (CallArgRegStart / CallArgStackOff): the first regWords go to GP
+// arg regs argReg(rs..) — rs ABSOLUTE, so no separate base offset — any remainder
+// (AAPCS §6.5 SPLIT) goes to the outgoing-args stack at
+// [sp + so + (k-regWords)*WordBytes].  A stack-destined word shuttles through R4
+// (the frame-saved memory→memory shuttle, distinct from the IP pointer base) since
+// a memory→memory move needs a GP temp; the OUTGOING store is a plain WordBytes STR
+// (an aggregate word never narrows, and AAPCS32 does not pack narrow stack args),
+// matching the callee's emitAggregateArg.  The store uses arm32.Str (MemImm)
+// directly rather than routing through emitBaseScalarStore's IP-materializing path:
+// IP holds the pointer base across this loop, and a coerced aggregate is <=
+// AggregateInRegMax (16 bytes = <=4 words) placed near the start of the outgoing-
+// args area, so its SPLIT-tail offsets always fit the 12-bit STR immediate — no
+// address scratch is needed, so IP stays the live pointer base.  (staged is always
+// true when this runs — a coerced aggregate is exactly what makes
+// shimHasCoercedAggArm32 / needStage true — but it is threaded through so
+// emitSpillSrcToRegArm32 reads the pointer word from its staging slot.)
+func emitSpillCoercedAggArm32(a @asm.Assembler, cc common.CallConv, classifyTypes @[]@types.Type,
+		classifyIdx int, pt @types.Type, srcG int, frameDelta int, stageOff int, staged bool) {
+	var n int = cc.ArgWords(pt)
+	var rs int = cc.CallArgRegStart(classifyTypes, classifyIdx)
+	var so int = cc.CallArgStackOff(classifyTypes, classifyIdx)
+	var regWords int = 0
+	if rs >= 0 {
+		if so >= 0 {
+			regWords = cc.NumGpArgRegs - rs
+		} else {
+			regWords = n
+		}
+	}
+	emitSpillSrcToRegArm32(a, cc, srcG, frameDelta, stageOff, arm32.IP, staged)
+	for k := 0; k < regWords; k++ {
+		arm32.Ldr(a, arm32.COND_AL, argReg(rs + k), arm32.MemImm(arm32.IP, cc.WordBytes * k))
+	}
+	for k := regWords; k < n; k++ {
+		arm32.Ldr(a, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.IP, cc.WordBytes * k))
+		arm32.Str(a, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, so + (k - regWords) * cc.WordBytes))
+	}
+}
+
+// emitSpillSrcToRegArm32 moves incoming dispatch word g into dstReg.  A register-
+// passed word (g < cc.NumGpArgRegs) is read from its staging slot
+// [sp + stageOff + WordBytes*g] when `staged`, else straight from the live
+// argReg(g) (safe without staging: the outgoing reg index never exceeds the
+// incoming, so the source is untouched at read time).  An overflow word is read
+// from the dispatch caller's stack at [sp + frameDelta + (g-NumGpArgRegs)*WordBytes]
+// — NO +8 return-addr slot, since arm enters the shim via Blx (return addr in LR,
+// nothing pushed).
+func emitSpillSrcToRegArm32(a @asm.Assembler, cc common.CallConv, g int, frameDelta int,
+		stageOff int, dstReg int, staged bool) {
+	if g < cc.NumGpArgRegs && !staged {
+		if dstReg != argReg(g) {
+			arm32.Mov(a, arm32.COND_AL, false, dstReg, arm32.Reg(argReg(g)))
+		}
+		return
+	}
+	var off int = frameDelta + (g - cc.NumGpArgRegs) * cc.WordBytes
+	if g < cc.NumGpArgRegs {
+		off = stageOff + cc.WordBytes * g
+	}
+	arm32.Ldr(a, arm32.COND_AL, dstReg, arm32.MemImm(arm32.SP, off))
+}
+
+// emitSpillSrcToMemArm32 moves incoming dispatch word g to the outgoing-args stack
+// at [sp + dstOff].  A staged register word is read from its staging slot (see
+// emitSpillSrcToRegArm32) via R4; an un-staged live register word stores directly
+// (no shuttle needed); an overflow word shuttles through R4 from the dispatch
+// caller's stack.  The un-staged register-source case is defensive and currently
+// unreachable: a register source only reaches the outgoing STACK via a coerced-
+// aggregate straddle (handled by emitSpillCoercedAggArm32, not here) or a multi-
+// word non-coerced arg, which on ILP32 is an int64 register-pair — fail-loud
+// upstream (shimOutRegs) — so this path currently only ever places a SINGLE
+// overflow scalar word (w=1).  Keep the register-source branch — dropping it would
+// make a future reg→stack word read the unpopulated staging slot.  The OUTGOING
+// store is a plain WordBytes STR (AAPCS32 does not pack narrow stack args — the
+// callee's emitCallArg word-stores every scalar stack arg), routed through
+// emitFrameStore so a large outgoing offset materializes the address in IP (R4
+// holds the value, IP the address scratch — distinct; no pointer base is live in
+// this non-coerced path).
+func emitSpillSrcToMemArm32(a @asm.Assembler, cc common.CallConv, g int, frameDelta int,
+		stageOff int, dstOff int, staged bool) {
+	if g < cc.NumGpArgRegs && !staged {
+		emitFrameStore(a, argReg(g), dstOff)
+		return
+	}
+	var off int = frameDelta + (g - cc.NumGpArgRegs) * cc.WordBytes
+	if g < cc.NumGpArgRegs {
+		off = stageOff + cc.WordBytes * g
+	}
+	arm32.Ldr(a, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, off))
+	emitFrameStore(a, arm32.R4, dstOff)
+}

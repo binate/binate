@@ -88,6 +88,13 @@ runner_exec() {
                 "$tmpbin" 2>&1 || true
             fi
         elif [ -n "$QEMU_AARCH64" ]; then
+            # qemu-user shares the host filesystem, but the produced binaries are
+            # dynamically linked and their interpreter (/lib/ld-linux-aarch64.so.1)
+            # lives in the cross sysroot, not the host's /lib.  QEMU_LD_PREFIX
+            # points qemu at that sysroot; gcc-aarch64-linux-gnu installs it under
+            # /usr/aarch64-linux-gnu.  Mirrors the arm32_linux runner.
+            QEMU_LD_PREFIX="${QEMU_LD_PREFIX:-/usr/aarch64-linux-gnu}"
+            export QEMU_LD_PREFIX
             if command -v timeout >/dev/null 2>&1; then
                 timeout 10 "$QEMU_AARCH64" "$tmpbin" 2>&1 || true
             elif command -v gtimeout >/dev/null 2>&1; then

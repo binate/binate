@@ -36,6 +36,18 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 #     than bnc-0.0.10, so the bundled bnlint aborts at the PARSE pass (a cascade
 #     of `expected ;, got :=` / `expected declaration`).  The interface-only
 #     pkg/stdx/containers/iter is fine (generic interfaces predate the bundle).
+#   - pkg/binate/format + cmd/bnfmt: the TRANSITIVE case of the above.  format
+#     does not itself use methods-on-generics, but it IMPORTS
+#     pkg/stdx/containers/vec, so the bundled bnlint loads vec.bni to resolve the
+#     import and aborts at the same PARSE pass; cmd/bnfmt imports format, so it
+#     inherits the abort.  Skipping vec/hashmap/set as DIRECT targets does not
+#     cover an importer OR its importers — the whole import cone up to a linted
+#     root must be skipped.  TEMPORARY: drop these the moment the BUILDER bump
+#     lands methods-on-generics in the bundled bnlint (same trigger as the
+#     container skips).  This does NOT scale to the full container-adoption sweep
+#     (each new adopter drags its whole importer cone into the skip) — the real
+#     unblock is the BUILDER bump; see the container-adoption entry in
+#     claude-todo.md.
 #
 # (B) Pending real lint findings — uncovered until the recursive pkg/ discovery
 #     below was added (the old one-level `pkg/*/` glob never reached the
@@ -43,7 +55,7 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 #     [managed-to-raw-assign] (`var data *[]uint8 = sec.Data` — a borrow of a
 #     held @[]uint8); each needs a per-site judgement (real UAF risk vs a safe
 #     borrow the rule over-flags) before un-skipping.  Tracked in claude-todo.md.
-LINT_SKIP="pkg/binate/interp pkg/binate/asm/arm32 pkg/binate/asm/elf pkg/binate/asm/macho pkg/binate/asm/parse pkg/binate/asm/x64 pkg/stdx/containers/vec pkg/stdx/containers/hashmap pkg/stdx/containers/set"
+LINT_SKIP="pkg/binate/interp pkg/binate/asm/arm32 pkg/binate/asm/elf pkg/binate/asm/macho pkg/binate/asm/parse pkg/binate/asm/x64 pkg/stdx/containers/vec pkg/stdx/containers/hashmap pkg/stdx/containers/set pkg/binate/format cmd/bnfmt"
 
 # Discover targets:
 #   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so

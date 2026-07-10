@@ -6,6 +6,32 @@ import "pkg/binate/ir"
 import "pkg/binate/native/common"
 import "pkg/binate/types"
 
+// isByAddressAggX64 reports whether an aggregate func-value ARG rides the shim ABI
+// BY-ADDRESS (one pointer word the shim loads + re-expands): a coerced in-register
+// named struct/array (AggCoercedInReg) OR any other <=16-byte non-indirect-large
+// aggregate — a raw slice / iface-value.  Matches the LLVM cross-package shim, which
+// declares every such aggregate `i8*`.  (An indirect-large > AggregateInRegMax
+// aggregate ALSO rides by-address, but the callconv already models it as one word —
+// EffectiveArgWords == 1 — so it is excluded here and needs no by-address flag.)
+// Option B — the x64 counterpart of arm32's isByAddressAggArm32 / aa64's
+// isByAddressAggAA64: before this, non-coerced slices/iface-values rode first-class,
+// desyncing native-dispatch -> LLVM-emitted-shim (conformance 1006).
+func isByAddressAggX64(cc common.CallConv, pt @types.Type) bool {
+	if common.AggCoercedInReg(pt) { return true }
+	if !common.IsAggregateTyp(pt) { return false }
+	if cc.IndirectLargeAggregates && pt.SizeOf() > cc.AggregateInRegMax { return false }
+	return pt.SizeOf() <= cc.AggregateInRegMax
+}
+
+// shimInWordsForTypeX64 is the number of INCOMING dispatch words a func-value arg
+// of type pt occupies: 1 for a by-address aggregate (isByAddressAggX64 — the shim
+// re-expands its ArgWords value-words from the one pointer), else
+// cc.EffectiveArgWords (which already returns 1 for an indirect-large aggregate).
+func shimInWordsForTypeX64(cc common.CallConv, pt @types.Type) int {
+	if isByAddressAggX64(cc, pt) { return 1 }
+	return cc.EffectiveArgWords(pt)
+}
+
 // Per-function func-value SHIM body emission for the amd64 backend —
 // the text-section half of the func-value triple (the vtable / handle
 // data half and the OP_FUNC_VALUE / OP_FUNC_HANDLE reference collection
@@ -72,27 +98,28 @@ func shimReturnIsFloatScalar_x64(fvTyp @types.Type) bool {
 // start at RSI).  This is the native half of the float shim ABI (Design A);
 // the LLVM shim does the same bitcast in IR.
 //
-// A coerced in-register struct/array (named ≤ 16 B) arrives as ONE by-address
-// pointer word (EffectiveArgWords == 1); the shim copies that pointer to R10 (a
-// scratch — not a SysV arg reg nor the return reg) and loads its ArgWords value-
-// words from [R10 + 8k] into the consecutive outgoing GP regs the underlying's
-// coerced ABI reads.  The incoming cursor (srcWord) advances by 1 word but the
-// outgoing cursor (ngrn) by ArgWords — the two DIVERGE here (elsewhere they move
-// in lockstep).  Slices / managed-slices / iface- / func-values / > 16 B byval
-// aggregates are NOT coerced-in-reg and keep the generic register-shift path.
+// A by-address aggregate — a coerced in-register struct/array (named ≤ 16 B), OR
+// (option B) a raw slice / iface-value — arrives as ONE by-address pointer word
+// (shimInWordsForTypeX64 == 1); the shim copies that pointer to R10 (a scratch —
+// not a SysV arg reg nor the return reg) and loads its ArgWords value-words from
+// [R10 + 8k] into the consecutive outgoing GP regs the underlying's real ABI
+// reads.  The incoming cursor (srcWord) advances by 1 word but the outgoing cursor
+// (ngrn) by ArgWords — the two DIVERGE here (elsewhere they move in lockstep).
+// Scalars and > 16 B indirect-large byval aggregates are one incoming = one
+// outgoing word and keep the generic register-shift path.
 //
 // Clobber-safety: for the register-shift path the GP destination index never
 // exceeds the GP source index (gpDestBase + ngrn <= srcPrefix + srcWord), so
-// left-to-right MOVs read each source before it is overwritten; the coerced path
-// reads only through R10 (loads from memory, distinct from any arg reg), so it
-// can't clobber a not-yet-consumed source either; the XMM moves target the
+// left-to-right MOVs read each source before it is overwritten; the by-address
+// path reads only through R10 (loads from memory, distinct from any arg reg), so
+// it can't clobber a not-yet-consumed source either; the XMM moves target the
 // disjoint FP register file and never clobber a GP source.
 //
 // This path assumes everything fits in registers — callers gate it on the
 // register budget and route genuine overflow to emitShimArgSpill_x64.
 func emitShimArgMarshal_x64(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type, srcPrefix int,
 		gpDestBase int) {
-	// Clobber-safe staging, ONLY when a coerced aggregate is present.  Such an
+	// Clobber-safe staging, ONLY when a by-address aggregate is present.  Such an
 	// arg makes the OUTGOING register cursor (ArgWords words) advance faster than
 	// the INCOMING by-address cursor (one pointer word), so an outgoing write can
 	// land in a LATER param's not-yet-read incoming arg register (a register-
@@ -105,13 +132,13 @@ func emitShimArgMarshal_x64(a @asm.Assembler, cc common.CallConv, fvTyp @types.T
 	// value-load scratch.
 	var needStage bool = false
 	for pi := 0; pi < len(fvTyp.Params); pi++ {
-		if common.AggCoercedInReg(fvTyp.Params[pi].Type) { needStage = true }
+		if isByAddressAggX64(cc, fvTyp.Params[pi].Type) { needStage = true }
 	}
 	var frame int = 0
 	if needStage {
 		var nIn int = 0
 		for pi := 0; pi < len(fvTyp.Params); pi++ {
-			nIn = nIn + cc.EffectiveArgWords(fvTyp.Params[pi].Type)
+			nIn = nIn + shimInWordsForTypeX64(cc, fvTyp.Params[pi].Type)
 		}
 		frame = nIn * 8
 		if frame % 16 != 0 { frame = frame + 8 }
@@ -144,12 +171,13 @@ func emitShimArgMarshal_x64(a @asm.Assembler, cc common.CallConv, fvTyp @types.T
 			srcWord = srcWord + 1
 			continue
 		}
-		if common.AggCoercedInReg(pt) {
-			// Coerced in-register struct/array: the staged word at
+		if isByAddressAggX64(cc, pt) {
+			// By-address aggregate (a coerced in-register struct/array, OR — under
+			// option B — a raw slice / iface-value): the staged word at
 			// [RSP + 8*srcWord] is its by-address pointer (needStage is true
 			// here); load its value-words into the registers the underlying's
-			// coerced ABI reads.  Incoming consumed ONE pointer word; outgoing
-			// advanced several coerced regs (the cursors DIVERGE).
+			// real ABI reads.  Incoming consumed ONE pointer word; outgoing
+			// advanced ArgWords value-regs (the cursors DIVERGE).
 			x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Mem(x64.RSP, 8 * srcWord, x64.SZ64))
 			if cc.PassesSseInRegs(pt) {
 				// SSE aggregate: expand the by-address image into XMM/GP by
@@ -170,9 +198,13 @@ func emitShimArgMarshal_x64(a @asm.Assembler, cc common.CallConv, fvTyp @types.T
 			srcWord = srcWord + 1
 			continue
 		}
-		// Effective words: an indirect-large aggregate is 1 pointer word
-		// (the dispatch caller placed it as one), NOT its ArgWords expansion.
-		var w int = cc.EffectiveArgWords(pt)
+		// Generic register-shift path: scalars, floats-as-GP, and indirect-large
+		// aggregates — each occupies shimInWordsForTypeX64 incoming = outgoing words
+		// (1 for an indirect-large aggregate, the dispatch caller placed it as one
+		// pointer, NOT its ArgWords expansion).  By-address aggregates were handled
+		// above; nothing reaching here diverges, so incoming and outgoing move in
+		// lockstep.
+		var w int = shimInWordsForTypeX64(cc, pt)
 		for k := 0; k < w; k++ {
 			var dst int = argReg(gpDestBase + ngrn + k)
 			if needStage {
@@ -288,12 +320,13 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Modu
 		for pi := 0; pi < len(fvTyp.Params); pi++ {
 			var pt @types.Type = fvTyp.Params[pi].Type
 			// Budget the SHIM's register/spill routing on the OUTGOING (real
-			// ABI) GP word count: a coerced in-register struct/array arrives as
-			// ONE by-address pointer word (EffectiveArgWords == 1) but the shim
-			// expands it into ArgWords coerced regs, so counting it via
-			// EffectiveArgWords would undercount the outgoing register pressure
-			// and wrongly keep a wide call on the register-only path.
-			if common.AggCoercedInReg(pt) {
+			// ABI) GP word count: a by-address aggregate (a coerced in-register
+			// struct/array, OR — under option B — a raw slice / iface-value)
+			// arrives as ONE by-address pointer word (shimInWordsForTypeX64 == 1)
+			// but the shim expands it into ArgWords value regs, so counting it via
+			// the incoming word count would undercount the outgoing register
+			// pressure and wrongly keep a wide call on the register-only path.
+			if isByAddressAggX64(cc, pt) {
 				nUserWords = nUserWords + common.ArgWords(pt)
 			} else {
 				nUserWords = nUserWords + cc.EffectiveArgWords(pt)

@@ -32,6 +32,58 @@ import "pkg/binate/types"
 // bump: emitCallFuncValue substitutes a *uint8 (4-aligned) for each coerced
 // aggregate before placing it, so the by-address pointer rides ONE 4-aligned word.
 
+// isIndirectLargeArm32 reports whether pt is a >16-byte aggregate the AAPCS32
+// convention passes INDIRECTLY as a single pointer arg (IndirectLargeAggregates):
+// EffectiveArgWords already counts it as ONE word and the generic register/spill
+// down-shift places that pointer correctly, so it is NOT a by-address aggregate the
+// shim must re-expand.  It is the exclusion that keeps isByAddressAggArm32 to the
+// SMALL (<=16-byte) aggregates whose value-words must be spread from the pointer.
+func isIndirectLargeArm32(cc common.CallConv, pt @types.Type) bool {
+	return cc.IndirectLargeAggregates && common.IsAggregateTyp(pt) &&
+			pt.SizeOf() > cc.AggregateInRegMax
+}
+
+// isByAddressAggArm32 reports whether pt is an aggregate the func-value shim
+// receives BY-ADDRESS as ONE dispatch pointer word and must re-expand into the
+// underlying's AAPCS32 register/stack slots (its ArgWords value-words spread per the
+// classifier).  Two branches:
+//   - Branch 1 (AggCoercedInReg, PIECE 1): a COERCED in-register aggregate — any
+//     array, any NAMED struct, AND any source-level ANONYMOUS struct.  A
+//     source-level anon struct type is not nameless at this layer: IR-gen assigns it
+//     a synthetic `__anon_N` name (gen_type_resolve.bn), so AggInRegCoercedKind
+//     (len(Name) > 0) — and hence AggCoercedInReg — is TRUE for it, INCLUDING a
+//     <=4-byte one.  So a <=WordBytes anon struct rides THIS branch (by-address,
+//     coerced), matching the LLVM cross-package shim, which likewise declares such an
+//     arg i8* (coerced [1 x i32]) via aggParamCoerced.
+//   - Branch 2: every GENUINELY NON-coerced in-register aggregate <= AggregateInRegMax
+//     — a raw slice / iface-value / func-value (8 bytes, 2 words) or a managed-slice
+//     (16 bytes, 4 words), PIECE 2 (option B).  These are the only non-coerced
+//     aggregate shapes, and they are all >= 8 bytes, so no sub-word case exists here.
+// The upper bound excludes an indirect-large (>16-byte) aggregate: that already rides
+// one pointer word through the generic down-shift (isIndirectLargeArm32), so it never
+// needs the by-address value-word re-expansion.  This single predicate replaces the
+// scattered AggCoercedInReg checks in the shim path, so a by-address small aggregate
+// follows the SAME re-expansion as a coerced one.
+func isByAddressAggArm32(cc common.CallConv, pt @types.Type) bool {
+	if common.AggCoercedInReg(pt) { return true }
+	return common.IsAggregateTyp(pt) && !isIndirectLargeArm32(cc, pt) &&
+			pt.SizeOf() <= cc.AggregateInRegMax
+}
+
+// shimInWordsForTypeArm32 returns the INCOMING dispatch words type pt occupies in
+// the func-value shim ABI: ONE for a by-address aggregate (the dispatch caller places
+// a single pointer word — see emitCallFuncValue's i8* substitution), else
+// cc.EffectiveArgWords(pt).  It is arm32-LOCAL because option B makes arm32 the only
+// native backend that passes a NON-coerced small aggregate by-address: the shared
+// cc.EffectiveArgWords returns its ArgWords (2/4) — correct for aa64/x64's INLINE
+// convention but wrong for the incoming count here, where a by-address aggregate is
+// one pointer word.  (For a coerced or indirect-large aggregate EffectiveArgWords
+// already returns 1, so this only diverges for a non-coerced small aggregate.)
+func shimInWordsForTypeArm32(cc common.CallConv, pt @types.Type) int {
+	if isByAddressAggArm32(cc, pt) { return 1 }
+	return cc.EffectiveArgWords(pt)
+}
+
 // shimOutRegs walks the shim's user args exactly as emitShimArgMarshalArm32 does
 // and returns the final OUTGOING GP register count (RELATIVE to gpDestBase),
 // INCLUDING any AAPCS §6.5 C.3 even-register-pair pad words, or -1 (after
@@ -45,10 +97,11 @@ import "pkg/binate/types"
 // first-arg 8-aligned aggregate that would sit at an even relative index can still
 // need a pad when gpDestBase makes the absolute index odd.
 //
-// Fails LOUDLY on a float arg (P5 soft-float), a non-coerced in-register aggregate
-// (a shared unimplemented gap), and a multi-word register-pair SCALAR (a 64-bit
-// int on ILP32 — its own even-pair dispatch placement isn't modeled by the plain
-// down-shift).  A coerced in-register named struct/array (P1) is ACCEPTED.
+// Fails LOUDLY on a float arg (P5 soft-float) and a multi-word register-pair SCALAR
+// (a 64-bit int on ILP32 — its own even-pair dispatch placement isn't modeled by the
+// plain down-shift).  A coerced (P1) OR non-coerced small in-register aggregate
+// (P2, option B) is ACCEPTED: both ride by-address and re-expand their ArgWords
+// value-words into the outgoing GP regs.
 func shimOutRegs(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type, gpDestBase int) int {
 	var ngrn int = 0
 	for pi := 0; pi < len(fvTyp.Params); pi++ {
@@ -58,34 +111,30 @@ func shimOutRegs(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type, gpDest
 					"implemented (P5)")
 			return -1
 		}
-		if common.AggCoercedInReg(pt) {
-			// AAPCS §6.5 C.3: an 8-aligned coerced aggregate starts on an EVEN
+		if isByAddressAggArm32(cc, pt) {
+			// AAPCS §6.5 C.3: an 8-aligned by-address aggregate starts on an EVEN
 			// outgoing register.  The ABSOLUTE index is gpDestBase + ngrn; when it is
 			// odd, waste the odd register (a pad, later left unwritten — AAPCS pads
 			// are undefined).  Byte-identical to argRegWordsStackWords' bump.
 			if cc.NeedsEvenReg(pt) && (gpDestBase + ngrn) % 2 != 0 {
 				ngrn = ngrn + 1
 			}
-			// Coerced in-register struct/array: arrives BY-ADDRESS (one incoming
+			// A by-address aggregate (coerced array/named/anon struct OR non-coerced
+			// slice / iface-value / managed-slice) arrives BY-ADDRESS (one incoming
 			// pointer word) but re-expands into its ArgWords value-words in the
-			// outgoing coerced GP regs.  Use the TARGET-parameterised cc.ArgWords
-			// (WordBytes 4 on ILP32): the free common.ArgWords is LP64 (8-byte words),
-			// which would undercount an 8-byte struct as 1 word and misplace the
-			// expansion.
+			// outgoing GP regs.  Use the TARGET-
+			// parameterised cc.ArgWords (WordBytes 4 on ILP32): the free
+			// common.ArgWords is LP64 (8-byte words), which would undercount an 8-byte
+			// slice/struct as 1 word and misplace the expansion.
 			ngrn = ngrn + cc.ArgWords(pt)
 			continue
 		}
-		if common.IsAggregateTyp(pt) {
-			// A non-coerced in-register aggregate (slice / iface-value / managed-
-			// slice / anon struct) rides the dispatch convention by-address but the
-			// underlying spreads its inline words — a mismatch the register-only
-			// marshal doesn't yet re-expand (a pre-existing shared gap; see
-			// arm32_call_indirect.bn's emitCallFuncValue).  Fail LOUDLY.
-			a.SetError(
-					"native arm32: func-value shim with a non-coerced aggregate "
-							"arg not implemented (P4)")
-			return -1
-		}
+		// An indirect-large (>16-byte) aggregate and every scalar / pointer keep the
+		// generic down-shift.  cc.EffectiveArgWords counts an indirect-large aggregate
+		// as ONE pointer word, so the pw != 1 rejection below fires ONLY on a genuine
+		// multi-word register-pair SCALAR (a 64-bit int on ILP32), never on an
+		// aggregate — a slice's 2 words go through the by-address branch above, so
+		// they never reach here.
 		var pw int = cc.EffectiveArgWords(pt)
 		if pw != 1 {
 			a.SetError(
@@ -119,31 +168,31 @@ func shimArgsFitRegisters(cc common.CallConv, fvTyp @types.Type, srcPrefix int, 
 	return true
 }
 
-// shimNeedStageArm32 reports whether the shim's user-arg list contains a coerced
-// in-register aggregate — the ONLY case that makes the OUTGOING GP register cursor
-// (ArgWords words, plus any even-pair pad) advance faster than the INCOMING
-// by-address cursor (one pointer word), so an outgoing write could land in a LATER
-// param's not-yet-read incoming arg register (a register-permutation hazard).
-// Without one, incoming and outgoing advance in lockstep (a constant down-shift),
-// which is already clobber-safe, so the marshal reads live incoming regs and skips
-// staging.  Mirrors aarch64's needStage loop / x64's needStage loop.
-func shimNeedStageArm32(fvTyp @types.Type) bool {
+// shimNeedStageArm32 reports whether the shim's user-arg list contains a by-address
+// aggregate — the ONLY case that makes the OUTGOING GP register cursor (ArgWords
+// words, plus any even-pair pad) advance faster than the INCOMING by-address cursor
+// (one pointer word), so an outgoing write could land in a LATER param's not-yet-read
+// incoming arg register (a register-permutation hazard).  Without one, incoming and
+// outgoing advance in lockstep (a constant down-shift), which is already clobber-
+// safe, so the marshal reads live incoming regs and skips staging.  Mirrors
+// aarch64's needStage loop / x64's needStage loop.
+func shimNeedStageArm32(cc common.CallConv, fvTyp @types.Type) bool {
 	for pi := 0; pi < len(fvTyp.Params); pi++ {
-		if common.AggCoercedInReg(fvTyp.Params[pi].Type) { return true }
+		if isByAddressAggArm32(cc, fvTyp.Params[pi].Type) { return true }
 	}
 	return false
 }
 
 // shimInWordsArm32 returns the total INCOMING dispatch words the shim's user args
-// occupy (each coerced aggregate is ONE by-address pointer word — EffectiveArgWords
-// — not its ArgWords expansion; and NO even-pair bump, because the dispatch caller
+// occupy (each by-address aggregate is ONE pointer word — shimInWordsForTypeArm32 —
+// not its ArgWords expansion; and NO even-pair bump, because the dispatch caller
 // places the by-address pointer as a 4-aligned *uint8).  This is the incoming-
 // register pressure the shim reads from R(prefix)..; callers gate it against
 // R(prefix)..R3.
 func shimInWordsArm32(cc common.CallConv, fvTyp @types.Type) int {
 	var n int = 0
 	for pi := 0; pi < len(fvTyp.Params); pi++ {
-		n = n + cc.EffectiveArgWords(fvTyp.Params[pi].Type)
+		n = n + shimInWordsForTypeArm32(cc, fvTyp.Params[pi].Type)
 	}
 	return n
 }
@@ -156,19 +205,20 @@ func shimInWordsArm32(cc common.CallConv, fvTyp @types.Type) int {
 // underlying uses: 0 normally, but 1 for the sret shape (R0 holds the sret buffer
 // pointer, so explicit args start at R1).
 //
-// A coerced in-register struct/array arrives as ONE by-address pointer word; the
-// marshal parks that pointer in a scratch and loads its ArgWords value-words from
-// [scratch + 4k] into the consecutive outgoing GP regs the underlying's coerced
-// ABI reads.  An 8-byte-aligned coerced aggregate (cc.NeedsEvenReg) starts on an
-// EVEN outgoing register (AAPCS §6.5 C.3): when the absolute index gpDestBase+ngrn
-// is odd, the outgoing cursor skips the odd register (a pad left UNWRITTEN — AAPCS
-// pads are undefined), matching the callee's argRegWordsStackWords placement.  The
-// incoming cursor (srcWord) advances by 1 word and takes NO even-pair bump (the
-// dispatch caller placed the by-address pointer as a 4-aligned *uint8), so the two
-// cursors DIVERGE at each coerced aggregate.  Non-coerced args (scalars, indirect-
-// large single pointers) keep the generic register down-shift.
+// A by-address aggregate (coerced array/named/anon struct OR non-coerced slice /
+// iface-value / managed-slice) arrives as ONE by-address pointer word; the marshal
+// parks that pointer in a scratch and loads its ArgWords value-words from
+// [scratch + 4k] into the consecutive outgoing GP regs the underlying's ABI reads.
+// An 8-byte-aligned by-address aggregate (cc.NeedsEvenReg) starts on an EVEN outgoing
+// register (AAPCS §6.5 C.3): when the absolute index gpDestBase+ngrn is odd, the
+// outgoing cursor skips the odd register (a pad left UNWRITTEN — AAPCS pads are
+// undefined), matching the callee's argRegWordsStackWords placement.  The incoming
+// cursor (srcWord) advances by 1 word and takes NO even-pair bump (the dispatch
+// caller placed the by-address pointer as a 4-aligned *uint8), so the two cursors
+// DIVERGE at each by-address aggregate.  Non-by-address args (scalars, indirect-large
+// single pointers) keep the generic register down-shift.
 //
-// Clobber-safety: when a coerced aggregate is present (shimNeedStageArm32) the
+// Clobber-safety: when a by-address aggregate is present (shimNeedStageArm32) the
 // outgoing cursor can outrun the incoming one, so an outgoing write could clobber a
 // later arg's not-yet-read incoming register.  arm32 (unlike aarch64) has no
 // caller-saved register bank to stage into (only R12/IP; R4..R11 are callee-saved),
@@ -177,11 +227,11 @@ func shimInWordsArm32(cc common.CallConv, fvTyp @types.Type) int {
 // the branch/BL, so the caller shape's SP is untouched at the tail-branch).  IP is
 // the transient pointer/load scratch (an intra-call scratch, not an AAPCS32 arg or
 // return reg, so it can't clobber an outgoing arg reg or the return).  Without a
-// coerced aggregate the GP destination index never exceeds the source index, so
+// by-address aggregate the GP destination index never exceeds the source index, so
 // left-to-right MOVs read each source before it is overwritten — no staging needed.
 func emitShimArgMarshalArm32(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type, srcPrefix int,
 		gpDestBase int) {
-	var needStage bool = shimNeedStageArm32(fvTyp)
+	var needStage bool = shimNeedStageArm32(cc, fvTyp)
 	var frame int = 0
 	if needStage {
 		var nIn int = shimInWordsArm32(cc, fvTyp)
@@ -202,22 +252,24 @@ func emitShimArgMarshalArm32(a @asm.Assembler, cc common.CallConv, fvTyp @types.
 	var srcWord int = 0
 	for pi := 0; pi < len(fvTyp.Params); pi++ {
 		var pt @types.Type = fvTyp.Params[pi].Type
-		if common.AggCoercedInReg(pt) {
+		if isByAddressAggArm32(cc, pt) {
 			// AAPCS §6.5 C.3 even-register-pair pad on the OUTGOING cursor only —
 			// byte-identical to shimOutRegs / argRegWordsStackWords.  The pad register
 			// is left UNWRITTEN (undefined by the ABI).
 			if cc.NeedsEvenReg(pt) && (gpDestBase + ngrn) % 2 != 0 {
 				ngrn = ngrn + 1
 			}
-			emitShimAggregateArgArm32(a, cc, pt, gpDestBase, ngrn, argReg(srcPrefix + srcWord), srcWord,
+			emitShimByAddrAggArm32(a, cc, pt, gpDestBase, ngrn, argReg(srcPrefix + srcWord), srcWord,
 					frame > 0)
 			ngrn = ngrn + cc.ArgWords(pt)
 			srcWord = srcWord + 1
 			continue
 		}
 		// Effective words: an indirect-large aggregate is 1 pointer word (the
-		// dispatch caller placed it as one), NOT its ArgWords expansion.
-		var w int = cc.EffectiveArgWords(pt)
+		// dispatch caller placed it as one), NOT its ArgWords expansion.  (A
+		// by-address aggregate is peeled off above, so this counts scalars / pointers
+		// / indirect-large only — where shimInWordsForTypeArm32 equals EffectiveArgWords.)
+		var w int = shimInWordsForTypeArm32(cc, pt)
 		for k := 0; k < w; k++ {
 			var dst int = argReg(gpDestBase + ngrn + k)
 			if frame > 0 {
@@ -239,20 +291,22 @@ func emitShimArgMarshalArm32(a @asm.Assembler, cc common.CallConv, fvTyp @types.
 	}
 }
 
-// emitShimAggregateArgArm32 re-expands one coerced in-register aggregate arg.  Its
-// by-address pointer is the srcWord-th incoming dispatch word: staged at
-// [SP + WordBytes*srcWord] when `staged`, else live in liveReg (the incoming arg
-// register).  Park it in IP, then load its ArgWords value-words from [IP + 4k] into
-// the consecutive outgoing GP regs argReg(gpDestBase + ngrn + k) the underlying's
-// AAPCS32 coerced ABI reads (word-by-word from the struct image, matching
-// emitAggregateArg / the callee's writeAggParamSpillPtr layout).  ngrn already
-// carries any even-register-pair pad the caller inserted, so the value-words land
-// on the correctly-aligned register.  IP is disjoint from the R0..R3 outgoing bank
-// and the R0/R0:R1 return, so the loads can't clobber an outgoing arg or the
-// result.  (The register-only marshal always stages when any coerced aggregate is
-// present, so `staged` is true on the exercised path; the live-register branch
-// keeps this correct if the staging invariant ever changes.)
-func emitShimAggregateArgArm32(a @asm.Assembler, cc common.CallConv, pt @types.Type, gpDestBase int,
+// emitShimByAddrAggArm32 re-expands one by-address in-register aggregate arg (a
+// coerced array/named/anon struct OR a non-coerced slice / iface-value /
+// managed-slice).  Its by-address pointer is the srcWord-th
+// incoming dispatch word: staged at [SP + WordBytes*srcWord] when `staged`, else
+// live in liveReg (the incoming arg register).  Park it in IP, then load its
+// ArgWords value-words from [IP + 4k] into the consecutive outgoing GP regs
+// argReg(gpDestBase + ngrn + k) the underlying's AAPCS32 ABI reads (word-by-word
+// from the value image, matching emitAggregateArg / the callee's
+// writeAggParamSpillPtr layout).  ngrn already carries any even-register-pair pad
+// the caller inserted, so the value-words land on the correctly-aligned register.
+// IP is disjoint from the R0..R3 outgoing bank and the R0/R0:R1 return, so the
+// loads can't clobber an outgoing arg or the result.  (The register-only marshal
+// always stages when any by-address aggregate is present, so `staged` is true on
+// the exercised path; the live-register branch keeps this correct if the staging
+// invariant ever changes.)
+func emitShimByAddrAggArm32(a @asm.Assembler, cc common.CallConv, pt @types.Type, gpDestBase int,
 		ngrn int, liveReg int, srcWord int, staged bool) {
 	if staged {
 		arm32.Ldr(a, arm32.COND_AL, arm32.IP, arm32.MemImm(arm32.SP, cc.WordBytes * srcWord))

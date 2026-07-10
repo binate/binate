@@ -1,0 +1,232 @@
+package "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/std/strings"
+
+// Assignment-statement checking: simple/compound assignment, the multi-return
+// destructure, the comma-ok type assertion, and short-variable declaration.
+// Split from check_stmt.bn (which retains the statement dispatcher and the
+// remaining statement kinds).
+
+// checkAssignStmt type-checks assignment statements (simple and compound), including multi-return.
+// hasExpandableResults reports whether a single-expression RHS of type t is a
+// multi-result call that can be destructured across several assignment / short-
+// var / return targets.  checkCallExpr returns the callee's whole type for a
+// multi-result call, so this is true for a free function (TYP_FUNC) AND for a
+// function VALUE call (`*func`/`@func` — TYP_FUNC_VALUE / TYP_MANAGED_FUNC_VALUE);
+// the func-value kinds carry the same `.Results`, so the count + per-result
+// AssignableTo checks at the call sites are kind-agnostic once the kind is
+// admitted.  Guarding on TYP_FUNC alone rejected `a, b := fv()` for a
+// multi-return func value (`assignment count mismatch`).
+func hasExpandableResults(t @Type) bool {
+	if t == nil { return false }
+	return t.Kind == TYP_FUNC || t.Kind == TYP_FUNC_VALUE || t.Kind == TYP_MANAGED_FUNC_VALUE
+}
+
+// checkAssignTargetConst rejects assigning to a target that has no writable
+// storage: a const symbol (unqualified `C` or package-qualified `pkg.C`), or a
+// readonly-typed (const) LOCATION — a `readonly @T` / `readonly *T` etc., where
+// the binding itself is read-only (distinct from `@(readonly T)`, whose pointer
+// IS rebindable).  Applied by the multi-return-destructure path (the simple-
+// and compound-assign paths inline the equivalent checks): the destructure path missing the
+// readonly check compiled an illegal assignment to a `readonly @T` local, whose
+// multi-assign then RefDec'd an uninitialized slot at runtime (SIGBUS) —
+// claude-todo #114.
+func checkAssignTargetConst(c @Checker, target @ast.Expr, lhsType @Type) {
+	if target.Kind == ast.EXPR_IDENT {
+		var sym @Symbol = c.Scope.Lookup(target.Name)
+		if sym != nil && sym.Kind == SYM_CONST {
+			var cb @strings.Builder = strings.NewBuilder()
+			cb.Write("cannot assign to const ")
+			cb.Write(target.Name)
+			addCheckError(c, target.Pos, buf.CopyStr(cb.String()))
+		}
+	}
+	var qmember @Symbol = resolveQualifiedSym(c, target)
+	if qmember != nil && qmember.Kind == SYM_CONST {
+		var qcb @strings.Builder = strings.NewBuilder()
+		qcb.Write("cannot assign to const ")
+		qcb.Write(target.Name)
+		addCheckError(c, target.Pos, buf.CopyStr(qcb.String()))
+	}
+	if lhsType != nil && lhsType.IsReadonly() {
+		addCheckError(c, target.Pos, "cannot assign to const-typed location")
+	}
+}
+
+// checkCommaOkAssignTarget validates one target of a comma-ok assertion
+// assignment `v, ok = x.(*T)` (the `=` form): a blank discards, otherwise the
+// target must be a writable location the source type (`recovered` or bool) is
+// assignable to.
+func checkCommaOkAssignTarget(c @Checker, target @ast.Expr, srcType @Type) {
+	if target.Kind == ast.EXPR_IDENT && isBlank(target.Name) {
+		return
+	}
+	var lhsType @Type = checkExpr(c, target)
+	checkAssignTargetConst(c, target, lhsType)
+	if !srcType.AssignableTo(c, lhsType) {
+		errCannotAssign(c, target.Pos, srcType, lhsType)
+	}
+}
+
+// checkAssignStmt validates an assignment statement — a plain `a = b` (with
+// blank-identifier handling and per-target assignability), a compound `a += b`,
+// and the multi-return destructure `a, b = call()` (via hasExpandableResults).
+func checkAssignStmt(c @Checker, s @ast.Stmt) {
+	if s.Op == cast(int, token.ASSIGN) {
+		// Simple assignment
+		if len(s.Exprs) != len(s.Exprs2) {
+			// Multi-return case
+			if len(s.Exprs2) == 1 {
+				var rhsType @Type = checkExpr(c, s.Exprs2[0])
+				// Comma-ok type assertion `v, ok = x.(*T)` assigns (recovered,
+				// bool) to two existing locations.  Sibling of the `:=` form in
+				// checkShortVarDecl (which BINDS new vars instead).
+				if s.Exprs2[0].Kind == ast.EXPR_TYPE_ASSERT && len(s.Exprs) == 2 {
+					if rhsType == nil || rhsType.Kind == TYP_VOID { return }
+					checkCommaOkAssignTarget(c, s.Exprs[0], rhsType)
+					checkCommaOkAssignTarget(c, s.Exprs[1], TypBool())
+					return
+				}
+				if hasExpandableResults(rhsType) && len(rhsType.Results) == len(s.Exprs) {
+					for i := 0; i < len(s.Exprs); i++ {
+						// The call materializes EVERY result as a value, so an
+						// opaque (cross-package opaque-export) result is rejected
+						// even when discarded to `_` (bug 211).
+						requireSizedType(c, rhsType.Results[i], s.Exprs2[0].Pos)
+						// Blank identifier: discard this result.
+						if s.Exprs[i].Kind == ast.EXPR_IDENT && isBlank(s.Exprs[i].Name) {
+							continue
+						}
+						var lhsType @Type = checkExpr(c, s.Exprs[i])
+						checkAssignTargetConst(c, s.Exprs[i], lhsType)
+						if !rhsType.Results[i].AssignableTo(c, lhsType) {
+							errCannotAssign(c, s.Exprs[i].Pos, rhsType.Results[i], lhsType)
+						}
+					}
+					return
+				}
+			}
+			addCheckError(c, s.Pos, "assignment count mismatch")
+			return
+		}
+		for i := 0; i < len(s.Exprs); i++ {
+			// Blank identifier on LHS: type-check the RHS for side
+			// effects but skip the assignability check — there's no
+			// target to constrain.
+			if s.Exprs[i].Kind == ast.EXPR_IDENT && isBlank(s.Exprs[i].Name) {
+				var bt @Type = checkExpr(c, s.Exprs2[i])
+				// `_ = *opaquePtr` discards a deref-LOAD that forms an opaque
+				// value (an 8-byte ptrSize fabrication); reject forming it.
+				requireSizedType(c, bt, s.Exprs2[i].Pos)
+				continue
+			}
+			// Reject assignment to constants — unqualified (`C = v`) and
+			// package-qualified (`pkg.C = v`).  A const has no storage; the
+			// qualified case otherwise slips through to a silently-no-op
+			// store (sibling of the &pkg.C rejection in check_expr.bn).
+			if s.Exprs[i].Kind == ast.EXPR_IDENT {
+				var sym @Symbol = c.Scope.Lookup(s.Exprs[i].Name)
+				if sym != nil && sym.Kind == SYM_CONST {
+					var cb @strings.Builder = strings.NewBuilder()
+					cb.Write("cannot assign to const ")
+					cb.Write(s.Exprs[i].Name)
+					addCheckError(c, s.Exprs[i].Pos, buf.CopyStr(cb.String()))
+				}
+			}
+			var qmember @Symbol = resolveQualifiedSym(c, s.Exprs[i])
+			if qmember != nil && qmember.Kind == SYM_CONST {
+				var qcb @strings.Builder = strings.NewBuilder()
+				qcb.Write("cannot assign to const ")
+				qcb.Write(s.Exprs[i].Name)
+				addCheckError(c, s.Exprs[i].Pos, buf.CopyStr(qcb.String()))
+			}
+			var lhsType @Type = checkExpr(c, s.Exprs[i])
+			// Apply the LHS type as the function-value flavour hint, so a
+			// bare func literal RHS (`f = func(){...}`) resolves to the
+			// LHS's @func / *func flavour — mirroring the var-init,
+			// call-arg, and return sites.  Without it the literal defaults
+			// to raw *func(), which is not assignable to an @func() LHS.
+			var rhsType @Type = checkExprWithFVHint(c, s.Exprs2[i], lhsType)
+			// `*dst = *src` copies an opaque value through a deref-LOAD RHS
+			// (the var / decl gates don't see a deref-LHS assignment); reject
+			// forming the value.  Harmless for a non-opaque RHS.
+			requireSizedType(c, rhsType, s.Exprs2[i].Pos)
+			if lhsType.IsReadonly() {
+				addCheckError(c, s.Exprs[i].Pos, "cannot assign to const-typed location")
+			}
+			if !rhsType.AssignableTo(c, lhsType) {
+				errCannotAssign(c, s.Exprs2[i].Pos, rhsType, lhsType)
+			}
+		}
+	} else {
+		// Compound assignment (+=, etc.) — also check const
+		if s.Exprs[0].Kind == ast.EXPR_IDENT {
+			var sym @Symbol = c.Scope.Lookup(s.Exprs[0].Name)
+			if sym != nil && sym.Kind == SYM_CONST {
+				var cb @strings.Builder = strings.NewBuilder()
+				cb.Write("cannot assign to const ")
+				cb.Write(s.Exprs[0].Name)
+				addCheckError(c, s.Exprs[0].Pos, buf.CopyStr(cb.String()))
+			}
+		}
+		var lhsType @Type = checkExpr(c, s.Exprs[0])
+		var rhsType @Type = checkExpr(c, s.Exprs2[0])
+		if lhsType.IsReadonly() {
+			addCheckError(c, s.Exprs[0].Pos, "cannot compound-assign to const-typed location")
+		}
+		var baseOp int = compoundToBase(s.Op)
+		checkShiftCountNonNegative(c, s.Pos, baseOp, s.Exprs2[0], rhsType)
+		checkBinaryOp(c, s.Pos, baseOp, lhsType, rhsType)
+	}
+}
+
+// checkShortVarDecl type-checks a short variable declaration (:=), defining new variables.
+// Blank identifiers (`_`) on the LHS are skipped — the RHS is still
+// checked for side effects, but no name enters scope.
+func checkShortVarDecl(c @Checker, s @ast.Stmt) {
+	// s.Exprs = names (as ident exprs), s.Exprs2 = RHS values
+	if len(s.Exprs) != len(s.Exprs2) {
+		// Multi-return
+		if len(s.Exprs2) == 1 {
+			var rhsType @Type = checkExpr(c, s.Exprs2[0])
+			// Comma-ok type assertion `v, ok := x.(*T)` binds (recovered, bool).
+			// checkExpr already typed and validated the assertion (interim-
+			// rejecting interface / value-recovery targets); rhsType is the
+			// recovered type, and the second target is always bool.
+			if s.Exprs2[0].Kind == ast.EXPR_TYPE_ASSERT && len(s.Exprs) == 2 {
+				if rhsType == nil || rhsType.Kind == TYP_VOID { return }
+				if !isBlank(s.Exprs[0].Name) {
+					defineVar(c.Scope, s.Exprs[0].Name, rhsType)
+				}
+				if !isBlank(s.Exprs[1].Name) {
+					defineVar(c.Scope, s.Exprs[1].Name, TypBool())
+				}
+				return
+			}
+			if hasExpandableResults(rhsType) && len(rhsType.Results) == len(s.Exprs) {
+				for i := 0; i < len(s.Exprs); i++ {
+					// The call materializes EVERY result as a value, so an opaque
+					// (cross-package opaque-export) result is rejected here even
+					// when discarded to `_` — mirrors the single-result call gate
+					// (bug 211).  Multi-return is the single-result gate's sibling.
+					requireSizedType(c, rhsType.Results[i], s.Exprs2[0].Pos)
+					if isBlank(s.Exprs[i].Name) { continue }
+					defineVar(c.Scope, s.Exprs[i].Name, rhsType.Results[i])
+				}
+				return
+			}
+		}
+		addCheckError(c, s.Pos, "assignment count mismatch")
+		return
+	}
+	for i := 0; i < len(s.Exprs); i++ {
+		var rhsType @Type = checkExpr(c, s.Exprs2[i])
+		if isBlank(s.Exprs[i].Name) { continue }
+		var defaulted @Type = defaultTypeForExpr(rhsType, s.Exprs2[i])
+		checkDefaultIntFits(c, s.Exprs2[i].Pos, rhsType, defaulted)
+		defineVar(c.Scope, s.Exprs[i].Name, defaulted)
+	}
+}

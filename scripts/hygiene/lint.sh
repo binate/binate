@@ -30,6 +30,12 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 #     (The earlier bnc-0.0.9 lag — pkg/builtins/rt's void `__c_call` spelling and
 #     pkg/std/os's .bni method fix `796effc7`, plus their vm/repl/cmd-bni/bnas/
 #     bnlint importer chain — cleared at the bnc-0.0.10 bump and is now linted.)
+#   - pkg/stdx/containers/{vec,hashmap,set}: migrated to generic-receiver methods
+#     (`func (v @Vec[T]) Push(x T)`) and parameterized-receiver impls
+#     (`impl *Cursor[T] : iter.Iterator[T]`) — methods-on-generic-types, newer
+#     than bnc-0.0.10, so the bundled bnlint aborts at the PARSE pass (a cascade
+#     of `expected ;, got :=` / `expected declaration`).  The interface-only
+#     pkg/stdx/containers/iter is fine (generic interfaces predate the bundle).
 #
 # (B) Pending real lint findings — uncovered until the recursive pkg/ discovery
 #     below was added (the old one-level `pkg/*/` glob never reached the
@@ -37,7 +43,7 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 #     [managed-to-raw-assign] (`var data *[]uint8 = sec.Data` — a borrow of a
 #     held @[]uint8); each needs a per-site judgement (real UAF risk vs a safe
 #     borrow the rule over-flags) before un-skipping.  Tracked in claude-todo.md.
-LINT_SKIP="pkg/binate/interp pkg/binate/asm/arm32 pkg/binate/asm/elf pkg/binate/asm/macho pkg/binate/asm/parse pkg/binate/asm/x64"
+LINT_SKIP="pkg/binate/interp pkg/binate/asm/arm32 pkg/binate/asm/elf pkg/binate/asm/macho pkg/binate/asm/parse pkg/binate/asm/x64 pkg/stdx/containers/vec pkg/stdx/containers/hashmap pkg/stdx/containers/set"
 
 # Discover targets:
 #   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so

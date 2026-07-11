@@ -33,14 +33,15 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 #     `// bnlint:allow managed-to-raw-assign` directives (claude-todo asm
 #     INCREMENT 2; the 1 real UAF was fixed separately in 8a883450).
 #
-# One skip remains (CHECK-TOOLS-lag, NOT the resolved BUILDER/methods-on-generics lag):
-# the injectable-key-policy packages pkg/stdx/{hash,cmp}.  Their blanket impls
-# (`impl Default[K] : Hasher[K]`) lean on the generic-instantiation-as-constraint-arg
-# support + the genericImplSatisfies guard (checker fixes 2f8969e8 / 6647c49f) that
-# POSTDATE bnc-0.0.11pre2, so pre2's bnlint typecheck aborts with a false "type argument
-# K does not satisfy constraint Hashable/Comparable" at those impls.  A current-source
-# bnlint accepts them.  Drop at the next CHECK_TOOLS bump past 6647c49f.
-LINT_SKIP="pkg/stdx/hash pkg/stdx/cmp"
+# One skip remains (CHECK-TOOLS-lag, NOT BUILDER-lag): the injectable-key-policy +
+# fn-injected-container packages pkg/stdx/{hash,cmp} and pkg/stdx/containers/{table,
+# mapfn,setfn}.  They lean on the generic-instantiation-as-constraint-arg support and
+# the genericImplSatisfies guard (checker fixes 2f8969e8 / 6647c49f) that postdate
+# bnc-0.0.11pre2, so pre2's bnlint typecheck aborts with false "type argument H does
+# not satisfy constraint Hasher[T]" / "K does not satisfy Hashable" at their blanket
+# impls.  A current-source bnlint accepts them.  Drop at the next CHECK_TOOLS bump past
+# 6647c49f.
+LINT_SKIP="pkg/stdx/hash pkg/stdx/cmp pkg/stdx/containers/table pkg/stdx/containers/mapfn pkg/stdx/containers/setfn"
 
 # Discover targets:
 #   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so

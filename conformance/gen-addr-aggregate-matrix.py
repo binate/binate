@@ -97,11 +97,12 @@ def top_decl(k, op):
     """Extra top-level declarations beyond the kind's shared decls.  Only the
     `global` operation needs one: a package-level var of the 2-word type,
     initialized through the producer (mkv).  This exercises the backend's
-    global-materialization path — the storage must be sized for BOTH words
-    (SizeOf peels readonly/named wrappers and reports 2 words for @func/@Iface)
-    and zero-filled before __init stores mkv's result; a global mis-sized to one
-    word (the codegen/VM wrapper-transparency gap) drops a word and faults or
-    returns wrong.  Other operations keep the value in a local."""
+    global-materialization path — the value is materialized into a package-level
+    cell, stored there by `__init` (mkv's result), then read back and invoked.
+    It pins that materialization / `__init`-store / read-back wiring, NOT storage
+    sizing: the store and the load use the same width, so the cell round-trips
+    consistently whatever allocation size the codegen picks.  Other operations
+    keep the value in a local."""
     if op == "global":
         return "\n\nvar gv %s = mkv()" % k["tname"]
     return ""

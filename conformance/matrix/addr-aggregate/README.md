@@ -20,8 +20,9 @@ dropping or swapping a word, so a later dispatch hits a nil/garbage vtable.
   `direct` (none) · `copy` (assignment) · `return` (return copy-back) · `arg`
   (arg-marshal) · `return-arg` (returned **then** passed directly) · `field`
   (struct-field store + extract) · `array-elem` (array-element store + index) ·
-  `global` (package-level global materialization — the storage must be sized
-  for both words and zero-filled before `__init` stores the value).
+  `global` (package-level global materialization — the value is stored into a
+  package-level cell by `__init`, then read back and invoked; pins the
+  materialization / `__init`-store / read-back wiring, not storage sizing).
 
 Assertion: **both words survive every operation** — observed by INVOKING the
 value (call the func / call the iface method) after it crosses the boundary. A

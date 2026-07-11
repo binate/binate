@@ -1,0 +1,173 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Native arm32 closure-shim STACK-SPILL path: the over-budget capturing-closure /
+// method-value shim (captures + user args exceed R0..R3, or a capture takes an
+// AAPCS §6.5 C.3 even-pair pad), split out of arm32_closure_shim.bn to keep each
+// file under the hygiene length cap.  P4-d Phase B of plan-native-arm32.md; mirrors
+// aarch64_closure_shim_spill.bn's emitClosureShimStackSpillAA64 for the AAPCS32
+// (4-GP-arg-reg, soft-float) case, reusing the non-closure spill marshal
+// (emitSpillMarshalArm32 in arm32_funcvalue_spill.bn) with a CAPTURE-PREFIX classify.
+//
+// The shim is entered under the uniform all-int dispatch ABI `<ret>(data, user
+// args…)` — the capture-struct pointer in R0, user args in R1..  The underlying's
+// REAL ABI PREPENDS the captures as leading params (`underlying(captures…,
+// user_args…)`); on AAPCS32's 4 GP arg regs the total captures + user words spill
+// to the stack far sooner than on aa64's 8, so this framed-BL shim is common.
+//
+// The single load-bearing correctness surface (a SILENT MISCOMPILE if wrong) is the
+// CAPTURE-PREFIX classify: the user args must classify over the FULL captures++users
+// type list (argTypes) at classifyBase = NumCaptureParams — so the classifier's
+// running NGRN reaches each capture and user arg at its ABSOLUTE (post-capture)
+// register index, and the AAPCS §6.5 C.3 even-pair pads land at the same parity the
+// callee reads.  captureWords + a dense cursor would drop the pads (see
+// aarch64_closure_shim_spill.bn's userArgStart = f.NumCaptureParams — the identical
+// structure).  Captures and users are placed at their authoritative
+// CallArgRegStart(argTypes, k) / CallArgStackOff(argTypes, k) positions, so a
+// capture-even-pair pad or a SPLIT capture is handled here (unlike the fast path's
+// dense-cursor capture load).  An indirect-large (>16-byte) aggregate capture still
+// fails LOUDLY upstream (no pointer-pass capture-load path on arm32) — the caller
+// routes it away before reaching this shim.
+
+// emitClosureShimSpillArm32 emits the framed-BL over-budget capturing shim.  Frame
+// and ordering (mirrors emitClosureShimStackSpillAA64, with AAPCS32's push/pop
+// frame and IP/R4 in place of X16/X9):
+//   1. push {r4, lr}                 -- save the caller's R4 (memory→memory shuttle)
+//                                       and LR (BL clobbers it); 2 regs keep SP
+//                                       8-aligned.
+//      sub sp, sp, #innerBytes       -- reserve outgoing-args + staging.
+//   2. Stage every incoming GP dispatch reg (r0..r3) to the frame.  The captures
+//      prepend into the low outgoing regs, so the user args UP-shift (outgoing reg
+//      index > incoming) — an outgoing write could clobber a later user arg's
+//      not-yet-read incoming reg, so every source is read from the staged frame
+//      (the emitShimArgMarshalArm32 forceStage rationale, applied to the spill
+//      marshal).  Staging R0 too is harmless — R0 the REGISTER stays live for the
+//      capture loads in step 4 (the user marshal never writes R0: user args classify
+//      at index >= NumCaptureParams, so their reg start >= captureWords >= 1).
+//   3. Spill stack-bound capture words from [R0 + FieldOffset] to their outgoing
+//      stack offsets (via IP), while R0 is live.
+//   4. Marshal the user args incoming→outgoing via the shared spill marshal, with the
+//      CAPTURE-PREFIX classify (argTypes = captures++users, classifyBase =
+//      NumCaptureParams, srcPrefix = 1).
+//   5. Load register-bound capture words from [R0 + FieldOffset] into their outgoing
+//      arg regs, RIGHT-TO-LEFT (i=0 last so R0 stays a valid base until the final
+//      load, whose destination may be R0 itself).
+//   6. bl underlying; add sp, sp, #innerBytes; pop {r4, pc}.  BL (not a tail-branch):
+//      LR is saved on the stack and the frame must be torn down before RET.
+func emitClosureShimSpillArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type, f @ir.Func,
+		cc common.CallConv, argTypes @[]@types.Type) {
+	// outBytes = the outgoing-args area for the FULL captures++users call (both a
+	// stack-bound capture's SPLIT tail and an over-budget user arg spill here).
+	// CallStackBytes already rounds to StackAlign (8).
+	var outBytes int = cc.CallStackBytes(argTypes)
+	var savedBytes int = 8
+	// Staging sits above the outgoing-args area; every incoming GP dispatch reg is
+	// staged so the up-shifted user marshal reads clobber-safe sources.
+	var stageOff int = outBytes
+	var innerBytes int = stageOff + cc.NumGpArgRegs * cc.WordBytes
+	if innerBytes % cc.StackAlign != 0 {
+		innerBytes = innerBytes + (cc.StackAlign - innerBytes % cc.StackAlign)
+	}
+	// frameDelta = the SP decrement from shim entry ({r4,lr} save + inner area), used
+	// by the spill marshal to address the dispatch caller's incoming-overflow words.
+	var frameDelta int = savedBytes + innerBytes
+
+	arm32.Push(a, arm32.COND_AL, packShimPushMask())
+	if innerBytes > 0 {
+		emitSpAdjust(a, false, innerBytes)
+	}
+	// Stage r0..r3 before any outgoing write; the marshal reads register-source words
+	// from [sp + stageOff + WordBytes*g].
+	for g := 0; g < cc.NumGpArgRegs; g++ {
+		arm32.Str(a, arm32.COND_AL, argReg(g), arm32.MemImm(arm32.SP, stageOff + cc.WordBytes * g))
+	}
+	// Step 3: spill stack-bound capture words from the closure-struct base (R0, live).
+	emitClosureCaptureSpillArm32(a, cc, f, argTypes)
+	// Step 4: marshal the user args over the CAPTURE-PREFIX classify (argTypes =
+	// captures++users, classifyBase = NumCaptureParams, srcPrefix = 1 drops the data
+	// word).  staged = true (every incoming word was staged above).
+	var userTypes @[]@types.Type = shimUserTypesArm32(fvTyp)
+	emitSpillMarshalArm32(a, cc, argTypes, f.NumCaptureParams, userTypes, 1, frameDelta, stageOff,
+			true)
+	// Step 5: load register-bound capture words from R0 into their outgoing regs,
+	// right-to-left so R0 survives until the last (i=0) load.
+	emitClosureCaptureRegLoadSpillArm32(a, cc, f, argTypes)
+	// Step 6: BL, tear down the frame, and return.
+	a.SetGlobal(fnLabel)
+	arm32.Bl(a, arm32.COND_AL, fnLabel)
+	if innerBytes > 0 {
+		emitSpAdjust(a, true, innerBytes)
+	}
+	arm32.Pop(a, arm32.COND_AL, packShimPopMask())
+}
+
+// emitClosureCaptureSpillArm32 spills every STACK-BOUND capture word to the outgoing-
+// args area at [SP + CallArgStackOff(argTypes, i)], reading capture fields from
+// [R0 + FieldOffset] and shuttling through IP (the AAPCS32 intra-procedure scratch,
+// not an arg/return reg — so it can't clobber an outgoing arg or the return).  A
+// capture that SPLITs (some words in regs, the rest on the stack) spills only its
+// stack tail here; the reg part is loaded by emitClosureCaptureRegLoadSpillArm32.
+// The outgoing store is a plain WordBytes STR (AAPCS32 does not pack narrow stack
+// args — NaturalSizeStackArgs is unset, so every stack word is a full 4-byte slot),
+// routed through emitFrameStore so a large outgoing offset materializes the address
+// in IP.  Indirect-large captures are excluded upstream (no pointer-pass path), so
+// every capture here is a per-word scalar / small-aggregate whose value-words load
+// directly.  Mirrors emitClosureCaptureSpillAA64 at the arm32 (no indirect-large,
+// no natural-narrow-store) surface.
+func emitClosureCaptureSpillArm32(a @asm.Assembler, cc common.CallConv, f @ir.Func,
+		argTypes @[]@types.Type) {
+	for i := 0; i < f.NumCaptureParams; i = i + 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var regStart int = cc.CallArgRegStart(argTypes, i)
+		var stkOff int = cc.CallArgStackOff(argTypes, i)
+		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
+		if stkOff < 0 { continue }
+		var nWords int = cc.ArgWords(ft)
+		// The first firstStackWord words rode registers (a SPLIT capture); only the
+		// tail spills.  A wholly-stack capture has regStart < 0 -> firstStackWord 0.
+		var firstStackWord int = 0
+		if regStart >= 0 {
+			firstStackWord = cc.NumGpArgRegs - regStart
+		}
+		for k := firstStackWord; k < nWords; k = k + 1 {
+			arm32.Ldr(a, arm32.COND_AL, arm32.IP, arm32.MemImm(arm32.R0, fieldOfs + k * cc.WordBytes))
+			emitFrameStore(a, arm32.IP, stkOff + (k - firstStackWord) * cc.WordBytes)
+		}
+	}
+}
+
+// emitClosureCaptureRegLoadSpillArm32 loads every REGISTER-BOUND capture word into
+// its outgoing arg register from [R0 + FieldOffset], using the capture's
+// authoritative classifier position CallArgRegStart(argTypes, i) — so an even-pair-
+// padded or SPLIT capture lands on the correctly-aligned register (the reg part; the
+// stack part was spilled by emitClosureCaptureSpillArm32).  Iterates captures RIGHT-
+// TO-LEFT and, within a capture, high word first, so the i=0 case (which may target
+// R0 when regStart == 0) runs LAST — keeping R0 (the closure-struct base) live until
+// the final load.  Unlike the fast path's emitClosureCaptureRegLoadArm32 (dense
+// captureWords cursor, no pads), this reads the classifier position directly and so
+// serves the padded / SPLIT captures the fast path routes here.  Mirrors
+// emitClosureCaptureRegLoadAA64 at the arm32 (no indirect-large pointer-pass) surface.
+func emitClosureCaptureRegLoadSpillArm32(a @asm.Assembler, cc common.CallConv, f @ir.Func,
+		argTypes @[]@types.Type) {
+	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var regStart int = cc.CallArgRegStart(argTypes, i)
+		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
+		if regStart < 0 { continue }
+		var nWords int = cc.ArgWords(ft)
+		// A SPLIT capture loads only its reg portion (the tail spilled to the stack).
+		var regWords int = nWords
+		if cc.CallArgStackOff(argTypes, i) >= 0 {
+			regWords = cc.NumGpArgRegs - regStart
+		}
+		for k := regWords - 1; k >= 0; k = k - 1 {
+			arm32.Ldr(a, arm32.COND_AL, argReg(regStart + k),
+					arm32.MemImm(arm32.R0, fieldOfs + k * cc.WordBytes))
+		}
+	}
+}

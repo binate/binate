@@ -48,12 +48,32 @@ func emitClosureShimAggregateStackSpill_x64(a @asm.Assembler, fnLabel @[]char, f
 		marshalArgTypes = slices.Append[@types.Type](marshalArgTypes, fvTyp.Params[pi].Type)
 	}
 	var stkBytes int = cc.CallStackBytes(marshalArgTypes)
-	// +8 compensates for the return-address push at shim entry (RSP is
-	// 8-aligned there; the outgoing CALL needs 16).  For the pack shape
-	// that same 8-byte slot doubles as the retbuf save area.
-	var rspDelta int = stkBytes + 8
 	var userArgBase int = capBaseSlot + f.NumCaptureParams
 	var nUserWords int = userWords_x64(cc, fvTyp)
+	var captureWords int = 0
+	for i := 0; i < f.NumCaptureParams; i = i + 1 {
+		captureWords = captureWords + effectiveCapWords_x64(cc, f.ClosureStruct.Fields[i].Type)
+	}
+	// When the outgoing user slot sits BELOW its incoming slot (pack-return + a
+	// single capture word, capBaseSlot + captureWords < 2) a divergent by-address
+	// aggregate (1 incoming pointer word -> ArgWords outgoing value words) writes
+	// value words that drift UP onto a LATER param's live incoming register before
+	// it is read — a silent clobber (the CRITICAL closure-aggregate-return bug).
+	// That case STAGES every incoming user word to a scratch region just above the
+	// retbuf slot and marshals from memory (source-order-free).  stageBytes reserves
+	// the region; being 16-aligned it preserves the CALL's rsp alignment.
+	var staged bool = capBaseSlot + captureWords < 2 && hasByAddressUserArg_x64(cc, fvTyp)
+	var stageBytes int = 0
+	if staged {
+		stageBytes = nUserWords * 8
+		if stageBytes % 16 != 0 { stageBytes = stageBytes + 8 }
+	}
+	var stageBase int = stkBytes + 8
+	// +8 compensates for the return-address push at shim entry (RSP is
+	// 8-aligned there; the outgoing CALL needs 16).  For the pack shape
+	// that same 8-byte slot doubles as the retbuf save area.  stageBytes (if any)
+	// sits above it and shifts the return-addr / caller-stack args up by that much.
+	var rspDelta int = stkBytes + 8 + stageBytes
 	x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(rspDelta))
 	if !useSret {
 		x64.Mov(a, x64.Mem(x64.RSP, stkBytes, x64.SZ64), x64.Reg(x64.RDI, x64.SZ64))
@@ -88,18 +108,36 @@ func emitClosureShimAggregateStackSpill_x64(a @asm.Assembler, fnLabel @[]char, f
 	// slots come from the classifier over marshalArgTypes (the REAL types), so a
 	// by-address aggregate's ArgWords value-words land in their proper reg/stack
 	// slots — see emitSpillAggUserArg_x64, which dereferences the pointer for that
-	// case.  When the first outgoing user slot sits at/above the
-	// incoming base (capBaseSlot + captureWords >= 2) the params/words move
-	// HIGH-first / right-to-left so each source is read before its slot is
-	// overwritten; for the pack shape with a single capture word the first
-	// outgoing slot is below the incoming base, so they move LOW-first /
-	// left-to-right instead — otherwise a move would overwrite the next word's
-	// source.
-	var captureWords int = 0
-	for i := 0; i < f.NumCaptureParams; i = i + 1 {
-		captureWords = captureWords + effectiveCapWords_x64(cc, f.ClosureStruct.Fields[i].Type)
-	}
-	if capBaseSlot + captureWords >= 2 {
+	// case.  When the first outgoing user slot sits at/above the incoming base
+	// (capBaseSlot + captureWords >= 2) the params/words move HIGH-first / right-to-
+	// left so each source is read before its slot is overwritten.  When it sits
+	// below (pack + a single capture word) a plain list moves LOW-first / left-to-
+	// right — but a divergent by-address aggregate would then drift an outgoing
+	// value word up onto a later param's not-yet-read incoming register, so that
+	// case instead STAGES every incoming word to a scratch region and marshals from
+	// memory (see the `staged` branch / emitSpillAggUserArgStaged_x64).
+	if staged {
+		// Stage every incoming user word to [rsp + stageBase + w*8]: register-
+		// resident words (w < NumGpArgRegs-2) from argReg(2+w); overflow words from
+		// the caller's stack (whose offset shifted up by stageBytes when the frame
+		// grew).  Then marshal from memory — no live incoming register is read after
+		// an outgoing write, so the divergent down-shift can't clobber it.
+		for w := 0; w < nUserWords; w = w + 1 {
+			if w < cc.NumGpArgRegs - 2 {
+				x64.Mov(a, x64.Mem(x64.RSP, stageBase + w * 8, x64.SZ64), x64.Reg(argReg(2 + w), x64.SZ64))
+			} else {
+				x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+						x64.Mem(x64.RSP, stkBytes + 16 + stageBytes + (w - (cc.NumGpArgRegs - 2)) * 8, x64.SZ64))
+				x64.Mov(a, x64.Mem(x64.RSP, stageBase + w * 8, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+			}
+		}
+		var inWordBase int = 0
+		for ui := 0; ui < len(fvTyp.Params); ui = ui + 1 {
+			emitSpillAggUserArgStaged_x64(a, cc, fvTyp, marshalArgTypes, userArgBase, ui, inWordBase,
+					stageBase)
+			inWordBase = inWordBase + shimInWordsForTypeX64(cc, fvTyp.Params[ui].Type)
+		}
+	} else if capBaseSlot + captureWords >= 2 {
 		var inRegBase int = 1 + nUserWords
 		for ui := len(fvTyp.Params) - 1; ui >= 0; ui = ui - 1 {
 			var nUw int = shimInWordsForTypeX64(cc, fvTyp.Params[ui].Type)
@@ -213,6 +251,42 @@ func emitSpillAggUserArg_x64(a @asm.Assembler, cc common.CallConv, fvTyp @types.
 	} else {
 		for k := 0; k < n; k = k + 1 {
 			emitCoercedValueWord_x64(a, k, outRegStart, outStkOff)
+		}
+	}
+}
+
+// emitSpillAggUserArgStaged_x64 marshals one user param (index ui) of the stack-
+// spill aggregate shim from the STAGING region (every incoming word pre-saved to
+// [rsp + stageBase + w*8]) to its outgoing real-ABI reg/stack slot.  Because the
+// source is memory there is no register-permutation hazard — the divergent
+// by-address down-shift that clobbers a register in the direct-marshal path is
+// harmless here — so param/word order is free.  A by-address aggregate loads its
+// pointer from the staging slot into R10 and fans its ArgWords value-words out via
+// emitCoercedValueWord_x64; a scalar / indirect-large arg copies its shimInWords
+// words straight to the outgoing slot (RAX shuttles a stack destination).  inWordBase
+// is the param's first global incoming word index in the staging region.
+func emitSpillAggUserArgStaged_x64(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type,
+		marshalArgTypes @[]@types.Type, userArgBase int, ui int, inWordBase int, stageBase int) {
+	var ut @types.Type = fvTyp.Params[ui].Type
+	var outRegStart int = cc.CallArgRegStart(marshalArgTypes, userArgBase + ui)
+	var outStkOff int = cc.CallArgStackOff(marshalArgTypes, userArgBase + ui)
+	if isByAddressAggX64(cc, ut) {
+		x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Mem(x64.RSP, stageBase + inWordBase * 8, x64.SZ64))
+		var n int = common.ArgWords(ut)
+		for k := 0; k < n; k = k + 1 {
+			emitCoercedValueWord_x64(a, k, outRegStart, outStkOff)
+		}
+		return
+	}
+	var nUw int = shimInWordsForTypeX64(cc, ut)
+	for k := 0; k < nUw; k = k + 1 {
+		if outRegStart >= 0 {
+			x64.Mov(a, x64.Reg(argReg(outRegStart + k), x64.SZ64),
+					x64.Mem(x64.RSP, stageBase + (inWordBase + k) * 8, x64.SZ64))
+		} else {
+			x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+					x64.Mem(x64.RSP, stageBase + (inWordBase + k) * 8, x64.SZ64))
+			x64.Mov(a, x64.Mem(x64.RSP, outStkOff + k * 8, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
 		}
 	}
 }

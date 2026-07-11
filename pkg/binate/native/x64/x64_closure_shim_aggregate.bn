@@ -135,13 +135,17 @@ func emitClosureShimAggregate_x64(a @asm.Assembler, fnLabel @[]char, fvTyp @type
 //      convention places user args after the retbuf+data prefix, so word w of
 //      the incoming dispatch sequence is argReg(2+w)) to their outgoing real-ABI
 //      slots starting at outBase = capBaseSlot+captureWords.  Most params shift
-//      word-for-word; a coerced in-register struct/array DIVERGES — it arrives as
-//      ONE by-address pointer word but expands into ArgWords outgoing regs (see
-//      marshalAggUserArg_x64).  Because outgoing positions never fall below
-//      incoming ones once outBase >= 2 (dest >= source pointwise), those moves go
-//      right-to-left so each source is read before its slot is overwritten;
-//      otherwise (outBase < 2, i.e. the pack shape with a single capture word)
-//      dest <= source, so they go left-to-right.
+//      word-for-word; a by-address aggregate DIVERGES — it arrives as ONE
+//      by-address pointer word but expands into ArgWords outgoing regs (see
+//      marshalAggUserArg_x64).  When outBase >= 2 outgoing positions never fall
+//      below incoming ones (dest >= source pointwise), so right-to-left is
+//      clobber-safe.  When outBase < 2 (pack + a single capture word) dest <=
+//      source; a plain (non-divergent) list is then a lockstep down-shift, safe
+//      left-to-right — but a divergent by-address aggregate makes a later param's
+//      outgoing value words drift UP onto an earlier param's not-yet-read incoming
+//      register, so that case STAGES every incoming word to a scratch frame and
+//      marshals from memory (source-order-free).  Without staging this was a
+//      silent register clobber (the CRITICAL closure-aggregate-return bug).
 //   2. Load the captures from [R11] into
 //      argReg(capBaseSlot..capBaseSlot+captureWords-1) — after the
 //      user-arg moves, so a capture write can't clobber an unread user
@@ -151,12 +155,39 @@ func loadClosureAggCallArgs_x64(a @asm.Assembler, cc common.CallConv, fvTyp @typ
 		captureWords int, nUserWords int, capBaseSlot int) {
 	var outBase int = capBaseSlot + captureWords
 	if outBase >= 2 {
+		// Every outgoing slot sits at/above its incoming slot (dest >= source);
+		// right-to-left is clobber-safe even when a by-address aggregate diverges
+		// the cursors (its higher outgoing writes can only land on already-read
+		// higher slots).
 		for pi := len(fvTyp.Params) - 1; pi >= 0; pi = pi - 1 {
-			marshalAggUserArg_x64(a, cc, fvTyp, pi, outBase, true)
+			marshalAggUserArg_x64(a, cc, fvTyp, pi, outBase, true, false, 0)
 		}
-	} else {
+	} else if hasByAddressUserArg_x64(cc, fvTyp) {
+		// outBase < 2 (pack-return + a single capture word): outgoing sits BELOW
+		// incoming, so a divergent by-address aggregate (1 incoming pointer word ->
+		// ArgWords outgoing value words) writes value words that drift UP onto a
+		// LATER param's live incoming register before it is read — a silent clobber
+		// (the CRITICAL closure-aggregate-return bug).  Neither pure direction is
+		// safe under divergent cursors, so STAGE every incoming user word to a
+		// balanced scratch frame and marshal from memory (source-order-free): no
+		// register source is ever overwritten early.  Mirrors the func-value shim's
+		// needStage.  (nUserWords <= 4 here — a wider call routes to the spill shim —
+		// so every incoming user word is live in argReg(2..5).)
+		var frame int = nUserWords * 8
+		if frame % 16 != 0 { frame = frame + 8 }
+		x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frame))
+		for w := 0; w < nUserWords; w = w + 1 {
+			x64.Mov(a, x64.Mem(x64.RSP, 8 * w, x64.SZ64), x64.Reg(argReg(2 + w), x64.SZ64))
+		}
 		for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
-			marshalAggUserArg_x64(a, cc, fvTyp, pi, outBase, false)
+			marshalAggUserArg_x64(a, cc, fvTyp, pi, outBase, false, true, 0)
+		}
+		x64.Add(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frame))
+	} else {
+		// outBase < 2 with no divergent param: a plain lockstep down-shift, safe
+		// left-to-right (each dest is written after its own source is read).
+		for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
+			marshalAggUserArg_x64(a, cc, fvTyp, pi, outBase, false, false, 0)
 		}
 	}
 	var wi int = 0
@@ -198,6 +229,17 @@ func outgoingUserWords_x64(cc common.CallConv, fvTyp @types.Type) int {
 	return n
 }
 
+// hasByAddressUserArg_x64 reports whether any user param is a by-address aggregate
+// (isByAddressAggX64) — the divergent-cursor arg shape whose presence forces the
+// ascending-marshal (outBase < 2) path to stage incoming words rather than shuffle
+// registers directly (see loadClosureAggCallArgs_x64).
+func hasByAddressUserArg_x64(cc common.CallConv, fvTyp @types.Type) bool {
+	for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
+		if isByAddressAggX64(cc, fvTyp.Params[pi].Type) { return true }
+	}
+	return false
+}
+
 // marshalAggUserArg_x64 marshals one user param (index pi) of the register-only
 // aggregate shim from its incoming dispatch slots to its outgoing real-ABI
 // argReg slots.  The incoming dispatch sequence places user word w at argReg(2+w)
@@ -213,12 +255,18 @@ func outgoingUserWords_x64(cc common.CallConv, fvTyp @types.Type) int {
 // [R10 + 8k] into argReg(outBase + outWord + k).  Copying to R10 first keeps the
 // pointer safe from a write to its own incoming slot.
 //
-// hiToLo selects the within-param word order so a write can't clobber an unread
-// source: high-to-low when outgoing slots sit at/above incoming (outBase >= 2,
-// dest >= source), low-to-high otherwise (the caller picks the matching param
-// order — descending vs ascending — for the same reason).
+// When `staged`, every incoming dispatch word was pre-saved to
+// [rsp + stageOff + w*8] (the caller staged the incoming regs to a scratch frame
+// because a divergent-cursor down-shift would otherwise clobber a later param's
+// live incoming reg — see loadClosureAggCallArgs_x64); the source is that memory
+// slot, so there is no register-source hazard and the word/param order is free
+// (hiToLo is then ignored).  When NOT staged, the source is the live argReg(2 + w)
+// and hiToLo selects the within-param word order so a write can't clobber an
+// unread source: high-to-low when outgoing slots sit at/above incoming
+// (outBase >= 2, dest >= source), low-to-high otherwise (the caller picks the
+// matching param order — descending vs ascending — for the same reason).
 func marshalAggUserArg_x64(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type, pi int,
-		outBase int, hiToLo bool) {
+		outBase int, hiToLo bool, staged bool, stageOff int) {
 	var inWord int = 0
 	var outWord int = 0
 	for q := 0; q < pi; q = q + 1 {
@@ -233,20 +281,26 @@ func marshalAggUserArg_x64(a @asm.Assembler, cc common.CallConv, fvTyp @types.Ty
 	var pt @types.Type = fvTyp.Params[pi].Type
 	if isByAddressAggX64(cc, pt) {
 		var n int = common.ArgWords(pt)
-		var ptrReg int = argReg(2 + inWord)
-		x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Reg(ptrReg, x64.SZ64))
-		if hiToLo {
-			for k := n - 1; k >= 0; k = k - 1 {
-				x64.Mov(a, x64.Reg(argReg(outBase + outWord + k), x64.SZ64), x64.Mem(x64.R10, 8 * k, x64.SZ64))
-			}
+		if staged {
+			x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Mem(x64.RSP, stageOff + inWord * 8, x64.SZ64))
 		} else {
-			for k := 0; k < n; k = k + 1 {
-				x64.Mov(a, x64.Reg(argReg(outBase + outWord + k), x64.SZ64), x64.Mem(x64.R10, 8 * k, x64.SZ64))
-			}
+			x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Reg(argReg(2 + inWord), x64.SZ64))
+		}
+		for k := 0; k < n; k = k + 1 {
+			var kk int = k
+			if hiToLo { kk = n - 1 - k }
+			x64.Mov(a, x64.Reg(argReg(outBase + outWord + kk), x64.SZ64), x64.Mem(x64.R10, 8 * kk, x64.SZ64))
 		}
 		return
 	}
 	var w int = shimInWordsForTypeX64(cc, pt)
+	if staged {
+		for k := 0; k < w; k = k + 1 {
+			x64.Mov(a, x64.Reg(argReg(outBase + outWord + k), x64.SZ64),
+					x64.Mem(x64.RSP, stageOff + (inWord + k) * 8, x64.SZ64))
+		}
+		return
+	}
 	if hiToLo {
 		for k := w - 1; k >= 0; k = k - 1 {
 			moveAggUserWord_x64(a, 2 + inWord + k, outBase + outWord + k)

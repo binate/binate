@@ -10,52 +10,35 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 
-# Targets temporarily skipped because they use a language feature newer than
-# the BUILDER-bundled bnlint (a BUILDER_VERSION snapshot) can typecheck — such
-# source aborts at the typecheck pass before any lint rule runs.  bnlint
-# typechecks dependency BODIES, so a skip must cover the whole transitive
-# importer chain of the offending source, not just the file that names the
-# feature.  Skipped targets stay fully type-checked and compiled by every
-# conformance mode — only bnlint's style rules are paused.
+# Targets skipped from linting (all tracked in claude-todo.md).  bnlint is
+# fetched from the CHECK_TOOLS_VERSION bundle (bnc-0.0.11pre2), decoupled from
+# BUILDER_VERSION so a newer check-tool feature does not require a build-ladder
+# rung (see explorations/plan-check-tools-version.md).  Skipped targets stay
+# fully type-checked and compiled by every conformance mode — only bnlint's
+# style rules are paused.
 #
-# The skips fall in two groups (all tracked in claude-todo.md):
-#
-# (A) BUILDER-lag — the bundled bnlint (bnc-0.0.10) predates a feature/fix that
-#     is already in the tree, so it aborts at the typecheck pass.  Clears at the
-#     next BUILDER bump (verified: a current-source bnlint accepts it).
-#   - pkg/binate/interp: its extern-registration enumerates `rt.__Package()` and
-#     wraps each entry via `_func_handle` (the embeddable-interp work), a usage
-#     newer than bnc-0.0.10 — the bundled bnlint aborts with `undefined:
-#     __Package` / `_func_handle argument must be a named function`.
-#     (The earlier bnc-0.0.9 lag — pkg/builtins/rt's void `__c_call` spelling and
-#     pkg/std/os's .bni method fix `796effc7`, plus their vm/repl/cmd-bni/bnas/
-#     bnlint importer chain — cleared at the bnc-0.0.10 bump and is now linted.)
-#   - pkg/stdx/containers/{vec,hashmap,set}: migrated to generic-receiver methods
-#     (`func (v @Vec[T]) Push(x T)`) and parameterized-receiver impls
-#     (`impl *Cursor[T] : iter.Iterator[T]`) — methods-on-generic-types, newer
-#     than bnc-0.0.10, so the bundled bnlint aborts at the PARSE pass (a cascade
-#     of `expected ;, got :=` / `expected declaration`).  The interface-only
-#     pkg/stdx/containers/iter is fine (generic interfaces predate the bundle).
-#   - pkg/binate/format + cmd/bnfmt: the TRANSITIVE case of the above.  format
-#     does not itself use methods-on-generics, but it IMPORTS
-#     pkg/stdx/containers/vec, so the bundled bnlint loads vec.bni to resolve the
-#     import and aborts at the same PARSE pass; cmd/bnfmt imports format, so it
-#     inherits the abort.  Skipping vec/hashmap/set as DIRECT targets does not
-#     cover an importer OR its importers — the whole import cone up to a linted
-#     root must be skipped.  TEMPORARY: drop these the moment the BUILDER bump
-#     lands methods-on-generics in the bundled bnlint (same trigger as the
-#     container skips).  This does NOT scale to the full container-adoption sweep
-#     (each new adopter drags its whole importer cone into the skip) — the real
-#     unblock is the BUILDER bump; see the container-adoption entry in
-#     claude-todo.md.
-#
-# (B) Pending real lint findings — uncovered until the recursive pkg/ discovery
-#     below was added (the old one-level `pkg/*/` glob never reached the
-#     compiler at pkg/binate/<pkg>).  These asm subpackages trip
-#     [managed-to-raw-assign] (`var data *[]uint8 = sec.Data` — a borrow of a
-#     held @[]uint8); each needs a per-site judgement (real UAF risk vs a safe
-#     borrow the rule over-flags) before un-skipping.  Tracked in claude-todo.md.
-LINT_SKIP="pkg/binate/interp pkg/binate/asm/arm32 pkg/binate/asm/elf pkg/binate/asm/macho pkg/binate/asm/parse pkg/binate/asm/x64 pkg/stdx/containers/vec pkg/stdx/containers/hashmap pkg/stdx/containers/set pkg/binate/format cmd/bnfmt"
+# The only remaining skip is a PENDING REAL LINT FINDING needing a per-site fix
+# before un-skipping.  (No version-lag skips remain: (1) the container-adoption
+# methods-on-generics cone — pkg/stdx/containers/{vec,hashmap,set} + its importer
+# chain pkg/binate/format + cmd/bnfmt — cleared at the bnc-0.0.11pre2 CHECK_TOOLS
+# bump, whose bnlint parses methods-on-generic-types / parameterized-receiver
+# impls AND carries the cross-package generic name-collision fix the COMBINED
+# sweep needs (pre1's bnlint lints them clean individually, but colliding `Cursor`
+# names across vec/set/hashmap tripped that bug in one invocation); (2)
+# pkg/binate/interp's `undefined: __Package` / `_func_handle` abort cleared at the
+# same bump, and its lone `[unused-func] shortName` was a FALSE POSITIVE — that
+# helper is used by imports_test.bn, which `--tests` now counts — so interp lints
+# clean and is no longer skipped.  bnlint typechecks dependency BODIES, so a
+# version-lag skip, were one needed again, would have to cover the whole
+# transitive importer chain of the source.)
+#   - pkg/binate/asm/{arm32,elf,macho,parse,x64}: [managed-to-raw-assign]
+#     (`var data *[]uint8 = sec.Data` — a borrow of a held @[]uint8).  Each needs
+#     a per-site judgement (real UAF risk vs a safe borrow the rule over-flags);
+#     the 17 safe-borrow over-flags un-skip by adopting `// bnlint:allow`
+#     directives (claude-todo asm INCREMENT 2).  Uncovered once the recursive
+#     pkg/ discovery below reached the compiler at pkg/binate/<pkg> (a one-level
+#     `pkg/*/` glob missed it).
+LINT_SKIP="pkg/binate/asm/arm32 pkg/binate/asm/elf pkg/binate/asm/macho pkg/binate/asm/parse pkg/binate/asm/x64"
 
 # Discover targets:
 #   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so
@@ -129,7 +112,7 @@ if [ -z "$BNLINT_BIN" ] || [ ! -x "$BNLINT_BIN" ]; then
     }
 fi
 
-"$BNLINT_BIN" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" $TARGETS
+"$BNLINT_BIN" --tests -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" $TARGETS
 rc=$?
 
 if [ "$rc" -ne 0 ]; then

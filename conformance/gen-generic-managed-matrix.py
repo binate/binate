@@ -149,25 +149,54 @@ def bni(t_decls):
     return (f'package "pkg/gh"\n\n{HOLDER_DECLS}\n')
 
 
+MV_INV = "A method VALUE taken off a generic instantiation (or a generic-call result) links + runs: the captured-receiver closure struct is named by the MANGLED instantiation name on every name-mangling backend (2d48f348/fedbd0c5)."
+DISTINCT_INV = "Two generic instantiations differing ONLY within a structured type arg (array LENGTH, func SIGNATURE) are DISTINCT types; assigning one to the other is a compile error (42b3bc83)."
+
 CELLS = []
 for site in ("inpkg", "xpkg"):
     pfx = "" if site == "inpkg" else "gh."
     for kind, mk in BALANCE_KINDS.items():
         e = mk(pfx)
-        CELLS.append(dict(site=site, rel=f"{site}/{kind}/balance", inv=BAL_INV,
+        CELLS.append(dict(site=site, rel=f"{site}/{kind}/balance", inv=BAL_INV, holder=True,
                           decls=e["decls"], body=balance_body(e, pfx), exp=BALANCE_EXPECTED))
     for kind, mk in LINKRUN_KINDS.items():
         e = mk(pfx)
-        CELLS.append(dict(site=site, rel=f"{site}/{kind}/empty", inv=LR_INV,
+        CELLS.append(dict(site=site, rel=f"{site}/{kind}/empty", inv=LR_INV, holder=True,
                           decls=e["decls"], body=linkrun_body(e, pfx), exp=LINKRUN_EXPECTED))
+
+# method-value cells (holder=False: their own Box[T] with methods, not the Holder
+# container).  Link+run — the whole point is exercising name-mangling backends.
+CELLS.append(dict(site="inpkg", rel="method-value/scalar", inv=MV_INV, holder=False, exp=[42],
+                  decls="type Box[T any] struct {\n\tval T\n}\n\nfunc (b *Box[T]) Get() T {\n\treturn b.val\n}",
+                  body=["var bx Box[int]", "bx.val = 42", "var bp *Box[int] = &bx",
+                        "var f *func() int = bp.Get", "println(f())"]))
+CELLS.append(dict(site="inpkg", rel="method-value/call-result", inv=MV_INV, holder=False, exp=[42],
+                  decls=("type Box[T any] struct {\n\tval T\n}\n\n"
+                         "func (b @Box[T]) Get() T {\n\treturn b.val\n}\n\n"
+                         "func mkbox[T any](v T) @Box[T] {\n\tvar b @Box[T] = make(Box[T])\n\tb.val = v\n\treturn b\n}"),
+                  body=["var f *func() int = mkbox[int](42).Get", "println(f())"]))
+
+# type-distinctness compile-error PAIR cells (neg: assign must fail).
+CELLS.append(dict(site="inpkg", rel="distinct/array-len", inv=DISTINCT_INV, holder=False,
+                  neg=True, err="cannot assign",
+                  decls="type Box[T any] struct {\n\tfn T\n}",
+                  body=["var b3 @Box[[3]int] = make(Box[[3]int])",
+                        "var b5 @Box[[5]int] = make(Box[[5]int])", "b3 = b5"]))
+CELLS.append(dict(site="inpkg", rel="distinct/func-sig", inv=DISTINCT_INV, holder=False,
+                  neg=True, err="cannot assign",
+                  decls="type Box[T any] struct {\n\tfn T\n}",
+                  body=["var bi @Box[@func(int) uint] = make(Box[@func(int) uint])",
+                        "var bb @Box[@func(bool) uint] = make(Box[@func(bool) uint])", "bi = bb"]))
 
 
 def render_main(c):
     imp = '\nimport "pkg/gh"\n' if c["site"] == "xpkg" else ""
     out = HEADER.format(desc=c["rel"], inv=c["inv"]) + imp + "\n"
-    # in-package: the generic Holder lives in this file; cross-package: it's in pkg/gh.
+    # holder cells define the generic Holder in-file (in-package) or import it
+    # (cross-package); non-holder cells (method-value, distinct) carry their own
+    # generic in `decls`.
     decls = c["decls"]
-    if c["site"] == "inpkg":
+    if c["site"] == "inpkg" and c.get("holder"):
         decls = (decls + "\n\n" if decls else "") + HOLDER_DECLS
     if decls:
         out += decls + "\n\n"
@@ -195,11 +224,14 @@ def main():
     check = "--check" in sys.argv[1:]
     changed = []
     for c in CELLS:
-        exp = "".join(str(x) + "\n" for x in c["exp"])
+        exp = "".join(str(x) + "\n" for x in c.get("exp", []))
         if c["site"] == "inpkg":
             base = os.path.join(DIR, c["rel"])
             _write(base + ".bn", render_main(c), changed, check)
-            _write(base + ".expected", exp, changed, check)
+            if c.get("neg"):
+                _write(base + ".error", c["err"] + "\n", changed, check)
+            else:
+                _write(base + ".expected", exp, changed, check)
         else:  # cross-package cell = a directory with main.bn + pkg/gh fixture
             d = os.path.join(DIR, c["rel"])
             _write(os.path.join(d, "main.bn"), render_main(c), changed, check)

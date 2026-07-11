@@ -89,7 +89,39 @@ def managed_slice(pfx):
         use=f"{pfx}At[@[]int](h, 0)[0]")
 
 
-BALANCE_KINDS = {"managed-ptr": managed_ptr, "managed-slice": managed_slice}
+def managed_struct(pfx):
+    # element is a struct-with-a-managed-field (by value); the container copies the
+    # struct in (RefInc the field) and RefDec's it on destroy.  Observe the field.
+    return dict(
+        decls="type Counter struct {\n\tn int\n}\n\ntype Box struct {\n\tc @Counter\n}",
+        t="Box",
+        construct=["var src Box", "src.c = make(Counter)", "src.c.n = 42",
+                   "var po *uint8 = bit_cast(*uint8, src.c)"],
+        use=f"{pfx}At[Box](h, 0).c.n")
+
+
+def func_value(pfx):
+    return dict(
+        decls="",
+        t="@func() int",
+        construct=["var nn int = 42", "var src @func() int = func() int { return nn }",
+                   "var hp *int = bit_cast(*int, &src)",
+                   "var po *uint8 = bit_cast(*uint8, hp[1])"],
+        use=f"{pfx}At[@func() int](h, 0)()")
+
+
+BALANCE_KINDS = {"managed-ptr": managed_ptr, "managed-slice": managed_slice,
+                 "managed-struct": managed_struct, "func-value": func_value}
+
+# NOTE: a managed-interface element (`@Numbered`) balance cell is deferred — its
+# natural value-use (`At[@Numbered](h,0).num()`) hits a SEPARATE bug: an interface
+# method call on a generic-function-call RESULT emits an undefined method symbol
+# (`bn_..._num` referenced-but-not-defined), the sibling of conformance/168's
+# method-VALUE case (2d48f348/fedbd0c5 fixed the method-value path but not the
+# interface-method-CALL path). Tracked separately (claude-todo + a dedicated
+# conformance repro); the iface element holds/releases correctly through the
+# container (a var-bound read links + balances), so this is a call-on-result bug,
+# not an iface-in-container bug.
 
 
 def named_wrapper(pfx):

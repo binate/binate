@@ -110,18 +110,29 @@ def func_value(pfx):
         use=f"{pfx}At[@func() int](h, 0)()")
 
 
-BALANCE_KINDS = {"managed-ptr": managed_ptr, "managed-slice": managed_slice,
-                 "managed-struct": managed_struct, "func-value": func_value}
+def iface(pfx):
+    # element is a managed interface value (`@Numbered`) wrapping a mortal @Counter.
+    # Observe the UNDERLYING @Counter box (bit_cast the managed ptr) — holding the
+    # iface value in the container RefIncs that box (mirrors dispatch-refcount's
+    # iface cell).  The xpkg `use` (`gh.At[@Numbered](h,0).num()`) is an iface-method
+    # CALL on a generic-call RESULT — the exact shape of the bug this element first
+    # surfaced (conformance/1027; fixed in `66666980`'s sibling `dfbdf1dd`), so this
+    # cell now regression-guards it.
+    return dict(
+        decls=("type Counter struct {\n\tn int\n}\n\n"
+               "func (c *Counter) num() int {\n\treturn c.n\n}\n\n"
+               "interface Numbered {\n\tnum() int\n}\n\n"
+               "impl *Counter : Numbered"),
+        t="@Numbered",
+        construct=["var cc @Counter = make(Counter)", "cc.n = 42",
+                   "var po *uint8 = bit_cast(*uint8, cc)",
+                   "var src @Numbered = cc"],
+        use=f"{pfx}At[@Numbered](h, 0).num()")
 
-# NOTE: a managed-interface element (`@Numbered`) balance cell is deferred — its
-# natural value-use (`At[@Numbered](h,0).num()`) hits a SEPARATE bug: an interface
-# method call on a generic-function-call RESULT emits an undefined method symbol
-# (`bn_..._num` referenced-but-not-defined), the sibling of conformance/168's
-# method-VALUE case (2d48f348/fedbd0c5 fixed the method-value path but not the
-# interface-method-CALL path). Tracked separately (claude-todo + a dedicated
-# conformance repro); the iface element holds/releases correctly through the
-# container (a var-bound read links + balances), so this is a call-on-result bug,
-# not an iface-in-container bug.
+
+BALANCE_KINDS = {"managed-ptr": managed_ptr, "managed-slice": managed_slice,
+                 "managed-struct": managed_struct, "func-value": func_value,
+                 "iface": iface}
 
 
 def named_wrapper(pfx):

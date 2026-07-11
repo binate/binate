@@ -1,0 +1,133 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Native arm32 emission for the AGGREGATE-RESULT path of a capturing closure /
+// method-value shim — the sibling of arm32_closure_shim.bn's scalar/void path,
+// split out to stay under the hygiene file-length cap.  P4-d Phase C of
+// plan-native-arm32.md; mirrors the aa64 split (aarch64_closure_shim_aggregate.bn
+// + _spill.bn), but reuses the arm32 NON-closure sret machinery
+// (prependSretPtrArm32 + the retbuf-aware emitSpillMarshalArm32) rather than a
+// bespoke marshal, because on AAPCS32 the sret buffer pointer rides R0 (an ARG
+// register), exactly as it does for the non-closure sret shim (emitSretShim).
+//
+// PHASE C.1 SCOPE: only the BIG single-aggregate SRET shape (a single aggregate
+// result with SizeOf > InternalSretBytes = 4, returned through the R0 retbuf).
+// A SMALL (<=4-byte) single aggregate (pack, C.2) and a multi-return tuple (C.3)
+// still fail LOUDLY in emitClosureShimArm32 — this cut is narrowed to sret only.
+//
+// The shim is entered under the aggregate-return dispatch ABI (emitCallFuncValue):
+//
+//     R0 = retbuf   (address of the caller's result buffer)
+//     R1 = data     (the closure-struct pointer)
+//     R2.. = user args
+//
+// The underlying lifted body's REAL ABI is `underlying(retbuf@R0, captures…,
+// users…)`: the retbuf pointer STAYS in R0 (SretInGpArgReg — the underlying reads
+// it there and writes the result through it), the captures prepend as leading GP
+// params starting at R1, then the user args.  So the crux is a THREE-way prefix on
+// the outgoing registers — [sret]++captures++users — which the shim reproduces by
+// classifying the user args over prependSretPtrArm32(captures++users) at
+// classifyBase = 1 + NumCaptureParams (so R0=retbuf stays and the AAPCS §6.5 C.3
+// even-pair parity the callee sees is preserved), and loading the captures from
+// [R1 + FieldOffset] (captureBase = R1 — R0 holds the retbuf, the analog of aa64's
+// X9-for-X0 threading) into R1..R(captureWords).
+//
+// On AAPCS32's 4 GP arg regs the [sret]++captures prefix over-budgets fast, so the
+// framed spill (emitClosureShimAggregateSretSpillArm32) is the common case; the
+// frameless fast path serves only a small closure (captures + users all fit
+// R1..R3 past the retbuf).
+
+// emitClosureShimSretArm32 emits the big-single-aggregate SRET capturing-closure
+// shim (Phase C.1).  argTypes is the outgoing captures++users type list the caller
+// (emitClosureShimArm32) already built.  Two paths: a frameless fast path
+// (everything fits R0..R3) that up-shifts users past [retbuf]++captures and tail-
+// branches (retbuf stays in R0, the underlying writes the result through it), and
+// the framed spill for the over-budget common case.
+func emitClosureShimSretArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type, f @ir.Func,
+		cc common.CallConv, argTypes @[]@types.Type) {
+	// captureWords is the dense GP-word footprint of the captures (Σ ArgWords).  It
+	// is valid as a dense cursor here only because the indirect-large-capture and
+	// capture-even-pair-pad cases are routed to the spill path below (the pad check
+	// runs over the SRET-PREFIXED classify, so a capture that pads once R0 holds the
+	// retbuf is caught).  The user args start at outgoing register 1 + captureWords
+	// (R0 = retbuf, then captureWords capture regs).
+	var captureWords int = 0
+	for i := 0; i < f.NumCaptureParams; i++ {
+		captureWords = captureWords + cc.ArgWords(f.ClosureStruct.Fields[i].Type)
+	}
+	// The user args classify over the SRET-PREFIXED captures++users register parity:
+	// gpDestBase = 1 + captureWords places them at their ABSOLUTE (post-retbuf, post-
+	// capture) register index, so shimOutRegs applies the same even-pair pads the
+	// callee does and fails LOUDLY on an unmodeled user-arg shape.
+	var gpDestBase int = 1 + captureWords
+	var nOut int = shimOutRegs(a, cc, fvTyp, gpDestBase)
+	if nOut < 0 { return }
+	// A capture that takes an AAPCS §6.5 C.3 even-pair pad ONCE THE RETBUF OCCUPIES R0
+	// (the sret-prefixed classify) shifts the user-arg base off the dense captureWords
+	// the fast path assumes, and a stack-bound / SPLIT capture needs the classifier-
+	// position spill loads — both route to the framed spill.  The pad check runs over
+	// prependSretPtrArm32(argTypes) at index 1 + i so it sees the R0-is-retbuf origin.
+	// The user-arg fit test carries srcPrefix = 2 (drop retbuf + data) and the sret
+	// gpDestBase.
+	if closureCaptureNeedsSretPadArm32(cc, f, argTypes) || closureSretNeedsSpillArm32(cc, argTypes) ||
+			!shimArgsFitRegisters(cc, fvTyp, 2, gpDestBase, nOut) {
+		emitClosureShimAggregateSretSpillArm32(a, fnLabel, fvTyp, f, cc, argTypes)
+		return
+	}
+	// Fast (frameless) path.  Step 1: up-shift the user args (incoming R2.., srcPrefix
+	// 2 drops retbuf + data) to their post-[retbuf]-post-capture outgoing slots
+	// R(1+captureWords)..  forceStage makes the UP-shift clobber-safe (gpDestBase =
+	// 1+captureWords > srcPrefix = 2 whenever captureWords >= 2; forceStage is
+	// unconditional to keep the marshal independent of that boundary and to match the
+	// scalar closure fast path).  The marshal writes only argReg(gpDestBase + …) with
+	// gpDestBase >= 2, so it never touches R0 (retbuf) or R1 (data / capture0 base);
+	// its balanced SP scratch is freed before the capture loads.
+	emitShimArgMarshalArm32(a, cc, fvTyp, 2, gpDestBase, true)
+	// Step 2: load each capture word from [R1 + FieldOffset] into R1..R(captureWords),
+	// RIGHT-TO-LEFT (capture i=0 loads LAST so R1 — the closure-struct base AND
+	// capture0's destination — stays valid until the final load).  Unified scalar
+	// reg-load with captureBase = R1 and regBase = 1 (the +1 sret prefix past R0=retbuf).
+	emitClosureCaptureRegLoadArm32(a, cc, f, captureWords, arm32.R1, 1)
+	// Step 3: tail-branch to the underlying (retbuf stays in R0, untouched).
+	a.SetGlobal(fnLabel)
+	arm32.B(a, arm32.COND_AL, fnLabel)
+}
+
+// closureCaptureNeedsSretPadArm32 reports whether any capture takes an AAPCS §6.5
+// C.3 even-pair pad UNDER THE SRET PREFIX — i.e. its authoritative classifier
+// position over prependSretPtrArm32(captures++users) at index 1 + i diverges from
+// its running DENSE cursor (1 + Σ preceding ArgWords).  With the retbuf occupying
+// R0, an 8-aligned capture (e.g. an int64 capture first) pads to R2:R3 (R1 wasted)
+// rather than the dense R1:R2 the fast path assumes, so it must route to the spill
+// shim (which places each capture at its classifier position).  Callers must have
+// already excluded indirect-large captures (closureHasIndirectLargeCaptureArm32),
+// whose ArgWords over-count would corrupt the dense cursor.  This is the sret analog
+// of closureCaptureNeedsPadArm32, keyed on the 1-slot retbuf origin.
+func closureCaptureNeedsSretPadArm32(cc common.CallConv, f @ir.Func, argTypes @[]@types.Type) bool {
+	var sretTypes @[]@types.Type = prependSretPtrArm32(argTypes)
+	var dense int = 1
+	for i := 0; i < f.NumCaptureParams; i++ {
+		if cc.CallArgRegStart(sretTypes, 1 + i) != dense { return true }
+		dense = dense + cc.ArgWords(f.ClosureStruct.Fields[i].Type)
+	}
+	return false
+}
+
+// closureSretNeedsSpillArm32 reports whether any arg in the SRET-PREFIXED outgoing
+// call ([sret]++captures++users) lands (partially or wholly) on the stack — i.e. the
+// retbuf + captures + user words exceed R0..R3.  On AAPCS32's 4 GP arg regs the
+// retbuf prefix triggers this far sooner than the scalar closure's data prefix, so
+// the framed spill is the common case.  Classifies over prependSretPtrArm32(argTypes)
+// so the retbuf slot (index 0) occupies R0 and the captures/users are pushed up.
+func closureSretNeedsSpillArm32(cc common.CallConv, argTypes @[]@types.Type) bool {
+	var sretTypes @[]@types.Type = prependSretPtrArm32(argTypes)
+	for i := 0; i < len(sretTypes); i++ {
+		if cc.CallArgStackOff(sretTypes, i) >= 0 { return true }
+	}
+	return false
+}

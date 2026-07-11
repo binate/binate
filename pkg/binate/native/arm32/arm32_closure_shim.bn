@@ -83,18 +83,24 @@ func funcValueDtorHandleSymArm32(a @asm.Assembler, pkgName *[]readonly char, mod
 // on an out-of-Phase-A shape.
 func emitClosureShimArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type, f @ir.Func) {
 	// A float capture / param / return needs FP marshalling (P5) — the GP-only path
-	// below would mis-place it.
+	// below would mis-place it.  closureHasFloatPartsArm32 only rejects a float SCALAR
+	// result; a float FIELD of an AGGREGATE / multi-return result (a soft-float arm32
+	// has no HFA — a float part anywhere is a float scalar) is caught by the separate
+	// closureResultHasFloatPartArm32 guard below, BEFORE the sret dispatch, else it
+	// would silently ride the GP-only store (a miscompile).
 	if closureHasFloatPartsArm32(fvTyp, f) {
 		a.SetError("native arm32: float-containing closure func value not "
 				"implemented (P5)")
 		return
 	}
-	// An aggregate or multi-return result rides a retbuf convention the Phase-A
-	// scalar/void tail-branch does not implement — Phase C.
-	if shimReturnIsNonScalarArm32(fvTyp) {
+	// A float FIELD inside an aggregate or multi-return result: the GP-only sret /
+	// pack / field stores below would move the float bits through a GP register instead
+	// of the FP path the lifted body uses, so it must fail LOUDLY (P5) before the
+	// aggregate dispatch — the must-add guard for the C.1 cut (risk R3).
+	if closureResultHasFloatPartArm32(fvTyp) {
 		a.SetError(
-				"native arm32: closure func value with an aggregate or "
-						"multi-return result not implemented (P4-d Phase C)")
+				"native arm32: float-containing aggregate/multi-return closure "
+						"result not implemented (P5)")
 		return
 	}
 	var cc common.CallConv = common.AAPCS32()
@@ -108,6 +114,22 @@ func emitClosureShimArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type, 
 		a.SetError(
 				"native arm32: closure func value with an indirect-large "
 						"(>16-byte) aggregate capture not implemented (P4-d Phase C)")
+		return
+	}
+	// A BIG single-aggregate result (SizeOf > InternalSretBytes = 4) rides the R0-retbuf
+	// sret convention (Phase C.1): route it to the aggregate emitter, which reuses the
+	// non-closure sret machinery with a capture-prefix classify.  A SMALL (<=4-byte)
+	// single aggregate (pack, C.2) and a multi-return tuple (C.3) still fail LOUDLY —
+	// this cut is narrowed to sret only, to keep the fail-loud invariant (a wrong shape
+	// COMPILE_ERRORs rather than silently miscompiling).
+	if shimReturnIsBigSretAggregateArm32(cc, fvTyp) {
+		emitClosureShimSretArm32(a, fnLabel, fvTyp, f, cc, argTypes)
+		return
+	}
+	if shimReturnIsNonScalarArm32(fvTyp) {
+		a.SetError(
+				"native arm32: closure func value with a small-aggregate or "
+						"multi-return result not implemented (P4-d Phase C.2/C.3)")
 		return
 	}
 	// Any arg (capture or user) that spills to the outgoing stack — or a capture that
@@ -151,7 +173,7 @@ func emitClosureShimArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type, 
 	// Step 2: load each capture word from [R0 + FieldOffset] into R0..R(captureWords
 	// -1), RIGHT-TO-LEFT (i=0 loads last so R0 stays a valid base until the final
 	// load, whose destination may be R0 itself).
-	emitClosureCaptureRegLoadArm32(a, cc, f, argTypes, captureWords, arm32.R0)
+	emitClosureCaptureRegLoadArm32(a, cc, f, captureWords, arm32.R0, 0)
 	// Step 3: tail-branch to the underlying.
 	a.SetGlobal(fnLabel)
 	arm32.B(a, arm32.COND_AL, fnLabel)
@@ -179,13 +201,69 @@ func closureHasFloatPartsArm32(fvTyp @types.Type, f @ir.Func) bool {
 
 // shimReturnIsNonScalarArm32 reports whether the closure's result is an aggregate
 // (any size) or a multi-return tuple — the shapes that ride a retbuf convention
-// the Phase-A scalar/void tail-branch shim does not implement (deferred to
-// Phase C).  A single non-aggregate scalar / pointer (incl. a 64-bit register-pair
-// int64 / uint64) or void is Phase-A.
+// the Phase-A scalar/void tail-branch shim does not implement.  A single non-
+// aggregate scalar / pointer (incl. a 64-bit register-pair int64 / uint64) or void
+// is scalar/void.  Phase C.1 handles the BIG single-aggregate sret sub-shape
+// (shimReturnIsBigSretAggregateArm32); the remainder (small single aggregate, any
+// multi-return) is still deferred (C.2/C.3), so this predicate gates the residual
+// fail-loud.
 func shimReturnIsNonScalarArm32(fvTyp @types.Type) bool {
 	if len(fvTyp.Results) > 1 { return true }
 	if len(fvTyp.Results) == 1 && fvTyp.Results[0] != nil {
 		return common.IsAggregateTyp(fvTyp.Results[0])
+	}
+	return false
+}
+
+// shimReturnIsBigSretAggregateArm32 reports whether the closure's result is a SINGLE
+// aggregate larger than InternalSretBytes (4) — the big-sret sub-shape Phase C.1
+// implements (returned through the R0 retbuf).  A <=4-byte single aggregate (pack,
+// C.2) and a multi-return tuple (C.3) are excluded (len > 1 fails the single-result
+// gate), so they fall through to the residual fail-loud.
+func shimReturnIsBigSretAggregateArm32(cc common.CallConv, fvTyp @types.Type) bool {
+	if len(fvTyp.Results) != 1 || fvTyp.Results[0] == nil { return false }
+	var rt @types.Type = fvTyp.Results[0]
+	return common.IsAggregateTyp(rt) && rt.SizeOf() > cc.InternalSretBytes
+}
+
+// closureResultHasFloatPartArm32 reports whether the closure's result — a single
+// aggregate OR a multi-return tuple — contains a FLOAT leaf anywhere (recursively
+// through nested structs / arrays).  arm32 is soft-float with no HFA, so a float part
+// inside an aggregate/tuple result is a float scalar that the GP-only sret / pack /
+// field stores would mis-place; it must fail LOUDLY (P5) before the aggregate
+// dispatch.  A float SCALAR result is handled separately by closureHasFloatPartsArm32,
+// so this walker only needs to cover the aggregate/tuple result cases; a non-aggregate
+// scalar result is not walked here (it has no fields).
+func closureResultHasFloatPartArm32(fvTyp @types.Type) bool {
+	if len(fvTyp.Results) > 1 {
+		for i := 0; i < len(fvTyp.Results); i++ {
+			if typHasFloatLeafArm32(fvTyp.Results[i]) { return true }
+		}
+		return false
+	}
+	if len(fvTyp.Results) == 1 && fvTyp.Results[0] != nil && common.IsAggregateTyp(fvTyp.Results[0]) {
+		return typHasFloatLeafArm32(fvTyp.Results[0])
+	}
+	return false
+}
+
+// typHasFloatLeafArm32 reports whether t contains a float scalar leaf anywhere —
+// t itself is a float scalar, or (recursively) any struct field / array element is.
+// Peels type-alias / readonly / named wrappers via StripWrappers before inspecting
+// the kind, matching the ABI-level view the layout/HFA code uses.
+func typHasFloatLeafArm32(t @types.Type) bool {
+	if t == nil { return false }
+	if common.IsFloatScalarTyp(t) { return true }
+	var s @types.Type = types.StripWrappers(t)
+	if s == nil { return false }
+	if s.Kind == types.TYP_STRUCT {
+		for i := 0; i < len(s.Fields); i++ {
+			if typHasFloatLeafArm32(s.Fields[i].Type) { return true }
+		}
+		return false
+	}
+	if s.Kind == types.TYP_ARRAY {
+		return typHasFloatLeafArm32(s.Elem)
 	}
 	return false
 }
@@ -252,15 +330,16 @@ func closureCaptureNeedsPadArm32(cc common.CallConv, f @ir.Func, argTypes @[]@ty
 // RIGHT-TO-LEFT and, within a multi-word capture, high word first.  Right-to-left keeps
 // captureBase (the closure-struct pointer) live until the final load: the base register
 // is also capture i=0's destination, so loading capture 0 LAST means every earlier
-// capture load still reads a valid base.  captureBase is R0 for the scalar/void shim
-// (the closure data pointer arrives in R0); a Phase-C sret/retbuf shape passes R1
-// instead (R0 then holds the sret buffer pointer).  captureWords is the dense capture
-// footprint the caller verified equals CallArgRegStart(argTypes, NumCaptureParams) — so
-// capture i occupies the registers [regStart(i), regStart(i)+ArgWords) with no even-pair
-// pad.  Mirrors emitClosureCaptureRegLoadAA64 at the Phase-A register-only surface (no
-// indirect-large / SPLIT capture — those spill, and the spill shape is Phase B).
+// capture load still reads a valid base.  captureBase / regBase select the base pointer
+// and the outgoing-register origin: (R0, 0) for the scalar/void shim (the data pointer
+// arrives in R0, captures fill R0..), and (R1, 1) for a Phase-C sret shape (R0 holds the
+// retbuf, so captures fill R1.. — the same dense placement shifted up by the 1-slot sret
+// prefix).  captureWords is the dense capture footprint the caller verified has no even-
+// pair pad, so the captures occupy argReg(regBase .. regBase+captureWords) densely.
+// Mirrors emitClosureCaptureRegLoadAA64 at the register-only surface (no indirect-large /
+// SPLIT capture — those spill, and the spill shape is emitClosureCaptureRegLoadSpillArm32).
 func emitClosureCaptureRegLoadArm32(a @asm.Assembler, cc common.CallConv, f @ir.Func,
-		argTypes @[]@types.Type, captureWords int, captureBase int) {
+		captureWords int, captureBase int, regBase int) {
 	var w int = captureWords
 	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
 		var ft @types.Type = f.ClosureStruct.Fields[i].Type
@@ -268,7 +347,8 @@ func emitClosureCaptureRegLoadArm32(a @asm.Assembler, cc common.CallConv, f @ir.
 		var nWords int = cc.ArgWords(ft)
 		for k := nWords - 1; k >= 0; k = k - 1 {
 			w = w - 1
-			arm32.Ldr(a, arm32.COND_AL, argReg(w), arm32.MemImm(captureBase, fieldOfs + k * cc.WordBytes))
+			arm32.Ldr(a, arm32.COND_AL, argReg(regBase + w),
+					arm32.MemImm(captureBase, fieldOfs + k * cc.WordBytes))
 		}
 	}
 }

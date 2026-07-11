@@ -1,0 +1,104 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Native arm32 STACK-SPILL path for the big-single-aggregate SRET capturing-closure
+// / method-value shim (P4-d Phase C.1) — the over-budget sibling of
+// arm32_closure_shim_aggregate.bn's frameless fast path, split out to stay under the
+// hygiene file-length cap.  Mirrors emitClosureShimSpillArm32 (the scalar/void
+// closure spill) with the SRET PREFIX: R0 holds the retbuf (SretInGpArgReg), so the
+// captures/users classify over prependSretPtrArm32(captures++users) and the capture
+// base is R1 (not R0).
+//
+// The shim is entered under the aggregate-return dispatch ABI `void(retbuf=R0,
+// data=R1, args=R2..)`; the underlying's real ABI is `underlying(retbuf@R0,
+// captures…, users…)`.  Because AAPCS32 keeps the sret buffer pointer in R0 across
+// the call (unlike aa64's X8), R0 must STAY untouched from entry to the tail — the
+// sret-prefixed classify keeps every capture and user off R0, and the capture loads
+// read from R1.  The BL (not a tail-branch) preserves the underlying's write-through-
+// R0 result (the underlying wrote the aggregate through the retbuf); the frame is torn
+// down and control returns to the dispatch caller.
+
+// emitClosureShimAggregateSretSpillArm32 emits the framed-BL over-budget big-single-
+// aggregate SRET capturing shim.  Frame and ordering mirror emitClosureShimSpillArm32,
+// with the SRET-prefixed classify (sretTypes = [*uint8]++captures++users), captureBase
+// = R1, and srcPrefix = 2 (drop retbuf + data):
+//   1. push {r4, lr}; sub sp, sp, #innerBytes  -- save R4 (memory→memory shuttle) + LR
+//      (BL clobbers it), reserve outgoing-args + staging.
+//   2. Stage every incoming GP dispatch reg (r0..r3) to the frame.  R0 (retbuf) and R1
+//      (data) are staged too, harmlessly — R0 the REGISTER stays live (nothing writes
+//      it: users classify at index >= 1 + NumCaptureParams, captures at >= 1, so every
+//      outgoing reg is >= R1), and R1 the REGISTER stays live for the capture loads in
+//      step 5.  The user marshal reads its sources from the staged frame (clobber-safe
+//      for the UP-shift past [retbuf]++captures).
+//   3. Spill stack-bound capture words from [R1 + FieldOffset] to their outgoing stack
+//      offsets (via R4), while R1 is live.
+//   4. Marshal the user args incoming→outgoing via the shared spill marshal, with the
+//      SRET-PREFIX classify (sretTypes, classifyBase = 1 + NumCaptureParams,
+//      srcPrefix = 2).
+//   5. Load register-bound capture words from [R1 + FieldOffset] into their outgoing
+//      regs, RIGHT-TO-LEFT (capture 0 last so R1 stays a valid base until the final
+//      load, whose destination may be R1 itself).
+//   6. bl underlying (R0 = retbuf stays; the underlying wrote the result through it);
+//      add sp, sp, #innerBytes; pop {r4, pc}.
+func emitClosureShimAggregateSretSpillArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type,
+		f @ir.Func, cc common.CallConv, argTypes @[]@types.Type) {
+	// The SRET-prefixed classify: a leading *uint8 sret-pointer slot (R0 = retbuf)
+	// followed by the captures++users.  Every capture/user is classified at its index
+	// + 1, so R0=retbuf stays and the AAPCS §6.5 C.3 even-pair parity matches the callee
+	// (which prepends the same *uint8 sret slot — see prependSretPtrArm32 / emitSretShim).
+	var sretTypes @[]@types.Type = prependSretPtrArm32(argTypes)
+	// outBytes = the outgoing-args area for the full [sret]++captures++users call (a
+	// stack-bound capture's SPLIT tail and an over-budget user arg spill).  The sret
+	// pointer itself never spills (it rides R0), but classifying over sretTypes gives
+	// every capture/user its authoritative post-retbuf stack offset.
+	var outBytes int = cc.CallStackBytes(sretTypes)
+	var savedBytes int = 8
+	// Staging sits above the outgoing-args area; every incoming GP dispatch reg is
+	// staged so the up-shifted user marshal reads clobber-safe sources.
+	var stageOff int = outBytes
+	var innerBytes int = stageOff + cc.NumGpArgRegs * cc.WordBytes
+	if innerBytes % cc.StackAlign != 0 {
+		innerBytes = innerBytes + (cc.StackAlign - innerBytes % cc.StackAlign)
+	}
+	// frameDelta = the SP decrement from shim entry ({r4,lr} save + inner area), used
+	// by the spill marshal to address the dispatch caller's incoming-overflow words.
+	var frameDelta int = savedBytes + innerBytes
+
+	arm32.Push(a, arm32.COND_AL, packShimPushMask())
+	if innerBytes > 0 {
+		emitSpAdjust(a, false, innerBytes)
+	}
+	// Stage r0..r3 before any outgoing write; the marshal reads register-source words
+	// from [sp + stageOff + WordBytes*g].  emitFrameStore (not a raw STR) materializes a
+	// large stageOff into IP as its address scratch (argReg(g) is R0..R3, never IP, so no
+	// aliasing).
+	for g := 0; g < cc.NumGpArgRegs; g++ {
+		emitFrameStore(a, argReg(g), stageOff + cc.WordBytes * g)
+	}
+	// Step 3: spill stack-bound capture words from the closure-struct base (R1, live;
+	// R0 holds the retbuf), classified over the SRET-prefixed list at index 1 + i
+	// (classifyOff = 1, captureBase = R1 — the unified scalar spill helper).
+	emitClosureCaptureSpillArm32(a, cc, f, sretTypes, 1, arm32.R1)
+	// Step 4: marshal the user args over the SRET-PREFIX classify (sretTypes,
+	// classifyBase = 1 + NumCaptureParams, srcPrefix = 2 drops retbuf + data).  staged =
+	// true (every incoming word was staged above).
+	var userTypes @[]@types.Type = shimUserTypesArm32(fvTyp)
+	emitSpillMarshalArm32(a, cc, sretTypes, 1 + f.NumCaptureParams, userTypes, 2, frameDelta, stageOff,
+			true)
+	// Step 5: load register-bound capture words from R1 into their outgoing regs,
+	// right-to-left so R1 survives until the last (i=0) load, classified over sretTypes
+	// at index 1 + i (classifyOff = 1, captureBase = R1 — the unified scalar reg-load).
+	emitClosureCaptureRegLoadSpillArm32(a, cc, f, sretTypes, 1, arm32.R1)
+	// Step 6: BL (R0 = retbuf stays), tear down the frame, and return.
+	a.SetGlobal(fnLabel)
+	arm32.Bl(a, arm32.COND_AL, fnLabel)
+	if innerBytes > 0 {
+		emitSpAdjust(a, true, innerBytes)
+	}
+	arm32.Pop(a, arm32.COND_AL, packShimPopMask())
+}

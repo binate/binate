@@ -113,26 +113,25 @@ func main() {
 }
 EOF
 
-# Compile through gen1 (the current tree's cmd/bnc, built fresh from source),
-# NOT the pinned BUILDER directly: os's struct-stat decoding depends on a
-# compiler fix that postdates BUILDER_VERSION, so the prebuilt BUILDER cannot
-# compile os yet.  Once BUILDER is bumped past that fix this can revert to the
-# simpler `$BUILDER … cmd/bnc -- …` form other e2e scripts use (see todo:
-# "drop the gen1 build in e2e/stat-values.sh after the next BUILDER bump").
-GEN1="$TMP/gen1"
-gen1_log=$("$BINATE_DIR/scripts/build-bnc.sh" -o "$GEN1" 2>&1) || true
-if [ ! -x "$GEN1" ]; then
-    echo "FAIL: building the gen1 compiler failed" >&2
-    echo "$gen1_log" | tail -8 | sed 's/^/  /' >&2
-    exit 1
-fi
+# Compile the stat probe by running cmd/bnc (current source) via the pinned
+# BUILDER — no gen1 build needed.  os's struct-stat decoding once required a .bni
+# free-func/method fix (796effc7) that postdated the then-BUILDER (bnc-0.0.9);
+# that fix is contained in the current BUILDER_VERSION, so the BUILDER compiles os
+# directly.  Mirrors e2e/print-args.sh's BUILDER -> cmd/bnc form (inner -I/-L
+# resolve os's stdlib deps from the BUILDER's frozen bundle, source prepended).
+BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
+BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
+BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
 BNC_BIN="$TMP/sprobe"
 BUILD_DIR="$TMP/build"
 mkdir -p "$BUILD_DIR"
-bnc_log=$("$GEN1" \
+bnc_log=$("$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
-    --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
+    "$BINATE_DIR/cmd/bnc" -- \
+    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
+    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
+    --runtime "$BUILDER_RUNTIME" \
     --build-dir "$BUILD_DIR" -o "$BNC_BIN" "$TMP/sprobe.bn" 2>&1) || true
 if [ ! -x "$BNC_BIN" ]; then
     echo "FAIL: Binate compile of the stat probe failed" >&2

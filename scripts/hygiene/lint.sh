@@ -34,14 +34,16 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 #     INCREMENT 2; the 1 real UAF was fixed separately in 8a883450).
 #
 # One skip remains (CHECK-TOOLS-lag, NOT BUILDER-lag): the injectable-key-policy +
-# fn-injected-container packages pkg/stdx/{hash,cmp} and pkg/stdx/containers/{table,
-# mapfn,setfn}.  They lean on the generic-instantiation-as-constraint-arg support and
-# the genericImplSatisfies guard (checker fixes 2f8969e8 / 6647c49f) that postdate
-# bnc-0.0.11pre2, so pre2's bnlint typecheck aborts with false "type argument H does
-# not satisfy constraint Hasher[T]" / "K does not satisfy Hashable" at their blanket
-# impls.  A current-source bnlint accepts them.  Drop at the next CHECK_TOOLS bump past
-# 6647c49f.
-LINT_SKIP="pkg/stdx/hash pkg/stdx/cmp pkg/stdx/containers/table pkg/stdx/containers/mapfn pkg/stdx/containers/setfn"
+# Table-based container packages pkg/stdx/{hash,cmp} and pkg/stdx/containers/{table,
+# mapfn,setfn,hashmap,set}.  They lean on the generic-instantiation-as-constraint-arg
+# support and the genericImplSatisfies guard (checker fixes 2f8969e8 / 6647c49f) that
+# postdate bnc-0.0.11pre2, so pre2's bnlint typecheck aborts with false "type argument H
+# does not satisfy constraint Hasher[T]" / "K does not satisfy Hashable" at their blanket
+# impls.  (hashmap/set left the skip after the methods migration but rejoined it once they
+# were folded onto the shared Table engine — Table[K,V,hash.Default[K],cmp.Default[K]] hits
+# the same pre2 constraint-check bug.)  A current-source bnlint accepts them all.  Drop at
+# the next CHECK_TOOLS bump past 6647c49f.
+LINT_SKIP="pkg/stdx/hash pkg/stdx/cmp pkg/stdx/containers/table pkg/stdx/containers/mapfn pkg/stdx/containers/setfn pkg/stdx/containers/hashmap pkg/stdx/containers/set"
 
 # Discover targets:
 #   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so

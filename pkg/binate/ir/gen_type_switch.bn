@@ -1,0 +1,182 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// Type-switch lowering (`switch [v :=] x.(type) { case K T: ... }`, §14.10) —
+// the IR-gen counterpart to checkTypeSwitchStmt.  A first-match chain of
+// comma-ok assertions over the once-evaluated scrutinee, mirroring genSwitch's
+// caseBlk/nextBlk chain but branching on an assert's `ok` bool (assertCommaOkOn)
+// instead of an OP_EQ compare.
+//
+// Three subtleties beyond an expression switch, all memory-safety-critical:
+//
+//  1. Scrutinee lifetime.  The scrutinee is evaluated ONCE (§14.10) and rooted
+//     in a switch-scoped managed local slot, so it stays alive across EVERY case
+//     — a case's `@T`/`@J` recovery RefIncs its box, which would be a use-after-
+//     free if the scrutinee were an owned temp (`switch foo().(type)`) released
+//     before that case ran.  The slot is RefDec'd exactly once when the switch is
+//     left: at the exit block (all fall-through / break paths converge there;
+//     BreakVarLen is pinned ABOVE the slot so `break` does not also release it),
+//     or by return/continue's own cleanup (which unwinds from below the slot).
+//
+//  2. The `@`-binder.  The switch variable is bound INSIDE each case's own scope
+//     (genTypeSwitchCaseBody) so a managed recovery is RefDec'd at the case's own
+//     exit (emitDecForScopeVars) — else it lingers in ctx.Vars and is spuriously
+//     RefDec'd on later exit paths.  A single-target case binds the recovered
+//     value; a multi-target or default case binds the scrutinee itself.
+//
+//  3. vm.SP.  Each interface comma-ok grows vm.SP (EmitIfaceValueDyn).
+//     BC_SP_RESTORE resets vm.SP to the frame end (idempotent), so it is emitted
+//     on every case path once the recovered value is safely copied into a frame
+//     slot (in genTypeSwitchCaseBody) and on each miss (nextBlk) once the `ok`
+//     bools are in registers — reclaiming the growth without clobbering a live
+//     value.  ctx.StmtGrewSP is a single compile-time flag that cannot model both
+//     branch sides, so the restores are emitted directly.
+
+// genTypeSwitch lowers a STMT_TYPE_SWITCH.  Returns the block flow continues in.
+// The scrutinee's hidden root slot is named `.typeswitch.scrutinee` — an
+// unspellable name (a leading `.`) that no source identifier collides with, used
+// only for cleanup bookkeeping; no source code references it.
+func genTypeSwitch(ctx @GenContext, b @Block, s @ast.Stmt) @Block {
+	var f @Func = ctx.Func
+
+	// Evaluate the scrutinee ONCE and root it in a switch-scoped slot (subtlety 1).
+	var ivVal @Instr = genExpr(ctx, b, s.X)
+	b = ctx.CurBlock
+	var opType @types.Type = ivVal.Typ
+	var scrutSlot @Instr = b.EmitAlloc(opType)
+	b = emitStoreManagedSlot(ctx, b, scrutSlot, ivVal, opType, true)
+	b = emitTempCleanup(ctx, b)
+	// baseVarLen is the scope depth BELOW the scrutinee slot: the exit block
+	// RefDecs down to here, releasing the scrutinee once.
+	var baseVarLen int = len(ctx.Vars)
+	defineVar(ctx, ".typeswitch.scrutinee", scrutSlot, opType)
+
+	var exitBlk @Block = AddBlock(f, "typeswitch.exit")
+	// `break` inside a case exits the type switch (like an expression switch).
+	// BreakVarLen is set ABOVE the scrutinee slot so a break unwinds only case
+	// locals — the scrutinee is released at the exit block all break paths reach.
+	var savedBreak @Block = ctx.BreakTo
+	var savedBreakVL int = ctx.BreakVarLen
+	ctx.BreakTo = exitBlk
+	ctx.BreakVarLen = len(ctx.Vars)
+
+	// First-match chain over the non-default cases; default is deferred to the
+	// final fall-through (it runs iff no case matched, regardless of position).
+	var defaultCase @ast.CaseClause = nil
+	var curBlk @Block = b
+	for i := 0; i < len(s.Cases); i++ {
+		var cc @ast.CaseClause = s.Cases[i]
+		if len(cc.Types) == 0 {
+			defaultCase = cc
+			continue
+		}
+		var caseBlk @Block = AddBlock(f, "typeswitch.case")
+		var nextBlk @Block = AddBlock(f, "typeswitch.next")
+
+		// match = OR over the case's targets of each comma-ok assert's `ok`.  A
+		// single-target case keeps its assert result to recover the binder value;
+		// a multi-target case binds the scrutinee, so only the ok bools matter.
+		var isSingle bool = len(cc.Types) == 1
+		var match @Instr = nil
+		var singleRes @Instr = nil
+		var singleTyp @types.Type = nil
+		for j := 0; j < len(cc.Types); j++ {
+			var rt @types.Type = resolveTypeExpr(ctx.Gc, cc.Types[j])
+			var iv @Instr = curBlk.EmitLoad(scrutSlot, opType)
+			var res @Instr = assertCommaOkOn(ctx, curBlk, iv, rt)
+			curBlk = ctx.CurBlock
+			var ok @Instr = curBlk.EmitExtract(res, 1, types.TypBool())
+			if match == nil {
+				match = ok
+			} else {
+				match = curBlk.EmitBinop(iropcode.OP_LOR, match, ok, types.TypBool())
+			}
+			if isSingle {
+				singleRes = res
+				singleTyp = rt
+			}
+		}
+		curBlk.EmitBranch(match, caseBlk, nextBlk)
+
+		// Case body (matched): bind the switch variable, narrowed.  A single-target
+		// case recovers the asserted value (field 0 of its {recovered, ok} — a
+		// borrow the binder slot copy-acquires); a multi-target case binds the
+		// scrutinee itself.
+		var binderVal @Instr = nil
+		var binderTyp @types.Type = opType
+		if isSingle {
+			binderVal = caseBlk.EmitExtract(singleRes, 0, singleTyp)
+			binderTyp = singleTyp
+		} else {
+			binderVal = caseBlk.EmitLoad(scrutSlot, opType)
+		}
+		genTypeSwitchCaseBody(ctx, caseBlk, s.Binder, binderVal, binderTyp, cc.Body, exitBlk)
+
+		// Miss: reclaim this case's assert growth (the ok bools are in registers)
+		// and fall through to the next case.
+		nextBlk.EmitSPRestore()
+		curBlk = nextBlk
+	}
+
+	// No case matched: run default (if present) then exit; else fall to exit.
+	if defaultCase != nil {
+		var dv @Instr = curBlk.EmitLoad(scrutSlot, opType)
+		genTypeSwitchCaseBody(ctx, curBlk, s.Binder, dv, opType, defaultCase.Body, exitBlk)
+	} else if len(curBlk.Instrs) == 0 || !curBlk.Instrs[len(curBlk.Instrs) - 1].IsTerminator() {
+		curBlk.EmitJump(exitBlk)
+	}
+
+	ctx.BreakTo = savedBreak
+	ctx.BreakVarLen = savedBreakVL
+
+	// Release the scrutinee slot once, at the single exit all paths reach, then
+	// drop it from the scope.  A stale StmtGrewSP (the SP restores above were
+	// emitted directly) is cleared so it does not leak into the next statement.
+	ctx.StmtGrewSP = false
+	exitBlk = emitDecForScopeVars(ctx, exitBlk, baseVarLen)
+	ctx.Vars = ctx.Vars[:baseVarLen]
+	return exitBlk
+}
+
+// genTypeSwitchCaseBody generates one type-switch case (or default) body as its
+// own variable scope (mirroring genCaseBody), binding the switch variable FIRST
+// so a managed recovery is RefDec'd at the case's own exit.  `binderVal` (of type
+// `binderTyp`) is the narrowed value; `binder` is empty for the binderless form.
+// Emits the case's SP restore after the binder value is copied into its frame
+// slot.  Returns the block flow continues in.
+func genTypeSwitchCaseBody(ctx @GenContext, bodyBlk @Block, binder @[]char, binderVal @Instr,
+		binderTyp @types.Type, body @[]@ast.Stmt, exitBlk @Block) @Block {
+	var savedVarLen int = len(ctx.Vars)
+	var b @Block = bodyBlk
+	// Bind the switch variable into this case's scope (binder form only).  The
+	// store acquires (RefIncs a managed @T/@J) into a fresh frame slot, which the
+	// scope-exit emitDecForScopeVars then RefDecs — copying the value out of any
+	// vm.SP growth BEFORE the restore below reclaims it.
+	if len(binder) > 0 {
+		var slot @Instr = b.EmitAlloc(binderTyp)
+		b = emitStoreManagedSlot(ctx, b, slot, binderVal, binderTyp, true)
+		defineVar(ctx, binder, slot, binderTyp)
+	}
+	// Reclaim the case's comma-ok assert growth (idempotent frame-end reset), now
+	// that the recovered value is safely in the frame.
+	b.EmitSPRestore()
+
+	for j := 0; j < len(body); j++ {
+		b = genStmt(ctx, b, body[j])
+		if len(b.Instrs) > 0 && b.Instrs[len(b.Instrs) - 1].IsTerminator() {
+			// Terminated (return/break/continue): the terminator self-cleans; just
+			// drop this scope's vars.
+			ctx.Vars = ctx.Vars[:savedVarLen]
+			return b
+		}
+	}
+	b = emitDecForScopeVars(ctx, b, savedVarLen)
+	ctx.Vars = ctx.Vars[:savedVarLen]
+	if len(b.Instrs) == 0 || !b.Instrs[len(b.Instrs) - 1].IsTerminator() {
+		b.EmitJump(exitBlk)
+	}
+	return b
+}

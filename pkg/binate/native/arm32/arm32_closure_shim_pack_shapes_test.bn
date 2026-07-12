@@ -1,0 +1,366 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Byte-level tests for the arm32 SMALL-single-aggregate PACK / small-MULTI-RETURN
+// capturing-closure shim (arm32_closure_shim_pack.bn, P4-d Phase C.2 / C.3) under the
+// RICHER arg shapes the C.2/C.3 adversarial reviews flagged were untested on the PACK
+// path.  The plain 1-word-int-capture/0-user pack refs (arm32_closure_shim_pack_test.bn,
+// arm32_closure_shim_multiret_test.bn) do NOT exercise the pack framing (captureBase =
+// R5 + always-staged frame) combined with a by-address-aggregate user arg, an int64
+// register-pair user arg, an even-pair-padded int64 capture, a SPLIT (reg+stack straddle)
+// capture, or the multi-return-store × user-arg-marshal COMBINATION — even though the
+// underlying marshal helpers (emitSpillMarshalArm32 / emitClosureCaptureSpillArm32 /
+// emitClosureCaptureRegLoadSpillArm32) ARE byte-tested for those shapes at base R0/R1
+// (the scalar/void spill + C.1 sret paths).  These pin that the PACK path threads R5 —
+// not the live R1 data base — into those shared helpers under each shape.
+//
+// REFERENCE CONSTRUCTION.  Each reference is built by packRefArm32, which reproduces
+// emitClosureShimPackCoreArm32's framing (push {r4,r5,r6,lr}, SP adjust, stage r0..r3,
+// stash retbuf, re-home the data pointer, then the shared marshal body, BL, retbuf
+// reload + store, teardown) — but with the capture base supplied as a PARAMETER.  The
+// marshal body reuses the same shared helpers the implementation calls (mirroring
+// TestSpillByAddrAggReReadByteRef, which builds its reference from emitSpillSrcToRegArm32):
+// the unit under test here is the PACK CHOREOGRAPHY — that it re-homes the data pointer
+// into R5 and threads R5 (not R1) as the capture base — so a base = R1 reference must
+// DIVERGE byte-for-byte from the emitter.  Every test below asserts BOTH: the R5
+// reference matches AND the R1 (mutation) reference does not (asmTextEqSpill is byte-exact
+// — see its use in the sibling pack byte-ref tests).
+//
+// Shared helpers (mkIntCaptureClosure / intParams / int64OneParam / closureFvType /
+// aggSmallType / aggPairType / setArm32Target / buildShimArgTypesArm32 /
+// packClosure{Push,Pop}Mask / emitSpAdjust / emitFrameStore / emitFrameLoad / argReg /
+// asmTextEqSpill / fail) live in the sibling arm32 native (test) files (same package).
+
+// packRefArm32 builds the pack-shim reference for argTypes / f / fvTyp with the given
+// post-BL store (retTuple == nil -> single STR R0; else the field-per-register tuple
+// store) and the given capture base.  Passing captureBase = R5 reproduces the emitter;
+// passing R1 is the CLOBBER mutation (the live data base) each test proves diverges.
+func packRefArm32(cc common.CallConv, argTypes @[]@types.Type, f @ir.Func, fvTyp @types.Type,
+		retTuple @types.Type, captureBase int) @asm.Assembler {
+	var outBytes int = cc.CallStackBytes(argTypes)
+	var retbufOff int = outBytes
+	var stageOff int = outBytes + cc.WordBytes
+	var innerBytes int = stageOff + cc.NumGpArgRegs * cc.WordBytes
+	if innerBytes % cc.StackAlign != 0 {
+		innerBytes = innerBytes + (cc.StackAlign - innerBytes % cc.StackAlign)
+	}
+	var frameDelta int = 16 + innerBytes
+
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	arm32.Push(ref, arm32.COND_AL, packClosurePushMask()) // push {r4, r5, r6, lr}
+	emitSpAdjust(ref, false, innerBytes)
+	for g := 0; g < cc.NumGpArgRegs; g++ {
+		emitFrameStore(ref, argReg(g), stageOff + cc.WordBytes * g) // stage r0..r3
+	}
+	emitFrameStore(ref, arm32.R0, retbufOff) // stash retbuf
+	emitFrameLoad(ref, captureBase, stageOff + cc.WordBytes) // re-home data -> captureBase
+	emitClosureCaptureSpillArm32(ref, cc, f, argTypes, 0, captureBase)
+	var userTypes @[]@types.Type = shimUserTypesArm32(fvTyp)
+	emitSpillMarshalArm32(ref, cc, argTypes, f.NumCaptureParams, userTypes, 2, frameDelta, stageOff,
+			true)
+	emitClosureCaptureRegLoadSpillArm32(ref, cc, f, argTypes, 0, captureBase)
+	ref.SetGlobal("bn_ul")
+	arm32.Bl(ref, arm32.COND_AL, "bn_ul")
+	emitFrameLoad(ref, arm32.R4, retbufOff) // reload retbuf
+	if retTuple == nil {
+		arm32.Str(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R4, 0)) // by-value word
+	} else {
+		storeMultiReturnTupleFieldsArm32(ref, retTuple, arm32.R4, 0, cc.NumGpRetRegs, cc.WordBytes,
+				arm32.IP)
+	}
+	emitSpAdjust(ref, true, innerBytes)
+	arm32.Pop(ref, arm32.COND_AL, packClosurePopMask()) // pop {r4, r5, r6, pc}
+	return ref
+}
+
+// checkPackShapeArm32 emits the closure shim for (fv, f), asserts it matches the R5-based
+// packRefArm32 reference, and asserts the R1-base (clobber) mutation reference DIVERGES.
+// retTuple selects the single-aggregate (nil) vs tuple post-BL store.  Returns "" on
+// success, else a failure message keyed on `what`.
+func checkPackShapeArm32(fv @types.Type, f @ir.Func, retTuple @types.Type,
+		what *[]readonly char) testing.TestResult {
+	var cc common.CallConv = common.AAPCS32()
+	var argTypes @[]@types.Type = buildShimArgTypesArm32(fv, f)
+
+	var got @asm.Assembler = asm.New(4)
+	got.SetSection("text", -1)
+	emitClosureShimArm32(got, "bn_ul", fv, f)
+	if got.HasError { return fail(what) }
+
+	var ref @asm.Assembler = packRefArm32(cc, argTypes, f, fv, retTuple, arm32.R5)
+	if !asmTextEqSpill(got, ref) {
+		return fail(what)
+	}
+	// MUTATION-VERIFY: the same reference with captureBase = the LIVE R1 data base (the
+	// clobber the R5 re-home exists to prevent) must produce DIFFERENT bytes — else the
+	// R5 threading is not actually pinned.
+	var mut @asm.Assembler = packRefArm32(cc, argTypes, f, fv, retTuple, arm32.R1)
+	if asmTextEqSpill(got, mut) {
+		return fail(what)
+	}
+	return ""
+}
+
+// aggUserParamArm32 builds a single user param of the given aggregate type.
+func aggUserParamArm32(t @types.Type) @[]@types.Param {
+	var params @[]@types.Param = make_slice(@types.Param, 1)
+	params[0] = make(types.Param)
+	params[0].Type = t
+	return params
+}
+
+// (a) A 1-int-capture / 1-BY-ADDRESS-AGGREGATE-user (an 8-byte Pair) closure returning a
+// SMALL aggregate.  The Pair arrives as ONE by-address dispatch word but the underlying
+// reads its 2 value-words from that buffer (emitSpillByAddrAggArm32) into the classifier's
+// post-capture regs (cap0 -> R0, Pair -> R1:R2 under the no-prefix pack classify) — under
+// the PACK frame (staged, captureBase = R5).  Pins that the by-address-agg marshal runs
+// correctly beneath the pack frame (data re-homed to R5, not the live R1).
+func TestClosureShimPackByAddrAggUserByteRef() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(1, aggUserParamArm32(aggPairType()))
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = aggSmallType()
+	var fv @types.Type = closureFvType(aggUserParamArm32(aggPairType()), results)
+	// Confirm the Pair is a by-address aggregate (the shape under test) and rides regs
+	// R1:R2 (past cap0 at R0), not the stack, so it exercises emitSpillByAddrAggArm32's
+	// register-fit path under the pack frame.
+	var cc common.CallConv = common.AAPCS32()
+	var argTypes @[]@types.Type = buildShimArgTypesArm32(fv, f)
+	if !isByAddressAggArm32(cc, aggPairType()) {
+		return fail("test setup: Pair must be a by-address aggregate")
+	}
+	if cc.CallArgRegStart(argTypes, 1) != 1 || cc.CallArgStackOff(argTypes, 1) >= 0 {
+		return fail("test setup: Pair user arg must ride regs R1:R2 (register-fit)")
+	}
+	return checkPackShapeArm32(fv, f, nil,
+			"1-cap/by-address-aggregate-user pack closure shim bytes must match the "
+					"framed-BL reference (data re-homed to R5, Pair value-words marshalled from "
+					"its buffer to R1:R2 under the pack frame) and DIVERGE from the R1-base clobber")
+}
+
+// (b1) A 1-int-capture / 1-INT64-user closure returning a SMALL aggregate.  The int64
+// user is a register-pair scalar that keeps its real type in the dispatch
+// (paddedKeepsTypeArm32): under the no-prefix pack classify cap0 -> R0, then the int64
+// even-pair-pads (pad R1) to R2:R3.  Pins the int64 user-arg incoming/outgoing even-pair
+// pad under the PACK frame (captureBase = R5).
+func TestClosureShimPackInt64UserByteRef() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(1, int64OneParam())
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = aggSmallType()
+	var fv @types.Type = closureFvType(int64OneParam(), results)
+	var cc common.CallConv = common.AAPCS32()
+	var argTypes @[]@types.Type = buildShimArgTypesArm32(fv, f)
+	// The int64 user (classify index 1) even-pair-pads to R2 (pad R1) past cap0 at R0.
+	if cc.CallArgRegStart(argTypes, 1) != 2 {
+		return fail("test setup: int64 user must even-pair-pad to R2")
+	}
+	return checkPackShapeArm32(fv, f, nil,
+			"1-cap/int64-user pack closure shim bytes must match the framed-BL reference "
+					"(int64 even-pair-padded to R2:R3 past cap0 at R0, data base R5) and DIVERGE "
+					"from the R1-base clobber")
+}
+
+// mkPadCapClosureArm32 builds a 2-capture closure whose captures are [int, int64]: the
+// int64 capture (classify index 1) even-pair-pads (dense cursor 1 is odd -> pad R1 ->
+// R2:R3), a paddedKeepsTypeArm32 INCOMING even-pair pad on the capture side.
+func mkPadCapClosureArm32() @ir.Func {
+	var fields @[]@types.Field = make_slice(@types.Field, 2)
+	fields[0] = make(types.Field)
+	fields[0].Type = types.TypInt()
+	fields[1] = make(types.Field)
+	fields[1].Type = types.TypInt64()
+	var f @ir.Func = make(ir.Func)
+	f.Name = "main.__padcap"
+	f.IsClosure = true
+	f.NumCaptureParams = 2
+	f.ClosureStruct = types.MakeStructType("__closure_padcap", fields)
+	var noP @[]@ir.Param
+	f.Params = noP
+	var noR @[]@types.Type
+	f.Results = noR
+	return f
+}
+
+// (b2) An EVEN-PAIR-PADDED int64 CAPTURE under the pack frame: [int, int64] captures, 0
+// users, small-aggregate result.  cap0 -> R0, cap1(int64) even-pair-pads (pad R1) to
+// R2:R3 — a capture pad the plain-int pack refs never hit.  Pins that the pack path
+// places the padded capture at its classifier position (R2:R3) via the R5 base.
+func TestClosureShimPackInt64CaptureEvenPairByteRef() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkPadCapClosureArm32()
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = aggSmallType()
+	var noParams @[]@types.Param
+	var fv @types.Type = closureFvType(noParams, results)
+	var cc common.CallConv = common.AAPCS32()
+	var argTypes @[]@types.Type = buildShimArgTypesArm32(fv, f)
+	// cap1 (int64) even-pair-pads to R2 (pad R1) — an odd-dense-cursor capture pad.
+	if cc.CallArgRegStart(argTypes, 1) != 2 {
+		return fail("test setup: int64 capture must even-pair-pad to R2")
+	}
+	return checkPackShapeArm32(fv, f, nil,
+			"even-pair-padded int64-capture pack closure shim bytes must match the framed-BL "
+					"reference (cap1 placed at R2:R3 past pad R1, all from the R5 base) and DIVERGE "
+					"from the R1-base clobber")
+}
+
+// mkSplitCapClosureArm32 builds a 4-capture closure [int, int, int, S2] where S2 is a
+// 2-word struct: cap0..2 fill R0..R2, and cap3 (S2) STRADDLES — its first word rides R3,
+// its second word spills to the outgoing stack (a SPLIT capture, reg + stack).
+func mkSplitCapClosureArm32() @ir.Func {
+	var s2 @[]@types.Field = make_slice(@types.Field, 2)
+	s2[0] = make(types.Field)
+	s2[0].Type = types.TypInt()
+	s2[1] = make(types.Field)
+	s2[1].Type = types.TypInt()
+	var s2ty @types.Type = types.MakeStructType("S2", s2)
+	var fields @[]@types.Field = make_slice(@types.Field, 4)
+	for i := 0; i < 3; i++ {
+		fields[i] = make(types.Field)
+		fields[i].Type = types.TypInt()
+	}
+	fields[3] = make(types.Field)
+	fields[3].Type = s2ty
+	var f @ir.Func = make(ir.Func)
+	f.Name = "main.__splitcap"
+	f.IsClosure = true
+	f.NumCaptureParams = 4
+	f.ClosureStruct = types.MakeStructType("__closure_splitcap", fields)
+	var noP @[]@ir.Param
+	f.Params = noP
+	var noR @[]@types.Type
+	f.Results = noR
+	return f
+}
+
+// (c) A SPLIT (reg+stack straddle) CAPTURE under the pack frame: [int, int, int, S2(2
+// words)] captures, 0 users, small-aggregate result.  cap3 (S2) rides R3 for its first
+// word and spills its second word to the outgoing stack — exercising BOTH
+// emitClosureCaptureSpillArm32 (the spilled tail word, memory->memory via R4) AND
+// emitClosureCaptureRegLoadSpillArm32 (the R3 reg word) under the pack frame's R5 base.
+func TestClosureShimPackSplitCaptureByteRef() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkSplitCapClosureArm32()
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = aggSmallType()
+	var noParams @[]@types.Param
+	var fv @types.Type = closureFvType(noParams, results)
+	var cc common.CallConv = common.AAPCS32()
+	var argTypes @[]@types.Type = buildShimArgTypesArm32(fv, f)
+	// cap3 must STRADDLE: a reg part (regStart 3) AND a stack part (stackOff >= 0).
+	if cc.CallArgRegStart(argTypes, 3) != 3 || cc.CallArgStackOff(argTypes, 3) < 0 {
+		return fail("test setup: cap3 (S2) must SPLIT — reg word at R3 + stack tail")
+	}
+	return checkPackShapeArm32(fv, f, nil,
+			"split-capture (reg R3 + stack tail) pack closure shim bytes must match the "
+					"framed-BL reference (the spilled tail and the R3 reg word both from the R5 "
+					"base) and DIVERGE from the R1-base clobber")
+}
+
+// (C.3) A 1-int-capture / 2-INT-user SMALL multi-return (int, int) closure — the multi-
+// return-store × user-arg-marshal COMBINATION at the shim level.  cap0 -> R0, user0 ->
+// R1, user1 -> R2 under the no-prefix pack classify; the post-BL store is the field-per-
+// register tuple store (r0 -> [retbuf+0], r1 -> [retbuf+4]).  Pins that the C.3 small-
+// multiret path marshals user args AND stores the tuple fields correctly under the pack
+// frame's R5 base — the plain-int C.3 refs use 0 user args, so this is the first combined
+// coverage.
+func TestClosureShimMultiRetSmall1Cap2UserByteRef() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(1, intParams(2))
+	var results @[]@types.Type = intResultsMulti(2) // (int, int) -> gpWords 2 -> small pack
+	var fv @types.Type = closureFvType(intParams(2), results)
+	var tuple @types.Type = funcValMultiReturnTupleArm32(fv)
+	return checkPackShapeArm32(fv, f, tuple,
+			"1-cap/2-user small-multiret closure shim bytes must match the framed-BL "
+					"reference (users marshalled to R1:R2 past cap0 at R0, tuple fields r0/r1 "
+					"stored through the reloaded retbuf, data base R5) and DIVERGE from the "
+					"R1-base clobber")
+}
+
+// (Task 2) An empty-struct (`struct{}`, SizeOf 0) result routes to the PACK path (SizeOf
+// 0 <= InternalSretBytes 4) yet carries NO data — its retbuf is a 0-byte buffer.  The
+// emitter must SKIP the post-BL by-value store (and its retbuf reload) rather than
+// STR R0 a garbage word past the 0-byte buffer's end (a silent memory corruption).  A
+// `func() struct{}` closure IS reachable — it compiles on the LLVM backend, and
+// conformance 1029 has zero-size struct values — so this is not a dead case.  The
+// reference is the pack framing with NO retbuf-reload / store tail; it must match, and a
+// non-empty single-int-struct pack shim (which DOES store) must be strictly longer.
+func TestClosureShimPackEmptyStructResultSkipsStore() testing.TestResult {
+	setArm32Target()
+	var cc common.CallConv = common.AAPCS32()
+	var f @ir.Func = mkIntCaptureClosure(1, intParams(0))
+	var noFields @[]@types.Field
+	var empty @types.Type = types.MakeStructType("Empty", noFields)
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = empty
+	var noParams @[]@types.Param
+	var fv @types.Type = closureFvType(noParams, results)
+	// The empty struct is an aggregate of SizeOf 0 that routes to the pack path.
+	if empty.SizeOf() != 0 {
+		return fail("test setup: struct{} must have SizeOf 0")
+	}
+	if !shimReturnIsSmallPackAggregateArm32(cc, fv) {
+		return fail("test setup: struct{} result must route to the pack path")
+	}
+
+	var got @asm.Assembler = asm.New(4)
+	got.SetSection("text", -1)
+	emitClosureShimArm32(got, "bn_ul", fv, f)
+	if got.HasError { return fail("empty-struct-result pack closure shim must not error") }
+
+	// Reference: the pack framing with the post-BL store tail elided (retTuple nil AND
+	// the empty-result skip fires, so packRefArm32's store tail is wrong here — build the
+	// no-store reference explicitly).
+	var argTypes @[]@types.Type = buildShimArgTypesArm32(fv, f)
+	var outBytes int = cc.CallStackBytes(argTypes)
+	var retbufOff int = outBytes
+	var stageOff int = outBytes + cc.WordBytes
+	var innerBytes int = stageOff + cc.NumGpArgRegs * cc.WordBytes
+	if innerBytes % cc.StackAlign != 0 {
+		innerBytes = innerBytes + (cc.StackAlign - innerBytes % cc.StackAlign)
+	}
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	arm32.Push(ref, arm32.COND_AL, packClosurePushMask())
+	emitSpAdjust(ref, false, innerBytes)
+	for g := 0; g < cc.NumGpArgRegs; g++ {
+		emitFrameStore(ref, argReg(g), stageOff + cc.WordBytes * g)
+	}
+	emitFrameStore(ref, arm32.R0, retbufOff) // stash retbuf (unused, but still staged/stashed)
+	emitFrameLoad(ref, arm32.R5, stageOff + cc.WordBytes) // re-home data -> R5
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R5, 0)) // capture0 -> R0
+	ref.SetGlobal("bn_ul")
+	arm32.Bl(ref, arm32.COND_AL, "bn_ul")
+	// NO retbuf reload, NO store: the 0-byte result carries nothing.
+	emitSpAdjust(ref, true, innerBytes)
+	arm32.Pop(ref, arm32.COND_AL, packClosurePopMask())
+
+	if !asmTextEqSpill(got, ref) {
+		return fail(
+				"empty-struct-result pack closure shim must SKIP the post-BL store (framed BL "
+						"with no retbuf-reload / STR R0 tail) — a 0-byte retbuf must not be "
+						"4-byte-overwritten")
+	}
+	// A non-empty single-int-struct pack shim (identical shape but a nonzero result) DOES
+	// reload the retbuf and store R0 — so it must be strictly longer, proving the empty
+	// case elided exactly those two instructions.
+	var f2 @ir.Func = mkIntCaptureClosure(1, intParams(0))
+	var results2 @[]@types.Type = make_slice(@types.Type, 1)
+	results2[0] = aggSmallType()
+	var fv2 @types.Type = closureFvType(noParams, results2)
+	var got2 @asm.Assembler = asm.New(4)
+	got2.SetSection("text", -1)
+	emitClosureShimArm32(got2, "bn_ul", fv2, f2)
+	if got.Sections[0].Len >= got2.Sections[0].Len {
+		return fail("empty-struct-result shim must be shorter than the storing pack shim")
+	}
+	return ""
+}

@@ -1,0 +1,158 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Native arm32 emission for the SMALL-single-aggregate PACK-RESULT path of a
+// capturing closure / method-value shim (P4-d Phase C.2 of plan-native-arm32.md) —
+// the sibling of the C.1 big-single-aggregate SRET path
+// (arm32_closure_shim_aggregate.bn).  Split out to stay under the hygiene file-length
+// cap.  Reuses the arm32 NON-closure spill machinery (emitSpillMarshalArm32 +
+// emitClosureCaptureSpillArm32 / emitClosureCaptureRegLoadSpillArm32) with a CAPTURE
+// (no-sret-prefix) classify, because the underlying takes NO retbuf arg — it returns
+// the <=4-byte aggregate BY VALUE in R0.
+//
+// The shim is entered under the aggregate-return dispatch ABI (emitCallFuncValue):
+//
+//     R0 = retbuf   (address of the caller's result buffer)
+//     R1 = data     (the closure-struct pointer)
+//     R2.. = user args
+//
+// The underlying lifted body's REAL ABI is `underlying(captures…, users…)`: it takes
+// NO retbuf (a <=4-byte aggregate is returned by value in R0), so captures classify
+// DENSELY from R0 (classifyOff = 0, regBase = 0 — the same origin the SCALAR closure
+// shim uses) and the users follow.  So — unlike C.1 sret — the shim runs a FRAMED BL
+// (not a tail-branch): it saves the retbuf, marshals captures + users, BLs the
+// underlying, then stores the returned R0 word through the retbuf.
+//
+// THE CRUX (why pack differs from C.1 sret).  For sret the capture base is R1 and
+// capture 0 classifies at R1 (past the R0 retbuf slot), so capture 0's DESTINATION ==
+// the base register, and the right-to-left load keeps R1 live until capture 0 loads
+// last.  For PACK that does NOT hold: captures classify from R0, so capture 0's
+// destination is R0 but the data base is entry R1.  A capture at classify-index 1
+// targets R1 and — under the right-to-left capture load — loads BEFORE capture 0,
+// which would CLOBBER the R1 data base before capture 0 (targeting R0) reads its field
+// from [R1].  Worse, the user marshal writes R(NumCaptureParams)..; when there is 1
+// capture the users start at R1, so the marshal too would overwrite the R1 data base.
+// Either is a SILENT MISCOMPILE.
+//
+// CLOBBER-SAFE BASE.  The shim stages every incoming GP dispatch reg (r0..r3) to the
+// frame, then RE-HOMES the data pointer into R5 (a callee-saved register the shim
+// saves in its entry push) by loading it from the staged data slot.  R5 is distinct
+// from R4 (the capture-spill memory→memory shuttle / the post-BL retbuf holder) and is
+// never a capture-load or user-marshal destination (captures fill R0.., users follow,
+// both scratch through R4 / IP only), so it survives from the staged-slot load through
+// the final capture register load.  Every capture read then addresses [R5 + FieldOffset]
+// — immune to the R1 / R0.. clobbers above.  This is the task's "re-home the base to a
+// callee-saved register" option; it costs one extra saved register (R5) over the C.1
+// sret spill's push, resolved by widening the entry push to {r4, r5, r6, lr} (16 bytes,
+// 8-aligned — R6 is unused, present only to keep the push an even register count).
+//
+// RETBUF-SAVE REGISTER PRESSURE.  The non-closure pack (emitPackShim) parks the retbuf
+// in R4 across the whole shim.  Here R4 is ALSO the capture-spill shuttle (a stack-bound
+// capture word loads to R4, then stores to the outgoing stack), so R4 cannot hold the
+// retbuf across the marshal.  The retbuf is instead STASHED to a dedicated frame slot
+// (retbufOff) and reloaded into R4 only AFTER the BL — exactly the non-closure PACK
+// SPILL's split (emitFuncvalSpillShimArm32's usePack arm) — so R4 is free as the shuttle
+// during the marshal and holds the retbuf only for the single post-BL store.
+
+// emitClosureShimPackArm32 emits the small-single-aggregate PACK capturing-closure /
+// method-value shim (Phase C.2).  argTypes is the outgoing captures++users type list
+// the caller (emitClosureShimArm32) already built.  The shim is ALWAYS framed (a pack
+// return needs a real BL — the underlying returns the aggregate by value in R0, which
+// the shim stores through the retbuf), and ALWAYS stages r0..r3 so the R5-based capture
+// reads are clobber-safe (see THE CRUX).  Register-fit and over-budget captures/users
+// share this one path: the classifier places each capture/user at its authoritative
+// R0.. reg or outgoing-stack slot, so a capture even-pair pad, a SPLIT capture, and an
+// over-budget user arg are all handled by the shared spill helpers — no separate
+// frameless path (a pack shim can never tail-branch).
+func emitClosureShimPackArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type, f @ir.Func,
+		cc common.CallConv, argTypes @[]@types.Type) {
+	// outBytes = the outgoing-args area for the FULL captures++users call (a stack-bound
+	// capture's SPLIT tail and an over-budget user arg spill).  Captures classify DENSELY
+	// from R0 (no retbuf/data prefix — the underlying returns by value, taking no sret
+	// arg), so the classify list is argTypes as-is (no prependSretPtr, unlike C.1).
+	// CallStackBytes already rounds to StackAlign (8).
+	var outBytes int = cc.CallStackBytes(argTypes)
+	var savedBytes int = 16
+	// Inner layout (low→high, all below the {r4,r5,r6,lr} save):
+	//   [0, outBytes)                        outgoing-args (8-rounded already)
+	//   [retbufOff, +WordBytes)              retbuf save (reloaded post-BL)
+	//   [stageOff, +NumGpArgRegs*WordBytes)  clobber-safe staging of r0..r3
+	var retbufOff int = outBytes
+	var stageOff int = outBytes + cc.WordBytes
+	var innerBytes int = stageOff + cc.NumGpArgRegs * cc.WordBytes
+	if innerBytes % cc.StackAlign != 0 {
+		innerBytes = innerBytes + (cc.StackAlign - innerBytes % cc.StackAlign)
+	}
+	// frameDelta = the SP decrement from shim entry ({r4,r5,r6,lr} save + inner area),
+	// used by the spill marshal to address the dispatch caller's incoming-overflow words.
+	var frameDelta int = savedBytes + innerBytes
+
+	// push {r4, r5, r6, lr}: save the caller's R4 (memory→memory shuttle + post-BL
+	// retbuf holder), R5 (the re-homed data base), R6 (unused — even-count alignment
+	// padding), and LR (the BL clobbers it).  Four registers keep SP 8-aligned (AAPCS32).
+	arm32.Push(a, arm32.COND_AL, packClosurePushMask())
+	if innerBytes > 0 {
+		emitSpAdjust(a, false, innerBytes)
+	}
+	// Stage r0..r3 before any outgoing write; the user marshal reads register-source
+	// words from [sp + stageOff + WordBytes*g], and the data base is re-homed from the
+	// staged data slot below.  emitFrameStore (not a raw STR) materializes a large stageOff
+	// into IP (argReg(g) is R0..R3, never IP — no aliasing).
+	for g := 0; g < cc.NumGpArgRegs; g++ {
+		emitFrameStore(a, argReg(g), stageOff + cc.WordBytes * g)
+	}
+	// Stash the retbuf (staged at g=0) to its dedicated slot; reloaded into R4 post-BL.
+	// R0 is still live here (nothing has overwritten it yet), so store it directly.
+	emitFrameStore(a, arm32.R0, retbufOff)
+	// Re-home the data pointer (entry R1, staged at g=1) into R5 — the clobber-safe
+	// capture base (see THE CRUX).  R5 is untouched by the marshal and capture loads
+	// below, so this one load carries the base through to the final capture register load.
+	emitFrameLoad(a, arm32.R5, stageOff + cc.WordBytes)
+	// Step: spill stack-bound capture words from the re-homed base (R5), classified over
+	// argTypes at index i (classifyOff = 0 — no sret prefix).  The shuttle is R4 (freed
+	// for reuse as the post-BL retbuf holder), the address scratch IP.
+	emitClosureCaptureSpillArm32(a, cc, f, argTypes, 0, arm32.R5)
+	// Step: marshal the user args over the CAPTURE-PREFIX classify (argTypes =
+	// captures++users, classifyBase = NumCaptureParams, srcPrefix = 2 drops retbuf +
+	// data).  staged = true (every incoming word was staged above).
+	var userTypes @[]@types.Type = shimUserTypesArm32(fvTyp)
+	emitSpillMarshalArm32(a, cc, argTypes, f.NumCaptureParams, userTypes, 2, frameDelta, stageOff,
+			true)
+	// Step: load register-bound capture words from R5 into their outgoing regs, right-to-
+	// left, classified over argTypes at index i (classifyOff = 0).  The base is R5 (NOT
+	// R0/R1), so capture 1 targeting R1 no longer clobbers the base before capture 0's
+	// [R5 + 0] read (THE CRUX).
+	emitClosureCaptureRegLoadSpillArm32(a, cc, f, argTypes, 0, arm32.R5)
+	// Step: BL the underlying (returns the <=4-byte aggregate by value in R0).
+	a.SetGlobal(fnLabel)
+	arm32.Bl(a, arm32.COND_AL, fnLabel)
+	// Reload the stashed retbuf into R4 and store the returned R0 word through it.
+	emitFrameLoad(a, arm32.R4, retbufOff)
+	arm32.Str(a, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R4, 0))
+	// Tear down the frame and return.
+	if innerBytes > 0 {
+		emitSpAdjust(a, true, innerBytes)
+	}
+	arm32.Pop(a, arm32.COND_AL, packClosurePopMask())
+}
+
+// packClosurePushMask is the {r4, r5, r6, lr} register mask (bit i = register i) for
+// the pack closure shim's entry push: save the caller's R4 (memory→memory shuttle +
+// post-BL retbuf holder), R5 (the re-homed clobber-safe data base), R6 (unused — even-
+// count alignment padding to keep SP 8-aligned across the push), and LR (the BL clobbers
+// it).  Wider than the scalar/sret closure spill's {r4, lr} because pack needs the
+// extra callee-saved R5 for the data base (see THE CRUX in the file header).
+func packClosurePushMask() int {
+	return (1 << arm32.R4) | (1 << arm32.R5) | (1 << arm32.R6) | (1 << arm32.LR)
+}
+
+// packClosurePopMask is the {r4, r5, r6, pc} register mask for the pack closure shim's
+// exit pop: restore the caller's R4 / R5 / R6 and load the saved LR into PC to return.
+func packClosurePopMask() int {
+	return (1 << arm32.R4) | (1 << arm32.R5) | (1 << arm32.R6) | (1 << arm32.PC)
+}

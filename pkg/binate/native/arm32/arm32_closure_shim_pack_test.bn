@@ -1,0 +1,237 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Byte-level tests for the arm32 SMALL-single-aggregate PACK capturing-closure /
+// method-value shim (arm32_closure_shim_pack.bn, P4-d Phase C.2), plus the float-in-
+// small-aggregate-result P5 fail-loud guard.  Each shape is compared byte-for-byte
+// against a hand-built reference so the PACK register choreography is pinned: the shim
+// runs a FRAMED BL (a pack return can never tail-branch), stages r0..r3, RE-HOMES the
+// data pointer into R5 (the clobber-safe capture base — THE CRUX), marshals captures +
+// users, BLs, then stores the returned-by-value R0 word through the reloaded retbuf.
+// The capture-base-survival mutation (a >=2-capture closure whose capture 1 targets R1)
+// is the load-bearing case: the reference reads captures from R5, so a captureBase=R1
+// (live-data-base) mutation FAILS it.  End-to-end behavior is covered by conformance
+// (capturing-closure-aggregate-return's small 4-byte closure) in
+// builder-comp_native_arm32_baremetal; these pin the register-level correctness a smoke
+// run cannot see.
+//
+// Shared helpers (mkIntCaptureClosure / intParams / closureFvType / aggSmallType /
+// setArm32Target / packClosure{Push,Pop}Mask / emitSpAdjust / asmTextEqSpill / fail)
+// live in the sibling arm32 native test files (same package).
+
+// A 1-int-capture / 0-user closure returning a SMALL (4-byte) aggregate is the minimal
+// PACK shape.  Entered as (retbuf R0, data R1); the underlying is
+// underlying(capture@R0) returning the 4-byte aggregate BY VALUE in R0.  Framed, staged:
+//   PUSH {r4, r5, r6, lr}
+//   SUB SP, SP, #24         ; retbufOff=0, stageOff=4, innerBytes=4+4*4=20 -> 24
+//   STR R0, [SP, #4]        ; stage g=0 (retbuf)
+//   STR R1, [SP, #8]        ; stage g=1 (data)
+//   STR R2, [SP, #12]       ; stage g=2 (unused)
+//   STR R3, [SP, #16]       ; stage g=3 (unused)
+//   STR R0, [SP, #0]        ; stash retbuf (retbufOff=0)
+//   LDR R5, [SP, #8]        ; re-home data base -> R5 (staged data g=1)
+//   ; (no stack-bound captures; no users)
+//   LDR R0, [R5, #0]        ; capture0 -> R0 from the R5 base (NOT live R1)
+//   BL underlying           ; returns the 4-byte aggregate by value in R0
+//   LDR R4, [SP, #0]        ; reload retbuf
+//   STR R0, [R4, #0]        ; store the by-value result through retbuf
+//   ADD SP, SP, #24
+//   POP {r4, r5, r6, pc}
+func TestClosureShimPack1Cap0UserByteRef() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(1, intParams(0))
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = aggSmallType() // 4-byte struct -> small (pack) aggregate return
+	var noParams @[]@types.Param
+	var fv @types.Type = closureFvType(noParams, results)
+
+	var got @asm.Assembler = asm.New(4)
+	got.SetSection("text", -1)
+	emitClosureShimArm32(got, "bn_ul", fv, f)
+	if got.HasError { return fail("1-cap/0-user pack closure shim must not error") }
+
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	arm32.Push(ref, arm32.COND_AL, packClosurePushMask()) // push {r4, r5, r6, lr}
+	emitSpAdjust(ref, false, 24) // sub sp, sp, #24
+	arm32.Str(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.SP, 4)) // stage g=0 (retbuf)
+	arm32.Str(ref, arm32.COND_AL, arm32.R1, arm32.MemImm(arm32.SP, 8)) // stage g=1 (data)
+	arm32.Str(ref, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.SP, 12)) // stage g=2
+	arm32.Str(ref, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.SP, 16)) // stage g=3
+	arm32.Str(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.SP, 0)) // stash retbuf
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R5, arm32.MemImm(arm32.SP, 8)) // re-home data -> R5
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R5, 0)) // capture0 -> R0 (from R5)
+	ref.SetGlobal("bn_ul")
+	arm32.Bl(ref, arm32.COND_AL, "bn_ul")
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, 0)) // reload retbuf
+	arm32.Str(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R4, 0)) // store result through retbuf
+	emitSpAdjust(ref, true, 24) // add sp, sp, #24
+	arm32.Pop(ref, arm32.COND_AL, packClosurePopMask()) // pop {r4, r5, r6, pc}
+
+	if !asmTextEqSpill(got, ref) {
+		return fail(
+				"1-cap/0-user pack closure shim bytes must match the framed-BL reference "
+						"(stage r0..r3, re-home data to R5, capture from R5, bl, store R0 through "
+						"the reloaded retbuf, teardown)")
+	}
+	return ""
+}
+
+// THE CRUX capture-base-survival mutation test.  A 2-int-capture / 0-user closure
+// returning a SMALL aggregate: capture 0 -> R0, capture 1 -> R1.  The captures load
+// RIGHT-TO-LEFT (capture 1 first, capture 0 last).  If the base were the LIVE R1 (the
+// entry data pointer), loading capture 1 (LDR R1, [R1, #4]) would CLOBBER the base
+// before capture 0 (LDR R0, [R1, #0]) reads its field — a silent miscompile.  The pack
+// shim re-homes the base into R5, so both loads read [R5 + ofs]:
+//   ... push / sub / stage r0..r3 / stash retbuf / re-home data -> R5 ...
+//   LDR R1, [R5, #4]        ; capture1 -> R1 (right-to-left, first) from the R5 base
+//   LDR R0, [R5, #0]        ; capture0 -> R0 (last) from the R5 base
+//   BL underlying ; reload retbuf ; store R0 ; teardown
+// MUTATION-VERIFY: a captureBase = live R1 (instead of R5) would emit
+// `LDR R1,[R1,#4]; LDR R0,[R1,#0]` — clobbering the base at capture 1.  This reference
+// (both loads from R5) FAILS under that captureBase=R1 mutation, proving the base
+// survives.
+func TestClosureShimPack2Cap0UserCaptureBaseSurvivesByteRef() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(2, intParams(0))
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = aggSmallType()
+	var noParams @[]@types.Param
+	var fv @types.Type = closureFvType(noParams, results)
+
+	var got @asm.Assembler = asm.New(4)
+	got.SetSection("text", -1)
+	emitClosureShimArm32(got, "bn_ul", fv, f)
+	if got.HasError { return fail("2-cap/0-user pack closure shim must not error") }
+
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	arm32.Push(ref, arm32.COND_AL, packClosurePushMask())
+	emitSpAdjust(ref, false, 24)
+	arm32.Str(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.SP, 4)) // stage g=0 (retbuf)
+	arm32.Str(ref, arm32.COND_AL, arm32.R1, arm32.MemImm(arm32.SP, 8)) // stage g=1 (data)
+	arm32.Str(ref, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.SP, 12)) // stage g=2
+	arm32.Str(ref, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.SP, 16)) // stage g=3
+	arm32.Str(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.SP, 0)) // stash retbuf
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R5, arm32.MemImm(arm32.SP, 8)) // re-home data -> R5
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R1, arm32.MemImm(arm32.R5, 4)) // capture1 -> R1 (from R5)
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R5, 0)) // capture0 -> R0 (from R5)
+	ref.SetGlobal("bn_ul")
+	arm32.Bl(ref, arm32.COND_AL, "bn_ul")
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, 0)) // reload retbuf
+	arm32.Str(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R4, 0)) // store result through retbuf
+	emitSpAdjust(ref, true, 24)
+	arm32.Pop(ref, arm32.COND_AL, packClosurePopMask())
+
+	if !asmTextEqSpill(got, ref) {
+		return fail(
+				"2-cap/0-user pack closure shim bytes must match the R5-based capture loads "
+						"(capture1 -> R1 and capture0 -> R0 BOTH from [R5], not the live R1 base) — "
+						"the capture-base-survival crux")
+	}
+	return ""
+}
+
+// A 3-int-capture / 2-int-user closure returning a SMALL aggregate OVER-BUDGETS the 4
+// GP arg regs under the pack (no-prefix) classify (cap0..cap2 -> R0..R2, user0 -> R3,
+// user1 spills to the outgoing stack), exercising the shared spill marshal AND the
+// register-capture loads together.  Byte-compared against the hand-built reference:
+//   PUSH {r4, r5, r6, lr}
+//   SUB SP, SP, #32         ; outBytes=8, retbufOff=8, stageOff=12, inner=12+16=28 -> 32
+//   STR R0, [SP, #12]       ; stage g=0 (retbuf)
+//   STR R1, [SP, #16]       ; stage g=1 (data)
+//   STR R2, [SP, #20]       ; stage g=2 (user0 incoming, srcPrefix 2)
+//   STR R3, [SP, #24]       ; stage g=3 (user1 incoming)
+//   STR R0, [SP, #8]        ; stash retbuf (retbufOff=8)
+//   LDR R5, [SP, #16]       ; re-home data base -> R5 (staged data g=1)
+//   ; (no stack-bound captures: caps 0..2 ride R0..R2)
+//   ; user marshal (classifyBase = 3, srcPrefix = 2): user0 -> R3, user1 -> stack[0]:
+//   LDR R3, [SP, #20]       ; user0 (staged g=2) -> R3
+//   LDR R4, [SP, #24]       ; user1 (staged g=3) -> outgoing stack[0] via R4
+//   STR R4, [SP, #0]
+//   ; register captures right-to-left from R5 (cap0 last):
+//   LDR R2, [R5, #8]        ; capture2 -> R2
+//   LDR R1, [R5, #4]        ; capture1 -> R1
+//   LDR R0, [R5, #0]        ; capture0 -> R0
+//   BL underlying
+//   LDR R4, [SP, #8]        ; reload retbuf
+//   STR R0, [R4, #0]        ; store result through retbuf
+//   ADD SP, SP, #32
+//   POP {r4, r5, r6, pc}
+func TestClosureShimPack3Cap2UserStackSpillByteRef() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(3, intParams(2))
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = aggSmallType()
+	var fv @types.Type = closureFvType(intParams(2), results)
+
+	var got @asm.Assembler = asm.New(4)
+	got.SetSection("text", -1)
+	emitClosureShimArm32(got, "bn_ul", fv, f)
+	if got.HasError { return fail("3-cap/2-user pack closure spill shim must not error") }
+
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	arm32.Push(ref, arm32.COND_AL, packClosurePushMask())
+	emitSpAdjust(ref, false, 32)
+	arm32.Str(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.SP, 12)) // stage g=0 (retbuf)
+	arm32.Str(ref, arm32.COND_AL, arm32.R1, arm32.MemImm(arm32.SP, 16)) // stage g=1 (data)
+	arm32.Str(ref, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.SP, 20)) // stage g=2 (user0)
+	arm32.Str(ref, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.SP, 24)) // stage g=3 (user1)
+	arm32.Str(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.SP, 8)) // stash retbuf
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R5, arm32.MemImm(arm32.SP, 16)) // re-home data -> R5
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.SP, 20)) // user0 -> R3
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, 24)) // user1 -> stack[0]
+	arm32.Str(ref, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, 0))
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.R5, 8)) // capture2 -> R2
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R1, arm32.MemImm(arm32.R5, 4)) // capture1 -> R1
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R5, 0)) // capture0 -> R0 (last)
+	ref.SetGlobal("bn_ul")
+	arm32.Bl(ref, arm32.COND_AL, "bn_ul")
+	arm32.Ldr(ref, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, 8)) // reload retbuf
+	arm32.Str(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R4, 0)) // store result through retbuf
+	emitSpAdjust(ref, true, 32)
+	arm32.Pop(ref, arm32.COND_AL, packClosurePopMask())
+
+	if !asmTextEqSpill(got, ref) {
+		return fail(
+				"3-cap/2-user pack closure spill shim bytes must match the framed-BL "
+						"reference (stage r0..r3, re-home data to R5, user0 -> R3 / user1 spilled at "
+						"classifyBase=3, R5-based right-to-left capture loads, bl, store R0 through "
+						"the reloaded retbuf, teardown)")
+	}
+	return ""
+}
+
+// A closure whose SMALL (<=4-byte) aggregate result contains a FLOAT FIELD must fail
+// LOUDLY (P5): arm32 is soft-float with no HFA, so a float leaf anywhere in the result
+// is a float scalar the GP-only pack store would mis-place.  closureHasFloatPartsArm32
+// only rejects a float SCALAR result — the separate closureResultHasFloatPartArm32
+// guard (shared with the C.1 sret cut) catches a float FIELD inside the aggregate,
+// BEFORE the pack dispatch.  A { float32 } (4 bytes) is small-pack by SIZE but the float
+// field must trip the P5 guard before the pack emitter runs.
+func TestClosureShimPackFloatFieldResultSetsError() testing.TestResult {
+	setArm32Target()
+	var f @ir.Func = mkIntCaptureClosure(1, intParams(0))
+	var fields @[]@types.Field = make_slice(@types.Field, 1)
+	fields[0] = make(types.Field)
+	fields[0].Type = types.TypFloat32()
+	var floaty @types.Type = types.MakeStructType("FloatOne", fields)
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = floaty
+	var noParams @[]@types.Param
+	var fv @types.Type = closureFvType(noParams, results)
+
+	var a @asm.Assembler = asm.New(4)
+	a.SetSection("text", -1)
+	emitClosureShimArm32(a, "bn_ul", fv, f)
+	if !a.HasError {
+		return fail("a float-field small-aggregate-result closure shim must fail loud (P5)")
+	}
+	return ""
+}

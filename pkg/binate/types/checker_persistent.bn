@@ -1,0 +1,222 @@
+package "pkg/binate/types"
+
+import "pkg/binate/ast"
+
+// REPL / persistent-mode checker entry points, extracted from checker.bn.
+// These type-check a main file or an individual decl/expr/stmt-list while
+// LEAVING the file's scope installed on c.Scope (the REPL keeps it active
+// across prompt entries), and register a REPL import.  Same package as
+// checker.bn, so they retain access to every checker helper.
+
+// CheckMainPersistent type-checks a main source file like Check but
+// leaves the file's scope (imports + decls) installed on c.Scope
+// when it returns.  REPL entry point: the loaded file's symbols
+// must remain visible to prompt entries for the duration of the
+// session, so the scope is intentionally not popped.
+func (c @Checker) CheckMainPersistent(file @ast.File) {
+	// Set persistently (no restore): the REPL keeps this scope active for
+	// subsequent CheckDeclInScope calls, which qualify their struct names
+	// against this same package path and stamp interface Pkg from the short
+	// name.  Both must be set (matching Check) — omitting curPkgShort leaves
+	// REPL-defined interfaces with an empty Pkg, breaking the (Pkg, Name)
+	// identity used to match them against imported interfaces.  (The checker
+	// `c` is threaded explicitly into AssignableTo by each prompt entry, so
+	// no ambient checker needs installing here.)
+	c.curPkgShort = file.PkgName
+	c.curPkgPath = stripQuotes(file.PkgName)
+	pushScope(c)
+	c.PackageScope = c.Scope
+	registerImports(c, file)
+	collectDecls(c, file.Decls)
+	checkValueEmbedding(c, file.Decls)
+	checkAllImplsSatisfaction(c)
+	checkDecls(c, file.Decls)
+	// Intentionally do NOT popScope — the REPL session keeps using
+	// this scope for subsequent CheckExprInScope / CheckStmtListInScope
+	// calls. c.PackageScope is intentionally retained to match —
+	// function literals at the prompt skip into this same scope.
+}
+
+// CheckDeclInScope type-checks a single top-level declaration
+// against the checker's current scope (c.Scope) — registers the
+// decl's symbol(s) in c.Scope persistently and checks any
+// associated body / initializer.  REPL entry point for Tier 2:
+// the declared name remains visible to subsequent prompt
+// entries.  Errors are appended to c.Errors.
+//
+// Sets c.AllowRedef while running the inner passes so a
+// previously-defined symbol can be redefined (compatible-sig
+// replace or incompatible-sig shadow) without firing the
+// .bni-vs-.bn signature mismatch check, whose error wording
+// ("X: .bni declares N") would be misleading at the prompt.
+// The flag is restored on exit so non-REPL callers (if any)
+// keep the strict behavior.
+//
+// Mechanically: wraps `d` in a one-element slice and runs the
+// existing collectDecls + checkDecls passes.  collectDecls adds
+// the symbol to c.Scope (no push/pop); checkDecls inspects the
+// body in a temporary inner scope.
+//
+// Tier 3 forward refs: the body / initializer check (the
+// `checkDecls` half) runs with TentativeMode set for DECL_FUNC,
+// DECL_VAR, DECL_CONST, and the members of a DECL_GROUP.  Any
+// "undefined: <name>" errors are captured into
+// c.TentativeMissing instead of surfacing.  If TentativeMissing
+// is non-empty after the body check AND no other errors fired,
+// the decl is parked on c.Pending for later retry.
+//
+// For DECL_VAR / DECL_CONST the "body" is the initializer
+// expression; otherwise the flow is identical to DECL_FUNC.
+// Untyped vars / consts whose initializer parks won't have
+// their symbol entered in scope until the initializer resolves
+// (no type to define them with); subsequent use-site refs
+// surface as "undefined: X" rather than "variable X is
+// unresolved".  Acceptable first-cut limitation — users
+// usually spell the type explicitly for forward-ref initializer
+// patterns anyway.
+//
+// DECL_GROUP is handled per-member (Stage 1 (c) of plan-repl-
+// tier3-pending-types.md): each const inside the group runs
+// its own tentative check, parks individually if its value
+// references undefined names, or lands cleanly otherwise.
+// Groups are syntactic sugar with no semantic effect.  iota
+// is tracked positionally — a parked member records its
+// position via parkPendingDeclMember so retry restores the
+// right iota value.
+//
+// Other decl kinds (DECL_TYPE, DECL_INTERFACE, DECL_IMPL) keep
+// strict checking — pending types are out of scope for this
+// stage; see plan-repl-tier3-pending-types.md Stage 2.
+//
+// Param/result types (the sig) are checked in collectDecls,
+// which always runs in non-tentative mode — sig types must
+// resolve at decl time, otherwise the func can't enter scope
+// with a usable type.  Same for typed vars / consts: the
+// TypeRef resolves strictly in collectDecls; only the
+// initializer is tentative.
+func (c @Checker) CheckDeclInScope(d @ast.Decl) {
+	var prevAllowRedef bool = c.AllowRedef
+	c.AllowRedef = true
+	var prevReplDeclMode bool = c.ReplDeclMode
+	c.ReplDeclMode = true
+	var emptyMissing @[]@[]char
+	c.TentativeMissing = emptyMissing
+	var emptyTentErrs @[]CheckError
+	c.TentativeErrors = emptyTentErrs
+	// Snapshot Pending so IsDeclPending() and the driver can
+	// see which decls parked during THIS call (vs. accumulated
+	// from earlier prompt entries).
+	c.PendingMark = len(c.Pending)
+	var single @[]@ast.Decl = make_slice(@ast.Decl, 1)
+	single[0] = d
+	// DECL_TYPE: type resolution happens in pass 1 (collectTypeDecl)
+	// — pass 2 / checkDecls is a no-op for types.  Stage 2 of plan-
+	// repl-tier3-pending-types.md routes the resolution through
+	// TentativeMode so a struct / alias / named-non-struct whose
+	// referenced types aren't yet bound parks instead of firing
+	// "undefined: X".  preRegisterTypeNames runs first to install
+	// the placeholder symbol; checkDeclTypeTentative then fills it
+	// (or parks).
+	if d.Kind == ast.DECL_TYPE {
+		// The other REPL decl kinds reach checkReservedDeclNames via
+		// collectDecls below, but the DECL_TYPE branch returns before it —
+		// so reject a reserved type name (e.g. `type __T`) here, where it
+		// would otherwise slip through to a colliding mangled symbol.
+		checkReservedDeclNames(c, single)
+		preRegisterTypeNames(c, single)
+		checkDeclTypeTentative(c, d)
+		// If the type resolved (didn't park), run the value-embedding gate
+		// the batch paths apply but the REPL otherwise skips, so a REPL
+		// `type S struct { o Opaque }` is rejected.  A parked type re-runs
+		// this on retry once its references resolve.
+		var tsym @Symbol = c.Scope.Lookup(d.Name)
+		if tsym != nil && tsym.Type != nil && !tsym.Type.IsPending {
+			checkValueEmbedding(c, single)
+		}
+		c.AllowRedef = prevAllowRedef
+		c.ReplDeclMode = prevReplDeclMode
+		return
+	}
+	// Pass 1: signature / non-body checks.  Always strict; sig
+	// types missing → real error.
+	collectDecls(c, single)
+	// Pass 2: body / initializer checks.
+	if d.Kind == ast.DECL_GROUP {
+		checkGroupDeclTentative(c, d)
+	} else if isParkableKind(d.Kind) {
+		c.TentativeMode = true
+		// DECL_FUNC sig audit: pending types in the receiver /
+		// params / results park f, so calling f isn't allowed
+		// until the sig fully resolves.  Pass 2 (checkFuncDecl)
+		// only inspects the body, so without this captureFunc-
+		// SigPendingDeps call a func whose sig references a
+		// pending type wouldn't park.  Per Stage 2 (d) of plan-
+		// repl-tier3-pending-types.md.
+		if d.Kind == ast.DECL_FUNC {
+			captureFuncSigPendingDeps(c, d)
+		}
+		checkDecls(c, single)
+		c.TentativeMode = false
+		if len(c.TentativeMissing) > 0 {
+			// Park: the missing names are why; the captured
+			// cascading errors are noise.  Discard them.
+			parkPendingDecl(c, d, c.TentativeMissing)
+		} else {
+			// No missing names — any captured errors are real
+			// (a type mismatch unrelated to forward refs).
+			// Migrate them so the user sees them.
+			migrateTentativeErrors(c)
+			// The decl fully resolved (not parked): run the value-embedding
+			// gate the batch paths apply but the REPL otherwise skips, so a
+			// `func f(o Opaque)` / `func f() Opaque` at the prompt is rejected
+			// (a value-typed var is already gated by checkVarDecl).
+			checkValueEmbedding(c, single)
+		}
+	} else {
+		checkDecls(c, single)
+	}
+	c.AllowRedef = prevAllowRedef
+	c.ReplDeclMode = prevReplDeclMode
+}
+
+// CheckExprInScope type-checks a single expression against the
+// checker's current scope (c.Scope).  REPL entry point for
+// immediate-mode bare expressions.  A child scope is pushed so any
+// transient bindings do not leak to the enclosing scope.  Returns the
+// resolved type of the expression; errors are appended to c.Errors.
+func (c @Checker) CheckExprInScope(e @ast.Expr) @Type {
+	pushScope(c)
+	var t @Type = checkExpr(c, e)
+	popScope(c)
+	return t
+}
+
+// CheckStmtListInScope type-checks a list of statements against the
+// checker's current scope (c.Scope).  REPL entry point for
+// immediate-mode bare statement lists.  A child scope is pushed so
+// any local declarations introduced by the statements do not leak to
+// the enclosing scope.  Errors are appended to c.Errors.
+func (c @Checker) CheckStmtListInScope(ss @[]@ast.Stmt) {
+	pushScope(c)
+	for i := 0; i < len(ss); i++ {
+		checkStmt(c, ss[i])
+	}
+	popScope(c)
+}
+
+// RegisterReplImport defines a package symbol in the REPL
+// session scope after a mid-session `import` prompt entry.
+// The package's scope must already be registered (via
+// LoadPackageInterface / CheckPackage from the loader-side
+// import path).  Errors if the package isn't registered.
+// Per Tier 5 of plan-repl.md.
+//
+// `alias` is the user-typed alias (empty for the default — the
+// last segment of `path`); the caller is responsible for
+// computing the empty-alias default via the parser-side
+// `ImportSpec.Alias` and `lastPathSegment(path)` together.
+func (c @Checker) RegisterReplImport(alias @[]char, path @[]char) bool {
+	if lookupPackage(c, path) == nil { return false }
+	definePkg(c.Scope, alias, path)
+	return true
+}

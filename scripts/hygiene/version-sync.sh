@@ -50,3 +50,17 @@ if [ "$got" != "$want_bare" ]; then
     echo "  update the version-package string to match VERSION (they name the same build)"
     exit 1
 fi
+
+# Format check: the version must be canonical — X.Y.Z (tagged release),
+# X.Y.Z-pre (untagged working tree), or X.Y.Z-preN (tagged pre-release): three
+# numeric components + an OPTIONAL hyphenated `-pre` + optional number.
+# Prerelease is always hyphenated (semver-consistent).  The
+# `#[build(at_least(version, …))]` predicate parser (pkg/binate/buildcfg) accepts
+# exactly this shape, so a stray non-hyphenated `preN`, an unknown suffix, or a
+# missing/extra component would make every version-gated build fail — catch it
+# here instead of at some distant compile.
+if ! printf '%s\n' "$want_bare" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-pre[0-9]*)?$'; then
+    echo "version-sync: VERSION '$want' is not a canonical version"
+    echo "  expected X.Y.Z, X.Y.Z-pre, or X.Y.Z-preN (the VERSION file adds a bnc- prefix)"
+    exit 1
+fi

@@ -1,0 +1,375 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// Soft-float (float32 / float64) support
+// ============================================================
+//
+// arm32-baremetal is SOFT-float: there is no VFP, so a float rides GP registers
+// exactly like an integer of the same width — a float32 is a single word (like
+// int32), a float64 an even-aligned register PAIR (like int64).  This is the
+// AAPCS "base standard" (`-mfloat-abi=soft`) that clang / gcc emit, so float
+// args/returns/params reuse the int32 / int64 GP machinery (getOperand /
+// load64 / store64 / placeInt64Arg) unchanged — the only float-specific code is
+// the COMPUTE ops here, which have no open-coded form and call the ARM run-time
+// ABI (AEABI) helpers linked from libgcc.a, the same way int64 mul/div do
+// (arm32_int64_libcall.bn).  Helper names + register conventions confirmed
+// against `arm-none-eabi-gcc -O1 -mfloat-abi=soft`:
+//   arithmetic  __aeabi_f{add,sub,mul,div}   (a=r0, b=r1 -> r0)          [f32]
+//               __aeabi_d{add,sub,mul,div}   (a=r0:r1, b=r2:r3 -> r0:r1) [f64]
+//   compare     __aeabi_fcmp{eq,lt,le,gt,ge} (a=r0, b=r1 -> 0/1 in r0)   [f32]
+//               __aeabi_dcmp{eq,lt,le,gt,ge} (a=r0:r1, b=r2:r3 -> r0)    [f64]
+//   convert     see arm32_float_cast.bn (i2f / f2iz / f2d / l2d / ...)
+//   negate      inline sign-bit flip (no libcall)
+//
+// The IEEE-754 bit value of a float LITERAL comes from
+// common.ParseFloatLitToBits (shared with every backend + the VM, so a literal
+// is bit-identical across modes); a float32 narrows through F64BitsToF32Bits.
+
+// isFloatTyp reports whether t is a float scalar (float32 / float64 /
+// untyped-float), peeling TYP_NAMED so a `type Celsius float64` classifies too.
+// The module-local mirror of common.IsFloatScalarTyp, read more directly at the
+// per-op sites here.
+func isFloatTyp(t @types.Type) bool {
+	if t == nil { return false }
+	var u @types.Type = common.UnwrapNamed(t)
+	if u == nil { return false }
+	return u.Kind == types.TYP_FLOAT || u.Kind == types.TYP_UNTYPED_FLOAT
+}
+
+// floatBitWidth returns 32 for float32, 64 for float64 / untyped-float (peeling
+// a named distinct float type to its underlying).  Only meaningful when
+// isFloatTyp(t).
+func floatBitWidth(t @types.Type) int {
+	var u @types.Type = common.UnwrapNamed(t)
+	if u == nil { return 64 }
+	if u.Kind == types.TYP_UNTYPED_FLOAT { return 64 }
+	if u.Kind == types.TYP_FLOAT && u.Width == 32 { return 32 }
+	return 64
+}
+
+// isFloat64Typ reports whether t is a 64-bit float (the register-PAIR float
+// class), so float64 routes through the load64 / store64 pair machinery and
+// float32 through the single-word path.
+func isFloat64Typ(t @types.Type) bool {
+	return isFloatTyp(t) && floatBitWidth(t) == 64
+}
+
+// ============================================================
+// Routing
+// ============================================================
+
+// instrIsFloat reports whether ins is a float COMPUTE op this file lowers — a
+// float const, float arithmetic / negate, a compare on float operands, or a
+// cast / bit_cast with a float endpoint.  emitInstr checks it BEFORE instrIs64
+// (arm32_int64.bn) so a float64↔int64 conversion routes to the AEABI float
+// helpers here rather than to the integer-pair path (which can't convert), and
+// so a float compare never reaches the integer CMP delegate.  A float ARG /
+// RETURN / PARAM is NOT a compute op — it rides the int32 / int64 GP path — so
+// it is deliberately absent here.
+func instrIsFloat(ins @ir.Instr) bool {
+	switch ins.Op {
+	case iropcode.OP_CONST_FLOAT:
+		return true
+	case iropcode.OP_ADD, iropcode.OP_SUB, iropcode.OP_MUL, iropcode.OP_DIV, iropcode.OP_NEG:
+		return isFloatTyp(ins.Typ)
+	case iropcode.OP_EQ, iropcode.OP_NE, iropcode.OP_LT, iropcode.OP_LE, iropcode.OP_GT,
+			iropcode.OP_GE:
+		return len(ins.Args) >= 1 && isFloatTyp(ins.Args[0].Typ)
+	case iropcode.OP_CAST, iropcode.OP_BIT_CAST:
+		if isFloatTyp(ins.Typ) { return true }
+		if ins.TypeArg != nil && isFloatTyp(ins.TypeArg) { return true }
+		return len(ins.Args) >= 1 && isFloatTyp(ins.Args[0].Typ)
+	}
+	return false
+}
+
+// emitInstrFloat lowers one float compute instruction (only ops instrIsFloat
+// recognizes reach here).  Returns true when it matched and emitted (or
+// SetError'd loudly); false is unreachable given the instrIsFloat gate but keeps
+// the same shape as emitInstr64.
+func emitInstrFloat(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr) bool {
+	switch ins.Op {
+	case iropcode.OP_CONST_FLOAT:
+		emitConstFloat(a, rm, ins)
+		return true
+	case iropcode.OP_ADD, iropcode.OP_SUB, iropcode.OP_MUL, iropcode.OP_DIV:
+		emitFloatBinop(a, pkgName, rm, ins)
+		return true
+	case iropcode.OP_NEG:
+		emitFloatNeg(a, pkgName, rm, ins)
+		return true
+	case iropcode.OP_EQ, iropcode.OP_NE, iropcode.OP_LT, iropcode.OP_LE, iropcode.OP_GT,
+			iropcode.OP_GE:
+		emitFloatCompare(a, pkgName, rm, ins)
+		return true
+	case iropcode.OP_CAST:
+		emitFloatCast(a, pkgName, rm, ins)
+		return true
+	case iropcode.OP_BIT_CAST:
+		emitFloatBitCast(a, pkgName, rm, ins)
+		return true
+	}
+	return false
+}
+
+// ============================================================
+// Constant
+// ============================================================
+
+// emitConstFloat lowers OP_CONST_FLOAT: convert the literal text to its IEEE-754
+// bit pattern and materialize it as a plain integer const in the value's
+// slot(s) — a float32 in one word (nextReg + emitConstInt32, spilled by the
+// following spillAndReset), a float64 in the lo/hi pair (store64, like
+// emitConst64).  A float32 carries its NARROWED 32-bit value (round-to-even),
+// not the low half of the float64 pattern, so bit_cast(int32, C) reads the right
+// bits.
+func emitConstFloat(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	var bits uint64 = common.ParseFloatLitToBits(ins.StrVal)
+	if floatBitWidth(ins.Typ) == 32 {
+		var bits32 uint32 = common.F64BitsToF32Bits(bits)
+		var rd int = nextReg(rm, ins.ID)
+		emitConstInt32(a, rd, cast(int, bits32))
+		return
+	}
+	var lo int = scratchReg(rm)
+	materializeWord(a, lo, cast(int, bits & cast(uint64, 0xFFFFFFFF)))
+	var hi int = scratchReg(rm)
+	materializeWord(a, hi, cast(int, (bits >> cast(uint64, 32)) & cast(uint64, 0xFFFFFFFF)))
+	store64(a, rm, ins, lo, hi)
+}
+
+// ============================================================
+// Arithmetic (add / sub / mul / div) via AEABI helpers
+// ============================================================
+
+// emitFloatBinop lowers OP_ADD/SUB/MUL/DIV on a float result to the AEABI
+// arithmetic helper (float rem is rejected by the checker, so it never reaches
+// here).  float32 marshals both operands into r0 / r1 and reads the result from
+// r0; float64 marshals the two even-aligned pairs r0:r1 / r2:r3 (marshalPairArgs)
+// and reads r0:r1 — identical to the int64 __aeabi_lmul sequence.
+func emitFloatBinop(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) != 2 {
+		a.SetError("native arm32: float binop expects 2 operands")
+		return
+	}
+	if isFloat64Typ(ins.Typ) {
+		if !marshalPairArgs(a, rm, ins.Args[0], ins.Args[1]) {
+			a.SetError("native arm32: float64 binop operand not materializable")
+			return
+		}
+		emitAeabiCall(a, floatBinopHelper(ins.Op, true))
+		rm.ResetRegs()
+		var rlo int = scratchReg(rm)
+		arm32.Mov(a, arm32.COND_AL, false, rlo, arm32.Reg(arm32.R0))
+		var rhi int = scratchReg(rm)
+		arm32.Mov(a, arm32.COND_AL, false, rhi, arm32.Reg(arm32.R1))
+		store64(a, rm, ins, rlo, rhi)
+		return
+	}
+	if !marshalFloat32Args(a, pkgName, rm, ins.Args[0], ins.Args[1]) {
+		a.SetError("native arm32: float32 binop operand not materializable")
+		return
+	}
+	emitAeabiCall(a, floatBinopHelper(ins.Op, false))
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	arm32.Mov(a, arm32.COND_AL, false, rd, arm32.Reg(arm32.R0))
+}
+
+// floatBinopHelper maps an arithmetic op to its AEABI helper symbol, `d`
+// (double) or `f` (single).  Only the four arithmetic ops reach here.
+func floatBinopHelper(op int, isF64 bool) *[]readonly char {
+	if op == iropcode.OP_ADD {
+		if isF64 { return "__aeabi_dadd" }
+		return "__aeabi_fadd"
+	}
+	if op == iropcode.OP_SUB {
+		if isF64 { return "__aeabi_dsub" }
+		return "__aeabi_fsub"
+	}
+	if op == iropcode.OP_MUL {
+		if isF64 { return "__aeabi_dmul" }
+		return "__aeabi_fmul"
+	}
+	if isF64 { return "__aeabi_ddiv" }
+	return "__aeabi_fdiv"
+}
+
+// marshalFloat32Args loads two single-word float operands into r0 (a) and r1
+// (b).  Each operand reloads into a pool scratch (R4..R10) first, then moves
+// into the arg reg, so neither placement clobbers the other's source (the pool
+// never overlaps r0-r3).  b is placed before a for symmetry with the pair
+// marshaler (lowest arg reg written last).
+func marshalFloat32Args(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		argA @ir.Instr, argB @ir.Instr) bool {
+	var sa int = emitValOperand(a, pkgName, rm, argA)
+	if sa < 0 { return false }
+	var sb int = emitValOperand(a, pkgName, rm, argB)
+	if sb < 0 { return false }
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R1, arm32.Reg(sb))
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R0, arm32.Reg(sa))
+	return true
+}
+
+// ============================================================
+// Compare via AEABI helpers
+// ============================================================
+
+// emitFloatCompare lowers a float OP_EQ/NE/LT/LE/GT/GE to a 0/1 bool.  Each of
+// the five ORDERED relations maps to its AEABI helper (__aeabi_fcmpXX /
+// dcmpXX), which returns nonzero iff the relation holds under IEEE ordered
+// semantics (NaN → 0); the result is normalized to exactly 0/1 with a
+// CMP #0 + conditional MOV, matching emitCompare's bool idiom.  `!=` is the
+// UNORDERED complement of `==` (true for NaN), realized as fcmpeq followed by
+// the INVERTED (EQ→1-when-zero) normalization, so NaN != NaN is true.
+func emitFloatCompare(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr) {
+	if len(ins.Args) != 2 {
+		a.SetError("native arm32: float compare expects 2 operands")
+		return
+	}
+	var isF64 bool = isFloat64Typ(ins.Args[0].Typ)
+	if isF64 {
+		if !marshalPairArgs(a, rm, ins.Args[0], ins.Args[1]) {
+			a.SetError("native arm32: float64 compare operand not materializable")
+			return
+		}
+	} else {
+		if !marshalFloat32Args(a, pkgName, rm, ins.Args[0], ins.Args[1]) {
+			a.SetError("native arm32: float32 compare operand not materializable")
+			return
+		}
+	}
+	// OP_NE compares via fcmpEQ then inverts; the four ordered relations use
+	// their own helper directly.
+	var cmpOp int = ins.Op
+	if ins.Op == iropcode.OP_NE { cmpOp = iropcode.OP_EQ }
+	emitAeabiCall(a, floatCompareHelper(cmpOp, isF64))
+	rm.ResetRegs()
+	// Normalize the r0 result (nonzero => relation holds) to a 0/1 bool.  For
+	// the direct relations rd = (r0 != 0); for OP_NE rd = (r0 == 0) — the
+	// unordered complement of ==.
+	var rd int = nextReg(rm, ins.ID)
+	arm32.Cmp(a, arm32.COND_AL, arm32.R0, arm32.Imm(0))
+	arm32.Mov(a, arm32.COND_AL, false, rd, arm32.Imm(0))
+	var setCond int = arm32.COND_NE
+	if ins.Op == iropcode.OP_NE { setCond = arm32.COND_EQ }
+	arm32.Mov(a, setCond, false, rd, arm32.Imm(1))
+}
+
+// floatCompareHelper maps an ordered comparison op (EQ/LT/LE/GT/GE — never NE,
+// which the caller folds to EQ) to its AEABI helper symbol.
+func floatCompareHelper(op int, isF64 bool) *[]readonly char {
+	if op == iropcode.OP_EQ {
+		if isF64 { return "__aeabi_dcmpeq" }
+		return "__aeabi_fcmpeq"
+	}
+	if op == iropcode.OP_LT {
+		if isF64 { return "__aeabi_dcmplt" }
+		return "__aeabi_fcmplt"
+	}
+	if op == iropcode.OP_LE {
+		if isF64 { return "__aeabi_dcmple" }
+		return "__aeabi_fcmple"
+	}
+	if op == iropcode.OP_GT {
+		if isF64 { return "__aeabi_dcmpgt" }
+		return "__aeabi_fcmpgt"
+	}
+	if isF64 { return "__aeabi_dcmpge" }
+	return "__aeabi_fcmpge"
+}
+
+// ============================================================
+// Negate — inline sign-bit flip (no libcall)
+// ============================================================
+
+// emitFloatNeg lowers OP_NEG on a float by flipping the IEEE sign bit: bit 31 of
+// a float32's word, or bit 31 of a float64's HIGH word (bit 63 overall).  The
+// mask (0x80000000) is materialized in a scratch (it is not an ARM rotated
+// immediate reachable safely) and EOR'd in.  No AEABI call — negation touches
+// only the sign bit.
+func emitFloatNeg(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) != 1 {
+		a.SetError("native arm32: float neg expects 1 operand")
+		return
+	}
+	if isFloat64Typ(ins.Typ) {
+		var lo int
+		var hi int
+		lo, hi = load64(a, rm, ins.Args[0])
+		if lo < 0 {
+			a.SetError("native arm32: float64 neg operand not materializable")
+			return
+		}
+		var mask int = scratchReg(rm)
+		emitConstInt32(a, mask, floatSignMask())
+		var rhi int = scratchReg(rm)
+		arm32.Eor(a, arm32.COND_AL, false, rhi, hi, arm32.Reg(mask))
+		store64(a, rm, ins, lo, rhi)
+		return
+	}
+	var src int = emitValOperand(a, pkgName, rm, ins.Args[0])
+	if src < 0 {
+		a.SetError("native arm32: float32 neg operand not materializable")
+		return
+	}
+	var mask int = scratchReg(rm)
+	emitConstInt32(a, mask, floatSignMask())
+	var rd int = nextReg(rm, ins.ID)
+	arm32.Eor(a, arm32.COND_AL, false, rd, src, arm32.Reg(mask))
+}
+
+// floatSignMask returns 0x80000000, the single-word IEEE sign-bit mask (bit 31),
+// used to negate a float32 or the high word of a float64.
+func floatSignMask() int {
+	return 1 << 31
+}
+
+// ============================================================
+// bit_cast — same-size reinterpret (soft-float: bits are already in GP)
+// ============================================================
+
+// emitFloatBitCast lowers OP_BIT_CAST when a float endpoint is involved.  Under
+// soft-float a float already lives in GP register(s) as its raw IEEE bits, so a
+// float↔int reinterpret of the same size is a pure value copy: a float64↔int64
+// bit_cast is the two-word pair identity (emitCast64Identity), a float32↔int32
+// bit_cast a single MOV.  (The non-float 64-bit bit_cast — int64↔uint64 — is
+// handled by the int64 path; only float endpoints route here.)
+func emitFloatBitCast(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr) {
+	if len(ins.Args) != 1 {
+		a.SetError("native arm32: float bit_cast expects 1 operand")
+		return
+	}
+	if bitCastIs64(ins) {
+		emitCast64Identity(a, rm, ins)
+		return
+	}
+	var src int = emitValOperand(a, pkgName, rm, ins.Args[0])
+	if src < 0 {
+		a.SetError("native arm32: float bit_cast operand not materializable")
+		return
+	}
+	var rd int = nextReg(rm, ins.ID)
+	arm32.Mov(a, arm32.COND_AL, false, rd, arm32.Reg(src))
+}
+
+// bitCastIs64 reports whether a float bit_cast is between 64-bit values (float64
+// ↔ int64), so it copies the register pair rather than a single word.  Keys on
+// either endpoint being a 64-bit pair value (int64 / uint64 / float64).
+func bitCastIs64(ins @ir.Instr) bool {
+	if is64Typ(ins.TypeArg) || isFloat64Typ(ins.TypeArg) { return true }
+	if len(ins.Args) >= 1 && (is64Typ(ins.Args[0].Typ) || isFloat64Typ(ins.Args[0].Typ)) {
+		return true
+	}
+	return false
+}

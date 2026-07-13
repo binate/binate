@@ -28,12 +28,14 @@ runner_exec() {
     if [ -x "$tmpbin" ]; then
         # Cap wall-clock via timeout(1) so a runaway test (e.g. a
         # codegen bug that yields an infinite loop) doesn't wedge the
-        # sweep.  Inherited from the older builder-comp_native_aa64
-        # runner.
+        # sweep.  10s matches every other native runner; the tighter 3s
+        # this runner historically inherited spuriously timed out a
+        # correct binary (empty output) when the full parallel sweep
+        # saturated the host — the intermittent native-aa64 flakiness.
         if command -v timeout >/dev/null 2>&1; then
-            timeout 3 "$tmpbin" 2>&1 || true
+            timeout 10 "$tmpbin" 2>&1 || true
         elif command -v gtimeout >/dev/null 2>&1; then
-            gtimeout 3 "$tmpbin" 2>&1 || true
+            gtimeout 10 "$tmpbin" 2>&1 || true
         else
             "$tmpbin" 2>&1 || true
         fi

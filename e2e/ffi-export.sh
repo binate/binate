@@ -109,6 +109,14 @@ func mul(a int, b int) int { return a * b }
 // One function exported under SEVERAL C names.
 #[c_export("ffi_sub", "ffi_sub2")]
 func Sub(a int, b int) int { return a - b }
+
+// A package-level var initializer — set to 40 ONLY when the closure's inits run.
+// The --library arm reads it (after bn_init) to prove bn_init actually ran the
+// initializers, not just that the symbol linked.  (The --pkg arms never call it.)
+var base int = 40
+
+#[c_export("ffi_base")]
+func GetBase() int { return base }
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -160,10 +168,58 @@ check_backend() {
     fi
 }
 
+# check_library builds the facade + its transitive closure into a static
+# archive via `bnc --library`, then links a C driver that inits the whole library
+# ONCE through the well-known `bn_init` symbol and calls the exports — the Phase-5a
+# "a Binate .a a C program inits once and calls into" end-to-end contract.
+check_library() {
+    work="$TMP/library"
+    mkdir -p "$work"
+    if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" --runtime "$RT" \
+            --build-dir "$work" -o "$work/libffiexp.a" --library ffiexp >"$work/lib.log" 2>&1 \
+            || [ ! -f "$work/libffiexp.a" ]; then
+        fail "library: --library ffiexp produced no archive" "$(tail -5 "$work/lib.log")"
+        return
+    fi
+    # The 5th value (ffi_base) is 40 ONLY if bn_init ran the package
+    # initializer `base` — so it makes this arm a real regression gate for the
+    # "inits once" contract, not just for symbol resolution.
+    cat > "$work/driver.c" <<'EOF'
+#include <stdio.h>
+extern void bn_init(void);
+extern int ffi_add(int, int);
+extern int ffi_mul(int, int);
+extern int ffi_sub(int, int);
+extern int ffi_sub2(int, int);
+extern int ffi_base(void);
+int main(void) {
+    bn_init();
+    printf("%d %d %d %d %d\n",
+           ffi_add(20, 22), ffi_mul(6, 7),
+           ffi_sub(50, 8), ffi_sub2(100, 1), ffi_base());
+    return 0;
+}
+EOF
+    if ! "$CLANG" -w "$work/driver.c" "$work/libffiexp.a" -o "$work/run" 2>"$work/link.err" \
+            || [ ! -x "$work/run" ]; then
+        fail "library: link of C driver + .a failed" "$(head -6 "$work/link.err")"
+        return
+    fi
+    got="$("$work/run" 2>&1)"
+    want_lib="$WANT 40"
+    if [ "$got" = "$want_lib" ]; then
+        pass "library: C inits once via bn_init (ffi_base=40 proves inits ran) + calls exports: '$got'"
+    else
+        fail "library: output mismatch (got '$got', want '$want_lib')"
+    fi
+}
+
 # LLVM backend (default) — always required.
 check_backend "llvm" "" 1
 # Native backend — real link+run coverage of the second-symbol emission when the
 # host's native backend can emit the facade; self-skips otherwise.
 check_backend "native" "--backend native" 0
+# The --library archive: init-once-via-bn_init + call the exports from a real .a.
+check_library
 
 summary

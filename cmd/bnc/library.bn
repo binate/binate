@@ -1,0 +1,149 @@
+package "main"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/codegen"
+import "pkg/binate/debug"
+import "pkg/binate/ir"
+import "pkg/binate/loader"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/bootstrap"
+import "pkg/std/os"
+import "pkg/stdx/slices"
+
+// ============================================================
+// Library build mode (--library)
+// ============================================================
+
+// compileLibrary compiles a facade package + its transitive closure into a
+// static archive (`.a`).  A C program links the archive, calls the well-known
+// `bn_init` symbol ONCE (which runs every package's var-initializers in
+// dependency order — the library counterpart of a program's `bn_entry`), then
+// calls the facade's `#[c_export]`'d functions by their C names.
+//
+// It builds on the loading path `--pkg` uses (facade + closure + forced runtime
+// deps + type-check), then — like the whole-program driver's dependency loop —
+// emits one object per package.  The facade object is emitted LAST, carrying the
+// synthetic `bn_init` dispatcher (EmitLibInit) over the whole closure's init
+// list, and every object is archived with `ar` into the `.a`.  See
+// explorations/plan-ffi-export-detailed.md (Phase 5a).
+func compileLibrary(cli CLIArgs) {
+	var binateRoot @[]char = buf.CopyStr(discoverBinateRoot(cli.RuntimePath))
+	var facadePath @[]char = cli.LibraryFlag
+	var ldr @loader.Loader = loader.NewLoader()
+	ldr.AddBniPath(binateRoot)
+	ldr.AddImplPath(binateRoot)
+	applyPathFlags(ldr, cli)
+	// Set arch/os for #[build(...)] gating from the active target, matching
+	// --pkg and the whole-program path.
+	ldr.BuildConfig = activeBuildConfig(cli.Target)
+
+	// Load the facade + its transitive closure (a synthetic import of the
+	// facade, exactly as compileSinglePkg does).
+	var syntheticImports @[]@ast.ImportSpec
+	var imp @ast.ImportSpec = make(ast.ImportSpec)
+	imp.Path = quotePath(facadePath)
+	syntheticImports = slices.Append[@ast.ImportSpec](syntheticImports, imp)
+	ldr.LoadImports(syntheticImports)
+	if len(ldr.Errors) > 0 {
+		for i := 0; i < len(ldr.Errors); i++ {
+			println(ldr.Errors[i])
+		}
+		os.Exit(1)
+	}
+	// Force-load the implicit runtime deps so each emitted object is as
+	// self-contained as a whole-program dependency object (see
+	// ensureRuntimeDepsLoaded; the same fix --pkg needed).
+	ensureRuntimeDepsLoaded(ldr)
+	var checker @types.Checker = typecheckPackages(ldr)
+
+	var base @[]char = shortName(buf.CopyStr(facadePath))
+	if len(cli.Output) > 0 {
+		base = shortName(buf.CopyStr(cli.Output))
+	}
+	var outPrefix @[]char = outPrefixFor(cli.BuildDir, base)
+
+	// Emit one object per closure package, tracking which ones have a
+	// `<pkg>.__init` (so the dispatcher lists them in dependency order).  The
+	// facade is DEFERRED so its `bn_init` dispatcher can see the whole closure.
+	var oFiles @[]@[]char
+	var initPkgNames @[]@[]char
+	var facadeMod @ir.Module = nil
+	var facadeBase @[]char
+	for i := 0; i < len(ldr.Order); i++ {
+		var pkg @loader.Package = ldr.GetPackage(ldr.Order[i])
+		if pkg == nil || pkg.Merged == nil {
+			continue
+		}
+		debug.Log(buf.Concat("compiling ", ldr.Order[i]))
+		var mod @ir.Module = ir.InitModule(quotePath(ldr.Order[i]))
+		mod.Checker = checker
+		var gc @ir.GenCtx = ir.NewGenCtx(mod)
+		registerPkgImports(ldr, pkg, gc)
+		if pkg.BNI != nil {
+			ir.RegisterSelfTypes(checker, pkg.BNI, gc)
+		}
+		ir.GeneratePackage(checker, pkg.Merged, gc, pkg.Files)
+		if mod.HasPackageInit() {
+			initPkgNames = appendRawCharSlice(initPkgNames,
+					ir.PackageInitName(mangle.PkgPathFromQuoted(ldr.Order[i])))
+		}
+		if streq(ldr.Order[i], facadePath) {
+			facadeMod = mod
+			facadeBase = pathFileBase(ldr.Order[i])
+			continue
+		}
+		var oFile @[]char = compileLL(codegen.EmitModule(mod), outPrefix, pathFileBase(ldr.Order[i]))
+		oFiles = appendRawCharSlice(oFiles, oFile)
+	}
+
+	if facadeMod == nil {
+		print("error: --library package not found: ")
+		println(facadePath)
+		os.Exit(1)
+	}
+	// The facade carries `bn_init` — the library init dispatcher over the
+	// closure's per-package inits, collected in dependency order (the facade's
+	// `__init` is last among its transitive closure).  The force-loaded runtime
+	// deps trail the facade in ldr.Order but contribute no package `__init`
+	// today, so the list stays dependency-ordered; if a runtime dep ever gains a
+	// top-level var initializer, initPkgNames would need a true topological
+	// build rather than raw ldr.Order iteration (a hazard shared with the
+	// whole-program dispatcher in main.bn).
+	facadeMod.EmitLibInit(initPkgNames)
+	var facadeO @[]char = compileLL(codegen.EmitModule(facadeMod), outPrefix, facadeBase)
+	oFiles = appendRawCharSlice(oFiles, facadeO)
+
+	// Archive the objects into a static library.  `ar rcs` creates/replaces the
+	// archive and its symbol index; remove any stale archive first so a rebuild
+	// never keeps orphaned members.
+	var aPath @[]char = libraryArchivePath(cli.Output, facadePath)
+	remove(aPath)
+	var arArgs @[]@[]char
+	arArgs = appendRawCharSlice(arArgs, "rcs")
+	arArgs = appendRawCharSlice(arArgs, aPath)
+	for i := 0; i < len(oFiles); i++ {
+		arArgs = appendRawCharSlice(arArgs, oFiles[i])
+	}
+	if bootstrap.Exec("ar", arArgs) != 0 {
+		println("error: ar failed to create the archive")
+		os.Exit(1)
+	}
+	if !cli.KeepObjs {
+		for i := 0; i < len(oFiles); i++ {
+			remove(oFiles[i])
+		}
+	}
+	println(aPath)
+}
+
+// libraryArchivePath returns the output archive path for --library: the
+// explicit -o value verbatim when given, else the default `lib<facade>.a`
+// (the facade's short name, `/`-stripped).
+func libraryArchivePath(output *[]readonly char, facadePath *[]readonly char) @[]char {
+	if len(output) > 0 {
+		return buf.CopyStr(output)
+	}
+	return buf.Concat("lib", buf.Concat(shortName(buf.CopyStr(facadePath)), ".a"))
+}

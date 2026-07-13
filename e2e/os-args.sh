@@ -1,28 +1,26 @@
 #!/bin/sh
 # e2e/os-args.sh — End-to-end check of pkg/std/os's Args() against a real
-# process argv, on the compiled path.
+# process argv, on BOTH execution paths: a compiled native binary, and the same
+# program interpreted by cmd/bni.
 #
-# os.Args() returns the command-line arguments as a fully-readonly
-# @[]readonly @[]readonly char, indexed like Go's os.Args: element 0 the program
-# name (currently an empty placeholder — nothing exposes argv[0] yet), elements
-# 1.. the arguments.  Unit tests pin the shaping logic on a synthetic list, and
+# os.Args() returns the command-line arguments as @[]readonly @[]readonly char,
+# indexed like Go's os.Args: element 0 the program name, elements 1.. the
+# arguments.  Unit tests pin the shaping logic on a synthetic list, and
 # conformance/stdlib/os/011_args pins the no-argument case cross-mode; neither
-# can pin the with-REAL-args path, because the conformance runner passes a
-# program no arguments.  So this compiles a fixture to a native binary and runs
-# it with a known argv, checking that os.Args() surfaces exactly [placeholder,
-# args...].
+# pins the with-REAL-args path, because the conformance runner passes a program
+# no arguments.  So this compiles/interprets a fixture over a known argv and
+# checks that os.Args() surfaces exactly [<program name>, args...].
 #
-# COMPILED PATH ONLY.  Under the interpreter (cmd/bni) os.Args() returns the
-# HOST interpreter's own argv, because pkg/std/os is injected into the VM as
-# host-native code and so reaches bni's native bootstrap.Args() rather than the
-# program's args — a known cross-mode plumbing gap tracked in claude-todo.md and
-# xfail'd in 011_args's -int modes.  This e2e deliberately does not exercise the
-# interpreter, to avoid encoding that broken behavior as an expectation.
+# The fixture prints len(Args()) then the arguments (Args()[1..]) only — NOT
+# element 0.  Element 0 is the program-name slot, whose CONTENT differs by path
+# (an empty placeholder when compiled — nothing exposes argv[0] there yet — vs.
+# the program path when interpreted, which cmd/bni installs via os.SetArgs), so
+# a cross-path check must skip it; the argument elements are identical either way.
 #
 # Compiling needs a gen1 (checkout-source) compiler, NOT the BUILDER directly:
-# os.Args() postdates the pinned BUILDER's frozen stdlib bundle, so the fixture
-# must link against the current pkg/std/os.  Mirrors e2e/print-args.sh's
-# BUILDER -> gen1 -> compile-fixture-with-checkout-paths shape.
+# os.Args()/SetArgs postdate the pinned BUILDER's frozen stdlib bundle, so the
+# fixture and cmd/bni must link against the current pkg/std/os.  Mirrors
+# e2e/print-args.sh's BUILDER -> gen1 -> build-with-checkout-paths shape.
 #
 # Exit 0 on full pass; non-zero with a diff on any mismatch.
 
@@ -46,9 +44,9 @@ trap 'rm -rf "$TMP"' EXIT
 BUILD_DIR="$TMP/build"
 mkdir -p "$BUILD_DIR"
 
-# Fixture: print the argument count, then each element wrapped in brackets so the
-# empty program-name placeholder is visible as "[]" and any stray whitespace in
-# an argument would show.
+# Fixture: print the argument count, then each ARGUMENT (Args()[1..]) wrapped in
+# brackets — element 0 (the program-name slot) is skipped because its content is
+# path-dependent.
 cat > "$TMP/os_args.bn" <<'EOF'
 package "main"
 
@@ -57,7 +55,7 @@ import "pkg/std/os"
 func main() {
 	var a @[]readonly @[]readonly char = os.Args()
 	println(len(a))
-	for i := 0; i < len(a); i++ {
+	for i := 1; i < len(a); i++ {
 		print("[")
 		print(a[i])
 		println("]")
@@ -92,17 +90,26 @@ if [ ! -x "$GEN1_BNC" ]; then
     exit 1
 fi
 
-# ----- Compile the fixture with gen1 against the CHECKOUT stdlib + runtime, -----
-# so it links against the current pkg/std/os (the one that defines Args()).
+# Common checkout -I/-L (fixture and cmd/bni both link against the current stdlib).
+CK_I="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
+CK_L="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
+CK_RT="$BINATE_DIR/runtime/binate_runtime.c"
+
+# ----- Build the fixture (native) and cmd/bni (native), both via gen1. -----
 ARGS_BIN="$TMP/os_args-bin"
-compile_log=$("$GEN1_BNC" \
-    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
-    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
-    --runtime "$BINATE_DIR/runtime/binate_runtime.c" \
+compile_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" --runtime "$CK_RT" \
     --build-dir "$BUILD_DIR" -o "$ARGS_BIN" "$TMP/os_args.bn" 2>&1) || true
 if [ ! -x "$ARGS_BIN" ]; then
     echo "FAIL: Binate compile of the os.Args fixture failed" >&2
     echo "$compile_log" | sed 's/^/  /' >&2
+    exit 1
+fi
+BNI_BIN="$TMP/bni-bin"
+bni_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" --runtime "$CK_RT" \
+    --build-dir "$BUILD_DIR" -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1) || true
+if [ ! -x "$BNI_BIN" ]; then
+    echo "FAIL: could not build cmd/bni" >&2
+    echo "$bni_log" | sed 's/^/  /' >&2
     exit 1
 fi
 
@@ -126,17 +133,21 @@ check() {
     fi
 }
 
-# A native binary sees argv[1..] directly (no host interpreter, no `--`).
-# element 0 is the empty program-name placeholder, then the three arguments.
-check "with-args" "4
-[]
+WITH_ARGS="4
 [alpha]
 [beta]
-[gamma]" "$("$ARGS_BIN" alpha beta gamma 2>&1)"
+[gamma]"
 
-# No arguments: just the single program-name placeholder.
-check "no-args" "1
-[]" "$("$ARGS_BIN" 2>&1)"
+# (a) compiled native binary: argv[1..] are seen directly (no host, no `--`).
+check "compiled/with-args" "$WITH_ARGS" "$("$ARGS_BIN" alpha beta gamma 2>&1)"
+check "compiled/no-args"   "1"          "$("$ARGS_BIN" 2>&1)"
+
+# (b) cmd/bni interpreting the fixture: the program's args come after `--`, and
+# cmd/bni installs them (via os.SetArgs) so os.Args() surfaces them.
+check "interp/with-args" "$WITH_ARGS" \
+    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" -- alpha beta gamma 2>&1)"
+check "interp/no-args"   "1" \
+    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" 2>&1)"
 
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="

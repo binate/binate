@@ -117,6 +117,23 @@ var base int = 40
 
 #[c_export("ffi_base")]
 func GetBase() int { return base }
+
+// A NON-idempotent init side effect, so the --library arm can prove bn_init runs
+// the inits exactly ONCE.  `counter` has no initializer, so __init never resets
+// it; the blank-var initializer bumps it once per __init run.  The arm calls
+// bn_init() TWICE and asserts counter == 1 — a missing run-once guard (inits
+// re-running) would show counter == 2.  (base == 40 alone can't catch that: its
+// assignment is idempotent.)
+var counter int
+var _ int = bumpCounter()
+
+func bumpCounter() int {
+	counter = counter + 1
+	return 0
+}
+
+#[c_export("ffi_counter")]
+func GetCounter() int { return counter }
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -170,8 +187,9 @@ check_backend() {
 
 # check_library builds the facade + its transitive closure into a static
 # archive via `bnc --library`, then links a C driver that inits the whole library
-# ONCE through the well-known `bn_init` symbol and calls the exports — the Phase-5a
-# "a Binate .a a C program inits once and calls into" end-to-end contract.
+# through the well-known `bn_init` symbol and calls the exports — the Phase-5a
+# "a Binate .a a C program inits and calls into" end-to-end contract.  The driver
+# calls bn_init() TWICE to exercise the run-once idempotency guard.
 check_library() {
     work="$TMP/library"
     mkdir -p "$work"
@@ -181,9 +199,11 @@ check_library() {
         fail "library: --library ffiexp produced no archive" "$(tail -5 "$work/lib.log")"
         return
     fi
-    # The 5th value (ffi_base) is 40 ONLY if bn_init ran the package
-    # initializer `base` — so it makes this arm a real regression gate for the
-    # "inits once" contract, not just for symbol resolution.
+    # The 5th value (ffi_base) is 40 ONLY if bn_init ran the package initializer
+    # `base` (proves inits ran).  The 6th (ffi_counter) is 1 ONLY if bn_init's
+    # run-once guard held across the TWO bn_init() calls — a missing guard would
+    # re-run the inits and show 2.  Together this arm gates both "inits run" and
+    # "inits run exactly once".
     cat > "$work/driver.c" <<'EOF'
 #include <stdio.h>
 extern void bn_init(void);
@@ -192,11 +212,13 @@ extern int ffi_mul(int, int);
 extern int ffi_sub(int, int);
 extern int ffi_sub2(int, int);
 extern int ffi_base(void);
+extern int ffi_counter(void);
 int main(void) {
     bn_init();
-    printf("%d %d %d %d %d\n",
+    bn_init(); /* second call must be a no-op: the run-once guard */
+    printf("%d %d %d %d %d %d\n",
            ffi_add(20, 22), ffi_mul(6, 7),
-           ffi_sub(50, 8), ffi_sub2(100, 1), ffi_base());
+           ffi_sub(50, 8), ffi_sub2(100, 1), ffi_base(), ffi_counter());
     return 0;
 }
 EOF
@@ -206,9 +228,9 @@ EOF
         return
     fi
     got="$("$work/run" 2>&1)"
-    want_lib="$WANT 40"
+    want_lib="$WANT 40 1"
     if [ "$got" = "$want_lib" ]; then
-        pass "library: C inits once via bn_init (ffi_base=40 proves inits ran) + calls exports: '$got'"
+        pass "library: bn_init runs inits once across 2 calls (base=40, counter=1) + calls exports: '$got'"
     else
         fail "library: output mismatch (got '$got', want '$want_lib')"
     fi

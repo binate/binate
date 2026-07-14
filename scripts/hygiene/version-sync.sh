@@ -7,8 +7,8 @@
 # prefix (distinguishing bnc-as-builder from the retired bootstrap
 # interpreter); the version package omits it (the calling tool prepends
 # its own name).  So this compares VERSION with its `bnc-` prefix
-# stripped against the package literal — e.g. VERSION `bnc-0.0.7-pre`
-# must match `Version = "0.0.7-pre"`.  A release bumps both in lockstep.
+# stripped against the package literal — e.g. VERSION `bnc-0.0.7-pre1`
+# must match `Version = "0.0.7-pre1"`.  A release bumps both in lockstep.
 #
 # Exit code: 1 if they differ (or either can't be read / parsed),
 # 0 if they match.
@@ -51,9 +51,12 @@ if [ "$got" != "$want_bare" ]; then
     exit 1
 fi
 
-# Format check: the version must be canonical — X.Y.Z (tagged release),
-# X.Y.Z-pre (untagged working tree), or X.Y.Z-preN (tagged pre-release): three
-# numeric components + an OPTIONAL hyphenated `-pre` + optional number.
+# Format check: the version must be canonical — X.Y.Z (tagged release) or
+# X.Y.Z-preN (a prerelease): three numeric components + an OPTIONAL hyphenated
+# `-pre` + optional number.  The untagged working tree between releases uses a
+# prerelease starting at -pre1 right after a release (a bare `-pre` with no
+# number, the lowest-ordered form, is still accepted but is no longer the
+# post-release convention).
 # Prerelease is always hyphenated (semver-consistent).  The
 # `#[build(at_least(version, …))]` predicate parser (pkg/binate/buildcfg) accepts
 # exactly this shape, so a stray non-hyphenated `preN`, an unknown suffix, or a

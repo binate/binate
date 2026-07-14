@@ -74,7 +74,7 @@ while [ $# -gt 0 ]; do
 done
 
 # Default the version from the VERSION file (e.g. a local build of an
-# in-progress "bnc-X.Y.Z-pre").  A release passes the tag explicitly.
+# in-progress "bnc-X.Y.Z-pre1").  A release passes the tag explicitly.
 if [ -z "$VERSION" ]; then
     VERSION="$(tr -d '[:space:]' < "$BINATE_DIR/VERSION" 2>/dev/null || true)"
 fi

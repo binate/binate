@@ -60,7 +60,12 @@ fail() {
 # triple (i.e. the cross sysroot / headers are installed).  Same probe the
 # conformance cross runners use to detect a missing cross toolchain early.
 clang_can_target() {
-    echo 'int main(void){return 0;}' | \
+    # Include <stdio.h> so the probe needs the target's libc headers, exactly as
+    # the real cross build does (via binate_runtime.c).  A header-free TU compiles
+    # even when the cross libc-dev is absent, so it would wrongly report the
+    # toolchain present and the real build would then fail on a missing
+    # bits/libc-header-start.h — which is precisely what reddened ubuntu CI.
+    printf '#include <stdio.h>\nint main(void){return 0;}\n' | \
         "$CLANG" -target "$1" -x c -c - -o "$TMP/_probe.o" >/dev/null 2>&1
 }
 

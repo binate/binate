@@ -91,7 +91,7 @@ build_gen1() {
     # checkout runtime.  (The OUTER -I/-L, before `--`, is a bootstrap-shape
     # prefix a bootstrap-* BUILDER consumes; a bnc-* BUILDER's fetch-builder
     # wrapper strips everything up to `--`, so only the inner paths reach bnc.)
-    # e2e/{repl,print-args}.sh + scripts/build-*.sh: same inner form.
+    # e2e/{repl,os-args}.sh + scripts/build-*.sh: same inner form.
     build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" "$BINATE_DIR/cmd/bnc" -- -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$blib")" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"

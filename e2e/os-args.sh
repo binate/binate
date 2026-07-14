@@ -19,8 +19,8 @@
 #
 # Compiling needs a gen1 (checkout-source) compiler, NOT the BUILDER directly:
 # os.Args()/SetArgs postdate the pinned BUILDER's frozen stdlib bundle, so the
-# fixture and cmd/bni must link against the current pkg/std/os.  Mirrors
-# e2e/print-args.sh's BUILDER -> gen1 -> build-with-checkout-paths shape.
+# fixture and cmd/bni must link against the current pkg/std/os.  Uses the standard
+# BUILDER -> gen1 -> build-with-checkout-paths shape.
 #
 # Exit 0 on full pass; non-zero with a diff on any mismatch.
 

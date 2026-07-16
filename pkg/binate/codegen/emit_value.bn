@@ -1,0 +1,303 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/mangle"
+import "pkg/binate/stringutils"
+import "pkg/binate/types"
+import "pkg/std/strings"
+
+// emitReturn emits a ret instruction, packing multiple returns via insertvalue.
+func emitReturn(out *strings.Builder, instr @ir.Instr) {
+	if len(instr.Args) == 0 {
+		out.Write("ret void\n")
+	} else if len(instr.Args) == 1 {
+		// NOTE: RefInc for ownership transfer on return is emitted in the IR gen
+		// (before scope-exit RefDecs), not here. See genReturn in gen_stmt.bn.
+		if currentFuncUsesSret {
+			// sret-returning function: write through %v.retbuf and
+			// `ret void`.  emitFuncDbg set up the sret arg as
+			// %v.retbuf in the define-line.
+			out.Write("store ")
+			out.Write(llvmType(instr.Args[0].Typ))
+			out.WriteByte(' ')
+			emitValRef(out, instr.Args[0])
+			out.Write(", ptr %v.retbuf\n")
+			out.Write("  ret void\n")
+			return
+		}
+		if aggRetCoerced(instr.Args[0].Typ) {
+			// In-register aggregate return: coerce the `%S` result to the
+			// ABI return shape — x64 SSE returns the first-class `{ .. }` /
+			// eightbyte aggregate (sysvEmitReturn), every other target the
+			// GP `[N x iW]` (emitAggReturn).
+			if types.SysVInSse(instr.Args[0].Typ) {
+				sysvEmitReturn(out, instr)
+				return
+			}
+			emitAggReturn(out, instr)
+			return
+		}
+		out.Write("ret ")
+		out.Write(llvmType(instr.Args[0].Typ))
+		out.WriteByte(' ')
+		emitValRef(out, instr.Args[0])
+		out.WriteByte('\n')
+	} else {
+		// Multi-return: pack values into struct with insertvalue
+		var structTyp @[]char
+		if instr.Typ != nil {
+			structTyp = llvmType(instr.Typ)
+		} else {
+			structTyp = multiReturnType_args(instr.Args)
+		}
+		// Build aggregate with insertvalue chain
+		// Previous agg name -- starts as "undef", then becomes "%v.ret.N.I"
+		var prevIsUndef bool = true
+		var prevRetSeq int = 0
+		var prevRetIdx int = 0
+		for i := 0; i < len(instr.Args); i++ {
+			var curRetSeq int = retSeq
+			retSeq++
+			out.WriteByte(' ')
+			out.Write("%v.ret.")
+			stringutils.WriteInt(out, curRetSeq)
+			out.WriteByte('.')
+			stringutils.WriteInt(out, i)
+			out.Write(" = insertvalue ")
+			out.Write(structTyp)
+			out.WriteByte(' ')
+			if prevIsUndef {
+				out.Write("undef")
+			} else {
+				out.Write("%v.ret.")
+				stringutils.WriteInt(out, prevRetSeq)
+				out.WriteByte('.')
+				stringutils.WriteInt(out, prevRetIdx)
+			}
+			out.Write(", ")
+			out.Write(llvmType(instr.Args[i].Typ))
+			out.WriteByte(' ')
+			emitValRef(out, instr.Args[i])
+			out.Write(", ")
+			stringutils.WriteInt(out, i)
+			out.WriteByte('\n')
+			out.Write("  ")
+			prevIsUndef = false
+			prevRetSeq = curRetSeq
+			prevRetIdx = i
+		}
+		out.Write("ret ")
+		out.Write(structTyp)
+		out.WriteByte(' ')
+		out.Write("%v.ret.")
+		stringutils.WriteInt(out, prevRetSeq)
+		out.WriteByte('.')
+		stringutils.WriteInt(out, prevRetIdx)
+		out.WriteByte('\n')
+	}
+	return
+}
+
+// emitExtract emits an extractvalue to unpack a field from a multi-return aggregate.
+func emitExtract(out *strings.Builder, instr @ir.Instr, funcRetTypes *[]FuncRetType) {
+	emitRef(out, instr.ID)
+	out.Write(" = extractvalue ")
+	// The aggregate is a call result -- look up its type from funcRetTypes
+	var aggTyp @[]char
+	var callInstr @ir.Instr = instr.Args[0]
+	if callInstr.Op == iropcode.OP_CALL {
+		aggTyp = lookupRetType(funcRetTypes, mangle.FuncName(modulePkgName, callInstr.StrVal))
+	}
+	if len(aggTyp) == 0 {
+		aggTyp = llvmType(instr.Args[0].Typ)
+	}
+	out.Write(aggTyp)
+	out.WriteByte(' ')
+	emitRef(out, instr.Args[0].ID)
+	out.Write(", ")
+	stringutils.WriteInt(out, instr.Index)
+	out.WriteByte('\n')
+	return
+}
+
+// emitManagedToRawInstr emits extractvalue/insertvalue to convert @[]T to *[]T.
+func emitManagedToRawInstr(out *strings.Builder, instr @ir.Instr) {
+	// @[]T -> *[]T: extract {data, len} prefix from %BnManagedSlice
+	var srcID int = instr.Args[0].ID
+	emitRef(out, instr.ID)
+	out.Write(".d = extractvalue %BnManagedSlice ")
+	emitRef(out, srcID)
+	out.Write(", 0\n  ")
+	emitRef(out, instr.ID)
+	out.Write(".l = extractvalue %BnManagedSlice ")
+	emitRef(out, srcID)
+	out.Write(", 1\n  ")
+	emitRef(out, instr.ID)
+	out.Write(".0 = insertvalue %BnSlice undef, i8* ")
+	emitRef(out, instr.ID)
+	out.Write(".d, 0\n  ")
+	emitRef(out, instr.ID)
+	out.Write(" = insertvalue %BnSlice ")
+	emitRef(out, instr.ID)
+	out.Write(".0, ")
+	out.Write(intLL())
+	out.WriteByte(' ')
+	emitRef(out, instr.ID)
+	out.Write(".l, 1\n")
+	return
+}
+
+// rtSym returns the mangled symbol name for a pkg/builtins/rt runtime
+// function (e.g. "Alloc" -> the mangled symbol for `rt.Alloc`), routed through
+// mangle.FuncName so the runtime-call sites the codegen emits track the
+// mangling scheme (one source of truth shared with the native backends).
+// Callers emit the `@` sigil themselves, then this name.
+func rtSym(name *[]readonly char) @[]char {
+	return mangle.FuncName("pkg/builtins/rt", name)
+}
+
+// emitMakeSliceInstr emits a call to MakeManagedSlice for make_slice.
+// The `.p` alloca is hoisted to function entry by emitMakeSliceAllocDecl;
+// here we emit the sret call (passing `.p` as the sret buffer pointer)
+// plus a load of the result.
+func emitMakeSliceInstr(out *strings.Builder, instr @ir.Instr) {
+	var elemSize int = elemSizeOf(instr.TypeArg)
+	out.Write("call void @")
+	out.Write(rtSym("MakeManagedSlice"))
+	out.Write("(")
+	out.Write("ptr sret(%BnManagedSlice) align 8 %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".p, ")
+	out.Write(intLL())
+	out.WriteByte(' ')
+	stringutils.WriteInt(out, elemSize)
+	out.Write(", ")
+	out.Write(intLL())
+	out.WriteByte(' ')
+	emitRef(out, instr.Args[0].ID)
+	out.Write(")\n  ")
+	emitRef(out, instr.ID)
+	out.Write(" = load %BnManagedSlice, %BnManagedSlice* %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".p\n")
+	return
+}
+
+// boxValLLVM returns the LLVM type of OP_BOX's payload — the type whose
+// `.tmp` slot the scalar-source path alloca's before handing its address
+// to rt.Box.  emitBoxAllocDecl (the alloca hoist) and emitBoxInstr must
+// agree on it.
+func boxValLLVM(instr @ir.Instr) @[]char {
+	var valTyp @types.Type = instr.Args[0].Typ
+	if instr.Args[0].Op == iropcode.OP_ALLOC && instr.Args[0].TypeArg != nil {
+		valTyp = instr.Args[0].TypeArg
+	}
+	return llvmType(valTyp)
+}
+
+// emitBoxAllocDecl emits the `%vID.tmp = alloca <T>` for an OP_BOX whose
+// source is a scalar register (not an existing alloca): the payload must
+// live in memory to take its address for rt.Box.  Hoisted to the entry
+// block so a box() inside a loop body doesn't leak native stack per
+// iteration.  An OP_ALLOC source already has its slot — no `.tmp` there.
+func emitBoxAllocDecl(out *strings.Builder, instr @ir.Instr) {
+	if len(instr.Args) < 1 { return }
+	if instr.Args[0].Op == iropcode.OP_ALLOC { return }
+	out.Write("%v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".tmp = alloca ")
+	out.Write(boxValLLVM(instr))
+	out.WriteByte('\n')
+	return
+}
+
+// emitBoxInstr emits LLVM IR for OP_BOX: allocates a managed wrapper for
+// a value, copies the value in, and returns a pointer to the payload.
+// Branches on whether the source is an alloca (bitcast its address) or a
+// scalar register (store-then-bitcast) to keep the generated IR direct.
+// In the scalar-source case the `.tmp` spill alloca is hoisted to the
+// entry block by emitBoxAllocDecl.
+func emitBoxInstr(out *strings.Builder, instr @ir.Instr) {
+	var valTyp @types.Type = instr.Args[0].Typ
+	if instr.Args[0].Op == iropcode.OP_ALLOC && instr.Args[0].TypeArg != nil {
+		valTyp = instr.Args[0].TypeArg
+	}
+	var valLLVM @[]char = llvmType(valTyp)
+	var sizeBytes int = typeSizeBytes(valTyp)
+
+	if instr.Args[0].Op == iropcode.OP_ALLOC {
+		out.Write("%v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".bc = bitcast ")
+		out.Write(valLLVM)
+		out.Write("* ")
+		emitRef(out, instr.Args[0].ID)
+		out.Write(" to i8*\n")
+		out.Write("  ")
+		emitRef(out, instr.ID)
+		out.Write(" = call i8* @")
+		out.Write(rtSym("Box"))
+		out.Write("(i8* %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".bc, ")
+		out.Write(intLL())
+		out.WriteByte(' ')
+		stringutils.WriteInt(out, sizeBytes)
+		out.Write(")\n")
+	} else {
+		// The `.tmp` alloca is hoisted to the entry block by
+		// emitBoxAllocDecl; only the store/bitcast/call run here.
+		out.Write("  store ")
+		out.Write(valLLVM)
+		out.WriteByte(' ')
+		emitRef(out, instr.Args[0].ID)
+		out.Write(", ")
+		out.Write(valLLVM)
+		out.Write("* %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".tmp\n  %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".bc = bitcast ")
+		out.Write(valLLVM)
+		out.Write("* %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".tmp to i8*\n  ")
+		emitRef(out, instr.ID)
+		out.Write(" = call i8* @")
+		out.Write(rtSym("Box"))
+		out.Write("(i8* %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".bc, ")
+		out.Write(intLL())
+		out.WriteByte(' ')
+		stringutils.WriteInt(out, sizeBytes)
+		out.Write(")\n")
+	}
+	return
+}
+
+// emitDerefInstr lowers OP_DEREF to a `bitcast i8* to T*` followed by
+// a `load T` of the result, where T is the element type recorded on
+// instr.Typ. Used for raw-pointer field/element loads that don't fit
+// the OP_LOAD path.
+func emitDerefInstr(out *strings.Builder, instr @ir.Instr) {
+	var elemTyp @types.Type = instr.Typ
+	var elemLLVM @[]char = llvmType(elemTyp)
+	out.Write("%v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".bc = bitcast i8* ")
+	emitRef(out, instr.Args[0].ID)
+	out.Write(" to ")
+	out.Write(elemLLVM)
+	out.Write("*\n  ")
+	emitRef(out, instr.ID)
+	out.Write(" = load ")
+	out.Write(elemLLVM)
+	out.Write(", ")
+	out.Write(elemLLVM)
+	out.Write("* %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".bc\n")
+	return
+}

@@ -57,8 +57,13 @@ CLANG="${CLANG:-$(command -v clang || echo clang)}"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/binate_e2e_sepc.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
-# The real, nontrivial target compiled via separate compilation.
-TARGET="cmd/bnas"
+# The real, nontrivial target compiled via separate compilation.  ABSOLUTE so
+# bnc resolves the entry package regardless of CWD: CI runs this script from the
+# workspace root (`binate/scripts/e2e-run.sh …`), where a relative `cmd/bnas`
+# would resolve to <workspace>/cmd/bnas and fail ("cannot read cmd/bnas").  The
+# imported deps (pkg/…) are found via -I/-L and are CWD-independent; only the
+# entry target is read relative to CWD.
+TARGET="$BINATE_DIR/cmd/bnas"
 
 # A data-only assembly fixture (avoids bnas's instruction dialect — just the
 # directive/data-emission + object-writer path) used to prove the separately

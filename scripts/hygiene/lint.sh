@@ -11,39 +11,40 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 
 # Packages to skip from linting.  bnlint is fetched from the CHECK_TOOLS_VERSION
-# bundle (bnc-0.0.11pre2), decoupled from BUILDER_VERSION so a newer check-tool
+# bundle (bnc-0.0.11), decoupled from BUILDER_VERSION so a newer check-tool
 # feature does not require a build-ladder rung (see
 # explorations/plan-check-tools-version.md).  A skipped target stays fully
 # type-checked and compiled by every conformance mode — only bnlint's style rules
-# pause — and bnlint typechecks dependency BODIES, so a version-lag skip must
-# cover the whole transitive importer chain of the offending source.
+# pause — and bnlint typechecks dependency BODIES, so a skip must cover the whole
+# transitive importer chain of the offending source.
 #
-# LINT_SKIP is EMPTY: every package is linted.  The last skips cleared at the
-# bnc-0.0.11pre2 CHECK_TOOLS bump + the --tests wiring:
-#   - the container-adoption methods-on-generics cone (pkg/stdx/containers/
-#     {vec,hashmap,set} + importers pkg/binate/format + cmd/bnfmt) — pre2's bnlint
-#     parses methods-on-generic-types AND carries the cross-package generic
-#     name-collision fix the COMBINED sweep needs;
-#   - pkg/binate/interp — its `undefined: __Package` version-lag cleared at the
-#     bump, and its lone `[unused-func] shortName` was a false positive (used by
-#     imports_test.bn, which `--tests` now counts);
-#   - pkg/binate/asm/{arm32,elf,macho,parse,x64} — the 17 [managed-to-raw-assign]
-#     safe-borrow over-flags (raw views of fields of a live @asm.Section /
-#     @Assembler / buffer that outlive the synchronous read) now carry per-site
-#     `// bnlint:allow managed-to-raw-assign` directives (claude-todo asm
-#     INCREMENT 2; the 1 real UAF was fixed separately in 8a883450).
+# LINT_SKIP holds ONE package: pkg/stdx/containers/setfn.  Unlike the historical
+# skips below, this is NOT a CHECK_TOOLS version-lag — a bump will not clear it.  It
+# is a live checker state-leak: within ONE bnlint process, linting setfn AFTER a
+# package whose dependency closure interns a `readonly uint8` slice element (e.g.
+# pkg/binate/format, via pkg/std/strings' `Builder.Write(p *[]readonly uint8)`) leaks
+# that element type into setfn's typecheck, which then spuriously rejects an `@[]char`
+# (== @[]uint8) assignment with "cannot assign @[]readonly uint8 to @[]uint8".  It is
+# order-dependent — setfn linted FIRST, or alone, is clean; the whole-tree run below
+# hits the poisoning order.  Tracked as a MAJOR in explorations/claude-todo.md
+# ("bnlint multi-root typecheck leaks checker state across roots"); DROP setfn once
+# that is fixed.
 #
-# One skip remains (CHECK-TOOLS-lag, NOT BUILDER-lag): the injectable-key-policy +
-# Table-based container packages pkg/stdx/{hash,cmp} and pkg/stdx/containers/{table,
-# mapfn,setfn,hashmap,set}.  They lean on the generic-instantiation-as-constraint-arg
-# support and the genericImplSatisfies guard (checker fixes 2f8969e8 / 6647c49f) that
-# postdate bnc-0.0.11pre2, so pre2's bnlint typecheck aborts with false "type argument H
-# does not satisfy constraint Hasher[T]" / "K does not satisfy Hashable" at their blanket
-# impls.  (hashmap/set left the skip after the methods migration but rejoined it once they
-# were folded onto the shared Table engine — Table[K,V,hash.Default[K],cmp.Default[K]] hits
-# the same pre2 constraint-check bug.)  A current-source bnlint accepts them all.  Drop at
-# the next CHECK_TOOLS bump past 6647c49f.
-LINT_SKIP="pkg/stdx/hash pkg/stdx/cmp pkg/stdx/containers/table pkg/stdx/containers/mapfn pkg/stdx/containers/setfn pkg/stdx/containers/hashmap pkg/stdx/containers/set"
+# Previously skipped, now linted (kept as changelog — do NOT re-add without cause):
+#   - the rest of the injectable-key-policy + Table container cone (pkg/stdx/{hash,
+#     cmp} + pkg/stdx/containers/{table,mapfn,hashmap,set}) — LEFT the skip at the
+#     bnc-0.0.11 bump, which carries the generic-instantiation-as-constraint-arg /
+#     genericImplSatisfies fixes (2f8969e8 / 6647c49f) that pre2 lacked, so pre2's
+#     false "type argument H does not satisfy Hasher[T]" / "K does not satisfy
+#     Hashable" at their blanket impls is gone;
+#   - the container-adoption methods-on-generics cone (pkg/stdx/containers/{vec,
+#     hashmap,set} + pkg/binate/format + cmd/bnfmt), pkg/binate/interp, and
+#     pkg/binate/asm/{arm32,elf,macho,parse,x64} — all cleared at the bnc-0.0.11pre2
+#     bump + the --tests wiring (methods-on-generics parsing, the generic
+#     name-collision fix, `undefined: __Package` resolution, and per-site
+#     `// bnlint:allow managed-to-raw-assign` directives; the 1 real asm UAF was fixed
+#     separately in 8a883450).
+LINT_SKIP="pkg/stdx/containers/setfn"
 
 # Discover targets:
 #   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so

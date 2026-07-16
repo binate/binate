@@ -103,8 +103,16 @@ run_sepc() {
 
     # --- 1. the full dependency set --------------------------------------
     deps=$("$bnc" -I "$iface" -L "$impl" --runtime "$runtime" --list-deps "$TARGET" 2>"$work/listdeps.err")
-    if [ -z "$deps" ]; then
-        fail "$label: --list-deps produced no output" "$(head -3 "$work/listdeps.err")"
+    ld_rc=$?
+    # bnc prints loader errors to STDOUT (the same stream as the dep list — see
+    # cmd/bnc/main.bn's ListDeps path), and signals a failed load with a non-zero
+    # exit.  Guard on BOTH so a failure surfaces the real error instead of feeding
+    # a polluted list (e.g. an `error:` line) into the per-package loop below as a
+    # bogus "package".
+    if [ "$ld_rc" -ne 0 ] || [ -z "$deps" ]; then
+        fail "$label: --list-deps failed (rc=$ld_rc)" \
+             "stdout: $(printf '%s\n' "$deps" | head -5)" \
+             "stderr: $(head -3 "$work/listdeps.err")"
         return
     fi
     ndeps=$(printf '%s\n' "$deps" | grep -c .)

@@ -12,7 +12,10 @@
 # TODO: consider lowering the .bni cap toward 1000/1200; ir.bni (~1159 lines)
 # would need refactoring first.  See explorations/claude-todo.md.
 #
-# Exit code: 1 if any file exceeds its error limit, 0 otherwise.
+# Exit code: 1 if any file exceeds its ERROR (hard) limit, OR if MORE THAN ONE file
+# is in the WARN state (over the soft limit); 0 otherwise.  At most one file may sit
+# in warn as a grace period (mid-split); a second reddens the tree so the backlog is
+# worked off, not ignored.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -46,6 +49,19 @@ if [ "$errors" -gt 0 ] || [ "$warns" -gt 0 ]; then
     echo "=== $errors error(s), $warns warning(s) ==="
 fi
 
+# Fail on any hard-limit error.
 if [ "$errors" -gt 0 ]; then
+    exit 1
+fi
+
+# Fail on MORE THAN ONE file in the warn state.  A single file over the soft limit
+# is tolerated as a grace period — it may be mid-split, or you may be about to split
+# it before adding to it.  But warnings must not ACCUMULATE: the moment a second file
+# crosses the soft limit, the tree goes red, forcing the backlog to be worked off
+# (split along natural boundaries) instead of ignored.  ("Take Warnings Seriously" /
+# the file-length forcing function in CLAUDE.md.)
+if [ "$warns" -gt 1 ]; then
+    echo "FAIL: $warns files are over the soft limit — at most ONE is tolerated." \
+         "Split the extras down under the soft limit along natural boundaries."
     exit 1
 fi

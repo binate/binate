@@ -11,11 +11,15 @@
 # no arguments.  So this compiles/interprets a fixture over a known argv and
 # checks that os.Args() surfaces exactly [<program name>, args...].
 #
-# The fixture prints len(Args()) then the arguments (Args()[1..]) only — NOT
-# element 0.  Element 0 is the program-name slot, whose CONTENT differs by path
-# (an empty placeholder when compiled — nothing exposes argv[0] there yet — vs.
-# the program path when interpreted, which cmd/bni installs via os.SetArgs), so
-# a cross-path check must skip it; the argument elements are identical either way.
+# The fixture asserts element 0 (the program-name slot) is PRESENT (non-empty),
+# then prints len(Args()) and the arguments (Args()[1..]).  It does not print
+# element 0's CONTENT: that is the program path, which differs between the
+# compiled-binary run (the binary's path) and the interpreted run (the fixture
+# path cmd/bni installs via os.SetArgs), so a cross-path check must skip it.  Both
+# paths now populate it: the hosted Binate entry (pkg/builtins/startup._entry, the
+# c_export'd `main`) captures the real argv[0] when compiled, and cmd/bni's
+# os.SetArgs supplies it when interpreted.  len and the argument elements are
+# identical either way.
 #
 # Compiling needs a gen1 (checkout-source) compiler, NOT the BUILDER directly:
 # os.Args()/SetArgs postdate the pinned BUILDER's frozen stdlib bundle, so the
@@ -44,9 +48,10 @@ trap 'rm -rf "$TMP"' EXIT
 BUILD_DIR="$TMP/build"
 mkdir -p "$BUILD_DIR"
 
-# Fixture: print the argument count, then each ARGUMENT (Args()[1..]) wrapped in
-# brackets — element 0 (the program-name slot) is skipped because its content is
-# path-dependent.
+# Fixture: assert element 0 (the program-name slot) is present (non-empty), then
+# print the argument count and each ARGUMENT (Args()[1..]) wrapped in brackets.
+# Element 0's content is skipped (it is the path-dependent program name), but its
+# presence pins that the entry captured argv[0] rather than leaving it empty.
 cat > "$TMP/os_args.bn" <<'EOF'
 package "main"
 
@@ -54,6 +59,11 @@ import "pkg/std/os"
 
 func main() {
 	var a @[]readonly @[]readonly char = os.Args()
+	if len(a) > 0 && len(a[0]) > 0 {
+		println("argv0=present")
+	} else {
+		println("argv0=absent")
+	}
 	println(len(a))
 	for i := 1; i < len(a); i++ {
 		print("[")
@@ -133,20 +143,25 @@ check() {
     fi
 }
 
-WITH_ARGS="4
+# Every run leads with argv0=present: both the compiled entry and cmd/bni populate
+# the program-name slot (element 0), so it is never the empty placeholder.
+WITH_ARGS="argv0=present
+4
 [alpha]
 [beta]
 [gamma]"
+NO_ARGS="argv0=present
+1"
 
 # (a) compiled native binary: argv[1..] are seen directly (no host, no `--`).
 check "compiled/with-args" "$WITH_ARGS" "$("$ARGS_BIN" alpha beta gamma 2>&1)"
-check "compiled/no-args"   "1"          "$("$ARGS_BIN" 2>&1)"
+check "compiled/no-args"   "$NO_ARGS"   "$("$ARGS_BIN" 2>&1)"
 
 # (b) cmd/bni interpreting the fixture: the program's args come after `--`, and
 # cmd/bni installs them (via os.SetArgs) so os.Args() surfaces them.
 check "interp/with-args" "$WITH_ARGS" \
     "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" -- alpha beta gamma 2>&1)"
-check "interp/no-args"   "1" \
+check "interp/no-args"   "$NO_ARGS" \
     "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" 2>&1)"
 
 echo ""

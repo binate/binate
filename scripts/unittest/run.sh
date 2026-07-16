@@ -280,16 +280,17 @@ for pkg in $PACKAGES; do
     # ships (and for a __c_call package like pkg/std/os the --test runner rejects
     # it at the frontend — TypecheckPackages sets Checker.Interpreted — as a clean
     # "cannot be interpreted" error rather than running).  The set:
-    # pkg/std/* (the injected stdlib) plus pkg/builtins/rt (the runtime — native
-    # substrate, uses __c_call for malloc/free/exit/…).  Skip them under the int
+    # pkg/std/* (the injected stdlib) plus pkg/builtins/{rt,startup} (native
+    # substrate — rt uses __c_call for malloc/free/exit/…; startup's entry glue
+    # _entry is a __c_call'ing c_export'd `main`).  Skip them under the int
     # modes; the stdlib's cross-mode coverage is the conformance/stdlib suite
-    # (run.sh under conformance/, where the stdlib is INJECTED), and rt's logic
-    # is covered by its compiled-mode unit tests.  This is a by-design exclusion,
-    # NOT a perf .skip-pkg nor a failure .xfail.
+    # (run.sh under conformance/, where the stdlib is INJECTED), and rt's/startup's
+    # logic is covered by their compiled-mode unit tests.  This is a by-design
+    # exclusion, NOT a perf .skip-pkg nor a failure .xfail.
     case "$MODE" in
         *int*)
             case "$pkg" in
-                pkg/std/*|pkg/builtins/rt)
+                pkg/std/*|pkg/builtins/rt|pkg/builtins/startup)
                     if [ "$VERBOSE" -eq 1 ]; then
                         echo "SKIP-NATIVE-INT: $pkg (native-only, injected not interpreted)"
                     elif [ "$QUIET" -eq 0 ]; then

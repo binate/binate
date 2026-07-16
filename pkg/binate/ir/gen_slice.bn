@@ -1,0 +1,214 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/iropcode"
+import "pkg/binate/token"
+import "pkg/binate/types"
+
+// getIndexElemType returns the element type of an index expression
+func getIndexElemType(ctx @GenContext, e @ast.Expr) @types.Type {
+	if e.X == nil { return nil }
+	// Peel transparent wrappers (readonly / named / alias) before reading
+	// `.Elem`: a named array (`type Row [3]int`) carries its element type on
+	// the underlying TYP_ARRAY, not the TYP_NAMED wrapper (whose `.Elem` is
+	// nil), so an un-peeled read returns nil and the element type is lost.
+	if e.X.Kind == ast.EXPR_IDENT {
+		var arrTyp @types.Type = peelTransparent(lookupVarType(ctx, e.X.Name))
+		if arrTyp != nil && arrTyp.Elem != nil {
+			return arrTyp.Elem
+		}
+	}
+	// Handle selector collection: e.X is a selector (e.g., c.Packages in c.Packages[i])
+	if e.X.Kind == ast.EXPR_SELECTOR {
+		var collTyp @types.Type = peelTransparent(getSelectorType(ctx, e.X))
+		if collTyp != nil && collTyp.Elem != nil {
+			return collTyp.Elem
+		}
+	}
+	// Nested index base: e.X is itself an index expression (the `a[i]` base
+	// of `a[i][j].field`).  The IDENT/SELECTOR arms can't type it, so recurse
+	// through indexExprType (which walks nested indices) and take its element
+	// type.  Without this the field selector reads a const-0 and the lvalue
+	// store goes nowhere (silent data loss).
+	if e.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		var baseTyp @types.Type = peelTransparent(indexExprType(ctx, e.X))
+		if baseTyp != nil && baseTyp.Elem != nil {
+			return baseTyp.Elem
+		}
+	}
+	// Call-result base (`getarr()[i]`): the call's result type isn't in any
+	// var/field table, so take the checker's resolved type of the call and read
+	// its element (mirrors getSelectorType's call arm).
+	if e.X.Kind == ast.EXPR_CALL {
+		if ctx.Checker != nil && e.X.ResolvedTypeID != 0 {
+			var arrTyp @types.Type = peelTransparent(ctx.Checker.ExprType(e.X.ResolvedTypeID))
+			if arrTyp != nil && arrTyp.Elem != nil {
+				return arrTyp.Elem
+			}
+		}
+	}
+	return nil
+}
+
+// indexExprType returns the static type of an expression as used for
+// indexing, WITHOUT generating any code (so callers can classify a base
+// before deciding how to evaluate it — avoiding a genExpr that would both
+// be wasteful and double-evaluate a nested index).  Recurses through
+// nested indices.  Returns nil for bases whose type isn't statically
+// derivable here (e.g. call results) — those fall back to value-based
+// handling at the call site.
+func indexExprType(ctx @GenContext, e @ast.Expr) @types.Type {
+	if e == nil { return nil }
+	if e.Kind == ast.EXPR_IDENT { return lookupVarType(ctx, e.Name) }
+	if e.Kind == ast.EXPR_SELECTOR { return getSelectorType(ctx, e) }
+	if e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		var baseSt @types.Type = peelTransparent(indexExprType(ctx, e.X))
+		if baseSt == nil { return nil }
+		return baseSt.Elem
+	}
+	// Deref `*p` (so `(*p)[i]` classifies as a nested-array base when p is
+	// `*([N]T)`): the static type is p's pointee.
+	if e.Kind == ast.EXPR_UNARY && e.Op == cast(int, token.STAR) {
+		var pt @types.Type = peelTransparent(indexExprType(ctx, e.X))
+		if pt == nil || pt.Kind != types.TYP_POINTER { return nil }
+		return pt.Elem
+	}
+	// Call result (`getarr()[i][j]` — the inner `getarr()[i]` recurses here):
+	// take the checker's resolved type of the call.
+	if e.Kind == ast.EXPR_CALL {
+		if ctx.Checker != nil && e.ResolvedTypeID != 0 {
+			return peelTransparent(ctx.Checker.ExprType(e.ResolvedTypeID))
+		}
+		return nil
+	}
+	return nil
+}
+
+// isNestedArrayBase reports whether `e` is `base[idx]` whose base is
+// itself an index expression of ARRAY type — the case whose inner array
+// element has no backing pointer and so must be addressed via an in-place
+// element pointer (genIndexPtr) rather than the value-based load/store
+// fallbacks.
+func isNestedArrayBase(ctx @GenContext, e @ast.Expr) bool {
+	if e == nil || e.X == nil { return false }
+	if e.X.Kind != ast.EXPR_INSTANTIATE_OR_INDEX { return false }
+	var baseSt @types.Type = peelTransparent(indexExprType(ctx, e.X))
+	return baseSt != nil && baseSt.Kind == types.TYP_ARRAY
+}
+
+// genSliceExpr generates IR for a slice expression (s[lo:hi]), including array-to-slice conversion.
+func genSliceExpr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+	// e.X = slice, e.Z = lo (may be nil → 0), e.Y = hi (may be nil → len)
+	var collection @Instr = genExpr(ctx, b, e.X)
+	b = ctx.CurBlock
+
+	// Slicing a STRING LITERAL (`"abc"[:]`): a string literal's genExpr yields a
+	// bare `*readonly char` pointer (OP_CONST_STRING), not a {data, len} slice, so
+	// the array-to-slice arm below (keyed on TYP_ARRAY) misses it and the standard
+	// slice path's EmitSliceLen would `extractvalue` field 1 off the pointer
+	// (invalid LLVM).  Materialize it into a `*[]readonly char` rodata slice first
+	// — exactly as an assignment / argument of a string literal to a char-slice
+	// slot does (EmitStringToChars) — so the rest of this function sees a real
+	// slice.  The checker types the result the same way (checkSliceExpr on a
+	// `[N]readonly char` array → `*[]readonly char`).
+	if collection.Op == iropcode.OP_CONST_STRING {
+		var charSliceTyp @types.Type = types.MakeSliceType(
+				types.MakeReadonlyType(types.TypUint8()))
+		collection = b.EmitStringToChars(collection, charSliceTyp)
+		noteSPGrowingResult(ctx, collection)
+	}
+
+	// Array-to-slice conversion: convert [N]T alloca to BnSlice{ptr, len}
+	// so that slice expressions on arrays work through the standard slice
+	// path.  Peel transparent wrappers so a named array (`type Row [3]int`)
+	// — or a readonly one — is recognized and its element type / length come
+	// from the underlying array, not the wrapper (whose `.Elem` is nil and
+	// `.ArrayLen` is 0).
+	var collSt @types.Type = nil
+	if collection.Typ != nil { collSt = peelTransparent(collection.Typ) }
+	if collSt != nil && collSt.Kind == types.TYP_ARRAY {
+		var arrPtr @Instr = nil
+		if e.X.Kind == ast.EXPR_IDENT {
+			arrPtr = lookupVar(ctx, e.X.Name)
+		}
+		if arrPtr == nil {
+			// Fallback: alloc + store
+			arrPtr = b.EmitAlloc(collSt)
+			b.EmitStore(arrPtr, collection)
+		}
+		// Build BnSlice: bitcast array ptr to i8*, insert {ptr, len}
+		var elemTyp @types.Type = collSt.Elem
+		if elemTyp == nil { elemTyp = types.TypInt() }
+		var sliceTyp @types.Type = types.MakeSliceType(elemTyp)
+		var arrLen int = collSt.ArrayLen
+		// Emit as a call to get a proper BnSlice from the array
+		var dataPtr @Instr = b.EmitBitCast(arrPtr, types.MakePointerType(types.TypUint8()))
+		var lenInstr @Instr = b.EmitConstInt(arrLen, types.TypInt())
+		// Build the struct: insertvalue undef, ptr, 0; insertvalue _, len, 1
+		var nilSlice @Instr = b.EmitConstNil(sliceTyp)
+		// Use OP_EXTRACT-like pattern — actually we need insertvalue
+		// Simpler: just use the slice_expr on this constructed slice
+		// Actually, the simplest approach: emit a struct literal {ptr, len}
+		// For now, use EmitSliceExpr with the proper slice type
+		collection = nilSlice
+		collection.Typ = sliceTyp
+		// Override: construct the slice manually via alloca+store
+		// Alloca a BnSlice, GEP field 0 (ptr), store bitcast, GEP field 1 (len), store
+		var sliceAlloca @Instr = b.EmitAlloc(sliceTyp)
+		var ptrTyp @types.Type = types.MakePointerType(types.TypUint8())
+		var ptrField @Instr = b.EmitGetFieldPtr(sliceAlloca, 0, ptrTyp)
+		b.EmitStore(ptrField, dataPtr)
+		var lenField @Instr = b.EmitGetFieldPtr(sliceAlloca, 1, types.TypInt())
+		b.EmitStore(lenField, lenInstr)
+		collection = b.EmitLoad(sliceAlloca, sliceTyp)
+	}
+
+	var lo @Instr
+	var hi @Instr
+	var hiExplicit bool = e.Y != nil
+	var loExplicit bool = e.Z != nil
+
+	if loExplicit {
+		lo = genExpr(ctx, b, e.Z)
+		b = ctx.CurBlock
+	} else {
+		lo = b.EmitConstInt(0, types.TypInt())
+	}
+	if hiExplicit {
+		hi = genExpr(ctx, b, e.Y)
+		b = ctx.CurBlock
+	} else {
+		hi = b.EmitSliceLen(collection)
+	}
+
+	// Bounds checks: 0 ≤ lo ≤ hi ≤ len. The runtime BoundsCheck primitive
+	// asserts 0 ≤ idx < length, so we use it twice with adjusted upper
+	// bounds — passing N+1 turns the strict comparison into ≤. Order:
+	// check hi first (catches hi < 0 or hi > len), then check lo (catches
+	// lo < 0 or lo > hi). When an endpoint is implicit (defaults to 0 or
+	// len), the corresponding check is statically true and skipped.
+	if isSliceType(collSt) {
+		var length @Instr = b.EmitSliceLen(collection)
+		var one @Instr = b.EmitConstInt(1, types.TypInt())
+		if hiExplicit {
+			var lenPlus1 @Instr = b.EmitBinop(iropcode.OP_ADD, length, one, types.TypInt())
+			b.EmitBoundsCheck(hi, lenPlus1)
+		}
+		if loExplicit {
+			var hiPlus1 @Instr = b.EmitBinop(iropcode.OP_ADD, hi, one, types.TypInt())
+			b.EmitBoundsCheck(lo, hiPlus1)
+		}
+	}
+
+	var resultTyp @types.Type = collection.Typ
+	if resultTyp == nil {
+		resultTyp = types.MakeSliceType(types.TypInt())
+	}
+	var result @Instr = b.EmitSliceExpr(collection, lo, hi, resultTyp)
+	// Subslicing @[]T shares the backing — RefInc the backing refptr
+	if isManagedSliceType(resultTyp) {
+		emitManagedSliceRefInc(ctx.Func, b, result)
+		registerTemp(ctx, result)
+	}
+	return result
+}

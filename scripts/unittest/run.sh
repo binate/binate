@@ -175,6 +175,14 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 export SCRIPT_DIR BINATE_DIR BOOTSTRAP_DIR
 
+# A compiled test binary inherits its current directory from here, and
+# cmd/bnlint's integration tests load real packages from disk relative to CWD
+# (see cmd/bnlint/main_test.bn).  Pin CWD to the repo root so "." resolves
+# deterministically no matter where this script was invoked from.  Everything
+# below already uses absolute ($BINATE_DIR-rooted) paths, so this is a no-op for
+# every other package.
+cd "$BINATE_DIR" || exit 1
+
 # Load the runner
 RUNNER="$SCRIPT_DIR/runners/${MODE}.sh"
 if [ ! -f "$RUNNER" ]; then

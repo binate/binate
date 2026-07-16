@@ -1,10 +1,23 @@
 #!/bin/sh
-# Usage: ./scripts/hygiene/lint.sh
+# Usage: ./scripts/hygiene/lint.sh [--from-source]
 #
 # Runs cmd/bnlint over every package under pkg/ and every command under cmd/.
 # Fails if any lint diagnostic is reported.
 #
+# --from-source: build bnlint from the CURRENT source tree instead of preferring
+#   the pinned CHECK_TOOLS bundle.  Used by e2e/bnlint-self.sh to actually TEST
+#   this tree's bnlint against the whole repo — the default, bundle-preferring
+#   path exercises the pinned tool, not the tree.
+#
 # Exit code: 1 if any diagnostics found (or on bnlint error), 0 otherwise.
+
+FROM_SOURCE=0
+for arg in "$@"; do
+    case "$arg" in
+        --from-source) FROM_SOURCE=1 ;;
+        *) echo "lint: unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -100,22 +113,33 @@ if [ -z "$TARGETS" ]; then
     exit 1
 fi
 
-# Prefer the bundled bnlint from CHECK_TOOLS_VERSION when available
-# (bnc-* mode) — saves the per-invocation cost of compiling bnlint
-# from source.  --check-tools resolves the CHECK-TOOLS release (which may
-# be a pre-release ahead of the BUILDER, carrying newer language support
-# like methods-on-generics — see plan-check-tools-version.md), NOT the
-# BUILDER the tree builds with.  Falls back to building from current
-# source under bootstrap-* (no toolchain bundle exists) or when the
-# fetcher doesn't return a usable path.
-BNLINT_BIN="$("$BINATE_DIR/scripts/fetch-builder.sh" --check-tools --tool bnlint 2>/dev/null || true)"
-if [ -z "$BNLINT_BIN" ] || [ ! -x "$BNLINT_BIN" ]; then
+# build_bnlint_from_source sets BNLINT_BIN to a freshly-built bnlint from the
+# current tree (removed on exit).
+build_bnlint_from_source() {
     BNLINT_BIN="$(mktemp -t binate-lint.XXXXXX)"
     trap 'rm -f "$BNLINT_BIN"' EXIT
     "$SCRIPT_DIR/../build-bnlint.sh" -o "$BNLINT_BIN" >/dev/null || {
         echo "lint: failed to build bnlint" >&2
         exit 1
     }
+}
+
+if [ "$FROM_SOURCE" -eq 1 ]; then
+    # e2e/bnlint-self.sh path: test THIS tree's bnlint, never the pinned bundle.
+    build_bnlint_from_source
+else
+    # Prefer the bundled bnlint from CHECK_TOOLS_VERSION when available
+    # (bnc-* mode) — saves the per-invocation cost of compiling bnlint
+    # from source.  --check-tools resolves the CHECK-TOOLS release (which may
+    # be a pre-release ahead of the BUILDER, carrying newer language support
+    # like methods-on-generics — see plan-check-tools-version.md), NOT the
+    # BUILDER the tree builds with.  Falls back to building from current
+    # source under bootstrap-* (no toolchain bundle exists) or when the
+    # fetcher doesn't return a usable path.
+    BNLINT_BIN="$("$BINATE_DIR/scripts/fetch-builder.sh" --check-tools --tool bnlint 2>/dev/null || true)"
+    if [ -z "$BNLINT_BIN" ] || [ ! -x "$BNLINT_BIN" ]; then
+        build_bnlint_from_source
+    fi
 fi
 
 "$BNLINT_BIN" --tests -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" $TARGETS

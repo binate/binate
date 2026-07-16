@@ -1,0 +1,315 @@
+package "pkg/binate/loader"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/buildcfg"
+import "pkg/binate/parser"
+import "pkg/std/os"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// loadPackage reads, parses, and registers a single package and recursively loads its dependencies.
+func (l @Loader) loadPackage(path @[]char) {
+	// Cycle detection (entry guard; the per-dependency check in the recursion
+	// loop below is what normally catches a cycle, since `path` is kept on the
+	// loading stack across that loop).
+	if l.isLoading(path) {
+		l.Errors = slices.Append[@[]char](l.Errors, l.cycleErrorMsg(path))
+		return
+	}
+	l.pushLoading(path)
+
+	// Two independent search loops: BniPath for the .bni interface,
+	// ImplPath for the impl directory. First hit on each wins.
+	var bniFile @ast.File
+	var files @[]@ast.File
+
+	// Interface path: <dir>/<path>.bni
+	for ri := 0; ri < len(l.BniPath); ri++ {
+		var dir @[]char = l.BniPath[ri]
+		var bniCb @strings.Builder = strings.NewBuilder()
+		bniCb.Write(pathJoin(dir, path))
+		bniCb.Write(".bni")
+		var bniPath @[]char = buf.CopyStr(bniCb.String())
+		// The .bni must exist as a regular file (not a directory).
+		bniFi, bniErr := os.Stat(bniPath)
+		if present(bniErr) || bniFi.IsDir() { continue }
+		var bniSrc @[]uint8 = readFileBytes(bniPath)
+		if len(bniSrc) == 0 { continue }
+		var p @parser.Parser = parser.NewInterface(bniSrc, bniPath)
+		bniFile = p.ParseFile()
+		var errs @[]parser.ParseError = p.Errors()
+		if len(errs) > 0 {
+			for j := 0; j < len(errs); j++ {
+				l.Errors = slices.Append[@[]char](l.Errors, errs[j].Msg)
+			}
+			l.popLoading(path)
+			return
+		}
+		break
+	}
+
+	// Impl path: <dir>/<path>/ containing at least one .bn file.  Skipped
+	// entirely for an InterfaceOnly package (an interpreter's injected /
+	// compiled-instance package) — its impl is neither needed nor loaded, so
+	// `files` stays empty and `merged` falls back to the .bni below.
+	for ri := 0; ri < len(l.ImplPath) && !l.isInterfaceOnly(path); ri++ {
+		var dir @[]char = l.ImplPath[ri]
+		var dirPath @[]char = pathJoin(dir, path)
+		// The package path must resolve to a directory.
+		dirFi, dirErr := os.Stat(dirPath)
+		if present(dirErr) || !dirFi.IsDir() { continue }
+		dents, rderr := os.ReadDir(dirPath)
+		if present(rderr) { continue }
+		// os.ReadDir drops only "." and ".."; reduce to a sortable name list,
+		// additionally skipping dot-prefixed names so a hidden file (e.g. a
+		// stray ".foo.bn") is never picked up as a package source.
+		var entries @[]@[]char
+		for di := 0; di < len(dents); di++ {
+			var dnm @[]readonly char = dents[di].Name()
+			if len(dnm) > 0 && dnm[0] == '.' { continue }
+			entries = slices.Append[@[]char](entries, buf.CopyStr(dnm[0:len(dnm)]))
+		}
+		if len(entries) == 0 { continue }
+		sortStrings(entries)
+		for j := 0; j < len(entries); j++ {
+			var name @[]char = entries[j]
+			if !hasSuffix(name, ".bn") { continue }
+			if hasSuffix(name, "_test.bn") && !containsStr(l.TestPackages, path) {
+				continue
+			}
+			var filePath @[]char = pathJoin(dirPath, name)
+			var src @[]uint8 = readFileBytes(filePath)
+			if len(src) == 0 { continue }
+
+			var p @parser.Parser = parser.New(src, filePath)
+			var f @ast.File = p.ParseFile()
+			var errs @[]parser.ParseError = p.Errors()
+			if len(errs) > 0 {
+				for k := 0; k < len(errs); k++ {
+					l.Errors = slices.Append[@[]char](l.Errors, errs[k].Msg)
+				}
+				l.popLoading(path)
+				return
+			}
+			// Build-constraint gate: drop a file whose package-clause
+			// `build` constraint excludes it for the active target.  A
+			// malformed/unknown constraint aborts (never a silent skip).
+			if l.BuildConfig != nil {
+				var keep bool
+				var cerr @[]char
+				var chas bool
+				keep, cerr, chas = buildcfg.DeclIncluded(l.BuildConfig, f.Annotations)
+				if chas {
+					l.Errors = slices.Append[@[]char](l.Errors, cerr)
+					l.popLoading(path)
+					return
+				}
+				if !keep {
+					continue
+				}
+			}
+			files = slices.Append[@ast.File](files, f)
+		}
+		if len(files) > 0 { break }
+	}
+
+	// Build-constraint gate on the interface file (see gateBni; relaxes
+	// pkg-layout-spec Invariant 1).  Runs before the empty-package check so
+	// a fully gated-out interface with no impl is correctly "not found".
+	var bniOk bool
+	bniFile, bniOk = l.gateBni(bniFile)
+	if !bniOk {
+		l.popLoading(path)
+		return
+	}
+
+	// Tag every .bni decl with its origin so the checker can tell a benign
+	// .bni decl reprocessed via the merge-prepend (or, for a .bni-only
+	// package, via merged == bniFile) from a genuine .bn redeclaration of
+	// an already-full type (plan-type-redecl.md).  Done here so it covers
+	// both the with-impl path (prepend below carries the same decl pointers
+	// into merged.Decls) and the .bni-only fallback (merged = bniFile).
+	// Decls parsed from .bn files keep the default FromBNI == false.
+	if bniFile != nil {
+		for i := 0; i < len(bniFile.Decls); i++ {
+			bniFile.Decls[i].FromBNI = true
+		}
+	}
+
+	if bniFile == nil && len(files) == 0 {
+		var cb2 @strings.Builder = strings.NewBuilder()
+		cb2.Write("package \"")
+		cb2.Write(path)
+		cb2.Write("\" not found")
+		l.Errors = slices.Append[@[]char](l.Errors, buf.CopyStr(cb2.String()))
+		l.popLoading(path)
+		return
+	}
+
+	// Merge .bn files
+	var merged @ast.File
+	if len(files) > 0 {
+		if len(files) == 1 {
+			merged = files[0]
+		} else {
+			merged = MergeFiles(files)
+		}
+	}
+
+	// Declaration- and import-level build-constraint gate (see gateMerged).
+	// Runs before the .bni overlay so a surviving variant satisfies the
+	// interface declaration, and before imports are collected/followed so a
+	// gated-out import is not loaded; a malformed constraint aborts the load.
+	if !l.gateMerged(merged) {
+		l.popLoading(path)
+		return
+	}
+
+	// Merge .bni declarations into implementation
+	if bniFile != nil && merged != nil {
+		// Prepend type/const/group/interface/impl declarations from
+		// .bni, plus function declarations that have no matching
+		// body in the .bn. Interface decls (Slice 2.7 of plan-
+		// cross-package-interfaces.md) need to flow through so that
+		// importing TUs see the iface in the merged file (the bni
+		// alone form is also fine, but importers prefer the merged
+		// file when present).  Impl decls flow through for the same
+		// reason: an `impl T : Iface` in a .bni is the package's
+		// cross-package contract.  The type checker (CheckPackage),
+		// IR-gen's vtable generation (GeneratePackage), and the
+		// importer's imported-impl collection (collectPkgFile returns
+		// the merged file) ALL read the merged file — so a .bni-only impl
+		// was invisible to every one of them, leaving the type unusable as
+		// the interface it implements (no assignability, no vtable).
+		var bniDecls @[]@ast.Decl
+		for j := 0; j < len(bniFile.Decls); j++ {
+			var d @ast.Decl = bniFile.Decls[j]
+			if d.Kind == ast.DECL_TYPE || d.Kind == ast.DECL_CONST || d.Kind == ast.DECL_INTERFACE ||
+					d.Kind == ast.DECL_IMPL {
+				bniDecls = slices.Append[@ast.Decl](bniDecls, d)
+			}
+			// A .bni `var ( ... )` group is a set of EXTERN declarations
+			// (storage defined in the .bn) — just like a top-level `.bni`
+			// `var X T`, which is likewise NOT prepended.  Prepending it would
+			// double-register each member's global against the .bn's definition
+			// (`redefinition of global @bn_G..._X`).  Const/type groups ARE the
+			// definition (no .bn counterpart), so they still flow through.
+			if d.Kind == ast.DECL_GROUP && !isVarGroup(d) {
+				bniDecls = slices.Append[@ast.Decl](bniDecls, d)
+			}
+			if d.Kind == ast.DECL_FUNC && (d.Body == nil || len(d.TypeParams) > 0 || recvIsGenericInst(d)) {
+				// Include extern function declarations (no body in
+				// .bni) AND generic function declarations — a free
+				// generic func (TypeParams) or a method on a generic
+				// type (generic receiver, empty TypeParams) — whose
+				// body lives in .bni per plan-generics.md Slice 7 / Q7,
+				// unless the .bn has a matching implementation.
+				var hasImpl bool = false
+				for k := 0; k < len(merged.Decls); k++ {
+					if merged.Decls[k].Kind == ast.DECL_FUNC && sameFuncDecl(merged.Decls[k], d) {
+						hasImpl = true
+						break
+					}
+				}
+				if !hasImpl {
+					bniDecls = slices.Append[@ast.Decl](bniDecls, d)
+				}
+			}
+		}
+		if len(bniDecls) > 0 {
+			var newDecls @[]@ast.Decl
+			for j := 0; j < len(bniDecls); j++ {
+				newDecls = slices.Append[@ast.Decl](newDecls, bniDecls[j])
+			}
+			for j := 0; j < len(merged.Decls); j++ {
+				newDecls = slices.Append[@ast.Decl](newDecls, merged.Decls[j])
+			}
+			merged.Decls = newDecls
+		}
+
+		// Mark the exported surface: a function or package-level var declared
+		// in the .bni is exported (exports are the .bni surface, not
+		// capitalization).  Runs after the prepend so pure-extern .bni funcs
+		// are marked too.  B0 of plan-package-introspection-phase-b.md; the
+		// var marking drives the reflect descriptor's exported-global table.
+		markBniExportedFuncs(bniFile, merged)
+		markBniExportedVars(bniFile, merged)
+
+		// Merge .bni imports
+		if len(bniFile.Imports) > 0 {
+			for j := 0; j < len(bniFile.Imports); j++ {
+				var bniImpPath @[]char = bniFile.Imports[j].Path
+				var found bool = false
+				if len(merged.Imports) > 0 {
+					for k := 0; k < len(merged.Imports); k++ {
+						if streq(merged.Imports[k].Path, bniImpPath) {
+							found = true
+							break
+						}
+					}
+				}
+				if !found {
+					merged.Imports = slices.Append[@ast.ImportSpec](merged.Imports, bniFile.Imports[j])
+				}
+			}
+		}
+	}
+
+	// If we only have .bni (no impl), use it as the merged file, marking its
+	// exported funcs.  An all-`.bni` package (generics library — bodies in the
+	// `.bni`, no `.bn`) skips the merge overlay above (guarded on `merged !=
+	// nil`), so without this its funcs stay Exported = false and bnlint's
+	// unused-func flags the public API as dead.  Vars need no marking here: a
+	// `.bni` var is a storage-less extern, and unused-global exempts FromBNI vars.
+	if merged == nil && bniFile != nil {
+		merged = bniFile
+		markBniExportedFuncs(bniFile, merged)
+	}
+
+	// Register package
+	var pkg @Package = make(Package)
+	pkg.Path = path
+	pkg.BNI = bniFile
+	pkg.Merged = merged
+	// Retain the per-file impl ASTs (pre-merge) so consumers can resolve a
+	// qualifier against only its own file's imports — `merged` deduplicates
+	// imports and so cannot answer "which packages did THIS file import".
+	pkg.Files = files
+
+	// Extract imports
+	if merged != nil && len(merged.Imports) > 0 {
+		for j := 0; j < len(merged.Imports); j++ {
+			var impPath @[]char = unquote(merged.Imports[j].Path)
+			if !containsStr(pkg.Imports, impPath) {
+				pkg.Imports = slices.Append[@[]char](pkg.Imports, impPath)
+			}
+		}
+	}
+
+	// Record `expose "P"` re-export targets from the .bni surface.  Placement is
+	// load-bearing: recordExposes reads bniFile.Decls directly (the merged-only
+	// prepend block above is skipped for a pure forwarder), and this must run
+	// before the dependency recursion below so each exposed P is loaded and
+	// cycle-checked (see recordExposes for the full rationale).
+	recordExposes(pkg, bniFile)
+	l.Packages = slices.Append[@Package](l.Packages, pkg)
+
+	// Recursively load dependencies.  `path` stays on the loading stack across
+	// this loop (popLoading runs after it), so a dependency that imports back
+	// into the current chain is detected as a cycle HERE — before the
+	// GetPackage dedup below would skip the already-registered package and hide
+	// the cycle (the bug that made the entry-guard check unreachable).
+	if len(pkg.Imports) > 0 {
+		for j := 0; j < len(pkg.Imports); j++ {
+			if l.isLoading(pkg.Imports[j]) {
+				l.Errors = slices.Append[@[]char](l.Errors, l.cycleErrorMsg(pkg.Imports[j]))
+				continue
+			}
+			if l.GetPackage(pkg.Imports[j]) == nil {
+				l.loadPackage(pkg.Imports[j])
+			}
+		}
+	}
+	l.popLoading(path)
+}

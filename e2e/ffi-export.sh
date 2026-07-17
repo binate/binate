@@ -189,8 +189,8 @@ check_backend() {
 # archive via `bnc --library` (the Phase-5a "a Binate .a a C program inits and
 # calls into" contract).  Building the archive is checked; the C-driver link+run
 # (init via the well-known `bn_init` symbol, call the exports, verify the run-once
-# idempotency guard across two bn_init() calls) is SKIPPED pending the Phase-6
-# runtime main-move — see the skip note in the body.
+# idempotency guard across two bn_init() calls) is SKIPPED pending the shim
+# relocation — see the skip note in the body.
 check_library() {
     work="$TMP/library"
     mkdir -p "$work"
@@ -200,17 +200,17 @@ check_library() {
         fail "library: --library ffiexp produced no archive" "$(tail -5 "$work/lib.log")"
         return
     fi
-    # SKIP the C-driver link+run pending Phase 6.  The facade's transitive closure
-    # pulls in rt (-> bootstrap.Write) and the force-included startup
-    # (-> bootstrap.Args); those bootstrap.* symbols are defined in
-    # binate_runtime.c, which the --library archive does NOT bundle — and a
-    # C-owns-main driver can't link binate_runtime.c either, because it carries its
-    # own `main`.  Providing a main-less runtime for an archive consumer to link is
-    # the Phase-6 runtime main-move (move `main` out of binate_runtime.c; see
-    # claude-todo.md "ffi-export --library" / plan-ffi-export-detailed.md).  Until
-    # then the bn_init-idempotency + export-call assertions can't link.  The
-    # archive itself builds, which this arm still checks above.
-    skip "library: bn_init + export calls from a C driver (pending Phase-6 runtime main-move; --library archive builds, but its rt/startup closure needs bootstrap.* from binate_runtime.c, which has main)"
+    # SKIP the C-driver link+run.  The Phase-6 runtime main-move has LANDED, so the
+    # `main`-collision blocker is gone: the tree's binate_runtime.c no longer defines
+    # `main`, and the archive itself carries none (a --library build sets entrypoint
+    # "init", gating out startup's `_entry`).  What remains is the SHIM problem: the
+    # facade's closure can pull in bootstrap.Write/Exec, defined in binate_runtime.c,
+    # which the --library archive does NOT bundle.  Un-skipping needs the harness to
+    # ALSO link the now-main-less binate_runtime.c for those shims (no main collision
+    # now), or a pure-compute export that touches no shim — see claude-todo.md
+    # "ffi-export --library" / plan-ffi-export-detailed.md.  The archive itself
+    # builds, which this arm still checks above.
+    skip "library: bn_init + export calls from a C driver (pending the shim relocation; the Phase-6 main-move landed, so binate_runtime.c + the archive are main-less, but the archive still lacks bootstrap.Write/Exec)"
 }
 
 # LLVM backend (default) — always required.

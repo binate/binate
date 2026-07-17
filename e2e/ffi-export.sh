@@ -18,9 +18,10 @@
 #
 # The exported functions are PURE COMPUTE (no I/O, no allocation), so the object
 # is self-contained: it needs neither the bootstrap.* I/O shims nor a Binate
-# main/runtime, so the C driver owns main() and links the object directly.  (A
-# .a archive and the I/O-shim relocation are later phases; this MVP harness links
-# the raw object, mirroring e2e/separate-compilation.sh.)
+# main/runtime, so the C driver owns main() and links the object directly,
+# mirroring e2e/separate-compilation.sh.  The .a-archive path (check_library)
+# links + inits + calls the whole archive through a C driver; relocating the
+# bootstrap.* I/O shims into Binate is a later phase.
 #
 # Uses a gen1 bnc built from the current source: the shipped BUILDER predates
 # #[c_export] and would reject it.  Auto-discovered by
@@ -187,10 +188,13 @@ check_backend() {
 
 # check_library builds the facade + its transitive closure into a static
 # archive via `bnc --library` (the Phase-5a "a Binate .a a C program inits and
-# calls into" contract).  Building the archive is checked; the C-driver link+run
-# (init via the well-known `bn_init` symbol, call the exports, verify the run-once
-# idempotency guard across two bn_init() calls) is SKIPPED pending the shim
-# relocation — see the skip note in the body.
+# calls into" contract), then links it into a C driver that inits it via the
+# well-known `bn_init` symbol, calls the exports, and proves bn_init ran the
+# package initializers exactly ONCE (ffi_base == 40 shows the inits ran;
+# ffi_counter == 1 across two bn_init() calls shows the run-once guard held).  The
+# archive is self-contained except libc and a single bootstrap.Write reference,
+# which resolves by co-linking the now-main-less binate_runtime.c (no `main`
+# collision — the entry-point move retired the C `main`).
 check_library() {
     work="$TMP/library"
     mkdir -p "$work"
@@ -200,17 +204,41 @@ check_library() {
         fail "library: --library ffiexp produced no archive" "$(tail -5 "$work/lib.log")"
         return
     fi
-    # SKIP the C-driver link+run.  The Phase-6 runtime main-move has LANDED, so the
-    # `main`-collision blocker is gone: the tree's binate_runtime.c no longer defines
-    # `main`, and the archive itself carries none (a --library build sets entrypoint
-    # "init", gating out startup's `_entry`).  What remains is the SHIM problem: the
-    # facade's closure can pull in bootstrap.Write/Exec, defined in binate_runtime.c,
-    # which the --library archive does NOT bundle.  Un-skipping needs the harness to
-    # ALSO link the now-main-less binate_runtime.c for those shims (no main collision
-    # now), or a pure-compute export that touches no shim — see claude-todo.md
-    # "ffi-export --library" / plan-ffi-export-detailed.md.  The archive itself
-    # builds, which this arm still checks above.
-    skip "library: bn_init + export calls from a C driver (pending the shim relocation; the Phase-6 main-move landed, so binate_runtime.c + the archive are main-less, but the archive still lacks bootstrap.Write/Exec)"
+    # Link the archive into a C driver that inits it (bn_init) and calls the
+    # exports.  The archive is self-contained except libc and one bootstrap.Write
+    # reference, defined in the (now main-less) binate_runtime.c — so co-linking $RT
+    # resolves it with no `main` collision against the driver's own `main`.
+    cat > "$work/driver.c" <<'EOF'
+#include <stdio.h>
+extern void bn_init(void);
+extern int ffi_add(int, int);
+extern int ffi_mul(int, int);
+extern int ffi_sub(int, int);
+extern int ffi_sub2(int, int);
+extern int ffi_base(void);
+extern int ffi_counter(void);
+int main(void) {
+    bn_init();  /* run every package's __init once, in dependency order */
+    bn_init();  /* idempotent: the run-once guard must NOT re-run inits */
+    printf("%d %d %d %d %d %d\n",
+           ffi_add(20, 22), ffi_mul(6, 7), ffi_sub(50, 8), ffi_sub2(100, 1),
+           ffi_base(), ffi_counter());
+    return 0;
+}
+EOF
+    if ! "$CLANG" -w "$work/driver.c" "$work/libffiexp.a" "$RT" -o "$work/run" \
+            2>"$work/link.err" || [ ! -x "$work/run" ]; then
+        fail "library: link of C driver + --library archive + runtime failed" \
+             "$(head -8 "$work/link.err")"
+        return
+    fi
+    got="$("$work/run" 2>&1)"
+    want="$WANT 40 1"
+    if [ "$got" = "$want" ]; then
+        pass "library: bn_init + #[c_export] calls from a C driver (base=40 -> inits ran; counter=1 -> run-once): '$got'"
+    else
+        fail "library: bn_init/export output mismatch (got '$got', want '$want')"
+    fi
 }
 
 # LLVM backend (default) — always required.

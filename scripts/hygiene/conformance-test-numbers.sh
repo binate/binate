@@ -43,7 +43,7 @@ emit_test_numbers() {
     emit_ns="$2"
     for bn in "$emit_dir"/[0-9][0-9][0-9]*_*.bn; do
         [ -f "$bn" ] || continue
-        name="$(basename "$bn" .bn)"
+        name="${bn##*/}"; name="${name%.bn}"
         if [ -f "$emit_dir/${name}.expected" ] || \
            [ -f "$emit_dir/${name}.error" ]; then
             num="${name%%_*}"
@@ -52,7 +52,7 @@ emit_test_numbers() {
     done
     for dir in "$emit_dir"/[0-9][0-9][0-9]*_*/; do
         [ -d "$dir" ] || continue
-        name="$(basename "$dir")"
+        name="${dir%/}"; name="${name##*/}"
         num="${name%%_*}"
         printf "%s:%s %s\n" "$emit_ns" "$num" "$name"
     done
@@ -106,6 +106,8 @@ fi
 # such stem that emit_test_numbers did not record (i.e. is absent from
 # NUMS_TMP) means the enumeration glob is too narrow and dropped a real test.
 MISS_TMP="$(mktemp "${TMPDIR:-/tmp}/conformance-missing.XXXXXX")"
+CAND_TMP="$(mktemp "${TMPDIR:-/tmp}/conformance-cand.XXXXXX")"
+NUMS_SORTED="$(mktemp "${TMPDIR:-/tmp}/conformance-numsorted.XXXXXX")"
 find "$CONFORMANCE_DIR" -type d -name '[0-9][0-9][0-9]*_*' -prune -o -type d -print |
 while IFS= read -r d; do
     if [ "$d" = "$CONFORMANCE_DIR" ]; then
@@ -115,7 +117,7 @@ while IFS= read -r d; do
     fi
     for e in "$d"/*; do
         [ -e "$e" ] || continue
-        b="$(basename "$e")"
+        b="${e##*/}"   # basename via param expansion — no fork per entry
         # A numbered test starts with >=3 digits.  This classification does not
         # care where the underscore falls, so a 4-digit stem still qualifies.
         case "$b" in [0-9][0-9][0-9]*) ;; *) continue ;; esac
@@ -130,17 +132,28 @@ while IFS= read -r d; do
         if [ ! -d "$e" ]; then
             [ -f "$d/${stem}.expected" ] || [ -f "$d/${stem}.error" ] || continue
         fi
-        if ! grep -qxF "${ns}:${stem%%_*} ${stem}" "$NUMS_TMP"; then
-            printf "%s/%s\n" "$ns" "$stem" >> "$MISS_TMP"
-        fi
+        # Record the on-disk key (same format as NUMS_TMP).  A single set-diff
+        # after the walk finds any key the emit globs missed — far cheaper than
+        # a per-entry `grep` of NUMS_TMP (which was O(entries * NUMS_TMP)).
+        printf "%s:%s %s\n" "$ns" "${stem%%_*}" "$stem" >> "$CAND_TMP"
     done
 done
-missing="$(sort -u "$MISS_TMP" | wc -l | tr -d ' ')"
+# On-disk keys not in the emitted set = enumeration-glob misses.  comm needs both
+# inputs sorted the same way; LC_ALL=C keeps that independent of the locale.
+LC_ALL=C sort -u "$CAND_TMP" -o "$CAND_TMP"
+LC_ALL=C sort -u "$NUMS_TMP" -o "$NUMS_SORTED"
+# A missing line is "<ns>:<num> <stem>".  Split on the FIRST ':' for the ns and
+# the LAST ' ' for the stem, so a namespace containing a space (unusual, but the
+# key format allows it) still renders as "<ns>/<stem>" rather than mangling.
+comm -23 "$CAND_TMP" "$NUMS_SORTED" | while IFS= read -r mline; do
+    printf "%s/%s\n" "${mline%%:*}" "${mline##* }"
+done | sort -u > "$MISS_TMP"
+missing="$(wc -l < "$MISS_TMP" | tr -d ' ')"
 if [ "$missing" -gt 0 ]; then
     echo "UNDISCOVERED (enumeration glob too narrow to see these numbered tests):"
-    sort -u "$MISS_TMP" | sed 's/^/  /'
+    sed 's/^/  /' "$MISS_TMP"
 fi
-rm -f "$NUMS_TMP" "$MISS_TMP"
+rm -f "$NUMS_TMP" "$MISS_TMP" "$CAND_TMP" "$NUMS_SORTED"
 
 if [ "$dups" -gt 0 ] || [ "$missing" -gt 0 ]; then
     echo ""

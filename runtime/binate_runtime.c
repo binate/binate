@@ -111,9 +111,10 @@ bn_int_t bn_F2_3_pkg9_bootstrap1_4_Exec(BnSlice program, BnSlice args) {
 /* No `main` here: the process entry point (the C `main` symbol) and argv
  * capture are written in Binate — pkg/builtins/startup._entry, exported as the
  * unmangled `main` via #[c_export] and compiled into every hosted binary, which
- * captures argv into startup.Args and then calls bn_entry (the synthetic
- * `<main>.__entry` the compiler emits, running per-package var initializers then
- * the user's main).  This runtime now provides only the remaining hosted shims
+ * captures argv and installs it via startup.SetArgs, then calls bn_entry (the
+ * synthetic `<main>.__entry` the compiler emits, running per-package var
+ * initializers then the user's main).  This runtime now provides only the
+ * remaining hosted shims
  * (Write, Exec).  The frozen BUILDER-bundle copy of this file still defines
  * `main` + bootstrap.Args, for gen1 (which BUILDER links against); the version
  * gate on startup._entry keeps the two in lockstep.  See design-ffi-export.md

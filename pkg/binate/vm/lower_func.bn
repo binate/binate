@@ -141,11 +141,18 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 	if globalRegs < 1 { globalRegs = 1 }
 	vmf.NumRegs = f.NextID + maxArgs + globalRegs
 
+	// `blocks` is the function's body blocks followed by its VM-only cleanup
+	// pads (Func.FaultPads); the VM lowers both (pads get PCs after the body so a
+	// fault can branch to one), while the compiled backends iterate only
+	// Func.Blocks.  Empty FaultPads ⇒ blocks == f.Blocks (no copy, no behavior
+	// change).  See combinedBlocks + plan-rt-fault-cleanup-pads.md.
+	var blocks @[]@ir.Block = combinedBlocks(f)
+
 	// First pass: compute stack frame layout (alloca offsets)
 	var frameOffset int = 0
 	var allocaOffsets @[]int = make_slice(int, f.NextID)
-	for i := 0; i < len(f.Blocks); i++ {
-		var blk @ir.Block = f.Blocks[i]
+	for i := 0; i < len(blocks); i++ {
+		var blk @ir.Block = blocks[i]
 		for j := 0; j < len(blk.Instrs); j++ {
 			var instr @ir.Instr = blk.Instrs[j]
 			if instr.Op == iropcode.OP_ALLOC && instr.TypeArg != nil {
@@ -187,13 +194,19 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 	// Second pass: compute block offsets (label → bytecode index)
 	// We need to know how many bytecodes each block produces.
 	// Do a dry run to count, then a real emit pass.
-	var blockOffsets @[]int = make_slice(int, len(f.Blocks))
+	var blockOffsets @[]int = make_slice(int, len(blocks))
 	var totalInstrs int = 0
-	for i := 0; i < len(f.Blocks); i++ {
+	// faultCount: ops tagged with a cleanup pad (ir.Instr.PadBlock) — counted
+	// here so the emit pass fills fixed-size fault-entry arrays (Inc 2a).
+	var faultCount int = 0
+	for i := 0; i < len(blocks); i++ {
 		blockOffsets[i] = totalInstrs
-		var blk @ir.Block = f.Blocks[i]
+		var blk @ir.Block = blocks[i]
 		for j := 0; j < len(blk.Instrs); j++ {
 			var instr @ir.Instr = blk.Instrs[j]
+			if instr.PadBlock != nil {
+				faultCount = faultCount + 1
+			}
 			if instr.Op == iropcode.OP_PHI {
 				// Phi nodes don't emit directly — copies are inserted in predecessors
 				continue
@@ -264,8 +277,8 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 	}
 
 	// Add space for phi copies (conservative: count all phi entries)
-	for i := 0; i < len(f.Blocks); i++ {
-		var blk @ir.Block = f.Blocks[i]
+	for i := 0; i < len(blocks); i++ {
+		var blk @ir.Block = blocks[i]
 		for j := 0; j < len(blk.Instrs); j++ {
 			if blk.Instrs[j].Op == iropcode.OP_PHI {
 				totalInstrs = totalInstrs + len(blk.Instrs[j].Phis)
@@ -277,11 +290,20 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 	var code @[]BCInstr = make_slice(BCInstr, totalInstrs)
 	var codeIdx int = 0
 
+	// Fault entries (Inc 2a): parallel arrays filled as pad-tagged ops emit.
+	// faultKeyPCs[k] is the PC AFTER the faulting/call op's main bytecode (the
+	// resume pc a fault or a caller-unwind observes — the loop pre-increments pc,
+	// and pushFrame saves that post-op pc as callerPC); faultPadIdxs[k] the op's
+	// cleanup-pad index in `blocks`.  Resolved into VMFunc.FaultTable after emit.
+	var faultKeyPCs @[]int = make_slice(int, faultCount)
+	var faultPadIdxs @[]int = make_slice(int, faultCount)
+	var faultIdx int = 0
+
 	// Collect phi copies per block (inserted before terminator)
 	// phiCopies[blockIdx] = list of (dst, src) pairs
-	for i := 0; i < len(f.Blocks); i++ {
+	for i := 0; i < len(blocks); i++ {
 		blockOffsets[i] = codeIdx
-		var blk @ir.Block = f.Blocks[i]
+		var blk @ir.Block = blocks[i]
 
 		for j := 0; j < len(blk.Instrs); j++ {
 			var instr @ir.Instr = blk.Instrs[j]
@@ -403,6 +425,15 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 			var bc BCInstr = lowerInstr(vm, instr, allocaOffsets, blockOffsets, f, callArgBase)
 			code[codeIdx] = bc
 			codeIdx = codeIdx + 1
+			if instr.PadBlock != nil {
+				// Tagged faulting/call op: record (resume pc, pad-block index).
+				// codeIdx is now the pc past the op's main bytecode — exactly the
+				// pc a fault sees (loop pre-increments) or a caller-unwind resumes
+				// at (pushFrame saved it as callerPC).  Resolved below.  (Inc 2a)
+				faultKeyPCs[faultIdx] = codeIdx
+				faultPadIdxs[faultIdx] = blockIndexOf(blocks, instr.PadBlock)
+				faultIdx = faultIdx + 1
+			}
 			// Canonicalize a cross-mode sub-word/bool scalar RETURN: the native
 			// shim leaves bits above the value's width undefined (garbage on
 			// x86-64), and the VM reads the return as a full i64, so a direct use
@@ -432,6 +463,30 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 	}
 
 	vmf.Code = code[:codeIdx]
+
+	// Pass 2 counted faultCount pad-tagged ops; pass 3 must have emitted exactly
+	// that many entries.  If they diverge (a future emit-side skip not mirrored
+	// in the pass-2 count), catch it here rather than reading unwritten slots and
+	// silently corrupting the table.
+	if faultIdx != faultCount {
+		vmPanic("vm: fault-entry count mismatch between lowering passes")
+	}
+
+	// Assemble the recoverable-fault table: each pad-tagged op's resume pc → its
+	// cleanup pad's pc, as inline (opPC, padPC) pairs.  Emission is in ascending
+	// pc order, so the table is already sorted for the Inc-2b binary search.
+	// (plan-rt-fault-cleanup-pads.md)
+	if faultCount > 0 {
+		var ft @[]int = make_slice(int, faultCount * 2)
+		for i := 0; i < faultCount; i++ {
+			if faultPadIdxs[i] < 0 {
+				vmPanic("vm: fault-pad block not found in function (lowering bug)")
+			}
+			ft[i * 2] = faultKeyPCs[i]
+			ft[i * 2 + 1] = blockOffsets[faultPadIdxs[i]]
+		}
+		vmf.FaultTable = ft
+	}
 
 	// Remap register numbers to slots.  Until here a register number
 	// is the IR value id (plus the call-arg and global-address register

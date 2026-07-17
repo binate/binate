@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Packages to skip from linting.  bnlint is fetched from the CHECK_TOOLS_VERSION
-# bundle (bnc-0.0.12-pre1), decoupled from BUILDER_VERSION so a newer check-tool
+# bundle (bnc-0.0.12-pre2), decoupled from BUILDER_VERSION so a newer check-tool
 # feature does not require a build-ladder rung (see
 # explorations/plan-check-tools-version.md).  A skipped target stays fully
 # type-checked and compiled by every conformance mode — only bnlint's style rules
@@ -31,7 +31,7 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # transitive importer chain of the offending source.
 #
 # LINT_SKIP is currently EMPTY: the whole tree lints clean under the
-# bnc-0.0.12-pre1 bnlint.
+# bnc-0.0.12-pre2 bnlint.
 #
 # Previously skipped, now linted (kept as changelog — do NOT re-add without cause):
 #   - pkg/stdx/containers/setfn — a multi-root checker-state-leak: within ONE bnlint

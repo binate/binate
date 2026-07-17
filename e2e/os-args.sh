@@ -152,10 +152,21 @@ WITH_ARGS="argv0=present
 [gamma]"
 NO_ARGS="argv0=present
 1"
+# An EMPTY argument (`""`) must still surface as a present element that prints as
+# `[]` (len 0).  The compiled entry borrows argv in place (pkg/builtins/startup._entry),
+# and a zero-length arg must stay the canonical empty slice — this pins that an
+# empty arg flows through the borrow path at all (element count includes it, and
+# it renders empty, not dropped or garbled).
+EMPTY_ARG="argv0=present
+4
+[alpha]
+[]
+[gamma]"
 
 # (a) compiled native binary: argv[1..] are seen directly (no host, no `--`).
-check "compiled/with-args" "$WITH_ARGS" "$("$ARGS_BIN" alpha beta gamma 2>&1)"
-check "compiled/no-args"   "$NO_ARGS"   "$("$ARGS_BIN" 2>&1)"
+check "compiled/with-args"  "$WITH_ARGS" "$("$ARGS_BIN" alpha beta gamma 2>&1)"
+check "compiled/no-args"    "$NO_ARGS"   "$("$ARGS_BIN" 2>&1)"
+check "compiled/empty-arg"  "$EMPTY_ARG" "$("$ARGS_BIN" alpha '' gamma 2>&1)"
 
 # (b) cmd/bni interpreting the fixture: the program's args come after `--`, and
 # cmd/bni installs them (via os.SetArgs) so os.Args() surfaces them.
@@ -163,6 +174,8 @@ check "interp/with-args" "$WITH_ARGS" \
     "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" -- alpha beta gamma 2>&1)"
 check "interp/no-args"   "$NO_ARGS" \
     "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" 2>&1)"
+check "interp/empty-arg" "$EMPTY_ARG" \
+    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" -- alpha '' gamma 2>&1)"
 
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="

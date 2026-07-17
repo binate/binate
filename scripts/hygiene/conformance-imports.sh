@@ -36,104 +36,100 @@ ALLOWED_REAL="pkg/bootstrap"
 
 LIST=$(mktemp -t hygiene-conformance-imports-list.XXXXXX)
 VIOLATIONS=$(mktemp -t hygiene-conformance-imports-out.XXXXXX)
-trap 'rm -f "$LIST" "$VIOLATIONS"' EXIT
+IMPORTS=$(mktemp -t hygiene-conformance-imports-imp.XXXXXX)
+WL_CLEAN=$(mktemp -t hygiene-conformance-imports-wl.XXXXXX)
+trap 'rm -f "$LIST" "$VIOLATIONS" "$IMPORTS" "$WL_CLEAN"' EXIT
 
 find "$CONFORMANCE_DIR" -type f \( -name '*.bn' -o -name '*.bni' \) \
     | sort > "$LIST"
 
-is_exempt() {
-    rel="$1"
-    imp="$2"
-    [ -f "$WHITELIST_FILE" ] || return 1
-    grep -v '^[[:space:]]*#' "$WHITELIST_FILE" \
-        | grep -v '^[[:space:]]*$' \
-        | grep -Fxq "$rel:$imp"
-}
+# Pre-strip the exemption whitelist's comments/blanks ONCE (was re-done via two
+# greps on every non-allowed import).  Conformance paths never contain a tab or
+# space, so the tab-delimited pipeline below is unambiguous.
+if [ -f "$WHITELIST_FILE" ]; then
+    grep -v '^[[:space:]]*#' "$WHITELIST_FILE" | grep -v '^[[:space:]]*$' > "$WL_CLEAN"
+fi
 
-while IFS= read -r f; do
-    rel_conf="${f#$CONFORMANCE_DIR/}"
-    rel_repo="${f#$BINATE_DIR/}"
-    # A file's test directory is the nearest ancestor (up to conformance/)
-    # holding a main.bn — the multi-package test it belongs to. This covers
-    # both top-level (conformance/NNN_name/) and nested (conformance/spec/
-    # <chapter>/NNN_name/) multi-package tests. A file with no such ancestor
-    # is a single-file test and may use only whitelisted imports.
-    test_root=""
-    _d="$(dirname "$f")"
-    while [ "$_d" != "$CONFORMANCE_DIR" ] && [ "$_d" != "/" ] && [ -n "$_d" ]; do
-        if [ -f "$_d/main.bn" ]; then test_root="$_d"; break; fi
-        _d="$(dirname "$_d")"
-    done
-
-    # Extract every imported path of the form "pkg/...". Handles both
-    # the single-line form `import "pkg/X"` and the grouped form
-    # `import ( "pkg/X" "pkg/Y" )`. The state machine tolerates blank
-    # lines and comments inside the group.
-    imports=$(awk '
+# Extract every "pkg/..." import from EVERY file in ONE awk pass (was one awk
+# fork PER file — ~3,500 forks / ~10s).  Emit "<path>\t<import>".  FNR==1 resets
+# the group-state machine per file (an unterminated `import (` must not bleed
+# into the next file).  Handles the single-line `import "pkg/X"` and grouped
+# `import ( "pkg/X" ... )` forms, tolerating blanks/comments inside the group.
+if [ -s "$LIST" ]; then
+    xargs awk '
+        FNR == 1 { in_group = 0 }
         /^import \(/ { in_group = 1; next }
         in_group && /^\)/ { in_group = 0; next }
         in_group {
             if (match($0, /"pkg\/[^"]+"/)) {
-                print substr($0, RSTART + 1, RLENGTH - 2)
+                print FILENAME "\t" substr($0, RSTART + 1, RLENGTH - 2)
             }
             next
         }
         /^import "pkg\// {
             if (match($0, /"pkg\/[^"]+"/)) {
-                print substr($0, RSTART + 1, RLENGTH - 2)
+                print FILENAME "\t" substr($0, RSTART + 1, RLENGTH - 2)
             }
         }
-    ' "$f")
+    ' < "$LIST" > "$IMPORTS"
+fi
 
-    [ -z "$imports" ] && continue
+TAB=$(printf '\t')
+while IFS="$TAB" read -r f imp; do
+    [ -z "$imp" ] && continue
+    rel_conf="${f#$CONFORMANCE_DIR/}"
+    rel_repo="${f#$BINATE_DIR/}"
 
-    printf '%s\n' "$imports" | while IFS= read -r imp; do
-        [ -z "$imp" ] && continue
+    # Tier-0 builtins (pkg/builtins/*) are always-available runtime
+    # essentials — allowed for every conformance test.
+    case "$imp" in
+        pkg/builtins/*) continue ;;
+    esac
 
-        # Tier-0 builtins (pkg/builtins/*) are always-available runtime
-        # essentials — allowed for every conformance test.
-        case "$imp" in
-            pkg/builtins/*) continue ;;
-        esac
+    # Stdlib conformance subtree (conformance/stdlib/*) exercises the stdlib
+    # end-to-end, so it may import pkg/std/*.  Scoped to the subtree by the
+    # rel_conf prefix — the MAIN language conformance set stays core-only.
+    case "$rel_conf" in
+        stdlib/*)
+            case "$imp" in
+                pkg/std/*) continue ;;
+            esac
+            ;;
+    esac
 
-        # Stdlib conformance subtree (conformance/stdlib/*) exercises the
-        # stdlib end-to-end, so it may import pkg/std/*.  This is scoped to
-        # the subtree by the rel_conf prefix — the MAIN language conformance
-        # set (conformance/NNN_*, conformance/spec/*) stays core-only.  See
-        # claude-todo.md "Stdlib conformance tests".
-        case "$rel_conf" in
-            stdlib/*)
-                case "$imp" in
-                    pkg/std/*) continue ;;
-                esac
-                ;;
-        esac
+    # Whitelisted real package?
+    skip=0
+    for w in $ALLOWED_REAL; do
+        [ "$imp" = "$w" ] && { skip=1; break; }
+    done
+    [ "$skip" = 1 ] && continue
 
-        # Whitelisted real package?
-        for w in $ALLOWED_REAL; do
-            if [ "$imp" = "$w" ]; then
-                continue 2
-            fi
-        done
-
-        # Test-local fixture?
-        if [ -n "$test_root" ]; then
-            local_path="$test_root/$imp"
-            if [ -d "$local_path" ] || \
-               [ -f "$local_path.bn" ] || \
-               [ -f "$local_path.bni" ]; then
-                continue
-            fi
-        fi
-
-        # Per-file exemption?
-        if is_exempt "$rel_conf" "$imp"; then
+    # Test-local fixture?  A file's test directory is the nearest ancestor (up
+    # to conformance/) holding a main.bn.  Computed lazily here — only reached
+    # for the rare non-whitelisted import — via param-expansion (no `dirname`
+    # fork per file).
+    test_root=""
+    _d="${f%/*}"
+    while [ "$_d" != "$CONFORMANCE_DIR" ] && [ "$_d" != "/" ] && [ -n "$_d" ]; do
+        if [ -f "$_d/main.bn" ]; then test_root="$_d"; break; fi
+        _d="${_d%/*}"
+    done
+    if [ -n "$test_root" ]; then
+        local_path="$test_root/$imp"
+        if [ -d "$local_path" ] || \
+           [ -f "$local_path.bn" ] || \
+           [ -f "$local_path.bni" ]; then
             continue
         fi
+    fi
 
-        echo "$rel_repo: disallowed import \"$imp\"" >> "$VIOLATIONS"
-    done
-done < "$LIST"
+    # Per-file exemption? (single grep against the pre-stripped whitelist)
+    if [ -s "$WL_CLEAN" ] && grep -Fxq "$rel_conf:$imp" "$WL_CLEAN"; then
+        continue
+    fi
+
+    echo "$rel_repo: disallowed import \"$imp\"" >> "$VIOLATIONS"
+done < "$IMPORTS"
 
 if [ -s "$VIOLATIONS" ]; then
     cat "$VIOLATIONS"

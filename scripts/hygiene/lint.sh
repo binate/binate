@@ -24,26 +24,30 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 
 # Packages to skip from linting.  bnlint is fetched from the CHECK_TOOLS_VERSION
-# bundle (bnc-0.0.11), decoupled from BUILDER_VERSION so a newer check-tool
+# bundle (bnc-0.0.12-pre1), decoupled from BUILDER_VERSION so a newer check-tool
 # feature does not require a build-ladder rung (see
 # explorations/plan-check-tools-version.md).  A skipped target stays fully
 # type-checked and compiled by every conformance mode — only bnlint's style rules
 # pause — and bnlint typechecks dependency BODIES, so a skip must cover the whole
 # transitive importer chain of the offending source.
 #
-# LINT_SKIP holds ONE package: pkg/stdx/containers/setfn.  Unlike the historical
-# skips below, this is NOT a CHECK_TOOLS version-lag — a bump will not clear it.  It
-# is a live checker state-leak: within ONE bnlint process, linting setfn AFTER a
-# package whose dependency closure interns a `readonly uint8` slice element (e.g.
-# pkg/binate/format, via pkg/std/strings' `Builder.Write(p *[]readonly uint8)`) leaks
-# that element type into setfn's typecheck, which then spuriously rejects an `@[]char`
-# (== @[]uint8) assignment with "cannot assign @[]readonly uint8 to @[]uint8".  It is
-# order-dependent — setfn linted FIRST, or alone, is clean; the whole-tree run below
-# hits the poisoning order.  Tracked as a MAJOR in explorations/claude-todo.md
-# ("bnlint multi-root typecheck leaks checker state across roots"); DROP setfn once
-# that is fixed.
+# LINT_SKIP is currently EMPTY: the whole tree lints clean under the
+# bnc-0.0.12-pre1 bnlint.
 #
 # Previously skipped, now linted (kept as changelog — do NOT re-add without cause):
+#   - pkg/stdx/containers/setfn — a multi-root checker-state-leak: within ONE bnlint
+#     process, linting a target AFTER a package whose dependency closure interns a
+#     `readonly uint8` slice element (e.g. pkg/binate/format, via pkg/std/strings'
+#     `Builder.Write(p *[]readonly uint8)`, or any `vec.Vec[@[]readonly char]` site)
+#     leaked that element type into the later target's typecheck, spuriously rejecting
+#     an `@[]char` (== @[]uint8) assignment ("cannot assign @[]readonly uint8 to
+#     @[]uint8").  The checker's generic-instantiation cache conflating
+#     `readonly`-differing type args was FIXED in `962450cf`; setfn cleared at the
+#     bnc-0.0.12-pre1 CHECK_TOOLS bump — the first bundle past that fix.  (The same
+#     leak, once main gained more `vec.Vec[@[]readonly char]` instantiations, also
+#     began mis-firing on pkg/binate/repl/loop_test.bn — a victim that shifts with the
+#     instantiation set across the Vec sweep, so the CHECK_TOOLS bump, not a per-package
+#     LINT_SKIP, was the right fix.)
 #   - the rest of the injectable-key-policy + Table container cone (pkg/stdx/{hash,
 #     cmp} + pkg/stdx/containers/{table,mapfn,hashmap,set}) — LEFT the skip at the
 #     bnc-0.0.11 bump, which carries the generic-instantiation-as-constraint-arg /
@@ -57,7 +61,7 @@ BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
 #     name-collision fix, `undefined: __Package` resolution, and per-site
 #     `// bnlint:allow managed-to-raw-assign` directives; the 1 real asm UAF was fixed
 #     separately in 8a883450).
-LINT_SKIP="pkg/stdx/containers/setfn"
+LINT_SKIP=""
 
 # Discover targets:
 #   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so

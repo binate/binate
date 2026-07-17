@@ -756,6 +756,22 @@ println(x)
 > 42
 > "
 
+# --- Ordering pin: a parked var whose initializer PRINTS, resolved in ONE
+# turn.  Since the Inc 1 Kernel reshape, notices are returned as Result data
+# and rendered AFTER a turn's evaluated-code output (vs. the old immediate
+# sink) — so the "resolved" notice now prints AFTER the initializer's "7", not
+# before.  Pins that accepted ordering (plan-repl-kernel.md, notices-as-data
+# Decision #3); a future edit that reverts the order reddens here. ---
+run_repl "kernel-notice-renders-after-eval-output" \
+"var x int = f()
+func f() int { println(7); return 41 }
+" \
+"$BANNER
+> variable x parked (pending: f)
+> 7
+variable x resolved
+> "
+
 # --- Case 32 (Stage 1): a typed const whose value expression
 # references an undefined name parks; defining the missing
 # name resolves it.  Consts are folded at IR-gen time so

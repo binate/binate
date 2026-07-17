@@ -54,9 +54,7 @@ _resolve_builder() {
 # root.  Builder-link callers append this to -I/-L so a bnc-X.Y.Z
 # bundle can supply stdlib pieces missing from the current checkout
 # (or, when the user wants the bundled version specifically, override
-# their checkout by prepending the bundle dir instead).  For
-# bootstrap-* this echoes $BINATE_DIR — duplicate path entries are
-# cheap.
+# their checkout by prepending the bundle dir instead).
 _resolve_builder_lib() {
     if [ -z "$_BUILDER_LIB" ]; then
         _BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
@@ -77,7 +75,7 @@ build_gen1() {
     # deps) may only use language, core-lib (builtin), and stdlib features that
     # exist in the BUILDER — the BUILDER-compatibility constraint — so its
     # builtin + stdlib deps resolve entirely from the BUILDER's frozen bundle
-    # (the inner `--base "$blib"`, which also supplies the linked C runtime).
+    # (`--base "$blib"`, which also supplies the linked C runtime).
     # Pulling those from source instead would let cmd/bnc accidentally use a
     # not-yet-in-BUILDER feature (e.g. `same` in std/errors, added after
     # bnc-0.0.7) and fail the build.  Only pkg/binate (the compiler's own code)
@@ -88,11 +86,9 @@ build_gen1() {
     # incoherent.  If cmd/bnc needs a feature the BUILDER lacks, bump
     # BUILDER_VERSION.  gen1's objects carry the BUILDER's mangling/ABI; gen1's
     # OUTPUTS (gen2, tests, conformance) are emitted by gen1 and link the
-    # checkout runtime.  (The OUTER -I/-L, before `--`, is a bootstrap-shape
-    # prefix a bootstrap-* BUILDER consumes; a bnc-* BUILDER's fetch-builder
-    # wrapper strips everything up to `--`, so only the inner paths reach bnc.)
-    # e2e/{repl,os-args}.sh + scripts/build-*.sh: same inner form.
-    build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" "$BINATE_DIR/cmd/bnc" -- -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$blib")" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    # checkout runtime.
+    # e2e/{repl,os-args}.sh + scripts/build-*.sh use the same invocation form.
+    build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$blib")" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"

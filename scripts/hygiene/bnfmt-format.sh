@@ -44,7 +44,7 @@ hashcmd() {
 # Prefer the bundled bnfmt from CHECK_TOOLS_VERSION when available (a bnc-* bundle
 # that ships bnfmt).  --check-tools resolves the CHECK-TOOLS release, which may be a
 # pre-release ahead of the BUILDER (see plan-check-tools-version.md).  Bundles
-# without a bnfmt (e.g. bnc-0.0.10, or bootstrap-*) make the fetcher exit non-zero;
+# without a bnfmt (e.g. bnc-0.0.10) make the fetcher exit non-zero;
 # then bnfmt stays empty and the from-source build + cache below runs.  This whole
 # from-source path drops out once CHECK_TOOLS_VERSION ships a bnfmt.
 bnfmt="$("$BINATE_DIR/scripts/fetch-builder.sh" --check-tools --tool bnfmt 2>/dev/null || true)"

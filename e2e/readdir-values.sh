@@ -141,8 +141,8 @@ EOF
 # BUILDER — no gen1 build needed.  os once required a .bni free-func/method fix
 # (796effc7) that postdated the then-BUILDER (bnc-0.0.9); that fix is contained in
 # the current BUILDER_VERSION, so the BUILDER compiles os directly.  Mirrors
-# e2e/os-args.sh's BUILDER -> cmd/bnc form (inner -I/-L resolve os's stdlib
-# deps from the BUILDER's frozen bundle, source prepended).
+# e2e/os-args.sh (the -I/-L resolve os's stdlib deps from the BUILDER's
+# frozen bundle, source prepended).
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
@@ -150,9 +150,6 @@ BNC_BIN="$TMP/rprobe"
 BUILD_DIR="$TMP/build"
 mkdir -p "$BUILD_DIR"
 bnc_log=$("$BUILDER" \
-    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
-    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
-    "$BINATE_DIR/cmd/bnc" -- \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     --runtime "$BUILDER_RUNTIME" \

@@ -105,14 +105,11 @@ GEN1_BNC="$GEN1_DIR/bnc"
 mkdir -p "$GEN1_DIR/build"
 
 echo "  Stage 1: BUILDER → gen1 ..."
-# Stage 1's inner -I/-L resolve cmd/bnc's builtin + stdlib deps from the
+# Stage 1's -I/-L resolve cmd/bnc's builtin + stdlib deps from the
 # BUILDER's frozen bundle only (--base "$BUILDER_LIB" --prepend "$BINATE_DIR");
 # the bnc source cone may only use features the BUILDER has, so no source
 # fallback.  Full rationale: scripts/lib/build-compilers.sh build_gen1.
 "$BUILDER" \
-    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
-    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
-    "$BINATE_DIR/cmd/bnc" -- \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     --runtime "$BUILDER_RUNTIME" \

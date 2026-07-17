@@ -102,7 +102,7 @@ BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUIL
 # The final binary is then emitted by gen1 from current source,
 # linked against the checkout's C runtime — fully consistent.
 #
-# Stage 1's inner -I/-L resolve cmd/bnc's builtin + stdlib deps entirely from
+# Stage 1's -I/-L resolve cmd/bnc's builtin + stdlib deps entirely from
 # the BUILDER's frozen bundle (`--base "$BUILDER_LIB" --prepend "$BINATE_DIR"`):
 # the bnc source cone may only use language/core/stdlib features the BUILDER has
 # (BUILDER-compatibility), so source copies aren't used and there is no source
@@ -116,9 +116,6 @@ mkdir -p "$GEN1_DIR/build"
 
 echo "  Stage 1: BUILDER → gen1 ..."
 "$BUILDER" \
-    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
-    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
-    "$BINATE_DIR/cmd/bnc" -- \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     --runtime "$BUILDER_RUNTIME" \

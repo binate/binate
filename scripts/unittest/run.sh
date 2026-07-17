@@ -6,11 +6,10 @@
 #
 # Modes (chains of: builder=resolved BUILDER_VERSION binary running
 # cmd/bnc, comp=compiler from current tree, int=bytecode VM).  The
-# first link is the BUILDER_VERSION-resolved binary (currently
-# bootstrap-* via scripts/fetch-builder.sh, eventually a tagged
-# bnc-X.Y.Z bundle).
+# first link is the BUILDER_VERSION-resolved binary (a bnc-X.Y.Z
+# bundle resolved via scripts/fetch-builder.sh).
 #
-#   builder-comp             Builder interprets bnc, which compiles and runs tests
+#   builder-comp             BUILDER compiles bnc, which compiles and runs tests
 #   builder-comp-int         Compiled bni runs --test natively via bytecode VM
 #   builder-comp-comp        Self-compiled compiler (gen1) runs --test
 #   builder-comp-comp-int    Gen1-compiled bni runs --test natively via bytecode VM

@@ -2,7 +2,7 @@
 # Runner: builder-comp — current-tree cmd/bnc (compiled via the BUILDER
 # during runner_setup → GEN1_COMPILER) compiles each test.bn to a
 # native binary.  The "comp" link is always current-tree cmd/bnc,
-# regardless of whether BUILDER_VERSION names bootstrap-* or bnc-*.
+# regardless of which bnc-X.Y.Z BUILDER_VERSION is pinned.
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
 runner_setup() { build_gen1; }

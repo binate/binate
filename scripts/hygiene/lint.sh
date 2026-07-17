@@ -138,8 +138,8 @@ else
     # be a pre-release ahead of the BUILDER, carrying newer language support
     # like methods-on-generics — see plan-check-tools-version.md), NOT the
     # BUILDER the tree builds with.  Falls back to building from current
-    # source under bootstrap-* (no toolchain bundle exists) or when the
-    # fetcher doesn't return a usable path.
+    # source when the fetcher doesn't return a usable path (bundle lacks
+    # bnlint, network failure, etc.).
     BNLINT_BIN="$("$BINATE_DIR/scripts/fetch-builder.sh" --check-tools --tool bnlint 2>/dev/null || true)"
     if [ -z "$BNLINT_BIN" ] || [ ! -x "$BNLINT_BIN" ]; then
         build_bnlint_from_source

@@ -1,22 +1,19 @@
 #!/bin/sh
 # Usage: ./scripts/hygiene/file-format.sh
 #
-# Whitespace checks across authored text files, split by what bnfmt (the
-# bnfmt-format check, canonical for .bn/.bni) does and does NOT enforce:
+# Whitespace checks across authored TEXT files that bnfmt does NOT format --
+# .sh/.md/.yml.  All of .bn/.bni's whitespace hygiene is bnfmt's (the bnfmt-format
+# check is canonical for them): bnfmt strips trailing whitespace from every line --
+# inside comments included (`// x   `, `/* ... */`) -- ends every file with exactly
+# one newline, drops trailing blank lines, and canonicalizes import-group ordering.
+# Checks here:
 #
-#   1. No trailing whitespace (spaces or tabs) at end of any line — checked on
-#      .bn/.bni AND .sh/.md/.yml.  bnfmt normalizes trailing whitespace on CODE
-#      lines but NOT inside comments (`// x   `, `/* ... */`), so this line-based
-#      check is still needed for .bn/.bni to cover the comment case.
+#   1. No trailing whitespace (spaces or tabs) at end of any line.
 #   2. Every non-empty file ends with a final newline.
 #   3. No trailing blank lines at end of file.
-#      Checks 2-3 are .sh/.md/.yml ONLY: bnfmt already enforces both on every
-#      .bn/.bni (verified), so re-checking them there would be redundant.
-#
-# Import-group ordering (.bn/.bni) is NOT checked here — it is entirely bnfmt's.
 #
 # Scope: .git/, conformance/ (intentional fixtures), and */testdata are excluded.
-# Repo paths contain no spaces/tabs, so the newline list feeds `xargs awk` safely.
+# Repo paths contain no spaces/tabs, so the file list feeds `xargs awk` safely.
 #
 # Exit code: 1 if any violations found, 0 otherwise.
 
@@ -25,30 +22,27 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 violations=0
 
-ALL_LIST=$(mktemp -t hygiene-file-format-all.XXXXXX)
 TEXT_LIST=$(mktemp -t hygiene-file-format-text.XXXXXX)
-trap 'rm -f "$ALL_LIST" "$TEXT_LIST"' EXIT
+trap 'rm -f "$TEXT_LIST"' EXIT
 find "$BINATE_DIR" \
     \( -path "$BINATE_DIR/.git" -o -path "$BINATE_DIR/conformance" -o -path '*/testdata' \) -prune \
-    -o -type f \( -name '*.bn' -o -name '*.bni' -o -name '*.sh' \
-                  -o -name '*.md' -o -name '*.yml' \) -print \
-    | sort > "$ALL_LIST"
-grep -E '\.(sh|md|yml)$' "$ALL_LIST" > "$TEXT_LIST" || true
+    -o -type f \( -name '*.sh' -o -name '*.md' -o -name '*.yml' \) -print \
+    | sort > "$TEXT_LIST"
 
-# 1. Trailing whitespace — ALL files, one awk over the list (FNR = per-file line
-#    number now that a single process spans every file).
+# 1. Trailing whitespace — one awk over the list (FNR = per-file line number now
+#    that a single process spans every file).
 out=$(xargs awk '
     /[ \t]+$/ {
         rel = FILENAME; sub(BINATE "/", "", rel)
         printf("%s:%d: trailing whitespace\n", rel, FNR)
     }
-' BINATE="$BINATE_DIR" < "$ALL_LIST")
+' BINATE="$BINATE_DIR" < "$TEXT_LIST")
 if [ -n "$out" ]; then
     echo "$out"
     violations=$((violations + $(printf '%s\n' "$out" | wc -l | tr -d ' ')))
 fi
 
-# 2. Final newline — .sh/.md/.yml only (bnfmt covers .bn/.bni).
+# 2. Final newline.
 while IFS= read -r f; do
     if [ -s "$f" ]; then
         # tail -c 1 → that one byte. wc -l counts newlines (0 or 1).
@@ -60,7 +54,7 @@ while IFS= read -r f; do
     fi
 done < "$TEXT_LIST"
 
-# 3. No trailing blank lines — .sh/.md/.yml only (bnfmt covers .bn/.bni).  A
+# 3. No trailing blank lines.  A
 #    correctly-terminated file ends `<content>\n`; a trailing blank makes it
 #    `<content>\n\n` — the last two bytes both newlines.
 while IFS= read -r f; do

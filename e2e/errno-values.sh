@@ -1,14 +1,14 @@
 #!/bin/sh
-# e2e/errno-values.sh — Adversarially verify pkg/std/os's errno→base value
-# table against the platform's real <errno.h>, using the system C compiler as
-# the authoritative source.
+# e2e/errno-values.sh — Adversarially verify the os family's errno→base value
+# table (pkg/std/os/sys/errno.bn) against the platform's real <errno.h>, using
+# the system C compiler as the authoritative source.
 #
 # Most errnos can't be triggered from os's surface, so unit tests can't pin
 # their numeric values.  Instead we:
 #   1. Compile + run a tiny C program that prints each errno's REAL value
 #      (from <errno.h>) — the ground truth for whatever OS is compiling.
 #   2. Extract the values pkg/std/os CLAIMS (impls/stdlib/pkg/std/os/
-#      os_errno.bn) for that OS — os_errno.bn stays the single source, so this
+#      sys/errno.bn) for that OS — sys/errno.bn stays the single source, so this
 #      cannot pass against a stale mirror.
 #   3. diff.  Any mismatch fails the test.
 #
@@ -23,7 +23,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(dirname "$SCRIPT_DIR")"
-ERRNO_BN="$BINATE_DIR/impls/stdlib/pkg/std/os/os_errno.bn"
+ERRNO_BN="$BINATE_DIR/impls/stdlib/pkg/std/os/sys/errno.bn"
 
 [ -f "$ERRNO_BN" ] || { echo "FAIL: not found: $ERRNO_BN" >&2; exit 1; }
 
@@ -44,6 +44,7 @@ cat > "$TMP/dump.c" <<'EOF'
 #define DUMP(n) printf("%s %d\n", #n, n)
 int main(void) {
     DUMP(EPERM);  DUMP(ENOENT); DUMP(EINTR); DUMP(EIO);   DUMP(ENXIO);
+    DUMP(ENOEXEC);
     DUMP(EBADF);  DUMP(ENOMEM); DUMP(EACCES);DUMP(EFAULT);DUMP(EBUSY);
     DUMP(EEXIST); DUMP(EXDEV);  DUMP(ENODEV);DUMP(ENOTDIR);DUMP(EISDIR);
     DUMP(EINVAL); DUMP(ENFILE); DUMP(EMFILE);DUMP(ETXTBSY);DUMP(EFBIG);
@@ -57,7 +58,7 @@ EOF
 "$CC" -o "$TMP/dump" "$TMP/dump.c" || { echo "FAIL: C compile failed" >&2; exit 1; }
 "$TMP/dump" | sort > "$TMP/truth.txt"
 
-# ---- 2. os's claimed values for this OS, extracted from os_errno.bn.
+# ---- 2. os's claimed values for this OS, extracted from sys/errno.bn.
 # Shared codes (1..34) are an uppercase `NAME int = N` const block.  The 7
 # codes that differ per OS are lowercase locals: `var name int = <linux>` with
 # a `name = <darwin>` override inside `if build.OS == build.OS_DARWIN`.
@@ -69,23 +70,23 @@ awk -v os="$OS" '
     dar && /^\t\t[a-z][a-z0-9_]* = [0-9]+/     { if (os == "darwin") print toupper($1), $3 + 0; next }
 ' "$ERRNO_BN" | sort > "$TMP/claimed.txt"
 
-# Guard against silent under-extraction (e.g. os_errno.bn reformatted): the
+# Guard against silent under-extraction (e.g. sys/errno.bn reformatted): the
 # claimed set must cover exactly the errnos the dumper reports.
 n_truth=$(wc -l < "$TMP/truth.txt")
 n_claim=$(wc -l < "$TMP/claimed.txt")
 if [ "$n_claim" -ne "$n_truth" ]; then
     echo "FAIL: extracted $n_claim claimed values but expected $n_truth" >&2
-    echo "      (os_errno.bn format may have changed — fix the awk in $0)" >&2
+    echo "      (sys/errno.bn format may have changed — fix the awk in $0)" >&2
     diff "$TMP/claimed.txt" "$TMP/truth.txt" >&2 || true
     exit 1
 fi
 
 # ---- 3. Compare.
 if ! diff "$TMP/claimed.txt" "$TMP/truth.txt" > "$TMP/diff.txt"; then
-    echo "FAIL: os_errno.bn errno values disagree with <errno.h> on $OS" >&2
-    echo "  (< os_errno.bn claims   > real <errno.h>)" >&2
+    echo "FAIL: sys/errno.bn errno values disagree with <errno.h> on $OS" >&2
+    echo "  (< sys/errno.bn claims   > real <errno.h>)" >&2
     sed 's/^/  /' "$TMP/diff.txt" >&2
     exit 1
 fi
 
-echo "PASS: all $n_truth errno values in os_errno.bn match <errno.h> on $OS"
+echo "PASS: all $n_truth errno values in sys/errno.bn match <errno.h> on $OS"

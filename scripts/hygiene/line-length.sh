@@ -16,21 +16,31 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 LINE_LIMIT=100
 
-count=0
+LIST=$(mktemp -t hygiene-line-length.XXXXXX)
+trap 'rm -f "$LIST"' EXIT
+find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" \
+    \( -name '*.bn' -o -name '*.bni' \) -not -path '*/testdata/*' 2>/dev/null \
+    | sort > "$LIST"
 
-for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" \( -name '*.bn' -o -name '*.bni' \) -not -path '*/testdata/*' 2>/dev/null); do
-    rel="${f#"$BINATE_DIR"/}"
-    awk -v limit="$LINE_LIMIT" -v file="$rel" \
-        'length > limit && index($0, "// LONG-LINE ALLOWED") == 0 {
-             printf "%s:%d: %d chars\n", file, NR, length; found++
-         }
-         END { exit (found > 0) }' "$f"
-    if [ $? -ne 0 ]; then
-        count=$((count + 1))
-    fi
-done
+# One awk over every file (FNR = per-file line number) — was one awk fork PER
+# file (~thousands of forks).  A line opts out with the "// LONG-LINE ALLOWED"
+# marker.  Violations are reported per offending line; the summary counts
+# DISTINCT files (rel path is the pre-colon field, which file paths never
+# contain), matching the original per-file tally.  Repo paths have no spaces,
+# so the list feeds `xargs awk` safely.
+out=""
+if [ -s "$LIST" ]; then
+    out=$(xargs awk -v limit="$LINE_LIMIT" '
+        length > limit && index($0, "// LONG-LINE ALLOWED") == 0 {
+            rel = FILENAME; sub(BINATE "/", "", rel)
+            printf "%s:%d: %d chars\n", rel, FNR, length
+        }
+    ' BINATE="$BINATE_DIR" < "$LIST")
+fi
 
-if [ "$count" -gt 0 ]; then
+if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    count=$(printf '%s\n' "$out" | cut -d: -f1 | sort -u | wc -l | tr -d ' ')
     echo ""
     echo "=== $count file(s) with lines over $LINE_LIMIT chars ==="
     exit 1

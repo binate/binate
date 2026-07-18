@@ -30,8 +30,13 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # pause — and bnlint typechecks dependency BODIES, so a skip must cover the whole
 # transitive importer chain of the offending source.
 #
-# LINT_SKIP is currently EMPTY: the whole tree lints clean under the
-# bnc-0.0.12-pre2 bnlint.
+# TEMPORARY skip (remove at the next CHECK_TOOLS_VERSION bump past bnc-0.0.12-pre2):
+#   - pkg/stdx/fmt — uses scalar value-recovery (`case int:` etc.), which pre2's
+#     checker rejects ("value-recovery type assertion not yet supported").  pre2
+#     bnfmt (parse-only) formats fmt.bn fine; only bnlint's typecheck objects.  fmt
+#     has no in-tree importers, so skipping the package alone covers the chain.
+#     Value-recovery landed at `89b41531`; drop this skip once CHECK_TOOLS carries
+#     it (see explorations/claude-todo.md).
 #
 # Previously skipped, now linted (kept as changelog — do NOT re-add without cause):
 #   - pkg/stdx/containers/setfn — a multi-root checker-state-leak: within ONE bnlint
@@ -60,7 +65,7 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 #     name-collision fix, `undefined: __Package` resolution, and per-site
 #     `// bnlint:allow managed-to-raw-assign` directives; the 1 real asm UAF was fixed
 #     separately in 8a883450).
-LINT_SKIP=""
+LINT_SKIP="pkg/stdx/fmt"
 
 # Discover targets:
 #   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so

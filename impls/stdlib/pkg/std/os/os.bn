@@ -1,28 +1,16 @@
-// libc-backed pkg/std/os: the File handle and the Open / OpenFile /
-// Create entry points, implemented over the POSIX open/read/write/
-// pread/pwrite/lseek/close family reached through __c_call.
+// libc-backed pkg/std/os: the File handle and the Open / OpenFile / Create entry
+// points.  The raw fd I/O (read/write/close/pread/pwrite/lseek) and open now go
+// through the pkg/std/os/sys syscall layer, which retries EINTR and classifies
+// errno; this file supplies the stream semantics on top (empty read, EOF, short
+// write) and the portable O_* -> native flag translation.
 //
-// C-signature reference (no pkg/c alias package exists yet, so the C
-// types are spelled in raw Binate widths, with the C type in a comment).
-// C `int` is 32-bit even on an LP64 host, so it is spelled `int32`, NOT
-// Binate `int` (which is pointer-width); size_t / ssize_t are
-// pointer-width (`uint` / `int`).  `off_t` is 64-bit on our LP64 libc
-// hosts (x64/aarch64 linux+darwin) but 32-bit on ILP32 arm32-linux glibc,
-// so the three offset-bearing calls go through the cLseek/cPread/cPwrite
-// wrappers, which select the 64-bit-off_t libc entry point per target
-// (see their definitions below); a Binate `int64` offset must reach a
-// 64-bit-off_t C function or its register-pair argument layout corrupts.
+// It still reaches rename/remove/mkdir directly via __c_call (pending a later
+// port onto sys wrappers).  C `int` is 32-bit even on an LP64 host, so it is
+// spelled `int32`, NOT Binate `int` (which is pointer-width).
 //
-//   int     open  (const char *path, int flags, ... /* mode_t mode */);
-//   ssize_t read  (int fd, void *buf, size_t count);
-//   ssize_t write (int fd, const void *buf, size_t count);
-//   ssize_t pread (int fd, void *buf, size_t count, off_t offset);
-//   ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
-//   off_t   lseek (int fd, off_t offset, int whence);
-//   int     close (int fd);
-//   int     rename(const char *old, const char *new);
-//   int     remove(const char *path);
-//   int     mkdir (const char *path, mode_t mode);
+//   int  rename(const char *old, const char *new);
+//   int  remove(const char *path);
+//   int  mkdir (const char *path, mode_t mode);
 //
 // Selected on every target except bare metal, which has its own stub variant
 // (os_baremetal.bn).  See plan-impls-constraints-migration.md.
@@ -78,25 +66,9 @@ func nativeOpenFlags(flag int) int {
 	return native
 }
 
-// dataOf returns a raw *uint8 to the first byte of a mutable byte
-// slice's backing.  `&p[0]` is currently restricted to slice-of-struct
-// (genIndexPtr), so reach the data word directly: a raw slice is
-// {data, len} and the data pointer is the first word.  Caller must
-// ensure len(p) > 0 (the data word may be null for an empty slice).
-func dataOf(p *[]uint8) *uint8 {
-	return bit_cast(*uint8, bit_cast(*int, &p)[0])
-}
-
-// dataOfRO is dataOf for a readonly byte slice (write's buffer).  C
-// write/pwrite take a `const void *`, so handing back a plain *uint8 is
-// fine — the bytes are only read.
-func dataOfRO(p *[]readonly uint8) *uint8 {
-	return bit_cast(*uint8, bit_cast(*int, &p)[0])
-}
-
-// dataOfManaged is dataOf for a managed byte slice (the NUL-terminated
-// path buffer).  A managed slice is {data, len, refptr, backingLen};
-// the data pointer is still the first word.
+// dataOfManaged returns a raw *uint8 to the first byte of a managed byte slice
+// (the NUL-terminated path buffer for rename/remove/mkdir).  A managed slice is
+// {data, len, refptr, backingLen}; the data pointer is the first word.
 func dataOfManaged(p @[]uint8) *uint8 {
 	return bit_cast(*uint8, bit_cast(*int, &p)[0])
 }
@@ -160,11 +132,9 @@ func (f *File) Read(p *[]uint8) (int, @errors.Error) {
 	var noErr @errors.Error
 	if len(p) == 0 { return 0, noErr }
 	var n int
-	for {
-		n = __c_call("read", int, cast(int32, f.fd), dataOf(p), cast(uint, len(p)))
-		if n >= 0 || !sys.Interrupted() { break }
-	}
-	if n < 0 { return 0, sys.FailErrno("read") }
+	var err @errors.Error
+	n, err = sys.Read(f.fd, p)
+	if present(err) { return 0, err }
 	if n == 0 { return 0, io.EOF }
 	return n, noErr
 }
@@ -175,84 +145,16 @@ func (f *File) Write(p *[]readonly uint8) (int, @errors.Error) {
 	var noErr @errors.Error
 	if len(p) == 0 { return 0, noErr }
 	var n int
-	for {
-		n = __c_call("write", int, cast(int32, f.fd), dataOfRO(p), cast(uint, len(p)))
-		if n >= 0 || !sys.Interrupted() { break } // EINTR before any byte: retry
-	}
-	if n < 0 { return 0, sys.FailErrno("write") }
+	var err @errors.Error
+	n, err = sys.Write(f.fd, p)
+	if present(err) { return 0, err }
 	if n < len(p) { return n, errors.Wrap(errors.Unknown, "short write") }
 	return n, noErr
 }
 
 // Close closes the descriptor via close(2).
 func (f *File) Close() @errors.Error {
-	var r int32 = __c_call("close", int32, cast(int32, f.fd))
-	if cast(int, r) < 0 {
-		// close(2) on EINTR: on both Linux and macOS/BSD the descriptor
-		// is released even when close reports EINTR, so a retry could
-		// close an unrelated (reused) fd — treat EINTR as success.
-		if sys.Interrupted() {
-			var noErr @errors.Error
-			return noErr
-		}
-		return sys.FailErrno("close")
-	}
-	var noErr @errors.Error
-	return noErr
-}
-
-// cLseek / cPread / cPwrite wrap the three offset-bearing libc calls,
-// selecting an entry point whose C `off_t` is 64-bit so a Binate `int64`
-// offset passes through intact.  On ILP32 arm32-linux glibc the plain
-// lseek/pread/pwrite take a 32-bit `off_t`; handing them a 64-bit value
-// shifts the register-pair argument layout (AAPCS places an `int64` in an
-// even-aligned register pair, but a 32-bit `off_t` expects a single
-// register) and corrupts the call — so arm32 routes to the LFS `*64`
-// variants, which take a 64-bit `off64_t` on every Linux arch.  Every
-// other hosted target (x64/aarch64 linux+darwin) is LP64 with a 64-bit
-// `off_t` and uses the plain names directly (Darwin has no `*64` symbols).
-// These are per-declaration `#[build]` variants rather than a runtime
-// branch because __c_call needs a literal symbol that must LINK — the same
-// reasoning as the per-OS errno() accessor in pkg/std/os/sys.
-
-#[build(is(arch, "arm32"))]
-func cLseek(fd int32, off int64, whence int32) int64 {
-	return __c_call("lseek64", int64, fd, off, whence)
-}
-
-// cLseek on a 64-bit-off_t target (LP64 linux + darwin): plain lseek(2).
-
-#[build(!is(arch, "arm32"))]
-func cLseek(fd int32, off int64, whence int32) int64 {
-	return __c_call("lseek", int64, fd, off, whence)
-}
-
-// cPread wraps pread64(2) on arm32-linux (64-bit off64_t).
-
-#[build(is(arch, "arm32"))]
-func cPread(fd int32, buf *uint8, count uint, off int64) int {
-	return __c_call("pread64", int, fd, buf, count, off)
-}
-
-// cPread on a 64-bit-off_t target: plain pread(2).
-
-#[build(!is(arch, "arm32"))]
-func cPread(fd int32, buf *uint8, count uint, off int64) int {
-	return __c_call("pread", int, fd, buf, count, off)
-}
-
-// cPwrite wraps pwrite64(2) on arm32-linux (64-bit off64_t).
-
-#[build(is(arch, "arm32"))]
-func cPwrite(fd int32, buf *uint8, count uint, off int64) int {
-	return __c_call("pwrite64", int, fd, buf, count, off)
-}
-
-// cPwrite on a 64-bit-off_t target: plain pwrite(2).
-
-#[build(!is(arch, "arm32"))]
-func cPwrite(fd int32, buf *uint8, count uint, off int64) int {
-	return __c_call("pwrite", int, fd, buf, count, off)
+	return sys.Close(f.fd)
 }
 
 // ReadAt reads at an explicit offset via pread(2), leaving the stream
@@ -263,11 +165,9 @@ func (f *File) ReadAt(p *[]uint8, off int64) (int, @errors.Error) {
 	var noErr @errors.Error
 	if len(p) == 0 { return 0, noErr }
 	var n int
-	for {
-		n = cPread(cast(int32, f.fd), dataOf(p), cast(uint, len(p)), off)
-		if n >= 0 || !sys.Interrupted() { break } // EINTR before any byte: retry
-	}
-	if n < 0 { return 0, sys.FailErrno("pread") }
+	var err @errors.Error
+	n, err = sys.Pread(f.fd, p, off)
+	if present(err) { return 0, err }
 	if n < len(p) { return n, io.EOF }
 	return n, noErr
 }
@@ -278,11 +178,9 @@ func (f *File) WriteAt(p *[]readonly uint8, off int64) (int, @errors.Error) {
 	var noErr @errors.Error
 	if len(p) == 0 { return 0, noErr }
 	var n int
-	for {
-		n = cPwrite(cast(int32, f.fd), dataOfRO(p), cast(uint, len(p)), off)
-		if n >= 0 || !sys.Interrupted() { break } // EINTR before any byte: retry
-	}
-	if n < 0 { return 0, sys.FailErrno("pwrite") }
+	var err @errors.Error
+	n, err = sys.Pwrite(f.fd, p, off)
+	if present(err) { return 0, err }
 	if n < len(p) { return n, errors.Wrap(errors.Unknown, "short write") }
 	return n, noErr
 }
@@ -292,12 +190,7 @@ func (f *File) WriteAt(p *[]readonly uint8, off int64) (int, @errors.Error) {
 // no translation is needed.  Unlike read/write, lseek does not block, so it
 // cannot return EINTR — no retry loop is needed.
 func (f *File) Seek(offset int64, whence Whence) (int64, @errors.Error) {
-	var pos int64 = cLseek(cast(int32, f.fd), offset, cast(int32, cast(int, whence)))
-	if pos < cast(int64, 0) {
-		return cast(int64, 0), sys.FailErrno("lseek")
-	}
-	var noErr @errors.Error
-	return pos, noErr
+	return sys.Lseek(f.fd, offset, cast(int, whence))
 }
 
 // ReadByte reads the next byte via Read.  At end-of-input the error is
@@ -325,18 +218,14 @@ func (f *File) WriteByte(c uint8) @errors.Error {
 // it without O_CREATE) as the trailing vararg, per the C prototype
 // `int open(const char *, int, ...)`.
 func OpenFile(name *[]readonly char, flag int, perm FileMode) (@File, @errors.Error) {
-	var path @[]uint8 = cPath(name)
-	var fd int32
-	for {
-		fd = __c_call("open", int32, dataOfManaged(path), cast(int32, nativeOpenFlags(flag)), ...,
-				cast(int32, perm))
-		if cast(int, fd) >= 0 || !sys.Interrupted() { break } // EINTR: retry open
-	}
-	if cast(int, fd) < 0 {
+	var fd int
+	var err @errors.Error
+	fd, err = sys.Open(name, nativeOpenFlags(flag), cast(int, perm))
+	if present(err) {
 		var none @File
-		return none, sys.FailErrno("open")
+		return none, err
 	}
-	return newFile(cast(int, fd), name), errEmpty()
+	return newFile(fd, name), errEmpty()
 }
 
 // Open opens name read-only.  Open is OpenFile(name, O_RDONLY, 0).

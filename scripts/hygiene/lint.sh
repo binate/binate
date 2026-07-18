@@ -23,22 +23,18 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Packages to skip from linting.  bnlint is fetched from the CHECK_TOOLS_VERSION
-# bundle (bnc-0.0.12-pre2), decoupled from BUILDER_VERSION so a newer check-tool
+# bundle (bnc-0.0.12-pre3), decoupled from BUILDER_VERSION so a newer check-tool
 # feature does not require a build-ladder rung (see
 # explorations/plan-check-tools-version.md).  A skipped target stays fully
 # type-checked and compiled by every conformance mode — only bnlint's style rules
 # pause — and bnlint typechecks dependency BODIES, so a skip must cover the whole
-# transitive importer chain of the offending source.
-#
-# TEMPORARY skip (remove at the next CHECK_TOOLS_VERSION bump past bnc-0.0.12-pre2):
-#   - pkg/stdx/fmt — uses scalar value-recovery (`case int:` etc.), which pre2's
-#     checker rejects ("value-recovery type assertion not yet supported").  pre2
-#     bnfmt (parse-only) formats fmt.bn fine; only bnlint's typecheck objects.  fmt
-#     has no in-tree importers, so skipping the package alone covers the chain.
-#     Value-recovery landed at `89b41531`; drop this skip once CHECK_TOOLS carries
-#     it (see explorations/claude-todo.md).
+# transitive importer chain of the offending source.  (No skips today.)
 #
 # Previously skipped, now linted (kept as changelog — do NOT re-add without cause):
+#   - pkg/stdx/fmt — pre2's bnlint rejected its scalar value-recovery (`case int:`
+#     etc.) with "value-recovery type assertion not yet supported"; value-recovery
+#     landed at `89b41531`, so it cleared at the bnc-0.0.12-pre3 CHECK_TOOLS bump —
+#     the first bundle carrying that fix.
 #   - pkg/stdx/containers/setfn — a multi-root checker-state-leak: within ONE bnlint
 #     process, linting a target AFTER a package whose dependency closure interns a
 #     `readonly uint8` slice element (e.g. pkg/binate/format, via pkg/std/strings'
@@ -65,7 +61,7 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 #     name-collision fix, `undefined: __Package` resolution, and per-site
 #     `// bnlint:allow managed-to-raw-assign` directives; the 1 real asm UAF was fixed
 #     separately in 8a883450).
-LINT_SKIP="pkg/stdx/fmt"
+LINT_SKIP=""
 
 # Discover targets:
 #   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so

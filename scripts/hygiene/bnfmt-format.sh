@@ -14,7 +14,7 @@
 # bnfmt is fetched from the CHECK_TOOLS_VERSION bundle when that release ships one
 # (`fetch-builder.sh --check-tools --tool bnfmt`, mirroring lint.sh's bnlint fetch).
 # CHECK_TOOLS_VERSION may be a pre-release ahead of the BUILDER (see
-# plan-check-tools-version.md).  The current CHECK_TOOLS_VERSION (bnc-0.0.12-pre2)
+# plan-check-tools-version.md).  The current CHECK_TOOLS_VERSION (bnc-0.0.12-pre3)
 # ships a bnfmt, so the bundled binary is used directly.  A bundle WITHOUT a bnfmt
 # (as bnc-0.0.10 was) falls back to building bnfmt from source and caching the
 # binary keyed on a hash of its build inputs (its own package plus the

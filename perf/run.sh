@@ -20,8 +20,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
-export SCRIPT_DIR BINATE_DIR BOOTSTRAP_DIR
+export SCRIPT_DIR BINATE_DIR
 
 MODE="$1"
 if [ -z "$MODE" ]; then

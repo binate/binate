@@ -27,9 +27,8 @@
 # self-contained (it parses and re-prints source syntax), so it needs no lib/.
 #
 # Building each binary goes through scripts/build-{bnc,bni,bnas,bnlint,bnfmt}.sh,
-# which resolve a BUILDER via scripts/fetch-builder.sh — so the bootstrap
-# repo must be a sibling checkout when BUILDER_VERSION is a bootstrap-*
-# (the build scripts enforce this).
+# which resolve a BUILDER via scripts/fetch-builder.sh (a prebuilt bnc-*
+# release bundle).
 
 set -e
 

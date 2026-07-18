@@ -171,8 +171,7 @@ MODES="$(expand_set "$MODE" 2>/dev/null)" || {
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
-export SCRIPT_DIR BINATE_DIR BOOTSTRAP_DIR
+export SCRIPT_DIR BINATE_DIR
 
 # A compiled test binary inherits its current directory from here, and
 # cmd/bnlint's integration tests load real packages from disk relative to CWD

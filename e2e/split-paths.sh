@@ -1,7 +1,7 @@
 #!/bin/sh
 # e2e/split-paths.sh — End-to-end test of the two-path package
-# resolution (-I / --interface-path and -L / --impl-path) across all
-# four tools that load Binate packages: bootstrap, bnc, bni, bnlint.
+# resolution (-I / --interface-path and -L / --impl-path) across the
+# tools that load Binate packages: bnc, bni, bnlint.
 #
 # Sets up a fixture where pkg/splitlib's interface lives in one root
 # and its impl lives in a different root. No single root contains
@@ -18,14 +18,9 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(dirname "$SCRIPT_DIR")"
-BOOTSTRAP_DIR="$(cd "$BINATE_DIR/.." && pwd)/bootstrap"
 
 if [ ! -d "$BINATE_DIR/pkg" ]; then
     echo "FAIL: BINATE_DIR not a binate repo: $BINATE_DIR" >&2
-    exit 1
-fi
-if [ ! -d "$BOOTSTRAP_DIR" ]; then
-    echo "FAIL: bootstrap repo not found at $BOOTSTRAP_DIR" >&2
     exit 1
 fi
 
@@ -82,13 +77,6 @@ check() {
     fi
 }
 
-# ----- bootstrap (Go interpreter) ---------------------------------
-# Bootstrap accepts -I/-L directly (Stage 5).
-actual=$(cd "$BOOTSTRAP_DIR" && go run . \
-    -I "$BNI_ROOT:$BINATE_DIR" -L "$IMPL_ROOT:$BINATE_DIR" \
-    "$TMP/main.bn" 2>&1) || true
-check "bootstrap" "$actual"
-
 # ----- bnc (compile to native binary, then run) -------------------
 # The resolved BUILDER (bnc) compiles the fixture; the -I/-L below are
 # bnc's own search paths.
@@ -115,13 +103,11 @@ fi
 check "bnc" "$actual"
 
 # ----- bni (bytecode VM) ------------------------------------------
-# bni is skipped here: cmd/bni imports pkg/binate/vm, which uses float
-# literals that the bootstrap lexer doesn't recognize, so we can't
-# interpret bni via bootstrap. To cover bni we would have to first
-# compile it (via builder-comp) and then invoke the binary against the
-# fixture. That belongs in the broader e2e build-out — see the
-# "Build out e2e testing" entry in explorations/claude-todo.md.
-echo "SKIP: bni (bootstrap can't interp cmd/bni — needs builder-comp build)"
+# bni is skipped here: covering it means first compiling cmd/bni (via
+# builder-comp) and then invoking the binary against the fixture.  That
+# belongs in the broader e2e build-out — see the "Build out e2e testing"
+# entry in explorations/claude-todo.md.
+echo "SKIP: bni (needs a builder-comp build of cmd/bni)"
 
 # ----- bnlint (lint pkg/splitlib via -I/-L) -----------------------
 # bnlint is no longer required to be bootstrap-runnable, so we build

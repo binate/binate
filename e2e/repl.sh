@@ -1,8 +1,7 @@
 #!/bin/sh
 # e2e/repl.sh — End-to-end test for `bni --repl` (Tier 1 PoC).
 #
-# Builds bni via builder-comp (cmd/bni isn't bootstrap-runnable since
-# pkg/binate/vm uses floats), creates a tiny fixture module that defines a
+# Builds bni via builder-comp, creates a tiny fixture module that defines a
 # `helper` function, then drives the REPL via piped stdin and
 # compares output byte-for-byte against expectations.
 #
@@ -21,14 +20,9 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(dirname "$SCRIPT_DIR")"
-BOOTSTRAP_DIR="$(cd "$BINATE_DIR/.." && pwd)/bootstrap"
 
 if [ ! -d "$BINATE_DIR/pkg" ]; then
     echo "FAIL: BINATE_DIR not a binate repo: $BINATE_DIR" >&2
-    exit 1
-fi
-if [ ! -d "$BOOTSTRAP_DIR" ]; then
-    echo "FAIL: bootstrap repo not found at $BOOTSTRAP_DIR" >&2
     exit 1
 fi
 

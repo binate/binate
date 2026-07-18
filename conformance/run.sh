@@ -171,8 +171,7 @@ MODES="$(expand_set "$MODE" 2>/dev/null)" || {
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BOOTSTRAP_DIR="$(cd "$BINATE_DIR/../bootstrap" && pwd)"
-export SCRIPT_DIR BINATE_DIR BOOTSTRAP_DIR
+export SCRIPT_DIR BINATE_DIR
 
 # Host CPU arch in Binate's naming (matches `#[build(is(arch, ...))]` tokens).
 # Used as an `expected.<arch>` resolution tier for tests whose output tracks

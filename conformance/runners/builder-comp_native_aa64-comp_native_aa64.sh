@@ -1,15 +1,14 @@
 #!/bin/sh
-# Runner: builder-comp_native_aa64-comp_native_aa64 — Bootstrap builds bnc
+# Runner: builder-comp_native_aa64-comp_native_aa64 — the BUILDER builds bnc
 # with --backend native (cmd/bnc's main module emitted via the native
 # aarch64 path; deps still go through LLVM as in compileMainNative's
 # hybrid).  That native bnc binary then compiles each conformance test
 # with --backend native.  macOS/Apple Silicon only.
 #
-# Why this exists: the older `builder-comp_native_aa64` runner invoked
-# `go run bootstrap → bnc --backend native` per test, paying the
-# bootstrap-interpretation tax on every compile.  Native EmitObject
-# under bootstrap interp is the dominant cost — running it once for
-# bnc itself rather than once per test amortises that cost.
+# Why build native bnc up front: native EmitObject is the dominant
+# compile cost, so emitting bnc's own main module natively once (in
+# runner_setup) and reusing that binary across every test amortises
+# that cost rather than paying it per test.
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
 runner_setup() { build_bnc_native_aa64; }

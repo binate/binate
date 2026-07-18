@@ -40,9 +40,9 @@ _new_build_dir() {
 }
 
 # _resolve_builder caches the BUILDER_VERSION binary at first use and
-# echoes its path.  All build_* helpers go through this so the
-# fetcher's per-test rebuild check (a stat of bootstrap's .go files
-# against the cache) runs once per runner_setup rather than per call.
+# echoes its path.  All build_* helpers go through this so the fetcher
+# (which resolves + sha256-verifies the release bundle) runs once per
+# runner_setup rather than per call.
 _resolve_builder() {
     if [ -z "$_BUILDER_BIN" ]; then
         _BUILDER_BIN="$("$BINATE_DIR/scripts/fetch-builder.sh")"

@@ -122,6 +122,32 @@ func isBorrowableValueSource(t @types.Type) bool {
 			r.Kind != types.TYP_INTERFACE_VALUE && r.Kind != types.TYP_INTERFACE_VALUE_MANAGED
 }
 
+// defaultedBorrowType maps an untyped source type to its concrete default, for
+// the element type of a materialised value-borrow temporary.  Allocating the
+// UNTYPED type would carry an untyped element into the `(T, any)` box record and
+// re-trip the box(<untyped constant>) class of crash (checker/IR-gen divergence),
+// so a `fmt.Print(42)` temp must be `int`, a `2.5` temp `float64`, etc.  Mirrors
+// the checker's defaultType.  A concrete source type passes through unchanged.
+func defaultedBorrowType(t @types.Type) @types.Type {
+	if t == nil { return t }
+	if t.Kind == types.TYP_UNTYPED_INT { return types.TypInt() }
+	if t.Kind == types.TYP_UNTYPED_FLOAT { return types.TypFloat64() }
+	if t.Kind == types.TYP_UNTYPED_BOOL { return types.TypBool() }
+	return t
+}
+
+// borrowTempNeedsCleanup reports whether a materialised value-borrow temporary
+// of type `t` owns a managed reference that must be RefDec'd (the copy into the
+// temp acquired it).  Mirrors the managed-local cleanup predicate
+// (emitDecForManagedLocals).  A pointer-free temp (a scalar, a pointer-free
+// struct) needs no cleanup and is a plain frame-lived alloca.
+func borrowTempNeedsCleanup(t @types.Type) bool {
+	if t == nil { return false }
+	var st @types.Type = peelTransparent(t)
+	return isManagedSliceType(st) || isManagedIfaceValueType(st) || isManagedFuncValueType(st) ||
+			needsStructCopy(st)
+}
+
 // genExprOrFuncRef evaluates e in the receiving context of targetTyp.
 // When targetTyp is a function-value type and e is a function reference
 // (Ident or pkg.Name), emits OP_FUNC_VALUE. When targetTyp is an
@@ -233,27 +259,64 @@ func genExprOrFuncRef(ctx @GenContext, b @Block, e @ast.Expr, targetTyp @types.T
 	var haveVal bool = false
 	if e != nil && ctx.Checker != nil && targetTyp != nil && e.ResolvedTypeID != 0 {
 		var bptgt @types.Type = peelTransparent(targetTyp)
-		if bptgt != nil && bptgt.Kind == types.TYP_INTERFACE_VALUE &&
-				isBorrowableValueSource(ctx.Checker.ExprType(e.ResolvedTypeID)) {
-			var ptr @Instr = genLValueAddr(ctx, b, e)
-			if ptr != nil && ptr.Typ != nil &&
-					(ptr.Typ.Kind == types.TYP_POINTER || ptr.Typ.Kind == types.TYP_MANAGED_PTR) {
-				// srcExprTyp must be the POINTER whose .Elem is the boxed pointee
-				// (what wrapAsIfaceValue's name-less `*any` path dereferences),
-				// matching the synthetic `ptr = &e` — NOT e's value type.  For a
-				// name-less source (a func value / slice) e's value type has a nil
-				// or element `.Elem`, so passing it would panic or mis-key the box;
-				// MakePointerType(ExprType(e)) is exactly what the explicit `&e`
-				// path supplies.  Inert for a named source (srcExprTyp is unused
-				// there — receiverBaseTypeName finds the nominal name).
-				var iv @Instr = wrapAsIfaceValue(ctx, ctx.CurBlock, ptr, bptgt,
-						types.MakePointerType(ctx.Checker.ExprType(e.ResolvedTypeID)))
+		var srcT @types.Type = ctx.Checker.ExprType(e.ResolvedTypeID)
+		if bptgt != nil && bptgt.Kind == types.TYP_INTERFACE_VALUE && isBorrowableValueSource(srcT) {
+			var lp @Instr = genLValueAddr(ctx, b, e)
+			var boxPtr @Instr = nil
+			var boxSrcTyp @types.Type = nil
+			if lp != nil && lp.Typ != nil &&
+					(lp.Typ.Kind == types.TYP_POINTER || lp.Typ.Kind == types.TYP_MANAGED_PTR) {
+				// 2a: ADDRESSABLE source — `lp` IS the `*T` (`&e` with no load).  The
+				// box source type is the POINTER whose .Elem is the pointee (what
+				// wrapAsIfaceValue's name-less `*any` path dereferences), matching
+				// `lp` — NOT e's value type, whose `.Elem` is nil / the element for a
+				// name-less func value / slice.  This is what the explicit `&e` path
+				// supplies; inert for a named source (srcExprTyp unused there).
+				boxPtr = lp
+				boxSrcTyp = types.MakePointerType(srcT)
+			} else if lp != nil {
+				// 2b: NON-addressable rvalue — the checker admitted it only at a
+				// BORROWING position, so materialise a stack temp of the DEFAULTED
+				// concrete type (an untyped constant defaulted here — else it re-trips
+				// the box(<untyped constant>) crash), store the value into it via
+				// emitStoreManagedSlot (which MOVES a fresh managed value's ref, or
+				// COPIES a managed-field struct's fields, or plain-stores a
+				// pointer-free value), and box the temp's address.  A managed-carrying
+				// temp then OWNS a reference and is enrolled for scope-end cleanup
+				// (below); a pointer-free temp is a plain frame-lived alloca.
+				var vt @types.Type = defaultedBorrowType(srcT)
+				var slot @Instr = ctx.CurBlock.EmitAlloc(vt)
+				ctx.CurBlock = emitStoreManagedSlot(ctx, ctx.CurBlock, slot, lp, vt, true)
+				if borrowTempNeedsCleanup(vt) {
+					// A managed-carrying temp OWNS the copied/moved reference and must
+					// be RefDec'd.  Enroll it as a SCOPE-scoped managed local
+					// (ctx.Vars) rather than a statement temp: (1) emitTempRefDecs's
+					// alloca arm only cleans STRUCT/ARRAY allocas, so a managed-scalar
+					// alloca (@[]T / @T / @func / @Iface) registered as a statement temp
+					// would leak; the scope-var cleanup (emitDecForManagedLocals) loads
+					// the alloca and RefDec's every managed kind.  (2) scope lifetime
+					// co-scopes the temp with a var-init binding (so a var-init'd *any
+					// stays valid), and is sound for an argument too (the borrow does
+					// not outlive the frame).  Mirrors the composite-literal-into-var
+					// enrollment (gen_short_var.bn).  The `.`-prefixed synthetic name
+					// (`.` is not an identifier char — unlike a `__` name, which is a legal
+					// user ident that would shadow a same-named user var under the
+					// most-recent-first lookupVar; convention shared with
+					// `.typeswitch.scrutinee`) never
+					// collides with a source ident and is never looked up.
+					defineVar(ctx, ".borrow_temp", slot, vt)
+				}
+				boxPtr = slot
+				boxSrcTyp = types.MakePointerType(vt)
+			}
+			if boxPtr != nil {
+				var iv @Instr = wrapAsIfaceValue(ctx, ctx.CurBlock, boxPtr, bptgt, boxSrcTyp)
 				if iv != nil {
 					noteSPGrowingResult(ctx, iv)
 					return iv
 				}
 			}
-			val = ptr
+			val = lp
 			haveVal = true
 		}
 	}

@@ -62,6 +62,32 @@ func selectorIsMethodValue(c @Checker, e @ast.Expr) bool {
 	return recvNamed != nil && recvNamed.LookupMethod(e.Name) != nil
 }
 
+// isGenericFuncInstantiation reports whether an EXPR_INSTANTIATE_OR_INDEX node
+// is a generic-function instantiation `f[T]` (as opposed to an `a[i]` index):
+// its head is a bare ident or a package-qualified selector resolving to a
+// generic FUNC symbol.  Mirrors checkInstantiateOrIndex's interpretation so
+// addressability agrees with how the expression is type-checked.
+func isGenericFuncInstantiation(c @Checker, e @ast.Expr) bool {
+	if e == nil || e.X == nil {
+		return false
+	}
+	if e.X.Kind == ast.EXPR_IDENT {
+		var sym @Symbol = c.Scope.Lookup(e.X.Name)
+		return sym != nil && sym.Kind == SYM_FUNC && sym.Type != nil && len(sym.Type.TypeParams) > 0
+	}
+	if e.X.Kind == ast.EXPR_SELECTOR && e.X.X != nil && e.X.X.Kind == ast.EXPR_IDENT {
+		var pkgSym @Symbol = c.Scope.Lookup(e.X.X.Name)
+		if pkgSym != nil && pkgSym.Kind == SYM_PKG {
+			var pkgScope @Scope = lookupPackage(c, pkgSym.PkgPath)
+			if pkgScope != nil {
+				var sym @Symbol = pkgScope.Lookup(e.X.Name)
+				return sym != nil && sym.Kind == SYM_FUNC && sym.Type != nil && len(sym.Type.TypeParams) > 0
+			}
+		}
+	}
+	return false
+}
+
 // isAddressable reports whether `e` is an addressable lvalue — one whose
 // address `&e` may be taken because it has storage.  Addressable: a variable,
 // a struct-field / imported-variable selector, an array/slice/pointer index, a
@@ -81,14 +107,23 @@ func isAddressable(c @Checker, e @ast.Expr) bool {
 		return selectorIsAddressable(c, e)
 	}
 	if e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		// A generic-function instantiation `f[T]` shares this node kind with an
+		// `a[i]` index but is a function VALUE, not an lvalue — it has no storage,
+		// so it is NOT addressable.  Distinguish it exactly as the type-checker
+		// does (checkInstantiateOrIndex): head resolving to a generic FUNC symbol.
+		// Without this, `&f[T]` / `f[T] = x` / an implicit interface value-borrow
+		// of `f[T]` would be admitted and then mis-lowered (the address-of has no
+		// pointer to take).
+		if isGenericFuncInstantiation(c, e) {
+			return false
+		}
 		// `a[i]` indexing.  A SLICE / raw-pointer element is addressable through
 		// the shared backing regardless of whether the base expression is
 		// addressable (`getSlice()[i] = v` is legal — it writes the backing).  An
 		// ARRAY element is addressable only if the array (the base) is: an r-value
 		// array (`getArr()[i]`, a by-value call result) is a non-addressable
 		// temporary, so `&getArr()[i]` / `getArr()[i] = v` / a `*T`-method call on
-		// it must be rejected.  (A generic instantiation `f[T]` shares this node
-		// kind and is NOT addressable, but is exotic and not distinguished here.)
+		// it must be rejected.
 		if e.X != nil {
 			var bt @Type = c.ExprType(e.X.ResolvedTypeID)
 			if bt != nil {
@@ -195,4 +230,61 @@ func reportCannotAddr(c @Checker, e @ast.Expr) {
 		}
 	}
 	addCheckError(c, e.Pos, "cannot take the address of a non-addressable value")
+}
+
+// canBorrowValueIntoRawIface reports whether a VALUE-typed source (not a
+// pointer / managed pointer / interface value — those are AssignableTo's job)
+// may be implicitly borrowed to construct a RAW `*Iface`
+// (`iface.construct.value-borrow`, spec 11-interfaces §11.4).  It is the
+// expr-aware half AssignableTo cannot do: the type-only assignability chain has
+// no source expression, so the addressability gate lives here at the
+// construction site, mirroring the method-receiver auto-address gate
+// (checkResolvedMethodCall).  Only an ADDRESSABLE lvalue is admitted — an
+// implicit `&x`, legal in every position an explicit `&x` is; a non-addressable
+// rvalue (a literal / expression / call result) is materialised into a
+// temporary by a separate rule and returns false here.  A managed `@Iface`
+// target is out of scope: a value → `@Iface` is never implicit (it would invent
+// a refcount), so only the raw `*Iface` path takes the borrow.
+func canBorrowValueIntoRawIface(c @Checker, srcExpr @ast.Expr, src @Type, dst @Type) bool {
+	if c == nil || srcExpr == nil || src == nil || dst == nil {
+		return false
+	}
+	var d @Type = resolveAliasAndConst(dst)
+	if d == nil || d.Kind != TYP_INTERFACE_VALUE {
+		return false // raw *Iface only; @Iface never takes an implicit value borrow
+	}
+	var srcResolved @Type = src.ResolveAlias()
+	if srcResolved == nil {
+		return false
+	}
+	// Pointer / managed / interface-value sources are handled by AssignableTo;
+	// only a genuine value source reaches the implicit borrow.
+	if srcResolved.Kind == TYP_POINTER || srcResolved.Kind == TYP_MANAGED_PTR ||
+			srcResolved.Kind == TYP_INTERFACE_VALUE || srcResolved.Kind == TYP_INTERFACE_VALUE_MANAGED {
+		return false
+	}
+	if !isAddressable(c, srcExpr) {
+		return false // non-addressable rvalue: materialise-a-temporary rule (separate)
+	}
+	var iface @Type = d.Elem
+	if iface == nil {
+		return false
+	}
+	return valuePtrSatisfies(c, src, iface)
+}
+
+// assignableOrBorrowsIface bundles the type-level AssignableTo check with the
+// implicit value-borrow fallback, for the construction sites that build a value
+// from a source expression (var/`:=` init, call argument, composite element,
+// assignment, return).  Callers pass the source EXPRESSION — needed for the
+// borrow's addressability test.  The comparison-only AssignableTo callers (`==`,
+// switch-tag) keep calling AssignableTo directly and never admit a borrow.  For
+// a non-interface target the borrow fallback is inert (returns false on the dst
+// kind), so this is a safe drop-in wherever an assignability check guards a
+// construction.
+func assignableOrBorrowsIface(c @Checker, srcExpr @ast.Expr, src @Type, dst @Type) bool {
+	if src != nil && src.AssignableTo(c, dst) {
+		return true
+	}
+	return canBorrowValueIntoRawIface(c, srcExpr, src, dst)
 }

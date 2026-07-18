@@ -19,9 +19,9 @@
 # aarch64-linux, x86_64-darwin); omitted builds for the host arch.
 #
 # After building:
-#   <path> <file.bn>          format to stdout
-#   <path> -w <file.bn>       rewrite the file in place
-#   <path> --check <file.bn>  exit non-zero if the file is not formatted
+#   <path> <file.bn>            format to stdout (one file)
+#   <path> -w <file.bn>...      rewrite each file in place
+#   <path> --check <file.bn>... exit non-zero if any file is not formatted
 
 set -e
 

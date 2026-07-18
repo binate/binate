@@ -180,6 +180,10 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 			}
 			if freeOnPop != 0 {
 				rt.Free(bit_cast(*uint8, freeOnPop))
+				// A non-zero freeOnPop marks a destructor frame (only the two
+				// BC_REFDEC dtor-dispatch pushes set it); popping it leaves that
+				// dtor's cleanup context (§6).  Balances the increment at the push.
+				vm.CleanupDepth = vm.CleanupDepth - 1
 			}
 			continue
 		}
@@ -197,6 +201,13 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 			// main.main, method/thunk wrappers) with nothing to release.  A NON-empty
 			// FaultTable missing a pad for this pc is a genuine lowering gap (a managed
 			// frame would leak), so abort loudly.
+			//
+			// This terminator ends the pad we were running, so leave its cleanup
+			// context (§6); if the unwind continues into a caller's pad below, that
+			// re-opens one.  A dtor frame is never on the unwind path — a fault inside
+			// a dtor is fatal (setFault → vmPanic) — so ufreeOnPop is always 0 here and
+			// needs no CleanupDepth adjustment (dtor pops balance in BC_RETURN).
+			vm.CleanupDepth = vm.CleanupDepth - 1
 			var unwound bool = false
 			for !unwound {
 				var uhdr *int = stackPtr(vm, regsOff - FRAME_HDR)
@@ -216,6 +227,8 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 				}
 				var upadPC int = lookupFaultPad(f, ucallerPC)
 				if upadPC >= 0 {
+					// Entering the caller's call-site pad: re-open a cleanup context.
+					vm.CleanupDepth = vm.CleanupDepth + 1
 					pc = upadPC
 					unwound = true
 				} else if len(f.FaultTable) != 0 {
@@ -302,71 +315,20 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 		}
 
 		if instr.Op == BC_CALL_IFACE_METHOD {
-			// Slice 2.3c of plan-interface-syntax-revision.md.
-			// Read the iv slot at regs[Src1]; iv[0] = data ptr,
-			// iv[1] = 1-based vtable index into vm.IfaceVtables
-			// (0 = nil iv — see execIfaceOp's BC_IFACE_VALUE arm
-			// for the encoding rationale). Aux is the absolute
-			// vtable slot (slot 0 = dtor; see below). Args follow
-			// at [Src2, Src2+Imm-1]; the data ptr is prepended to
-			// them as the impl method's receiver argument.
-			var ivAddr int = regs[instr.Src1]
-			if ivAddr == 0 {
-				println("vm: call through nil interface value")
-				rt.Exit(1)
+			// Dispatch extracted to execCallIfaceMethod (vm_exec_ifacecall.bn) for file
+			// length.  It handles a native-vtable iface inline (pushed=false, continue
+			// at pc) or pushes a VM frame (pushed=true) whose control state we switch
+			// to here — mirrors the BC_CALL_FUNC_VALUE arm above.
+			var mnfi int = 0
+			var mnro int = 0
+			var mpushed bool = false
+			mnfi, mnro, mpushed = execCallIfaceMethod(vm, instr, pc, funcIdx, regsOff, regs)
+			if mpushed {
+				funcIdx = mnfi
+				regsOff = mnro
+				f, code, regs, frameBase = frameLocals(vm, funcIdx, regsOff)
+				pc = 0
 			}
-			var iv *int = bit_cast(*int, ivAddr)
-			var dataPtr int = iv[types.IfaceValueDataIndex()]
-			var vtIdxPlus int = iv[types.IfaceValueVtableIndex()]
-			if vtIdxPlus == 0 {
-				println("vm: call through nil interface value")
-				rt.Exit(1)
-			}
-			if ifaceVtIsNative(vm, vtIdxPlus) {
-				// iv came from an injected COMPILED package: iv[1] is a
-				// native @__ivt pointer.  Dispatch the method natively
-				// through the shim primitives (no VM frame).
-				dispatchCompiledIfaceMethod(vm, regs, instr, iv)
-				continue
-			}
-			var vtIdx int = vtIdxPlus - 1
-			if vtIdx < 0 || vtIdx >= len(vm.IfaceVtables) {
-				vmPanic("vm: interface vtable index out of range")
-			}
-			var vt @IfaceVtable = vm.IfaceVtables[vtIdx]
-			// instr.Aux is the absolute vtable slot (Slice E.4 of
-			// plan-interface-embedding.md).  Slots 0-1 are the any-block
-			// (dtor, then *TypeInfo); methods live at slot >= 2, with
-			// extended interfaces' inherited methods landing inside nested
-			// parent sub-vtables (still absolute offsets).
-			// Aux's low 16 bits hold the slot; the high bits carry the
-			// method result size (used only by the native-vtable path,
-			// dispatchCompiledIfaceMethod) — mask them off here.
-			var slot int = instr.Aux & 65535
-			if slot < 2 || slot >= len(vt.Methods) {
-				vmPanic("vm: interface method slot out of range")
-			}
-			var fnIdx int = vt.Methods[slot]
-			if fnIdx == 0 {
-				vmPanic("vm: interface method slot is empty")
-			}
-			var calleeFuncIdx int = fnIdx - 1
-			var calleeFunc @VMFunc = vm.Funcs[calleeFuncIdx]
-			var newRegsOff int = pushFrame(vm, calleeFunc, pc, funcIdx, regsOff, vm.SP, instr.Dst)
-			var newRegs *int = stackPtr(vm, newRegsOff)
-			// Receiver: data ptr in slot 0 (pointer = one slot);
-			// user args follow as packed slots.  Imm is the packed
-			// slot count of user args (Layer 2 step 2b); bound
-			// against NumParamSlots, which includes the 1-slot
-			// receiver.  No-op on a 64-bit host.
-			newRegs[0] = dataPtr
-			for i := 0; i < instr.Imm && i + 1 < calleeFunc.NumParamSlots; i++ {
-				newRegs[i + 1] = regs[instr.Src2 + i]
-			}
-			funcIdx = calleeFuncIdx
-			regsOff = newRegsOff
-			f, code, regs, frameBase = frameLocals(vm, funcIdx, regsOff)
-			pc = 0
 			continue
 		}
 
@@ -380,7 +342,10 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 				// A guard inside execManagedMemoryOp raised a recoverable fault (Plan
 				// 2).  Consume the signal and jump to the cleanup pad; pc is already
 				// the post-op pc (loop pre-incremented) == the op's FaultTable key.
+				// Entering the pad opens a cleanup context (§6): a guard that fires
+				// while it runs is fatal, not a nested recovery.
 				vm.FaultRaised = false
+				vm.CleanupDepth = vm.CleanupDepth + 1
 				pc = dispatchFaultPad(f, pc)
 			}
 			continue
@@ -446,6 +411,9 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 				var ccRegsOff int = pushFrame(vm, ccDtor, pc, funcIdx, regsOff, vm.SP, -1)
 				var ccHdr *int = stackPtr(vm, ccRegsOff - FRAME_HDR)
 				ccHdr[5] = csAddr
+				// Entering a destructor frame opens a cleanup context (§6); the pop
+				// (BC_RETURN, freeOnPop != 0) balances it.
+				vm.CleanupDepth = vm.CleanupDepth + 1
 				var ccRegs *int = stackPtr(vm, ccRegsOff)
 				ccRegs[0] = csAddr
 				funcIdx = dIdx
@@ -471,6 +439,9 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 					var newRegsOff int = pushFrame(vm, dtorFunc, pc, funcIdx, regsOff, vm.SP, -1)
 					var newHdr *int = stackPtr(vm, newRegsOff - FRAME_HDR)
 					newHdr[5] = bit_cast(int, ptr)
+					// Entering a destructor frame opens a cleanup context (§6); the
+					// pop (BC_RETURN, freeOnPop != 0) balances it.
+					vm.CleanupDepth = vm.CleanupDepth + 1
 					var newRegs *int = stackPtr(vm, newRegsOff)
 					newRegs[0] = bit_cast(int, ptr)
 					funcIdx = fnIdx - 1

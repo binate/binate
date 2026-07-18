@@ -48,77 +48,103 @@ cd "$BINATE_DIR"
 RUNTIME_PKGS=$(find runtime -type f \( -name '*.bn' -o -name '*.bni' \) 2>/dev/null \
     | sed -E 's#^runtime/[^/]+/##; s#^(pkg/[^/]+)/.*#\1#; s#\.bni?$##' | sort -u)
 
-# import_level <import-path> -> tier level 0..3 of the imported package.
+# import_level <import-path> -> sets RET to tier level 0..3 of imported package.
+# A shell function assigning a variable (not `echo` in `$(...)`) so the hot loop
+# below stays fork-free — it runs once per (file, import) pair.
 import_level() {
     case "$1" in
-        pkg/builtins/*)                echo 0; return ;;
-        pkg/bootstrap|pkg/bootstrap/*) echo 0; return ;;
-        pkg/std/*)                     echo 1; return ;;
-        pkg/stdx/*)                    echo 2; return ;;
+        pkg/builtins/*)                RET=0; return ;;
+        pkg/bootstrap|pkg/bootstrap/*) RET=0; return ;;
+        pkg/std/*)                     RET=1; return ;;
+        pkg/stdx/*)                    RET=2; return ;;
     esac
     for r in $RUNTIME_PKGS; do
-        [ "$1" = "$r" ] && { echo 0; return; }
-        case "$1" in "$r"/*) echo 0; return ;; esac
+        [ "$1" = "$r" ] && { RET=0; return; }
+        case "$1" in "$r"/*) RET=0; return ;; esac
     done
     case "$1" in
-        pkg/*) echo 3; return ;;   # tier 2 (pkg/<org>/*)
+        pkg/*) RET=3; return ;;   # tier 2 (pkg/<org>/*)
     esac
-    echo 4                          # non-pkg import (unexpected)
+    RET=4                          # non-pkg import (unexpected)
 }
 
-# file_level <repo-relative-file> -> tier level 0..4 of the OWNING package.
+# file_level <repo-relative-file> -> sets RET to tier level 0..4 of the OWNING
+# package.  (Same var-assign convention as import_level, for the same reason.)
 file_level() {
     case "$1" in
-        runtime/*)         echo 0; return ;;   # runtime-shipped
-        */pkg/builtins/*)  echo 0; return ;;   # tier 0/0b
-        */pkg/bootstrap*)  echo 0; return ;;
-        */pkg/std/*)       echo 1; return ;;
-        */pkg/stdx/*)      echo 2; return ;;   # tier 1x
-        pkg/*)             echo 3; return ;;   # tier 2 collocated (top-level pkg/)
-        cmd/*)             echo 4; return ;;   # tier 3 app
+        runtime/*)         RET=0; return ;;   # runtime-shipped
+        */pkg/builtins/*)  RET=0; return ;;   # tier 0/0b
+        */pkg/bootstrap*)  RET=0; return ;;
+        */pkg/std/*)       RET=1; return ;;
+        */pkg/stdx/*)      RET=2; return ;;   # tier 1x
+        pkg/*)             RET=3; return ;;   # tier 2 collocated (top-level pkg/)
+        cmd/*)             RET=4; return ;;   # tier 3 app
     esac
-    echo 4                                      # other -> app-level (permissive)
+    RET=4                                      # other -> app-level (permissive)
 }
 
-# lvl_name <level> -> the human tier label.
+# lvl_name <level> -> the human tier label.  Only used to render a violation
+# message (rare), so it stays an `echo`/`$(...)` helper.
 lvl_name() {
     case "$1" in 0) echo "0/0b" ;; 1) echo "1" ;; 2) echo "1x" ;; 3) echo "2" ;; *) echo "3" ;; esac
 }
 
-is_exempt() {  # <rel-file> <import>
-    [ -f "$WHITELIST_FILE" ] || return 1
-    grep -v '^[[:space:]]*#' "$WHITELIST_FILE" | grep -v '^[[:space:]]*$' \
-        | grep -Fxq "$1:$2"
-}
-
+LIST=$(mktemp -t hygiene-pkg-tiers-list.XXXXXX)
+IMPORTS=$(mktemp -t hygiene-pkg-tiers-imp.XXXXXX)
+WL_CLEAN=$(mktemp -t hygiene-pkg-tiers-wl.XXXXXX)
 VIOL=$(mktemp -t hygiene-pkg-tiers.XXXXXX)
-trap 'rm -f "$VIOL"' EXIT
+trap 'rm -f "$LIST" "$IMPORTS" "$WL_CLEAN" "$VIOL"' EXIT
 
 find ifaces impls runtime pkg cmd -type f \( -name '*.bn' -o -name '*.bni' \) 2>/dev/null \
-    | grep -v '_test\.bn$' | sort | while IFS= read -r f; do
-    ilevel=$(file_level "$f")
-    # Extract every "pkg/..." import (single-line, optionally aliased, and the
-    # grouped `import ( ... )` form).
-    imports=$(awk '
+    | grep -v '_test\.bn$' | sort > "$LIST"
+
+# Pre-strip the exemption whitelist's comments/blanks ONCE (was re-done by two
+# greps inside is_exempt on every higher-tier import).  Repo-relative paths and
+# import paths contain no tab, so the tab-delimited pipeline below is unambiguous.
+if [ -f "$WHITELIST_FILE" ]; then
+    grep -v '^[[:space:]]*#' "$WHITELIST_FILE" | grep -v '^[[:space:]]*$' > "$WL_CLEAN"
+fi
+
+# Extract every "pkg/..." import from EVERY file in ONE awk pass (was one awk
+# fork PER file).  Emit "<path>\t<import>".  FNR==1 resets the group-state
+# machine per file (an unterminated `import (` must not bleed into the next).
+# Handles the single-line `import "pkg/X"` / aliased `import a "pkg/X"` and the
+# grouped `import ( "pkg/X" ... )` forms.
+if [ -s "$LIST" ]; then
+    xargs awk '
+        FNR == 1 { in_group = 0 }
         /^import[ \t]*\(/ { in_group = 1; next }
         in_group && /^\)/  { in_group = 0; next }
-        in_group { if (match($0, /"pkg\/[^"]+"/)) print substr($0, RSTART + 1, RLENGTH - 2); next }
-        /^import[ \t]/ { if (match($0, /"pkg\/[^"]+"/)) print substr($0, RSTART + 1, RLENGTH - 2) }
-    ' "$f")
-    [ -z "$imports" ] && continue
-    printf '%s\n' "$imports" | while IFS= read -r imp; do
-        [ -z "$imp" ] && continue
-        dlevel=$(import_level "$imp")
-        [ "$dlevel" -le "$ilevel" ] && continue    # same tier or lower -> ok
-        # The only sanctioned higher-tier edge is std (.bn) -> stdx.
-        if [ "$ilevel" -eq 1 ] && [ "$dlevel" -eq 2 ]; then
-            case "$f" in *.bn) continue ;; esac    # std IMPL may use stdx
-            # a .bni std -> stdx falls through to a violation (refinement).
-        fi
-        is_exempt "$f" "$imp" && continue
-        echo "$f: tier-$(lvl_name "$ilevel") package imports higher-tier \"$imp\" (tier-$(lvl_name "$dlevel"))" >> "$VIOL"
-    done
-done
+        in_group {
+            if (match($0, /"pkg\/[^"]+"/))
+                print FILENAME "\t" substr($0, RSTART + 1, RLENGTH - 2)
+            next
+        }
+        /^import[ \t]/ {
+            if (match($0, /"pkg\/[^"]+"/))
+                print FILENAME "\t" substr($0, RSTART + 1, RLENGTH - 2)
+        }
+    ' < "$LIST" > "$IMPORTS"
+fi
+
+TAB=$(printf '\t')
+while IFS="$TAB" read -r f imp; do
+    [ -z "$imp" ] && continue
+    file_level "$f"; ilevel=$RET
+    import_level "$imp"; dlevel=$RET
+    [ "$dlevel" -le "$ilevel" ] && continue    # same tier or lower -> ok
+    # The only sanctioned higher-tier edge is std (.bn) -> stdx.
+    if [ "$ilevel" -eq 1 ] && [ "$dlevel" -eq 2 ]; then
+        case "$f" in *.bn) continue ;; esac    # std IMPL may use stdx
+        # a .bni std -> stdx falls through to a violation (refinement).
+    fi
+    # Per-file exemption? (single grep against the pre-stripped whitelist —
+    # only reached for a genuine higher-tier edge, which is rare.)
+    if [ -s "$WL_CLEAN" ] && grep -Fxq "$f:$imp" "$WL_CLEAN"; then
+        continue
+    fi
+    echo "$f: tier-$(lvl_name "$ilevel") package imports higher-tier \"$imp\" (tier-$(lvl_name "$dlevel"))" >> "$VIOL"
+done < "$IMPORTS"
 
 if [ -s "$VIOL" ]; then
     sort -u "$VIOL"

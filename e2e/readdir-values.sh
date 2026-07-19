@@ -5,8 +5,8 @@
 #
 # os.ReadDir decodes the native struct dirent that readdir returns by
 # reproducing the d_type / d_name offsets per (os, arch) in Binate
-# (impls/stdlib/pkg/std/os/readdir_<target>.bn) — a per-(os,arch) ABI fact that
-# unit tests cannot pin (they run on no fixed layout). Instead we:
+# (impls/stdlib/pkg/std/os/sys/readdir_<target>.bn) — a per-(os,arch) ABI fact
+# that unit tests cannot pin (they run on no fixed layout). Instead we:
 #   1. Compile + run a tiny C program that readdir()s a known directory and, for
 #      each known entry name, prints its d_type kind (reg/dir/lnk) — plus the
 #      count of non-".",".." entries — the ground truth for this (OS, arch).

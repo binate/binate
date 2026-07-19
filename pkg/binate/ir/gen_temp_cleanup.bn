@@ -1,0 +1,154 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/stdx/slices"
+
+// Temporary-value cleanup: tracking managed temporaries created mid-statement
+// (registerTemp / consumeTemp) and RefDec-ing the live ones at statement / scope /
+// return boundaries.  Split out of gen_util_refcount.bn for file-length hygiene.
+
+// registerTemp adds a managed temporary for cleanup at end of statement.
+func registerTemp(ctx @GenContext, instr @Instr) {
+	ctx.Temps = slices.Append[@Instr](ctx.Temps, instr)
+}
+
+// noteSPGrowingResult inspects an Emit*-returned Instr and marks the
+// current statement for end-of-statement OP_SP_RESTORE if the op
+// grows vm.SP at runtime. Centralizes the list of SP-growing IR ops
+// so call sites in IR-gen don't each have to know which emitters
+// matter. Aggregate-returning OP_CALL / CALL_INDIRECT / CALL_FUNC_VALUE
+// are handled separately in genCall (the SP growth happens at the
+// callee's BC_RETURN copy-back, keyed off resultTyp shape, not on
+// the call instr's Op).
+func noteSPGrowingResult(ctx @GenContext, instr @Instr) {
+	if instr == nil { return }
+	if instr.Op == iropcode.OP_MAKE_SLICE { ctx.StmtGrewSP = true; return }
+	if instr.Op == iropcode.OP_FUNC_VALUE { ctx.StmtGrewSP = true; return }
+	if instr.Op == iropcode.OP_IFACE_VALUE { ctx.StmtGrewSP = true; return }
+	if instr.Op == iropcode.OP_RODATA_MSLICE_COPY { ctx.StmtGrewSP = true; return }
+	if instr.Op == iropcode.OP_RODATA_ARRAY { ctx.StmtGrewSP = true; return }
+}
+
+// consumeTemp removes a specific instruction from the temps list.
+func consumeTemp(ctx @GenContext, instr @Instr) {
+	if len(ctx.Temps) == 0 { return }
+	for i := 0; i < len(ctx.Temps); i++ {
+		if ctx.Temps[i].ID == instr.ID {
+			for j := i; j < len(ctx.Temps) - 1; j++ {
+				ctx.Temps[j] = ctx.Temps[j + 1]
+			}
+			ctx.Temps = ctx.Temps[:len(ctx.Temps) - 1]
+			return
+		}
+	}
+}
+
+// emitTempCleanup emits RefDec for all managed temporaries and clears the list.
+// Also emits OP_SP_RESTORE if the statement set ctx.StmtGrewSP — the
+// bytecode VM uses this to reclaim vm.Stack bytes accumulated during
+// the statement (aggregate-return copy-backs, BC_MAKE_SLICE /
+// BC_STRING_COPY* / BC_FUNC_VALUE pushes). LLVM and native backends
+// treat OP_SP_RESTORE as a no-op. SP_RESTORE is emitted AFTER the
+// RefDec loop because some RefDecs read header bytes that may live
+// on vm.SP; reclaiming those bytes after they're no longer needed
+// is fine.
+//
+// Use emitTempCleanupForReturn at the return-statement cleanup site —
+// SP_RESTORE THERE would truncate the about-to-be-returned aggregate's
+// bytes before BC_RETURN's copy-back has a chance to memcpy them into
+// the caller's region.
+func emitTempCleanup(ctx @GenContext, b @Block) @Block {
+	b = emitTempCleanupBody(ctx, b)
+	if ctx.StmtGrewSP {
+		b.EmitSPRestore()
+		ctx.StmtGrewSP = false
+	}
+	return b
+}
+
+// emitTempCleanupForReturn is the return-path variant: same RefDec
+// loop but never emits OP_SP_RESTORE. The pending vm.SP growth gets
+// reclaimed by BC_RETURN's `vm.SP = callerSP` (which restores back to
+// the caller's SP at the time of the original BC_CALL).
+func emitTempCleanupForReturn(ctx @GenContext, b @Block) @Block {
+	b = emitTempCleanupBody(ctx, b)
+	// Don't emit SP_RESTORE — see fn comment.
+	ctx.StmtGrewSP = false
+	return b
+}
+
+// emitTempCleanupBody is the shared RefDec-temps loop used by both
+// regular and return-path cleanups.  It RefDecs every managed temp and then
+// CLEARS ctx.Temps.
+func emitTempCleanupBody(ctx @GenContext, b @Block) @Block {
+	b = emitTempRefDecs(ctx, b)
+	ctx.Temps = ctx.Temps[:0]
+	return b
+}
+
+// emitTempRefDecs is the RefDec-temps loop WITHOUT clearing ctx.Temps.  A
+// cleanup landing pad (plan-rt-fault-cleanup-pads.md) reuses this to RefDec the
+// temps live at a fault point without disturbing the normal cleanup that still
+// runs at the enclosing statement's end.
+func emitTempRefDecs(ctx @GenContext, b @Block) @Block {
+	for i := 0; i < len(ctx.Temps); i++ {
+		var tmp @Instr = ctx.Temps[i]
+		if tmp.Typ == nil { continue }
+		if isManagedPtrType(tmp.Typ) {
+			emitManagedPtrRefDec(ctx.Func, b, tmp)
+		}
+		if isManagedSliceType(tmp.Typ) {
+			b = emitManagedSliceRefDec(ctx.Func, b, tmp)
+		}
+		if isManagedIfaceValueType(tmp.Typ) {
+			b = emitManagedIfaceValueRefDec(ctx.Func, b, tmp)
+		}
+		if isManagedFuncValueType(tmp.Typ) {
+			b = emitManagedFuncValueRefDec(ctx.Func, b, tmp)
+		}
+		if needsStructCopy(tmp.Typ) {
+			var tmpSlot @Instr = b.EmitAlloc(tmp.Typ)
+			b.EmitStore(tmpSlot, tmp)
+			emitStructDtor(ctx.Func, b, tmpSlot, tmp.Typ)
+		}
+		if isStructOrArrayAlloc(tmp) && needsStructCopy(tmp.TypeArg) {
+			// A registered struct/array composite-literal ALLOCA temp (a fresh
+			// managed-field literal that was NOT bound to a surviving var — see
+			// genCompositeLit / genArrayLit).  The temp IS the pointer to the
+			// storage, so dtor it in place; the value-temp arm above does not fire
+			// because tmp.Typ is the *pointer* type here (needsStructCopy(*T) is
+			// false), so without this the literal's managed fields never RefDec,
+			// leaving the copy the consumer took for itself unbalanced (a leak).
+			emitStructDtor(ctx.Func, b, tmp, tmp.TypeArg)
+		}
+	}
+	return b
+}
+
+// emitTempCleanupSince emits RefDec for temps added since savedLen.
+func emitTempCleanupSince(ctx @GenContext, b @Block, savedLen int) @Block {
+	if len(ctx.Temps) == 0 { return b }
+	for i := savedLen; i < len(ctx.Temps); i++ {
+		var tmp @Instr = ctx.Temps[i]
+		if tmp.Typ == nil { continue }
+		if isManagedPtrType(tmp.Typ) {
+			emitManagedPtrRefDec(ctx.Func, b, tmp)
+		}
+		if isManagedSliceType(tmp.Typ) {
+			b = emitManagedSliceRefDec(ctx.Func, b, tmp)
+		}
+		if isManagedIfaceValueType(tmp.Typ) {
+			b = emitManagedIfaceValueRefDec(ctx.Func, b, tmp)
+		}
+		if isManagedFuncValueType(tmp.Typ) {
+			b = emitManagedFuncValueRefDec(ctx.Func, b, tmp)
+		}
+		if needsStructCopy(tmp.Typ) {
+			var tmpSlot @Instr = b.EmitAlloc(tmp.Typ)
+			b.EmitStore(tmpSlot, tmp)
+			emitStructDtor(ctx.Func, b, tmpSlot, tmp.Typ)
+		}
+	}
+	ctx.Temps = ctx.Temps[:savedLen]
+	return b
+}

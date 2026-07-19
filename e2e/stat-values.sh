@@ -4,7 +4,7 @@
 # authoritative source.
 #
 # os.Stat reads the native struct stat by reproducing its layout field-for-field
-# in Binate (impls/stdlib/pkg/std/os/stat_<target>.bn) — a per-(os,arch) ABI
+# in Binate (impls/stdlib/pkg/std/os/sys/stat_<target>.bn) — a per-(os,arch) ABI
 # fact that unit tests cannot pin (they run on no fixed layout). Instead we:
 #   1. Compile + run a tiny C program that stat()s a known file and a known
 #      directory and prints size / perm / type / mtime — the ground truth for

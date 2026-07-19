@@ -1,0 +1,425 @@
+package "pkg/binate/lint"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+import "pkg/stdx/containers/vec"
+
+// ============================================================
+// Rule: iface-borrow-escape
+// ============================================================
+//
+// The implicit value-borrow of `iface.construct.value-borrow` (spec
+// 11-interfaces §11.4) lets a VALUE-typed source construct a RAW interface
+// value (`*Iface` / `*any`) with no visible `&`: `Opts{Any: x}` means
+// `Opts{Any: &x}`, and `var iv *any = 42` materialises a frame temporary and
+// borrows it.  The borrow takes no reference count, so the raw interface value
+// dangles the moment the borrowed storage dies (§18.7 `mem.raw-uaf`).
+//
+// The checker's position rule (§11.4) stops a NON-addressable rvalue borrow
+// from being built DIRECTLY into a store / field / return, but it deliberately
+// does not do lifetime analysis: an addressable frame-local borrowed at an
+// escaping position (`func f(x T) *any { return x }`), and a named borrow
+// escaping via a LATER statement (`var iv *any = 42; … ; return iv`), both
+// type-check.  Because the borrow reads like ordinary value construction — no
+// `&` in sight — the ordinary raw-pointer-escape intuition doesn't fire.  This
+// lint flags those escapes.  (Binate emits no compiler warning for this; a
+// dangling-borrow diagnostic is a lint concern, not a compiler one.)
+//
+// A raw interface value BORROWS FRAME-LOCAL STORAGE when its data pointer roots
+// in this frame: an implicit value-borrow of a frame-local lvalue (2a), of a
+// materialised rvalue temporary (2b), or an explicit `&frameLocal`.  It ESCAPES
+// when it is `return`ed, or stored into a location that does NOT root in this
+// frame — a store through a pointer / managed handle (`p.f = x`, `s[i] = x`,
+// `*p = x`) OR into a global (`G = x`, `G.f = x`).  A pointer- / managed-typed
+// source (not an explicit `&`) borrows whatever the pointee's lifetime is — the
+// ordinary raw-pointer escape hazard, out of THIS rule's scope.
+//
+// The same footgun also arises EMBEDDED in an aggregate: `Opts{Any: x}` builds a
+// struct whose `*any` field borrows a frame-local, and returning / escaping-
+// storing that struct BY VALUE carries the dangling borrow out (the spec
+// canonical example).  This is flagged too — for a composite literal at the
+// escape site (`return Opts{Any: x}`, including nested composites and array /
+// slice element borrows) and for a variable initialised by such a composite
+// (`var o = Opts{Any: x}` or `o := Opts{Any: x}`, then escaping).
+//
+// Frame-locality is resolved with LEXICAL SCOPING: the walk carries a scope
+// stack and resolves each name to its in-scope binding, so a global is not
+// mistaken for a like-named block-local (a `global + for i := …` shadow), and a
+// borrow variable in one block does not taint a same-named variable in a
+// disjoint block.  A borrow variable that is later REASSIGNED is dropped from
+// tracking (its post-assignment source is unknown; see gap (a)).
+//
+// The rule is CONSERVATIVE.  Known gaps: a borrow variable produced by an
+// ASSIGNMENT rather than its initialiser (`var iv *any; iv = local; return iv`),
+// and — as a corollary — a borrow whose reassignment is CONDITIONAL (the drop is
+// flow-insensitive, so the not-taken path is not re-flagged); a DIRECT explicit
+// `&local` at a non-`any` `*Iface` return slot (its `*T` source is
+// indistinguishable from a plain struct-pointer return without resolving the
+// interface — the `*any` slot and the named-borrow-variable paths still cover
+// it); an aggregate whose raw-interface field is set by a later FIELD ASSIGNMENT
+// rather than a composite initialiser (`var o Opts; o.a = x; return o`); an
+// aggregate whose embedding composite is behind a heap indirection built by a
+// CALL (`box(Opts{Any: x})` — the composite is the call's argument, not the
+// escaping expression); and returns/stores inside a nested function literal (a
+// separate frame).  These are under-warns.  In the over-warn direction the rule
+// shares one conservative approximation with the sibling `func-value-escape`
+// rule: a store through a
+// pointer / slice that actually roots in a frame-local (`var p *Box = &b; p.f =
+// x`) is treated as escaping (distinguishing it needs alias analysis).
+
+// ============================================================
+// Lexical scope stack
+// ============================================================
+
+// escScope is one lexical block's escape-analysis state: the frame-local names
+// and the raw-interface borrow-variable names DECLARED IN THIS BLOCK, plus a
+// link to the enclosing scope.  Name resolution walks the Parent chain.
+type escScope struct {
+	Locals @vec.Vec[@[]char]
+	// Borrows holds candidate raw-interface borrow-variable names.  It is OVER-
+	// approximate: escWalkDecl enrolls any local whose initialiser borrows frame-
+	// local storage, without confirming the variable's type is a raw interface
+	// value (which is not reliably available at the declaration).  Every consult
+	// of borrowActive is therefore gated by typeIsRawIfaceValue at the USE site,
+	// which filters the non-interface entries — so borrowActive must NOT be used
+	// without that type guard.
+	Borrows @vec.Vec[@[]char]
+	// AggBorrows holds names of aggregate variables whose raw-interface field/
+	// element holds a frame-local value-borrow (`var o Opts = Opts{Any: x}`).
+	// Distinct from Borrows because an aggregate is not itself a raw interface
+	// value, so it is recognised precisely at its declaration (not filtered by
+	// type at the use site the way a raw-interface borrow variable is).
+	AggBorrows @vec.Vec[@[]char]
+	// Dropped holds borrow-variable names (raw-interface OR aggregate) declared
+	// in THIS scope that were later REASSIGNED, so their post-assignment source
+	// is unknown and they are no longer tracked.  Per-scope (not function-global)
+	// so a drop in one block cannot suppress a distinct same-named borrow
+	// variable in a disjoint scope.
+	Dropped @vec.Vec[@[]char]
+	Parent  @escScope
+}
+
+// newEscScope returns an empty scope nested in `parent` (nil for a function's
+// root scope).
+func newEscScope(parent @escScope) @escScope {
+	var s @escScope = make(escScope)
+	s.Locals = vec.New[@[]char]()
+	s.Borrows = vec.New[@[]char]()
+	s.AggBorrows = vec.New[@[]char]()
+	s.Dropped = vec.New[@[]char]()
+	s.Parent = parent
+	return s
+}
+
+// declLocal records a frame-local binding in this scope.
+func (s @escScope) declLocal(name @[]char) {
+	if len(name) == 0 || streq(name, "_") { return }
+	s.Locals.Push(name)
+}
+
+// declBorrow records a raw-interface borrow variable in this scope.
+func (s @escScope) declBorrow(name @[]char) {
+	if len(name) == 0 || streq(name, "_") { return }
+	s.Borrows.Push(name)
+}
+
+// declAggBorrow records an aggregate borrow variable in this scope.
+func (s @escScope) declAggBorrow(name @[]char) {
+	if len(name) == 0 || streq(name, "_") { return }
+	s.AggBorrows.Push(name)
+}
+
+// hasLocal reports whether `name` resolves to a frame-local binding in this
+// scope or an enclosing one.
+func (s @escScope) hasLocal(name @[]char) bool {
+	var cur @escScope = s
+	for cur != nil {
+		if nameInVec(cur.Locals, name) { return true }
+		cur = cur.Parent
+	}
+	return false
+}
+
+// borrowActive reports whether `name` resolves to a still-active raw-interface
+// borrow variable.  Resolution is to the NEAREST binding: at each scope, a
+// Borrows entry wins (active unless dropped), a non-borrow Locals entry SHADOWS
+// any outer borrow of the same name (so an inner safe redeclaration is not
+// mistaken for the outer borrow), and otherwise the search continues outward.
+func (s @escScope) borrowActive(name @[]char) bool {
+	var cur @escScope = s
+	for cur != nil {
+		if nameInVec(cur.Borrows, name) {
+			return !nameInVec(cur.Dropped, name)
+		}
+		if nameInVec(cur.Locals, name) {
+			return false // shadowed by a nearer non-borrow local
+		}
+		cur = cur.Parent
+	}
+	return false
+}
+
+// aggBorrowActive is borrowActive for the AggBorrows set (aggregate borrow
+// variables), with the same nearest-binding shadowing and drop rules.
+func (s @escScope) aggBorrowActive(name @[]char) bool {
+	var cur @escScope = s
+	for cur != nil {
+		if nameInVec(cur.AggBorrows, name) {
+			return !nameInVec(cur.Dropped, name)
+		}
+		if nameInVec(cur.Locals, name) {
+			return false // shadowed by a nearer non-borrow local
+		}
+		cur = cur.Parent
+	}
+	return false
+}
+
+// markReassigned records that `name` was reassigned: it drops the borrow at the
+// NEAREST scope that declares it as a borrow variable — raw-interface OR
+// aggregate — (stopping if a nearer non-borrow local shadows it, so there is no
+// borrow to drop).
+func (s @escScope) markReassigned(name @[]char) {
+	var cur @escScope = s
+	for cur != nil {
+		if nameInVec(cur.Borrows, name) || nameInVec(cur.AggBorrows, name) {
+			cur.Dropped.Push(name)
+			return
+		}
+		if nameInVec(cur.Locals, name) { return }
+		cur = cur.Parent
+	}
+}
+
+// escCtx is the per-function escape-analysis context: the lint context and the
+// current function's declared return-slot type expressions.
+type escCtx struct {
+	Lint     @lintCtx
+	RetSlots @[]@ast.TypeExpr
+}
+
+// ============================================================
+// Entry point + per-function walk
+// ============================================================
+
+// lintIfaceBorrowEscapes runs the rule over every top-level function / method in
+// the merged file.
+func lintIfaceBorrowEscapes(ctx @lintCtx, file @ast.File) {
+	if file == nil { return }
+	for i := 0; i < len(file.Decls); i++ {
+		lintBorrowEscapeDecl(ctx, file.Decls[i])
+	}
+}
+
+// lintBorrowEscapeDecl walks one function's body (recursing grouped decls;
+// ignoring non-functions and bodiless declarations).
+func lintBorrowEscapeDecl(ctx @lintCtx, d @ast.Decl) {
+	if d == nil { return }
+	if d.Kind == ast.DECL_GROUP {
+		for i := 0; i < len(d.Decls); i++ {
+			lintBorrowEscapeDecl(ctx, d.Decls[i])
+		}
+		return
+	}
+	if d.Kind != ast.DECL_FUNC || d.Body == nil { return }
+	var ec @escCtx = make(escCtx)
+	ec.Lint = ctx
+	ec.RetSlots = d.Results
+	// Root scope: receiver + parameters are frame-local.
+	var root @escScope = newEscScope(nil)
+	if d.Recv != nil {
+		root.declLocal(d.Recv.Name)
+	}
+	for i := 0; i < len(d.Params); i++ {
+		root.declLocal(d.Params[i].Name)
+	}
+	escWalkStmt(ec, d.Body, root)
+}
+
+// escWalkStmt walks statement `s` under scope `scope`, recording declarations
+// and checking escape sites.  A block / control construct opens a nested scope.
+func escWalkStmt(ec @escCtx, s @ast.Stmt, scope @escScope) {
+	if s == nil { return }
+	if s.Kind == ast.STMT_BLOCK {
+		var child @escScope = newEscScope(scope)
+		for i := 0; i < len(s.Stmts); i++ {
+			escWalkStmt(ec, s.Stmts[i], child)
+		}
+		return
+	}
+	if s.Kind == ast.STMT_DECL {
+		escWalkDecl(ec, s.DeclRef, scope)
+		return
+	}
+	if s.Kind == ast.STMT_SHORT_VAR {
+		// `:=` cannot bind a raw interface value from a value-borrow (an inferred
+		// type is the source's own value type, never `*Iface`), so the names are
+		// never raw-interface Borrows.  But `:=` CAN infer an AGGREGATE type that
+		// carries an embedded frame-local borrow (`o := Opts{Any: x}`), so the
+		// aggregate check applies exactly as it does in the `var` path.
+		for i := 0; i < len(s.Exprs); i++ {
+			if s.Exprs[i] == nil || s.Exprs[i].Kind != ast.EXPR_IDENT { continue }
+			if i < len(s.Exprs2) && aggregateEmbedsFrameLocalBorrow(ec, s.Exprs2[i], scope) {
+				scope.declAggBorrow(s.Exprs[i].Name)
+			}
+			scope.declLocal(s.Exprs[i].Name)
+		}
+		return
+	}
+	if s.Kind == ast.STMT_ASSIGN {
+		escWalkAssign(ec, s, scope)
+		return
+	}
+	if s.Kind == ast.STMT_RETURN {
+		for i := 0; i < len(s.Exprs); i++ {
+			var slot @ast.TypeExpr
+			if i < len(ec.RetSlots) { slot = ec.RetSlots[i] }
+			checkReturnEscape(ec, s.Exprs[i], slot, scope)
+		}
+		return
+	}
+	if s.Kind == ast.STMT_IF {
+		// Binate has no if-init clause; the then/else are blocks that open their
+		// own scopes.
+		escWalkStmt(ec, s.Body, scope)
+		escWalkStmt(ec, s.Else, scope)
+		return
+	}
+	if s.Kind == ast.STMT_FOR {
+		var child @escScope = newEscScope(scope)
+		if s.ForVal != nil {
+			if s.ForKey != nil && s.ForKey.Kind == ast.EXPR_IDENT {
+				child.declLocal(s.ForKey.Name)
+			}
+			if s.ForVal.Kind == ast.EXPR_IDENT {
+				child.declLocal(s.ForVal.Name)
+			}
+		} else {
+			escWalkStmt(ec, s.Init, child)
+			escWalkStmt(ec, s.Post, child)
+		}
+		escWalkStmt(ec, s.Body, child)
+		return
+	}
+	if s.Kind == ast.STMT_SWITCH || s.Kind == ast.STMT_TYPE_SWITCH {
+		// Binate has no switch-init clause.  A type switch `switch v := x.(type)`
+		// binds `v` (the recovered value, a frame-local) across all case bodies.
+		var child @escScope = newEscScope(scope)
+		if len(s.Binder) != 0 {
+			child.declLocal(s.Binder)
+		}
+		for i := 0; i < len(s.Cases); i++ {
+			var cc @ast.CaseClause = s.Cases[i]
+			if cc == nil { continue }
+			var caseScope @escScope = newEscScope(child)
+			for j := 0; j < len(cc.Body); j++ {
+				escWalkStmt(ec, cc.Body[j], caseScope)
+			}
+		}
+		return
+	}
+}
+
+// escWalkDecl records a `var` declaration (recursing grouped decls) into
+// `scope`: its name is frame-local, and it is a borrow variable when its
+// initialiser borrows frame-local storage.
+func escWalkDecl(ec @escCtx, d @ast.Decl, scope @escScope) {
+	if d == nil { return }
+	if d.Kind == ast.DECL_GROUP {
+		for i := 0; i < len(d.Decls); i++ {
+			escWalkDecl(ec, d.Decls[i], scope)
+		}
+		return
+	}
+	if d.Kind != ast.DECL_VAR { return }
+	if len(d.Name) == 0 { return }
+	if d.Value != nil && borrowSourceFrameLocal(ec, d.Value, scope) {
+		scope.declBorrow(d.Name)
+	}
+	if d.Value != nil && aggregateEmbedsFrameLocalBorrow(ec, d.Value, scope) {
+		scope.declAggBorrow(d.Name)
+	}
+	scope.declLocal(d.Name)
+}
+
+// escWalkAssign handles `lhs = rhs` (plain assignment only): a reassignment of a
+// borrow variable drops it from tracking, and a store whose target does not root
+// in this frame is an escape site.
+func escWalkAssign(ec @escCtx, s @ast.Stmt, scope @escScope) {
+	if s.Op != cast(int, token.ASSIGN) { return }
+	var n int = len(s.Exprs)
+	if n != len(s.Exprs2) { return }
+	for i := 0; i < n; i++ {
+		var lhs @ast.Expr = s.Exprs[i]
+		var rhs @ast.Expr = s.Exprs2[i]
+		if lhs == nil { continue }
+		// The blank identifier `_` discards the value — it is not storage, so it
+		// neither reassigns a borrow variable nor escapes.
+		if lhs.Kind == ast.EXPR_IDENT && streq(lhs.Name, "_") { continue }
+		if lhs.Kind == ast.EXPR_IDENT {
+			scope.markReassigned(lhs.Name) // its post-assignment source is unknown
+		}
+		if !lvalueFrameLocal(ec, lhs, scope) {
+			checkStoreEscape(ec, lhs, rhs, scope)
+		}
+	}
+}
+
+// ============================================================
+// Escape checks
+// ============================================================
+
+// checkReturnEscape flags `return e` where `e` is a raw interface value
+// borrowing frame-local storage — a named borrow variable, or a direct
+// value-borrow into the raw-interface return slot `slot`.
+func checkReturnEscape(ec @escCtx, e @ast.Expr, slot @ast.TypeExpr, scope @escScope) {
+	if e == nil { return }
+	// Named aggregate borrow variable: `var o Opts = Opts{Any: x}; return o`.
+	if e.Kind == ast.EXPR_IDENT && scope.aggBorrowActive(e.Name) {
+		addDiag(ec.Lint, e.Pos, "iface-borrow-escape", ifaceBorrowAggregateMsg())
+		return
+	}
+	// Named raw-interface borrow variable: `var iv *any = 42; … return iv`.
+	if e.Kind == ast.EXPR_IDENT && scope.borrowActive(e.Name) &&
+			typeIsRawIfaceValue(resolveExprType(ec.Lint, e)) {
+		addDiag(ec.Lint, e.Pos, "iface-borrow-escape", ifaceBorrowEscapeMsg(true))
+		return
+	}
+	// Direct aggregate literal carrying an embedded borrow: `return Opts{Any: x}`.
+	if aggregateEmbedsFrameLocalBorrow(ec, e, scope) {
+		addDiag(ec.Lint, e.Pos, "iface-borrow-escape", ifaceBorrowAggregateMsg())
+		return
+	}
+	// Direct value-borrow into a raw-interface return slot.
+	if !borrowSourceFrameLocal(ec, e, scope) { return }
+	if returnSlotIsAnyPointer(slot) {
+		addDiag(ec.Lint, e.Pos, "iface-borrow-escape", ifaceBorrowEscapeMsg(false))
+		return
+	}
+	if returnSlotIsPointerToNamed(slot) && sourceIsImplicitValueBorrow(e) {
+		addDiag(ec.Lint, e.Pos, "iface-borrow-escape", ifaceBorrowEscapeMsg(false))
+	}
+}
+
+// checkStoreEscape flags `lhs = rhs` (lhs already known not to root in this
+// frame) storing a raw interface value that borrows frame-local storage — a
+// named borrow variable, or a direct value-borrow into a raw-interface target.
+func checkStoreEscape(ec @escCtx, lhs @ast.Expr, rhs @ast.Expr, scope @escScope) {
+	if rhs == nil { return }
+	if rhs.Kind == ast.EXPR_IDENT && scope.aggBorrowActive(rhs.Name) {
+		addDiag(ec.Lint, rhs.Pos, "iface-borrow-escape", ifaceBorrowAggregateMsg())
+		return
+	}
+	if rhs.Kind == ast.EXPR_IDENT && scope.borrowActive(rhs.Name) &&
+			typeIsRawIfaceValue(resolveExprType(ec.Lint, rhs)) {
+		addDiag(ec.Lint, rhs.Pos, "iface-borrow-escape", ifaceBorrowEscapeMsg(true))
+		return
+	}
+	if aggregateEmbedsFrameLocalBorrow(ec, rhs, scope) {
+		addDiag(ec.Lint, rhs.Pos, "iface-borrow-escape", ifaceBorrowAggregateMsg())
+		return
+	}
+	if typeIsRawIfaceValue(resolveExprType(ec.Lint, lhs)) && borrowSourceFrameLocal(ec, rhs, scope) {
+		addDiag(ec.Lint, rhs.Pos, "iface-borrow-escape", ifaceBorrowEscapeMsg(false))
+	}
+}

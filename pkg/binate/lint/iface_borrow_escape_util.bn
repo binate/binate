@@ -1,0 +1,250 @@
+package "pkg/binate/lint"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/std/strings"
+import "pkg/stdx/containers/vec"
+
+// Frame-locality and raw-interface-slot recognition helpers for the
+// `iface-borrow-escape` rule.  The scope stack, walk, and escape checks live in
+// iface_borrow_escape.bn; these are the leaf predicates it consults.
+
+// nameInVec reports whether the name set `v` contains `name`.
+func nameInVec(v @vec.Vec[@[]char], name @[]char) bool {
+	if v == nil { return false }
+	for i := 0; i < v.Len(); i++ {
+		if streq(v.Get(i), name) { return true }
+	}
+	return false
+}
+
+// resolveExprType returns `e`'s alias-resolved checked type, or nil.
+func resolveExprType(ctx @lintCtx, e @ast.Expr) @types.Type {
+	if e == nil { return nil }
+	var t @types.Type = ctx.Checker.ExprType(e.ResolvedTypeID)
+	if t == nil { return nil }
+	return t.ResolveAlias()
+}
+
+// typeIsRawIfaceValue reports whether resolved type `t` is a raw interface
+// value (`*Iface` / `*any`, TYP_INTERFACE_VALUE), peeling named wrappers.
+func typeIsRawIfaceValue(t @types.Type) bool {
+	if t == nil { return false }
+	t = t.ResolveAlias()
+	var depth int = 0
+	for t != nil && t.Kind == types.TYP_NAMED && t.Underlying != nil && depth < 64 {
+		t = t.Underlying.ResolveAlias()
+		depth = depth + 1
+	}
+	return t != nil && t.Kind == types.TYP_INTERFACE_VALUE
+}
+
+// isAddressableExprShape reports whether `e` has an addressable-lvalue SHAPE (a
+// variable / field / index / deref).  A coarse structural approximation of the
+// checker's addressability, used only to split a value source into "addressable
+// but not frame-rooted" (a global, a heap field) from "non-addressable rvalue"
+// (materialised into a frame temporary).  A composite literal is intentionally
+// NOT counted: its backing alloca is frame-local, so it is treated as an rvalue
+// temporary (frame-local) rather than as an addressable non-frame source.
+func isAddressableExprShape(e @ast.Expr) bool {
+	if e == nil { return false }
+	if e.Kind == ast.EXPR_IDENT { return true }
+	if e.Kind == ast.EXPR_SELECTOR { return true }
+	if e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX { return true }
+	if e.Kind == ast.EXPR_UNARY && e.Op == cast(int, token.STAR) { return true }
+	return false
+}
+
+// lvalueFrameLocal reports whether the lvalue `e` denotes storage rooted in the
+// current function's frame (a local / parameter / receiver, or a field or array
+// element thereof), as opposed to a global or heap-reachable location.  Crossing
+// a pointer / managed handle (`p.f`, `s[i]` on a slice) reaches heap storage and
+// returns false; an ident is frame-local only when it RESOLVES to an in-scope
+// local (so a global is not confused with a like-named block-local).
+func lvalueFrameLocal(ec @escCtx, e @ast.Expr, scope @escScope) bool {
+	if e == nil { return false }
+	if e.Kind == ast.EXPR_IDENT {
+		return scope.hasLocal(e.Name)
+	}
+	if e.Kind == ast.EXPR_SELECTOR {
+		if e.X == nil { return false }
+		var xt @types.Type = resolveExprType(ec.Lint, e.X)
+		if xt != nil && (xt.Kind == types.TYP_POINTER || xt.Kind == types.TYP_MANAGED_PTR) {
+			return false // auto-deref through a pointer reaches heap storage
+		}
+		return lvalueFrameLocal(ec, e.X, scope)
+	}
+	if e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		if e.X == nil { return false }
+		var xt @types.Type = resolveExprType(ec.Lint, e.X)
+		if xt != nil && xt.Kind == types.TYP_ARRAY {
+			return lvalueFrameLocal(ec, e.X, scope) // array element co-locates with its array
+		}
+		return false // slice / pointer index reaches heap backing
+	}
+	return false
+}
+
+// borrowSourceFrameLocal reports whether constructing a raw interface value FROM
+// `src` borrows frame-local storage — the resulting interface value's data
+// pointer roots in this frame and dangles once the frame unwinds.  Covers an
+// implicit value-borrow of a frame-local lvalue (2a), of a non-addressable
+// rvalue materialised into a frame temporary (2b), and an explicit
+// `&frameLocal`.  A pointer- / managed- / interface- / slice- / func-value-typed
+// source (not an explicit `&`), and nil / void / error, are out of scope.
+func borrowSourceFrameLocal(ec @escCtx, src @ast.Expr, scope @escScope) bool {
+	if src == nil { return false }
+	if src.Kind == ast.EXPR_UNARY && src.Op == cast(int, token.AMP) {
+		return lvalueFrameLocal(ec, src.X, scope)
+	}
+	var st @types.Type = resolveExprType(ec.Lint, src)
+	if st == nil { return false }
+	if st.Kind == types.TYP_POINTER || st.Kind == types.TYP_MANAGED_PTR ||
+			st.Kind == types.TYP_INTERFACE_VALUE || st.Kind == types.TYP_INTERFACE_VALUE_MANAGED ||
+			st.Kind == types.TYP_SLICE || st.Kind == types.TYP_MANAGED_SLICE ||
+			st.Kind == types.TYP_FUNC_VALUE || st.Kind == types.TYP_MANAGED_FUNC_VALUE {
+		return false
+	}
+	// nil / void / error are not value-borrow sources (nil borrows nothing; the
+	// others cannot construct an interface value).
+	if st.Kind == types.TYP_NIL || st.Kind == types.TYP_VOID || st.Kind == types.TYP_ERROR {
+		return false
+	}
+	if lvalueFrameLocal(ec, src, scope) { return true } // 2a: addressable, frame-rooted
+	return !isAddressableExprShape(src) // 2b: rvalue → frame temporary
+}
+
+// aggregateEmbedsFrameLocalBorrow reports whether the composite literal `e`
+// constructs an aggregate whose raw-interface field / element is a value-borrow
+// of frame-local storage (recursively through nested composites) — the spec
+// canonical footgun `Opts{Any: x}`.  When such an aggregate escapes BY VALUE
+// (returned, or stored into an outliving location), its embedded raw interface
+// value dangles once the frame unwinds.
+func aggregateEmbedsFrameLocalBorrow(ec @escCtx, e @ast.Expr, scope @escScope) bool {
+	if e == nil || e.Kind != ast.EXPR_COMPOSITE { return false }
+	var ct @types.Type = resolveExprType(ec.Lint, e)
+	if ct == nil { return false }
+	var st @types.Type = types.StripWrappers(ct)
+	if st == nil { return false }
+	for i := 0; i < len(e.Elems); i++ {
+		var el @ast.Element = e.Elems[i]
+		var val @ast.Expr = el.Value
+		if val == nil { continue }
+		if aggregateEmbedsFrameLocalBorrow(ec, val, scope) { return true } // nested composite
+		var ft @types.Type = aggregateElemTargetType(st, el, i)
+		if ft != nil && typeIsRawIfaceValue(ft) && borrowSourceFrameLocal(ec, val, scope) {
+			return true
+		}
+	}
+	return false
+}
+
+// aggregateElemTargetType returns the declared field / element type that
+// composite element `el` (running index `i`) initialises in aggregate `st`, or
+// nil.  A struct element binds by field NAME (keyed) or POSITION; an array /
+// slice element's type is the common element type regardless of index.
+func aggregateElemTargetType(st @types.Type, el @ast.Element, i int) @types.Type {
+	if st.Kind == types.TYP_STRUCT {
+		if el.Key != nil && el.Key.Kind == ast.EXPR_IDENT {
+			var f @types.Field = st.FieldByName(el.Key.Name)
+			if f == nil { return nil }
+			return f.Type
+		}
+		if i < len(st.Fields) { return st.Fields[i].Type }
+		return nil
+	}
+	if st.Kind == types.TYP_ARRAY || st.Kind == types.TYP_SLICE || st.Kind == types.TYP_MANAGED_SLICE {
+		return st.Elem
+	}
+	return nil
+}
+
+// A return SLOT is a type expression, not a value expression, so no persistent
+// resolved type is available for it at lint time (the checker pops the package
+// scope on return, so a NAMED pointee cannot be looked up either).  A raw-
+// interface return slot is instead recognised without resolution: syntactic
+// `*any`, or — by type soundness — a `*Named` slot receiving a VALUE-typed
+// source (returning a value where a `*T` pointer is declared type-checks ONLY
+// when `T` is an interface and the implicit value-borrow of §11.4 applied; there
+// is no value→pointer conversion for a non-interface `T`).
+
+// peelTexprWrappers strips TEXPR_PAREN / TEXPR_CONST wrappers off `te`.
+func peelTexprWrappers(te @ast.TypeExpr) @ast.TypeExpr {
+	var depth int = 0
+	for te != nil && (te.Kind == ast.TEXPR_PAREN || te.Kind == ast.TEXPR_CONST) && te.Base != nil &&
+			depth < 64 {
+		te = te.Base
+		depth = depth + 1
+	}
+	return te
+}
+
+// texprPointeeName returns the pointee's NAMED-type name and package for a
+// `*Name` / `*pkg.Name` type expression (with wrappers peeled), or empty names
+// when `te` is not a pointer-to-named.  ok reports whether it matched.
+func texprPointeeName(te @ast.TypeExpr) (@[]char, @[]char, bool) {
+	var empty @[]char
+	te = peelTexprWrappers(te)
+	if te == nil || te.Kind != ast.TEXPR_POINTER { return empty, empty, false }
+	var base @ast.TypeExpr = peelTexprWrappers(te.Base)
+	if base == nil || base.Kind != ast.TEXPR_NAMED { return empty, empty, false }
+	return base.Name, base.Pkg, true
+}
+
+// returnSlotIsAnyPointer reports whether `slot` is syntactically `*any` — the
+// universal raw interface value, recognisable by name with no scope resolution.
+func returnSlotIsAnyPointer(slot @ast.TypeExpr) bool {
+	var name @[]char
+	var pkg @[]char
+	var ok bool
+	name, pkg, ok = texprPointeeName(slot)
+	return ok && len(pkg) == 0 && streq(name, "any")
+}
+
+// returnSlotIsPointerToNamed reports whether `slot` is a `*Name` / `*pkg.Name`
+// pointer to a named type.  Combined with a value-typed source, type soundness
+// makes this a raw interface value (see the block comment above).
+func returnSlotIsPointerToNamed(slot @ast.TypeExpr) bool {
+	var ok bool
+	_, _, ok = texprPointeeName(slot)
+	return ok
+}
+
+// sourceIsImplicitValueBorrow reports whether `e` is an IMPLICIT value-borrow
+// source (a value-typed lvalue / rvalue, borrowed with no visible `&`), as
+// opposed to an explicit `&x`.  For an implicit value source into a `*Named`
+// slot, type soundness proves `Named` is an interface; an explicit `&x` yields a
+// `*T` whose target type is indistinguishable from a plain struct-pointer return
+// without resolving `Named`, so it is left to the `*any` path only.
+func sourceIsImplicitValueBorrow(e @ast.Expr) bool {
+	if e == nil { return false }
+	return !(e.Kind == ast.EXPR_UNARY && e.Op == cast(int, token.AMP))
+}
+
+// ifaceBorrowEscapeMsg builds the diagnostic message.  `named` distinguishes a
+// previously-bound borrow variable from a direct construction at the escape.
+func ifaceBorrowEscapeMsg(named bool) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	if named {
+		cb.Write("raw interface value borrows frame-local storage and escapes the frame here")
+	} else {
+		cb.Write("constructing a raw interface value from frame-local storage that ")
+		cb.Write("escapes the frame here")
+	}
+	cb.Write("; the borrow takes no reference and dangles once the frame unwinds ")
+	cb.Write("(use box(...) for a heap copy, or a source that outlives the interface value)")
+	return buf.CopyStr(cb.String())
+}
+
+// ifaceBorrowAggregateMsg is the diagnostic for an aggregate value carrying a
+// raw-interface field/element that borrows frame-local storage (`Opts{Any: x}`).
+func ifaceBorrowAggregateMsg() @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("aggregate value carries a raw interface field borrowing frame-local ")
+	cb.Write("storage and escapes the frame here; that borrow takes no reference and ")
+	cb.Write("dangles once the frame unwinds (box(...) the source, or use one that ")
+	cb.Write("outlives the aggregate)")
+	return buf.CopyStr(cb.String())
+}

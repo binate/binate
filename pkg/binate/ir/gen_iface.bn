@@ -2,7 +2,6 @@ package "pkg/binate/ir"
 
 import "pkg/binate/ast"
 import "pkg/binate/buf"
-import "pkg/binate/mangle"
 import "pkg/binate/types"
 import "pkg/stdx/slices"
 
@@ -222,7 +221,25 @@ func wrapAsIfaceValue(ctx @GenContext, b @Block, val @Instr, dstTyp @types.Type,
 	// identity AND its name reflect element-`readonly`.
 	var boxedElem @types.Type = val.Typ.Elem
 	var srcName @[]char = receiverBaseTypeName(val.Typ)
-	if len(srcName) == 0 {
+	// A managed `@any` that OWNS a managed POINTEE — the pointee of its data
+	// pointer (boxedElem) is itself a managed slice (`@(@[]T)`, §9) or a managed
+	// pointer (`@(@T)`) — keys on that pointee's STRUCTURAL identity and drops it
+	// through the pointee's own `__dtor_ms` / `__dtor_mp`, NOT through
+	// receiverBaseTypeName's fully-peeled leaf.  A NOMINAL leaf (`@(@Node)`) would
+	// otherwise peel both `@`s to "Node", which (a) collides with a plain `@Node`
+	// box's (recvPkg,"Node",any) row and (b) selects Node's STRUCT dtor — cleaning a
+	// Node at the cell address and leaking the `@Node`.  So take the structural path
+	// whenever the pointee is managed, even for a nominal leaf.  Peel a named-
+	// distinct / readonly / alias wrapper (`type H @Node`, `type S @[]int`,
+	// `readonly @[]int`) to the underlying managed kind first: a wrapped pointee is
+	// structurally the same managed ptr / slice and must take the SAME owning path,
+	// else it falls to the nominal branch with a null / mis-selected slot-0 dtor and
+	// LEAKS the pointee by one per box.
+	var peeledElem @types.Type = peelTransparent(boxedElem)
+	var mgdManagedPointee bool = dstTyp.Kind == types.TYP_INTERFACE_VALUE_MANAGED &&
+			isUniverseAny(iface) && peeledElem != nil &&
+			(peeledElem.Kind == types.TYP_MANAGED_SLICE || peeledElem.Kind == types.TYP_MANAGED_PTR)
+	if len(srcName) == 0 || mgdManagedPointee {
 		// A pointer to a name-less type (a slice / array / func-value pointee)
 		// has no nominal identity for the (T, any) box row, but boxing it into a
 		// RAW `*any` must still produce a well-formed 2-word iface value {data,
@@ -233,16 +250,20 @@ func wrapAsIfaceValue(ctx @GenContext, b @Block, val @Instr, dstTyp @types.Type,
 		// (namelessAnySrcName) so each distinct spelling gets its own real,
 		// weak-coalesced `__ivt` / `__typeinfo`.
 		// A RAW iface BORROWS, so its any-block slot-0 dtor is never called (stays
-		// null).  A managed `@any` OWNS its data and drops it through slot 0, so a
-		// name-less MANAGED pointee is admitted only for a managed SLICE -- which has
-		// a real dtor (`__dtor_ms_<elem>`, RefDec the backing) to place in slot 0
-		// (plan-slice-type-identity.md §9).  Other managed name-less pointees (func /
-		// array / raw-slice) still bail; their dtor answer is deferred.
+		// null).  A managed `@any` OWNS its data and drops it through slot 0:
+		//   - a managed SLICE / PTR pointee has a real owning dtor
+		//     (`__dtor_ms_<elem>` / `__dtor_mp_<T>`, RefDec the backing / pointee) to
+		//     place in slot 0 (plan-slice-type-identity.md §9 for the slice case);
+		//   - a name-less BORROWING pointee (a raw slice, `@(*[]T)`) owns only the
+		//     cell — freed by the any-drop's RefDec — so a null slot 0 is correct;
+		//   - a name-less pointee that needs destruction but is neither ms nor mp (an
+		//     array-of-managed / func-value pointee) still bails; deferred.
 		var rawNamelessBox bool = dstTyp.Kind == types.TYP_INTERFACE_VALUE &&
 				isBoxableNamelessType(val.Typ)
-		var mgdNamelessSlice bool = dstTyp.Kind == types.TYP_INTERFACE_VALUE_MANAGED &&
-				boxedElem != nil && boxedElem.Kind == types.TYP_MANAGED_SLICE
-		if isUniverseAny(iface) && (rawNamelessBox || mgdNamelessSlice) {
+		var mgdOwning bool = mgdManagedPointee
+		var mgdBorrow bool = dstTyp.Kind == types.TYP_INTERFACE_VALUE_MANAGED && len(srcName) == 0 &&
+				boxedElem != nil && !boxedElem.NeedsDestruction()
+		if isUniverseAny(iface) && (rawNamelessBox || mgdOwning || mgdBorrow) {
 			// Key BOTH the identity and the record on a CANONICAL element type that
 			// carries element-`readonly` AND fully-qualified named leaves — the two
 			// things a slice-assertion match must agree with (a `case @[]T:` target
@@ -274,13 +295,44 @@ func wrapAsIfaceValue(ctx @GenContext, b @Block, val @Instr, dstTyp @types.Type,
 			}
 			boxedElem = mergeQualifiedReadonly(val.Typ.Elem, srcExprTyp.Elem)
 			srcName = namelessAnySrcName(boxedElem)
-			// Emit the managed slice's real dtor so ensureAnyImplInfo's slot-0 reference
-			// (dtorNameForType) resolves to a body -- else a managed `@any` box finds a null
-			// slot 0 and leaks the backing.  A raw box borrows and never drops its data, so
-			// it needs no body (slot 0 stays null).
-			if mgdNamelessSlice {
-				registerPendingMsDtor(ctx.Func, boxedElem)
+			// Emit the pointee's real owning dtor so ensureAnyImplInfo's slot-0
+			// reference (dtorNameForType) resolves to a body -- else a managed `@any`
+			// box finds a null slot 0 and leaks the pointee.  A raw `*any` box and a
+			// borrowing pointee (raw slice) drop no data, so they need no body (slot 0
+			// stays null).  Register the PEELED managed kind, not the wrapper:
+			// genManagedSliceDtor/genManagedPtrDtor read `.Elem` directly, and a
+			// TYP_READONLY wrapper's `.Elem` is the underlying managed slice/ptr (not
+			// its element), so registering the wrapper would emit a second,
+			// element-iterating body under the same readonly-collapsed dtor name -- a
+			// duplicate-symbol link failure.  (A named-distinct slice/ptr carries a
+			// usable `.Elem`, so only the readonly wrapper actually miscompiles, but
+			// peeling is correct for all wrappers.)
+			if mgdOwning {
+				var regTyp @types.Type = peelTransparent(boxedElem)
+				if regTyp.Kind == types.TYP_MANAGED_SLICE {
+					registerPendingMsDtor(ctx.Func, regTyp)
+				} else {
+					registerPendingMpDtor(ctx.Func, regTyp)
+				}
 			}
+		} else if dstTyp.Kind == types.TYP_INTERFACE_VALUE_MANAGED && isUniverseAny(iface) &&
+				boxedElem != nil && boxedElem.NeedsDestruction() {
+			// A managed `@any` box of a name-less pointee that NEEDS destruction but is
+			// neither a managed slice nor a managed ptr (a managed pointer to an
+			// array-of-managed `@([N]@Node)`, a managed func-value, or an anonymous
+			// managed struct) has no owning dtor answer yet: admitting it with a null
+			// slot 0 would leak, and bailing to `return nil` makes the caller
+			// extractvalue an i8* -> invalid LLVM.  Fail loud until the owning
+			// treatment for these pointees lands (FU4 -- they also leak on a NORMAL
+			// drop today, since emitManagedPtrRefDec has no array / func-value arm, so
+			// the fix is not @any-specific).
+			panic(
+					"internal error: boxing a managed pointer to a name-less aggregate "
+							"whose contents need destruction (array-of-managed, managed "
+							"func-value, or anonymous managed struct) into `@any` is not yet "
+							"supported -- its owning slot-0 dtor is unimplemented (FU4); the "
+							"compiler declines rather than emit a leaking or invalid "
+							"interface value -- see gen_iface.bn")
 		} else {
 			return nil
 		}
@@ -338,106 +390,4 @@ func wrapAsIfaceValue(ctx @GenContext, b @Block, val @Instr, dstTyp @types.Type,
 		b.EmitRefInc(val)
 	}
 	return b.EmitIfaceValue(val, vtable, dstTyp)
-}
-
-// isUniverseAny reports whether `iface` is the universe `any`
-// interface (TYP_INTERFACE with Pkg="" and Name="any").  Used by
-// wrapAsIfaceValue to recognize when to synthesize an ImplInfo on
-// the fly (plan §6).
-func isUniverseAny(iface @types.Type) bool {
-	if iface == nil { return false }
-	if iface.Kind != types.TYP_INTERFACE { return false }
-	if len(iface.Pkg) != 0 { return false }
-	return charEq(iface.Name, "any")
-}
-
-// ensureAnyImplInfo appends a (recvPkg.recvName, any) ImplInfo to
-// m.Impls if no entry for that pair already exists.  The synthesized
-// info carries the receiver's dtor in DtorFuncName (or empty if T
-// has no dtor) and an empty MethodFuncs (since `any` has no methods).
-// Codegen's vtable emitter then produces `__ivt.bn_V...`
-// as `[2 x i8*]` with slot 0 = dtor (or null) and slot 1 =
-// *TypeInfo (a null placeholder until RTTI is populated).
-func ensureAnyImplInfo(m @Module, recvPkg @[]char, recvName @[]char, recvTyp @types.Type) {
-	var emptyPkg @[]char
-	var anyName @[]char = "any"
-	for i := 0; i < len(m.Impls); i++ {
-		var info @ImplInfo = m.Impls[i]
-		if info == nil { continue }
-		if !charEq(info.RecvPkg, recvPkg) { continue }
-		if !charEq(info.RecvTypeName, recvName) { continue }
-		if !charEq(info.IfacePkg, emptyPkg) { continue }
-		if !charEq(info.IfaceName, anyName) { continue }
-		return
-	}
-	var dtorName @[]char = implDtorFuncName(recvPkg, recvName)
-	// A name-less SLICE recvTyp has no impl-dtor; its any-block slot-0 dtor is the
-	// managed-slice drop (`__dtor_ms_<elem>`, RefDec the backing), so a managed
-	// `@any` box of a name-less slice cleans up instead of leaking (§9).  The ms-dtor
-	// is generated in THIS module (generateDtors → m.PkgPath), so its `f.Name` is
-	// `QualifyName(m.PkgPath, "__dtor_ms_<elem>")`; implDtorSlotSym matches
-	// DtorFuncName against that verbatim, so qualify to m.PkgPath — NOT recvPkg (the
-	// name-less identity's `rt` qualifier), where no dtor lives.  For a raw box the
-	// body isn't emitted (registerPendingMsDtor runs only on the managed path), so
-	// implDtorSlotSym still yields a null slot 0 (correct: a raw iface borrows).
-	if recvTyp != nil && (recvTyp.Kind == types.TYP_SLICE || recvTyp.Kind == types.TYP_MANAGED_SLICE) {
-		dtorName = mangle.QualifyName(m.PkgPath, dtorNameForType(recvTyp))
-	}
-	var info @ImplInfo = make(ImplInfo)
-	info.RecvPkg = buf.CopyStr(recvPkg)
-	info.RecvTypeName = buf.CopyStr(recvName)
-	info.IfacePkg = emptyPkg
-	info.IfaceName = buf.CopyStr(anyName)
-	info.DtorFuncName = dtorName
-	// Per-type RTTI facts (recvTyp / dtorName) go in the per-type registry, not
-	// on this (T, any) row — register coupled 1:1 with this ImplInfo append.
-	registerTypeInfo(m, recvPkg, recvName, recvTyp, dtorName)
-	m.Impls = slices.Append[@ImplInfo](m.Impls, info)
-}
-
-// splitQualName splits a possibly-qualified IR-gen identifier
-// (`pkg.Name`) into its components. For unqualified inputs, returns
-// empty pkg + the input as name. Used by wrapAsIfaceValue to
-// recover the receiver's canonical (pkg, name) pair from
-// IR-gen's qualified-form Type.Name (`hello.Hello`) so cross-
-// package impl-table lookup matches. Slice 2.8.
-func splitQualName(name *[]readonly char) (@[]char, @[]char) {
-	var emptyPkg @[]char
-	for i := 0; i < len(name); i++ {
-		if name[i] == '.' {
-			var pkg @[]char = make_slice(char, i)
-			for j := 0; j < i; j++ { pkg[j] = name[j] }
-			var rest @[]char = make_slice(char, len(name) - i - 1)
-			for j := 0; j < len(rest); j++ {
-				rest[j] = name[i + 1 + j]
-			}
-			return pkg, rest
-		}
-	}
-	return emptyPkg, buf.CopyStr(name)
-}
-
-// receiverBaseTypeName extracts the underlying named-type name
-// from a pointer / managed-pointer / const-wrapped type expression
-// resolved by IR-gen. Mirrors types.ReceiverBaseNamed but accepts
-// IR-gen's representation where struct types may live as TYP_STRUCT
-// directly (with Name populated) rather than wrapped in TYP_NAMED.
-func receiverBaseTypeName(t @types.Type) @[]char {
-	var empty @[]char
-	if t == nil { return empty }
-	if t.Kind == types.TYP_POINTER || t.Kind == types.TYP_MANAGED_PTR || t.Kind == types.TYP_READONLY {
-		return receiverBaseTypeName(t.Elem)
-	}
-	if t.Kind == types.TYP_NAMED || t.Kind == types.TYP_STRUCT {
-		return t.Name
-	}
-	// Universe primitives carry the stdlib carve-out
-	// (`pkg/builtins/lang`) qualifier per plan-primitives-impl-
-	// interfaces.md, so the downstream splitQualName / impl-
-	// table lookup matches the (RecvPkg=std, RecvName=int)
-	// form the impl was registered under.
-	if isUniversePrimitive(t) && len(t.Name) > 0 {
-		return primitiveQualifiedName(t.Name)
-	}
-	return empty
 }

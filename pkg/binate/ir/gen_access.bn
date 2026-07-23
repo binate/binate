@@ -60,7 +60,8 @@ func genIndex(ctx @GenContext, b @Block, e @ast.Expr, checked bool) @Instr {
 	// nested SLICE base needs no special case — its loaded value carries
 	// the backing pointer, so the standard path works.
 	if len(e.Args) == 1 && isNestedArrayBase(ctx, e) {
-		var elemPtr @Instr = genIndexPtr(ctx, b, e)
+		// Read of a nested-array element => forDeref=true.
+		var elemPtr @Instr = genIndexPtr(ctx, b, e, true)
 		b = ctx.CurBlock
 		if elemPtr != nil && elemPtr.Typ != nil && elemPtr.Typ.Elem != nil {
 			return b.EmitLoad(elemPtr, elemPtr.Typ.Elem)
@@ -133,6 +134,15 @@ func genIndex(ctx @GenContext, b @Block, e @ast.Expr, checked bool) @Instr {
 	if collSt != nil && collSt.Kind == types.TYP_POINTER {
 		// Pointer indexing: GEP on raw pointer, then load.  collSt is peeled so
 		// a named pointer reaches this arm instead of falling to the slice path.
+		// A raw pointer carries no length (no bounds check above), so the deref is
+		// unguarded — nil-check the pointer we index through (opt-in; a read is
+		// always a deref).  Gated on `checked`: `unsafe_index(p, i)` opts out of ALL
+		// guards (bounds AND nil), so the caller-asserted access stays fully
+		// unchecked.  For `(*p)[i]` where `*p` is a pointer-to-array the base is
+		// TYP_ARRAY (not this arm) and N2a's `*p` check guards `p`; where `*p` is
+		// itself a raw pointer (`p` is `**T`), `collection` IS that inner pointer and
+		// this checks it, while N2a separately checks the outer `p`.
+		if checked { emitNilCheckIfEnabled(ctx, b, collection) }
 		var elemPtr @Instr = b.EmitGetElemPtr(collection, index, elemTyp)
 		return b.EmitLoad(elemPtr, elemTyp)
 	}
@@ -141,8 +151,17 @@ func genIndex(ctx @GenContext, b @Block, e @ast.Expr, checked bool) @Instr {
 	return b.EmitSliceGet(collection, index, elemTyp)
 }
 
-// genIndexPtr returns a pointer to an array element (for field access on indexed structs)
-func genIndexPtr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
+// genIndexPtr returns a pointer to an array/slice/pointer element (for field
+// access on indexed structs, index-assignment lvalues, and `&coll[i]`).
+// `forDeref` says whether the returned element address WILL be dereferenced
+// (load/store) rather than merely address-computed (`&coll[i]`): when true, a
+// RAW-POINTER base this function indexes through is nil-checked before the GEP
+// (opt-in nil-checking, plan-nil-check-opt-in.md; a no-op unless
+// GenCtx.EmitNilChecks is on).  Array bases (an alloca) and slice bases (a
+// bounds check catches a nil/short slice) need no such check.  Address-of
+// callers pass false so `&nilp[i]` stays a bare address computation.  The
+// recursion passes true (a nested `a[i][j]` loads `a[i]` through to reach `[j]`).
+func genIndexPtr(ctx @GenContext, b @Block, e @ast.Expr, forDeref bool) @Instr {
 	if e.X == nil || len(e.Args) != 1 { return nil }
 	var index @Instr = genExpr(ctx, b, e.Args[0])
 	b = ctx.CurBlock
@@ -173,6 +192,7 @@ func genIndexPtr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 				var ptrVal @Instr = b.EmitLoad(arrPtr, arrUnd)
 				var elemTyp @types.Type = arrUnd.Elem
 				if elemTyp == nil { elemTyp = types.TypInt() }
+				emitDerefNilCheck(ctx, b, ptrVal, forDeref)
 				return b.EmitGetElemPtr(ptrVal, index, elemTyp)
 			}
 			// Slice element: GEP a typed pointer to the element in-place,
@@ -229,6 +249,7 @@ func genIndexPtr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 			b = ctx.CurBlock
 			var elemTyp @types.Type = collArr.Elem
 			if elemTyp == nil { elemTyp = types.TypInt() }
+			emitDerefNilCheck(ctx, b, ptrVal, forDeref)
 			return b.EmitGetElemPtr(ptrVal, index, elemTyp)
 		}
 		// Slice-field element: same as the IDENT slice arm, for ANY
@@ -263,6 +284,7 @@ func genIndexPtr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 				if elemTyp == nil { elemTyp = types.TypInt() }
 				var lenInstr @Instr = b.EmitConstInt(arrSt.ArrayLen, types.TypInt())
 				genBoundsCheck(ctx, b, index, lenInstr)
+				emitDerefNilCheck(ctx, b, ptrVal, forDeref)
 				return b.EmitGetElemPtr(ptrVal, index, elemTyp)
 			}
 		}
@@ -276,7 +298,9 @@ func genIndexPtr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 	// a slice / raw-pointer inner element is a value carrying its own
 	// backing, so load it first and index through the value.
 	if e.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
-		var basePtr @Instr = genIndexPtr(ctx, b, e.X)
+		// The inner element is loaded through to reach the outer index — a deref —
+		// so forDeref=true even when the outermost use is address-of.
+		var basePtr @Instr = genIndexPtr(ctx, b, e.X, true)
 		b = ctx.CurBlock
 		if basePtr == nil || basePtr.Typ == nil || basePtr.Typ.Kind != types.TYP_POINTER ||
 				basePtr.Typ.Elem == nil {
@@ -302,6 +326,7 @@ func genIndexPtr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 		}
 		if innerSt.Kind == types.TYP_POINTER && innerSt.Elem != nil {
 			var ptrVal @Instr = b.EmitLoad(basePtr, innerSt)
+			emitDerefNilCheck(ctx, b, ptrVal, forDeref)
 			return b.EmitGetElemPtr(ptrVal, index, innerSt.Elem)
 		}
 		return nil
@@ -333,6 +358,7 @@ func genIndexPtr(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 			// (genIndexPtr → nil, then the loaded pointer VALUE is used as the
 			// element address — a wild pointer).
 			if baseSt != nil && baseSt.Kind == types.TYP_POINTER && baseSt.Elem != nil {
+				emitDerefNilCheck(ctx, b, baseVal, forDeref)
 				return b.EmitGetElemPtr(baseVal, index, baseSt.Elem)
 			}
 			// R-value ARRAY (a call result `getArr()[i]`): no backing storage, so

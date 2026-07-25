@@ -1,0 +1,219 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/stringutils"
+import "pkg/binate/types"
+import "pkg/std/strings"
+
+// ============================================================
+// Multi-return tuple RETURN-ABI bridge (register-returned tuples)
+// ============================================================
+//
+// A multi-return tuple returned in registers (NOT sret) is built as the raw
+// PACKED `<{T0, T1, …}>` aggregate (anonStructLL — byte layout matching
+// types.FieldOffset, needed for the in-memory dtor/sret/copy paths).  But that
+// packed form is WRONG as a first-class-aggregate RETURN type: LLVM gives each
+// explicit `[N x i8]` padding member its OWN return register, and on AArch64 a
+// `[N x i8]`-padded struct FIELD makes return legalization fall back to sret (x8).
+// Either way the register layout diverges from what the NATIVE caller expects
+// (which classifies the tuple as register-returned by word count and reads each
+// field by position), so a native↔LLVM multi-return boundary corrupts / faults.
+//
+// The bridge reinterprets the raw packed tuple to a FLAT, padding-member-free
+// boundary type at the ret/call boundary (store raw packed -> shared slot -> load
+// flat -> ret/call flat; the two share bytes, so the reinterpret is lossless).  The
+// flat boundary type (multiReturnCoercedLLTy) spells each field as its plain
+// llvmType, EXCEPT on AArch64 where a struct/array field is `[N x iW]`-coerced
+// (aggCoerceLLTy) to dodge the sret fallback above.  Two independent triggers put a
+// tuple on the bridge: an AArch64-coercible field (multiRetTypeHasCoercibleField)
+// or ANY padding member (multiRetHasPadding), on any arch.
+//
+// The func-value path does NOT use this bridge for its retbuf (memory, packed is
+// correct there) — see writeFuncResultsLLVM — but the shim's UNDERLYING call spells
+// the same flat boundary (multiRetResultsCoerced / multiReturnCoercedLLTyResults) so
+// it agrees with the bridged callee `define`.
+
+// multiRetCoercionActive reports whether register-returned multi-return tuples
+// field-coerce a struct/array field to `[N x iW]` on the CURRENT target.  Restricted
+// to AArch64: the sret divergence is specific to LLVM's AArch64 return legalization
+// of a `[N x i8]`-padded struct member (proven via `llc`); x64 (SysV) and arm32
+// (AAPCS32) use different return ABIs that do NOT exhibit it, so their struct fields
+// stay `%name` (byte-identical, avoids an untestable change).  Covers aa64 darwin
+// AND aa64 linux (both ARCH_AA64 / AAPCS64).  (The separate padding-member bridge —
+// multiRetHasPadding — applies on every arch and is NOT gated by this.)
+func multiRetCoercionActive() bool {
+	return types.GetTarget().Arch == types.ARCH_AA64
+}
+
+// multiRetTypeHasCoercibleField reports whether the multi-return tuple `t` has at
+// least one field that would be `[N x iW]`-coerced — i.e. a struct/array whose
+// first-class LLVM form can diverge from the native word packing.  When false,
+// the coerced spelling equals the raw one, so no coercion is emitted (a pure
+// scalar/iface/float tuple like `(int, @Error)` is unaffected).
+func multiRetTypeHasCoercibleField(t @types.Type) bool {
+	if t == nil { return false }
+	if !multiRetCoercionActive() { return false }
+	for i := 0; i < len(t.Fields); i++ {
+		if aggInRegCoercedKind(t.Fields[i].Type) { return true }
+	}
+	return false
+}
+
+// multiRetHasPadding reports whether the multi-return tuple `t` carries ANY
+// explicit `[N x i8]` padding MEMBER in its PACKED LLVM emission (anonStructLL) —
+// either a field preceded by alignment padding (StructLayout PaddingBefore > 0,
+// e.g. the int64 in `(int32, int64)` at offset 8, or the `@Error` in `(bool,
+// @Error)` at offset 4) OR trailing padding to the tuple's alignment (t.Trailing-
+// Padding() > 0, e.g. the 4 bytes after `(int64, int32)`).  When such a tuple is
+// register-returned as a first-class aggregate, LLVM gives each `[N x i8]` member
+// its OWN return register — a leading/interior pad shifts a real field off the
+// register the native caller reads it from, and even a trailing pad member makes
+// LLVM's arm32 backend lower the return incompatibly with native's plain register
+// layout (empirically: `(int64,int32)` → `<{i64,i32,[4 x i8]}>` hangs, while a pad-
+// free `(f64,f64)` → `<{double,double}>` round-trips fine).  So a padded tuple must
+// go through the flat-FCA reinterpret bridge on EVERY arch.  A tuple with NO padding
+// members returns its raw packed form directly — its register layout matches native.
+func multiRetHasPadding(t @types.Type) bool {
+	if t == nil { return false }
+	var layout @[]types.FieldLayout = t.StructLayout()
+	for i := 0; i < len(layout); i++ {
+		if layout[i].PaddingBefore > 0 { return true }
+	}
+	return t.TrailingPadding() > 0
+}
+
+// multiRetNeedsFlatFCA reports whether a register-returned multi-return tuple `t`
+// must be reinterpreted to a flat (padding-member-free) FCA boundary type instead
+// of returned as its raw PACKED form: true when it has a field the aa64 quirk
+// coerces to `[N x iW]` (multiRetTypeHasCoercibleField) OR any padding member
+// (multiRetHasPadding).  Either makes the raw packed FCA disagree with the native
+// caller's per-field register layout.  A tuple with neither (only word-aligned
+// fields, no trailing pad) returns its raw packed form directly.
+func multiRetNeedsFlatFCA(t @types.Type) bool {
+	return multiRetTypeHasCoercibleField(t) || multiRetHasPadding(t)
+}
+
+// funcMultiRetCoerced reports whether f returns a multi-value tuple that is
+// register-returned (NOT sret) AND needs the flat-FCA boundary (multiRetNeedsFlatFCA
+// — an aa64-coercible field, or any padding member on any arch), so its LLVM return
+// type is the flat boundary tuple (multiReturnCoercedLLTy) reinterpreted from the
+// raw packed build.  Combines the register-vs-sret decision (multiRetNeedsSret)
+// with the flat-FCA test.
+func funcMultiRetCoerced(f @ir.Func) bool {
+	if len(f.Results) <= 1 || f.MultiReturnType == nil { return false }
+	if multiRetNeedsSret(f) { return false }
+	return multiRetNeedsFlatFCA(f.MultiReturnType)
+}
+
+// callMultiRetCoerced is the OP_CALL counterpart of funcMultiRetCoerced: the call's
+// result tuple (ins.Typ) is a register-returned multi-return that needs the flat-FCA
+// boundary, so the call line spells the flat boundary type and the result is
+// reinterpreted back to the raw packed tuple for the downstream extracts.
+func callMultiRetCoerced(ins @ir.Instr) bool {
+	if ins == nil || !common.IsMultiReturnCall(ins) { return false }
+	if callConvForTarget().MultiReturnTupleNeedsSret(ins.Typ) { return false }
+	return multiRetNeedsFlatFCA(ins.Typ)
+}
+
+// multiRetResultsCoerced is the results-list counterpart of funcMultiRetCoerced
+// (used by the func-value shim, whose signature is a @Type result list, not an
+// @ir.Func): a register-returned multi-return that needs the flat-FCA boundary.
+func multiRetResultsCoerced(results @[]@types.Type) bool {
+	if len(results) <= 1 { return false }
+	if multiRetResultsNeedSret(results) { return false }
+	return multiRetNeedsFlatFCA(multiReturnTupleType(results))
+}
+
+// multiReturnCoercedLLTyResults writes the flat boundary tuple type for a results
+// list (the func-value-shim counterpart of multiReturnCoercedLLTy).
+func multiReturnCoercedLLTyResults(out *strings.Builder, results @[]@types.Type) {
+	multiReturnCoercedLLTy(out, multiReturnTupleType(results))
+}
+
+// multiReturnCoercedLLTy writes the flat (padding-member-free) LLVM boundary type
+// for a register-returned multi-return tuple: `{ <field0>, <field1>, … }` — the
+// FLAT `{...}` convention multi-returns use (see aggInRegCoercedKind's comment).
+// The crucial property vs the raw PACKED tuple (anonStructLL) is the ABSENCE of
+// explicit `[N x i8]` padding MEMBERS: those would each claim a first-class-return
+// register and desync a native caller.  Each field is its plain llvmType, EXCEPT on
+// aa64 (multiRetCoercionActive), where a struct/array field is spelled as its
+// `[N x iW]` coerced form (aggCoerceLLTy) — the aa64-specific quirk fix; on x64 /
+// arm32 a struct field stays its `%name` (the working pre-existing form).  Either
+// way byte-identical to the raw tuple, so the return/call reinterprets through a
+// shared slot are layout-exact.
+func multiReturnCoercedLLTy(out *strings.Builder, t @types.Type) {
+	out.WriteByte('{')
+	for i := 0; i < len(t.Fields); i++ {
+		if i > 0 { out.Write(", ") }
+		out.WriteByte(' ')
+		if multiRetCoercionActive() && aggInRegCoercedKind(t.Fields[i].Type) {
+			aggCoerceLLTy(out, t.Fields[i].Type)
+		} else {
+			out.Write(llvmType(t.Fields[i].Type))
+		}
+	}
+	out.Write(" }")
+	return
+}
+
+// emitMultiRetCoercedReturn reinterprets the built raw tuple value
+// `%v.ret.<seq>.<idx>` to the flat boundary return type through the function-scoped
+// `%mrret.slot` (emitted once at entry by emitEntryAllocaDecls) and emits `ret
+// {flat}`.  The raw and flat tuple share bytes, so the store/load reinterprets
+// losslessly.  `retName` is the fully-formed name of the last insertvalue result
+// (the packed raw tuple); `retSeqTag` disambiguates the loaded value across multiple
+// returns in one function.
+func emitMultiRetCoercedReturn(out *strings.Builder, instr @ir.Instr, retName @[]char,
+		retSeqTag int) {
+	out.Write("store ")
+	out.Write(llvmType(instr.Typ))
+	out.WriteByte(' ')
+	out.Write(retName)
+	out.Write(", ptr %mrret.slot\n  %mrret.v")
+	stringutils.WriteInt(out, retSeqTag)
+	out.Write(" = load ")
+	multiReturnCoercedLLTy(out, instr.Typ)
+	out.Write(", ptr %mrret.slot\n  ret ")
+	multiReturnCoercedLLTy(out, instr.Typ)
+	out.Write(" %mrret.v")
+	stringutils.WriteInt(out, retSeqTag)
+	out.WriteByte('\n')
+	return
+}
+
+// emitMultiRetCallAllocaDecl hoists the `%v<callID>.mrRB` slot used by
+// emitCall to reinterpret a flat-boundary multi-return call result back to the raw
+// tuple the downstream extracts consume.  No-op unless the call is a bridged
+// multi-return.
+func emitMultiRetCallAllocaDecl(out *strings.Builder, instr @ir.Instr) {
+	if !callMultiRetCoerced(instr) {
+		return
+	}
+	emitRef(out, instr.ID)
+	out.Write(".mrRB = alloca ")
+	multiReturnCoercedLLTy(out, instr.Typ)
+	out.WriteByte('\n')
+	return
+}
+
+// emitMultiRetCallResultBind emits, AFTER a bridged multi-return call line, the
+// reinterpret of the flat-boundary result `%v<callID>.mrR` back to the raw tuple
+// `%v<callID>` (which the downstream extractvalue reads), through the entry-hoisted
+// `.mrRB` slot.
+func emitMultiRetCallResultBind(out *strings.Builder, instr @ir.Instr) {
+	out.Write("  store ")
+	multiReturnCoercedLLTy(out, instr.Typ)
+	out.Write(" %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".mrR, ptr %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".mrRB\n  ")
+	emitRef(out, instr.ID)
+	out.Write(" = load ")
+	out.Write(llvmType(instr.Typ))
+	out.Write(", ptr %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".mrRB\n")
+	return
+}

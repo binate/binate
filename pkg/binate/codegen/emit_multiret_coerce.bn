@@ -38,24 +38,26 @@ import "pkg/std/strings"
 // multiRetCoercionActive reports whether register-returned multi-return tuples
 // field-coerce a struct/array field to `[N x iW]` (W = the field's alignment-derived
 // element size — aggCoerceElemBytes: i64 on LP64, and on ILP32 i64 for an 8-aligned
-// field else i32) on the CURRENT target.  Active on AArch64 (AAPCS64) AND arm32
-// (AAPCS32): an uncoerced struct/array field in a register-returned tuple makes LLVM's
-// return legalization diverge from the native caller's per-field word packing.  On
-// aa64 a `[N x i8]`-padded struct member falls back to sret (x8).  On arm32 a nested
-// struct whose leaves flatten to more than 4 legalized parts is returned via sret (an
-// r0 buffer) — e.g. `(St, int)` with St = `{bool,int,int}` flattens to i1 + [3 x i8]
-// (3 i8 parts) + i32 + i32 = 6 parts, so LLVM sret's the 16-byte tuple while native
-// classifies it as register-returned by word count (gpWords <= 4) and reads r0..r3,
-// crashing at the native<->LLVM boundary (conformance 1119).  Coercing each such field
-// to `[N x iW]` (no sub-word / padding leaves) keeps LLVM's return in registers with a
-// per-field word layout matching native.  x64 (SysV) is EXCLUDED: it has its own
-// eightbyte SSE/INTEGER multi-return coercion (emit_sysv_coerce.bn) that already agrees
-// with native — conformance 1119 (this exact shape) passes on native x64.  (The
-// separate padding-member bridge — multiRetHasPadding — applies on every arch and is
-// NOT gated by this.)
+// field else i32) on the CURRENT target.  Active on every real backend (AArch64 /
+// AAPCS64, arm32 / AAPCS32, x64 / SysV): an UNCOERCED struct/array field in a register-
+// returned tuple makes LLVM's return lowering EXPAND that field differently than the
+// native caller's per-field word collect, so the two disagree at the native<->LLVM
+// boundary.  The divergence is per-target but the same class:
+//   - aa64: a `[N x i8]`-padded struct member falls back to sret (x8).
+//   - arm32: a nested struct whose leaves flatten to > 4 legalized parts is sret'd (an
+//     r0 buffer) while native classifies register-return by word count — e.g. `(St,int)`
+//     with St = `{bool,int,int}` → i1 + [3 x i8] + i32 + i32 = 6 parts (conformance 1119).
+//   - x64: LLVM returns a first-class integer aggregate as ONE GP register PER i32/i64
+//     LEAF (`{i32, P{i32,i32}}` → EAX, EDX, ECX), but native reads an 8-byte aggregate
+//     field as ONE 8-byte word register — so the second leaf lands in the wrong register
+//     (`(int32, P)` → P.y read from RDX-high instead of ECX → garbage; conformance 1138).
+// Coercing each such field to `[N x iW]` (no sub-word / multi-leaf expansion) makes LLVM
+// return it in exactly ceil(size/W) word registers, matching native's collect on all
+// three.  (The separate padding-member bridge — multiRetHasPadding — applies on every
+// arch and is NOT gated by this.)
 func multiRetCoercionActive() bool {
 	var arch int = types.GetTarget().Arch
-	return arch == types.ARCH_AA64 || arch == types.ARCH_ARM32
+	return arch == types.ARCH_AA64 || arch == types.ARCH_ARM32 || arch == types.ARCH_X64
 }
 
 // multiRetTypeHasCoercibleField reports whether the multi-return tuple `t` has at
@@ -186,38 +188,162 @@ func multiReturnCoercedLLTy(out *strings.Builder, t @types.Type) {
 	for i := 0; i < len(t.Fields); i++ {
 		if i > 0 { out.Write(", ") }
 		out.WriteByte(' ')
-		if multiRetCoercionActive() && aggInRegCoercedKind(t.Fields[i].Type) {
-			aggCoerceLLTy(out, t.Fields[i].Type)
-		} else {
-			out.Write(llvmType(t.Fields[i].Type))
-		}
+		writeFlatMemberLLTy(out, t.Fields[i].Type)
 	}
 	out.Write(" }")
 	return
 }
 
+// writeFlatMemberLLTy writes ONE multi-return field's flat boundary member type: its
+// `[N x iW]` coerced form when it is a struct/array field on a coercing target
+// (multiRetCoercionActive), else its plain llvmType.  The per-field building block of
+// multiReturnCoercedLLTy AND the field-by-field bridge (emitMultiRetCoercedReturn's
+// gather + emitScatterFlatValue) — using ONE spelling everywhere keeps the boundary
+// type and its raw<->flat reinterpret provably in step.
+func writeFlatMemberLLTy(out *strings.Builder, fldTyp @types.Type) {
+	if multiRetCoercionActive() && aggInRegCoercedKind(fldTyp) {
+		aggCoerceLLTy(out, fldTyp)
+	} else {
+		out.Write(llvmType(fldTyp))
+	}
+	return
+}
+
+// emitScatterFlatValue writes each field of the flat multi-return value `flatRef` (of
+// tuple type `t`) to its RAW `types.FieldOffset` in the raw-layout buffer `dstRef` (a
+// ptr), each with its flat member type (writeFlatMemberLLTy).  This is the flat->raw
+// half of the field-by-field bridge: storing per-field at the raw offset — instead of a
+// single whole-struct `store <flat>` — is what makes the reinterpret offset-faithful,
+// because a coerced `[N x iW]` field whose LLVM alignment/size differs from its raw
+// extent still lands at its true FieldOffset.  Fields are written in index order (ascending
+// FieldOffset), so if a word-rounded sub-word aggregate field's store spills into the next
+// field's byte, the later field's store overwrites it and the raw layout ends up exact.
+// `pfx` disambiguates the SSA temps.  Shared by the direct/iface call-result bind
+// (emitMultiRetCallResultBind) and the func-value + capturing-closure shims, so all three
+// agree by construction.
+func emitScatterFlatValue(out *strings.Builder, t @types.Type, flatRef *[]readonly char,
+		dstRef *[]readonly char, pfx *[]readonly char) {
+	for i := 0; i < len(t.Fields); i++ {
+		out.Write("  %")
+		out.Write(pfx)
+		out.Write(".se")
+		stringutils.WriteInt(out, i)
+		out.Write(" = extractvalue ")
+		multiReturnCoercedLLTy(out, t)
+		out.WriteByte(' ')
+		out.Write(flatRef)
+		out.Write(", ")
+		stringutils.WriteInt(out, i)
+		out.Write("\n  %")
+		out.Write(pfx)
+		out.Write(".sp")
+		stringutils.WriteInt(out, i)
+		out.Write(" = getelementptr i8, ptr ")
+		out.Write(dstRef)
+		out.Write(", i32 ")
+		stringutils.WriteInt(out, t.FieldOffset(i))
+		out.Write("\n  store ")
+		writeFlatMemberLLTy(out, t.Fields[i].Type)
+		out.Write(" %")
+		out.Write(pfx)
+		out.Write(".se")
+		stringutils.WriteInt(out, i)
+		out.Write(", ptr %")
+		out.Write(pfx)
+		out.Write(".sp")
+		stringutils.WriteInt(out, i)
+		// align 1: a field at a non-word-aligned raw FieldOffset (e.g. a sub-word
+		// aggregate coerced to [1 x i32] landing at an odd byte) is an UNALIGNED store;
+		// without this the arm32 baremetal backend emits a natural-alignment store that
+		// faults.  Correct-but-conservative on every target (multi-return is not hot).
+		out.Write(", align 1\n")
+	}
+	return
+}
+
 // emitMultiRetCoercedReturn reinterprets the built raw tuple value
 // `%v.ret.<seq>.<idx>` to the flat boundary return type through the function-scoped
-// `%mrret.slot` (emitted once at entry by emitEntryAllocaDecls) and emits `ret
-// {flat}`.  The raw and flat tuple share bytes, so the store/load reinterprets
-// losslessly.  `retName` is the fully-formed name of the last insertvalue result
-// (the packed raw tuple); `retSeqTag` disambiguates the loaded value across multiple
-// returns in one function.
+// `%mrret.slot` (emitted once at entry by emitEntryAllocaDecls) and emits `ret {flat}`.
+// It stores the raw packed tuple to the slot (raw FieldOffset layout) and then GATHERS
+// the flat return value field-by-field, loading each field's flat member type from its
+// RAW FieldOffset (NOT a single whole-struct load of the flat type — that would read a
+// coerced `[N x iW]` field from wherever the flat type's own LLVM alignment placed it,
+// which diverges from the raw offset for a non-word-aligned struct field; see
+// multiReturnCoercedLLTy's CAVEAT).  `retName` is the fully-formed name of the last
+// insertvalue result (the packed raw tuple); `retSeqTag` disambiguates the SSA temps
+// across multiple returns in one function.
 func emitMultiRetCoercedReturn(out *strings.Builder, instr @ir.Instr, retName @[]char,
 		retSeqTag int) {
 	out.Write("store ")
 	out.Write(llvmType(instr.Typ))
 	out.WriteByte(' ')
 	out.Write(retName)
-	out.Write(", ptr %mrret.slot\n  %mrret.v")
-	stringutils.WriteInt(out, retSeqTag)
-	out.Write(" = load ")
-	multiReturnCoercedLLTy(out, instr.Typ)
-	out.Write(", ptr %mrret.slot\n  ret ")
-	multiReturnCoercedLLTy(out, instr.Typ)
+	out.Write(", ptr %mrret.slot\n")
+	var t @types.Type = instr.Typ
+	// Gather: build the flat value in %mrret.v<tag> from per-field raw-offset loads.
+	for i := 0; i < len(t.Fields); i++ {
+		out.Write("  %mrret.g")
+		stringutils.WriteInt(out, retSeqTag)
+		out.WriteByte('.')
+		stringutils.WriteInt(out, i)
+		out.Write(" = getelementptr i8, ptr %mrret.slot, i32 ")
+		stringutils.WriteInt(out, t.FieldOffset(i))
+		out.Write("\n  %mrret.c")
+		stringutils.WriteInt(out, retSeqTag)
+		out.WriteByte('.')
+		stringutils.WriteInt(out, i)
+		out.Write(" = load ")
+		writeFlatMemberLLTy(out, t.Fields[i].Type)
+		out.Write(", ptr %mrret.g")
+		stringutils.WriteInt(out, retSeqTag)
+		out.WriteByte('.')
+		stringutils.WriteInt(out, i)
+		// align 1: the field is loaded from its raw FieldOffset, which may be non-word-
+		// aligned (a sub-word aggregate coerced to [1 x i32] at an odd byte); an
+		// unannotated natural-alignment load faults on arm32 baremetal.  See the store
+		// counterpart in emitScatterFlatValue.
+		out.Write(", align 1\n  ")
+		writeGatherAccName(out, retSeqTag, i, len(t.Fields))
+		out.Write(" = insertvalue ")
+		multiReturnCoercedLLTy(out, t)
+		out.WriteByte(' ')
+		if i == 0 {
+			out.Write("undef")
+		} else {
+			writeGatherAccName(out, retSeqTag, i - 1, len(t.Fields))
+		}
+		out.Write(", ")
+		writeFlatMemberLLTy(out, t.Fields[i].Type)
+		out.Write(" %mrret.c")
+		stringutils.WriteInt(out, retSeqTag)
+		out.WriteByte('.')
+		stringutils.WriteInt(out, i)
+		out.Write(", ")
+		stringutils.WriteInt(out, i)
+		out.WriteByte('\n')
+	}
+	out.Write("  ret ")
+	multiReturnCoercedLLTy(out, t)
 	out.Write(" %mrret.v")
 	stringutils.WriteInt(out, retSeqTag)
 	out.WriteByte('\n')
+	return
+}
+
+// writeGatherAccName writes the insertvalue accumulator name for gather field `i` of a
+// tuple with `n` fields: the LAST field writes the final flat value `%mrret.v<tag>`
+// (which emitMultiRetCoercedReturn returns), earlier fields write intermediates
+// `%mrret.a<tag>.<i>`.
+func writeGatherAccName(out *strings.Builder, retSeqTag int, i int, n int) {
+	if i == n - 1 {
+		out.Write("%mrret.v")
+		stringutils.WriteInt(out, retSeqTag)
+		return
+	}
+	out.Write("%mrret.a")
+	stringutils.WriteInt(out, retSeqTag)
+	out.WriteByte('.')
+	stringutils.WriteInt(out, i)
 	return
 }
 
@@ -238,16 +364,25 @@ func emitMultiRetCallAllocaDecl(out *strings.Builder, instr @ir.Instr) {
 
 // emitMultiRetCallResultBind emits, AFTER a bridged multi-return call line, the
 // reinterpret of the flat-boundary result `%v<callID>.mrR` back to the raw tuple
-// `%v<callID>` (which the downstream extractvalue reads), through the entry-hoisted
-// `.mrRB` slot.
+// `%v<callID>` (which the downstream extractvalue reads).  It SCATTERS each flat field
+// to its raw FieldOffset in the entry-hoisted `.mrRB` slot (emitScatterFlatValue) — the
+// field-by-field reinterpret that is offset-faithful for a coerced non-word-aligned
+// struct field — then loads the raw tuple from the slot.
 func emitMultiRetCallResultBind(out *strings.Builder, instr @ir.Instr) {
-	out.Write("  store ")
-	multiReturnCoercedLLTy(out, instr.Typ)
-	out.Write(" %v")
-	stringutils.WriteInt(out, instr.ID)
-	out.Write(".mrR, ptr %v")
-	stringutils.WriteInt(out, instr.ID)
-	out.Write(".mrRB\n  ")
+	var fb @strings.Builder = strings.NewBuilder()
+	fb.Write("%v")
+	stringutils.WriteInt(fb, instr.ID)
+	fb.Write(".mrR")
+	var db @strings.Builder = strings.NewBuilder()
+	db.Write("%v")
+	stringutils.WriteInt(db, instr.ID)
+	db.Write(".mrRB")
+	var pb @strings.Builder = strings.NewBuilder()
+	pb.Write("v")
+	stringutils.WriteInt(pb, instr.ID)
+	pb.Write(".mrb")
+	emitScatterFlatValue(out, instr.Typ, fb.String(), db.String(), pb.String())
+	out.Write("  ")
 	emitRef(out, instr.ID)
 	out.Write(" = load ")
 	out.Write(llvmType(instr.Typ))

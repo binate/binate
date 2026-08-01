@@ -1,5 +1,6 @@
 package "pkg/binate/irdata"
 
+import "pkg/binate/buf"
 import "pkg/binate/types"
 import "pkg/stdx/slices"
 
@@ -10,12 +11,22 @@ import "pkg/stdx/slices"
 // concrete assertion compares.  The `*TypeInfo` pointer lives in every
 // interface vtable's any-block slot 1 (§7.13.8).
 //
-// Fixed 5-word layout (word = target int size), in emission order:
+// 8-word layout (word = target int size), in emission order:
 //   word 0: destructor handle (*void; null if the type needs none)
 //   word 1: size  (SizeOf, bytes)
 //   word 2: align (AlignOf, bytes)
 //   word 3: name pointer (*readonly char into static storage)
 //   word 4: name length
+//   word 5: KIND (a KIND_* discriminator; how a reflective reader interprets the
+//           value's bytes — the exact width is word 1 / a field's size)
+//   word 6: fields pointer (&__typefields.<T>, the field-table blob; null for a
+//           non-struct or a fieldless struct)
+//   word 7: field count (0 for a non-struct)
+//
+// Words 6–7 are ordered {ptr, len} so a reflective reader can overlay a
+// `*[]FieldInfo` raw slice on them.  Words 0–4 keep their offsets, so every
+// existing assertion reader (which reads words 0–4 by fixed offset and compares
+// the record ADDRESS for identity) is unaffected by the trailing additions.
 //
 // Interface SATISFACTION is deliberately NOT carried here (spec
 // `type.layout.satisfaction`): because `impl` may live in any package (no orphan
@@ -31,14 +42,16 @@ import "pkg/stdx/slices"
 
 // BuildTypeInfo builds the static `TypeInfo` record named `desc.Sym`
 // (mangle.TypeInfoName).  Weak so duplicate emissions across TUs coalesce
-// to one record — hence one identity — per type program-wide.
+// to one record — hence one identity — per type program-wide.  For a struct it
+// also emits two TU-local trailer blobs: the field table (`__typefields.<T>`)
+// and the concatenated field-name blob (`__typefieldnames.<T>`).
 //
-// The record interleaves pointer-sized words (dtor, name-ptr) with `IntSize`-
-// wide scalar words (size, align, name-len).  This is byte-consistent across the
-// LLVM and native emitters only because `PointerSize == IntSize` on every
-// current target (LP64 8/8, ILP32 4/4) — the same assumption
-// BuildPackageDescriptor relies on.  A future target with `PointerSize !=
-// IntSize` would need explicit per-word widths here.
+// The record interleaves pointer-sized words (dtor, name-ptr, fields-ptr) with
+// `IntSize`-wide scalar words (size, align, name-len, kind, field-count).  This
+// is byte-consistent across the LLVM and native emitters only because
+// `PointerSize == IntSize` on every current target (LP64 8/8, ILP32 4/4) — the
+// same assumption BuildPackageDescriptor relies on.  A future target with
+// `PointerSize != IntSize` would need explicit per-word widths here.
 func BuildTypeInfo(desc @TypeInfoDesc) @[]@DataGlobal {
 	var w int = types.GetTarget().IntSize
 	var dg @DataGlobal = NewDataGlobal(desc.Sym, DG_WEAK, w, true)
@@ -57,6 +70,16 @@ func BuildTypeInfo(desc @TypeInfoDesc) @[]@DataGlobal {
 	if len(desc.Name) > 0 { nameSym = desc.NameSym }
 	dg.Init = appendTerm(dg.Init, DataSymref(nameSym, 0))
 	dg.Init = appendTerm(dg.Init, DataInt(w, cast(uint64, cast(int64, len(desc.Name)))))
+	// word 5: KIND discriminator.
+	dg.Init = appendTerm(dg.Init, DataInt(w, cast(uint64, cast(int64, desc.Kind))))
+	// words 6-7: fields pointer + count ({ptr, len}).  The pointer is emitted
+	// ONLY for a struct with >= 1 field (and hence a field-table blob) — an
+	// absent/empty field table gives a null pointer + 0 count, keeping the word
+	// reloc-free and never referencing a blob that was not emitted.
+	var fieldsSym @[]char
+	if len(desc.Fields) > 0 { fieldsSym = desc.FieldsSym }
+	dg.Init = appendTerm(dg.Init, DataSymref(fieldsSym, 0))
+	dg.Init = appendTerm(dg.Init, DataInt(w, cast(uint64, cast(int64, len(desc.Fields)))))
 
 	var out @[]@DataGlobal
 	out = slices.Append[@DataGlobal](out, dg)
@@ -66,5 +89,47 @@ func BuildTypeInfo(desc @TypeInfoDesc) @[]@DataGlobal {
 	if len(desc.Name) > 0 {
 		out = slices.Append[@DataGlobal](out, buildRodata(desc.NameSym, desc.Name))
 	}
+	// The field-table blob + concatenated field-name blob (both TU-local, like
+	// the name blob) — emitted only for a struct with >= 1 field.
+	if len(desc.Fields) > 0 {
+		out = slices.Append[@DataGlobal](out, buildFieldTable(desc, w))
+		out = slices.Append[@DataGlobal](out, buildFieldNames(desc))
+	}
 	return out
+}
+
+// buildFieldTable lays the field-table blob (`__typefields.<T>`): one 6-word
+// FieldEntry per field {name-ptr, name-len, offset, kind, size, typeinfo-ptr},
+// in declaration order.  name-ptr references the concatenated field-name blob
+// (desc.NamesSym) with the field's byte offset into it as the symref addend;
+// typeinfo-ptr references the field type's own `__typeinfo` record when set
+// (empty → null, until reflection recurses into nested structs).  TU-local,
+// word-aligned, read-only; it carries relocations (name-ptr), so the native
+// lowering routes it to rodata_relro automatically.
+func buildFieldTable(desc @TypeInfoDesc, w int) @DataGlobal {
+	var dg @DataGlobal = NewDataGlobal(desc.FieldsSym, DG_LOCAL, w, true)
+	var nameOff int = 0
+	for i := 0; i < len(desc.Fields); i++ {
+		var f @FieldInfoDesc = desc.Fields[i]
+		dg.Init = appendTerm(dg.Init, DataSymref(desc.NamesSym, nameOff))
+		dg.Init = appendTerm(dg.Init, DataInt(w, cast(uint64, cast(int64, len(f.Name)))))
+		dg.Init = appendTerm(dg.Init, DataInt(w, cast(uint64, cast(int64, f.Offset))))
+		dg.Init = appendTerm(dg.Init, DataInt(w, cast(uint64, cast(int64, f.Kind))))
+		dg.Init = appendTerm(dg.Init, DataInt(w, cast(uint64, cast(int64, f.Size))))
+		dg.Init = appendTerm(dg.Init, DataSymref(f.TypeInfoSym, 0))
+		nameOff = nameOff + len(f.Name)
+	}
+	return dg
+}
+
+// buildFieldNames lays the concatenated field-name blob (`__typefieldnames.<T>`):
+// every field name laid end to end (no separators), each FieldEntry's name
+// pointer referencing it at that field's byte offset.  TU-local, align-1,
+// read-only — exactly like the type-name blob.
+func buildFieldNames(desc @TypeInfoDesc) @DataGlobal {
+	var all @[]char
+	for i := 0; i < len(desc.Fields); i++ {
+		all = buf.Concat(all, desc.Fields[i].Name)
+	}
+	return buildRodata(desc.NamesSym, all)
 }

@@ -111,12 +111,15 @@ func emitClosureShimSpillArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.T
 }
 
 // emitClosureCaptureSpillArm32 spills every STACK-BOUND capture word to the outgoing-
-// args area at [SP + CallArgStackOff(classifyTypes, classifyOff + i)], reading capture
-// fields from [captureBase + FieldOffset] into R4 (emitBaseLoad) and storing them through
-// emitFrameStore.  classifyOff / classifyTypes / captureBase select the shape: (0, argTypes
-// = captures++users, R0) for the scalar/void shim, and (1, sretTypes = [*uint8]++captures
-// ++users, R1) for a Phase-C sret shape whose R0 holds the retbuf — so capture i classifies
-// at classifyOff + i and loads from the live closure-struct pointer captureBase.  A
+// args area at [SP + CallArgStackOff(classifyTypes, classifyOff + i)], reading each capture
+// word from [captureBase + FieldOffset] into R4 — a word LDR (emitBaseLoad) for a word-
+// aligned capture, or a BYTE-WISE build (emitBytewiseWordLoadArm32) for a sub-word-aligned
+// aggregate whose packed offset a word LDR could not reach on strict-align arm32 — and
+// storing them through emitFrameStore.  classifyOff / classifyTypes / captureBase select
+// the shape: (0, argTypes = captures++users, R0) for the scalar/void shim, and (1,
+// sretTypes = [*uint8]++captures++users, R1) for a Phase-C sret shape whose R0 holds the
+// retbuf — so capture i classifies at classifyOff + i and loads from the live closure-
+// struct pointer captureBase.  A
 // capture that SPLITs (some words in regs, the rest on the stack) spills only its stack
 // tail here; the reg part is loaded by emitClosureCaptureRegLoadSpillArm32.  The outgoing
 // store is a plain WordBytes STR (AAPCS32 does not pack narrow stack args —
@@ -140,9 +143,10 @@ func emitClosureShimSpillArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.T
 // the non-closure spill emitSpillSrcToMemArm32 uses.
 //
 // Indirect-large captures are excluded upstream (no pointer-pass path), so every capture
-// here is a per-word scalar / small-aggregate whose value-words load directly.  Mirrors
-// emitClosureCaptureSpillAA64 at the arm32 (no indirect-large, no natural-narrow-store)
-// surface.
+// here is a per-word scalar / small-aggregate whose value-words load directly (word-aligned)
+// or byte-wise (sub-word-aligned aggregate).  Mirrors emitClosureCaptureSpillAA64 at the
+// arm32 (no indirect-large, no natural-narrow-store) surface; the byte-wise build is the
+// strict-align addition AA64 (unaligned-tolerant) does not need.
 func emitClosureCaptureSpillArm32(a @asm.Assembler, cc common.CallConv, f @ir.Func,
 		classifyTypes @[]@types.Type, classifyOff int, captureBase int) {
 	for i := 0; i < f.NumCaptureParams; i = i + 1 {
@@ -152,6 +156,13 @@ func emitClosureCaptureSpillArm32(a @asm.Assembler, cc common.CallConv, f @ir.Fu
 		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
 		if stkOff < 0 { continue }
 		var nWords int = cc.ArgWords(ft)
+		// A SUB-word-aligned aggregate capture is packed at a possibly non-word offset,
+		// so its words must be assembled BYTE-WISE (a word LDR would fault on strict-align
+		// arm32); a word-aligned capture rides the fast word load.  The byte-wise word
+		// build shuttles through R4 (the value), IP (field-address scratch), and R2 (byte
+		// temp — a staged, non-captureBase arg reg, free before the step-4 marshal).
+		var byteWise bool = aggNeedsBytewiseArm32(ft)
+		var ftSz int = ft.SizeOf()
 		// The first firstStackWord words rode registers (a SPLIT capture); only the
 		// tail spills.  A wholly-stack capture has regStart < 0 -> firstStackWord 0.
 		var firstStackWord int = 0
@@ -159,7 +170,14 @@ func emitClosureCaptureSpillArm32(a @asm.Assembler, cc common.CallConv, f @ir.Fu
 			firstStackWord = cc.NumGpArgRegs - regStart
 		}
 		for k := firstStackWord; k < nWords; k = k + 1 {
-			emitBaseLoad(a, arm32.R4, captureBase, fieldOfs + k * cc.WordBytes, arm32.IP)
+			if byteWise {
+				var nb int = cc.WordBytes
+				if ftSz - k * cc.WordBytes < nb { nb = ftSz - k * cc.WordBytes }
+				emitBytewiseWordLoadArm32(a, arm32.R4, captureBase, fieldOfs + k * cc.WordBytes, nb, arm32.IP,
+						arm32.R2)
+			} else {
+				emitBaseLoad(a, arm32.R4, captureBase, fieldOfs + k * cc.WordBytes, arm32.IP)
+			}
 			emitFrameStore(a, arm32.R4, stkOff + (k - firstStackWord) * cc.WordBytes)
 		}
 	}
@@ -176,7 +194,11 @@ func emitClosureCaptureSpillArm32(a @asm.Assembler, cc common.CallConv, f @ir.Fu
 // targets captureBase's own register) runs LAST — keeping captureBase (the closure-struct
 // pointer) live until the final load.  Unlike the fast path's emitClosureCaptureRegLoadArm32 (dense
 // captureWords cursor, no pads), this reads the classifier position directly and so
-// serves the padded / SPLIT captures the fast path routes here.  Mirrors
+// serves the padded / SPLIT captures the fast path routes here.  A sub-word-aligned
+// aggregate capture (packed at a possibly non-word offset) is assembled BYTE-WISE
+// (emitBytewiseWordLoadArm32, R4 field-address scratch + IP byte temp — both free at this
+// post-marshal step) rather than a faulting word LDR; the strict-align closure captures
+// route here (closureCaptureNeedsBytewiseArm32) precisely so this path serves them.  Mirrors
 // emitClosureCaptureRegLoadAA64 at the arm32 (no indirect-large pointer-pass) surface.
 func emitClosureCaptureRegLoadSpillArm32(a @asm.Assembler, cc common.CallConv, f @ir.Func,
 		classifyTypes @[]@types.Type, classifyOff int, captureBase int) {
@@ -186,14 +208,29 @@ func emitClosureCaptureRegLoadSpillArm32(a @asm.Assembler, cc common.CallConv, f
 		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
 		if regStart < 0 { continue }
 		var nWords int = cc.ArgWords(ft)
+		// A SUB-word-aligned aggregate capture is packed at a possibly non-word offset, so
+		// each reg word is assembled BYTE-WISE (a word LDR would fault on strict-align
+		// arm32).  The build shuttles the field address through R4 and each byte through IP
+		// (both free at this post-marshal reg-load step); the destination is the capture's
+		// own outgoing arg register, so capture 0's base-aliasing dst is safe (the base is
+		// read once into R4 before any write, and capture 0 loads last).
+		var byteWise bool = aggNeedsBytewiseArm32(ft)
+		var ftSz int = ft.SizeOf()
 		// A SPLIT capture loads only its reg portion (the tail spilled to the stack).
 		var regWords int = nWords
 		if cc.CallArgStackOff(classifyTypes, classifyOff + i) >= 0 {
 			regWords = cc.NumGpArgRegs - regStart
 		}
 		for k := regWords - 1; k >= 0; k = k - 1 {
-			arm32.Ldr(a, arm32.COND_AL, argReg(regStart + k),
-					arm32.MemImm(captureBase, fieldOfs + k * cc.WordBytes))
+			if byteWise {
+				var nb int = cc.WordBytes
+				if ftSz - k * cc.WordBytes < nb { nb = ftSz - k * cc.WordBytes }
+				emitBytewiseWordLoadArm32(a, argReg(regStart + k), captureBase, fieldOfs + k * cc.WordBytes, nb,
+						arm32.R4, arm32.IP)
+			} else {
+				arm32.Ldr(a, arm32.COND_AL, argReg(regStart + k),
+						arm32.MemImm(captureBase, fieldOfs + k * cc.WordBytes))
+			}
 		}
 	}
 }

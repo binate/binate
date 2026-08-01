@@ -7,9 +7,9 @@ runner_setup() { build_gen1; build_interp "$GEN1_COMPILER"; }
 runner_exec() {
     bn="$1"; root="$2"
     if [ -n "$root" ]; then
-        "$COMPILED_INTERP" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$root")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$root")" "$bn" 2>&1 || true
+        "$COMPILED_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$root")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$root")" "$bn" 2>&1 || true
     else
-        "$COMPILED_INTERP" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" "$bn" 2>&1 || true
+        "$COMPILED_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" "$bn" 2>&1 || true
     fi
 }
 

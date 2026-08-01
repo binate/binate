@@ -242,6 +242,21 @@ skipped=0
 failures=""
 suite_start=$(date +%s)
 
+# set_check_nil_env sets CONF_CHECK_NIL=1 iff a ${name}.check-nil marker file
+# exists next to the test, else empty.  The VM (int) runners read it and pass
+# `bni --check-nil`, turning on opt-in nil-pointer-deref checking so a nil deref
+# raises a recoverable VM fault (a message + non-zero exit) instead of a SEGV.
+# Compiled runners ignore it — a nil deref SEGVs there, so such a test is
+# xfail'd on every compiled mode.  See explorations/plan-nil-check-opt-in.md (N3).
+set_check_nil_env() {
+    if [ -f "$SCRIPT_DIR/${1}.check-nil" ]; then
+        CONF_CHECK_NIL=1
+    else
+        CONF_CHECK_NIL=
+    fi
+    export CONF_CHECK_NIL
+}
+
 run_test() {
     name="$1"
     bn="$2"         # path to .bn file (single-file) or main.bn (multi-pkg)
@@ -272,6 +287,7 @@ run_test() {
         return
     fi
 
+    set_check_nil_env "$name"
     t_start=$(date +%s)
     actual=$(runner_exec "$bn" "$root")
     actual=$(strip_signal_msgs "$actual")
@@ -338,6 +354,7 @@ run_error_test() {
         return
     fi
 
+    set_check_nil_env "$name"
     t_start=$(date +%s)
     actual=$(runner_exec "$bn" "$root")
     rc=$?

@@ -72,11 +72,11 @@ runner_exec() {
         impls="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
     fi
     if command -v timeout >/dev/null 2>&1; then
-        timeout 20 "$QEMU_ARM" "$ARM32_INTERP" -I "$ifaces" -L "$impls" "$bn" 2>&1 || true
+        timeout 20 "$QEMU_ARM" "$ARM32_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$ifaces" -L "$impls" "$bn" 2>&1 || true
     elif command -v gtimeout >/dev/null 2>&1; then
-        gtimeout 20 "$QEMU_ARM" "$ARM32_INTERP" -I "$ifaces" -L "$impls" "$bn" 2>&1 || true
+        gtimeout 20 "$QEMU_ARM" "$ARM32_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$ifaces" -L "$impls" "$bn" 2>&1 || true
     else
-        "$QEMU_ARM" "$ARM32_INTERP" -I "$ifaces" -L "$impls" "$bn" 2>&1 || true
+        "$QEMU_ARM" "$ARM32_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$ifaces" -L "$impls" "$bn" 2>&1 || true
     fi
 }
 

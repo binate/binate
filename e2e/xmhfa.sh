@@ -110,12 +110,14 @@ import "pkg/binate/parser"
 import "pkg/builtins/reflect"
 import "pkg/std/errors"
 import "pkg/std/os"
-import "pkg/bootstrap"
 import "pkg/xmhfa"
 
 // host <prog.bn> <I-paths colon-sep> <L-paths colon-sep>
 func main() {
-	var args @[]@[]char = bootstrap.Args()
+	// progArgs() re-derives the no-program-name argv shape bootstrap.Args() used to
+	// return (retired when argv moved to pkg/builtins/startup behind os.Args), so
+	// args[0] is the first real arg and the indices below are unchanged.
+	var args @[]@[]char = progArgs()
 	if len(args) < 3 {
 		println("usage: host <prog.bn> <I-paths> <L-paths>")
 		os.Exit(1)
@@ -218,6 +220,25 @@ func appendCharSlice(s @[]@[]char, v @[]char) @[]@[]char {
 	for i := 0; i < n; i++ { ns[i] = s[i] }
 	ns[n] = v
 	return ns
+}
+
+// progArgs returns the host's own arguments — os.Args() minus the program-name
+// slot at index 0 — each element copied into an owned @[]char.  This is the
+// no-program-name shape the retired bootstrap.Args() used to return (its
+// element slots readonly, os.Args() can't borrow straight into *[]readonly
+// char), matching cmd/bni's / cmd/bnas's own os.Args bridge.
+func progArgs() @[]@[]char {
+	var full @[]readonly @[]readonly char = os.Args()
+	var n int = len(full)
+	if n <= 1 { return make_slice(@[]char, 0) }
+	var out @[]@[]char = make_slice(@[]char, n - 1)
+	for i := 1; i < n; i++ {
+		var m int = len(full[i])
+		var s @[]char = make_slice(char, m)
+		for j := 0; j < m; j++ { s[j] = full[i][j] }
+		out[i - 1] = s
+	}
+	return out
 }
 EOF
 

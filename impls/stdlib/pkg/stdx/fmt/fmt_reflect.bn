@@ -7,17 +7,26 @@ import "pkg/std/strconv"
 
 // Struct/default reflection for `%v`/`%+v` (and `%s`/Print of a struct without a
 // String()) — the read-bytes-per-kind renderer (plan-struct-reflection.md P2/P3/
-// P4a).  A struct boxed BY VALUE carries a KIND_STRUCT `reflect.TypeInfo` with a
-// field table; this walks it and, per field, reads the raw bytes at `DataOf +
-// offset` interpreted by the field's KIND_* + size, formatting scalars /
+// P4a/P4b-1).  A struct boxed BY VALUE carries a KIND_STRUCT `reflect.TypeInfo`
+// with a field table; this walks it and, per field, reads the raw bytes at `DataOf
+// + offset` interpreted by the field's KIND_* + size, formatting scalars /
 // char-slices with the same strconv paths writeArg uses.  `%v` renders values
 // only (`{3 4}`); `%+v` (withNames, from the Printf path) labels each field
 // (`{x:3 y:4}`), recursively for nested structs.  It is a pure BORROW: it reads the
 // still-live boxed value in place and builds raw views (like writeArg's char-slice
 // cases), never RefInc/RefDec/allocating.  A nested by-value NAMED struct field
-// recurses through its own record (P3); array / slice / pointer / interface / func
-// fields — and anonymous / alias struct fields (no nameable record yet) — render a
-// placeholder (aggregate / pointer rendering and anon-struct records are later).
+// recurses through its own record (P3).  An array or (non-char) slice field renders
+// its elements as `[e0 e1 ...]` (P4b-1), reading each field's `ElemKind`/`ElemSize`
+// off the field table — a scalar/char-slice element formats in place, and a struct
+// element recurses through the element record (`f.Type` points at the ELEMENT's
+// `__typeinfo` for an array/slice field).  Pointer / interface / func fields —
+// anonymous / alias struct fields (no nameable record yet) — and a nested-aggregate
+// element (array-of-array / slice-of-slice, whose element record carries only the
+// immediate element kind) render a compact placeholder (pointer following and
+// anon-struct records are later).  Slice-backed element recursion can form a
+// CYCLE (e.g. `type T struct { kids @[]T }` with `t.kids[0] = t` — itself a
+// refcount cycle); a (base, TypeInfo)-keyed guard renders a re-entered struct as
+// `{...}` rather than overflowing the stack (see reflectCtx / writeStructAt).
 //
 // Because a raw `*T` boxes into `*any` as its POINTEE `T`, `&s` and a bare `s`
 // both present as KIND_STRUCT here and render identically (`{…}`) — matching the
@@ -26,31 +35,77 @@ import "pkg/std/strconv"
 // slice — KIND_ARRAY/SLICE) is not KIND_STRUCT, so writeStructReflect returns
 // handled=false and the caller falls back to the `%!?(unknown)` placeholder.
 
+// reflectCtx threads the `%+v`-vs-`%v` flag and the cycle-guard stack through the
+// (mutually recursive) renderers.  vbase/vtype are the (base address, `TypeInfo`
+// pointer) pairs of the structs currently being rendered along the root-to-here
+// path — a fixed on-stack stack (no heap allocation) owned by writeStructReflect.
+// depth is the count of live entries; it is passed BY VALUE, so returning from a
+// nested render auto-"pops" it, while vbase/vtype (raw-slice views over the owner's
+// arrays) are shared so a sibling never sees another sibling's entries — only its
+// ancestors.  The cycle key is (base, type), NOT base alone: a single-field wrapper
+// (`type A struct { b B }`, where A and its `b` share a base) or a zero-size field
+// at offset 0 shares a base with its container but differs in type, so it must not
+// read as a cycle.
+type reflectCtx struct {
+	withNames bool
+	vbase     *[]int
+	vtype     *[]int
+	depth     int
+}
+
 // writeStructReflect renders a by-value struct operand as `{f0 f1 ...}`.  Returns
 // (byteCount, err, handled); handled is false when arg's dynamic type is not a
-// struct, so the caller can fall through to its own default.
+// struct, so the caller can fall through to its own default.  It owns the
+// cycle-guard stack (see reflectCtx): two fixed on-stack arrays sized to the
+// maximum render depth.
 func writeStructReflect(w @io.Writer, arg *any, withNames bool) (int, @errors.Error, bool) {
 	var noErr @errors.Error
 	var ti *reflect.TypeInfo = reflect.TypeOf(arg)
 	if ti == nil || ti.Kind != reflect.KIND_STRUCT {
 		return 0, noErr, false
 	}
+	// The 64 entries are both the max render depth and the cycle-guard capacity: a
+	// path deeper than this degrades to `{...}` rather than overflowing the stack.
+	var vbase [64]int
+	var vtype [64]int
+	var ctx reflectCtx
+	ctx.withNames = withNames
+	ctx.vbase = vbase[:]
+	ctx.vtype = vtype[:]
+	ctx.depth = 0
 	var n int
 	var e @errors.Error
-	n, e = writeStructAt(w, ti, reflect.DataOf(arg), withNames)
+	n, e = writeStructAt(w, ti, reflect.DataOf(arg), ctx)
 	return n, e, true
 }
 
 // writeStructAt renders the struct described by `ti` whose bytes begin at `base`
-// as `{f0 f1 ...}` (or, when withNames, the `%+v` form `{n0:f0 n1:f1 ...}`),
+// as `{f0 f1 ...}` (or, when ctx.withNames, the `%+v` form `{n0:f0 n1:f1 ...}`),
 // walking ti's field table and reading each field's bytes at `base + Offset`.
 // Factored out of writeStructReflect so a nested-struct field recurses:
 // writeFieldByKind's KIND_STRUCT branch calls back in with the field's own
-// TypeInfo (`f.Type`), its in-place byte address as the new base, and the SAME
-// withNames flag (so `%+v` labels nested structs too).  By-value struct nesting
-// is acyclic, so this mutual recursion terminates with no depth guard.
+// TypeInfo (`f.Type`) and its in-place byte address as the new base.  Guards
+// against a cycle: if this (base, TypeInfo) pair is already on the active render
+// path — a slice- or pointer-backed self-reference — or the depth budget is
+// exhausted, it renders `{...}` instead of recursing forever (a cyclic structure
+// is user error, like a refcount cycle).  By-value struct/array nesting alone is
+// acyclic and consumes the budget only shallowly; genuine indirection is what can
+// re-enter a (base, type).
 func writeStructAt(w @io.Writer, ti *reflect.TypeInfo, base *uint8,
-		withNames bool) (int, @errors.Error) {
+		ctx reflectCtx) (int, @errors.Error) {
+	var baseAddr int = bit_cast(int, base)
+	var typeAddr int = bit_cast(int, ti)
+	for i := 0; i < ctx.depth; i++ {
+		if ctx.vbase[i] == baseAddr && ctx.vtype[i] == typeAddr {
+			return w.Write("{...}")
+		}
+	}
+	if ctx.depth >= len(ctx.vbase) {
+		return w.Write("{...}")
+	}
+	ctx.vbase[ctx.depth] = baseAddr
+	ctx.vtype[ctx.depth] = typeAddr
+	ctx.depth = ctx.depth + 1
 	var total int = 0
 	var n int
 	var e @errors.Error
@@ -64,7 +119,7 @@ func writeStructAt(w @io.Writer, ti *reflect.TypeInfo, base *uint8,
 			if present(e) { return total, e }
 		}
 		var f reflect.FieldInfo = ti.Fields[i]
-		if withNames {
+		if ctx.withNames {
 			// `%+v` prefixes each field value with `name:`.
 			n, e = w.Write(f.Name)
 			total = total + n
@@ -74,7 +129,7 @@ func writeStructAt(w @io.Writer, ti *reflect.TypeInfo, base *uint8,
 			if present(e) { return total, e }
 		}
 		var fptr *uint8 = bit_cast(*uint8, bit_cast(int, base) + f.Offset)
-		n, e = writeFieldByKind(w, f, fptr, withNames)
+		n, e = writeFieldByKind(w, f, fptr, ctx)
 		total = total + n
 		if present(e) { return total, e }
 	}
@@ -92,41 +147,90 @@ func writeStructAt(w @io.Writer, ti *reflect.TypeInfo, base *uint8,
 // was not force-emitted (f.Type null) — render a compact placeholder until later
 // phases render them in full.
 func writeFieldByKind(w @io.Writer, f reflect.FieldInfo, ptr *uint8,
-		withNames bool) (int, @errors.Error) {
-	if f.Kind == reflect.KIND_INT {
-		return writeMs(w, strconv.FormatInt(readSignedField(ptr, f.Size), 10))
+		ctx reflectCtx) (int, @errors.Error) {
+	// An array holds f.Size / f.ElemSize elements inline at `ptr`.
+	if f.Kind == reflect.KIND_ARRAY {
+		if f.ElemSize <= 0 { return w.Write("[...]") }
+		return writeElems(w, f.ElemKind, f.ElemSize, f.Type, bit_cast(int, ptr), f.Size / f.ElemSize, ctx)
 	}
-	if f.Kind == reflect.KIND_UINT {
-		return writeMs(w, strconv.FormatUint(readUnsignedField(ptr, f.Size), 10))
+	// A (non-char) slice field is a header {data, len, ...} at `ptr`; word 0 is the
+	// data pointer, word 1 the length (same for a raw `*[]T` and managed `@[]T`).
+	if f.Kind == reflect.KIND_SLICE {
+		if f.ElemSize <= 0 { return w.Write("[...]") }
+		var hdr *int = bit_cast(*int, ptr)
+		return writeElems(w, f.ElemKind, f.ElemSize, f.Type, hdr[0], hdr[1], ctx)
 	}
-	if f.Kind == reflect.KIND_BOOL {
+	return writeValue(w, f.Kind, f.Size, f.Type, ptr, ctx)
+}
+
+// writeValue renders ONE value at `ptr` interpreted by (kind, size, typeInfo): a
+// scalar, a char-slice, or a nested struct (recurse via typeInfo — the value's
+// own record).  A value that is itself an array/slice/pointer, or a struct with
+// no nameable record, renders a compact placeholder (deeper aggregate nesting and
+// pointer-following are later phases).  Shared by struct-field rendering
+// (writeFieldByKind) and array/slice element rendering (writeElems).
+func writeValue(w @io.Writer, kind int, size int, typeInfo *uint8, ptr *uint8,
+		ctx reflectCtx) (int, @errors.Error) {
+	if kind == reflect.KIND_INT {
+		return writeMs(w, strconv.FormatInt(readSignedField(ptr, size), 10))
+	}
+	if kind == reflect.KIND_UINT {
+		return writeMs(w, strconv.FormatUint(readUnsignedField(ptr, size), 10))
+	}
+	if kind == reflect.KIND_BOOL {
 		return writeMs(w, strconv.FormatBool(bit_cast(*uint8, ptr)[0] != 0))
 	}
-	if f.Kind == reflect.KIND_FLOAT {
-		if f.Size == 4 {
+	if kind == reflect.KIND_FLOAT {
+		if size == 4 {
 			return writeMs(w, strconv.FormatFloat(cast(float64, bit_cast(*float32, ptr)[0]), 'g', -1, 32))
 		}
 		return writeMs(w, strconv.FormatFloat(bit_cast(*float64, ptr)[0], 'g', -1, 64))
 	}
-	if f.Kind == reflect.KIND_STRING {
-		// The field's first two words {data, len} form a valid raw char-slice
+	if kind == reflect.KIND_STRING {
+		// The value's first two words {data, len} form a valid raw char-slice
 		// view for both raw (`*[]char`) and managed (`@[]char`) spellings.
 		return w.Write(bit_cast(*(*[]readonly char), ptr)[0])
 	}
-	if f.Kind == reflect.KIND_STRUCT {
-		// A by-value nested struct recurses over its own field table with `ptr` as
-		// the nested base.  f.Type = &__typeinfo.<FieldType> (non-null for a named
-		// struct field, force-emitted by the gather).  Guard null defensively (an
-		// anonymous / alias struct field has no nameable record) → placeholder.
-		if f.Type == nil {
-			return w.Write("{...}")
-		}
-		return writeStructAt(w, bit_cast(*reflect.TypeInfo, f.Type), ptr, withNames)
+	if kind == reflect.KIND_STRUCT {
+		// A by-value struct recurses over its own field table with `ptr` as the
+		// base.  typeInfo = &__typeinfo.<T> (non-null for a named struct,
+		// force-emitted by the gather).  Guard null (an anonymous / alias struct
+		// with no nameable record) → placeholder.
+		if typeInfo == nil { return w.Write("{...}") }
+		return writeStructAt(w, bit_cast(*reflect.TypeInfo, typeInfo), ptr, ctx)
 	}
-	if f.Kind == reflect.KIND_ARRAY || f.Kind == reflect.KIND_SLICE {
+	if kind == reflect.KIND_ARRAY || kind == reflect.KIND_SLICE {
 		return w.Write("[...]")
 	}
 	return w.Write("<...>")
+}
+
+// writeElems renders `count` elements — each `elemSize` bytes, kind `elemKind`,
+// struct-element record `elemType` — laid out contiguously from address `base`,
+// as `[e0 e1 ...]`.  A count of 0 (e.g. an empty/nil slice) renders `[]` with no
+// deref of `base`.
+func writeElems(w @io.Writer, elemKind int, elemSize int, elemType *uint8, base int, count int,
+		ctx reflectCtx) (int, @errors.Error) {
+	var total int = 0
+	var n int
+	var e @errors.Error
+	n, e = w.Write("[")
+	total = total + n
+	if present(e) { return total, e }
+	for i := 0; i < count; i++ {
+		if i > 0 {
+			n, e = w.Write(" ")
+			total = total + n
+			if present(e) { return total, e }
+		}
+		var eptr *uint8 = bit_cast(*uint8, base + i * elemSize)
+		n, e = writeValue(w, elemKind, elemSize, elemType, eptr, ctx)
+		total = total + n
+		if present(e) { return total, e }
+	}
+	n, e = w.Write("]")
+	total = total + n
+	return total, e
 }
 
 // readSignedField reads a signed integer field of `size` bytes (1/2/4/8) at ptr,

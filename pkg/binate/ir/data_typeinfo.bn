@@ -43,73 +43,185 @@ func registerTypeInfo(m @Module, recvPkg @[]char, recvName @[]char, recvTyp @typ
 }
 
 // CollectTypeInfoDescs returns the distinct per-type records module `m` must
-// emit — one per TypeInfoEntry in the per-type registry (already deduped at
-// registration, so no symbol-dedup pass here), each carrying that type's
-// size/align/name read HERE (at codegen) off the entry's held RecvTyp.  Each
-// backend iterates this list and emits irdata.BuildTypeInfo(desc) through its
-// own data-global lowering; the weak linkage coalesces the same type emitted
-// from several TUs.  Keyed on the same (RecvPkg, RecvTypeName) as the `__ivt`
-// slot-1 reference, so the emitted record and the vtable pointer to it agree.
+// emit: the registered per-type entries (m.TypeInfos) PLUS the transitive closure
+// of by-value NAMED struct types reachable as a field of any of them (force-emit,
+// so a nested-struct field's typeinfo pointer targets a real, locally-defined
+// weak record — reflection recurses through it).  Each carries that type's
+// size/align/name/kind/field-table read HERE (at codegen) off the held RecvTyp.
+//
+// This is a DETERMINISTIC PURE function of m.TypeInfos: a worklist seeded from
+// m.TypeInfos in order, expanded in field-declaration order, deduped by
+// TypeInfoName symbol — so every one of its ~5 backend call sites (LLVM
+// emit/collectDefined, 3 native, VM) sees the byte-identical set.  That
+// consistency is load-bearing: the LLVM backend calls it once to emit weak
+// definitions and once to suppress redundant `external` decls, and the two must
+// agree or a force-emitted record gets both a def and an extern decl (a
+// redefinition error).  It does NOT mutate m.TypeInfos (which stays pure); the
+// force-emitted entries live only in the local worklist.  The by-value struct
+// graph is acyclic, so the closure terminates (dedup stops any re-add).
 func CollectTypeInfoDescs(m @Module) @[]@irdata.TypeInfoDesc {
 	var out @[]@irdata.TypeInfoDesc
+	var seen @[]@[]char
+	// Local worklist seeded from the registered entries (in order); force-emitted
+	// field-type entries are appended here, never to m.TypeInfos.
+	var wl @[]@TypeInfoEntry
 	for i := 0; i < len(m.TypeInfos); i++ {
-		var e @TypeInfoEntry = m.TypeInfos[i]
-		if e == nil { continue }
-		// Read the type's layout HERE (codegen), off the held RecvTyp — by now
-		// the in-place field population has run, so SizeOf is correct (at
-		// registration it would read an empty struct → 0).  The nil-guard is
-		// defensive: a real receiver holds a non-nil laid-out type, but were
-		// RecvTyp ever nil, SizeOf(nil) returns ptrSize() — a plausible-WRONG
-		// size — so guard to 0 rather than borrow a pointer's width.
-		var size int = 0
-		var align int = 0
-		var name @[]char
-		if e.RecvTyp != nil {
-			size = e.RecvTyp.SizeOf()
-			align = e.RecvTyp.AlignOf()
-			// The record's name is the type's canonical, path-qualified name
-			// (unambiguous across packages, TU-invariant) — read off the held
-			// RecvTyp at codegen, like size/align.
-			name = e.RecvTyp.QualifiedTypeName()
+		if m.TypeInfos[i] != nil {
+			wl = slices.Append[@TypeInfoEntry](wl, m.TypeInfos[i])
 		}
-		var desc @irdata.TypeInfoDesc = make(irdata.TypeInfoDesc)
-		desc.Sym = mangle.TypeInfoName(e.RecvPkg, e.RecvTypeName)
-		desc.Size = size
-		desc.Align = align
-		desc.Name = name
-		// Carry the receiver's qualified dtor name.  Each backend resolves it
-		// into the word-0 handle slot (DtorSym) via its own dtor-slot helper,
-		// gated on module presence exactly like the vtable slot-0 dtor; empty
-		// here for a type that needs no destruction.
-		desc.DtorFuncName = e.DtorFuncName
-		// Neutral name-blob symbol (each backend prefixes it into NameSym, like
-		// Sym); keyed on the receiver type like the record symbol.
-		desc.NameSym = mangle.TypeInfoNameBlobName(e.RecvPkg, e.RecvTypeName)
-		// KIND (record word 5) + field table — per-type facts read off RecvTyp
-		// HERE (codegen), like size/align.  A struct records each field's
-		// name/offset/kind/size; the per-field typeinfo pointer stays null until
-		// reflection recurses into nested records (a later phase), so this pass
-		// emits NO cross-record references.  FieldsSym/NamesSym are neutral (each
-		// backend prefixes them like NameSym), set only for a struct with fields.
-		if e.RecvTyp != nil {
-			desc.Kind = typeKind(e.RecvTyp)
-			var st @types.Type = structReprOf(e.RecvTyp)
-			if st != nil && len(st.Fields) > 0 {
-				desc.Fields = collectFieldDescs(st)
-				desc.FieldsSym = mangle.TypeFieldsName(e.RecvPkg, e.RecvTypeName)
-				desc.NamesSym = mangle.TypeFieldNamesName(e.RecvPkg, e.RecvTypeName)
+	}
+	for i := 0; i < len(wl); i++ {
+		var e @TypeInfoEntry = wl[i]
+		var sym @[]char = mangle.TypeInfoName(e.RecvPkg, e.RecvTypeName)
+		// Dedup by record symbol: a field type that also has its own registered
+		// entry (or is shared by several structs / reached via a diamond) is
+		// emitted exactly once.  A registered entry always wins — the seed loop
+		// enqueues all of m.TypeInfos before any field type — so its real dtor
+		// (from the ImplInfo) survives over a force-emit-derived one.
+		if symSeen(seen, sym) { continue }
+		seen = slices.Append[@[]char](seen, sym)
+		out = slices.Append[@irdata.TypeInfoDesc](out, buildTypeInfoDesc(m, e))
+		// Force-emit reachable by-value NAMED struct field types (their records
+		// carry field tables too, so recursion terminates on scalar leaves).
+		// Anonymous / alias struct fields yield no entry (fieldStructEntry → nil)
+		// and render a placeholder — a structural mangler for anon structs is a
+		// separate follow-up.
+		var st @types.Type = structReprOf(e.RecvTyp)
+		if st != nil {
+			for j := 0; j < len(st.Fields); j++ {
+				var fe @TypeInfoEntry = fieldStructEntry(m, st.Fields[j].Type)
+				if fe != nil {
+					wl = slices.Append[@TypeInfoEntry](wl, fe)
+				}
 			}
 		}
-		out = slices.Append[@irdata.TypeInfoDesc](out, desc)
 	}
 	return out
 }
 
+// buildTypeInfoDesc builds one per-type record desc from a (registered or
+// force-emitted) entry, reading the type's layout HERE (codegen), off the held
+// RecvTyp — by now the in-place field population has run, so SizeOf is correct.
+// The nil-guard is defensive: a real receiver holds a non-nil laid-out type, but
+// were RecvTyp ever nil, SizeOf(nil) returns ptrSize() — a plausible-WRONG size —
+// so guard to 0 rather than borrow a pointer's width.
+func buildTypeInfoDesc(m @Module, e @TypeInfoEntry) @irdata.TypeInfoDesc {
+	var size int = 0
+	var align int = 0
+	var name @[]char
+	if e.RecvTyp != nil {
+		size = e.RecvTyp.SizeOf()
+		align = e.RecvTyp.AlignOf()
+		// The record's name is the type's canonical, path-qualified name
+		// (unambiguous across packages, TU-invariant).
+		name = e.RecvTyp.QualifiedTypeName()
+	}
+	var desc @irdata.TypeInfoDesc = make(irdata.TypeInfoDesc)
+	desc.Sym = mangle.TypeInfoName(e.RecvPkg, e.RecvTypeName)
+	desc.Size = size
+	desc.Align = align
+	desc.Name = name
+	// Carry the receiver's qualified dtor name.  Each backend resolves it into
+	// the word-0 handle slot (DtorSym); empty for a type needing no destruction.
+	desc.DtorFuncName = e.DtorFuncName
+	desc.NameSym = mangle.TypeInfoNameBlobName(e.RecvPkg, e.RecvTypeName)
+	// KIND (record word 5) + field table.  FieldsSym/NamesSym are neutral (each
+	// backend prefixes them like NameSym), set only for a struct with fields.
+	if e.RecvTyp != nil {
+		desc.Kind = typeKind(e.RecvTyp)
+		var st @types.Type = structReprOf(e.RecvTyp)
+		if st != nil && len(st.Fields) > 0 {
+			desc.Fields = collectFieldDescs(m, st)
+			desc.FieldsSym = mangle.TypeFieldsName(e.RecvPkg, e.RecvTypeName)
+			desc.NamesSym = mangle.TypeFieldNamesName(e.RecvPkg, e.RecvTypeName)
+		}
+	}
+	return desc
+}
+
+// fieldStructName derives the (pkg, name) of a by-value NAMED struct field type —
+// the SAME derivation the box/assert sides use (receiverBaseTypeName +
+// splitQualName, empty-pkg → this module), so the field's typeinfo pointer is
+// byte-identical to the record force-emit produces (ODR-safe weak coalescing).
+// Returns ok=false for a non-struct field, or a struct with no nameable record
+// (an anonymous struct, or an alias — receiverBaseTypeName yields no name); such
+// a field gets a null typeinfo pointer and renders as a placeholder.
+func fieldStructName(m @Module, ft @types.Type) (@[]char, @[]char, bool) {
+	var empty @[]char
+	if typeKind(ft) != irdata.KIND_STRUCT {
+		return empty, empty, false
+	}
+	var bn @[]char = receiverBaseTypeName(ft)
+	if len(bn) == 0 {
+		return empty, empty, false
+	}
+	// An anonymous struct type carries a per-OCCURRENCE synthetic name
+	// (`__anon_<N>`, gen_type_resolve.bn) — occurrence-ordered, so neither
+	// structural nor TU-invariant, hence unsafe as the key of a weak,
+	// cross-TU-coalesced record (two distinct anon structs could collide on one
+	// `__anon_0` across TUs).  Skip: the field's typeinfo pointer stays null and
+	// it renders as a placeholder.  A structural anon-struct mangler (which would
+	// make anon records safe) is a tracked follow-up — plan-struct-reflection.md
+	// decision 7.
+	if isAnonStructName(bn) {
+		return empty, empty, false
+	}
+	var pkg @[]char
+	var name @[]char
+	pkg, name = splitQualName(bn)
+	if len(pkg) == 0 {
+		pkg = m.PkgPath
+	}
+	return pkg, name, true
+}
+
+// isAnonStructName reports whether a struct type's name is a compiler-synthesized
+// anonymous-struct name (`__anon_<N>`) rather than a user-written nominal name.
+func isAnonStructName(name *[]readonly char) bool {
+	var pfx *[]readonly char = "__anon_"
+	if len(name) < len(pfx) { return false }
+	for i := 0; i < len(pfx); i++ {
+		if name[i] != pfx[i] { return false }
+	}
+	return true
+}
+
+// fieldStructEntry builds a synthetic force-emit entry for a by-value named
+// struct field type (its record + field table must exist so the field's
+// typeinfo pointer resolves), or nil for a non-struct / un-nameable field.  The
+// dtor is derived the SAME way a box of that type would (boxSlot0DtorName), so a
+// force-emitted record is byte-identical to any box/impl record for the type.
+func fieldStructEntry(m @Module, ft @types.Type) @TypeInfoEntry {
+	var pkg @[]char
+	var name @[]char
+	var ok bool
+	pkg, name, ok = fieldStructName(m, ft)
+	if !ok { return nil }
+	var st @types.Type = structReprOf(ft)
+	var e @TypeInfoEntry = make(TypeInfoEntry)
+	e.RecvPkg = pkg
+	e.RecvTypeName = name
+	e.RecvTyp = st
+	e.DtorFuncName = boxSlot0DtorName(m, pkg, name, st)
+	return e
+}
+
+// symSeen reports whether `sym` is already in the emitted-set `seen`.
+func symSeen(seen @[]@[]char, sym *[]readonly char) bool {
+	for i := 0; i < len(seen); i++ {
+		if charEq(seen[i], sym) { return true }
+	}
+	return false
+}
+
 // collectFieldDescs builds the per-field metadata for a struct type's field
-// table (declaration order): each field's source name, byte offset, KIND_*
-// tag, and type size.  The per-field typeinfo pointer is left empty (null) —
-// P1 does not reference nested records.
-func collectFieldDescs(st @types.Type) @[]@irdata.FieldInfoDesc {
+// table (declaration order): each field's source name, byte offset, KIND_* tag,
+// and type size.  For a by-value NAMED struct field it also sets the per-field
+// typeinfo pointer (mangle.TypeInfoName of the field type) — the record is
+// force-emitted by CollectTypeInfoDescs, so the pointer resolves and reflection
+// recurses into the nested struct.  Non-struct fields, and anonymous / alias
+// struct fields (no nameable record), leave it null (a placeholder).
+func collectFieldDescs(m @Module, st @types.Type) @[]@irdata.FieldInfoDesc {
 	var out @[]@irdata.FieldInfoDesc
 	for i := 0; i < len(st.Fields); i++ {
 		var f @types.Field = st.Fields[i]
@@ -119,6 +231,15 @@ func collectFieldDescs(st @types.Type) @[]@irdata.FieldInfoDesc {
 		fd.Kind = typeKind(f.Type)
 		if f.Type != nil {
 			fd.Size = f.Type.SizeOf()
+		}
+		if fd.Kind == irdata.KIND_STRUCT {
+			var fpkg @[]char
+			var fname @[]char
+			var ok bool
+			fpkg, fname, ok = fieldStructName(m, f.Type)
+			if ok {
+				fd.TypeInfoSym = mangle.TypeInfoName(fpkg, fname)
+			}
 		}
 		out = slices.Append[@irdata.FieldInfoDesc](out, fd)
 	}

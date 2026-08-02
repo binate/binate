@@ -156,24 +156,18 @@ func main() {
 
 The `pkg/bootstrap` package provides the OS-level primitives we lean on while bootstrapping the toolchain. In compiled binaries they're backed by the C runtime in `runtime/binate_runtime.c`; in `bni` (the bytecode VM) they're forwarded by the host process through the extern registry.
 
-It's slated for replacement by a proper OS-abstraction package once the stdlib design lands (see [explorations/claude-todo.md](https://github.com/binate/explorations/blob/main/claude-todo.md)). Existing uses are fine until then; **don't extend its surface with new primitives** — wait for the replacement instead.
+Its surface has been steadily slimmed as the stdlib OS abstraction (`pkg/std/os`, `pkg/std/os/process`) took over; what remains is the minimal set the print/println lowering and process startup still reach directly. **Don't extend its surface with new primitives** — add them to `pkg/std/os` instead.
 
 Current surface:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `Open`   | `(path *[]char, flags int) int` | Open file, returns fd |
-| `Read`   | `(fd int, buf *[]uint8, n int) int` | Read bytes into buffer |
-| `Write`  | `(fd int, buf *[]uint8, n int) int` | Write bytes from buffer |
-| `Close`  | `(fd int) int` | Close file descriptor |
-| `Exit`   | `(code int)` | Exit process |
-| `Args`   | `() *[]*[]char` | Program arguments (after `--`) |
-| `Stat`   | `(path *[]char) int` | 0=not found, 1=file, 2=directory |
-| `ReadDir`| `(path *[]char) *[]*[]char` | Sorted directory entries |
-| `Itoa`   | `(v int) *[]char` | Int to decimal string |
-| `Concat` | `(a *[]char, b *[]char) *[]char` | String concatenation |
+| `Write` | `(fd int, buf *[]readonly uint8) int` | Write `len(buf)` bytes to `fd` (1 = stdout, 2 = stderr); returns bytes written or -1. The print/println lowering's I/O sink. |
+| `Args`  | `() @[]@[]char` | Command-line arguments, as managed slices |
 
-Constants: `O_RDONLY`, `O_WRONLY`, `O_RDWR`, `O_CREATE`, `O_TRUNC`, `O_APPEND`, `STDIN`, `STDOUT`, `STDERR`.
+Plus the print/println lowering's internal integer/float/bool formatting helpers — `formatInt`, `formatInt64`, `formatUint`, `formatBool`, `formatFloat` — which IR-gen emits direct calls to; not intended for direct use.
+
+General file I/O now lives in `pkg/std/os`, process control in `pkg/std/os/process`; the historical `Open` / `Read` / `Close` / `Exit` / `Stat` / `ReadDir` / `Itoa` / `Concat` / `Exec` surface and its `O_*` / `STD*` constants have been retired.
 
 ## Testing
 

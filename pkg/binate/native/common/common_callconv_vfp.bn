@@ -1,0 +1,206 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/types"
+
+// ============================================================
+// AAPCS-VFP float-argument allocation (cc.VfpBackfill)
+// ============================================================
+//
+// Under the arm32 hard-float ABI (AAPCS-VFP), float scalar arguments are NOT
+// allocated by the monotonic NSRN cursor the LP64 conventions use.  The 8 double
+// / 16 single FP argument registers are ONE physical bank — d0..d7 === s0..s15
+// (D_n = {S_2n, S_2n+1}) — and allocation is at single-slot (S) granularity with
+// an even-alignment constraint for doubles, plus BACK-FILL, plus a stack-poison
+// latch (AAPCS §6.1.2.1, VFP variant):
+//
+//   - float32 (1 S-slot): the LOWEST-numbered free S-slot, which may be BELOW the
+//     current high-water — back-filling a hole an earlier float64's even-alignment
+//     left free.
+//   - float64 (1 D = an even-aligned S-pair): the lowest EVEN i with S_i and
+//     S_{i+1} both free (D_{i/2}); any odd slot skipped below i stays free for a
+//     later float32 to back-fill.
+//   - stack-poison: the FIRST FP-eligible arg that spills to the stack latches the
+//     bank exhausted — every later FP arg then stacks too, even if free S-slots
+//     remain (back-fill is disabled once the bank has overflowed).
+//
+//   Worked example  f(d0:float64, f0:float32, d1:float64, f1:float32):
+//     d0 → D0 (s0,s1);  f0 → s2;  d1 → D2 (s4,s5, since s2 is taken — s3 a hole);
+//     f1 → s3 (back-fills the hole).  A naive +2/+1 NSRN model would put f1 in s6,
+//     an ABI mismatch with an LLVM-compiled (clang -mfloat-abi=hard) callee.
+//
+// The state is a 16-bit S-occupancy mask (bit i set == S<i> in use) plus a
+// bankExhausted latch, both threaded as plain loop locals through the three arg
+// walkers (exactly as NSRN is threaded on the monotonic path — no persistent
+// state).  vfpArgPlace is the SINGLE allocator predicate the walkers AND
+// CallArgFpReg all consult, so the in-reg-vs-stack decision, the stack accounting,
+// and the concrete register the emitter reads cannot diverge (the "one predicate"
+// discipline, mirroring how sysvSseAggFitsInRegs is shared).
+//
+// SCOPE (increment 3a): scalar float args only.  Hard-float HOMOGENEOUS
+// FLOAT-AGGREGATE (HFA) passing is ALSO a VFP CPRC that back-fills as a unit of N
+// slots, but it is a tracked follow-up (see explorations recon §2/§4) — under
+// cc.VfpBackfill an HFA still rides the legacy nsrn path in argRegWordsStackWords
+// below, which does NOT back-fill and does NOT observe the mask.  That is
+// incomplete (and inert: cc.VfpBackfill is only set when types.Arm32HardFloat(),
+// which no target stamps yet); the follow-up must route HFAs through this mask.
+
+// vfpArgPlace classifies FP-eligible arg t under the AAPCS-VFP allocator, given
+// the running 16-bit S-occupancy mask and the bankExhausted latch.  Returns
+// (sSlot, isDouble, isFloat, newMask, newExhausted):
+//   - isFloat reports whether t is an FP-eligible float scalar at all.  A
+//     non-float returns isFloat=false with mask/exhausted unchanged, and its
+//     sSlot/isDouble are meaningless — the caller runs the GP path.
+//   - For a float, sSlot is the assigned S-slot BASE (0..15) when it rides a
+//     register: a float32 occupies S<sSlot>, a float64 occupies the pair
+//     S<sSlot>,S<sSlot+1> (= D<sSlot/2>).  sSlot -1 means it spilled to the stack;
+//     the spill latches newExhausted true, disabling all further back-fill.
+//   - isDouble is true for a float64 (S-pair), false for a float32 (single S).
+func (cc CallConv) vfpArgPlace(t @types.Type, mask int, exh bool) (int, bool, bool, int, bool) {
+	if !IsFloatScalarTyp(t) {
+		return -1, false, false, mask, exh
+	}
+	var isDouble bool = !FloatScalarIsI32(t)
+	if exh {
+		return -1, isDouble, true, mask, true
+	}
+	if isDouble {
+		// Lowest even S-slot with both it and its successor free (D_{i/2}).
+		for i := 0; i + 1 < 16; i = i + 2 {
+			if (mask & (1 << i)) == 0 && (mask & (1 << (i + 1))) == 0 {
+				return i, true, true, mask | (1 << i) | (1 << (i + 1)), false
+			}
+		}
+		return -1, true, true, mask, true
+	}
+	// float32: lowest free single S-slot (may back-fill a hole below high-water).
+	for i := 0; i < 16; i = i + 1 {
+		if (mask & (1 << i)) == 0 {
+			return i, false, true, mask | (1 << i), false
+		}
+	}
+	return -1, false, true, mask, true
+}
+
+// vfpCallArgRegStart is the cc.VfpBackfill form of CallArgRegStart: a float scalar
+// rides the VFP bank and NEVER consumes a GP register (returns -1); every non-float
+// arg walks the ordinary GP path (argRegWordsStackWords + advanceNgrn), unchanged.
+func (cc CallConv) vfpCallArgRegStart(argTypes @[]@types.Type, i int) int {
+	var ngrn int = 0
+	var nsrn int = 0
+	var mask int = 0
+	var exhausted bool = false
+	for k := 0; k <= i; k++ {
+		_, _, isFloat, newMask, newExh := cc.vfpArgPlace(argTypes[k], mask, exhausted)
+		if isFloat {
+			if k == i { return -1 }
+			mask = newMask
+			exhausted = newExh
+			continue
+		}
+		rs, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn, nsrn)
+		if k == i { return rs }
+		nsrn = cc.advanceNsrn(argTypes[k], ngrn, nsrn)
+		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
+	}
+	return -1
+}
+
+// vfpCallArgStackOff is the cc.VfpBackfill form of CallArgStackOff: a float that
+// rides an FP register has no stack slot (-1); a spilled float takes its ILP32
+// footprint (float32 → 4 B, float64 → 8 B / 8-aligned via stackArgFootprint), and
+// non-float args keep the ordinary GP stack accounting.
+func (cc CallConv) vfpCallArgStackOff(argTypes @[]@types.Type, i int) int {
+	var ngrn int = 0
+	var nsrn int = 0
+	var mask int = 0
+	var exhausted bool = false
+	var soff int = 0
+	for k := 0; k <= i; k++ {
+		sSlot, _, isFloat, newMask, newExh := cc.vfpArgPlace(argTypes[k], mask, exhausted)
+		if isFloat {
+			mask = newMask
+			exhausted = newExh
+			if sSlot >= 0 {
+				if k == i { return -1 }
+			} else {
+				var sw int = cc.ArgWords(argTypes[k])
+				align, bytes := cc.stackArgFootprint(argTypes[k], sw, false)
+				soff = alignUpStack(soff, align)
+				if k == i { return soff }
+				soff = soff + bytes
+			}
+			continue
+		}
+		rs, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn, nsrn)
+		align, bytes := cc.stackArgFootprint(argTypes[k], sw, false)
+		if sw > 0 {
+			soff = alignUpStack(soff, align)
+			if k == i { return soff }
+			soff = soff + bytes
+		} else if k == i {
+			return -1
+		}
+		nsrn = cc.advanceNsrn(argTypes[k], ngrn, nsrn)
+		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
+	}
+	return -1
+}
+
+// vfpCallStackBytes is the cc.VfpBackfill form of CallStackBytes: the total
+// outgoing-args area, summing only the FP args that spilled (past the 16 S-slots
+// or after the stack-poison latch) plus the ordinary GP stack tally, rounded up to
+// StackAlign.
+func (cc CallConv) vfpCallStackBytes(argTypes @[]@types.Type) int {
+	var ngrn int = 0
+	var nsrn int = 0
+	var mask int = 0
+	var exhausted bool = false
+	var soff int = 0
+	for k := 0; k < len(argTypes); k++ {
+		sSlot, _, isFloat, newMask, newExh := cc.vfpArgPlace(argTypes[k], mask, exhausted)
+		if isFloat {
+			mask = newMask
+			exhausted = newExh
+			if sSlot < 0 {
+				var sw int = cc.ArgWords(argTypes[k])
+				align, bytes := cc.stackArgFootprint(argTypes[k], sw, false)
+				soff = alignUpStack(soff, align) + bytes
+			}
+			continue
+		}
+		rs, rw, sw := cc.argRegWordsStackWords(argTypes[k], ngrn, nsrn)
+		if sw > 0 {
+			align, bytes := cc.stackArgFootprint(argTypes[k], sw, false)
+			soff = alignUpStack(soff, align) + bytes
+		}
+		nsrn = cc.advanceNsrn(argTypes[k], ngrn, nsrn)
+		ngrn = cc.advanceNgrn(argTypes[k], ngrn, rs, rw, sw)
+	}
+	if cc.StackAlign > 1 && soff % cc.StackAlign != 0 {
+		soff = soff + (cc.StackAlign - soff % cc.StackAlign)
+	}
+	return soff
+}
+
+// CallArgFpReg walks the same allocator to report the concrete VFP register float
+// arg i lands in.  Only float args touch the mask, so non-float args between
+// floats leave it unchanged — ngrn need not be threaded here.  Returns the D-index
+// (float64) or S-index (float32), or (-1, false) when arg i is not an in-register
+// float or cc.VfpBackfill is off.
+func (cc CallConv) CallArgFpReg(argTypes @[]@types.Type, i int) (int, bool) {
+	if !cc.VfpBackfill { return -1, false }
+	var mask int = 0
+	var exhausted bool = false
+	for k := 0; k <= i; k++ {
+		sSlot, isDouble, isFloat, newMask, newExh := cc.vfpArgPlace(argTypes[k], mask, exhausted)
+		if k == i {
+			if !isFloat { return -1, false }
+			if sSlot < 0 { return -1, false }
+			if isDouble { return sSlot / 2, true }
+			return sSlot, false
+		}
+		mask = newMask
+		exhausted = newExh
+	}
+	return -1, false
+}

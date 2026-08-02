@@ -168,7 +168,6 @@ Current surface:
 | `Close`  | `(fd int) int` | Close file descriptor |
 | `Exit`   | `(code int)` | Exit process |
 | `Args`   | `() *[]*[]char` | Program arguments (after `--`) |
-| `Exec`   | `(cmd *[]char, args *[]*[]char) int` | Execute command, returns exit code |
 | `Stat`   | `(path *[]char) int` | 0=not found, 1=file, 2=directory |
 | `ReadDir`| `(path *[]char) *[]*[]char` | Sorted directory entries |
 | `Itoa`   | `(v int) *[]char` | Int to decimal string |

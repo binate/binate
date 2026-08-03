@@ -173,6 +173,15 @@ for bn in "$SCRIPT_DIR"/*.bn; do
     run_s="$(delta "$t1" "$t2")s"
     rm -f "$tmpbin"
 
+    # total = compile + run (the end-to-end "compile then run" cost, the
+    # apples-to-apples against an interpreted mode's run).  A no-compile mode
+    # (compile=-) has total == run.
+    if [ "$has_compile" -eq 1 ]; then
+        total_s="$(delta "$t0" "$t2")s"
+    else
+        total_s="$run_s"
+    fi
+
     if [ "$actual" = "$expected_content" ]; then
         status="PASS"
     else
@@ -180,8 +189,8 @@ for bn in "$SCRIPT_DIR"/*.bn; do
         failures=$((failures + 1))
         failure_names="$failure_names $name"
     fi
-    printf "%-12s %-20s compile=%-8s run=%-8s [%s]\n" \
-        "$MODE" "$name" "$compile_s" "$run_s" "$status"
+    printf "%-12s %-20s compile=%-8s run=%-8s total=%-8s [%s]\n" \
+        "$MODE" "$name" "$compile_s" "$run_s" "$total_s" "$status"
     if [ "$status" = "FAIL" ]; then
         echo "  expected: $expected_content"
         echo "  actual:   $actual"

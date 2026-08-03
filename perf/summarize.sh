@@ -2,13 +2,17 @@
 # Usage: ./perf/summarize.sh <results-dir>
 #
 # Aggregates per-mode perf-test output files (`<mode>.txt`) from
-# <results-dir> into a single markdown table on stdout. Each row is
-# a test; each column is a mode. Cell shows the `run=` timing, or
-# `SKIP` / `COMPILE_ERROR` / `FAIL` for non-OK statuses.
+# <results-dir> into markdown tables on stdout: one table each for the
+# TOTAL (compile+run), COMPILE, and RUN timings.  So the summary carries
+# both the end-to-end cost (compile+run — the apples-to-apples against an
+# interpreted mode's run, now that compiled fixtures pull in real stdlib)
+# AND the separate compile / run breakdown (run-only stays the useful
+# comparison among compiled modes).  Each table is a test×mode grid; a
+# cell shows the timing for a PASS, the status (COMPILE_ERROR / FAIL / SKIP)
+# for a non-PASS, or an em dash when the test is absent for that mode.
 #
-# Used by the perf-tests CI workflow's summary job. The output is
-# fed into $GITHUB_STEP_SUMMARY so the workflow run page renders it
-# inline.
+# Used by the perf-tests CI workflow's summary job. The output is fed into
+# $GITHUB_STEP_SUMMARY so the workflow run page renders it inline.
 
 set -e
 
@@ -25,63 +29,73 @@ if [ -z "$modes" ]; then
     exit 1
 fi
 
-# Tests are the union of test names across all modes, in lexical
-# order. Each results file has lines of the form:
-#   <mode>  <name>  compile=<s>  run=<s>  [STATUS]
-# (status is PASS / FAIL / COMPILE_ERROR; skipped tests show up
-# differently — see the `[SKIP]` arm below).
+# Tests are the union of test names across all modes, in lexical order.
+# Each results file has lines of the form:
+#   <mode>  <name>  compile=<s>  run=<s>  total=<s>  [STATUS]
+# (a COMPILE_ERROR line has only compile=; a SKIP line has neither.)
 all_tests=$(awk '
     /^[a-zA-Z0-9_-]+ +[0-9]+_/ { print $2 }
 ' "$RESULTS_DIR"/*.txt | sort -u)
 
-# Build a header. The first column is the test name; one column per mode.
-{
-    printf '## Perf summary\n\n'
+# emit_table <heading> <field>
+# Renders a test×mode markdown table whose cells are the given field
+# (compile / run / total).  A PASS cell shows the timing; a non-PASS cell
+# shows its status; a test absent for a mode shows an em dash.
+emit_table() {
+    heading="$1"
+    field="$2"
+    printf '### %s\n\n' "$heading"
     printf '| test |'
     for m in $modes; do printf ' %s |' "$m"; done
     printf '\n'
     printf '| --- |'
     for m in $modes; do printf ' --- |'; done
     printf '\n'
-
-    # Row per test.
     for t in $all_tests; do
         printf '| %s |' "$t"
         for m in $modes; do
-            cell=$(awk -v t="$t" '
+            cell=$(awk -v t="$t" -v field="$field" '
                 $2 == t {
-                    # Extract status (last bracketed token) and run= field.
-                    line = $0
-                    # Strip everything after the leading "compile=" prefix into fields.
-                    # Layout: <mode> <name> compile=<s> run=<s> [STATUS]
                     status = ""
-                    if (match(line, /\[[A-Z_]+\]/)) {
-                        status = substr(line, RSTART+1, RLENGTH-2)
+                    if (match($0, /\[[A-Z_]+\]/)) {
+                        status = substr($0, RSTART + 1, RLENGTH - 2)
+                    } else if ($3 == "SKIP") {
+                        # A skip line is `<mode> <name> SKIP (reason)` — no
+                        # bracketed status and no timing fields.
+                        status = "SKIP"
                     }
-                    runs = ""
-                    if (match(line, /run=[^ ]+/)) {
-                        runs = substr(line, RSTART+4, RLENGTH-4)
+                    val = ""
+                    if (match($0, field "=[^ ]+")) {
+                        val = substr($0, RSTART + length(field) + 1,
+                                     RLENGTH - length(field) - 1)
                     }
-                    if (status == "PASS") { print runs }
+                    if (status == "PASS") { print val }
                     else if (status == "") { print "?" }
-                    else { print status " " runs }
+                    else { print status }
                     exit
                 }
             ' "$RESULTS_DIR/$m.txt")
             if [ -z "$cell" ]; then
-                # Mode-specific skip (NNN_name.skip.<mode> file)
-                # or otherwise absent — show a dash.
+                # Test entirely absent from this mode's results.
                 cell="—"
             fi
             printf ' %s |' "$cell"
         done
         printf '\n'
     done
-
     printf '\n'
+}
 
-    # Per-mode trailing notes: include the `=== <mode>: N failure(s)`
-    # tail line if present, so the summary surfaces failures.
+{
+    printf '## Perf summary\n\n'
+    printf 'Timings in seconds. **Total** = compile + run (end-to-end, comparable to an '
+    printf 'interpreted-mode run); **Compile** and **Run** are the separate breakdown.\n\n'
+    emit_table 'Total (compile + run)' total
+    emit_table 'Compile' compile
+    emit_table 'Run' run
+
+    # Per-mode trailing notes: the `=== <mode>: N failure(s)` tail line, if
+    # present, so the summary surfaces failures.
     failures_shown=0
     for m in $modes; do
         tail=$(grep '^=== ' "$RESULTS_DIR/$m.txt" 2>/dev/null || true)

@@ -1,0 +1,395 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// Hard-float (VFP / AAPCS-VFP) COMPUTE path
+// ============================================================
+//
+// arm32-linux (arm-linux-gnueabihf) is HARD-float: it has a VFP unit, so the
+// float COMPUTE ops lower to native VFP instructions (arm32_vfp.bn) instead of
+// the AEABI libcalls the soft path (arm32_float.bn) uses.  This path is gated
+// on types.Arm32HardFloat() and is INERT until a target is stamped
+// FLOAT_ABI_HARD (P6 inc 3e); when the gate is false the soft path runs
+// byte-for-byte unchanged.
+//
+// COMPUTE MODEL — floats still HOME in GP value slots.  Like the aarch64
+// sibling (aarch64_float.bn), a float's value slot is a GP word (float32) or a
+// GP register pair (float64), reloaded via emitValOperand / load64 and spilled
+// via nextReg+spill / store64 — exactly as the soft path and the integer paths
+// do.  VFP registers are used ONLY as transient per-op compute scratch: each op
+// VMOVs its GP operand word(s) into a fixed scratch S/D reg, runs the VFP
+// instruction, and VMOVs the result back into a GP reg.  There is no VFP
+// register allocation and no cross-op VFP liveness, so fixed scratch regs are
+// safe (no save/restore — they never carry a value across an op boundary).
+//
+// int64 / uint64 <-> float casts have NO single VFP instruction (VFP VCVT
+// converts 32-bit integer operands only), so they STAY on the AEABI libcall
+// path in arm32_float_cast.bn — emitFloatCastHard returns false for them, and
+// the soft dispatch runs.  Same-width float<->float and OP_BIT_CAST are pure
+// reinterprets of an identical GP representation, so they also stay on the GP
+// path (emitFloatCastHard returns false; emitFloatBitCast has no hard branch).
+//
+// FP_SCRATCH_D_A / _D_B are the double-precision compute scratch (f64 ops);
+// FP_SCRATCH_S_A / _S_B the single-precision scratch (f32 ops) and the VCVT
+// integer-operand holder.  The single set (S4/S5 = D2) is DISJOINT from the
+// double set (D0/D1), so a mixed-precision VCVT (which needs one S and one D
+// simultaneously) never has its operand and result overlap.
+
+// FP_SCRATCH_D_A is the primary double-precision compute scratch (LHS / result).
+const FP_SCRATCH_D_A int = arm32.D0
+
+// FP_SCRATCH_D_B is the secondary double-precision compute scratch (RHS).
+const FP_SCRATCH_D_B int = arm32.D1
+
+// FP_SCRATCH_S_A is the primary single-precision compute scratch (LHS / result /
+// VCVT integer-operand holder).
+const FP_SCRATCH_S_A int = arm32.S4
+
+// FP_SCRATCH_S_B is the secondary single-precision compute scratch (RHS).
+const FP_SCRATCH_S_B int = arm32.S5
+
+// ============================================================
+// Arithmetic
+// ============================================================
+
+// emitFloatBinopHard lowers OP_ADD/SUB/MUL/DIV to a native VFP instruction.
+// Operand words are reloaded from their GP slots, VMOV'd into VFP scratch, the
+// VFP op runs, and the result VMOV's back into a fresh GP reg / pair for the
+// standard spill.  The caller (emitFloatBinop) has already validated 2 operands.
+func emitFloatBinopHard(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr) {
+	if isFloat64Typ(ins.Typ) {
+		var alo int
+		var ahi int
+		alo, ahi = load64(a, rm, ins.Args[0])
+		if alo < 0 {
+			a.SetError("native arm32: float64 binop operand not materializable")
+			return
+		}
+		var blo int
+		var bhi int
+		blo, bhi = load64(a, rm, ins.Args[1])
+		if blo < 0 {
+			a.SetError("native arm32: float64 binop operand not materializable")
+			return
+		}
+		arm32.VmovCoresToDouble(a, arm32.COND_AL, FP_SCRATCH_D_A, alo, ahi)
+		arm32.VmovCoresToDouble(a, arm32.COND_AL, FP_SCRATCH_D_B, blo, bhi)
+		emitVfpArithF64(a, ins.Op, FP_SCRATCH_D_A, FP_SCRATCH_D_A, FP_SCRATCH_D_B)
+		rm.ResetRegs()
+		var rlo int = scratchReg(rm)
+		var rhi int = scratchReg(rm)
+		arm32.VmovDoubleToCores(a, arm32.COND_AL, rlo, rhi, FP_SCRATCH_D_A)
+		store64(a, rm, ins, rlo, rhi)
+		return
+	}
+	var sa int = emitValOperand(a, pkgName, rm, ins.Args[0])
+	if sa < 0 {
+		a.SetError("native arm32: float32 binop operand not materializable")
+		return
+	}
+	var sb int = emitValOperand(a, pkgName, rm, ins.Args[1])
+	if sb < 0 {
+		a.SetError("native arm32: float32 binop operand not materializable")
+		return
+	}
+	arm32.VmovCoreToSingle(a, arm32.COND_AL, FP_SCRATCH_S_A, sa)
+	arm32.VmovCoreToSingle(a, arm32.COND_AL, FP_SCRATCH_S_B, sb)
+	emitVfpArithF32(a, ins.Op, FP_SCRATCH_S_A, FP_SCRATCH_S_A, FP_SCRATCH_S_B)
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	arm32.VmovSingleToCore(a, arm32.COND_AL, rd, FP_SCRATCH_S_A)
+}
+
+// emitVfpArithF64 emits the double-precision VFP op for one arithmetic OP_*.
+// Only the four arithmetic ops reach here (the instrIsFloat gate).
+func emitVfpArithF64(a @asm.Assembler, op int, dd int, dn int, dm int) {
+	if op == iropcode.OP_ADD {
+		arm32.VaddF64(a, arm32.COND_AL, dd, dn, dm)
+		return
+	}
+	if op == iropcode.OP_SUB {
+		arm32.VsubF64(a, arm32.COND_AL, dd, dn, dm)
+		return
+	}
+	if op == iropcode.OP_MUL {
+		arm32.VmulF64(a, arm32.COND_AL, dd, dn, dm)
+		return
+	}
+	arm32.VdivF64(a, arm32.COND_AL, dd, dn, dm)
+}
+
+// emitVfpArithF32 emits the single-precision VFP op for one arithmetic OP_*.
+func emitVfpArithF32(a @asm.Assembler, op int, sd int, sn int, sm int) {
+	if op == iropcode.OP_ADD {
+		arm32.VaddF32(a, arm32.COND_AL, sd, sn, sm)
+		return
+	}
+	if op == iropcode.OP_SUB {
+		arm32.VsubF32(a, arm32.COND_AL, sd, sn, sm)
+		return
+	}
+	if op == iropcode.OP_MUL {
+		arm32.VmulF32(a, arm32.COND_AL, sd, sn, sm)
+		return
+	}
+	arm32.VdivF32(a, arm32.COND_AL, sd, sn, sm)
+}
+
+// ============================================================
+// Negate
+// ============================================================
+
+// emitFloatNegHard lowers OP_NEG via VNEG (a true FP negate — flips the sign of
+// zeroes and NaNs the same way an IEEE negate does).  The caller has already
+// validated 1 operand.
+func emitFloatNegHard(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr) {
+	if isFloat64Typ(ins.Typ) {
+		var lo int
+		var hi int
+		lo, hi = load64(a, rm, ins.Args[0])
+		if lo < 0 {
+			a.SetError("native arm32: float64 neg operand not materializable")
+			return
+		}
+		arm32.VmovCoresToDouble(a, arm32.COND_AL, FP_SCRATCH_D_A, lo, hi)
+		arm32.VnegF64(a, arm32.COND_AL, FP_SCRATCH_D_A, FP_SCRATCH_D_A)
+		rm.ResetRegs()
+		var rlo int = scratchReg(rm)
+		var rhi int = scratchReg(rm)
+		arm32.VmovDoubleToCores(a, arm32.COND_AL, rlo, rhi, FP_SCRATCH_D_A)
+		store64(a, rm, ins, rlo, rhi)
+		return
+	}
+	var src int = emitValOperand(a, pkgName, rm, ins.Args[0])
+	if src < 0 {
+		a.SetError("native arm32: float32 neg operand not materializable")
+		return
+	}
+	arm32.VmovCoreToSingle(a, arm32.COND_AL, FP_SCRATCH_S_A, src)
+	arm32.VnegF32(a, arm32.COND_AL, FP_SCRATCH_S_A, FP_SCRATCH_S_A)
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	arm32.VmovSingleToCore(a, arm32.COND_AL, rd, FP_SCRATCH_S_A)
+}
+
+// ============================================================
+// Compare
+// ============================================================
+
+// emitFloatCompareHard lowers OP_EQ/NE/LT/LE/GT/GE to VCMP + VMRS APSR_nzcv +
+// a 0/1 materialize (Mov #0 then a CONDITIONAL Mov #1).  The condition codes
+// are NaN-safe (see floatCompareCond): the ordered relations key off N / C so
+// an unordered (NaN) compare — which sets C=1,V=1 — never makes an ordered
+// relation fire.  The caller has already validated 2 operands.
+//
+// VMRS copies FPSCR N/Z/C/V into CPSR; the Mov #0 (COND_AL, S=0) does not touch
+// the flags, so the conditional Mov #1 still tests VMRS's result.
+func emitFloatCompareHard(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr) {
+	if isFloat64Typ(ins.Args[0].Typ) {
+		var alo int
+		var ahi int
+		alo, ahi = load64(a, rm, ins.Args[0])
+		if alo < 0 {
+			a.SetError("native arm32: float64 compare operand not materializable")
+			return
+		}
+		var blo int
+		var bhi int
+		blo, bhi = load64(a, rm, ins.Args[1])
+		if blo < 0 {
+			a.SetError("native arm32: float64 compare operand not materializable")
+			return
+		}
+		arm32.VmovCoresToDouble(a, arm32.COND_AL, FP_SCRATCH_D_A, alo, ahi)
+		arm32.VmovCoresToDouble(a, arm32.COND_AL, FP_SCRATCH_D_B, blo, bhi)
+		arm32.VcmpF64(a, arm32.COND_AL, FP_SCRATCH_D_A, FP_SCRATCH_D_B)
+	} else {
+		var sa int = emitValOperand(a, pkgName, rm, ins.Args[0])
+		if sa < 0 {
+			a.SetError("native arm32: float32 compare operand not materializable")
+			return
+		}
+		var sb int = emitValOperand(a, pkgName, rm, ins.Args[1])
+		if sb < 0 {
+			a.SetError("native arm32: float32 compare operand not materializable")
+			return
+		}
+		arm32.VmovCoreToSingle(a, arm32.COND_AL, FP_SCRATCH_S_A, sa)
+		arm32.VmovCoreToSingle(a, arm32.COND_AL, FP_SCRATCH_S_B, sb)
+		arm32.VcmpF32(a, arm32.COND_AL, FP_SCRATCH_S_A, FP_SCRATCH_S_B)
+	}
+	arm32.VmrsApsrNzcv(a, arm32.COND_AL)
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	arm32.Mov(a, arm32.COND_AL, false, rd, arm32.Imm(0))
+	arm32.Mov(a, floatCompareCond(ins.Op), false, rd, arm32.Imm(1))
+}
+
+// floatCompareCond returns the NaN-safe ARM condition for a float relation,
+// tested after VCMP + VMRS.  VFP flags: ordered-LT -> N=1; EQ -> Z=1,C=1;
+// ordered-GT -> C=1; UNORDERED(NaN) -> C=1,V=1.  The ordered relations MUST NOT
+// fire on unordered, so `<` uses MI (N=1) not LT (N!=V, which fires on
+// unordered N=0,V=1) and `<=` uses LS (C=0 or Z=1) not LE — mirroring the
+// aarch64 sibling's OP_LT->MI / OP_LE->LS mapping.  `!=` is NE (Z=0), true on
+// NaN — the unordered complement of `==`.
+func floatCompareCond(op int) int {
+	if op == iropcode.OP_EQ { return arm32.COND_EQ }
+	if op == iropcode.OP_NE { return arm32.COND_NE }
+	if op == iropcode.OP_LT { return arm32.COND_MI }
+	if op == iropcode.OP_LE { return arm32.COND_LS }
+	if op == iropcode.OP_GT { return arm32.COND_GT }
+	return arm32.COND_GE // OP_GE
+}
+
+// ============================================================
+// Casts (32-bit-int and float<->float only; 64-bit stays AEABI)
+// ============================================================
+
+// emitFloatCastHard lowers an OP_CAST with a float endpoint via VFP VCVT, for
+// the cases VFP can do in one instruction: f32<->f64 widen/narrow and
+// int32<->float.  Returns true when it emitted; false when the cast must stay
+// on the soft AEABI / GP path — a same-width float<->float reinterpret (pure GP
+// copy) or an int64/uint64<->float cast (no single VFP VCVT; VCVT is 32-bit-int
+// only).
+func emitFloatCastHard(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins @ir.Instr,
+		srcTyp @types.Type, dstTyp @types.Type) bool {
+	var srcF bool = isFloatTyp(srcTyp)
+	var dstF bool = isFloatTyp(dstTyp)
+	if srcF && dstF {
+		var srcW int = floatBitWidth(srcTyp)
+		var dstW int = floatBitWidth(dstTyp)
+		if srcW == dstW { return false }
+		emitFloatToFloatHard(a, pkgName, rm, ins, srcW == 32)
+		return true
+	}
+	if dstF {
+		if is64Typ(srcTyp) { return false }
+		emitInt32ToFloatHard(a, pkgName, rm, ins, srcTyp, dstTyp)
+		return true
+	}
+	if is64Typ(dstTyp) { return false }
+	emitFloatToInt32Hard(a, pkgName, rm, ins, srcTyp, dstTyp)
+	return true
+}
+
+// emitFloatToFloatHard lowers a widen (f32->f64, widen=true) via VCVT.F64.F32 or
+// a narrow (f64->f32) via VCVT.F32.F64.  A widen reads a single-word operand and
+// writes a pair; a narrow reads a pair and writes a single word.
+func emitFloatToFloatHard(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr, widen bool) {
+	if widen {
+		var src int = emitValOperand(a, pkgName, rm, ins.Args[0])
+		if src < 0 {
+			a.SetError("native arm32: float widen operand not materializable")
+			return
+		}
+		arm32.VmovCoreToSingle(a, arm32.COND_AL, FP_SCRATCH_S_A, src)
+		arm32.VcvtF64F32(a, arm32.COND_AL, FP_SCRATCH_D_A, FP_SCRATCH_S_A)
+		rm.ResetRegs()
+		var rlo int = scratchReg(rm)
+		var rhi int = scratchReg(rm)
+		arm32.VmovDoubleToCores(a, arm32.COND_AL, rlo, rhi, FP_SCRATCH_D_A)
+		store64(a, rm, ins, rlo, rhi)
+		return
+	}
+	var lo int
+	var hi int
+	lo, hi = load64(a, rm, ins.Args[0])
+	if lo < 0 {
+		a.SetError("native arm32: float narrow operand not materializable")
+		return
+	}
+	arm32.VmovCoresToDouble(a, arm32.COND_AL, FP_SCRATCH_D_A, lo, hi)
+	arm32.VcvtF32F64(a, arm32.COND_AL, FP_SCRATCH_S_A, FP_SCRATCH_D_A)
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	arm32.VmovSingleToCore(a, arm32.COND_AL, rd, FP_SCRATCH_S_A)
+}
+
+// emitInt32ToFloatHard lowers a 32-bit int -> float cast.  The integer word
+// must cross into an S reg first (VCVT's integer operand is a single-precision
+// register), then VCVT.F32/F64.S32/U32 converts it; signedness picks S32 vs
+// U32.  A sub-word integer source is already sign-/zero-extended to a canonical
+// 32-bit word in its slot, so the 32-bit VCVT reads it directly.
+func emitInt32ToFloatHard(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr, srcTyp @types.Type, dstTyp @types.Type) {
+	var src int = emitValOperand(a, pkgName, rm, ins.Args[0])
+	if src < 0 {
+		a.SetError("native arm32: int-to-float operand not materializable")
+		return
+	}
+	var unsigned bool = common.IsUnsignedIntType(srcTyp)
+	arm32.VmovCoreToSingle(a, arm32.COND_AL, FP_SCRATCH_S_A, src)
+	if isFloat64Typ(dstTyp) {
+		if unsigned {
+			arm32.VcvtF64U32(a, arm32.COND_AL, FP_SCRATCH_D_A, FP_SCRATCH_S_A)
+		} else {
+			arm32.VcvtF64S32(a, arm32.COND_AL, FP_SCRATCH_D_A, FP_SCRATCH_S_A)
+		}
+		rm.ResetRegs()
+		var rlo int = scratchReg(rm)
+		var rhi int = scratchReg(rm)
+		arm32.VmovDoubleToCores(a, arm32.COND_AL, rlo, rhi, FP_SCRATCH_D_A)
+		store64(a, rm, ins, rlo, rhi)
+		return
+	}
+	if unsigned {
+		arm32.VcvtF32U32(a, arm32.COND_AL, FP_SCRATCH_S_A, FP_SCRATCH_S_A)
+	} else {
+		arm32.VcvtF32S32(a, arm32.COND_AL, FP_SCRATCH_S_A, FP_SCRATCH_S_A)
+	}
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	arm32.VmovSingleToCore(a, arm32.COND_AL, rd, FP_SCRATCH_S_A)
+}
+
+// emitFloatToInt32Hard lowers a float -> 32-bit int cast via a round-toward-zero
+// VCVT (the trunc form, matching the AEABI `z` helpers).  VCVT's integer result
+// lands in an S reg and crosses back to GP; a sub-word integer target then
+// re-narrows.  The IR's saturation guard (gen_cast_float.bn) brackets the value
+// before this, so the raw truncating VCVT is what's wanted.  Signedness picks
+// S32 vs U32.
+func emitFloatToInt32Hard(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr, srcTyp @types.Type, dstTyp @types.Type) {
+	var unsigned bool = common.IsUnsignedIntType(dstTyp)
+	if isFloat64Typ(srcTyp) {
+		var lo int
+		var hi int
+		lo, hi = load64(a, rm, ins.Args[0])
+		if lo < 0 {
+			a.SetError("native arm32: float-to-int operand not materializable")
+			return
+		}
+		arm32.VmovCoresToDouble(a, arm32.COND_AL, FP_SCRATCH_D_A, lo, hi)
+		if unsigned {
+			arm32.VcvtU32F64(a, arm32.COND_AL, FP_SCRATCH_S_A, FP_SCRATCH_D_A)
+		} else {
+			arm32.VcvtS32F64(a, arm32.COND_AL, FP_SCRATCH_S_A, FP_SCRATCH_D_A)
+		}
+	} else {
+		var src int = emitValOperand(a, pkgName, rm, ins.Args[0])
+		if src < 0 {
+			a.SetError("native arm32: float-to-int operand not materializable")
+			return
+		}
+		arm32.VmovCoreToSingle(a, arm32.COND_AL, FP_SCRATCH_S_A, src)
+		if unsigned {
+			arm32.VcvtU32F32(a, arm32.COND_AL, FP_SCRATCH_S_A, FP_SCRATCH_S_A)
+		} else {
+			arm32.VcvtS32F32(a, arm32.COND_AL, FP_SCRATCH_S_A, FP_SCRATCH_S_A)
+		}
+	}
+	rm.ResetRegs()
+	var rd int = nextReg(rm, ins.ID)
+	arm32.VmovSingleToCore(a, arm32.COND_AL, rd, FP_SCRATCH_S_A)
+	emitSubWordNarrow(a, rd, dstTyp)
+}

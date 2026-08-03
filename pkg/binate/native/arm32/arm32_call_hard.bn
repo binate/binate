@@ -1,0 +1,322 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// ============================================================
+// Hard-float (AAPCS-VFP) DIRECT-CALL / RETURN / PARAM movement
+// ============================================================
+//
+// arm32-linux (arm-linux-gnueabihf) is HARD-float: float scalars ride the VFP
+// register file at the call/return/param boundary instead of the GP registers
+// the soft path uses.  This file holds the FP-register arg/return/param movement
+// gated on types.Arm32HardFloat(); every entry point is invoked from a leading
+// `if types.Arm32HardFloat() && IsFloatScalarTyp(...)` guard placed BEFORE the
+// isPair64Typ branch at each site (arm32_call.bn / arm32_emit_func.bn /
+// arm32_return.bn), so a float64 PEELS OFF the int64 r-pair path onto a single D
+// register.  INERT until a target is stamped FLOAT_ABI_HARD (P6 inc 3e); when the
+// gate is false the soft-float GP path runs byte-for-byte unchanged.
+//
+// VALUE MODEL — like the compute path (arm32_float_hard.bn) and the aarch64
+// sibling, a float still HOMES in a GP value slot: a float32 is one GP word, a
+// float64 a GP register pair, reloaded via emitValOperand / load64 and spilled
+// via nextReg+spill / store64.  The VFP registers are used only as the ABI
+// arg/return/param carriers:
+//   - Placing an arg / return value INTO an FP register: VMOV the GP value
+//     word(s) across (VmovCoreToSingle / VmovCoresToDouble).
+//   - Storing an incoming FP-register param / a returned FP-register value TO a
+//     memory slot (spill slot / result slot / tuple field): VSTR direct from the
+//     S/D register (vfpStoreBaseHard, which materializes the address in a GP
+//     scratch past VLDR/VSTR's ±1020 reach — the VFP load/store, unlike the GP
+//     emitFrame* helpers, has no built-in large-offset fallback).
+//
+// CONCRETE S/D REGISTER — never D0+nsrn.  The AAPCS-VFP allocator BACK-FILLS
+// (common_callconv_vfp.bn): the shared s0..s15 = d0..d7 bank fills a float32 into
+// the lowest free single S-slot and a float64 into the lowest free even S-pair,
+// so a naive monotonic cursor mis-places a mixed-width sequence (e.g. the return
+// tuple {float32, float64} lands in s0 + D1, NOT s0 + D0).  cc.CallArgFpReg walks
+// that ONE allocator and returns the concrete (hwSlot, isDouble): a float32 rides
+// S<hwSlot>, a float64 rides D<hwSlot>.  Both the call-site arg allocation and the
+// literal-FCA return allocation use it — pinned against clang
+// -target arm-linux-gnueabihf -mfloat-abi=hard (a float ret field lands in the
+// same CPRC-allocated S/D register the arg allocation would give).
+
+// fpRegForSlot maps a CallArgFpReg (hwSlot, isDouble) result to the asm register
+// constant: D<hwSlot> for a float64 (isDouble), S<hwSlot> for a float32.
+func fpRegForSlot(hwSlot int, isDouble bool) int {
+	if isDouble {
+		return arm32.D0 + hwSlot
+	}
+	return arm32.S0 + hwSlot
+}
+
+// vfpStoreBaseHard stores the VFP register `vreg` (a double when isDouble, else a
+// single) to [base + off].  VLDR/VSTR reach only ±1020 (a multiple of 4), and —
+// unlike the GP emitBaseStore, which routes a large offset through a scratch — the
+// VFP store has no built-in fallback; so for an offset past 1020 the address is
+// materialized in `scratch` (a GP reg distinct from base) and the store addresses
+// [scratch, #0].  Frame slots and tuple field offsets both scale with frame /
+// tuple size and can exceed 1020, so this bound must be handled.
+func vfpStoreBaseHard(a @asm.Assembler, isDouble bool, vreg int, base int, off int, scratch int) {
+	if off >= 0 && off <= 1020 {
+		if isDouble {
+			arm32.Vstr64(a, arm32.COND_AL, vreg, base, off)
+		} else {
+			arm32.Vstr32(a, arm32.COND_AL, vreg, base, off)
+		}
+		return
+	}
+	emitAddImm(a, scratch, base, off, scratch)
+	if isDouble {
+		arm32.Vstr64(a, arm32.COND_AL, vreg, scratch, 0)
+	} else {
+		arm32.Vstr32(a, arm32.COND_AL, vreg, scratch, 0)
+	}
+}
+
+// ============================================================
+// Call ARG (Site A) / RETURN collect (Site B)
+// ============================================================
+
+// emitCallArgFloatHard places a float scalar call arg into its AAPCS-VFP
+// register: the concrete S/D register comes from cc.CallArgFpReg (the CPRC
+// back-fill), and the GP value word(s) VMOV across into it (a float32's single
+// word via VmovCoreToSingle, a float64's lo/hi pair via VmovCoresToDouble).
+// Returns true when the arg was placed in an FP register; false for an FP-file
+// OVERFLOW (hwSlot < 0), where the caller's GP path stores the bits to the
+// outgoing stack slot exactly as a spilled GP scalar does.
+func emitCallArgFloatHard(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		argTypes @[]@types.Type, arg @ir.Instr, dispatchIdx int) bool {
+	var hwSlot int
+	var isDouble bool
+	hwSlot, isDouble = rm.CC.CallArgFpReg(argTypes, dispatchIdx)
+	if hwSlot < 0 {
+		return false
+	}
+	if isDouble {
+		var lo int
+		var hi int
+		lo, hi = load64(a, rm, arg)
+		if lo < 0 {
+			a.SetError("native arm32: hard-float float64 call arg not materializable")
+			return true
+		}
+		arm32.VmovCoresToDouble(a, arm32.COND_AL, arm32.D0 + hwSlot, lo, hi)
+		return true
+	}
+	var src int = emitValOperand(a, pkgName, rm, arg)
+	if src < 0 {
+		a.SetError("native arm32: hard-float float32 call arg not materializable")
+		return true
+	}
+	arm32.VmovCoreToSingle(a, arm32.COND_AL, arm32.S0 + hwSlot, src)
+	return true
+}
+
+// emitCallReturnFloatHard collects a float scalar call return, which rides S0
+// (float32) / D0 (float64), into the result's spill slot — a VSTR direct from the
+// FP return register (the destination is memory, so no GP round-trip).
+func emitCallReturnFloatHard(a @asm.Assembler, retTyp @types.Type, spillOff int) {
+	if isFloat64Typ(retTyp) {
+		vfpStoreBaseHard(a, true, arm32.D0, arm32.SP, spillOff, arm32.IP)
+		return
+	}
+	vfpStoreBaseHard(a, false, arm32.S0, arm32.SP, spillOff, arm32.IP)
+}
+
+// ============================================================
+// RETURN produce (Site B producer) / PARAM spill (Site D)
+// ============================================================
+
+// emitReturnScalarFloatHard produces a single float scalar return in its
+// AAPCS-VFP return register — S0 (float32) / D0 (float64) — by VMOV'ing the
+// operand's GP value word(s) across.
+func emitReturnScalarFloatHard(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		arg @ir.Instr) {
+	if isFloat64Typ(arg.Typ) {
+		var lo int
+		var hi int
+		lo, hi = load64(a, rm, arg)
+		if lo < 0 {
+			a.SetError("native arm32: hard-float float64 return not materializable")
+			return
+		}
+		arm32.VmovCoresToDouble(a, arm32.COND_AL, arm32.D0, lo, hi)
+		return
+	}
+	var src int = emitValOperand(a, pkgName, rm, arg)
+	if src < 0 {
+		a.SetError("native arm32: hard-float float32 return not materializable")
+		return
+	}
+	arm32.VmovCoreToSingle(a, arm32.COND_AL, arm32.S0, src)
+}
+
+// emitSpillParamFloatHard spills an incoming float scalar param that arrived in a
+// VFP register (S/D, allocated by CallArgFpReg's CPRC back-fill) to its frame
+// slot — a VSTR direct from the FP register (source is a register, destination
+// memory).  Returns true when the param was in an FP register; false for an
+// FP-file OVERFLOW (hwSlot < 0), whose bits arrived on the incoming stack and are
+// spilled by the caller's GP stack path exactly as a GP stack param.
+func emitSpillParamFloatHard(a @asm.Assembler, rm @common.RegMap, p @ir.Param,
+		paramTypes @[]@types.Type, dispatchIdx int) bool {
+	var hwSlot int
+	var isDouble bool
+	hwSlot, isDouble = rm.CC.CallArgFpReg(paramTypes, dispatchIdx)
+	if hwSlot < 0 {
+		return false
+	}
+	var off int = rm.LookupSpill(p.ID)
+	if off < 0 {
+		return true
+	}
+	vfpStoreBaseHard(a, isDouble, fpRegForSlot(hwSlot, isDouble), arm32.SP, off, arm32.IP)
+	return true
+}
+
+// ============================================================
+// MULTI-RETURN tuple collect (Site C) / pack (Site C producer)
+// ============================================================
+//
+// Field placement is pinned against clang -target arm-linux-gnueabihf
+// -mfloat-abi=hard on hand-written literal-FCA returns: a float field rides a VFP
+// return register allocated by the SAME CPRC back-fill as args (cc.CallArgFpReg
+// over the tuple's field-type list), and a non-float field (int / int64 /
+// aggregate) rides the GP return registers via an independent retGp cursor.  Two
+// independent cursors, exactly like the aarch64 retGp/retFp split.  Observed:
+//   {float, double}       -> s0, D1       (double back-fills to the even pair)
+//   {double, float}       -> D0, s2
+//   {float, i32, float}   -> s0, r0, s1   (GP and FP cursors independent)
+//   {i32, double, i32}    -> r0, D0, r1
+//   {float, float, float} -> s0, s1, s2
+// The classifier (MultiReturnTupleNeedsSret) routes an over-budget tuple to sret
+// BEFORE these run, so every tuple reaching here fits: CallArgFpReg never returns
+// an overflow slot for a valid in-register float field.
+
+// collectMultiReturnFieldsHard spills an IN-REGISTER hard-float multi-return tuple
+// from its AAPCS-VFP return registers into ins's spill slot: each float field
+// VSTRs from its CPRC-allocated S/D return register, each non-float field takes
+// the shared GP field store (storeMultiRetGpFieldArm32) at the independent retGp
+// cursor.  Only reached for a float-containing tuple (a pure-GP tuple stays on the
+// shared soft path); IP is the large-offset address scratch.
+func collectMultiReturnFieldsHard(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr,
+		spillOff int) {
+	var tupleTyp @types.Type = ins.Typ
+	var fieldTypes @[]@types.Type = tupleFieldTypesArm32(tupleTyp)
+	var wByte int = wordBytes()
+	var retGp int = 0
+	for fi := 0; fi < len(tupleTyp.Fields); fi++ {
+		var fldTyp @types.Type = tupleTyp.Fields[fi].Type
+		var fldOff int = spillOff + tupleTyp.FieldOffset(fi)
+		if common.IsFloatScalarTyp(fldTyp) {
+			var hwSlot int
+			var isDouble bool
+			hwSlot, isDouble = rm.CC.CallArgFpReg(fieldTypes, fi)
+			if hwSlot < 0 {
+				a.SetError(
+						"native arm32: hard-float multi-return float field has no FP "
+								"return register (over budget — should have been sret)")
+				return
+			}
+			vfpStoreBaseHard(a, isDouble, fpRegForSlot(hwSlot, isDouble), arm32.SP, fldOff, arm32.IP)
+		} else {
+			retGp = retGp +
+					storeMultiRetGpFieldArm32(a, arm32.SP, fldOff, retGp, fldTyp, rm.CC.NumGpRetRegs, wByte,
+							arm32.IP)
+		}
+	}
+}
+
+// emitMultiReturnPackHard packs an IN-REGISTER hard-float multi-return tuple into
+// its AAPCS-VFP return registers: each float field VMOVs its GP value word(s) into
+// its CPRC-allocated S/D return register, each non-float field takes the shared GP
+// field packer (packMultiReturnFieldGpArm32) at the independent retGp cursor.  The
+// per-field ResetRegs mirrors the soft pack, keeping the R4..R10 pool from
+// saturating on a long tuple.
+func emitMultiReturnPackHard(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr) {
+	var fieldTypes @[]@types.Type = argFieldTypesArm32(ins)
+	var retGp int = 0
+	for ai := 0; ai < len(ins.Args); ai++ {
+		var arg @ir.Instr = ins.Args[ai]
+		if common.IsFloatScalarTyp(arg.Typ) {
+			var hwSlot int
+			var isDouble bool
+			hwSlot, isDouble = rm.CC.CallArgFpReg(fieldTypes, ai)
+			if hwSlot < 0 {
+				a.SetError(
+						"native arm32: hard-float multi-return float field has no FP "
+								"return register (over budget — should have been sret)")
+				return
+			}
+			if isDouble {
+				var lo int
+				var hi int
+				lo, hi = load64(a, rm, arg)
+				if lo >= 0 {
+					arm32.VmovCoresToDouble(a, arm32.COND_AL, arm32.D0 + hwSlot, lo, hi)
+				}
+			} else {
+				var src int = emitValOperand(a, pkgName, rm, arg)
+				if src >= 0 {
+					arm32.VmovCoreToSingle(a, arm32.COND_AL, arm32.S0 + hwSlot, src)
+				}
+			}
+		} else {
+			var adv int = packMultiReturnFieldGpArm32(a, pkgName, rm, arg, retGp)
+			if adv < 0 { return }
+			retGp = retGp + adv
+		}
+		rm.ResetRegs()
+	}
+}
+
+// ============================================================
+// Small helpers
+// ============================================================
+
+// tupleHasFloatFieldArm32 reports whether tuple type t has any float scalar field
+// — the gate that diverts a multi-return collect to the FP-aware hard path (a
+// tuple with no float field is byte-identical on the GP path).
+func tupleHasFloatFieldArm32(t @types.Type) bool {
+	if t == nil { return false }
+	for fi := 0; fi < len(t.Fields); fi++ {
+		if common.IsFloatScalarTyp(t.Fields[fi].Type) { return true }
+	}
+	return false
+}
+
+// multiReturnHasFloatArg reports whether the return instruction ins packs any
+// float scalar field — the gate that diverts the multi-return PACK to the
+// FP-aware hard path.
+func multiReturnHasFloatArg(ins @ir.Instr) bool {
+	for ai := 0; ai < len(ins.Args); ai++ {
+		if common.IsFloatScalarTyp(ins.Args[ai].Typ) { return true }
+	}
+	return false
+}
+
+// tupleFieldTypesArm32 collects a tuple's field types into a @[]@types.Type, the
+// "argument list" cc.CallArgFpReg walks to CPRC-allocate the float fields' S/D
+// return registers on the collect side.
+func tupleFieldTypesArm32(t @types.Type) @[]@types.Type {
+	var ts @[]@types.Type = make_slice(@types.Type, len(t.Fields))
+	for fi := 0; fi < len(t.Fields); fi++ {
+		ts[fi] = t.Fields[fi].Type
+	}
+	return ts
+}
+
+// argFieldTypesArm32 collects a return instruction's arg types into a
+// @[]@types.Type — the pack-side counterpart of tupleFieldTypesArm32 (the fields
+// being produced), which cc.CallArgFpReg walks the same way.
+func argFieldTypesArm32(ins @ir.Instr) @[]@types.Type {
+	var ts @[]@types.Type = make_slice(@types.Type, len(ins.Args))
+	for ai := 0; ai < len(ins.Args); ai++ {
+		ts[ai] = ins.Args[ai].Typ
+	}
+	return ts
+}

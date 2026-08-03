@@ -44,10 +44,11 @@ func registerTypeInfo(m @Module, recvPkg @[]char, recvName @[]char, recvTyp @typ
 
 // CollectTypeInfoDescs returns the distinct per-type records module `m` must
 // emit: the registered per-type entries (m.TypeInfos) PLUS the transitive closure
-// of by-value NAMED struct types reachable as a field of any of them (force-emit,
-// so a nested-struct field's typeinfo pointer targets a real, locally-defined
-// weak record — reflection recurses through it).  Each carries that type's
-// size/align/name/kind/field-table read HERE (at codegen) off the held RecvTyp.
+// of struct types reachable from any of them as a by-value field, an array/slice
+// ELEMENT, or a pointer POINTEE (force-emit, so a field's typeinfo pointer targets
+// a real, locally-defined weak record — reflection recurses/follows through it).
+// Each carries that type's size/align/name/kind/field-table read HERE (at codegen)
+// off the held RecvTyp.
 //
 // This is a DETERMINISTIC PURE function of m.TypeInfos: a worklist seeded from
 // m.TypeInfos in order, expanded in field-declaration order, deduped by
@@ -57,8 +58,10 @@ func registerTypeInfo(m @Module, recvPkg @[]char, recvName @[]char, recvTyp @typ
 // definitions and once to suppress redundant `external` decls, and the two must
 // agree or a force-emitted record gets both a def and an extern decl (a
 // redefinition error).  It does NOT mutate m.TypeInfos (which stays pure); the
-// force-emitted entries live only in the local worklist.  The by-value struct
-// graph is acyclic, so the closure terminates (dedup stops any re-add).
+// force-emitted entries live only in the local worklist.  Pointer pointees make
+// the reachability graph potentially CYCLIC (`type Node struct { next *Node }`),
+// so termination relies on the symSeen dedup dropping a re-add — NOT on the graph
+// being acyclic (by-value/array nesting alone is, but pointers break that).
 func CollectTypeInfoDescs(m @Module) @[]@irdata.TypeInfoDesc {
 	var out @[]@irdata.TypeInfoDesc
 	var seen @[]@[]char
@@ -81,16 +84,18 @@ func CollectTypeInfoDescs(m @Module) @[]@irdata.TypeInfoDesc {
 		if symSeen(seen, sym) { continue }
 		seen = slices.Append[@[]char](seen, sym)
 		out = slices.Append[@irdata.TypeInfoDesc](out, buildTypeInfoDesc(m, e))
-		// Force-emit reachable by-value NAMED struct field types (their records
-		// carry field tables too, so recursion terminates on scalar leaves).
-		// Anonymous / alias struct fields yield no entry (fieldStructEntry → nil)
-		// and render a placeholder — a structural mangler for anon structs is a
-		// separate follow-up.
+		// Force-emit the struct type each field recurses into (its records carry
+		// field tables too).  Anonymous / alias struct fields yield no entry
+		// (fieldStructEntry → nil) and render a placeholder — a structural mangler
+		// for anon structs is a separate follow-up.
 		var st @types.Type = structReprOf(e.RecvTyp)
 		if st != nil {
 			for j := 0; j < len(st.Fields); j++ {
 				// Force-emit the record a field recurses into — the field's own
-				// struct, OR the element struct of an array/slice-of-structs.
+				// struct, the element struct of an array/slice-of-structs, or the
+				// pointee struct of a pointer field.  A self-referential pointer
+				// (`type Node struct { next *Node }`) re-enqueues Node, which the
+				// symSeen dedup drops, so the closure still terminates.
 				var fe @TypeInfoEntry = fieldStructEntry(m, recordTypeForField(st.Fields[j].Type))
 				if fe != nil {
 					wl = slices.Append[@TypeInfoEntry](wl, fe)
@@ -188,11 +193,23 @@ func isAnonStructName(name *[]readonly char) bool {
 	return true
 }
 
-// fieldStructEntry builds a synthetic force-emit entry for a by-value named
-// struct field type (its record + field table must exist so the field's
-// typeinfo pointer resolves), or nil for a non-struct / un-nameable field.  The
-// dtor is derived the SAME way a box of that type would (boxSlot0DtorName), so a
-// force-emitted record is byte-identical to any box/impl record for the type.
+// fieldStructEntry builds a synthetic force-emit entry for the struct type a field
+// recurses into — a by-value struct field, an array/slice element, or a pointer
+// pointee — so its record + field table exist and the field's typeinfo pointer
+// resolves; nil for a non-struct / un-nameable field.
+//
+// The dtor is left NULL: a force-emitted record is REFLECTION-ONLY (it lets fmt
+// render the type), never a destruction path — cleanup always runs the dtor
+// directly via compiler-emitted RefDec or the vtable any-block's own slot, never
+// through the record's word-0.  Deriving the dtor here (as a box would) is not just
+// unnecessary but WRONG across packages: the dtor is a `@__handle.…__dtor_T` global
+// defined only in T's own TU, so a force-emit reaching a DIFFERENT package's type
+// (e.g. a `*ir.FuncSig` field compiled into pkg/binate/repl) would reference an
+// undefined handle → "use of undefined value" at compile time.  Nulling it also
+// aligns native/LLVM with the VM, which already leaves force-emit record dtors null
+// (the record's identity/size/name/kind/fields are all it needs).  A type that is
+// genuinely boxed keeps its real dtor via its own m.TypeInfos entry, which the seed
+// loop enqueues first so symSeen keeps it over this reflection-only one.
 func fieldStructEntry(m @Module, ft @types.Type) @TypeInfoEntry {
 	var pkg @[]char
 	var name @[]char
@@ -204,7 +221,7 @@ func fieldStructEntry(m @Module, ft @types.Type) @TypeInfoEntry {
 	e.RecvPkg = pkg
 	e.RecvTypeName = name
 	e.RecvTyp = st
-	e.DtorFuncName = boxSlot0DtorName(m, pkg, name, st)
+	e.DtorFuncName = ""
 	return e
 }
 
@@ -234,9 +251,10 @@ func collectFieldDescs(m @Module, st @types.Type) @[]@irdata.FieldInfoDesc {
 		if f.Type != nil {
 			fd.Size = f.Type.SizeOf()
 		}
-		// An array/slice field records its ELEMENT's kind + size so a reader can
-		// stride over and interpret the elements.
-		if fd.Kind == irdata.KIND_ARRAY || fd.Kind == irdata.KIND_SLICE {
+		// An array/slice field records its ELEMENT's kind + size (so a reader can
+		// stride over and interpret the elements); a pointer field records its
+		// POINTEE's kind + size (so a reader can follow it and interpret the target).
+		if fd.Kind == irdata.KIND_ARRAY || fd.Kind == irdata.KIND_SLICE || fd.Kind == irdata.KIND_PTR {
 			var elem @types.Type = elemTypeOf(f.Type)
 			if elem != nil {
 				fd.ElemKind = typeKind(elem)
@@ -280,12 +298,16 @@ func structReprOf(t @types.Type) @types.Type {
 	return nil
 }
 
-// elemTypeOf returns the element type of an array or (raw/managed) slice type,
-// peeling readonly/alias/named wrappers first; nil if t is not an array/slice.
+// elemTypeOf returns the "inner" type a reflective reader steps into: the element
+// of an array or (raw/managed) slice, or the POINTEE of a (raw/managed) pointer —
+// all spelled `.Elem` — peeling readonly/alias/named wrappers first; nil otherwise.
+// A pointer's pointee is the reader's next step exactly as an element is, so both
+// ride the same FieldEntry element slots (ElemKind/ElemSize + word-5 record).
 func elemTypeOf(t @types.Type) @types.Type {
 	var s @types.Type = peelToRepr(t)
 	if s == nil { return nil }
-	if s.Kind == types.TYP_ARRAY || s.Kind == types.TYP_SLICE || s.Kind == types.TYP_MANAGED_SLICE {
+	if s.Kind == types.TYP_ARRAY || s.Kind == types.TYP_SLICE || s.Kind == types.TYP_MANAGED_SLICE ||
+			s.Kind == types.TYP_POINTER || s.Kind == types.TYP_MANAGED_PTR {
 		return s.Elem
 	}
 	return nil
@@ -293,14 +315,16 @@ func elemTypeOf(t @types.Type) @types.Type {
 
 // recordTypeForField returns the type whose `__typeinfo` record a field recurses
 // into (for reflection rendering): a struct field → the field type itself; an
-// array/slice field → its element type (a struct element gets a record; a
-// non-struct element is filtered downstream by fieldStructName/fieldStructEntry);
-// anything else → nil.  Pointer fields are NOT followed here (a later phase).
+// array/slice field → its element type; a pointer field → its pointee type (a
+// struct element/pointee gets a record; a non-struct one is filtered downstream by
+// fieldStructName/fieldStructEntry); anything else → nil.
 func recordTypeForField(fieldTyp @types.Type) @types.Type {
 	if fieldTyp == nil { return nil }
 	var k int = typeKind(fieldTyp)
 	if k == irdata.KIND_STRUCT { return fieldTyp }
-	if k == irdata.KIND_ARRAY || k == irdata.KIND_SLICE { return elemTypeOf(fieldTyp) }
+	if k == irdata.KIND_ARRAY || k == irdata.KIND_SLICE || k == irdata.KIND_PTR {
+		return elemTypeOf(fieldTyp)
+	}
 	return nil
 }
 

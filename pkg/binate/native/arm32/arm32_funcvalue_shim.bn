@@ -1,0 +1,204 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Func-value shim BODIES: emitFuncValueShimBody dispatches on the func value's
+// return shape to the matching shim shape (scalar/void tail-branch, R0-sret,
+// small-aggregate pack, multi-return pack).  Split from arm32_funcvalue.bn (which
+// keeps the reference collection, vtable/shim TABLE emission, and the
+// OP_FUNC_VALUE construction handler); mirrors arm32_closure_shim.bn.  Same
+// package, so the shared helpers these call (emitShimArgMarshalArm32,
+// emitMultiRetPackShim, emitFuncvalSpillShimArm32, funcValueShimHasFloatArm32)
+// resolve across the sibling files with no import.
+
+// emitFuncValueShimBody classifies the func value's return shape and emits the
+// matching shim.  A big (>InternalSretBytes = 4) aggregate return goes through
+// the AAPCS32 R0-sret path (emitSretShim); a SMALL (<=4-byte) aggregate return
+// goes through the pack shim (emitPackShim — it comes back by value in R0, which
+// the shim stores through the retbuf).  A MULTI-return uses the retbuf-for-any-
+// multi-return convention: the caller passes a retbuf in R0.  A BIG multi-return
+// tuple (gpWords > 4) srets through R0, so emitSretShim; a SMALL multi-return
+// (gpWords <= 4) comes back field-per-register in r0..r3, so emitMultiRetPackShim
+// (a framed CALL shim that saves the retbuf, calls the underlying, then stores
+// r0..r3 through it).  Void, a scalar/pointer, a 64-bit pair return (r0:r1), or a
+// float scalar (float32 in R0, float64 in r0:r1 — soft-float rides GP like the
+// same-width integer) go through emitScalarVoidShim, which tail-branches so the
+// underlying's return value flows straight back to the caller untouched.
+func emitFuncValueShimBody(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
+	// Under hard-float (AAPCS-VFP) a float PARAM or a float RETURN — a scalar, or
+	// a float leaf inside an aggregate / multi-return-tuple result — rides the VFP
+	// register file, which none of the GP-only shim shapes below (scalar/void,
+	// sret, pack, multiret, spill) can place.  Fail LOUD rather than marshal it
+	// through GP (shim VFP movement is a later P6 increment).  Inert on soft-float,
+	// where Arm32HardFloat() is false and a float rides GP like its same-width
+	// integer (P5.3).
+	if types.Arm32HardFloat() && funcValueShimHasFloatArm32(fvTyp) {
+		a.SetError(
+				"native arm32 hard-float: float through func value shim not "
+						"yet implemented (P6 follow-up)")
+		return
+	}
+	if len(fvTyp.Results) == 1 && fvTyp.Results[0] != nil {
+		var rt @types.Type = fvTyp.Results[0]
+		// Gate on IsAggregateReturnTyp (not the kind-only IsAggregateTyp): a 0-byte
+		// aggregate result (`struct{}` / `[0]T`) is void-like — the caller passes
+		// no retbuf (IsAggregateReturnTyp false) and there are no bytes to store —
+		// so it must fall through to the scalar/void tail-branch shim below,
+		// matching the LLVM shim (isAggregateReturn false).  For every SizeOf >= 1
+		// aggregate the two predicates agree, so this only carves out the 0-byte
+		// case.
+		if types.IsAggregateReturnTyp(rt) {
+			var cc common.CallConv = common.AAPCS32()
+			if rt.SizeOf() > cc.InternalSretBytes {
+				// Big aggregate (>4 bytes): returned through the R0 sret buffer —
+				// tail-branch shim (retbuf stays in R0).
+				emitSretShim(a, fnLabel, fvTyp)
+			} else {
+				// Small aggregate (<=4 bytes): returned BY VALUE in R0 — the pack
+				// shim calls the underlying and stores the returned word through
+				// the retbuf.
+				emitPackShim(a, fnLabel, fvTyp)
+			}
+			return
+		}
+	}
+	// Multi-return (retbuf-for-any-multi-return): the caller passes a retbuf in R0
+	// for EVERY multi-return.  A BIG tuple srets through R0 (tail-branch sret
+	// shim — the underlying writes each field through the R0 retbuf).  A SMALL
+	// tuple comes back field-per-register in r0..r3, so it needs a framed CALL
+	// shim that saves the retbuf, calls the underlying, then stores r0..r3 THROUGH
+	// the retbuf (emitMultiRetPackShim).  (Pre-fix a small tuple tail-branched and
+	// rode r0..r3 back to the caller, which collected them — but the caller now
+	// passes a retbuf the tail-branch shim never writes.)
+	if len(fvTyp.Results) > 1 {
+		if isBigMultiReturnArm32(fvTyp) {
+			emitSretShim(a, fnLabel, fvTyp)
+		} else {
+			emitMultiRetPackShim(a, fnLabel, fvTyp)
+		}
+		return
+	}
+	emitScalarVoidShim(a, fnLabel, fvTyp)
+}
+
+// emitScalarVoidShim emits the scalar/void shim body: drop the data word (R0),
+// marshal user args (incoming R1..) down into R0.. — a plain down-shift for
+// scalars/pointers, plus by-address re-expansion of any coerced in-register
+// aggregate (emitShimArgMarshalArm32) — then tail-branch to fnLabel.  A void or
+// scalar/pointer return (incl. a 64-bit-pair return in r0:r1) rides straight back
+// through the tail-branch — the shim never touches the return value; the marshal's
+// staging (present only for a coerced aggregate) is a BALANCED SP scratch, freed
+// before the branch, so the tail-branch stays frameless.  Fails LOUDLY on arg
+// shapes the register-only marshal can't place (shimOutRegs); when the user-arg
+// words exceed the register budget it routes to the framed-BL stack-spill shim
+// (emitFuncvalSpillShimArm32).  Callers reach it via emitFuncValueShimBody, which
+// has already ruled out the aggregate return shapes; a float scalar return rides
+// this shim's tail-branch (float32 in R0, float64 in r0:r1) untouched.
+func emitScalarVoidShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
+	var cc common.CallConv = common.AAPCS32()
+	// shimOutRegs accepts every arg shape the register-only marshal can place — a
+	// scalar / pointer, a float (float32 one word, float64 an even pair), a 64-bit
+	// register-pair scalar, and a by-address aggregate — and fails loud only on a
+	// hypothetical unmodeled multi-word scalar (none exists on ILP32 today).  So a
+	// genuine register-budget overflow (nOut fits the checks below but the args
+	// don't fit R0..R3) is what routes to the framed-BL stack-spill shim.
+	var nOut int = shimOutRegs(a, cc, fvTyp, 0)
+	if nOut < 0 { return }
+	if !shimArgsFitRegisters(cc, fvTyp, 1, 0, nOut) {
+		emitFuncvalSpillShimArm32(a, cc, fnLabel, fvTyp, 0, false, false, false, false)
+		return
+	}
+	emitShimArgMarshalArm32(a, cc, fvTyp, 1, 0, false)
+	a.SetGlobal(fnLabel)
+	arm32.B(a, arm32.COND_AL, fnLabel)
+}
+
+// emitSretShim emits the big-aggregate (>InternalSretBytes = 4) return shim.  It
+// is entered under the aggregate-return dispatch ABI as
+// `void(retbuf=R0, data=R1, args=R2..)`.  AAPCS32 passes the sret buffer pointer
+// in R0 (SretInGpArgReg) — and the underlying function ALSO expects it in R0 —
+// so, unlike AAPCS64's `Mov X8, X0`, the retbuf simply STAYS in R0 across the
+// shim: keep R0, drop the data word (R1), shift user args R2.. down to R1.., and
+// tail-branch (the underlying writes the result through R0).  Fails LOUDLY on the
+// same arg shapes as the scalar shim; when the user args exceed R2..R3 (the
+// retbuf + data prefix leaves one fewer arg register than the scalar shape) it
+// routes to the framed-BL sret stack-spill shim (retbuf stays in R0 there too).
+func emitSretShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
+	var cc common.CallConv = common.AAPCS32()
+	// R0 = retbuf stays; the user args start at R1 (gpDestBase 1), and the incoming
+	// dispatch drops retbuf + data (srcPrefix 2 — R0 = retbuf, R1 = data).
+	var nOut int = shimOutRegs(a, cc, fvTyp, 1)
+	if nOut < 0 { return }
+	if !shimArgsFitRegisters(cc, fvTyp, 2, 1, nOut) {
+		// Over-budget: the framed-BL sret spill (retbuf stays in R0 across the
+		// marshal + BL — useSret; the underlying writes the result through R0).  It
+		// covers both a big single aggregate and a big multi-return tuple, since
+		// emitFuncValueShimBody routes both here.
+		var useSretMulti bool = len(fvTyp.Results) > 1
+		emitFuncvalSpillShimArm32(a, cc, fnLabel, fvTyp, 0, false, !useSretMulti, false, useSretMulti)
+		return
+	}
+	emitShimArgMarshalArm32(a, cc, fvTyp, 2, 1, false)
+	a.SetGlobal(fnLabel)
+	arm32.B(a, arm32.COND_AL, fnLabel)
+}
+
+// emitPackShim emits the small (<=InternalSretBytes = 4) in-register aggregate
+// return shim.  Unlike the tail-branch scalar/sret shims, a packed return needs
+// a real call: the underlying function returns the aggregate BY VALUE in R0 (one
+// word for a <=4-byte result), which the shim must then store through the retbuf.
+// It is entered under the aggregate-return dispatch ABI as
+// `void(retbuf=R0, data=R1, args=R2..)`; it saves retbuf in R4 (callee-saved, so
+// the underlying call preserves it — and the push restores the caller's R4),
+// drops retbuf + data by shifting user args R2.. down to R0.., BLs the
+// underlying, stores the returned R0 word through retbuf, and returns.  Mirrors
+// x64/aarch64's usePack shim, with arm32's explicit push/pop frame (no red zone).
+// Over-budget arg counts route to the framed-BL pack stack-spill shim.
+func emitPackShim(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type) {
+	var cc common.CallConv = common.AAPCS32()
+	// The underlying is a small-aggregate function (returns by value, no sret arg),
+	// so its user args start at R0 (gpDestBase 0); the incoming dispatch drops
+	// retbuf + data (srcPrefix 2).
+	var nOut int = shimOutRegs(a, cc, fvTyp, 0)
+	if nOut < 0 { return }
+	if !shimArgsFitRegisters(cc, fvTyp, 2, 0, nOut) {
+		// Over-budget: the framed-BL pack spill (retbuf stashed to the frame; the
+		// underlying returns the <=4-byte aggregate by value in R0, which the spill
+		// stores through the reloaded retbuf — usePack).
+		var retSz int = fvTyp.Results[0].SizeOf()
+		emitFuncvalSpillShimArm32(a, cc, fnLabel, fvTyp, retSz, true, false, false, false)
+		return
+	}
+	// push {r4, lr}: save the caller's R4 (reused for retbuf) and LR (the BL
+	// clobbers it).  Two registers keep SP 8-aligned across the call (AAPCS32).
+	arm32.Push(a, arm32.COND_AL, packShimPushMask())
+	// retbuf (R0) -> R4: survives the BL (R4 is callee-saved).
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R4, arm32.Reg(arm32.R0))
+	// Drop retbuf + data; marshal user args (incoming R2..) down to R0.., re-
+	// expanding any coerced in-register aggregate by-address (emitShimArgMarshalArm32,
+	// which stages to a balanced SP scratch when one is present — freed before the BL,
+	// so it composes with this frame; R4 is untouched).
+	emitShimArgMarshalArm32(a, cc, fvTyp, 2, 0, false)
+	a.SetGlobal(fnLabel)
+	arm32.Bl(a, arm32.COND_AL, fnLabel)
+	// The underlying returned the <=4-byte aggregate by value in R0 (one word);
+	// store it through the retbuf.
+	arm32.Str(a, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R4, 0))
+	// pop {r4, pc}: restore the caller's R4 and return (writing PC).
+	arm32.Pop(a, arm32.COND_AL, packShimPopMask())
+}
+
+// packShimPushMask is the {r4, lr} register mask (bit i = register i) for the
+// pack shim's entry push: save the caller's R4 (reused to hold the retbuf) and LR.
+func packShimPushMask() int {
+	return (1 << arm32.R4) | (1 << arm32.LR)
+}
+
+// packShimPopMask is the {r4, pc} register mask for the pack shim's exit pop:
+// restore the caller's R4 and load the saved LR into PC to return.
+func packShimPopMask() int {
+	return (1 << arm32.R4) | (1 << arm32.PC)
+}

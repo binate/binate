@@ -137,40 +137,47 @@ func emitIfaceUpcast(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
 // Interface method DISPATCH — emitCallIfaceMethod (P4-c.3)
 // ============================================================
 //
-// Loads the method pointer from the interface value's vtable and calls it
-// indirectly (BLX IP), passing the iv's data pointer as the receiver.  Ported
-// from x64_iface.bn (the [sret, data, args...] 2-slot-prefix model), NOT the
-// aa64 X8-sret one-slot model: AAPCS32 carries the sret pointer in a GP arg
-// register (R0), so a big return prepends TWO synthetic slots (sret + data)
-// ahead of the user args — matching common_call.bn's OP_CALL_IFACE_METHOD sizer,
-// which sets prefixSlots=2 exactly when `bigRet && SretInGpArgReg` (AAPCS32 sets
-// SretInGpArgReg=true).  The caller-side prefix MUST match that reservation or a
-// big-return iface call silently miscompiles.
+// Every @__ivt method slot holds the method's function-value HANDLE
+// (@__handle.<m>, emitOneImplVtable useHandles=true) — the same convention slot 0
+// (the dtor) already uses — so interface dispatch goes THROUGH the handle's
+// marshaling shim, exactly like OP_CALL_FUNC_VALUE.  That is what lets a native-
+// emitted iface dispatch reach an impl whose @__ivt was emitted by ANOTHER backend
+// (the hybrid native-main / LLVM-dep build): both sides agree on the handle+shim
+// contract.  The shim re-marshals the incoming dispatch words to the real method,
+// so the caller here uses the SAME shim ABI (and the SAME shared helpers) as the
+// func-value call path.  See emit_iface_call.bn:emitCallIfaceMethod (the LLVM
+// reference), aarch64_iface.bn, and explorations/plan-iface-crossmode.md.
 
 // emitCallIfaceMethod lowers OP_CALL_IFACE_METHOD.  Args[0] is the iv value (an
 // 8-byte {data, vtable} aggregate held at the alloc region getOperand points at,
 // ILP32); Args[1..] are user args; ins.Index is the ABSOLUTE vtable slot (already
 // past the two-word any-block — dtor@0, *TypeInfo@1 — and any parent sub-vtable
 // inlining) — see pkg/binate/ir/gen_iface.bn:findInterfaceMethodFromBase and the
-// LLVM emission in pkg/binate/codegen/emit_impls.bn.  It is dispatched raw as
-// `Index * wordBytes()`, no +2.
+// LLVM emission in pkg/binate/codegen/emit_impls.bn.  The HANDLE is loaded from
+// vt[Index] (Index * wordBytes(), no +2), and dispatch goes through its marshaling
+// shim.
 //
-// Unlike aa64 (which holds the method pointer live in X17 across the arg loop),
+// Mirrors emitCallFuncValue (shared shim helpers, so the two arg layouts can't
+// drift), with two differences: (a) the handle is LOADED from the vtable slot at
+// iv.vtable + wordBytes()*Index instead of being a func-value operand, and (b) the
+// RECEIVER (iv[0]) is prepended as the shim's first arg after the handle's data —
+// so the prefix is [data, receiver] (prefixSlots 2, scalar/void) or [retbuf, data,
+// receiver] (prefixSlots 3, aggregate/multi return), one more than the func-value
+// path.  Everything the dispatch needs derives from the iv pointer, which
+// getOperand reloads after the arg loop (just as emitCallFuncValue reloads its
+// func-value operand): the handle ptr = vt[Index], the shim = handle.vtable.call,
+// data = handle.data, receiver = iv.data.
+//
 // arm32's only intra-call scratch is IP (R12), which emitAggregateArg /
-// emitFrameAddr clobber — so the loaded method pointer is SPILLED to a stack slot
-// before the arg loop and RELOADED into IP just before BLX (the same spill/reload
-// discipline emitCallIndirect / emitCallFuncValue use).  The spill must bracket
-// the ENTIRE arg loop, or the call jumps through garbage.
+// emitFrameAddr clobber, so the shim call target is materialized into IP as the
+// LAST step before BLX (after all the prefix loads).  The handle ptr rides a POOL
+// reg across the prefix loads — never a frame slot — so a large frame never needs a
+// method-pointer spill (unlike the pre-handle raw-call shape).
 //
-// Scalar / void / single-aggregate (sret) / multi-return results — including
-// aggregates with float FIELDS, and float scalar args / returns — are all in scope.
-// Interface dispatch reaches its target through the func-value shim ABI, and on
-// soft-float a float scalar rides GP exactly like its same-width integer: a float32
-// in one word (like int32), a float64 in the even-aligned register pair (like int64).
-// The consumer here places float args via the same emitCallArg lowering the direct
-// call uses (no *uint8 coercion — the argTypes below carry the real type), the shim
-// marshals them (isPair64Typ), and the return is collected below (float32 from R0, a
-// float64 pair from r0:r1).
+// Scalar / void / single-aggregate / multi-return results — including aggregates
+// with float FIELDS, and float scalar args / returns — are all in scope; the shim
+// ABI marshals a float scalar on the soft-float GP path (a float32 in one word, a
+// float64 in the even-aligned register pair), matching the func-value call path.
 func emitCallIfaceMethod(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
 		allFuncs @[]@ir.Func, ins @ir.Instr) {
 	if len(ins.Args) < 1 {
@@ -190,167 +197,96 @@ func emitCallIfaceMethod(a @asm.Assembler, pkgName *[]readonly char, rm @common.
 		return
 	}
 
-	// Two-step load of the method pointer into IP:
-	//   IP = iv.vtable     (LDR IP, [ivAddr + IfaceValueVtableOffset()])
-	//   IP = vt[Index]     (LDR IP, [IP + Index * wordBytes()])
-	// wordBytes() = 4 on this ILP32 target (each vtable slot is one target word),
-	// NOT the literal 8 the LP64 backends use.
+	// Classify the return under the shim convention (a retbuf for ANY aggregate /
+	// multi return — the shim writes every one THROUGH the retbuf, matching the LLVM
+	// shim + VM cross-mode dispatch), single-source-of-truth via IsAggregateReturnTyp
+	// / IsMultiReturnCall so the caller and shim agree.  The prefix is [data,
+	// receiver] (prefixSlots 2) for a scalar/void return or [retbuf, data, receiver]
+	// (prefixSlots 3) for a retbuf return — one more slot than emitCallFuncValue's,
+	// for the receiver.
+	var aggregateRet bool = ins.ID >= 0 && types.IsAggregateReturnTyp(ins.Typ) &&
+			!common.IsMultiReturnCall(ins)
+	var multiRet bool = ins.ID >= 0 && common.IsMultiReturnCall(ins)
+	var useRetbuf bool = aggregateRet || multiRet
+	var prefixSlots int = 2
+	if useRetbuf { prefixSlots = 3 }
+
+	// Synthetic argTypes + user-arg marshalling via the shared shim helpers (so the
+	// func-value and iface layouts can't drift), BEFORE the prefix loads so a user
+	// arg sourced from a prefix register is read first.
+	var nCallArgs int = len(ins.Args) - 1
+	var argTypes @[]@types.Type = shimArgTypesArm32(rm.CC, ins, nCallArgs, prefixSlots)
+	emitShimUserArgsArm32(a, pkgName, rm, ins, argTypes, prefixSlots, nCallArgs)
+	if a.HasError { return }
+
+	// Reload the iv pointer (the arg loop's ResetRegs may have stranded it), then
+	// recompute the method HANDLE pointer into a POOL reg:
+	//   handleReg = iv.vtable   (LDR handleReg, [ivAddr + IfaceValueVtableOffset()])
+	//   handleReg = vt[Index]   (LDR handleReg, [handleReg + Index*wordBytes()])
+	// wordBytes() = 4 on this ILP32 target (each vtable slot is one target word), NOT
+	// the literal 8 the LP64 backends use.  The slot offset scales with ins.Index, so
+	// it overflows the 12-bit LDR immediate for an interface with > 1023 methods;
+	// emitBaseLoad materializes it via IP (dead here — IP takes the shim only at the
+	// very end).  For the common fitting offset it emits the identical bare
+	// `LDR handleReg, [handleReg, #off]`.
 	var ivAddr int = getOperand(a, rm, ins.Args[0].ID)
 	if ivAddr < 0 {
 		a.SetError("native arm32: iface value not materializable (P4-c.3)")
 		return
 	}
-	arm32.Ldr(a, arm32.COND_AL, arm32.IP, arm32.MemImm(ivAddr, types.IfaceValueVtableOffset()))
-	// The vtable slot offset scales with ins.Index, so it overflows the 12-bit LDR
-	// immediate for an interface with > 1023 methods; route the second load through
-	// emitBaseLoad, which materializes the offset when it doesn't fit.  Base and
-	// destination are both IP, so the address scratch must be a POOL reg, never IP:
-	// ivAddr is dead here (the arg loop below reloads it via getOperand), so it
-	// serves.  For the common (fitting) offset emitBaseLoad emits the identical bare
-	// `LDR IP, [IP, #off]` and never touches ivAddr.
-	emitBaseLoad(a, arm32.IP, arm32.IP, wordBytes() * ins.Index, ivAddr)
+	var handleReg int = scratchReg(rm)
+	arm32.Ldr(a, arm32.COND_AL, handleReg, arm32.MemImm(ivAddr, types.IfaceValueVtableOffset()))
+	emitBaseLoad(a, handleReg, handleReg, wordBytes() * ins.Index, arm32.IP)
 
-	// Spill the loaded method pointer immediately: the arg loop below freely calls
-	// getOperand / ResetRegs and emitAggregateArg / emitFrameAddr clobber IP, so it
-	// CANNOT be held live.  Reload just before BLX.  Prefer the result spill slot;
-	// fall back to the alloc region when the call has no result slot (void return —
-	// PlanFrame always reserves an alloc region for an iface call, since the iv
-	// receiver is an aggregate).  This mirrors x64_iface.bn's fnPtrSlot stash.
-	var fnPtrSlot int = -1
-	if ins.ID >= 0 {
-		fnPtrSlot = rm.LookupSpill(ins.ID)
-	}
-	if fnPtrSlot < 0 {
-		fnPtrSlot = rm.LookupAlloc(ins.ID)
-	}
-	if fnPtrSlot < 0 {
-		a.SetError("native arm32: iface dispatch has no spill slot for the method "
-				"pointer (P4-c.3)")
-		return
-	}
-	// Spill via a POOL reg, not IP: for a large frame (fnPtrSlot > 4095)
-	// emitFrameStore uses IP as its own address scratch — storing IP directly would
-	// overwrite the method pointer with the materialized offset and spill garbage
-	// (silent wrong-code: the later BLX would branch through the offset). A pool reg
-	// (R4-R10) never aliases IP/SP, so the spill is correct at any frame size.
-	var fnPtrReg int = scratchReg(rm)
-	arm32.Mov(a, arm32.COND_AL, false, fnPtrReg, arm32.Reg(arm32.IP))
-	emitFrameStore(a, fnPtrReg, fnPtrSlot)
-
-	// A big-aggregate single return OR a big multi-return tuple travels via AAPCS32
-	// sret (a hidden buffer pointer in R0), which shifts the data receiver and all
-	// user args up one register — so prepend a SECOND synthetic pointer slot ahead
-	// of the data slot.  This is the x64 [sret, data, args...] shape; SretInGpArgReg
-	// is true on AAPCS32, so it matches common_call.bn's OP_CALL_IFACE_METHOD sizer
-	// (prefixSlots = 2 when bigRet && SretInGpArgReg).  A small return uses
-	// prefixSlots = 1 (just the data slot).
-	var bigMultiRet bool = ins.ID >= 0 && rm.CC.CallReturnsBigMultiReturn(ins)
-	var bigRet bool = ins.ID >= 0 && (rm.CC.CallReturnsBigAggregate(ins) || bigMultiRet)
-	var prefixSlots int = 1
-	if bigRet { prefixSlots = 2 }
-
-	// Synthetic argTypes: prefixSlots leading pointer slots (sret + data, or just
-	// data), then the user args.  Going through the classifier keeps the ILP32
-	// even-align pad correct for a following int64-pair user arg.
-	var nCallArgs int = len(ins.Args) - 1
-	var argTypes @[]@types.Type = make_slice(@types.Type, nCallArgs + prefixSlots)
-	for p := 0; p < prefixSlots; p++ {
-		argTypes[p] = types.MakePointerType(types.TypUint8())
-	}
-	for i := 0; i < nCallArgs; i++ {
-		argTypes[i + prefixSlots] = ins.Args[i + 1].Typ
-	}
-
-	// Marshal user args via the shared AAPCS32 path (emitCallArg handles scalar /
-	// pointer / aggregate / global-ref, a float scalar via the soft-float GP lowering,
-	// and a 64-bit-pair scalar via its two value-words).  argTypes carries the real arg
-	// type (no *uint8 float coercion), so a float64 even-aligns to a register pair.
-	// User arg ai lands at dispatch slot ai + prefixSlots (the prefix takes the
-	// leading register slots).  Per-arg ResetRegs keeps the (tight) R4..R10 scratch
-	// pool from saturating on a long arg list.
-	for ai := 0; ai < nCallArgs; ai++ {
-		emitCallArg(a, pkgName, rm, argTypes, ins.Args[ai + 1], ai + prefixSlots)
-		if a.HasError { return }
-		rm.ResetRegs()
-	}
-
-	// Reload the iv pointer — the arg loop's ResetRegs may have stranded it — then
-	// load the data (receiver) pointer into its AAPCS32 register.  Without sret the
-	// data slot is R0 (slot 0); with sret it is R1 (slot 1; sret takes R0).
-	// emitFrameAddr uses IP as its scratch, so do the data load BEFORE loading the
-	// call target into IP below.
-	ivAddr = getOperand(a, rm, ins.Args[0].ID)
-	if ivAddr < 0 {
-		a.SetError("native arm32: iface value not reloadable after arg loop (P4-c.3)")
-		return
-	}
-	arm32.Ldr(a, arm32.COND_AL, argReg(prefixSlots - 1),
-			arm32.MemImm(ivAddr, types.IfaceValueDataOffset()))
-
-	// AAPCS32 sret: materialize &returnBuffer into R0 (the hidden sret pointer the
-	// callee writes through).  A big multi-return tuple lands in the result spill
-	// slot (PlanFrame sized it to the full tuple); a single big aggregate lands in
-	// the alloc data region.  This is the R0 analogue of x64's `Lea RDI, [RSP+off]`.
-	if bigRet {
-		var sretOff int = -1
-		if bigMultiRet {
-			sretOff = rm.LookupSpill(ins.ID)
+	// Place the shim's prefix registers.  emitFrameAddr uses IP as its scratch, so do
+	// the retbuf materialization + the (plain-LDR) data / receiver loads BEFORE
+	// loading the call target into IP below.  With a retbuf, R0 = &retbuf and
+	// data / receiver shift to R1 / R2; without, data = R0, receiver = R1.
+	var dataSlot int = 0
+	var recvSlot int = 1
+	if useRetbuf {
+		// R0 = &retbuf (the AAPCS32 sret pointer the shim writes the whole result
+		// through): a single aggregate uses its pre-allocated alloc region; a multi-
+		// return (big OR small) uses the spill slot the tuple lands in.  The shim does
+		// its own R0-sret plumbing internally — the caller just supplies the buffer.
+		var retbufOff int = -1
+		if multiRet {
+			retbufOff = rm.LookupSpill(ins.ID)
 		} else {
-			sretOff = rm.LookupAlloc(ins.ID)
+			retbufOff = rm.LookupAlloc(ins.ID)
 		}
-		if sretOff >= 0 {
-			emitFrameAddr(a, arm32.R0, sretOff)
-		}
+		if retbufOff < 0 { return }
+		emitFrameAddr(a, arm32.R0, retbufOff)
+		dataSlot = 1
+		recvSlot = 2
+	}
+	// data = handle.data (from the handle ptr); receiver = iv.data (iv[0]).
+	var dataRegStart int = rm.CC.CallArgRegStart(argTypes, dataSlot)
+	if dataRegStart >= 0 {
+		arm32.Ldr(a, arm32.COND_AL, argReg(dataRegStart),
+				arm32.MemImm(handleReg, types.FuncValueDataOffset()))
+	}
+	var recvRegStart int = rm.CC.CallArgRegStart(argTypes, recvSlot)
+	if recvRegStart >= 0 {
+		arm32.Ldr(a, arm32.COND_AL, argReg(recvRegStart),
+				arm32.MemImm(ivAddr, types.IfaceValueDataOffset()))
 	}
 
-	// Reload the method pointer from its spill slot into IP as the LAST step, then
-	// BLX IP.  (emitFrameAddr / the data load above clobbered IP.)
-	emitFrameLoad(a, arm32.IP, fnPtrSlot)
+	// Two-step load of the shim (handle.vtable.call) into IP, LAST (emitFrameAddr
+	// above clobbered IP):
+	//   IP = handle.vtable        (LDR IP, [handleReg + FuncValueVtableOffset()])
+	//   IP = [IP + wordBytes()]                ; slot 1 = call (slot 0 = dtor)
+	// wordBytes() (4), NOT the literal 8: the {vtable, data} handle is 8 bytes on
+	// ILP32, so slot 1 is at offset 4.
+	arm32.Ldr(a, arm32.COND_AL, arm32.IP, arm32.MemImm(handleReg, types.FuncValueVtableOffset()))
+	arm32.Ldr(a, arm32.COND_AL, arm32.IP, arm32.MemImm(arm32.IP, wordBytes()))
 	arm32.Blx(a, arm32.COND_AL, arm32.IP)
 
-	// BLX clobbers R0-R3 and IP.  Reset the pool, then collect the return value(s).
+	// BLX clobbers R0-R3 and IP.  Reset the pool, then collect the return value(s)
+	// via the shared shim-return helper (so the collect can't drift from the
+	// func-value path).
 	rm.ResetRegs()
-	if ins.ID < 0 { return }
-
-	// Single-aggregate return: a big aggregate came back via AAPCS32 sret (the
-	// callee wrote through the R0 buffer into the alloc data region — nothing to
-	// store); a small (<=InternalSretBytes) aggregate came back BY VALUE in R0
-	// (store it into the data region first).  Either way, produce the data-region
-	// pointer.  Mirrors emitCallReturn's aggregate arm and x64's post-CALL agg path.
-	if ins.Typ != nil && common.IsAggregateTyp(ins.Typ) && !common.IsMultiReturnCall(ins) {
-		var dataOff int = rm.LookupAlloc(ins.ID)
-		if dataOff < 0 { return }
-		if !bigRet {
-			emitFrameStore(a, arm32.R0, dataOff)
-		}
-		var rd int = nextReg(rm, ins.ID)
-		emitFrameAddr(a, rd, dataOff)
-		return
-	}
-	if ins.Typ != nil && ins.Typ.Kind == types.TYP_VOID { return }
-
-	var spillOff int = rm.LookupSpill(ins.ID)
-	if spillOff < 0 { return }
-	// Multi-return tuple: a big tuple was already written through the R0 sret buffer
-	// into this spill slot (nothing to collect); a small tuple comes back field-per-
-	// register in r0..r3, collected by the SHARED collectMultiReturnFields (which
-	// delegates to storeMultiReturnTupleFieldsArm32 — the same store the direct /
-	// func-value collect and the func-value shim use, so the field layout cannot
-	// drift from arm32_return.bn's pack/sret side).
-	if common.IsMultiReturnCall(ins) {
-		if bigMultiRet { return }
-		collectMultiReturnFields(a, rm, ins, spillOff)
-		return
-	}
-	// A 64-bit-pair scalar return (int64 / uint64 / float64) comes back in r0:r1;
-	// store both words.  Every other scalar / pointer — including a float32 — returns
-	// in R0.  A soft-float float64 return rides the pair bit-for-bit like an int64.
-	if isPair64Typ(ins.Typ) {
-		emitFrameStore(a, arm32.R0, spillOff)
-		emitFrameStore(a, arm32.R1, spillOff + 4)
-		return
-	}
-	emitFrameStore(a, arm32.R0, spillOff)
+	collectShimReturnArm32(a, rm, allFuncs, ins, aggregateRet, multiRet)
 }
 
 // ============================================================

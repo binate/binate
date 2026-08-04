@@ -123,10 +123,74 @@ func callDispatchArgTypes(cc CallConv, ins @ir.Instr) @[]@types.Type {
 	return ts
 }
 
+// shimDispatchArgTypes returns the dispatch-side arg-type sequence for a
+// handle-marshaling-shim call — OP_CALL_FUNC_VALUE / OP_CALL_HANDLE
+// (extraFixedPrefix 0) or OP_CALL_IFACE_METHOD (extraFixedPrefix 1, the extra
+// receiver slot).  It is a MATCHED PAIR with the per-backend shim emitters
+// (emitCallFuncValue / emitCallIfaceMethod): the iface dispatch is exactly the
+// func-value dispatch with ONE additional fixed prefix slot (the receiver), so
+// routing both through this one function guarantees PlanFrame's outgoing-args
+// reservation equals what those emitters spill.  Args[0] (the func-value / iface
+// value) is skipped; the leading prefix is TypInt() slots and the user args are
+// substituted to the all-int shim ABI.
+//
+// prefixSlots = 1 + extraFixedPrefix (the data ptr, plus the receiver for
+// iface), then +1 for the retbuf when the result rides a caller-supplied buffer:
+// a single aggregate return (types.IsAggregateReturnTyp, EXCLUDING a 0-byte
+// aggregate, which is void-like) or ANY multi-return (IsMultiReturnCall).  This
+// is the same retbuf-vs-scalar classification emitCallFuncValue /
+// emitCallIfaceMethod use for their own prefixSlots, on ALL calling conventions:
+// under retbuf-for-any-multi-return the shim passes a retbuf as a GP arg even on
+// AAPCS64 (the retbuf rides X0; the callee's X8 sret plumbing is internal to the
+// shim, not an extra prefix slot), so the count MUST NOT be gated on
+// SretInGpArgReg — doing so left aa64 under-counting once it too passes the
+// retbuf as a GP arg.
+func shimDispatchArgTypes(cc CallConv, ins @ir.Instr, extraFixedPrefix int) @[]@types.Type {
+	var prefixSlots int = 1 + extraFixedPrefix
+	var aggregateRet bool = ins.ID >= 0 && types.IsAggregateReturnTyp(ins.Typ) &&
+			!IsMultiReturnCall(ins)
+	if aggregateRet || (ins.ID >= 0 && IsMultiReturnCall(ins)) {
+		prefixSlots = prefixSlots + 1
+	}
+	var nUserArgs int = len(ins.Args) - 1
+	if nUserArgs < 0 { nUserArgs = 0 }
+	var ts @[]@types.Type = make_slice(@types.Type, nUserArgs + prefixSlots)
+	for p := 0; p < prefixSlots; p++ {
+		ts[p] = types.TypInt()
+	}
+	for i := 0; i < nUserArgs; i++ {
+		// Mirror the shim emitters' all-int shim-ABI substitution so the outgoing-args
+		// SIZE this feeds PlanFrame matches what the emitter actually spills: the
+		// dispatch carries a float scalar in GP register(s) of its byte width — ONE word
+		// for a float32 (and for any float on LP64, where an 8-byte float is a single
+		// 8-byte word), a TWO-word even-aligned PAIR for a float64 on ILP32.  Size it as
+		// the same-width GP INTEGER (a float wider than one word -> int64, else a 1-word
+		// *uint8) so the sizing matches the emitter, which lets a float ride its real
+		// type via the soft-float GP path.  A 1-word *uint8 for EVERY float would
+		// UNDER-reserve a float64 on ILP32 (2 words), and PlanFrame would then place a
+		// caller local inside the region the emitted spill overruns — a hang (see
+		// conformance 565 / 888).  On a natural-size-stack-arg CC a narrow (<8-byte)
+		// non-aggregate scalar rides a rounded 8-byte GP slot.
+		var at @types.Type = ins.Args[i + 1].Typ
+		if IsFloatScalarTyp(at) {
+			if at.SizeOf() > cc.WordBytes {
+				at = types.TypInt64()
+			} else {
+				at = types.MakePointerType(types.TypUint8())
+			}
+		} else if cc.NaturalSizeStackArgs && !IsAggregateTyp(at) && at.SizeOf() < 8 {
+			at = types.MakePointerType(types.TypUint8())
+		}
+		ts[prefixSlots + i] = at
+	}
+	return ts
+}
+
 // callDispatchArgTypesAnyOp returns the dispatch-side arg-type
 // sequence for any IR call op — direct (OP_CALL / OP_C_CALL),
-// func-value (OP_CALL_FUNC_VALUE / OP_CALL_HANDLE), or
-// indirect-ptr (OP_CALL_INDIRECT).  Used by PlanFrame to size the
+// func-value (OP_CALL_FUNC_VALUE / OP_CALL_HANDLE),
+// iface-method (OP_CALL_IFACE_METHOD), or indirect-ptr
+// (OP_CALL_INDIRECT).  Used by PlanFrame to size the
 // outgoing-args stack reservation uniformly across all call
 // shapes; before this helper, only OP_CALL / OP_C_CALL were
 // counted, which let the closure-struct local overlap the
@@ -136,11 +200,16 @@ func callDispatchArgTypes(cc CallConv, ins @ir.Instr) @[]@types.Type {
 // Shapes:
 //   - OP_CALL / OP_C_CALL: same as callDispatchArgTypes (incl. the
 //     SretInGpArgReg-prepend for big-aggregate returns).
-//   - OP_CALL_FUNC_VALUE / OP_CALL_HANDLE: skip Args[0] (the
-//     func-value), prepend `prefixSlots` TypInt() slots — 1 for
-//     scalar returns (just the data ptr in RDI / X0) or 2 for
-//     aggregate returns (retbuf + data).  Mirrors the emitter's
-//     own prefixSlots computation.
+//   - OP_CALL_FUNC_VALUE / OP_CALL_HANDLE: shimDispatchArgTypes
+//     with no extra prefix — skip Args[0] (the func-value),
+//     prepend [data] (+ retbuf for an aggregate / multi return),
+//     then the shim-ABI user args.
+//   - OP_CALL_IFACE_METHOD: shimDispatchArgTypes with ONE extra
+//     fixed prefix (the receiver) — skip Args[0] (the iface
+//     value), prepend [data, receiver] (+ retbuf for an aggregate
+//     / multi return), then the shim-ABI user args.  Exactly the
+//     func-value dispatch plus the receiver slot the native
+//     emitCallIfaceMethod prepends after the handle's data.
 //   - OP_CALL_INDIRECT: skip Args[0] (the function ptr); no
 //     prefix slots — emitter passes user-args straight in
 //     RDI..R9 / X0..X7.
@@ -149,67 +218,9 @@ func callDispatchArgTypesAnyOp(cc CallConv, ins @ir.Instr) @[]@types.Type {
 		return callDispatchArgTypes(cc, ins)
 	}
 	if ins.Op == iropcode.OP_CALL_FUNC_VALUE || ins.Op == iropcode.OP_CALL_HANDLE {
-		var prefixSlots int = 1
-		// Classify the RESULT with types.IsAggregateReturnTyp — a MATCHED PAIR with
-		// emitCallFuncValue's own `aggregateRet` (see below): the two must agree
-		// field-for-field or PlanFrame's outgoing-args count desyncs from what the
-		// emitter spills.  IsAggregateReturnTyp is the single-source-of-truth
-		// retbuf-vs-scalar predicate; it agrees with the old kind-only IsAggregateTyp
-		// for every SizeOf >= 1 result and differs only for a 0-byte aggregate
-		// (`struct{}` / `[0]T`), which is void-like (1 prefix slot, not 2) — exactly
-		// the classification the emitter now uses.
-		var aggregateRet bool = ins.ID >= 0 && types.IsAggregateReturnTyp(ins.Typ) &&
-				!IsMultiReturnCall(ins)
-		// Under retbuf-for-any-multi-return the func-value emitter passes a retbuf
-		// as a GP arg for EVERY multi-return (alongside data) — TWO prefix slots
-		// (emitCallFuncValue's `useRetbuf = aggregateRet || IsMultiReturnCall` →
-		// prefixSlots=2) — on ALL calling conventions, including AArch64.  (On aa64
-		// the retbuf rides X0 as a GP arg even for a big tuple; the callee's X8 sret
-		// plumbing is internal to the shim, NOT a third prefix slot.)  The sizer
-		// MUST reserve the same 2 slots, or PlanFrame under-counts outgoing-args and
-		// a spilled user arg overlaps a frame slot — a cross-module silent
-		// miscompile.  Gating this on SretInGpArgReg (as before) left aa64 at 1,
-		// which under-counts once aa64 also passes the retbuf as a GP arg.  This is
-		// a MATCHED PAIR with emitCallFuncValue's prefixSlots — they must agree
-		// field-for-field per backend.
-		if aggregateRet || (ins.ID >= 0 && IsMultiReturnCall(ins)) {
-			prefixSlots = 2
-		}
-		var nUserArgs int = len(ins.Args) - 1
-		if nUserArgs < 0 { nUserArgs = 0 }
-		var ts @[]@types.Type = make_slice(@types.Type, nUserArgs + prefixSlots)
-		for p := 0; p < prefixSlots; p++ {
-			ts[p] = types.TypInt()
-		}
-		for i := 0; i < nUserArgs; i++ {
-			// Mirror emitCallFuncValue's all-int shim-ABI substitution so the
-			// outgoing-args SIZE this feeds PlanFrame matches what the emitter
-			// actually spills: the dispatch carries a float scalar in GP register(s)
-			// of its byte width — ONE word for a float32 (and for any float on LP64,
-			// where an 8-byte float is a single 8-byte word), a TWO-word even-aligned
-			// PAIR for a float64 on ILP32.  Size it as the same-width GP INTEGER (a
-			// float wider than one word -> int64, else a 1-word *uint8) so the sizing
-			// matches emitCallFuncValue, which now lets a float ride its real type via
-			// the soft-float GP path.  A 1-word *uint8 for EVERY float would
-			// UNDER-reserve a float64 on ILP32 (2 words), and PlanFrame would then
-			// place a caller local inside the region the emitted spill overruns — a
-			// hang (see conformance 565 / 888; claude-todo "func-value dispatch
-			// UNDER-COUNTS outgoing-args when float args spill").  On a natural-size-
-			// stack-arg CC a narrow (<8-byte) non-aggregate scalar rides a rounded
-			// 8-byte GP slot.
-			var at @types.Type = ins.Args[i + 1].Typ
-			if IsFloatScalarTyp(at) {
-				if at.SizeOf() > cc.WordBytes {
-					at = types.TypInt64()
-				} else {
-					at = types.MakePointerType(types.TypUint8())
-				}
-			} else if cc.NaturalSizeStackArgs && !IsAggregateTyp(at) && at.SizeOf() < 8 {
-				at = types.MakePointerType(types.TypUint8())
-			}
-			ts[prefixSlots + i] = at
-		}
-		return ts
+		// The func-value shim prefix is [data] (+ retbuf for an aggregate / multi
+		// return) — no extra fixed prefix.  Matched pair with emitCallFuncValue.
+		return shimDispatchArgTypes(cc, ins, 0)
 	}
 	if ins.Op == iropcode.OP_CALL_INDIRECT {
 		var nUserArgs int = len(ins.Args) - 1
@@ -252,26 +263,18 @@ func callDispatchArgTypesAnyOp(cc CallConv, ins @ir.Instr) @[]@types.Type {
 		return ts
 	}
 	if ins.Op == iropcode.OP_CALL_IFACE_METHOD {
-		// Args[0] is the interface value; the dispatch passes its data
-		// (receiver) pointer as the first arg slot, then the user args.
-		// A big-aggregate / big-multi return adds a leading sret-pointer
-		// slot ONLY where sret travels in a GP arg register (SysV RDI);
-		// AArch64 carries it in X8, off the arg-reg sequence, so it adds
-		// no slot — exactly the native emitCallIfaceMethod layouts.
-		var prefixSlots int = 1
-		var bigRet bool = ins.ID >= 0 &&
-				(cc.CallReturnsBigAggregate(ins) || cc.CallReturnsBigMultiReturn(ins))
-		if bigRet && cc.SretInGpArgReg { prefixSlots = 2 }
-		var nUserArgs int = len(ins.Args) - 1
-		if nUserArgs < 0 { nUserArgs = 0 }
-		var ts @[]@types.Type = make_slice(@types.Type, nUserArgs + prefixSlots)
-		for p := 0; p < prefixSlots; p++ {
-			ts[p] = types.TypInt()
-		}
-		for i := 0; i < nUserArgs; i++ {
-			ts[prefixSlots + i] = ins.Args[i + 1].Typ
-		}
-		return ts
+		// The native emitCallIfaceMethod dispatches THROUGH the method's func-value
+		// HANDLE + marshaling shim (like OP_CALL_FUNC_VALUE), with the interface
+		// value's data (iv[0]) prepended as the shim's receiver after the handle's
+		// data — so the prefix is [data, receiver] (+ retbuf for an aggregate / multi
+		// return), i.e. the func-value dispatch with ONE extra fixed prefix slot.
+		// shimDispatchArgTypes with extraFixedPrefix=1 produces exactly that, INCLUDING
+		// the shim-ABI user-arg coercions, so the sizer stays a matched pair with the
+		// emitter on every backend.  (The old raw-dispatch sizing — 1 prefix slot, no
+		// receiver, raw un-coerced arg types — under-reserved outgoing-args by the
+		// receiver word: a spilled user arg overran the frame slot above the outgoing
+		// area, a silent stack corruption; conformance/1160, 1161.)
+		return shimDispatchArgTypes(cc, ins, 1)
 	}
 	var empty @[]@types.Type
 	return empty

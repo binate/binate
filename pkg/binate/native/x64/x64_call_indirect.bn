@@ -226,54 +226,13 @@ func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char, rm @common.Re
 
 	var nCallArgs int = len(ins.Args) - 1
 
-	// Place user args first (so any user arg whose source happens to be RDI/RSI
-	// is read before we overwrite those for retbuf/data).
-	//
-	// The func-value dispatch ABI is ALL-INT WORD-POSITIONAL: dispatch word g
-	// (g < prefixSlots is a leading data — or retbuf+data — slot) rides argReg(g)
-	// when g < NumGpArgRegs, else the outgoing-args stack at [rsp+(g-NumGpArgRegs)
-	// *8], and each arg's shimInWordsForTypeX64 words occupy CONSECUTIVE positions.
-	// A scalar/float rides ONE GP word (the shim movq/movd's a float into xmm), so
-	// there is no separate FP path.  Under option B EVERY aggregate arg also rides
-	// exactly ONE word — its ADDRESS (isByAddressAggX64: a coerced <=16 B struct/
-	// array, a non-coerced slice / iface-value, or an indirect-large > 16 B image) —
-	// so no aggregate ever straddles the reg/stack boundary in dispatch.  The shim
-	// (emitFuncvalSpillShim_x64 / emitShimArgMarshal_x64) reads its incoming words on
-	// exactly this positional model and re-expands each by-address aggregate's value-
-	// words from the pointer, matching the LLVM cross-package shim's i8*-per-aggregate
-	// contract (conformance 1006).  The two MUST agree: the dispatch and shim key the
-	// same shimInWordsForTypeX64 / isByAddressAggX64 so a slice occupies one incoming
-	// word on both sides.
-	var numGp int = rm.CC.NumGpArgRegs
-	var gWord int = prefixSlots
-	for ai := 0; ai < nCallArgs; ai++ {
-		var arg @ir.Instr = ins.Args[ai + 1]
-		var w int = shimInWordsForTypeX64(rm.CC, arg.Typ)
-		if common.IsAggregateTyp(arg.Typ) {
-			// Option B: EVERY func-value aggregate arg rides BY-ADDRESS as ONE
-			// pointer word — a coerced <=16 B struct/array, a non-coerced slice /
-			// iface-value (isByAddressAggX64), OR an indirect-large > 16 B aggregate
-			// (the callconv already models it as one word).  shimInWordsForTypeX64
-			// gives 1 for all of them.  The shim loads + re-expands it, matching the
-			// LLVM cross-package shim's i8*-per-aggregate contract (fixes 1006).
-			// (Before option B a non-coerced slice rode first-class and desynced with
-			// the LLVM-emitted shim; for a native-emitted shim it straddled the last
-			// GP reg.)
-			var ptr int = getOperand(a, rm, arg.ID)
-			if ptr >= 0 {
-				placeDispatchWordReg_x64(a, gWord, ptr, numGp)
-			}
-			rm.ResetRegs()
-			gWord = gWord + w
-			continue
-		}
-		var src int = emitValOperand(a, pkgName, rm, arg)
-		if src >= 0 {
-			placeDispatchWordReg_x64(a, gWord, src, numGp)
-		}
-		rm.ResetRegs()
-		gWord = gWord + w
-	}
+	// Marshal the user args into their all-int word-positional dispatch slots,
+	// starting at dispatch word prefixSlots (past the leading data — or retbuf+data —
+	// prefix).  Shared with emitCallIfaceMethod (x64_iface.bn), which passes a larger
+	// prefixSlots (an extra receiver slot), so the two layouts can't drift.  Doing
+	// this before the retbuf/data loads means a user arg whose source happens to be
+	// RDI/RSI is read before we overwrite those.
+	emitShimUserArgsX64(a, pkgName, rm, ins, prefixSlots, nCallArgs, rm.CC.NumGpArgRegs)
 
 	// Reload fvAddr — the arg loop's ResetRegs may have stranded it.
 	if nCallArgs > 0 {
@@ -314,10 +273,73 @@ func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char, rm @common.Re
 	}
 	x64.CallReg(a, x64.R11)
 	rm.ResetRegs()
-	if ins.ID < 0 { return }
+	collectShimReturnX64(a, rm, ins, aggregateRet, multiRet)
+}
 
-	// Aggregate single-return: shim wrote through retbuf we passed
-	// in RDI.  Just produce the alloc-region pointer.
+// emitShimUserArgsX64 dispatches a handle/shim call's user args (ins.Args[1..])
+// into their dispatch slots under the all-int WORD-POSITIONAL shim ABI, starting
+// at dispatch word `prefixSlots` (the shim's leading data — or retbuf/data, or
+// retbuf/data/receiver — prefix).  Dispatch word g rides argReg(g) when g < numGp,
+// else the outgoing-args stack at [rsp+(g-numGp)*8], and each arg's
+// shimInWordsForTypeX64 words occupy CONSECUTIVE positions.  A scalar/float rides
+// ONE GP word (the shim movq/movd's a float into xmm), so there is no separate FP
+// path.  Under option B EVERY aggregate arg also rides exactly ONE word — its
+// ADDRESS (isByAddressAggX64: a coerced <=16 B struct/array, a non-coerced slice /
+// iface-value, or an indirect-large > 16 B image) — so no aggregate ever straddles
+// the reg/stack boundary in dispatch.  The shim (emitFuncvalSpillShim_x64 /
+// emitShimArgMarshal_x64) reads its incoming words on exactly this positional model
+// and re-expands each by-address aggregate's value-words from the pointer, matching
+// the LLVM cross-package shim's i8*-per-aggregate contract (conformance 1006).  The
+// two MUST agree: the dispatch and shim key the same shimInWordsForTypeX64 /
+// isByAddressAggX64 so a slice occupies one incoming word on both sides.  Per-arg
+// ResetRegs keeps the scratch pool from saturating on long arg lists.  Shared by
+// emitCallFuncValue and emitCallIfaceMethod.
+func emitShimUserArgsX64(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr, prefixSlots int, nCallArgs int, numGp int) {
+	var gWord int = prefixSlots
+	for ai := 0; ai < nCallArgs; ai++ {
+		var arg @ir.Instr = ins.Args[ai + 1]
+		var w int = shimInWordsForTypeX64(rm.CC, arg.Typ)
+		if common.IsAggregateTyp(arg.Typ) {
+			// Option B: EVERY aggregate arg rides BY-ADDRESS as ONE pointer word — a
+			// coerced <=16 B struct/array, a non-coerced slice / iface-value
+			// (isByAddressAggX64), OR an indirect-large > 16 B aggregate (the callconv
+			// already models it as one word).  shimInWordsForTypeX64 gives 1 for all of
+			// them.  The shim loads + re-expands it, matching the LLVM cross-package
+			// shim's i8*-per-aggregate contract (fixes 1006).  (Before option B a
+			// non-coerced slice rode first-class and desynced with the LLVM-emitted
+			// shim; for a native-emitted shim it straddled the last GP reg.)
+			var ptr int = getOperand(a, rm, arg.ID)
+			if ptr >= 0 {
+				placeDispatchWordReg_x64(a, gWord, ptr, numGp)
+			}
+			rm.ResetRegs()
+			gWord = gWord + w
+			continue
+		}
+		var src int = emitValOperand(a, pkgName, rm, arg)
+		if src >= 0 {
+			placeDispatchWordReg_x64(a, gWord, src, numGp)
+		}
+		rm.ResetRegs()
+		gWord = gWord + w
+	}
+}
+
+// collectShimReturnX64 collects a handle/shim call's return value after the CALL
+// (and its rm.ResetRegs()).  aggregateRet: the shim wrote the single aggregate
+// THROUGH the retbuf we passed in RDI (the alloc region) — just produce the region
+// pointer as this instruction's result, no RAX/RDX spill.  multiRet: the shim wrote
+// the whole tuple through the retbuf (the spill slot) — big via its internal sret,
+// small via a store-through-retbuf — so nothing is collected from return registers
+// (which the shim never wrote).  Otherwise a scalar result (float scalars included —
+// the shim already movq/movd'd a float xmm0 into rax) comes back in RAX and is moved
+// to the result register.  Shared by emitCallFuncValue and emitCallIfaceMethod —
+// their shims use the identical retbuf/scalar return ABI, so the collect can't drift
+// between the two.
+func collectShimReturnX64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, aggregateRet bool,
+		multiRet bool) {
+	if ins.ID < 0 { return }
 	if aggregateRet {
 		var dataOff int = rm.LookupAlloc(ins.ID)
 		if dataOff < 0 { return }
@@ -325,18 +347,7 @@ func emitCallFuncValue(a @asm.Assembler, pkgName *[]readonly char, rm @common.Re
 		x64.Lea(a, x64.Reg(rd, x64.SZ64), x64.Mem(x64.RSP, dataOff, x64.SZ64))
 		return
 	}
-
-	if multiRet {
-		// The shim wrote the whole tuple THROUGH retbuf (the spill slot) — big
-		// via sret, small via a store-through-retbuf.  Nothing to collect from
-		// return registers (the previous field-per-register collect read regs the
-		// LLVM/VM shim never wrote); the spill slot already holds the result.
-		return
-	}
-	// Scalar single-return.  All-int shim ABI: the result — float
-	// scalars included — comes back in RAX (the shim already movq/movd'd
-	// a float xmm0 -> rax), unlike a native call where a float result is
-	// in xmm0.  Store RAX; do not special-case floats here.
+	if multiRet { return }
 	if ins.Typ != nil && ins.Typ.Kind == types.TYP_VOID { return }
 	var rd int = nextReg(rm, ins.ID)
 	if rd != x64.RAX {

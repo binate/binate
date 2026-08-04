@@ -4,6 +4,7 @@ import "pkg/binate/ir"
 import "pkg/binate/stringutils"
 import "pkg/binate/types"
 import "pkg/std/strings"
+import "pkg/stdx/slices"
 
 // ============================================================
 // Interface-value ops: OP_IFACE_VALUE (construction), OP_CALL_IFACE_METHOD
@@ -14,49 +15,64 @@ import "pkg/std/strings"
 // keeps the vtable-emission side (impl vtable globals + slot wiring
 // + slot collection).
 
-// emitCallIfaceMethod lowers OP_CALL_IFACE_METHOD: dispatch through
-// the vtable of an interface value. Args[0] is the iv value
-// (TYP_INTERFACE_VALUE / TYP_INTERFACE_VALUE_MANAGED); Args[1..] are
-// user args; Index is the method slot.
+// emitCallIfaceMethod lowers OP_CALL_IFACE_METHOD: dispatch through the vtable
+// of an interface value.  Args[0] is the iv value (TYP_INTERFACE_VALUE /
+// TYP_INTERFACE_VALUE_MANAGED); Args[1..] are user args; Index is the method
+// slot.
 //
-// LLVM shape:
+// Every @__ivt method slot holds the method's function-value HANDLE
+// (@__handle.<m>) — the same convention slot 0 (the dtor) already uses (see
+// emitImplVtable, useHandles=true).  Dispatch therefore goes THROUGH the
+// handle's marshaling shim exactly like OP_CALL_FUNC_VALUE, so a bytecode
+// (VM-lowered) impl's method — whose handle re-enters the VM — is callable by
+// native code identically to a native impl's.  The shim (@__shim.<m>, emitted
+// by emitFuncValueShim over the method's `(receiver, args) -> results`
+// func-value type) takes `(data, receiver, args)` (or `(retbuf, data, receiver,
+// args)` for an aggregate return) and strips `data` before forwarding
+// `(receiver, args)` to the real method.  See explorations/plan-iface-crossmode.md.
 //
-//   %dt   = extractvalue %BnIfaceValue %iv, 0   ; data ptr
-//   %vt8  = extractvalue %BnIfaceValue %iv, 1   ; vtable ptr (i8*)
-//   %vt   = bitcast i8* %vt8 to i8**             ; -> array of slots
-//   %sp   = getelementptr inbounds i8*, i8** %vt, i64 <Index>
-//   %fp   = load i8*, i8** %sp                   ; function pointer
-//   %fn   = bitcast i8* %fp to <ret>(i8*, <argTys>)*
-//   %r    = call <ret> %fn(i8* %dt, <args>)
+// LLVM shape (scalar return, one scalar user arg):
 //
-// Slice 2.3a-3 of plan-interface-syntax-revision.md.
+//   %recv = extractvalue %BnIfaceValue %iv, 0     ; iv data ptr = the receiver
+//   %vt8  = extractvalue %BnIfaceValue %iv, 1     ; vtable word (i8*)
+//   %vts  = bitcast i8* %vt8 to i8**              ; -> array of slots
+//   %hsp  = getelementptr inbounds i8*, i8** %vts, i64 <Index>
+//   %hp   = load i8*, i8** %hsp                   ; the method HANDLE (a %BnFuncValue*)
+//   %h    = bitcast i8* %hp to %BnFuncValue*
+//   %dt   = load i8*, ... %h.data                 ; handle's own data word
+//   %vt   = bitcast (load %h.vtable) to %BnVtable*
+//   %cb   = load i8*, ... %vt.call                ; the shim
+//   %fn   = bitcast i8* %cb to <ret>(i8*, i8*, <argTys>)*
+//   %r    = call <ret> %fn(i8* %dt, i8* %recv, <args>)
+//
+// The handle-field extraction mirrors emitCallHandle (the handle is a POINTER
+// loaded at runtime, not an SSA aggregate); the arg/return marshaling mirrors
+// emitCallFuncValue, with the iv data ptr prepended as the first arg after the
+// handle's data (the shim's receiver param).  Slice 2.3a-3 of
+// plan-interface-syntax-revision.md; unified onto handles per S1 of
+// plan-iface-crossmode.md.
 func emitCallIfaceMethod(out *strings.Builder, instr @ir.Instr) {
 	var iv @ir.Instr = instr.Args[0]
 	var nArgs int = len(instr.Args) - 1
+	var fnTyp @types.Type = ifaceMethodFuncType(instr)
 	var isVoid bool = instr.Typ == nil || instr.Typ.Kind == types.TYP_VOID
-	// The bitcast signature and call shape must match the callee's
-	// definition convention (emit_debug.bn): a SINGLE >16-byte result is
-	// returned via explicit sret, but a MULTI-return tuple is returned BY
-	// VALUE.  ifaceMethodUsesSret encodes that distinction — using sret for
-	// a multi-return would read an unwritten buffer (garbage).
-	var useSret bool = ifaceMethodUsesSret(instr)
-	// SysV argTypes for the dispatch: [sret ptr?, receiver i8*] then the
-	// positional args, so a positional arg's memory-class decision (aggMemClass)
-	// matches the impl method's define-line (emit_debug.bn / defineArgTypes) and
-	// the native x64 iface walk.  ifOff is where the positional args start.
-	var ifArgTypes @[]@types.Type = ifaceArgTypes(instr, useSret)
-	var ifOff int = 1
-	if useSret {
-		ifOff = 2
-	}
+	var isAggregate bool = isAggregateReturn(fnTyp)
 
+	// Receiver = the iv's data ptr (%v<id>.recv), passed to the shim ahead of
+	// the user args.
 	out.Write("%v")
 	stringutils.WriteInt(out, instr.ID)
-	out.Write(".dt = extractvalue %BnIfaceValue ")
+	out.Write(".recv = extractvalue %BnIfaceValue ")
 	emitRef(out, iv.ID)
 	out.Write(", ")
 	stringutils.WriteInt(out, types.IfaceValueDataIndex())
 	out.Write("\n  ")
+	// Vtable word -> i8** -> method slot -> handle pointer (i8*).  instr.Index
+	// is the absolute vtable slot (Slice E.4 of plan-interface-embedding.md):
+	// for a non-extended interface method_position + 2 (the two-word any-block —
+	// dtor then *TypeInfo — precedes the methods); an extended interface
+	// accounts for the concat layout's nested parent any-blocks.
+	// findInterfaceMethod produces it.
 	out.Write("%v")
 	stringutils.WriteInt(out, instr.ID)
 	out.Write(".vt8 = extractvalue %BnIfaceValue ")
@@ -66,244 +82,237 @@ func emitCallIfaceMethod(out *strings.Builder, instr @ir.Instr) {
 	out.Write("\n  ")
 	out.Write("%v")
 	stringutils.WriteInt(out, instr.ID)
-	out.Write(".vt = bitcast i8* %v")
+	out.Write(".vts = bitcast i8* %v")
 	stringutils.WriteInt(out, instr.ID)
 	out.Write(".vt8 to i8**\n  ")
 	out.Write("%v")
 	stringutils.WriteInt(out, instr.ID)
-	out.Write(
-			".sp = getelementptr inbounds i8*, i8** %v")
+	out.Write(".hsp = getelementptr inbounds i8*, i8** %v")
 	stringutils.WriteInt(out, instr.ID)
-	out.Write(".vt, i64 ")
-	// instr.Index is the absolute vtable slot (Slice E.4 of
-	// plan-interface-embedding.md).  For a non-extended interface
-	// it equals method_position + 2 (the two-word any-block — dtor
-	// then *TypeInfo — precedes the methods); for an extended
-	// interface it accounts for the concat layout's nested parent
-	// any-blocks.  findInterfaceMethod produces it.
+	out.Write(".vts, i64 ")
 	stringutils.WriteInt(out, instr.Index)
 	out.Write("\n  ")
 	out.Write("%v")
 	stringutils.WriteInt(out, instr.ID)
-	out.Write(".fp = load i8*, i8** %v")
+	out.Write(".hp = load i8*, i8** %v")
 	stringutils.WriteInt(out, instr.ID)
-	out.Write(".sp\n  ")
-	// Bitcast the function pointer to the thunk's actual signature:
-	//   sret form: void(ptr sret(<ret>) align 8, i8*, args...)*
-	//   direct:    <ret>(i8*, args...)*   or   void(i8*, args...)*
+	out.Write(".hsp\n  ")
+	// From the handle (mirrors emitCallHandle): load its data word and its
+	// vtable.call slot (the shim).
+	out.Write("%v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".h = bitcast i8* %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".hp to %BnFuncValue*\n  ")
+	out.Write("%v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".dtp = getelementptr inbounds %BnFuncValue, %BnFuncValue* %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".h, i32 0, i32 ")
+	stringutils.WriteInt(out, types.FuncValueDataIndex())
+	out.Write("\n  ")
+	out.Write("%v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".dt = load i8*, i8** %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".dtp\n  ")
+	out.Write("%v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".vt8p = getelementptr inbounds %BnFuncValue, %BnFuncValue* %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".h, i32 0, i32 ")
+	stringutils.WriteInt(out, types.FuncValueVtableIndex())
+	out.Write("\n  ")
+	out.Write("%v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".hvt8 = load i8*, i8** %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".vt8p\n  ")
+	out.Write("%v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".vt = bitcast i8* %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".hvt8 to %BnVtable*\n  ")
+	out.Write("%v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".cp = getelementptr inbounds %BnVtable, %BnVtable* %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".vt, i32 0, i32 1\n  ")
+	out.Write("%v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".cb = load i8*, i8** %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".cp\n  ")
+
+	// Bitcast the shim call slot to the method's shim signature — `<ret>(i8*
+	// data, i8* receiver, <argTys>)*`, or `void(i8* retbuf, i8* data, i8*
+	// receiver, <argTys>)*` for an aggregate return.  funcSignatureLLVM spells
+	// the whole thing from fnTyp (Params[0] = receiver).
+	var sig @[]char = funcSignatureLLVM(fnTyp)
 	out.Write("%v")
 	stringutils.WriteInt(out, instr.ID)
 	out.Write(".fn = bitcast i8* %v")
 	stringutils.WriteInt(out, instr.ID)
-	out.Write(".fp to ")
-	if useSret {
-		out.Write("void")
-	} else if isVoid {
-		out.Write("void")
-	} else if aggCallResultCoerced(instr) {
-		// Coerced in-register-aggregate result: the thunk returns the
-		// coerced ABI type, so the bitcast signature + the call result must
-		// spell it — x64 SSE's `{ .. }` / eightbyte aggregate (sysvReturnLLTy)
-		// or the GP `[N x iW]` (aggCoerceLLTy).  See emit_sysv_coerce.bn.
-		if types.SysVInSse(instr.Typ) {
-			sysvReturnLLTy(out, instr.Typ)
-		} else {
-			aggCoerceLLTy(out, instr.Typ)
-		}
-	} else if callMultiRetCoerced(instr) {
-		// Coerced register-returned multi-return: the thunk returns the
-		// per-field-coerced tuple, so the bitcast signature must spell it.
-		multiReturnCoercedLLTy(out, instr.Typ)
-	} else {
-		out.Write(llvmType(instr.Typ))
-	}
-	out.WriteByte('(')
-	if useSret {
-		out.Write("ptr, ")
-	}
-	out.Write("i8*")
-	for i := 0; i < nArgs; i++ {
-		var argInstr @ir.Instr = instr.Args[i + 1]
-		out.Write(", ")
-		if aggMemClass(ifArgTypes, i + ifOff) {
-			// x64 SysV memory-class aggregate arg: a bare `ptr` in the
-			// function-POINTER type (a `byval(...)` parameter attribute is
-			// invalid inside a function type — it lives only on the CALL arg,
-			// emitted below with writeMemByvalArg).  LLVM still lays the
-			// aggregate on the outgoing stack from the call-site `byval`.
-			out.Write("ptr")
-		} else if types.SysVInSse(argInstr.Typ) {
-			// x64 SSE aggregate arg: the thunk's define splits it into
-			// per-eightbyte params, so the bitcast sig must too.
-			sysvWriteDeclareParamTypes(out, argInstr.Typ)
-		} else {
-			writeParamTypeLLVM(out, argInstr.Typ)
-		}
-	}
-	out.Write(")*\n  ")
-	// Spill each >16-byte by-value aggregate arg into its hoisted
-	// `.bv<i>` slot and pass a plain `ptr`: the vtable thunk declares
-	// those params as `ptr` (writeParamTypeLLVM), so passing the
-	// aggregate by value would shift every following arg (598) or
-	// wild-deref a value-as-pointer (the >16-byte indirect-call SIGSEGV).
-	writeByvalArgPreamble(out, instr)
+	out.Write(".cb to ")
+	out.Write(sig)
+	out.Write("\n  ")
 
-	// Coerce in-register-aggregate positional args to `[N x iW]` (the
-	// thunk's coerced param type) before the call line.
-	emitAggIfaceArgPreamble(out, instr, nArgs, useSret)
+	// Aggregate user args ride the shim's by-address convention.  paramBase 1
+	// skips the receiver param (fnTyp.Params[0]); the arg values are still
+	// instr.Args[i+1].
+	emitFuncValueArgPreamble(out, instr, fnTyp, nArgs, 1)
 
-	if useSret {
-		// The sret buffer (%v<id>.rb) is hoisted to the function
-		// entry block by emitIfaceMethodSretAllocDecl (emitFuncDbg's
-		// pre-pass) so an iface-method call returning a big struct
-		// from inside a loop doesn't leak a fresh buffer per
-		// iteration; here we only call the thunk through it and load
-		// the result.
-		out.Write("call void %v")
+	if isAggregate {
+		// retbuf (%v<id>.rb) is hoisted to the entry block by
+		// emitIfaceMethodCallAllocDecls; bitcast it to i8*, call the shim with
+		// (retbuf, data, receiver, args...), then load the result back.
+		out.Write("%v")
 		stringutils.WriteInt(out, instr.ID)
-		out.Write(".fn(ptr sret(")
-		out.Write(llvmType(instr.Typ))
-		out.Write(") align 8 %v")
+		out.Write(".rb8 = bitcast ")
+		writeFuncResultsLLVM(out, fnTyp)
+		out.Write("* %v")
 		stringutils.WriteInt(out, instr.ID)
-		out.Write(".rb, i8* %v")
-		stringutils.WriteInt(out, instr.ID)
-		out.Write(".dt")
-	} else if isVoid {
+		out.Write(".rb to i8*\n  ")
 		out.Write("call void %v")
 		stringutils.WriteInt(out, instr.ID)
 		out.Write(".fn(i8* %v")
 		stringutils.WriteInt(out, instr.ID)
-		out.Write(".dt")
-	} else {
-		if aggCallResultCoerced(instr) {
-			// Capture the thunk's coerced result as `%v<id>.agR`; the
-			// post-call bind (emitAggCallResultBind, SSE-aware) loads
-			// `%v<id>` as the struct.  x64 SSE's `{ .. }` / eightbyte
-			// aggregate (sysvReturnLLTy) or the GP `[N x iW]`.
-			out.Write("%v")
-			stringutils.WriteInt(out, instr.ID)
-			out.Write(".agR = call ")
-			if types.SysVInSse(instr.Typ) {
-				sysvReturnLLTy(out, instr.Typ)
-			} else {
-				aggCoerceLLTy(out, instr.Typ)
-			}
-		} else if callMultiRetCoerced(instr) {
-			// Capture the thunk's coerced multi-return tuple as `%v<id>.mrR`;
-			// the post-call bind reinterprets it back to the raw tuple.
-			out.Write("%v")
-			stringutils.WriteInt(out, instr.ID)
-			out.Write(".mrR = call ")
-			multiReturnCoercedLLTy(out, instr.Typ)
-		} else {
-			emitRef(out, instr.ID)
-			out.Write(" = call ")
+		out.Write(".rb8, i8* %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".dt, i8* %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".recv")
+		emitFuncValueArgList(out, instr, fnTyp, nArgs, 1)
+		out.Write(")\n  ")
+		// The retbuf holds the natural aggregate bytes; for a coerced
+		// in-register aggregate result the IR consumes the struct value, so load
+		// it back as the struct (%S) — same bytes.  Otherwise load the natural
+		// result type.  Mirrors emitCallFuncValue.
+		emitRef(out, instr.ID)
+		out.Write(" = load ")
+		if aggRetCoerced(instr.Typ) {
 			out.Write(llvmType(instr.Typ))
+		} else {
+			writeFuncResultsLLVM(out, fnTyp)
 		}
+		out.Write(", ")
+		writeFuncResultsLLVM(out, fnTyp)
+		out.Write("* %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".rb\n")
+		return
+	}
+
+	if isVoid {
+		out.Write("call void %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".fn(i8* %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".dt, i8* %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".recv")
+		emitFuncValueArgList(out, instr, fnTyp, nArgs, 1)
+		out.Write(")\n")
+		return
+	}
+	if isFloatScalarParam(instr.Typ) {
+		// The shim returns the int slot; receive it into a temp, then bitcast
+		// back to the natural float type as the result value.
+		out.Write("%v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".fc = call ")
+		out.Write(shimIntSlotType(instr.Typ))
 		out.Write(" %v")
 		stringutils.WriteInt(out, instr.ID)
 		out.Write(".fn(i8* %v")
 		stringutils.WriteInt(out, instr.ID)
-		out.Write(".dt")
-	}
-	for i := 0; i < nArgs; i++ {
-		out.Write(", ")
-		var argInstr @ir.Instr = instr.Args[i + 1]
-		if aggMemClass(ifArgTypes, i + ifOff) {
-			// x64 SysV memory-class aggregate of ANY kind (struct/array, slice,
-			// iface- / func-value): `ptr byval(<T>) align 8` at the `.agA<i>`
-			// slot emitAggIfaceArgPreamble stored into, so LLVM lays the whole
-			// aggregate on the outgoing stack (matching native).
-			writeMemByvalArg(out, instr.ID, argInstr.Typ, i)
-		} else if aggIfaceArgCoerced(instr, i) {
-			// Coerced in-register aggregate (loaded from the `.agA<i>` slot
-			// by emitAggIfaceArgPreamble): x64 SSE passes split per-eightbyte
-			// values (sysvWriteIfaceArg), the GP path one `[N x iW]` value.
-			if types.SysVInSse(argInstr.Typ) {
-				sysvWriteIfaceArg(out, instr, i)
-			} else {
-				writeAggIfaceArg(out, instr, i)
-			}
-		} else if argInstr.Typ.IsByvalParam() {
-			// Pass the spill-slot pointer filled by the preamble above;
-			// matches the thunk's `ptr` param.  Args index is i+1
-			// (Args[0] is the iface value), so the slot is `.bv<i+1>`.
-			out.Write("ptr %v")
-			stringutils.WriteInt(out, instr.ID)
-			out.Write(".bv")
-			stringutils.WriteInt(out, i + 1)
-		} else {
-			out.Write(llvmType(argInstr.Typ))
-			out.WriteByte(' ')
-			emitValRef(out, argInstr)
-		}
-	}
-	out.Write(")\n")
-	if useSret {
-		// Load the result from the sret alloca to produce the SSA value.
-		out.Write("  ")
-		emitRef(out, instr.ID)
-		out.Write(" = load ")
-		out.Write(llvmType(instr.Typ))
-		out.Write(", ptr %v")
+		out.Write(".dt, i8* %v")
 		stringutils.WriteInt(out, instr.ID)
-		out.Write(".rb\n")
-	} else if aggCallResultCoerced(instr) {
-		// Bind the coerced `[N x iW]` result back to the `%S` value
-		// `%v<id>` via the entry-hoisted `.agRB` slot.
-		emitAggCallResultBind(out, instr)
-	} else if callMultiRetCoerced(instr) {
-		// Reinterpret the coerced multi-return tuple back to the raw tuple
-		// `%v<id>` via the entry-hoisted `.mrRB` slot.
-		emitMultiRetCallResultBind(out, instr)
+		out.Write(".recv")
+		emitFuncValueArgList(out, instr, fnTyp, nArgs, 1)
+		out.Write(")\n  ")
+		emitRef(out, instr.ID)
+		out.Write(" = bitcast ")
+		out.Write(shimIntSlotType(instr.Typ))
+		out.Write(" %v")
+		stringutils.WriteInt(out, instr.ID)
+		out.Write(".fc to ")
+		out.Write(llvmType(instr.Typ))
+		out.Write("\n")
+		return
 	}
+	emitRef(out, instr.ID)
+	out.Write(" = call ")
+	out.Write(llvmType(instr.Typ))
+	out.Write(" %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".fn(i8* %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".dt, i8* %v")
+	stringutils.WriteInt(out, instr.ID)
+	out.Write(".recv")
+	emitFuncValueArgList(out, instr, fnTyp, nArgs, 1)
+	out.Write(")\n")
 	return
 }
 
-// ifaceMethodUsesSret reports whether an OP_CALL_IFACE_METHOD's return uses
-// the explicit-sret convention.  Both emitCallIfaceMethod and
-// emitIfaceMethodSretAllocDecl gate on this so the hoisted alloca and the
-// call shape always agree (see singleResultUsesSret for the rationale).
-func ifaceMethodUsesSret(instr @ir.Instr) bool {
-	return singleResultUsesSret(instr.Typ)
-}
-
-// singleResultUsesSret reports whether a call returning `typ` passes the
-// result via an explicit sret pointer, as opposed to by value in registers.
-// Gates the iface-method path (ifaceMethodUsesSret) so it agrees with the
-// callee's definition convention (emit_debug.bn) AND the native iface dispatch
-// (common_call.bn's CallReturnsBigMultiReturn):
-//   - a SINGLE result is sret only when >16-byte (needsSret);
-//   - a MULTI-return result reaches codegen as an anonymous tuple struct (no
-//     Name, has fields) and is sret'd by the register-COUNT rule — the SAME
-//     decision the direct callee def uses (multiRetNeedsSret) — so a large
-//     tuple goes through the sret buffer and a small one stays register-style.
-// Dispatching a large multi-return register-style against its now-sret'd
-// definition would read an unwritten buffer (garbage) / mis-lower on arm32.
-func singleResultUsesSret(typ @types.Type) bool {
-	if typ == nil || typ.Kind == types.TYP_VOID { return false }
-	if typ.Kind == types.TYP_STRUCT && len(typ.Name) == 0 && len(typ.Fields) > 0 {
-		return callConvForTarget().MultiReturnTupleNeedsSret(typ)
+// ifaceMethodFuncType reconstructs the method's func-value TYPE at an
+// OP_CALL_IFACE_METHOD site — the SAME type emitFuncValueShim used to emit the
+// method's @__shim (so the dispatch's signature + return convention match the
+// shim exactly).  Params = [receiver, user args]; Results = the method's result
+// list.  The receiver is a plain `*uint8` because the shim's first non-data
+// param is always a pointer (llvmType collapses every pointer receiver — raw,
+// managed, or a value-receiver thunk's `*readonly T` — to i8*), so the exact
+// pointee is irrelevant to the LLVM slot.  User-arg types come from the already-
+// coerced call args (buildCallArgs bound them to the method's params), and the
+// result list is recovered from instr.Typ.
+func ifaceMethodFuncType(instr @ir.Instr) @types.Type {
+	var nArgs int = len(instr.Args) - 1
+	var params @[]@types.Param
+	var recv @types.Param = make(types.Param)
+	recv.Type = types.MakePointerType(types.TypUint8())
+	params = slices.Append[@types.Param](params, recv)
+	for i := 0; i < nArgs; i++ {
+		var p @types.Param = make(types.Param)
+		p.Type = instr.Args[i + 1].Typ
+		params = slices.Append[@types.Param](params, p)
 	}
-	if !needsSret(typ) { return false }
-	return true
+	return types.MakeFuncValueType(params, ifaceMethodResultTypes(instr.Typ))
 }
 
-// emitIfaceMethodSretAllocDecl emits ONLY the `%v<id>.rb = alloca
-// <ret>` for an OP_CALL_IFACE_METHOD whose return uses the sret
-// convention (>16-byte aggregate).  Called from emitFuncDbg's
-// alloca-hoist pre-pass; the thunk call through the buffer and the
-// result-load stay at the call site (emitCallIfaceMethod).  The
-// sret-vs-direct decision mirrors emitCallIfaceMethod's `useSret`
-// exactly, so the hoisted alloca is emitted iff the call site
-// references it.  Returns out unchanged otherwise.
-func emitIfaceMethodSretAllocDecl(out *strings.Builder, instr @ir.Instr) {
-	if !ifaceMethodUsesSret(instr) { return }
-	out.Write("%v")
-	stringutils.WriteInt(out, instr.ID)
-	out.Write(".rb = alloca ")
-	out.Write(llvmType(instr.Typ))
-	out.WriteByte('\n')
+// ifaceMethodResultTypes recovers a method's result-type LIST from the collapsed
+// OP_CALL_IFACE_METHOD result type stamped by genInterfaceMethodCall: void (nil
+// / TYP_VOID) -> empty; a nameless struct with fields -> its field types (the
+// multi-return tuple makeMultiReturnStructType built, reversed field-for-field);
+// anything else -> the single type.  This is the exact inverse of the void /
+// single / makeMultiReturnStructType collapse, so ifaceMethodFuncType's Results
+// equal the impl method's real results and isAggregateReturn / writeFuncResultsLLVM
+// agree with the shim.
+func ifaceMethodResultTypes(typ @types.Type) @[]@types.Type {
+	var results @[]@types.Type
+	if typ == nil || typ.Kind == types.TYP_VOID { return results }
+	if typ.Kind == types.TYP_STRUCT && len(typ.Name) == 0 && len(typ.Fields) > 0 {
+		for i := 0; i < len(typ.Fields); i++ {
+			results = slices.Append[@types.Type](results, typ.Fields[i].Type)
+		}
+		return results
+	}
+	results = slices.Append[@types.Type](results, typ)
+	return results
+}
+
+// emitIfaceMethodCallAllocDecls emits the entry-block `alloca` lines an
+// OP_CALL_IFACE_METHOD lowering needs under the handle/shim convention: the
+// aggregate-arg coercion slots (`.cas<i>` / `.ap<i>`) and, for an aggregate
+// return, the `%v<id>.rb` retbuf — exactly the func-value shape
+// (emitShimCallAllocDecls, paramBase 1 to skip the receiver).  Called from
+// emitFuncDbg's alloca-hoist pre-pass; the stores / call / result-load stay at
+// the call site (emitCallIfaceMethod).  Returns out unchanged when the call has
+// no aggregate args and a non-aggregate return.
+func emitIfaceMethodCallAllocDecls(out *strings.Builder, instr @ir.Instr) {
+	var fnTyp @types.Type = ifaceMethodFuncType(instr)
+	var nArgs int = len(instr.Args) - 1
+	emitShimCallAllocDecls(out, instr, fnTyp, nArgs, 1)
 	return
 }
 

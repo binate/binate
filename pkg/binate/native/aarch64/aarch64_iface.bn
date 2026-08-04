@@ -14,203 +14,120 @@ import "pkg/stdx/slices"
 //
 // Mirrors the LLVM lowering in pkg/binate/codegen/emit_impls.bn: each
 // `impl T : I` declaration produces one `__ivt.bn_V...`
-// global containing [dtor, *TypeInfo, m1, m2, ...] pointers; an
-// `OP_IFACE_VALUE` site packs {data, vtable_global_addr} into a
-// 16-byte aggregate; `OP_CALL_IFACE_METHOD` loads
-// vtable[Index] (Index is the ABSOLUTE vtable slot, already past
-// the two-word any-block — dtor + *TypeInfo) and calls it indirectly
-// with `data` as the first arg; `OP_IFACE_DTOR`
-// loads vtable[0] for the @Iface scope-exit cleanup path.
-// See plan-interface-syntax-revision.md slices 2.3a / 2.5.
+// global containing [dtor, *TypeInfo, m1, m2, ...] pointers, where every
+// method slot holds the method's function-value HANDLE (@__handle.<m>, like
+// slot 0's dtor); an `OP_IFACE_VALUE` site packs {data, vtable_global_addr}
+// into a 16-byte aggregate; `OP_CALL_IFACE_METHOD` loads vtable[Index] (Index
+// is the ABSOLUTE vtable slot, already past the two-word any-block — dtor +
+// *TypeInfo) as a handle and dispatches THROUGH its marshaling shim, with the
+// iv's data ptr (iv[0]) as the receiver; `OP_IFACE_DTOR` loads vtable[0] for
+// the @Iface scope-exit cleanup path.  See plan-interface-syntax-revision.md
+// slices 2.3a / 2.5 and plan-iface-crossmode.md.
 // ============================================================
 
-// emitCallIfaceMethod lowers OP_CALL_IFACE_METHOD.  Args[0] is the
-// iv value (a 16-byte {data, vtable} aggregate held at the alloc
-// region pointed to by getOperand); Args[1..] are user args;
-// Index is the ABSOLUTE vtable slot (slots 0-1 = any-block: dtor,
-// *TypeInfo; first method = slot 2; an extended interface's inherited
-// methods land at nested absolute offsets) — dispatched raw as
-// `8 * Index`, no +2.
+// emitCallIfaceMethod lowers OP_CALL_IFACE_METHOD.  Args[0] is the iv value (a
+// 16-byte {data, vtable} aggregate held at the alloc region pointed to by
+// getOperand); Args[1..] are user args; Index is the ABSOLUTE vtable slot (slots
+// 0-1 = any-block: dtor, *TypeInfo; first method = slot 2; an extended interface's
+// inherited methods land at nested absolute offsets) — dispatched raw as `8 *
+// Index`, no +2 (findInterfaceMethodFromBase already added it).
 //
-// Shape mirrors emitCallFuncValue, but with iv's slot ordering:
-// vtable lives at offset 8 (not 0 like func value); data at 0.
+// Every @__ivt method slot holds the method's function-value HANDLE
+// (@__handle.<m>, emitOneImplVtable useHandles=true) — the same convention slot 0
+// (the dtor) already uses — so dispatch goes THROUGH the handle's marshaling shim
+// exactly like OP_CALL_FUNC_VALUE.  That is what lets a native-emitted iface
+// dispatch reach an impl whose @__ivt was emitted by ANOTHER backend (the
+// hybrid native-main / LLVM-dep build): both sides agree on the handle+shim
+// contract.  Mirrors emitCallFuncValue, but (a) the handle is LOADED from the
+// vtable slot at iv.vtable + 8*Index instead of being the func-value's own
+// address, and (b) the RECEIVER (iv[0]) is prepended as the shim's first arg
+// after the handle's data.  See emit_iface_call.bn:emitCallIfaceMethod (the LLVM
+// reference) and explorations/plan-iface-crossmode.md.
 func emitCallIfaceMethod(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
 		allFuncs @[]@ir.Func, ins @ir.Instr) {
 	if len(ins.Args) < 1 { return }
 
-	// Two-step load into X17:
-	//   X17 = iv.vtable     (LDR X17, [ivAddr + 8])
-	//   X17 = vt[Index]     (LDR X17, [X17 + 8 * Index])
-	// `ins.Index` is the ABSOLUTE vtable slot (already accounting
-	// for the two-word any-block — dtor + *TypeInfo — plus any parent
-	// sub-vtable inlining) — see
-	// pkg/binate/ir/gen_iface.bn:findInterfaceMethodFromBase, which
-	// computes `cursor = base + 2` (skipping the any-block) before
-	// adding the method's own offset.  Matches LLVM emission in
-	// pkg/binate/codegen/emit_impls.bn:emitCallIfaceMethod which also
-	// uses `instr.Index` raw.  (Earlier draft of this code added
-	// `+1` here too, which double-shifted past the real slot and
-	// dispatched into garbage on every method call.)
+	// Load the method HANDLE from the vtable slot, then extract its marshaling shim
+	// into X17 (the BLR target), holding the handle pointer in X16:
+	//   X16 = iv.vtable          (LDR X16, [ivAddr + IfaceValueVtableOffset()])
+	//   X16 = vt[Index]          (LDR X16, [X16 + 8*Index])   ; the @__handle ptr
+	//   X17 = handle.vtable      (LDR X17, [X16 + FuncValueVtableOffset()])
+	//   X17 = handle.vtable.call (LDR X17, [X17 + 8])          ; the shim
+	// X16 (IP0) and X17 (IP1) survive the arg loop: emitShimUserArgsAA64's per-arg
+	// ResetRegs keeps the scratch pool below index 7, so neither is handed out from
+	// the pool, and the loop never touches X16/X17 directly (see aarch64_regmap.bn's
+	// X16/X17 direct-use discipline).
 	var ivAddr int = getOperand(a, rm, ins.Args[0].ID)
 	if ivAddr < 0 { return }
-	aarch64.Ldr(a, true, aarch64.X17, aarch64.MemImm(ivAddr, types.IfaceValueVtableOffset()))
-	aarch64.Ldr(a, true, aarch64.X17, aarch64.MemImm(aarch64.X17, 8 * ins.Index))
+	aarch64.Ldr(a, true, aarch64.X16, aarch64.MemImm(ivAddr, types.IfaceValueVtableOffset()))
+	aarch64.Ldr(a, true, aarch64.X16, aarch64.MemImm(aarch64.X16, 8 * ins.Index))
+	aarch64.Ldr(a, true, aarch64.X17, aarch64.MemImm(aarch64.X16, types.FuncValueVtableOffset()))
+	aarch64.Ldr(a, true, aarch64.X17, aarch64.MemImm(aarch64.X17, 8))
 
-	// Synthetic argTypes list with *uint8 prepended for the data
-	// (receiver) slot so AAPCS register-start computations account
-	// for it.  Identical to emitCallFuncValue's pattern.
+	// Shim shape (mirrors emitCallFuncValue) with one EXTRA prefix slot for the
+	// receiver: an iface method's func-value type is `(receiver, args)`, so its
+	// shim is `<ret>(data, receiver, args)` (scalar/void) or
+	// `void(retbuf, data, receiver, args)` (aggregate/multi return).  So the prefix
+	// is [data, receiver] (prefixSlots 2) or [retbuf, data, receiver] (prefixSlots
+	// 3), and user args start one slot later than the func-value path.  The
+	// retbuf-vs-scalar decision uses the same single-source-of-truth predicates as
+	// the shim (emitted over the method's func-value type) so caller and shim agree.
+	var aggregateRet bool = ins.ID >= 0 && types.IsAggregateReturnTyp(ins.Typ) &&
+			!common.IsMultiReturnCall(ins)
+	var multiRet bool = ins.ID >= 0 && common.IsMultiReturnCall(ins)
+	var useRetbuf bool = aggregateRet || multiRet
+	var prefixSlots int = 2
+	if useRetbuf { prefixSlots = 3 }
+
+	// Marshal user args into their shim-ABI slots (shared helpers, so the func-value
+	// and iface layouts can't drift), before the prefix loads so a user arg sourced
+	// from a prefix register was read first.
 	var nCallArgs int = len(ins.Args) - 1
-	var argTypes @[]@types.Type = make_slice(@types.Type, nCallArgs + 1)
-	argTypes[0] = types.MakePointerType(types.TypUint8())
-	for i := 0; i < nCallArgs; i++ {
-		argTypes[i + 1] = ins.Args[i + 1].Typ
-	}
+	var argTypes @[]@types.Type = shimArgTypesAA64(rm.CC, ins, nCallArgs, prefixSlots)
+	emitShimUserArgsAA64(a, pkgName, rm, ins, argTypes, prefixSlots, nCallArgs)
 
-	// User args land in X1+ (X0 reserved for data).  Read these
-	// before the data load so any user arg whose source reg is X0
-	// is read before X0 is overwritten.
-	var nsrn int = 0
-	for ai := 0; ai < nCallArgs; ai++ {
-		var arg @ir.Instr = ins.Args[ai + 1]
-		if isFloatTyp(arg.Typ) {
-			var src int = getOperand(a, rm, arg.ID)
-			if src < 0 { continue }
-			if nsrn < 8 {
-				aarch64.Fmov_gp_to_fp(a, aarch64.D0 + nsrn, src)
-				nsrn = nsrn + 1
-			}
-			continue
-		}
-		hn, hw := types.HfaClassify(arg.Typ)
-		if rm.CC.HfaAggregates && hn > 0 {
-			// HFA arg: place each member in D[nsrn+m] (loaded from the data
-			// region); on FP overflow the whole HFA spills to the outgoing-args
-			// stack.  Mirrors emitCall's HFA arg branch.
-			var ptr int = getOperand(a, rm, arg.ID)
-			if ptr >= 0 {
-				if nsrn + hn <= rm.CC.NumFpArgRegs {
-					for m := 0; m < hn; m++ {
-						hfaMemberLoadToFp(a, aarch64.D0 + nsrn + m, ptr, m * hw, hw)
-					}
-					nsrn = nsrn + hn
-				} else {
-					var soff int = rm.CC.CallArgStackOff(argTypes, ai + 1)
-					var nWords int = common.ArgWords(arg.Typ)
-					if soff >= 0 {
-						for w := 0; w < nWords; w++ {
-							aarch64.Ldr(a, true, aarch64.X16, aarch64.MemImm(ptr, 8 * w))
-							aarch64.Str(a, true, aarch64.X16, aarch64.MemImm(aarch64.SP, soff + 8 * w))
-						}
-					}
-					nsrn = rm.CC.NumFpArgRegs
-				}
-			}
-			rm.ResetRegs()
-			continue
-		}
-		var regStart int = rm.CC.CallArgRegStart(argTypes, ai + 1)
-		var stackOff int = rm.CC.CallArgStackOff(argTypes, ai + 1)
-		if common.IsAggregateTyp(arg.Typ) {
-			emitAggregateArg(a, rm, arg, regStart, stackOff)
-		} else {
-			// emitValOperand (not bare getOperand) so a global address
-			// passed to an iface method (`i.m(&G)`) is materialized — the
-			// IsGlobalRef pseudo (ID -1) has no SSA register, so getOperand
-			// misses it and the arg is silently dropped.  Mirrors the x64
-			// iface-arg path; a global ref is always a scalar pointer, so
-			// only this branch needs it (the float / aggregate branches
-			// never carry one).
-			var src int = emitValOperand(a, pkgName, rm, arg)
-			if src < 0 { continue }
-			if regStart >= 0 {
-				if src != argReg(regStart) {
-					aarch64.Mov(a, true, argReg(regStart), aarch64.Reg(src))
-				}
-			} else {
-				// A narrow fixed scalar (int8 / int16 / int32 / float32) packs
-				// at its natural size + alignment on a natural-size-stack
-				// convention (Apple-AArch64); an over-wide store here would
-				// overrun the now-natural-sized outgoing-args area into the
-				// caller's frame.  Mirrors emitCall.
-				aarch64.StrSized(a, rm.CC.StackArgStoreSize(arg.Typ, false), src,
-						aarch64.MemImm(aarch64.SP, stackOff))
-			}
-		}
-		// Mirror emitCall: per-arg ResetRegs to keep the scratch
-		// pool from saturating on long arg lists.  Without this, an
-		// iface dispatch with 9+ scalar args trips the X9..X17 pool
-		// (same op=50 / OP_CALL_INDIRECT-class saturation that
-		// emitCallFuncValue and emitCallIndirect now guard against).
-		rm.ResetRegs()
-	}
-
-	// If the arg loop ran, ResetRegs reallocated slot 0 (X9 =
-	// ivAddr's reg) for an arg's scratch, clobbering ivAddr's
-	// contents.  Reload before the data read below.
+	// If the arg loop ran, its per-arg ResetRegs reallocated the pool reg holding
+	// ivAddr for an arg's scratch, clobbering it.  Reload before reading the
+	// receiver (iv[0]).  (X16 = handle ptr and X17 = shim are unaffected — not pool
+	// regs.)
 	if nCallArgs > 0 {
 		ivAddr = getOperand(a, rm, ins.Args[0].ID)
 		if ivAddr < 0 { return }
 	}
-	// Load data (iv[0]) into the AAPCS register for arg 0.
-	var dataRegStart int = rm.CC.CallArgRegStart(argTypes, 0)
-	if dataRegStart >= 0 {
-		aarch64.Ldr(a, true, argReg(dataRegStart), aarch64.MemImm(ivAddr, types.IfaceValueDataOffset()))
-	}
 
-	// AAPCS sret for big aggregate / multi-return results.
-	var bigMultiRet bool = ins.ID >= 0 && rm.CC.CallReturnsBigMultiReturn(ins)
-	var bigRet bool = ins.ID >= 0 && (rm.CC.CallReturnsBigAggregate(ins) || bigMultiRet)
-	if bigRet {
-		var sretOff int = -1
-		if bigMultiRet {
-			sretOff = rm.LookupSpill(ins.ID)
+	// Load the shim's prefix registers: retbuf (aggregate/multi) into X0, then
+	// data = handle.data (from X16) and receiver = iv[0] into the next two slots.
+	var dataSlot int = 0
+	var recvSlot int = 1
+	if useRetbuf {
+		// X0 = retbuf: a single aggregate uses its pre-allocated alloc region; a
+		// multi-return (big OR small) uses the spill slot the tuple lands in.  The
+		// shim does its own X8 sret plumbing for a big tuple — the caller does NOT
+		// set X8.  data/receiver then shift to X1/X2.
+		var retbufOff int = -1
+		if aggregateRet {
+			retbufOff = rm.LookupAlloc(ins.ID)
 		} else {
-			sretOff = rm.LookupAlloc(ins.ID)
+			retbufOff = rm.LookupSpill(ins.ID)
 		}
-		if sretOff >= 0 {
-			aarch64.Add(a, true, aarch64.X8, aarch64.SP, aarch64.Imm(sretOff))
-		}
+		if retbufOff < 0 { return }
+		aarch64.Add(a, true, argReg(0), aarch64.SP, aarch64.Imm(retbufOff))
+		dataSlot = 1
+		recvSlot = 2
+	}
+	var dataRegStart int = rm.CC.CallArgRegStart(argTypes, dataSlot)
+	if dataRegStart >= 0 {
+		aarch64.Ldr(a, true, argReg(dataRegStart),
+				aarch64.MemImm(aarch64.X16, types.FuncValueDataOffset()))
+	}
+	var recvRegStart int = rm.CC.CallArgRegStart(argTypes, recvSlot)
+	if recvRegStart >= 0 {
+		aarch64.Ldr(a, true, argReg(recvRegStart), aarch64.MemImm(ivAddr, types.IfaceValueDataOffset()))
 	}
 
 	aarch64.Blr(a, aarch64.X17)
 	rm.ResetRegs()
-	if ins.ID < 0 { return }
-
-	// Aggregate single-return: spill X0..X(N-1) into the alloc
-	// region and produce its pointer.  Same as emitCallFuncValue.
-	if ins.Typ != nil && common.IsAggregateTyp(ins.Typ) && !common.IsMultiReturnCall(ins) {
-		var dataOff int = rm.LookupAlloc(ins.ID)
-		if dataOff < 0 { return }
-		var sz int = ins.Typ.SizeOf()
-		if sz <= 0 { return }
-		if !bigRet {
-			if rm.CC.ReturnsHfaInRegs(ins.Typ) {
-				// HFA result: members come back in D0..D(n-1); store each
-				// from its FP reg (mirrors emitCall's collect).
-				hn, hw := types.HfaClassify(ins.Typ)
-				for m := 0; m < hn; m++ {
-					hfaMemberStoreFromFp(a, aarch64.D0 + m, aarch64.SP, dataOff + m * hw, hw)
-				}
-			} else {
-				var nWords int = common.ArgWords(ins.Typ)
-				for ri := 0; ri < nWords && ri < 8; ri++ {
-					aarch64.Str(a, true, argReg(ri), aarch64.MemImm(aarch64.SP, dataOff + 8 * ri))
-				}
-			}
-		}
-		var rd int = nextReg(rm, ins.ID)
-		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(dataOff))
-		return
-	}
-
-	var spillOff int = rm.LookupSpill(ins.ID)
-	if spillOff < 0 { return }
-	if bigMultiRet { return }
-	if !common.IsMultiReturnCall(ins) {
-		collectScalarReturn(a, rm, ins, spillOff)
-		return
-	}
-	collectMultiReturnFields(a, rm, ins, spillOff)
+	collectShimReturnAA64(a, rm, ins, aggregateRet, multiRet)
 }
 
 // emitImplVtables emits one `__ivt.<...>` constant for each
@@ -271,16 +188,24 @@ func dtorSlotSymNative(pkgName *[]readonly char, mod @ir.Module,
 // Slice E.3:
 //   slots 0-1:               R's any-block (dtor, then *TypeInfo)
 //   per parent P, recursively: full vtable of (R, P)
-//   per own method m:         R's mangled <m> function pointer
+//   per own method m:         R's method function-value HANDLE (@__handle.<m>)
 // For non-extending interfaces this collapses to [dtor, *TypeInfo, m1, m2, ...]
 // — the original Slice 2.5 layout.  The recursion supports Slice E.4
 // upcasts: `*Child → *Parent` becomes a pointer +offset that lands
 // at the parent's any-block, where the parent-typed dispatch path
 // expects to find a dtor + the parent's full layout.
+//
+// useHandles=true: every method slot holds the method's function-value HANDLE
+// (@__handle.<m>), the same convention slot 0 (dtor) already uses.  Interface
+// method dispatch (emitCallIfaceMethod, and the LLVM backend's) therefore goes
+// through the handle's marshaling shim uniformly, so a native-emitted dispatch can
+// reach an impl whose @__ivt was emitted by another backend (the hybrid native-
+// main / LLVM-dep build).  This makes @__ivt and the parallel @__ivtshim identical
+// content.  Matches emit_impls.bn:emitImplVtable.  See plan-iface-crossmode.md.
 func emitOneImplVtable(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Module,
 		info @ir.ImplInfo) {
 	var slots @[]@[]char = collectImplVtableSlotsNative(pkgName, mod, info, info.IfacePkg,
-			info.IfaceName, false)
+			info.IfaceName, true)
 	markImplSlotsGlobalNative(a, slots)
 	common.EmitDataGlobal(a, irdata.BuildImplVtable(implVtableNameNative(info), slots))
 }
@@ -308,10 +233,12 @@ func emitOneImplShimVtable(a @asm.Assembler, pkgName *[]readonly char, mod @ir.M
 // the LLVM collectImplVtableSlots.  An empty slot symbol is a null pointer;
 // irdata.BuildImplVtable lays the bytes.
 //
-// useHandles=false gives the raw `@__ivt` layout (method slots hold the raw
-// method fn symbol); useHandles=true gives the parallel `@__ivtshim` layout
-// (method slots hold the method's `@__handle`), threaded through the parent
-// recursion so every nested sub-block uses the same form.
+// useHandles=true (both @__ivt via emitOneImplVtable and @__ivtshim via
+// emitOneImplShimVtable now use it — the two are identical content) makes every
+// method slot hold the method's function-value `@__handle`, threaded through the
+// parent recursion so every nested sub-block uses the same form.  useHandles=false
+// would instead hold the raw method fn symbol; no live caller uses it (kept as a
+// parameter to mirror the LLVM collectImplVtableSlots signature).
 func collectImplVtableSlotsNative(pkgName *[]readonly char, mod @ir.Module, info @ir.ImplInfo,
 		ifacePkg *[]readonly char, ifaceName *[]readonly char, useHandles bool) @[]@[]char {
 	var slots @[]@[]char

@@ -1,0 +1,99 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/types"
+import "pkg/builtins/rt"
+
+// Cross-mode interface-value marshalling (plan-iface-crossmode.md S2).
+//
+// A bytecode (user) impl's interface value carries a VM-index vtable word (a
+// 1-based index into vm.IfaceVtables), which an injected-NATIVE stdlib callee
+// (e.g. errors.Is) cannot dereference — native code treats the vtable word as
+// a native @__ivt pointer and faults on the small index.  At the bytecode →
+// native marshalling boundary (dispatchExternBinding), every interface-typed
+// arg whose word is a VM index is replaced by a COPY pointing at a NATIVE
+// handle-based vtable built from the same vm.IfaceVtables entry, so the callee's
+// RefDec (slot 0) and method dispatch (method slots) re-enter the VM through the
+// func-value handle convention S1 unified native dispatch onto.
+
+// buildNativeIfaceVtable returns the native handle-based vtable for a bytecode
+// impl's vm.IfaceVtables entry, building it once and caching the address on the
+// entry (vt.NativeVt).  The layout mirrors the native @__ivt an equivalent
+// compiled impl would carry (the concat any-block layout fillVtableLayout
+// produced into vt.Methods), so a native upcast that advances the vtable pointer
+// by whole slots still lands on a correctly-shaped sub-block:
+//   - a slot holding a 1-based VM function index (dtor slot 0, or a method slot)
+//     becomes that VMFunc's {vtable, data} HANDLE — ensureHandle builds the
+//     universal-trampoline vtable + VMClosureRec{vm, fnIdx} once and shares it,
+//     so native `handle.vtable.call(handle.data, recv, args)` (S1) / `_call_dtor
+//     (handle, ptr)` re-enter execFunc.  A 0 (no dtor / a method the impl didn't
+//     resolve locally) stays 0 — native code reads a null dtor as "just free".
+//   - the *TypeInfo slot (slot 1, and each nested any-block's slot 1) is a
+//     materialized `__typeinfo.<R>` record address, passed through verbatim.
+// The two are told apart by RANGE, the same discipline ifaceVtIsNative uses for
+// the vtable word itself: a real function index lies in [1, vm.Funcs.Len()],
+// while a *TypeInfo record address is a heap/immortal pointer far above the
+// function count (and 0 is the null sentinel) — so the classification is exact,
+// never a magnitude guess.
+//
+// The array is raw immortal memory (VM-lifetime, like the descriptor blocks):
+// it holds only int words (handle addresses / a *TypeInfo / 0), no managed refs,
+// and the handles it points at live on their VMFuncs for the VM's lifetime.
+func buildNativeIfaceVtable(vm @VM, vt @IfaceVtable) int {
+	if vt.NativeVt != 0 {
+		return vt.NativeVt
+	}
+	var n int = len(vt.Methods)
+	var nativeVt *int = bit_cast(*int, rt.RawAlloc(n * REG_SLOT))
+	var funcCount int = vm.Funcs.Len()
+	for j := 0; j < n; j++ {
+		var v int = vt.Methods[j]
+		if v >= 1 && v <= funcCount {
+			var fn @VMFunc = vm.Funcs.Get(v - 1)
+			ensureHandle(vm, fn, v - 1)
+			nativeVt[j] = bit_cast(int, fn.Handle)
+		} else {
+			nativeVt[j] = v
+		}
+	}
+	vt.NativeVt = bit_cast(int, nativeVt)
+	return vt.NativeVt
+}
+
+// substituteIfaceArgs rewrites the flagged interface args of a bytecode →
+// injected-native extern call.  For each arg SLOT k set in ifaceBits (the
+// caller's static-type-derived per-slot interface bitmap), if the arg is a live
+// interface value (`{data, vtable_word}` by-address) whose vtable_word is a VM
+// index (a bytecode impl — !ifaceVtIsNative), it writes a fresh 2-word COPY on
+// vm.Stack that keeps the ORIGINAL data pointer (so `same`/`present`/identity
+// still see the real box) but swaps in the impl's native handle-vtable pointer,
+// and points args[k] at the copy.  The original iface block is never mutated.
+// A nil-vtable (0) or already-native word is left untouched.
+//
+// The copy rides vm.Stack exactly like the aggregate retbuf: it is scratch that
+// only has to outlive the synchronous native call and is reclaimed at the next
+// statement boundary (BC_SP_RESTORE), so it needs no explicit free.
+func substituteIfaceArgs(vm @VM, args @[]int, ifaceBits int) {
+	for k := 0; k < 7; k++ {
+		if (ifaceBits & (1 << k)) == 0 {
+			continue
+		}
+		var ivPtr int = args[k]
+		if ivPtr == 0 {
+			continue
+		}
+		var iv *int = bit_cast(*int, ivPtr)
+		var vtWord int = iv[types.IfaceValueVtableIndex()]
+		if ifaceVtIsNative(vm, vtWord) {
+			// Already a native @__ivt address, or the 0 nil-iface sentinel — the
+			// callee handles both directly; nothing to translate.
+			continue
+		}
+		var nativeVt int = buildNativeIfaceVtable(vm, vm.IfaceVtables.Get(vtWord - 1))
+		var copyInt int = bit_cast(int, vm.Stack) + vm.SP
+		var copyPtr *int = bit_cast(*int, copyInt)
+		vm.SP = vm.SP + 2 * REG_SLOT
+		copyPtr[types.IfaceValueDataIndex()] = iv[types.IfaceValueDataIndex()]
+		copyPtr[types.IfaceValueVtableIndex()] = nativeVt
+		args[k] = copyInt
+	}
+}

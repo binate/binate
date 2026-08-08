@@ -1,8 +1,7 @@
 # operator matrix
 
 Operator lowering across the `op × width/sign × wrapper` grid where the
-path-parity / result-type bugs live (Code-Red-2 Class C; `plan-code-red-2.md`
-§3.3). Coordinate-addressed:
+path-parity / result-type bugs live (Code-Red-2 Class C). Coordinate-addressed:
 
     conformance/matrix/operator/<op>/<wrapper>/<type>.bn   (+ .expected)
 
@@ -14,7 +13,7 @@ This is the **targeted** layer — the confirmed/predicted-gap sub-grids — not
 full operator Cartesian (`scalar`/`scalar-diff` already cover sub-word arithmetic
 *values*). Currently the **unary**, **compound-assign**, **eq-reject**, and
 **rel** (relational operand-position) sub-grids; the broader pairwise binary
-sample is a planned follow-up (§3.3).
+sample is a planned follow-up.
 
 ### rel sub-grid
 

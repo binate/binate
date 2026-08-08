@@ -1,8 +1,8 @@
 # dispatch-refcount matrix
 
 Refcount **balance** of a managed multi-return component produced through an
-**indirect** call (Code-Red-2 §3.4 — the indirect-producer axis the `refcount`
-matrix never crossed). Coordinate-addressed:
+**indirect** call (the indirect-producer axis the `refcount` matrix never
+crossed). Coordinate-addressed:
 
     conformance/matrix/dispatch-refcount/<producer>/<component>.bn   (+ .expected)
 
@@ -45,7 +45,7 @@ against a future leak/UAF.
 
 - The `func-value` cell drops its alias via a `var`-init (`var drp @func() int =
   …; g = drp`) rather than a bare `g = func(){…}` assignment, which hits the
-  separate func-literal-flavour-inference bug (`plan-cr2-followup.md` Plan B).
+  separate func-literal-flavour-inference bug.
 - The `funcval` producer is a NON-capturing func reading a global; a *capturing*
   closure returning a multi-return is a separate LLVM-codegen bug (silent garbage)
   filed in `claude-todo.md` CRITICAL and pinned by

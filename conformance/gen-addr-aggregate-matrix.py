@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate conformance/matrix/addr-aggregate cells — 16-byte address-aggregate
-(2-word) value handling (Class 2 of the code-red taxonomy; see plan-code-red.md
-§2 and claude-todo.md TEST COVERAGE b1).
+(2-word) value handling (Class 2 of the code-red taxonomy; see claude-todo.md
+TEST COVERAGE b1).
 
 A managed interface value (`@Iface` = {data, vtable}) and a function value
 (`@func` = {vtable, data}) are 16-byte 2-word "address aggregates". The recurring
@@ -117,7 +117,7 @@ HEADER = """package "main"
 // addr-aggregate matrix cell — kind={kind}, operation={op}.
 // A 16-byte 2-word address-aggregate (@func / @Iface) must survive this
 // operation with both words intact; invoking it must yield 42. A dropped/swapped
-// word faults or returns wrong. See ../../README.md and plan-code-red.md §2.
+// word faults or returns wrong. See ../../README.md.
 
 """
 

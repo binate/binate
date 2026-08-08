@@ -247,7 +247,7 @@ suite_start=$(date +%s)
 # `bni --check-nil`, turning on opt-in nil-pointer-deref checking so a nil deref
 # raises a recoverable VM fault (a message + non-zero exit) instead of a SEGV.
 # Compiled runners ignore it — a nil deref SEGVs there, so such a test is
-# xfail'd on every compiled mode.  See explorations/plan-nil-check-opt-in.md (N3).
+# xfail'd on every compiled mode.
 set_check_nil_env() {
     if [ -f "$SCRIPT_DIR/${1}.check-nil" ]; then
         CONF_CHECK_NIL=1
@@ -519,9 +519,9 @@ done
 # ${name}.expected and ${name}.xfail.${MODE} resolve to the cell's own
 # siblings. (Paths must not contain spaces — they are word-split here.)
 #
-# conformance/spec/ holds the rule-ID-cited spec-conformance tests
-# (plan-spec-tests.md); like matrix/ and regressions/ it runs in the default
-# suite, and thus in the conformance CI matrix.
+# conformance/spec/ holds the rule-ID-cited spec-conformance tests; like
+# matrix/ and regressions/ it runs in the default suite, and thus in the
+# conformance CI matrix.
 #
 # A nested directory holding a main.bn is a multi-package test (same form as the
 # top-level NNN_name/ tests) — those are run by the loop further below; their

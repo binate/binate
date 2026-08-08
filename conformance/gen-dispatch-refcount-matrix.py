@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate conformance/matrix/dispatch-refcount cells — refcount balance of a
-MANAGED multi-return component produced through an INDIRECT call (Code-Red-2
-§3.4: the indirect-producer axis the refcount matrix never crossed).
+MANAGED multi-return component produced through an INDIRECT call (the
+indirect-producer axis the refcount matrix never crossed).
 
 The result-side dispatch value/packing was fixed (the MethodResultsFlat SEAM,
 `6c39d460`); this matrix asks the *refcount* question its value-only sibling
@@ -141,7 +141,7 @@ HEADER = """package "main"
 // A managed component destructured from an interface-dispatch multi-return must
 // arrive with exactly one added ref and be released when the alias drops — no
 // leak, no UAF — on every backend. Output: 1 (added one ref), value, 1 (balanced).
-// See ../README.md and plan-code-red-2.md §3.4.
+// See ../README.md.
 
 import "pkg/builtins/rt"
 

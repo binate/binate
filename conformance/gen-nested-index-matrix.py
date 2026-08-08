@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Generate conformance/matrix/nested-index cells — field/element access through a
-(possibly nested) array INDEX base (Code-Red-2 path-parity family; see
-plan-cr2-1-frontend.md Round-2 "[N][M]Struct value-struct field access reads 0 and
-writes NOWHERE", and plan-code-red-2.md §7).
+(possibly nested) array INDEX base (a path-parity family defect: [N][M]Struct
+value-struct field access reads 0 and writes NOWHERE).
 
 The defect: the field-selector read path and the field-write lvalue path both
 resolve the element type via `getIndexElemType` (gen_access.bn), which handles an
@@ -63,8 +62,7 @@ HEADER = """package "main"
 // nested-index matrix cell — {desc}.
 // Field/element access through a (possibly nested) array index base must read
 // back the written value. The nested-`[N][M]` × field cells are the defect
-// (getIndexElemType doesn't recurse the nested base). See ../README.md and
-// plan-cr2-1-frontend.md Round-2 / plan-code-red-2.md §7.
+// (getIndexElemType doesn't recurse the nested base). See ../README.md.
 
 """
 

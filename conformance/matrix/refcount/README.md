@@ -2,8 +2,8 @@
 
 The **managed-value refcount discipline** (Class 1) member of the conformance
 matrix family (`../README.md`) — a systematic, **coordinate-addressed** body of
-tests for the code-red's "every cell must be exercised" thesis (see
-`explorations/plan-code-red.md` §7). Each test's identity is its *coordinates*,
+tests for the code-red's "every cell must be exercised" thesis. Each test's
+identity is its *coordinates*,
 encoded as its path, not an allocated number:
 
     conformance/matrix/refcount/<form>/<shape>/<type>.bn   (+ .expected)

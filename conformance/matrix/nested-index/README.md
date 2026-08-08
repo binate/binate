@@ -1,8 +1,7 @@
 # nested-index matrix
 
 Field/element access through a (possibly nested) array **index base** — a
-Code-Red-2 path-parity family (`plan-cr2-1-frontend.md` Round-2;
-`plan-code-red-2.md` §7). Coordinate-addressed:
+Code-Red-2 path-parity family. Coordinate-addressed:
 
     conformance/matrix/nested-index/<op>/<shape>.bn   (+ .expected)
 
@@ -34,6 +33,5 @@ field access works), `whole/nested-value-struct` (whole-element r/w through a
 nested index works — no field selector), `scalar/nested` (nested scalar index
 works). So the break is specifically the nested-base **field-selector** path.
 
-Fix-of-record: `plan-cr2-1-frontend.md` Round-2 — covers the value-struct read,
-the value-struct **write**, and the managed-ptr read (the former
-`plan-cr2-followup.md` item) as one root.
+The fix covers the value-struct read, the value-struct **write**, and the
+managed-ptr read as one root.

@@ -7,7 +7,7 @@
 #
 # arm-linux-gnueabihf is the HARD-float (AAPCS-VFP) ABI: applyTarget stamps
 # types.SetFloatABI(FLOAT_ABI_HARD), so the native backend + codegen classify
-# floats in VFP registers (plan-native-arm32.md P6).  Like the LLVM sibling it
+# floats in VFP registers (hard-float ABI).  Like the LLVM sibling it
 # links against the cross-glibc and runs under qemu-arm user-mode — NOT the
 # freestanding semihosting path of builder-comp_native_arm32_baremetal.
 #

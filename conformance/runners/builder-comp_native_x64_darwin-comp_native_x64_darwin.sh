@@ -9,8 +9,7 @@
 # This is the macOS sibling of builder-comp_native_x64-comp_native_x64
 # (which targets x86_64-linux / ELF and needs qemu-x86_64 off-x86_64).
 # Its point: make the amd64 native backend end-to-end verifiable on a
-# stock Apple-Silicon dev machine — no qemu, no Linux box — per
-# explorations/plan-backend-objformat-decoupling.md.
+# stock Apple-Silicon dev machine — no qemu, no Linux box.
 #
 # Like the ELF runner, this does NOT pre-build a native bnc: the amd64
 # backend only lowers a subset of ops today, so most tests fail as

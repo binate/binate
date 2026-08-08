@@ -1,8 +1,8 @@
 # Conformance matrices
 
 A family of **coordinate-addressed** conformance test sets, one per recurring
-defect class from the code-red taxonomy (see `explorations/plan-code-red.md`
-§7). Each matrix systematically covers the product of its axes; the path
+defect class from the code-red taxonomy. Each matrix systematically covers the
+product of its axes; the path
 encodes the coordinates, so names are stable and collision-free and a generator
 can regenerate idempotently.
 

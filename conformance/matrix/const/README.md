@@ -1,9 +1,8 @@
 # const matrix
 
 The **compile-time constant materialization** member of the conformance matrix
-family (`../README.md`) — it realizes the named-constant invariant
-(`plan-code-red.md` §5), distinct from the 8-class bug taxonomy.
-Coordinate-addressed:
+family (`../README.md`) — it realizes the named-constant invariant, distinct
+from the 8-class bug taxonomy. Coordinate-addressed:
 
     conformance/matrix/const/<read-form>/<type>/<value>.bn   (+ .expected)
 

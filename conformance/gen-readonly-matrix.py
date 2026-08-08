@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate conformance/matrix/readonly cells — the `readonly` type modifier as a
-transparent wrapper (Code-Red-2 Class B; see explorations/plan-code-red-2.md §3.2).
+transparent wrapper.
 
 `readonly`/`const` is a semantic-only wrapper (like TYP_ALIAS): it must be PEELED
 by every code path that switches on Type.Kind to pick a representation. The read
@@ -83,7 +83,7 @@ CELLS = [
     # --- wrapper-ORDER: the modifier on the POINTEE (`@readonly Box` / `*readonly
     #     Box`), not the pointer (`readonly @Box`). The inner-pointee variants the
     #     outer-wrapper field-read fix (27c1ee8b) did not cover — gen_selector reads
-    #     an un-peeled `.Elem`. (2026-06-08 review sibling; plan-cr2-1 Round-2.) ---
+    #     an un-peeled `.Elem`. (2026-06-08 review sibling.) ---
     ("wrapper-order/inner-managed-ptr", BOX,
      ["var m @Box = make(Box)", "m.v = 7", "var p @readonly Box = m", "println(p.v)"], [7]),
     ("wrapper-order/inner-raw-ptr", BOX,
@@ -109,7 +109,7 @@ HEADER = """package "main"
 // readonly matrix cell — {desc}.
 // A readonly view must observe the same value / dispatch as the plain value;
 // `readonly` is a transparent wrapper every Kind-dispatch must peel.
-// See ../README.md and plan-code-red-2.md §2 (Class B) / §3.2.
+// See ../README.md.
 
 """
 

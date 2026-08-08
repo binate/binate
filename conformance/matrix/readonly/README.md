@@ -1,8 +1,7 @@
 # readonly matrix
 
 The **`readonly` type-modifier transparency** member of the conformance matrix
-family (`../README.md`) — Code-Red-2 Class B (`explorations/plan-code-red-2.md`
-§2 / §3.2). Coordinate-addressed:
+family (`../README.md`) — Code-Red-2 Class B. Coordinate-addressed:
 
     conformance/matrix/readonly/<operation>/<shape>.bn   (+ .expected)
 
@@ -44,8 +43,6 @@ backends — the same wrapper-transparency root, one variant over (xfailed):
   has no `TYP_ALIAS` arm) — sibling of the readonly-receiver fix.
 - **`construct/readonly-iface` → reject.** A concrete value can't be iface-wrapped
   into a `readonly @Iface` target.
-
-Fix-of-record for the Round-2 cells: `plan-cr2-1-frontend.md` Round-2.
 
 ## Note (language design vs bug)
 

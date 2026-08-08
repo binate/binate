@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate conformance/matrix/aggregate cells — value-movement correctness for
 plain (non-managed) values: does every element/field survive a given movement
-form?  (See explorations/plan-code-red.md; the sibling matrices cover adjacent
+form?  (The sibling matrices cover adjacent
 classes — `abi` covers call-boundary PASSING, `refcount` the managed-value
 lifecycle, `const` const materialization — but none covered plain aggregate/
 global var ASSIGNMENT, copy, deref, and initializer value correctness.)

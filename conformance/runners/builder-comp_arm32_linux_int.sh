@@ -9,7 +9,7 @@
 # through the VM ON A 32-BIT HOST, under qemu-arm user-mode emulation.  This is
 # the configuration that exposes the VM's latent 32-bit-host bugs (int64/target-
 # word handling) that the default -int legs (bni run NATIVELY on the 64-bit build
-# host) cannot reach.  See explorations/plan-vm-64bit-on-32bit.md.
+# host) cannot reach.
 #
 # Distinct from builder-comp_arm32_linux (which puts the compiled TEST PROGRAM on
 # arm32): here the VM ITSELF is the arm32 binary and the test .bn stays bytecode.

@@ -19,7 +19,7 @@
 # Why this exists: validates the v0 ARM32-Linux derisking path end-
 # to-end — type system at 32 bits, LLVM IR with intLL() = i32,
 # binate_runtime.c with bn_int_t = int32, clang cross-compile, and
-# QEMU user-mode execution.  See explorations/plan-arm32-bare-metal.md.
+# QEMU user-mode execution.
 
 QEMU_ARM="${QEMU_ARM:-}"
 if [ -z "$QEMU_ARM" ]; then

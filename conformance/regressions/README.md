@@ -22,8 +22,8 @@ matrix instead.
   `*-div`, `*-mul`, `bool-comparison`, and `array-dim` cells are xfailed.
 - **`c-call/`** — the `__c_call` (C-ABI FFI) call shape, self-contained against
   already-linked libc (`abs` / `labs` / `strlen` / `printf`). All cells xfail
-  the VM modes (FFI is compiled-mode-only, Stage 1 of `plan-c-call.md`) and the
+  the VM modes (FFI is compiled-mode-only) and the
   arm32 modes (no native arm32 backend yet). `printf-variadic-float`
   additionally xfails the native backends: a variadic `double` is passed wrong
   (x64-SysV needs `AL`=vector-count; darwin-arm64 stacks varargs) → printf reads
-  `0` (filed, §3.9).
+  `0` (filed).

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Generate conformance/matrix/operator cells — operator lowering across the
-op × width/sign × wrapper grid where the path-parity / result-type bugs live
-(Code-Red-2 Class C; see plan-code-red-2.md §3.3).
+op × width/sign × wrapper grid where the path-parity / result-type bugs live.
 
 This is the TARGETED layer (the confirmed/predicted-gap sub-grids). The pairwise
 sample of the broader binary product, and the aggregate `==`/`!=` `.error` cells,
-are planned follow-ups (§3.3) — start with the unary sub-grid, which pins the
-live `-x`-on-a-named-sub-word defect (plan-cr2-1 Round-2 finding 8: the unary-minus
-arm gates on `TYP_INT` and never peels `TYP_NAMED`, emitting `sub i64 0, %i8`).
+are planned follow-ups — start with the unary sub-grid, which pins the
+live `-x`-on-a-named-sub-word defect (the unary-minus arm gates on `TYP_INT` and
+never peels `TYP_NAMED`, emitting `sub i64 0, %i8`).
 
 Unary sub-grid: `op {neg, bitnot} × type {i8 u8 i16 u16 i32 u32 i64 u64} ×
 wrapper {plain, named}`. Assertion: the unary result equals the spec value at the
@@ -71,7 +70,7 @@ HEADER = """package "main"
 // operator matrix cell — {desc}.
 // The unary result must equal the spec value at the operand's width. A named
 // sub-word `neg` is the live defect (the MINUS arm doesn't peel TYP_NAMED).
-// See ../README.md and plan-code-red-2.md §3.3 / plan-cr2-1 Round-2.
+// See ../README.md.
 
 """
 

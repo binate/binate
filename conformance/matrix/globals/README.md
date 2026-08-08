@@ -1,8 +1,8 @@
 # globals matrix
 
 The **package-level global/static storage materialization** member of the
-conformance matrix family (`../README.md`) — Code-Red-2 Class A
-(`explorations/plan-code-red-2.md` §2 / §3.1). Coordinate-addressed:
+conformance matrix family (`../README.md`) — Code-Red-2 Class A.
+Coordinate-addressed:
 
     conformance/matrix/globals/<storage>/<type>.bn   (+ .expected)
 
@@ -29,8 +29,8 @@ green on every backend, as are the named-over-non-struct globals (see "Resolved"
 below). Red cells (xfailed + filed):
 
 - **`readonly/struct` — all backends.** A `readonly` struct global reads its
-  fields as 0 — the shared `gen_selector` IR-gen literal-0 bug (Class B;
-  plan-cr2-1 Defect 1), surfacing in global position (the `io.EOF` shape).
+  fields as 0 — the shared `gen_selector` IR-gen literal-0 bug (Class B),
+  surfacing in global position (the `io.EOF` shape).
 
 ### Resolved
 
@@ -60,4 +60,4 @@ a cell — see claude-todo for the named-composite-literal IR-gen defect.)
 
 - Cross-package globals (the `access` axis) are not yet built — they need
   multi-package directories; the cross-module struct-type-discovery defect
-  (plan-cr2-2 Defect 2) is pinned by a point-test until then.
+  is pinned by a point-test until then.

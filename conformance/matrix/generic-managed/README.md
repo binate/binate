@@ -57,8 +57,8 @@ pair cells (array-length `[3]`vs`[5]` per `1017`, func-signature
 uses `gh.At[@Numbered](h,0).num()` — an iface-method CALL on a generic-call result —
 so it regression-guards conformance/1027 (fixed in `dfbdf1dd`).
 
-Planned follow-ups (see `explorations/plan-matrix-tests-generics-rtti.md`):
-array-of-managed / nested-generic element kinds; `copy` and `destroy-populated`
+Planned follow-ups: array-of-managed / nested-generic element kinds; `copy`
+and `destroy-populated`
 ops.  Second wave (gated on a minimal cell compiling): method-expression,
 parameterized-receiver-impl and generic-constraint dispatch.
 

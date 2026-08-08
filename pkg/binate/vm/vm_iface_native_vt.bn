@@ -3,6 +3,45 @@ package "pkg/binate/vm"
 import "pkg/binate/types"
 import "pkg/builtins/rt"
 
+// g_crossModeVmAddr is the VM currently dispatching an injected-native callee — set
+// (and restored, for re-entrancy) around each native extern dispatch
+// (dispatchExternBinding) so that a native rt.SatLookup MISS, routed through the
+// installed rt fallback (satFallbackFn), can reach THIS VM's satentry registry.  A
+// raw address, not an @VM, so the global never perturbs the VM's own refcount.
+// 0 = no VM is currently dispatching native code, so the fallback declines.
+var g_crossModeVmAddr int = 0
+
+// InstallSatFallback wires satFallbackFn as rt.SatLookup's MISS fallback (rt
+// SetSatFallback).  The host calls it once at VM setup (RegisterVmTrampolines), so
+// an injected-native callee's `x.(*J)` on a bytecode-boxed value whose (T,J) fact
+// lives only VM-side resolves through the VM registry rather than MISSing.
+func InstallSatFallback() {
+	rt.SetSatFallback(satFallbackFn)
+}
+
+// satFallbackFn is the rt.SetSatFallback resolver: on a native rt.SatLookup MISS it
+// consults the executing VM's own satentry registry (lookupSatEntry) so a `(T, J)`
+// fact that lives only VM-side — a bytecode program's own user type asserted by
+// injected-native code — still resolves.  A VM-index result (a bytecode-lowered
+// impl) is translated to a native handle-vtable (buildNativeIfaceVtable) so the
+// recovered value's method re-enters the VM; a native `@__ivt` result (an injected
+// package) is returned as-is (ifaceVtIsNative discriminates).  Non-capturing (reads
+// the g_crossModeVmAddr global), as an rt `*func` requires.
+func satFallbackFn(ti *uint8, id *uint8) *uint8 {
+	if g_crossModeVmAddr == 0 {
+		return nil
+	}
+	var vm @VM = bit_cast(@VM, g_crossModeVmAddr)
+	var w int = lookupSatEntry(vm, bit_cast(int, ti), bit_cast(int, id))
+	if w == 0 {
+		return nil
+	}
+	if ifaceVtIsNative(vm, w) {
+		return bit_cast(*uint8, w)
+	}
+	return bit_cast(*uint8, buildNativeIfaceVtable(vm, vm.IfaceVtables.Get(w - 1)))
+}
+
 // Cross-mode interface-value marshalling (plan-iface-crossmode.md S2).
 //
 // A bytecode (user) impl's interface value carries a VM-index vtable word (a
@@ -104,5 +143,73 @@ func substituteIfaceArgs(vm @VM, args @[]int, ifaceBits int) {
 		if (ifaceBits & (1 << k)) != 0 {
 			args[k] = substTopLevelIfaceSlot(vm, args[k])
 		}
+	}
+}
+
+// substituteSliceIfaceArgs is substituteIfaceArgs one level down: it rewrites the
+// flagged RAW-SLICE args whose ELEMENTS are raw interface values.  For each arg
+// SLOT k set in sliceIfaceBits, args[k] is the by-address pointer to a 2-word raw
+// slice `{data, len}` whose backing holds `len` raw interface values (2 words each,
+// `{data, vtable_word}` — e.g. the `*[]*any` a `...*any` variadic packs).  A
+// bytecode impl's element carries a VM-index vtable word an injected-native callee
+// cannot dereference; the top-level substituteIfaceArgs bitmap never reaches values
+// NESTED in a slice, so those elements would reach native code untranslated (a
+// SIGSEGV when the callee reads the small index as a native @__ivt).  This copies
+// the backing array to vm.Stack, translating each VM-index element to the impl's
+// native handle-vtable (buildNativeIfaceVtable) while keeping its data pointer,
+// copies the `{data, len}` header pointing at that translated backing, and repoints
+// args[k] at the copy.  A native/nil element word is copied verbatim.
+//
+// Like substituteIfaceArgs the copies ride vm.Stack (scratch reclaimed at the next
+// BC_SP_RESTORE) and the ORIGINAL backing is never mutated — a spread `s...` of a
+// user slice must see its own elements unchanged.  Only RAW interface elements
+// (2-word) are handled; a slice of MANAGED interface elements is not flagged by the
+// lower-time classifier (argIsSliceOfRawIface), so it never reaches here.
+func substituteSliceIfaceArgs(vm @VM, args @[]int, sliceIfaceBits int) {
+	for k := 0; k < 7; k++ {
+		if (sliceIfaceBits & (1 << k)) == 0 {
+			continue
+		}
+		var hdrInt int = args[k]
+		if hdrInt == 0 {
+			continue
+		}
+		var hdr *int = bit_cast(*int, hdrInt)
+		var dataInt int = hdr[0]
+		var n int = hdr[1]
+		if dataInt == 0 || n <= 0 {
+			continue
+		}
+		// Unlike substituteIfaceArgs (a fixed 2 words) and the aggregate retbuf (a
+		// static return-type size), this scratch bump is a RUNTIME slice length, so
+		// bound it: a pathologically large cross-mode `...*any` spread must fail loud
+		// rather than write the translated backing + header past vm.Stack's end.
+		if vm.SP + (n * 2 + 2) * REG_SLOT > vm.StackSize {
+			vmPanic("vm: cross-mode variadic slice too large for VM scratch stack")
+		}
+		var src *int = bit_cast(*int, dataInt)
+		// Copy the backing (n elements x 2 words) onto vm.Stack, translating each
+		// element's vtable word.
+		var copyBackingInt int = bit_cast(int, vm.Stack) + vm.SP
+		var copyBacking *int = bit_cast(*int, copyBackingInt)
+		vm.SP = vm.SP + n * 2 * REG_SLOT
+		for e := 0; e < n; e++ {
+			var dataIdx int = e * 2 + types.IfaceValueDataIndex()
+			var vtIdx int = e * 2 + types.IfaceValueVtableIndex()
+			copyBacking[dataIdx] = src[dataIdx]
+			var vtWord int = src[vtIdx]
+			if ifaceVtIsNative(vm, vtWord) {
+				copyBacking[vtIdx] = vtWord
+			} else {
+				copyBacking[vtIdx] = buildNativeIfaceVtable(vm, vm.IfaceVtables.Get(vtWord - 1))
+			}
+		}
+		// Copy the {data, len} header pointing at the translated backing.
+		var copyHdrInt int = bit_cast(int, vm.Stack) + vm.SP
+		var copyHdr *int = bit_cast(*int, copyHdrInt)
+		vm.SP = vm.SP + 2 * REG_SLOT
+		copyHdr[0] = copyBackingInt
+		copyHdr[1] = n
+		args[k] = copyHdrInt
 	}
 }

@@ -30,7 +30,7 @@ long-tail bugs that aren't a systematic product.
   The oracle is the **spec** (computed at full precision), not a backend, so a
   value wrong on *every* backend is caught too. Each cell sweeps a fixed,
   seeded value set per coordinate and is self-checking
-  (`println(cast(int, computed == spec_expected))` → `1`) for target-stability.
+  (`testing.Println(cast(int, computed == spec_expected))` → `1`) for target-stability.
   Generator: `conformance/gen-diff-scalar.py`. See `scalar-diff/README.md`.
 - **`abi/`** — aggregate & multi-return passing (Class 4). Categories
   `multi-return` / `struct-return` / `struct-param`, plus the call-shape axis
@@ -55,7 +55,7 @@ long-tail bugs that aren't a systematic product.
   values. Axes `<form>/<kind>` where form = decl-init / assign / copy / deref /
   global / field / param / return and kind = `{scalar,array,struct}-{int,float}`;
   assertion: every lane (element / field / scalar) reads back its value after the
-  movement (`println(cast(int, access == lit))` → 1). Fills the gap left by
+  movement (`testing.Println(cast(int, access == lit))` → 1). Fills the gap left by
   `abi` (call-boundary passing), `refcount` (managed lifecycle), and `const`
   (const materialization): plain var assignment / copy / deref-store / global
   initializer value correctness. Generator: `conformance/gen-aggregate-matrix.py`.

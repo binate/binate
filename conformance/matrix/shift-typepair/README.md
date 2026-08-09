@@ -33,7 +33,7 @@ Each (value-type, count-type) pair asserts three things:
   width that pins the result WIDTH (overshift yields 0 for `<<` / logical `>>`,
   sign-fill for arithmetic `>>`; a wider-typed result would not).
 
-Every line is a target-stable `println(bi(<computed> == <spec>))` -> 1. The
+Every line is a target-stable `testing.Println(bi(<computed> == <spec>))` -> 1. The
 target-width value types (`int` / `uint`) skip the overshift-width check (its
 result depends on the target int size); they still assert permitted +
 result-type + small value.

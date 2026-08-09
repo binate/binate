@@ -42,7 +42,7 @@ ABI_DIR = os.path.join(
 
 def _print(t, expr):
     # Print a field/value of type t as an int (sub-word/unsigned/float need a cast).
-    return f"println({expr})" if t == "int" else f"println(cast(int, {expr}))"
+    return f"testing.Println({expr})" if t == "int" else f"testing.Println(cast(int, {expr}))"
 
 
 def _lit(tname, v):
@@ -261,7 +261,7 @@ def managed_mr_cell(arity, form, dispatch):
         callexpr = f"mr({passargs})"
 
     thread_body = pre + _bind("@Node", anames, callexpr, form)
-    thread_body += [f"println({n}.Val)" for n in anames]
+    thread_body += [f"testing.Println({n}.Val)" for n in anames]
     parts.append(f"func thread({params}) {{\n"
                  + "".join("\t" + ln + "\n" for ln in thread_body) + "}")
     helper = "\n\n".join(parts)
@@ -272,7 +272,7 @@ def managed_mr_cell(arity, form, dispatch):
         body.append(f"n{i}.Val = {vals[i]}")
     body.append(f"thread({', '.join(f'n{i}' for i in range(arity))})")
     for i in range(arity):
-        body.append(f"println(rt.Refcount(bit_cast(*uint8, n{i})))")
+        body.append(f"testing.Println(rt.Refcount(bit_cast(*uint8, n{i})))")
 
     # expected: each component's value (survival), then each Node's rc == 1
     # (balance restored after the threading call).
@@ -321,7 +321,7 @@ def _managed_struct_lit(vfields):
 
 def _managed_struct_body(val):
     return ["var n0 @Node = make(Node)", f"n0.Val = {val}", "thread(n0)",
-            "println(rt.Refcount(bit_cast(*uint8, n0)))"]
+            "testing.Println(rt.Refcount(bit_cast(*uint8, n0)))"]
 
 
 def managed_struct_return_cell(shape, form):
@@ -336,7 +336,7 @@ def managed_struct_return_cell(shape, form):
         bind = ["var b S = mkS(x)"]
     else:  # assign
         bind = ["var b S", "b = mkS(x)"]
-    thread_body = bind + ["println(b.n.Val)"]
+    thread_body = bind + ["testing.Println(b.n.Val)"]
     parts.append("func thread(x @Node) {\n"
                  + "".join("\t" + ln + "\n" for ln in thread_body) + "}")
     return "\n\n".join(parts), _managed_struct_body(val), [val, 1]
@@ -348,7 +348,7 @@ def managed_struct_param_cell(shape):
     # param but never dtor'd).
     vfields, val = MANAGED_STRUCT_SHAPES[shape]
     parts = [_managed_struct_prelude(vfields),
-             "func takeS(s S) {\n\tprintln(s.n.Val)\n}",
+             "func takeS(s S) {\n\ttesting.Println(s.n.Val)\n}",
              "func thread(x @Node) {\n\ttakeS(" + _managed_struct_lit(vfields) + ")\n}"]
     return "\n\n".join(parts), _managed_struct_body(val), [val, 1]
 
@@ -363,7 +363,7 @@ def managed_struct_method_return_cell(shape):
              "interface Maker {\n\tmkS(x @Node) S\n}",
              "impl *Impl : Maker",
              "func thread(x @Node) {\n\tvar mk @Maker = make(Impl)\n"
-             "\tvar b S = mk.mkS(x)\n\tprintln(b.n.Val)\n}"]
+             "\tvar b S = mk.mkS(x)\n\ttesting.Println(b.n.Val)\n}"]
     return "\n\n".join(parts), _managed_struct_body(val), [val, 1]
 
 
@@ -464,10 +464,13 @@ def all_cells():
 
 def render(desc, helper, body):
     out = 'package "main"\n\n'
-    # Auto-detect imports from the cell text (managed cells use rt.Refcount).
+    # Every cell prints via testing.Println (always imported); managed cells
+    # additionally use rt.Refcount (auto-detected from the cell text).
+    out += 'import "pkg/builtins/testing"\n'
     text = helper + "\n" + "\n".join(body)
     if "rt." in text:
-        out += 'import "pkg/builtins/rt"\n\n'
+        out += 'import "pkg/builtins/rt"\n'
+    out += "\n"
     out += COMMENT.format(desc=desc)
     out += helper + "\n\nfunc main() {\n"
     for ln in body:

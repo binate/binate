@@ -23,28 +23,40 @@ if [ ! -x "$BUILDER" ]; then
 fi
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 
-# End-to-end check: compile + run the simplest conformance test
-# through the resolved BUILDER.  The chain is:
-#   <builder> -I LIB -L LIB --runtime ... -o BIN HELLO
-# and the produced BIN should print the expected output.
+# End-to-end check: compile + run a self-contained minimal program through the
+# resolved BUILDER — proving the fetched bnc actually compiles, links, and runs.
+# The canary source is written HERE, not read from the conformance suite, so the
+# conformance tests stay free to evolve (e.g. migrate off the print/println
+# builtins) without breaking this smoke check.  It exercises stdlib fmt + the
+# runtime, both shipped in the pinned BUILDER bundle.
 TMP="$(mktemp -d -t binate-fetch-builder-smoke.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
-BIN="$TMP/hello"
+SRC="$TMP/canary.bn"
+BIN="$TMP/canary"
+cat > "$SRC" <<'CANARY'
+package "main"
+
+import "pkg/stdx/fmt"
+
+func main() {
+	fmt.Println("hello, binate")
+}
+CANARY
+expected="hello, binate"
 build_log="$("$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB")" \
     --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")" \
     --build-dir "$TMP" -o "$BIN" \
-    "$BINATE_DIR/conformance/001_hello.bn" 2>&1)" || true
+    "$SRC" 2>&1)" || true
 if [ ! -x "$BIN" ]; then
-    echo "fetch-builder smoke: 001_hello compile failed under $BUILDER_VERSION" >&2
+    echo "fetch-builder smoke: canary compile failed under $BUILDER_VERSION" >&2
     echo "$build_log" >&2
     exit 1
 fi
 output="$("$BIN" 2>&1)"
-expected="$(cat "$BINATE_DIR/conformance/001_hello.expected")"
 if [ "$output" != "$expected" ]; then
-    echo "fetch-builder smoke: 001_hello output mismatch" >&2
+    echo "fetch-builder smoke: canary output mismatch" >&2
     echo "  expected: $expected" >&2
     echo "  actual:   $output" >&2
     exit 1

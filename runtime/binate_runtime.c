@@ -56,14 +56,10 @@ bn_int_t bn_F2_3_pkg9_bootstrap1_5_Write(bn_int_t fd, BnSlice buf) {
     return (bn_int_t)w;
 }
 
-/* No `main` here: the process entry point (the C `main` symbol) and argv
- * capture are written in Binate — pkg/builtins/startup._entry, exported as the
- * unmangled `main` via #[c_export] and compiled into every hosted binary, which
- * captures argv and installs it via startup.SetArgs, then calls bn_entry (the
- * synthetic `<main>.__entry` the compiler emits, running per-package var
- * initializers then the user's main).  This runtime now provides only the
- * remaining hosted shim
- * (Write).  The frozen BUILDER-bundle copy of this file still defines
- * `main` + bootstrap.Args, for gen1 (which BUILDER links against); the version
- * gate on startup._entry keeps the two in lockstep.  See design-ffi-export.md
- * §3.3 and plan-build-version-predicate.md. */
+/* No `main` here: the process entry point (the C `main` symbol) is written in
+ * Binate — `pkg/builtins/startup._entry`, `#[c_export("main")]` (emitted under
+ * the unmangled `main` that crt0 calls) and gated `#[build(is(entrypoint,
+ * "main"))]`, so a hosted program gets exactly this one `main` and no collision.
+ * It captures argv/envp, installs them via startup.SetArgs / SetEnv, then calls
+ * bn_entry (the synthesized `main.__init_all(); main.main()`).  This runtime now
+ * provides only the remaining hosted shim (Write). */

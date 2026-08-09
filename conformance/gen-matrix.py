@@ -164,12 +164,12 @@ def _common(t, bind_lines, drop_lines, extra_decls=""):
     b = t["baseline"]
     lines = []
     lines += t["construct"]("src")
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     lines += bind_lines
-    lines.append('println(rt.Refcount(src_po))')
-    lines.append(f'println({t["use"]("tgt")})')
+    lines.append('testing.Println(rt.Refcount(src_po))')
+    lines.append(f'testing.Println({t["use"]("tgt")})')
     lines += drop_lines
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     expected = [b, b + 1, t["useval"], b]
     return lines, expected, extra_decls
 
@@ -200,14 +200,14 @@ def form_short_var(t):
 def _shape(t, decl_lines, lv, extra_decls=""):
     b = t["baseline"]
     lines = t["construct"]("src")
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     lines += decl_lines
     lines.append(f'{lv} = src')
-    lines.append('println(rt.Refcount(src_po))')
-    lines.append(f'println({t["use"](lv)})')
+    lines.append('testing.Println(rt.Refcount(src_po))')
+    lines.append(f'testing.Println({t["use"](lv)})')
     lines += t["fresh"]("drp")
     lines.append(f'{lv} = drp')
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     return lines, [b, b + 1, t["useval"], b], extra_decls
 
 
@@ -257,14 +257,14 @@ def _multi_shape(t, decl_lines, lv, extra_decls=""):
     extra = (extra_decls + "\n\n" + helper) if extra_decls else helper
     b = t["baseline"]
     lines = t["construct"]("src")
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     lines += decl_lines
     lines.append(f'{lv}, _ = pair(src)')
-    lines.append('println(rt.Refcount(src_po))')
-    lines.append(f'println({t["use"](lv)})')
+    lines.append('testing.Println(rt.Refcount(src_po))')
+    lines.append(f'testing.Println({t["use"](lv)})')
     lines += t["fresh"]("drp")
     lines.append(f'{lv} = drp')
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     return lines, [b, b + 1, t["useval"], b], extra
 
 
@@ -291,12 +291,12 @@ def form_multi_assign_index_rawptr(t):
 def _slot(t, bind_lines, lv, drop_lines, extra_decls=""):
     b = t["baseline"]
     lines = t["construct"]("src")
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     lines += bind_lines
-    lines.append('println(rt.Refcount(src_po))')
-    lines.append(f'println({t["use"](lv)})')
+    lines.append('testing.Println(rt.Refcount(src_po))')
+    lines.append(f'testing.Println({t["use"](lv)})')
     lines += drop_lines
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     return lines, [b, b + 1, t["useval"], b], extra_decls
 
 
@@ -335,9 +335,9 @@ def form_assign_blank(t):
     helper = f"func wrap(v {t['tname']}) {t['tname']} {{\n\treturn v\n}}"
     b = t["baseline"]
     lines = t["construct"]("src")
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     lines.append('_ = wrap(src)')
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     return lines, [b, b], helper
 
 
@@ -352,7 +352,7 @@ def form_for_range_value(t):
     # (the N-1 leak) reads baseline+3+(N-1) = baseline+5 after.
     helper = (f"func loopOnce(s @[]{t['tname']}) {{\n"
               f"\tfor v in s {{\n"
-              f"\t\tprintln({t['use']('v')})\n"
+              f"\t\ttesting.Println({t['use']('v')})\n"
               f"\t}}\n}}")
     b = t["baseline"]
     lines = t["construct"]("src")
@@ -360,9 +360,9 @@ def form_for_range_value(t):
     lines.append('s[0] = src')
     lines.append('s[1] = src')
     lines.append('s[2] = src')
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     lines.append('loopOnce(s)')
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     return lines, [b + 3, t["useval"], t["useval"], t["useval"], b + 3], helper
 
 
@@ -374,9 +374,9 @@ def form_discard_stmt(t):
     helper = f"func wrap(v {t['tname']}) {t['tname']} {{\n\treturn v\n}}"
     b = t["baseline"]
     lines = t["construct"]("src")
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     lines.append('wrap(src)')
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     return lines, [b, b], helper
 
 
@@ -388,9 +388,9 @@ def form_param(t):
               f"\treturn rt.Refcount(po)\n}}")
     b = t["baseline"]
     lines = t["construct"]("src")
-    lines.append('println(rt.Refcount(src_po))')
-    lines.append('println(take(src, src_po))')
-    lines.append('println(rt.Refcount(src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
+    lines.append('testing.Println(take(src, src_po))')
+    lines.append('testing.Println(rt.Refcount(src_po))')
     return lines, [b, b + 1, b], helper
 
 
@@ -422,6 +422,8 @@ FORMS = {
 # --- Emit -------------------------------------------------------------------
 
 HEADER = """package "main"
+
+import "pkg/builtins/testing"
 
 // GENERATED by conformance/gen-matrix.py — do not edit by hand.
 // Matrix cell — form={form}, shape={shape}, type={type}.

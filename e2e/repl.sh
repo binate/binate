@@ -86,6 +86,8 @@ echo "Built: $BNI_BIN"
 cat > "$FIXTURE" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
+
 type Box struct { V int }
 
 func helper(x int) int {
@@ -95,7 +97,7 @@ func helper(x int) int {
 func main() {
     // Unused — REPL never invokes main.  Defined to satisfy the
     // loader's expectation of a main entry point.
-    println(helper(0))
+    testing.Println(helper(0))
 }
 EOF
 
@@ -128,10 +130,12 @@ BAD_FIXTURE="$TMP/bad_fixture.bn"
 cat > "$BAD_FIXTURE" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
+
 var bad int = undefinedThing
 
 func main() {
-    println(bad)
+    testing.Println(bad)
 }
 EOF
 
@@ -230,7 +234,7 @@ BANNER="Binate REPL (Tier 1 PoC). Ctrl-D to exit."
 
 # --- Case 1: basic call into the loaded module. ---
 run_repl "basic-call" \
-"println(helper(7))
+"testing.Println(helper(7))
 " \
 "$BANNER
 > 14
@@ -242,7 +246,7 @@ run_repl "basic-call" \
 # errors "first cut") rather than the stmt-list path; short-var
 # stays on the stmt path. ---
 run_repl "multi-stmt" \
-"x := 5; x = x + 10; println(x)
+"x := 5; x = x + 10; testing.Println(x)
 " \
 "$BANNER
 > 15
@@ -252,7 +256,7 @@ run_repl "multi-stmt" \
 # and the next turn still works against the loaded module. ---
 run_repl "error-recovery" \
 "undefined_name
-println(helper(3))
+testing.Println(helper(3))
 " \
 "$BANNER
 > <repl>:1:1: undefined: undefined_name
@@ -265,7 +269,7 @@ println(helper(3))
 # concatenates onto the same prompt line as the leading `... `s. ---
 run_repl "multi-line-for" \
 "for i := 0; i < 3; i++ {
-println(helper(i))
+testing.Println(helper(i))
 }
 " \
 "$BANNER
@@ -277,7 +281,7 @@ println(helper(i))
 # --- Case 5: braces inside a string literal must NOT trigger
 # multi-line accumulation.  This input is one balanced line. ---
 run_repl "braces-in-string" \
-'println("hello {world}")
+'testing.Println("hello {world}")
 ' \
 "$BANNER
 > hello {world}
@@ -287,7 +291,7 @@ run_repl "braces-in-string" \
 # persists, and a subsequent turn can call it. ---
 run_repl "tier2-func-persists" \
 "func double(x int) int { return x * 2 }
-println(double(7))
+testing.Println(double(7))
 " \
 "$BANNER
 > > 14
@@ -300,7 +304,7 @@ println(double(7))
 run_repl "tier2-cross-decl-call" \
 "func a(x int) int { return x + 1 }
 func b(x int) int { return a(x) * 10 }
-println(b(4))
+testing.Println(b(4))
 " \
 "$BANNER
 > > > 50
@@ -314,7 +318,7 @@ run_repl "tier2-type-struct" \
 var p Point
 p.X = 10
 p.Y = 20
-println(p.X + p.Y)
+testing.Println(p.X + p.Y)
 " \
 "$BANNER
 > > > > > 30
@@ -329,7 +333,7 @@ run_repl "tier2-type-managed-field" \
 var b Bag
 b.items = make_slice(int, 3)
 b.items[0] = 10; b.items[1] = 20; b.items[2] = 30
-println(b.items[0] + b.items[1] + b.items[2])
+testing.Println(b.items[0] + b.items[1] + b.items[2])
 " \
 "$BANNER
 > > > > > 60
@@ -344,7 +348,7 @@ func (c *Counter) Inc() { c.n = c.n + 1 }
 func (c Counter) Get() int { return c.n }
 var k Counter
 k.Inc(); k.Inc(); k.Inc()
-println(k.Get())
+testing.Println(k.Get())
 " \
 "$BANNER
 > > > > > > 3
@@ -359,7 +363,7 @@ run_repl "tier2-method-on-loaded-type" \
 "func (b *Box) Doubled() int { return b.V * 2 }
 var b Box
 b.V = 21
-println(b.Doubled())
+testing.Println(b.Doubled())
 " \
 "$BANNER
 > > > > 42
@@ -373,7 +377,7 @@ run_repl "tier2-type-named-nonstruct" \
 "type Celsius int
 var t Celsius
 t = 100
-println(t)
+testing.Println(t)
 " \
 "$BANNER
 > > > > 100
@@ -384,7 +388,7 @@ println(t)
 # is unaffected: helpers from the loaded module still work. ---
 run_repl "tier2-bad-body-recovery" \
 "func bad() bool { return 1 }
-println(helper(11))
+testing.Println(helper(11))
 " \
 "$BANNER
 > <repl>:1:26: cannot assign untyped int to bool
@@ -395,7 +399,7 @@ println(helper(11))
 # usable from a subsequent stmt-list turn. ---
 run_repl "tier2-const-typed" \
 "const K int = 42
-println(K)
+testing.Println(K)
 " \
 "$BANNER
 > > 42
@@ -406,7 +410,7 @@ println(K)
 run_repl "tier2-const-untyped" \
 "const A = 7
 const B = 35
-println(A + B)
+testing.Println(A + B)
 " \
 "$BANNER
 > > > 42
@@ -418,7 +422,7 @@ println(A + B)
 # documented PoC limitation.) ---
 run_repl "tier2-const-group-inline" \
 "const ( A = 10; B = 20 )
-println(A); println(B)
+testing.Println(A); testing.Println(B)
 " \
 "$BANNER
 > > 10
@@ -431,7 +435,7 @@ println(A); println(B)
 run_repl "tier2-const-then-func" \
 "const SCALE int = 3
 func tripled(x int) int { return x * SCALE }
-println(tripled(11))
+testing.Println(tripled(11))
 " \
 "$BANNER
 > > > 33
@@ -447,7 +451,7 @@ run_repl "multi-line-const-group" \
 A = 100
 B = 200
 )
-println(A); println(B)
+testing.Println(A); testing.Println(B)
 " \
 "$BANNER
 > ... ... ... > 100
@@ -459,9 +463,9 @@ println(A); println(B)
 # writes from subsequent prompt entries see the same storage. ---
 run_repl "tier2-var-readwrite" \
 "var x int
-println(x)
+testing.Println(x)
 x = 42
-println(x)
+testing.Println(x)
 " \
 "$BANNER
 > > 0
@@ -475,7 +479,7 @@ println(x)
 run_repl "tier2-var-init-eval" \
 "var a int = 5
 var b int = a * 10 + 1
-println(a); println(b)
+testing.Println(a); testing.Println(b)
 " \
 "$BANNER
 > > > 5
@@ -490,7 +494,7 @@ run_repl "tier2-var-func-mutates" \
 "var counter int
 func bump() { counter = counter + 1 }
 bump(); bump(); bump()
-println(counter)
+testing.Println(counter)
 " \
 "$BANNER
 > > > > 3
@@ -503,10 +507,10 @@ println(counter)
 run_repl "tier2-var-untyped" \
 "var i = 7
 var s = \"hi\"
-println(i)
-println(s)
+testing.Println(i)
+testing.Println(s)
 var x = i + 100
-println(helper(7))
+testing.Println(helper(7))
 " \
 "$BANNER
 > > > 7
@@ -519,9 +523,9 @@ println(helper(7))
 # signature replaces the old body.  The fixture's `helper` is
 # x*2; the new one is x*3.  Subsequent calls hit the new body. ---
 run_repl "tier4-redef-replace" \
-"println(helper(7))
+"testing.Println(helper(7))
 func helper(x int) int { return x * 3 }
-println(helper(7))
+testing.Println(helper(7))
 " \
 "$BANNER
 > 14
@@ -533,9 +537,9 @@ println(helper(7))
 # the in-place vm.Funcs rebind keeps cached call indices valid. ---
 run_repl "tier4-redef-caller-sees-new" \
 "func caller() int { return helper(10) }
-println(caller())
+testing.Println(caller())
 func helper(x int) int { return x * 5 }
-println(caller())
+testing.Println(caller())
 " \
 "$BANNER
 > > 20
@@ -551,10 +555,10 @@ println(caller())
 # explicitly so the user knows it happened. ---
 run_repl "tier4-shadow-diff-sig" \
 "func caller() int { return helper(5) }
-println(caller())
+testing.Println(caller())
 func helper(a int, b int) int { return a + b }
-println(caller())
-println(helper(3, 4))
+testing.Println(caller())
+testing.Println(helper(3, 4))
 " \
 "$BANNER
 > > 10
@@ -570,7 +574,7 @@ println(helper(3, 4))
 run_repl "tier3-forward-ref" \
 "func f() int { return g() + 1 }
 func g() int { return 41 }
-println(f())
+testing.Println(f())
 " \
 "$BANNER
 > function f parked (pending: g)
@@ -584,7 +588,7 @@ run_repl "tier3-forward-ref-chain" \
 "func a() int { return b() + 1 }
 func b() int { return c() + 10 }
 func c() int { return 100 }
-println(a())
+testing.Println(a())
 " \
 "$BANNER
 > function a parked (pending: b)
@@ -599,12 +603,12 @@ function b resolved
 # hit \"extern not found\"). ---
 run_repl "tier3-pending-use-site-error" \
 "func f() int { return g() }
-println(f())
-println(helper(7))
+testing.Println(f())
+testing.Println(helper(7))
 " \
 "$BANNER
 > function f parked (pending: g)
-> <repl>:1:9: function f is unresolved (pending: g)
+> <repl>:1:17: function f is unresolved (pending: g)
 > 14
 > "
 
@@ -618,10 +622,10 @@ run_repl "tier4-method-redef-replace" \
 func (c *Counter) Inc() { c.n = c.n + 1 }
 var k Counter
 k.Inc(); k.Inc()
-println(k.n)
+testing.Println(k.n)
 func (c *Counter) Inc() { c.n = c.n + 10 }
 k.Inc()
-println(k.n)
+testing.Println(k.n)
 " \
 "$BANNER
 > > > > > 2
@@ -638,10 +642,10 @@ run_repl "tier4-method-shadow-diff-sig" \
 func (c *Counter) Add() { c.n = c.n + 1 }
 var k Counter
 k.Add()
-println(k.n)
+testing.Println(k.n)
 func (c *Counter) Add(amt int) { c.n = c.n + amt }
 k.Add(7)
-println(k.n)
+testing.Println(k.n)
 " \
 "$BANNER
 > > > > > 1
@@ -659,7 +663,7 @@ println(k.n)
 # fix the func's end-of-statement cleanup hit a missing extern;
 # after, the helper is emitted and lowered before the body. ---
 run_repl "tier2-body-introduces-managed-slice-of-managed-ptr" \
-"func g() { var s @[]@Box = make_slice(@Box, 2); println(len(s)) }
+"func g() { var s @[]@Box = make_slice(@Box, 2); testing.Println(len(s)) }
 g()
 " \
 "$BANNER
@@ -672,7 +676,7 @@ g()
 # leading `var` would route to the decl path instead).  Verifies
 # the drain runs on the evalReplStmtList synthetic too. ---
 run_repl "tier2-body-stmt-list-managed-slice-of-managed-ptr" \
-"s := make_slice(@Box, 3); println(len(s))
+"s := make_slice(@Box, 3); testing.Println(len(s))
 " \
 "$BANNER
 > 3
@@ -686,7 +690,7 @@ run_repl "tier2-body-stmt-list-managed-slice-of-managed-ptr" \
 # bare-stmt println. ---
 run_repl "tier2-body-var-init-managed-slice-of-managed-ptr" \
 "var t @[]@Box = make_slice(@Box, 4)
-println(len(t))
+testing.Println(len(t))
 " \
 "$BANNER
 > > 4
@@ -704,7 +708,7 @@ println(len(t))
 # slot.  Keeping the drain in retryPending is an optimization
 # + consistency win, not a sole correctness fix.) ---
 run_repl "tier3-body-introduced-shape-via-retry" \
-"func f() { var s @[]@Box = make_slice(@Box, 2); h(); println(len(s)) }
+"func f() { var s @[]@Box = make_slice(@Box, 2); h(); testing.Println(len(s)) }
 func h() {}
 f()
 " \
@@ -724,7 +728,7 @@ run_repl "tier2-method-body-introduced-shape" \
 "func (b *Box) Reset() { var s @[]@Box = make_slice(@Box, 2); b.V = len(s) }
 var k Box
 k.Reset()
-println(k.V)
+testing.Println(k.V)
 " \
 "$BANNER
 > > > > 2
@@ -739,7 +743,7 @@ println(k.V)
 run_repl "tier3-pending-var-resolves" \
 "var x int = g() + 1
 func g() int { return 41 }
-println(x)
+testing.Println(x)
 " \
 "$BANNER
 > variable x parked (pending: g)
@@ -755,7 +759,7 @@ println(x)
 # Decision #3); a future edit that reverts the order reddens here. ---
 run_repl "kernel-notice-renders-after-eval-output" \
 "var x int = f()
-func f() int { println(7); return 41 }
+func f() int { testing.Println(7); return 41 }
 " \
 "$BANNER
 > variable x parked (pending: f)
@@ -771,7 +775,7 @@ variable x resolved
 run_repl "tier3-pending-const-resolves" \
 "const N int = M + 1
 const M int = 41
-println(N)
+testing.Println(N)
 " \
 "$BANNER
 > constant N parked (pending: M)
@@ -785,11 +789,11 @@ println(N)
 # use-site error case from the Tier 3 first cut. ---
 run_repl "tier3-pending-var-use-site-error" \
 "var x int = g() + 1
-println(x)
+testing.Println(x)
 " \
 "$BANNER
 > variable x parked (pending: g)
-> <repl>:1:9: variable x is unresolved (pending: g)
+> <repl>:1:17: variable x is unresolved (pending: g)
 > "
 
 # --- Case 34 (Stage 1 (c) — per-member group parking):
@@ -805,7 +809,7 @@ A int = 1
 B int = M + 1
 )
 const M int = 40
-println(A); println(B)
+testing.Println(A); testing.Println(B)
 " \
 "$BANNER
 > ... ... ... constant B parked (pending: M)
@@ -829,7 +833,7 @@ B int = M + iota
 C int = iota
 )
 const M int = 10
-println(A); println(B); println(C)
+testing.Println(A); testing.Println(B); testing.Println(C)
 " \
 "$BANNER
 > ... ... ... ... constant B parked (pending: M)
@@ -849,7 +853,7 @@ run_repl "tier3-pending-struct-type-resolves" \
 type Bag struct { N int }
 var x T
 x.F.N = 42
-println(x.F.N)
+testing.Println(x.F.N)
 " \
 "$BANNER
 > type T parked (pending: Bag)
@@ -865,7 +869,7 @@ run_repl "tier3-pending-type-use-site-propagates" \
 "type T struct { F Bag }
 var x T
 type Bag struct { N int }
-println(\"resolved\")
+testing.Println(\"resolved\")
 " \
 "$BANNER
 > type T parked (pending: Bag)
@@ -884,7 +888,7 @@ run_repl "tier3-pending-alias-resolves" \
 type Bag struct { N int }
 var x R
 x.N = 7
-println(x.N)
+testing.Println(x.N)
 " \
 "$BANNER
 > type R parked (pending: Bag)
@@ -900,7 +904,7 @@ run_repl "tier3-pending-named-nonstruct-resolves" \
 "type Celsius Heat
 type Heat int
 var t Celsius
-println(t)
+testing.Println(t)
 " \
 "$BANNER
 > type Celsius parked (pending: Heat)
@@ -917,7 +921,7 @@ run_repl "tier3-pending-type-reference-use-no-park" \
 "type T struct { F Bag }
 var p *T
 type Bag struct { N int }
-println(\"reached\")
+testing.Println(\"reached\")
 " \
 "$BANNER
 > type T parked (pending: Bag)
@@ -933,7 +937,7 @@ println(\"reached\")
 run_repl "tier3-pending-mutual-recursion-resolves" \
 "type A struct { Next @B }
 type B struct { Next @A }
-println(\"resolved\")
+testing.Println(\"resolved\")
 " \
 "$BANNER
 > type A parked (pending: B)
@@ -951,7 +955,7 @@ run_repl "tier3-pending-func-sig-parks-func" \
 "type T struct { F Bag }
 func f(x T) int { return 0 }
 type Bag struct { N int }
-println(\"done\")
+testing.Println(\"done\")
 " \
 "$BANNER
 > type T parked (pending: Bag)
@@ -971,7 +975,7 @@ run_repl "tier3-pending-method-on-pending-receiver" \
 func (t *T) M() int { return 7 }
 type Bag struct { N int }
 var x T
-println(x.M())
+testing.Println(x.M())
 " \
 "$BANNER
 > type T parked (pending: Bag)
@@ -1005,7 +1009,7 @@ pending cycle: B -> A -> B
 # prompt entries can call repldemo.Double. ---
 run_repl "tier5-mid-session-import-call" \
 'import "pkg/repldemo"
-println(repldemo.Double(21))
+testing.Println(repldemo.Double(21))
 ' \
 "$BANNER
 > package pkg/repldemo loaded
@@ -1019,7 +1023,7 @@ println(repldemo.Double(21))
 # alias-bearing branch of evalReplImport. ---
 run_repl "tier5-mid-session-import-alias" \
 'import alt "pkg/repldemo"
-println(alt.Double(11))
+testing.Println(alt.Double(11))
 ' \
 "$BANNER
 > package pkg/repldemo loaded
@@ -1034,7 +1038,7 @@ println(alt.Double(11))
 run_repl "tier5-mid-session-reimport-idempotent" \
 'import "pkg/repldemo"
 import "pkg/repldemo"
-println(repldemo.Double(5))
+testing.Println(repldemo.Double(5))
 ' \
 "$BANNER
 > package pkg/repldemo loaded
@@ -1052,7 +1056,7 @@ println(repldemo.Double(5))
 # reaches lower_instr's default arm and aborts the whole session. ---
 run_repl_import_rejected "tier5-mid-session-import-ccall-rejected" \
 'import "pkg/std/os"
-println(helper(7))
+testing.Println(helper(7))
 ' \
     "__c_call cannot be interpreted" \
     "14"
@@ -1065,7 +1069,7 @@ println(helper(7))
 run_repl "tier3-pending-const-group-bare-iota-repeat" \
 "const ( B0 int = M << iota; B1 )
 const M int = 2
-println(B1)
+testing.Println(B1)
 " \
 "$BANNER
 > constant B0 parked (pending: M)

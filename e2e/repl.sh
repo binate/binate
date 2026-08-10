@@ -139,6 +139,22 @@ func main() {
 }
 EOF
 
+# ----- No-`testing` fixture: it does NOT import pkg/builtins/testing, so a
+# prompt `import "pkg/builtins/testing"` is a genuine FIRST-time mid-session
+# import of that injected package (exercises RegisterImportFuncSigs — the
+# prompt then knows testing.Println is `...*any` variadic). ---
+NOTESTING_FIXTURE="$TMP/notesting_fixture.bn"
+cat > "$NOTESTING_FIXTURE" <<'EOF'
+package "main"
+
+func helper(x int) int {
+    return x * 2
+}
+
+func main() {
+}
+EOF
+
 PASSES=0
 FAILS=0
 FAIL_NAMES=""
@@ -150,10 +166,11 @@ run_repl() {
     label="$1"
     input="$2"
     expected="$3"
+    fixture="${4:-$FIXTURE}"
     actual=$(printf '%s' "$input" | "$BNI_BIN" --repl \
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
         -I "$TMP" -L "$TMP" \
-        "$FIXTURE" 2>&1)
+        "$fixture" 2>&1)
     if [ "$actual" = "$expected" ]; then
         echo "PASS: $label"
         PASSES=$((PASSES + 1))
@@ -1045,6 +1062,43 @@ testing.Println(repldemo.Double(5))
 > package pkg/repldemo loaded
 > 10
 > "
+
+# --- Case 47b (Tier 5: a top-level `var` decl AFTER a mid-session import).  The
+# import's per-package LowerModule leaves the VM's module-lowering context at the
+# imported package; a following `var g` must be qualified under the SESSION module
+# (SetModuleContext restores it) — else MaterializeOneGlobal registers the global
+# under the import's package while the init synthetic stores under "main", a
+# null-address SIGSEGV.  Regression guard for that (pre-existing) crash. testing
+# comes from the fixture, so this exercises SetModuleContext independent of the
+# prompt-import-of-testing path. ---
+run_repl "tier5-var-decl-after-mid-session-import" \
+'import "pkg/repldemo"
+var g int = 42
+testing.Println(g)
+' \
+"$BANNER
+> package pkg/repldemo loaded
+> > 42
+> "
+
+# --- Case 47c (Tier 5: mid-session import of testing, an injected VARIADIC
+# package, then boxing a PROMPT-DEFINED type into it).  Against NOTESTING_FIXTURE
+# so `import "pkg/builtins/testing"` is a genuine first-time mid-session import:
+# the prompt then knows testing.Println is `...*any` (RegisterImportFuncSigs) and a
+# subsequent prompt-defined `type Fahr int` value boxes + prints.  Exercises the
+# whole prompt-import-and-use-testing path (adversarial-review repro). ---
+run_repl "tier5-mid-session-import-testing-box-prompt-type" \
+'import "pkg/builtins/testing"
+type Fahr int
+var f Fahr
+f = 451
+testing.Println(f)
+' \
+"$BANNER
+> package pkg/builtins/testing loaded
+> > > > 451
+> " \
+"$NOTESTING_FIXTURE"
 
 # --- Case 47a (Tier 5: mid-session import of a __c_call package is rejected
 # cleanly, WITHOUT killing the session).  pkg/std/os uses native-only __c_call,

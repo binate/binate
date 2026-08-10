@@ -17,7 +17,7 @@ fails the cell vs the reference. (An LLVM-as-oracle differential would miss it.)
 Self-checking, for target-stability: each tuple computes the op at runtime
 (operands in `var`s, so the BACKEND op runs, not const-fold) and prints
 `cast(int, (computed == spec_expected))` -> `1`. The comparison happens at the
-operand width in-language; only a 0/1 reaches `println`, so a 64-bit result
+operand width in-language; only a 0/1 is printed, so a 64-bit result
 never truncates through `cast(int, ...)` on a 32-bit target, and a sub-word
 value never hits the native sub-word print path. Every `.expected` is therefore
 a column of `1`s; a `0` on line N means tuple N (commented in the .bn) diverged.

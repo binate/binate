@@ -35,7 +35,7 @@ IFACE_G = ("interface Getter {\n\tget() int\n}\n\n"
 BOX = "type Box struct {\n\tv int\n}"
 
 # Each cell: (relpath, helpers, gdecl, reads[list of exprs], expected[list]).
-# `reads` are expressions printed via println; an expr already an int prints
+# `reads` are expressions to print; an expr already an int prints
 # directly, else it's cast to int by _emit.
 CELLS = [
     # --- init: value types, assert the materialized VALUE (controls) ---

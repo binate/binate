@@ -69,18 +69,20 @@ import "pkg/binate/types"
 //      LR is saved on the stack and the frame must be torn down before RET.
 func emitClosureShimSpillArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type, f @ir.Func,
 		cc common.CallConv, argTypes @[]@types.Type) {
-	// The over-budget closure spill USER-ARG marshal (emitSpillMarshalArm32) is GP-only.
-	// Under hard-float a SCALAR float PARAM rides VFP, which that marshal cannot place, so a
-	// scalar float param here would be silently miscompiled — fail LOUD (inc 3f b4b/c).  A
-	// scalar float CAPTURE, by contrast, IS handled (inc 3f b4a): emitClosureCaptureVfpLoadArm32
-	// VLDRs an in-VFP-reg float capture into its CPRC register before the marshal, and
-	// emitClosureCaptureSpillArm32 spills a bank-overflowed one as raw stack words.  A float
-	// nested in an AGGREGATE param/capture is float-agnostic on the GP path (re-expanded /
-	// by-word).  Inert on soft-float.
-	if types.Arm32HardFloat() && funcValueShimHasScalarFloatParamArm32(fvTyp) {
+	// A SCALAR float PARAM is handled here (inc 3f b4b): emitSpillMarshalArm32 SKIPS it
+	// (hardFloatShimSkipArm32; it rides VFP) and it is passed through untouched (no float
+	// captures) or VFP-up-shifted past the float captures (emitClosureParamVfpUpShiftArm32).  A
+	// scalar float CAPTURE is loaded into its VFP register by emitClosureCaptureVfpLoadArm32
+	// (inc 3f b4a), or spilled as raw stack words if bank-overflowed.  A float nested in an
+	// AGGREGATE param/capture is float-agnostic on the GP path.  A scalar float param whose
+	// OUTGOING VFP slot spills the bank, or that the float captures force to move DOWN in the
+	// VFP file (a back-fill reorder the monotonic up-shift can not do clobber-free), stays —
+	// fail LOUD (inc 3f b4c).  Inert on soft-float.
+	if types.Arm32HardFloat() && closureFloatParamUpShiftUnhandledArm32(cc, fvTyp, f) {
 		a.SetError(
-				"native arm32 hard-float: scalar float param through over-budget closure "
-						"spill shim not yet implemented (inc 3f b4b/c)")
+				"native arm32 hard-float: unhandled scalar float param (VFP-bank spill or "
+						"back-fill down-move) through over-budget closure spill shim not yet "
+						"implemented (inc 3f b4c)")
 		return
 	}
 	// outBytes = the outgoing-args area for the FULL captures++users call (both a
@@ -114,6 +116,9 @@ func emitClosureShimSpillArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.T
 	}
 	// Step 3: spill stack-bound capture words from the closure-struct base (R0, live).
 	emitClosureCaptureSpillArm32(a, cc, f, argTypes, 0, arm32.R0)
+	// Step 3a: VFP-up-shift the scalar float USER params past the float captures — BEFORE the
+	// capture VFP load, whose LOW capture slots may overlap a param's incoming slot (inc 3f b4b).
+	emitClosureParamVfpUpShiftArm32(a, cc, fvTyp, f, argTypes, 0)
 	// Step 3b: load hard-float scalar float captures into their VFP registers from
 	// [R0 + FieldOffset] — BEFORE the marshal, while R0 is live (a float capture consumes no
 	// GP word, so a GP user arg can land in R0 and the marshal would clobber it; inc 3f b4a).
@@ -289,5 +294,63 @@ func emitClosureCaptureVfpLoadArm32(a @asm.Assembler, cc common.CallConv, f @ir.
 		if hwSlot < 0 { continue }
 		vfpLoadBaseHard(a, isDouble, fpRegForSlot(hwSlot, isDouble), captureBase,
 				f.ClosureStruct.FieldOffset(i), arm32.IP)
+	}
+}
+
+// emitClosureParamVfpUpShiftArm32 VFP-up-shifts a closure's scalar float USER params past its
+// float CAPTURES (inc 3f b4b).  When a closure has float captures, those captures occupy the
+// leading VFP slots, so each float user param — which the dispatch caller placed at its incoming
+// slot CallArgFpReg(userTypes, j) (the users-only allocation; the GP data/retbuf prefix consumes
+// no VFP) — must move UP to its outgoing slot CallArgFpReg(classifyTypes, classifyOff +
+// NumCaptureParams + j) (the captures++users allocation).  VMOV'd param by param in DESCENDING
+// outgoing-slot order (outSBase = 2*hwSlot for a double, hwSlot for a single), which makes the
+// shift-up clobber-free: every not-yet-moved source lies at or below the current move's outgoing
+// base, so writing the highest-outgoing move first cannot overwrite a pending source.  MUST run
+// BEFORE the capture VFP load (which writes the LOW capture slots, one of which may equal a
+// param's incoming slot); the outgoing slots are HIGH (past the captures) so they don't collide
+// with the capture slots the later load writes.  A param whose OUTGOING slot spills the VFP bank
+// (hwSlot < 0 — the captures pushed it over) is fail-loud upstream (b4c) and skipped here.  Inert
+// when there are no float captures (the params pass through untouched — incoming == outgoing) and
+// on soft-float.  classifyTypes / classifyOff mirror the capture load: (argTypes, 0) for the
+// scalar-void & pack shims, (sretTypes, 1) for the sret shim (the leading *uint8 retbuf is GP, so
+// it does not shift the VFP slots).
+func emitClosureParamVfpUpShiftArm32(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type,
+		f @ir.Func, classifyTypes @[]@types.Type, classifyOff int) {
+	if !types.Arm32HardFloat() { return }
+	if !anyCaptureHasScalarFloatArm32(f) { return }
+	var userTypes @[]@types.Type = funcValueParamTypesArm32(fvTyp)
+	var n int = len(userTypes)
+	var emitted @[]bool = make_slice(bool, n)
+	for iter := 0; iter < n; iter = iter + 1 {
+		// Select the un-emitted float user param with the HIGHEST outgoing VFP slot.
+		var bestJ int = -1
+		var bestBase int = -1
+		for j := 0; j < n; j = j + 1 {
+			if emitted[j] { continue }
+			if !common.IsFloatScalarTyp(userTypes[j]) { continue }
+			var oh int
+			var od bool
+			oh, od = cc.CallArgFpReg(classifyTypes, classifyOff + f.NumCaptureParams + j)
+			if oh < 0 { continue } // outgoing spills -> fail-loud upstream (b4c); not up-shifted
+			var ob int = oh
+			if od { ob = 2 * oh }
+			if ob > bestBase {
+				bestBase = ob
+				bestJ = j
+			}
+		}
+		if bestJ < 0 { break }
+		emitted[bestJ] = true
+		var ih int
+		ih, _ = cc.CallArgFpReg(userTypes, bestJ)
+		if ih < 0 { continue } // incoming spills -> fail-loud upstream; no VMOV
+		var oh int
+		var od bool
+		oh, od = cc.CallArgFpReg(classifyTypes, classifyOff + f.NumCaptureParams + bestJ)
+		if od {
+			arm32.VmovF64(a, arm32.COND_AL, arm32.D0 + oh, arm32.D0 + ih)
+		} else {
+			arm32.VmovF32(a, arm32.COND_AL, arm32.S0 + oh, arm32.S0 + ih)
+		}
 	}
 }

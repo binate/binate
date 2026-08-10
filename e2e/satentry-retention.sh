@@ -55,6 +55,8 @@ SRC="$TMP/prog.bn"
 cat > "$SRC" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
+
 interface Greeter {
 	greet() int
 }
@@ -73,7 +75,7 @@ func main() {
 	var t Thing
 	t.x = 42
 	var g *Greeter = &t
-	println(g.greet())
+	testing.Println(g.greet())
 }
 EOF
 

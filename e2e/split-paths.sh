@@ -42,8 +42,10 @@ EOF
 cat > "$IMPL_ROOT/pkg/splitlib/splitlib.bn" <<'EOF'
 package "pkg/splitlib"
 
+import "pkg/builtins/testing"
+
 func Greet() {
-    println("split-paths-ok")
+    testing.Println("split-paths-ok")
 }
 EOF
 
@@ -123,7 +125,8 @@ if [ ! -x "$BNLINT_BIN" ]; then
     FAIL_NAMES="$FAIL_NAMES bnlint"
 else
     bnlint_out=$("$BNLINT_BIN" \
-        -I "$BNI_ROOT:$BINATE_DIR" -L "$IMPL_ROOT:$BINATE_DIR" \
+        -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$BNI_ROOT")" \
+        -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$IMPL_ROOT")" \
         pkg/splitlib 2>&1) || true
     if [ -z "$bnlint_out" ]; then
         echo "PASS: bnlint"

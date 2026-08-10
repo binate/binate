@@ -217,6 +217,7 @@ EOF
 cat > "$HOST_DIR/host.bn" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/binate/ast"
 import "pkg/binate/interp"
 import "pkg/binate/parser"
@@ -232,20 +233,20 @@ func main() {
 	// args[0] is the first real arg and the indices below are unchanged.
 	var args @[]@[]char = progArgs()
 	if len(args) < 3 {
-		println("usage: host <prog.bn> <I-paths> <L-paths>")
+		testing.Println("usage: host <prog.bn> <I-paths> <L-paths>")
 		os.Exit(1)
 	}
 	var src @[]uint8 = readFile(args[0])
 	if len(src) == 0 {
-		print("host: cannot read ")
-		println(args[0])
+		testing.Print("host: cannot read ")
+		testing.Println(args[0])
 		os.Exit(1)
 	}
 	var p @parser.Parser = parser.New(src, args[0])
 	var f @ast.File = p.ParseFile()
 	var perrs @[]parser.ParseError = p.Errors()
 	if len(perrs) > 0 {
-		for i := 0; i < len(perrs); i++ { println(perrs[i].Msg) }
+		for i := 0; i < len(perrs); i++ { testing.Println(perrs[i].Msg) }
 		os.Exit(1)
 	}
 	var files @[]@ast.File = make_slice(@ast.File, 1)
@@ -266,13 +267,13 @@ func main() {
 
 	var loadErrs @[]@[]char = it.LoadProgram(files)
 	if len(loadErrs) > 0 {
-		for i := 0; i < len(loadErrs); i++ { println(loadErrs[i]) }
+		for i := 0; i < len(loadErrs); i++ { testing.Println(loadErrs[i]) }
 		os.Exit(1)
 	}
 	var runErrs @[]@[]char
 	_, runErrs = it.RunMain()
 	if len(runErrs) > 0 {
-		for i := 0; i < len(runErrs); i++ { println(runErrs[i]) }
+		for i := 0; i < len(runErrs); i++ { testing.Println(runErrs[i]) }
 		os.Exit(1)
 	}
 }
@@ -359,69 +360,72 @@ EOF
 cat > "$TMP/prog_ok.bn" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/xmiface"
 
 func main() {
 	// (a) value-receiver dispatch (iv-thunk deref).
 	var w xmiface.Wrapper = xmiface.Wrapper{V: 21}
 	var d *xmiface.Doubler = &w
-	println(d.Double())
+	testing.Println(d.Double())
 
 	// (b) multiple aggregate args.
 	var adder xmiface.Adder = xmiface.Adder{Base: 100}
 	var c *xmiface.Combiner = &adder
-	println(c.Combine(xmiface.Pair{X: 1, Y: 2}, xmiface.Pair{X: 3, Y: 4}))
+	testing.Println(c.Combine(xmiface.Pair{X: 1, Y: 2}, xmiface.Pair{X: 3, Y: 4}))
 
 	// (c) float arg (int-slot -> FP bitcast in the shim).
 	var mult xmiface.Mult = xmiface.Mult{Factor: 10}
 	var s *xmiface.Scaler = &mult
-	println(s.Scale(2.5))
+	testing.Println(s.Scale(2.5))
 }
 EOF
 
 cat > "$TMP/prog_overflow.bn" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/xmiface"
 
 func main() {
 	// (d) >6 user args: the cross-mode dispatch overflow guard must fire.
 	var summer xmiface.Summer = xmiface.Summer{Tag: 0}
 	var m *xmiface.Many = &summer
-	println(m.Sum7(1, 2, 3, 4, 5, 6, 7))
+	testing.Println(m.Sum7(1, 2, 3, 4, 5, 6, 7))
 }
 EOF
 
 cat > "$TMP/prog_upcast.bn" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/xmiface"
 
 func main() {
 	var node xmiface.Node = xmiface.Node{V: 7}
 	var e *xmiface.Ext = &node
 	// Child-interface dispatch (offset 0 — resolves the registered base).
-	println(e.ExtVal())         // 70
+	testing.Println(e.ExtVal())         // 70
 	// Upcast Ext -> Base (offset>0), then dispatch the PARENT method through
 	// the upcast view: the vtable word is advanced by offset*8, so the shim
 	// lookup must RANGE-resolve the interior address (exact-match aborts).
 	var b *xmiface.Base = e
-	println(b.BaseVal())        // 7
+	testing.Println(b.BaseVal())        // 7
 
 	// Multi-level: transitive upcast C1 -> A1 (grandparent), offset>1.
 	var ch xmiface.Chain = xmiface.Chain{V: 5}
 	var c *xmiface.C1 = &ch
-	println(c.CVal())           // 15
+	testing.Println(c.CVal())           // 15
 	var a *xmiface.A1 = c
-	println(a.AVal())           // 5
+	testing.Println(a.AVal())           // 5
 
 	// Value-receiver PARENT method at offset>0: the iv-dispatch thunk resolves
 	// through the range-lookup-selected shim slot.
 	var vn xmiface.VNode = xmiface.VNode{V: 8}
 	var ve *xmiface.VExt = &vn
-	println(ve.VExtVal())       // 800
+	testing.Println(ve.VExtVal())       // 800
 	var vb *xmiface.VBase = ve
-	println(vb.VBaseVal())      // 8
+	testing.Println(vb.VBaseVal())      // 8
 }
 EOF
 

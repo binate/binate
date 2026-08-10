@@ -121,15 +121,16 @@ cat > "$SCRIPT" <<EOF
 $SHEBANG
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/std/os"
 
 func main() {
 	var a @[]readonly @[]readonly char = os.Args()
-	println(len(a))
+	testing.Println(len(a))
 	for i := 1; i < len(a); i++ {
-		print("[")
-		print(a[i])
-		println("]")
+		testing.Print("[")
+		testing.Print(a[i])
+		testing.Println("]")
 	}
 }
 EOF

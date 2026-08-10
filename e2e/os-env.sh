@@ -50,14 +50,15 @@ mkdir -p "$BUILD_DIR"
 cat > "$TMP/os_env.bn" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/std/os"
 
 func main() {
 	var env @[]readonly @[]readonly char = os.Env()
 	if len(env) > 0 {
-		println("env-nonempty")
+		testing.Println("env-nonempty")
 	} else {
-		println("env-empty")
+		testing.Println("env-empty")
 	}
 	var key *[]readonly char = "BINATE_TEST_ENV="
 	for i := 0; i < len(env); i++ {
@@ -69,38 +70,20 @@ func main() {
 				}
 			}
 			if match {
-				print("found=")
-				print(env[i])
-				println("")
+				testing.Print("found=")
+				testing.Print(env[i])
+				testing.Println("")
 			}
 		}
 	}
 }
 EOF
 
-# ----- Build gen1 (a native, checkout-source compiler). -----
-# The BUILDER (bnc) compiles cmd/bnc (checkout source); the -I/-L resolve cmd/bnc's
-# own deps from the BUILDER's frozen bundle (with source prepended), because the
-# bnc source cone may only use features the BUILDER already has.  See
-# scripts/lib/build-compilers.sh build_gen1 for the full rationale.
-BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
-GEN1_DIR="$BUILD_DIR/gen1"
-GEN1_BNC="$GEN1_DIR/bnc"
-mkdir -p "$GEN1_DIR/build"
-gen1_log=$("$BUILDER" \
-    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-    --runtime "$BUILDER_RUNTIME" \
-    --build-dir "$GEN1_DIR/build" \
-    -o "$GEN1_BNC" \
-    "$BINATE_DIR/cmd/bnc" 2>&1)
-if [ ! -x "$GEN1_BNC" ]; then
-    echo "FAIL: gen1 build failed:" >&2
-    echo "$gen1_log" | sed 's/^/  /' >&2
-    exit 1
-fi
+# ----- Resolve a gen1 (native, checkout-source) compiler. -----
+# resolve-gen1.sh builds+caches gen1 (the BUILDER compiling checkout cmd/bnc) once
+# per tree state, so a full e2e run builds it once and shares it across tests
+# rather than each test rebuilding its own.
+GEN1_BNC="$("$BINATE_DIR/scripts/resolve-gen1.sh")"
 
 # Common checkout -I/-L (fixture and cmd/bni both link against the current stdlib).
 CK_I="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"

@@ -92,17 +92,20 @@ EOF
 # --- the Binate program: __c_call each, compare / widen -------------------
 cat > "$TMP/main.bn" <<'EOF'
 package "main"
+
+import "pkg/builtins/testing"
+
 func main() {
-	if __c_call("sc", int8) == cast(int8, -5) { println(1) } else { println(0) }
-	if __c_call("sh", int16) == cast(int16, -300) { println(1) } else { println(0) }
-	if __c_call("uc", uint8) == cast(uint8, 200) { println(1) } else { println(0) }
+	if __c_call("sc", int8) == cast(int8, -5) { testing.Println(1) } else { testing.Println(0) }
+	if __c_call("sh", int16) == cast(int16, -300) { testing.Println(1) } else { testing.Println(0) }
+	if __c_call("uc", uint8) == cast(uint8, 200) { testing.Println(1) } else { testing.Println(0) }
 	// A dirty-upper int32 return (0xBEEF00000000_0005 truncated -> low 32 = 5): only
 	// the low 32 bits are ABI-guaranteed, so the native caller must re-canonicalize
 	// before the 64-bit compare, else `== 5` is false on aarch64.
 	var hi int64 = cast(int64, 0xBEEF)
 	var dirty int64 = (hi << 48) | 5
-	if __c_call("trunc32", int32, dirty) == 5 { println(1) } else { println(0) }
-	println(cast(int, __c_call("sc", int8)))
+	if __c_call("trunc32", int32, dirty) == 5 { testing.Println(1) } else { testing.Println(0) }
+	testing.Println(cast(int, __c_call("sc", int8)))
 }
 EOF
 

@@ -92,6 +92,7 @@ EOF
 cat > "$TMP/rprobe.bn" <<EOF
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/std/os"
 import "pkg/std/errors"
 
@@ -115,7 +116,7 @@ func main() {
 	var ents @[]@os.DirEntry
 	var err @errors.Error
 	ents, err = os.ReadDir("$READDIR_DIR")
-	if present(err) { println(0 - 1); return }
+	if present(err) { testing.Println(0 - 1); return }
 	var count int = 0
 	var kf int = 0 - 1
 	var ks int = 0 - 1
@@ -129,30 +130,28 @@ func main() {
 		if nameEq(nm, "alink") { kl = kindOf(ents[i]) }
 		if nameEq(nm, ".hidden") { kh = kindOf(ents[i]) }
 	}
-	println(count)
-	println(kf)
-	println(ks)
-	println(kl)
-	println(kh)
+	testing.Println(count)
+	testing.Println(kf)
+	testing.Println(ks)
+	testing.Println(kl)
+	testing.Println(kh)
 }
 EOF
 
-# Compile the readdir probe by running cmd/bnc (current source) via the pinned
-# BUILDER — no gen1 build needed.  os once required a .bni free-func/method fix
-# (796effc7) that postdated the then-BUILDER (bnc-0.0.9); that fix is contained in
-# the current BUILDER_VERSION, so the BUILDER compiles os directly.  Mirrors
-# e2e/os-args.sh (the -I/-L resolve os's stdlib deps from the BUILDER's
-# frozen bundle, source prepended).
-BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
+# Compile the readdir probe with a gen1 (checkout-source) compiler, resolving its
+# stdlib deps from the checkout.  The probe prints via testing.Print*, which
+# postdates the pinned BUILDER's frozen stdlib bundle — so the BUILDER cannot
+# compile it directly.  resolve-gen1.sh builds+caches gen1 (the BUILDER compiling
+# checkout cmd/bnc) once per tree state, so this stays cheap across the e2e run.
+# Mirrors e2e/os-args.sh.
+GEN1_BNC="$("$BINATE_DIR/scripts/resolve-gen1.sh")"
+CK_I="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
+CK_L="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
+CK_RT="$BINATE_DIR/runtime/binate_runtime.c"
 BNC_BIN="$TMP/rprobe"
 BUILD_DIR="$TMP/build"
 mkdir -p "$BUILD_DIR"
-bnc_log=$("$BUILDER" \
-    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-    --runtime "$BUILDER_RUNTIME" \
+bnc_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" --runtime "$CK_RT" \
     --build-dir "$BUILD_DIR" -o "$BNC_BIN" "$TMP/rprobe.bn" 2>&1) || true
 if [ ! -x "$BNC_BIN" ]; then
     echo "FAIL: Binate compile of the readdir probe failed" >&2

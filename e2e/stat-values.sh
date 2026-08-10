@@ -74,6 +74,7 @@ EOF
 cat > "$TMP/sprobe.bn" <<EOF
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/std/os"
 import "pkg/std/errors"
 import "pkg/std/time"
@@ -88,13 +89,13 @@ func emit(path *[]readonly char) {
 	var err @errors.Error
 	fi, err = os.Stat(path)
 	if present(err) {
-		println(0 - 1)
+		testing.Println(0 - 1)
 		return
 	}
-	println(cast(int, fi.Size()))
-	println(cast(int, fi.Mode().Perm()))
-	println(yn(fi.Mode().IsRegular()))
-	println(yn(fi.IsDir()))
+	testing.Println(cast(int, fi.Size()))
+	testing.Println(cast(int, fi.Mode().Perm()))
+	testing.Println(yn(fi.Mode().IsRegular()))
+	testing.Println(yn(fi.IsDir()))
 	// Bind the time.Point to a var before calling ToUnix on it: chaining a
 	// method onto the by-value struct result of a cross-package method
 	// (fi.ModTime()) currently miscompiles (extractvalue on a scalar) — see
@@ -103,8 +104,8 @@ func emit(path *[]readonly char) {
 	var sec int64
 	var nsec int32
 	sec, nsec = mt.ToUnix()
-	println(cast(int, sec))
-	println(cast(int, nsec))
+	testing.Println(cast(int, sec))
+	testing.Println(cast(int, nsec))
 }
 
 func main() {
@@ -113,22 +114,20 @@ func main() {
 }
 EOF
 
-# Compile the stat probe by running cmd/bnc (current source) via the pinned
-# BUILDER — no gen1 build needed.  os's struct-stat decoding once required a .bni
-# free-func/method fix (796effc7) that postdated the then-BUILDER (bnc-0.0.9);
-# that fix is contained in the current BUILDER_VERSION, so the BUILDER compiles os
-# directly.  Mirrors e2e/os-args.sh (the -I/-L resolve os's stdlib deps
-# from the BUILDER's frozen bundle, source prepended).
-BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
+# Compile the stat probe with a gen1 (checkout-source) compiler, resolving its
+# stdlib deps from the checkout.  The probe prints via testing.Print*, which
+# postdates the pinned BUILDER's frozen stdlib bundle — so the BUILDER cannot
+# compile it directly.  resolve-gen1.sh builds+caches gen1 (the BUILDER compiling
+# checkout cmd/bnc) once per tree state, so this stays cheap across the e2e run.
+# Mirrors e2e/os-args.sh.
+GEN1_BNC="$("$BINATE_DIR/scripts/resolve-gen1.sh")"
+CK_I="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
+CK_L="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
+CK_RT="$BINATE_DIR/runtime/binate_runtime.c"
 BNC_BIN="$TMP/sprobe"
 BUILD_DIR="$TMP/build"
 mkdir -p "$BUILD_DIR"
-bnc_log=$("$BUILDER" \
-    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-    --runtime "$BUILDER_RUNTIME" \
+bnc_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" --runtime "$CK_RT" \
     --build-dir "$BUILD_DIR" -o "$BNC_BIN" "$TMP/sprobe.bn" 2>&1) || true
 if [ ! -x "$BNC_BIN" ]; then
     echo "FAIL: Binate compile of the stat probe failed" >&2

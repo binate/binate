@@ -69,6 +69,8 @@ env -i $FIXED_ENV "$TMP/cref" > "$TMP/truth.txt"
 cat > "$TMP/eprobe.bn" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
+
 func main() {
 	var pp ***char = __c_global("environ", **char)
 	var env **char = *pp
@@ -83,8 +85,8 @@ func main() {
 		}
 		count = count + 1
 	}
-	println(count)
-	println(sum)
+	testing.Println(count)
+	testing.Println(sum)
 }
 EOF
 

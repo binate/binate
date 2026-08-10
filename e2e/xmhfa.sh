@@ -104,6 +104,7 @@ EOF
 cat > "$HOST_DIR/host.bn" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/binate/ast"
 import "pkg/binate/interp"
 import "pkg/binate/parser"
@@ -119,20 +120,20 @@ func main() {
 	// args[0] is the first real arg and the indices below are unchanged.
 	var args @[]@[]char = progArgs()
 	if len(args) < 3 {
-		println("usage: host <prog.bn> <I-paths> <L-paths>")
+		testing.Println("usage: host <prog.bn> <I-paths> <L-paths>")
 		os.Exit(1)
 	}
 	var src @[]uint8 = readFile(args[0])
 	if len(src) == 0 {
-		print("host: cannot read ")
-		println(args[0])
+		testing.Print("host: cannot read ")
+		testing.Println(args[0])
 		os.Exit(1)
 	}
 	var p @parser.Parser = parser.New(src, args[0])
 	var f @ast.File = p.ParseFile()
 	var perrs @[]parser.ParseError = p.Errors()
 	if len(perrs) > 0 {
-		for i := 0; i < len(perrs); i++ { println(perrs[i].Msg) }
+		for i := 0; i < len(perrs); i++ { testing.Println(perrs[i].Msg) }
 		os.Exit(1)
 	}
 	var files @[]@ast.File = make_slice(@ast.File, 1)
@@ -153,13 +154,13 @@ func main() {
 
 	var loadErrs @[]@[]char = it.LoadProgram(files)
 	if len(loadErrs) > 0 {
-		for i := 0; i < len(loadErrs); i++ { println(loadErrs[i]) }
+		for i := 0; i < len(loadErrs); i++ { testing.Println(loadErrs[i]) }
 		os.Exit(1)
 	}
 	var runErrs @[]@[]char
 	_, runErrs = it.RunMain()
 	if len(runErrs) > 0 {
-		for i := 0; i < len(runErrs); i++ { println(runErrs[i]) }
+		for i := 0; i < len(runErrs); i++ { testing.Println(runErrs[i]) }
 		os.Exit(1)
 	}
 }
@@ -246,6 +247,7 @@ EOF
 cat > "$TMP/prog.bn" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/xmhfa"
 
 func main() {
@@ -256,24 +258,24 @@ func main() {
 	var a xmhfa.D2
 	a.x = 4.0
 	a.y = 6.0
-	println(cast(int, iv.Sum2(a)))                 // 110  (16B)
+	testing.Println(cast(int, iv.Sum2(a)))                 // 110  (16B)
 
 	var b xmhfa.D3
 	b.a = 1.0
 	b.b = 2.0
 	b.c = 3.0
-	println(cast(int, iv.Sum3(b)))                 // 106  (24B)
+	testing.Println(cast(int, iv.Sum3(b)))                 // 106  (24B)
 
 	var d xmhfa.D4
 	d.p = 1000.0
 	d.q = 200.0
 	d.r = 30.0
 	d.s = 4.0
-	println(cast(int, iv.Sum4(d)))                 // 1334 (32B)
+	testing.Println(cast(int, iv.Sum4(d)))                 // 1334 (32B)
 
 	// HFA RESULT crossing compiled -> bytecode (v0..v2 -> retbuf -> VM).
 	var t xmhfa.D3 = iv.Mk3(3.0)
-	println(cast(int, t.a + t.b + t.c))            // 109  (3 + 6 + 100)
+	testing.Println(cast(int, t.a + t.b + t.c))            // 109  (3 + 6 + 100)
 }
 EOF
 
@@ -283,12 +285,13 @@ EOF
 cat > "$TMP/prog_overflow.bn" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/xmhfa"
 
 func main() {
 	var im xmhfa.Impl = xmhfa.Impl{Base: 0.0}
 	var iv *xmhfa.Big = &im
-	println(iv.Sum7(1, 2, 3, 4, 5, 6, 7))
+	testing.Println(iv.Sum7(1, 2, 3, 4, 5, 6, 7))
 }
 EOF
 

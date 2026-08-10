@@ -74,6 +74,8 @@ echo "Built: $BNI_BIN"
 cat > "$TMP/nilderef.bn" <<'EOF'
 package "main"
 
+import "pkg/builtins/testing"
+
 type Node struct {
 	val int
 }
@@ -81,9 +83,12 @@ type Node struct {
 func main() {
 	// Read a field through a nil managed pointer.  With --check-nil the VM
 	// raises a recoverable "nil pointer dereference" fault (message + non-zero
-	// exit); without it this is a bare load through address 0 -> SEGV.
+	// exit); without it this is a bare load through address 0 -> SEGV.  The
+	// field read rides through testing.Println (a `...*any` variadic): the
+	// implicit value-borrow of `p.val` nil-checks the base pointer, so the
+	// nil deref is detected exactly as the print/println builtin detected it.
 	var p @Node = nil
-	println(p.val)
+	testing.Println(p.val)
 }
 EOF
 

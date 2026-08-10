@@ -90,7 +90,7 @@ type Node struct {
 // keep going; without the --test EmitNilChecks wiring it would SEGV the runner.
 func TestNilDeref() testing.TestResult {
 	var p @Node = nil
-	println(p.val)
+	testing.Println(p.val)
 	return ""
 }
 

@@ -74,15 +74,14 @@ func emitClosureShimSpillArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.T
 	// captures) or VFP-up-shifted past the float captures (emitClosureParamVfpUpShiftArm32).  A
 	// scalar float CAPTURE is loaded into its VFP register by emitClosureCaptureVfpLoadArm32
 	// (inc 3f b4a), or spilled as raw stack words if bank-overflowed.  A float nested in an
-	// AGGREGATE param/capture is float-agnostic on the GP path.  A scalar float param whose
-	// OUTGOING VFP slot spills the bank, or that the float captures force to move DOWN in the
-	// VFP file (a back-fill reorder the monotonic up-shift can not do clobber-free), stays —
-	// fail LOUD (inc 3f b4c).  Inert on soft-float.
+	// AGGREGATE param/capture is float-agnostic on the GP path.  A back-fill DOWN-MOVE reorder is
+	// handled by the up-shift's cycle-agnostic parallel move.  The one shape still unhandled is a
+	// scalar float param whose OUTGOING VFP slot SPILLS the bank once the float captures fill it
+	// — fail LOUD (inc 3f b4c).  Inert on soft-float.
 	if types.Arm32HardFloat() && closureFloatParamUpShiftUnhandledArm32(cc, fvTyp, f) {
 		a.SetError(
-				"native arm32 hard-float: unhandled scalar float param (VFP-bank spill or "
-						"back-fill down-move) through over-budget closure spill shim not yet "
-						"implemented (inc 3f b4c)")
+				"native arm32 hard-float: VFP-bank-spilling scalar float param through over-budget "
+						"closure spill shim not yet implemented (inc 3f b4c)")
 		return
 	}
 	// outBytes = the outgoing-args area for the FULL captures++users call (both a
@@ -297,60 +296,69 @@ func emitClosureCaptureVfpLoadArm32(a @asm.Assembler, cc common.CallConv, f @ir.
 	}
 }
 
-// emitClosureParamVfpUpShiftArm32 VFP-up-shifts a closure's scalar float USER params past its
-// float CAPTURES (inc 3f b4b).  When a closure has float captures, those captures occupy the
-// leading VFP slots, so each float user param — which the dispatch caller placed at its incoming
-// slot CallArgFpReg(userTypes, j) (the users-only allocation; the GP data/retbuf prefix consumes
-// no VFP) — must move UP to its outgoing slot CallArgFpReg(classifyTypes, classifyOff +
-// NumCaptureParams + j) (the captures++users allocation).  VMOV'd param by param in DESCENDING
-// outgoing-slot order (outSBase = 2*hwSlot for a double, hwSlot for a single), which makes the
-// shift-up clobber-free: every not-yet-moved source lies at or below the current move's outgoing
-// base, so writing the highest-outgoing move first cannot overwrite a pending source.  MUST run
-// BEFORE the capture VFP load (which writes the LOW capture slots, one of which may equal a
-// param's incoming slot); the outgoing slots are HIGH (past the captures) so they don't collide
-// with the capture slots the later load writes.  A param whose OUTGOING slot spills the VFP bank
-// (hwSlot < 0 — the captures pushed it over) is fail-loud upstream (b4c) and skipped here.  Inert
-// when there are no float captures (the params pass through untouched — incoming == outgoing) and
-// on soft-float.  classifyTypes / classifyOff mirror the capture load: (argTypes, 0) for the
-// scalar-void & pack shims, (sretTypes, 1) for the sret shim (the leading *uint8 retbuf is GP, so
-// it does not shift the VFP slots).
+// emitClosureParamVfpUpShiftArm32 relocates a closure's scalar float USER params from their
+// INCOMING VFP slots (CallArgFpReg over the users-only allocation, where the dispatch caller
+// placed them; the GP data/retbuf prefix consumes no VFP) to their OUTGOING slots (CallArgFpReg
+// over captures++users, classifyOff + NumCaptureParams + j).  When the closure has float
+// captures those captures occupy the leading VFP slots, so a param shifts UP — but AAPCS-VFP
+// back-fill can also drop a NARROWER param DOWN into the odd hole a wider param's even-alignment
+// left, so the relocation is a general PERMUTATION (possibly with cycles), NOT a monotonic shift.
+// It is done cycle-agnostically as a MEMORY-STAGED parallel move: reserve nFloat 8-byte scratch
+// slots (SUB sp), VSTR every incoming float param to its slot, VLDR every one into its outgoing
+// VFP register, then release (ADD sp).  Every incoming value reaches memory before any outgoing
+// write, so no move clobbers a not-yet-read source regardless of the permutation — this is what a
+// prior single-order VMOV shift got wrong for a back-fill down-move (a silent-miscompile 2-cycle).
+// MUST run BEFORE the capture VFP load (its LOW capture slots may equal a param's incoming slot);
+// the SUB/ADD are balanced so the staged r0..r3 and the GP captureBase are untouched by the
+// following capture load / marshal.  classifyTypes / classifyOff mirror the capture load:
+// (argTypes, 0) for the scalar-void & pack shims, (sretTypes, 1) for the sret shim (the leading
+// *uint8 retbuf is GP, so it does not shift the VFP slots).  A param whose incoming or outgoing
+// slot SPILLS the VFP bank is fail-loud upstream (closureFloatParamUpShiftUnhandledArm32 /
+// funcValueShimUnhandledFloatB1Arm32) and skipped here.  Inert when there are no float captures
+// (a param passes through — incoming == outgoing) and on soft-float.
 func emitClosureParamVfpUpShiftArm32(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type,
 		f @ir.Func, classifyTypes @[]@types.Type, classifyOff int) {
 	if !types.Arm32HardFloat() { return }
 	if !anyCaptureHasScalarFloatArm32(f) { return }
 	var userTypes @[]@types.Type = funcValueParamTypesArm32(fvTyp)
 	var n int = len(userTypes)
-	var emitted @[]bool = make_slice(bool, n)
-	for iter := 0; iter < n; iter = iter + 1 {
-		// Select the un-emitted float user param with the HIGHEST outgoing VFP slot.
-		var bestJ int = -1
-		var bestBase int = -1
-		for j := 0; j < n; j = j + 1 {
-			if emitted[j] { continue }
-			if !common.IsFloatScalarTyp(userTypes[j]) { continue }
-			var oh int
-			var od bool
-			oh, od = cc.CallArgFpReg(classifyTypes, classifyOff + f.NumCaptureParams + j)
-			if oh < 0 { continue } // outgoing spills -> fail-loud upstream (b4c); not up-shifted
-			var ob int = oh
-			if od { ob = 2 * oh }
-			if ob > bestBase {
-				bestBase = ob
-				bestJ = j
-			}
-		}
-		if bestJ < 0 { break }
-		emitted[bestJ] = true
+	var nFloat int = 0
+	for j := 0; j < n; j = j + 1 {
+		if common.IsFloatScalarTyp(userTypes[j]) { nFloat = nFloat + 1 }
+	}
+	if nFloat == 0 { return }
+	// Reserve nFloat 8-byte stage slots below SP (nFloat*8 is 8-aligned, so SP stays
+	// AAPCS32-aligned).  The SUB/ADD are balanced within this helper, so the staged r0..r3 and
+	// the GP captureBase register are untouched by the marshal / capture load that follow.
+	var stageBytes int = nFloat * 8
+	emitSpAdjust(a, false, stageBytes)
+	// Stage 1 — VSTR every incoming float param to its slot (reads the live incoming VFP regs,
+	// which the dispatch caller placed per the users-only allocation).
+	var slot int = 0
+	for j := 0; j < n; j = j + 1 {
+		if !common.IsFloatScalarTyp(userTypes[j]) { continue }
 		var ih int
-		ih, _ = cc.CallArgFpReg(userTypes, bestJ)
-		if ih < 0 { continue } // incoming spills -> fail-loud upstream; no VMOV
+		var id bool
+		ih, id = cc.CallArgFpReg(userTypes, j)
+		if ih >= 0 {
+			vfpStoreBaseHard(a, id, fpRegForSlot(ih, id), arm32.SP, slot * 8, arm32.IP)
+		}
+		slot = slot + 1
+	}
+	// Stage 2 — VLDR every param into its OUTGOING VFP register (captures++users allocation).
+	// All incoming values are now in memory, so a param whose outgoing slot equals another
+	// param's incoming slot (an AAPCS-VFP back-fill down-move / cycle) reads the memory copy,
+	// never a clobbered register — this is a cycle-agnostic parallel move.
+	slot = 0
+	for j := 0; j < n; j = j + 1 {
+		if !common.IsFloatScalarTyp(userTypes[j]) { continue }
 		var oh int
 		var od bool
-		oh, od = cc.CallArgFpReg(classifyTypes, classifyOff + f.NumCaptureParams + bestJ)
-		if od {
-			arm32.VmovF64(a, arm32.COND_AL, arm32.D0 + oh, arm32.D0 + ih)
-		} else {
-			arm32.VmovF32(a, arm32.COND_AL, arm32.S0 + oh, arm32.S0 + ih)
+		oh, od = cc.CallArgFpReg(classifyTypes, classifyOff + f.NumCaptureParams + j)
+		if oh >= 0 {
+			vfpLoadBaseHard(a, od, fpRegForSlot(oh, od), arm32.SP, slot * 8, arm32.IP)
 		}
+		slot = slot + 1
 	}
+	emitSpAdjust(a, true, stageBytes)
 }

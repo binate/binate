@@ -8,7 +8,7 @@
 
 The self-hosted Binate toolchain — interpreter, compiler, and supporting packages — written in Binate itself.
 
-Builds use a **prebuilt `bnc`** (the **BUILDER**) fetched by `scripts/fetch-builder.sh`. The version is pinned in the `BUILDER_VERSION` file at the repo root (currently `bnc-0.0.1`). See [BUILDER_VERSION](#builder_version) and [Releases](#releases) below.
+Builds use a **prebuilt `bnc`** (the **BUILDER**) fetched by `scripts/fetch-builder.sh`. The version is pinned in the `BUILDER_VERSION` file at the repo root (currently `bnc-0.0.12`). See [BUILDER_VERSION](#builder_version) and [Releases](#releases) below.
 
 ## Status
 
@@ -49,8 +49,8 @@ Requires `clang` on `PATH` (used as the final linker for compiled output).
 
 The `BUILDER_VERSION` file at the repo root names the compiler used to build the current tree's compiler. Two schemes are recognized by `scripts/fetch-builder.sh`:
 
-- **`bnc-X.Y.Z`** (the default; current pin: `bnc-0.0.1`): downloaded from a published GitHub release as a tarball containing `bnc`, `bni`, `bnas`, `bnlint`, and a `lib/` stdlib root. Cached under `~/.cache/binate/builders/<version>/`. No source build needed.
-- **`bootstrap-X.Y.Z`**: builds the sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter on demand and uses it as the BUILDER. Slow (multi-minute) and limited to a language subset (no floats, no method dispatch via interface, etc.) — only used when bootstrapping a new `bnc-X.Y.Z` release where no prior `bnc` exists. See [explorations/bootstrap-subset.md](https://github.com/binate/explorations/blob/main/bootstrap-subset.md) for what the bootstrap subset covers.
+- **`bnc-X.Y.Z`** (the only supported scheme; current pin: `bnc-0.0.12`): downloaded from a published GitHub release as a tarball containing `bnc`, `bni`, `bnas`, `bnlint`, and a `lib/` stdlib root. Cached under `~/.cache/binate/builders/<version>/`. No source build needed.
+- **`bootstrap-X.Y.Z`** (RETIRED): formerly built the sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter and used it as the BUILDER. That scheme is gone — `fetch-builder.sh` now ERRORS on any `bootstrap-*` value; every build bootstraps from a published `bnc-X.Y.Z` release instead. See [explorations/plan-bnc-as-builder.md](https://github.com/binate/explorations/blob/main/plan-bnc-as-builder.md).
 
 All test runners and `scripts/build-*.sh` helpers go through `fetch-builder.sh`; you don't normally invoke it directly outside the Quick Start example.
 
@@ -146,17 +146,26 @@ myproject/
 Import and use:
 ```
 import "pkg/math"
+import "pkg/builtins/testing"
 
 func main() {
-    println(math.Add(2, 3))
+    testing.Println(math.Add(2, 3))
 }
 ```
+
+> **⚠️ `print` / `println` are DEPRECATED and being removed.** Do not use the bare
+> `print` / `println` builtins in programs or tests. Use `pkg/builtins/testing`'s
+> `testing.Print` / `testing.Println` instead — they mirror the builtins
+> byte-for-byte (space-separated operands, trailing newline for `Println`) but are
+> ordinary library functions. The builtins are slated for removal from the
+> language; a hygiene check (`scripts/hygiene/conformance-builtin-print.sh`) already
+> forbids them in the conformance suite.
 
 ### pkg/bootstrap
 
 The `pkg/bootstrap` package provides the OS-level primitives we lean on while bootstrapping the toolchain. In compiled binaries they're backed by the C runtime in `runtime/binate_runtime.c`; in `bni` (the bytecode VM) they're forwarded by the host process through the extern registry.
 
-Its surface has been steadily slimmed as the stdlib OS abstraction (`pkg/std/os`, `pkg/std/os/process`) took over; what remains is the minimal set the print/println lowering and process startup still reach directly. **Don't extend its surface with new primitives** — add them to `pkg/std/os` instead.
+Its surface has been steadily slimmed as the stdlib OS abstraction (`pkg/std/os`, `pkg/std/os/process`) took over; what remains is the minimal set the (deprecated) print/println lowering and process startup still reach directly. **Don't extend its surface with new primitives** — add them to `pkg/std/os` instead. Much of what's left — `Write` as the print sink and the `format*` helpers below — exists solely to back the print/println builtins, and retires with them (see the deprecation note above); modern output goes through `pkg/builtins/testing` → `pkg/builtins/lang`, not `pkg/bootstrap`.
 
 Current surface:
 
@@ -204,7 +213,7 @@ cd binate
 
 ### Go-Level Tests
 
-The sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter has its own Go test suite (`go test ./...` in that repo). It's relevant only when the BUILDER is set to `bootstrap-X.Y.Z`.
+The sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter — retired as a BUILDER (see [BUILDER_VERSION](#builder_version) above) — still has its own Go test suite (`go test ./...` in that repo), but it is no longer part of building or testing the toolchain.
 
 ## Releases
 

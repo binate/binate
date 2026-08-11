@@ -191,9 +191,8 @@ check_backend() {
 # well-known `bn_init` symbol, calls the exports, and proves bn_init ran the
 # package initializers exactly ONCE (ffi_base == 40 shows the inits ran;
 # ffi_counter == 1 across two bn_init() calls shows the run-once guard held).  The
-# archive is self-contained except libc; it co-links the now-main-less
-# binate_runtime.c (which defines only the ABI struct layouts, no executable
-# shim and no `main`) — so there is no `main` collision with the driver's own.
+# archive is self-contained except libc and supplies no `main` of its own, so
+# there is no `main` collision with the driver's own.
 check_library() {
     work="$TMP/library"
     mkdir -p "$work"
@@ -204,10 +203,8 @@ check_library() {
         return
     fi
     # Link the archive into a C driver that inits it (bn_init) and calls the
-    # exports.  The archive is self-contained except libc; co-linking $RT (the
-    # now main-less binate_runtime.c) is harmless — it defines only the ABI
-    # struct layouts, with no executable shim and no `main` to collide with the
-    # driver's own.
+    # exports.  The archive is self-contained except libc and defines no `main`,
+    # so the driver supplies the single `main`.
     cat > "$work/driver.c" <<'EOF'
 #include <stdio.h>
 extern void bn_init(void);
@@ -226,9 +223,9 @@ int main(void) {
     return 0;
 }
 EOF
-    if ! "$CLANG" -w "$work/driver.c" "$work/libffiexp.a" "$RT" -o "$work/run" \
+    if ! "$CLANG" -w "$work/driver.c" "$work/libffiexp.a" -o "$work/run" \
             2>"$work/link.err" || [ ! -x "$work/run" ]; then
-        fail "library: link of C driver + --library archive + runtime failed" \
+        fail "library: link of C driver + --library archive failed" \
              "$(head -8 "$work/link.err")"
         return
     fi

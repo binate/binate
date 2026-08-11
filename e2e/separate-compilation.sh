@@ -148,7 +148,12 @@ run_sepc() {
     # --- 4. link the independently-built objects into a binary ----------
     sep_objs=$(find "$work/sep" -name '*.o' | tr '\n' ' ')
     bnas_sep="$work/bnas_sep"
-    if ! "$CLANG" -w -o "$bnas_sep" "$work/wp/main.o" $sep_objs "$runtime" 2>"$work/link.err" \
+    # Link the C runtime file only if it exists: the current tree ships none
+    # (the current bnc links no C runtime), but the pinned BUILDER's bundle
+    # still does, and its separately-built objects may reference it.
+    rt_obj=""
+    [ -f "$runtime" ] && rt_obj="$runtime"
+    if ! "$CLANG" -w -o "$bnas_sep" "$work/wp/main.o" $sep_objs $rt_obj 2>"$work/link.err" \
             || [ ! -x "$bnas_sep" ]; then
         fail "$label: link of separately-compiled objects failed" "$(head -4 "$work/link.err")"
         return

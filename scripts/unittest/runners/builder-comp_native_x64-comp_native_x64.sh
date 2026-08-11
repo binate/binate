@@ -35,9 +35,9 @@ runner_setup() {
         exit 2
     fi
     # Probe that clang can actually build for x86_64-linux-gnu.  Include
-    # <stdio.h> so the probe needs the target libc headers exactly as the
-    # real build does (via binate_runtime.c) — a header-free TU compiles
-    # even when the cross-libc is absent, then the per-test build fails.
+    # <stdio.h> so the probe needs the target libc headers — the real build
+    # links against the target libc, and a header-free TU compiles even when
+    # the cross-libc is absent, then the per-test build fails.
     if ! printf '#include <stdio.h>\nint main(void){return 0;}\n' \
             | clang -target x86_64-linux-gnu -x c -c - -o /tmp/_bn_x64_unit_probe.o 2>/dev/null; then
         echo "error: clang cannot target x86_64-linux-gnu" >&2

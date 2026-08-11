@@ -18,7 +18,7 @@
 #   <version>-<platform>/
 #     bin/{bnc,bni,bnas,bnlint,bnfmt}   the release binaries
 #     bin/binate-paths            search-path helper (see BUNDLE-HOWTO.md)
-#     lib/runtime/                C runtime (binate_runtime.c + stubs)
+#     lib/runtime/                bare-metal target startup (baremetal_arm32/)
 #     lib/ifaces/{core,stdlib}/   .bni interfaces (builtins + stdlib)
 #     lib/impls/{core,stdlib}/    implementations (core builtins + stdlib)
 #

@@ -17,13 +17,13 @@ bin/
   bnas     assembler:   .s → .o
   bnlint   static analyzer: memory-safety lints
   bnfmt    formatter:   canonically re-prints .bn / .bni source (self-contained)
-  binate-paths  prints the -I/-L/--runtime search paths for lib/ (see below)
+  binate-paths  prints the -I/-L search paths for lib/ (see below)
 lib/
   ifaces/core/      .bni for the builtins (pkg/builtins/*)
   ifaces/stdlib/    .bni for the stdlib    (pkg/std/*: strconv, errors, math/…)
   impls/core/       core impls: common, libc
   impls/stdlib/     stdlib implementations: common, libc
-  runtime/          binate_runtime.c (+ baremetal_arm32/ for that target)
+  runtime/          baremetal_arm32/ (bare-metal target startup + linker script)
 ```
 
 Put `bin/` on your `PATH`; everything else is reached through the search paths
@@ -32,27 +32,30 @@ below.
 ## The search paths (set these once)
 
 Every tool resolves packages from interface directories (`-I`) and
-implementation directories (`-L`); `bnc` also links a C runtime (`--runtime`).
-The bundle ships `bin/binate-paths`, which emits all three for the bundle's
-`lib/` — use it rather than spelling the paths out by hand:
+implementation directories (`-L`).  The bundle ships `bin/binate-paths`, which
+emits both for the bundle's `lib/` — use it rather than spelling the paths out
+by hand:
 
 ```sh
 # binate-paths self-locates the bundle's lib/ from its own bin/ location.
 I="$(binate-paths --iface)"
 L="$(binate-paths --impl)"
-RT="$(binate-paths --runtime)"      # bnc only — linked into the executable
 ```
 
-(`eval "$(binate-paths)"` instead sets `$BINATE_I` / `$BINATE_L` / `$BINATE_RT`
-in one shot. Pass `--base /path/to/lib` if you invoke `binate-paths` from
-outside the bundle.) It expands to the standard set — paths are colon-separated
-and repeatable (cc-style), and the first `-I` entry doubles as the "source root":
+(`eval "$(binate-paths)"` instead sets `$BINATE_I` / `$BINATE_L` in one shot.
+Pass `--base /path/to/lib` if you invoke `binate-paths` from outside the
+bundle.) It expands to the standard set — paths are colon-separated and
+repeatable (cc-style), and the first `-I` entry doubles as the "source root":
 
 ```
 -I  $LIB:$LIB/ifaces/core:$LIB/ifaces/stdlib
 -L  $LIB:$LIB/impls/core/common:$LIB/impls/core/libc:$LIB/impls/stdlib
---runtime  $LIB/runtime/binate_runtime.c
 ```
+
+(`bnc` still accepts a `--runtime <path>` flag — and `binate-paths --runtime`
+still prints one — but it is a **no-op**: bnc links no C runtime.  It is kept
+only so scripts that drive an older pinned `bnc` keep working, and will be
+removed.)
 
 What each entry covers:
 
@@ -107,10 +110,6 @@ Useful flags:
 | `-g`              | emit DWARF debug info |
 | `--target <key>`  | cross-target (e.g. `arm32-linux`); default is the host |
 | `--test`          | build a unit-test binary (see below) |
-
-> **Pass `--runtime` explicitly against a bundle.** bnc only auto-discovers
-> `runtime/binate_runtime.c` relative to your source, not inside the bundle, so a
-> bundle build must name it.
 
 ### Unit tests with bnc
 

@@ -84,7 +84,7 @@ binate/
     rt/                      Runtime library (written in Binate)
     builtin/testing/         Test framework (TestResult type alias)
   runtime/
-    binate_runtime.c         C runtime (memory management, slice ops)
+    baremetal_arm32/         Bare-metal ARM32 startup + semihosting + linker script
 ```
 
 ## Architecture

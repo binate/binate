@@ -84,13 +84,11 @@ check() {
 # bnc's own search paths.
 BNC_BIN="$TMP/bnc-bin"
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-# The fixture is compiled by the BUILDER directly, so it is emitted with
-# the BUILDER's mangling scheme. Link the BUILDER's OWN bundled runtime
-# (same scheme) rather than the checkout runtime/binate_runtime.c, which
-# tracks current-source mangling and can name its symbols differently
-# from the BUILDER (e.g. across a mangle-scheme change) — pairing a
-# BUILDER-scheme compile against the checkout runtime then fails to link
-# with undefined runtime symbols (bn_..._Write, etc.).
+# The fixture is compiled by the BUILDER directly, so it is emitted with the
+# BUILDER's mangling scheme, and the pinned BUILDER still requires a --runtime
+# file to link.  Point it at the BUILDER's OWN bundled runtime, whose symbols
+# match that scheme — the current tree ships no C runtime of its own (the
+# current bnc links none and ignores --runtime).
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 bnc_compile_log=$("$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$BNI_ROOT")" \

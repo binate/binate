@@ -31,7 +31,7 @@ runner_setup() {
         exit 2
     fi
     # Probe that clang can build for x86_64-linux-gnu (needs the target libc
-    # headers, as the real build does via binate_runtime.c's <stdio.h>) —
+    # headers, which the real build's link against the target libc requires) —
     # catches a missing cross-libc early instead of per-test.
     if ! printf '#include <stdio.h>\nint main(void){return 0;}\n' \
             | clang -target x86_64-linux-gnu -x c -c - -o /tmp/_bn_x64_perf_probe.o 2>/dev/null; then

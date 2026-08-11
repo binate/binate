@@ -90,9 +90,17 @@ BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 # match that scheme — the current tree ships no C runtime of its own (the
 # current bnc links none and ignores --runtime).
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
+# Base search is the CHECKOUT (so testing.Println, resolved from the current
+# tree, is available — the BUILDER's own bundle predates it), with the fixture
+# roots prepended.  But the pinned BUILDER still implicitly loads pkg/bootstrap
+# (a behavior removed from the current tree after this BUILDER was cut), which
+# the checkout no longer ships — so the BUILDER's own bundle is APPENDED as a
+# fallback that supplies it.  When BUILDER_VERSION next moves past the
+# pkg/bootstrap removal, the force-load goes away and this fallback becomes an
+# unconsulted no-op.
 bnc_compile_log=$("$BUILDER" \
-    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$BNI_ROOT")" \
-    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$IMPL_ROOT")" \
+    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$BNI_ROOT" --append "$BUILDER_LIB/ifaces/core")" \
+    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$IMPL_ROOT" --append "$BUILDER_LIB/impls/core/libc")" \
     --runtime "$BUILDER_LIB/runtime/binate_runtime.c" \
     --build-dir "$BUILD_DIR" -o "$BNC_BIN" "$TMP/main.bn" 2>&1) || true
 if [ -x "$BNC_BIN" ]; then

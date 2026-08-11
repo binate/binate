@@ -108,9 +108,10 @@ func emitClosureShimSpillArm32(a @asm.Assembler, fnLabel @[]char, fvTyp @types.T
 	}
 	// Step 3: spill stack-bound capture words from the closure-struct base (R0, live).
 	emitClosureCaptureSpillArm32(a, cc, f, argTypes, 0, arm32.R0)
-	// Step 3a: VFP-up-shift the scalar float USER params past the float captures — BEFORE the
-	// capture VFP load, whose LOW capture slots may overlap a param's incoming slot (inc 3f b4b).
-	emitClosureParamVfpUpShiftArm32(a, cc, fvTyp, f, argTypes, 0)
+	// Step 3a: relocate the scalar float USER params to their outgoing slots (up-shift past float
+	// captures, and place any that spill the VFP bank on the outgoing stack) — BEFORE the capture
+	// VFP load, whose LOW capture slots may overlap a param's incoming slot (inc 3f b4b/b5).
+	emitClosureParamVfpUpShiftArm32(a, cc, fvTyp, f, argTypes, 0, frameDelta)
 	// Step 3b: load hard-float scalar float captures into their VFP registers from
 	// [R0 + FieldOffset] — BEFORE the marshal, while R0 is live (a float capture consumes no
 	// GP word, so a GP user arg can land in R0 and the marshal would clobber it; inc 3f b4a).
@@ -305,32 +306,51 @@ func emitClosureCaptureVfpLoadArm32(a @asm.Assembler, cc common.CallConv, f @ir.
 // the SUB/ADD are balanced so the staged r0..r3 and the GP captureBase are untouched by the
 // following capture load / marshal.  classifyTypes / classifyOff mirror the capture load:
 // (argTypes, 0) for the scalar-void & pack shims, (sretTypes, 1) for the sret shim (the leading
-// *uint8 retbuf is GP, so it does not shift the VFP slots).  A param whose OUTGOING slot spills
-// the VFP bank (the float captures push it past d0..d7) is placed at its outgoing STACK slot
-// instead of a VFP register (inc 3f b5, the else arm of Stage 2).  A param whose users-only
-// INCOMING slot spills — the dispatch delivers it stacked (a func value / closure declaring > 8
-// float params) — is a distinct shape kept fail-loud upstream
-// (funcValueShimUnhandledFloatB1Arm32), so here every param has a staged incoming value.  Inert
-// when there are no float captures (a param passes through — incoming == outgoing) and on
-// soft-float.
+// *uint8 retbuf is GP, so it does not shift the VFP slots).  Each incoming value is read into its
+// scratch slot from wherever the dispatch delivered it — a VFP register (ih >= 0) via VSTR, or,
+// when the declared float params exceed the VFP bank so the param arrives STACKED (ih < 0), from
+// the caller's stack at [SP + stageBytes + frameDelta + CallArgStackOff(userTypes, j)] (frameDelta
+// = the shim's entry SP decrement).  Each is then placed at its outgoing slot — a VFP register
+// (oh >= 0) via VLDR, or, if its captures++users slot spills the bank (oh < 0), copied to its
+// outgoing STACK slot.  So all four incoming/outgoing reg/stack combinations are handled (inc 3f
+// b4b up-shift + b5 outgoing/incoming spill) — a cycle-agnostic parallel move.  Runs only
+// in the FRAMED shims (the frameless tail-branch shims pass a stacked float straight through, so
+// they never call this); inert when no float param needs relocation (no captures + every param
+// register-resident on both sides — incoming == outgoing) and on soft-float.
 func emitClosureParamVfpUpShiftArm32(a @asm.Assembler, cc common.CallConv, fvTyp @types.Type,
-		f @ir.Func, classifyTypes @[]@types.Type, classifyOff int) {
+		f @ir.Func, classifyTypes @[]@types.Type, classifyOff int, frameDelta int) {
 	if !types.Arm32HardFloat() { return }
-	if !anyCaptureHasScalarFloatArm32(f) { return }
 	var userTypes @[]@types.Type = funcValueParamTypesArm32(fvTyp)
 	var n int = len(userTypes)
+	// Relocation is needed when the float captures shift the VFP file (up-shift), OR when a float
+	// param's INCOMING or OUTGOING slot spills the VFP bank (a stacked float the shim's frame
+	// moves).  With no float captures and every float param register-resident on both sides,
+	// incoming == outgoing and there is nothing to do (the frameless tail-branch shims never call
+	// this).
 	var nFloat int = 0
+	var needsReloc bool = anyCaptureHasScalarFloatArm32(f)
 	for j := 0; j < n; j = j + 1 {
-		if common.IsFloatScalarTyp(userTypes[j]) { nFloat = nFloat + 1 }
+		if !common.IsFloatScalarTyp(userTypes[j]) { continue }
+		nFloat = nFloat + 1
+		var ci int
+		ci, _ = cc.CallArgFpReg(userTypes, j)
+		var co int
+		co, _ = cc.CallArgFpReg(classifyTypes, classifyOff + f.NumCaptureParams + j)
+		if ci < 0 || co < 0 { needsReloc = true }
 	}
-	if nFloat == 0 { return }
+	if nFloat == 0 || !needsReloc { return }
 	// Reserve nFloat 8-byte stage slots below SP (nFloat*8 is 8-aligned, so SP stays
 	// AAPCS32-aligned).  The SUB/ADD are balanced within this helper, so the staged r0..r3 and
 	// the GP captureBase register are untouched by the marshal / capture load that follow.
 	var stageBytes int = nFloat * 8
 	emitSpAdjust(a, false, stageBytes)
-	// Stage 1 — VSTR every incoming float param to its slot (reads the live incoming VFP regs,
-	// which the dispatch caller placed per the users-only allocation).
+	// Stage 1 — read every incoming float param into its scratch slot.  A register-resident param
+	// (ih >= 0) is VSTR'd from its incoming VFP reg (where the dispatch caller placed it per the
+	// users-only allocation).  An INCOMING-SPILLED param (ih < 0 — the declared float params exceed
+	// the VFP bank, so the dispatch delivers it stacked) is copied word-by-word from the caller's
+	// stack at [SP + stageBytes + frameDelta + CallArgStackOff(userTypes, j)]: frameDelta is the
+	// shim's entry SP decrement, and the GP data/retbuf prefix rides registers so the users-only
+	// allocation gives the caller-side float stack offset.  Shuttle via R4 (value) + IP (address).
 	var slot int = 0
 	for j := 0; j < n; j = j + 1 {
 		if !common.IsFloatScalarTyp(userTypes[j]) { continue }
@@ -339,6 +359,14 @@ func emitClosureParamVfpUpShiftArm32(a @asm.Assembler, cc common.CallConv, fvTyp
 		ih, id = cc.CallArgFpReg(userTypes, j)
 		if ih >= 0 {
 			vfpStoreBaseHard(a, id, fpRegForSlot(ih, id), arm32.SP, slot * 8, arm32.IP)
+		} else {
+			var inStk int = cc.CallArgStackOff(userTypes, j)
+			var words int = userTypes[j].SizeOf() / cc.WordBytes
+			for w := 0; w < words; w = w + 1 {
+				emitBaseLoad(a, arm32.R4, arm32.SP, stageBytes + frameDelta + inStk + w * cc.WordBytes,
+						arm32.IP)
+				emitFrameStore(a, arm32.R4, slot * 8 + w * cc.WordBytes)
+			}
 		}
 		slot = slot + 1
 	}
@@ -347,10 +375,8 @@ func emitClosureParamVfpUpShiftArm32(a @asm.Assembler, cc common.CallConv, fvTyp
 	// incoming slot (an AAPCS-VFP back-fill down-move / cycle) reads the memory copy, never a
 	// clobbered register — a cycle-agnostic parallel move.  A param whose outgoing slot fits the
 	// VFP bank (oh >= 0) is VLDR'd into that register; one whose outgoing slot SPILLS the bank
-	// (oh < 0, the float captures pushed it past the 16 S / 8 D arg slots) is copied to its
-	// outgoing STACK slot instead — the underlying reads it there.  (An INCOMING spill — the
-	// param arrives stacked, ih < 0 — is a distinct shape kept fail-loud by
-	// funcValueShimUnhandledFloatB1Arm32; here ih >= 0 always, so the staged copy is present.)
+	// (oh < 0 — the float captures or an over-budget float-param list pushed it past the 16 S / 8 D
+	// arg slots) is copied to its outgoing STACK slot instead — the underlying reads it there.
 	slot = 0
 	for j := 0; j < n; j = j + 1 {
 		if !common.IsFloatScalarTyp(userTypes[j]) { continue }

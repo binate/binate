@@ -79,7 +79,7 @@ build_gen1() {
     # Pulling those from source instead would let cmd/bnc accidentally use a
     # not-yet-in-BUILDER feature (e.g. `same` in std/errors, added after
     # bnc-0.0.7) and fail the build.  Only pkg/binate (the compiler's own code)
-    # and pkg/bootstrap come from source — `--prepend "$BINATE_DIR"`, which is
+    # comes from source — `--prepend "$BINATE_DIR"`, which is
     # also the primaryRoot and shadows the stale pkg/binate the bundle ships.
     # There is deliberately NO source fallback: mixing source and bundle copies
     # of interdependent packages (source A built against the BUILDER's B) is

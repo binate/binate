@@ -5,7 +5,6 @@
 # real packages, or from a test-local fixture inside the same test
 # directory. Always-allowed real packages:
 #
-#   pkg/bootstrap   — system calls (Write, Exit, Args, file I/O)
 #   pkg/builtins/*  — tier-0 always-available runtime essentials (rt,
 #                     lang, testing, reflect, ...); stable and bundled
 #                     with the toolchain, so any conformance test may use
@@ -32,7 +31,10 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONFORMANCE_DIR="$BINATE_DIR/conformance"
 WHITELIST_FILE="$SCRIPT_DIR/conformance-imports.whitelist"
 
-ALLOWED_REAL="pkg/bootstrap"
+# No non-builtins real package is universally allowed; pkg/builtins/* is handled
+# separately below, and everything else needs a test-local fixture or a per-file
+# exemption in conformance-imports.whitelist.
+ALLOWED_REAL=""
 
 LIST=$(mktemp -t hygiene-conformance-imports-list.XXXXXX)
 VIOLATIONS=$(mktemp -t hygiene-conformance-imports-out.XXXXXX)
@@ -136,7 +138,7 @@ if [ -s "$VIOLATIONS" ]; then
     n=$(wc -l < "$VIOLATIONS" | tr -d ' ')
     echo ""
     echo "=== $n conformance import violation(s) ==="
-    echo "Allowed: $ALLOWED_REAL, pkg/builtins/*, plus any test-local fixture."
+    echo "Allowed: pkg/builtins/*, plus any test-local fixture."
     echo "See $WHITELIST_FILE for per-file exemptions."
     exit 1
 fi

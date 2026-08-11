@@ -19,9 +19,9 @@ bin/
   bnfmt    formatter:   canonically re-prints .bn / .bni source (self-contained)
   binate-paths  prints the -I/-L/--runtime search paths for lib/ (see below)
 lib/
-  ifaces/core/      .bni for the builtins (pkg/builtins/*) + pkg/bootstrap
+  ifaces/core/      .bni for the builtins (pkg/builtins/*)
   ifaces/stdlib/    .bni for the stdlib    (pkg/std/*: strconv, errors, math/…)
-  impls/core/       core impls: common, libc, baremetal (incl. pkg/bootstrap)
+  impls/core/       core impls: common, libc
   impls/stdlib/     stdlib implementations: common, libc
   runtime/          binate_runtime.c (+ baremetal_arm32/ for that target)
 ```
@@ -56,8 +56,7 @@ and repeatable (cc-style), and the first `-I` entry doubles as the "source root"
 
 What each entry covers:
 
-- `ifaces/core` + `impls/core/*` — the builtins (`pkg/builtins/*`) and
-  `pkg/bootstrap`.
+- `ifaces/core` + `impls/core/*` — the builtins (`pkg/builtins/*`).
 - `ifaces/stdlib` + `impls/stdlib` — the bundled stdlib
   (`pkg/std/strconv`, `pkg/std/errors`, …).
 - `$LIB` (the bare root) — resolves nothing in a bundle (it's there for the

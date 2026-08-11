@@ -67,7 +67,7 @@ LINT_SKIP=""
 #   - every package directory under pkg/ that has a .bn file — RECURSIVELY, so
 #     the compiler (which lives at pkg/binate/<pkg>, two levels deep) is covered;
 #     a one-level `pkg/*/` glob misses it (pkg/ holds only pkg/binate/, which has
-#     no direct .bn).  Excludes pkg/bootstrap (only a .bni interface, no dir).
+#     no direct .bn).
 #   - every directory under cmd/
 TARGETS=""
 for d in $(find "$BINATE_DIR/pkg" -type d -not -path '*/testdata/*' 2>/dev/null | sort); do

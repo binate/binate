@@ -5,8 +5,8 @@
 # ("Tiers"): a package may import only packages at its own tier or LOWER.
 # Tiers, low -> high:
 #
-#   0/0b  pkg/builtins/*  (+ pkg/bootstrap, + runtime/<target>/pkg/* shipped
-#         runtime components) — always bundled with the toolchain
+#   0/0b  pkg/builtins/*  (+ runtime/<target>/pkg/* shipped runtime
+#         components) — always bundled with the toolchain
 #   1     pkg/std/*   — standards library (bundled by default)
 #   1x    pkg/stdx/*  — standards-track, no inter-version compat (bundled by default)
 #   2     pkg/<org>/* (e.g. pkg/binate/*) — package-manager-pulled
@@ -54,7 +54,6 @@ RUNTIME_PKGS=$(find runtime -type f \( -name '*.bn' -o -name '*.bni' \) 2>/dev/n
 import_level() {
     case "$1" in
         pkg/builtins/*)                RET=0; return ;;
-        pkg/bootstrap|pkg/bootstrap/*) RET=0; return ;;
         pkg/std/*)                     RET=1; return ;;
         pkg/stdx/*)                    RET=2; return ;;
     esac
@@ -74,7 +73,6 @@ file_level() {
     case "$1" in
         runtime/*)         RET=0; return ;;   # runtime-shipped
         */pkg/builtins/*)  RET=0; return ;;   # tier 0/0b
-        */pkg/bootstrap*)  RET=0; return ;;
         */pkg/std/*)       RET=1; return ;;
         */pkg/stdx/*)      RET=2; return ;;   # tier 1x
         pkg/*)             RET=3; return ;;   # tier 2 collocated (top-level pkg/)

@@ -228,9 +228,8 @@ import "pkg/xmiface"
 
 // host <prog.bn> <I-paths colon-sep> <L-paths colon-sep>
 func main() {
-	// progArgs() re-derives the no-program-name argv shape bootstrap.Args() used to
-	// return (retired when argv moved to pkg/builtins/startup behind os.Args), so
-	// args[0] is the first real arg and the indices below are unchanged.
+	// progArgs() strips the program-name slot from os.Args(), so args[0] is the
+	// first real arg and the indices below are unchanged.
 	var args @[]@[]char = progArgs()
 	if len(args) < 3 {
 		testing.Println("usage: host <prog.bn> <I-paths> <L-paths>")
@@ -337,9 +336,8 @@ func appendCharSlice(s @[]@[]char, v @[]char) @[]@[]char {
 }
 
 // progArgs returns the host's own arguments — os.Args() minus the program-name
-// slot at index 0 — each element copied into an owned @[]char.  This is the
-// no-program-name shape the retired bootstrap.Args() used to return (its
-// element slots readonly, os.Args() can't borrow straight into *[]readonly
+// slot at index 0 — each element copied into an owned @[]char (os.Args()'s
+// element slots are readonly, so it can't borrow straight into *[]readonly
 // char), matching cmd/bni's / cmd/bnas's own os.Args bridge.
 func progArgs() @[]@[]char {
 	var full @[]readonly @[]readonly char = os.Args()

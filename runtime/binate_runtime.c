@@ -1,10 +1,9 @@
-#include <stdio.h>
-#include <stdlib.h>
 #include <stdint.h>
-#include <unistd.h>
 
 // Binate runtime library
-// Provides I/O and basic operations for compiled Binate programs.
+// Defines the ABI struct layouts (slice representations) shared with the
+// code pkg/binate/codegen emits.  All I/O and process shims have moved
+// into Binate (pkg/builtins/rt, pkg/std/os); nothing here executes.
 
 // Binate's `int` type is the target word-sized signed integer (8
 // bytes on LP64, 4 bytes on 32-bit ARM Linux ILP32).  Every C field /
@@ -40,24 +39,14 @@ typedef struct {
 // I/O and process: all bn_* shims have been removed. OP_PANIC lowers
 // to rt.Panic, which writes the message through rt's own sink and
 // Aborts (__c_call("abort") on a hosted target, a nonzero semihost
-// exit on a libc-free one).
+// exit on a libc-free one).  Output (print/testing) lowers to Binate
+// in pkg/builtins/testing, which reaches libc write via __c_call.
 // ============================================================
-
-// ============================================================
-// Bootstrap package — the Write I/O sink
-// ============================================================
-
-// Write(fd int, buf *[]uint8) int — writes len(buf) bytes
-bn_int_t bn_F2_3_pkg9_bootstrap1_5_Write(bn_int_t fd, BnSlice buf) {
-    if (!buf.data || buf.len <= 0) return 0;
-    ssize_t w = write((int)fd, buf.data, (size_t)buf.len);
-    return (bn_int_t)w;
-}
 
 /* No `main` here: the process entry point (the C `main` symbol) is written in
  * Binate — `pkg/builtins/startup._entry`, `#[c_export("main")]` (emitted under
  * the unmangled `main` that crt0 calls) and gated `#[build(is(entrypoint,
  * "main"))]`, so a hosted program gets exactly this one `main` and no collision.
  * It captures argv/envp, installs them via startup.SetArgs / SetEnv, then calls
- * bn_entry (the synthesized `main.__init_all(); main.main()`).  This runtime now
- * provides only the remaining hosted shim (Write). */
+ * bn_entry (the synthesized `main.__init_all(); main.main()`).  This runtime no
+ * longer provides any executable shim — only the ABI struct layouts above. */

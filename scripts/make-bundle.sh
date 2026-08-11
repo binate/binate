@@ -19,8 +19,8 @@
 #     bin/{bnc,bni,bnas,bnlint,bnfmt}   the release binaries
 #     bin/binate-paths            search-path helper (see BUNDLE-HOWTO.md)
 #     lib/runtime/                C runtime (binate_runtime.c + stubs)
-#     lib/ifaces/{core,stdlib}/   .bni interfaces (builtins, pkg/bootstrap, stdlib)
-#     lib/impls/{core,stdlib}/    implementations (incl. pkg/bootstrap under core)
+#     lib/ifaces/{core,stdlib}/   .bni interfaces (builtins + stdlib)
+#     lib/impls/{core,stdlib}/    implementations (core builtins + stdlib)
 #
 # The lib/ tree is what bnc/bni/bnas/bnlint resolve against; see
 # BUNDLE-HOWTO.md for how a consumer points -I/-L/--runtime at it.  bnfmt is
@@ -170,10 +170,9 @@ test -x "$dest/bin/binate-paths" || {
 # the source layout intact so a consumer resolves the bundle directly
 # with -I <lib>/ifaces/... -L <lib>/impls/... (see BUNDLE-HOWTO.md).
 echo "==> assembling lib/"
-# pkg/bootstrap lives under ifaces/core + impls/core/common, so it ships with
-# the ifaces/ and impls/ trees below; no separate pkg/ copy.  Nothing else from pkg/ is
-# shipped: pkg/binate/* is the compiler's own source, and shipping it would
-# make compiler internals importable through the bare-root -I entry.
+# Nothing from pkg/ is shipped: pkg/binate/* is the compiler's own source, and
+# shipping it would make compiler internals importable through the bare-root -I
+# entry.  The core builtins ship via the ifaces/ and impls/ trees below.
 cp -R "$BINATE_DIR/runtime" "$dest/lib/runtime"
 cp -R "$BINATE_DIR/ifaces"  "$dest/lib/ifaces"
 cp -R "$BINATE_DIR/impls"   "$dest/lib/impls"

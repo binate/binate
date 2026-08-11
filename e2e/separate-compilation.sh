@@ -22,7 +22,7 @@
 #      assembler across the separately-compiled binary).
 #
 # Guards the fix that made this work at all: `--pkg` used to skip loading the
-# implicit runtime packages (rt / bootstrap / reflect / lang), so a package that
+# implicit runtime packages (rt / reflect / lang), so a package that
 # emitted a runtime-helper call — e.g. `rt.BoundsCheck` from ANY slice/array
 # index — referenced an undeclared symbol and clang rejected the IR
 # (`use of undefined value`).  Separate compilation was thus dead-on-arrival for

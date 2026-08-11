@@ -17,11 +17,10 @@
 # link-and-run coverage, not just an in-memory symbol-table assertion.
 #
 # The exported functions are PURE COMPUTE (no I/O, no allocation), so the object
-# is self-contained: it needs neither the bootstrap.* I/O shims nor a Binate
+# is self-contained: it needs neither runtime I/O shims nor a Binate
 # main/runtime, so the C driver owns main() and links the object directly,
 # mirroring e2e/separate-compilation.sh.  The .a-archive path (check_library)
-# links + inits + calls the whole archive through a C driver; relocating the
-# bootstrap.* I/O shims into Binate is a later phase.
+# links + inits + calls the whole archive through a C driver.
 #
 # Uses a gen1 bnc built from the current source: the shipped BUILDER predates
 # #[c_export] and would reject it.  Auto-discovered by
@@ -192,9 +191,9 @@ check_backend() {
 # well-known `bn_init` symbol, calls the exports, and proves bn_init ran the
 # package initializers exactly ONCE (ffi_base == 40 shows the inits ran;
 # ffi_counter == 1 across two bn_init() calls shows the run-once guard held).  The
-# archive is self-contained except libc and a single bootstrap.Write reference,
-# which resolves by co-linking the now-main-less binate_runtime.c (no `main`
-# collision — the entry-point move retired the C `main`).
+# archive is self-contained except libc; it co-links the now-main-less
+# binate_runtime.c (which defines only the ABI struct layouts, no executable
+# shim and no `main`) — so there is no `main` collision with the driver's own.
 check_library() {
     work="$TMP/library"
     mkdir -p "$work"
@@ -205,9 +204,10 @@ check_library() {
         return
     fi
     # Link the archive into a C driver that inits it (bn_init) and calls the
-    # exports.  The archive is self-contained except libc and one bootstrap.Write
-    # reference, defined in the (now main-less) binate_runtime.c — so co-linking $RT
-    # resolves it with no `main` collision against the driver's own `main`.
+    # exports.  The archive is self-contained except libc; co-linking $RT (the
+    # now main-less binate_runtime.c) is harmless — it defines only the ABI
+    # struct layouts, with no executable shim and no `main` to collide with the
+    # driver's own.
     cat > "$work/driver.c" <<'EOF'
 #include <stdio.h>
 extern void bn_init(void);

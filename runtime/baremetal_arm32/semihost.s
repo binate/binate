@@ -131,8 +131,9 @@ abort:
 
 @ ============================================================
 @ semihost.SemihostWriteChar(c char) — write one byte to the debug
-@ console via SYS_WRITEC.  pkg/bootstrap.Write loops over the buffer
-@ calling this for each byte.  Cheaper than SYS_WRITE0 (which would
+@ console via SYS_WRITEC.  The bare-metal output sinks (rt's panic
+@ writer, testing's stdout) loop over a buffer calling this for each
+@ byte.  Cheaper than SYS_WRITE0 (which would
 @ need a null-terminated copy) or SYS_WRITE (which would need to open
 @ a "console" file handle first).  The symbol is the length-prefix
 @ mangling of (pkg "pkg/semihost", func "SemihostWriteChar").

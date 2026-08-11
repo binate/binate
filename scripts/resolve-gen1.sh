@@ -134,7 +134,7 @@ GEN1_TMP="$WORK/bnc"
 
 # gen1 = the BUILDER compiling checkout cmd/bnc.  Its builtin + stdlib deps
 # resolve from the BUILDER's frozen bundle (`--base "$BUILDER_LIB"`, also the C
-# runtime); only the compiler's own source (pkg/binate, pkg/bootstrap) comes from
+# runtime); only the compiler's own source (pkg/binate) comes from
 # the checkout via `--prepend "$BINATE_DIR"`.  Identical to build-compilers.sh
 # build_gen1 and e2e/os-args.sh — the shape this script exists to deduplicate.
 if ! "$BUILDER" \

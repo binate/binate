@@ -14,7 +14,7 @@ runner_compile() {
     tmpbin="$2"
     bdir="$(mktemp -d "${TMPDIR:-/tmp}/binate_build_XXXXXX")"
     # Full stdlib search paths (matching the conformance/unit runners):
-    # the bare $BINATE_DIR resolves pkg/binate/* + pkg/bootstrap; the
+    # the bare $BINATE_DIR resolves pkg/binate/*; the
     # ifaces/impls entries resolve the split stdlib.  -I/-L of the test
     # dir alone could not link a test's stdlib/builtins imports (e.g.
     # pkg/builtins/testing → pkg/builtins/lang), so every perf test that

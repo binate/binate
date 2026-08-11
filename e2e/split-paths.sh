@@ -10,7 +10,7 @@
 #
 # Each tool resolves the fixture package purely via -I and -L (no
 # extra root flag).  $BINATE_DIR is added on each path so
-# pkg/bootstrap, pkg/builtins/rt, etc. resolve normally.
+# pkg/builtins/rt, pkg/std/*, etc. resolve normally.
 #
 # Exit 0 on full pass; non-zero with per-tool diagnostics on failure.
 

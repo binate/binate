@@ -107,7 +107,7 @@ BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUIL
 # the bnc source cone may only use language/core/stdlib features the BUILDER has
 # (BUILDER-compatibility), so source copies aren't used and there is no source
 # fallback (pulling them in could hit a not-yet-in-BUILDER feature like `same`).
-# Only pkg/binate + pkg/bootstrap come from source.  Full rationale:
+# Only pkg/binate (the compiler's own code) comes from source.  Full rationale:
 # scripts/lib/build-compilers.sh build_gen1.
 
 GEN1_DIR="$BUILD_DIR/gen1"

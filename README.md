@@ -83,7 +83,6 @@ binate/
     debug/                   Verbose logging (SetVerbose, Log)
     rt/                      Runtime library (written in Binate)
     builtin/testing/         Test framework (TestResult type alias)
-    bootstrap.bni            OS primitives used during bootstrap — slated for replacement
   runtime/
     binate_runtime.c         C runtime (memory management, slice ops)
 ```
@@ -152,23 +151,6 @@ func main() {
     testing.Println(math.Add(2, 3))
 }
 ```
-
-### pkg/bootstrap
-
-The `pkg/bootstrap` package provides the OS-level primitives we lean on while bootstrapping the toolchain. In compiled binaries they're backed by the C runtime in `runtime/binate_runtime.c`; in `bni` (the bytecode VM) they're forwarded by the host process through the extern registry.
-
-Its surface has been steadily slimmed as the stdlib OS abstraction (`pkg/std/os`, `pkg/std/os/process`) took over. **Don't extend its surface with new primitives** — add them to `pkg/std/os` instead. Process startup still reaches `Args` directly; `Write` and the `format*` helpers below are vestigial — no live callers remain, and they are slated for removal. Modern output goes through `pkg/builtins/testing` → `pkg/builtins/lang`, not `pkg/bootstrap`.
-
-Current surface:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `Write` | `(fd int, buf *[]readonly uint8) int` | Write `len(buf)` bytes to `fd` (1 = stdout, 2 = stderr); returns bytes written or -1. |
-| `Args`  | `() @[]@[]char` | Command-line arguments, as managed slices |
-
-Plus vestigial integer/float/bool formatting helpers — `formatInt`, `formatInt64`, `formatUint`, `formatBool`, `formatFloat` — with no live callers, slated for removal.
-
-General file I/O now lives in `pkg/std/os`, process control in `pkg/std/os/process`; the historical `Open` / `Read` / `Close` / `Exit` / `Stat` / `ReadDir` / `Itoa` / `Concat` / `Exec` surface and its `O_*` / `STD*` constants have been retired.
 
 ## Testing
 

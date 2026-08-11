@@ -14,17 +14,17 @@ prefixes from diagnostic file paths).  `-L` mirrors the `-I` list when
 the impl tree lives next to the .bni tree (typical for an in-tree
 checkout); see `e2e/split-paths.sh` for the split-tree shape.
 
-Run via the bootstrap interpreter:
+Build a `bnlint` binary from source with the BUILDER bnc (no Go needed), then
+run it:
 
 ```
-go run . -root <binate-src> cmd/bnlint -- -I <binate-src> -L <binate-src> pkg/foo pkg/bar
+scripts/build-bnlint.sh -o /tmp/bnlint
+/tmp/bnlint -I <binate-src> -L <binate-src> pkg/foo pkg/bar
 ```
 
-Or via the self-hosted interpreter:
-
-```
-binate -I <binate-src> -L <binate-src> cmd/bnlint -- -I <binate-src> -L <binate-src> pkg/foo
-```
+The hygiene/CI path instead uses the prebuilt `bnlint` shipped in the CHECK_TOOLS
+bundle (`scripts/fetch-builder.sh --check-tools --tool bnlint`); see
+`scripts/hygiene/lint.sh`.
 
 ## Flags
 
@@ -105,20 +105,22 @@ is generic — every rule can be suppressed by name (or `*`).
 
 ## Examples
 
-Lint a single package:
+Lint a single package (with a `bnlint` binary built as above):
 
 ```
-go run . -root ~/binate/binate cmd/bnlint -- -I ~/binate/binate -L ~/binate/binate pkg/binate/ir
+bnlint -I ~/binate/binate -L ~/binate/binate pkg/binate/ir
 ```
 
 Lint multiple packages:
 
 ```
-go run . -root ~/binate/binate cmd/bnlint -- -I ~/binate/binate -L ~/binate/binate pkg/binate/ir pkg/binate/types pkg/binate/codegen
+bnlint -I ~/binate/binate -L ~/binate/binate pkg/binate/ir pkg/binate/types pkg/binate/codegen
 ```
 
 ## Running Tests
 
+bnlint's own tests run through the standard unit-test harness:
+
 ```
-go run . -test -root <binate-src> cmd/bnlint
+scripts/unittest/run.sh builder-comp cmd/bnlint
 ```

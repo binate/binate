@@ -26,9 +26,8 @@ BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 # End-to-end check: compile + run a self-contained minimal program through the
 # resolved BUILDER — proving the fetched bnc actually compiles, links, and runs.
 # The canary source is written HERE, not read from the conformance suite, so the
-# conformance tests stay free to evolve (e.g. migrate off the print/println
-# builtins) without breaking this smoke check.  It exercises stdlib fmt + the
-# runtime, both shipped in the pinned BUILDER bundle.
+# conformance tests stay free to evolve without breaking this smoke check.  It
+# exercises stdlib fmt + the runtime, both shipped in the pinned BUILDER bundle.
 TMP="$(mktemp -d -t binate-fetch-builder-smoke.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 SRC="$TMP/canary.bn"

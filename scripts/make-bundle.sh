@@ -170,9 +170,8 @@ test -x "$dest/bin/binate-paths" || {
 # the source layout intact so a consumer resolves the bundle directly
 # with -I <lib>/ifaces/... -L <lib>/impls/... (see BUNDLE-HOWTO.md).
 echo "==> assembling lib/"
-# pkg/bootstrap (print/println backing — IR-gen emits direct calls into it)
-# lives under ifaces/core + impls/core/common, so it ships with the ifaces/
-# and impls/ trees below; no separate pkg/ copy.  Nothing else from pkg/ is
+# pkg/bootstrap lives under ifaces/core + impls/core/common, so it ships with
+# the ifaces/ and impls/ trees below; no separate pkg/ copy.  Nothing else from pkg/ is
 # shipped: pkg/binate/* is the compiler's own source, and shipping it would
 # make compiler internals importable through the bare-root -I entry.
 cp -R "$BINATE_DIR/runtime" "$dest/lib/runtime"

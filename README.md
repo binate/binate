@@ -153,28 +153,20 @@ func main() {
 }
 ```
 
-> **⚠️ `print` / `println` are DEPRECATED and being removed.** Do not use the bare
-> `print` / `println` builtins in programs or tests. Use `pkg/builtins/testing`'s
-> `testing.Print` / `testing.Println` instead — they mirror the builtins
-> byte-for-byte (space-separated operands, trailing newline for `Println`) but are
-> ordinary library functions. The builtins are slated for removal from the
-> language; a hygiene check (`scripts/hygiene/conformance-builtin-print.sh`) already
-> forbids them in the conformance suite.
-
 ### pkg/bootstrap
 
 The `pkg/bootstrap` package provides the OS-level primitives we lean on while bootstrapping the toolchain. In compiled binaries they're backed by the C runtime in `runtime/binate_runtime.c`; in `bni` (the bytecode VM) they're forwarded by the host process through the extern registry.
 
-Its surface has been steadily slimmed as the stdlib OS abstraction (`pkg/std/os`, `pkg/std/os/process`) took over; what remains is the minimal set the (deprecated) print/println lowering and process startup still reach directly. **Don't extend its surface with new primitives** — add them to `pkg/std/os` instead. Much of what's left — `Write` as the print sink and the `format*` helpers below — exists solely to back the print/println builtins, and retires with them (see the deprecation note above); modern output goes through `pkg/builtins/testing` → `pkg/builtins/lang`, not `pkg/bootstrap`.
+Its surface has been steadily slimmed as the stdlib OS abstraction (`pkg/std/os`, `pkg/std/os/process`) took over. **Don't extend its surface with new primitives** — add them to `pkg/std/os` instead. Process startup still reaches `Args` directly; `Write` and the `format*` helpers below are vestigial — no live callers remain, and they are slated for removal. Modern output goes through `pkg/builtins/testing` → `pkg/builtins/lang`, not `pkg/bootstrap`.
 
 Current surface:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `Write` | `(fd int, buf *[]readonly uint8) int` | Write `len(buf)` bytes to `fd` (1 = stdout, 2 = stderr); returns bytes written or -1. The print/println lowering's I/O sink. |
+| `Write` | `(fd int, buf *[]readonly uint8) int` | Write `len(buf)` bytes to `fd` (1 = stdout, 2 = stderr); returns bytes written or -1. |
 | `Args`  | `() @[]@[]char` | Command-line arguments, as managed slices |
 
-Plus the print/println lowering's internal integer/float/bool formatting helpers — `formatInt`, `formatInt64`, `formatUint`, `formatBool`, `formatFloat` — which IR-gen emits direct calls to; not intended for direct use.
+Plus vestigial integer/float/bool formatting helpers — `formatInt`, `formatInt64`, `formatUint`, `formatBool`, `formatFloat` — with no live callers, slated for removal.
 
 General file I/O now lives in `pkg/std/os`, process control in `pkg/std/os/process`; the historical `Open` / `Read` / `Close` / `Exit` / `Stat` / `ReadDir` / `Itoa` / `Concat` / `Exec` surface and its `O_*` / `STD*` constants have been retired.
 

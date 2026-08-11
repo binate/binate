@@ -12,7 +12,7 @@ runner_compile() {
     tmpbin="$2"
     bdir="$(mktemp -d "${TMPDIR:-/tmp}/binate_build_XXXXXX")"
     # Full stdlib search paths — see builder-comp.sh for why the test
-    # dir alone can't link println(int) → bootstrap.formatInt64.
+    # dir alone can't link a test's stdlib/builtins imports.
     out=$("$BNC_NATIVE" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$bdir" \
         -backend native -o "$tmpbin" "$bn" 2>&1)
     rc=$?

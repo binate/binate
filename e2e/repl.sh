@@ -704,7 +704,7 @@ run_repl "tier2-body-stmt-list-managed-slice-of-managed-ptr" \
 # synthetic.  A managed-slice-of-managed-ptr initializer
 # registers a pending dtor; the drain emits the helper before
 # the synthetic is lowered.  Read-back through a subsequent
-# bare-stmt println. ---
+# bare-stmt testing.Println. ---
 run_repl "tier2-body-var-init-managed-slice-of-managed-ptr" \
 "var t @[]@Box = make_slice(@Box, 4)
 testing.Println(len(t))

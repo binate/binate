@@ -35,7 +35,7 @@ Each tuple computes the op at runtime — operands live in `var`s, so the
 **backend** op runs, not the const-folder — and prints
 `cast(int, (computed == spec_expected))`, which is `1` exactly when the backend
 matches the spec. The comparison happens at the operand width *in-language*;
-only a `0`/`1` reaches `println`. So a 64-bit result never truncates through
+only a `0`/`1` is emitted. So a 64-bit result never truncates through
 `cast(int, …)` on a 32-bit (arm32/ILP32) target, and a sub-word value never
 hits the native sub-word print path — the cell's output is target-stable.
 Every `.expected` is therefore a column of `1`s; a `0` on line N means tuple N

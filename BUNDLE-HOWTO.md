@@ -57,7 +57,7 @@ and repeatable (cc-style), and the first `-I` entry doubles as the "source root"
 What each entry covers:
 
 - `ifaces/core` + `impls/core/*` — the builtins (`pkg/builtins/*`) and
-  `pkg/bootstrap` (which backs `print`/`println`).
+  `pkg/bootstrap`.
 - `ifaces/stdlib` + `impls/stdlib` — the bundled stdlib
   (`pkg/std/strconv`, `pkg/std/errors`, …).
 - `$LIB` (the bare root) — resolves nothing in a bundle (it's there for the
@@ -88,11 +88,12 @@ The bundled stdlib is used automatically once `ifaces/stdlib` +
 ```
 package "main"
 
+import "pkg/builtins/testing"
 import "pkg/std/strconv"
 
 func main() {
 	var s @[]char = strconv.Itoa(4242)
-	println(s[0:len(s)])
+	testing.Println(s[0:len(s)])
 }
 ```
 

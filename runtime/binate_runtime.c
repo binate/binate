@@ -37,16 +37,14 @@ typedef struct {
 // directly via __c_call (no separate stub file).
 
 // ============================================================
-// I/O and process: all bn_* shims have been removed. Print/println's
-// IR-gen now lowers each type through bootstrap.formatX (where
-// needed) + bootstrap.Write. OP_PANIC lowers to rt.Panic, which writes
-// the message through rt's own sink and Aborts (__c_call("abort") on a
-// hosted target, a nonzero semihost exit on a libc-free one). See
-// explorations/plan-print-builtin-runtime-decoupling.md.
+// I/O and process: all bn_* shims have been removed. OP_PANIC lowers
+// to rt.Panic, which writes the message through rt's own sink and
+// Aborts (__c_call("abort") on a hosted target, a nonzero semihost
+// exit on a libc-free one).
 // ============================================================
 
 // ============================================================
-// Bootstrap package — the print/println lowering's I/O sink (Write)
+// Bootstrap package — the Write I/O sink
 // ============================================================
 
 // Write(fd int, buf *[]uint8) int — writes len(buf) bytes

@@ -4,7 +4,7 @@
 # conformance test for ARMv7-A bare-metal (--target arm32-baremetal).
 # The resulting ELF binary boots
 # directly under `qemu-system-arm -M virt -semihosting` — no
-# kernel, no libc, no argv — and the test's println output goes
+# kernel, no libc, no argv — and the test's output goes
 # through SYS_WRITEC, with rt.Exit terminating via
 # SYS_EXIT_EXTENDED.
 #

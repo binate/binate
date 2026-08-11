@@ -86,7 +86,7 @@ func main() {
 	// exit); without it this is a bare load through address 0 -> SEGV.  The
 	// field read rides through testing.Println (a `...*any` variadic): the
 	// implicit value-borrow of `p.val` nil-checks the base pointer, so the
-	// nil deref is detected exactly as the print/println builtin detected it.
+	// nil deref is detected.
 	var p @Node = nil
 	testing.Println(p.val)
 }

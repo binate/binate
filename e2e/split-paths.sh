@@ -85,10 +85,9 @@ check() {
 BNC_BIN="$TMP/bnc-bin"
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 # The fixture is compiled by the BUILDER directly, so it is emitted with the
-# BUILDER's mangling scheme, and the pinned BUILDER still requires a --runtime
-# file to link.  Point it at the BUILDER's OWN bundled runtime, whose symbols
-# match that scheme — the current tree ships no C runtime of its own (the
-# current bnc links none and ignores --runtime).
+# BUILDER's mangling scheme.  Neither the BUILDER nor the current bnc links a C
+# runtime (the runtime is pure Binate — pkg/builtins/rt + startup), so no
+# --runtime is passed.
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 # Base search is the CHECKOUT (so testing.Println, resolved from the current
 # tree, is available — the BUILDER's own bundle predates it), with the fixture
@@ -101,7 +100,6 @@ BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
 bnc_compile_log=$("$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$BNI_ROOT" --append "$BUILDER_LIB/ifaces/core")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$IMPL_ROOT" --append "$BUILDER_LIB/impls/core/libc")" \
-    --runtime "$BUILDER_LIB/runtime/binate_runtime.c" \
     --build-dir "$BUILD_DIR" -o "$BNC_BIN" "$TMP/main.bn" 2>&1) || true
 if [ -x "$BNC_BIN" ]; then
     actual=$("$BNC_BIN" 2>&1) || true

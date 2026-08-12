@@ -45,7 +45,6 @@ expected="hello, binate"
 build_log="$("$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB")" \
-    --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")" \
     --build-dir "$TMP" -o "$BIN" \
     "$SRC" 2>&1)" || true
 if [ ! -x "$BIN" ]; then

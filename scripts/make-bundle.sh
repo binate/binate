@@ -23,7 +23,7 @@
 #     lib/impls/{core,stdlib}/    implementations (core builtins + stdlib)
 #
 # The lib/ tree is what bnc/bni/bnas/bnlint resolve against; see
-# BUNDLE-HOWTO.md for how a consumer points -I/-L/--runtime at it.  bnfmt is
+# BUNDLE-HOWTO.md for how a consumer points -I/-L at it.  bnfmt is
 # self-contained (it parses and re-prints source syntax), so it needs no lib/.
 #
 # Building each binary goes through scripts/build-{bnc,bni,bnas,bnlint,bnfmt}.sh,
@@ -157,7 +157,7 @@ for b in bnc bni bnas bnlint bnfmt; do
 done
 
 # Ship the search-path helper next to the binaries (bin/ goes on PATH).  It
-# emits the standard -I/-L/--runtime for the bundle's lib/, self-locating the
+# emits the standard -I/-L for the bundle's lib/, self-locating the
 # base as ../lib from bin/, so a consumer never re-derives the layout by hand.
 # Same script the in-tree build/test scripts use, so the formula has one
 # definition.  See BUNDLE-HOWTO.md.

@@ -123,11 +123,10 @@ EOF
 GEN1_BNC="$("$BINATE_DIR/scripts/resolve-gen1.sh")"
 CK_I="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 CK_L="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
-CK_RT="$BINATE_DIR/runtime/binate_runtime.c"
 BNC_BIN="$TMP/sprobe"
 BUILD_DIR="$TMP/build"
 mkdir -p "$BUILD_DIR"
-bnc_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" --runtime "$CK_RT" \
+bnc_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" \
     --build-dir "$BUILD_DIR" -o "$BNC_BIN" "$TMP/sprobe.bn" 2>&1) || true
 if [ ! -x "$BNC_BIN" ]; then
     echo "FAIL: Binate compile of the stat probe failed" >&2

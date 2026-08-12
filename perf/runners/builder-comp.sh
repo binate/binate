@@ -19,7 +19,7 @@ runner_compile() {
     # dir alone could not link a test's stdlib/builtins imports (e.g.
     # pkg/builtins/testing → pkg/builtins/lang), so every perf test that
     # produces output failed.
-    out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
+    out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
         --build-dir "$bdir" -o "$tmpbin" "$bn" 2>&1)
     rc=$?
     rm -rf "$bdir"

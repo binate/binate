@@ -1,10 +1,10 @@
 #!/bin/sh
 # binate-paths — emit the standard Binate package search paths for a layout
-# base: the `-I` interface path, the `-L` implementation path, and the `bnc`
-# `--runtime` C-runtime file.  This is the single source of truth for the
-# formula that BUNDLE-HOWTO.md documents and that the build/test scripts and
-# the examples repo consume; it ships in a release bundle as `bin/binate-paths`
-# so consumers never re-derive the bundle layout by hand.
+# base: the `-I` interface path and the `-L` implementation path.  This is the
+# single source of truth for the formula that BUNDLE-HOWTO.md documents and that
+# the build/test scripts and the examples repo consume; it ships in a release
+# bundle as `bin/binate-paths` so consumers never re-derive the bundle layout by
+# hand.
 #
 # A "layout base" is a directory holding `ifaces/`, `impls/`, and `runtime/`
 # (a release bundle's `lib/`, or a source checkout's root — make-bundle.sh
@@ -12,7 +12,7 @@
 #
 # Usage:
 #   binate-paths [--base DIR] [--prepend PATH]... [--append PATH]...
-#                [--target KEY] [--iface | --impl | --runtime] [--export]
+#                [--target KEY] [--iface | --impl] [--export]
 #
 #   --base DIR     The layout base.  Default: self-locate relative to this
 #                  script — `<dir>/../lib` (a bundle's bin/) or `<dir>/..`
@@ -27,11 +27,10 @@
 #                  "host"/omitted to auto-detect the host via uname.  Pass the
 #                  SAME key you pass to `bnc --target`.  Per-target package
 #                  *impls* are expressed via #[build(...)] in the common tree,
-#                  not a separate impls/targets dir.  --runtime is unaffected.
+#                  not a separate impls/targets dir.
 #   --iface        Print only the -I value.
 #   --impl         Print only the -L value.
-#   --runtime      Print only the --runtime file (ignores --prepend/--append).
-#   (no selector)  Print an eval-able block setting BINATE_I/BINATE_L/BINATE_RT.
+#   (no selector)  Print an eval-able block setting BINATE_I/BINATE_L.
 #   --export       With the eval block, prefix each line with `export `.
 #
 # Duplicate path entries collapse to their first occurrence, so a
@@ -40,7 +39,7 @@
 #
 # Examples:
 #   I="$(binate-paths --iface --base "$LIB" --prepend "$ROOT")"
-#   eval "$(binate-paths --base "$LIB")"      # sets BINATE_I/_L/_RT
+#   eval "$(binate-paths --base "$LIB")"      # sets BINATE_I/_L
 set -e
 
 prog=binate-paths
@@ -52,7 +51,7 @@ usage() {
 abspath() { CDPATH= cd -- "$1" 2>/dev/null && pwd; }
 
 BASE=""
-SELECTOR=""          # iface | impl | runtime | "" (eval block)
+SELECTOR=""          # iface | impl | "" (eval block)
 EXPORT=""
 PREPEND=""           # newline-terminated entries
 APPEND=""            # newline-terminated entries
@@ -74,7 +73,6 @@ while [ $# -gt 0 ]; do
         --target=*)  TARGET="${1#--target=}"; shift ;;
         --iface)     SELECTOR=iface; shift ;;
         --impl)      SELECTOR=impl; shift ;;
-        --runtime)   SELECTOR=runtime; shift ;;
         --export)    EXPORT=1; shift ;;
         -h|--help)   usage; exit 0 ;;
         *) echo "$prog: unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -158,12 +156,9 @@ build_list() {   # $1 = iface | impl
     } | join_dedup
 }
 
-RT="$BASE/runtime/binate_runtime.c"
-
 case "$SELECTOR" in
     iface)   build_list iface ;;
     impl)    build_list impl ;;
-    runtime) printf '%s\n' "$RT" ;;
     *)
         I="$(build_list iface)"
         L="$(build_list impl)"
@@ -171,6 +166,5 @@ case "$SELECTOR" in
         [ -n "$EXPORT" ] && pfx="export "
         printf "%sBINATE_I='%s'\n" "$pfx" "$I"
         printf "%sBINATE_L='%s'\n" "$pfx" "$L"
-        printf "%sBINATE_RT='%s'\n" "$pfx" "$RT"
         ;;
 esac

@@ -52,10 +52,10 @@ repeatable (cc-style), and the first `-I` entry doubles as the "source root":
 -L  $LIB:$LIB/impls/core/common:$LIB/impls/core/libc:$LIB/impls/stdlib
 ```
 
-(`bnc` still accepts a `--runtime <path>` flag — and `binate-paths --runtime`
-still prints one — but it is a **no-op**: bnc links no C runtime.  It is kept
-only so scripts that drive an older pinned `bnc` keep working, and will be
-removed.)
+(A host build links no C runtime, so no `--runtime` is passed below.  `bnc`
+still accepts a `--runtime <path>` flag, but it survives only for bare-metal
+targets, which resolve their startup / linker inputs from its directory — see
+`--target arm32-baremetal`.)
 
 What each entry covers:
 
@@ -71,17 +71,17 @@ inline at each use, or regenerate them with `binate-paths --prepend "$ROOT"`):
 
 ```sh
 ROOT=/path/to/my/project
-bnc -I "$ROOT:$I" -L "$ROOT:$L" --runtime "$RT" -o app "$ROOT/cmd/app"
+bnc -I "$ROOT:$I" -L "$ROOT:$L" -o app "$ROOT/cmd/app"
 ```
 
 ## bnc — compile
 
 ```sh
 # A single file → ./hello
-bnc -I "$I" -L "$L" --runtime "$RT" -o hello hello.bn
+bnc -I "$I" -L "$L" -o hello hello.bn
 
 # A directory compiles every .bn in it (excluding *_test.bn)
-bnc -I "$ROOT:$I" -L "$ROOT:$L" --runtime "$RT" -o app "$ROOT/cmd/app"
+bnc -I "$ROOT:$I" -L "$ROOT:$L" -o app "$ROOT/cmd/app"
 ```
 
 The bundled stdlib is used automatically once `ifaces/stdlib` +
@@ -117,7 +117,7 @@ Useful flags:
 prints its path; run that binary to execute the tests:
 
 ```sh
-bin=$(bnc --test -I "$ROOT:$I" -L "$ROOT:$L" --runtime "$RT" pkg/demo)
+bin=$(bnc --test -I "$ROOT:$I" -L "$ROOT:$L" pkg/demo)
 "$bin"      # === RUN … / --- PASS … / ok  1 passed
 ```
 
@@ -125,8 +125,7 @@ bin=$(bnc --test -I "$ROOT:$I" -L "$ROOT:$L" --runtime "$RT" pkg/demo)
 
 ## bni — interpret, test, REPL
 
-bni runs `.bn` through the bytecode VM. No `--runtime` is needed — nothing is
-linked.
+bni runs `.bn` through the bytecode VM — nothing is compiled or linked.
 
 ```sh
 # Run a program

@@ -106,7 +106,6 @@ mkdir -p "$BUILD_DIR"
 bnc_log=$("$GEN1" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
-    --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
     --build-dir "$BUILD_DIR" -o "$BNC_BIN" "$TMP/eprobe.bn" 2>&1) || true
 if [ ! -x "$BNC_BIN" ]; then
     echo "FAIL: Binate compile of the __c_global probe failed" >&2

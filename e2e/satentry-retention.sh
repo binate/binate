@@ -89,7 +89,6 @@ if [ ! -x "$GEN1" ]; then
 fi
 IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
-RT="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")"
 
 # check_retention <label> <extra-bnc-flags...>
 #   Compile $SRC, run it (expect "42"), and assert the root + own/dependency
@@ -99,7 +98,7 @@ check_retention() {
     bin="$TMP/prog_$label"
     bd="$TMP/bd_$label"
     mkdir -p "$bd"
-    if ! "$GEN1" -I "$IFACE" -L "$IMPL" --runtime "$RT" --build-dir "$bd" "$@" \
+    if ! "$GEN1" -I "$IFACE" -L "$IMPL" --build-dir "$bd" "$@" \
             -o "$bin" "$SRC" >"$TMP/compile_$label.log" 2>&1; then
         fail "$label compile/link failed" "$(tail -5 "$TMP/compile_$label.log")"
         return

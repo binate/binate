@@ -90,7 +90,6 @@ echo
 
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
 
 # Two-step BUILDER → gen1 → final build, so any difference between the
 # BUILDER's compiled-in mangled-symbol literals and current-source's
@@ -113,7 +112,6 @@ echo "  Stage 1: BUILDER → gen1 ..."
 "$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-    --runtime "$BUILDER_RUNTIME" \
     --build-dir "$GEN1_DIR/build" \
     -o "$GEN1_BNC" \
     "$BINATE_DIR/cmd/bnc"
@@ -133,7 +131,6 @@ if [ -n "$DBG_FLAG" ]; then
     "$GEN1_BNC" \
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $TARGET_OPT)" \
         -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $TARGET_OPT)" \
-        --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         $TARGET_OPT \
@@ -144,7 +141,6 @@ else
     "$GEN1_BNC" \
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $TARGET_OPT)" \
         -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $TARGET_OPT)" \
-        --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
         --build-dir "$BUILD_DIR" \
         --cflag "$CFLAGS" \
         $TARGET_OPT \

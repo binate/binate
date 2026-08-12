@@ -49,7 +49,7 @@ runner_compile() {
     bn="$1"
     tmpbin="$2"
     bdir="$(mktemp -d "${TMPDIR:-/tmp}/binate_build_XXXXXX")"
-    out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target x86_64-linux)" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$bdir" \
+    out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target x86_64-linux)" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --build-dir "$bdir" \
         --backend native --target x86_64-linux -o "$tmpbin" "$bn" 2>&1)
     rc=$?
     rm -rf "$bdir"

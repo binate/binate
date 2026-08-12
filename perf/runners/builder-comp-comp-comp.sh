@@ -10,7 +10,7 @@ runner_compile() {
     bdir="$(mktemp -d "${TMPDIR:-/tmp}/binate_build_XXXXXX")"
     # Full stdlib search paths — see builder-comp.sh for why the test
     # dir alone can't link a test's stdlib/builtins imports.
-    out=$("$GEN2_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1)
+    out=$("$GEN2_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1)
     rc=$?
     rm -rf "$bdir"
     [ -n "$out" ] && echo "$out"

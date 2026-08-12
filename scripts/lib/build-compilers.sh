@@ -88,7 +88,7 @@ build_gen1() {
     # OUTPUTS (gen2, tests, conformance) are emitted by gen1 and link the
     # checkout runtime.
     # e2e/{repl,os-args}.sh + scripts/build-*.sh use the same invocation form.
-    build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$blib")" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"
@@ -105,7 +105,7 @@ build_gen2() {
     GEN2_COMPILER="$_COMPILERS_DIR/gen2_compiler"
     GEN2_BUILD_DIR="$(_new_build_dir)"
     echo "Building gen2 compiler..."
-    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$GEN2_BUILD_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --build-dir "$GEN2_BUILD_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN2_COMPILER" ]; then
         echo "ERROR: Failed to build gen2 compiler:"
         echo "$build_out"
@@ -133,7 +133,7 @@ build_bnc_native_aa64() {
     BNC_NATIVE="$_COMPILERS_DIR/bnc_native_aa64"
     BNC_NATIVE_BUILD_DIR="$(_new_build_dir)"
     echo "Building bnc with native aarch64 backend..."
-    build_out=$("$GEN1_COMPILER" --backend native -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$GEN1_COMPILER" --backend native -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$BNC_NATIVE" ]; then
         echo "ERROR: Failed to build bnc (native aarch64):"
         echo "$build_out"
@@ -161,7 +161,7 @@ build_interp() {
     COMPILED_INTERP="$_COMPILERS_DIR/compiled_interp"
     INTERP_BUILD_DIR="$(_new_build_dir)"
     echo "Building compiled interpreter..."
-    build_out=$("$compiler" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    build_out=$("$compiler" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"
@@ -184,7 +184,7 @@ build_interp_arm32() {
     ARM32_INTERP="$_COMPILERS_DIR/arm32_interp"
     ARM32_INTERP_BUILD_DIR="$(_new_build_dir)"
     echo "Cross-building compiled interpreter (bni) for arm32-linux..."
-    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target arm32-linux)" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --target arm32-linux --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$ARM32_INTERP_BUILD_DIR" -o "$ARM32_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target arm32-linux)" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --target arm32-linux --build-dir "$ARM32_INTERP_BUILD_DIR" -o "$ARM32_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$ARM32_INTERP" ]; then
         echo "ERROR: Failed to cross-build arm32 compiled interpreter:"
         echo "$build_out"

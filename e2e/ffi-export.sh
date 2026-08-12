@@ -84,7 +84,6 @@ if [ ! -x "$GEN1" ]; then
 fi
 IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
-RT="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")"
 
 # --- the facade package (out-of-tree, in TMP) -----------------------------
 mkdir -p "$TMP/if" "$TMP/im/ffiexp"
@@ -161,7 +160,7 @@ check_backend() {
     label="$1"; extra="$2"; required="$3"
     work="$TMP/$label"
     mkdir -p "$work"
-    if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" --runtime "$RT" \
+    if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
             $extra --build-dir "$work" --pkg ffiexp >"$work/pkg.log" 2>&1 \
             || [ ! -f "$work/ffiexp.o" ]; then
         if [ "$required" -eq 1 ]; then
@@ -196,7 +195,7 @@ check_backend() {
 check_library() {
     work="$TMP/library"
     mkdir -p "$work"
-    if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" --runtime "$RT" \
+    if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
             --build-dir "$work" -o "$work/libffiexp.a" --library ffiexp >"$work/lib.log" 2>&1 \
             || [ ! -f "$work/libffiexp.a" ]; then
         fail "library: --library ffiexp produced no archive" "$(tail -5 "$work/lib.log")"

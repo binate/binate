@@ -125,7 +125,6 @@ echo "resolve-gen1: building gen1 for $PLATFORM (key $(printf '%.8s' "$KEY")…)
 
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/binate_gen1.XXXXXX")"
 trap 'rmdir "$LOCK" 2>/dev/null || true; rm -rf "$WORK"' EXIT
@@ -140,7 +139,6 @@ GEN1_TMP="$WORK/bnc"
 if ! "$BUILDER" \
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
         -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-        --runtime "$BUILDER_RUNTIME" \
         --build-dir "$WORK/build" \
         -o "$GEN1_TMP" \
         "$BINATE_DIR/cmd/bnc" >"$WORK/log" 2>&1 || [ ! -x "$GEN1_TMP" ]; then

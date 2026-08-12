@@ -83,11 +83,10 @@ GEN1_BNC="$("$BINATE_DIR/scripts/resolve-gen1.sh")"
 # Common checkout -I/-L (fixture and cmd/bni both link against the current stdlib).
 CK_I="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 CK_L="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
-CK_RT="$BINATE_DIR/runtime/binate_runtime.c"
 
 # ----- Build the fixture (native) and cmd/bni (native), both via gen1. -----
 ARGS_BIN="$TMP/os_args-bin"
-compile_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" --runtime "$CK_RT" \
+compile_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" \
     --build-dir "$BUILD_DIR" -o "$ARGS_BIN" "$TMP/os_args.bn" 2>&1) || true
 if [ ! -x "$ARGS_BIN" ]; then
     echo "FAIL: Binate compile of the os.Args fixture failed" >&2
@@ -95,7 +94,7 @@ if [ ! -x "$ARGS_BIN" ]; then
     exit 1
 fi
 BNI_BIN="$TMP/bni-bin"
-bni_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" --runtime "$CK_RT" \
+bni_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" \
     --build-dir "$BUILD_DIR" -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1) || true
 if [ ! -x "$BNI_BIN" ]; then
     echo "FAIL: could not build cmd/bni" >&2

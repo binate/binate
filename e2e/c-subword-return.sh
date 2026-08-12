@@ -120,7 +120,6 @@ fi
 
 IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
-RT="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")"
 
 # check_backend <label> <extra-bnc-flags> <required>
 #   Compile the C callee for the HOST arch (which matches both the host-native and
@@ -136,7 +135,7 @@ check_backend() {
         fail "$label: C callee compile failed" "$(head -4 "$work/cc.err")"
         return
     fi
-    if ! "$GEN1" -I "$IFACE" -L "$IMPL" --runtime "$RT" $extra \
+    if ! "$GEN1" -I "$IFACE" -L "$IMPL" $extra \
             --link-after-objs "$work/csub.o" --build-dir "$work" \
             -o "$work/run" "$TMP/main.bn" >"$work/comp.log" 2>&1 \
             || [ ! -x "$work/run" ]; then

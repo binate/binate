@@ -297,10 +297,9 @@ EOF
 build_gen1
 IFACES="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$I_ROOT")"
 IMPLS="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$L_ROOT")"
-RT="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")"
 HOST_BIN="$TMP/host-bin"
 echo "Building cross-mode HFA host..."
-build_out=$("$GEN1_COMPILER" -I "$IFACES" -L "$IMPLS" --runtime "$RT" \
+build_out=$("$GEN1_COMPILER" -I "$IFACES" -L "$IMPLS" \
     --build-dir "$BUILD_DIR" -o "$HOST_BIN" "$HOST_DIR" 2>&1) || true
 if [ ! -x "$HOST_BIN" ]; then
     echo "FAIL: host build"

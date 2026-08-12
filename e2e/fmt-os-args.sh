@@ -71,14 +71,12 @@ EOF
 # scripts/lib/build-compilers.sh build_gen1 for the full rationale.
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
 GEN1_DIR="$BUILD_DIR/gen1"
 GEN1_BNC="$GEN1_DIR/bnc"
 mkdir -p "$GEN1_DIR/build"
 gen1_log=$("$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-    --runtime "$BUILDER_RUNTIME" \
     --build-dir "$GEN1_DIR/build" \
     -o "$GEN1_BNC" \
     "$BINATE_DIR/cmd/bnc" 2>&1)
@@ -91,11 +89,10 @@ fi
 # Common checkout -I/-L (fixture and cmd/bni both link against the current stdlib).
 CK_I="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 CK_L="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
-CK_RT="$BINATE_DIR/runtime/binate_runtime.c"
 
 # ----- Build the fixture (native) and cmd/bni (native), both via gen1. -----
 ARGS_BIN="$TMP/fmt_os_args-bin"
-compile_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" --runtime "$CK_RT" \
+compile_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" \
     --build-dir "$BUILD_DIR" -o "$ARGS_BIN" "$TMP/fmt_os_args.bn" 2>&1) || true
 if [ ! -x "$ARGS_BIN" ]; then
     echo "FAIL: Binate compile of the fmt-os.Args fixture failed" >&2
@@ -103,7 +100,7 @@ if [ ! -x "$ARGS_BIN" ]; then
     exit 1
 fi
 BNI_BIN="$TMP/bni-bin"
-bni_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" --runtime "$CK_RT" \
+bni_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" \
     --build-dir "$BUILD_DIR" -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1) || true
 if [ ! -x "$BNI_BIN" ]; then
     echo "FAIL: could not build cmd/bni" >&2

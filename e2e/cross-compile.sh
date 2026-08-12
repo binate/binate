@@ -110,9 +110,8 @@ else
                     printf 'package "main"\n\nimport "pkg/stdx/fmt"\n\nfunc main() {\n\tfmt.Println("cross-compile-ok")\n}\n' > "$hello"
                     I="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target "$XTARGET")"
                     L="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --target "$XTARGET")"
-                    RT="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")"
                     prog="$TMP/hello-$XTARGET"
-                    clog=$($RUN_EMU "$XBNC" -I "$I" -L "$L" --runtime "$RT" \
+                    clog=$($RUN_EMU "$XBNC" -I "$I" -L "$L" \
                             --target "$XTARGET" -o "$prog" "$hello" 2>&1) || true
                     if [ ! -x "$prog" ]; then
                         fail "cross-run: cross-built bnc failed to compile a hello" \

@@ -53,14 +53,12 @@ mkdir -p "$BUILD_DIR"
 # ----- Build gen1 (a native, checkout-source compiler). -----
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
 GEN1_DIR="$BUILD_DIR/gen1"
 GEN1_BNC="$GEN1_DIR/bnc"
 mkdir -p "$GEN1_DIR/build"
 gen1_log=$("$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-    --runtime "$BUILDER_RUNTIME" \
     --build-dir "$GEN1_DIR/build" \
     -o "$GEN1_BNC" \
     "$BINATE_DIR/cmd/bnc" 2>&1)
@@ -73,11 +71,10 @@ fi
 # Checkout -I/-L/runtime (cmd/bni and the fixture link the current stdlib).
 CK_I="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 CK_L="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
-CK_RT="$BINATE_DIR/runtime/binate_runtime.c"
 
 # ----- Build cmd/bni (native) via gen1. -----
 BNI_BIN="$TMP/bni"
-bni_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" --runtime "$CK_RT" \
+bni_log=$("$GEN1_BNC" -I "$CK_I" -L "$CK_L" \
     --build-dir "$BUILD_DIR" -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1) || true
 if [ ! -x "$BNI_BIN" ]; then
     echo "FAIL: could not build cmd/bni" >&2

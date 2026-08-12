@@ -75,7 +75,7 @@ runner_exec() {
     # (deps still go via LLVM).  No -mfloat-abi=soft (hard-float) and no explicit
     # libgcc — clang's hosted gnueabihf link supplies AEABI helpers automatically.
     compile_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$compile_root" --target arm32-linux)" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$compile_root")" \
-        --target arm32-linux --backend native --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$bdir" $BINATE_FLAGS \
+        --target arm32-linux --backend native --build-dir "$bdir" $BINATE_FLAGS \
         -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
         QEMU_LD_PREFIX="${QEMU_LD_PREFIX:-/usr/arm-linux-gnueabihf}"

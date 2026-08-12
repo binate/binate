@@ -43,7 +43,6 @@ FIXTURE="$TMP/fixture.bn"
 echo "Building bni via builder-comp (BUILDER → gen1 → bni)..."
 BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
 BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-BUILDER_RUNTIME="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
 GEN1_DIR="$BUILD_DIR/gen1"
 GEN1_BNC="$GEN1_DIR/bnc"
 mkdir -p "$GEN1_DIR/build"
@@ -57,7 +56,6 @@ mkdir -p "$GEN1_DIR/build"
 gen1_log=$("$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-    --runtime "$BUILDER_RUNTIME" \
     --build-dir "$GEN1_DIR/build" \
     -o "$GEN1_BNC" \
     "$BINATE_DIR/cmd/bnc" 2>&1)
@@ -70,7 +68,6 @@ fi
 build_log=$("$GEN1_BNC" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
-    --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" \
     --build-dir "$BUILD_DIR" \
     -o "$BNI_BIN" "$BINATE_DIR/cmd/bni" 2>&1)
 if [ ! -x "$BNI_BIN" ]; then

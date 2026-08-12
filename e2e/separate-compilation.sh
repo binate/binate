@@ -15,7 +15,7 @@
 #   2. `bnc --pkg <P>` for EACH package, in its own invocation -> one .o each.
 #   3. `bnc -c cmd/bnas`           -> main.o (the entry module; its dep .o's are
 #                                     discarded — we link the --pkg ones).
-#   4. link main.o + all the separately-built .o's + runtime -> bnas_sep.
+#   4. link main.o + all the separately-built .o's          -> bnas_sep.
 #   5. build a canonical bnas the normal whole-program way    -> bnas_canon.
 #   6. assert bnas_sep and bnas_canon AGREE: identical --version, and assembling
 #      a data fixture .s yields BYTE-IDENTICAL objects (exercises the real
@@ -98,16 +98,16 @@ fail() {
     FAILS=$((FAILS + 1))
 }
 
-# run_sepc <label> <bnc> <iface> <impl> <runtime>
-#   iface/impl/runtime must be the search paths + runtime object matching <bnc>
+# run_sepc <label> <bnc> <iface> <impl>
+#   iface/impl must be the search paths matching <bnc>
 #   (the current tree for gen1, the frozen bundle for the BUILDER).
 run_sepc() {
-    label="$1"; bnc="$2"; iface="$3"; impl="$4"; runtime="$5"
+    label="$1"; bnc="$2"; iface="$3"; impl="$4"
     work="$TMP/$label"
     mkdir -p "$work/sep" "$work/wp"
 
     # --- 1. the full dependency set --------------------------------------
-    deps=$("$bnc" -I "$iface" -L "$impl" --runtime "$runtime" --list-deps "$TARGET" 2>"$work/listdeps.err")
+    deps=$("$bnc" -I "$iface" -L "$impl" --list-deps "$TARGET" 2>"$work/listdeps.err")
     ld_rc=$?
     # bnc prints loader errors to STDOUT (the same stream as the dep list — see
     # cmd/bnc/main.bn's ListDeps path), and signals a failed load with a non-zero
@@ -128,7 +128,7 @@ run_sepc() {
         n=$((n + 1))
         d="$work/sep/p$n"
         mkdir -p "$d"
-        if ! "$bnc" -I "$iface" -L "$impl" --runtime "$runtime" \
+        if ! "$bnc" -I "$iface" -L "$impl" \
                 --build-dir "$d" --pkg "$p" >"$d/log" 2>&1 \
                 || [ -z "$(ls "$d"/*.o 2>/dev/null)" ]; then
             fail "$label: separate compile of '$p' produced no object" \
@@ -138,7 +138,7 @@ run_sepc() {
     done
 
     # --- 3. the entry module (main.o) -----------------------------------
-    if ! "$bnc" -I "$iface" -L "$impl" --runtime "$runtime" \
+    if ! "$bnc" -I "$iface" -L "$impl" \
             --build-dir "$work/wp" -c "$TARGET" >"$work/wp/log" 2>&1 \
             || [ ! -f "$work/wp/main.o" ]; then
         fail "$label: could not compile main.o (-c $TARGET)" "$(tail -3 "$work/wp/log")"
@@ -148,12 +148,10 @@ run_sepc() {
     # --- 4. link the independently-built objects into a binary ----------
     sep_objs=$(find "$work/sep" -name '*.o' | tr '\n' ' ')
     bnas_sep="$work/bnas_sep"
-    # Link the C runtime file only if it exists: the current tree ships none
-    # (the current bnc links no C runtime), but the pinned BUILDER's bundle
-    # still does, and its separately-built objects may reference it.
-    rt_obj=""
-    [ -f "$runtime" ] && rt_obj="$runtime"
-    if ! "$CLANG" -w -o "$bnas_sep" "$work/wp/main.o" $sep_objs $rt_obj 2>"$work/link.err" \
+    # Neither the current tree nor the pinned BUILDER (bnc-0.0.13+) links a C
+    # runtime — the runtime is pure Binate — so the separately-built objects
+    # link with no extra runtime object.
+    if ! "$CLANG" -w -o "$bnas_sep" "$work/wp/main.o" $sep_objs 2>"$work/link.err" \
             || [ ! -x "$bnas_sep" ]; then
         fail "$label: link of separately-compiled objects failed" "$(head -4 "$work/link.err")"
         return
@@ -161,7 +159,7 @@ run_sepc() {
 
     # --- 5. a canonical (whole-program) build for comparison ------------
     bnas_canon="$work/bnas_canon"
-    if ! "$bnc" -I "$iface" -L "$impl" --runtime "$runtime" \
+    if ! "$bnc" -I "$iface" -L "$impl" \
             --build-dir "$work/wp" -o "$bnas_canon" "$TARGET" >"$work/canon.log" 2>&1 \
             || [ ! -x "$bnas_canon" ]; then
         fail "$label: canonical build failed (test harness problem)" "$(tail -3 "$work/canon.log")"
@@ -204,8 +202,7 @@ if [ ! -x "$GEN1" ]; then
 fi
 GEN1_IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 GEN1_IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
-GEN1_RT="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")"
-run_sepc "gen1" "$GEN1" "$GEN1_IFACE" "$GEN1_IMPL" "$GEN1_RT"
+run_sepc "gen1" "$GEN1" "$GEN1_IFACE" "$GEN1_IMPL"
 
 # ---- BUILDER (opt-in sanity check) ---------------------------------------
 if [ "$WITH_BUILDER" -eq 1 ]; then
@@ -220,8 +217,7 @@ if [ "$WITH_BUILDER" -eq 1 ]; then
     else
         BLD_IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB")"
         BLD_IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB")"
-        BLD_RT="$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BUILDER_LIB")"
-        run_sepc "builder" "$BUILDER" "$BLD_IFACE" "$BLD_IMPL" "$BLD_RT"
+        run_sepc "builder" "$BUILDER" "$BLD_IFACE" "$BLD_IMPL"
     fi
 fi
 

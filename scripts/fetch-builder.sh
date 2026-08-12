@@ -7,7 +7,7 @@
 #     BUILDER_LIB="$(scripts/fetch-builder.sh --lib)" # stdlib root
 #     "$BUILDER" -I "$BINATE_DIR:$BUILDER_LIB/ifaces/core:$BUILDER_LIB/ifaces/stdlib" \
 #         -L "$BINATE_DIR:$BUILDER_LIB/impls/core/common:$BUILDER_LIB/impls/core/libc:$BUILDER_LIB/impls/stdlib" \
-#         --runtime ... -o out "$BINATE_DIR/cmd/bnc"
+#         -o out "$BINATE_DIR/cmd/bnc"
 #
 # The resolved path is the bundled binary directly — callers invoke it
 # with the plain bnc command line (no wrapper, no prefix).

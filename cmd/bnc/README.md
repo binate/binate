@@ -23,12 +23,23 @@ building against a release bundle and its bundled stdlib, see
 | `-o <name>` | Output name |
 | `-c` | Compile to `.o` files only (don't link) |
 | `--emit-llvm` | Print LLVM IR to stdout |
-| `-I <dirs>` | Colon-separated dirs searched for `.bni` interface files (repeatable; later flags append). The first entry is the project root for package resolution. |
-| `-L <dirs>` | Colon-separated dirs searched for impl directories (repeatable). |
+| `-I <dirs>` | Colon-separated dirs searched for `.bni` interface files (repeatable; later flags append). The first entry is the project root for package resolution. Falls back to `BINATE_PACKAGE_INTERFACE_PATH` (see Environment). |
+| `-L <dirs>` | Colon-separated dirs searched for impl directories (repeatable). Falls back to `BINATE_PACKAGE_IMPL_PATH` (see Environment). |
 | `--pkg <path>` | Compile a single package (requires `-I`) |
 | `-g`, `--debug` | Emit DWARF debug info |
 | `-v`, `--verbose` | Verbose logging |
 | `--test` | Compile the given packages into a unit-test binary and print its path — run that binary to execute the tests |
+
+## Environment
+
+When the matching flag is absent, a search path is taken from the environment:
+
+- `BINATE_PACKAGE_INTERFACE_PATH` (alias `BINATE_BNI_PATH`) — supplies `-I`.
+- `BINATE_PACKAGE_IMPL_PATH` (alias `BINATE_IMPL_PATH`) — supplies `-L`.
+
+Each is a colon-separated list, same syntax as the flag. The flag wins per path
+(a path given on the command line ignores its env var); the long form wins over
+the short alias when both are set.
 
 ## Examples
 

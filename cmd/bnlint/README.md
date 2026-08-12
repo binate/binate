@@ -29,9 +29,21 @@ bundle (`scripts/fetch-builder.sh --check-tools --tool bnlint`); see
 ## Flags
 
 - `-I <dirs>` / `--interface-path <dirs>` — Colon-separated dirs searched for
-  `.bni` files.  Repeatable; the first entry seeds the source root.  Required.
+  `.bni` files.  Repeatable; the first entry seeds the source root.  Required
+  unless supplied by the environment (see below).
 - `-L <dirs>` / `--impl-path <dirs>` — Colon-separated dirs searched for impl
   directories.  Repeatable.
+
+## Environment
+
+When the matching flag is absent, a search path is taken from the environment:
+
+- `BINATE_PACKAGE_INTERFACE_PATH` (alias `BINATE_BNI_PATH`) — supplies `-I`.
+- `BINATE_PACKAGE_IMPL_PATH` (alias `BINATE_IMPL_PATH`) — supplies `-L`.
+
+Each is a colon-separated list, same syntax as the flag.  The flag wins per
+path (a path given on the command line ignores its env var); the long form
+wins over the short alias when both are set.
 
 ## Output
 

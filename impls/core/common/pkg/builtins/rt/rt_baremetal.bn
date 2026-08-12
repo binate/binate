@@ -1,330 +1,223 @@
-// Bare-metal ARM32 implementation of pkg/builtins/rt.  Gated to bare-metal
-// targets by its #[build(...)] constraint; every other target uses the
-// hosted (libc) variant in rt.bn.
+// Bare-metal ARM32 Raw-allocator backend for pkg/builtins/rt.  Gated to bare-metal
+// targets by #[build(...)]; every other target uses the hosted (libc) backend in
+// rt.bn.  This file supplies ONLY the per-target Raw layer — RawAlloc / RawAllocZero /
+// RawFree, plus Abort and the semihosting stderr sink; the target-agnostic managed /
+// refcount layer lives once in rt_managed.bn and the fault handlers in rt_diag.bn.
 //
-// Differs from the libc-host pkg/builtins/rt only in the underlying
-// transport for two host primitives:
-//   - Exit → semihost.SemihostExit (vs the libc-host's C `exit`)
-//   - RawAlloc / RawAllocZero / RawFree → in-process bump
-//     allocator over a static `heap` array (vs the libc-host's C
-//     `malloc` / `calloc` / `free`)
+// The allocator is SFL: size-classed segregated free lists carved from one static
+// arena, WITH RECLAMATION (unlike the earlier bump allocator, which never reclaimed
+// and exhausted its heap under refcount-heavy workloads — the unit-test suites
+// allocate-and-free far more than the arena holds cumulatively).  A reclaiming free
+// list is bounded by the PEAK-LIVE set, not cumulative allocation, so the 4 MiB arena
+// is now generous rather than marginal.  Small requests (payload <= SMALL_MAX) round up
+// to an 8-byte granule and are served / returned via a per-class LIFO free list, O(1);
+// a fresh block is carved from a monotonic frontier only on a class miss.  Large
+// requests use one first-fit free list (no splitting, no coalescing — the historically
+// bug-prone allocator parts are simply absent).  There is no locking (single-threaded).
+// A boundary-tag COALESCING backend (see explorations/claude-todo.md) is the documented
+// drop-in upgrade behind this same Raw contract if a phase-shift / large-variable-buffer
+// workload ever blows the segregated arena.
 //
-// Everything else (MemCopy / MemZero — pure-Binate byte loops in
-// both impls now — plus Alloc, Free, RefInc / RefDec, BoundsCheck,
-// Box, MakeManagedSlice, headerPtr, etc.) is target-agnostic and
-// identical to the libc-host impl — kept here verbatim so the bare-
-// metal target supplies a complete pkg/builtins/rt.
-//
-// Bump-allocator caveats: Free is a no-op (allocations are never
-// reclaimed); refcount-driven reuse doesn't happen.  Enough for
-// v1's QEMU-bound conformance subset — replace with a real free-
-// list before serious workloads.
+// CORRECTNESS INVARIANTS (the review checklist):
+//   1. Free-list heads / links hold ABSOLUTE addresses, never arena offsets, so 0 is a
+//      safe "empty" sentinel (the arena's address is never 0).
+//   2. Every block carries a fixed 8-BYTE size prefix (NOT sizeof(int)): on arm32
+//      int == 4, so a 4-byte prefix would land the payload at base+4 — misaligned —
+//      and every managed access would DATA-ABORT and hang.  An 8-byte prefix keeps the
+//      payload 8-aligned by induction (8-aligned arena base + 8-multiple carves).
+//   3. RawAllocZero MUST MemZero — reused blocks are dirty (the old bump code could skip
+//      it only because .bss is zero AND never reused).
+//   4. Double-free now corrupts a free list rather than being an inert no-op — the same
+//      contract libc `free` has, and rt.bni already declares it UB.  (A stolen prefix
+//      low bit as an alloc/free trap is a cheap future add.)
 #[build(is(os, "baremetal"))]
 package "pkg/builtins/rt"
 
 import "pkg/semihost"
 
-// HEAP_BYTES is the size of the bump-allocator's backing region.
-// 4 MiB fits inside the linker script's 8 MiB RAM with room for
-// .text / .data / stack.  Anything smaller surfaces
-// `rt.RawAlloc: bump heap exhausted` in conformance tests that
-// allocate many managed objects (especially refcount-heavy ones
-// that the bump allocator never reclaims).
-const HEAP_BYTES int = 4194304
+// ARENA_BYTES is the size of the single static backing region.  4 MiB fits inside the
+// linker script's 16 MiB RAM with ample room for .text / .rodata / other .bss / stack.
+// With reclamation the arena need only hold the PEAK-LIVE set, so this is generous.
+const ARENA_BYTES int = 4194304
 
-// heap is the backing region for the bare-metal bump allocator.
-// Lives in .bss (zero-initialized at boot).  bumpPtr advances
-// through it monotonically as RawAlloc hands out chunks.
-//
-// Element type is uint64 (NOT uint8) so the arena's TYPE alignment is 8.  The
-// object emitter places each global at its type alignment: a uint8 (align-1)
-// arena can land at an ODD address when an odd-sized global (e.g. a `uint8`)
-// precedes it in .bss, and since RawAlloc aligns only the OFFSET into the arena,
-// EVERY allocation would then be misaligned — faulting a strict-alignment target
-// (a data abort that hangs bare metal).  A uint64 arena is placed 8-aligned, so
-// RawAlloc's offset alignment suffices.  524288 * 8 == HEAP_BYTES (4 MiB).
-var heap [524288]uint64
+// SMALL_MAX is the largest payload served from the segregated small-class lists; a
+// request whose rounded payload exceeds it uses the large first-fit list.
+const SMALL_MAX int = 1024
 
-// bumpPtr is the bump allocator's high-water mark: the byte offset
-// into heap of the next free chunk.  RawAlloc advances it
-// monotonically; Free never lowers it (allocations aren't reclaimed).
-var bumpPtr int
+// NCLASSES is the number of small size classes — SMALL_MAX / 8 (class ci holds payloads of
+// exactly (ci+1)*8 bytes); it sizes smallHeads so the array length, the class count, and the
+// SMALL_MAX bound are all driven from SMALL_MAX (no drift between three spellings of one quantity).
+const NCLASSES int = SMALL_MAX / 8
 
-// Management header layout (2 words = 16 bytes):
-//   word 0: refcount (int)
-//   word 1: free function pointer (int, stored as int)
-// Header sits at negative offset from payload pointer.
+// PREFIX is the fixed per-block size-prefix in bytes (invariant #2).
+const PREFIX int = 8
 
-// HEADER_WORDS is the size of the management header in words
-// (refcount + free_fn).  Always 2, regardless of target.
-const HEADER_WORDS int = 2
+// arena is the backing region.  Element type uint64 (NOT uint8) so its TYPE alignment
+// is 8: the object emitter places each global at its type alignment, so a uint8 arena
+// could land at an odd address after an odd-sized .bss global and every allocation
+// would then be misaligned (a data abort that hangs bare metal).  A uint64 arena is
+// placed 8-aligned.  524288 * 8 == ARENA_BYTES (4 MiB).
+var arena [524288]uint64
 
-// HEADER_SIZE is the size of the management header in bytes —
-// HEADER_WORDS * sizeof(int).  16 under LP64, 8 under arm32-linux
-// (4-byte int) — 2 * sizeof(int), the header layout every allocator in
-// this package shares.
-const HEADER_SIZE int = HEADER_WORDS * cast(int, sizeof(int))
+// frontier is the ABSOLUTE address of the next never-yet-carved byte (the bump front;
+// reuse never touches it).  0 means "not yet initialized" — a valid frontier is always
+// >= the arena's (nonzero) base, so lazy-init on first use is unambiguous.
+var frontier int
 
-// Function-value `data`-record kind tags. When the data slot of a
-// function value is non-null, it points at a record whose first
-// word is one of these constants. Lets every dispatcher
-// (BC_CALL_FUNC_VALUE, the cross-mode trampoline, future Phase 2
-// closure handling) tell apart what's behind the pointer without
-// fragile null-vs-non-null heuristics.
-const (
-	// VM-side function value: data points at a VMClosureRec
-	// `{ kind, vm_func_idx, captured_ctx_or_nil }`.
-	DATA_KIND_VM_CLOSURE_REC int = 1
+// smallHeads[ci] is the head of class ci's LIFO free list — the ABSOLUTE address of a
+// free block, or 0 for empty (invariant #1).  Zero-initialized in .bss ⇒ all empty.
+var smallHeads [NCLASSES]int
 
-	// Phase 2 placeholder: compiled-side capturing closure. data
-	// points at a per-closure captured-fields struct. The constant
-	// is reserved now so the dispatch shape doesn't have to be
-	// re-touched when Phase 2 lands.
-	DATA_KIND_COMPILED_CLOSURE int = 2
-)
+// largeHead is the single first-fit free list for blocks with payload > SMALL_MAX
+// (ABSOLUTE address; 0 == empty).
+var largeHead int
 
-// alignUp rounds `n` up to the next multiple of `alignment`.
-// `alignment` must be a power of 2.
+// alignUp rounds n up to the next multiple of alignment (a power of 2).
 func alignUp(n int, alignment int) int {
 	return (n + alignment - 1) & ~(alignment - 1)
 }
 
-// RawAlloc allocates size bytes of uninitialized memory from the
-// bump heap.  Aborts the process if size <= 0 or if the heap is
-// exhausted.  No reclamation — see HEAP_BYTES comment.
+// arenaBase returns the arena's absolute base address (8-aligned by the uint64 element
+// type).  Cheap — the address of a global — so recomputed rather than cached.
+//
+// Addresses are held in `int` (pointer-width on the live targets — ILP32 arm32 int=4, LP64
+// int=8) and compared as signed in carve's bound check, which assumes the arena sits in the
+// non-negative half of the address space (arm32 bare metal places it at 0x40000000, far below
+// 0x7FFFFFFF).  A backend whose arena straddled the sign bit would need unsigned comparison.
+func arenaBase() int {
+	return bit_cast(int, &arena[0])
+}
+
+// storeSize writes the block's payload size into the low int of its 8-byte prefix at the
+// block base.  Only the low int is used (the full 8 bytes exist for payload alignment,
+// invariant #2); size fits an int (<= ARENA_BYTES).
+func storeSize(base int, need int) {
+	var p *int = bit_cast(*int, base)
+	p[0] = need
+}
+
+// sizeAt reads the payload size back from a block's prefix (the low int at the block base).
+func sizeAt(base int) int {
+	var p *int = bit_cast(*int, base)
+	return p[0]
+}
+
+// payloadPtr returns the caller-visible payload pointer for a block base: base + PREFIX
+// (8-aligned since base is 8-aligned).
+func payloadPtr(base int) *uint8 {
+	return bit_cast(*uint8, base + PREFIX)
+}
+
+// blockBaseOf recovers a block's base address from its payload pointer (payload - PREFIX).
+func blockBaseOf(ptr *uint8) int {
+	return bit_cast(int, ptr) - PREFIX
+}
+
+// nextOf reads a FREE block's next-link, overlaid in the first int of its (now-dead) payload
+// at base + PREFIX.  The smallest class is 8 payload bytes >= a pointer, so the link always
+// fits and overlays no live data.
+func nextOf(base int) int {
+	var p *int = bit_cast(*int, base + PREFIX)
+	return p[0]
+}
+
+// setNext writes a FREE block's next-link (see nextOf for the overlay).
+func setNext(base int, nxt int) {
+	var p *int = bit_cast(*int, base + PREFIX)
+	p[0] = nxt
+}
+
+// carve hands out a fresh block of `need` payload bytes (need already 8-aligned) from
+// the monotonic frontier, storing its size prefix.  Aborts on arena exhaustion.
+func carve(need int) int {
+	var abase int = arenaBase()
+	if frontier == 0 { frontier = abase } // lazy init (invariant #1: absolute)
+	var base int = frontier
+	var newFrontier int = base + PREFIX + need
+	if newFrontier > abase + ARENA_BYTES {
+		abortWithMessage("rt.RawAlloc: arena exhausted\n")
+	}
+	frontier = newFrontier
+	storeSize(base, need)
+	return base
+}
+
+// RawAlloc allocates size bytes of uninitialized memory from the arena.  Aborts if
+// size <= 0 or the arena is exhausted.  Small requests reuse a per-class free block
+// (O(1)) or carve fresh; large requests first-fit the large list or carve fresh.
 func RawAlloc(size int) *uint8 {
 	if size <= 0 {
 		abortWithMessage("rt.RawAlloc: size must be > 0\n")
 	}
-	// 8-byte align so refcount-header / pointer fields land
-	// naturally on the next allocation.
-	var start int = alignUp(bumpPtr, 8)
-	var end int = start + size
-	if end > HEAP_BYTES {
-		abortWithMessage("rt.RawAlloc: bump heap exhausted\n")
+	var need int = alignUp(size, 8)
+	if need <= SMALL_MAX {
+		var ci int = need / 8 - 1
+		var b int = smallHeads[ci]
+		if b != 0 {
+			// reuse — O(1) pop
+			smallHeads[ci] = nextOf(b)
+			return payloadPtr(b) // b's prefix already == need
+		}
+		return payloadPtr(carve(need))
 	}
-	bumpPtr = end
-	// heap is [uint64]; start is 8-aligned (alignUp above), so start/8 is the
-	// element index at byte offset start.  Return a byte pointer to it — 8-aligned
-	// because the arena base is 8-aligned (uint64 element type) and start is too.
-	return bit_cast(*uint8, &heap[start / 8])
+	// large: first-fit scan (few large blocks), whole block, no split.
+	var prev int = 0
+	var b int = largeHead
+	for b != 0 {
+		if sizeAt(b) >= need {
+			if prev == 0 {
+				largeHead = nextOf(b)
+			} else {
+				setNext(prev, nextOf(b))
+			}
+			return payloadPtr(b)
+		}
+		prev = b
+		b = nextOf(b)
+	}
+	return payloadPtr(carve(need))
 }
 
-// RawAllocZero allocates size bytes of zero-initialized memory.
-// The bump heap lives in .bss (zero at boot) and we never reuse
-// bytes, so freshly-bumped bytes are already zero — same as
-// RawAlloc.
+// RawAllocZero allocates size bytes of zero-initialized memory.  Reused blocks are
+// dirty, so it MUST explicitly zero the caller-requested bytes (invariant #3).
 func RawAllocZero(size int) *uint8 {
-	return RawAlloc(size)
+	var p *uint8 = RawAlloc(size)
+	MemZero(p, size)
+	return p
 }
 
-// RawFree releases a raw allocation.  No-op for the bump
-// allocator — bytes are never returned.
+// RawFree returns a block to its size class's free list (O(1) push).  nil is a no-op;
+// double-free is UB (see rt.bni) — it would push a live block onto a free list.
 func RawFree(ptr *uint8) {
 	if ptr == nil { return }
-}
-
-// MemCopy copies size bytes from src to dst (no overlap). size ==
-// 0 is a no-op (no pointer requirements); size < 0 aborts.
-// Byte-at-a-time loop — replaceable with an arm32-tuned word-copy
-// once perf matters.
-func MemCopy(dst *uint8, src *readonly uint8, size int) {
-	if size == 0 { return }
-	if size < 0 {
-		abortWithMessage("rt.MemCopy: size must be >= 0\n")
-	}
-	for i := 0; i < size; i++ {
-		dst[i] = src[i]
+	var base int = blockBaseOf(ptr)
+	var n int = sizeAt(base)
+	if n <= SMALL_MAX {
+		var ci int = n / 8 - 1
+		setNext(base, smallHeads[ci])
+		smallHeads[ci] = base
+	} else {
+		setNext(base, largeHead)
+		largeHead = base
 	}
 }
 
-// MemZero writes size zero bytes starting at ptr.  Byte-at-a-time
-// loop — replaceable with a word-store loop once perf matters.
-func MemZero(ptr *uint8, size int) {
-	if size == 0 { return }
-	if size < 0 {
-		abortWithMessage("rt.MemZero: size must be >= 0\n")
-	}
-	for i := 0; i < size; i++ {
-		ptr[i] = 0
-	}
-}
-
-// rtWriteRawStderr is the bare-metal target's raw fault-diagnostic sink: n bytes
-// at ptr to the semihosting debug console, one byte at a time via
-// SemihostWriteChar (SYS_WRITEC).  Semihosting has a single console (no
-// stdout/stderr split), so the name simply matches the hosted variant, where
-// rt's fault output goes to fd 2.  The target-neutral formatter,
-// abortWithMessage, and the fault handlers that write through it (BoundsFail /
-// DivFail / ShiftFail / AssertFail / Panic) live in rt_diag.bn.
+// rtWriteRawStderr is the bare-metal target's raw fault-diagnostic sink: n bytes at ptr
+// to the semihosting debug console, one byte at a time via SemihostWriteChar (SYS_WRITEC).
+// Semihosting has a single console (no stdout/stderr split), so the name simply matches
+// the hosted variant.  The target-neutral formatter, abortWithMessage, and the fault
+// handlers that write through it (BoundsFail / DivFail / ShiftFail / AssertFail / Panic)
+// live in rt_diag.bn.
 func rtWriteRawStderr(ptr *uint8, n int) {
 	for i := 0; i < n; i++ {
 		semihost.SemihostWriteChar(cast(char, ptr[i]))
 	}
 }
 
-// Abort terminates abnormally for an unrecoverable runtime fault / "this should
-// never happen" condition.  Bare-metal has no libc abort()/SIGABRT, so it exits
-// with a nonzero status via semihosting (the closest available "crash").
+// Abort terminates abnormally for an unrecoverable runtime fault / "this should never
+// happen" condition.  Bare-metal has no libc abort()/SIGABRT, so it exits with a nonzero
+// status via semihosting (the closest available "crash").
 func Abort() {
 	semihost.SemihostExit(1)
 	for {}
-}
-
-// Alloc allocates a managed object with the given payload size.
-// Returns a pointer to the payload; the header (refcount=1,
-// free_fn=&RawFree) is at a negative offset. The payload is zero-
-// initialized. The free_fn slot records *which* allocator's free
-// function releases this allocation — Free reads it and dispatches
-// indirectly. A different pkg/builtins/rt impl that doesn't use libc-backed
-// RawAlloc would still set header[1] to *its own* free function;
-// Free's body doesn't need to know which.
-func Alloc(payloadSize int) *uint8 {
-	var totalSize int = HEADER_SIZE + payloadSize
-	var base *uint8 = RawAlloc(totalSize)
-	var header *int = bit_cast(*int, base)
-	header[0] = 1 // refcount = 1
-	header[1] = bit_cast(int, _func_handle(RawFree))
-	var payload *uint8 = bit_cast(*uint8, &header[HEADER_WORDS])
-	MemZero(payload, payloadSize)
-	return payload
-}
-
-// headerPtr returns a pointer to the management header for a managed payload.
-// The header is HEADER_SIZE bytes before the payload pointer.
-func headerPtr(ptr *uint8) *int {
-	// ptr points to payload; header is HEADER_WORDS ints before it
-	var asInt *int = bit_cast(*int, ptr)
-	var addr int = bit_cast(int, asInt)
-	var headerAddr int = addr - HEADER_SIZE
-	return bit_cast(*int, headerAddr)
-}
-
-// Free releases the memory for a managed payload (including its header).
-// ptr must be a managed payload pointer from Alloc, or nil (no-op).
-// Dispatches through header[1] — the free_fn slot, the allocator-CHOSEN
-// deallocation step (spec §18.2 mem.header / §7b type.layout.header) — so a
-// value's origin allocator releases it, which matters for cross-allocator
-// scenarios where origin and current owner disagree on a globally-hardcoded
-// free function.  header[1] == 0 is the sentinel for an allocator that left
-// free_fn unspecified: default to RawFree.  This is INDEPENDENT of immortality
-// — immortal static-managed data also carries free_fn == 0, but a negative
-// refcount (not free_fn) guards it in RefDec, so it never reaches Free.
-func Free(ptr *uint8) {
-	if ptr == nil { return }
-	var h *int = headerPtr(ptr)
-	if h[1] == 0 {
-		RawFree(bit_cast(*uint8, h))
-		return
-	}
-	var freeFn *uint8 = bit_cast(*uint8, h[1])
-	_call_free_fn(freeFn, bit_cast(*uint8, h))
-}
-
-// RefInc increments the reference count. ptr must be a managed payload pointer, or nil (no-op).
-func RefInc(ptr *uint8) {
-	if ptr == nil { return }
-	var h *int = headerPtr(ptr)
-	if h[0] < 0 { return } // immortal static-managed data — never counted
-	h[0] = h[0] + 1
-}
-
-// RefDec decrements the reference count. If it reaches zero, calls dtor (if non-nil)
-// to clean up managed fields, then frees the allocation. ptr must be a managed
-// payload pointer, or nil (no-op).
-func RefDec(ptr *uint8, dtor *uint8) {
-	if ptr == nil { return }
-	var h *int = headerPtr(ptr)
-	if h[0] < 0 { return } // immortal static-managed data — never counted
-	if h[0] == 0 {
-		BoundsFail(h[0], 0) // abuse bounds_fail to print the bad refcount
-	}
-	h[0] = h[0] - 1
-	if h[0] == 0 {
-		if dtor != nil {
-			_call_dtor(dtor, ptr)
-		}
-		Free(ptr)
-	}
-}
-
-// ZeroRefDestroy is the slow-path helper for the inline RefDec fast
-// path. Backends that inline RefDec call this when the decrement leaves
-// the refcount at zero — at which point ptr is non-nil (the inline
-// fast path filtered nil) and the refcount has already been written
-// out as zero by the caller. Runs the optional destructor and frees.
-func ZeroRefDestroy(ptr *uint8, dtor *uint8) {
-	if dtor != nil {
-		_call_dtor(dtor, ptr)
-	}
-	Free(ptr)
-}
-
-// Refcount returns the current reference count of a managed allocation.
-// ptr must be a managed payload pointer (i.e., the result of Alloc or
-// the raw pointer underlying an @T). Use bit_cast to convert @T to *uint8.
-func Refcount(ptr *uint8) int {
-	if ptr == nil { return 0 }
-	var h *int = headerPtr(ptr)
-	return h[0]
-}
-
-// BoundsCheck aborts with a bounds-failure diagnostic if index is out of [0, length).
-func BoundsCheck(index int, length int) {
-	if index < 0 || index >= length {
-		BoundsFail(index, length)
-	}
-}
-
-// DivCheck aborts if an integer divide/remainder would fault. dividend
-// and divisor are the sign/zero-extended 64-bit operands; signedMin is
-// the operand type's most-negative value (consulted only when isSigned
-// is non-zero). Mirrors BoundsCheck — all the compare logic lives here
-// so the backends only marshal the four arguments.
-func DivCheck(dividend int64, divisor int64, signedMin int64, isSigned int) {
-	if divisor == cast(int64, 0) {
-		DivFail(0)
-	}
-	if isSigned != 0 && dividend == signedMin && divisor == cast(int64, -1) {
-		DivFail(1)
-	}
-}
-
-// ShiftCheck aborts with a negative-shift-count diagnostic if count < 0.
-// count is the sign-extended 64-bit shift count. Mirrors BoundsCheck /
-// DivCheck — all the compare logic lives here so the backends only marshal
-// the one argument.
-func ShiftCheck(count int64) {
-	if count < cast(int64, 0) {
-		ShiftFail()
-	}
-}
-
-// Box allocates a managed copy of size bytes from src and returns the payload pointer.
-// The new allocation has refcount=1.
-func Box(src *uint8, size int) *uint8 {
-	var payload *uint8 = Alloc(size)
-	MemCopy(payload, src, size)
-	return payload
-}
-
-// MakeManagedSlice allocates a zero-initialized managed slice with the given
-// element count. Returns a ManagedSlice where Data and Refptr point to the
-// same allocation (refcount=1). If length is 0, Data and Refptr are nil.
-// A negative length is a programmer error (e.g. an integer-overflowed
-// capacity); trap rather than silently produce a nil-backed, negative-length
-// slice that corrupts on the next write.
-func MakeManagedSlice(elemSize int, length int) ManagedSlice {
-	if length < 0 {
-		abortWithMessage("runtime error: make_slice with negative length\n")
-	}
-	var ms ManagedSlice
-	if length > 0 {
-		var ptr *uint8 = Alloc(length * elemSize)
-		ms.Data = ptr
-		ms.Refptr = ptr
-	}
-	ms.Len = length
-	ms.BackingLen = length
-	return ms
 }

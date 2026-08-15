@@ -1,0 +1,207 @@
+package "pkg/binate/interp"
+
+import "pkg/binate/buf"
+import "pkg/binate/types"
+import "pkg/binate/vm"
+
+// RunFuncTyped calls the package-level function `pkgPath.funcName` (pkgPath is
+// the FULL import path, e.g. "pkg/std/strconv") with typed arguments and returns
+// typed results.  Where RunFunc takes int args and returns one scalar word, this
+// marshals managed / aggregate values (via the checker's resolved param/result
+// types) in both directions.  It runs the package-init dispatcher once (like
+// RunFunc), then the function.  Errors (function not found, a recoverable run
+// fault) are returned as the second value (empty = ok).
+//
+// The caller OWNS the returned Values and MUST call Release() on each once done
+// (a returned managed value arrives +1-owned).  The passed-in arg Values are
+// untouched by the call — the caller still owns and Releases them.
+//
+// Stage B: scalar (int/int64/bool) + @[]char args and a single scalar/@[]char
+// result.  Multi-return, structs, @[]@[]char, and interface-value results land
+// in Stage C (they share the synthetic-struct result-offset layout).
+func (it @Interp) RunFuncTyped(pkgPath *[]readonly char, funcName *[]readonly char,
+		args @[]Value) (@[]Value, @[]@[]char) {
+	var sig @types.Type = it.Checker.PackageType(pkgPath, funcName)
+	if sig == nil {
+		return emptyValues(), oneErr("interp: function not found in the type checker")
+	}
+	if sig.Kind != types.TYP_FUNC {
+		return emptyValues(), oneErr("interp: named symbol is not a function")
+	}
+	if len(sig.Results) > 1 {
+		return emptyValues(), oneErr("interp: multi-return marshaling is not yet supported (Stage C)")
+	}
+	// Only scalar and managed-slice-of-scalar (@[]char / @[]int) params/result are
+	// marshaled today.  A struct / array / raw-slice / interface / func-value or
+	// managed-element slice (@[]@[]char) would nil-retbuf-crash or leak unaccounted
+	// managed fields — reject it here (Stage C) rather than fall through.
+	for pi := 0; pi < len(sig.Params); pi++ {
+		if !supportedMarshalType(sig.Params[pi].Type) {
+			return emptyValues(), oneErr("interp: parameter type not yet supported (Stage C)")
+		}
+	}
+	if len(sig.Results) == 1 && !supportedMarshalType(sig.Results[0]) {
+		return emptyValues(), oneErr("interp: result type not yet supported (Stage C)")
+	}
+	var dotted @[]char = buf.Concat(pkgPath, ".")
+	var qual @[]char = buf.Concat(dotted, funcName)
+	if it.Vm.LookupFunc(qual) < 0 {
+		return emptyValues(), oneErr("interp: function not lowered into the VM")
+	}
+	// Run package init once, mirroring RunFunc — a called function may read
+	// package globals.
+	if it.Vm.LookupFunc("main.__init_all") >= 0 {
+		var noInitArgs @[]int
+		it.Vm.CallFunc("main.__init_all", noInitArgs)
+	}
+
+	var argSlots @[]int = marshalArgs(sig.Params, args)
+	var retSize int = types.AggregateReturnSize(sig.Results)
+	var retbuf @[]uint8
+	var retbufPtr *uint8
+	if retSize > 0 {
+		retbuf = make_slice(uint8, retSize)
+		retbufPtr = &retbuf[0]
+	}
+	var retWord int = it.Vm.CallFuncAggregate(qual, argSlots, retbufPtr, retSize)
+	if it.Vm.Status == vm.VM_STATUS_FAULTED {
+		return emptyValues(), oneErr(it.Vm.FaultMsg)
+	}
+	return unmarshalResults(sig.Results, retWord, retbuf), noErrs()
+}
+
+// marshalArgs lays each arg Value into the VM's flat arg-slot sequence: a scalar
+// rides one slot holding its low word; an aggregate (managed-slice/struct/...)
+// rides one by-address slot holding the address of the Value's image (the VM
+// reads a multi-word arg by address, matching lower_call.bn).  One slot per arg
+// on a 64-bit host; a 64-bit-scalar arg on an ILP32 host needs two slots — a
+// Stage-C follow-up (the interp runs LP64 in CI).
+func marshalArgs(params @[]@types.Param, args @[]Value) @[]int {
+	var slots @[]int = make_slice(int, len(args))
+	for i := 0; i < len(args); i++ {
+		var pt @types.Type
+		if i < len(params) {
+			pt = params[i].Type
+		} else {
+			pt = args[i].Typ
+		}
+		if isByAddressType(pt) {
+			slots[i] = bit_cast(int, &args[i].Bytes[0])
+		} else {
+			// Scalar: zero-extend the value's low SizeOf bytes into the slot.  A
+			// sub-word scalar (bool = 1 byte) must NOT carry the Bytes buffer's
+			// uninitialized slack bytes — the VM tests the full register word, so a
+			// full-word read of a 1-byte buffer could see BoolValue(false) as true.
+			var word int = 0
+			var wb *uint8 = bit_cast(*uint8, &word)
+			var sz int = args[i].Typ.SizeOf()
+			var wsz int = cast(int, sizeof(int))
+			if sz > wsz { sz = wsz }
+			for j := 0; j < sz; j++ {
+				wb[j] = args[i].Bytes[j]
+			}
+			slots[i] = word
+		}
+	}
+	return slots
+}
+
+// unmarshalResults rebuilds Values from a single-or-zero-result call: void →
+// empty; a scalar → the returned word (low SizeOf bytes); a single aggregate →
+// a copy of the retbuf image, which already carries the callee's transferred +1
+// (so the Value owns it — do NOT RefInc on receipt).
+func unmarshalResults(results @[]@types.Type, retWord int, retbuf @[]uint8) @[]Value {
+	if len(results) == 0 {
+		return emptyValues()
+	}
+	var rt0 @types.Type = results[0]
+	var out @[]Value = make_slice(Value, 1)
+	var v Value
+	v.Typ = rt0
+	var sz int = rt0.SizeOf()
+	v.Bytes = make_slice(uint8, sz)
+	if isByAddressType(rt0) {
+		var j int = 0
+		for j < sz {
+			v.Bytes[j] = retbuf[j]
+			j = j + 1
+		}
+	} else {
+		// Copy the low min(sz, word) bytes of the return word; a truncated
+		// int64 on an ILP32 host keeps its high bytes zero (the scalar-path
+		// truncation, documented).
+		var wbytes *uint8 = bit_cast(*uint8, &retWord)
+		var wordSz int = cast(int, sizeof(int))
+		var n int = sz
+		if n > wordSz {
+			n = wordSz
+		}
+		var j int = 0
+		for j < n {
+			v.Bytes[j] = wbytes[j]
+			j = j + 1
+		}
+	}
+	out[0] = v
+	return out
+}
+
+// supportedMarshalType reports whether RunFuncTyped can marshal a value of type
+// t today: a scalar, or a managed-slice whose element is itself a scalar (@[]char
+// / @[]int).  Structs, arrays, raw slices, interface / func values, and managed-
+// element slices (@[]@[]char) are Stage C — see the guards in RunFuncTyped.
+func supportedMarshalType(t @types.Type) bool {
+	if t == nil {
+		return false
+	}
+	var st @types.Type = types.StripWrappers(t)
+	if !isByAddressType(st) {
+		return true // scalar
+	}
+	if st.Kind != types.TYP_MANAGED_SLICE {
+		return false // struct / array / raw slice
+	}
+	return !isByAddressType(st.Elem) // element must be a scalar (not a managed slice)
+}
+
+// isByAddressType reports whether a value of type t is passed / returned by
+// address (a multi-word aggregate the VM references by pointer) rather than in a
+// register word.  Peels named / readonly wrappers first (an ABI decision must see
+// through them).  Interface / func-value aggregates are Stage C.
+func isByAddressType(t @types.Type) bool {
+	if t == nil {
+		return false
+	}
+	var st @types.Type = types.StripWrappers(t)
+	var k int = st.Kind
+	if k == types.TYP_MANAGED_SLICE {
+		return true
+	}
+	if k == types.TYP_SLICE {
+		return true
+	}
+	if k == types.TYP_STRUCT {
+		return true
+	}
+	if k == types.TYP_ARRAY {
+		return true
+	}
+	return false
+}
+
+// emptyValues returns a fresh empty result slice.
+func emptyValues() @[]Value {
+	var e @[]Value
+	return e
+}
+
+// noErrs returns the empty (ok) error bundle.
+func noErrs() @[]@[]char {
+	var e @[]@[]char
+	return e
+}
+
+// oneErr returns a single-message error bundle.
+func oneErr(msg @[]char) @[]@[]char {
+	return appendCharSlice(noErrs(), msg)
+}

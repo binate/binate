@@ -1,20 +1,28 @@
 /* Linker script for the v1 arm32-baremetal target — QEMU's `virt`
  * ARMv7-A machine.
  *
- * Memory map: a single 1 MiB region starting at 0x40000000 (the
+ * Memory map: a single 16 MiB region starting at 0x40000000 (the
  * default `virt` RAM base).  Code and rodata go at the bottom of
  * the region, then data + bss, then stack growing down from the
  * top.  No MMU / paging in v1; identity-mapped flat.
  *
  * Sections we explicitly route:
- *   .text.startup — the crt0's _start label.  Placed first so
- *                   the entry point sits at 0x40000000.
- *   .text         — Binate-compiled code + semihost.s helpers.
+ *   .text.startup — reserved for a startup section placed first; the
+ *                   crt0 now lands in plain .text and the entry point is
+ *                   taken from ENTRY(_start) -> e_entry (QEMU's -kernel
+ *                   loader honors the ELF entry), so its physical position
+ *                   in .text no longer matters.  The KEEP stays as a
+ *                   forward-looking slot for a real-hardware reset vector.
+ *   .text         — crt0 + Binate-compiled code + semihost helpers.
  *   .rodata       — string constants and the per-string
  *                   %BnManagedSlice globals bnc emits.
  *   .data / .bss  — initialized / zero-init globals.
  *
- * `_stack_top` is the symbol crt0.s loads into sp at boot.
+ * `_stack_top` = ORIGIN(RAM) + LENGTH(RAM) (the top of RAM).  crt0.s
+ * does NOT load this symbol — bnas (the assembler for crt0.s) has no
+ * literal-pool / symbol-load pseudo-instruction, so crt0.s hardcodes the
+ * same value via a movw/movt pair.  If you change RAM ORIGIN/LENGTH below,
+ * update crt0.s's movw/movt to match.
  */
 
 ENTRY(_start)

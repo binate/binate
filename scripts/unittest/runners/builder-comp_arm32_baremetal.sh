@@ -47,10 +47,11 @@ runner_setup() {
         exit 2
     fi
     build_gen1
+    build_bnas
 }
 
-# Build the per-invocation `--cflag` / `--link-after-objs` args
-# from $BAREMETAL_LD_FLAGS / $BAREMETAL_LIBGCC_A.  Stored in a
+# Build the per-invocation `--cflag` / `--link-after-objs` / `--bnas` args
+# from $BAREMETAL_LD_FLAGS / $BAREMETAL_LIBGCC_A / $GEN1_BNAS.  Stored in a
 # function so the conformance runner can share the recipe.
 _baremetal_bnc_extra_args() {
     set --
@@ -58,6 +59,9 @@ _baremetal_bnc_extra_args() {
         set -- "$@" --cflag "$BAREMETAL_LD_FLAGS"
     fi
     set -- "$@" --link-after-objs "$BAREMETAL_LIBGCC_A"
+    # bnc assembles the bare-metal `.s` runtime files (crt0.s / semihost.s)
+    # with this bnas rather than clang; built in runner_setup.
+    set -- "$@" --bnas "$GEN1_BNAS"
     printf '%s\n' "$@"
 }
 

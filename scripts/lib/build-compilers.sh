@@ -193,12 +193,32 @@ build_interp_arm32() {
     echo "arm32 compiled interpreter ready: $ARM32_INTERP"
 }
 
+# Build the Binate assembler (bnas): current-tree cmd/bnas compiled by the
+# current-tree cmd/bnc (GEN1_COMPILER) for the host.  bnc invokes this bnas
+# (via --bnas) to assemble `.s` runtime files (arm32-baremetal crt0.s /
+# semihost.s) into `.o` at link time — clang/lld only links the result.  Calls
+# build_gen1 first so the assembler matches the current tree.  Sets GEN1_BNAS.
+build_bnas() {
+    if [ -z "$GEN1_COMPILER" ]; then build_gen1; fi
+    _ensure_compilers_dir
+    GEN1_BNAS="$_COMPILERS_DIR/gen1_bnas"
+    BNAS_BUILD_DIR="$(_new_build_dir)"
+    echo "Building bnas..."
+    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --runtime "$("$BINATE_DIR/scripts/binate-paths.sh" --runtime --base "$BINATE_DIR")" --build-dir "$BNAS_BUILD_DIR" -o "$GEN1_BNAS" "$BINATE_DIR/cmd/bnas" 2>&1)
+    if [ ! -x "$GEN1_BNAS" ]; then
+        echo "ERROR: Failed to build bnas:"
+        echo "$build_out"
+        exit 1
+    fi
+    echo "bnas ready: $GEN1_BNAS"
+}
+
 # Cleanup helper — removes the session dir (which holds every compiler
 # binary + build dir).  The explicit BUILD_DIRS / binary removals are
 # redundant with the session-dir rm but kept as a belt-and-suspenders in
 # case a caller pointed a path elsewhere.
 cleanup_compilers() {
-    rm -f "$GEN1_COMPILER" "$GEN2_COMPILER" "$COMPILED_INTERP" "$BNC_NATIVE"
+    rm -f "$GEN1_COMPILER" "$GEN2_COMPILER" "$COMPILED_INTERP" "$BNC_NATIVE" "$GEN1_BNAS"
     for d in $BUILD_DIRS; do
         rm -rf "$d"
     done

@@ -195,6 +195,8 @@ def bni(t_decls):
 
 MV_INV = "A method VALUE taken off a generic instantiation (or a generic-call result) links + runs: the captured-receiver closure struct is named by the MANGLED instantiation name on every name-mangling backend (2d48f348/fedbd0c5)."
 DISTINCT_INV = "Two generic instantiations differing ONLY within a structured type arg (array LENGTH, func SIGNATURE) are DISTINCT types; assigning one to the other is a compile error (42b3bc83)."
+PI_INV = "A parameterized-receiver impl (`impl @Box[T] : Getter[T]`) lets a concrete `@Box[int]` box into a `@Getter[int]` interface value and dispatch through the per-instantiation vtable (gen.impl.generic-recv; mirrors 447)."
+GC_INV = "A generic function body that calls a method on its type param's CONSTRAINT interface (`func f[T Show](x T) int { return x.show() }`) dispatches correctly in the instantiation (mirrors 434)."
 
 CELLS = []
 for site in ("inpkg", "xpkg"):
@@ -219,6 +221,31 @@ CELLS.append(dict(site="inpkg", rel="method-value/call-result", inv=MV_INV, hold
                          "func (b @Box[T]) Get() T {\n\treturn b.val\n}\n\n"
                          "func mkbox[T any](v T) @Box[T] {\n\tvar b @Box[T] = make(Box[T])\n\tb.val = v\n\treturn b\n}"),
                   body=["var f *func() int = mkbox[int](42).Get", "testing.Println(f())"]))
+
+# --- second-wave dispatch cells (plan's deferred axes; in-package minimal per the
+# plan's "after a minimal cell of each compiles").  Each exercises a DISTINCT
+# generic-dispatch path the method-value/balance cells do not.  (The plan's third
+# second-wave axis, a method EXPRESSION off a generic instantiation `Box[int].Get`,
+# is NOT emitted: the compiler rejects it — `Box[int]` parses as an index
+# expression, not a generic instantiation for a method expression.  Tracked as a
+# compiler gap in claude-todo.md; add the cell when it is supported.)
+# parameterized-receiver-impl dispatch (`impl @Box[T] : Getter[T]`, via iface value).
+CELLS.append(dict(site="inpkg", rel="param-impl/dispatch", inv=PI_INV, holder=False, exp=[42],
+                  decls=("interface Getter[T any] {\n\tGet() T\n}\n\n"
+                         "type Box[T any] struct {\n\tval T\n}\n\n"
+                         "func (b @Box[T]) Get() T {\n\treturn b.val\n}\n\n"
+                         "impl @Box[T] : Getter[T]"),
+                  body=["var b @Box[int] = make(Box[int])", "b.val = 42",
+                        "var g @Getter[int] = b", "testing.Println(g.Get())"]))
+# generic-constraint dispatch (call a constraint-interface method on a type param).
+CELLS.append(dict(site="inpkg", rel="constraint/dispatch", inv=GC_INV, holder=False, exp=[42],
+                  decls=("interface Show {\n\tshow() int\n}\n\n"
+                         "type Widget struct {\n\tv int\n}\n\n"
+                         "func (w *Widget) show() int {\n\treturn w.v\n}\n\n"
+                         "impl *Widget : Show\n\n"
+                         "func showIt[T Show](x T) int {\n\treturn x.show()\n}"),
+                  body=["var w Widget", "w.v = 42", "var p *Widget = &w",
+                        "testing.Println(showIt[*Widget](p))"]))
 
 # type-distinctness compile-error PAIR cells (neg: assign must fail).
 CELLS.append(dict(site="inpkg", rel="distinct/array-len", inv=DISTINCT_INV, holder=False,

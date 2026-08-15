@@ -16,9 +16,10 @@ import "pkg/binate/vm"
 // (a returned managed value arrives +1-owned).  The passed-in arg Values are
 // untouched by the call — the caller still owns and Releases them.
 //
-// Stage B: scalar (int/int64/bool) + @[]char args and a single scalar/@[]char
-// result.  Multi-return, structs, @[]@[]char, and interface-value results land
-// in Stage C (they share the synthetic-struct result-offset layout).
+// Supported today: scalar (int/int64/bool) + @[]char + by-value struct (fields
+// themselves supported, SizeOf <= 64) args and a single such result.  Multi-
+// return, @[]@[]char, and interface-value results are later Stage-C increments
+// (they share the synthetic-struct result-offset layout).
 func (it @Interp) RunFuncTyped(pkgPath *[]readonly char, funcName *[]readonly char,
 		args @[]Value) (@[]Value, @[]@[]char) {
 	var sig @types.Type = it.Checker.PackageType(pkgPath, funcName)
@@ -31,16 +32,15 @@ func (it @Interp) RunFuncTyped(pkgPath *[]readonly char, funcName *[]readonly ch
 	if len(sig.Results) > 1 {
 		return emptyValues(), oneErr("interp: multi-return marshaling is not yet supported (Stage C)")
 	}
-	// Only scalar and managed-slice-of-scalar (@[]char / @[]int) params/result are
-	// marshaled today.  A struct / array / raw-slice / interface / func-value or
-	// managed-element slice (@[]@[]char) would nil-retbuf-crash or leak unaccounted
-	// managed fields — reject it here (Stage C) rather than fall through.
+	// Guard every param and the single result against a not-yet-marshalable type
+	// (see supportedMarshalType) rather than fall through to a nil-retbuf crash or
+	// an unaccounted-managed-field leak.
 	for pi := 0; pi < len(sig.Params); pi++ {
-		if !supportedMarshalType(sig.Params[pi].Type) {
+		if !supportedParamType(sig.Params[pi].Type) {
 			return emptyValues(), oneErr("interp: parameter type not yet supported (Stage C)")
 		}
 	}
-	if len(sig.Results) == 1 && !supportedMarshalType(sig.Results[0]) {
+	if len(sig.Results) == 1 && !supportedResultType(sig.Results[0]) {
 		return emptyValues(), oneErr("interp: result type not yet supported (Stage C)")
 	}
 	var dotted @[]char = buf.Concat(pkgPath, ".")
@@ -147,21 +147,85 @@ func unmarshalResults(results @[]@types.Type, retWord int, retbuf @[]uint8) @[]V
 }
 
 // supportedMarshalType reports whether RunFuncTyped can marshal a value of type
-// t today: a scalar, or a managed-slice whose element is itself a scalar (@[]char
-// / @[]int).  Structs, arrays, raw slices, interface / func values, and managed-
-// element slices (@[]@[]char) are Stage C — see the guards in RunFuncTyped.
+// t today: a scalar; a managed-slice whose element is itself a scalar (@[]char /
+// @[]int); or a struct (SizeOf <= 64) every field of which is itself supported.
+// Arrays, raw slices, interface / func values, managed-pointer values, and
+// managed-element slices (@[]@[]char) are later Stage-C increments.
+//
+// The predicate must admit *exactly* the set releaseImage can fully free — never
+// wider (an over-wide admit leaks or reads garbage).  In particular a managed
+// single/double-word value (@T, @func, @Iface) is NOT a marshalable scalar: it
+// needs a cross-mode dtor handle Release can't yet invoke, so the scalar arm
+// rejects anything that NeedsDestruction rather than treating a bare managed
+// pointer word as a harmless scalar.
 func supportedMarshalType(t @types.Type) bool {
 	if t == nil {
 		return false
 	}
 	var st @types.Type = types.StripWrappers(t)
 	if !isByAddressType(st) {
-		return true // scalar
+		// Single-word by-value type.  Admit only a genuine (non-managed) scalar
+		// that fits in a register word — a managed word (@T / @func / @Iface, all
+		// NeedsDestruction) would leak, and an over-word-size non-managed value
+		// (e.g. a 2-word unmanaged interface) does not fit a scalar slot.
+		if st.NeedsDestruction() {
+			return false
+		}
+		return st.SizeOf() <= cast(int, sizeof(int))
 	}
-	if st.Kind != types.TYP_MANAGED_SLICE {
-		return false // struct / array / raw slice
+	if st.Kind == types.TYP_STRUCT {
+		// A by-value struct rides the retbuf; CallFuncAggregate's copy window caps
+		// it at 64 bytes, and every field must itself be marshalable so
+		// releaseImage's field walk stays total (no unhandled managed kind).
+		if st.SizeOf() > 64 {
+			return false
+		}
+		for i := 0; i < len(st.Fields); i++ {
+			if !supportedMarshalType(st.Fields[i].Type) {
+				return false
+			}
+		}
+		return true
 	}
-	return !isByAddressType(st.Elem) // element must be a scalar (not a managed slice)
+	if st.Kind == types.TYP_MANAGED_SLICE {
+		// The element must free with NO dtor — releaseImage RefDecs the backing
+		// once and does not walk elements yet.  Gate on NeedsDestruction, not
+		// isByAddressType: a managed single-word element (@[]@Node) is not
+		// by-address but DOES need per-element RefDecs, so admitting it would leak
+		// every element (SI-2 relaxes this to recurse).
+		return !st.Elem.NeedsDestruction()
+	}
+	return false // raw slice / array — a later increment
+}
+
+// supportedParamType reports whether RunFuncTyped can pass a value of type t as a
+// call ARGUMENT.  Beyond supportedMarshalType, a by-address argument must ALSO be
+// one the VM takes by address (IsAggregateArg): a small struct (<= one word) is
+// coerced in-register by the ABI, so marshalArgs' by-address hand-off of &Bytes[0]
+// would mismatch the callee — reject that classifier disagreement.
+func supportedParamType(t @types.Type) bool {
+	if !supportedMarshalType(t) {
+		return false
+	}
+	if isByAddressType(t) {
+		return types.IsAggregateArg(t)
+	}
+	return true
+}
+
+// supportedResultType reports whether RunFuncTyped can unpack a single RESULT of
+// type t.  Beyond supportedMarshalType, a by-address result must ALSO actually be
+// returned via the retbuf (IsAggregateReturnTyp): a small anonymous struct is
+// classified by-address by isByAddressType but returned as a SCALAR (retbuf size
+// 0), so unmarshalResults would read an empty retbuf — reject that disagreement.
+func supportedResultType(t @types.Type) bool {
+	if !supportedMarshalType(t) {
+		return false
+	}
+	if isByAddressType(t) {
+		return types.IsAggregateReturnTyp(t)
+	}
+	return true
 }
 
 // isByAddressType reports whether a value of type t is passed / returned by

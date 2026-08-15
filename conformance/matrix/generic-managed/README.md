@@ -61,14 +61,19 @@ constraint interface, mirroring `434`).  The `iface` balance element's `xpkg`
 cell uses `gh.At[@Numbered](h,0).num()` — an iface-method CALL on a generic-call
 result — so it regression-guards conformance/1027 (fixed in `dfbdf1dd`).
 
+The plan's third second-wave axis, a method EXPRESSION off a generic
+instantiation (`method-expression/scalar`, `Box[int].Get`), is present as an
+**XFAIL cell** (`.xfail.all`): the compiler rejects it — `Box[int]` parses as an
+index expression, not a generic instantiation for a method expression
+(`(Box[int]).Get` fails identically). The bound method-VALUE forms already work
+(`method-value/*`); only this unbound expression-on-generic form is missing. The
+cell XPASS-alerts when the compiler supports it; gap tracked in
+`explorations/claude-todo.md`.
+
 Planned follow-ups: array-of-managed / nested-generic element kinds; `copy`
 and `destroy-populated` ops; and cross-package variants of the two dispatch
 cells (the bug-dense mangling axis — needs the generator's `xpkg` fixture
-generalized past the single `Holder`).  The plan's third second-wave axis, a
-method EXPRESSION off a generic instantiation (`Box[int].Get`), is NOT yet a
-cell: the compiler rejects it (`Box[int]` parses as an index expression, not a
-generic instantiation for a method expression) — a gap tracked in
-`explorations/claude-todo.md`.
+generalized past the single `Holder`).
 
 Mode scope: green under the six default modes + native x64/aa64. `native-arm32`
 (`builder-comp_native_arm32_baremetal`) is an incomplete backend — any red there is

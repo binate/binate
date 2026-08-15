@@ -196,6 +196,7 @@ def bni(t_decls):
 MV_INV = "A method VALUE taken off a generic instantiation (or a generic-call result) links + runs: the captured-receiver closure struct is named by the MANGLED instantiation name on every name-mangling backend (2d48f348/fedbd0c5)."
 DISTINCT_INV = "Two generic instantiations differing ONLY within a structured type arg (array LENGTH, func SIGNATURE) are DISTINCT types; assigning one to the other is a compile error (42b3bc83)."
 PI_INV = "A parameterized-receiver impl (`impl @Box[T] : Getter[T]`) lets a concrete `@Box[int]` box into a `@Getter[int]` interface value and dispatch through the per-instantiation vtable (gen.impl.generic-recv; mirrors 447)."
+ME_INV = "A method EXPRESSION off a generic instantiation (`Box[int].Get`, receiver as first param — the unbound form of the method value) should link + run with the qualified method name mangled per instantiation.  XFAIL: the compiler parses `Box[int]` as an index expression, not a generic instantiation for a method expression, so `Box[int].Get` (and `(Box[int]).Get`) do not compile — a gap this cell tracks (XPASS = fixed)."
 GC_INV = "A generic function body that calls a method on its type param's CONSTRAINT interface (`func f[T Show](x T) int { return x.show() }`) dispatches correctly in the instantiation (mirrors 434)."
 
 CELLS = []
@@ -224,11 +225,17 @@ CELLS.append(dict(site="inpkg", rel="method-value/call-result", inv=MV_INV, hold
 
 # --- second-wave dispatch cells (plan's deferred axes; in-package minimal per the
 # plan's "after a minimal cell of each compiles").  Each exercises a DISTINCT
-# generic-dispatch path the method-value/balance cells do not.  (The plan's third
-# second-wave axis, a method EXPRESSION off a generic instantiation `Box[int].Get`,
-# is NOT emitted: the compiler rejects it — `Box[int]` parses as an index
-# expression, not a generic instantiation for a method expression.  Tracked as a
-# compiler gap in claude-todo.md; add the cell when it is supported.)
+# generic-dispatch path the method-value/balance cells do not.
+# method EXPRESSION off a generic instantiation (unbound `Box[int].Get`).  XFAIL:
+# the compiler parses `Box[int]` as an index expression (a compiler gap, tracked in
+# claude-todo.md); this cell XPASS-alerts when method expressions on generic
+# instantiations are supported.
+CELLS.append(dict(site="inpkg", rel="method-expression/scalar", inv=ME_INV, holder=False, exp=[42],
+                  xfail="method expression off a generic instantiation (`Box[int].Get`) — compiler parses `Box[int]` as an index expression; unsupported (see claude-todo.md)",
+                  decls="type Box[T any] struct {\n\tval T\n}\n\nfunc (b *Box[T]) Get() T {\n\treturn b.val\n}",
+                  body=["var bx Box[int]", "bx.val = 42",
+                        "var f *func(*Box[int]) int = Box[int].Get",
+                        "testing.Println(f(&bx))"]))
 # parameterized-receiver-impl dispatch (`impl @Box[T] : Getter[T]`, via iface value).
 CELLS.append(dict(site="inpkg", rel="param-impl/dispatch", inv=PI_INV, holder=False, exp=[42],
                   decls=("interface Getter[T any] {\n\tGet() T\n}\n\n"
@@ -303,6 +310,8 @@ def main():
                 _write(base + ".error", c["err"] + "\n", changed, check)
             else:
                 _write(base + ".expected", exp, changed, check)
+                if c.get("xfail"):  # fails in EVERY mode → one .xfail.all marker
+                    _write(base + ".xfail.all", c["xfail"] + "\n", changed, check)
         else:  # cross-package cell = a directory with main.bn + pkg/gh fixture
             d = os.path.join(DIR, c["rel"])
             _write(os.path.join(d, "main.bn"), render_main(c), changed, check)

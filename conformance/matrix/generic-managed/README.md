@@ -47,8 +47,9 @@ fixture mirrors `conformance/995`'s `gholder.bni`.
 
 ## Status / scope
 
-Landed (20 cells): the `balance` core over five element kinds (managed-ptr,
-managed-slice, managed-struct, func-value, iface) × both sites; the `empty`
+Landed (22 cells): the `balance` core over six element kinds (managed-ptr,
+managed-slice, managed-struct, func-value, iface, **nested-generic** — a generic
+instantiation `@Box[int]` held inside the container) × both sites; the `empty`
 never-populated-destroy op over named-wrapper / named-array × both sites; the
 **method-value** operation (`method-value/scalar`, `method-value/call-result`,
 mirroring `146`/`167`/`168`); the **type-distinctness** compile-error `.error`
@@ -70,10 +71,17 @@ index expression, not a generic instantiation for a method expression
 cell XPASS-alerts when the compiler supports it; gap tracked in
 `explorations/claude-todo.md`.
 
-Planned follow-ups: array-of-managed / nested-generic element kinds; `copy`
-and `destroy-populated` ops; and cross-package variants of the two dispatch
-cells (the bug-dense mangling axis — needs the generator's `xpkg` fixture
-generalized past the single `Holder`).
+The `array-of-managed` element kind (a `[N]@T` array held in the container) is
+likewise blocked by a compiler gap, captured as a second **XFAIL cell**
+(`array-typearg/scalar`, `.xfail.all`): a generic-function CALL with an array type
+argument (`zero[[2]int]()`) does not parse (`expected {, got ]`), so the
+container's `New[[N]@T]()` calls cannot be spelled. Array types work in a TYPE
+position (`@Box[[2]int]`, `make(Box[[2]int])`, cf. `distinct/array-len`), only not
+in a call's type-arg list. Gap tracked in `explorations/claude-todo.md`.
+
+Planned follow-ups: `copy` and `destroy-populated` ops; and cross-package
+variants of the two dispatch cells (the bug-dense mangling axis — needs the
+generator's `xpkg` fixture generalized past the single `Holder`).
 
 Mode scope: green under the six default modes + native x64/aa64. `native-arm32`
 (`builder-comp_native_arm32_baremetal`) is an incomplete backend — any red there is

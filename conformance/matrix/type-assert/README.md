@@ -53,6 +53,12 @@ everywhere else. This matrix crosses the axes the spec pins.
   value-recovers from a `*any` box (expr + comma-ok), and is a DISTINCT type from
   another instantiation: a comma-ok on `Box[bool]` MISSES. RTTI type identity keys
   on the monomorphized type.
+- `iface/mgd-struct-value/recover` — a value target `T` recovers the POINTEE
+  struct BY VALUE from a **typed** interface `@I` (not an erased `*any`/`@any`):
+  `a.(Dog)` on an `@Animal` built from `impl *Dog` HITs (the box's data slot is a
+  pointer to the value; recovery unwraps it and field-wise-copies the pointee,
+  §11.12 `iface.assert.kind`), while a wrong struct type (`Cat`) MISSES — the
+  match keys on the pointee type, not "any pointer". Expr + comma-ok forms.
 - `type-switch/{mgd-narrowing,raw-absent,mgd-absent}` — the §14.10 type switch.
   `mgd-narrowing` dispatches on a MANAGED `@Animal` (the source axis
   conformance/1054 omits — it is raw-`*Shape`-only): a single-target case narrows
@@ -64,10 +70,12 @@ everywhere else. This matrix crosses the axes the spec pins.
   is true and the switch matches its OWN case, not `default` — while an **unset**
   box has no dynamic type — `present` is false and the switch runs `default`.
   There is no `case nil`.
-- `balance/{concrete,iface,struct-value}` — refcount balance: a mortal managed
-  observable recovered via `@T` / `@J` (ownership transfer) returns to baseline
-  after the recovered value drops; a value struct-with-managed-field recovered in
-  a 100-iteration switch/comma-ok/expr loop stays at baseline (mirror 1093).
+- `balance/{concrete,iface,struct-value,iface-struct-value}` — refcount balance: a
+  mortal managed observable recovered via `@T` / `@J` (ownership transfer) returns
+  to baseline after the recovered value drops; a value struct-with-managed-field
+  recovered in a 100-iteration switch/comma-ok/expr loop stays at baseline (mirror
+  1093 — `struct-value` recovers from a raw `*any`, `iface-struct-value` from a
+  typed `@Boxed`, exercising the retaining copy on each source).
 - `legality/*` — the §11.12 recovery-kind rules are COMPILE errors (`.error`):
   `@T`/`@J` needs a managed `@I` (a raw `*I` has no reference to share); an
   interface recovers via `*J`/`@J`, never by value.
@@ -91,22 +99,22 @@ everywhere else. This matrix crosses the axes the spec pins.
 
 ## Status / scope
 
-Landed (25 cells): the `iface` grid (raw/mgd × concrete/iface/ancestor, ok +
-abort — every `ok` cell packs HIT + wrong-type-MISS + unset-MISS), `any` value
-recovery (scalar from both box kinds + a slice-from-raw balance cell + a
-generic-instantiation value target), the three `type-switch` cells (managed-source
-narrowing + typed-nil/unset, raw and managed), the three `balance` cells, and the
-three `legality` compile-error cells. Green under the six default modes + native
-x64/aa64.
+Landed (27 cells): the `iface` grid (raw/mgd × concrete/iface/ancestor, ok +
+abort — every `ok` cell packs HIT + wrong-type-MISS + unset-MISS) plus a
+value-struct recovery from a typed `@I`, `any` value recovery (scalar from both
+box kinds + a slice-from-raw balance cell + a generic-instantiation value target),
+the three `type-switch` cells (managed-source narrowing + typed-nil/unset, raw and
+managed), the four `balance` cells, and the three `legality` compile-error cells.
+Green under the six default modes + native x64/aa64.
 
 The plan gated the type-switch cells on "Phase 6 IR-gen lowering" and the
 cross-mode axis on "Slice 5 (VM RTTI)"; both have since landed
 (`pkg/binate/ir/gen_type_switch.bn`, `pkg/binate/vm/lower_typeinfo.bn`), so the
 whole matrix — including the switch form and every mode — builds now.
 
-Planned follow-up (the plan's last later wave): a struct-value recovery from an
-interface `@I` (not just `*any`). This one needs a semantic decision first — an
-`@Animal` built from `impl *Dog : Animal` records dynamic type `*Dog`, so a value
-target `Dog` (≠ `*Dog`) would MISS; a genuine value-struct recovery from `@I`
-needs a value-receiver impl (dynamic type = the struct), whose support is not yet
-confirmed here.
+The plan's Part B waves are all landed. (A struct-value recovery from a typed `@I`
+was the last one: it needed no new language support — value recovery matches on the
+POINTEE type, so `a.(Dog)` on an `@Animal` built from `impl *Dog` HITs by
+unwrapping the pointer, verified green across all modes.) Part A's remaining ops
+(`copy` / `destroy-populated`, cross-package dispatch) live in the sibling
+`../generic-managed/` matrix.

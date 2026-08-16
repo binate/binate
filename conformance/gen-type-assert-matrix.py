@@ -360,6 +360,78 @@ STRUCT_BALANCE_BODY = [
 ]
 
 
+# --- value-struct recovery from a typed interface @I ------------------------
+# A value target `T` recovers the POINTEE struct from an interface whose dynamic
+# type is `*T`/`@T`: the box's data slot holds a pointer to the value, and value
+# recovery LOADs + field-wise-copies it (§11.12 iface.assert.kind).  So `a.(Dog)`
+# on an `@Animal` built from `impl *Dog` HITs (unwrapping the pointer), while a
+# wrong struct type (`Cat`) MISSES — the match keys on the pointee type, not "any
+# pointer".  Distinct from the `any/*` grid (an erased `*any`/`@any` box): here the
+# source is a real method-carrying interface.
+def iface_struct_value():
+    return [
+        "var d @Dog = make(Dog)", "d.x = 7", "var a @Animal = d",
+        # expr form: value-recover the pointee struct.
+        "var dv Dog = a.(Dog)",
+        "testing.Println(dv.x)",
+        # comma-ok HIT.
+        "dv2, ok := a.(Dog)",
+        "if ok { testing.Println(dv2.x) } else { testing.Println(-1) }",
+        # wrong-struct-type comma-ok MISS: dynamic *Dog is not the value target Cat.
+        "_, ok2 := a.(Cat)",
+        "if ok2 { testing.Println(999) } else { testing.Println(0) }",
+    ]
+
+
+# balance: a struct-with-managed-field value-recovered from a typed `@Boxed` in a
+# 100-iteration loop must return the field backing's refcount to baseline — the
+# retaining copy (§11.12: value STRUCT recovery RefInc's managed fields so the copy
+# co-owns) is released at each iteration's scope exit.  Interface-source counterpart
+# of balance/struct-value (which recovers from a raw *any).
+STRUCT_FROM_IFACE_DECLS = '''interface Boxed {
+	tag() int
+}
+
+type Holder struct {
+	name @[]char
+	t int
+}
+
+func (h *Holder) tag() int {
+	return h.t
+}
+
+impl *Holder : Boxed
+
+// readBackingRC reads a managed-slice field's backing refcount from word 2 of its
+// 4-word header (per conformance/130).
+func readBackingRC(hdr *int) int {
+	var backingPtr *uint8 = bit_cast(*uint8, hdr[2])
+	if backingPtr == nil {
+		return 0
+	}
+	return rt.Refcount(backingPtr)
+}
+
+func loopRecover(a @Boxed) {
+	for i := 0; i < 100; i++ {
+		var h Holder = a.(Holder)
+		_ = len(h.name)
+	}
+}'''
+
+STRUCT_FROM_IFACE_BODY = [
+    "var hh @Holder = make(Holder)",
+    "hh.name = make_slice(char, 5)",
+    "hh.t = 3",
+    "var pn *int = bit_cast(*int, &hh.name)",
+    "var before int = readBackingRC(pn)",
+    "var a @Boxed = hh",
+    "loopRecover(a)",
+    "if before == readBackingRC(pn) { testing.Println(0) } else { testing.Println(1) }",
+]
+
+
 # --- type-switch narrowing cells --------------------------------------------
 # Three concrete Animal impls (Dog is also Named); a third type Fox drives the
 # `default` arm.  Mirrors conformance/1054's raw `*Shape` grid but on a MANAGED
@@ -524,6 +596,7 @@ INV = {
     "legality": "The §11.12 recovery-kind rules are COMPILE errors: `@T`/`@J` needs a managed `@I` source (a raw `*I` has no reference to share); an interface recovers via `*J`/`@J`, never value.",
     "generic-inst": "A generic-INSTANTIATION struct (`Box[int]`) value-recovers from a `*any` box, and is a DISTINCT type from another instantiation (`Box[bool]`) — a comma-ok on the wrong instantiation misses; the RTTI type identity keys on the monomorphized type, across every mode.",
     "type-switch": "A type switch dispatches on the dynamic type of a MANAGED `@I` scrutinee: a single-target case narrows the `@`-binder to its concrete type, an interface case matches by satisfaction, a multi-target case keeps the scrutinee type, `default` catches the rest; a typed-nil box matches its OWN case (present true) while an unset box runs `default` (present false) — no `case nil` — across every mode.",
+    "struct-value": "A value target `T` recovers the POINTEE struct BY VALUE from a typed interface `@I` whose dynamic type is `*T` — unwrapping the pointer and field-wise-copying the pointee (§11.12 iface.assert.kind) — while a wrong struct type misses; the match keys on the pointee type, across every mode.",
 }
 
 CELLS = []
@@ -565,6 +638,10 @@ CELLS.append(dict(rel="any/generic-inst/recover", inv=INV["generic-inst"],
                   decls="type Box[T any] struct {\n\tv T\n}",
                   body=any_generic_inst(), exp=[1, 2, 3]))
 
+# value-struct recovery from a typed interface `@I` (not an erased `*any`/`@any`).
+CELLS.append(dict(rel="iface/mgd-struct-value/recover", inv=INV["struct-value"],
+                  decls=IFACE_DECLS, body=iface_struct_value(), exp=[7, 7, 0]))
+
 # type-switch narrowing: managed-source narrowing (the axis 1054 omits) + the
 # typed-nil / unset distinction (§11.12 iface.assert.absent), raw and managed.
 CELLS.append(dict(rel="type-switch/mgd-narrowing", inv=INV["type-switch"],
@@ -584,6 +661,8 @@ CELLS.append(dict(rel="balance/iface", inv=INV["balance"], decls=IFACE_DECLS + "
                   body=balance_body("retainReleaseNamed(a)"), exp=[107, 0], rt=True))
 CELLS.append(dict(rel="balance/struct-value", inv=INV["balance"], decls=STRUCT_BALANCE_DECLS,
                   body=STRUCT_BALANCE_BODY, exp=[0, 0, 0], rt=True))
+CELLS.append(dict(rel="balance/iface-struct-value", inv=INV["balance"], decls=STRUCT_FROM_IFACE_DECLS,
+                  body=STRUCT_FROM_IFACE_BODY, exp=[0], rt=True))
 
 # legality compile-error cells.
 for lc in LEGALITY:

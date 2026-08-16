@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Generate conformance/matrix/type-assert cells — the type-assertion / RTTI
-matrix (spec §11.12 `iface.assert`, §14.10 type switch).  Part B of
-explorations/plan-matrix-tests-generics-rtti.md.
+matrix (spec §11.12 `iface.assert`, §14.10 type switch).
 
 The recent MAJOR/CRITICAL bug cluster lived in generics AND RTTI; the RTTI space
 has ~99 POINT tests (998–1015, 1054/1055, 1074–1098, …) but no CROSS-AXIS matrix,

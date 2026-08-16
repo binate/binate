@@ -42,17 +42,11 @@ func BoolValue(b bool) Value {
 	return v
 }
 
-// StringValue boxes a @[]char argument, taking an OWNED +1 on its backing so the
-// Value's 4-word image is a valid managed slice independent of the caller's `s`
-// (the callee's entry-RefInc / exit-RefDec on the param is then net-zero over
-// this owned reference — the backing can't be freed out from under the Value
-// during the call).  Release() drops the reference.
-func StringValue(s @[]char) Value {
-	var v Value
-	v.Typ = types.MakeManagedSliceType(types.TypChar())
-	v.Bytes = make_slice(uint8, v.Typ.SizeOf())
-	var src *rt.ManagedSlice = bit_cast(*rt.ManagedSlice, &s)
-	var dst *rt.ManagedSlice = bit_cast(*rt.ManagedSlice, &v.Bytes[0])
+// copyManagedSliceHeader copies the 4-word managed-slice header from src to dst
+// and takes an owned +1 on the (now shared) backing, so dst is a valid managed
+// slice independent of src.  The single primitive behind boxing a managed-slice
+// as a Value and reconstructing one from a Value.
+func copyManagedSliceHeader(dst *rt.ManagedSlice, src *rt.ManagedSlice) {
 	dst.Data = src.Data
 	dst.Len = src.Len
 	dst.Refptr = src.Refptr
@@ -60,7 +54,33 @@ func StringValue(s @[]char) Value {
 	if dst.Refptr != nil {
 		rt.RefInc(dst.Refptr)
 	}
+}
+
+// managedSliceValue boxes a managed-slice value of type typ whose 4-word header
+// is at src, taking an OWNED +1 on the backing so the Value is independent of the
+// source slice (the callee's entry-RefInc / exit-RefDec on a param is then
+// net-zero over this owned reference).  For a nested slice (@[]@[]char) the inner
+// elements are owned by the shared backing — releaseImage frees them only when
+// this is the last reference (its last-reference guard).  Release() drops the ref.
+func managedSliceValue(typ @types.Type, src *rt.ManagedSlice) Value {
+	var v Value
+	v.Typ = typ
+	v.Bytes = make_slice(uint8, typ.SizeOf())
+	copyManagedSliceHeader(bit_cast(*rt.ManagedSlice, &v.Bytes[0]), src)
 	return v
+}
+
+// StringValue boxes a @[]char argument.
+func StringValue(s @[]char) Value {
+	return managedSliceValue(types.MakeManagedSliceType(types.TypChar()),
+			bit_cast(*rt.ManagedSlice, &s))
+}
+
+// StringSliceValue boxes a @[]@[]char argument (a managed-slice of managed
+// slices).  Only the outer backing is +1'd; the inner slices ride it.
+func StringSliceValue(s @[]@[]char) Value {
+	return managedSliceValue(types.MakeManagedSliceType(types.MakeManagedSliceType(types.TypChar())),
+			bit_cast(*rt.ManagedSlice, &s))
 }
 
 // AsInt reads a host-word int result/value.
@@ -85,15 +105,17 @@ func (v Value) AsBool() bool {
 // two are released independently).  Valid only for a managed-slice Value.
 func (v Value) AsString() @[]char {
 	var result @[]char
-	var src *rt.ManagedSlice = bit_cast(*rt.ManagedSlice, &v.Bytes[0])
-	var dst *rt.ManagedSlice = bit_cast(*rt.ManagedSlice, &result)
-	dst.Data = src.Data
-	dst.Len = src.Len
-	dst.Refptr = src.Refptr
-	dst.BackingLen = src.BackingLen
-	if dst.Refptr != nil {
-		rt.RefInc(dst.Refptr)
-	}
+	copyManagedSliceHeader(bit_cast(*rt.ManagedSlice, &result),
+			bit_cast(*rt.ManagedSlice, &v.Bytes[0]))
+	return result
+}
+
+// AsStringSlice reconstructs a @[]@[]char sharing the Value's backing (a +1 on
+// the outer backing).  Valid only for a @[]@[]char Value.
+func (v Value) AsStringSlice() @[]@[]char {
+	var result @[]@[]char
+	copyManagedSliceHeader(bit_cast(*rt.ManagedSlice, &result),
+			bit_cast(*rt.ManagedSlice, &v.Bytes[0]))
 	return result
 }
 
@@ -114,22 +136,36 @@ func (v Value) Release() {
 // host (the callee transferred ownership into the returned image), so Release is
 // the sole drop.  Only shapes supportedMarshalType admits reach here, which keeps
 // this walk total: a non-managed field bottoms out via NeedsDestruction, a
-// managed-slice-of-scalar field RefDecs its backing, a struct field recurses.
-// (@[]@[]char element recursion and interface / managed-pointer fields are later
-// Stage-C increments — supportedMarshalType rejects them until then.)
+// managed-slice recurses into its elements (last-reference-guarded), a struct
+// field recurses.  (Interface / managed-pointer / func-value references are a
+// later Stage-C increment — their per-element dtor is a cross-mode handle
+// releaseImage cannot yet invoke — so supportedMarshalType rejects them.)
 func releaseImage(t @types.Type, ptr *uint8) {
 	var st @types.Type = types.StripWrappers(t)
 	if !st.NeedsDestruction() {
 		return
 	}
 	if st.Kind == types.TYP_MANAGED_SLICE {
-		// The element is a scalar (@[]char / @[]int): RefDec the backing once with
-		// a nil dtor — the backing holds no managed elements of its own.
 		var ms *rt.ManagedSlice = bit_cast(*rt.ManagedSlice, ptr)
-		if ms.Refptr != nil {
-			var noDtor *uint8
-			rt.RefDec(ms.Refptr, noDtor)
+		if ms.Refptr == nil {
+			return
 		}
+		// If the element itself owns managed references (@[]@[]char, @[]struct{…}),
+		// free them — but ONLY when this is the last reference to the backing
+		// (Refcount == 1), mirroring the compiler's genManagedSliceDtor isLast
+		// guard: another owner still needs the elements otherwise.  Iterate the
+		// BACKING (Refptr), not Data — a subslice's Data points into the middle of
+		// the backing, while the dtor must visit every allocated element.
+		var elem @types.Type = types.StripWrappers(st.Elem)
+		if elem.NeedsDestruction() && rt.Refcount(ms.Refptr) == 1 {
+			var stride int = elem.SizeOf()
+			for i := 0; i < ms.BackingLen; i++ {
+				var ep *uint8 = bit_cast(*uint8, bit_cast(int, ms.Refptr) + i * stride)
+				releaseImage(elem, ep)
+			}
+		}
+		var noDtor *uint8
+		rt.RefDec(ms.Refptr, noDtor) // backing freed here iff its refcount hits 0
 		return
 	}
 	if st.Kind == types.TYP_STRUCT {

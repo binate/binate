@@ -1,0 +1,135 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/types"
+import "pkg/builtins/rt"
+
+// CallIfaceMethod invokes interface-method `slot` on the interface value whose
+// 2-word {data, vtable} image lives at `ivAddr`, host-driven — a native caller
+// (e.g. interp's RunFuncTyped, holding a marshaled iface RESULT) calling a method
+// on it.  It is the synchronous counterpart of dispatchCompiledIfaceMethod's
+// native arm minus the BCInstr / register file: resolve the method's func-value
+// handle from the iface's (native) vtable, prepend the receiver as a0, and dispatch
+// through the handle's marshaling shim.  There is NO execFunc / frame push here;
+// the shim itself re-enters the VM for a bytecode-impl method.  It handles both a
+// VM-impl iface (SI-4-substituted buildNativeIfaceVtable, handles in the word) and
+// a native-injected-package iface (raw @__ivt, handles in the parallel @__ivtshim
+// via lookupShimVtable) — see the resolution below.
+//
+// Convention (mirrors CallFuncAggregate): `args` is one word per user arg (at most
+// 6 — the shim's a0..a6 budget minus the receiver at a0); a scalar / scalar64
+// result comes back as the returned word, an aggregate is written into the caller-
+// provided `retbuf` (sized to types.AggregateReturnSize, host-owned — so execFunc's
+// 64-byte result window does not apply).  A nil interface value raises a recoverable
+// fault (the caller inspects vm.Status / vm.FaultMsg); a contract violation (a
+// non-substituted VM-index vtable word, or > 6 args) is a vmPanic.  Interface-typed
+// method ARGS are unsupported — they need the arg-direction substitution the host
+// cannot supply, so callers must reject them.
+//
+// The `slot` is the ABSOLUTE vtable slot (slot 0 = dtor, slot 1 = *TypeInfo, method
+// slots at 2+); the interp layer resolves it from (interface, method name).
+func (vm @VM) CallIfaceMethod(ivAddr int, slot int, retbufSize int, scalar64 bool, args @[]int,
+		retbuf *uint8) int {
+	// Start from a clean fault status, mirroring CallFunc / CallFuncAggregate.
+	vm.Status = VM_STATUS_CONTINUE
+	var noFaultMsg @[]char
+	vm.FaultMsg = noFaultMsg
+	vm.FaultRaised = false
+	vm.CleanupDepth = 0
+
+	if ivAddr == 0 {
+		setFault(vm, "vm: method call on a nil interface value")
+		return 0
+	}
+	var iv *int = bit_cast(*int, ivAddr)
+	var vtword int = iv[types.IfaceValueVtableIndex()]
+	if vtword == 0 {
+		setFault(vm, "vm: method call on a nil interface value")
+		return 0
+	}
+	if !ifaceVtIsNative(vm, vtword) {
+		// The host must pass a marshaled / SI-4-substituted image, never a raw VM
+		// box — a VM-index word here is a host-contract violation, not user error.
+		vmPanic("vm: CallIfaceMethod requires a substituted (native) vtable word")
+	}
+	// "Native" covers TWO vtable representations; both hold func-value @__handle
+	// {vtable, data} per slot, but at different addresses:
+	//   (1) a VM-impl iface whose word SI-4 substituted to a buildNativeIfaceVtable
+	//       handle-vtable — the handles are in that word directly;
+	//   (2) a native-injected COMPILED package's iface carrying a raw @__ivt whose
+	//       slots hold raw method fns — the handles live in the PARALLEL @__ivtshim
+	//       that lookupShimVtable resolves (exactly as dispatchCompiledIfaceMethod).
+	// lookupShimVtable returns non-zero ONLY for a registered raw @__ivt (a VM-owned
+	// substituted block is not one), so it distinguishes the two: use the shim
+	// vtable when it resolves, else the substituted word itself.  Reading a raw
+	// method fn as a handle would wild-dispatch, so this resolution is load-bearing.
+	var handleVt int = vtword
+	var shimVt int = lookupShimVtable(vm, vtword)
+	if shimVt != 0 {
+		handleVt = shimVt
+	}
+	// The chosen vtable holds a func-value @__handle {vtable, data} per slot; the
+	// marshaling shim is handle.vtable.call (word 1), exactly as func-value / extern
+	// dispatch reads it.
+	var handle *int = bit_cast(*int, bit_cast(*int, handleVt)[slot])
+	if bit_cast(int, handle) == 0 {
+		vmPanic("vm: iface method slot has no handle")
+	}
+	var vtable *int = bit_cast(*int, handle[types.FuncValueVtableIndex()])
+	var fnPtr *uint8 = bit_cast(*uint8, vtable[1])
+	var dataPtr *uint8 = bit_cast(*uint8, handle[types.FuncValueDataIndex()])
+
+	if len(args) > 6 {
+		vmPanic("vm: iface method has > 6 user arg slots (unsupported)")
+	}
+	// a0 = receiver (the iv data ptr, verbatim — a borrow, no RefInc); a1.. = user
+	// args, one word per slot.
+	var a0 int = iv[types.IfaceValueDataIndex()]
+	var a1 int = 0
+	var a2 int = 0
+	var a3 int = 0
+	var a4 int = 0
+	var a5 int = 0
+	var a6 int = 0
+	if len(args) > 0 {
+		a1 = args[0]
+	}
+	if len(args) > 1 {
+		a2 = args[1]
+	}
+	if len(args) > 2 {
+		a3 = args[2]
+	}
+	if len(args) > 3 {
+		a4 = args[3]
+	}
+	if len(args) > 4 {
+		a5 = args[4]
+	}
+	if len(args) > 5 {
+		a6 = args[5]
+	}
+
+	// A bytecode-impl method re-enters the VM through its handle; the cross-mode
+	// SatLookup fallback keys off g_crossModeVmAddr, so set it around the dispatch
+	// (mirroring dispatchExternBinding) and restore it after.
+	var savedVmAddr int = g_crossModeVmAddr
+	g_crossModeVmAddr = bit_cast(int, vm)
+	var result int = 0
+	if retbufSize > 0 {
+		// Aggregate return: the shim writes the natural-typed result through the
+		// caller's retbuf.  A method returning another interface value hands back
+		// native words automatically (the handle's shim is TrampolineAggregate,
+		// which applies substituteVtWords over the callee's ResultIfaceVtOffsets).
+		rt._call_shim_aggregate(fnPtr, retbuf, dataPtr, a0, a1, a2, a3, a4, a5, a6)
+		result = bit_cast(int, retbuf)
+	} else if scalar64 {
+		// 64-bit scalar return: read via the wide primitive.  The host receives the
+		// low word on an ILP32 target (the documented scalar truncation); no-op on
+		// LP64 where int is 8 bytes.
+		result = cast(int, rt._call_shim_scalar64(fnPtr, dataPtr, a0, a1, a2, a3, a4, a5, a6))
+	} else {
+		result = rt._call_shim_scalar(fnPtr, dataPtr, a0, a1, a2, a3, a4, a5, a6)
+	}
+	g_crossModeVmAddr = savedVmAddr
+	return result
+}

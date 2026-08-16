@@ -53,6 +53,17 @@ everywhere else. This matrix crosses the axes the spec pins.
   value-recovers from a `*any` box (expr + comma-ok), and is a DISTINCT type from
   another instantiation: a comma-ok on `Box[bool]` MISSES. RTTI type identity keys
   on the monomorphized type.
+- `type-switch/{mgd-narrowing,raw-absent,mgd-absent}` — the §14.10 type switch.
+  `mgd-narrowing` dispatches on a MANAGED `@Animal` (the source axis
+  conformance/1054 omits — it is raw-`*Shape`-only): a single-target case narrows
+  the `@`-binder to its concrete type (method access on `@Dog`/`@Cat`), an
+  interface case matches by satisfaction, a multi-target case keeps the
+  scrutinee's `@Animal` type, and a third impl (`Fox`) drives `default`.
+  `{raw,mgd}-absent` cross the two "empty" states (§11.12 `iface.assert.absent`):
+  a **typed-nil** box (a nil pointer boxed) has its dynamic type set — `present`
+  is true and the switch matches its OWN case, not `default` — while an **unset**
+  box has no dynamic type — `present` is false and the switch runs `default`.
+  There is no `case nil`.
 - `balance/{concrete,iface,struct-value}` — refcount balance: a mortal managed
   observable recovered via `@T` / `@J` (ownership transfer) returns to baseline
   after the recovered value drops; a value struct-with-managed-field recovered in
@@ -69,6 +80,10 @@ everywhere else. This matrix crosses the axes the spec pins.
   not RefDec the nil recovered value.
 - **refcount balance** — `@`-recovery and value-struct recovery are leak- and
   double-free-free, in a loop (relative form, baseline-independent).
+- **type-switch narrowing** — a single-target case narrows its binder to the
+  matched type (a multi-target case / `default` keeps the scrutinee type); a
+  typed-nil box matches its own case (`present` true) while an unset box runs
+  `default` (`present` false); there is no `case nil`.
 - **recovery-kind legality** — the compile-error `legality/*` cells.
 - **cross-mode agreement** — the identical `.expected` / `.error` under every
   mode (compiled LLVM · VM · native x64/aa64) is the spec's cross-mode-result
@@ -76,11 +91,12 @@ everywhere else. This matrix crosses the axes the spec pins.
 
 ## Status / scope
 
-Landed (22 cells): the `iface` grid (raw/mgd × concrete/iface/ancestor, ok +
+Landed (25 cells): the `iface` grid (raw/mgd × concrete/iface/ancestor, ok +
 abort — every `ok` cell packs HIT + wrong-type-MISS + unset-MISS), `any` value
 recovery (scalar from both box kinds + a slice-from-raw balance cell + a
-generic-instantiation value target), the three `balance` cells, and the three
-`legality` compile-error cells. Green under the six default modes + native
+generic-instantiation value target), the three `type-switch` cells (managed-source
+narrowing + typed-nil/unset, raw and managed), the three `balance` cells, and the
+three `legality` compile-error cells. Green under the six default modes + native
 x64/aa64.
 
 The plan gated the type-switch cells on "Phase 6 IR-gen lowering" and the
@@ -88,6 +104,9 @@ cross-mode axis on "Slice 5 (VM RTTI)"; both have since landed
 (`pkg/binate/ir/gen_type_switch.bn`, `pkg/binate/vm/lower_typeinfo.bn`), so the
 whole matrix — including the switch form and every mode — builds now.
 
-Planned follow-ups (the plan's later waves): a struct-value recovery from an
-interface `@I` (not just `*any`); the typed-nil-→-its-type and default type-switch
-narrowing cells as their own grid.
+Planned follow-up (the plan's last later wave): a struct-value recovery from an
+interface `@I` (not just `*any`). This one needs a semantic decision first — an
+`@Animal` built from `impl *Dog : Animal` records dynamic type `*Dog`, so a value
+target `Dog` (≠ `*Dog`) would MISS; a genuine value-struct recovery from `@I`
+needs a value-receiver impl (dynamic type = the struct), whose support is not yet
+confirmed here.

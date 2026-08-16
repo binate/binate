@@ -360,6 +360,139 @@ STRUCT_BALANCE_BODY = [
 ]
 
 
+# --- type-switch narrowing cells --------------------------------------------
+# Three concrete Animal impls (Dog is also Named); a third type Fox drives the
+# `default` arm.  Mirrors conformance/1054's raw `*Shape` grid but on a MANAGED
+# `@Animal` source (the axis 1054 omits) and adds the typed-nil / unset
+# distinction (§11.12 iface.assert.absent) that no point test crosses.
+TS_DECLS = """interface Animal {
+	sound() int
+}
+
+interface Named {
+	name() int
+}
+
+type Dog struct {
+	x int
+}
+
+func (d *Dog) sound() int {
+	return d.x
+}
+
+func (d *Dog) name() int {
+	return d.x + 100
+}
+
+type Cat struct {
+	y int
+}
+
+func (c *Cat) sound() int {
+	return c.y
+}
+
+type Fox struct {
+	z int
+}
+
+func (f *Fox) sound() int {
+	return f.z
+}
+
+impl *Dog : Animal
+impl *Dog : Named
+impl *Cat : Animal
+impl *Fox : Animal"""
+
+# Managed-source narrowing: a single-target case narrows the `@`-binder to the
+# concrete type (method access resolves on `@Dog` / `@Cat`); an interface case
+# does a satisfaction lookup; a multi-target case keeps the scrutinee's `@Animal`
+# type (so only interface methods); Fox drives `default`.
+TS_MGD_HELPERS = """func classify(a @Animal) int {
+	switch v := a.(type) {
+	case @Dog:
+		return v.name()
+	case @Cat:
+		return v.sound() + 1000
+	default:
+		return -1
+	}
+}
+
+func hasName(a @Animal) int {
+	switch a.(type) {
+	case @Named:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func grouped(a @Animal) int {
+	switch v := a.(type) {
+	case @Dog, @Cat:
+		return v.sound() + 10
+	default:
+		return v.sound() + 20
+	}
+}"""
+
+TS_MGD_NARROWING_BODY = [
+    "var d @Dog = make(Dog)", "d.x = 5",
+    "var c @Cat = make(Cat)", "c.y = 4",
+    "var f @Fox = make(Fox)", "f.z = 3",
+    "var ad @Animal = d",
+    "var ac @Animal = c",
+    "var af @Animal = f",
+    "testing.Println(classify(ad))",  # 105  (@Dog → name = 5+100)
+    "testing.Println(classify(ac))",  # 1004 (@Cat → sound 4 + 1000)
+    "testing.Println(classify(af))",  # -1   (Fox → default)
+    "testing.Println(hasName(ad))",   # 1    (Dog implements Named)
+    "testing.Println(hasName(ac))",   # 0    (Cat does not)
+    "testing.Println(grouped(ad))",   # 15   (@Dog, @Cat multi → sound 5 + 10)
+    "testing.Println(grouped(af))",   # 23   (Fox → default → sound 3 + 20)
+]
+
+
+# typed-nil vs unset (§11.12 iface.assert.absent): a nil concrete pointer boxed
+# into the interface has its dynamic type SET (present → true) and the switch
+# matches its OWN case, not default; a zero-value (unset) interface has no
+# dynamic type (present → false) and runs default.  There is no `case nil`.
+def ts_absent_helper(src):
+    p = "*" if src == "raw" else "@"
+    k = "Raw" if src == "raw" else "Mgd"
+    return (f"func absentClassify{k}(a {p}Animal) int {{\n"
+            "\tswitch a.(type) {\n"
+            f"\tcase {p}Dog:\n"
+            "\t\treturn 1\n"
+            f"\tcase {p}Cat:\n"
+            "\t\treturn 2\n"
+            "\tdefault:\n"
+            "\t\treturn -1\n"
+            "\t}\n"
+            "}")
+
+
+def ts_absent_body(src):
+    p = "*" if src == "raw" else "@"
+    k = "Raw" if src == "raw" else "Mgd"
+    return [
+        # typed-nil: boxing a nil pointer sets the dynamic type (present true), so
+        # the switch matches its own case (1), NOT default (§545's typed-nil idiom).
+        f"var np {p}Dog = nil",
+        f"var tn {p}Animal = np",
+        "if present(tn) { testing.Println(1) } else { testing.Println(-1) }",
+        f"testing.Println(absentClassify{k}(tn))",
+        # unset: a zero-value interface has no dynamic type (present false) and
+        # runs default (-1) — the null vtable short-circuits, no stray release.
+        f"var un {p}Animal",
+        "if present(un) { testing.Println(-2) } else { testing.Println(2) }",
+        f"testing.Println(absentClassify{k}(un))",
+    ]
+
+
 # --- legality (compile-error) cells -----------------------------------------
 # §11.12 recovery-kind rules, enforced by the CHECKER (compile errors).
 LEGALITY = [
@@ -390,6 +523,7 @@ INV = {
     "balance": "A managed value recovered via `@T`/`@J` (ownership transfer) or a value struct-with-managed-field returns the observed box to baseline refcount after the recovered value drops — no leak, no double-free.",
     "legality": "The §11.12 recovery-kind rules are COMPILE errors: `@T`/`@J` needs a managed `@I` source (a raw `*I` has no reference to share); an interface recovers via `*J`/`@J`, never value.",
     "generic-inst": "A generic-INSTANTIATION struct (`Box[int]`) value-recovers from a `*any` box, and is a DISTINCT type from another instantiation (`Box[bool]`) — a comma-ok on the wrong instantiation misses; the RTTI type identity keys on the monomorphized type, across every mode.",
+    "type-switch": "A type switch dispatches on the dynamic type of a MANAGED `@I` scrutinee: a single-target case narrows the `@`-binder to its concrete type, an interface case matches by satisfaction, a multi-target case keeps the scrutinee type, `default` catches the rest; a typed-nil box matches its OWN case (present true) while an unset box runs `default` (present false) — no `case nil` — across every mode.",
 }
 
 CELLS = []
@@ -430,6 +564,18 @@ CELLS.append(dict(rel="any/raw-slice/recover", inv=INV["slice"], decls=HOLD_SLIC
 CELLS.append(dict(rel="any/generic-inst/recover", inv=INV["generic-inst"],
                   decls="type Box[T any] struct {\n\tv T\n}",
                   body=any_generic_inst(), exp=[1, 2, 3]))
+
+# type-switch narrowing: managed-source narrowing (the axis 1054 omits) + the
+# typed-nil / unset distinction (§11.12 iface.assert.absent), raw and managed.
+CELLS.append(dict(rel="type-switch/mgd-narrowing", inv=INV["type-switch"],
+                  decls=TS_DECLS + "\n\n" + TS_MGD_HELPERS,
+                  body=TS_MGD_NARROWING_BODY, exp=[105, 1004, -1, 1, 0, 15, 23]))
+CELLS.append(dict(rel="type-switch/raw-absent", inv=INV["type-switch"],
+                  decls=TS_DECLS + "\n\n" + ts_absent_helper("raw"),
+                  body=ts_absent_body("raw"), exp=[1, 1, 2, -1]))
+CELLS.append(dict(rel="type-switch/mgd-absent", inv=INV["type-switch"],
+                  decls=TS_DECLS + "\n\n" + ts_absent_helper("mgd"),
+                  body=ts_absent_body("mgd"), exp=[1, 1, 2, -1]))
 
 # balance cells.  The @T / @J recovery helpers reference the Animal/Named/Dog decls.
 CELLS.append(dict(rel="balance/concrete", inv=INV["balance"], decls=IFACE_DECLS + "\n\n" + CONCRETE_BALANCE,

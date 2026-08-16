@@ -47,7 +47,7 @@ fixture mirrors `conformance/995`'s `gholder.bni`.
 
 ## Status / scope
 
-Landed (22 cells): the `balance` core over six element kinds (managed-ptr,
+Landed (23 cells): the `balance` core over six element kinds (managed-ptr,
 managed-slice, managed-struct, func-value, iface, **nested-generic** — a generic
 instantiation `@Box[int]` held inside the container) × both sites; the `empty`
 never-populated-destroy op over named-wrapper / named-array × both sites; the
@@ -58,7 +58,8 @@ pair cells (array-length `[3]`vs`[5]` per `1017`, func-signature
 `param-impl/dispatch` (a parameterized-receiver impl `impl @Box[T] : Getter[T]`
 dispatched through a per-instantiation vtable, mirroring `447`) and
 `constraint/dispatch` (a generic function calling a method on its type param's
-constraint interface, mirroring `434`).  The `iface` balance element's `xpkg`
+constraint interface, mirroring `434`); plus `array-typearg/scalar`, a parser-fix
+regression cell (described below).  The `iface` balance element's `xpkg`
 cell uses `gh.At[@Numbered](h,0).num()` — an iface-method CALL on a generic-call
 result — so it regression-guards conformance/1027 (fixed in `dfbdf1dd`).
 
@@ -71,17 +72,19 @@ index expression, not a generic instantiation for a method expression
 cell XPASS-alerts when the compiler supports it; gap tracked in
 `explorations/claude-todo.md`.
 
-The `array-of-managed` element kind (a `[N]@T` array held in the container) is
-likewise blocked by a compiler gap, captured as a second **XFAIL cell**
-(`array-typearg/scalar`, `.xfail.all`): a generic-function CALL with an array type
-argument (`zero[[2]int]()`) does not parse (`expected {, got ]`), so the
-container's `New[[N]@T]()` calls cannot be spelled. Array types work in a TYPE
-position (`@Box[[2]int]`, `make(Box[[2]int])`, cf. `distinct/array-len`), only not
-in a call's type-arg list. Gap tracked in `explorations/claude-todo.md`.
+`array-typearg/scalar` is a passing regression cell for a parser fix: a
+generic-function CALL with an array type argument (`zero[[2]int]()`) used to be
+rejected (`expected {, got ]`) — array types were routed to the type parser only
+in a TYPE position (`@Box[[2]int]`, `make(Box[[2]int])`, cf. `distinct/array-len`),
+not in a call's bracket type-arg list. `startsBracketTypeArg` now routes a leading
+`[` to the type parser, so `New[[N]@T]()` (the shape an array-of-managed element
+needs) parses. This cell guards that.
 
-Planned follow-ups: `copy` and `destroy-populated` ops; and cross-package
-variants of the two dispatch cells (the bug-dense mangling axis — needs the
-generator's `xpkg` fixture generalized past the single `Holder`).
+Planned follow-ups: the `array-of-managed` balance element kind (a `[N]@T` array
+held in the container — now unblocked by the fix above); `copy` and
+`destroy-populated` ops; and cross-package variants of the two dispatch cells (the
+bug-dense mangling axis — needs the generator's `xpkg` fixture generalized past the
+single `Holder`).
 
 Mode scope: green under the six default modes + native x64/aa64. `native-arm32`
 (`builder-comp_native_arm32_baremetal`) is an incomplete backend — any red there is

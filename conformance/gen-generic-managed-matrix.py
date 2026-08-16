@@ -210,7 +210,7 @@ MV_INV = "A method VALUE taken off a generic instantiation (or a generic-call re
 DISTINCT_INV = "Two generic instantiations differing ONLY within a structured type arg (array LENGTH, func SIGNATURE) are DISTINCT types; assigning one to the other is a compile error (42b3bc83)."
 PI_INV = "A parameterized-receiver impl (`impl @Box[T] : Getter[T]`) lets a concrete `@Box[int]` box into a `@Getter[int]` interface value and dispatch through the per-instantiation vtable (gen.impl.generic-recv; mirrors 447)."
 ME_INV = "A method EXPRESSION off a generic instantiation (`Box[int].Get`, receiver as first param — the unbound form of the method value) should link + run with the qualified method name mangled per instantiation.  XFAIL: the compiler parses `Box[int]` as an index expression, not a generic instantiation for a method expression, so `Box[int].Get` (and `(Box[int]).Get`) do not compile — a gap this cell tracks (XPASS = fixed)."
-ATC_INV = "A generic-function CALL with an ARRAY type argument (`zero[[2]int]()`) should instantiate over `[2]int` and run.  XFAIL: the compiler rejects an array type in a call's explicit type-arg list (`expected {, got ]`) — it works in a TYPE position (`@Box[[2]int]`, `make(Box[[2]int])`, per `distinct/array-len`) but not in a call.  This blocks an array-of-managed container element (its `New[[N]@T]()` calls); a gap this cell tracks (XPASS = fixed)."
+ATC_INV = "A generic-function CALL with an ARRAY type argument (`zero[[2]int]()`) instantiates over `[2]int` and runs — the array type is routed to the type parser in a call's bracket type-arg list, exactly as in a TYPE position (`@Box[[2]int]`, `make(Box[[2]int])`, per `distinct/array-len`).  Regression-guards the `startsBracketTypeArg` array-type fix; also the shape an array-of-managed container element needs (`New[[N]@T]()`)."
 GC_INV = "A generic function body that calls a method on its type param's CONSTRAINT interface (`func f[T Show](x T) int { return x.show() }`) dispatches correctly in the instantiation (mirrors 434)."
 
 CELLS = []
@@ -250,13 +250,10 @@ CELLS.append(dict(site="inpkg", rel="method-expression/scalar", inv=ME_INV, hold
                   body=["var bx Box[int]", "bx.val = 42",
                         "var f *func(*Box[int]) int = Box[int].Get",
                         "testing.Println(f(&bx))"]))
-# generic-function CALL with an ARRAY type argument (`zero[[2]int]()`).  XFAIL: the
-# parser rejects an array type in a call's type-arg list (`expected {, got ]`),
-# which blocks the plan's array-of-managed container element (its `New[[N]@T]()`
-# calls).  `zero` has no value args, so the explicit type arg is required — no
-# inference sidesteps the gap.  Tracked in claude-todo.md.
+# generic-function CALL with an ARRAY type argument (`zero[[2]int]()`).  `zero` has
+# no value args, so the explicit type arg is required — no inference hides it.
+# Regression-guards the startsBracketTypeArg array-type fix.
 CELLS.append(dict(site="inpkg", rel="array-typearg/scalar", inv=ATC_INV, holder=False, exp=[42],
-                  xfail="generic-function call with an array type argument (`zero[[2]int]()`) — parser rejects an array type in a call's type-arg list; unsupported (see claude-todo.md)",
                   decls="type Box[T any] struct {\n\tv T\n}\n\nfunc zero[T any]() @Box[T] {\n\treturn make(Box[T])\n}",
                   body=["var b @Box[[2]int] = zero[[2]int]()", "b.v[0] = 42",
                         "testing.Println(b.v[0])"]))

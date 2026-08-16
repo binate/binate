@@ -1,0 +1,338 @@
+package "pkg/binate/lint"
+
+import "pkg/binate/ast"
+import "pkg/stdx/containers/vec"
+
+// ============================================================
+// Rule: borrowable-char-param
+// ============================================================
+//
+// Flags a function / method parameter declared `@[]char` (a MANAGED char slice)
+// that could be `*[]readonly char` (a raw read-only borrow) with no semantic
+// change for correct callers — i.e. the parameter, and every value DERIVED from
+// it that survives, is only ever borrowed, never owned.
+//
+// Why it matters: a `@[]char` parameter forces a MORTAL heap copy when the
+// caller passes a STRING LITERAL (the literal's immortal rodata is copied into a
+// fresh managed allocation to satisfy the managed-slice ownership).  If a value
+// derived from the parameter is then held as a raw `*[]readonly char` borrow
+// past the statement, that is a use-after-free.  Taking `*[]readonly char`
+// instead lets a literal argument alias immortal rodata directly — no copy, no
+// UAF.  The rule nudges authors toward borrow-not-copy for read-only char-slice
+// parameters.  Binate emits no compiler warning for this; it is a lint concern.
+//
+// ------------------------------------------------------------
+// Why a VALUE-FAMILY analysis (not a per-occurrence one)
+// ------------------------------------------------------------
+//
+// A sub-slice `p[lo:hi]` of a `@[]char` is itself an OWNED `@[]char` that SHARES
+// the backing (checkSliceExpr returns the managed-slice type unchanged), NOT a
+// raw borrow.  So whether the parameter is reducible to `*[]readonly char` does
+// not depend on the parameter's occurrences alone — it depends on where the
+// parameter AND its sub-slices (and locals bound to them) ultimately FLOW.  Two
+// concrete traps a naive per-occurrence rule falls into:
+//
+//   * `gg = p[1:]` (store a sub-slice into a `@[]char` global / field / a
+//     `@[]char` callee): the sub-slice reads like a borrow, but converting `p`
+//     to `*[]readonly char` makes `p[1:]` a `*[]readonly char` and the store a
+//     hard type error (`cannot assign *[]readonly char to @[]char`).
+//   * `var rest = n[1:]; … return rest` PLUS `return make_slice(…)`: the view is
+//     laundered through a local and the function ALSO returns a fresh owned
+//     allocation, so the `@[]char` return type cannot uniformly become
+//     `*[]readonly char` — the owned path would become a dangling raw-slice
+//     return (a silent use-after-free).
+//
+// So the rule tracks the parameter's VALUE FAMILY: the parameter itself, its
+// sub-slices `fam[lo:hi]`, and any local FRESHLY BOUND (`var x = fam` / `x :=
+// fam`) to a family value — transitively.  Every family value would become a
+// `*[]readonly char` borrow under the conversion.  The parameter is flaggable
+// iff:
+//   (1) some family member is actually borrowed (read `fam[i]` / `len` / range /
+//       sub-slice / returned / passed to a `*[]readonly char` callee), AND
+//   (2) NO family member ESCAPES as owning — stored into a non-family managed
+//       slot (global / struct field / an existing `@[]char` local / a composite
+//       element / a `@[]char` (or unresolvable) callee argument), mutated
+//       (`fam[i] = e`), address-taken (`&fam`), or captured by a closure, AND
+//   (3) if any family member is RETURNED (the return type must then cascade to
+//       `*[]readonly char`), EVERY other return operand of that char-slice type
+//       is a family view or a nil literal — no owned `@[]char` return (a call /
+//       make / make_slice / composite / index / another `@[]char` variable),
+//       which could not cascade.
+//
+// This is SOUND (never over-warns → never drives a broken / UAF-inducing
+// conversion) and keeps the laundered-view true positives.  Known UNDER-warns
+// (accepted; the rule errs toward silence): a fresh ZERO-VALUE local returned on
+// an empty path (`var e @[]char; return e`) is treated as a non-family owned
+// return and suppresses the cascade (returning an empty family view such as
+// `p[0:0]` instead is recognised as a borrow — note a slice is non-nillable, so
+// `return nil` is not an option); a family member reassigned via `=` (rather than
+// a fresh `:=` / `var` binding); and a for-in that reassigns the parameter.
+//
+// The classification of individual expression / call / return / assignment uses
+// lives in borrowable_char_param_expr.bn; the leaf type predicates and the
+// message live in borrowable_char_param_util.bn.
+
+// pcResult is the per-parameter analysis state.  It is a managed handle so the
+// walk mutates it in place: HasBorrow records that some family member is
+// borrowed, HasOwn that some family member escapes as owning (→ suppress),
+// Returned that a family member is returned (→ the return type must cascade),
+// OwnedCharReturn that a NON-family char-slice value is returned (→ the return
+// cannot cascade), and RetView that the parameter is returned DIRECTLY as a view
+// (`return p` / `return p[lo:hi]`) — used only to enrich the message.
+type pcResult struct {
+	Lint            @lintCtx
+	PName           @[]char
+	HasBorrow       bool
+	HasOwn          bool
+	Returned        bool
+	OwnedCharReturn bool
+	RetView         bool
+}
+
+// ============================================================
+// Family scope stack
+// ============================================================
+//
+// One lexical block's family state: the family-member names and ALL local names
+// DECLARED IN THIS BLOCK, plus a link to the enclosing scope.  Family resolution
+// (familyActive) walks the Parent chain to the NEAREST binding so a same-named
+// non-family local in an inner scope shadows an outer family member and a
+// disjoint block's local cannot be mistaken for a family member.
+
+// famScope is one block's family / local name state (see the section comment).
+type famScope struct {
+	Family @vec.Vec[@[]char]
+	Locals @vec.Vec[@[]char]
+	Parent @famScope
+}
+
+// newFamScope returns an empty scope nested in `parent` (nil for the root).
+func newFamScope(parent @famScope) @famScope {
+	var s @famScope = make(famScope)
+	s.Family = vec.New[@[]char]()
+	s.Locals = vec.New[@[]char]()
+	s.Parent = parent
+	return s
+}
+
+// declFamily records `name` as a family member (a value borrow-rooted in the
+// parameter) declared in this scope.  It is also a local (for shadowing).
+func (s @famScope) declFamily(name @[]char) {
+	if len(name) == 0 || streq(name, "_") { return }
+	s.Family.Push(name)
+	s.Locals.Push(name)
+}
+
+// declLocal records a non-family local binding in this scope.
+func (s @famScope) declLocal(name @[]char) {
+	if len(name) == 0 || streq(name, "_") { return }
+	s.Locals.Push(name)
+}
+
+// familyActive reports whether `name` resolves to a family member: at each scope
+// a Family entry wins, a non-family Locals entry SHADOWS any outer family member
+// of the same name, otherwise the search continues outward.
+func (s @famScope) familyActive(name @[]char) bool {
+	var cur @famScope = s
+	for cur != nil {
+		if nameInVec(cur.Family, name) { return true }
+		if nameInVec(cur.Locals, name) { return false }
+		cur = cur.Parent
+	}
+	return false
+}
+
+// ============================================================
+// Entry point + per-function analysis
+// ============================================================
+
+// lintBorrowableCharParams runs the rule over every top-level function / method
+// in the merged file.
+func lintBorrowableCharParams(ctx @lintCtx, file @ast.File) {
+	if file == nil { return }
+	for i := 0; i < len(file.Decls); i++ {
+		pcDecl(ctx, file.Decls[i])
+	}
+}
+
+// pcDecl analyses each `@[]char` parameter of one function independently
+// (recursing grouped decls; ignoring non-functions and bodiless declarations).
+func pcDecl(ctx @lintCtx, d @ast.Decl) {
+	if d == nil { return }
+	if d.Kind == ast.DECL_GROUP {
+		for i := 0; i < len(d.Decls); i++ {
+			pcDecl(ctx, d.Decls[i])
+		}
+		return
+	}
+	if d.Kind != ast.DECL_FUNC || d.Body == nil { return }
+	for i := 0; i < len(d.Params); i++ {
+		if !isManagedCharSliceParam(d.Params[i]) { continue }
+		pcAnalyzeParam(ctx, d, d.Params[i])
+	}
+}
+
+// pcAnalyzeParam runs the family walk for one `@[]char` parameter of `d` and
+// emits the diagnostic when the parameter is flaggable.
+func pcAnalyzeParam(ctx @lintCtx, d @ast.Decl, param @ast.ParamDecl) {
+	var res @pcResult = make(pcResult)
+	res.Lint = ctx
+	res.PName = param.Name
+	// Root scope: the analysed parameter seeds the family; the receiver and every
+	// other parameter are plain (non-family) locals — so a return of a DIFFERENT
+	// `@[]char` parameter is correctly seen as a non-family owned return.
+	var root @famScope = newFamScope(nil)
+	if d.Recv != nil { root.declLocal(d.Recv.Name) }
+	for i := 0; i < len(d.Params); i++ {
+		if streq(d.Params[i].Name, param.Name) {
+			root.declFamily(param.Name)
+		} else {
+			root.declLocal(d.Params[i].Name)
+		}
+	}
+	pcWalkStmt(res, d.Body, root)
+	if !(res.HasBorrow && !res.HasOwn) { return }
+	if res.Returned && res.OwnedCharReturn { return } // return type cannot cascade
+	addDiag(ctx, param.Pos, "borrowable-char-param", borrowableParamMsg(param.Name, res.RetView))
+}
+
+// ============================================================
+// Statement walk
+// ============================================================
+
+// pcWalkStmt walks statement `s` under family scope `scope`, opening nested
+// scopes for blocks / control constructs and classifying every family use.
+func pcWalkStmt(res @pcResult, s @ast.Stmt, scope @famScope) {
+	if s == nil { return }
+	if s.Kind == ast.STMT_BLOCK {
+		var child @famScope = newFamScope(scope)
+		for i := 0; i < len(s.Stmts); i++ { pcWalkStmt(res, s.Stmts[i], child) }
+		return
+	}
+	if s.Kind == ast.STMT_DECL {
+		pcWalkDeclStmt(res, s.DeclRef, scope)
+		return
+	}
+	if s.Kind == ast.STMT_SHORT_VAR {
+		pcWalkShortVar(res, s, scope)
+		return
+	}
+	if s.Kind == ast.STMT_ASSIGN {
+		pcWalkAssign(res, s, scope)
+		return
+	}
+	if s.Kind == ast.STMT_INC_DEC {
+		// `fam[i]++` / `fam++` mutates the backing (or the family binding).
+		if pcIsFamilyBackingLValue(scope, s.X) {
+			res.HasOwn = true
+		} else {
+			pcRead(res, s.X, scope)
+		}
+		return
+	}
+	if s.Kind == ast.STMT_EXPR {
+		pcRead(res, s.X, scope)
+		return
+	}
+	if s.Kind == ast.STMT_RETURN {
+		for i := 0; i < len(s.Exprs); i++ { pcReturnOperand(res, s.Exprs[i], scope) }
+		return
+	}
+	if s.Kind == ast.STMT_IF {
+		pcRead(res, s.X, scope)
+		pcWalkStmt(res, s.Body, scope)
+		pcWalkStmt(res, s.Else, scope)
+		return
+	}
+	if s.Kind == ast.STMT_FOR {
+		pcWalkFor(res, s, scope)
+		return
+	}
+	if s.Kind == ast.STMT_SWITCH || s.Kind == ast.STMT_TYPE_SWITCH {
+		pcWalkSwitch(res, s, scope)
+		return
+	}
+}
+
+// pcWalkDeclStmt classifies a function-local `var` / `const` declaration.  A
+// binding whose initialiser is a family value JOINS the family (it would become
+// a `*[]readonly char` borrow under the conversion); any other initialiser is a
+// generic read and the bound name is a plain local.
+func pcWalkDeclStmt(res @pcResult, d @ast.Decl, scope @famScope) {
+	if d == nil { return }
+	if d.Kind == ast.DECL_GROUP {
+		for i := 0; i < len(d.Decls); i++ { pcWalkDeclStmt(res, d.Decls[i], scope) }
+		return
+	}
+	if d.Kind != ast.DECL_VAR && d.Kind != ast.DECL_CONST { return }
+	if d.Value != nil && pcIsFamilyExpr(scope, d.Value) {
+		pcWalkFamilyExprIndices(res, d.Value, scope)
+		scope.declFamily(d.Name)
+		return
+	}
+	if d.Value != nil { pcRead(res, d.Value, scope) }
+	scope.declLocal(d.Name)
+}
+
+// pcWalkShortVar classifies a `:=` short-variable declaration.  A single binding
+// from a family value joins the family; a multi-value bind (from one call) never
+// yields a family value, and every RHS is read.
+func pcWalkShortVar(res @pcResult, s @ast.Stmt, scope @famScope) {
+	if len(s.Exprs) == len(s.Exprs2) {
+		for i := 0; i < len(s.Exprs); i++ {
+			var lhs @ast.Expr = s.Exprs[i]
+			var rhs @ast.Expr = s.Exprs2[i]
+			if lhs != nil && lhs.Kind == ast.EXPR_IDENT && pcIsFamilyExpr(scope, rhs) {
+				pcWalkFamilyExprIndices(res, rhs, scope)
+				scope.declFamily(lhs.Name)
+			} else {
+				pcRead(res, rhs, scope)
+				if lhs != nil && lhs.Kind == ast.EXPR_IDENT { scope.declLocal(lhs.Name) }
+			}
+		}
+		return
+	}
+	for i := 0; i < len(s.Exprs2); i++ { pcRead(res, s.Exprs2[i], scope) }
+	for i := 0; i < len(s.Exprs); i++ {
+		if s.Exprs[i] != nil && s.Exprs[i].Kind == ast.EXPR_IDENT {
+			scope.declLocal(s.Exprs[i].Name)
+		}
+	}
+}
+
+// pcWalkFor classifies a for statement in a fresh child scope.  Ranging a family
+// member reads its elements (a borrow); the loop variables are plain locals (a
+// range element of a `@[]char` is a `char`, never a family slice).
+func pcWalkFor(res @pcResult, s @ast.Stmt, scope @famScope) {
+	var child @famScope = newFamScope(scope)
+	if s.ForVal != nil {
+		if pcIsFamilyExpr(scope, s.X) {
+			res.HasBorrow = true
+		} else {
+			pcRead(res, s.X, scope)
+		}
+		if s.ForKey != nil && s.ForKey.Kind == ast.EXPR_IDENT { child.declLocal(s.ForKey.Name) }
+		if s.ForVal.Kind == ast.EXPR_IDENT { child.declLocal(s.ForVal.Name) }
+	} else {
+		pcWalkStmt(res, s.Init, child)
+		pcRead(res, s.X, child)
+		pcWalkStmt(res, s.Post, child)
+	}
+	pcWalkStmt(res, s.Body, child)
+}
+
+// pcWalkSwitch classifies a switch / type-switch.  The subject and case guards
+// are reads; a type-switch binder is a plain local shared by the case bodies,
+// each of which opens its own scope.
+func pcWalkSwitch(res @pcResult, s @ast.Stmt, scope @famScope) {
+	pcRead(res, s.X, scope)
+	var child @famScope = newFamScope(scope)
+	if len(s.Binder) != 0 { child.declLocal(s.Binder) }
+	for i := 0; i < len(s.Cases); i++ {
+		var cc @ast.CaseClause = s.Cases[i]
+		if cc == nil { continue }
+		for j := 0; j < len(cc.Exprs); j++ { pcRead(res, cc.Exprs[j], child) }
+		var caseScope @famScope = newFamScope(child)
+		for j := 0; j < len(cc.Body); j++ { pcWalkStmt(res, cc.Body[j], caseScope) }
+	}
+}

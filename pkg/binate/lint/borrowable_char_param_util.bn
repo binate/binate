@@ -1,0 +1,133 @@
+package "pkg/binate/lint"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/types"
+import "pkg/std/strings"
+
+// Predicates and the message builder for the `borrowable-char-param` rule.  The
+// body walk and use classification live in borrowable_char_param.bn; these are
+// the leaf helpers it consults.
+
+// isManagedCharSliceParam reports whether parameter `p`'s DECLARED type is
+// exactly `@[]char` — a managed slice whose element is the unqualified,
+// non-readonly `char`.  A readonly element (`@[]readonly char`) makes Base a
+// TEXPR_CONST, a raw slice (`*[]char` / `*[]readonly char`) is TEXPR_SLICE, and
+// any other element name or package qualifier fails the match, so only the
+// copy-forcing `@[]char` spelling is considered.  A variadic or blank parameter
+// is skipped.
+func isManagedCharSliceParam(p @ast.ParamDecl) bool {
+	if p == nil { return false }
+	if p.Variadic { return false }
+	if len(p.Name) == 0 || streq(p.Name, "_") { return false }
+	var te @ast.TypeExpr = p.Type
+	if te == nil || te.Kind != ast.TEXPR_MANAGED_SLICE { return false }
+	var base @ast.TypeExpr = te.Base
+	if base == nil || base.Kind != ast.TEXPR_NAMED { return false }
+	return len(base.Pkg) == 0 && streq(base.Name, "char")
+}
+
+// isRawReadonlyCharSlice reports whether resolved type `t` is `*[]readonly char`
+// — a raw slice whose element carries the const modifier and resolves to char
+// (== uint8).  This is the one callee-parameter type a value converted to
+// `*[]readonly char` can be passed to unchanged, so it marks a borrow-consuming
+// call argument.
+func isRawReadonlyCharSlice(t @types.Type) bool {
+	if t == nil { return false }
+	t = t.ResolveAlias()
+	if t.Kind != types.TYP_SLICE { return false }
+	var elem @types.Type = t.SliceElem()
+	if elem == nil || !elem.IsReadonly() { return false }
+	var base @types.Type = elem.StripReadonly().ResolveAlias()
+	if base == nil { return false }
+	return base.Identical(types.TypUint8())
+}
+
+// resolveCalleeFuncType returns the callee expression's resolved FUNC / func-
+// value type (peeling alias + named wrappers), or nil when it cannot be
+// resolved — e.g. a method call, whose selector the checker resolves via the
+// method path (leaving the call's `e.X` selector expression untyped).  A nil
+// result is treated by the caller as an unresolvable callee — conservatively
+// owning.
+func resolveCalleeFuncType(ctx @lintCtx, callee @ast.Expr) @types.Type {
+	if callee == nil { return nil }
+	var t @types.Type = ctx.Checker.ExprType(callee.ResolvedTypeID)
+	if t == nil { return nil }
+	t = t.ResolveAlias()
+	var depth int = 0
+	for t != nil && t.Kind == types.TYP_NAMED && t.Underlying != nil && depth < 64 {
+		t = t.Underlying.ResolveAlias()
+		depth = depth + 1
+	}
+	if t == nil { return nil }
+	if t.Kind == types.TYP_FUNC || t.Kind == types.TYP_FUNC_VALUE ||
+			t.Kind == types.TYP_MANAGED_FUNC_VALUE {
+		return t
+	}
+	return nil
+}
+
+// isManagedCharSliceType reports whether resolved type `t` is a MANAGED char
+// slice (`@[]char`, `@[]readonly char`, or a DEFINED named type whose underlying
+// is one, e.g. `type Str @[]char`) — the copy-forcing family the rule targets.
+// Used by the return-cascade check: a return operand of this type that is not a
+// parameter view is an OWNED value that cannot become `*[]readonly char` without
+// dangling, so it blocks the parameter's conversion.  Named wrappers are peeled
+// (like resolveCalleeFuncType / typeIsRawIfaceValue) because a `type Str @[]char`
+// return dangles exactly the same way a bare `@[]char` return would.
+func isManagedCharSliceType(t @types.Type) bool {
+	t = peelNamed(t)
+	if t == nil || t.Kind != types.TYP_MANAGED_SLICE { return false }
+	var elem @types.Type = t.SliceElem()
+	if elem == nil { return false }
+	return elem.Identical(types.TypUint8())
+}
+
+// isFuncTyped reports whether resolved type `t` is any function type: a bare
+// `TYP_FUNC` (the checked type checkCallExpr stamps on a MULTI-VALUE call node,
+// whether the callee is a plain function or a method) or a func VALUE
+// (`TYP_FUNC_VALUE` / `TYP_MANAGED_FUNC_VALUE`, stamped for a multi-value call
+// THROUGH a `*func` / `@func` value).  A multi-value call forwarded as a return
+// operand (`return g()` / `return fv()` where the callee yields `(@[]char, …)`)
+// forwards an OWNED char-slice result into the cascade slot, so it must block the
+// conversion the same way a direct owned char return does — but its node type is
+// the callee signature, not the `@[]char` slot, so isManagedCharSliceType cannot
+// see it.  Treating any function-typed return operand as blocking is sound: such
+// an operand is never a family char view (a function-typed value can never share
+// a return slot with a `@[]char` view), so the extra suppression only closes this
+// hole (mirrors resolveCalleeFuncType's kind list).
+func isFuncTyped(t @types.Type) bool {
+	t = peelNamed(t)
+	if t == nil { return false }
+	return t.Kind == types.TYP_FUNC || t.Kind == types.TYP_FUNC_VALUE ||
+			t.Kind == types.TYP_MANAGED_FUNC_VALUE
+}
+
+// peelNamed resolves aliases and unwraps defined named types (`type X …`) to
+// their underlying type, bounded against a pathological cycle.
+func peelNamed(t @types.Type) @types.Type {
+	if t == nil { return nil }
+	t = t.ResolveAlias()
+	var depth int = 0
+	for t != nil && t.Kind == types.TYP_NAMED && t.Underlying != nil && depth < 64 {
+		t = t.Underlying.ResolveAlias()
+		depth = depth + 1
+	}
+	return t
+}
+
+// borrowableParamMsg builds the diagnostic message.  `retView` appends a note
+// that the function's return type would also become `*[]readonly char` — the
+// view-helper pattern, where the parameter is returned directly or as a
+// sub-slice.
+func borrowableParamMsg(name @[]char, retView bool) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("parameter ")
+	cb.Write(name)
+	cb.Write(" is a read-only @[]char; consider *[]readonly char (a raw read-only ")
+	cb.Write("borrow) to avoid copying a string-literal argument")
+	if retView {
+		cb.Write(" (the return type would also become *[]readonly char)")
+	}
+	return buf.CopyStr(cb.String())
+}

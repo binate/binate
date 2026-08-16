@@ -1,0 +1,325 @@
+package "pkg/binate/lint"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+import "pkg/binate/types"
+
+// Expression / return / assignment classification for `borrowable-char-param`.
+// The statement walk and the family scope stack live in borrowable_char_param.bn;
+// the leaf type predicates and the message live in borrowable_char_param_util.bn.
+// A "family value" is the parameter, a sub-slice `fam[lo:hi]` of a family value,
+// or a local freshly bound to one (recorded in the scope by the statement walk).
+
+// pcIsFamilyExpr reports whether `e` denotes a family value: a bare reference to
+// a family member, or a sub-slice of a family value (recursively).
+func pcIsFamilyExpr(scope @famScope, e @ast.Expr) bool {
+	if e == nil { return false }
+	if e.Kind == ast.EXPR_IDENT { return scope.familyActive(e.Name) }
+	if e.Kind == ast.EXPR_SLICE { return pcIsFamilyExpr(scope, e.X) }
+	return false
+}
+
+// pcIsFamilyBackingLValue reports whether `lhs` is a WRITE through a family
+// member's backing — an element/slice write `fam[i]` / `fam[lo:hi]`, or the bare
+// family binding itself.  Such a write mutates data the parameter must be able to
+// share read-only, so it is an owning use.
+func pcIsFamilyBackingLValue(scope @famScope, lhs @ast.Expr) bool {
+	if lhs == nil { return false }
+	if lhs.Kind == ast.EXPR_INSTANTIATE_OR_INDEX { return pcIsFamilyExpr(scope, lhs.X) }
+	if lhs.Kind == ast.EXPR_SLICE { return pcIsFamilyExpr(scope, lhs.X) }
+	if lhs.Kind == ast.EXPR_IDENT { return scope.familyActive(lhs.Name) }
+	return false
+}
+
+// pcExprRootsInFamily reports whether `e`'s storage roots in a family member —
+// the family value itself, or an element / sub-slice access based on one
+// (`fam[i]`, `fam[lo:hi]`, recursively).  Taking the ADDRESS of such an
+// expression (`&fam[i]`) escapes a raw pointer into the family backing — one that
+// can outlive the borrow or mutate it — so it is an owning use, distinct from a
+// plain element READ.
+func pcExprRootsInFamily(scope @famScope, e @ast.Expr) bool {
+	if e == nil { return false }
+	if e.Kind == ast.EXPR_IDENT { return scope.familyActive(e.Name) }
+	if e.Kind == ast.EXPR_SLICE { return pcExprRootsInFamily(scope, e.X) }
+	if e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX { return pcExprRootsInFamily(scope, e.X) }
+	return false
+}
+
+// pcWalkFamilyExprIndices reads the index sub-expressions of a family sub-slice
+// (`fam[lo:hi]` — `lo` / `hi` may themselves read the parameter, e.g.
+// `p[0:len(p)]`), descending through nested sub-slices.  The sliced value itself
+// is a family value and needs no further classification here.
+func pcWalkFamilyExprIndices(res @pcResult, e @ast.Expr, scope @famScope) {
+	if e == nil { return }
+	if e.Kind == ast.EXPR_SLICE {
+		pcWalkFamilyExprIndices(res, e.X, scope)
+		pcRead(res, e.Y, scope)
+		pcRead(res, e.Z, scope)
+	}
+}
+
+// pcReturnOperand classifies a return operand.  A parameter view (direct or
+// laundered through a family local) is a borrow that requires the return type to
+// cascade to `*[]readonly char`; a non-family char-slice value is an owned return
+// that cannot cascade (recorded in OwnedCharReturn); a nil literal is compatible
+// with either return type.
+func pcReturnOperand(res @pcResult, e @ast.Expr, scope @famScope) {
+	if e == nil { return }
+	if e.Kind == ast.EXPR_IDENT && streq(e.Name, res.PName) {
+		res.HasBorrow = true
+		res.Returned = true
+		res.RetView = true
+		return
+	}
+	if e.Kind == ast.EXPR_SLICE && e.X != nil && e.X.Kind == ast.EXPR_IDENT &&
+			streq(e.X.Name, res.PName) {
+		res.HasBorrow = true
+		res.Returned = true
+		res.RetView = true
+		pcRead(res, e.Y, scope)
+		pcRead(res, e.Z, scope)
+		return
+	}
+	if pcIsFamilyExpr(scope, e) {
+		res.HasBorrow = true
+		res.Returned = true
+		pcWalkFamilyExprIndices(res, e, scope)
+		return
+	}
+	if e.Kind != ast.EXPR_NIL_LIT {
+		// A non-family, non-nil operand blocks the return-type cascade when it is (or
+		// forwards) an owned char slice: a managed char slice (incl. a named wrapper),
+		// or a multi-value call whose result slots the node type hides.  An
+		// unresolved type is treated conservatively as owned — never over-warn.
+		var rt @types.Type = resolveExprType(res.Lint, e)
+		if rt == nil || isManagedCharSliceType(rt) || isFuncTyped(rt) {
+			res.OwnedCharReturn = true
+		}
+	}
+	pcRead(res, e, scope)
+}
+
+// ============================================================
+// Assignments
+// ============================================================
+
+// pcWalkAssign classifies an assignment statement.  A plain `lhs = rhs` with
+// matching arity is classified pairwise; a compound assignment (`+=` …) or a
+// multi-value assignment from one call has no 1:1 family RHS, so every LHS is
+// checked for a family-backing write and every RHS is read.
+func pcWalkAssign(res @pcResult, s @ast.Stmt, scope @famScope) {
+	if s.Op != cast(int, token.ASSIGN) || len(s.Exprs) != len(s.Exprs2) {
+		for i := 0; i < len(s.Exprs); i++ {
+			if pcIsFamilyBackingLValue(scope, s.Exprs[i]) {
+				res.HasOwn = true
+			} else {
+				pcReadLValueIndices(res, s.Exprs[i], scope)
+			}
+		}
+		for i := 0; i < len(s.Exprs2); i++ { pcRead(res, s.Exprs2[i], scope) }
+		return
+	}
+	for i := 0; i < len(s.Exprs); i++ {
+		pcClassifyAssign(res, s.Exprs[i], s.Exprs2[i], scope)
+	}
+}
+
+// pcClassifyAssign classifies one `lhs = rhs` pair.  A family value stored into a
+// non-family slot (a global / field / index / a non-family local) is an owning
+// escape; a family-backing write is a mutation; a family local re-bound to a
+// non-family value can no longer be retyped uniformly — all owning.
+func pcClassifyAssign(res @pcResult, lhs @ast.Expr, rhs @ast.Expr, scope @famScope) {
+	if lhs == nil {
+		pcRead(res, rhs, scope)
+		return
+	}
+	if lhs.Kind == ast.EXPR_INSTANTIATE_OR_INDEX && pcIsFamilyExpr(scope, lhs.X) {
+		res.HasOwn = true // fam[i] = e
+		for i := 0; i < len(lhs.Args); i++ { pcRead(res, lhs.Args[i], scope) }
+		pcRead(res, rhs, scope)
+		return
+	}
+	if lhs.Kind == ast.EXPR_SLICE && pcIsFamilyExpr(scope, lhs.X) {
+		res.HasOwn = true // fam[lo:hi] = e
+		pcRead(res, lhs.Y, scope)
+		pcRead(res, lhs.Z, scope)
+		pcRead(res, rhs, scope)
+		return
+	}
+	if lhs.Kind == ast.EXPR_IDENT {
+		if streq(lhs.Name, res.PName) {
+			res.HasOwn = true // reassigning the parameter binding
+			pcRead(res, rhs, scope)
+			return
+		}
+		if pcIsFamilyExpr(scope, rhs) {
+			if scope.familyActive(lhs.Name) {
+				pcWalkFamilyExprIndices(res, rhs, scope) // family local ← family value
+			} else {
+				res.HasOwn = true // family value into a non-family local slot
+			}
+			return
+		}
+		if scope.familyActive(lhs.Name) {
+			res.HasOwn = true // family local polluted with a non-family value
+		}
+		pcRead(res, rhs, scope)
+		return
+	}
+	// Field / index / deref / global target.
+	if pcIsFamilyExpr(scope, rhs) {
+		res.HasOwn = true // family value stored into a non-retypeable slot
+		pcReadLValueIndices(res, lhs, scope)
+		return
+	}
+	pcReadLValueIndices(res, lhs, scope)
+	pcRead(res, rhs, scope)
+}
+
+// ============================================================
+// Generic read / value context
+// ============================================================
+
+// pcRead walks expression `e` in a value-read context.  A bare family member (or
+// a family sub-slice) reaching here has flowed into a non-borrow position — a
+// composite element, a binary / unary operand (`&fam`), a whole-slice builtin
+// argument — so it is an owning use.  The borrow-compatible forms (index / len /
+// range / sub-slice bound-or-returned / borrow-consuming call argument) are
+// recognised at the node whose operand is the family member.
+func pcRead(res @pcResult, e @ast.Expr, scope @famScope) {
+	if e == nil { return }
+	if e.Kind == ast.EXPR_IDENT {
+		if scope.familyActive(e.Name) { res.HasOwn = true }
+		return
+	}
+	if e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		if pcIsFamilyExpr(scope, e.X) {
+			res.HasBorrow = true // fam[i] element read
+		} else {
+			pcRead(res, e.X, scope)
+		}
+		for i := 0; i < len(e.Args); i++ { pcRead(res, e.Args[i], scope) }
+		return
+	}
+	if e.Kind == ast.EXPR_SLICE {
+		if pcIsFamilyExpr(scope, e.X) {
+			res.HasOwn = true // a family sub-slice nested in a larger read = owning
+		} else {
+			pcRead(res, e.X, scope)
+		}
+		pcRead(res, e.Y, scope)
+		pcRead(res, e.Z, scope)
+		return
+	}
+	if e.Kind == ast.EXPR_BUILTIN {
+		pcReadBuiltin(res, e, scope)
+		return
+	}
+	if e.Kind == ast.EXPR_CALL {
+		pcReadCall(res, e, scope)
+		return
+	}
+	if e.Kind == ast.EXPR_FUNC_LIT {
+		if e.DeclRef != nil && pcCapturesFamily(scope, e.DeclRef) { res.HasOwn = true }
+		return
+	}
+	if e.Kind == ast.EXPR_UNARY && e.Op == cast(int, token.AMP) {
+		// &X: taking the address of storage rooted in a family member escapes a raw
+		// pointer into the family backing — an owning use.  A whole-slice `&fam` also
+		// reaches this (its operand is the bare family ident); an element / sub-slice
+		// address `&fam[i]` / `&fam[lo:hi]` would otherwise look like a plain read.
+		if pcExprRootsInFamily(scope, e.X) {
+			res.HasOwn = true
+		} else {
+			pcRead(res, e.X, scope)
+		}
+		return
+	}
+	pcRead(res, e.X, scope)
+	pcRead(res, e.Y, scope)
+	pcRead(res, e.Z, scope)
+	for i := 0; i < len(e.Args); i++ { pcRead(res, e.Args[i], scope) }
+	for i := 0; i < len(e.Elems); i++ {
+		pcRead(res, e.Elems[i].Key, scope)
+		pcRead(res, e.Elems[i].Value, scope)
+	}
+}
+
+// pcReadBuiltin classifies a builtin call.  `len(fam)` and `unsafe_index(fam, i)`
+// READ the family member (a borrow); any other builtin (make / box / cast /
+// bit_cast / …) reinterprets or consumes a whole-slice operand, so a family
+// argument there falls to the owning default via the generic walk.
+func pcReadBuiltin(res @pcResult, e @ast.Expr, scope @famScope) {
+	if (e.Op == cast(int, token.LEN) || e.Op == cast(int, token.UNSAFE_INDEX)) && len(e.Args) >= 1 &&
+			pcIsFamilyExpr(scope, e.Args[0]) {
+		res.HasBorrow = true
+		for i := 1; i < len(e.Args); i++ { pcRead(res, e.Args[i], scope) }
+		return
+	}
+	for i := 0; i < len(e.Args); i++ { pcRead(res, e.Args[i], scope) }
+}
+
+// pcReadCall classifies a function call.  A family value passed DIRECTLY as an
+// argument is a borrow iff the callee's corresponding parameter is
+// `*[]readonly char`; otherwise the callee may own it (owning).  A family value
+// nested in a larger argument expression is classified by walking it.
+func pcReadCall(res @pcResult, e @ast.Expr, scope @famScope) {
+	pcRead(res, e.X, scope)
+	for i := 0; i < len(e.Args); i++ {
+		var a @ast.Expr = e.Args[i]
+		if pcIsFamilyExpr(scope, a) {
+			if pcCalleeArgBorrows(res, e, i) {
+				res.HasBorrow = true
+			} else {
+				res.HasOwn = true
+			}
+		} else {
+			pcRead(res, a, scope)
+		}
+	}
+}
+
+// pcCalleeArgBorrows reports whether a family value passed as call `e`'s argument
+// `i` reaches a callee parameter of type `*[]readonly char` — a borrow consumer.
+// It requires an EXACT arity match between the resolved callee signature and the
+// call's arguments, so argument i maps directly to parameter i (sidestepping a
+// method's receiver-in-Params[0] offset and variadic packing).  A spread call, an
+// unresolved callee, or an arity mismatch is conservatively NOT a borrow.
+func pcCalleeArgBorrows(res @pcResult, e @ast.Expr, i int) bool {
+	if e.Spread { return false }
+	var ft @types.Type = resolveCalleeFuncType(res.Lint, e.X)
+	if ft == nil { return false }
+	if len(ft.Params) != len(e.Args) { return false }
+	if i < 0 || i >= len(ft.Params) { return false }
+	return isRawReadonlyCharSlice(ft.Params[i].Type)
+}
+
+// pcReadLValueIndices reads the sub-expressions of a non-family assignment target
+// (an index `a[i]`, a slice `a[lo:hi]`, a field `x.f`) — which may themselves
+// read the parameter — without treating the target as an owning store.
+func pcReadLValueIndices(res @pcResult, lhs @ast.Expr, scope @famScope) {
+	if lhs == nil { return }
+	if lhs.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		pcRead(res, lhs.X, scope)
+		for i := 0; i < len(lhs.Args); i++ { pcRead(res, lhs.Args[i], scope) }
+		return
+	}
+	if lhs.Kind == ast.EXPR_SLICE {
+		pcRead(res, lhs.X, scope)
+		pcRead(res, lhs.Y, scope)
+		pcRead(res, lhs.Z, scope)
+		return
+	}
+	pcRead(res, lhs.X, scope)
+}
+
+// pcCapturesFamily reports whether func-literal decl `d` captures a family member
+// from the enclosing scope — a nested closure holding a live reference, an owning
+// use.
+func pcCapturesFamily(scope @famScope, d @ast.Decl) bool {
+	if d == nil { return false }
+	for i := 0; i < len(d.Captures); i++ {
+		if d.Captures[i] != nil && scope.familyActive(d.Captures[i].Name) { return true }
+	}
+	return false
+}

@@ -47,10 +47,13 @@ fixture mirrors `conformance/995`'s `gholder.bni`.
 
 ## Status / scope
 
-Landed (29 cells): the `balance` core over six element kinds (managed-ptr,
+Landed (32 cells): the `balance` core over seven element kinds (managed-ptr,
 managed-slice, managed-struct, func-value, iface, **nested-generic** — a generic
-instantiation `@Box[int]` held inside the container) × both sites; the `empty`
-never-populated-destroy op over named-wrapper / named-array × both sites; the
+instantiation `@Box[int]` held inside the container — and **array-of-managed** — a
+bare `[2]@Counter` array held by value, which needs a generic-CALL array type arg
+`New[[2]@Counter]()`, unblocked by the array-typearg parser fix) × both sites; the
+`empty` never-populated-destroy op over named-wrapper / named-array × both sites;
+the
 **method-value** operation (`method-value/scalar`, `method-value/call-result`,
 mirroring `146`/`167`/`168`); the **type-distinctness** compile-error `.error`
 pair cells (array-length `[3]`vs`[5]` per `1017`, func-signature
@@ -84,8 +87,7 @@ not in a call's bracket type-arg list. `startsBracketTypeArg` now routes a leadi
 `[` to the type parser, so `New[[N]@T]()` (the shape an array-of-managed element
 needs) parses. This cell guards that.
 
-Planned follow-ups: the `array-of-managed` balance element kind (a `[N]@T` array
-held in the container — now unblocked by the fix above); `copy` and
+Planned follow-ups: `copy` and
 `destroy-populated` ops; and cross-package variants of the two dispatch cells (the
 bug-dense mangling axis — needs the generator's `xpkg` fixture generalized past the
 single `Holder`).

@@ -142,9 +142,27 @@ def nested_generic(pfx):
         use=f"{pfx}At[@Box[int]](h, 0).v")
 
 
+def array_of_managed(pfx):
+    # element is a bare ARRAY of managed pointers (`[2]@Counter`) held BY VALUE in
+    # the container.  Storing the array RefIncs each element; the container's
+    # destroy releases them.  Observe element 0's box: before storing it is held by
+    # `c0` + `src[0]` (=before), Put adds the container's copy (before+1), the
+    # container drop releases it (before).  Needs a generic-CALL array type arg
+    # (`New[[2]@Counter]()`), the shape the array-typearg parser fix unblocked.
+    return dict(
+        decls="type Counter struct {\n\tn int\n}",
+        t="[2]@Counter",
+        construct=["var c0 @Counter = make(Counter)", "c0.n = 42",
+                   "var c1 @Counter = make(Counter)", "c1.n = 7",
+                   "var src [2]@Counter", "src[0] = c0", "src[1] = c1",
+                   "var po *uint8 = bit_cast(*uint8, c0)"],
+        use=f"{pfx}At[[2]@Counter](h, 0)[0].n")
+
+
 BALANCE_KINDS = {"managed-ptr": managed_ptr, "managed-slice": managed_slice,
                  "managed-struct": managed_struct, "func-value": func_value,
-                 "iface": iface, "nested-generic": nested_generic}
+                 "iface": iface, "nested-generic": nested_generic,
+                 "array-of-managed": array_of_managed}
 
 
 def named_wrapper(pfx):

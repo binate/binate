@@ -260,6 +260,23 @@ def any_slice_raw():
     ]
 
 
+def any_generic_inst():
+    # value-recover a generic-INSTANTIATION struct `Box[int]` from a raw `*any`:
+    # a struct value-recovery whose target is a MONOMORPHIZED generic type, distinct
+    # from `Box[bool]` (a wrong-instantiation comma-ok must miss).  Covers expr +
+    # comma-ok forms and the type-distinctness of two instantiations under RTTI.
+    return [
+        "var b Box[int]", "b.v = 42",
+        "var a *any = &b",
+        "var e Box[int] = a.(Box[int])",
+        "if e.v == 42 { testing.Println(1) } else { testing.Println(-1) }",
+        "r, ok := a.(Box[int])",
+        "if ok && r.v == 42 { testing.Println(2) } else { testing.Println(-2) }",
+        "_, ok2 := a.(Box[bool])",
+        "if ok2 { testing.Println(-3) } else { testing.Println(3) }",
+    ]
+
+
 # --- balance cells ----------------------------------------------------------
 # A helper recovers a managed value, uses it, and drops it at its own return; the
 # observed box's refcount must return to baseline.  Relative form → [<value>, 0].
@@ -372,6 +389,7 @@ INV = {
     "slice": "A managed-slice `@[]T` recovers from a RAW `*any` box (§11.12 iface.assert.slice): recovery RefInc-acquires the still-live backing — a NEW reference (the raw box owns none), OBSERVED via the relative form (held == before+1, dropped == before) so a borrow-miscompile is caught.",
     "balance": "A managed value recovered via `@T`/`@J` (ownership transfer) or a value struct-with-managed-field returns the observed box to baseline refcount after the recovered value drops — no leak, no double-free.",
     "legality": "The §11.12 recovery-kind rules are COMPILE errors: `@T`/`@J` needs a managed `@I` source (a raw `*I` has no reference to share); an interface recovers via `*J`/`@J`, never value.",
+    "generic-inst": "A generic-INSTANTIATION struct (`Box[int]`) value-recovers from a `*any` box, and is a DISTINCT type from another instantiation (`Box[bool]`) — a comma-ok on the wrong instantiation misses; the RTTI type identity keys on the monomorphized type, across every mode.",
 }
 
 CELLS = []
@@ -409,6 +427,9 @@ CELLS.append(dict(rel="any/mgd-scalar/recover", inv=INV["any"], decls="",
                   body=any_scalar("mgd"), exp=[1, 2, 3, 4]))
 CELLS.append(dict(rel="any/raw-slice/recover", inv=INV["slice"], decls=HOLD_SLICE,
                   body=any_slice_raw(), exp=[1, 42, 1], rt=True))
+CELLS.append(dict(rel="any/generic-inst/recover", inv=INV["generic-inst"],
+                  decls="type Box[T any] struct {\n\tv T\n}",
+                  body=any_generic_inst(), exp=[1, 2, 3]))
 
 # balance cells.  The @T / @J recovery helpers reference the Animal/Named/Dog decls.
 CELLS.append(dict(rel="balance/concrete", inv=INV["balance"], decls=IFACE_DECLS + "\n\n" + CONCRETE_BALANCE,

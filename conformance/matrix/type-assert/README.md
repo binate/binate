@@ -49,6 +49,10 @@ everywhere else. This matrix crosses the axes the spec pins.
   OBSERVED via the relative refcount form (held `== before+1`, dropped
   `== before`) so a borrow-miscompile — which a value-only check would miss — is
   caught.
+- `any/generic-inst/recover` — a generic-INSTANTIATION struct (`Box[int]`)
+  value-recovers from a `*any` box (expr + comma-ok), and is a DISTINCT type from
+  another instantiation: a comma-ok on `Box[bool]` MISSES. RTTI type identity keys
+  on the monomorphized type.
 - `balance/{concrete,iface,struct-value}` — refcount balance: a mortal managed
   observable recovered via `@T` / `@J` (ownership transfer) returns to baseline
   after the recovered value drops; a value struct-with-managed-field recovered in
@@ -72,17 +76,18 @@ everywhere else. This matrix crosses the axes the spec pins.
 
 ## Status / scope
 
-Landed (21 cells): the `iface` grid (raw/mgd × concrete/iface/ancestor, ok +
+Landed (22 cells): the `iface` grid (raw/mgd × concrete/iface/ancestor, ok +
 abort — every `ok` cell packs HIT + wrong-type-MISS + unset-MISS), `any` value
-recovery (scalar from both box kinds + a slice-from-raw balance cell), the three
-`balance` cells, and the three `legality` compile-error cells. Green under the
-six default modes + native x64/aa64.
+recovery (scalar from both box kinds + a slice-from-raw balance cell + a
+generic-instantiation value target), the three `balance` cells, and the three
+`legality` compile-error cells. Green under the six default modes + native
+x64/aa64.
 
 The plan gated the type-switch cells on "Phase 6 IR-gen lowering" and the
 cross-mode axis on "Slice 5 (VM RTTI)"; both have since landed
 (`pkg/binate/ir/gen_type_switch.bn`, `pkg/binate/vm/lower_typeinfo.bn`), so the
 whole matrix — including the switch form and every mode — builds now.
 
-Planned follow-ups (the plan's later waves): a generic-instantiation value
-target; a struct-value recovery from an interface `@I` (not just `*any`); the
-typed-nil-→-its-type and default type-switch narrowing cells as their own grid.
+Planned follow-ups (the plan's later waves): a struct-value recovery from an
+interface `@I` (not just `*any`); the typed-nil-→-its-type and default type-switch
+narrowing cells as their own grid.

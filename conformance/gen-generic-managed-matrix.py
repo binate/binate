@@ -201,8 +201,31 @@ def linkrun_body(e, pfx):
     ]
 
 
+# destroy-populated (scope-exit): a helper fills a Holder with the element and
+# returns — the POPULATED container drops at the helper's SCOPE EXIT (its dtor
+# RefDec's the element), a distinct cleanup trigger from the `balance` op's
+# reassignment-destroy (`h = drp`).  After the helper returns the element's
+# refcount is back to baseline (== before); a scope-exit-destroy leak would leave
+# it above.
+def destroy_populated_decls(e, pfx):
+    helper = (f'func fillAndDrop(src {e["t"]}) {{\n'
+              f'\tvar h @{pfx}Holder[{e["t"]}] = {pfx}New[{e["t"]}]()\n'
+              f'\t{pfx}Put[{e["t"]}](h, src)\n'
+              "}")
+    return (e["decls"] + "\n\n" if e["decls"] else "") + helper
+
+
+def destroy_populated_body(e, pfx):
+    return e["construct"] + [
+        "var before int = rt.Refcount(po)",
+        "fillAndDrop(src)",
+        "testing.Println(cast(int, rt.Refcount(po) == before))",
+    ]
+
+
 BALANCE_EXPECTED = [1, 42, 1]
 LINKRUN_EXPECTED = [0]
+DP_EXPECTED = [1]
 
 HEADER = '''package "main"
 
@@ -218,6 +241,7 @@ import "pkg/builtins/rt"
 
 BAL_INV = "A managed element held in a generic container gains exactly one ref and is released when the container drops (== before+1, then == before) — no leak, no UAF."
 LR_INV = "A cross/in-package generic container over a named-wrapper/array element must EMIT the element dtor helper even when EMPTY (the c14dd95e/aba92526 trigger); links + runs, Count == 0."
+DP_INV = "A POPULATED generic container dropped at a helper's SCOPE EXIT releases its managed element (the Holder dtor RefDec's it) — a distinct cleanup trigger from the balance op's reassignment-destroy; after the helper returns the element refcount is back to baseline (no scope-exit-destroy leak), on every backend and both sites."
 
 
 def bni(c):
@@ -247,6 +271,12 @@ for site in ("inpkg", "xpkg"):
         e = mk(pfx)
         CELLS.append(dict(site=site, rel=f"{site}/{kind}/empty", inv=LR_INV, holder=True,
                           decls=e["decls"], body=linkrun_body(e, pfx), exp=LINKRUN_EXPECTED))
+    # destroy-populated (scope-exit) op — one representative element kind
+    # (managed-ptr) × both sites (the mangling axis); distinct cleanup trigger.
+    e = managed_ptr(pfx)
+    CELLS.append(dict(site=site, rel=f"{site}/managed-ptr/destroy-populated", inv=DP_INV, holder=True,
+                      decls=destroy_populated_decls(e, pfx), body=destroy_populated_body(e, pfx),
+                      exp=DP_EXPECTED))
 
 # method-value cells (holder=False: their own Box[T] with methods, not the Holder
 # container).  Link+run — the whole point is exercising name-mangling backends.

@@ -47,7 +47,7 @@ fixture mirrors `conformance/995`'s `gholder.bni`.
 
 ## Status / scope
 
-Landed (32 cells): the `balance` core over seven element kinds (managed-ptr,
+Landed (34 cells): the `balance` core over seven element kinds (managed-ptr,
 managed-slice, managed-struct, func-value, iface, **nested-generic** — a generic
 instantiation `@Box[int]` held inside the container — and **array-of-managed** — a
 bare `[2]@Counter` array held by value, which needs a generic-CALL array type arg
@@ -61,7 +61,11 @@ pair cells (array-length `[3]`vs`[5]` per `1017`, func-signature
 `param-impl/dispatch` (a parameterized-receiver impl `impl @Box[T] : Getter[T]`
 dispatched through a per-instantiation vtable, mirroring `447`) and
 `constraint/dispatch` (a generic function calling a method on its type param's
-constraint interface, mirroring `434`); `array-typearg/scalar`, a parser-fix
+constraint interface, mirroring `434`) — plus their **cross-package** variants
+(`xpkg/param-impl/dispatch`, `xpkg/constraint/dispatch`), where the generic + impl /
+constraint live in `pkg/gh` and the consumer monomorphizes and dispatches (the
+bug-dense mangling axis the in-package prefix-alignment cannot exercise);
+`array-typearg/scalar`, a parser-fix
 regression cell; and the **method-expression** grid (`method-expression/*` — the
 unbound `Box[int].Get` form, described below).  The `iface` balance element's `xpkg`
 cell uses `gh.At[@Numbered](h,0).num()` — an iface-method CALL on a generic-call
@@ -87,10 +91,9 @@ not in a call's bracket type-arg list. `startsBracketTypeArg` now routes a leadi
 `[` to the type parser, so `New[[N]@T]()` (the shape an array-of-managed element
 needs) parses. This cell guards that.
 
-Planned follow-ups: `copy` and
-`destroy-populated` ops; and cross-package variants of the two dispatch cells (the
-bug-dense mangling axis — needs the generator's `xpkg` fixture generalized past the
-single `Holder`).
+Planned follow-ups: `copy` and `destroy-populated` ops. (The cross-package dispatch
+variants have landed — the generator's `xpkg` fixture is now generalized past the
+single `Holder` via a per-cell `gh_decls`.)
 
 Mode scope: green under the six default modes + native x64/aa64. `native-arm32`
 (`builder-comp_native_arm32_baremetal`) is an incomplete backend — any red there is

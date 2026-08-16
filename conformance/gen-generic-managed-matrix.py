@@ -220,8 +220,11 @@ BAL_INV = "A managed element held in a generic container gains exactly one ref a
 LR_INV = "A cross/in-package generic container over a named-wrapper/array element must EMIT the element dtor helper even when EMPTY (the c14dd95e/aba92526 trigger); links + runs, Count == 0."
 
 
-def bni(t_decls):
-    return (f'package "pkg/gh"\n\n{HOLDER_DECLS}\n')
+def bni(c):
+    # The cross-package fixture's body-included generic decls: the Holder container
+    # by default, or a cell-specific `gh_decls` block (e.g. a parameterized-receiver
+    # impl or a constraint interface + generic function, for the dispatch cells).
+    return f'package "pkg/gh"\n\n{c.get("gh_decls", HOLDER_DECLS)}\n'
 
 
 MV_INV = "A method VALUE taken off a generic instantiation (or a generic-call result) links + runs: the captured-receiver closure struct is named by the MANGLED instantiation name on every name-mangling backend (2d48f348/fedbd0c5)."
@@ -230,6 +233,8 @@ PI_INV = "A parameterized-receiver impl (`impl @Box[T] : Getter[T]`) lets a conc
 ME_INV = "A method EXPRESSION off a generic instantiation (`Box[int].Get`, receiver as Params[0] — the unbound form of the method value) links + runs: the func value binds the mangled instantiation method, the SAME symbol the bound form (`bp.Get`) and direct calls use."
 ATC_INV = "A generic-function CALL with an ARRAY type argument (`zero[[2]int]()`) instantiates over `[2]int` and runs — the array type is routed to the type parser in a call's bracket type-arg list, exactly as in a TYPE position (`@Box[[2]int]`, `make(Box[[2]int])`, per `distinct/array-len`).  Regression-guards the `startsBracketTypeArg` array-type fix; also the shape an array-of-managed container element needs (`New[[N]@T]()`)."
 GC_INV = "A generic function body that calls a method on its type param's CONSTRAINT interface (`func f[T Show](x T) int { return x.show() }`) dispatches correctly in the instantiation (mirrors 434)."
+PI_XPKG_INV = "A parameterized-receiver impl (`impl @Box[T] : Getter[T]`) declared CROSS-PACKAGE (in pkg/gh): a `@gh.Box[int]` boxes into a `@gh.Getter[int]` and dispatches through the per-instantiation vtable monomorphized in the consumer — the mangling-divergent site (the in-package prefix-alignment does not hide a mismatch here)."
+GC_XPKG_INV = "A CROSS-PACKAGE generic-constraint dispatch: the constraint interface + generic function live in pkg/gh, the concrete type and its `impl *Widget : gh.Show` live in the consumer, and `gh.showIt[*Widget](p)` dispatches the method — exercising the impl-in-consumer / constraint-in-provider mangling the in-package cell cannot."
 
 CELLS = []
 for site in ("inpkg", "xpkg"):
@@ -329,6 +334,28 @@ CELLS.append(dict(site="inpkg", rel="constraint/dispatch", inv=GC_INV, holder=Fa
                   body=["var w Widget", "w.v = 42", "var p *Widget = &w",
                         "testing.Println(showIt[*Widget](p))"]))
 
+# cross-package variants of the two dispatch cells — the plan's bug-dense mangling
+# axis (in-package coincidentally aligns the mangled prefixes; cross-package
+# diverges).  The generic + impl / constraint live in pkg/gh (gh_decls); the
+# consumer monomorphizes and dispatches.
+CELLS.append(dict(site="xpkg", rel="xpkg/param-impl/dispatch", inv=PI_XPKG_INV, holder=False, exp=[42],
+                  decls="",
+                  gh_decls=("interface Getter[T any] {\n\tGet() T\n}\n\n"
+                            "type Box[T any] struct {\n\tval T\n}\n\n"
+                            "func (b @Box[T]) Get() T {\n\treturn b.val\n}\n\n"
+                            "func NewBox[T any](v T) @Box[T] {\n\tvar b @Box[T] = make(Box[T])\n\tb.val = v\n\treturn b\n}\n\n"
+                            "impl @Box[T] : Getter[T]"),
+                  body=["var b @gh.Box[int] = gh.NewBox[int](42)",
+                        "var g @gh.Getter[int] = b", "testing.Println(g.Get())"]))
+CELLS.append(dict(site="xpkg", rel="xpkg/constraint/dispatch", inv=GC_XPKG_INV, holder=False, exp=[42],
+                  decls=("type Widget struct {\n\tv int\n}\n\n"
+                         "func (w *Widget) show() int {\n\treturn w.v\n}\n\n"
+                         "impl *Widget : gh.Show"),
+                  gh_decls=("interface Show {\n\tshow() int\n}\n\n"
+                            "func showIt[T Show](x T) int {\n\treturn x.show()\n}"),
+                  body=["var w Widget", "w.v = 42", "var p *Widget = &w",
+                        "testing.Println(gh.showIt[*Widget](p))"]))
+
 # type-distinctness compile-error PAIR cells (neg: assign must fail).
 CELLS.append(dict(site="inpkg", rel="distinct/array-len", inv=DISTINCT_INV, holder=False,
                   neg=True, err="cannot assign",
@@ -391,7 +418,7 @@ def main():
             d = os.path.join(DIR, c["rel"])
             _write(os.path.join(d, "main.bn"), render_main(c), changed, check)
             _write(os.path.join(d, "expected"), exp, changed, check)
-            _write(os.path.join(d, "pkg", "gh.bni"), bni(c["decls"]), changed, check)
+            _write(os.path.join(d, "pkg", "gh.bni"), bni(c), changed, check)
             _write(os.path.join(d, "pkg", "gh", "gh.bn"), GH_SENTINEL, changed, check)
     if check:
         if changed:

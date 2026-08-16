@@ -60,7 +60,6 @@ runner_setup() {
         exit 2
     fi
     build_gen1
-    build_bnas
 }
 
 # Compose the host-specific bnc args: macOS needs `-fuse-ld=lld`
@@ -73,9 +72,6 @@ _baremetal_bnc_extra_args() {
         set -- "$@" --cflag "$BAREMETAL_LD_FLAGS"
     fi
     set -- "$@" --link-after-objs "$BAREMETAL_LIBGCC_A"
-    # bnc assembles the bare-metal `.s` runtime files (crt0.s / semihost.s)
-    # with this bnas rather than clang; built in runner_setup.
-    set -- "$@" --bnas "$GEN1_BNAS"
     printf '%s\n' "$@"
 }
 

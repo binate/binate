@@ -279,6 +279,13 @@ CELLS.append(dict(site="inpkg", rel="method-expression/paren", inv=ME_INV, holde
                   body=["var bx Box[int]", "bx.val = 42",
                         "var f *func(*Box[int]) int = (Box[int]).Get",
                         "testing.Println(f(&bx))"]))
+# DIRECT invocation `Box[int].Get(&bx)` (the method expression is the call CALLEE,
+# not assigned to a func value) — the checker's tryMethodCall defers to the
+# func-value call; funcRefName names the instantiation method for a direct call.
+CELLS.append(dict(site="inpkg", rel="method-expression/direct-call", inv=ME_INV, holder=False, exp=[42],
+                  decls=ME_PTR_BOX,
+                  body=["var bx Box[int]", "bx.val = 42",
+                        "testing.Println(Box[int].Get(&bx))"]))
 # generic-function CALL with an ARRAY type argument (`zero[[2]int]()`).  `zero` has
 # no value args, so the explicit type arg is required — no inference hides it.
 # Regression-guards the startsBracketTypeArg array-type fix.

@@ -47,7 +47,7 @@ fixture mirrors `conformance/995`'s `gholder.bni`.
 
 ## Status / scope
 
-Landed (23 cells): the `balance` core over six element kinds (managed-ptr,
+Landed (29 cells): the `balance` core over six element kinds (managed-ptr,
 managed-slice, managed-struct, func-value, iface, **nested-generic** — a generic
 instantiation `@Box[int]` held inside the container) × both sites; the `empty`
 never-populated-destroy op over named-wrapper / named-array × both sites; the
@@ -58,19 +58,23 @@ pair cells (array-length `[3]`vs`[5]` per `1017`, func-signature
 `param-impl/dispatch` (a parameterized-receiver impl `impl @Box[T] : Getter[T]`
 dispatched through a per-instantiation vtable, mirroring `447`) and
 `constraint/dispatch` (a generic function calling a method on its type param's
-constraint interface, mirroring `434`); plus `array-typearg/scalar`, a parser-fix
-regression cell (described below).  The `iface` balance element's `xpkg`
+constraint interface, mirroring `434`); `array-typearg/scalar`, a parser-fix
+regression cell; and the **method-expression** grid (`method-expression/*` — the
+unbound `Box[int].Get` form, described below).  The `iface` balance element's `xpkg`
 cell uses `gh.At[@Numbered](h,0).num()` — an iface-method CALL on a generic-call
 result — so it regression-guards conformance/1027 (fixed in `dfbdf1dd`).
 
 The plan's third second-wave axis, a method EXPRESSION off a generic
-instantiation (`method-expression/scalar`, `Box[int].Get`), is present as an
-**XFAIL cell** (`.xfail.all`): the compiler rejects it — `Box[int]` parses as an
-index expression, not a generic instantiation for a method expression
-(`(Box[int]).Get` fails identically). The bound method-VALUE forms already work
-(`method-value/*`); only this unbound expression-on-generic form is missing. The
-cell XPASS-alerts when the compiler supports it; gap tracked in
-`explorations/claude-todo.md`.
+instantiation (`Box[int].Get`, the unbound form of the method value — receiver as
+Params[0]), was a compiler gap: the checker + IR-gen only recognized a method
+expression off a bare type name, not a generic instantiation. Now fixed — the func
+value binds the mangled instantiation method, the SAME symbol the bound `bp.Get`
+form and a direct call use. The `method-expression/*` cells cover ptr / managed /
+value receiver (`scalar` / `managed` / `value-recv`), the method-expr as the
+**sole/first mention** of the instantiation (`sole-mention`, driving struct +
+method emission from the expression), an **array type arg** (`array-arg`,
+`Box[[4]int].Tag`), and the **parenthesized** form (`paren`, `(Box[int]).Get`). The
+cross-package form (`mp.Box[int].Get`) is covered by `conformance/1211`.
 
 `array-typearg/scalar` is a passing regression cell for a parser fix: a
 generic-function CALL with an array type argument (`zero[[2]int]()`) used to be

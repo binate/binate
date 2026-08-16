@@ -209,7 +209,7 @@ def bni(t_decls):
 MV_INV = "A method VALUE taken off a generic instantiation (or a generic-call result) links + runs: the captured-receiver closure struct is named by the MANGLED instantiation name on every name-mangling backend (2d48f348/fedbd0c5)."
 DISTINCT_INV = "Two generic instantiations differing ONLY within a structured type arg (array LENGTH, func SIGNATURE) are DISTINCT types; assigning one to the other is a compile error (42b3bc83)."
 PI_INV = "A parameterized-receiver impl (`impl @Box[T] : Getter[T]`) lets a concrete `@Box[int]` box into a `@Getter[int]` interface value and dispatch through the per-instantiation vtable (gen.impl.generic-recv; mirrors 447)."
-ME_INV = "A method EXPRESSION off a generic instantiation (`Box[int].Get`, receiver as first param — the unbound form of the method value) should link + run with the qualified method name mangled per instantiation.  XFAIL: the compiler parses `Box[int]` as an index expression, not a generic instantiation for a method expression, so `Box[int].Get` (and `(Box[int]).Get`) do not compile — a gap this cell tracks (XPASS = fixed)."
+ME_INV = "A method EXPRESSION off a generic instantiation (`Box[int].Get`, receiver as Params[0] — the unbound form of the method value) links + runs: the func value binds the mangled instantiation method, the SAME symbol the bound form (`bp.Get`) and direct calls use."
 ATC_INV = "A generic-function CALL with an ARRAY type argument (`zero[[2]int]()`) instantiates over `[2]int` and runs — the array type is routed to the type parser in a call's bracket type-arg list, exactly as in a TYPE position (`@Box[[2]int]`, `make(Box[[2]int])`, per `distinct/array-len`).  Regression-guards the `startsBracketTypeArg` array-type fix; also the shape an array-of-managed container element needs (`New[[N]@T]()`)."
 GC_INV = "A generic function body that calls a method on its type param's CONSTRAINT interface (`func f[T Show](x T) int { return x.show() }`) dispatches correctly in the instantiation (mirrors 434)."
 
@@ -240,15 +240,44 @@ CELLS.append(dict(site="inpkg", rel="method-value/call-result", inv=MV_INV, hold
 # --- second-wave dispatch cells (plan's deferred axes; in-package minimal per the
 # plan's "after a minimal cell of each compiles").  Each exercises a DISTINCT
 # generic-dispatch path the method-value/balance cells do not.
-# method EXPRESSION off a generic instantiation (unbound `Box[int].Get`).  XFAIL:
-# the compiler parses `Box[int]` as an index expression (a compiler gap, tracked in
-# claude-todo.md); this cell XPASS-alerts when method expressions on generic
-# instantiations are supported.
+# method EXPRESSION off a generic instantiation (unbound `Box[int].Get`).  Covers
+# ptr / managed / value receiver; the method-expr as the SOLE/FIRST mention of the
+# instantiation (drives struct + method emission from the expression itself); an
+# ARRAY type arg (`Box[[4]int]`, exercising the array-type-arg parse); and the
+# parenthesized form `(Box[int]).Get`.
+ME_PTR_BOX = "type Box[T any] struct {\n\tval T\n}\n\nfunc (b *Box[T]) Get() T {\n\treturn b.val\n}"
 CELLS.append(dict(site="inpkg", rel="method-expression/scalar", inv=ME_INV, holder=False, exp=[42],
-                  xfail="method expression off a generic instantiation (`Box[int].Get`) — compiler parses `Box[int]` as an index expression; unsupported (see claude-todo.md)",
-                  decls="type Box[T any] struct {\n\tval T\n}\n\nfunc (b *Box[T]) Get() T {\n\treturn b.val\n}",
+                  decls=ME_PTR_BOX,
                   body=["var bx Box[int]", "bx.val = 42",
                         "var f *func(*Box[int]) int = Box[int].Get",
+                        "testing.Println(f(&bx))"]))
+CELLS.append(dict(site="inpkg", rel="method-expression/sole-mention", inv=ME_INV, holder=False, exp=[42],
+                  decls=ME_PTR_BOX,
+                  body=["var f *func(*Box[int]) int = Box[int].Get",
+                        "var bx Box[int]", "bx.val = 42",
+                        "testing.Println(f(&bx))"]))
+CELLS.append(dict(site="inpkg", rel="method-expression/managed", inv=ME_INV, holder=False, exp=[42],
+                  decls="type Box[T any] struct {\n\tval T\n}\n\nfunc (b @Box[T]) Get() T {\n\treturn b.val\n}",
+                  body=["var bx @Box[int] = make(Box[int])", "bx.val = 42",
+                        "var f *func(@Box[int]) int = Box[int].Get",
+                        "testing.Println(f(bx))"]))
+CELLS.append(dict(site="inpkg", rel="method-expression/value-recv", inv=ME_INV, holder=False, exp=[42],
+                  decls="type Box[T any] struct {\n\tval T\n}\n\nfunc (b Box[T]) Get() T {\n\treturn b.val\n}",
+                  body=["var bx Box[int]", "bx.val = 42",
+                        "var f *func(Box[int]) int = Box[int].Get",
+                        "testing.Println(f(bx))"]))
+# array type ARG: `Box[[4]int]` holds an array field (exercising the array-type-arg
+# in the instantiation), and the method reads a scalar field (a T-typed field can't
+# be indexed inside the generic body — T is `any`).
+CELLS.append(dict(site="inpkg", rel="method-expression/array-arg", inv=ME_INV, holder=False, exp=[42],
+                  decls="type Box[T any] struct {\n\tval T\n\ttag int\n}\n\nfunc (b *Box[T]) Tag() int {\n\treturn b.tag\n}",
+                  body=["var bx Box[[4]int]", "bx.tag = 42",
+                        "var f *func(*Box[[4]int]) int = Box[[4]int].Tag",
+                        "testing.Println(f(&bx))"]))
+CELLS.append(dict(site="inpkg", rel="method-expression/paren", inv=ME_INV, holder=False, exp=[42],
+                  decls=ME_PTR_BOX,
+                  body=["var bx Box[int]", "bx.val = 42",
+                        "var f *func(*Box[int]) int = (Box[int]).Get",
                         "testing.Println(f(&bx))"]))
 # generic-function CALL with an ARRAY type argument (`zero[[2]int]()`).  `zero` has
 # no value args, so the explicit type arg is required — no inference hides it.

@@ -1,0 +1,118 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// Synthetic per-package global-teardown function generation.  A managed global
+// (`var g @T`, or a struct/array global with managed fields) independently
+// allocates its CONTENT — the `@T` pointee, or the managed values inside the
+// aggregate — which no code ever tears down: the compiled backend leaves globals
+// alive for program lifetime and just exits.  For an embedder that spins bytecode
+// VMs up and down, that content accumulates across VM lifecycles (the static-data
+// BLOCK the global lives in is freed by @VM's destructor, but not what it points
+// at).
+//
+// genGlobalTeardownFunc synthesizes `<pkg>.__vm_teardown_globals`, whose body
+// RefDecs each managed global by reusing the SAME per-type release emitters a
+// return's scope-exit cleanup uses (emitManagedPtrRefDec / …).  The VM's opt-in
+// Shutdown runs it; the compiled backend lowers it like any other function but
+// never calls it.
+//
+// Emitting this body is also what makes the per-type destructors it needs exist
+// at all: the release emitters register each referenced dtor on the module's
+// pending-dtor work-lists, so building the teardown BEFORE generateDtors is
+// load-bearing — a managed global is destroyed nowhere else, so without this
+// emission there would be no `__dtor_<T>` to run.
+
+// globalNeedsTeardown reports whether a global of (already-peeled) type `st`
+// owns managed content that must be RefDec'd at teardown — the exact predicate
+// set emitDecForManagedLocals gates a managed local on.
+func globalNeedsTeardown(st @types.Type) bool {
+	return isManagedPtrType(st) || isManagedSliceType(st) || isManagedIfaceValueType(st) ||
+			isManagedFuncValueType(st) || needsStructCopy(st)
+}
+
+// moduleHasManagedGlobal reports whether `m` has at least one non-extern global
+// whose content needs teardown — the gate for emitting a teardown function at
+// all (no managed global ⇒ no function, and Shutdown finds nothing to call).
+func moduleHasManagedGlobal(m @Module) bool {
+	for i := 0; i < len(m.Globals); i++ {
+		if m.Globals[i].IsExtern { continue }
+		if globalNeedsTeardown(peelTransparent(m.Globals[i].Typ)) { return true }
+	}
+	return false
+}
+
+// globalTeardownRef builds a fresh IsGlobalRef pseudo-pointer to global `g`'s
+// storage, mirroring lookupVar's global fallback (gen_func.bn) and
+// libInitGuardRef (gen_init.bn): an OP_ALLOC pseudo (ID -1) whose StrVal is the
+// global's own (bare, same-package) name, so the VM materializes its address via
+// lookupGlobalAddr — the same name materializeGlobals keyed it under — and
+// codegen renders it as `@<mangled g>`.  A fresh instance per global keeps
+// distinct globals' refs from sharing one pseudo-Instr node.
+func globalTeardownRef(g @Global) @Instr {
+	var gp @Instr = make(Instr)
+	gp.ID = -1
+	gp.Op = iropcode.OP_ALLOC
+	gp.StrVal = g.Name
+	gp.Typ = types.MakePointerType(g.Typ)
+	gp.TypeArg = g.Typ
+	gp.IsGlobalRef = true
+	return gp
+}
+
+// addGlobalTeardownFunc synthesizes the module's global-teardown function and
+// adds it to `m` (a no-op when there is no managed global).  MUST be called
+// BEFORE generateDtors so the per-type dtors the teardown body references are
+// collected onto the module's pending-dtor work-lists — see the file comment.
+// Both IR-gen entry points (GenModule / GeneratePackage) call it, so the VM and
+// compiled backends both receive the function; the compiled backend never calls
+// it.
+func addGlobalTeardownFunc(m @Module) {
+	var teardown @Func = genGlobalTeardownFunc(m)
+	if teardown != nil {
+		m.AddFunc(teardown)
+	}
+}
+
+// genGlobalTeardownFunc synthesizes the module's `<pkg>.__vm_teardown_globals`
+// function, or returns nil when the module has no managed global that needs
+// teardown.  The body RefDecs each managed global's content via the shared
+// release emitters (see the file comment); f.Mod is set so those emitters can
+// register the per-type dtors they reference (registerPendingStructDtor etc.),
+// exactly as body-gen sets f.Mod for a user function.
+func genGlobalTeardownFunc(m @Module) @Func {
+	if !moduleHasManagedGlobal(m) { return nil }
+	var emptyParams @[]@Param
+	var emptyResults @[]@types.Type
+	var f @Func = NewFunc(m.PkgPath, "__vm_teardown_globals", emptyParams, emptyResults)
+	f.Mod = m
+	var b @Block = AddBlock(f, "entry")
+	for i := 0; i < len(m.Globals); i++ {
+		var g @Global = m.Globals[i]
+		if g.IsExtern { continue }
+		// Peel IR-transparent wrappers so a named-distinct / readonly managed
+		// global is still recognized (matches emitDecForManagedLocals).
+		var st @types.Type = peelTransparent(g.Typ)
+		if !globalNeedsTeardown(st) { continue }
+		var gp @Instr = globalTeardownRef(g)
+		// The four managed-scalar release emitters take the LOADED value; the
+		// struct/array dtor takes the ADDRESS.  Mutually exclusive kinds, so at
+		// most one arm fires per global.  A slice/iface/func-value RefDec can
+		// branch, so thread `b` forward for the following globals.
+		if isManagedPtrType(st) {
+			emitManagedPtrRefDec(f, b, b.EmitLoad(gp, st))
+		} else if isManagedSliceType(st) {
+			b = emitManagedSliceRefDec(f, b, b.EmitLoad(gp, st))
+		} else if isManagedIfaceValueType(st) {
+			b = emitManagedIfaceValueRefDec(f, b, b.EmitLoad(gp, st))
+		} else if isManagedFuncValueType(st) {
+			b = emitManagedFuncValueRefDec(f, b, b.EmitLoad(gp, st))
+		} else if needsStructCopy(st) {
+			emitStructDtor(f, b, gp, st)
+		}
+	}
+	var noVals @[]@Instr
+	b.EmitReturn(noVals)
+	return f
+}

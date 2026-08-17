@@ -1,0 +1,266 @@
+package "pkg/binate/interp"
+
+import "pkg/binate/ast"
+import "pkg/binate/ir"
+import "pkg/binate/parser"
+import "pkg/binate/types"
+import "pkg/binate/vm"
+import "pkg/builtins/reflect"
+import "pkg/builtins/rt"
+import "pkg/builtins/testing"
+import "pkg/stdx/slices"
+
+// externBinding returns the (VtableAddr, DataAddr) of the extern binding
+// registered under `name` in v — the two words RegisterExtern read out of a
+// FunctionInfo's Value — or (-1, -1) if the name is unbound.  Two names dispatch
+// to the same function value iff their pairs are equal.
+func externBinding(v @vm.VM, name *[]readonly char) (int, int) {
+	var idx int = v.LookupExtern(name)
+	if idx < 0 {
+		return -1, -1
+	}
+	return v.Externs[idx].VtableAddr, v.Externs[idx].DataAddr
+}
+
+// TestWrapPackageOverridesRealDescriptor is the injection-level check on a REAL
+// compiler-emitted descriptor: wrap pkg/std/errors so its first exported
+// function's slot is rebound to its second function's callable value, then
+// confirm (a) the wrapped descriptor keeps the first NAME but takes the second's
+// VALUE while other slots are untouched, and (b) injecting the wrapped descriptor
+// makes the first name dispatch to the same value as the second — whereas the
+// base descriptor binds them to different values.  This proves WrapPackage
+// rewrites the binding an inject picks up, on an actual `__Package()` descriptor.
+func TestWrapPackageOverridesRealDescriptor() testing.TestResult {
+	var std @[]@reflect.Package = StandardPackages()
+	// errors (std[0]) exports several functions (New, Wrap, Is, ...); use the
+	// first two — distinct functions, so overriding one with the other is
+	// observable.
+	var base @reflect.Package = std[0]
+	var fns *[]@reflect.FunctionInfo = base.Functions
+	if len(fns) < 2 {
+		return fail("expected the base package to export >= 2 functions")
+	}
+	var targetName *[]readonly char = fns[0].Name
+	var replName *[]readonly char = fns[1].Name
+	if bit_cast(int, fns[0].Value) == bit_cast(int, fns[1].Value) {
+		return fail("test needs two distinct base functions to override between")
+	}
+
+	var ovs @[]FuncOverride = make_slice(FuncOverride, 1)
+	ovs[0].TargetName = targetName
+	ovs[0].Replacement = fns[1]
+	var wrapped @WrappedPackage = WrapPackage(base, ovs)
+	var wp @reflect.Package = wrapped.Package()
+
+	// Descriptor: slot 0 keeps the target NAME but takes the replacement's VALUE;
+	// slot 1 (not overridden) is unchanged.
+	if !seq(wp.Functions[0].Name, targetName) {
+		return fail("override must keep the target function's name")
+	}
+	if bit_cast(int, wp.Functions[0].Value) != bit_cast(int, fns[1].Value) {
+		return fail("override slot must carry the replacement's callable value")
+	}
+	if bit_cast(int, wp.Functions[1].Value) != bit_cast(int, fns[1].Value) {
+		return fail("a non-overridden slot must be left unchanged")
+	}
+
+	// Injection: inject base vs wrapped into fresh VMs.  In the base, the two names
+	// bind to different values; after the override, the target name dispatches to
+	// the SAME value as the replacement.
+	var vmBase @vm.VM = vm.NewVM(64 * 1024)
+	vm.RegisterPackageFunctions(vmBase, base)
+	var vmWrap @vm.VM = vm.NewVM(64 * 1024)
+	vm.RegisterPackageFunctions(vmWrap, wp)
+
+	var btVt int
+	var btData int
+	btVt, btData = externBinding(vmBase, targetName)
+	var brVt int
+	var brData int
+	brVt, brData = externBinding(vmBase, replName)
+	if btVt < 0 || brVt < 0 {
+		return fail("expected both names bound after injecting the base")
+	}
+	if btVt == brVt && btData == brData {
+		return fail("test vacuous: base target and replacement bind identically")
+	}
+
+	var wtVt int
+	var wtData int
+	wtVt, wtData = externBinding(vmWrap, targetName)
+	var wrVt int
+	var wrData int
+	wrVt, wrData = externBinding(vmWrap, replName)
+	if wtVt < 0 || wrVt < 0 {
+		return fail("expected both names bound after injecting the wrapped descriptor")
+	}
+	if wtVt != wrVt || wtData != wrData {
+		return fail("after the override, the target name must dispatch to the "
+				"replacement's value")
+	}
+	if wtVt == btVt && wtData == btData {
+		return fail("injecting the wrapped descriptor must change the target binding")
+	}
+	return ""
+}
+
+// ---- behavioral: a wrapped package changes observed runtime behavior ----
+
+// wrapDouble / wrapTriple are two same-signature functions with observably
+// different behavior, used as the "base function" and its "override" in the
+// behavioral test below.
+func wrapDouble(x int) int {
+	return x * 2
+}
+
+func wrapTriple(x int) int {
+	return x * 3
+}
+
+// mkExternInfo builds a scalar-return FunctionInfo binding `name` to the function
+// value at `fv` (a `*func(int) int` holder's address).  RetbufSize 0 = scalar
+// return; ParamSlots / Sig are unread by RegisterPackageFunctions, left zero/nil.
+func mkExternInfo(name *[]readonly char, fv *uint8) @reflect.FunctionInfo {
+	var fi @reflect.FunctionInfo = make(reflect.FunctionInfo)
+	fi.Name = name
+	fi.Value = fv
+	fi.RetbufSize = 0
+	return fi
+}
+
+// loadCallingExtern builds an @Interp whose "test" package (implSrc) calls
+// functions declared as externs by bniSrc (a bodyless `.bni` merged loader-style,
+// so the checker resolves the calls while the VM leaves them un-compiled ->
+// execExtern dispatch), with `descriptor`'s functions registered so those calls
+// dispatch to it.  Mirrors runfunc_typed_test's loadSelfContained plus the
+// .bni-merge (from vm's extern-mechanism tests) and the descriptor injection this
+// exercises.  Ready for RunFuncTyped.
+func loadCallingExtern(implSrc *[]readonly char, bniSrc *[]readonly char,
+		descriptor @reflect.Package) @Interp {
+	var bniP @parser.Parser = parser.NewInterface(strToBytes(bniSrc), "test.bni")
+	var bniFile @ast.File = bniP.ParseFile()
+	var implP @parser.Parser = parser.New(strToBytes(implSrc), "test.bn")
+	var implFile @ast.File = implP.ParseFile()
+	// Prepend the .bni extern decls into the impl file, the way the loader merges a
+	// package's interface decls ahead of its impl decls.
+	var merged @[]@ast.Decl
+	for i := 0; i < len(bniFile.Decls); i++ {
+		bniFile.Decls[i].FromBNI = true
+		merged = slices.Append[@ast.Decl](merged, bniFile.Decls[i])
+	}
+	for i := 0; i < len(implFile.Decls); i++ {
+		merged = slices.Append[@ast.Decl](merged, implFile.Decls[i])
+	}
+	implFile.Decls = merged
+
+	var c @types.Checker = types.NewChecker()
+	var noFiles @[]@ast.File
+	var noBni @ast.File
+	c.CheckPackage("test", implFile, noFiles, noBni)
+	var m @ir.Module = ir.GenModule(c, implFile)
+	var it @Interp = New(1024 * 1024, StandardPackages())
+	vm.RegisterPackageFunctions(it.Vm, descriptor)
+	it.Vm.LowerModule(m)
+	it.Checker = c
+	it.DispatchModule = m
+	return it
+}
+
+// TestWrapPackageChangesRuntimeBehavior is the behavioral end-to-end: a program
+// calls an injected package's `wrapDouble`; with the BASE descriptor injected the
+// call returns 7*2 = 14, but with a WrapPackage'd descriptor that overrides
+// wrapDouble with wrapTriple's value it returns 7*3 = 21 — the same program,
+// observing the override through a real VM dispatch.  This proves WrapPackage
+// changes observed runtime behavior, not merely the descriptor's bytes.
+func TestWrapPackageChangesRuntimeBehavior() testing.TestResult {
+	// Local function-value holders: RegisterExtern copies their {vtable,data}
+	// words at registration, so they need only outlive loadCallingExtern (they
+	// live for the whole test).
+	var doubleFv *func(int) int = wrapDouble
+	var tripleFv *func(int) int = wrapTriple
+
+	// Hand-built base descriptor for a "test" package (two functions).  baseFuncs
+	// stays local so base.Functions' raw borrow is valid through the calls below.
+	var baseFuncs @[]@reflect.FunctionInfo = make_slice(@reflect.FunctionInfo, 2)
+	baseFuncs[0] = mkExternInfo("test.wrapDouble", bit_cast(*uint8, &doubleFv))
+	baseFuncs[1] = mkExternInfo("test.wrapTriple", bit_cast(*uint8, &tripleFv))
+	var base @reflect.Package = make(reflect.Package)
+	base.Name = "test"
+	// bnlint:allow managed-to-raw-assign - baseFuncs is a live local; it outlives the reads
+	base.Functions = baseFuncs
+
+	var implSrc *[]readonly char = "package \"test\"\n"
+			"func callDouble() int { return wrapDouble(7) }\n"
+	var bniSrc *[]readonly char = "package \"test\"\n"
+			"func wrapDouble(x int) int\n"
+			"func wrapTriple(x int) int\n"
+	var noArgs @[]Value
+
+	// Base: wrapDouble runs as itself -> 7*2 = 14.
+	var itBase @Interp = loadCallingExtern(implSrc, bniSrc, base)
+	var rBase @[]Value
+	var eBase @[]@[]char
+	rBase, eBase = itBase.RunFuncTyped("test", "callDouble", noArgs)
+	if len(eBase) != 0 {
+		return fail(eBase[0])
+	}
+	if rBase[0].AsInt() != 14 {
+		return fail("base: wrapDouble(7) should run as itself (14)")
+	}
+	rBase[0].Release()
+
+	// Wrapped: override wrapDouble with wrapTriple's value -> 7*3 = 21.
+	var ovs @[]FuncOverride = make_slice(FuncOverride, 1)
+	ovs[0].TargetName = "test.wrapDouble"
+	ovs[0].Replacement = baseFuncs[1]
+	var wrapped @WrappedPackage = WrapPackage(base, ovs)
+	var itWrap @Interp = loadCallingExtern(implSrc, bniSrc, wrapped.Package())
+	var rWrap @[]Value
+	var eWrap @[]@[]char
+	rWrap, eWrap = itWrap.RunFuncTyped("test", "callDouble", noArgs)
+	if len(eWrap) != 0 {
+		return fail(eWrap[0])
+	}
+	if rWrap[0].AsInt() != 21 {
+		return fail("wrapped: overridden wrapDouble(7) should run wrapTriple (21)")
+	}
+	rWrap[0].Release()
+	return ""
+}
+
+// wrapScope calls WrapPackage in a scope its result does not escape, so the
+// returned WrappedPackage — and the funcs backing, the heap override
+// FunctionInfo nodes, and the @Package it owns — is released at return.  Returns
+// the wrapped Functions length so the call is not dead code.
+func wrapScope(base @reflect.Package, ovs @[]FuncOverride) int {
+	var w @WrappedPackage = WrapPackage(base, ovs)
+	return len(w.Package().Functions)
+}
+
+// TestWrapPackageRefcountBalance guards WrapPackage against a refcount leak: two
+// wrapScope calls (each fully releasing its WrappedPackage) must leave the live
+// block count unchanged across the measured second call.  A managed-to-raw borrow
+// that accidentally retained a wrapper, or an override FunctionInfo node that
+// never RefDec'd, would show up here as a rising count.  Measured on a warmed-up
+// second call so one-time first-call allocations do not skew the delta.
+func TestWrapPackageRefcountBalance() testing.TestResult {
+	var std @[]@reflect.Package = StandardPackages()
+	var base @reflect.Package = std[0]
+	var fns *[]@reflect.FunctionInfo = base.Functions
+	if len(fns) < 2 {
+		return fail("expected the base package to export >= 2 functions")
+	}
+	var ovs @[]FuncOverride = make_slice(FuncOverride, 1)
+	ovs[0].TargetName = fns[0].Name
+	ovs[0].Replacement = fns[1]
+	var n1 int = wrapScope(base, ovs)
+	var baseLive int = rt.LiveBlocks()
+	var n2 int = wrapScope(base, ovs)
+	if n2 != n1 {
+		return fail("wrapScope should be deterministic")
+	}
+	if rt.LiveBlocks() != baseLive {
+		return fail("WrapPackage leaked a managed allocation")
+	}
+	return ""
+}

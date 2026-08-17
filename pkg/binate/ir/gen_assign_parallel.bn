@@ -63,6 +63,41 @@ func genParallelAssign(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
 	return b
 }
 
+// registerParallelAcquire tracks a just-acquired phase-1 value for FAULT-only
+// cleanup.  Between the acquire and the phase-2 store, the value's acquire
+// reference — a managed-scalar slot-acquire RefInc (emitManagedValueCopyRefInc),
+// or a managed struct/array copy's field RefIncs (emitStructCopy) — is orphaned:
+// owned by no slot yet.  If a LATER phase-1 entry raises a recoverable VM fault,
+// that entry's fault pad RefDecs the live ctx.Temps, so registering the value
+// here is what releases the orphaned reference instead of leaking it by 1.
+// storeParallelEntry consumes it once the store transfers ownership into the
+// slot, so the normal path neither double-frees (statement-end cleanup) nor
+// double-dtors (the struct move).  A value that was ALSO registered as a temp by
+// its producer (a string-literal copy in coerceParallelRHS, a call result) is
+// then registered twice and RefDec'd twice by the pad — matching its two orphaned
+// references (own + acquire).  Emits nothing itself (a compile-time list op), so
+// non-fault IR — and every compiled/native backend, which has no fault pads — is
+// byte-identical.  A raw slice/pointer (borrow, not managed) is never acquired,
+// so isManagedScalarType keeps it off the list.
+func registerParallelAcquire(ctx @GenContext, e PAEntry) {
+	if e.Val == nil { return }
+	if e.IsStruct || isManagedScalarType(e.Typ) {
+		registerTemp(ctx, e.Val)
+	}
+}
+
+// releaseParallelAcquire deregisters a phase-1 acquire once phase 2 has stored it
+// (ownership moved to the slot), so the statement-end temp cleanup does not
+// RefDec / dtor it a second time.  Pairs with registerParallelAcquire; consuming
+// exactly one entry undoes exactly one of the possibly-two registrations (the
+// acquire), leaving a producer's own temp registration to run at statement end.
+func releaseParallelAcquire(ctx @GenContext, e PAEntry) {
+	if e.Val == nil { return }
+	if e.IsStruct || isManagedScalarType(e.Typ) {
+		consumeTemp(ctx, e.Val)
+	}
+}
+
 // resolveParallelEntry resolves one LHS target of a parallel assignment and
 // evaluates+acquires its RHS, returning the PAEntry and the (possibly split)
 // current block.  This entry's LHS operands (index / pointer subexpressions)
@@ -128,7 +163,16 @@ func resolveParallelEntry(ctx @GenContext, b @Block, lhs @ast.Expr,
 		// copy (RefInc) its managed fields, so a later store of another target
 		// can't free a field this value still references.  Phase 2 MOVES the
 		// temp's bits into the slot.
-		var tmp @Instr = b.EmitAlloc(e.Typ)
+		//
+		// EmitAlloc with the PEELED type (mirroring genCompositeLit) so the temp's
+		// TypeArg is the concrete TYP_STRUCT / TYP_ARRAY, not a named-distinct
+		// wrapper: the fault pad releases this temp via emitTempRefDecs'
+		// isStructOrArrayAlloc arm, which tests TypeArg.Kind WITHOUT peeling — a
+		// TYP_NAMED TypeArg (from `type NBox Box` / `type Row [N]@T`) would slip
+		// past it and leak the copied fields on the recoverable-fault path.  The
+		// underlying has identical layout (codegen peels named anyway), so the
+		// non-fault lowering is unchanged.
+		var tmp @Instr = b.EmitAlloc(peelTransparent(e.Typ))
 		b.EmitStore(tmp, v)
 		emitStructCopy(ctx.Func, b, tmp, e.Typ)
 		e.Val = tmp
@@ -137,6 +181,8 @@ func resolveParallelEntry(ctx @GenContext, b @Block, lhs @ast.Expr,
 		emitManagedValueCopyRefInc(ctx.Func, b, v, e.Typ)
 		e.Val = v
 	}
+	// Track the acquire for release on a LATER entry's recoverable-fault pad.
+	registerParallelAcquire(ctx, e)
 	return e, b
 }
 
@@ -257,6 +303,10 @@ func coerceParallelRHS(ctx @GenContext, b @Block, v @Instr, slotTyp @types.Type)
 // resolved target, releasing the old occupant (Axiom 5) WITHOUT re-acquiring
 // (the value was already acquired in phase 1).
 func storeParallelEntry(ctx @GenContext, b @Block, e PAEntry) @Block {
+	// Ownership now transfers to the slot, so stop tracking this acquire for
+	// fault cleanup (registerParallelAcquire) — else statement-end cleanup would
+	// double-free it.  Covers PA_SLICE too (dispatched below after this point).
+	releaseParallelAcquire(ctx, e)
 	if e.Kind == PA_BLANK { return b }
 	if e.Kind == PA_SLICE { return storeParallelSliceElem(ctx, b, e) }
 	if e.IsStruct {

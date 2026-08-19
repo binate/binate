@@ -1,0 +1,219 @@
+package "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+
+// checkCastSafeSet gates `cast` to its SAFE set (spec §8.5).  A cast outside the
+// set is a compile error naming the correct alternative (unsafe_cast / bit_cast /
+// a type assertion / explicit construction).  The safe set is the union of:
+//   (1) everything ASSIGNABLE (cast ⊇ assignability) — incl. interface WIDENING,
+//       the single-named-side composite crossing, and the managed->raw borrow;
+//   (2) numeric SCALAR conversions — int/float, and bool->numeric (a defined
+//       widening), but NOT numeric->bool (an int/float value need not be a valid
+//       bool — that is unsafe_cast's job);
+//   (3) named <-> underlying for ANY type — two named types sharing one
+//       underlying, or a named type and its underlying (a same-layout retype);
+//   (4) aggregate leaf-wise retype — a slice/array element retyped to a same-size,
+//       bit-preserving element (e.g. @[]int8 -> @[]uint8).
+// Constant operands are fit-checked (conv.cast.const-not-laundered).
+func checkCastSafeSet(c @Checker, pos token.Pos, argExpr @ast.Expr, src @Type, dst @Type) {
+	if src == nil || dst == nil {
+		return // a prior error produced the nil; don't pile on
+	}
+	// A cast involving an abstract type PARAMETER (a generic body: `cast(T, x)`)
+	// cannot be checked at definition time — T could instantiate to a type for
+	// which the cast is valid (e.g. `@any`, widening).  Defer to instantiation +
+	// IR-gen (which fails loud on an outlawed shape reached via a type parameter).
+	if isTypeParamType(src) || isTypeParamType(dst) {
+		return
+	}
+	// A CONSTANT operand to an integer target must fit, and is not laundered
+	// (conv.cast.const-not-laundered) — even for a same-type cast, since a bitwise
+	// constant can overflow its own type (`cast(uint64, A << 3)`).  Runs first,
+	// unconditionally; it no-ops for a non-integer target or a non-constant operand.
+	checkCastConstFits(c, argExpr.Pos, dst, src, argExpr)
+	// (1) Everything assignable is a safe cast.
+	if src.AssignableTo(c, dst) {
+		return
+	}
+	var ps @Type = peelNamedBounded(src)
+	var pd @Type = peelNamedBounded(dst)
+	if ps == nil || pd == nil {
+		return
+	}
+	// (2) Numeric scalar conversions.
+	if ps.IsScalar() && pd.IsScalar() {
+		if pd.IsBool() && !ps.IsBool() {
+			addCheckError(c, pos,
+					"cast cannot convert a numeric value to bool (a value outside"
+							" {0, 1} is not a valid bool); use unsafe_cast(bool, x)")
+			return
+		}
+		// int<->int, int<->float, float<->float, float->int, bool->numeric: defined
+		// (the constant fit-check above already covered a constant operand).
+		return
+	}
+	// (3) Named <-> underlying: a named type and its underlying, or two named types
+	// sharing one underlying (§8.5, any type — a same-layout retype).  Both peel to
+	// one base for a named->underlying chain; two distinct same-field named structs
+	// need a structural field compare (Identical is nominal on named structs).
+	// `Identical` is CONST-TRANSPARENT, so guard with `!dropsConst` — a readonly
+	// DROP (`*readonly int` -> `*int`) is "identical modulo const" but is the
+	// unverifiable unsafe_cast case, NOT a same-layout retype.
+	if ps.Identical(pd) && !dropsConst(src, dst) {
+		return
+	}
+	if ps.Kind == TYP_STRUCT && pd.Kind == TYP_STRUCT && sameStructFields(ps, pd) {
+		return
+	}
+	// (4) Aggregate leaf-wise retype.
+	if isAggregateLeafRetype(ps, pd) {
+		return
+	}
+	// Otherwise: not in the safe set.
+	addCastRejectError(c, pos, src, dst, ps, pd)
+}
+
+// isAggregateLeafRetype reports whether ps -> pd (both peeled) is a slice/array
+// element retype to a same-size, bit-preserving element.  Codegen relabels the
+// whole container with NO per-element loop, so the element conversion MUST be
+// bit-preserving for the retype to be correct.
+func isAggregateLeafRetype(ps @Type, pd @Type) bool {
+	if ps.Kind != pd.Kind {
+		return false
+	}
+	if ps.Kind != TYP_SLICE && ps.Kind != TYP_MANAGED_SLICE && ps.Kind != TYP_ARRAY {
+		return false
+	}
+	if ps.Kind == TYP_ARRAY && ps.ArrayLen != pd.ArrayLen {
+		return false
+	}
+	if ps.Elem == nil || pd.Elem == nil {
+		return false
+	}
+	return bitPreservingElem(ps.Elem, pd.Elem)
+}
+
+// bitPreservingElem reports whether an element retype from se to de is a same-size
+// bit-preserving reinterpret: identical elements, or same-size mutable integers
+// (int8<->uint8, int32<->uint32).  Excludes int<->float (value change), ->bool
+// (partial), a readonly drop/add, and managed elements (refcount).
+func bitPreservingElem(se @Type, de @Type) bool {
+	// A readonly change at the element level — in either direction, INCLUDING one
+	// hidden behind an alias/named wrapper — is not a plain bit-preserving retype (a
+	// drop is unsafe_cast's job).  dropsConstStrict peels aliases before checking.
+	if dropsConstStrict(se, de) || dropsConstStrict(de, se) {
+		return false
+	}
+	if se.Identical(de) {
+		return true
+	}
+	var ps @Type = peelNamedBounded(se)
+	var pd @Type = peelNamedBounded(de)
+	if ps == nil || pd == nil {
+		return false
+	}
+	return ps.IsInteger() && pd.IsInteger() && ps.SizeOf() == pd.SizeOf()
+}
+
+// sameStructFields reports whether two structs have the same field layout (same
+// field names + types, in order) — the "same underlying" relationship for two
+// distinct NAMED structs, which `Identical` treats nominally (by the struct's own
+// name).  It deliberately ignores the structs' own names.
+func sameStructFields(a @Type, b @Type) bool {
+	if len(a.Fields) != len(b.Fields) {
+		return false
+	}
+	for i := 0; i < len(a.Fields); i++ {
+		if !charEq(a.Fields[i].Name, b.Fields[i].Name) {
+			return false
+		}
+		if a.Fields[i].Type == nil || b.Fields[i].Type == nil {
+			return false
+		}
+		if !a.Fields[i].Type.Identical(b.Fields[i].Type) {
+			return false
+		}
+	}
+	return true
+}
+
+// addCastRejectError reports a cast outside the safe set, naming the correct
+// alternative for the (src, dst) shape.  ps / pd are the peeled forms.
+func addCastRejectError(c @Checker, pos token.Pos, src @Type, dst @Type, ps @Type, pd @Type) {
+	// Dropping element-level readonly is the unverifiable const_cast-like op.
+	if dropsConst(src, dst) {
+		addCheckError(c, pos,
+				"cast cannot drop element-level readonly (another handle may rely on"
+						" the readonly view); use unsafe_cast (§8.7)")
+		return
+	}
+	// Raw pointer -> managed pointer invents a reference count.
+	if ps.Kind == TYP_POINTER && pd.Kind == TYP_MANAGED_PTR {
+		addCheckError(c, pos,
+				"cast cannot convert a raw pointer to a managed pointer; use"
+						" unsafe_cast(@T, p) (asserts a management header) or bit_cast")
+		return
+	}
+	// An interface-value OPERAND is a narrowing (recover a concrete type).
+	if isInterfaceValueType(ps) {
+		addCheckError(c, pos,
+				"cast cannot recover a concrete type from an interface value; use a"
+						" type assertion `x.(T)` (checked) or unsafe_cast (unchecked)")
+		return
+	}
+	// An interface-value TARGET that assignability rejected: the operand does not
+	// satisfy the interface (or a raw pointer cannot widen to a managed interface).
+	if isInterfaceValueType(pd) {
+		addCheckError(c, pos,
+				"cast cannot widen this operand to the target interface value (it does"
+						" not satisfy the interface, or a raw `*T` cannot widen to a"
+						" managed `@I` — box / convert to `@T` first)")
+		return
+	}
+	// Pointer <-> integer is a same-size reinterpret.
+	if (isPointerKind(ps) && pd.IsInteger()) || (ps.IsInteger() && isPointerKind(pd)) {
+		addCheckError(c, pos,
+				"cast cannot convert between a pointer and an integer; use bit_cast"
+						" (a same-size reinterpret, §8.6)")
+		return
+	}
+	// Anything else (aggregate reinterpret, array -> managed-slice, ...).
+	addCheckError(c, pos,
+			"cast does not support this conversion; use bit_cast for a same-size"
+					" reinterpret (§8.6), a type assertion `x.(T)`, or construct the"
+					" value explicitly (allocate + copy)")
+}
+
+// isPointerKind reports whether t (already peeled) is a raw or managed pointer.
+func isPointerKind(t @Type) bool {
+	return t != nil && (t.Kind == TYP_POINTER || t.Kind == TYP_MANAGED_PTR)
+}
+
+// isTypeParamType reports whether t is, or STRUCTURALLY CONTAINS, an abstract
+// generic type parameter — a cast touching one cannot be gated until the type is
+// instantiated (`cast(T, x)`, but also `cast(@[]T, x)` / `cast(*T, x)` /
+// `cast(struct{ f T }, x)`).  Deferred casts are checked at IR-gen (which fails
+// loud on an outlawed instantiated shape).
+func isTypeParamType(t @Type) bool {
+	var p @Type = peelNamedBounded(t)
+	if p == nil {
+		return false
+	}
+	if p.Kind == TYP_TYPE_PARAM {
+		return true
+	}
+	if p.Elem != nil &&
+			(p.Kind == TYP_POINTER || p.Kind == TYP_MANAGED_PTR || p.Kind == TYP_SLICE ||
+					p.Kind == TYP_MANAGED_SLICE || p.Kind == TYP_ARRAY) {
+		return isTypeParamType(p.Elem)
+	}
+	if p.Kind == TYP_STRUCT {
+		for i := 0; i < len(p.Fields); i++ {
+			if isTypeParamType(p.Fields[i].Type) {
+				return true
+			}
+		}
+	}
+	return false
+}

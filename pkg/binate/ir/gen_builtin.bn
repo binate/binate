@@ -9,7 +9,8 @@ import "pkg/stdx/slices"
 // genBuiltin generates IR for builtin keyword expressions
 // (cast, bit_cast, len, make, make_slice, box).
 func genBuiltin(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
-	if e.Op == cast(int, token.CAST) || e.Op == cast(int, token.BIT_CAST) {
+	if e.Op == cast(int, token.CAST) || e.Op == cast(int, token.BIT_CAST) ||
+			e.Op == cast(int, token.UNSAFE_CAST) {
 		if len(e.Args) >= 1 {
 			var targetTyp @types.Type = resolveTypeExpr(ctx.Gc, e.TypeRef)
 			// When the cast operand is an integer literal that fits the
@@ -18,11 +19,11 @@ func genBuiltin(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 			// 32-bit target would first lower the literal at the
 			// untyped-int default (i32), truncating it to
 			// 0x05060708 before the widening cast ever runs.
-			// Only fires for CAST (value-preserving conversion);
+			// Fires for the value-conversion casts (CAST / UNSAFE_CAST);
 			// BIT_CAST requires same-width operands so its literal
 			// is already correctly typed by the type checker.
 			var val @Instr = nil
-			if e.Op == cast(int, token.CAST) {
+			if e.Op == cast(int, token.CAST) || e.Op == cast(int, token.UNSAFE_CAST) {
 				val = genIntLitWithHint(ctx, b, e.Args[0], targetTyp)
 			}
 			if val == nil {
@@ -30,28 +31,13 @@ func genBuiltin(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 			}
 			b = ctx.CurBlock
 			if e.Op == cast(int, token.CAST) {
-				// Float -> int saturates to the target's range + NaN->0;
-				// the hardware converts disagree on out-of-range/NaN, so
-				// normalize in shared IR.
-				if isFloatToIntCast(val.Typ, targetTyp) {
-					return emitGuardedFloatToInt(b, val, targetTyp)
-				}
-				// `cast(*[]T, m)` where m is @[]T: the managed->raw slice decay
-				// (spec §7.6) is a {data,len} field EXTRACTION, not a bit-
-				// reinterpret — %BnManagedSlice (4 words) and %BnSlice (2 words)
-				// differ in layout.  Emit the same OP_MANAGED_TO_RAW the implicit
-				// decay uses (gen_call / gen_return / ...); a plain OP_CAST
-				// mis-declares the result's LLVM type (`%BnManagedSlice` used as
-				// `%BnSlice`).
-				if isManagedSliceType(val.Typ) && peelReadonly(targetTyp).Kind == types.TYP_SLICE {
-					return b.EmitManagedToRaw(val)
-				}
 				// A cast to/from an interface value (a 2-word `{data, vtable}`) is
 				// invalid -- OP_CAST would mis-declare `%BnIfaceValue` as a 1-word
 				// pointer.  The checker (check_builtin.bn) rejects the direct form, but a
 				// `cast(T, x)` inside a GENERIC body whose T is instantiated to `@any` /
 				// `@I` substitutes the interface type only HERE (the definition-time check
 				// saw an abstract type parameter), so guard again on the concrete types.
+				// (unsafe_cast, by contrast, DOES convert interface values — see below.)
 				var castSrc @types.Type = peelTransparent(val.Typ)
 				var castDst @types.Type = peelTransparent(targetTyp)
 				if isIfaceValueKind(castSrc) || isIfaceValueKind(castDst) {
@@ -62,7 +48,48 @@ func genBuiltin(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 									"interface -- recover a concrete type with a type assertion "
 									"`x.(T)` instead of `cast`")
 				}
-				return b.EmitCast(val, targetTyp)
+				return genCastValueConversion(b, val, targetTyp)
+			}
+			if e.Op == cast(int, token.UNSAFE_CAST) {
+				// unsafe_cast is a superset of cast (spec §8.7); its interface
+				// conversions are the part cast cannot do:
+				//   - NARROWING (interface value -> concrete `@T`/`*T`/value): extract
+				//     the data word UNCHECKED (no runtime type check, unlike `x.(T)`),
+				//     taking NO reference — refcount-neutral; a binding to an owning
+				//     location co-owns via its own copy-RefInc.
+				//   - WIDENING (concrete pointer -> interface value): construct the
+				//     {data, vtable} pair (RefInc for a managed target — the safe
+				//     conversion cast performs; the checker verified satisfaction).
+				// Every non-interface conversion reuses cast's value conversion.
+				var ucSrc @types.Type = peelTransparent(val.Typ)
+				var ucDst @types.Type = peelTransparent(targetTyp)
+				// Interface -> interface is rejected by the checker for CONCRETE
+				// types, but a `unsafe_cast(B, x)` in a GENERIC body whose A/B both
+				// instantiate to interface values substitutes them only HERE (the
+				// definition-time check saw abstract parameters).  Guard again on the
+				// concrete types -- EmitCast(iface, iface) would mis-declare the 2-word
+				// %BnIfaceValue as a 1-word pointer (mirrors the CAST arm's backstop).
+				if isIfaceValueKind(ucSrc) && isIfaceValueKind(ucDst) {
+					panic(
+							"internal error: unsafe_cast between interface values is not "
+									"supported (an interface value is a 2-word {data, vtable}); this "
+									"reached codegen via a generic type parameter bound to an "
+									"interface -- recover with a type assertion `x.(I)` instead")
+				}
+				if isIfaceValueKind(ucSrc) && !isIfaceValueKind(ucDst) {
+					return emitRecoveredValue(b, val, targetTyp)
+				}
+				if isIfaceValueKind(ucDst) && !isIfaceValueKind(ucSrc) {
+					var wrapped @Instr = wrapAsIfaceValue(ctx, b, val, targetTyp, val.Typ)
+					if wrapped == nil {
+						panic(
+								"internal error: unsafe_cast widening to an interface value "
+										"produced no value (non-pointer operand or missing impl vtable); "
+										"the checker should have rejected it")
+					}
+					return wrapped
+				}
+				return genCastValueConversion(b, val, targetTyp)
 			}
 			// A bit_cast that involves an aggregate stored BY ADDRESS (native/VM) /
 			// BY-VALUE first-class (LLVM), or that crosses the by-address/by-value
@@ -357,6 +384,29 @@ func defaultUntypedType(t @types.Type) @types.Type {
 		return types.TypBool()
 	}
 	return t
+}
+
+// genCastValueConversion lowers the value-conversion cases shared by `cast` and
+// `unsafe_cast` (the non-interface conversions): float->int saturation, the
+// @[]T -> *[]T managed-slice decay, and the general OP_CAST (numeric width /
+// sign conversion, pointer relabel, readonly drop).  Interface-value operands
+// never reach here — cast rejects them and unsafe_cast narrows/widens them at
+// the call site.
+func genCastValueConversion(b @Block, val @Instr, targetTyp @types.Type) @Instr {
+	// Float -> int saturates to the target's range + NaN->0; the hardware
+	// converts disagree on out-of-range/NaN, so normalize in shared IR.
+	if isFloatToIntCast(val.Typ, targetTyp) {
+		return emitGuardedFloatToInt(b, val, targetTyp)
+	}
+	// `cast(*[]T, m)` where m is @[]T: the managed->raw slice decay (spec §7.6) is
+	// a {data,len} field EXTRACTION, not a bit-reinterpret — %BnManagedSlice (4
+	// words) and %BnSlice (2 words) differ in layout.  Emit the same
+	// OP_MANAGED_TO_RAW the implicit decay uses; a plain OP_CAST mis-declares the
+	// result's LLVM type (`%BnManagedSlice` used as `%BnSlice`).
+	if isManagedSliceType(val.Typ) && peelReadonly(targetTyp).Kind == types.TYP_SLICE {
+		return b.EmitManagedToRaw(val)
+	}
+	return b.EmitCast(val, targetTyp)
 }
 
 // emitBitCastViaMemory lowers a same-size bit_cast that involves an aggregate

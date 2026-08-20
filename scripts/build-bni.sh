@@ -20,9 +20,8 @@
 # aarch64-linux, x86_64-darwin); omitted builds for the host arch.
 #
 # After building:
-#   <path> -main-file <file.bn>              run a single-file program
-#   <path> -main-dir <dir>                   run a directory main package
-#   <path> --repl -main-file <file.bn>       REPL against the loaded module
+#   <path> <file.bn|dir> [args]              run a main package (file or dir)
+#   <path> --repl <file.bn|dir>              REPL against the loaded module
 #   <path> --test <pkg> -I <iface> -L <impl> run unit tests in a package
 
 set -e
@@ -153,7 +152,6 @@ echo
 echo "Built: $OUT"
 echo
 echo "Try:"
-echo "  $OUT -main-file <file.bn>              # run a single-file program"
-echo "  $OUT -main-dir <dir>                   # run a directory main package"
-echo "  $OUT --repl -main-file <file.bn>       # interactive REPL against the loaded module"
+echo "  $OUT <file.bn|dir> [args]              # run a main package (first positional; file or dir)"
+echo "  $OUT --repl <file.bn|dir>              # interactive REPL against the loaded module"
 echo "  $OUT --test pkg/foo -I <iface> -L <impl>   # run unit tests (paths via scripts/binate-paths.sh)"

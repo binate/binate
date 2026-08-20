@@ -156,6 +156,23 @@ check "interp/no-args"   "$NO_ARGS" \
 check "interp/empty-arg" "$EMPTY_ARG" \
     "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" -main-file "$TMP/os_args.bn" -- alpha '' gamma 2>&1)"
 
+# (c) implicit target: a bare positional names the main package (no -main-file),
+# and flag parsing stops there — so the args (even flag-looking or empty ones)
+# reach the program WITHOUT a `--`.  This is the `bni script.bn args…` / shebang
+# form.
+check "interp/implicit-file" "$WITH_ARGS" \
+    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" alpha beta gamma 2>&1)"
+check "interp/implicit-empty-arg" "$EMPTY_ARG" \
+    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" alpha '' gamma 2>&1)"
+
+# (d) implicit DIRECTORY main package (auto-detected dir vs file): the same
+# program as <dir>/main.bn, run via a bare directory positional.  argv[0] is the
+# directory path, which the program skips like any argv[0].
+mkdir -p "$TMP/argsdir"
+cp "$TMP/os_args.bn" "$TMP/argsdir/main.bn"
+check "interp/implicit-dir" "$WITH_ARGS" \
+    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/argsdir" alpha beta gamma 2>&1)"
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then

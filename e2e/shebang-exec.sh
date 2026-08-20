@@ -3,21 +3,21 @@
 # shebang runs DIRECTLY as `./script.bn args…` and receives its command-line
 # arguments, exercising the whole shebang chain end to end:
 #   - the kernel reads the `#!` line and invokes the interpreter (exec-bit + `#!`),
-#   - bni's `-main-file` single-file mode (spec §17.3.1) takes that flag's value as
-#     the script and hands every following arg to the program (bare positionals are
-#     the program's argv, not more source files / bni flags),
+#   - bni takes the kernel-appended script path as the implicit main package and
+#     hands every following arg to the program (after `--`, positionals are the
+#     program's argv, not bni flags — even flag-looking ones),
 #   - bni's LEXER skips the `#!` line (spec lex.shebang) so the shebang'd source
 #     still parses,
 #   - and os.Args() surfaces [<script>, args…] to the program.
 #
 # Harness note: bni has no default/built-in stdlib location — it resolves packages
 # from the script's directory or an explicit -I/-L (cmd/bni resolveRoot), so a
-# script importing pkg/std/os can't be found by a bare `#!/usr/bin/env -S bni
-# -main-file`.  So the shebang appends the checkout's stdlib search paths:
-# `#!/usr/bin/env -S <bni> -I <iface> -L <impl> -main-file`.  `-main-file` must be
-# the LAST word: `-S` splits the words into argv and the kernel appends the script
-# path, which then becomes `-main-file`'s value.  This is the spec's own shebang
-# form (§17.3.1) —
+# script importing pkg/std/os needs the checkout's stdlib search paths on the
+# shebang: `#!/usr/bin/env -S <bni> -I <iface> -L <impl> --`.  The trailing `--`
+# is the LAST word: `-S` splits the words into argv and the kernel appends the
+# script path after `--`, so the script (and even a script named like a flag)
+# lands as a positional — the implicit main — and its args follow.  This is the
+# spec's own shebang form (§17.3.1) —
 # `env` is a binary and its `-S` splits the remaining words into argv, working
 # around the kernel's single-argument shebang limit; a deployed bni that shipped
 # its stdlib would need no -I/-L.  (The shebang interpreter MUST be a binary —
@@ -105,7 +105,7 @@ shorten() {
 SI="$(shorten "$CK_I" i)"
 SL="$(shorten "$CK_L" l)"
 
-SHEBANG="#!/usr/bin/env -S $BNI_BIN -I $SI -L $SL -main-file"
+SHEBANG="#!/usr/bin/env -S $BNI_BIN -I $SI -L $SL --"
 # Defensive: if a future path addition pushed the line past the kernel cap the
 # kernel would SILENTLY TRUNCATE it (catastrophic), so fail loud instead.
 if [ "${#SHEBANG}" -gt 250 ]; then
@@ -114,7 +114,7 @@ if [ "${#SHEBANG}" -gt 250 ]; then
 fi
 
 # ----- The executable script: the `env -S` shebang (naming bni + the shortened
-# stdlib search paths + a trailing `-main-file`), then a program that prints its argument count
+# stdlib search paths + a trailing `--`), then a program that prints its argument count
 # and each argument (Args()[1..]); element 0 is the path-dependent script name,
 # skipped like e2e/os-args.sh. -----
 SCRIPT="$TMP/greet.bn"
@@ -163,6 +163,14 @@ NO_ARGS="1"
 
 check "exec/with-args" "$WITH_ARGS" "$("$SCRIPT" one two 2>&1)"
 check "exec/no-args"   "$NO_ARGS"   "$("$SCRIPT" 2>&1)"
+
+# A FLAG-looking script argument must reach the program, not be swallowed by bni.
+# The `--` in the shebang ends bni's flags, so `--flag` after the kernel-appended
+# script path is a program arg (element of os.Args()), not `unknown flag: --flag`.
+WITH_FLAG_ARG="3
+[--flag]
+[one]"
+check "exec/flag-arg"  "$WITH_FLAG_ARG" "$("$SCRIPT" --flag one 2>&1)"
 
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="

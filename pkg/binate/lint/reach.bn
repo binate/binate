@@ -1,0 +1,268 @@
+package "pkg/binate/lint"
+
+import "pkg/binate/ast"
+import "pkg/binate/buildcfg"
+import "pkg/stdx/containers/mapfn"
+import "pkg/stdx/containers/setfn"
+import "pkg/stdx/containers/vec"
+
+// ============================================================
+// Unified reachability
+// ============================================================
+//
+// One reachability closure shared by unused-func / unused-global /
+// unused-type: which unexported package entities are
+// reachable from a "root".  REACHABILITY, not mere reference-presence — so an
+// entity referenced ONLY by other dead code (an unreachable private func, a
+// dead type's field) is still flagged, and a dead-code ISLAND (mutually
+// referencing decls that no root reaches) is flagged in full.
+//
+// Roots (always live; their references are seeded): exported entities
+// (part of the package's `.bni` contract), `main`, `#[c_export]` functions,
+// `Test…` / `Benchmark…` functions (test-framework entries), and every method.
+// A method's own RECEIVER type is excluded from what it seeds
+// (walkDeclRefsExRecv): a type reachable only as its methods' receiver is dead,
+// since nothing can construct it to dispatch them.
+//
+// Candidates (flagged when unreachable): unexported top-level funcs, unexported
+// package `var`s, and unexported package types.  A name is a value
+// (func/var/const) OR a type, never both, so one reached-name set and one
+// candidate map suffice across namespaces.
+//
+// A local or parameter that shadows a top-level name records the top-level name
+// as referenced (refs.bn over-counts deliberately), so every rule built on this
+// can only ever UNDER-warn, never false-positive.
+
+// reachState holds the reachability result for one package: the reached-name set
+// plus the per-kind candidate lists the rules flag against.
+type reachState struct {
+	reached     @setfn.SetFn[@[]char] // names proven reachable (value + type)
+	work        @vec.Vec[@[]char] // worklist of names still to process
+	cand        @mapfn.MapFn[@[]char, @ast.Decl] // candidate name → its decl (closure lookup)
+	funcCands   @vec.Vec[@ast.Decl] // unexported func candidates
+	globalCands @vec.Vec[@ast.Decl] // unexported var candidates
+	typeCands   @vec.Vec[@ast.Decl] // unexported type candidates
+}
+
+// newReachState returns an empty reachability state.
+func newReachState() @reachState {
+	var s @reachState = make(reachState)
+	s.reached = setfn.NewSetFn[@[]char](nameHash, nameEq)
+	s.work = vec.New[@[]char]()
+	s.cand = mapfn.NewMapFn[@[]char, @ast.Decl](nameHash, nameEq)
+	s.funcCands = vec.New[@ast.Decl]()
+	s.globalCands = vec.New[@ast.Decl]()
+	s.typeCands = vec.New[@ast.Decl]()
+	return s
+}
+
+// isReach reports whether `name` was proven reachable from a root.
+func (s @reachState) isReach(name @[]char) bool {
+	return s.reached.Has(name)
+}
+
+// computeReach classifies every top-level decl as a root or a candidate, seeds
+// the worklist from the roots' references, and closes over the candidates.
+func computeReach(merged @ast.File) @reachState {
+	var s @reachState = newReachState()
+	if merged == nil {
+		return s
+	}
+	classifyDecls(s, merged.Decls, merged)
+	// Reachability closure: a candidate referenced from a root (or from an
+	// already-reached candidate) is reachable; its own references are seeded in
+	// turn.  work grows during the walk and Len() re-reads each iteration, so
+	// newly-enqueued names are still processed.
+	var qi int = 0
+	for qi < s.work.Len() {
+		var name @[]char = s.work.Get(qi)
+		qi = qi + 1
+		if s.reached.Has(name) {
+			continue
+		}
+		var d @ast.Decl
+		var ok bool
+		d, ok = s.cand.Get(name)
+		if !ok {
+			continue
+		}
+		s.reached.Add(name)
+		seedDeclRefs(s, d)
+	}
+	return s
+}
+
+// classifyDecls records each decl (recursing groups) as a candidate of its kind
+// or, if it is a root, seeds its references immediately.
+func classifyDecls(s @reachState, decls @[]@ast.Decl, merged @ast.File) {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d == nil {
+			continue
+		}
+		if d.Kind == ast.DECL_GROUP {
+			classifyDecls(s, d.Decls, merged)
+			continue
+		}
+		if isUnusedFuncCandidate(d) {
+			s.cand.Put(d.Name, d)
+			s.funcCands.Push(d)
+		} else if isGlobalCandidate(d) {
+			s.cand.Put(d.Name, d)
+			s.globalCands.Push(d)
+		} else if isTypeCandidate(d, merged) {
+			s.cand.Put(d.Name, d)
+			s.typeCands.Push(d)
+		} else {
+			seedDeclRefs(s, d)
+		}
+	}
+}
+
+// seedDeclRefs enqueues every name `d` references onto the worklist.  A method
+// excludes its own receiver type (walkDeclRefsExRecv) so a type reachable only
+// as its methods' receiver stays dead; every other decl seeds all its refs.
+func seedDeclRefs(s @reachState, d @ast.Decl) {
+	var idx @refIndex = newRefIndex()
+	if d.Recv != nil {
+		walkDeclRefsExRecv(idx, d)
+	} else {
+		walkDeclRefs(idx, d)
+	}
+	var it setfn.SetCursor[@[]char] = idx.RefNames.Iter()
+	var name @[]char
+	var ok bool
+	name, ok = it.Next()
+	for ok {
+		if len(name) != 0 {
+			s.work.Push(name)
+		}
+		name, ok = it.Next()
+	}
+}
+
+// ============================================================
+// Candidate / root classification
+// ============================================================
+
+// isUnusedFuncCandidate reports whether `d` is an unexported top-level function
+// eligible for the unused-func check.  Methods (vtable/selector-dispatched),
+// exported funcs (the package contract), `#[c_export]` funcs (called from C
+// under their exported name — e.g. startup._entry is crt0's `main`), extern /
+// forward decls (no body), `main`, and `Test…` / `Benchmark…` entries are ROOTS,
+// not candidates.
+func isUnusedFuncCandidate(d @ast.Decl) bool {
+	if d == nil || d.Kind != ast.DECL_FUNC {
+		return false
+	}
+	if d.Recv != nil {
+		return false
+	}
+	if d.Exported {
+		return false
+	}
+	if buildcfg.HasCExport(d.Annotations) {
+		return false
+	}
+	if d.Body == nil {
+		return false
+	}
+	if streq(d.Name, "main") {
+		return false
+	}
+	if isTestEntryName(d.Name) {
+		return false
+	}
+	return true
+}
+
+// isGlobalCandidate reports whether `d` is an unexported package-level `var`
+// eligible for the unused-global check.  A `.bni`-sourced or exported var is the
+// contract; a blank `var _ = …` is an intentional discard (its initializer still
+// runs for side effects) — all roots, not candidates.
+func isGlobalCandidate(d @ast.Decl) bool {
+	if d == nil || d.Kind != ast.DECL_VAR {
+		return false
+	}
+	if d.FromBNI {
+		return false
+	}
+	if d.Exported {
+		return false
+	}
+	if streq(d.Name, "_") {
+		return false
+	}
+	return true
+}
+
+// isTypeCandidate reports whether `d` is an unexported package-level type
+// eligible for the unused-type check.  A `.bni`-sourced type is the interface
+// declaration; a type declared in the package's `.bni` is exported (the
+// contract) — both are roots.
+func isTypeCandidate(d @ast.Decl, merged @ast.File) bool {
+	if d == nil || d.Kind != ast.DECL_TYPE {
+		return false
+	}
+	if d.FromBNI {
+		return false
+	}
+	if isExportedType(merged, d.Name) {
+		return false
+	}
+	return true
+}
+
+// isTestEntryName reports whether `name` is a test-framework entry point (a
+// `Test…` or `Benchmark…` function).
+func isTestEntryName(name *[]readonly char) bool {
+	return hasNamePrefix(name, "Test") || hasNamePrefix(name, "Benchmark")
+}
+
+// hasNamePrefix reports whether `name` starts with `prefix`.
+func hasNamePrefix(name *[]readonly char, prefix *[]readonly char) bool {
+	if len(name) < len(prefix) {
+		return false
+	}
+	for i := 0; i < len(prefix); i++ {
+		if name[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// isExportedType reports whether a same-name type is declared in the package's
+// `.bni` (a `.bni`-sourced DECL_TYPE), recursing groups.
+func isExportedType(merged @ast.File, name @[]char) bool {
+	return bniDeclMatches(merged, ast.DECL_TYPE, name)
+}
+
+// bniDeclMatches reports whether the merged file holds a `.bni`-sourced decl of
+// the given kind and name (recursing groups) — the interface declaration that
+// makes an entity part of the package's exported contract.
+func bniDeclMatches(merged @ast.File, kind int, name @[]char) bool {
+	for i := 0; i < len(merged.Decls); i++ {
+		if bniDeclMatchesDecl(merged.Decls[i], kind, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// bniDeclMatchesDecl reports whether decl `d` (or a group member) is a
+// `.bni`-sourced decl of `kind` named `name`.
+func bniDeclMatchesDecl(d @ast.Decl, kind int, name @[]char) bool {
+	if d == nil {
+		return false
+	}
+	if d.Kind == ast.DECL_GROUP {
+		for i := 0; i < len(d.Decls); i++ {
+			if bniDeclMatchesDecl(d.Decls[i], kind, name) {
+				return true
+			}
+		}
+		return false
+	}
+	return d.FromBNI && d.Kind == kind && streq(d.Name, name)
+}

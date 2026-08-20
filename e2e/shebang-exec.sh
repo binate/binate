@@ -3,17 +3,21 @@
 # shebang runs DIRECTLY as `./script.bn args…` and receives its command-line
 # arguments, exercising the whole shebang chain end to end:
 #   - the kernel reads the `#!` line and invokes the interpreter (exec-bit + `#!`),
-#   - bni's `-x` script mode (spec §17.3.1) treats the one file as the script and
-#     hands every following arg to the program (not more source files / bni flags),
+#   - bni's `-main-file` single-file mode (spec §17.3.1) takes that flag's value as
+#     the script and hands every following arg to the program (bare positionals are
+#     the program's argv, not more source files / bni flags),
 #   - bni's LEXER skips the `#!` line (spec lex.shebang) so the shebang'd source
 #     still parses,
 #   - and os.Args() surfaces [<script>, args…] to the program.
 #
 # Harness note: bni has no default/built-in stdlib location — it resolves packages
 # from the script's directory or an explicit -I/-L (cmd/bni resolveRoot), so a
-# script importing pkg/std/os can't be found by a bare `#!/usr/bin/env -S bni -x`.
-# So the shebang appends the checkout's stdlib search paths: `#!/usr/bin/env -S
-# <bni> -x -I <iface> -L <impl>`.  This is the spec's own shebang form (§17.3.1) —
+# script importing pkg/std/os can't be found by a bare `#!/usr/bin/env -S bni
+# -main-file`.  So the shebang appends the checkout's stdlib search paths:
+# `#!/usr/bin/env -S <bni> -I <iface> -L <impl> -main-file`.  `-main-file` must be
+# the LAST word: `-S` splits the words into argv and the kernel appends the script
+# path, which then becomes `-main-file`'s value.  This is the spec's own shebang
+# form (§17.3.1) —
 # `env` is a binary and its `-S` splits the remaining words into argv, working
 # around the kernel's single-argument shebang limit; a deployed bni that shipped
 # its stdlib would need no -I/-L.  (The shebang interpreter MUST be a binary —
@@ -23,7 +27,7 @@
 # only dispatches .bn files through bnc/bni and has no exec-bit notion).
 #
 # Compiling cmd/bni needs a gen1 (checkout-source) compiler, NOT the BUILDER
-# directly: os.Args()/-x postdate the pinned BUILDER's frozen bundle.  Standard
+# directly: os.Args()/-main-file postdate the pinned BUILDER's frozen bundle.  Standard
 # BUILDER -> gen1 -> build-with-checkout-paths shape (mirrors e2e/os-args.sh).
 #
 # Exit 0 on pass; non-zero with a diff on any mismatch.
@@ -101,7 +105,7 @@ shorten() {
 SI="$(shorten "$CK_I" i)"
 SL="$(shorten "$CK_L" l)"
 
-SHEBANG="#!/usr/bin/env -S $BNI_BIN -x -I $SI -L $SL"
+SHEBANG="#!/usr/bin/env -S $BNI_BIN -I $SI -L $SL -main-file"
 # Defensive: if a future path addition pushed the line past the kernel cap the
 # kernel would SILENTLY TRUNCATE it (catastrophic), so fail loud instead.
 if [ "${#SHEBANG}" -gt 250 ]; then
@@ -109,8 +113,8 @@ if [ "${#SHEBANG}" -gt 250 ]; then
     exit 1
 fi
 
-# ----- The executable script: the `env -S` shebang (naming bni + `-x` + the
-# shortened stdlib search paths), then a program that prints its argument count
+# ----- The executable script: the `env -S` shebang (naming bni + the shortened
+# stdlib search paths + a trailing `-main-file`), then a program that prints its argument count
 # and each argument (Args()[1..]); element 0 is the path-dependent script name,
 # skipped like e2e/os-args.sh. -----
 SCRIPT="$TMP/greet.bn"

@@ -95,7 +95,7 @@ IMPLS="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
 fail=0
 
 # ----- 1. With --check-nil: the fault is recovered (message + non-zero exit). -----
-checked_out=$("$BNI_BIN" --check-nil -I "$IFACES" -L "$IMPLS" "$TMP/nilderef.bn" 2>&1)
+checked_out=$("$BNI_BIN" --check-nil -I "$IFACES" -L "$IMPLS" -main-file "$TMP/nilderef.bn" 2>&1)
 checked_ec=$?
 if ! printf '%s' "$checked_out" | grep -q "nil pointer dereference"; then
     echo "FAIL: 'bni --check-nil' on a nil deref must print 'nil pointer dereference'"
@@ -108,7 +108,7 @@ fi
 
 # ----- 2. Without the flag (default off): the check is NOT emitted, so there is -----
 # no recovery message — the deref just crashes.  Proves the feature is opt-in.
-plain_out=$("$BNI_BIN" -I "$IFACES" -L "$IMPLS" "$TMP/nilderef.bn" 2>&1 || true)
+plain_out=$("$BNI_BIN" -I "$IFACES" -L "$IMPLS" -main-file "$TMP/nilderef.bn" 2>&1 || true)
 if printf '%s' "$plain_out" | grep -q "nil pointer dereference"; then
     echo "FAIL: a plain 'bni' run (no --check-nil) must NOT emit a nil-check message (default off)"
     fail=1

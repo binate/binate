@@ -99,11 +99,10 @@ func TestGood() testing.TestResult {
 EOF
 
 # ----- Run `bni --test pkg/faultynil` and assert. -----
-out=$("$BNI_BIN" --test \
+out=$("$BNI_BIN" --test pkg/faultynil \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
-    -I "$TMP" -L "$TMP" \
-    pkg/faultynil 2>&1)
+    -I "$TMP" -L "$TMP" 2>&1)
 ec=$?
 
 fail=0

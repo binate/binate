@@ -150,11 +150,11 @@ check "compiled/empty-arg"  "$EMPTY_ARG" "$("$ARGS_BIN" alpha '' gamma 2>&1)"
 # (b) cmd/bni interpreting the fixture: the program's args come after `--`, and
 # cmd/bni installs them (via os.SetArgs) so os.Args() surfaces them.
 check "interp/with-args" "$WITH_ARGS" \
-    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" -- alpha beta gamma 2>&1)"
+    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" -main-file "$TMP/os_args.bn" -- alpha beta gamma 2>&1)"
 check "interp/no-args"   "$NO_ARGS" \
-    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" 2>&1)"
+    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" -main-file "$TMP/os_args.bn" 2>&1)"
 check "interp/empty-arg" "$EMPTY_ARG" \
-    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_args.bn" -- alpha '' gamma 2>&1)"
+    "$("$BNI_BIN" -I "$CK_I" -L "$CK_L" -main-file "$TMP/os_args.bn" -- alpha '' gamma 2>&1)"
 
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="

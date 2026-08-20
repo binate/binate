@@ -167,7 +167,7 @@ run_repl() {
     actual=$(printf '%s' "$input" | "$BNI_BIN" --repl \
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
         -I "$TMP" -L "$TMP" \
-        "$fixture" 2>&1)
+        -main-file "$fixture" 2>&1)
     if [ "$actual" = "$expected" ]; then
         echo "PASS: $label"
         PASSES=$((PASSES + 1))
@@ -196,7 +196,7 @@ run_repl_setup_error() {
     actual=$(printf '' | "$BNI_BIN" --repl \
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
         -I "$TMP" -L "$TMP" \
-        "$fixture" 2>&1)
+        -main-file "$fixture" 2>&1)
     ec=$?
     if printf '%s' "$actual" | grep -qF "$expect_fragment" \
             && ! printf '%s' "$actual" | grep -qF "$BANNER" \
@@ -226,7 +226,7 @@ run_repl_import_rejected() {
     actual=$(printf '%s' "$input" | "$BNI_BIN" --repl \
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
         -I "$TMP" -L "$TMP" \
-        "$FIXTURE" 2>&1)
+        -main-file "$FIXTURE" 2>&1)
     if printf '%s' "$actual" | grep -qF "$err_fragment" \
             && printf '%s' "$actual" | grep -qF "$survive_fragment"; then
         echo "PASS: $label"

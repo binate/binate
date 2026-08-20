@@ -128,14 +128,14 @@ bin=$(bnc --test -I "$ROOT:$I" -L "$ROOT:$L" pkg/demo)
 bni runs `.bn` through the bytecode VM — nothing is compiled or linked.
 
 ```sh
-# Run a program
-bni -I "$I" -L "$L" hello.bn
+# Run a single-file program
+bni -I "$I" -L "$L" -main-file hello.bn
 
 # Run a package's tests inline (prints RUN/PASS directly)
 bni -I "$ROOT:$I" -L "$ROOT:$L" --test pkg/demo
 
 # REPL: a context file seeds the scope; expressions are read from stdin
-bni -I "$I" -L "$L" --repl ctx.bn
+bni -I "$I" -L "$L" --repl -main-file ctx.bn
 ```
 
 `--test` also accepts `--run <substr>` and `--skip <substr>` name filters.

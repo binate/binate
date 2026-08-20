@@ -12,7 +12,7 @@ runner_run() {
     # migration), so cmd/bni itself failed to resolve its stdlib imports.
     ip="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
     lp="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
-    "$COMPILED_INTERP" -I "$ip" -L "$lp" "$BINATE_DIR/cmd/bni" -- -I "$ip" -L "$lp" "$bn" 2>&1
+    "$COMPILED_INTERP" -I "$ip" -L "$lp" -main-dir "$BINATE_DIR/cmd/bni" -- -I "$ip" -L "$lp" -main-file "$bn" 2>&1
 }
 
 runner_cleanup() { cleanup_compilers; }

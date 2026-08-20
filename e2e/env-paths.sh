@@ -122,7 +122,7 @@ check_out "bnc (-I/-L overrides env)" "$EXPECTED" "$actual"
 
 # ----- bni: env resolves (VM runs the program) ---------------------
 actual=$(env BINATE_PACKAGE_INTERFACE_PATH="$IFACE_PATHS" BINATE_PACKAGE_IMPL_PATH="$IMPL_PATHS" \
-         "$BNI_BIN" "$TMP/main.bn" 2>&1 || true)
+         "$BNI_BIN" -main-file "$TMP/main.bn" 2>&1 || true)
 check_out "bni (env)" "$EXPECTED" "$actual"
 
 # ----- bnlint: env resolves, and the short aliases work ------------

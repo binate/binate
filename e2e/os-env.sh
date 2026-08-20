@@ -140,7 +140,7 @@ check "compiled/with-var" "$WITH_VAR" \
 # shares cmd/bni's env cell (populated by cmd/bni's own _entry) — no os.SetEnv
 # needed, since env (unlike argv) is not split at `--`.
 check "interp/with-var" "$WITH_VAR" \
-    "$(BINATE_TEST_ENV=hello123 "$BNI_BIN" -I "$CK_I" -L "$CK_L" "$TMP/os_env.bn" 2>&1)"
+    "$(BINATE_TEST_ENV=hello123 "$BNI_BIN" -I "$CK_I" -L "$CK_L" -main-file "$TMP/os_env.bn" 2>&1)"
 
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="

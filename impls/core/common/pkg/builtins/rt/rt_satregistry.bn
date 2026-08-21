@@ -1,8 +1,12 @@
 // Interface-satisfaction registry — the native reader half of RTTI type
 // assertions (spec §11.12 `iface.assert`, plan-type-assertions-execution §U.6).
-// Built once at process start from the whole-program `_satentry_root`
-// (BuildSatRegistry, called as `__entry`'s first statement), then queried by
-// `x.(*J)` interface-target assertions via SatLookup.
+// Built once at process start by walking the per-package `_pkg_satfrag` graph
+// from the main module's node (BuildSatRegistry, called as `__entry`'s first
+// statement), then queried by `x.(*J)` interface-target assertions via SatLookup.
+// The graph is the decentralized replacement for the old whole-program
+// `_satentry_root`: each package's node lists its own satentries + symrefs to its
+// direct dependencies' nodes, so the walk reaches every linked package's
+// satentries without any TU knowing the whole-program set.
 //
 // This is deliberately reflect-free: it walks the raw record words directly —
 // only the first three payload words of a reflect.SatEntryInfo (`Type`, `Iface`,
@@ -34,7 +38,7 @@ var (
 	g_satMask int
 	// g_satFallback is an OPTIONAL secondary resolver a host installs (rt itself
 	// never sets it): consulted on a native-registry MISS so a caller whose
-	// satentries live OUTSIDE this process's linked `_satentry_root` can still
+	// satentries live OUTSIDE this process's linked `_pkg_satfrag` graph can still
 	// resolve `x.(*J)`.  The bytecode-VM host (pkg/binate/vm) installs one — an
 	// injected-native callee (e.g. testing.Println) asserting an interface on a
 	// value a BYTECODE program boxed, whose (T,J) fact lives only in the VM's own
@@ -95,67 +99,114 @@ func satInsert(tw *int, ti int, id int, vt int) {
 	}
 }
 
-// countSatEntries sums the per-package entry counts recorded in the root's
-// pairs array (each pair is {&_pkg_satentries, count}).
-func countSatEntries(pairsW *int, n int) int {
-	var total int = 0
-	for i := 0; i < n; i++ {
-		total = total + pairsW[i * 2 + 1]
+// insertPkgEntries inserts one package's satentries — its `_pkg_satentries`
+// backing array of `count` @SatEntryInfo pointers at `pkgSatAddr` — into the
+// table.  A SatEntryInfo (reflect.bni) payload begins {Type, Iface, Vtable} (past
+// the node's 2-word managed header); the registry uses only those three words and
+// ignores the trailing cross-mode name slices.
+func insertPkgEntries(tw *int, pkgSatAddr int, count int) {
+	if pkgSatAddr == 0 {
+		return
 	}
-	return total
+	var pkgW *int = bit_cast(*int, pkgSatAddr)
+	for j := 0; j < count; j++ {
+		var seAddr int = pkgW[j]
+		if seAddr == 0 {
+			continue
+		}
+		var seW *int = bit_cast(*int, seAddr)
+		satInsert(tw, seW[0], seW[1], seW[2])
+	}
 }
 
-// BuildSatRegistry builds the satisfaction hash from the whole-program
-// `_satentry_root` (`root` points at its {&pairs, N} header).  Idempotent-safe
-// for the "no satentries" case (root == nil, N == 0, or zero total entries):
-// it leaves the table nil so every SatLookup MISSes.  Called once, as the first
-// statement of `__entry`, before `__init_all` (assertions can run in top-level
-// variable initializers).
+// fragInList reports whether frag address `addr` is among list[0..count).  The
+// graph walk's visited-set is a plain linear-scan list — the package count is
+// small, so O(V²) membership is cheap, and it needs no hash primitive.
+func fragInList(list *int, count int, addr int) bool {
+	for i := 0; i < count; i++ {
+		if list[i] == addr {
+			return true
+		}
+	}
+	return false
+}
+
+// A `_pkg_satfrag` node is { entriesPtr (&_pkg_satentries or null), ownCount,
+// depCount, dep-node symrefs... } — all machine words.  These index its fields.
+const (
+	FRAG_ENTRIES int = 0
+	FRAG_OWNCOUNT int = 1
+	FRAG_DEPCOUNT int = 2
+	FRAG_DEPS int = 3
+)
+
+// BuildSatRegistry builds the satisfaction hash by walking the `_pkg_satfrag`
+// graph from the main module's node (`root`).  It BFS-collects every reachable
+// node — `visited` doubles as the queue: a node is appended once (deduped by
+// address, so the rt/lang import cycle and diamond imports terminate) and
+// processed in order — sums the entry count for sizing, then fills the table.
+// Idempotent-safe for the "no satentries" case (root == nil or zero total
+// entries): it leaves the table nil so every SatLookup MISSes.  Called once, as
+// the first statement of `__entry`, before `__init_all` (assertions can run in
+// top-level variable initializers).
 func BuildSatRegistry(root *uint8) {
 	if root == nil {
 		return
 	}
-	var rootW *int = bit_cast(*int, root)
-	var pairsAddr int = rootW[0]
-	var n int = rootW[1]
-	if pairsAddr == 0 || n <= 0 {
-		return
+	var wordSize int = cast(int, sizeof(int))
+
+	// BFS the graph, collecting all reachable nodes into `visited` (which is also
+	// the queue).  One-time startup allocation; a doubling grow leaks its old
+	// buffer (process-lifetime, bounded by 2× the node count) — rt has no realloc.
+	var visitedCap int = 16
+	var visited *int = bit_cast(*int, RawAllocZero(visitedCap * wordSize))
+	visited[0] = bit_cast(int, root)
+	var count int = 1
+	var total int = 0
+	var i int = 0
+	for i < count {
+		var fragW *int = bit_cast(*int, visited[i])
+		total = total + fragW[FRAG_OWNCOUNT]
+		var depCount int = fragW[FRAG_DEPCOUNT]
+		for d := 0; d < depCount; d++ {
+			var depAddr int = fragW[FRAG_DEPS + d]
+			if depAddr == 0 {
+				continue
+			}
+			if fragInList(visited, count, depAddr) {
+				continue
+			}
+			if count == visitedCap {
+				var newCap int = visitedCap * 2
+				var grown *int = bit_cast(*int, RawAllocZero(newCap * wordSize))
+				for k := 0; k < count; k++ {
+					grown[k] = visited[k]
+				}
+				visited = grown
+				visitedCap = newCap
+			}
+			visited[count] = depAddr
+			count = count + 1
+		}
+		i = i + 1
 	}
-	var pairsW *int = bit_cast(*int, pairsAddr)
-	var total int = countSatEntries(pairsW, n)
 	if total <= 0 {
 		return
 	}
 
 	// Load factor ~0.5: smallest power of two strictly greater than 2*total.
-	var cap int = 1
-	for cap < total * 2 {
-		cap = cap * 2
+	var tcap int = 1
+	for tcap < total * 2 {
+		tcap = tcap * 2
 	}
-	var wordSize int = cast(int, sizeof(int))
-	g_satTable = RawAllocZero(cap * 3 * wordSize)
-	g_satCap = cap
-	g_satMask = cap - 1
+	g_satTable = RawAllocZero(tcap * 3 * wordSize)
+	g_satCap = tcap
+	g_satMask = tcap - 1
 
 	var tw *int = bit_cast(*int, g_satTable)
-	for i := 0; i < n; i++ {
-		var pkgSatAddr int = pairsW[i * 2]
-		var count int = pairsW[i * 2 + 1]
-		if pkgSatAddr == 0 {
-			continue
-		}
-		var pkgW *int = bit_cast(*int, pkgSatAddr)
-		for j := 0; j < count; j++ {
-			var seAddr int = pkgW[j]
-			if seAddr == 0 {
-				continue
-			}
-			// A SatEntryInfo (reflect.bni) payload begins {Type, Iface, Vtable}
-			// (past the node's 2-word managed header); the registry uses only
-			// those three words and ignores the trailing name slices.
-			var seW *int = bit_cast(*int, seAddr)
-			satInsert(tw, seW[0], seW[1], seW[2])
-		}
+	for k := 0; k < count; k++ {
+		var fragW *int = bit_cast(*int, visited[k])
+		insertPkgEntries(tw, fragW[FRAG_ENTRIES], fragW[FRAG_OWNCOUNT])
 	}
 }
 

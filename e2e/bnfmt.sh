@@ -90,6 +90,32 @@ else
     bad "stdout multi error message unclear: $(cat "$TMP/e4.err")"
 fi
 
+# ----- 5. --version prints the bnfmt-<version> banner and exits 0 -----
+vout="$("$BNFMT" --version 2>&1)"
+if [ $? -eq 0 ] && printf '%s\n' "$vout" | grep -q '^bnfmt-'; then
+    ok "--version prints the bnfmt-<version> banner"
+else
+    bad "--version should print 'bnfmt-<version>' and exit 0 (got: $vout)"
+fi
+
+# ----- 6. -w and --check together are rejected (mutually exclusive) -----
+if "$BNFMT" -w --check "$TMP/good.bn" > /dev/null 2>"$TMP/e6.err"; then
+    bad "-w --check together should exit non-zero"
+elif grep -q 'mutually exclusive' "$TMP/e6.err"; then
+    ok "-w and --check are rejected as mutually exclusive"
+else
+    bad "-w/--check exclusion message unclear: $(cat "$TMP/e6.err")"
+fi
+
+# ----- 7. an unknown flag is rejected and named on stderr -----
+if "$BNFMT" --bogus "$TMP/good.bn" > /dev/null 2>"$TMP/e7.err"; then
+    bad "an unknown flag should exit non-zero"
+elif grep -q 'bogus' "$TMP/e7.err"; then
+    ok "an unknown flag is rejected and named"
+else
+    bad "unknown-flag error should name the flag: $(cat "$TMP/e7.err")"
+fi
+
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="
 [ "$FAILS" -eq 0 ] || exit 1

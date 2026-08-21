@@ -1,23 +1,24 @@
 #!/bin/sh
-# e2e/satentry-retention.sh — End-to-end test that the whole-program SatEntry
-# root retains every package's `__satentry.<T,J>` nodes across the linker's
-# dead-strip (RTTI Slice 3, plan-type-assertions-execution.md §U.4).
+# e2e/satentry-retention.sh — End-to-end test that the decentralized per-package
+# `_pkg_satfrag` graph retains every package's `__satentry.<T,J>` nodes across the
+# linker's dead-strip (RTTI, plan-rtti-decentralize.md).
 #
-# `impl T : J` emits a weak per-`(T,J)` `__satentry` record, but nothing READS it
-# until the Phase-5 interface-assertion reader — so without a live root the
-# linker would dead-strip every one, leaving the reader an empty registry.  bnc
-# therefore emits a compiler-synthesized `{ptr,len}[]` root over each package's
-# `_pkg_satentries` array (gathered `ldr.Order ∪ main`) and roots it from
-# `__entry`: LLVM pins it in `@llvm.used`; the native backends reference it with a
-# real LEA/ADRP reloc.  This test compiles a program with an `impl` and asserts,
-# via `nm`, that the root AND the `__satentry` nodes — BOTH the program's OWN and
-# a cross-package DEPENDENCY's (`builtins/lang`, always pulled in transitively;
-# exercises the M4 cross-object extern-data path) — survive into the linked
-# binary.  It checks the DEFAULT LLVM backend and the host `--backend native`.
+# `impl T : J` emits a weak per-`(T,J)` `__satentry` record.  Each package emits a
+# `_pkg_satfrag` graph node listing its own `_pkg_satentries` array plus STRONG
+# symrefs to its direct dependencies' `_pkg_satfrag` nodes.  The main module's
+# node is pinned from `__entry` (LLVM `@llvm.used`; native a real LEA/ADRP reloc
+# via the `rt.BuildSatRegistry(&_pkg_satfrag)` call), and the strong dep chain
+# then retains the whole graph — so each package's `_pkg_satentries`, and thus its
+# `__satentry` nodes, survives dead-strip.  This test compiles a program with an
+# `impl` and asserts, via `nm`, that the graph AND the `__satentry` nodes — BOTH
+# the program's OWN and a cross-package DEPENDENCY's (`builtins/lang`, always
+# pulled in transitively; exercises the cross-object strong-symref path) — survive
+# into the linked binary.  It checks the DEFAULT LLVM backend and the host
+# `--backend native`.
 #
-# The root is inert until Slice 5 wires the reader, so a retention regression is
-# INVISIBLE to conformance (an unread root changes no program output) — only a
-# symbol-table check like this one catches it.
+# The graph is inert without a wired reader, so a retention regression is largely
+# INVISIBLE to conformance (unread satentry data changes no program output) — only
+# a symbol-table check like this one catches it.
 #
 # Exit 0 on pass; non-zero with diagnostics on failure.
 
@@ -109,9 +110,10 @@ check_retention() {
         return
     fi
     syms="$("$NM" -a "$bin" 2>/dev/null)"
-    # The synthesized root header must survive (it is the retention anchor).
-    if ! printf '%s\n' "$syms" | grep -q 'satentry_root'; then
-        fail "$label root symbol dead-stripped" "no *_satentry_root in nm output"
+    # The `_pkg_satfrag` graph must survive: main's node is pinned (the retention
+    # anchor), and the strong dep-symref chain keeps every package's node alive.
+    if ! printf '%s\n' "$syms" | grep -q '_pkg_satfrag'; then
+        fail "$label _pkg_satfrag graph dead-stripped" "no *_pkg_satfrag in nm output"
         return
     fi
     # The program's OWN impl node (Thing : Greeter) must survive.
@@ -119,16 +121,16 @@ check_retention() {
         fail "$label own __satentry dead-stripped" "no Thing __satentry in nm output"
         return
     fi
-    # A cross-package DEPENDENCY node (builtins/lang) must survive — this is the
-    # M4 cross-object extern-data path (the root references another object's
-    # `_pkg_satentries`, forcing the linker to retain it).
+    # A cross-package DEPENDENCY node (builtins/lang) must survive — retained via
+    # the strong `_pkg_satfrag` dep-symref chain from main (main's node strongly
+    # references lang's node, which references lang's `_pkg_satentries`).
     if ! printf '%s\n' "$syms" | grep -q 'satentry.*builtins4_lang'; then
         fail "$label dependency __satentry dead-stripped" \
-            "no builtins/lang __satentry retained via the root's dep path"
+            "no builtins/lang __satentry retained via the frag dep chain"
         return
     fi
     node_count="$(printf '%s\n' "$syms" | grep -c '__satentry\.')"
-    pass "$label (root + $node_count __satentry nodes survive dead-strip)"
+    pass "$label (_pkg_satfrag graph + $node_count __satentry nodes survive dead-strip)"
 }
 
 check_retention "llvm"                 # default backend (deps + main via LLVM)

@@ -18,9 +18,13 @@
 # wrapper like os.cLseek become an un-injectable bytecode call — the exact hazard
 # a prior carve-out for os let through. No carve-outs: one mechanism, one rule.)
 #
-# There is deliberately NO exemption list: every pkg/std package must be
-# injected. If a future package genuinely should NOT be, that is a deliberate
-# decision to surface here (and update this check), not to paper over silently.
+# There is ONE deliberate exemption: pkg/std/debug. It introspects the VM's OWN
+# bytecode call stack (its _stack_frames intrinsic walks vm.Stack frame headers
+# for FRAME_VM frames), so it MUST be lowered to bytecode and run inside the VM —
+# injecting the single native instance would substitute an FP-chain walk of the
+# host stack, which is meaningless in the interpreter. This is surfaced here as a
+# named skip, not papered over. Every OTHER pkg/std package must still be
+# injected; a future exemption is likewise a deliberate decision to add here.
 #
 # Packages are enumerated from the iface tree (one .bni per package — the
 # canonical importable list). The injection set is read from externs.bn so the
@@ -41,6 +45,12 @@ for bni in $(find "$IFACE_STD" -name '*.bni' | sort); do
     # ifaces/stdlib/pkg/std/math/big.bni -> pkg/std/math/big.
     rel="${bni#"$BINATE_DIR"/ifaces/stdlib/}"
     pkg="${rel%.bni}"
+
+    # pkg/std/debug is the one deliberate carve-out (see the header comment): it
+    # walks the VM's own bytecode stack, so it must be lowered, never injected.
+    if [ "$pkg" = "pkg/std/debug" ]; then
+        continue
+    fi
 
     # Injected iff it has a stdPkg{ path: "<pkg>" } entry in stdPkgs() (which
     # drives both the lowering skip and the injection — see externs.bn).

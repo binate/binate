@@ -285,9 +285,19 @@ for pkg in $PACKAGES; do
     # (run.sh under conformance/, where the stdlib is INJECTED), and rt's/startup's
     # logic is covered by their compiled-mode unit tests.  This is a by-design
     # exclusion, NOT a perf .skip-pkg nor a failure .xfail.
+    #
+    # pkg/std/debug is the deliberate exception: it is the one stdlib package
+    # EXEMPT from native injection (scripts/hygiene/stdlib-injected.sh), so under
+    # the VM its _stack_frames intrinsic lowers to BC_STACK_FRAMES and walks the
+    # VM's own frame stack.  Interpreting it is the POINT — that is how the
+    # bytecode stack-capture path gets exercised; injecting/skipping it would
+    # bypass exactly the code the test verifies.  So it must NOT be skipped here.
     case "$MODE" in
         *int*)
             case "$pkg" in
+                pkg/std/debug)
+                    : # fall through — interpret it (see above)
+                    ;;
                 pkg/std/*|pkg/builtins/rt|pkg/builtins/startup)
                     if [ "$VERBOSE" -eq 1 ]; then
                         echo "SKIP-NATIVE-INT: $pkg (native-only, injected not interpreted)"

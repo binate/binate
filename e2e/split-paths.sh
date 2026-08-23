@@ -80,26 +80,22 @@ check() {
 }
 
 # ----- bnc (compile to native binary, then run) -------------------
-# The resolved BUILDER (bnc) compiles the fixture; the -I/-L below are
-# bnc's own search paths.
+# A gen1 (checkout-source) bnc compiles the fixture; the -I/-L below are bnc's
+# own search paths.  gen1 — NOT the pinned BUILDER — is used because the fixture
+# links the current-tree runtime (pkg/builtins/rt + startup), and the BUILDER
+# predates the satentry-registry contract that runtime now uses: a BUILDER-
+# compiled binary emits the OLD flat satentry structure yet calls the NEW
+# registry graph-walk, and segfaults at startup.  gen1 uses one consistent
+# contract on both sides.  Neither gen1 nor the BUILDER links a C runtime (the
+# runtime is pure Binate), so no --runtime is passed.  resolve-gen1.sh
+# builds+caches gen1 (the BUILDER compiling checkout cmd/bnc) once per tree
+# state, so this stays cheap across the e2e run — the same caching the other
+# checkout-compiler e2e tests (os-args, stat-values, readdir-values) use.
 BNC_BIN="$TMP/bnc-bin"
-BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-# The fixture is compiled by the BUILDER directly, so it is emitted with the
-# BUILDER's mangling scheme.  Neither the BUILDER nor the current bnc links a C
-# runtime (the runtime is pure Binate — pkg/builtins/rt + startup), so no
-# --runtime is passed.
-BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
-# Base search is the CHECKOUT (so testing.Println, resolved from the current
-# tree, is available — the BUILDER's own bundle predates it), with the fixture
-# roots prepended.  But the pinned BUILDER still implicitly loads pkg/bootstrap
-# (a behavior removed from the current tree after this BUILDER was cut), which
-# the checkout no longer ships — so the BUILDER's own bundle is APPENDED as a
-# fallback that supplies it.  When BUILDER_VERSION next moves past the
-# pkg/bootstrap removal, the force-load goes away and this fallback becomes an
-# unconsulted no-op.
-bnc_compile_log=$("$BUILDER" \
-    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$BNI_ROOT" --append "$BUILDER_LIB/ifaces/core")" \
-    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$IMPL_ROOT" --append "$BUILDER_LIB/impls/core/libc")" \
+GEN1_BNC="$("$BINATE_DIR/scripts/resolve-gen1.sh")"
+bnc_compile_log=$("$GEN1_BNC" \
+    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$BNI_ROOT")" \
+    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$IMPL_ROOT")" \
     --build-dir "$BUILD_DIR" -o "$BNC_BIN" "$TMP/main.bn" 2>&1) || true
 if [ -x "$BNC_BIN" ]; then
     actual=$("$BNC_BIN" 2>&1) || true

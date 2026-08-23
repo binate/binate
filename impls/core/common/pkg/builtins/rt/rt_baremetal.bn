@@ -4,32 +4,54 @@
 // RawFree, plus Abort and the semihosting stderr sink; the target-agnostic managed /
 // refcount layer lives once in rt_managed.bn and the fault handlers in rt_diag.bn.
 //
-// The allocator is SFL: size-classed segregated free lists carved from one static
-// arena, WITH RECLAMATION (unlike the earlier bump allocator, which never reclaimed
-// and exhausted its heap under refcount-heavy workloads — the unit-test suites
-// allocate-and-free far more than the arena holds cumulatively).  A reclaiming free
-// list is bounded by the PEAK-LIVE set, not cumulative allocation, so the 4 MiB arena
-// is now generous rather than marginal.  Small requests (payload <= SMALL_MAX) round up
-// to an 8-byte granule and are served / returned via a per-class LIFO free list, O(1);
-// a fresh block is carved from a monotonic frontier only on a class miss.  Large
-// requests use one first-fit free list (no splitting, no coalescing — the historically
-// bug-prone allocator parts are simply absent).  There is no locking (single-threaded).
-// A boundary-tag COALESCING backend (see explorations/claude-todo.md) is the documented
-// drop-in upgrade behind this same Raw contract if a phase-shift / large-variable-buffer
-// workload ever blows the segregated arena.
+// The allocator is TagCoalesce: size-classed segregated free lists carved from one
+// static arena, with SPLITTING and boundary-tag COALESCING.  It is the documented
+// drop-in upgrade of the earlier SFL backend (segregated lists, no split/coalesce),
+// cut over once a large-variable-buffer workload — the embeddable interpreter, which
+// churns many differently-sized large buffers (1 MiB VM stacks + doubling @vec.Vec
+// backings) — fragmented SFL's 4 MiB arena to exhaustion.  SFL stranded a freed large
+// block: with no split it was handed WHOLE to a smaller large request (then lost to
+// that size), and with no coalescing a region broken into pieces never re-formed the
+// contiguous span the next large request needed, so the carve frontier marched to the
+// wall even though the true peak-live set fit.  TagCoalesce reclaims that: a large
+// block is split to serve a smaller request (remainder stays free), and freeing a
+// block merges it with its physically-adjacent free neighbours (both directions) so
+// full spans re-form regardless of the order fragments are freed.
+//
+// Layout per block:  [ 8B header ][ payload (`size` bytes) ][ 8B footer ].  Header and
+// footer both hold `size | FREE_BIT`; the footer lets a free reach its BACKWARD physical
+// neighbour (its footer sits at base-FOOTER), the header free-bit lets it test the
+// FORWARD one (at base+PREFIX+size+FOOTER) — so coalescing is order-INDEPENDENT (a
+// forward-only scheme reunifies a split region only if fragments free high→low, which a
+// refcount-cascade teardown does not guarantee).  Free lists are DOUBLY linked (next+prev
+// overlaid in the free payload) so a coalesced neighbour unlinks O(1) instead of an O(n)
+// list scan.  Small payloads (<= SMALL_MAX) use per-class LIFO lists; larger use one
+// first-fit list; a fresh block carves from the monotonic frontier on a miss.  No locking
+// (single-threaded).  ARM32 only (ILP32: int=4, so the 8-byte min free payload holds
+// next+prev; a 64-bit baremetal port would need a 16-byte min payload).
 //
 // CORRECTNESS INVARIANTS (the review checklist):
 //   1. Free-list heads / links hold ABSOLUTE addresses, never arena offsets, so 0 is a
 //      safe "empty" sentinel (the arena's address is never 0).
-//   2. Every block carries a fixed 8-BYTE size prefix (NOT sizeof(int)): on arm32
-//      int == 4, so a 4-byte prefix would land the payload at base+4 — misaligned —
-//      and every managed access would DATA-ABORT and hang.  An 8-byte prefix keeps the
-//      payload 8-aligned by induction (8-aligned arena base + 8-multiple carves).
+//   2. Every block carries a fixed 8-BYTE size prefix (NOT sizeof(int)) AND an 8-byte
+//      footer: on arm32 int==4, so a 4-byte prefix would land the payload at base+4 —
+//      misaligned — and every managed access would DATA-ABORT.  8-byte tags keep the
+//      payload 8-aligned by induction (8-aligned base + 8-multiple `PREFIX+size+FOOTER`
+//      extents), and the whole arena stays exactly tiled so a forward walk
+//      (base+PREFIX+size+FOOTER) always lands on the next block's base.
 //   3. RawAllocZero MUST MemZero — reused blocks are dirty (the old bump code could skip
-//      it only because .bss is zero AND never reused).
-//   4. Double-free now corrupts a free list rather than being an inert no-op — the same
-//      contract libc `free` has, and rt.bni already declares it UB.  (A stolen prefix
-//      low bit as an alloc/free trap is a cheap future add.)
+//      it only because .bss is zero AND never reused).  It zeroes only the `size` payload
+//      bytes; the footer (at payload end) is written by writeTags and left intact.
+//   4. The FREE_BIT is the allocation state of record: every alloc / carve / split-served
+//      path writes it CLEAR, every free / split-remainder path writes it SET, in BOTH
+//      header and footer.  A live block that read as free would be swallowed by a
+//      neighbour's coalesce (handing out live memory), so the bit must never lag the
+//      block's real state.  An IMMEDIATE double-free — freeing a block that is still on a
+//      free list, its header bit intact — is now TRAPPED (aborts) rather than silently
+//      corrupting a list.  It is best-effort, not total: freeing a pointer whose block has
+//      since coalesced into a neighbour (or been re-served) reads a stale bit-clear header
+//      and slips through, as with any boundary-tag allocator.  Double-free stays UB per
+//      rt.bni; the trap catches the common case, it does not license it.
 #[build(is(os, "baremetal"))]
 package "pkg/builtins/rt"
 
@@ -49,8 +71,31 @@ const SMALL_MAX int = 1024
 // SMALL_MAX bound are all driven from SMALL_MAX (no drift between three spellings of one quantity).
 const NCLASSES int = SMALL_MAX / 8
 
-// PREFIX is the fixed per-block size-prefix in bytes (invariant #2).
-const PREFIX int = 8
+// PREFIX / FOOTER are the fixed per-block boundary tags in bytes (invariant #2): an 8-byte
+// header at the block base and an 8-byte footer at the payload's end, each holding
+// `size | FREE_BIT`.  Both are 8 so block extents stay 8-multiples and the payload stays
+// 8-aligned.
+const (
+	PREFIX int = 8
+	FOOTER int = 8
+)
+
+// FREE_BIT flags a block free in its size word (header + footer); SIZE_MASK recovers the
+// payload size.  Sizes are <= ARENA_BYTES = 0x400000 (bit 22), so bit 30 is free for the
+// flag with room to spare and no sign-bit interaction on ILP32.
+const (
+	FREE_BIT int = 0x40000000
+	SIZE_MASK int = 0x3FFFFFFF
+)
+
+// MIN_PAYLOAD is the smallest payload a block can carry — 8 bytes, which on arm32 holds a
+// free block's two 4-byte list links (next + prev).  MIN_SPLIT_EXTENT is the whole-block
+// extent that yields (PREFIX + MIN_PAYLOAD + FOOTER = 24 bytes): a split is taken only if
+// the remainder reaches it, so every free block can always hold its own tags + links.
+const (
+	MIN_PAYLOAD int = 8
+	MIN_SPLIT_EXTENT int = 24
+)
 
 // arena is the backing region.  Element type uint64 (NOT uint8) so its TYPE alignment
 // is 8: the object emitter places each global at its type alignment, so a uint8 arena
@@ -64,12 +109,12 @@ var arena [524288]uint64
 // >= the arena's (nonzero) base, so lazy-init on first use is unambiguous.
 var frontier int
 
-// smallHeads[ci] is the head of class ci's LIFO free list — the ABSOLUTE address of a
-// free block, or 0 for empty (invariant #1).  Zero-initialized in .bss ⇒ all empty.
+// smallHeads[ci] is the head of class ci's doubly-linked free list — the ABSOLUTE address
+// of a free block, or 0 for empty (invariant #1).  Zero-initialized in .bss ⇒ all empty.
 var smallHeads [NCLASSES]int
 
-// largeHead is the single first-fit free list for blocks with payload > SMALL_MAX
-// (ABSOLUTE address; 0 == empty).
+// largeHead is the single first-fit doubly-linked free list for blocks with payload >
+// SMALL_MAX (ABSOLUTE address; 0 == empty).
 var largeHead int
 
 // alignUp rounds n up to the next multiple of alignment (a power of 2).
@@ -80,26 +125,37 @@ func alignUp(n int, alignment int) int {
 // arenaBase returns the arena's absolute base address (8-aligned by the uint64 element
 // type).  Cheap — the address of a global — so recomputed rather than cached.
 //
-// Addresses are held in `int` (pointer-width on the live targets — ILP32 arm32 int=4, LP64
-// int=8) and compared as signed in carve's bound check, which assumes the arena sits in the
-// non-negative half of the address space (arm32 bare metal places it at 0x40000000, far below
-// 0x7FFFFFFF).  A backend whose arena straddled the sign bit would need unsigned comparison.
+// Addresses are held in `int` (pointer-width; ILP32 arm32 int=4) and compared as signed in
+// carve's bound check, which assumes the arena sits in the non-negative half of the address
+// space (arm32 bare metal places it at 0x40000000, far below 0x7FFFFFFF).
 func arenaBase() int {
 	return bit_cast(int, &arena[0])
 }
 
-// storeSize writes the block's payload size into the low int of its 8-byte prefix at the
-// block base.  Only the low int is used (the full 8 bytes exist for payload alignment,
-// invariant #2); size fits an int (<= ARENA_BYTES).
-func storeSize(base int, need int) {
-	var p *int = bit_cast(*int, base)
-	p[0] = need
+// --- boundary tags -------------------------------------------------------------
+
+// writeTags stamps a block's size + free-state into BOTH its header (at base) and its
+// footer (at base+PREFIX+size).  The single source that keeps the two tags in sync — every
+// state change routes through it.
+func writeTags(base int, size int, free bool) {
+	var w int = size
+	if free { w = size | FREE_BIT }
+	var hp *int = bit_cast(*int, base)
+	hp[0] = w
+	var fp *int = bit_cast(*int, base + PREFIX + size)
+	fp[0] = w
 }
 
-// sizeAt reads the payload size back from a block's prefix (the low int at the block base).
+// sizeAt reads a block's payload size from its header (masking off the free-bit).
 func sizeAt(base int) int {
 	var p *int = bit_cast(*int, base)
-	return p[0]
+	return p[0] & SIZE_MASK
+}
+
+// isFree reports whether the block at base is on a free list (header free-bit set).
+func isFree(base int) bool {
+	var p *int = bit_cast(*int, base)
+	return (p[0] & FREE_BIT) != 0
 }
 
 // payloadPtr returns the caller-visible payload pointer for a block base: base + PREFIX
@@ -113,38 +169,113 @@ func blockBaseOf(ptr *uint8) int {
 	return bit_cast(int, ptr) - PREFIX
 }
 
-// nextOf reads a FREE block's next-link, overlaid in the first int of its (now-dead) payload
-// at base + PREFIX.  The smallest class is 8 payload bytes >= a pointer, so the link always
-// fits and overlays no live data.
-func nextOf(base int) int {
+// --- doubly-linked free lists --------------------------------------------------
+// A FREE block overlays two links in its (dead) payload: next at base+PREFIX, prev at
+// base+PREFIX+4.  The 8-byte minimum payload holds both on arm32.
+
+// getNext reads a free block's next-link (the first list word at base+PREFIX).
+func getNext(base int) int {
 	var p *int = bit_cast(*int, base + PREFIX)
 	return p[0]
 }
 
-// setNext writes a FREE block's next-link (see nextOf for the overlay).
-func setNext(base int, nxt int) {
+// setNext writes a free block's next-link.
+func setNext(base int, v int) {
 	var p *int = bit_cast(*int, base + PREFIX)
-	p[0] = nxt
+	p[0] = v
 }
 
-// carve hands out a fresh block of `need` payload bytes (need already 8-aligned) from
-// the monotonic frontier, storing its size prefix.  Aborts on arena exhaustion.
+// getPrev reads a free block's prev-link (the second list word at base+PREFIX+4).
+func getPrev(base int) int {
+	var p *int = bit_cast(*int, base + PREFIX)
+	return p[1]
+}
+
+// setPrev writes a free block's prev-link.
+func setPrev(base int, v int) {
+	var p *int = bit_cast(*int, base + PREFIX)
+	p[1] = v
+}
+
+// classHead returns the free-list head for a payload size: the exact small class when
+// size <= SMALL_MAX, else the single large list.  Returns -1 for "large" so callers can
+// tell which head to write back (Binate has no pointer-to-head to hand out).
+func classIndexOf(size int) int {
+	if size <= SMALL_MAX { return size / 8 - 1 }
+	return -1
+}
+
+// insertFree links the (already-tagged FREE) block at base onto its size class's list head.
+func insertFree(base int) {
+	var ci int = classIndexOf(sizeAt(base))
+	var head int = largeHead
+	if ci >= 0 { head = smallHeads[ci] }
+	setPrev(base, 0)
+	setNext(base, head)
+	if head != 0 { setPrev(head, base) }
+	if ci >= 0 { smallHeads[ci] = base } else { largeHead = base }
+}
+
+// unlinkFree removes the block at base from its size class's doubly-linked list (O(1)).
+func unlinkFree(base int) {
+	var ci int = classIndexOf(sizeAt(base))
+	var pv int = getPrev(base)
+	var nx int = getNext(base)
+	if pv != 0 {
+		setNext(pv, nx)
+	} else {
+		if ci >= 0 { smallHeads[ci] = nx } else { largeHead = nx }
+	}
+	if nx != 0 { setPrev(nx, pv) }
+}
+
+// --- carve / alloc / free ------------------------------------------------------
+
+// carve hands out a fresh ALLOCATED block of `need` payload bytes (need already 8-aligned)
+// from the monotonic frontier, stamping its tags.  Aborts on arena exhaustion.
 func carve(need int) int {
 	var abase int = arenaBase()
 	if frontier == 0 { frontier = abase } // lazy init (invariant #1: absolute)
 	var base int = frontier
-	var newFrontier int = base + PREFIX + need
+	var newFrontier int = base + PREFIX + need + FOOTER
 	if newFrontier > abase + ARENA_BYTES {
 		abortWithMessage("rt.RawAlloc: arena exhausted\n")
 	}
 	frontier = newFrontier
-	storeSize(base, need)
+	writeTags(base, need, false)
 	return base
 }
 
+// firstFitLarge returns the first large-list block whose payload is >= need, or 0.
+func firstFitLarge(need int) int {
+	var b int = largeHead
+	for b != 0 {
+		if sizeAt(b) >= need { return b }
+		b = getNext(b)
+	}
+	return 0
+}
+
+// splitServed carves `need` payload out of the front of a just-unlinked free block `b`
+// (payload `have`), returning `b` ALLOCATED at `need`; if the tail can form a whole block
+// (>= MIN_SPLIT_EXTENT of slack) it becomes a FREE remainder placed on its class list,
+// otherwise the whole block is served (internal slack).  8-alignment holds: have, need and
+// PREFIX+FOOTER are all 8-multiples, so the remainder base and size are too.
+func splitServed(b int, have int, need int) {
+	if have >= need + MIN_SPLIT_EXTENT {
+		writeTags(b, need, false)
+		var remBase int = b + PREFIX + need + FOOTER
+		var remSize int = have - need - PREFIX - FOOTER
+		writeTags(remBase, remSize, true)
+		insertFree(remBase)
+	} else {
+		writeTags(b, have, false)
+	}
+}
+
 // RawAlloc allocates size bytes of uninitialized memory from the arena.  Aborts if
-// size <= 0 or the arena is exhausted.  Small requests reuse a per-class free block
-// (O(1)) or carve fresh; large requests first-fit the large list or carve fresh.
+// size <= 0 or the arena is exhausted.  A small request pops its exact class (O(1)); on a
+// miss it splits a larger free block (first-fit large list) or carves fresh.
 func RawAlloc(size int) *uint8 {
 	if size <= 0 {
 		abortWithMessage("rt.RawAlloc: size must be > 0\n")
@@ -157,26 +288,20 @@ func RawAlloc(size int) *uint8 {
 		var ci int = need / 8 - 1
 		var b int = smallHeads[ci]
 		if b != 0 {
-			// reuse — O(1) pop
-			smallHeads[ci] = nextOf(b)
-			return payloadPtr(b) // b's prefix already == need
-		}
-		return payloadPtr(carve(need))
-	}
-	// large: first-fit scan (few large blocks), whole block, no split.
-	var prev int = 0
-	var b int = largeHead
-	for b != 0 {
-		if sizeAt(b) >= need {
-			if prev == 0 {
-				largeHead = nextOf(b)
-			} else {
-				setNext(prev, nextOf(b))
-			}
+			unlinkFree(b)
+			writeTags(b, need, false) // exact class ⇒ size already == need; clear free-bit
 			return payloadPtr(b)
 		}
-		prev = b
-		b = nextOf(b)
+	}
+	// Split a larger free block (first-fit large list), else carve.  A small request whose
+	// exact class was empty reuses coalesced large space here — the only way freed spans
+	// re-serve small requests, so the arena doesn't march on the small side.
+	var lb int = firstFitLarge(need)
+	if lb != 0 {
+		var have int = sizeAt(lb)
+		unlinkFree(lb)
+		splitServed(lb, have, need)
+		return payloadPtr(lb)
 	}
 	return payloadPtr(carve(need))
 }
@@ -189,21 +314,45 @@ func RawAllocZero(size int) *uint8 {
 	return p
 }
 
-// RawFree returns a block to its size class's free list (O(1) push).  nil is a no-op;
-// double-free is UB (see rt.bni) — it would push a live block onto a free list.
+// RawFree returns a block to the free lists, coalescing with its physically-adjacent free
+// neighbours (both directions) so fragmented spans re-form.  nil is a no-op; an immediate
+// double-free (block still free-listed) is TRAPPED (invariant #4; still UB per rt.bni).
 func RawFree(ptr *uint8) {
 	if ptr == nil { return }
-	liveBlocks = liveBlocks - 1
 	var base int = blockBaseOf(ptr)
-	var n int = sizeAt(base)
-	if n <= SMALL_MAX {
-		var ci int = n / 8 - 1
-		setNext(base, smallHeads[ci])
-		smallHeads[ci] = base
-	} else {
-		setNext(base, largeHead)
-		largeHead = base
+	if isFree(base) {
+		abortWithMessage("rt.RawFree: double free\n")
 	}
+	liveBlocks = liveBlocks - 1
+	var size int = sizeAt(base)
+	var abase int = arenaBase()
+
+	// Coalesce forward: absorb the next physical block if it exists (below the frontier)
+	// and is free.  The swallowed footer + prefix become payload.
+	var nextBase int = base + PREFIX + size + FOOTER
+	if nextBase < frontier {
+		if isFree(nextBase) {
+			var nsize int = sizeAt(nextBase)
+			unlinkFree(nextBase)
+			size = size + FOOTER + PREFIX + nsize
+		}
+	}
+
+	// Coalesce backward: if a block precedes this one (base above the arena floor) and is
+	// free, fold this block into it — read the predecessor's size from its footer at base-FOOTER.
+	if base > abase {
+		var prevFooter *int = bit_cast(*int, base - FOOTER)
+		if (prevFooter[0] & FREE_BIT) != 0 {
+			var prevSize int = prevFooter[0] & SIZE_MASK
+			var prevBase int = base - FOOTER - prevSize - PREFIX
+			unlinkFree(prevBase)
+			size = prevSize + PREFIX + FOOTER + size
+			base = prevBase
+		}
+	}
+
+	writeTags(base, size, true)
+	insertFree(base)
 }
 
 // rtWriteRawStderr is the bare-metal target's raw fault-diagnostic sink: n bytes at ptr

@@ -260,17 +260,43 @@ for pkg in $PACKAGES; do
         fi
     fi
 
-    # Apply shard selection (1-based: shard i of n keeps positions
-    # where shard_pos % n == i - 1).  Packages skipped by sharding
-    # are NOT counted in `skipped` — they're being handled by some
-    # other shard's invocation.
+    # Package key (pkg/binate/ir -> pkg-binate-ir), used by all the marker
+    # files below (xfail / skip-pkg / skip / split).
+    xfail_key="$(echo "$pkg" | tr '/' '-')"
+
+    # Shard selection.  By default a package lands on ONE shard by position
+    # (shard_pos % n == i - 1), whole.  But a package marked
+    # <pkg-key>.split.<mode> has its TESTS split across ALL shards instead: it
+    # runs on every shard, forwarding TEST_SHARD_IDX/TEST_SHARD_COUNT to the test
+    # runner (bni --test --shard-index/--shard-count runs `pos % count == idx-1`
+    # of the package's tests).  That spreads a single package too heavy to fit one
+    # shard, rather than SKIPPING it (which loses its double-VM coverage).  Only
+    # the bni-based runners honor the forwarded shard; other modes ignore it.
+    # Packages dropped by position-sharding are NOT counted in `skipped` (another
+    # shard runs them).
+    # A per-mode <pkg-key>.split.<mode> marks one package; <pkg-key>.split.vm marks
+    # it for EVERY VM mode (any mode with an `int` leg — single or double VM), the
+    # ones where compile-heavy packages blow the shard timeout.  (Splitting a
+    # package that would have fit is harmless — it just runs its tests in slices.)
+    split_file="$SCRIPT_DIR/${xfail_key}.split.${MODE}"
+    if [ ! -f "$split_file" ]; then
+        case "$MODE" in *int*) split_file="$SCRIPT_DIR/${xfail_key}.split.vm" ;; esac
+    fi
+    TEST_SHARD_IDX=""
+    TEST_SHARD_COUNT=""
     if [ "$SHARD_COUNT" -gt 0 ]; then
-        if [ $((shard_pos % SHARD_COUNT)) -ne $((SHARD_IDX - 1)) ]; then
+        if [ -f "$split_file" ]; then
+            TEST_SHARD_IDX="$SHARD_IDX"
+            TEST_SHARD_COUNT="$SHARD_COUNT"
+            shard_pos=$((shard_pos + 1))
+        elif [ $((shard_pos % SHARD_COUNT)) -ne $((SHARD_IDX - 1)) ]; then
             shard_pos=$((shard_pos + 1))
             continue
+        else
+            shard_pos=$((shard_pos + 1))
         fi
     fi
-    shard_pos=$((shard_pos + 1))
+    export TEST_SHARD_IDX TEST_SHARD_COUNT
 
     # Native-only packages are ALWAYS injected (native) in production — the
     # bytecode VM never interprets them.  Unit-testing one under an interpreter
@@ -312,8 +338,8 @@ for pkg in $PACKAGES; do
     esac
 
     # Check for xfail.  is_xfail records that this package carries a marker so
-    # the result handler can interpret pass/fail as XPASS/XFAIL.
-    xfail_key="$(echo "$pkg" | tr '/' '-')"
+    # the result handler can interpret pass/fail as XPASS/XFAIL.  (xfail_key was
+    # computed above, at the shard-selection step.)
     xfail_file="$SCRIPT_DIR/${xfail_key}.xfail.${MODE}"
     # A mode-independent <pkg>.xfail.all marks a package expected to fail in
     # EVERY mode — one marker instead of one per mode. A mode-specific

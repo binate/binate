@@ -19,4 +19,25 @@ runner_test() {
         --test "$pkg" $extra -I "$_I" -L "$_L"
 }
 
+# runner_test_batch runs MANY packages in ONE cmd/bni invocation, so cmd/bni
+# loads + lowers its shared dependency tree ONCE rather than re-doing it per
+# package — the double-VM lane's dominant per-shard floor.  $1 is the
+# space-separated package list; $2 is a package-qualified --skip spec
+# (pkg:pattern,… — see bni's skipMatchesAny) or empty.  Sharding applies to the
+# COMBINED test set via --shard-index/--shard-count (even load across shards).
+# cmd/bni emits a per-package `ok`/`FAIL`/`?` line, which run.sh parses.
+runner_test_batch() {
+    pkgs="$1"
+    skips="$2"
+    _I="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
+    _L="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
+    tflags=""
+    for p in $pkgs; do tflags="$tflags --test $p"; done
+    [ -n "$skips" ] && tflags="$tflags --skip $skips"
+    [ "$SHARD_COUNT" -gt 0 ] && tflags="$tflags --shard-index $SHARD_IDX --shard-count $SHARD_COUNT"
+    # shellcheck disable=SC2086
+    "$COMPILED_INTERP" -I "$_I" -L "$_L" -main-dir "$BINATE_DIR/cmd/bni" -- \
+        $tflags -I "$_I" -L "$_L"
+}
+
 runner_cleanup() { cleanup_compilers; }

@@ -241,6 +241,20 @@ skipped=0
 pkgskipped=0
 failures=""
 
+# BATCH_MODE: on the double-VM lane (*-int-int), cmd/bni --test re-loads+lowers
+# all of cmd/bni + each package's dep tree on EVERY per-package invocation — the
+# lane's dominant per-shard floor (~15 loads/shard).  cmd/bni --test is
+# multi-package with a SHARED loader, so batching all non-excluded packages into
+# ONE invocation pays that floor once.  Off under --check-xpass (which needs the
+# per-package XPASS detection path).  BATCH_PKGS accumulates the packages;
+# BATCH_SKIPS accumulates package-qualified skip patterns (pkg:pattern).
+BATCH_MODE=0
+if [ "$CHECK_XPASS" -eq 0 ]; then
+    case "$MODE" in *-int-int) BATCH_MODE=1 ;; esac
+fi
+BATCH_PKGS=""
+BATCH_SKIPS=""
+
 # Counter for the shard's modulo selection.  Incremented for every
 # package that survives the substring filter (i.e. would have been
 # run absent the --shard flag), so the same shard config produces a
@@ -263,6 +277,47 @@ for pkg in $PACKAGES; do
     # Package key (pkg/binate/ir -> pkg-binate-ir), used by all the marker
     # files below (xfail / skip-pkg / skip / split).
     xfail_key="$(echo "$pkg" | tr '/' '-')"
+
+    # BATCH path (double-VM lane): collect non-excluded packages for one shared
+    # cmd/bni invocation instead of running each individually.  Exclusions
+    # (native-only / xfail / skip-pkg) are still decided per package; everything
+    # else joins the batch, whose --shard shards the COMBINED test set.  Bypasses
+    # the per-package shard-select / split / runner_test below.
+    if [ "$BATCH_MODE" -eq 1 ]; then
+        # Native-only packages are injected (not interpreted) under the VM;
+        # pkg/std/debug is the deliberate exception (its BC_STACK_FRAMES path is
+        # the point).  See the non-batch native-only block below.
+        case "$pkg" in
+            pkg/std/debug) : ;;
+            pkg/std/*|pkg/builtins/rt|pkg/builtins/startup)
+                pkgskipped=$((pkgskipped + 1))
+                continue ;;
+        esac
+        # xfail: expected to fail here — keep it OUT of the batch (a real failure
+        # among passing packages would obscure it).  --check-xpass already
+        # disables BATCH_MODE, so this is the plain skip-the-xfailed-package case.
+        b_xf="$SCRIPT_DIR/${xfail_key}.xfail.${MODE}"
+        [ -f "$b_xf" ] || b_xf="$SCRIPT_DIR/${xfail_key}.xfail.all"
+        if [ -f "$b_xf" ]; then
+            xfailed=$((xfailed + 1))
+            continue
+        fi
+        # skip-pkg: omitted from this lane (too slow / no added coverage).
+        if [ -f "$SCRIPT_DIR/${xfail_key}.skip-pkg.${MODE}" ]; then
+            pkgskipped=$((pkgskipped + 1))
+            continue
+        fi
+        BATCH_PKGS="$BATCH_PKGS $pkg"
+        # Qualify each of this package's per-test .skip patterns as pkg:pattern so
+        # they only affect THIS package in the shared batch.
+        b_sf="$SCRIPT_DIR/${xfail_key}.skip.${MODE}"
+        if [ -f "$b_sf" ]; then
+            for b_pat in $(tr ',' ' ' < "$b_sf"); do
+                BATCH_SKIPS="$BATCH_SKIPS,$pkg:$b_pat"
+            done
+        fi
+        continue
+    fi
 
     # Shard selection.  By default a package lands on ONE shard by position
     # (shard_pos % n == i - 1), whole.  But a package marked
@@ -444,6 +499,49 @@ for pkg in $PACKAGES; do
         fi
     fi
 done
+
+# Run the collected BATCH (double-VM lane) in ONE cmd/bni invocation, then map
+# its per-package `ok`/`FAIL`/`?` lines back to the pass/fail tallies.  cmd/bni
+# loaded its shared dep tree once for the whole batch.
+if [ "$BATCH_MODE" -eq 1 ] && [ -n "$BATCH_PKGS" ]; then
+    b_n=$(echo $BATCH_PKGS | wc -w | tr -d ' ')
+    if [ "$VERBOSE" -eq 1 ]; then echo "STARTING (batched): $b_n packages"; fi
+    b_start=$(date +%s)
+    b_out=$(runner_test_batch "$BATCH_PKGS" "${BATCH_SKIPS#,}" 2>&1)
+    b_elapsed=$(( $(date +%s) - b_start ))
+    if [ "$VERBOSE" -eq 1 ]; then echo "batched run: ${b_elapsed}s for $b_n packages"; fi
+    for p in $BATCH_PKGS; do
+        # cmd/bni prints one line per package: `FAIL<TAB>pkg`, `ok  <TAB>pkg<TAB>…`,
+        # or `?   <TAB>pkg<TAB>[no test functions]`.  A package with NO line means
+        # the batch died before reaching it — count that as a failure.
+        if printf '%s\n' "$b_out" | grep -q "^FAIL	${p}$"; then
+            failed=$((failed + 1))
+            failures="$failures $p"
+            if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
+                echo ""
+                echo "FAIL: $p (batched) [${b_elapsed}s for the batch]"
+            fi
+        elif printf '%s\n' "$b_out" | grep -q "^ok  	${p}	"; then
+            passed=$((passed + 1))
+            if [ "$VERBOSE" -eq 1 ]; then echo "PASS: $p (batched)"; fi
+        elif printf '%s\n' "$b_out" | grep -q "^?   	${p}	"; then
+            passed=$((passed + 1))
+        else
+            failed=$((failed + 1))
+            failures="$failures $p(no-result)"
+            if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
+                echo ""
+                echo "FAIL: $p (batched — no per-package result; batch aborted?)"
+            fi
+        fi
+    done
+    # On a batch-wide abort, surface the tail so the failure is diagnosable.
+    if [ "$failed" -gt 0 ]; then
+        if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
+            printf '%s\n' "$b_out" | tail -20 | sed 's/^/  /'
+        fi
+    fi
+fi
 
 if [ "$VERBOSE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     echo ""

@@ -243,17 +243,29 @@ failures=""
 
 # BATCH_MODE: on the double-VM lane (*-int-int), cmd/bni --test re-loads+lowers
 # all of cmd/bni + each package's dep tree on EVERY per-package invocation — the
-# lane's dominant per-shard floor (~15 loads/shard).  cmd/bni --test is
-# multi-package with a SHARED loader, so batching all non-excluded packages into
-# ONE invocation pays that floor once.  Off under --check-xpass (which needs the
-# per-package XPASS detection path).  BATCH_PKGS accumulates the packages;
-# BATCH_SKIPS accumulates package-qualified skip patterns (pkg:pattern).
+# lane's dominant per-shard floor.  cmd/bni --test is multi-package with a SHARED
+# loader, so batching packages into ONE invocation pays the shared core (cmd/bni +
+# types/ir/ast) once.  But batching ALL packages per shard loads ALL ~50 package
+# impls on EVERY shard — a per-shard-CONSTANT floor no shard count can reduce.  So
+# the batch is HYBRID:
+#   - LIGHT packages (not .split.vm) are PACKAGE-sharded: each is assigned to ONE
+#     shard by position and runs its FULL tests there, so a shard loads only its
+#     own light subset's impls.  Collected into BATCH_LIGHT_PKGS.
+#   - HEAVY packages (the .split.vm set — too big to fit one shard) are
+#     TEST-sharded: loaded on EVERY shard, each running 1/N of its own tests via
+#     --shard.  Collected into BATCH_HEAVY_PKGS.
+# An unsharded run (SHARD_COUNT=0) collapses both into one full-test batch (the
+# heavy/light split only matters when sharding).  Off under --check-xpass (which
+# needs the per-package XPASS detection path).  BATCH_*_SKIPS accumulate
+# package-qualified skip patterns (pkg:pattern) for their batch.
 BATCH_MODE=0
 if [ "$CHECK_XPASS" -eq 0 ]; then
     case "$MODE" in *-int-int) BATCH_MODE=1 ;; esac
 fi
-BATCH_PKGS=""
-BATCH_SKIPS=""
+BATCH_LIGHT_PKGS=""
+BATCH_LIGHT_SKIPS=""
+BATCH_HEAVY_PKGS=""
+BATCH_HEAVY_SKIPS=""
 
 # Counter for the shard's modulo selection.  Incremented for every
 # package that survives the substring filter (i.e. would have been
@@ -278,11 +290,10 @@ for pkg in $PACKAGES; do
     # files below (xfail / skip-pkg / skip / split).
     xfail_key="$(echo "$pkg" | tr '/' '-')"
 
-    # BATCH path (double-VM lane): collect non-excluded packages for one shared
-    # cmd/bni invocation instead of running each individually.  Exclusions
-    # (native-only / xfail / skip-pkg) are still decided per package; everything
-    # else joins the batch, whose --shard shards the COMBINED test set.  Bypasses
-    # the per-package shard-select / split / runner_test below.
+    # BATCH path (double-VM lane): collect non-excluded packages into the light or
+    # heavy batch (see BATCH_MODE above) instead of running each individually.
+    # Exclusions (native-only / xfail / skip-pkg) are still decided per package.
+    # Bypasses the per-package shard-select / split / runner_test below.
     if [ "$BATCH_MODE" -eq 1 ]; then
         # Native-only packages are injected (not interpreted) under the VM;
         # pkg/std/debug is the deliberate exception (its BC_STACK_FRAMES path is
@@ -307,15 +318,44 @@ for pkg in $PACKAGES; do
             pkgskipped=$((pkgskipped + 1))
             continue
         fi
-        BATCH_PKGS="$BATCH_PKGS $pkg"
-        # Qualify each of this package's per-test .skip patterns as pkg:pattern so
-        # they only affect THIS package in the shared batch.
+        # This package's per-test .skip patterns, qualified as pkg:pattern so they
+        # only affect THIS package in the shared batch.
         b_sf="$SCRIPT_DIR/${xfail_key}.skip.${MODE}"
+        b_pkg_skips=""
         if [ -f "$b_sf" ]; then
             for b_pat in $(tr ',' ' ' < "$b_sf"); do
-                BATCH_SKIPS="$BATCH_SKIPS,$pkg:$b_pat"
+                b_pkg_skips="$b_pkg_skips,$pkg:$b_pat"
             done
         fi
+        # Heavy = marked .split.<mode> (or .split.vm for any VM mode): its own
+        # tests are too many to fit one shard, so test-shard it (loaded on every
+        # shard).  Everything else is light.  Same marker resolution as the
+        # non-batch shard-selection below.
+        b_split="$SCRIPT_DIR/${xfail_key}.split.${MODE}"
+        if [ ! -f "$b_split" ]; then
+            case "$MODE" in *int*) b_split="$SCRIPT_DIR/${xfail_key}.split.vm" ;; esac
+        fi
+        if [ "$SHARD_COUNT" -eq 0 ]; then
+            # Unsharded: heavy/light split is moot — one full-test batch.
+            BATCH_LIGHT_PKGS="$BATCH_LIGHT_PKGS $pkg"
+            BATCH_LIGHT_SKIPS="$BATCH_LIGHT_SKIPS$b_pkg_skips"
+            continue
+        fi
+        if [ -f "$b_split" ]; then
+            # Heavy: on every shard, tests split 1/N via --shard.
+            BATCH_HEAVY_PKGS="$BATCH_HEAVY_PKGS $pkg"
+            BATCH_HEAVY_SKIPS="$BATCH_HEAVY_SKIPS$b_pkg_skips"
+            continue
+        fi
+        # Light: package-shard — assigned to ONE shard by position (shard_pos %
+        # count == index-1), running its full tests there.  shard_pos advances for
+        # every light package on every shard identically (deterministic package
+        # order + deterministic exclusions), so each lands on exactly one shard.
+        if [ $((shard_pos % SHARD_COUNT)) -eq $((SHARD_IDX - 1)) ]; then
+            BATCH_LIGHT_PKGS="$BATCH_LIGHT_PKGS $pkg"
+            BATCH_LIGHT_SKIPS="$BATCH_LIGHT_SKIPS$b_pkg_skips"
+        fi
+        shard_pos=$((shard_pos + 1))
         continue
     fi
 
@@ -500,31 +540,56 @@ for pkg in $PACKAGES; do
     fi
 done
 
-# Run the collected BATCH (double-VM lane) in ONE cmd/bni invocation, then map
-# its per-package `ok`/`FAIL`/`?` lines back to the pass/fail tallies.  cmd/bni
-# loaded its shared dep tree once for the whole batch.
-if [ "$BATCH_MODE" -eq 1 ] && [ -n "$BATCH_PKGS" ]; then
-    b_n=$(echo $BATCH_PKGS | wc -w | tr -d ' ')
-    if [ "$VERBOSE" -eq 1 ]; then echo "STARTING (batched): $b_n packages"; fi
+# Run the collected batches (double-VM lane), then map cmd/bni's per-package
+# ok/FAIL/? lines back to the tallies.  Two invocations so the two sharding
+# policies coexist on one shard: the LIGHT batch (already package-sharded to this
+# shard) runs its packages' FULL tests (no --shard); the HEAVY batch (.split.vm,
+# loaded on every shard) runs 1/N of each package's tests (--shard).  Each cmd/bni
+# load pays the shared core (cmd/bni + types/ir/ast) once for its whole batch, so a
+# shard's floor is core + (its light subset's impls) + (the heavy impls), not all
+# ~50 impls.  Output is tee'd to a temp file when verbose (live progress in CI; a
+# diagnosable tail survives a timeout) and grepped afterward.
+if [ "$BATCH_MODE" -eq 1 ] && { [ -n "$BATCH_LIGHT_PKGS" ] || [ -n "$BATCH_HEAVY_PKGS" ]; }; then
+    b_tmp="$(mktemp)"
+    : > "$b_tmp"
+    # emit_batch runs one batch, appending its output to $b_tmp; streams live to
+    # stdout when verbose (CI passes -v), else silent-to-file.
+    emit_batch() {
+        if [ "$VERBOSE" -eq 1 ]; then
+            runner_test_batch "$1" "$2" "$3" 2>&1 | tee -a "$b_tmp"
+        else
+            runner_test_batch "$1" "$2" "$3" >> "$b_tmp" 2>&1
+        fi
+    }
     b_start=$(date +%s)
-    b_out=$(runner_test_batch "$BATCH_PKGS" "${BATCH_SKIPS#,}" 2>&1)
+    if [ -n "$BATCH_LIGHT_PKGS" ]; then
+        b_ln=$(echo $BATCH_LIGHT_PKGS | wc -w | tr -d ' ')
+        if [ "$VERBOSE" -eq 1 ]; then echo "STARTING (batched light/full): $b_ln packages"; fi
+        emit_batch "$BATCH_LIGHT_PKGS" "${BATCH_LIGHT_SKIPS#,}" 0
+    fi
+    if [ -n "$BATCH_HEAVY_PKGS" ]; then
+        b_hn=$(echo $BATCH_HEAVY_PKGS | wc -w | tr -d ' ')
+        if [ "$VERBOSE" -eq 1 ]; then echo "STARTING (batched heavy/1-of-$SHARD_COUNT): $b_hn packages"; fi
+        emit_batch "$BATCH_HEAVY_PKGS" "${BATCH_HEAVY_SKIPS#,}" 1
+    fi
     b_elapsed=$(( $(date +%s) - b_start ))
-    if [ "$VERBOSE" -eq 1 ]; then echo "batched run: ${b_elapsed}s for $b_n packages"; fi
-    for p in $BATCH_PKGS; do
+    if [ "$VERBOSE" -eq 1 ]; then echo "batched run: ${b_elapsed}s"; fi
+    for p in $BATCH_LIGHT_PKGS $BATCH_HEAVY_PKGS; do
         # cmd/bni prints one line per package: `FAIL<TAB>pkg`, `ok  <TAB>pkg<TAB>…`,
-        # or `?   <TAB>pkg<TAB>[no test functions]`.  A package with NO line means
-        # the batch died before reaching it — count that as a failure.
-        if printf '%s\n' "$b_out" | grep -q "^FAIL	${p}$"; then
+        # or `?   <TAB>pkg<TAB>[no test functions]` (also `ok` with the full count
+        # for a heavy package whose tests all fell on other shards).  A package with
+        # NO line means the batch died before reaching it — count that a failure.
+        if grep -q "^FAIL	${p}$" "$b_tmp"; then
             failed=$((failed + 1))
             failures="$failures $p"
             if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
                 echo ""
-                echo "FAIL: $p (batched) [${b_elapsed}s for the batch]"
+                echo "FAIL: $p (batched)"
             fi
-        elif printf '%s\n' "$b_out" | grep -q "^ok  	${p}	"; then
+        elif grep -q "^ok  	${p}	" "$b_tmp"; then
             passed=$((passed + 1))
             if [ "$VERBOSE" -eq 1 ]; then echo "PASS: $p (batched)"; fi
-        elif printf '%s\n' "$b_out" | grep -q "^?   	${p}	"; then
+        elif grep -q "^?   	${p}	" "$b_tmp"; then
             passed=$((passed + 1))
         else
             failed=$((failed + 1))
@@ -535,12 +600,13 @@ if [ "$BATCH_MODE" -eq 1 ] && [ -n "$BATCH_PKGS" ]; then
             fi
         fi
     done
-    # On a batch-wide abort, surface the tail so the failure is diagnosable.
-    if [ "$failed" -gt 0 ]; then
-        if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
-            printf '%s\n' "$b_out" | tail -20 | sed 's/^/  /'
-        fi
+    # Non-verbose runs did not stream the output; on failure surface its tail so
+    # the batch abort / failing package is diagnosable.  (Verbose already streamed
+    # everything via tee.)
+    if [ "$failed" -gt 0 ] && [ "$QUIET" -eq 0 ] && [ "$VERBOSE" -eq 0 ]; then
+        tail -20 "$b_tmp" | sed 's/^/  /'
     fi
+    rm -f "$b_tmp"
 fi
 
 if [ "$VERBOSE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then

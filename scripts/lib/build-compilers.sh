@@ -155,13 +155,21 @@ build_interp_boot_comp() {
 # Build compiled interpreter (bni, a bytecode VM) using a given compiler.
 # $1 = compiler binary path
 # Sets COMPILED_INTERP to the path.
+#
+# Built --cflag -O2 (the release opt level — see scripts/build-bni.sh): this is
+# the VM lanes' execution vehicle, and on the double-VM lane (-int-int) it runs
+# cmd/bni's whole load pipeline (parse→typecheck→IR→bytecode) plus the interpreter
+# dispatch loop, all compute-bound.  clang defaults to -O0 when bnc passes no -O,
+# and -O0 native here is several times slower — enough to blow the per-shard
+# timeout.  The one-time -O2 build cost (once per shard in runner_setup) is dwarfed
+# by the faster execution across the shard.
 build_interp() {
     local compiler="$1"
     _ensure_compilers_dir
     COMPILED_INTERP="$_COMPILERS_DIR/compiled_interp"
     INTERP_BUILD_DIR="$(_new_build_dir)"
-    echo "Building compiled interpreter..."
-    build_out=$("$compiler" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    echo "Building compiled interpreter (-O2)..."
+    build_out=$("$compiler" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --cflag -O2 --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"

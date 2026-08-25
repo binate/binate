@@ -1,0 +1,121 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/ir"
+import "pkg/binate/types"
+
+// BC_EXTRACT reads a scalar / pointer field out of a struct or anonymous
+// multi-return tuple.  Both halves live here: lowerExtract (the OP_EXTRACT ->
+// BC_EXTRACT lowering, called from lowerInstr) and execExtractOp (the executor
+// case, called from execMemoryOp).  Split out of lower_instr.bn /
+// vm_exec_helpers.bn to keep both under the file-length cap.
+
+func lowerExtract(instr @ir.Instr, bc BCInstr) BCInstr {
+	bc.Op = BC_EXTRACT
+	bc.Src1 = instr.Args[0].ID
+	var srcTyp @types.Type = instr.Args[0].Typ
+	if srcTyp != nil {
+		srcTyp = resolveToStruct(srcTyp)
+	}
+	if srcTyp != nil && srcTyp.Kind == types.TYP_STRUCT {
+		// Anonymous multi-return struct or named struct.
+		// Use byte offset and detect multi-word fields.
+		bc.Imm = srcTyp.FieldOffset(instr.Index)
+		if instr.Index < len(srcTyp.Fields) {
+			var ft @types.Type = srcTyp.Fields[instr.Index].Type
+			// Interface- and function-value fields are 16-byte
+			// address-based aggregates too: extract them in pointer
+			// mode so the result is the address of the field's slot
+			// — matching how packMultiReturn writes a multi-return
+			// component and how such a value is otherwise carried
+			// (its register holds the slot address).  See
+			// isVMAddressAggregate.
+			if isMultiWordField(ft) || isVMAddressAggregate(ft) {
+				bc.Aux = 1 // pointer mode
+			} else {
+				// A scalar field: pack its byte SIZE + a sign bit into Aux (an
+				// immediate — NOT Src2, a register the slot-remap pass rewrites) so
+				// the executor reads exactly that many bytes.  A sub-word field read
+				// as a full word pulls in garbage past a byte-packed struct (e.g. a
+				// comma-ok `{char, bool}` value-recovery result), corrupting the
+				// value.  Aux encoding + rationale: see BC_EXTRACT in
+				// vm_exec_helpers.bn.  size >= 1 avoids the pointer/legacy sentinels.
+				var extractSize int = ft.SizeOf()
+				var signBit int = 0
+				if ft.Kind == types.TYP_INT && ft.Signed {
+					signBit = 1
+				}
+				// Bit 1 = pair-wide: set iff the DESTINATION register is a
+				// 64-bit pair — is64BitScalar, the SAME predicate buildSlotMap
+				// uses to size the dest.  The executor's pair read keys off this,
+				// NOT SizeOf()==8: the two diverge for a wrapper is64BitScalar
+				// doesn't peel (a readonly / alias 64-bit scalar — SizeOf 8 but
+				// dest one slot), where a pair write would clobber the neighbor
+				// register.  Such a field still truncates (the tracked readonly-
+				// wrapper bug) but no longer corrupts an adjacent slot.
+				var wideBit int = 0
+				if is64BitScalar(ft) && REG_SLOT < 8 {
+					wideBit = 2
+				}
+				bc.Aux = (extractSize << 2) | signBit | wideBit
+			}
+		}
+	} else {
+		// Legacy: word-indexed (managed-slice fields)
+		bc.Imm = instr.Index
+		bc.Aux = 2
+	}
+	return bc
+}
+
+// execExtractOp is the BC_EXTRACT executor (dispatched from execMemoryOp): it
+// reads instr's field out of the source struct/tuple into regs[Dst] per the mode
+// packed in Aux by lowerExtract.
+func execExtractOp(regs *int, instr BCInstr) bool {
+	// Imm = byte offset (or word index in legacy mode).  Aux selects the mode:
+	//   1          = return a pointer to the field (offset arithmetic only)
+	//   2          = legacy word-indexed load (Imm * word)
+	//   0          = value load, size unset → whole-word read (defensive)
+	//   (sz<<2)|w|s = value load of `sz` bytes; bit 0 (s) sign-extends a signed
+	//                 sub-word, bit 1 (w) = 64-bit pair-wide dest (read lo/hi
+	//                 into Dst/Dst+1).  sz>=1 keeps this >=4, clear of 0/1/2.
+	// Size rides in Aux (an immediate), NOT Src2 (a register the slot-remap pass
+	// rewrites).  Reading exactly `sz` bytes never reaches past the field into
+	// adjacent bytes (garbage beyond a byte-packed struct).
+	if instr.Aux == 1 {
+		regs[instr.Dst] = regs[instr.Src1] + instr.Imm
+	} else if instr.Aux == 2 {
+		var p *int = bit_cast(*int, regs[instr.Src1])
+		regs[instr.Dst] = p[instr.Imm]
+	} else if instr.Aux == 0 {
+		var p *int = bit_cast(*int, regs[instr.Src1] + instr.Imm)
+		regs[instr.Dst] = p[0]
+	} else if (instr.Aux & 2) != 0 {
+		// Aux bit 1 (pair-wide): a 64-bit scalar field (int64 / uint64 /
+		// float64) whose destination register is a PAIR (low + high slots) on
+		// a host whose word is < 8 bytes.  Read the field's two little-endian
+		// words straight into it (lo at Dst, hi at Dst+1) exactly as
+		// BC_LOAD64_PAIR does.  The byte-accumulate path below would pack 8
+		// bytes into a host `int` (4 bytes here) — keeping only the low word
+		// and leaving the high slot unwritten — so a float64's magnitude (or a
+		// large int64's high half) is dropped and e.g. 100.0 reads back as 0.0.
+		// The lowerer sets this bit from is64BitScalar (the dest-sizing
+		// predicate), so it is only ever set when Dst+1 is a reserved slot; on
+		// a 64-bit host it is never set (the else-branch's host int holds all 8
+		// bytes).
+		var p *uint32 = bit_cast(*uint32, regs[instr.Src1] + instr.Imm)
+		regs[instr.Dst] = cast(int, p[0])
+		regs[instr.Dst + 1] = cast(int, p[1])
+	} else {
+		var esize int = instr.Aux >> 2
+		var p *uint8 = bit_cast(*uint8, regs[instr.Src1] + instr.Imm)
+		var val int = 0
+		for i := esize - 1; i >= 0; i-- { val = (val << 8) | cast(int, p[i]) }
+		// narrowToWidth is host-portable — it guards `bits >= host word` and
+		// uses an arithmetic shift for the signed case, unlike an inline
+		// `1 << bits` mask (which overflows for a word-wide field on a 32-bit
+		// host).  Aux bit 0 is the signed flag; the zero-extended sub-word read
+		// above already has its upper bits clear, so the unsigned path is a no-op.
+		regs[instr.Dst] = narrowToWidth(val, esize * 8, (instr.Aux & 1) != 0)
+	}
+	return true
+}

@@ -59,12 +59,21 @@ func emitCall(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins
 		}
 	}
 
+	// fixedCount marks the fixed/variadic boundary in dispatch-index space
+	// (argTypes, which carries the leading sret slot when bigRet — that slot is
+	// fixed).  Only OP_C_CALL is variadic (CFixedArgs = the count before `...`);
+	// every OP_CALL arg is fixed.  A variadic float then rides GP, not VFP —
+	// see VariadicFloatInGp / emitCallArg.
+	var fixedCount int = len(ins.Args)
+	if ins.Op == iropcode.OP_C_CALL { fixedCount = ins.CFixedArgs }
+	if bigRet { fixedCount = fixedCount + 1 }
+
 	for ai := 0; ai < len(ins.Args); ai++ {
 		// User arg ai lives at dispatch slot ai (no sret) or ai+1 (sret — the
 		// synthesised pointer takes slot 0).
 		var dispatchIdx int = ai
 		if bigRet { dispatchIdx = ai + 1 }
-		emitCallArg(a, pkgName, rm, argTypes, ins.Args[ai], dispatchIdx)
+		emitCallArg(a, pkgName, rm, argTypes, ins.Args[ai], dispatchIdx, fixedCount)
 		if a.HasError { return }
 		// Each arg's scratch reg is dead once consumed into argReg / the stack
 		// slot; reset so a long arg list doesn't saturate the pool.
@@ -117,18 +126,42 @@ func emitCall(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins
 // into the outgoing-args area.  A float32 rides the scalar single-word GP path
 // like an int32 — soft-float has no FP register file.
 func emitCallArg(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
-		argTypes @[]@types.Type, arg @ir.Instr, dispatchIdx int) {
-	var regStart int = rm.CC.CallArgRegStart(argTypes, dispatchIdx)
-	var stackOff int = rm.CC.CallArgStackOff(argTypes, dispatchIdx)
-	// Hard-float (AAPCS-VFP): a float scalar arg rides a VFP register (S/D), so
-	// PEEL it off the GP paths BEFORE the isPair64Typ branch — a float64 that
-	// stayed on isPair64Typ would call placeInt64Arg with regStart/stackOff both
-	// -1 (CallArgRegStart / CallArgStackOff return -1 for an in-FP-reg float) and
-	// emit NOTHING (a silent miscompile).  emitCallArgFloatHard places it in its
-	// CallArgFpReg S/D register; it returns false only for an FP-file OVERFLOW
-	// (the bits then go to the outgoing stack slot via the GP path below, exactly
-	// as a spilled GP scalar does).  Inert unless types.Arm32HardFloat().
-	if types.Arm32HardFloat() && common.IsFloatScalarTyp(arg.Typ) {
+		argTypes @[]@types.Type, arg @ir.Instr, dispatchIdx int, fixedCount int) {
+	// isVariadic: this arg is past the `...` boundary (OP_C_CALL vararg tail).
+	// A variadic float rides GP under AAPCS-VFP (VariadicFloatInGp), so the
+	// V-variant walkers place it in an even GP pair / stack — matching the skip
+	// of the VFP peel just below.  Non-variadic callers pass fixedCount = len,
+	// so the V-walkers reduce to the non-V ones (no behavior change).
+	var isVariadic bool = dispatchIdx >= fixedCount
+	// C promotes a variadic FLOAT argument to double, but the frontend does not
+	// yet apply that promotion (a user must pass float64 explicitly), and the
+	// GP-pair placement below assumes an already-8-byte variadic float.  A raw
+	// variadic float32 would mis-pass — 4 bytes in one GP slot vs the callee's
+	// promoted 8-byte double — so reject it loudly rather than silently
+	// miscompile.  Proper support is to VCVT-promote float32->float64 here
+	// (tracked in claude-todo); the common case (float64) is unaffected.
+	if isVariadic && types.Arm32HardFloat() && common.IsFloatScalarTyp(arg.Typ) &&
+			common.FloatScalarIsI32(arg.Typ) {
+		a.SetError(
+				"native arm32: variadic float32 arg must be cast to float64 "
+						"(C promotes variadic float to double; auto-promotion not yet applied)")
+		return
+	}
+	var regStart int = rm.CC.CallArgRegStartV(argTypes, dispatchIdx, fixedCount)
+	var stackOff int = rm.CC.CallArgStackOffV(argTypes, dispatchIdx, fixedCount)
+	// Hard-float (AAPCS-VFP): a NON-variadic float scalar arg rides a VFP
+	// register (S/D), so PEEL it off the GP paths BEFORE the isPair64Typ branch —
+	// a float64 that stayed on isPair64Typ would call placeInt64Arg with
+	// regStart/stackOff both -1 (the walkers return -1 for an in-FP-reg float)
+	// and emit NOTHING (a silent miscompile).  emitCallArgFloatHard places it in
+	// its CallArgFpReg S/D register; it returns false only for an FP-file
+	// OVERFLOW (the bits then go to the outgoing stack slot via the GP path
+	// below, exactly as a spilled GP scalar does).  A VARIADIC float is NOT
+	// peeled — AAPCS-VFP passes it by the base standard (GP pair / stack, the
+	// walkers gave the GP regStart/stackOff), so it falls through to the
+	// isPair64Typ / GP path exactly as a soft-float float64 does.  Inert unless
+	// types.Arm32HardFloat().
+	if types.Arm32HardFloat() && common.IsFloatScalarTyp(arg.Typ) && !isVariadic {
 		if emitCallArgFloatHard(a, pkgName, rm, argTypes, arg, dispatchIdx) {
 			return
 		}
@@ -215,257 +248,4 @@ func emitAggregateArg(a @asm.Assembler, rm @common.RegMap, arg @ir.Instr, regSta
 			emitFrameStore(a, tmp, stackOff + w * (wi - regWords))
 		}
 	}
-}
-
-// emitCallReturn collects the call's result after the BL.  A single (non-multi-
-// return) BIG aggregate return (SizeOf > InternalSretBytes = 4 — every slice,
-// most structs) arrived via AAPCS32 sret: the callee wrote its bytes through the
-// R0 buffer pointer directly into the call result's alloc data region, so there
-// is no post-call byte copy — the data region IS the result; LEA a pointer to it
-// into the result register (matching x64's `Lea rd, [RSP + dataOff]`) so
-// downstream consumers see a pointer to the bytes.  A SMALL aggregate (SizeOf <=
-// 4) is NOT sret — AAPCS32 returns it by value in R0 — so it is collected by
-// storing R0 into the result's data region first, then LEAing that region
-// pointer.  A MULTI-return tuple lands in the call's spill slot: a big tuple was
-// already written through the R0 sret buffer (nothing to collect); a small one
-// comes back field-per-register in r0..r3 (collectMultiReturnFields).  Otherwise
-// the result is a scalar / pointer; a 64-bit-pair scalar (int64 / uint64 /
-// float64) returns in r0:r1, and every other scalar (incl. float32) returns in
-// R0 and spills to the result's slot.
-func emitCallReturn(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
-	if ins.ID < 0 { return }
-	// A single-value aggregate return (a slice / array / named struct-by-value,
-	// NOT a multi-return TYP_STRUCT) uses the alloc-region convention below; a
-	// multi-return tuple (also a TYP_STRUCT that IsAggregateTyp matches) is
-	// collected into its spill slot further down.
-	if ins.Typ != nil && common.IsAggregateTyp(ins.Typ) && !common.IsMultiReturnCall(ins) {
-		// A big aggregate came back via AAPCS32 sret (the callee wrote through the
-		// R0 buffer into the call result's alloc data region), so there is nothing
-		// to store — just LEA the data-region pointer.  A small (<=4-byte)
-		// aggregate came back BY VALUE in R0 (one word), so store it into the data
-		// region first, then LEA.  Either way downstream consumers see a pointer
-		// to the bytes.  Mirrors x64's big-agg Lea / !bigRet RAX-store + Lea.
-		var bigRet bool = rm.CC.CallReturnsBigAggregate(ins)
-		var dataOff int = rm.LookupAlloc(ins.ID)
-		if dataOff < 0 { return }
-		if !bigRet {
-			emitFrameStore(a, arm32.R0, dataOff)
-		}
-		var rd int = nextReg(rm, ins.ID)
-		emitFrameAddr(a, rd, dataOff)
-		return
-	}
-	var spillOff int = rm.LookupSpill(ins.ID)
-	if spillOff < 0 { return }
-	// Multi-return tuple: a big tuple (gpWords > 4) was already written through
-	// the R0 sret buffer into this spill slot by the callee — nothing to collect.
-	// A small tuple comes back field-per-register in r0..r3.
-	if common.IsMultiReturnCall(ins) {
-		if rm.CC.CallReturnsBigMultiReturn(ins) { return }
-		collectMultiReturnFields(a, rm, ins, spillOff)
-		return
-	}
-	// Hard-float (AAPCS-VFP): a float scalar return rides S0 (float32) / D0
-	// (float64), not R0 / r0:r1 — VSTR it directly to the result slot (the
-	// destination is memory), BEFORE the isPair64Typ branch so a float64 does not
-	// read the unwritten r0:r1.  Inert unless types.Arm32HardFloat().
-	if types.Arm32HardFloat() && common.IsFloatScalarTyp(ins.Typ) {
-		emitCallReturnFloatHard(a, ins.Typ, spillOff)
-		return
-	}
-	// A 64-bit-pair scalar return (int64 / uint64 / float64) comes back in r0:r1;
-	// store both words to the slot.  A float32 returns in R0 like a 32-bit scalar.
-	if isPair64Typ(ins.Typ) {
-		emitFrameStore(a, arm32.R0, spillOff)
-		emitFrameStore(a, arm32.R1, spillOff + 4)
-		return
-	}
-	// Canonicalize a sub-word integer return in R0 before the spill (see
-	// aarch64.collectScalarReturn): AAPCS32 only guarantees the low width of a
-	// sub-word result, so a FOREIGN (C / cross-ABI) int8/int16 return must be
-	// sign/zero-extended to R0's full width before native code uses it directly (a
-	// compare / arithmetic), else `if c_signed_char_func() == -1` is false.  int32 IS
-	// the full ILP32 word, so only 1/2-byte returns need this.
-	var retSz int = 0
-	if ins.Typ != nil { retSz = ins.Typ.SizeOf() }
-	if retSz == 1 || retSz == 2 {
-		var u @types.Type = common.UnwrapNamed(ins.Typ)
-		var signed bool = u != nil && u.Signed
-		emitWidthExtend(a, arm32.R0, arm32.R0, retSz * 8, signed)
-	}
-	emitFrameStore(a, arm32.R0, spillOff)
-}
-
-// collectMultiReturnFields spills an IN-REGISTER multi-return tuple (gpWords <=
-// NumGpRetRegs = 4) from its AAPCS32 return registers r0..r3 into ins's stack
-// slot at spillOff, by the per-field register-class convention LLVM lowers a
-// tuple by: each field's words come from consecutive GP return registers
-// (soft-float folds float fields into GP — there is no FP file, so a single
-// retGp counter, unlike aarch64's retGp/retFp split), placed at the field's true
-// tuple FieldOffset with sized sub-word stores.  Delegates to the shared
-// storeMultiReturnTupleFieldsArm32 (base = SP, baseOff = the spill slot, scratch
-// = IP for large frame offsets) so the direct / func-value (and, later, iface)
-// caller collects share ONE implementation with the func-value SHIM store — they
-// cannot drift.  Mirrors aarch64_call.bn's collectMultiReturnFields.
-func collectMultiReturnFields(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, spillOff int) {
-	// Hard-float (AAPCS-VFP): a float tuple field comes back in a VFP return
-	// register (S/D, allocated by the CPRC back-fill = CallArgFpReg), NOT folded
-	// into the GP return budget.  Route a float-containing tuple to the FP-aware
-	// collect (it still uses the shared GP field store for the non-float fields);
-	// a tuple with no float field is byte-identical on the GP path below.  Inert
-	// unless types.Arm32HardFloat().  The func-value SHIM store keeps calling the
-	// shared GP function directly (its hard-float form is a later increment), so
-	// it is untouched here.
-	if types.Arm32HardFloat() && tupleHasFloatFieldArm32(ins.Typ) {
-		collectMultiReturnFieldsHard(a, rm, ins, spillOff)
-		return
-	}
-	storeMultiReturnTupleFieldsArm32(a, ins.Typ, arm32.SP, spillOff, rm.CC.NumGpRetRegs, wordBytes(),
-			arm32.IP)
-}
-
-// storeMultiReturnTupleFieldsArm32 is the field-per-register-by-class store loop
-// shared by collectMultiReturnFields (the RegMap-driven caller collect: base = SP,
-// baseOff = the result spill offset) and the func-value SHIM store-through-retbuf
-// path (base = the retbuf register, baseOff = 0).  A single implementation so the
-// caller collect and the shim store provably agree (they cannot drift).  It walks
-// the tuple fields with a single GP return-register cursor (retGp), delegating
-// each field's placement to storeMultiRetGpFieldArm32 at base + baseOff +
-// FieldOffset(fi).  This is the SOFT-float / GP-only lowering — every field
-// (including a float64 via isPair64Typ / a float32 via the scalar tail) folds into
-// the GP return budget, since soft-float has no FP file.  The hard-float caller
-// collect diverts to collectMultiReturnFieldsHard (FP-aware) upstream; this
-// function is what the hard-float shim store still uses (its FP-aware form is a
-// later increment).  numGpRetRegs is the GP return-register budget (AAPCS32: 4) =
-// the sret threshold, so a field is never dropped (an over-budget tuple was routed
-// to sret).  `scratch` materializes a large base+off and must not alias a return
-// reg or `base`.
-func storeMultiReturnTupleFieldsArm32(a @asm.Assembler, tupleTyp @types.Type, base int, baseOff int,
-		numGpRetRegs int, wByte int, scratch int) {
-	var retGp int = 0
-	for fi := 0; fi < len(tupleTyp.Fields); fi++ {
-		var fldTyp @types.Type = tupleTyp.Fields[fi].Type
-		var fldOff int = baseOff + tupleTyp.FieldOffset(fi)
-		retGp = retGp +
-				storeMultiRetGpFieldArm32(a, base, fldOff, retGp, fldTyp, numGpRetRegs, wByte, scratch)
-	}
-}
-
-// storeMultiRetGpFieldArm32 stores one multi-return field that rides the GP
-// return registers r0..r(numGpRetRegs-1), starting at cursor retGp, to
-// base+fldOff, and returns the number of GP return registers it consumed.  It is
-// the per-field GP store shared by the soft-float loop above (which sends EVERY
-// field here — a float64 field via isPair64Typ, a float32 via the scalar tail)
-// and the hard-float collect (collectMultiReturnFieldsHard, which peels every
-// float field to an FP return register BEFORE calling this, so only int64 /
-// uint64 and non-float scalars / aggregates reach here).  Cases:
-//   - Aggregate: spreads its words to consecutive regs; a 0-byte aggregate
-//     (`struct{}` / `[0]T`) reports 0 words and consumes NO register — a junk word
-//     would shift every later field, desyncing this store from the pack + LLVM
-//     shim.  A sub-word aggregate at a NON-word-aligned tuple offset is stored
-//     byte-wise (a full-word STR at an odd address FAULTS on strict-align arm32).
-//   - int64 / uint64 (isPair64Typ; a float64 is already peeled off in hard mode):
-//     a CONSECUTIVE register pair, NO even-register bump — AAPCS §6.5 C.3's
-//     even-pair rule is ARGUMENT-only; the small-aggregate RETURN coerces the tuple
-//     to consecutive r0..r3 words in field order (verified against the LLVM sibling:
-//     for {int32, int64} the int64 comes back in r1:r2, not r2:r3).  lo/hi store at
-//     [base+fldOff] / [+4] (fldOff keeps the tuple's 8-aligned FieldOffset for the
-//     memory image, independent of the register cursor).
-//   - Other scalar: a SIZED store so a sub-word field (uint16 / bool) does not
-//     clobber its neighbor in the same word cell.
-// The retGp<numGpRetRegs guards never drop a live field — an over-budget tuple was
-// routed to sret.  scratch materializes a large base+off and must not alias a
-// return reg or base.
-func storeMultiRetGpFieldArm32(a @asm.Assembler, base int, fldOff int, retGp int,
-		fldTyp @types.Type, numGpRetRegs int, wByte int, scratch int) int {
-	if common.IsAggregateTyp(fldTyp) {
-		var nWords int = argWordsArm32(fldTyp, wByte)
-		var fldSz int = fldTyp.SizeOf()
-		if fldSz > 0 && fldOff % wByte != 0 {
-			return storeAggFieldBytewiseArm32(a, base, fldOff, retGp, fldSz, numGpRetRegs, wByte, scratch)
-		}
-		var used int = 0
-		for wi := 0; wi < nWords && retGp + used < numGpRetRegs; wi++ {
-			emitBaseStore(a, argReg(retGp + used), base, fldOff + wByte * wi, scratch)
-			used = used + 1
-		}
-		return used
-	}
-	if isPair64Typ(fldTyp) {
-		if retGp + 1 < numGpRetRegs {
-			emitBaseStore(a, argReg(retGp), base, fldOff, scratch)
-			emitBaseStore(a, argReg(retGp + 1), base, fldOff + 4, scratch)
-			return 2
-		}
-		return 0
-	}
-	if retGp < numGpRetRegs {
-		var fldSz int = fldTyp.SizeOf()
-		if fldSz <= 0 { fldSz = wByte }
-		emitBaseScalarStore(a, argReg(retGp), base, fldOff, fldSz, scratch)
-		return 1
-	}
-	return 0
-}
-
-// storeAggFieldBytewiseArm32 stores a `fldSz`-byte aggregate FIELD byte-wise at
-// base+fldOff, pulling its bytes from consecutive return registers starting at retGp.
-// Used by storeMultiReturnTupleFieldsArm32 for an aggregate field at a NON-word-aligned
-// tuple offset (a sub-word aggregate like a 3-byte struct at an odd byte), where a
-// full-word STR would fault on strict-align bare-metal.  `scratch` (distinct from base
-// and every return reg) holds the field base address base+fldOff once, so each byte STRB
-// uses a small [scratch, #k] immediate; each return register is dead after its field, so
-// the low byte is stored then the register is shifted right 8 in place for the next byte.
-// Returns the number of return registers consumed (ceil(fldSz/wByte)), capped at the GP
-// return budget so it stays in lockstep with the pack + LLVM coercion.
-func storeAggFieldBytewiseArm32(a @asm.Assembler, base int, fldOff int, retGp int, fldSz int,
-		numGpRetRegs int, wByte int, scratch int) int {
-	emitConstInt32(a, scratch, fldOff)
-	arm32.Add(a, arm32.COND_AL, false, scratch, base, arm32.Reg(scratch))
-	var nWords int = (fldSz + wByte - 1) / wByte
-	var bi int = 0
-	var used int = 0
-	for wi := 0; wi < nWords && retGp + wi < numGpRetRegs; wi++ {
-		var reg int = argReg(retGp + wi)
-		var nb int = wByte
-		if fldSz - bi < nb {
-			nb = fldSz - bi
-		}
-		for bj := 0; bj < nb; bj++ {
-			arm32.Strb(a, arm32.COND_AL, reg, arm32.MemImm(scratch, bi))
-			if bj + 1 < nb {
-				arm32.Mov(a, arm32.COND_AL, false, reg, arm32.RegShift(reg, arm32.LSR, 8))
-			}
-			bi = bi + 1
-		}
-		used = used + 1
-	}
-	return used
-}
-
-// argWordsArm32 is the AAPCS32 (wByte-word) argument word count without needing a
-// CallConv — ceil(SizeOf / wByte).  storeMultiReturnTupleFieldsArm32 uses it in the
-// shim (no RegMap → no cc.ArgWords).  A zero-size aggregate reports 0 words (no
-// bytes → no register/stack, matching common.argWords and LLVM); it must NOT be
-// clamped to 1 (see common.argWords / conformance 1029).
-func argWordsArm32(t @types.Type, wByte int) int {
-	if t == nil { return 1 }
-	var sz int = t.SizeOf()
-	return (sz + wByte - 1) / wByte
-}
-
-// isReg64Scalar reports whether t is a 64-bit fundamental integer scalar
-// (int64 / uint64) — a value that AAPCS32 passes / returns in a register PAIR.
-// Slices and other aggregates are NOT this (they are handled by the aggregate
-// paths); a nil or sub-64-bit type is not this either.  Peels ALL transparent
-// wrappers (types.StripWrappers: alias / readonly / named), because a
-// `readonly int64` / a `type Id int64` has the identical register-pair value
-// shape — and MUST classify the same way the ABI / shim classifiers do (which
-// peel transparent), or a wrapped 64-bit arg is mis-placed as a single word.
-func isReg64Scalar(t @types.Type) bool {
-	if t == nil { return false }
-	var u @types.Type = types.StripWrappers(t)
-	if u == nil { return false }
-	if u.Kind != types.TYP_INT { return false }
-	return u.Width == 64
 }

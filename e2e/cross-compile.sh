@@ -107,7 +107,7 @@ else
                     # Full check: the cross bnc compiles+runs a hello for its
                     # target (RUN_EMU empty => direct exec, e.g. Rosetta).
                     hello="$TMP/hello.bn"
-                    printf 'package "main"\n\nimport "pkg/stdx/fmt"\n\nfunc main() {\n\tfmt.Println("cross-compile-ok")\n}\n' > "$hello"
+                    printf 'package "main"\n\nimport "pkg/std/fmt"\n\nfunc main() {\n\tfmt.Println("cross-compile-ok")\n}\n' > "$hello"
                     I="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target "$XTARGET")"
                     L="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --target "$XTARGET")"
                     prog="$TMP/hello-$XTARGET"

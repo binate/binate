@@ -1,5 +1,5 @@
 #!/bin/sh
-# e2e/fmt-os-args.sh — End-to-end check that pkg/stdx/fmt renders a REAL os.Args()
+# e2e/fmt-os-args.sh — End-to-end check that pkg/std/fmt renders a REAL os.Args()
 # element as text, on BOTH execution paths: a compiled native binary, and the same
 # program interpreted by cmd/bni.
 #
@@ -53,7 +53,7 @@ cat > "$TMP/fmt_os_args.bn" <<'EOF'
 package "main"
 
 import "pkg/std/os"
-import "pkg/stdx/fmt"
+import "pkg/std/fmt"
 
 func main() {
 	var a @[]readonly @[]readonly char = os.Args()

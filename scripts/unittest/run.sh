@@ -247,21 +247,33 @@ failures=""
 # loader, so batching packages into ONE invocation pays the shared core (cmd/bni +
 # types/ir/ast) once.  But batching ALL packages per shard loads ALL ~50 package
 # impls on EVERY shard — a per-shard-CONSTANT floor no shard count can reduce.  So
-# the batch is HYBRID:
-#   - LIGHT packages (not .split.vm) are PACKAGE-sharded: each is assigned to ONE
-#     shard by position and runs its FULL tests there, so a shard loads only its
-#     own light subset's impls.  Collected into BATCH_LIGHT_PKGS.
-#   - HEAVY packages (the .split.vm set — too big to fit one shard) are
-#     TEST-sharded: loaded on EVERY shard, each running 1/N of its own tests via
-#     --shard.  Collected into BATCH_HEAVY_PKGS.
-# An unsharded run (SHARD_COUNT=0) collapses both into one full-test batch (the
-# heavy/light split only matters when sharding).  Off under --check-xpass (which
-# needs the per-package XPASS detection path).  BATCH_*_SKIPS accumulate
-# package-qualified skip patterns (pkg:pattern) for their batch.
+# the batch runs a REPRESENTATIVE SUBSET (see the classification loop below):
+#   - HEAVY = the INTINT_HEAVY representative set (types, ir — moderate-cost at
+#     double-VM): TEST-sharded — loaded on EVERY shard, each running 1/N of its
+#     own tests via --shard.  Collected into BATCH_HEAVY_PKGS.
+#   - CHEAP packages (not .split.vm): PACKAGE-sharded — each assigned to ONE shard
+#     by position, running its FULL tests there.  Collected into BATCH_LIGHT_PKGS.
+#   - Other .split.vm packages (native/* backends, asm/*, lint/bnlint/bnfmt,
+#     parser, irdata): SKIPPED here — priciest at double-VM, covered by the
+#     single-VM / native lanes.  (Running ALL ~15 heavies was a ~16-min/shard load
+#     floor that blew the 45-min cap; the real fix is bni perf.)
+# An unsharded run (SHARD_COUNT=0) runs the subset full in one batch.  Off under
+# --check-xpass (which needs the per-package XPASS detection path).  BATCH_*_SKIPS
+# accumulate package-qualified skip patterns (pkg:pattern) for their batch.
 BATCH_MODE=0
 if [ "$CHECK_XPASS" -eq 0 ]; then
     case "$MODE" in *-int-int) BATCH_MODE=1 ;; esac
 fi
+# The double-VM representative set: the .split.vm packages whose tests are only
+# MODERATELY expensive under double-VM — types (typecheck) and ir (IR build),
+# measured ~0.9s/test.  Deliberately EXCLUDES codegen / vm / native-* etc.: their
+# tests compile or RUN whole programs, which under the VM-interpreting-the-VM
+# becomes ~100× (vm's own tests run a bytecode VM, so double-VM makes them
+# VM-on-VM-on-VM) — a full shard of {types,ir,vm,codegen} measured 5h44m locally.
+# Running the type-checker + IR builder under the VM still exercises the double-VM
+# path thoroughly; codegen/vm/native double-VM coverage waits on bni perf work.
+# Kept test-sharded; every other .split.vm package is dropped from this lane.
+INTINT_HEAVY="pkg/binate/types pkg/binate/ir"
 BATCH_LIGHT_PKGS=""
 BATCH_LIGHT_SKIPS=""
 BATCH_HEAVY_PKGS=""
@@ -327,30 +339,51 @@ for pkg in $PACKAGES; do
                 b_pkg_skips="$b_pkg_skips,$pkg:$b_pat"
             done
         fi
-        # Heavy = marked .split.<mode> (or .split.vm for any VM mode): its own
-        # tests are too many to fit one shard, so test-shard it (loaded on every
-        # shard).  Everything else is light.  Same marker resolution as the
-        # non-batch shard-selection below.
+        # int-int representative subset: the double-VM lane runs only the
+        # INTINT_HEAVY set test-sharded (loaded on every shard, 1/N tests each)
+        # PLUS all cheap (non-.split.vm) packages package-sharded.  Every OTHER
+        # .split.vm package — codegen, vm, the native/* backends, asm/*, lint/
+        # bnlint/bnfmt, parser, irdata — is SKIPPED here: their tests compile or
+        # RUN whole programs, which is pathological under the VM-interpreting-the-
+        # VM (native/arm32's 353 tests alone > 25 min; a shard of {types,ir,vm,
+        # codegen} took 5h44m — vm's own tests run a VM, so double-VM is
+        # VM-on-VM-on-VM).  Their coverage comes from the single-VM (-int /
+        # -comp-int) and native lanes; the double-VM path itself is package-
+        # agnostic, so running the type-checker + IR builder under it exercises it.
+        # The real fix is bni perf (see explorations/claude-todo.md); until then
+        # this keeps the lane green and useful.  int-int-specific — the single-VM
+        # lanes have no such cost and still use .split.vm via the non-batch
+        # shard-selection below.
         b_split="$SCRIPT_DIR/${xfail_key}.split.${MODE}"
         if [ ! -f "$b_split" ]; then
             case "$MODE" in *int*) b_split="$SCRIPT_DIR/${xfail_key}.split.vm" ;; esac
         fi
+        b_is_heavy=0
+        case " $INTINT_HEAVY " in *" $pkg "*) b_is_heavy=1 ;; esac
         if [ "$SHARD_COUNT" -eq 0 ]; then
-            # Unsharded: heavy/light split is moot — one full-test batch.
+            # Unsharded: run the subset (INTINT_HEAVY + cheap) full in one batch,
+            # but still exclude the non-subset expensive (.split.vm) packages.
+            if [ "$b_is_heavy" -eq 0 ] && [ -f "$b_split" ]; then
+                pkgskipped=$((pkgskipped + 1)); continue
+            fi
             BATCH_LIGHT_PKGS="$BATCH_LIGHT_PKGS $pkg"
             BATCH_LIGHT_SKIPS="$BATCH_LIGHT_SKIPS$b_pkg_skips"
             continue
         fi
-        if [ -f "$b_split" ]; then
-            # Heavy: on every shard, tests split 1/N via --shard.
+        if [ "$b_is_heavy" -eq 1 ]; then
+            # Core pipeline: test-shard — on every shard, tests split 1/N via --shard.
             BATCH_HEAVY_PKGS="$BATCH_HEAVY_PKGS $pkg"
             BATCH_HEAVY_SKIPS="$BATCH_HEAVY_SKIPS$b_pkg_skips"
             continue
         fi
-        # Light: package-shard — assigned to ONE shard by position (shard_pos %
-        # count == index-1), running its full tests there.  shard_pos advances for
-        # every light package on every shard identically (deterministic package
-        # order + deterministic exclusions), so each lands on exactly one shard.
+        if [ -f "$b_split" ]; then
+            # Expensive but NOT in the int-int subset: skip for this lane.
+            pkgskipped=$((pkgskipped + 1)); continue
+        fi
+        # Cheap package: package-shard — assigned to ONE shard by position
+        # (shard_pos % count == index-1), running its full tests there.  shard_pos
+        # advances for every cheap package on every shard identically (deterministic
+        # order + exclusions), so each lands on exactly one shard.
         if [ $((shard_pos % SHARD_COUNT)) -eq $((SHARD_IDX - 1)) ]; then
             BATCH_LIGHT_PKGS="$BATCH_LIGHT_PKGS $pkg"
             BATCH_LIGHT_SKIPS="$BATCH_LIGHT_SKIPS$b_pkg_skips"

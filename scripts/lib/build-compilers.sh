@@ -68,7 +68,7 @@ build_gen1() {
     _ensure_compilers_dir
     GEN1_COMPILER="$_COMPILERS_DIR/gen1_compiler"
     GEN1_BUILD_DIR="$(_new_build_dir)"
-    echo "Building gen1 compiler..."
+    echo "Building gen1 compiler (-O2)..."
     builder="$(_resolve_builder)"
     blib="$(_resolve_builder_lib)"
     # gen1 = the BUILDER compiling cmd/bnc.  The bnc source cone (cmd/bnc + its
@@ -88,7 +88,13 @@ build_gen1() {
     # OUTPUTS (gen2, tests, conformance) are emitted by gen1 and link the
     # checkout runtime.
     # e2e/{repl,os-args}.sh + scripts/build-*.sh use the same invocation form.
-    build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    #
+    # --cflag -O2 (the release opt level — scripts/build-bnc.sh): gen1 is the
+    # compiler that compiles every test in the comp-based lanes (unit,
+    # conformance, perf), so leaving it at clang's -O0 default makes the whole
+    # suite several × slower.  The one-time -O2 build cost (once per runner_setup)
+    # is dwarfed by the faster per-test compiles across the lane.
+    build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --cflag -O2 --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"
@@ -100,12 +106,14 @@ build_gen1() {
 # Build gen2 compiler (gen1 compiles cmd/bnc → gen2 binary)
 # Requires GEN1_COMPILER to be set (call build_gen1 first).
 # Sets GEN2_COMPILER to the path.
+# Built --cflag -O2 for the same reason as gen1 (it drives the comp-comp lanes'
+# per-test compiles).
 build_gen2() {
     _ensure_compilers_dir
     GEN2_COMPILER="$_COMPILERS_DIR/gen2_compiler"
     GEN2_BUILD_DIR="$(_new_build_dir)"
-    echo "Building gen2 compiler..."
-    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --build-dir "$GEN2_BUILD_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    echo "Building gen2 compiler (-O2)..."
+    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --cflag -O2 --build-dir "$GEN2_BUILD_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN2_COMPILER" ]; then
         echo "ERROR: Failed to build gen2 compiler:"
         echo "$build_out"

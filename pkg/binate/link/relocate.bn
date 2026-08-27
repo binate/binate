@@ -31,13 +31,12 @@ func writeLE(dst @[]uint8, off int, value int, n int) {
 }
 
 // Relocate patches every relocation in the linked objects: for each it computes
-// the patch site's virtual address P and the target symbol's address S, applies
-// the per-kind formula, and writes the result into the containing output section's
-// merged Data.  Supported x86-64 kinds: R_X86_64_64 (S + A, 64-bit absolute) and
-// R_X86_64_PC32 / R_X86_64_PLT32 (S + A - P, 32-bit PC-relative; PLT32 is patched
-// as PC32 for a statically-resolved symbol).  Returns "" on success, or a
-// non-empty error for an unsupported kind or a PC-relative displacement that does
-// not fit a signed 32-bit field.
+// the patch site's virtual address P and the target symbol's address S, then
+// dispatches on the object's machine to the per-arch patcher (patchX64 /
+// patchAArch64), which applies the per-kind formula and writes into the containing
+// output section's merged Data.  Returns "" on success, or a non-empty error for
+// an unsupported kind/machine, an out-of-range offset, or an out-of-range or
+// misaligned displacement.
 func Relocate(t @SymbolTable, lr @LayoutResult) @[]readonly char {
 	for o := 0; o < len(t.Objs); o++ {
 		var obj @InputObject = t.Objs[o]
@@ -57,32 +56,141 @@ func Relocate(t @SymbolTable, lr @LayoutResult) @[]readonly char {
 				return buf.Concat("unresolved symbol ", obj.Symbols[rel.SymIndex].Name)
 			}
 			var data @[]uint8 = lr.Sections[outIdx].Data
+			var symName @[]char = obj.Symbols[rel.SymIndex].Name
 
-			// Field width per kind; unsupported kinds fail loud before any write.
-			var width int = 0
-			if rel.Kind == R_X86_64_64 {
-				width = 8
-			} else if rel.Kind == R_X86_64_PC32 || rel.Kind == R_X86_64_PLT32 {
-				width = 4
-			} else if rel.Kind == R_X86_64_REX_GOTPCRELX {
-				return "GOT relocation unsupported (hermetic links only)"
+			var e @[]readonly char
+			if obj.Machine == EM_X86_64 {
+				e = patchX64(data, byteLoc, rel.Kind, rel.Addend, s, p, symName, obj.Path)
+			} else if obj.Machine == EM_AARCH64 {
+				e = patchAArch64(data, byteLoc, rel.Kind, rel.Addend, s, p, symName, obj.Path)
 			} else {
-				return buf.Concat("unsupported relocation in ", obj.Path)
+				e = buf.Concat("unsupported target machine in ", obj.Path)
 			}
-			if byteLoc < 0 || byteLoc + width > len(data) {
-				return buf.Concat("relocation offset out of range in ", obj.Path)
-			}
-
-			if width == 8 {
-				writeLE(data, byteLoc, cast(int, s) + rel.Addend, 8)
-			} else {
-				var val int = cast(int, s) + rel.Addend - cast(int, p)
-				if val > 0x7fffffff || val < (0 - 0x80000000) {
-					return buf.Concat("relocation out of range for ", obj.Symbols[rel.SymIndex].Name)
-				}
-				writeLE(data, byteLoc, val, 4)
-			}
+			if len(e) != 0 { return e }
 		}
 	}
 	return ""
+}
+
+// patchX64 applies an x86-64 relocation at byteLoc: R_X86_64_64 (S + A, 64-bit
+// absolute) and R_X86_64_PC32 / R_X86_64_PLT32 (S + A - P, 32-bit PC-relative;
+// PLT32 patched as PC32 for a statically-resolved symbol).  Returns "" or an error
+// (unsupported/GOT kind, out-of-range offset, or a displacement that does not fit
+// a signed 32-bit field).
+func patchX64(data @[]uint8, byteLoc int, kind int, addend int, s uint, p uint,
+		symName *[]readonly char, objPath *[]readonly char) @[]readonly char {
+	var width int = 0
+	if kind == R_X86_64_64 {
+		width = 8
+	} else if kind == R_X86_64_PC32 || kind == R_X86_64_PLT32 {
+		width = 4
+	} else if kind == R_X86_64_REX_GOTPCRELX {
+		return "GOT relocation unsupported (hermetic links only)"
+	} else {
+		return buf.Concat("unsupported relocation in ", objPath)
+	}
+	if byteLoc < 0 || byteLoc + width > len(data) {
+		return buf.Concat("relocation offset out of range in ", objPath)
+	}
+	if width == 8 {
+		writeLE(data, byteLoc, cast(int, s) + addend, 8)
+	} else {
+		var val int = cast(int, s) + addend - cast(int, p)
+		if val > 0x7fffffff || val < (0 - 0x80000000) {
+			return buf.Concat("relocation out of range for ", symName)
+		}
+		writeLE(data, byteLoc, val, 4)
+	}
+	return ""
+}
+
+// patch32Field reads the 32-bit little-endian instruction at loc, replaces the
+// bits selected by mask with value (shifted into place and confined to mask), and
+// writes it back — leaving the opcode bits intact.  Distinct fields of one
+// instruction (e.g. an ADRP's immlo and immhi) are patched by successive calls.
+func patch32Field(data @[]uint8, loc int, mask int, value int, shift int) {
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var r *[]readonly uint8 = data
+	var insn int = u32(r, loc)
+	insn = (insn & (0xffffffff ^ mask)) | ((value << cast(uint, shift)) & mask)
+	writeLE(data, loc, insn, 4)
+}
+
+// patchAArch64 applies an AArch64 relocation at byteLoc.  ABS64 is a 64-bit data
+// word; the rest patch a bit-field of the 32-bit instruction.  Branch
+// displacements are S + A - P in bytes (checked 4-aligned and in range); ADRP is
+// the page delta (page(S+A) - page(P)) >> 12 split across immlo/immhi; ADD/LDR
+// lo12 are the low 12 bits of S + A (LDR scaled by the access size).  Every
+// PC-relative field (branches, ADR, ADRP) is range-checked so an over-long
+// displacement is rejected loudly rather than truncated into a wrong target.
+// Returns "" or an error (unsupported/GOT kind, out-of-range file offset, or a
+// misaligned or out-of-range PC-relative displacement).
+func patchAArch64(data @[]uint8, byteLoc int, kind int, addend int, s uint, p uint,
+		symName *[]readonly char, objPath *[]readonly char) @[]readonly char {
+	var width int = 4
+	if kind == R_AARCH64_ABS64 { width = 8 }
+	if byteLoc < 0 || byteLoc + width > len(data) {
+		return buf.Concat("relocation offset out of range in ", objPath)
+	}
+
+	if kind == R_AARCH64_ABS64 {
+		writeLE(data, byteLoc, cast(int, s) + addend, 8)
+		return ""
+	}
+	if kind == R_AARCH64_CALL26 || kind == R_AARCH64_JUMP26 {
+		var v int = cast(int, s) + addend - cast(int, p)
+		if (v & 3) != 0 { return buf.Concat("misaligned branch target for ", symName) }
+		if v > 0x7ffffff || v < (0 - 0x8000000) { return buf.Concat("branch out of range for ", symName) }
+		patch32Field(data, byteLoc, 0x3ffffff, v >> 2, 0)
+		return ""
+	}
+	if kind == R_AARCH64_ADR_PREL_PG_HI21 {
+		var pageMask int = 0 - 0x1000 // ~0xFFF: page(x) = x & pageMask
+		var v int = (((cast(int, s) + addend) & pageMask) - (cast(int, p) & pageMask)) >> 12
+		// v is a page count in a signed 21-bit field: [-2^20, 2^20-1] pages (±4GB).
+		if v > 0xfffff || v < (0 - 0x100000) {
+			return buf.Concat("ADRP page offset out of range for ", symName)
+		}
+		patch32Field(data, byteLoc, 3 << 29, v & 3, 29) // immlo (bits 30:29)
+		patch32Field(data, byteLoc, 0x7ffff << 5, (v >> 2) & 0x7ffff, 5) // immhi (bits 23:5)
+		return ""
+	}
+	if kind == R_AARCH64_ADR_PREL_LO21 {
+		var v int = cast(int, s) + addend - cast(int, p)
+		// ADR's imm21 is a signed byte displacement: [-2^20, 2^20-1] (±1MB).
+		if v > 0xfffff || v < (0 - 0x100000) {
+			return buf.Concat("ADR offset out of range for ", symName)
+		}
+		patch32Field(data, byteLoc, 3 << 29, v & 3, 29)
+		patch32Field(data, byteLoc, 0x7ffff << 5, (v >> 2) & 0x7ffff, 5)
+		return ""
+	}
+	if kind == R_AARCH64_ADD_ABS_LO12_NC {
+		patch32Field(data, byteLoc, 0xfff << 10, (cast(int, s) + addend) & 0xfff, 10)
+		return ""
+	}
+	if kind == R_AARCH64_LDST64_ABS_LO12_NC {
+		patch32Field(data, byteLoc, 0xfff << 10, ((cast(int, s) + addend) & 0xfff) >> 3, 10)
+		return ""
+	}
+	if kind == R_AARCH64_CONDBR19 {
+		var v int = cast(int, s) + addend - cast(int, p)
+		if (v & 3) != 0 { return buf.Concat("misaligned branch target for ", symName) }
+		// imm19 is a signed ×4-scaled field: [-2^20, 2^20-4] (±1MB).
+		if v > 0xffffc || v < (0 - 0x100000) { return buf.Concat("branch out of range for ", symName) }
+		patch32Field(data, byteLoc, 0x7ffff << 5, (v >> 2) & 0x7ffff, 5)
+		return ""
+	}
+	if kind == R_AARCH64_TSTBR14 {
+		var v int = cast(int, s) + addend - cast(int, p)
+		if (v & 3) != 0 { return buf.Concat("misaligned branch target for ", symName) }
+		// imm14 is a signed ×4-scaled field: [-2^15, 2^15-4] (±32KB).
+		if v > 0x7ffc || v < (0 - 0x8000) { return buf.Concat("branch out of range for ", symName) }
+		patch32Field(data, byteLoc, 0x3fff << 5, (v >> 2) & 0x3fff, 5)
+		return ""
+	}
+	if kind == R_AARCH64_ADR_GOT_PAGE || kind == R_AARCH64_LD64_GOT_LO12_NC {
+		return "GOT relocation unsupported (hermetic links only)"
+	}
+	return buf.Concat("unsupported relocation in ", objPath)
 }

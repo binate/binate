@@ -84,3 +84,45 @@ __aeabi_ui2d:
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_U64ToF64
 __aeabi_ul2d:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_U64ToF64
+
+// ============================================================
+// Float add/sub group — libgcc member _arm_addsubsf3.o (fadd, fsub, frsub,
+// i2f, l2f, ui2f, ul2f).  ALL of its symbols the suite pulls are shimmed here
+// so the member is never linked from libgcc.  A binary32 / int / uint passes in
+// r0 and returns in r0; a 64-bit int (l2f/ul2f) in r0:r1 — all match the
+// corresponding softfloat function signatures, so each is a bare tail-call.
+// ============================================================
+	.global __aeabi_fadd
+	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F32Add
+__aeabi_fadd:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F32Add
+
+	.global __aeabi_fsub
+	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F32Sub
+__aeabi_fsub:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F32Sub
+
+	.global __aeabi_frsub
+	.global bn_F3_3_pkg8_builtins9_softfloat1_7_F32Rsub
+__aeabi_frsub:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_7_F32Rsub
+
+	.global __aeabi_i2f
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_I32ToF32
+__aeabi_i2f:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_I32ToF32
+
+	.global __aeabi_l2f
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_I64ToF32
+__aeabi_l2f:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_I64ToF32
+
+	.global __aeabi_ui2f
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_U32ToF32
+__aeabi_ui2f:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_U32ToF32
+
+	.global __aeabi_ul2f
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_U64ToF32
+__aeabi_ul2f:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_U64ToF32

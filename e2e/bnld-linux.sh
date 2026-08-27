@@ -117,7 +117,27 @@ _start:
 EOF
 echo "PASS: hello links to a static ELF64 x86-64 executable"
 
-# ----- run both programs if a linux-x86-64 runtime is available -----
+# ----- datax: exits with a byte loaded from .data (0x2a = 42).  .data is
+#       writable, so it lands in a separate R+W PT_LOAD from .text's R+X one;
+#       running it proves the two-segment (W^X) image loads and the .data segment
+#       is mapped and readable, and that a PC-relative reloc into the page-aligned
+#       .data resolves.  The 8-byte string's low byte is '*' (0x2a); the exit
+#       status is that low byte. -----
+asm_link datax <<'EOF'
+.arch x64
+.section data
+val:
+	.ascii "*0000000"
+.section text
+.global _start
+_start:
+	mov rdi, [rip + val]
+	mov eax, 60
+	syscall
+EOF
+echo "PASS: datax links to a static ELF64 x86-64 executable"
+
+# ----- run the programs if a linux-x86-64 runtime is available -----
 # Detect the runtime once (and pull the image on the Docker path) so a missing
 # runtime / Docker daemon-or-mount error becomes a per-program SKIP rather than a
 # false FAIL — while a binary that is structurally valid but fails to *exec* (126)
@@ -192,5 +212,16 @@ if [ "$RAN" = 1 ]; then
     echo "PASS: hello ran, printed 'hi', and exited 0"
 else
     echo "SKIP: hello not run here (no linux-x86-64 runtime) — build+structure verified"
+fi
+
+run_binary datax
+if [ "$RAN" = 1 ]; then
+    if [ "$CODE" != 42 ]; then
+        echo "FAIL: datax expected exit 42 (byte from .data), got $CODE" >&2
+        exit 1
+    fi
+    echo "PASS: datax ran and exited 42 (two-segment W^X image, .data mapped)"
+else
+    echo "SKIP: datax not run here (no linux-x86-64 runtime) — build+structure verified"
 fi
 exit 0

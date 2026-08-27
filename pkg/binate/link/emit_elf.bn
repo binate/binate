@@ -34,19 +34,73 @@ func writeFile(path *[]readonly char, data @[]uint8) @[]readonly char {
 	return ""
 }
 
+// groupStats scans the output sections whose writability matches `writable` and
+// returns (found, lo, fileEnd, memEnd, perms): whether any matched, the group's
+// lowest vaddr, its file-backed end (max Addr + len(Data)), its memory end (max
+// Addr + Size, so .bss counts), and the union of its PF_* permissions.  A group
+// with no file data (e.g. only .bss) reports fileEnd == lo (zero file span).
+func groupStats(sections @[]OutputSection, writable bool) (bool, uint, uint, uint, int) {
+	var found bool = false
+	var hasData bool = false
+	var lo uint = cast(uint, 0)
+	var fileEnd uint = cast(uint, 0)
+	var memEnd uint = cast(uint, 0)
+	var perms int = 0
+	for i := 0; i < len(sections); i++ {
+		if ((sections[i].Flags & SF_WRITE) != 0) != writable { continue }
+		var a uint = sections[i].Addr
+		if !found || a < lo { lo = a }
+		var me uint = a + sections[i].Size
+		if !found || me > memEnd { memEnd = me }
+		if len(sections[i].Data) > 0 {
+			var fe uint = a + cast(uint, len(sections[i].Data))
+			if !hasData || fe > fileEnd { fileEnd = fe }
+			hasData = true
+		}
+		perms = perms | segFlags(sections[i].Flags)
+		found = true
+	}
+	if !hasData { fileEnd = lo }
+	return found, lo, fileEnd, memEnd, perms
+}
+
+// writePhdr writes one Elf64_Phdr (PT_LOAD) at file offset phi, with p_paddr set
+// equal to p_vaddr.
+func writePhdr(out @[]uint8, phi int, flags int, off int, vaddr uint, filesz int, memsz int,
+		align int) {
+	writeLE(out, phi + 0, PT_LOAD, 4) // p_type
+	writeLE(out, phi + 4, flags, 4) // p_flags
+	writeLE(out, phi + 8, off, 8) // p_offset
+	writeLE(out, phi + 16, cast(int, vaddr), 8) // p_vaddr
+	writeLE(out, phi + 24, cast(int, vaddr), 8) // p_paddr
+	writeLE(out, phi + 32, filesz, 8) // p_filesz
+	writeLE(out, phi + 40, memsz, 8) // p_memsz
+	writeLE(out, phi + 48, align, 8) // p_align
+}
+
 // EmitElfExec writes a static ELF64 executable for the laid-out output sections
-// (from Layout), entering at `entry`.  This first increment uses a single loadable
-// PT_LOAD segment spanning all sections, with permissions the union of theirs
-// (per-section RX/RW segments are a follow-up).  Section file offsets keep
-// p_offset congruent to p_vaddr modulo the page size, so the segment is loadable
+// (from Layout), entering at `entry`.  Sections are mapped by two PT_LOADs — a
+// read-only/exec segment (.text/.rodata) and a read-write segment (.data/.bss) —
+// so no segment is both writable and executable (W^X).  Layout page-aligns the
+// writable group away from the read-only one, so the two segments never share a
+// page.  The lowest segment starts at file offset 0 so it maps the ELF header and
+// the program headers — a runtime that reads AT_PHDR (TLS setup, static-PIE
+// self-relocation, a libc _start) would otherwise dereference an unmapped address.
+// A program with only one group emits one segment.  Section file offsets keep
+// p_offset congruent to p_vaddr modulo the page size, so segments are loadable
 // even for a non-page-aligned base.  Returns "" on success or a non-empty error.
 func EmitElfExec(sections @[]OutputSection, entry uint, machine int,
 		path *[]readonly char) @[]readonly char {
 	if len(sections) == 0 { return "no sections to emit" }
-	var pagesize int = 0x1000
+	var pagesize int = linkPageSize
 	var ehsize int = 64
 	var phentsize int = 56
-	var phnum int = 1
+
+	roFound, _, roFileEnd, roMemEnd, roPerms := groupStats(sections, false)
+	rwFound, rwLo, rwFileEnd, rwMemEnd, rwPerms := groupStats(sections, true)
+	var phnum int = 0
+	if roFound { phnum = phnum + 1 }
+	if rwFound { phnum = phnum + 1 }
 	var hend int = ehsize + phnum * phentsize
 
 	// The load base is the first (lowest-address) section — Layout assigns
@@ -56,26 +110,19 @@ func EmitElfExec(sections @[]OutputSection, entry uint, machine int,
 	var dataStart int = alignUp(hend, pagesize) + cast(int, base % cast(uint, pagesize))
 	if base < cast(uint, dataStart) { return "load base too low to hold the ELF headers" }
 
-	// File-backed end (last section carrying data), memory end (incl. bss), and
-	// the union of segment permissions.
-	var fileEnd uint = base
+	// Overall memory/file ends and the below-base guard.
 	var memEnd uint = base
-	var perms int = 0
+	if roFound && roMemEnd > memEnd { memEnd = roMemEnd }
+	if rwFound && rwMemEnd > memEnd { memEnd = rwMemEnd }
+	var fileEnd uint = base
+	if roFound && roFileEnd > fileEnd { fileEnd = roFileEnd }
+	if rwFound && rwFileEnd > fileEnd { fileEnd = rwFileEnd }
 	for i := 0; i < len(sections); i++ {
 		if sections[i].Addr < base { return "a section address is below the load base" }
-		var end uint = sections[i].Addr + sections[i].Size
-		if end > memEnd { memEnd = end }
-		if len(sections[i].Data) > 0 {
-			var fe uint = sections[i].Addr + cast(uint, len(sections[i].Data))
-			if fe > fileEnd { fileEnd = fe }
-		}
-		perms = perms | segFlags(sections[i].Flags)
 	}
-	var filesz uint = fileEnd - base
-	var memsz uint = memEnd - base
 	if entry < base || entry >= memEnd { return "entry point is outside the loaded image" }
 
-	var totalFile int = dataStart + cast(int, filesz)
+	var totalFile int = dataStart + cast(int, fileEnd - base)
 	var out @[]uint8 = make_slice(uint8, totalFile)
 
 	// ELF header.
@@ -97,21 +144,25 @@ func EmitElfExec(sections @[]OutputSection, entry uint, machine int,
 	writeLE(out, 56, phnum, 2) // e_phnum
 	// e_shentsize / e_shnum / e_shstrndx stay 0.
 
-	// One PT_LOAD segment.  It starts at file offset 0 so it maps the ELF header
-	// and the program headers — a runtime that reads AT_PHDR (TLS setup, static-PIE
-	// self-relocation, a libc _start) would otherwise dereference an unmapped
-	// address.  Its vaddr is therefore base - dataStart (page-aligned, so p_offset 0
-	// stays congruent to p_vaddr), and its sizes include the dataStart prefix.
+	// Program headers.  The lowest group covers the ELF header + program headers
+	// (p_offset 0, p_vaddr = base - dataStart, sizes include the dataStart prefix);
+	// a following group maps at its own page-aligned vaddr and congruent offset.
+	// The read-only/exec group is always the lower one when present (Layout orders
+	// .text/.rodata below .data/.bss).
 	var segVaddr uint = base - cast(uint, dataStart)
-	var ph int = ehsize
-	writeLE(out, ph + 0, PT_LOAD, 4) // p_type
-	writeLE(out, ph + 4, perms, 4) // p_flags
-	writeLE(out, ph + 8, 0, 8) // p_offset (covers the ELF header + program headers)
-	writeLE(out, ph + 16, cast(int, segVaddr), 8) // p_vaddr
-	writeLE(out, ph + 24, cast(int, segVaddr), 8) // p_paddr
-	writeLE(out, ph + 32, dataStart + cast(int, filesz), 8) // p_filesz
-	writeLE(out, ph + 40, dataStart + cast(int, memsz), 8) // p_memsz
-	writeLE(out, ph + 48, pagesize, 8) // p_align
+	var phi int = ehsize
+	if roFound {
+		writePhdr(out, phi, roPerms, 0, segVaddr, dataStart + cast(int, roFileEnd - base),
+				dataStart + cast(int, roMemEnd - base), pagesize)
+		phi = phi + phentsize
+		if rwFound {
+			writePhdr(out, phi, rwPerms, dataStart + cast(int, rwLo - base), rwLo,
+					cast(int, rwFileEnd - rwLo), cast(int, rwMemEnd - rwLo), pagesize)
+		}
+	} else {
+		writePhdr(out, phi, rwPerms, 0, segVaddr, dataStart + cast(int, rwFileEnd - base),
+				dataStart + cast(int, rwMemEnd - base), pagesize)
+	}
 
 	// Section data at dataStart + (Addr - base).
 	for i := 0; i < len(sections); i++ {

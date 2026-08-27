@@ -1,0 +1,312 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/stdx/slices"
+
+// Dominance / dataflow infrastructure over a finalized @Func's CFG.
+//
+// The CFG is `f.Blocks`: block 0 is the entry (see data_satregistry.bn,
+// which treats f.Blocks[0] as `__entry`'s first block), and a block's
+// successors are read off its terminator (the last instruction) —
+// OP_JUMP has one target (Block1), OP_BRANCH has two (Block1/Block2),
+// and OP_RETURN / OP_UNREACHABLE / OP_UNWIND_RETURN have none.  Fault
+// pads (Func.FaultPads) are off Blocks and are not part of this CFG.
+//
+// This is the prerequisite infrastructure for scalar SSA promotion
+// (mem2reg): the immediate-dominator tree drives the renaming walk and
+// the iterated dominance frontier decides where phis go.
+//
+// The immediate-dominator computation is the Cooper-Harvey-Kennedy
+// iterative algorithm ("A Simple, Fast Dominance Algorithm"): DFS
+// postorder numbering (entry highest), then fixed-point refinement of
+// each block's idom by intersecting its predecessors' idom chains via
+// the postorder-number "finger" walk.  The dominance frontier is
+// Cooper's DF algorithm over that tree.  Everything is block-index-based
+// and hand-rolled (no generic set/map container) so it stays within the
+// BUILDER-compilable surface.
+
+// DomInfo holds per-function dominance data, indexed by block index
+// (position in f.Blocks).  A block unreachable from the entry has
+// Idom == -1 and PostNum == -1.
+type DomInfo struct {
+	// NumBlocks is len(f.Blocks) at computation time.
+	NumBlocks int
+	// Preds[b] lists the block indices with a CFG edge into b.
+	Preds @[]@[]int
+	// Succs[b] lists the block indices b's terminator branches to
+	// (0, 1, or 2 entries; deduplicated, so a branch whose two arms
+	// target the same block yields a single successor).
+	Succs @[]@[]int
+	// Idom[b] is b's immediate-dominator block index, or -1 for the
+	// entry (block 0, which is its own idom sentinel) and for any
+	// block unreachable from the entry.
+	Idom @[]int
+	// Postorder lists the reachable block indices in DFS postorder,
+	// entry last (highest position).
+	Postorder @[]int
+	// PostNum[b] is b's position in Postorder (entry the highest), or
+	// -1 if b is unreachable from the entry.
+	PostNum @[]int
+	// DF[b] is b's dominance frontier: the blocks where b's dominance
+	// stops just short — the phi-placement sites for a def in b.
+	DF @[]@[]int
+}
+
+// ComputeDom builds the dominance data for a finalized func's CFG.  On
+// an extern / bodyless func (no blocks) it returns an empty DomInfo.
+func ComputeDom(f @Func) @DomInfo {
+	var d @DomInfo = make(DomInfo)
+	var n int = len(f.Blocks)
+	d.NumBlocks = n
+	if n == 0 {
+		return d
+	}
+	buildSuccsPreds(d, f)
+	dfsPostorder(d)
+	computeIdom(d)
+	computeDF(d)
+	return d
+}
+
+// buildSuccsPreds fills d.Succs (from each block's terminator) and the
+// inverse d.Preds.  A block whose branch arms target the same block
+// contributes a single successor (so it is not mistaken for a merge).
+func buildSuccsPreds(d @DomInfo, f @Func) {
+	var n int = d.NumBlocks
+	for i := 0; i < n; i++ {
+		var empty @[]int
+		d.Succs = slices.Append[@[]int](d.Succs, empty)
+		var empty2 @[]int
+		d.Preds = slices.Append[@[]int](d.Preds, empty2)
+	}
+	for i := 0; i < n; i++ {
+		var b @Block = f.Blocks[i]
+		var ni int = len(b.Instrs)
+		if ni == 0 {
+			continue
+		}
+		var term @Instr = b.Instrs[ni - 1]
+		if term.Op == iropcode.OP_JUMP {
+			var t int = blockIndexIn(f, term.Block1)
+			if t >= 0 {
+				d.Succs[i] = slices.Append[int](d.Succs[i], t)
+			}
+		} else if term.Op == iropcode.OP_BRANCH {
+			var t1 int = blockIndexIn(f, term.Block1)
+			var t2 int = blockIndexIn(f, term.Block2)
+			if t1 >= 0 {
+				d.Succs[i] = slices.Append[int](d.Succs[i], t1)
+			}
+			if t2 >= 0 && t2 != t1 {
+				d.Succs[i] = slices.Append[int](d.Succs[i], t2)
+			}
+		}
+	}
+	// Invert Succs into Preds.
+	for i := 0; i < n; i++ {
+		for k := 0; k < len(d.Succs[i]); k++ {
+			var s int = d.Succs[i][k]
+			d.Preds[s] = slices.Append[int](d.Preds[s], i)
+		}
+	}
+}
+
+// dfsPostorder fills d.Postorder (reachable blocks in DFS postorder,
+// entry last) and d.PostNum (each block's position, -1 if unreachable).
+// Iterative (explicit stack) so a deep CFG cannot overflow the call
+// stack.
+func dfsPostorder(d @DomInfo) {
+	var n int = d.NumBlocks
+	var visited @[]bool
+	for i := 0; i < n; i++ {
+		visited = slices.Append[bool](visited, false)
+		d.PostNum = slices.Append[int](d.PostNum, -1)
+	}
+	// Parallel stacks: the block at each depth and the index of the
+	// next successor to descend into from it.
+	var stackNode @[]int
+	var stackIdx @[]int
+	visited[0] = true
+	stackNode = slices.Append[int](stackNode, 0)
+	stackIdx = slices.Append[int](stackIdx, 0)
+	for len(stackNode) > 0 {
+		var top int = len(stackNode) - 1
+		var node int = stackNode[top]
+		var ci int = stackIdx[top]
+		if ci < len(d.Succs[node]) {
+			stackIdx[top] = ci + 1
+			var s int = d.Succs[node][ci]
+			if !visited[s] {
+				visited[s] = true
+				stackNode = slices.Append[int](stackNode, s)
+				stackIdx = slices.Append[int](stackIdx, 0)
+			}
+		} else {
+			// All successors descended: emit `node` in postorder.
+			d.PostNum[node] = len(d.Postorder)
+			d.Postorder = slices.Append[int](d.Postorder, node)
+			stackNode = popInt(stackNode)
+			stackIdx = popInt(stackIdx)
+		}
+	}
+}
+
+// computeIdom fills d.Idom via the Cooper-Harvey-Kennedy fixed point.
+// The entry is its own idom (sentinel 0); every other reachable block's
+// idom is refined in reverse-postorder passes until stable.
+func computeIdom(d @DomInfo) {
+	var n int = d.NumBlocks
+	for i := 0; i < n; i++ {
+		d.Idom = slices.Append[int](d.Idom, -1)
+	}
+	d.Idom[0] = 0
+	var changed bool = true
+	for changed {
+		changed = false
+		// Reverse postorder = walk Postorder from the end (entry) down.
+		for pos := len(d.Postorder) - 1; pos >= 0; pos-- {
+			var b int = d.Postorder[pos]
+			if b == 0 {
+				continue
+			}
+			var newIdom int = -1
+			for k := 0; k < len(d.Preds[b]); k++ {
+				var p int = d.Preds[b][k]
+				if d.Idom[p] == -1 {
+					// Predecessor not yet processed (or unreachable).
+					continue
+				}
+				if newIdom == -1 {
+					newIdom = p
+				} else {
+					newIdom = intersectIdom(d, p, newIdom)
+				}
+			}
+			if newIdom != -1 && d.Idom[b] != newIdom {
+				d.Idom[b] = newIdom
+				changed = true
+			}
+		}
+	}
+}
+
+// intersectIdom walks two blocks up their (partial) idom chains to their
+// common dominator, using postorder numbers as the ordering: the block
+// with the smaller postorder number is deeper in the graph, so it steps
+// up (toward the entry, which has the highest number) until the fingers
+// meet.
+func intersectIdom(d @DomInfo, b1 int, b2 int) int {
+	var f1 int = b1
+	var f2 int = b2
+	for f1 != f2 {
+		for d.PostNum[f1] < d.PostNum[f2] {
+			f1 = d.Idom[f1]
+		}
+		for d.PostNum[f2] < d.PostNum[f1] {
+			f2 = d.Idom[f2]
+		}
+	}
+	return f1
+}
+
+// computeDF fills d.DF (each block's dominance frontier) via Cooper's
+// algorithm: for every join point (>= 2 predecessors), walk each
+// predecessor up the idom tree until reaching the join's own idom,
+// adding the join to every block passed on the way.
+func computeDF(d @DomInfo) {
+	var n int = d.NumBlocks
+	for i := 0; i < n; i++ {
+		var empty @[]int
+		d.DF = slices.Append[@[]int](d.DF, empty)
+	}
+	for b := 0; b < n; b++ {
+		if d.PostNum[b] < 0 {
+			continue
+		}
+		if len(d.Preds[b]) < 2 {
+			continue
+		}
+		for k := 0; k < len(d.Preds[b]); k++ {
+			var p int = d.Preds[b][k]
+			if d.PostNum[p] < 0 {
+				continue
+			}
+			var runner int = p
+			for runner != d.Idom[b] {
+				d.DF[runner] = appendUniqueInt(d.DF[runner], b)
+				runner = d.Idom[runner]
+			}
+		}
+	}
+}
+
+// Dominates reports whether block a dominates block b — i.e. every path
+// from the entry to b passes through a.  A block dominates itself; the
+// entry dominates every reachable block.  An unreachable b is dominated
+// only by itself.
+func (d @DomInfo) Dominates(a int, b int) bool {
+	if a == b {
+		return true
+	}
+	if b < 0 || b >= d.NumBlocks || d.PostNum[b] < 0 {
+		return false
+	}
+	var x int = b
+	for x != 0 {
+		x = d.Idom[x]
+		if x < 0 {
+			return false
+		}
+		if x == a {
+			return true
+		}
+	}
+	return false
+}
+
+// IteratedDF returns the iterated dominance frontier (DF+) of a set of
+// def-blocks: the set of blocks that need a phi for a value defined in
+// those blocks.  A phi is itself a definition, so a newly-added frontier
+// block is fed back through the worklist until the set stabilizes.
+func (d @DomInfo) IteratedDF(defBlocks @[]int) @[]int {
+	var inIDF @[]bool
+	for i := 0; i < d.NumBlocks; i++ {
+		inIDF = slices.Append[bool](inIDF, false)
+	}
+	var result @[]int
+	var worklist @[]int
+	for i := 0; i < len(defBlocks); i++ {
+		worklist = slices.Append[int](worklist, defBlocks[i])
+	}
+	for len(worklist) > 0 {
+		var x int = worklist[len(worklist) - 1]
+		worklist = popInt(worklist)
+		if x < 0 || x >= d.NumBlocks {
+			continue
+		}
+		for k := 0; k < len(d.DF[x]); k++ {
+			var y int = d.DF[x][k]
+			if !inIDF[y] {
+				inIDF[y] = true
+				result = slices.Append[int](result, y)
+				worklist = slices.Append[int](worklist, y)
+			}
+		}
+	}
+	return result
+}
+
+// popInt returns s without its last element.  s must be non-empty.
+func popInt(s @[]int) @[]int {
+	return s[0:len(s) - 1]
+}
+
+// appendUniqueInt appends v to s only if s does not already contain it.
+func appendUniqueInt(s @[]int, v int) @[]int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == v {
+			return s
+		}
+	}
+	return slices.Append[int](s, v)
+}

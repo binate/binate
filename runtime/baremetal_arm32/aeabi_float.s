@@ -126,3 +126,19 @@ __aeabi_ui2f:
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_U64ToF32
 __aeabi_ul2f:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_U64ToF32
+
+// ============================================================
+// Float mul/div group — libgcc member _arm_muldivsf3.o (fmul, fdiv).  Both
+// symbols the suite pulls are shimmed here so the member is never linked from
+// libgcc.  Two binary32 args in r0/r1, result in r0 — matches F32Mul/F32Div,
+// so each shim is a bare tail-call.
+// ============================================================
+	.global __aeabi_fmul
+	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F32Mul
+__aeabi_fmul:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F32Mul
+
+	.global __aeabi_fdiv
+	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F32Div
+__aeabi_fdiv:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F32Div

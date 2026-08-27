@@ -58,6 +58,15 @@ CONSTRUCTS = [
      ["var f @func(int) int", "sink(0)"], 840000),        # 16 B/iter
     ("const-nil-iface", "",
      ["var sp @Speaker", "sink(0)"], 840000),             # 16 B/iter
+    # --- leak-prone: a RAW multi-return CALL.  The VM copies the returned
+    #     (*int, *int) tuple back onto vm.SP; a raw tuple has no managed field,
+    #     so keying the OP_SP_RESTORE on NeedsDestruction skipped it and the
+    #     copy-back leaked vm.SP per call (int / int-int overflow). ---
+    ("raw-multiret-ptr",
+     "var gx int = 1\nvar gy int = 2\n\n"
+     "func rawPair(a *int, b *int) (*int, *int) { return a, b }",
+     ["var p *int", "var q *int", "p, q = rawPair(&gx, &gy)",
+      "sink(*p + *q)"], 840000),                          # 16 B/iter
     # --- controls: a default-init plain struct / array lowers via
     #     OP_ALLOC, which the entry-block alloca has always hoisted; these
     #     guard against a regression there (they never leaked). ---

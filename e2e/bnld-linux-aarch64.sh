@@ -152,7 +152,25 @@ _start:
 EOF
 echo "PASS: hellopg links to a static ELF64 aarch64 executable"
 
-# ----- run both programs if a linux-aarch64 runtime is available -----
+# ----- dataval: loads an 8-byte value from .data via ADRP+LDR and exits with it
+#       (0x2a = 42), so R_AARCH64_LDST64_ABS_LO12_NC is applied and exercised at run
+#       time — and .data being writable, this also runs the two-segment (W^X) image.
+asm_link dataval <<'EOF'
+.arch aarch64
+.section data
+val:
+	.uint64 42
+.section text
+.global _start
+_start:
+	adrp x1, val
+	ldr x0, [x1, #:lo12:val]
+	mov x8, #93
+	svc #0
+EOF
+echo "PASS: dataval links to a static ELF64 aarch64 executable"
+
+# ----- run the programs if a linux-aarch64 runtime is available -----
 # Detect the runtime once (and pull the image on the Docker path) so a missing
 # runtime / Docker daemon-or-mount error becomes a per-program SKIP rather than a
 # false FAIL — while a binary that is structurally valid but fails to *exec* (126)
@@ -240,5 +258,16 @@ if [ "$RAN" = 1 ]; then
     echo "PASS: hellopg ran (ADRP+ADD reached .rodata), printed 'hi', exited 0"
 else
     echo "SKIP: hellopg not run here (no linux-aarch64 runtime) — build+structure verified"
+fi
+
+run_binary dataval
+if [ "$RAN" = 1 ]; then
+    if [ "$CODE" != 42 ]; then
+        echo "FAIL: dataval expected exit 42 (value from .data via ADRP+LDR), got $CODE" >&2
+        exit 1
+    fi
+    echo "PASS: dataval ran (ADRP+LDR loaded from .data), exited 42"
+else
+    echo "SKIP: dataval not run here (no linux-aarch64 runtime) — build+structure verified"
 fi
 exit 0

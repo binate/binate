@@ -1,0 +1,261 @@
+package "pkg/binate/link"
+
+import "pkg/binate/buf"
+import "pkg/std/os"
+
+// readFile reads the entire file at path into a fresh @[]uint8.  Returns
+// (data, true) on success; (empty, false) on any open/stat/read error or a
+// short read.
+func readFile(path *[]readonly char) (@[]uint8, bool) {
+	f, oerr := os.Open(path)
+	if present(oerr) { return make_slice(uint8, 0), false }
+	fi, serr := f.Stat()
+	if present(serr) { _ = f.Close(); return make_slice(uint8, 0), false }
+	var size int = cast(int, fi.Size())
+	var data @[]uint8 = make_slice(uint8, size)
+	var got int = 0
+	for got < size {
+		// bnlint:allow managed-to-raw-assign - borrows a live managed local; outlives the read
+		var dst *[]uint8 = data[got:]
+		n, rerr := f.Read(dst)
+		if n <= 0 || present(rerr) { break }
+		got = got + n
+	}
+	_ = f.Close()
+	if got < size { return make_slice(uint8, 0), false }
+	return data, true
+}
+
+// rangeOk reports whether [off, off+size) lies within a buffer of dlen bytes.
+// off and size are expected non-negative (as returned by readOff).
+func rangeOk(off int, size int, dlen int) bool {
+	return off >= 0 && size >= 0 && off + size <= dlen
+}
+
+// readCStr reads a NUL-terminated string starting at byte offset off, never
+// reading at or past dlen.  An out-of-range start or a missing terminator yields
+// the bytes available (up to the buffer end) rather than an out-of-bounds abort,
+// so a malformed string table degrades to a garbled name, not a crash.
+func readCStr(b *[]readonly uint8, off int, dlen int) @[]char {
+	if off < 0 || off >= dlen { return make_slice(char, 0) }
+	var n int = 0
+	for off + n < dlen && b[off + n] != 0 { n = n + 1 }
+	var s @[]char = make_slice(char, n)
+	for i := 0; i < n; i++ { s[i] = cast(char, b[off + i]) }
+	return s
+}
+
+// copyBytes returns a fresh @[]uint8 holding n bytes copied from b at offset off.
+// The caller must have validated that [off, off+n) is in range.
+func copyBytes(b *[]readonly uint8, off int, n int) @[]uint8 {
+	var out @[]uint8 = make_slice(uint8, n)
+	for i := 0; i < n; i++ { out[i] = b[off + i] }
+	return out
+}
+
+// normFlags maps the ELF SHF_* section flags to the normalized SF_* set.
+func normFlags(shflags int) int {
+	var f int = 0
+	if (shflags & SHF_ALLOC) != 0 { f = f | SF_READ }
+	if (shflags & SHF_WRITE) != 0 { f = f | SF_WRITE }
+	if (shflags & SHF_EXECINSTR) != 0 { f = f | SF_EXEC }
+	return f
+}
+
+// parseSymbols reads the object's .symtab (SHT_SYMTAB) into an InputSymbol slice,
+// keeping symbols in symtab order (index 0 is the reserved null symbol) so a
+// relocation's symbol index maps directly.  A symbol's defining section is mapped
+// from the ELF section index through elfToMy; an undefined external gets -1.  The
+// symtab and its linked .strtab lie in ranges the caller (ReadObject) has already
+// validated against dlen; readCStr additionally caps every name at dlen.
+func parseSymbols(data *[]readonly uint8, dlen int, shoff int, shentsize int, shnum int,
+		elfToMy *[]readonly int) @[]InputSymbol {
+	var symSh int = -1
+	for i := 0; i < shnum; i++ {
+		var sh int = shoff + i * shentsize
+		if u32(data, sh + 4) == SHT_SYMTAB { symSh = sh; break }
+	}
+	if symSh < 0 { return make_slice(InputSymbol, 0) }
+
+	symOff, ooOk := readOff(data, symSh + 24) // sh_offset
+	symSize, osOk := readOff(data, symSh + 32) // sh_size
+	entsize, oeOk := readOff(data, symSh + 56) // sh_entsize (Elf64_Sym = 24)
+	var strIdx int = u32(data, symSh + 40) // sh_link -> the linked .strtab section
+	if !ooOk || !osOk || !oeOk || entsize < 24 || strIdx < 0 || strIdx >= shnum {
+		return make_slice(InputSymbol, 0)
+	}
+	strOff, soOk := readOff(data, shoff + strIdx * shentsize + 24) // .strtab sh_offset
+	if !soOk { return make_slice(InputSymbol, 0) }
+
+	var count int = symSize / entsize
+	var syms @[]InputSymbol = make_slice(InputSymbol, count)
+	for i := 0; i < count; i++ {
+		var e int = symOff + i * entsize
+		var nameOff int = u32(data, e + 0)
+		var info int = cast(int, data[e + 4]) // st_info: binding = info >> 4
+		var shndx int = u16(data, e + 6)
+		value, _ := readOff(data, e + 8) // st_value
+
+		var sym InputSymbol
+		if nameOff == 0 {
+			sym.Name = make_slice(char, 0)
+		} else {
+			sym.Name = readCStr(data, strOff + nameOff, dlen)
+		}
+		sym.Binding = info >> 4
+		sym.Value = cast(uint, value)
+		if shndx == SHN_UNDEF || shndx >= shnum {
+			// TODO(linker): SHN_ABS / SHN_COMMON (>= shnum) are folded into -1
+			// (undefined external) here.  A defined-absolute or COMMON (tentative)
+			// symbol needs a distinct kind so the resolver does not treat it as an
+			// import; model them explicitly when the resolver lands.  The current
+			// writer emits neither, so nothing exercises this yet.
+			sym.SecIndex = -1
+		} else {
+			sym.SecIndex = elfToMy[shndx]
+		}
+		syms[i] = sym
+	}
+	return syms
+}
+
+// parseRelocs reads every SHT_RELA section into a single InputReloc slice.  Each
+// .rela.SEC's sh_info names the patched content section (mapped through elfToMy);
+// each Elf64_Rela carries r_offset, r_info (low 32 bits = type, high 32 = symbol
+// index into parseSymbols' symtab order), and a signed r_addend.  Every rela
+// section's byte range is validated against dlen by ReadObject.
+func parseRelocs(data *[]readonly uint8, dlen int, shoff int, shentsize int, shnum int,
+		elfToMy *[]readonly int) @[]InputReloc {
+	var total int = 0
+	for i := 0; i < shnum; i++ {
+		var sh int = shoff + i * shentsize
+		if u32(data, sh + 4) != SHT_RELA { continue }
+		entsize, eOk := readOff(data, sh + 56)
+		size, sOk := readOff(data, sh + 32)
+		if !eOk || !sOk || entsize < 24 { continue }
+		total = total + size / entsize
+	}
+
+	var relocs @[]InputReloc = make_slice(InputReloc, total)
+	var w int = 0
+	for i := 0; i < shnum; i++ {
+		var sh int = shoff + i * shentsize
+		if u32(data, sh + 4) != SHT_RELA { continue }
+		roff, rOk := readOff(data, sh + 24) // sh_offset
+		rsize, zOk := readOff(data, sh + 32) // sh_size
+		entsize, eOk := readOff(data, sh + 56)
+		if !rOk || !zOk || !eOk || entsize < 24 { continue }
+		var applies int = u32(data, sh + 44) // sh_info -> patched section (ELF index)
+		var mySec int = -1
+		if applies >= 0 && applies < shnum { mySec = elfToMy[applies] }
+		var n int = rsize / entsize
+		for j := 0; j < n; j++ {
+			var e int = roff + j * entsize
+			roffset, _ := readOff(data, e + 0) // r_offset
+			var rel InputReloc
+			rel.SecIndex = mySec
+			rel.Offset = cast(uint, roffset)
+			rel.Kind = u32(data, e + 8) // r_info low 32 = r_type
+			rel.SymIndex = u32(data, e + 12) // r_info high 32 = r_sym
+			rel.Addend = u64(data, e + 16) // r_addend (signed; small in practice)
+			relocs[w] = rel
+			w = w + 1
+		}
+	}
+	return relocs
+}
+
+// ReadObject reads the ELF64 relocatable object at path into an InputObject: the
+// header, the content sections (allocatable text/rodata/data/bss), the symbol
+// table, and the relocations.  Structural offsets/sizes are validated against the
+// file length, so a truncated or malformed object yields a non-empty error rather
+// than an out-of-bounds abort.  On success the error is "" and the object is
+// present; on failure the object is absent.
+func ReadObject(path *[]readonly char) (@InputObject, @[]readonly char) {
+	var none @InputObject
+	data, ok := readFile(path)
+	if !ok { return none, "cannot read object file" }
+	var dlen int = len(data)
+	if dlen < 64 { return none, "file too small for an ELF64 header" }
+	if data[0] != 0x7f || data[1] != 0x45 || data[2] != 0x4c || data[3] != 0x46 {
+		return none, "not an ELF file (bad magic)"
+	}
+	if data[4] != ELFCLASS64 { return none, "not an ELF64 object" }
+	if data[5] != ELFDATA2LSB { return none, "not a little-endian ELF object" }
+
+	var machine int = u16(data, 18)
+	shoff, shoffOk := readOff(data, 40) // e_shoff
+	var shentsize int = u16(data, 58)
+	var shnum int = u16(data, 60)
+	var shstrndx int = u16(data, 62)
+	if !shoffOk || shoff == 0 || shnum == 0 { return none, "object has no section headers" }
+	if shentsize < 64 { return none, "unsupported section-header entry size" }
+	if !rangeOk(shoff, shnum * shentsize, dlen) { return none, "section-header table out of range" }
+	if shstrndx >= shnum { return none, "section-name table index out of range" }
+
+	// Validate every section's on-disk extent so later field reads are in range.
+	for i := 0; i < shnum; i++ {
+		var sh int = shoff + i * shentsize
+		if u32(data, sh + 4) == SHT_NOBITS { continue }
+		soff, soffOk := readOff(data, sh + 24)
+		ssize, ssizeOk := readOff(data, sh + 32)
+		if !soffOk || !ssizeOk || !rangeOk(soff, ssize, dlen) {
+			return none, "section data out of range"
+		}
+	}
+
+	// The section-name string table (validated above since shstrndx < shnum).
+	strDataOff, _ := readOff(data, shoff + shstrndx * shentsize + 24)
+
+	// Map every ELF section index to a kept content-section index.  A content
+	// section is PROGBITS/NOBITS *and* SHF_ALLOC — the alloc test drops
+	// .note.GNU-stack (PROGBITS, non-alloc) and debug sections, which are not
+	// content the linker lays out.
+	var elfToMy @[]int = make_slice(int, shnum)
+	var myCount int = 0
+	for i := 0; i < shnum; i++ {
+		var sh int = shoff + i * shentsize
+		var stype int = u32(data, sh + 4)
+		var flags int = u64(data, sh + 8)
+		if (stype == SHT_PROGBITS || stype == SHT_NOBITS) && (flags & SHF_ALLOC) != 0 {
+			elfToMy[i] = myCount
+			myCount = myCount + 1
+		} else {
+			elfToMy[i] = -1
+		}
+	}
+
+	// Read each kept section.
+	var secs @[]InputSection = make_slice(InputSection, myCount)
+	for i := 0; i < shnum; i++ {
+		if elfToMy[i] < 0 { continue }
+		var sh int = shoff + i * shentsize
+		var nameOff int = u32(data, sh + 0)
+		var stype int = u32(data, sh + 4)
+		var flags int = u64(data, sh + 8)
+		dataOff, _ := readOff(data, sh + 24) // validated above
+		dataSize, _ := readOff(data, sh + 32)
+		align, _ := readOff(data, sh + 48)
+
+		var sec InputSection
+		sec.Name = readCStr(data, strDataOff + nameOff, dlen)
+		sec.Type = stype
+		sec.Flags = normFlags(flags)
+		sec.Size = cast(uint, dataSize)
+		sec.Align = align
+		if stype == SHT_NOBITS {
+			sec.Data = make_slice(uint8, 0)
+		} else {
+			sec.Data = copyBytes(data, dataOff, dataSize)
+		}
+		secs[elfToMy[i]] = sec
+	}
+
+	var obj @InputObject = make(InputObject)
+	obj.Path = buf.CopyStr(path)
+	obj.Machine = machine
+	obj.Sections = secs
+	obj.Symbols = parseSymbols(data, dlen, shoff, shentsize, shnum, elfToMy)
+	obj.Relocs = parseRelocs(data, dlen, shoff, shentsize, shnum, elfToMy)
+	return obj, ""
+}

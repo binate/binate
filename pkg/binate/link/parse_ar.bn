@@ -1,0 +1,188 @@
+package "pkg/binate/link"
+
+import "pkg/binate/buf"
+
+// System V / GNU `ar` archive reader.  An archive is the 8-byte magic "!<arch>\n"
+// followed by members, each a 60-byte header + data padded to an even length:
+//
+//   name[16] mtime[12] uid[6] gid[6] mode[8] size[10] "`\n"
+//
+// Two members are metadata, not objects: "/" is the archive symbol index (which
+// symbol lives in which member — an optimization we don't yet use, since we parse
+// every member), and "//" is the long-name string table for names longer than 15
+// chars.  A normal member's name is slash-terminated ("foo.o/"); a "/N" name is the
+// string at byte offset N in the "//" table (terminated by '/' or newline).
+//
+// This is the format `ar` writes on Linux — the one that matters for C libraries
+// (libc.a, libgcc.a, …).  The BSD variant (macOS `ar`: a "__.SYMDEF" symbol table
+// and "#1/N" extended names stored inline at the front of the member data) is not
+// parsed — its "#1/N" names would be misread — and its members are rejected; only
+// its "__.SYMDEF" symbol table is recognized (and skipped).
+
+// Layout of the 60-byte `ar` member header: its fixed size, the offset and length
+// of the decimal size field, and the offset of the "`\n" end marker.
+const (
+	AR_HDR_SIZE int = 60
+	AR_SIZE_OFF int = 48
+	AR_SIZE_LEN int = 10
+	AR_FMAG_OFF int = 58
+)
+
+// arMagicOk reports whether data begins with the "!<arch>\n" signature.
+func arMagicOk(data *[]readonly uint8) bool {
+	if len(data) < 8 { return false }
+	return data[0] == 0x21 && data[1] == 0x3c && data[2] == 0x61 && data[3] == 0x72 &&
+			data[4] == 0x63 && data[5] == 0x68 && data[6] == 0x3e && data[7] == 0x0a
+}
+
+// arDecimal parses a left-justified, space-padded decimal field of n bytes at off.
+// Returns (value, true), or (0, false) if a non-space/non-digit byte appears before
+// the trailing padding.  An all-space field is 0.
+func arDecimal(data *[]readonly uint8, off int, n int) (int, bool) {
+	var v int = 0
+	var i int = 0
+	for i < n && data[off + i] == 0x20 { i = i + 1 } // (rare) leading spaces
+	for i < n {
+		var c uint8 = data[off + i]
+		if c == 0x20 { break } // trailing padding
+		if c < 0x30 || c > 0x39 { return 0, false }
+		v = v * 10 + cast(int, c - 0x30)
+		i = i + 1
+	}
+	for i < n {
+		if data[off + i] != 0x20 { return 0, false } // only spaces may follow
+		i = i + 1
+	}
+	return v, true
+}
+
+// arNameEnd returns the index in [off, off+limit) of the first '/' or newline, or
+// off+limit if neither is present.  Used to bound a name in the header field or the
+// long-name table.
+func arNameEnd(data *[]readonly uint8, off int, limit int) int {
+	var i int = 0
+	for i < limit {
+		var c uint8 = data[off + i]
+		if c == 0x2f || c == 0x0a { break } // '/' or '\n'
+		i = i + 1
+	}
+	return off + i
+}
+
+// arMemberName resolves the 16-byte name field at hdr into a member name and a
+// classification: kind 0 = a normal object member; 1 = the "/" symbol index; 2 =
+// the "//" long-name table; 3 = another metadata member to skip (BSD __.SYMDEF).
+// nameTabOff/nameTabLen bound the already-seen "//" table (len 0 if not yet seen);
+// a "/N" name is resolved against it.  Returns (name, kind, ok) — ok=false on a
+// malformed "/N" reference.
+func arMemberName(data *[]readonly uint8, hdr int, nameTabOff int,
+		nameTabLen int) (@[]char, int, bool) {
+	// "/"  followed by spaces  -> symbol index.
+	// "//" followed by spaces  -> long-name table.
+	if data[hdr] == 0x2f {
+		if data[hdr + 1] == 0x20 { return buf.CopyStr(""), 1, true } // "/"
+		if data[hdr + 1] == 0x2f && data[hdr + 2] == 0x20 { return buf.CopyStr(""), 2, true } // "//"
+		// "/N": long name at offset N in the "//" table.
+		n, ok := arDecimal(data, hdr + 1, 15)
+		if !ok || n < 0 || n >= nameTabLen { return buf.CopyStr(""), 0, false }
+		var start int = nameTabOff + n
+		var end int = arNameEnd(data, start, nameTabLen - n)
+		return bytesToChars(data, start, end - start), 0, true
+	}
+	// BSD symbol table ("__.SYMDEF" / "__.SYMDEF SORTED").  Match the full name, not
+	// just a "__" prefix — a real GNU member may legitimately be named "__foo.o".
+	if arNameStartsWith(data, hdr, "__.SYMDEF") { return buf.CopyStr(""), 3, true }
+	// A short name, '/'-terminated (GNU) or space-padded.
+	var end int = arNameEnd(data, hdr, 16)
+	return bytesToChars(data, hdr, end - hdr), 0, true
+}
+
+// arNameStartsWith reports whether the header name field at hdr begins with s.  The
+// caller guarantees a full 60-byte header is present, and len(s) <= 16 (a name-field
+// prefix), so the reads stay within the header.
+func arNameStartsWith(data *[]readonly uint8, hdr int, s *[]readonly char) bool {
+	for i := 0; i < len(s); i++ {
+		if cast(int, data[hdr + i]) != cast(int, s[i]) { return false }
+	}
+	return true
+}
+
+// bytesToChars copies n bytes from data at off into a fresh @[]char.
+func bytesToChars(data *[]readonly uint8, off int, n int) @[]char {
+	var s @[]char = make_slice(char, n)
+	for i := 0; i < n; i++ { s[i] = cast(char, data[off + i]) }
+	return s
+}
+
+// arScan walks the members once.  If parse is false it only counts the object
+// members (kind 0); if parse is true it parses each into out (which must have room)
+// and records the count in *pn via the returned count.  arPath labels members as
+// "arPath(member)".  It captures the "//" long-name table on the way so later "/N"
+// names resolve.  Returns (count, "") or (0, error) on a malformed header or a
+// member that is neither metadata nor a valid ELF object.
+func arScan(data *[]readonly uint8, arPath *[]readonly char, parse bool,
+		out @[]@InputObject) (int, @[]readonly char) {
+	var dlen int = len(data)
+	var pos int = 8 // past the magic
+	var nameTabOff int = 0
+	var nameTabLen int = 0
+	var count int = 0
+	for pos + AR_HDR_SIZE <= dlen {
+		if data[pos + AR_FMAG_OFF] != 0x60 || data[pos + AR_FMAG_OFF + 1] != 0x0a {
+			return 0, "malformed archive member header"
+		}
+		var body int = pos + AR_HDR_SIZE // <= dlen (loop guard), so dlen - body >= 0
+		size, sok := arDecimal(data, pos + AR_SIZE_OFF, AR_SIZE_LEN)
+		// Bound size to [0, dlen-body] — this is `body + size <= dlen` written so it
+		// cannot overflow (both sides non-negative), which matters on a 32-bit target
+		// where a crafted 10-digit size could otherwise wrap the sum negative and slip
+		// past the range check into an out-of-range member slice.
+		if !sok || size < 0 || size > dlen - body {
+			return 0, "archive member size out of range"
+		}
+		name, kind, nok := arMemberName(data, pos, nameTabOff, nameTabLen)
+		if !nok { return 0, "malformed archive member name" }
+		if kind == 2 {
+			// the "//" long-name table — remember it for "/N" names
+			nameTabOff = body
+			nameTabLen = size
+		} else if kind == 0 {
+			// an object member
+			if parse {
+				var label @[]char = buf.Concat(buf.Concat(buf.CopyStr(arPath), "("), buf.Concat(name, ")"))
+				// bnlint:allow managed-to-raw-assign - a live read-only view of the member's bytes
+				var member *[]readonly uint8 = data[body:body + size]
+				obj, perr := parseObjectBytes(member, label)
+				if len(perr) != 0 {
+					return 0, buf.Concat("archive member is not a valid object: ", label)
+				}
+				out[count] = obj
+			}
+			count = count + 1
+		}
+		// kind 1 (symbol index) and 3 (BSD metadata) are skipped.
+		pos = body + size
+		if (size & 1) != 0 { pos = pos + 1 } // members are 2-byte aligned
+	}
+	return count, ""
+}
+
+// ReadArchive reads a System V / GNU `ar` archive and returns its object members,
+// each parsed into an InputObject (labeled "path(member)").  The "/" symbol index
+// and "//" name table are consumed for name resolution but not returned; every
+// other member must be a valid ELF64 object.  Returns (members, "") or an error.
+func ReadArchive(path *[]readonly char) (@[]@InputObject, @[]readonly char) {
+	var empty @[]@InputObject = make_slice(@InputObject, 0)
+	data, ok := readFile(path)
+	if !ok { return empty, "cannot read archive file" }
+	// bnlint:allow managed-to-raw-assign - a live read-only view of the archive bytes
+	var raw *[]readonly uint8 = data
+	if !arMagicOk(raw) { return empty, "not an archive (bad magic)" }
+
+	n, cerr := arScan(raw, path, false, empty)
+	if len(cerr) != 0 { return empty, cerr }
+	var members @[]@InputObject = make_slice(@InputObject, n)
+	_, perr := arScan(raw, path, true, members)
+	if len(perr) != 0 { return empty, perr }
+	return members, ""
+}

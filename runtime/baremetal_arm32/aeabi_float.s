@@ -29,3 +29,11 @@
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToI32
 __aeabi_d2iz:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToI32
+
+// __aeabi_d2f(double a) -> float : binary64 -> binary32 (round to nearest even).
+//   a in r0:r1 ; result in r0.  softfloat.F64ToF32(uint64) uint32 matches.
+//   (_arm_truncdfsf2.o is a single-symbol libgcc member.)
+	.global __aeabi_d2f
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToF32
+__aeabi_d2f:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToF32

@@ -129,6 +129,29 @@ _start:
 EOF
 echo "PASS: hello links to a static ELF64 aarch64 executable"
 
+# ----- hellopg: same as hello, but reaches msg with the ADRP+ADD pair (the way
+#       to address data beyond ADR's ±1MB), so R_AARCH64_ADR_PREL_PG_HI21 and
+#       R_AARCH64_ADD_ABS_LO12_NC are both applied and exercised at run time. -----
+asm_link hellopg <<'EOF'
+.arch aarch64
+.section rodata
+msg2:
+	.ascii "hi\n"
+.section text
+.global _start
+_start:
+	mov x0, #1
+	adrp x1, msg2
+	add x1, x1, #:lo12:msg2
+	mov x2, #3
+	mov x8, #64
+	svc #0
+	mov x0, #0
+	mov x8, #93
+	svc #0
+EOF
+echo "PASS: hellopg links to a static ELF64 aarch64 executable"
+
 # ----- run both programs if a linux-aarch64 runtime is available -----
 # Detect the runtime once (and pull the image on the Docker path) so a missing
 # runtime / Docker daemon-or-mount error becomes a per-program SKIP rather than a
@@ -202,5 +225,20 @@ if [ "$RAN" = 1 ]; then
     echo "PASS: hello ran, printed 'hi', and exited 0"
 else
     echo "SKIP: hello not run here (no linux-aarch64 runtime) — build+structure verified"
+fi
+
+run_binary hellopg
+if [ "$RAN" = 1 ]; then
+    if [ "$CODE" != 0 ]; then
+        echo "FAIL: hellopg expected exit 0, got $CODE" >&2
+        exit 1
+    fi
+    if [ "$OUT" != "hi" ]; then
+        echo "FAIL: hellopg expected output 'hi', got '$OUT'" >&2
+        exit 1
+    fi
+    echo "PASS: hellopg ran (ADRP+ADD reached .rodata), printed 'hi', exited 0"
+else
+    echo "SKIP: hellopg not run here (no linux-aarch64 runtime) — build+structure verified"
 fi
 exit 0

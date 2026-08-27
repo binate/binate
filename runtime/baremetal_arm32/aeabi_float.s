@@ -158,3 +158,74 @@ __aeabi_dmul:
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F64Div
 __aeabi_ddiv:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F64Div
+
+// ============================================================
+// Compare groups — libgcc members _arm_cmpdf2.o (dcmpeq/dcmplt/dcmple/dcmpgt/
+// dcmpge) + _arm_unorddf2.o (dcmpun), and the sf equivalents.  The backend
+// emits these 0/1-returning AEABI compares; shimming them keeps the members
+// from being pulled.  (The flag-setting __aeabi_cdcmp* variants that also live
+// in _arm_cmpdf2.o are not emitted by the backend and are not provided here —
+// compiler-rt, our reference, does not define them either.)  Each helper takes
+// the same operand registers as the arithmetic ones (a double in r0:r1, a
+// float in r0) and returns 0/1 in r0, matching the F{64,32}Cmp* signatures, so
+// each shim is a bare tail-call.
+// ============================================================
+	.global __aeabi_dcmpeq
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpEq
+__aeabi_dcmpeq:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpEq
+
+	.global __aeabi_dcmplt
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpLt
+__aeabi_dcmplt:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpLt
+
+	.global __aeabi_dcmple
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpLe
+__aeabi_dcmple:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpLe
+
+	.global __aeabi_dcmpgt
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpGt
+__aeabi_dcmpgt:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpGt
+
+	.global __aeabi_dcmpge
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpGe
+__aeabi_dcmpge:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpGe
+
+	.global __aeabi_dcmpun
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpUn
+__aeabi_dcmpun:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpUn
+
+	.global __aeabi_fcmpeq
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpEq
+__aeabi_fcmpeq:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpEq
+
+	.global __aeabi_fcmplt
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpLt
+__aeabi_fcmplt:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpLt
+
+	.global __aeabi_fcmple
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpLe
+__aeabi_fcmple:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpLe
+
+	.global __aeabi_fcmpgt
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpGt
+__aeabi_fcmpgt:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpGt
+
+	.global __aeabi_fcmpge
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpGe
+__aeabi_fcmpge:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpGe
+
+	.global __aeabi_fcmpun
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpUn
+__aeabi_fcmpun:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpUn

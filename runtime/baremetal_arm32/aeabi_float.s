@@ -142,3 +142,19 @@ __aeabi_fmul:
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F32Div
 __aeabi_fdiv:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F32Div
+
+// ============================================================
+// Double mul/div group — libgcc member _arm_muldivdf3.o (dmul, ddiv).  Both
+// symbols the suite pulls are shimmed here so the member is never linked from
+// libgcc.  Two doubles in r0:r1 / r2:r3, result in r0:r1 — matches
+// F64Mul/F64Div, so each shim is a bare tail-call.
+// ============================================================
+	.global __aeabi_dmul
+	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F64Mul
+__aeabi_dmul:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F64Mul
+
+	.global __aeabi_ddiv
+	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F64Div
+__aeabi_ddiv:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F64Div

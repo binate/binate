@@ -76,12 +76,22 @@ if [ -z "$NM" ]; then
 fi
 
 # ----- the Binate program.  compute() allocates a managed slice, fills it in a
-# bounds-checked loop, and sums it (2+4+6+8+10+12 = 42) — so the linked binary
-# exercises the runtime's memory path at run time (MakeManagedSlice -> malloc,
-# indexed-access bounds checks, refcount cleanup), not just static init.  main is
-# empty; the exit code is compute()'s computed sum. -----
+# bounds-checked loop, sums it (2+4+6+8+10+12 = 42), then returns that sum THROUGH a
+# function value (applyfn(addfn, sum, 0)).  So the linked binary exercises, at run
+# time: the runtime memory path (MakeManagedSlice -> malloc, bounds checks, refcount)
+# AND an indirect call through a function pointer — whose address the LLVM backend
+# loads via the GOT (relaxed to a direct lea by bnld).  main is empty; the exit code
+# is the computed sum. -----
 cat > "$TMP/tiny.bn" <<'EOF'
 package "main"
+
+func addfn(a int, b int) int {
+	return a + b
+}
+
+func applyfn(f *func(int, int) int, x int, y int) int {
+	return f(x, y)
+}
 
 func compute() int {
 	var s @[]int = make_slice(int, 6)
@@ -92,7 +102,7 @@ func compute() int {
 	for i := 0; i < 6; i++ {
 		sum = sum + s[i]
 	}
-	return sum
+	return applyfn(addfn, sum, 0)
 }
 
 func main() {

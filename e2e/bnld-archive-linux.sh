@@ -125,4 +125,72 @@ if [ "$CODE" != 42 ]; then
     exit 1
 fi
 echo "PASS: the archive-linked program ran and exited 42 (helper extracted from lib.a)"
+
+# ----- transitive extraction via -L/-l: main2 calls entrypt (in the archive), which
+#       calls helper2 (also in the archive) — so bnld must pull entrypt AND, from
+#       entrypt's own reference, helper2, while leaving unused2 out. -----
+cat > "$TMP/helper2.s" <<'EOF'
+.arch x64
+.section text
+.global helper2
+helper2:
+	mov edi, 42
+	mov eax, 60
+	syscall
+EOF
+cat > "$TMP/entrypt.s" <<'EOF'
+.arch x64
+.section text
+.global entrypt
+.global helper2
+entrypt:
+	call helper2
+EOF
+cat > "$TMP/unused2.s" <<'EOF'
+.arch x64
+.section text
+.global unused2
+unused2:
+	ret
+EOF
+cat > "$TMP/main2.s" <<'EOF'
+.arch x64
+.section text
+.global _start
+.global entrypt
+_start:
+	call entrypt
+EOF
+asm helper2
+asm entrypt
+asm unused2
+asm main2
+
+mkdir -p "$TMP/libs"
+rm -f "$TMP/libs/libstuff.a"
+if ! ar rcs "$TMP/libs/libstuff.a" "$TMP/entrypt.o" "$TMP/helper2.o" "$TMP/unused2.o" \
+        > "$TMP/ar2.log" 2>&1; then
+    echo "FAIL: ar could not build libstuff.a" >&2
+    cat "$TMP/ar2.log" >&2
+    exit 1
+fi
+
+# Link with -L/-l (the way ld is invoked); bnld resolves libstuff.a from -L.
+if ! "$BNLD" -o "$TMP/prog2" "$TMP/main2.o" -L "$TMP/libs" -l stuff > "$TMP/link2.log" 2>&1; then
+    echo "FAIL: bnld could not link with -L/-l" >&2
+    cat "$TMP/link2.log" >&2
+    exit 1
+fi
+if [ ! -x "$TMP/prog2" ]; then
+    echo "FAIL: -L/-l output is not owner-executable" >&2; exit 1
+fi
+echo "PASS: -L/-l links against a library (entrypt + transitively helper2 extracted)"
+
+"$TMP/prog2"
+CODE2=$?
+if [ "$CODE2" != 42 ]; then
+    echo "FAIL: -L/-l program expected exit 42 (transitive helper2), got $CODE2" >&2
+    exit 1
+fi
+echo "PASS: the -L/-l program ran and exited 42 (transitive extraction to a fixpoint)"
 exit 0

@@ -1,0 +1,321 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// ============================================================
+// Shared SSA-destruction (phi elimination)
+// ============================================================
+
+// EliminatePhis destructs SSA form for the backends that don't lower OP_PHI
+// natively — the bytecode VM and the 3 native backends (x64/aarch64/arm32).  The
+// LLVM backend keeps phis (it emits a native `phi`), so it does NOT call this.
+// Each backend runs it at the start of per-function lowering; the result is
+// phi-free IR carrying explicit OP_COPY moves that those backends already handle.
+//
+// For each merge block it: gathers, per predecessor edge, the parallel copy set
+// { phi.ID <- incoming-value }; sequences that set so no source is overwritten
+// before it is read (breaking cycles — e.g. a loop-carried swap a<-b, b<-a — with
+// a fresh temp); places the copies either before the predecessor's terminator or,
+// for a critical edge, in a freshly split block on the edge; and finally drops the
+// OP_PHIs.  The copies carry the phi's OWN id (not a fresh one) — several copies
+// share it — which is exactly what the one-location-per-id VM (register == id) and
+// native (id-keyed spill slot) models require.
+//
+// Idempotent: a phi-free function is a no-op (so a second run, or a func that
+// never had phis, costs one scan).
+//
+// v1 is SCALAR-ONLY: it handles int / bool / raw-pointer phis (one word, no
+// refcount) and PANICS on an aggregate or managed phi — a one-word OP_COPY would
+// alias rather than copy a multi-word value, and a managed copy needs refcount
+// ops.  Managed/aggregate phis are deferred to the managed-promotion work (plan
+// Phase 2b); the scalar-only SSA promotion (Phase 2a) that will generate these
+// phis never produces them.
+func EliminatePhis(f @Func) {
+	if !funcHasPhi(f) {
+		return
+	}
+	// Snapshot the block count: critical-edge splitting appends blocks, and a split
+	// block has no phis, so processing only the original blocks is both sufficient
+	// and avoids iterating the new ones.  Append preserves the leading entries, so
+	// f.Blocks[bi] for bi < origCount stays the original block even if the backing
+	// grew.
+	var origCount int = len(f.Blocks)
+	for bi := 0; bi < origCount; bi++ {
+		eliminatePhisInBlock(f, f.Blocks[bi])
+	}
+}
+
+// funcHasPhi reports whether any block leads with an OP_PHI.
+func funcHasPhi(f @Func) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @Block = f.Blocks[bi]
+		for i := 0; i < len(b.Instrs); i++ {
+			if b.Instrs[i].Op == iropcode.OP_PHI {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// eliminatePhisInBlock destructs the leading phis of one merge block.
+func eliminatePhisInBlock(f @Func, b @Block) {
+	var nPhi int = countLeadingPhis(b)
+	if nPhi == 0 {
+		return
+	}
+	// Keep the phi instrs: their ids are the copy destinations, and they double as
+	// value refs for cycle-break temps (a temp reads "the current value at phi.ID").
+	var phis @[]@Instr = make_slice(@Instr, nPhi)
+	for i := 0; i < nPhi; i++ {
+		phis[i] = b.Instrs[i]
+		assertScalarPhi(phis[i])
+	}
+	// All phis in a well-formed block share the block's predecessor set, so derive
+	// it from the first phi.
+	var preds @[]@Block = phiPreds(phis[0])
+	var predCount int = len(preds)
+	for pi := 0; pi < predCount; pi++ {
+		placeCopiesForEdge(f, preds[pi], b, phis, predCount)
+	}
+	removeLeadingPhis(b, nPhi)
+}
+
+// countLeadingPhis counts the run of OP_PHIs at the top of a block.
+func countLeadingPhis(b @Block) int {
+	var n int = 0
+	for i := 0; i < len(b.Instrs); i++ {
+		if b.Instrs[i].Op != iropcode.OP_PHI {
+			break
+		}
+		n = n + 1
+	}
+	return n
+}
+
+// assertScalarPhi panics unless the phi's type is a one-word, non-managed scalar
+// (int / bool / raw pointer) — the only shapes a one-word OP_COPY can move safely.
+func assertScalarPhi(phi @Instr) {
+	var t @types.Type = peelToRepr(phi.Typ)
+	if t == nil {
+		panic("EliminatePhis: phi with nil type")
+	}
+	if t.Kind == types.TYP_INT {
+		return
+	}
+	if t.Kind == types.TYP_BOOL {
+		return
+	}
+	if t.Kind == types.TYP_POINTER {
+		return
+	}
+	panic(
+			"EliminatePhis: only scalar (int/bool/raw-pointer) phis are supported; aggregate/managed phis a"
+					"re deferred to Phase 2b (managed promotion)")
+}
+
+// phiPreds returns the predecessor blocks contributing to a phi (one per entry).
+func phiPreds(phi @Instr) @[]@Block {
+	var preds @[]@Block = make_slice(@Block, len(phi.Phis))
+	for i := 0; i < len(phi.Phis); i++ {
+		preds[i] = phi.Phis[i].Block
+	}
+	return preds
+}
+
+// phiValForPred returns the value a phi takes on the edge from predecessor p.
+func phiValForPred(phi @Instr, p @Block) @Instr {
+	for i := 0; i < len(phi.Phis); i++ {
+		if phi.Phis[i].Block == p {
+			return phi.Phis[i].Val
+		}
+	}
+	panic("EliminatePhis: phi missing an entry for a predecessor (malformed IR)")
+}
+
+// placeCopiesForEdge sequences and places the copy set for the edge p -> b.
+func placeCopiesForEdge(f @Func, p @Block, b @Block, phis @[]@Instr, predCount int) {
+	var srcs @[]@Instr = make_slice(@Instr, len(phis))
+	for i := 0; i < len(phis); i++ {
+		srcs[i] = phiValForPred(phis[i], p)
+	}
+	var seq @[]@Instr = sequenceCopies(f, phis, srcs)
+	var pTerm @Instr = terminatorOf(p)
+	// Critical edge: p has two successors (a conditional branch) AND b has two or
+	// more predecessors.  Placing the copies at p's end would run them on p's OTHER
+	// successor too; split the edge and put the copies (plus a jump to b) in a new
+	// block reached only on the p -> b edge.
+	if pTerm.Op == iropcode.OP_BRANCH && predCount >= 2 {
+		var s @Block = AddBlock(f, "phicrit")
+		redirectTerminator(pTerm, b, s)
+		var jmp @Instr = newVoidInstr(iropcode.OP_JUMP)
+		jmp.Block1 = b
+		s.Instrs = slices.Append[@Instr](seq, jmp)
+		return
+	}
+	spliceBeforeTerminator(p, seq)
+}
+
+// sequenceCopies orders a parallel copy set { phis[i].ID <- srcs[i] } into a
+// sequential list of OP_COPY instrs preserving parallel semantics (no source read
+// after it is overwritten).  Self-copies are dropped; cycles are broken with a
+// fresh temp.
+func sequenceCopies(f @Func, phis @[]@Instr, srcs @[]@Instr) @[]@Instr {
+	var n int = len(phis)
+	var result @[]@Instr
+	var removed @[]bool = make_slice(bool, n)
+	var curSrc @[]@Instr = make_slice(@Instr, n)
+	var pending int = 0
+	for i := 0; i < n; i++ {
+		curSrc[i] = srcs[i]
+		// Drop no-ops: phi.ID <- phi.ID.
+		if phis[i].ID == srcs[i].ID {
+			removed[i] = true
+		} else {
+			removed[i] = false
+			pending = pending + 1
+		}
+	}
+	for pending > 0 {
+		// Emit every copy whose destination is not still read by a pending copy.
+		var emittedAny bool = true
+		for emittedAny {
+			emittedAny = false
+			for i := 0; i < n; i++ {
+				if removed[i] {
+					continue
+				}
+				if !dstReadByPending(phis[i].ID, curSrc, removed, n) {
+					result = slices.Append[@Instr](result, makeCopyWithID(phis[i].ID, curSrc[i], phis[i].Typ))
+					removed[i] = true
+					pending = pending - 1
+					emittedAny = true
+				}
+			}
+		}
+		if pending > 0 {
+			// A cycle: save one destination's current value into a fresh temp and
+			// redirect its readers to the temp, unblocking that copy next pass.
+			var pick int = firstPending(removed, n)
+			var dstID int = phis[pick].ID
+			var tmp @Instr = makeFreshCopy(f, phis[pick], phis[pick].Typ)
+			result = slices.Append[@Instr](result, tmp)
+			for i := 0; i < n; i++ {
+				if !removed[i] && curSrc[i].ID == dstID {
+					curSrc[i] = tmp
+				}
+			}
+		}
+	}
+	return result
+}
+
+// dstReadByPending reports whether id is the source of any not-yet-emitted copy.
+func dstReadByPending(id int, curSrc @[]@Instr, removed @[]bool, n int) bool {
+	for j := 0; j < n; j++ {
+		if removed[j] {
+			continue
+		}
+		if curSrc[j].ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// firstPending returns the index of the first not-yet-emitted copy.
+func firstPending(removed @[]bool, n int) int {
+	for i := 0; i < n; i++ {
+		if !removed[i] {
+			return i
+		}
+	}
+	return -1
+}
+
+// makeCopyWithID builds an OP_COPY that writes value id `dstID` from `src`.  The
+// id is deliberately NOT fresh — copies for a phi share the phi's id so the
+// one-location-per-id backends all target the phi's single register/slot.
+func makeCopyWithID(dstID int, src @Instr, typ @types.Type) @Instr {
+	var c @Instr = make(Instr)
+	c.ID = dstID
+	c.Op = iropcode.OP_COPY
+	c.Typ = typ
+	c.Args = makeArgs1(src)
+	return c
+}
+
+// makeFreshCopy builds an OP_COPY with a FRESH id (a cycle-break temp) from `src`.
+// The fresh id auto-provisions its register/slot (both backends size from NextID).
+func makeFreshCopy(f @Func, src @Instr, typ @types.Type) @Instr {
+	var c @Instr = make(Instr)
+	c.ID = nextID(f)
+	c.Op = iropcode.OP_COPY
+	c.Typ = typ
+	c.Args = makeArgs1(src)
+	return c
+}
+
+// terminatorOf returns a block's terminator (its last instruction in well-formed
+// IR; falls back to a scan).
+func terminatorOf(b @Block) @Instr {
+	var n int = len(b.Instrs)
+	if n > 0 && b.Instrs[n - 1].IsTerminator() {
+		return b.Instrs[n - 1]
+	}
+	for i := 0; i < n; i++ {
+		if b.Instrs[i].IsTerminator() {
+			return b.Instrs[i]
+		}
+	}
+	panic("EliminatePhis: predecessor block has no terminator")
+}
+
+// redirectTerminator repoints a terminator's successor edges from `from` to `to`.
+func redirectTerminator(term @Instr, from @Block, to @Block) {
+	if term.Block1 == from {
+		term.Block1 = to
+	}
+	if term.Block2 == from {
+		term.Block2 = to
+	}
+}
+
+// spliceBeforeTerminator inserts `insns` just before b's terminator.
+func spliceBeforeTerminator(b @Block, insns @[]@Instr) {
+	if len(insns) == 0 {
+		return
+	}
+	var ti int = -1
+	for i := 0; i < len(b.Instrs); i++ {
+		if b.Instrs[i].IsTerminator() {
+			ti = i
+			break
+		}
+	}
+	if ti < 0 {
+		panic("EliminatePhis: predecessor block has no terminator")
+	}
+	var out @[]@Instr
+	for i := 0; i < ti; i++ {
+		out = slices.Append[@Instr](out, b.Instrs[i])
+	}
+	for i := 0; i < len(insns); i++ {
+		out = slices.Append[@Instr](out, insns[i])
+	}
+	for i := ti; i < len(b.Instrs); i++ {
+		out = slices.Append[@Instr](out, b.Instrs[i])
+	}
+	b.Instrs = out
+}
+
+// removeLeadingPhis drops the leading nPhi instructions (the phis) from b.
+func removeLeadingPhis(b @Block, nPhi int) {
+	var out @[]@Instr
+	for i := nPhi; i < len(b.Instrs); i++ {
+		out = slices.Append[@Instr](out, b.Instrs[i])
+	}
+	b.Instrs = out
+}

@@ -7,9 +7,10 @@
 # packages), a small hermetic shim supplies `_start` and the handful of libc
 # symbols the runtime references (malloc/calloc/free/write/abort) with a bump
 # allocator + syscalls, and bnld links the whole object graph into one static
-# ELF64 executable.  The program's exit code is the value its bnc-compiled
-# `compute()` returns (42) — so a correct run proves real compiled Binate code
-# was linked and executed.
+# ELF64 executable.  The program's exit code is what its bnc-compiled `compute()`
+# returns — the sum of a managed slice it allocates and fills at run time (42) — so
+# a correct run proves real compiled Binate code, INCLUDING the runtime memory path
+# (MakeManagedSlice -> malloc, bounds checks, refcount), was linked and executed.
 #
 # COST/POLICY: this is the heaviest bnld e2e — it builds bnc (the others build
 # only bnas+bnld).  Its unique value is proving bnld links REAL bnc output and the
@@ -66,12 +67,24 @@ if [ -z "$NM" ]; then
     exit 0
 fi
 
-# ----- the Binate program: compute() returns 42; main is empty -----
+# ----- the Binate program.  compute() allocates a managed slice, fills it in a
+# bounds-checked loop, and sums it (2+4+6+8+10+12 = 42) — so the linked binary
+# exercises the runtime's memory path at run time (MakeManagedSlice -> malloc,
+# indexed-access bounds checks, refcount cleanup), not just static init.  main is
+# empty; the exit code is compute()'s computed sum. -----
 cat > "$TMP/tiny.bn" <<'EOF'
 package "main"
 
 func compute() int {
-	return 42
+	var s @[]int = make_slice(int, 6)
+	for i := 0; i < 6; i++ {
+		s[i] = (i + 1) * 2
+	}
+	var sum int = 0
+	for i := 0; i < 6; i++ {
+		sum = sum + s[i]
+	}
+	return sum
 }
 
 func main() {
@@ -204,5 +217,5 @@ if [ "$CODE" != 42 ]; then
     echo "FAIL: program expected exit 42 (compute()), got $CODE" >&2
     exit 1
 fi
-echo "PASS: the bnld-linked bnc program ran and exited 42 (compute())"
+echo "PASS: the bnld-linked bnc program ran and exited 42 (compute() over a heap slice)"
 exit 0

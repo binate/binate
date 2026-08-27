@@ -1,16 +1,22 @@
 #!/bin/sh
 # e2e/bnld-real-program.sh — End-to-end proof that the Binate-native linker (bnld)
-# links a REAL bnc-compiled program: no clang/ld anywhere in the pipeline.
+# links a REAL bnc-compiled program: no ld in the link.
 #
-# A trivial Binate program is compiled with bnc's native x86-64 backend (which
-# emits several ELF objects — the main module plus the auto-pulled runtime
-# packages), a small hermetic shim supplies `_start` and the handful of libc
-# symbols the runtime references (malloc/calloc/free/write/abort) with a bump
-# allocator + syscalls, and bnld links the whole object graph into one static
-# ELF64 executable.  The program's exit code is what its bnc-compiled `compute()`
-# returns — the sum of a managed slice it allocates and fills at run time (42) — so
-# a correct run proves real compiled Binate code, INCLUDING the runtime memory path
-# (MakeManagedSlice -> malloc, bounds checks, refcount), was linked and executed.
+# A trivial Binate program is compiled to ELF objects (the main module plus the
+# auto-pulled runtime packages), a small hermetic shim supplies `_start` and the
+# handful of libc symbols the runtime references (malloc/calloc/free/write/abort)
+# with a bump allocator + syscalls, and bnld links the whole object graph into one
+# static ELF64 executable.  The program's exit code is what its bnc-compiled
+# `compute()` returns — the sum of a managed slice it allocates and fills at run
+# time (42) — so a correct run proves real compiled Binate code, INCLUDING the
+# runtime memory path (MakeManagedSlice -> malloc, bounds checks, refcount), was
+# linked and executed.
+#
+# Done twice: once for bnc's NATIVE x86-64 backend, and (when clang is present) once
+# for the LLVM/clang backend, whose objects load symbol addresses via the GOT
+# (R_X86_64_REX_GOTPCRELX) — which bnld relaxes to a direct lea.  The mangled
+# compute()/bn_entry symbols are backend-independent, so the same shim links both.
+# clang is used only to compile the LLVM variant; the LINK is always bnld, never ld.
 #
 # COST/POLICY: this is the heaviest bnld e2e — it builds bnc (the others build
 # only bnas+bnld).  Its unique value is proving bnld links REAL bnc output and the
@@ -218,4 +224,40 @@ if [ "$CODE" != 42 ]; then
     exit 1
 fi
 echo "PASS: the bnld-linked bnc program ran and exited 42 (compute() over a heap slice)"
+
+# ----- also link the SAME program compiled with the LLVM/clang backend, if clang is
+# available.  Those objects load symbol addresses via the GOT
+# (R_X86_64_REX_GOTPCRELX), which bnld relaxes to a direct lea; the shim above (same
+# backend-independent compute()/bn_entry symbols) links them unchanged. -----
+if command -v clang > /dev/null 2>&1; then
+    OBJL="$TMP/obj_llvm"
+    mkdir -p "$OBJL"
+    if ! "$BNC" --target x86_64-linux --build-dir "$OBJL" -c -o "$OBJL/tiny" \
+            "$TMP/tiny.bn" > "$TMP/compile_llvm.log" 2>&1; then
+        echo "FAIL: bnc (LLVM backend) could not compile the program" >&2
+        cat "$TMP/compile_llvm.log" >&2
+        exit 1
+    fi
+    if ! "$BNLD" -o "$TMP/prog_llvm" "$TMP/shim.o" "$OBJL"/*.o > "$TMP/link_llvm.log" 2>&1; then
+        echo "FAIL: bnld could not link the LLVM-backend objects" >&2
+        cat "$TMP/link_llvm.log" >&2
+        exit 1
+    fi
+    PL="$TMP/prog_llvm"
+    if [ "$(od -An -tx1 -N4 "$PL" | tr -d ' \n')" != "7f454c46" ]; then
+        echo "FAIL: LLVM-backend output is not an ELF file" >&2; exit 1
+    fi
+    [ "$(u16le "$PL" 18)" = 62 ] || { echo "FAIL: LLVM-backend output not EM_X86_64" >&2; exit 1; }
+    [ -x "$PL" ] || { echo "FAIL: LLVM-backend output not owner-executable" >&2; exit 1; }
+    echo "PASS: a bnc program built with the LLVM backend links with bnld (GOTPCRELX relaxed)"
+    "$PL"
+    CODEL=$?
+    if [ "$CODEL" != 42 ]; then
+        echo "FAIL: LLVM-backend program expected exit 42, got $CODEL" >&2
+        exit 1
+    fi
+    echo "PASS: the bnld-linked LLVM-backend program ran and exited 42"
+else
+    echo "SKIP: LLVM-backend link not exercised (no clang) — native path verified"
+fi
 exit 0

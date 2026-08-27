@@ -12,11 +12,13 @@
 # runtime memory path (MakeManagedSlice -> malloc, bounds checks, refcount), was
 # linked and executed.
 #
-# Done twice: once for bnc's NATIVE x86-64 backend, and (when clang is present) once
-# for the LLVM/clang backend, whose objects load symbol addresses via the GOT
-# (R_X86_64_REX_GOTPCRELX) — which bnld relaxes to a direct lea.  The mangled
-# compute()/bn_entry symbols are backend-independent, so the same shim links both.
-# clang is used only to compile the LLVM variant; the LINK is always bnld, never ld.
+# Done for bnc's NATIVE x86-64 backend, and (when clang is present) for the LLVM
+# backend, whose objects load symbol addresses via the GOT (R_X86_64_REX_GOTPCRELX)
+# — which bnld relaxes to a direct lea.  The mangled compute()/bn_entry symbols are
+# backend-independent, so the same shim links both.  The LLVM step additionally
+# LINKS (but does not run, on an x86-64 host) the aarch64 LLVM objects, exercising
+# the aarch64 GOT relaxation on real clang output.  clang is used only to compile;
+# the LINK is always bnld, never ld.
 #
 # COST/POLICY: this is the heaviest bnld e2e — it builds bnc (the others build
 # only bnas+bnld).  Its unique value is proving bnld links REAL bnc output and the
@@ -257,6 +259,65 @@ if command -v clang > /dev/null 2>&1; then
         exit 1
     fi
     echo "PASS: the bnld-linked LLVM-backend program ran and exited 42"
+
+    # Also LINK (not run — this host is x86-64) the aarch64 LLVM-backend objects, so
+    # the aarch64 GOT relaxation (ADRP+LDR -> ADRP+ADD) is exercised on real clang
+    # output in CI.  clang compiles aarch64 .ll -> .o without a sysroot; the run is
+    # covered out-of-band / by the aarch64 relocation unit tests.
+    OBJA="$TMP/obj_aa64"
+    mkdir -p "$OBJA"
+    if ! "$BNC" --target aarch64-linux --build-dir "$OBJA" -c -o "$OBJA/tiny" \
+            "$TMP/tiny.bn" > "$TMP/compile_aa64.log" 2>&1; then
+        echo "FAIL: bnc (LLVM backend, aarch64) could not compile the program" >&2
+        cat "$TMP/compile_aa64.log" >&2
+        exit 1
+    fi
+    # A minimal aarch64 shim: it only needs to DEFINE _start + the libc symbols so
+    # the graph links (it is not run, so the stubs need not work).
+    cat > "$TMP/shim_aa64.s" <<'AAEOF'
+.arch aarch64
+.global bn_entry
+.section text
+.global _start
+_start:
+	bl bn_entry
+	mov x8, #93
+	svc #0
+.global malloc
+malloc:
+	ret
+.global calloc
+calloc:
+	ret
+.global free
+free:
+	ret
+.global write
+write:
+	ret
+.global abort
+abort:
+	ret
+AAEOF
+    if ! "$BNAS" -target linux-aarch64 -o "$TMP/shim_aa64.o" "$TMP/shim_aa64.s" \
+            > "$TMP/shim_aa64.log" 2>&1; then
+        echo "FAIL: bnas could not assemble the aarch64 shim" >&2
+        cat "$TMP/shim_aa64.log" >&2
+        exit 1
+    fi
+    if ! "$BNLD" -target linux-aarch64 -o "$TMP/prog_aa64" "$TMP/shim_aa64.o" "$OBJA"/*.o \
+            > "$TMP/link_aa64.log" 2>&1; then
+        echo "FAIL: bnld could not link the aarch64 LLVM-backend objects" >&2
+        cat "$TMP/link_aa64.log" >&2
+        exit 1
+    fi
+    PA="$TMP/prog_aa64"
+    if [ "$(od -An -tx1 -N4 "$PA" | tr -d ' \n')" != "7f454c46" ]; then
+        echo "FAIL: aarch64 output is not an ELF file" >&2; exit 1
+    fi
+    [ "$(u16le "$PA" 18)" = 183 ] || { echo "FAIL: aarch64 output not EM_AARCH64" >&2; exit 1; }
+    [ "$(u16le "$PA" 56)" = 2 ] || { echo "FAIL: aarch64 output not two PT_LOAD segments" >&2; exit 1; }
+    echo "PASS: aarch64 LLVM-backend objects link with bnld (GOT relaxed; not run cross-arch)"
 else
     echo "SKIP: LLVM-backend link not exercised (no clang) — native path verified"
 fi

@@ -9,12 +9,13 @@
 #              an R_AARCH64_ADR_PREL_LO21 relocation from .text into .rodata is
 #              applied and exercised at run time).
 #
-# The run needs a way to execute linux/arm64: native on an aarch64 Linux host, or
-# a Docker that can run linux/arm64 — natively on an Apple-silicon Mac, or via
-# binfmt/qemu on an x86-64 Linux host.  Where it can't run (no such runtime, or a
-# Docker infrastructure error) the assemble+link+structure check still gates and
-# the execution reports SKIP — so a correct linker is never blamed for the
-# environment, while a broken one still reddens the run.
+# The run needs a way to execute linux/arm64.  CI has no native aarch64 Linux runner,
+# so the run happens under Docker/qemu — but ONLY on a Linux CI lane, so it executes on
+# exactly one CI platform (not duplicated on the macOS lane).  A default LOCAL run does
+# NOT use Docker (heavyweight): it runs natively on an aarch64 Linux host, else SKIPs —
+# unless BINATE_E2E_DOCKER=1 opts into Docker.  Where it can't run, the assemble+link+
+# structure check still gates and the run SKIPs, so a correct linker is never blamed on
+# the environment while a broken one still reddens a host that runs it.
 #
 # Exit 0 on pass (including run-skipped); non-zero on any failure.
 
@@ -181,14 +182,21 @@ if [ "$(uname -s)" = Linux ] && { [ "$(uname -m)" = aarch64 ] || [ "$(uname -m)"
     # Native aarch64 Linux: run the binaries directly.
     CAN_RUN=1
     RUN_KIND=native
-elif command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1; then
-    # Any host whose Docker can *execute* linux/arm64 — natively on an Apple-silicon
-    # Mac, or via binfmt/qemu on an x86-64 Linux host.  Preflight with a real arm64
-    # run (not just a pull): only if `true` exits 0 can this environment run aarch64,
-    # so a later non-zero exit is a genuine linker result.  If the preflight fails
-    # (no qemu/binfmt, or a daemon/mount error) the run is SKIPped rather than blamed
-    # on the linker.
-    if docker run --rm --platform linux/arm64 alpine true > /dev/null 2>&1; then
+else
+    # CI has no native aarch64 Linux runner, so arm64 is run under Docker/qemu — but
+    # ONLY on a Linux CI lane, so the run happens on exactly one CI platform and is not
+    # duplicated on the macOS lane.  Docker is deliberately NOT imposed on a default
+    # local run (it is heavyweight): a local box runs only natively or on an explicit
+    # BINATE_E2E_DOCKER=1 opt-in.  Preflight with a real arm64 `true` (not just a pull):
+    # only if it exits 0 can this environment run aarch64, so a later non-zero exit is a
+    # genuine linker result; a preflight failure (no qemu/binfmt, daemon/mount error) is
+    # SKIPped rather than blamed on the linker.
+    want_docker=0
+    if [ -n "${CI:-}" ] && [ "$(uname -s)" = Linux ]; then want_docker=1; fi
+    if [ "${BINATE_E2E_DOCKER:-0}" = 1 ]; then want_docker=1; fi
+    if [ "$want_docker" = 1 ] && command -v docker > /dev/null 2>&1 \
+            && docker info > /dev/null 2>&1 \
+            && docker run --rm --platform linux/arm64 alpine true > /dev/null 2>&1; then
         CAN_RUN=1
         RUN_KIND=docker
     fi
@@ -227,7 +235,7 @@ if [ "$RAN" = 1 ]; then
     fi
     echo "PASS: exit(42) ran and exited 42"
 else
-    echo "SKIP: exit42 not run here (no linux-aarch64 runtime) — build+structure verified"
+    echo "SKIP: exit42 not run here (no native aarch64 Linux; set BINATE_E2E_DOCKER=1 for a local Docker run) — build+structure verified"
 fi
 
 run_binary hello
@@ -242,7 +250,7 @@ if [ "$RAN" = 1 ]; then
     fi
     echo "PASS: hello ran, printed 'hi', and exited 0"
 else
-    echo "SKIP: hello not run here (no linux-aarch64 runtime) — build+structure verified"
+    echo "SKIP: hello not run here (no native aarch64 Linux; set BINATE_E2E_DOCKER=1 for a local Docker run) — build+structure verified"
 fi
 
 run_binary hellopg
@@ -257,7 +265,7 @@ if [ "$RAN" = 1 ]; then
     fi
     echo "PASS: hellopg ran (ADRP+ADD reached .rodata), printed 'hi', exited 0"
 else
-    echo "SKIP: hellopg not run here (no linux-aarch64 runtime) — build+structure verified"
+    echo "SKIP: hellopg not run here (no native aarch64 Linux; set BINATE_E2E_DOCKER=1 for a local Docker run) — build+structure verified"
 fi
 
 run_binary dataval
@@ -268,6 +276,6 @@ if [ "$RAN" = 1 ]; then
     fi
     echo "PASS: dataval ran (ADRP+LDR loaded from .data), exited 42"
 else
-    echo "SKIP: dataval not run here (no linux-aarch64 runtime) — build+structure verified"
+    echo "SKIP: dataval not run here (no native aarch64 Linux; set BINATE_E2E_DOCKER=1 for a local Docker run) — build+structure verified"
 fi
 exit 0

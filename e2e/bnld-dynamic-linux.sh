@@ -8,12 +8,14 @@
 # (PT_INTERP, .dynamic, .plt/.got.plt, the JUMP_SLOT bound by ld.so).
 #
 # The build + link + structure check run everywhere (host-independent ELF byte
-# generation).  The RUN needs a glibc linux/arm64 loader; it happens NATIVELY on any
-# Linux host that has /lib/ld-linux-aarch64.so.1 (a native aarch64 host, or an x86-64
-# host with aarch64 multiarch + binfmt) — the CI path, no Docker.  Docker is NOT used
-# by default: on a non-Linux dev box the run SKIPs unless BINATE_E2E_DOCKER=1 opts into
-# a glibc arm64 container.  A correct linker is never blamed on the environment, while
-# a broken one (or output ld.so rejects) still reddens a host that can run it.
+# generation).  The RUN needs a glibc linux/arm64 loader.  CI has no native aarch64
+# Linux runner (the e2e matrix is x86-64 Linux + arm64 macOS), so the run happens under
+# a glibc arm64 Docker image via qemu — but ONLY on a Linux CI lane, so it executes on
+# exactly one CI platform (not duplicated on the macOS lane).  A default LOCAL run does
+# NOT use Docker (it is heavyweight): it runs natively if the host can, else SKIPs —
+# unless BINATE_E2E_DOCKER=1 opts into Docker.  A correct linker is never blamed on the
+# environment, while a broken one (or output ld.so rejects) still reddens a host that
+# runs it.
 #
 # Exit 0 on pass (including run-skipped); non-zero on any failure.
 
@@ -84,21 +86,31 @@ if ! grep -q "libc.so.6" "$TMP/exit42_dyn"; then
 fi
 echo "PASS: bnld -dynamic produced a dynamically-linked aarch64 ELF (interp + libc.so.6)"
 
-# ----- run it natively where the host can; SKIP otherwise (no Docker by default) -----
-# A Linux host with the aarch64 glibc loader can exec the binary directly (natively,
-# or via binfmt/qemu on a multiarch x86-64 host) — this is the CI path.  Docker is used
-# only when explicitly opted in with BINATE_E2E_DOCKER=1 (a convenience for a local
-# non-Linux dev box), never by default.
+# ----- run it: natively where the host can, else via Docker/qemu -----
+# CI has no native aarch64 Linux runner (the e2e matrix is x86-64 Linux + arm64
+# macOS), so the arm64 binary is run under a glibc arm64 Docker image via qemu — but
+# ONLY on a Linux CI lane, so the run happens on exactly one CI platform and is not
+# duplicated on the macOS lane.  Docker is deliberately NOT imposed on a default local
+# run (it is heavyweight): a local box runs the binary only if it can natively, or if
+# BINATE_E2E_DOCKER=1 explicitly opts into Docker.
 CAN_RUN=0
 RUN_KIND=""
 if [ "$(uname -s)" = Linux ] && [ -e /lib/ld-linux-aarch64.so.1 ]; then
+    # Native aarch64 Linux (or an x86-64 host with aarch64 multiarch/binfmt).
     CAN_RUN=1
     RUN_KIND=native
-elif [ "${BINATE_E2E_DOCKER:-0}" = 1 ] && command -v docker > /dev/null 2>&1 \
-        && docker info > /dev/null 2>&1 \
-        && docker run --rm --platform linux/arm64 debian:stable-slim true > /dev/null 2>&1; then
-    CAN_RUN=1
-    RUN_KIND=docker
+else
+    # Docker/qemu is used on a Linux CI lane, or on an explicit local opt-in — never on
+    # a default local run, and never on the macOS CI lane (so it is not duplicated).
+    want_docker=0
+    if [ -n "${CI:-}" ] && [ "$(uname -s)" = Linux ]; then want_docker=1; fi
+    if [ "${BINATE_E2E_DOCKER:-0}" = 1 ]; then want_docker=1; fi
+    if [ "$want_docker" = 1 ] && command -v docker > /dev/null 2>&1 \
+            && docker info > /dev/null 2>&1 \
+            && docker run --rm --platform linux/arm64 debian:stable-slim true > /dev/null 2>&1; then
+        CAN_RUN=1
+        RUN_KIND=docker
+    fi
 fi
 
 RAN=0

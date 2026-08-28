@@ -1,0 +1,290 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// REPL type-declaration lowering (genReplTypeDecl) and managed-type
+// (dtor / copy) helper regeneration, split out of gen_repl.bn for
+// file-length hygiene.  GenDecl (in gen_repl.bn) dispatches a `type`
+// decl here; EnsureReplBodyHelpers regenerates the dtor/copy helpers a
+// prompt-entered body newly requires.
+
+// genReplTypeDecl handles a `type` declaration typed at the
+// prompt.  Supported forms:
+//
+//   type Result = @[]char            (alias)
+//   type Celsius int                  (named non-struct)
+//   type Point struct { X int; Y int } (struct, no managed fields)
+//
+// Rejected (deferred): struct types containing managed fields.
+// Those would require dedup-aware regeneration of `__dtor_<T>` /
+// `__copy_<T>` helpers — substantial machinery that interacts
+// with the existing `m.Funcs` redefinition / shadow paths.
+//
+// The type checker has already registered the symbol in
+// `c.Scope` via collectTypeDecl; here we only have to mirror
+// what GeneratePackage's pass-1/pass-2 do on the IR side
+// (register in `Module.Structs` for structs / `Module.TypeAliases`
+// for aliases and named distinct non-struct types — the latter as a
+// `TYP_NAMED` so method dispatch and scalar layout resolve).
+func genReplTypeDecl(gc @GenCtx, d @ast.Decl, m @Module) @[]char {
+	if isNonStructTypeDecl(d) {
+		var ta ModuleTypeAlias
+		ta.Name = buf.CopyStr(d.Name)
+		ta.Typ = typeDeclEntryType(gc, ta.Name, d)
+		gc.Mod.TypeAliases = slices.Append[ModuleTypeAlias](
+				gc.Mod.TypeAliases, ta)
+		return ""
+	}
+	if d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+		// Build the field list eagerly (single-pass at the
+		// prompt — no forward-referenced types within the same
+		// decl, since we're processing one DECL at a time).
+		var fields @[]@types.Field
+		for j := 0; j < len(d.TypeRef.Fields); j++ {
+			var fd @ast.FieldDecl = d.TypeRef.Fields[j]
+			var f @types.Field = make(types.Field)
+			f.Name = fd.Name
+			f.Type = resolveTypeExpr(gc, fd.Type)
+			fields = slices.Append[@types.Field](fields, f)
+		}
+		var ms ModuleStruct
+		ms.Name = qualifyForCurrentModule(gc, d.Name)
+		ms.Typ = types.MakeStructType(ms.Name, fields)
+		ms.Fields = fields
+		gc.Mod.Structs = slices.Append[ModuleStruct](gc.Mod.Structs, ms)
+		// If the struct contains any managed field, emit its
+		// dtor + copy (and any field-type helpers it needs)
+		// into m.Funcs, dedup'd against helpers that already
+		// landed for previously-loaded types.  Caller
+		// (cmd/bni/repl.bn evalReplDecl) lowers everything
+		// added during this GenDecl call.
+		if structTypeNeedsHelpers(ms.Typ) {
+			ensureReplStructHelpers(m, ms.Typ)
+		}
+		return ""
+	}
+	// Named non-struct (`type Celsius int`): the type checker
+	// owns the symbol; IR-gen has no per-decl state for these.
+	// Methods on the type would be a separate Tier 2 follow-up.
+	return ""
+}
+
+// structTypeNeedsHelpers reports whether `t` (a TYP_STRUCT)
+// requires `__dtor_<T>` / `__copy_<T>` emission.  True iff the
+// struct or any of its fields contains a managed pointer or
+// managed slice that requires cleanup.
+func structTypeNeedsHelpers(t @types.Type) bool {
+	return t.NeedsDestruction()
+}
+
+// ensureReplStructHelpers emits `__dtor_<T>` and `__copy_<T>`
+// for a freshly-registered prompt-defined struct, plus any
+// field-type helpers (managed-slice / array dtors+copies).
+// Dedup'd against m.Funcs: pre-populates the per-call
+// `generated` slice with names of helper-shaped functions
+// already present, so previously-emitted helpers from earlier
+// `type` decls or the loaded module aren't re-emitted.
+//
+// The substrate (genStructDtorWithName, ensureMsDtor, etc.)
+// is reused from gen_dtor_emit.bn / gen_copy_emit.bn — same
+// helpers the file-load passes call.  Difference is just the
+// scope: we target one struct at a time and skip work already
+// done.
+func ensureReplStructHelpers(m @Module, structTyp @types.Type) {
+	var generated @[]@[]char = collectExistingHelperNames(m)
+
+	// Struct dtor.
+	var dname @[]char = dtorNameForType(structTyp)
+	if !hasName(generated, dname) {
+		m.AddFunc(genStructDtorWithName(m.PkgPath, dname, structTyp))
+		generated = slices.Append[@[]char](generated, dname)
+	}
+	// Struct copy.
+	var cname @[]char = copyNameForType(structTyp)
+	if !hasName(generated, cname) {
+		m.AddFunc(genStructCopyWithName(m.PkgPath, cname, structTyp))
+		generated = slices.Append[@[]char](generated, cname)
+	}
+	// Field-type helpers (managed-slice + array-with-destructible
+	// element).  Mirrors the file-load generateNonStructDtors /
+	// generateCopies pass-3 logic, scoped to this struct.
+	for j := 0; j < len(structTyp.Fields); j++ {
+		// peelTransparent (readonly + named + alias), matching the main path
+		// (gen_dtor_emit.bn / gen_copy_emit.bn): a readonly `@[]T` / `[N]T` field
+		// still needs its element-helper emitted, or the struct dtor body's call
+		// to that helper is left undefined.
+		var ft @types.Type = peelTransparent(structTyp.Fields[j].Type)
+		if ft.Kind == types.TYP_MANAGED_SLICE {
+			generated = ensureMsDtor(m, ft, generated)
+		}
+		if ft.Kind == types.TYP_ARRAY && ft.Elem.NeedsDestruction() {
+			generated = ensureArrayDtor(m, ft, generated)
+			generated = ensureArrayCopy(m, ft, generated)
+		}
+	}
+}
+
+// collectExistingHelperNames returns the UNQUALIFIED names of
+// every __dtor_/__copy_-shaped function already present in
+// m.Funcs.  NewFunc qualifies names with the module package path
+// (so "__dtor_Bag" lands as "test.__dtor_Bag" in m.Funcs);
+// this strips the qualifier so dedup compares unqualified-to-
+// unqualified — matching what dtorNameForType / copyNameForType
+// produce for the about-to-be-emitted helper.
+func collectExistingHelperNames(m @Module) @[]@[]char {
+	var names @[]@[]char
+	for i := 0; i < len(m.Funcs); i++ {
+		var u @[]char = unqualifiedHelperName(m.Funcs[i].Name)
+		if len(u) > 0 {
+			names = slices.Append[@[]char](names, u)
+		}
+	}
+	return names
+}
+
+// unqualifiedHelperName returns the `__dtor_<...>` /
+// `__copy_<...>` suffix of `n` (stripping any `pkg.` prefix
+// before it), or empty if `n` isn't a helper-shaped name.
+func unqualifiedHelperName(n @[]char) @[]char {
+	// Find the start of the helper prefix: either at index 0
+	// or immediately after the last '.'.
+	var start int = 0
+	for i := 0; i < len(n); i++ {
+		if n[i] == '.' { start = i + 1 }
+	}
+	var rest @[]char = n[start:]
+	if startsWithChars(rest, "__dtor_") || startsWithChars(rest, "__copy_") {
+		return rest
+	}
+	var empty @[]char
+	return empty
+}
+
+// startsWithChars returns true if n begins with prefix.
+func startsWithChars(n *[]readonly char, prefix *[]readonly char) bool {
+	if len(n) < len(prefix) { return false }
+	for i := 0; i < len(prefix); i++ {
+		if n[i] != prefix[i] { return false }
+	}
+	return true
+}
+
+// EnsureReplBodyHelpers drains `m.PendingMsDtors` and
+// `m.PendingStructDtors` — managed-aggregate types registered during
+// the most-recent IR-gen of a prompt-entered body (func decl,
+// var-initializer one-shot, or bare stmt list) — into freshly-
+// emitted `__dtor_<T>` / `__copy_<T>` helpers appended to
+// `m.Funcs`.  Dedup'd against helpers already present in `m.Funcs`
+// via `collectExistingHelperNames`, so repeated prompt entries
+// using the same shape don't re-emit.  The pending lists are
+// reset on return so the next prompt entry starts clean.
+//
+// Counterpart to `ensureReplStructHelpers` (which handles the
+// helper needs of a freshly-defined struct type).  Together they
+// cover the two ways a prompt entry can introduce a new managed-
+// aggregate shape: by typing the struct itself, or by typing a
+// body that uses an `@[]T` (or `@T` / array-of-destructible)
+// shape the loaded module never used.
+//
+// Caller (cmd/bni/repl.bn) is responsible for lowering the new
+// helper entries.  Capture `helpersStart := len(m.Funcs)` before
+// the call and lower `m.Funcs[helpersStart:]` afterwards.  Lower
+// the helpers BEFORE the body that references them so the body's
+// eager `CallCache` fill resolves every helper name on first
+// pass (otherwise `backfillExternCachesForName` upgrades the -1
+// slots when the helper finally lands — correct, but wasteful).
+//
+// Mirrors the drain pass in `generateNonStructDtors` /
+// `generateCopies` that file-load runs at end-of-module.
+func EnsureReplBodyHelpers(m @Module) {
+	if len(m.PendingMsDtors) == 0 && len(m.PendingStructDtors) == 0 && len(m.PendingMpDtors) == 0 &&
+			!m.NeedsFuncValueDtor && !m.NeedsIfaceValueDtor {
+		return
+	}
+	var generated @[]@[]char = collectExistingHelperNames(m)
+
+	// Managed-slice dtor pending registrations.  ensureMsDtor
+	// recurses into nested element types, so `@[]@[]int` emits
+	// `__dtor_@[]int` first, then `__dtor_@[]@[]int`.
+	for i := 0; i < len(m.PendingMsDtors); i++ {
+		generated = ensureMsDtor(m, m.PendingMsDtors[i], generated)
+	}
+
+	// Managed-pointer dtor pending registrations (@(@T) drops).
+	for i := 0; i < len(m.PendingMpDtors); i++ {
+		generated = ensureMpDtor(m, m.PendingMpDtors[i], generated)
+	}
+
+	// The single managed-func-value dtor (`__dtor_func`), if a `@(@func())` drop
+	// referenced it.
+	if m.NeedsFuncValueDtor {
+		generated = ensureFuncValueDtor(m, generated)
+	}
+
+	// The single managed-iface-value dtor (`__dtor_interface`), if a `@(@I)` drop
+	// referenced it.
+	if m.NeedsIfaceValueDtor {
+		generated = ensureIfaceValueDtor(m, generated)
+	}
+
+	// Struct / array pending registrations — dtor side.  Mirrors
+	// gen_dtor_emit.bn's pending-drain block; same dedup semantics.
+	for i := 0; i < len(m.PendingStructDtors); i++ {
+		var pst @types.Type = m.PendingStructDtors[i]
+		if pst.Kind == types.TYP_ARRAY && pst.Elem.NeedsDestruction() {
+			generated = ensureArrayDtor(m, pst, generated)
+		}
+		if pst.Kind == types.TYP_STRUCT && pst.NeedsDestruction() {
+			var dname @[]char = dtorNameForType(pst)
+			if !hasName(generated, dname) {
+				m.AddFunc(genStructDtorWithName(m.PkgPath, dname, pst))
+				generated = slices.Append[@[]char](generated, dname)
+			}
+			for j := 0; j < len(pst.Fields); j++ {
+				var ft @types.Type = peelTransparent(pst.Fields[j].Type)
+				if ft.Kind == types.TYP_MANAGED_SLICE {
+					generated = ensureMsDtor(m, ft, generated)
+				}
+				if ft.Kind == types.TYP_ARRAY && ft.Elem.NeedsDestruction() {
+					generated = ensureArrayDtor(m, ft, generated)
+				}
+			}
+		}
+	}
+
+	// Struct / array pending registrations — copy side.  Mirrors
+	// gen_copy_emit.bn's pending-drain block.
+	for i := 0; i < len(m.PendingStructDtors); i++ {
+		var pst @types.Type = m.PendingStructDtors[i]
+		if pst.Kind == types.TYP_ARRAY && pst.Elem.NeedsDestruction() {
+			generated = ensureArrayCopy(m, pst, generated)
+		}
+		if pst.Kind == types.TYP_STRUCT && pst.NeedsDestruction() {
+			var cname @[]char = copyNameForType(pst)
+			if !hasName(generated, cname) {
+				m.AddFunc(genStructCopyWithName(m.PkgPath, cname, pst))
+				generated = slices.Append[@[]char](generated, cname)
+			}
+			for j := 0; j < len(pst.Fields); j++ {
+				var ft @types.Type = peelTransparent(pst.Fields[j].Type)
+				if ft.Kind == types.TYP_ARRAY && ft.Elem.NeedsDestruction() {
+					generated = ensureArrayCopy(m, ft, generated)
+				}
+			}
+		}
+	}
+
+	// Reset the module's work-lists for the next prompt entry.  Otherwise
+	// stale entries would re-trigger ensure* calls (dedup'd no-ops, but wasted
+	// work) and survive across this session module's prompt turns.
+	var emptyMs @[]@types.Type
+	m.PendingMsDtors = emptyMs
+	var emptyStructs @[]@types.Type
+	m.PendingStructDtors = emptyStructs
+	var emptyNames @[]@[]char
+	m.PendingMsDtorNames = emptyNames
+	m.PendingStructDtorNames = emptyNames
+}

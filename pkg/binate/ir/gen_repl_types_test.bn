@@ -1,0 +1,336 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/parser"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Tests for gen_repl_types.bn — REPL type-declaration lowering
+// (genReplTypeDecl, exercised through GenDecl) and managed-type
+// dtor / copy helper regeneration (EnsureReplBodyHelpers).  Each test
+// establishes module state via genFromSource, then exercises the
+// per-decl / body-helper path as the REPL prompt would.
+
+// TestGenDeclStructType verifies that a `type T struct {...}`
+// decl with no managed fields registers in m.Structs so
+// subsequent IR-gen of expressions referencing T resolves
+// against the new type.
+func TestGenDeclStructType() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\nfunc main() {}\n"
+	var m @Module = genFromSource(src)
+	var declSrc *[]readonly char = "type Point struct { X int; Y int }"
+	var p @parser.Parser = parser.New(strToBytes(declSrc), "<repl>")
+	var d @ast.Decl = p.ParseTopLevelDecl()
+	if d == nil { return fail("ParseTopLevelDecl returned nil") }
+
+	var msg @[]char = GenDecl(d, NewGenCtx(m))
+	if len(msg) > 0 { return fail("GenDecl rejected struct type") }
+	if lookupStructIdx(NewGenCtx(m), "Point") < 0 {
+		return fail("Point not registered in m.Structs")
+	}
+	return ""
+}
+
+// TestGenDeclManagedFieldStructAccepted verifies that a struct
+// containing a managed field is now accepted at the prompt:
+// registered in m.Structs, AND a `__dtor_<T>` plus
+// `__copy_<T>` (and a `__dtor_` for the field's managed-slice
+// type) are emitted into m.Funcs.
+func TestGenDeclManagedFieldStructAccepted() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\nfunc main() {}\n"
+	var m @Module = genFromSource(src)
+	var initialFuncs int = len(m.Funcs)
+
+	var declSrc *[]readonly char = "type Bag struct { items @[]int }"
+	var p @parser.Parser = parser.New(strToBytes(declSrc), "<repl>")
+	var d @ast.Decl = p.ParseTopLevelDecl()
+	if d == nil { return fail("ParseTopLevelDecl returned nil") }
+
+	var msg @[]char = GenDecl(d, NewGenCtx(m))
+	if len(msg) > 0 {
+		return fail("managed-field struct should be accepted now")
+	}
+	if lookupStructIdx(NewGenCtx(m), "Bag") < 0 {
+		return fail("Bag not registered in m.Structs")
+	}
+	if len(m.Funcs) <= initialFuncs {
+		return fail("expected helper funcs added to m.Funcs")
+	}
+	// Spot-check: Bag's struct dtor + copy must both be present.
+	// Names are qualified by NewFunc with the module package path
+	// ("test"), so the linker symbols read as `test.__dtor_Bag`
+	// / `test.__copy_Bag`.
+	var sawDtor bool = false
+	var sawCopy bool = false
+	for i := initialFuncs; i < len(m.Funcs); i++ {
+		var nm @[]char = m.Funcs[i].Name
+		if seq(nm, "test.__dtor_Bag") { sawDtor = true }
+		if seq(nm, "test.__copy_Bag") { sawCopy = true }
+	}
+	if !sawDtor { return fail("expected test.__dtor_Bag in m.Funcs") }
+	if !sawCopy { return fail("expected test.__copy_Bag in m.Funcs") }
+	return ""
+}
+
+// TestGenDeclManagedFieldStructDedupsFieldDtor verifies that
+// declaring two structs with the same managed-slice field type
+// only emits the field's __dtor_ once.  Without dedup against
+// m.Funcs, the second decl would re-emit the field's dtor.
+func TestGenDeclManagedFieldStructDedupsFieldDtor() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\nfunc main() {}\n"
+	var m @Module = genFromSource(src)
+
+	// Decl 1 — first struct with @[]int field.
+	var d1Src *[]readonly char = "type Bag struct { items @[]int }"
+	var p1 @parser.Parser = parser.New(strToBytes(d1Src), "<repl>")
+	var d1 @ast.Decl = p1.ParseTopLevelDecl()
+	if len(GenDecl(d1, NewGenCtx(m))) > 0 { return fail("decl 1 rejected") }
+	var afterFirst int = len(m.Funcs)
+
+	// Decl 2 — second struct with the same @[]int field type.
+	// Must emit __dtor_Box + __copy_Box only; the @[]int
+	// helpers were already added by decl 1 and must NOT
+	// re-appear.
+	var d2Src *[]readonly char = "type Box struct { items @[]int }"
+	var p2 @parser.Parser = parser.New(strToBytes(d2Src), "<repl>")
+	var d2 @ast.Decl = p2.ParseTopLevelDecl()
+	if len(GenDecl(d2, NewGenCtx(m))) > 0 { return fail("decl 2 rejected") }
+
+	// Newly-added funcs from decl 2 must be Box-only — no
+	// re-emission of the shared @[]int dtor / copy.  Names
+	// are qualified by NewFunc.
+	for i := afterFirst; i < len(m.Funcs); i++ {
+		var nm @[]char = m.Funcs[i].Name
+		if !seq(nm, "test.__dtor_Box") && !seq(nm, "test.__copy_Box") {
+			return fail("decl 2 emitted an unexpected helper (dedup miss)")
+		}
+	}
+	return ""
+}
+
+// nameHasSub reports whether `name` contains `sub` — used to spot a weak /
+// unqualified element-helper func name regardless of any package prefix.
+func nameHasSub(name *[]readonly char, sub *[]readonly char) bool {
+	if len(sub) == 0 { return true }
+	for i := 0; i + len(sub) <= len(name); i++ {
+		var match bool = true
+		for j := 0; j < len(sub); j++ {
+			if name[i + j] != sub[j] { match = false; break }
+		}
+		if match { return true }
+	}
+	return false
+}
+
+// A REPL struct with a `readonly @[]@Node` field must co-emit the field's
+// element dtor helper (__dtor_ms_mp_Node).  ensureReplStructHelpers's field-walk
+// was readonly-blind (ResolveAlias, not peelTransparent), so it skipped
+// ensureMsDtor for the readonly-wrapped managed-slice field and the struct dtor
+// body's call to that helper was left undefined — a REPL-only build break, same
+// class as the main-path fix `91d8b0a6`.
+func TestGenDeclReadonlyManagedSliceFieldEmitsElemHelper() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\nfunc main() {}\n"
+	var m @Module = genFromSource(src)
+	// Node is a MANAGED struct, so `@[]@Node`'s element is a managed pointer
+	// whose slice-dtor (__dtor_ms_mp_Node) is a distinct helper that must exist.
+	var nodeSrc *[]readonly char = "type Node struct { v @[]int }"
+	var pn @parser.Parser = parser.New(strToBytes(nodeSrc), "<repl>")
+	var dn @ast.Decl = pn.ParseTopLevelDecl()
+	if dn == nil { return fail("Node parse failed") }
+	if len(GenDecl(dn, NewGenCtx(m))) > 0 { return fail("Node decl rejected") }
+
+	var holderSrc *[]readonly char = "type Holder struct { items readonly @[]@Node }"
+	var ph @parser.Parser = parser.New(strToBytes(holderSrc), "<repl>")
+	var dh @ast.Decl = ph.ParseTopLevelDecl()
+	if dh == nil { return fail("Holder parse failed") }
+	if len(GenDecl(dh, NewGenCtx(m))) > 0 {
+		return fail("readonly @[]@Node-field struct rejected")
+	}
+
+	var saw bool = false
+	for i := 0; i < len(m.Funcs); i++ {
+		if nameHasSub(m.Funcs[i].Name, "__dtor_ms_mp_Node") { saw = true }
+	}
+	if !saw {
+		return fail("readonly @[]@Node field's __dtor_ms_mp_Node helper was not emitted")
+	}
+	return ""
+}
+
+// TestGenDeclTypeNamedNonStruct verifies `type Celsius int`
+// (a named distinct non-struct type) registers a TYP_NAMED in
+// m.TypeAliases carrying its name and integer underlying — so
+// resolveTypeExpr returns the named identity (method dispatch keys off
+// the name) and the underlying scalar layout (lowering peels it).  It
+// must NOT register as a struct.
+func TestGenDeclTypeNamedNonStruct() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\nfunc main() {}\n"
+	var m @Module = genFromSource(src)
+	var initialStructs int = len(m.Structs)
+
+	var declSrc *[]readonly char = "type Celsius int"
+	var p @parser.Parser = parser.New(strToBytes(declSrc), "<repl>")
+	var d @ast.Decl = p.ParseTopLevelDecl()
+	if d == nil { return fail("ParseTopLevelDecl returned nil") }
+
+	var msg @[]char = GenDecl(d, NewGenCtx(m))
+	if len(msg) > 0 { return fail("GenDecl rejected named non-struct") }
+	var t @types.Type = lookupTypeAlias(NewGenCtx(m), "Celsius")
+	if t == nil {
+		return fail("Celsius not registered in m.TypeAliases")
+	}
+	if t.Kind != types.TYP_NAMED {
+		return fail("Celsius must register as a TYP_NAMED")
+	}
+	if t.Underlying == nil || !t.Underlying.IsInteger() {
+		return fail("Celsius underlying must be the integer type")
+	}
+	// A named non-struct is not a struct registration.
+	if len(m.Structs) != initialStructs {
+		return fail("named non-struct must not register in m.Structs")
+	}
+	return ""
+}
+
+// TestGenDeclTypeAlias verifies `type Result = @[]char` registers
+// in m.TypeAliases so identifiers referencing it during IR-gen
+// resolve via lookupTypeAlias.
+func TestGenDeclTypeAlias() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\nfunc main() {}\n"
+	var m @Module = genFromSource(src)
+	var declSrc *[]readonly char = "type Result = @[]char"
+	var p @parser.Parser = parser.New(strToBytes(declSrc), "<repl>")
+	var d @ast.Decl = p.ParseTopLevelDecl()
+	if d == nil { return fail("ParseTopLevelDecl returned nil") }
+
+	var msg @[]char = GenDecl(d, NewGenCtx(m))
+	if len(msg) > 0 { return fail("GenDecl rejected type alias") }
+	if lookupTypeAlias(NewGenCtx(m), "Result") == nil {
+		return fail("Result not registered in m.TypeAliases")
+	}
+	return ""
+}
+
+// ============================================================
+// EnsureReplBodyHelpers
+// ============================================================
+
+// TestEnsureReplBodyHelpersNoopWhenNothingPending verifies that
+// the drain is a no-op (no helpers appended) when no body has
+// registered any pending managed-aggregate types since the last
+// drain.  Models the "user types a stmt that doesn't touch any
+// managed shape" prompt entry.
+func TestEnsureReplBodyHelpersNoopWhenNothingPending() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\nfunc main() {}\n"
+	var m @Module = genFromSource(src)
+	var initialFuncs int = len(m.Funcs)
+	EnsureReplBodyHelpers(m)
+	if len(m.Funcs) != initialFuncs {
+		return fail("EnsureReplBodyHelpers added funcs with no pending registrations")
+	}
+	return ""
+}
+
+// TestEnsureReplBodyHelpersBodyIntroducesManagedSlice verifies
+// the core Tier 2 follow-up: a prompt-typed func body that uses
+// an `@[]T` shape whose element type is destructible has its
+// dtor emitted by the drain.  Without this fix, the body's
+// end-of-statement RefDec called a `__dtor_ms_mp_Bag` symbol
+// that didn't exist.  `@[]int` doesn't exercise the bug because
+// `int` isn't destructible — RefDec on the backing alone is
+// sufficient there, so no `__dtor_ms_int` is needed.
+func TestEnsureReplBodyHelpersBodyIntroducesManagedSlice() testing.TestResult {
+	// Loaded module defines a struct with a managed field so
+	// `@Bag` is destructible; the body uses `@[]@Bag` which
+	// requires `__dtor_ms_mp_Bag` (RefDec the `@Bag` ptr on each
+	// slot at slice-free time).
+	var src *[]readonly char = "package \"test\"\ntype Bag struct { items @[]int }\nfunc main() {}\n"
+	var m @Module = genFromSource(src)
+
+	var declSrc *[]readonly char = "func f() { var s @[]@Bag = make_slice(@Bag, 3) }"
+	var p @parser.Parser = parser.New(strToBytes(declSrc), "<repl>")
+	var d @ast.Decl = p.ParseTopLevelDecl()
+	if d == nil { return fail("ParseTopLevelDecl returned nil") }
+	if len(GenDecl(d, NewGenCtx(m))) > 0 { return fail("GenDecl rejected") }
+
+	var afterBody int = len(m.Funcs)
+	EnsureReplBodyHelpers(m)
+	if len(m.Funcs) <= afterBody {
+		return fail("expected at least one helper appended for @[]@Bag")
+	}
+	// The drain emitted `__dtor_ms_mp_Bag` (qualified by NewFunc
+	// to `test.__dtor_ms_mp_Bag`).  Spot-check the linker name.
+	var foundDtor bool = false
+	for i := afterBody; i < len(m.Funcs); i++ {
+		if seq(m.Funcs[i].Name, "test.__dtor_ms_mp_Bag") {
+			foundDtor = true
+		}
+	}
+	if !foundDtor {
+		return fail("expected test.__dtor_ms_mp_Bag helper in m.Funcs")
+	}
+	return ""
+}
+
+// TestEnsureReplBodyHelpersDedupsAgainstExisting verifies that
+// a second prompt entry using the same `@[]T` shape doesn't
+// re-emit a duplicate dtor — the drain checks against
+// `collectExistingHelperNames(m)`, so the helper that landed
+// for the first entry is recognized and skipped.  Uses
+// `@[]@Bag` (destructible element) so the drain has actual
+// work to dedup; `@[]int` would be a no-op both times.
+func TestEnsureReplBodyHelpersDedupsAgainstExisting() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\ntype Bag struct { items @[]int }\nfunc main() {}\n"
+	var m @Module = genFromSource(src)
+
+	// Entry 1: emit @[]@Bag dtor.
+	var d1Src *[]readonly char = "func f() { var s @[]@Bag = make_slice(@Bag, 2) }"
+	var p1 @parser.Parser = parser.New(strToBytes(d1Src), "<repl>")
+	var d1 @ast.Decl = p1.ParseTopLevelDecl()
+	if len(GenDecl(d1, NewGenCtx(m))) > 0 { return fail("entry 1 rejected") }
+	EnsureReplBodyHelpers(m)
+
+	// Entry 2: another body, same @[]@Bag shape.  GenDecl appends
+	// the new func body to m.Funcs (exactly one entry); the
+	// follow-up drain must NOT add anything because the helper is
+	// already present from entry 1.
+	var d2Src *[]readonly char = "func g() { var t @[]@Bag = make_slice(@Bag, 4) }"
+	var p2 @parser.Parser = parser.New(strToBytes(d2Src), "<repl>")
+	var d2 @ast.Decl = p2.ParseTopLevelDecl()
+	if len(GenDecl(d2, NewGenCtx(m))) > 0 { return fail("entry 2 rejected") }
+	var afterSecondBody int = len(m.Funcs)
+	EnsureReplBodyHelpers(m)
+	if len(m.Funcs) != afterSecondBody {
+		return fail("expected dedup against existing @[]@Bag helper (drain re-emitted)")
+	}
+	return ""
+}
+
+// TestEnsureReplBodyHelpersResetsPendingLists verifies the
+// drain clears `m.PendingMsDtors` / `m.PendingStructDtors` so
+// the next prompt entry starts clean.  Otherwise stale entries
+// would survive across prompt turns and re-trigger
+// dedup'd-no-op ensure* calls forever.  Uses `@[]@Bag` so the
+// body IR-gen actually populates `m.PendingMsDtors` (a managed
+// slice of a non-destructible primitive doesn't).  The body func
+// GenDecl emits reaches the module's work-lists via @Func.Mod.
+func TestEnsureReplBodyHelpersResetsPendingLists() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\ntype Bag struct { items @[]int }\nfunc main() {}\n"
+	var m @Module = genFromSource(src)
+
+	var declSrc *[]readonly char = "func f() { var s @[]@Bag = make_slice(@Bag, 3) }"
+	var p @parser.Parser = parser.New(strToBytes(declSrc), "<repl>")
+	var d @ast.Decl = p.ParseTopLevelDecl()
+	if len(GenDecl(d, NewGenCtx(m))) > 0 { return fail("GenDecl rejected") }
+	if len(m.PendingMsDtors) == 0 {
+		return fail("expected m.PendingMsDtors populated by body IR-gen")
+	}
+	EnsureReplBodyHelpers(m)
+	if len(m.PendingMsDtors) != 0 {
+		return fail("m.PendingMsDtors not reset by drain")
+	}
+	if len(m.PendingStructDtors) != 0 {
+		return fail("m.PendingStructDtors not reset by drain")
+	}
+	return ""
+}

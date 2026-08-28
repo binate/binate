@@ -1,0 +1,152 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/stdx/slices"
+
+// Load-forwarding (redundant-load elimination) — a phi-free companion to mem2reg
+// (mem2reg.bn) that works for AGGREGATE slots too.  It forwards every load of a
+// non-escaping alloca that has EXACTLY ONE store dominating all its loads to the
+// stored value, then deletes the alloca / store / loads.  This coalesces the
+// two slice-header loads gen emits for `len(s)` (loop guard) and `s[i]`
+// (access) onto one SSA value, which loop-BCE (Phase 3) needs to prove the guard
+// bound equals the bounds-check length.
+//
+// Soundness spine: escape analysis bars any aliasing write / address leak, so
+// only `OP_STORE(A, …)` writes A; a single store dominating every load means
+// each load provably read exactly that value.  A store BETWEEN a would-be
+// forwarded load and its def is a second store, so it can never be crossed
+// (defeating the reslice-shrink case).  Binate's refcounting is explicit and
+// operand-based — plain load/store carry no implicit inc/dec — so rewriting a
+// load-use to the stored value leaves the RefInc/RefDec sequence byte-identical.
+// (Managed slices in a bounds-checked loop nonetheless escape via the check's
+// fault pad, so this fires mainly for raw slices and arrays — see
+// explorations/plan-load-forwarding-phase2b.md.)
+
+// forwardLoads runs load-forwarding over every non-extern func.  Invoked by
+// RunOptPasses at -O1+, after promoteScalars.
+func forwardLoads(m @Module) {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @Func = m.Funcs[fi]
+		if f.IsExtern {
+			continue
+		}
+		forwardLoadsFunc(f)
+	}
+}
+
+// forwardLoadsFunc forwards all eligible single-store slots in one function.
+func forwardLoadsFunc(f @Func) {
+	if len(f.Blocks) == 0 {
+		return
+	}
+	var d @DomInfo = ComputeDom(f)
+	var gReplID @[]int
+	var gReplVal @[]@Instr
+	var gDeletedAlloca @[]int
+	var any bool = false
+
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if instr.Op != iropcode.OP_ALLOC {
+				continue
+			}
+			if allocaEscapes(f, instr) {
+				continue
+			}
+			var res @fwdResult = analyzeForwardAlloca(f, d, instr)
+			if !res.ok {
+				continue
+			}
+			for k := 0; k < len(res.loadIDs); k++ {
+				gReplID = slices.Append[int](gReplID, res.loadIDs[k])
+				gReplVal = slices.Append[@Instr](gReplVal, res.val)
+			}
+			gDeletedAlloca = slices.Append[int](gDeletedAlloca, instr.ID)
+			any = true
+		}
+	}
+
+	if !any {
+		return
+	}
+
+	// Reuse mem2reg's mutation phase with no phis and no grounding: it builds the
+	// load-id -> value repl map, deletes the alloca/store/loads, rewrites all
+	// uses, and runs the no-surviving-use fail-loud assertion.
+	var noPhi @[]@Instr
+	var noPhiBlock @[]int
+	var noGroundL @[]@Instr
+	var noGroundV @[]@Instr
+	applyPromotion(f, d.NumBlocks, noPhi, noPhiBlock, gReplID, gReplVal, noGroundL, noGroundV,
+			gDeletedAlloca)
+}
+
+// fwdResult is one alloca's analysis: whether it is forwardable, its loads (all
+// forwarded to `val`), and the single stored value they read.
+type fwdResult struct {
+	ok      bool
+	loadIDs @[]int
+	val     @Instr
+}
+
+// analyzeForwardAlloca decides whether alloca a is forwardable: exactly one
+// store, at least one load, the store dominates every load (same block ⇒ store
+// textually before the load — Dominates(b,b) is order-blind), and the stored
+// value's type matches the load type (aggregates match; a scalar mismatch bails
+// rather than forwarding a wrong-typed value).
+func analyzeForwardAlloca(f @Func, d @DomInfo, a @Instr) @fwdResult {
+	var res @fwdResult = make(fwdResult)
+	res.ok = false
+
+	var storeCount int = 0
+	var storeBlk int = -1
+	var storePos int = -1
+	var val @Instr
+	var loadIDs @[]int
+	var loadBlks @[]int
+	var loadPoss @[]int
+
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 2 && instr.Args[0] == a {
+				storeCount = storeCount + 1
+				storeBlk = bi
+				storePos = ii
+				val = instr.Args[1]
+			} else if instr.Op == iropcode.OP_LOAD && len(instr.Args) >= 1 && instr.Args[0] == a {
+				loadIDs = slices.Append[int](loadIDs, instr.ID)
+				loadBlks = slices.Append[int](loadBlks, bi)
+				loadPoss = slices.Append[int](loadPoss, ii)
+			}
+		}
+	}
+
+	if storeCount != 1 || len(loadIDs) == 0 || val == nil {
+		return res
+	}
+	// Type match: a load reads the slot AS its type.  For aggregates this always
+	// agrees with the stored value; a scalar mismatch (looser stored type) would
+	// need grounding — bail instead of forwarding a wrong-typed value.
+	if needsGrounding(val, a.TypeArg) {
+		return res
+	}
+	// The single store must dominate every load.
+	for k := 0; k < len(loadIDs); k++ {
+		if loadBlks[k] == storeBlk {
+			if loadPoss[k] <= storePos {
+				return res // load at/before the store in its block — reads a prior value
+			}
+		} else if !d.Dominates(storeBlk, loadBlks[k]) {
+			return res
+		}
+	}
+
+	res.ok = true
+	res.loadIDs = loadIDs
+	res.val = val
+	return res
+}

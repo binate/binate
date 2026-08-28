@@ -1,0 +1,159 @@
+package "pkg/binate/link"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/asm/macho"
+import "pkg/binate/buf"
+import "pkg/builtins/testing"
+
+// Integration tests: a Mach-O object read by parseMachoBytes must flow through the
+// existing Resolve -> Layout -> Relocate pipeline unchanged (the reader normalizes to
+// the same InputObject model + canonical reloc kinds as the ELF reader).  These prove
+// the translated Mach-O relocations actually *apply* correctly — the reader unit tests
+// only check that the kinds are translated, not that the patched bytes come out right.
+// (readMachoObj / fail / findSymbol / u32 / charsEqual are package-level helpers.)
+
+// findRelocByKind returns the index of obj's first relocation of the given Kind, or -1.
+func findRelocByKind(obj @InputObject, kind int) int {
+	for r := 0; r < len(obj.Relocs); r++ {
+		if obj.Relocs[r].Kind == kind { return r }
+	}
+	return -1
+}
+
+// relocFieldAddr returns the virtual address of the byte field a relocation patches
+// (the output section's Addr + the input section's merged offset + the reloc offset).
+func relocFieldAddr(obj @InputObject, lr @LayoutResult, rel InputReloc) uint {
+	var outIdx int = obj.Sections[rel.SecIndex].OutIndex
+	return lr.Sections[outIdx].Addr + obj.Sections[rel.SecIndex].OutOffset + rel.Offset
+}
+
+// relocPatchedInsn returns the 32-bit instruction word at a relocation's patched site,
+// read from the merged output section (i.e. after Relocate has run).
+func relocPatchedInsn(obj @InputObject, lr @LayoutResult, rel InputReloc) int {
+	var outIdx int = obj.Sections[rel.SecIndex].OutIndex
+	var off int = cast(int, obj.Sections[rel.SecIndex].OutOffset + rel.Offset)
+	var data @[]uint8 = lr.Sections[outIdx].Data
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var rd *[]readonly uint8 = data
+	return u32(rd, off)
+}
+
+// resolvedAddr looks name up in the resolved symbol table and returns its virtual
+// address (0, false if undefined or address-less).
+func resolvedAddr(t @SymbolTable, lr @LayoutResult, name *[]readonly char) (uint, bool) {
+	oo, ss, found := t.Lookup(name)
+	if !found { return cast(uint, 0), false }
+	return symbolAddr(t, lr, oo, ss)
+}
+
+// A Mach-O object referencing undefined externals (a BL to helper, an ADRP+ADD to
+// msg) links against a second Mach-O object that defines them: after Relocate, the
+// BL's imm26 must land on helper's address and the ADRP+ADD pair must reconstruct
+// msg's address.  This exercises the whole Mach-O read -> resolve -> layout -> relocate
+// path and the BRANCH26/PAGE21/PAGEOFF12 -> ELF-kind translations at once.
+func TestMachoCrossObjectRelocation() testing.TestResult {
+	// Object A: _start references undefined externals msg (data) and helper (text).
+	// SetGlobal declares them as undefined so the assembler emits relocations rather
+	// than erroring on an unresolved label.
+	var a @asm.Assembler = asm.New(8)
+	a.SetSection("text", -1)
+	a.DefineLabel("_start")
+	a.SetGlobal("_start")
+	a.SetGlobal("msg")
+	a.SetGlobal("helper")
+	aarch64.Adrp(a, aarch64.X1, "msg")
+	aarch64.AddImmLabel(a, true, aarch64.X1, aarch64.X1, "msg")
+	aarch64.Bl(a, "helper")
+	aarch64.Ret(a)
+	objA, ea := readMachoObj(a, "/tmp/binate_macho_link_a.o")
+	if len(ea) != 0 { return fail(ea) }
+
+	// Object B defines helper (text) and msg (data).
+	var b @asm.Assembler = asm.New(8)
+	b.SetSection("text", -1)
+	b.DefineLabel("helper")
+	b.SetGlobal("helper")
+	aarch64.Ret(b)
+	b.SetSection("data", -1)
+	b.DefineLabel("msg")
+	b.SetGlobal("msg")
+	b.EmitAsciz("hi")
+	objB, eb := readMachoObj(b, "/tmp/binate_macho_link_b.o")
+	if len(eb) != 0 { return fail(eb) }
+
+	var objs @[]@InputObject = make_slice(@InputObject, 2)
+	objs[0] = objA
+	objs[1] = objB
+	t, rerr := Resolve(objs)
+	if len(rerr) != 0 { return fail("cross-object resolve failed") }
+	var lr @LayoutResult = Layout(objs, cast(uint, 0x400000))
+	if len(Relocate(t, lr)) != 0 { return fail("relocate failed") }
+
+	var helperAddr uint
+	var msgAddr uint
+	var haveHelper bool
+	var haveMsg bool
+	helperAddr, haveHelper = resolvedAddr(t, lr, "helper")
+	msgAddr, haveMsg = resolvedAddr(t, lr, "msg")
+	if !haveHelper { return fail("helper did not resolve to an address") }
+	if !haveMsg { return fail("msg did not resolve to an address") }
+
+	// BL helper: decode the patched imm26 and check where it lands.
+	var bi int = findRelocByKind(objA, R_AARCH64_CALL26)
+	if bi < 0 { return fail("no CALL26 relocation for the BL") }
+	var blAddr uint = relocFieldAddr(objA, lr, objA.Relocs[bi])
+	var blInsn int = relocPatchedInsn(objA, lr, objA.Relocs[bi])
+	var imm26 int = blInsn & 0x3ffffff
+	if imm26 >= 0x2000000 { imm26 = imm26 - 0x4000000 } // sign-extend the 26-bit field
+	var landing uint = cast(uint, cast(int, blAddr) + imm26 * 4)
+	if landing != helperAddr { return fail("Mach-O BL would not land on helper") }
+
+	// ADRP+ADD msg: reconstruct the address the pair computes.
+	var pi int = findRelocByKind(objA, R_AARCH64_ADR_PREL_PG_HI21)
+	var ai int = findRelocByKind(objA, R_AARCH64_ADD_ABS_LO12_NC)
+	if pi < 0 || ai < 0 { return fail("missing ADRP/ADD relocations for msg") }
+	var adrpAddr uint = relocFieldAddr(objA, lr, objA.Relocs[pi])
+	var adrpInsn int = relocPatchedInsn(objA, lr, objA.Relocs[pi])
+	var immlo int = (adrpInsn >> 29) & 0x3
+	var immhi int = (adrpInsn >> 5) & 0x7ffff
+	var page21 int = (immhi << 2) | immlo
+	if page21 >= 0x100000 { page21 = page21 - 0x200000 } // sign-extend the 21-bit field
+	var addInsn int = relocPatchedInsn(objA, lr, objA.Relocs[ai])
+	var imm12 int = (addInsn >> 10) & 0xfff
+	var reconstructed int = (cast(int, adrpAddr) & (0 - 0x1000)) + page21 * 0x1000 + imm12
+	if reconstructed != cast(int, msgAddr) { return fail("Mach-O ADRP+ADD would not reach msg") }
+	return ""
+}
+
+// The public Link API must accept a Mach-O object (classified by its magic) and drive
+// it through the whole pipeline to a loadable executable.  The output container is
+// still ELF (the Mach-O executable writer is a later round), so a Mach-O arm64 input
+// is relinked into a loadable arm64 ELF whose entry is the resolved _start address.
+func TestLinkMachoObject() testing.TestResult {
+	var a @asm.Assembler = asm.New(8)
+	a.SetSection("text", -1)
+	a.DefineLabel("_start")
+	a.SetGlobal("_start")
+	aarch64.Ret(a)
+	// Write it as Mach-O, then hand the path to Link (which classifies by magic).
+	aarch64.ResolveFixups(a)
+	a.Finalize()
+	if a.HasError { return fail("assembler error") }
+	if !macho.WriteARM64(a, "/tmp/binate_link_macho_prog.o") {
+		return fail("failed to write Mach-O object")
+	}
+
+	var paths @[]@[]char = make_slice(@[]char, 1)
+	paths[0] = buf.CopyStr("/tmp/binate_link_macho_prog.o")
+	var err @[]readonly char = Link(paths, "_start", EM_AARCH64, cast(uint, 0x400000),
+			"/tmp/binate_link_macho_prog")
+	if len(err) != 0 { return fail("linking a Mach-O object failed") }
+
+	data, ok := readFile("/tmp/binate_link_macho_prog")
+	if !ok { return fail("cannot read the linked executable") }
+	// _start is at the start of .text, which Layout places at the base.
+	var problem @[]char = checkLoadable(data, EM_AARCH64, 0x400000)
+	if len(problem) != 0 { return problem }
+	return ""
+}

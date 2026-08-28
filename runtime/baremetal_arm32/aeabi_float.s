@@ -229,3 +229,47 @@ __aeabi_fcmpge:
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpUn
 __aeabi_fcmpun:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpUn
+
+// ============================================================
+// Float -> int conversion group — single-symbol libgcc members _arm_fixsfsi.o
+// (f2iz), _arm_fixunssfsi.o (f2uiz), _fixsfdi.o (f2lz), _fixunssfdi.o (f2ulz),
+// _arm_fixunsdfsi.o (d2uiz), _fixdfdi.o (d2lz), _fixunsdfdi.o (d2ulz).  (d2iz's
+// _arm_fixdfsi.o is already shimmed above.)  A double arg is in r0:r1, a float
+// in r0; a 32-bit result in r0, a 64-bit result in r0:r1 — all match the
+// F{64,32}To{I,U}{32,64} signatures, so each shim is a bare tail-call.  The
+// compiler guards saturation/Inf/NaN before the call (emitGuardedFloatToInt).
+// ============================================================
+	.global __aeabi_d2uiz
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToU32
+__aeabi_d2uiz:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToU32
+
+	.global __aeabi_d2lz
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToI64
+__aeabi_d2lz:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToI64
+
+	.global __aeabi_d2ulz
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToU64
+__aeabi_d2ulz:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToU64
+
+	.global __aeabi_f2iz
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToI32
+__aeabi_f2iz:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToI32
+
+	.global __aeabi_f2uiz
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToU32
+__aeabi_f2uiz:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToU32
+
+	.global __aeabi_f2lz
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToI64
+__aeabi_f2lz:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToI64
+
+	.global __aeabi_f2ulz
+	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToU64
+__aeabi_f2ulz:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToU64

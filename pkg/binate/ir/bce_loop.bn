@@ -1,0 +1,195 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/stdx/slices"
+
+// Loop bounds-check elimination — remove OP_BOUNDS_CHECK(P, len) for an
+// induction-variable access in a counted loop, now that mem2reg (Phase 2a) makes
+// the induction variable an SSA loop-header phi and load-forwarding (Phase 2b)
+// coalesces a slice's length loads.  Runs in RunOptPasses at -O1+, after those.
+// Design + soundness argument: explorations/plan-loop-bce-phase3.md (reviewed
+// DESIGN SOUND).
+//
+// The check guards `0 <= idx < len` on a SIGNED index; it is eliminable only
+// when all three obligations are independently proven for the canonical
+// ascending unit-stride loop `for i := 0; i < L; i++ { … a[i] … }`:
+//   - idx IS the loop-header phi P;
+//   - lower bound P >= 0: the init entry is a const >= 0 and the step is P + 1
+//     (monotonic non-decreasing from a non-negative start);
+//   - no overflow: unit stride, so P runs to exactly L-1 and the guard stops it;
+//   - upper bound P < len: the header's guard is `OP_LT(P, L)` and the check's
+//     block is dominated by the guard's true target, and L is provably <= len.
+// Every case not matched is KEPT (still faults when the program should).
+
+// bceLoop runs loop-BCE over every non-extern func.
+func bceLoop(m @Module) {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @Func = m.Funcs[fi]
+		if f.IsExtern {
+			continue
+		}
+		bceLoopFunc(f)
+	}
+}
+
+// bceLoopFunc removes the eliminable induction-variable bounds checks in f.
+func bceLoopFunc(f @Func) {
+	if len(f.Blocks) == 0 {
+		return
+	}
+	var d @DomInfo = ComputeDom(f)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		bceLoopBlock(f, d, bi)
+	}
+}
+
+// bceLoopBlock drops the eliminable OP_BOUNDS_CHECKs from one block (the
+// bceBlock rebuild pattern: only reassign blk.Instrs when something is
+// removable; dropped checks stay owned by InstrsVec).
+func bceLoopBlock(f @Func, d @DomInfo, bi int) {
+	var blk @Block = f.Blocks[bi]
+	var anyRemovable bool = false
+	for ii := 0; ii < len(blk.Instrs); ii++ {
+		var instr @Instr = blk.Instrs[ii]
+		if instr.Op == iropcode.OP_BOUNDS_CHECK && loopBCEEliminable(f, d, bi, instr) {
+			anyRemovable = true
+		}
+	}
+	if !anyRemovable {
+		return
+	}
+	var kept @[]@Instr
+	for ii := 0; ii < len(blk.Instrs); ii++ {
+		var instr @Instr = blk.Instrs[ii]
+		if instr.Op == iropcode.OP_BOUNDS_CHECK && loopBCEEliminable(f, d, bi, instr) {
+			continue
+		}
+		kept = slices.Append[@Instr](kept, instr)
+	}
+	blk.Instrs = kept
+}
+
+// loopBCEEliminable reports whether the bounds check in block `checkBi` proves
+// all three obligations for its index and length.  Pure (no mutation).
+func loopBCEEliminable(f @Func, d @DomInfo, checkBi int, check @Instr) bool {
+	if len(check.Args) < 2 {
+		return false
+	}
+	var idx @Instr = check.Args[0]
+	var lenv @Instr = check.Args[1]
+
+	// idx must be a 2-entry loop-header phi P.
+	if idx == nil || idx.Op != iropcode.OP_PHI || len(idx.Phis) != 2 {
+		return false
+	}
+	var pBlk int = instrBlockIndex(f, idx)
+	if pBlk < 0 {
+		return false
+	}
+
+	// Classify the phi entries: the latch (back-edge) block is dominated by P's
+	// block H; the init (preheader) block is not.  Exactly one of each.
+	var e0 int = blockIndexIn(f, idx.Phis[0].Block)
+	var e1 int = blockIndexIn(f, idx.Phis[1].Block)
+	if e0 < 0 || e1 < 0 {
+		return false
+	}
+	var dom0 bool = d.Dominates(pBlk, e0)
+	var dom1 bool = d.Dominates(pBlk, e1)
+	var initVal @Instr
+	var stepVal @Instr
+	if dom1 && !dom0 {
+		initVal = idx.Phis[0].Val
+		stepVal = idx.Phis[1].Val
+	} else if dom0 && !dom1 {
+		initVal = idx.Phis[1].Val
+		stepVal = idx.Phis[0].Val
+	} else {
+		return false // not a simple reducible counted loop
+	}
+
+	// Lower bound: init is a constant >= 0.
+	if initVal == nil || initVal.Op != iropcode.OP_CONST_INT || initVal.IntVal < 0 {
+		return false
+	}
+	// No overflow: unit stride, step = P + 1 (either operand order).
+	if !isUnitStep(stepVal, idx) {
+		return false
+	}
+
+	// Upper bound: P's block ends with OP_BRANCH(cond, T, F), cond = OP_LT(P, L),
+	// and the check's block is dominated by the true target T.
+	var term @Instr = terminatorOf(f.Blocks[pBlk])
+	if term == nil || term.Op != iropcode.OP_BRANCH || len(term.Args) < 1 {
+		return false
+	}
+	var cond @Instr = term.Args[0]
+	if cond == nil || cond.Op != iropcode.OP_LT || len(cond.Args) < 2 || cond.Args[0] != idx {
+		return false
+	}
+	var l @Instr = cond.Args[1]
+	var tBlk int = blockIndexIn(f, term.Block1) // true target
+	if tBlk < 0 || !d.Dominates(tBlk, checkBi) {
+		return false
+	}
+
+	// L provably <= len, so P < L <= len.
+	return lengthProvablyLE(l, lenv)
+}
+
+// isUnitStep reports whether step is `p + 1` (either operand order).
+func isUnitStep(step @Instr, p @Instr) bool {
+	if step == nil || step.Op != iropcode.OP_ADD || len(step.Args) < 2 {
+		return false
+	}
+	if step.Args[0] == p && isConstOne(step.Args[1]) {
+		return true
+	}
+	if step.Args[1] == p && isConstOne(step.Args[0]) {
+		return true
+	}
+	return false
+}
+
+// isConstOne reports whether v is the integer constant 1.
+func isConstOne(v @Instr) bool {
+	return v != nil && v.Op == iropcode.OP_CONST_INT && v.IntVal == 1
+}
+
+// lengthProvablyLE reports whether the guard bound `l` is provably <= the
+// bounds-check length `lenv` — the crux of soundness (rejecting `i < n` where n
+// is not the collection length).  Sound cases: the same SSA value; two integer
+// constants with l <= lenv (an array length, or a literal bound <= the array
+// length); or the same slice length — a slice's `len` is `OP_EXTRACT(slice, 1)`
+// (field 1 of the header), so both being that extract of the SSA-identical slice
+// value (coalesced by load-forwarding) means l == len, hence l <= len.
+func lengthProvablyLE(l @Instr, lenv @Instr) bool {
+	if l == nil || lenv == nil {
+		return false
+	}
+	if l == lenv {
+		return true
+	}
+	if l.Op == iropcode.OP_CONST_INT && lenv.Op == iropcode.OP_CONST_INT {
+		return l.IntVal <= lenv.IntVal
+	}
+	// Same slice's length: EmitSliceLen(s) == OP_EXTRACT(s, 1).
+	if l.Op == iropcode.OP_EXTRACT && lenv.Op == iropcode.OP_EXTRACT && l.Index == 1 &&
+			lenv.Index == 1 && len(l.Args) >= 1 && len(lenv.Args) >= 1 && l.Args[0] == lenv.Args[0] {
+		return true
+	}
+	return false
+}
+
+// instrBlockIndex returns the index of the block containing instr, or -1.
+func instrBlockIndex(f @Func, instr @Instr) int {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			if blk.Instrs[ii] == instr {
+				return bi
+			}
+		}
+	}
+	return -1
+}

@@ -1,0 +1,160 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// The per-alloca SSA-construction core of scalar promotion (mem2reg.bn):
+// phi placement via the iterated dominance frontier and the dominator-tree
+// rename walk that computes reaching definitions.  See mem2reg.bn for the
+// orchestration and the one IR mutation phase.
+
+// m2rResult is one alloca's analysis: the phis to place (per block, nil where
+// none), the load-id -> reaching-value rewrites for loads that forward directly,
+// and the loads that instead need a grounding cast (their reaching value's type
+// differs observably from the load's), or ok=false if the alloca cannot be
+// cleanly promoted (a load / phi-operand with no reaching def).
+type m2rResult struct {
+	ok         bool
+	phiOfBlock @[]@Instr
+	replIDs    @[]int
+	replVals   @[]@Instr
+	// Parallel: a load whose reaching value must be grounded to the load's type
+	// (groundVals[i] is that reaching value).  A load reinterprets memory AS its
+	// type, so forwarding a reaching value of a LOOSER type (e.g. an untyped-int
+	// const/expr with Signed=false into a signed int slot) would change the
+	// signedness a downstream compare/div/shift/int->float reads off the operand
+	// type.  Such a load is rewritten in place into an OP_CAST to its own type.
+	groundLoads @[]@Instr
+	groundVals  @[]@Instr
+}
+
+// analyzeAlloca creates the phis for alloca a (via IteratedDF over defBlocks)
+// and renames — computing each load's reaching value and each phi's operands —
+// without mutating the IR.  Returns ok=false (and leaves the IR untouched) if
+// any load or phi-operand has no reaching def (a store-less path); the not-yet-
+// inserted phis are simply discarded.
+func analyzeAlloca(f @Func, d @DomInfo, domChildren @[]@[]int, n int, a @Instr,
+		defBlocks @[]int) @m2rResult {
+	var res @m2rResult = make(m2rResult)
+	res.ok = false
+	// Create one phi per iterated-dominance-frontier block (not inserted yet).
+	var phiOfBlock @[]@Instr
+	for b := 0; b < n; b++ {
+		var none @Instr
+		phiOfBlock = slices.Append[@Instr](phiOfBlock, none)
+	}
+	var phiBlocks @[]int = d.IteratedDF(defBlocks)
+	for k := 0; k < len(phiBlocks); k++ {
+		var b int = phiBlocks[k]
+		phiOfBlock[b] = newInstr(f, iropcode.OP_PHI, a.TypeArg)
+	}
+
+	var replIDs @[]int
+	var replVals @[]@Instr
+	var groundLoads @[]@Instr
+	var groundVals @[]@Instr
+
+	// Dominator-tree preorder walk, carrying the current reaching def.  Each
+	// block is pushed once, with its immediate dominator's exit value, so no
+	// save/restore is needed.
+	var stackB @[]int
+	var stackV @[]@Instr
+	stackB = slices.Append[int](stackB, 0)
+	var entryNil @Instr
+	stackV = slices.Append[@Instr](stackV, entryNil)
+	for len(stackB) > 0 {
+		var b int = stackB[len(stackB) - 1]
+		var curVal @Instr = stackV[len(stackV) - 1]
+		stackB = popInt(stackB)
+		stackV = stackV[0:len(stackV) - 1]
+
+		if phiOfBlock[b] != nil {
+			curVal = phiOfBlock[b]
+		}
+		var blk @Block = f.Blocks[b]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 2 && instr.Args[0] == a {
+				curVal = instr.Args[1]
+			} else if instr.Op == iropcode.OP_LOAD && len(instr.Args) >= 1 && instr.Args[0] == a {
+				if curVal == nil {
+					return res // load with no reaching def — abort promotion
+				}
+				if needsGrounding(curVal, instr.Typ) {
+					groundLoads = slices.Append[@Instr](groundLoads, instr)
+					groundVals = slices.Append[@Instr](groundVals, curVal)
+				} else {
+					replIDs = slices.Append[int](replIDs, instr.ID)
+					replVals = slices.Append[@Instr](replVals, curVal)
+				}
+			}
+		}
+		// Fill each successor phi's operand for the edge b -> s.
+		for si := 0; si < len(d.Succs[b]); si++ {
+			var s int = d.Succs[b][si]
+			if phiOfBlock[s] == nil {
+				continue
+			}
+			if curVal == nil {
+				return res // phi operand with no reaching def — abort promotion
+			}
+			var pe PhiEntry
+			pe.Block = f.Blocks[b]
+			pe.Val = curVal
+			phiOfBlock[s].Phis = slices.Append[PhiEntry](phiOfBlock[s].Phis, pe)
+		}
+		// Descend into dominator-tree children with this block's exit value.
+		for ci := 0; ci < len(domChildren[b]); ci++ {
+			stackB = slices.Append[int](stackB, domChildren[b][ci])
+			stackV = slices.Append[@Instr](stackV, curVal)
+		}
+	}
+
+	res.ok = true
+	res.phiOfBlock = phiOfBlock
+	res.replIDs = replIDs
+	res.replVals = replVals
+	res.groundLoads = groundLoads
+	res.groundVals = groundVals
+	return res
+}
+
+// needsGrounding reports whether forwarding v in place of a load of type
+// targetTyp would change an observable scalar property (kind / signedness /
+// width) that a backend reads off the operand type.  A load re-establishes the
+// slot type, so a reaching value of a looser type (the untyped-int Signed=false
+// case) must be grounded to targetTyp rather than forwarded raw.  Grounding is
+// always correct; this predicate only avoids an unnecessary cast when the types
+// already agree (e.g. a phi, whose type is already the slot type).
+func needsGrounding(v @Instr, targetTyp @types.Type) bool {
+	if v == nil {
+		return false
+	}
+	var vt @types.Type = peelToRepr(v.Typ)
+	var tt @types.Type = peelToRepr(targetTyp)
+	if vt == nil || tt == nil {
+		return false
+	}
+	return vt.Kind != tt.Kind || vt.Signed != tt.Signed || vt.Width != tt.Width
+}
+
+// buildDomChildren returns the dominator-tree children of each block (blocks
+// whose immediate dominator is that block), for the rename descent.
+func buildDomChildren(d @DomInfo) @[]@[]int {
+	var out @[]@[]int
+	for i := 0; i < d.NumBlocks; i++ {
+		var empty @[]int
+		out = slices.Append[@[]int](out, empty)
+	}
+	for c := 1; c < d.NumBlocks; c++ {
+		if d.PostNum[c] < 0 {
+			continue // unreachable (pruned before this in promoteFuncScalars)
+		}
+		var p int = d.Idom[c]
+		if p >= 0 && p != c {
+			out[p] = slices.Append[int](out[p], c)
+		}
+	}
+	return out
+}

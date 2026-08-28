@@ -1,0 +1,471 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Non-managed scalar SSA promotion (mem2reg) — the first OP_PHI producer.
+//
+// Promotes function-local non-managed scalar memory slots (an OP_ALLOC of
+// int / bool / raw-pointer whose address never escapes) to SSA values +
+// OP_PHI, so their loads/stores vanish and the value flows directly.  The
+// phis are consumed downstream by the LLVM backend (natively) and, for the
+// VM + native backends, by ir.EliminatePhis (which destructs them to copies).
+// Design: explorations/plan-mem2reg-phase2a.md.
+//
+// Scoping to non-managed scalars sidesteps the whole refcount-hazard family
+// AND the fault-pad hazard (pads only touch managed locals).  The promotable
+// type set is EXACTLY what EliminatePhis' assertScalarPhi accepts, since we
+// emit the phis it lowers.
+
+// promoteScalars runs scalar SSA promotion over every non-extern func in the
+// module.  Invoked by RunOptPasses at -O1+.
+func promoteScalars(m @Module) {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @Func = m.Funcs[fi]
+		if f.IsExtern {
+			continue
+		}
+		promoteFuncScalars(f)
+	}
+}
+
+// promoteFuncScalars promotes all eligible scalar slots in one function.
+func promoteFuncScalars(f @Func) {
+	if len(f.Blocks) == 0 {
+		return
+	}
+	// Prune unreachable blocks first: gen leaves benign orphan blocks (an
+	// if.merge / switch.exit whose arms all terminate) that still branch into
+	// their continuation.  If that continuation becomes a phi-block, the phi —
+	// filled only from reachable predecessors — would have fewer entries than
+	// the LLVM backend's CFG predecessor count (it emits every block), which
+	// the LLVM verifier rejects.  Removing the whole unreachable set dangles no
+	// kept terminator (no reachable block targets an unreachable one), so it is
+	// a sound precondition that also drops the offending orphan->merge edges.
+	pruneUnreachableBlocks(f)
+
+	var d @DomInfo = ComputeDom(f)
+	var n int = d.NumBlocks
+	var domChildren @[]@[]int = buildDomChildren(d)
+
+	// Global accumulators, applied in one mutation phase after all analysis so
+	// the CFG (blocks + terminators — untouched by promotion) stays stable and
+	// every alloca is analyzed against the original IR.
+	var gPhi @[]@Instr
+	var gPhiBlock @[]int
+	var gReplID @[]int
+	var gReplVal @[]@Instr
+	var gGroundLoad @[]@Instr
+	var gGroundVal @[]@Instr
+	var gDeletedAlloca @[]int
+	var promotedAny bool = false
+
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if !isPromotableAlloca(instr) {
+				continue
+			}
+			if allocaEscapes(f, instr) {
+				continue
+			}
+			var defBlocks @[]int = allocaDefBlocks(f, instr)
+			var res @m2rResult = analyzeAlloca(f, d, domChildren, n, instr, defBlocks)
+			if !res.ok {
+				continue
+			}
+			// Merge this alloca's promotion into the global accumulators.
+			for b := 0; b < n; b++ {
+				if res.phiOfBlock[b] != nil {
+					gPhi = slices.Append[@Instr](gPhi, res.phiOfBlock[b])
+					gPhiBlock = slices.Append[int](gPhiBlock, b)
+				}
+			}
+			for k := 0; k < len(res.replIDs); k++ {
+				gReplID = slices.Append[int](gReplID, res.replIDs[k])
+				gReplVal = slices.Append[@Instr](gReplVal, res.replVals[k])
+			}
+			for k := 0; k < len(res.groundLoads); k++ {
+				gGroundLoad = slices.Append[@Instr](gGroundLoad, res.groundLoads[k])
+				gGroundVal = slices.Append[@Instr](gGroundVal, res.groundVals[k])
+			}
+			gDeletedAlloca = slices.Append[int](gDeletedAlloca, instr.ID)
+			promotedAny = true
+		}
+	}
+
+	if !promotedAny {
+		return
+	}
+
+	applyPromotion(f, n, gPhi, gPhiBlock, gReplID, gReplVal, gGroundLoad, gGroundVal, gDeletedAlloca)
+	assertPromotion(f, d, gPhi, gPhiBlock)
+}
+
+// isPromotableAlloca reports whether instr is an OP_ALLOC of a non-managed
+// scalar type EliminatePhis can lower a phi of: int (<= target word), bool, or
+// a raw pointer.  Float / managed / aggregate slots are excluded.
+func isPromotableAlloca(instr @Instr) bool {
+	if instr.Op != iropcode.OP_ALLOC {
+		return false
+	}
+	var t @types.Type = peelToRepr(instr.TypeArg)
+	if t == nil {
+		return false
+	}
+	if t.Kind == types.TYP_INT {
+		return t.Width <= types.TypInt().Width
+	}
+	if t.Kind == types.TYP_BOOL {
+		return true
+	}
+	if t.Kind == types.TYP_POINTER {
+		return true
+	}
+	return false
+}
+
+// allocaEscapes reports whether the alloca's result is used as anything other
+// than the address (Args[0]) of a plain OP_LOAD / OP_STORE.  Over-broad by
+// design: ANY other appearance — as a store's value (Args[1]), any operand of
+// any other op, a phi entry, or ANY appearance inside FaultPads — pins the slot
+// unpromotable.  A scalar slot never legitimately appears in a pad; treating
+// any pad appearance as escape is a belt-and-suspenders that essentially never
+// fires.
+func allocaEscapes(f @Func, a @Instr) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		if blockUsesAllocaNonLoadStore(f.Blocks[bi], a) {
+			return true
+		}
+	}
+	for pi := 0; pi < len(f.FaultPads); pi++ {
+		if blockReferencesAlloca(f.FaultPads[pi], a) {
+			return true
+		}
+	}
+	return false
+}
+
+// blockUsesAllocaNonLoadStore reports whether any instr in b references a as an
+// operand in a way that is NOT the Args[0] pointer of a plain load/store.
+func blockUsesAllocaNonLoadStore(b @Block, a @Instr) bool {
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var instr @Instr = b.Instrs[ii]
+		if instr == a {
+			continue // the alloca definition itself is not a use
+		}
+		for k := 0; k < len(instr.Args); k++ {
+			if instr.Args[k] != a {
+				continue
+			}
+			var okLoad bool = instr.Op == iropcode.OP_LOAD && k == 0
+			var okStore bool = instr.Op == iropcode.OP_STORE && k == 0
+			if !okLoad && !okStore {
+				return true
+			}
+		}
+		for k := 0; k < len(instr.Phis); k++ {
+			if instr.Phis[k].Val == a {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// blockReferencesAlloca reports whether any instr in b references a at all (any
+// arg or phi entry) — used to treat ANY FaultPad appearance as an escape.
+func blockReferencesAlloca(b @Block, a @Instr) bool {
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var instr @Instr = b.Instrs[ii]
+		for k := 0; k < len(instr.Args); k++ {
+			if instr.Args[k] == a {
+				return true
+			}
+		}
+		for k := 0; k < len(instr.Phis); k++ {
+			if instr.Phis[k].Val == a {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// allocaDefBlocks returns the deduped block indices containing a store to a.
+func allocaDefBlocks(f @Func, a @Instr) @[]int {
+	var out @[]int
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		var found bool = false
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 1 && instr.Args[0] == a {
+				found = true
+			}
+		}
+		if found {
+			out = slices.Append[int](out, bi)
+		}
+	}
+	return out
+}
+
+// applyPromotion performs the single IR mutation phase: insert the phis at
+// block heads, delete the promoted loads/stores/allocas, and rewrite every
+// remaining use of a promoted load to its reaching value.
+func applyPromotion(f @Func, n int, gPhi @[]@Instr, gPhiBlock @[]int, gReplID @[]int,
+		gReplVal @[]@Instr, gGroundLoad @[]@Instr, gGroundVal @[]@Instr, gDeletedAlloca @[]int) {
+	var cap int = f.NextID
+	// Ground loads whose reaching value has a looser type: rewrite the load IN
+	// PLACE into an OP_CAST to the load's own type, reading the reaching value.
+	// Keeps the load's id (consumers are untouched) and its type (so a downstream
+	// signedness-sensitive op still reads the slot type), and — being an OP_CAST,
+	// not an OP_LOAD of the deleted alloca — it survives the rebuild below.  Its
+	// operand is chased by rewriteUsesInBlocks if the reaching value is itself a
+	// forwarded load.  Done before the delete/rebuild so instrIsDeleted sees a cast.
+	for i := 0; i < len(gGroundLoad); i++ {
+		var ld @Instr = gGroundLoad[i]
+		ld.Op = iropcode.OP_CAST
+		ld.Args = makeArgs1(gGroundVal[i])
+		ld.TypeArg = ld.Typ
+	}
+	// load-id -> reaching value (nil = not a promoted load).
+	var replByID @[]@Instr
+	for i := 0; i < cap; i++ {
+		var none @Instr
+		replByID = slices.Append[@Instr](replByID, none)
+	}
+	for i := 0; i < len(gReplID); i++ {
+		replByID[gReplID[i]] = gReplVal[i]
+	}
+	// alloca-id -> deleted?  A load/store is deleted iff its Args[0] is one.
+	var allocaDeleted @[]bool
+	for i := 0; i < cap; i++ {
+		allocaDeleted = slices.Append[bool](allocaDeleted, false)
+	}
+	for i := 0; i < len(gDeletedAlloca); i++ {
+		allocaDeleted[gDeletedAlloca[i]] = true
+	}
+	// block-index -> phis to prepend.
+	var phisForBlock @[]@[]@Instr
+	for i := 0; i < n; i++ {
+		var empty @[]@Instr
+		phisForBlock = slices.Append[@[]@Instr](phisForBlock, empty)
+	}
+	for i := 0; i < len(gPhi); i++ {
+		phisForBlock[gPhiBlock[i]] = slices.Append[@Instr](phisForBlock[gPhiBlock[i]], gPhi[i])
+	}
+
+	// Rebuild each block: prepend its phis, drop deleted alloca/load/store.
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		var kept @[]@Instr
+		for pi := 0; pi < len(phisForBlock[bi]); pi++ {
+			kept = slices.Append[@Instr](kept, phisForBlock[bi][pi])
+		}
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if instrIsDeleted(instr, allocaDeleted, cap) {
+				continue
+			}
+			kept = slices.Append[@Instr](kept, instr)
+		}
+		blk.Instrs = kept
+	}
+
+	// Rewrite uses: every remaining operand referencing a promoted load becomes
+	// its reaching value (chased transitively for `var x = y` chains).
+	rewriteUsesInBlocks(f.Blocks, replByID, cap)
+	rewriteUsesInBlocks(f.FaultPads, replByID, cap)
+
+	// Fail loud if anything still references a promoted (deleted) alloca or a
+	// forwarded (deleted) load — that would mean the escape analysis
+	// under-approximated, i.e. a real miscompile, which must never ship silently.
+	assertNoSurvivingUses(f.Blocks, replByID, allocaDeleted, cap)
+	assertNoSurvivingUses(f.FaultPads, replByID, allocaDeleted, cap)
+}
+
+// assertNoSurvivingUses panics if any operand across `blocks` still references a
+// deleted alloca (allocaDeleted) or a forwarded load (replByID != nil) — every
+// such reference should have been rewritten away.
+func assertNoSurvivingUses(blocks @[]@Block, replByID @[]@Instr, allocaDeleted @[]bool, cap int) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			for k := 0; k < len(instr.Args); k++ {
+				checkNoSurvivingUse(instr.Args[k], replByID, allocaDeleted, cap)
+			}
+			for k := 0; k < len(instr.Phis); k++ {
+				checkNoSurvivingUse(instr.Phis[k].Val, replByID, allocaDeleted, cap)
+			}
+		}
+	}
+}
+
+// checkNoSurvivingUse panics if v is a deleted alloca or a forwarded load.
+func checkNoSurvivingUse(v @Instr, replByID @[]@Instr, allocaDeleted @[]bool, cap int) {
+	if v == nil || v.ID < 0 || v.ID >= cap {
+		return
+	}
+	if allocaDeleted[v.ID] {
+		panic(
+				"mem2reg: a promoted (deleted) alloca is still referenced — escape analysis under-approximat"
+						"ed")
+	}
+	if replByID[v.ID] != nil {
+		panic("mem2reg: a forwarded (deleted) load is still referenced after rewrite")
+	}
+}
+
+// instrIsDeleted reports whether instr is a promoted alloca, or a load/store
+// whose pointer operand is a promoted alloca.
+func instrIsDeleted(instr @Instr, allocaDeleted @[]bool, cap int) bool {
+	if instr.Op == iropcode.OP_ALLOC {
+		return instr.ID >= 0 && instr.ID < cap && allocaDeleted[instr.ID]
+	}
+	if instr.Op == iropcode.OP_LOAD || instr.Op == iropcode.OP_STORE {
+		if len(instr.Args) >= 1 {
+			var p @Instr = instr.Args[0]
+			return p != nil && p.ID >= 0 && p.ID < cap && allocaDeleted[p.ID]
+		}
+	}
+	return false
+}
+
+// rewriteUsesInBlocks replaces, in every instr of every block, each Args entry
+// and phi-entry Val that is a promoted load with its (chased) reaching value.
+func rewriteUsesInBlocks(blocks @[]@Block, replByID @[]@Instr, cap int) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			for k := 0; k < len(instr.Args); k++ {
+				instr.Args[k] = chaseRepl(instr.Args[k], replByID, cap)
+			}
+			for k := 0; k < len(instr.Phis); k++ {
+				instr.Phis[k].Val = chaseRepl(instr.Phis[k].Val, replByID, cap)
+			}
+		}
+	}
+}
+
+// chaseRepl follows the promoted-load -> reaching-value map transitively (the
+// reaching value of a promoted load can itself be a promoted load, e.g.
+// `var x = y`).  Terminates: reaching defs strictly dominate, so the chain is
+// acyclic and ends at a non-load (const / phi / other).
+func chaseRepl(v @Instr, replByID @[]@Instr, cap int) @Instr {
+	var cur @Instr = v
+	for cur != nil && cur.ID >= 0 && cur.ID < cap && replByID[cur.ID] != nil {
+		cur = replByID[cur.ID]
+	}
+	return cur
+}
+
+// assertPromotion fails loud if a placed phi is malformed: its entry set must be
+// exactly its block's CFG predecessors (one entry per predecessor, each a
+// distinct real predecessor — the orphan-phi class the reachable-block prune
+// prevents), and it must be a phi EliminatePhis can lower.  This is the first phi
+// producer, so a wrong-code phi here would poison every backend.  (The
+// no-surviving-use check lives in applyPromotion, which holds the id views.)
+func assertPromotion(f @Func, d @DomInfo, gPhi @[]@Instr, gPhiBlock @[]int) {
+	for i := 0; i < len(gPhi); i++ {
+		var phi @Instr = gPhi[i]
+		var b int = gPhiBlock[i]
+		if len(phi.Phis) != len(d.Preds[b]) {
+			panic("mem2reg: phi entry count disagrees with CFG predecessor count")
+		}
+		assertPhiEntriesArePreds(f, d, phi, b)
+		assertScalarPhi(phi)
+	}
+}
+
+// assertPhiEntriesArePreds panics unless every phi entry's Block is a distinct
+// real predecessor of block b — so a correct count can't hide a duplicated or
+// foreign predecessor edge.
+func assertPhiEntriesArePreds(f @Func, d @DomInfo, phi @Instr, b int) {
+	for i := 0; i < len(phi.Phis); i++ {
+		var pi int = blockIndexIn(f, phi.Phis[i].Block)
+		if pi < 0 || !intContains(d.Preds[b], pi) {
+			panic("mem2reg: phi entry block is not a predecessor")
+		}
+		for j := i + 1; j < len(phi.Phis); j++ {
+			if phi.Phis[j].Block == phi.Phis[i].Block {
+				panic("mem2reg: phi has a duplicate predecessor entry")
+			}
+		}
+	}
+}
+
+// intContains reports whether s contains v.
+func intContains(s @[]int, v int) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == v {
+			return true
+		}
+	}
+	return false
+}
+
+// pruneUnreachableBlocks removes blocks not reachable from the entry
+// (f.Blocks[0]).  Sound because no reachable block's terminator targets an
+// unreachable block, so removing the whole unreachable set dangles no kept
+// terminator.  FaultPads are off f.Blocks and untouched.
+func pruneUnreachableBlocks(f @Func) {
+	var n int = len(f.Blocks)
+	if n == 0 {
+		return
+	}
+	var reachable @[]bool
+	for i := 0; i < n; i++ {
+		reachable = slices.Append[bool](reachable, false)
+	}
+	var stack @[]int
+	reachable[0] = true
+	stack = slices.Append[int](stack, 0)
+	for len(stack) > 0 {
+		var b int = stack[len(stack) - 1]
+		stack = popInt(stack)
+		var blk @Block = f.Blocks[b]
+		var ni int = len(blk.Instrs)
+		if ni == 0 {
+			continue
+		}
+		var term @Instr = blk.Instrs[ni - 1]
+		stack = pushIfUnvisited(f, term.Block1, reachable, stack)
+		stack = pushIfUnvisited(f, term.Block2, reachable, stack)
+	}
+	var anyDead bool = false
+	for i := 0; i < n; i++ {
+		if !reachable[i] {
+			anyDead = true
+		}
+	}
+	if !anyDead {
+		return
+	}
+	var kept @[]@Block
+	for i := 0; i < n; i++ {
+		if reachable[i] {
+			kept = slices.Append[@Block](kept, f.Blocks[i])
+		}
+	}
+	f.Blocks = kept
+}
+
+// pushIfUnvisited marks succ reachable and pushes it if it is a real,
+// not-yet-visited block of f; returns the (possibly grown) stack.
+func pushIfUnvisited(f @Func, succ @Block, reachable @[]bool, stack @[]int) @[]int {
+	if succ == nil {
+		return stack
+	}
+	var si int = blockIndexIn(f, succ)
+	if si < 0 || reachable[si] {
+		return stack
+	}
+	reachable[si] = true
+	return slices.Append[int](stack, si)
+}

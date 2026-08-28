@@ -168,3 +168,71 @@ __aeabi_ldivmod:
 	subs    r2, r2, r4
 	sbc     r3, r3, r4
 	pop     {r4, r5, r6, pc}
+
+// ============================================================
+// __aeabi_uidivmod — unsigned 32/32 -> quotient r0, remainder r1.
+// Binary long division, in place: shift the {rem:num} pair left one bit per
+// step (bringing num's top bit into rem's LSB); whenever rem >= den, subtract
+// and set the just-vacated num LSB as the quotient bit.  After 32 steps num
+// holds the quotient and r2 the remainder.  The 32-bit ISA has no divide
+// instruction, so this open-codes it (the LLVM arm32 backend lowers `/` to
+// these calls; the native backend inlines divide and never calls them, but
+// they are provided for the LLVM path and for C interop).  Inputs arrive
+// pre-guarded against a zero divisor and INT32_MIN / -1 (the IR's
+// OP_DIV_CHECK), so a valid den is assumed.
+//   n = r0, d = r1 ; working: rem = r2, i = r3
+// ============================================================
+	.global __aeabi_uidivmod
+__aeabi_uidivmod:
+	mov     r2, #0              // rem = 0
+	mov     r3, #32             // bit counter
+uidivmod_loop:
+	adds    r0, r0, r0          // num <<= 1, C = old bit31
+	adc     r2, r2, r2          // rem = (rem<<1) | C
+	cmp     r2, r1              // rem vs den
+	subhs   r2, r2, r1          // rem >= den: rem -= den
+	orrhs   r0, r0, #1          //            and set quotient LSB
+	subs    r3, r3, #1
+	bne     uidivmod_loop
+	mov     r1, r2              // remainder -> r1 (quotient already in r0)
+	bx      lr
+
+// __aeabi_uidiv — unsigned 32/32 -> quotient r0.  Same as uidivmod but the
+// caller ignores the remainder, so tail-call it (clobbering r1 is allowed).
+	.global __aeabi_uidiv
+__aeabi_uidiv:
+	b       __aeabi_uidivmod
+
+// ============================================================
+// __aeabi_idivmod — signed 32/32 -> quotient r0, remainder r1.  Wrap the
+// unsigned core: quotient sign = sign(n) XOR sign(d); remainder sign = sign(n).
+// |x| via the two's-complement mask trick abs = (x ^ m) - m where
+// m = (x >>a 31).
+// ============================================================
+	.global __aeabi_idivmod
+__aeabi_idivmod:
+	push    {r4, r5, lr}
+	mov     r4, r0, asr #31     // r4 = sign_n mask
+	eor     r5, r0, r1
+	mov     r5, r5, asr #31     // r5 = sign_q mask
+	mov     r2, r1, asr #31     // r2 = sign_d mask
+	// |n| = (n ^ sign_n) - sign_n
+	eor     r0, r0, r4
+	sub     r0, r0, r4
+	// |d| = (d ^ sign_d) - sign_d
+	eor     r1, r1, r2
+	sub     r1, r1, r2
+	bl      __aeabi_uidivmod    // |n| / |d| -> q=r0, rem=r1 (preserves r4, r5)
+	// negate quotient if sign_q: q = (q ^ r5) - r5
+	eor     r0, r0, r5
+	sub     r0, r0, r5
+	// negate remainder if sign_n: rem = (rem ^ r4) - r4
+	eor     r1, r1, r4
+	sub     r1, r1, r4
+	pop     {r4, r5, pc}
+
+// __aeabi_idiv — signed 32/32 -> quotient r0.  Tail-call idivmod (the caller
+// ignores the remainder left in r1).
+	.global __aeabi_idiv
+__aeabi_idiv:
+	b       __aeabi_idivmod

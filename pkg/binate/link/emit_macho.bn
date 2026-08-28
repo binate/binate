@@ -1,0 +1,165 @@
+package "pkg/binate/link"
+
+// Static Mach-O executable writer.  It mirrors EmitElfExec's layout — the same
+// LayoutResult, the same two load groups (read-only/exec and read-write), the same
+// "lowest segment starts at file offset 0 so it maps the header" trick — but emits
+// Mach-O load commands instead of ELF program headers, and an LC_UNIXTHREAD that
+// sets the initial PC directly (no dyld, no libc _start: the kernel loads the
+// segments and jumps to the entry).  arm64 only for now.
+//
+// Layout: __PAGEZERO (vmaddr 0, no access, covering everything below the image),
+// then __TEXT (maps the mach header + load commands at file 0, plus the ro/exec
+// sections), then __DATA (if any writable/bss sections), then LC_UNIXTHREAD.  As in
+// the ELF writer the read-only/exec group is placed below the writable group by
+// Layout and the two never share a page, so no segment is both writable and
+// executable.  Code-signing (required to run on modern macOS) is a later step.
+
+// Mach-O executable constants (the object-file constants live in parse_macho.bn).
+const (
+	MACHO_MH_EXECUTE int = 2         // filetype: a demand-paged executable
+	MACHO_MH_NOUNDEFS int = 0x1      // header flag: no undefined symbols (static)
+	MACHO_LC_UNIXTHREAD int = 0x5    // load command: initial thread/register state
+	MACHO_ARM_THREAD_STATE64 int = 6 // thread-state flavor for arm64
+	// ARM_THREAD_STATE64 is 68 uint32s (x0..x28, fp, lr, sp, pc = 33 uint64, then
+	// cpsr + pad = 2 uint32); __pc sits at byte offset 256 within the state.
+	MACHO_ARM_THREAD_STATE64_COUNT int = 68
+	MACHO_ARM_THREAD_STATE64_PC_OFF int = 256
+	// VM protection bits for a segment's max/init protection.
+	MACHO_VM_PROT_READ int = 1
+	MACHO_VM_PROT_WRITE int = 2
+	MACHO_VM_PROT_EXECUTE int = 4
+)
+
+// putName16 writes name into out at off as a 16-byte, NUL-padded fixed field (a
+// Mach-O segname/sectname).  A name longer than 16 bytes is truncated; the tail is
+// left zero (out is zero-initialized).
+func putName16(out @[]uint8, off int, name *[]readonly char) {
+	var n int = len(name)
+	if n > 16 { n = 16 }
+	for i := 0; i < n; i++ { out[off + i] = cast(uint8, name[i]) }
+}
+
+// writeSeg64 writes a section-less segment_command_64 (72 bytes) at off.
+func writeSeg64(out @[]uint8, off int, name *[]readonly char, vmaddr uint, vmsize uint, fileoff int,
+		filesize int, maxprot int, initprot int) {
+	writeLE(out, off + 0, MACHO_LC_SEGMENT_64, 4)
+	writeLE(out, off + 4, 72, 4) // cmdsize (no section_64 records)
+	putName16(out, off + 8, name)
+	writeLE(out, off + 24, cast(int, vmaddr), 8)
+	writeLE(out, off + 32, cast(int, vmsize), 8)
+	writeLE(out, off + 40, fileoff, 8)
+	writeLE(out, off + 48, filesize, 8)
+	writeLE(out, off + 56, maxprot, 4)
+	writeLE(out, off + 60, initprot, 4)
+	writeLE(out, off + 64, 0, 4) // nsects
+	writeLE(out, off + 68, 0, 4) // flags
+}
+
+// machoUnixthreadSize is the byte size of the arm64 LC_UNIXTHREAD command:
+// cmd + cmdsize + flavor + count (16) plus the 68-uint32 thread state (272).
+const machoUnixthreadSize int = 16 + MACHO_ARM_THREAD_STATE64_COUNT * 4
+
+// EmitMachoExec writes a static Mach-O executable for the laid-out output sections
+// (from Layout), entering at `entry`.  Sections map via __TEXT (read-only/exec) and
+// __DATA (read-write), with __PAGEZERO reserving everything below the image.  The
+// lowest real segment (__TEXT) starts at file offset 0 so it maps the mach header +
+// load commands (a runtime, or codesign, that walks the header from the mapped image
+// would otherwise fault).  Section file offsets keep fileoff congruent to vmaddr
+// modulo the page size, so segments are loadable at a non-page-aligned base.  Returns
+// "" on success or a non-empty error.  arm64 only.
+func EmitMachoExec(sections @[]OutputSection, entry uint, machine int,
+		path *[]readonly char) @[]readonly char {
+	if len(sections) == 0 { return "no sections to emit" }
+	if machine != EM_AARCH64 { return "Mach-O executable writer supports arm64 only" }
+	var pagesize int = linkPageSize
+
+	// Segment protection is fixed (__TEXT = RX, __DATA = RW), so groupStats' per-section
+	// permission union is unused here.
+	roFound, _, roFileEnd, roMemEnd, _ := groupStats(sections, false)
+	rwFound, rwLo, rwFileEnd, rwMemEnd, _ := groupStats(sections, true)
+	// The entry lives in the read-only/exec group (.text); require it so __TEXT (which
+	// also maps the header) is the lowest real segment, matching the ELF writer.
+	if !roFound { return "no read-only/exec section to hold the entry point" }
+
+	// Command layout: __PAGEZERO + __TEXT (+ __DATA) + LC_UNIXTHREAD.
+	var nsegs int = 2 // __PAGEZERO + __TEXT
+	if rwFound { nsegs = nsegs + 1 }
+	var ncmds int = nsegs + 1
+	var sizeofcmds int = nsegs * 72 + machoUnixthreadSize
+	var hend int = 32 + sizeofcmds
+
+	// The image base is the lowest section (Layout assigns ascending addresses).  The
+	// header occupies the file/vm prefix [segStart, base); code/data begin at base,
+	// file offset dataStart.  base must be page-aligned (Layout's base is) so segStart
+	// and dataStart are too.
+	var base uint = sections[0].Addr
+	var dataStart int = alignUp(hend, pagesize) + cast(int, base % cast(uint, pagesize))
+	if base < cast(uint, dataStart) { return "load base too low to hold the Mach-O header" }
+	var segStart uint = base - cast(uint, dataStart)
+
+	// Overall ends and below-base guard (as in EmitElfExec).
+	var memEnd uint = base
+	if roMemEnd > memEnd { memEnd = roMemEnd }
+	if rwFound && rwMemEnd > memEnd { memEnd = rwMemEnd }
+	var fileEnd uint = base
+	if roFileEnd > fileEnd { fileEnd = roFileEnd }
+	if rwFound && rwFileEnd > fileEnd { fileEnd = rwFileEnd }
+	for i := 0; i < len(sections); i++ {
+		if sections[i].Addr < base { return "a section address is below the load base" }
+	}
+	if entry < base || entry >= memEnd { return "entry point is outside the loaded image" }
+
+	var totalFile int = dataStart + cast(int, fileEnd - base)
+	var out @[]uint8 = make_slice(uint8, totalFile)
+
+	// mach_header_64.
+	writeLE(out, 0, 0xfeedfacf, 4) // magic (MH_MAGIC_64)
+	writeLE(out, 4, MACHO_CPU_ARM64, 4) // cputype
+	writeLE(out, 8, 0, 4) // cpusubtype (ARM64_ALL)
+	writeLE(out, 12, MACHO_MH_EXECUTE, 4) // filetype
+	writeLE(out, 16, ncmds, 4)
+	writeLE(out, 20, sizeofcmds, 4)
+	writeLE(out, 24, MACHO_MH_NOUNDEFS, 4) // flags
+	writeLE(out, 28, 0, 4) // reserved
+
+	var rx int = MACHO_VM_PROT_READ | MACHO_VM_PROT_EXECUTE
+	var rw int = MACHO_VM_PROT_READ | MACHO_VM_PROT_WRITE
+
+	// __PAGEZERO: [0, segStart), no access.
+	var lc int = 32
+	writeSeg64(out, lc, "__PAGEZERO", cast(uint, 0), segStart, 0, 0, 0, 0)
+	lc = lc + 72
+
+	// __TEXT: maps file [0, textFile) to [segStart, ...) — the header prefix plus the
+	// ro/exec sections.  vmsize is page-rounded so __DATA can start on the next page.
+	var textFile int = dataStart + cast(int, roFileEnd - base)
+	var textVm int = alignUp(dataStart + cast(int, roMemEnd - base), pagesize)
+	writeSeg64(out, lc, "__TEXT", segStart, cast(uint, textVm), 0, textFile, rx, rx)
+	lc = lc + 72
+
+	// __DATA: the writable group at its own page-aligned vmaddr / congruent fileoff.
+	if rwFound {
+		var dataFileOff int = dataStart + cast(int, rwLo - base)
+		var dataVm int = alignUp(cast(int, rwMemEnd - rwLo), pagesize)
+		writeSeg64(out, lc, "__DATA", rwLo, cast(uint, dataVm), dataFileOff, cast(int, rwFileEnd - rwLo),
+				rw, rw)
+		lc = lc + 72
+	}
+
+	// LC_UNIXTHREAD: initial register state; only __pc is set (kernel jumps to it).
+	writeLE(out, lc + 0, MACHO_LC_UNIXTHREAD, 4)
+	writeLE(out, lc + 4, machoUnixthreadSize, 4)
+	writeLE(out, lc + 8, MACHO_ARM_THREAD_STATE64, 4) // flavor
+	writeLE(out, lc + 12, MACHO_ARM_THREAD_STATE64_COUNT, 4) // count
+	writeLE(out, lc + 16 + MACHO_ARM_THREAD_STATE64_PC_OFF, cast(int, entry), 8) // __pc
+
+	// Section data at dataStart + (Addr - base).
+	for i := 0; i < len(sections); i++ {
+		var d @[]uint8 = sections[i].Data
+		if len(d) == 0 { continue }
+		var fo int = dataStart + cast(int, sections[i].Addr - base)
+		for j := 0; j < len(d); j++ { out[fo + j] = d[j] }
+	}
+
+	return writeFile(path, out)
+}

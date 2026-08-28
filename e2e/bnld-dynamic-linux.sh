@@ -44,10 +44,43 @@ if ! "$BINATE_DIR/scripts/build-bnld.sh" -o "$BNLD" > "$TMP/build_bnld.log" 2>&1
     exit 1
 fi
 
-# ----- assemble + dynamically link exit42 (calls libc exit; no raw syscall) -----
-# `exit` is declared .global (undefined) so the assembler emits a call relocation
-# against it; bnld -dynamic turns that into a libc import.
-cat > "$TMP/exit42.s" <<'EOF'
+# ----- helper: assemble + dynamically link + structure-check a program -----
+# asm_link_dyn <name>: read a .s from stdin, assemble with bnas and link with
+# `bnld -dynamic` to $TMP/<name>, then check the output is an ELF naming the dynamic
+# linker + libc.so.6.  `exit`/`puts` are declared .global (undefined) so bnas emits
+# call relocations against them; bnld -dynamic turns those into libc imports.
+asm_link_dyn() {
+    _name="$1"
+    cat > "$TMP/$_name.s"
+    if ! "$BNAS" -target linux-aarch64 -o "$TMP/$_name.o" "$TMP/$_name.s" \
+            > "$TMP/$_name.asm.log" 2>&1; then
+        echo "FAIL: bnas could not assemble $_name" >&2
+        cat "$TMP/$_name.asm.log" >&2
+        exit 1
+    fi
+    if ! "$BNLD" -target linux-aarch64 -dynamic -o "$TMP/$_name" "$TMP/$_name.o" \
+            > "$TMP/$_name.link.log" 2>&1; then
+        echo "FAIL: bnld could not dynamically link $_name" >&2
+        cat "$TMP/$_name.link.log" >&2
+        exit 1
+    fi
+    _magic="$(od -An -tx1 -N4 "$TMP/$_name" | tr -d ' \n')"
+    if [ "$_magic" != "7f454c46" ]; then
+        echo "FAIL: $_name is not an ELF file (magic $_magic)" >&2
+        exit 1
+    fi
+    if ! grep -q "/lib/ld-linux-aarch64.so.1" "$TMP/$_name"; then
+        echo "FAIL: $_name has no PT_INTERP dynamic-linker path" >&2
+        exit 1
+    fi
+    if ! grep -q "libc.so.6" "$TMP/$_name"; then
+        echo "FAIL: $_name does not name libc.so.6 (DT_NEEDED)" >&2
+        exit 1
+    fi
+}
+
+# ----- exit42: _start does `mov x0,#42 ; bl exit` — one libc import (exit). -----
+asm_link_dyn exit42 <<'EOF'
 .arch aarch64
 .section text
 .global _start
@@ -56,37 +89,30 @@ _start:
 	mov x0, #42
 	bl exit
 EOF
-if ! "$BNAS" -target linux-aarch64 -o "$TMP/exit42.o" "$TMP/exit42.s" > "$TMP/asm.log" 2>&1; then
-    echo "FAIL: bnas could not assemble exit42" >&2
-    cat "$TMP/asm.log" >&2
-    exit 1
-fi
-if ! "$BNLD" -target linux-aarch64 -dynamic -o "$TMP/exit42_dyn" "$TMP/exit42.o" \
-        > "$TMP/link.log" 2>&1; then
-    echo "FAIL: bnld could not dynamically link exit42" >&2
-    cat "$TMP/link.log" >&2
-    exit 1
-fi
+echo "PASS: exit42 links to a dynamically-linked aarch64 ELF (interp + libc.so.6)"
 
-# ----- structure check (host-side, runtime-independent) -----
-# ELF magic.
-magic="$(dd if="$TMP/exit42_dyn" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')"
-if [ "$magic" != "7f454c46" ]; then
-    echo "FAIL: exit42_dyn is not an ELF file (magic $magic)" >&2
-    exit 1
-fi
-# The dynamic-linker path and the needed library must be present (PT_INTERP / DT_NEEDED).
-if ! grep -q "/lib/ld-linux-aarch64.so.1" "$TMP/exit42_dyn"; then
-    echo "FAIL: exit42_dyn has no PT_INTERP dynamic-linker path" >&2
-    exit 1
-fi
-if ! grep -q "libc.so.6" "$TMP/exit42_dyn"; then
-    echo "FAIL: exit42_dyn does not name libc.so.6 (DT_NEEDED)" >&2
-    exit 1
-fi
-echo "PASS: bnld -dynamic produced a dynamically-linked aarch64 ELF (interp + libc.so.6)"
+# ----- hello: pass a .rodata string (reached via ADRP+ADD, an internal relocation)
+#       to libc puts, then exit 0 — exercises TWO imports (puts + exit), a data
+#       argument, and stdio (which proves ld.so ran libc's init before _start). -----
+asm_link_dyn hello <<'EOF'
+.arch aarch64
+.section rodata
+msg:
+	.asciz "hello from bnld"
+.section text
+.global _start
+.global puts
+.global exit
+_start:
+	adrp x0, msg
+	add x0, x0, #:lo12:msg
+	bl puts
+	mov x0, #0
+	bl exit
+EOF
+echo "PASS: hello links to a dynamically-linked aarch64 ELF (imports puts + exit)"
 
-# ----- run it: natively where the host can, else via Docker/qemu -----
+# ----- run: natively where the host can, else via Docker/qemu -----
 # CI has no native aarch64 Linux runner (the e2e matrix is x86-64 Linux + arm64
 # macOS), so the arm64 binary is run under a glibc arm64 Docker image via qemu — but
 # ONLY on a Linux CI lane, so the run happens on exactly one CI platform and is not
@@ -113,34 +139,55 @@ else
     fi
 fi
 
-RAN=0
-CODE=0
-if [ "$CAN_RUN" = 1 ]; then
+# run_dyn <name>: run $TMP/<name>, setting RAN=1 with CODE=<exit> and OUT=<stdout> on
+# execution.  A Docker daemon (125) / mount (127) error leaves RAN=0 (infra, not a
+# linker result); a real 126 (not executable) counts.
+run_dyn() {
+    _name="$1"
+    RAN=0
+    CODE=0
+    OUT=""
+    [ "$CAN_RUN" = 1 ] || return
     if [ "$RUN_KIND" = native ]; then
-        "$TMP/exit42_dyn"
+        OUT="$("$TMP/$_name")"
         CODE=$?
         RAN=1
     else
-        docker run --rm --platform linux/arm64 -v "$TMP:/w" debian:stable-slim /w/exit42_dyn
+        OUT="$(docker run --rm --platform linux/arm64 -v "$TMP:/w" debian:stable-slim "/w/$_name")"
         _dc=$?
-        # 125 = daemon error, 127 = mount/command-not-found: an infra problem, not a
-        # linker result.  Anything else (including a real 126 not-executable) counts.
         case "$_dc" in
             125 | 127) ;;
             *) CODE=$_dc; RAN=1 ;;
         esac
     fi
-fi
+}
 
+_skip_note="needs an aarch64 glibc Linux host, or BINATE_E2E_DOCKER=1 for a local Docker run"
+
+run_dyn exit42
 if [ "$RAN" = 1 ]; then
     if [ "$CODE" != 42 ]; then
-        echo "FAIL: exit42_dyn expected exit 42, got $CODE" >&2
+        echo "FAIL: exit42 expected exit 42, got $CODE" >&2
         exit 1
     fi
-    echo "PASS: bnld-linked dynamic ELF called libc exit(42) and exited 42"
+    echo "PASS: exit42 ran — libc exit(42) exited 42"
 else
-    echo "SKIP: exit42_dyn not run here (needs an aarch64 glibc Linux host, or" \
-            "BINATE_E2E_DOCKER=1 for a local Docker run) — build+structure verified"
+    echo "SKIP: exit42 not run here ($_skip_note) — build+structure verified"
+fi
+
+run_dyn hello
+if [ "$RAN" = 1 ]; then
+    if [ "$CODE" != 0 ]; then
+        echo "FAIL: hello expected exit 0, got $CODE" >&2
+        exit 1
+    fi
+    if [ "$OUT" != "hello from bnld" ]; then
+        echo "FAIL: hello expected output 'hello from bnld', got '$OUT'" >&2
+        exit 1
+    fi
+    echo "PASS: hello ran — printed via libc puts and exited 0"
+else
+    echo "SKIP: hello not run here ($_skip_note) — build+structure verified"
 fi
 
 echo "ALL PASS: bnld dynamic ELF linking (aarch64)"

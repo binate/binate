@@ -1,0 +1,130 @@
+package "pkg/binate/link"
+
+import "pkg/binate/buf"
+
+// Dynamic ELF linking (aarch64).  A dynamically-linked executable resolves its
+// undefined externals (e.g. libc's `exit`) from shared libraries at load time via the
+// platform dynamic linker (ld-linux-aarch64.so.1), instead of erroring on them.  We
+// synthesize the loader-facing machinery — .interp, .hash, .dynsym, .dynstr,
+// .rela.plt, .plt, .got.plt, .dynamic — as a single extra "dynamic stubs" input
+// object, then reuse the ordinary Resolve → Layout → Relocate pipeline: the stubs
+// object *defines* each import at its PLT stub, so the program's `bl exit` retargets
+// through the PLT like any cross-object call, while ld.so binds the real address into
+// the GOT at load (we set DF_BIND_NOW, so there is no lazy resolver).  See
+// explorations/plan-dynamic-linking.md for the validated byte-level recipe.
+
+// ELF dynamic-array tags (Elf64_Dyn.d_tag) and symbol/flag constants used below.
+const (
+	DT_NULL int = 0
+	DT_NEEDED int = 1
+	DT_PLTRELSZ int = 2
+	DT_PLTGOT int = 3
+	DT_HASH int = 4
+	DT_STRTAB int = 5
+	DT_SYMTAB int = 6
+	DT_STRSZ int = 10
+	DT_SYMENT int = 11
+	DT_PLTREL int = 20
+	DT_JMPREL int = 23
+	DT_BIND_NOW int = 24
+	DT_FLAGS int = 30
+	DF_BIND_NOW int = 0x8
+	STT_FUNC int = 2
+	STB_GLOBAL int = 1
+)
+
+// dynInterp is the aarch64 Linux dynamic linker path (NUL-terminated).
+func dynInterp() @[]uint8 {
+	var s *[]readonly char = "/lib/ld-linux-aarch64.so.1"
+	var out @[]uint8 = make_slice(uint8, len(s) + 1)
+	for i := 0; i < len(s); i++ { out[i] = cast(uint8, s[i]) }
+	return out // last byte stays 0 (NUL)
+}
+
+// aarch64 PLT-stub instruction encoders (Xd/Xn are register numbers).
+func encAdrp(rd int, frm uint, to uint) int {
+	// Page-align by subtracting the low 12 bits (avoids a negative page mask).
+	var pto uint = to - (to % 0x1000)
+	var pfrm uint = frm - (frm % 0x1000)
+	var imm int = (cast(int, pto) - cast(int, pfrm)) >> 12
+	return 0x90000000 | ((imm & 0x3) << 29) | (((imm >> 2) & 0x7ffff) << 5) | rd
+}
+
+// encLdr64 encodes `ldr Xt, [Xn, #off]` (unsigned offset, scaled by 8).
+func encLdr64(rt int, rn int, off int) int {
+	return 0xf9400000 | ((off / 8) << 10) | (rn << 5) | rt
+}
+
+// encAdd64 encodes `add Xd, Xn, #imm` (12-bit unsigned immediate).
+func encAdd64(rd int, rn int, imm int) int { return 0x91000000 | (imm << 10) | (rn << 5) | rd }
+
+// encBr encodes `br Xn` (branch to register).
+func encBr(rn int) int { return 0xd61f0000 | (rn << 5) }
+
+// collectImports returns the distinct undefined global symbol names across objs that
+// no object defines — the dynamic imports to satisfy from shared libraries.
+func collectImports(objs @[]@InputObject) @[]@[]char {
+	var cap int = 0
+	for o := 0; o < len(objs); o++ { cap = cap + len(objs[o].Symbols) }
+	var names @[]@[]char = make_slice(@[]char, cap)
+	var n int = 0
+	for o := 0; o < len(objs); o++ {
+		for s := 0; s < len(objs[o].Symbols); s++ {
+			var sym InputSymbol = objs[o].Symbols[s]
+			if sym.SecIndex >= 0 || len(sym.Name) == 0 || sym.Binding != BIND_GLOBAL { continue }
+			if definedBySome(objs, sym.Name) { continue }
+			if nameIndex(names, n, sym.Name) < 0 { names[n] = buf.CopyStr(sym.Name); n = n + 1 }
+		}
+	}
+	var out @[]@[]char = make_slice(@[]char, n)
+	for i := 0; i < n; i++ { out[i] = names[i] }
+	return out
+}
+
+// definedBySome reports whether any object defines name (a section-bound global/weak).
+func definedBySome(objs @[]@InputObject, name *[]readonly char) bool {
+	for o := 0; o < len(objs); o++ {
+		for s := 0; s < len(objs[o].Symbols); s++ {
+			var sym InputSymbol = objs[o].Symbols[s]
+			if sym.SecIndex >= 0 && charsEqual(sym.Name, name) &&
+					(sym.Binding == BIND_GLOBAL || sym.Binding == BIND_WEAK) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// mkDynSection builds one synthetic InputSection with the given name/flags/align and
+// a zero-or-content Data slice of the given size.
+func mkDynSection(name *[]readonly char, flags int, align int, data @[]uint8) InputSection {
+	var sec InputSection
+	sec.Name = buf.CopyStr(name)
+	sec.Type = SHT_PROGBITS
+	sec.Flags = flags
+	sec.Data = data
+	sec.Size = cast(uint, len(data))
+	sec.Align = align
+	sec.OutIndex = -1
+	sec.OutOffset = cast(uint, 0)
+	return sec
+}
+
+// dynStrtab builds the .dynstr blob (leading NUL, then each import name, then the
+// needed-library name) and returns it with each import's offset and the lib's offset.
+func dynStrtab(imports @[]@[]char, lib *[]readonly char) (@[]uint8, @[]int, int) {
+	var total int = 1
+	for i := 0; i < len(imports); i++ { total = total + len(imports[i]) + 1 }
+	var libOff int = total
+	total = total + len(lib) + 1
+	var out @[]uint8 = make_slice(uint8, total)
+	var offs @[]int = make_slice(int, len(imports))
+	var p int = 1
+	for i := 0; i < len(imports); i++ {
+		offs[i] = p
+		for j := 0; j < len(imports[i]); j++ { out[p] = cast(uint8, imports[i][j]); p = p + 1 }
+		p = p + 1 // NUL
+	}
+	for j := 0; j < len(lib); j++ { out[p] = cast(uint8, lib[j]); p = p + 1 }
+	return out, offs, libOff
+}

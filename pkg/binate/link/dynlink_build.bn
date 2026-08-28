@@ -1,0 +1,240 @@
+package "pkg/binate/link"
+
+import "pkg/binate/buf"
+
+// Synthesis + driver for dynamic ELF linking (see dynlink.bn for the overview).
+
+// Synthetic-object section indices (the order buildDynStubs emits them in).
+const (
+	dsInterp int = 0
+	dsHash int = 1
+	dsDynsym int = 2
+	dsDynstr int = 3
+	dsRelaplt int = 4
+	dsPlt int = 5
+	dsGotplt int = 6
+	dsDynamic int = 7
+	dynEntryCount int = 13 // .dynamic array length
+	pltStubSize int = 16
+	gotEntSize int = 8
+	relaEntSize int = 24
+	symEntSize int = 24
+)
+
+// dynSymtab builds the .dynsym blob: a null entry then one UND STT_FUNC/STB_GLOBAL
+// entry per import (st_name = its .dynstr offset).
+func dynSymtab(imports @[]@[]char, strOffs @[]int) @[]uint8 {
+	var n int = len(imports)
+	var out @[]uint8 = make_slice(uint8, (n + 1) * symEntSize)
+	for i := 0; i < n; i++ {
+		var e int = (i + 1) * symEntSize
+		writeLE(out, e + 0, strOffs[i], 4) // st_name
+		out[e + 4] = cast(uint8, (STB_GLOBAL << 4) | STT_FUNC) // st_info
+		// st_other(1)/st_shndx(2)=SHN_UNDEF/st_value(8)/st_size(8) stay zero.
+	}
+	return out
+}
+
+// dynHash builds a minimal SysV .hash over nsym symbols: one bucket, so all symbols
+// chain from bucket[0].  Layout: nbucket, nchain, bucket[1], chain[nsym].
+func dynHash(nsym int) @[]uint8 {
+	var out @[]uint8 = make_slice(uint8, (3 + nsym) * 4)
+	writeLE(out, 0, 1, 4) // nbucket
+	writeLE(out, 4, nsym, 4) // nchain
+	if nsym > 1 { writeLE(out, 8, 1, 4) } // bucket[0] = first real symbol
+	// chain[i] = i+1 for the interior symbols; chain[nsym-1] = 0 (STN_UNDEF, end).
+	for i := 1; i < nsym - 1; i++ { writeLE(out, 12 + i * 4, i + 1, 4) }
+	return out
+}
+
+// buildDynStubs assembles the synthetic "dynamic stubs" object: the loader-facing
+// sections (content-complete for .interp/.hash/.dynsym/.dynstr; correctly-sized zero
+// placeholders for .rela.plt/.plt/.got.plt/.dynamic, patched after Layout) plus a
+// global symbol per import defined at its PLT stub (so the program's call resolves
+// through the PLT).  Returns the object and the needed-library's .dynstr offset.
+func buildDynStubs(imports @[]@[]char, lib *[]readonly char, machine int) (@InputObject, int) {
+	strtab, strOffs, libOff := dynStrtab(imports, lib)
+	var n int = len(imports)
+	var secs @[]InputSection = make_slice(InputSection, 8)
+	secs[dsInterp] = mkDynSection(".interp", SF_READ, 1, dynInterp())
+	secs[dsHash] = mkDynSection(".hash", SF_READ, 8, dynHash(n + 1))
+	secs[dsDynsym] = mkDynSection(".dynsym", SF_READ, 8, dynSymtab(imports, strOffs))
+	secs[dsDynstr] = mkDynSection(".dynstr", SF_READ, 1, strtab)
+	secs[dsRelaplt] = mkDynSection(".rela.plt", SF_READ, 8, make_slice(uint8, n * relaEntSize))
+	secs[dsPlt] = mkDynSection(".plt", SF_READ | SF_EXEC, 4, make_slice(uint8, n * pltStubSize))
+	secs[dsGotplt] = mkDynSection(".got.plt", SF_READ | SF_WRITE, 8,
+			make_slice(uint8, (3 + n) * gotEntSize))
+	secs[dsDynamic] = mkDynSection(".dynamic", SF_READ | SF_WRITE, 8,
+			make_slice(uint8, dynEntryCount * 16))
+
+	var syms @[]InputSymbol = make_slice(InputSymbol, n)
+	for i := 0; i < n; i++ {
+		var sym InputSymbol
+		sym.Name = buf.CopyStr(imports[i])
+		sym.SecIndex = dsPlt
+		sym.Value = cast(uint, i * pltStubSize)
+		sym.Binding = BIND_GLOBAL
+		syms[i] = sym
+	}
+
+	var obj @InputObject = make(InputObject)
+	obj.Path = buf.CopyStr("<dynamic-stubs>")
+	obj.Machine = machine
+	obj.Sections = secs
+	obj.Symbols = syms
+	obj.Relocs = make_slice(InputReloc, 0)
+	return obj, libOff
+}
+
+// secVaddr returns the final virtual address of the dynObj section at index k.
+func secVaddr(dynObj @InputObject, lr @LayoutResult, k int) uint {
+	var s InputSection = dynObj.Sections[k]
+	return lr.Sections[s.OutIndex].Addr + s.OutOffset
+}
+
+// outData returns the merged output-section byte slice holding dynObj section k, and
+// the byte offset of section k within it.
+func outData(dynObj @InputObject, lr @LayoutResult, k int) (@[]uint8, int) {
+	var s InputSection = dynObj.Sections[k]
+	return lr.Sections[s.OutIndex].Data, cast(int, s.OutOffset)
+}
+
+// patchDynSections fills the address-dependent synthetic sections now that Layout has
+// assigned addresses: the PLT stubs (jump through the GOT), .got.plt[0] (&.dynamic),
+// the .rela.plt JUMP_SLOT relocations, and the .dynamic array.
+func patchDynSections(dynObj @InputObject, lr @LayoutResult, imports @[]@[]char, libOff int) {
+	var n int = len(imports)
+	var pltVa uint = secVaddr(dynObj, lr, dsPlt)
+	var gotVa uint = secVaddr(dynObj, lr, dsGotplt)
+	var relaVa uint = secVaddr(dynObj, lr, dsRelaplt)
+	var dynVa uint = secVaddr(dynObj, lr, dsDynamic)
+	var hashVa uint = secVaddr(dynObj, lr, dsHash)
+	var symVa uint = secVaddr(dynObj, lr, dsDynsym)
+	var strVa uint = secVaddr(dynObj, lr, dsDynstr)
+	var strSize int = len(dynObj.Sections[dsDynstr].Data)
+
+	// PLT stubs: adrp x16,GOTpage ; ldr x17,[x16,#:lo12] ; add x16,x16,#:lo12 ; br x17.
+	pltData, pltOff := outData(dynObj, lr, dsPlt)
+	for i := 0; i < n; i++ {
+		var gotSlot uint = gotVa + cast(uint, (3 + i) * gotEntSize)
+		var stubVa uint = pltVa + cast(uint, i * pltStubSize)
+		var lo int = cast(int, gotSlot & cast(uint, 0xfff))
+		var b int = pltOff + i * pltStubSize
+		writeLE(pltData, b + 0, encAdrp(16, stubVa, gotSlot), 4)
+		writeLE(pltData, b + 4, encLdr64(17, 16, lo), 4)
+		writeLE(pltData, b + 8, encAdd64(16, 16, lo), 4)
+		writeLE(pltData, b + 12, encBr(17), 4)
+	}
+
+	// .got.plt[0] = &.dynamic (glibc convention); [1],[2] and the import slots stay 0
+	// (ld.so writes the resolved addresses into the import slots).
+	gotData, gotOff := outData(dynObj, lr, dsGotplt)
+	writeLE(gotData, gotOff, cast(int, dynVa), 8)
+
+	// .rela.plt: one R_AARCH64_JUMP_SLOT per import -> its GOT slot, symbol index i+1.
+	relaData, relaOff := outData(dynObj, lr, dsRelaplt)
+	for i := 0; i < n; i++ {
+		var e int = relaOff + i * relaEntSize
+		writeLE(relaData, e + 0, cast(int, gotVa) + (3 + i) * gotEntSize, 8) // r_offset
+		writeLE(relaData, e + 8, ((i + 1) << 32) | R_AARCH64_JUMP_SLOT, 8) // r_info
+		// r_addend stays 0.
+	}
+
+	// .dynamic array.
+	dynData, dynOff := outData(dynObj, lr, dsDynamic)
+	var d int = dynOff
+	writeDyn(dynData, d, DT_NEEDED, libOff)
+	d = d + 16
+	writeDyn(dynData, d, DT_HASH, cast(int, hashVa))
+	d = d + 16
+	writeDyn(dynData, d, DT_STRTAB, cast(int, strVa))
+	d = d + 16
+	writeDyn(dynData, d, DT_SYMTAB, cast(int, symVa))
+	d = d + 16
+	writeDyn(dynData, d, DT_STRSZ, strSize)
+	d = d + 16
+	writeDyn(dynData, d, DT_SYMENT, symEntSize)
+	d = d + 16
+	writeDyn(dynData, d, DT_PLTGOT, cast(int, gotVa))
+	d = d + 16
+	writeDyn(dynData, d, DT_PLTRELSZ, n * relaEntSize)
+	d = d + 16
+	writeDyn(dynData, d, DT_PLTREL, 7) // DT_RELA
+	d = d + 16
+	writeDyn(dynData, d, DT_JMPREL, cast(int, relaVa))
+	d = d + 16
+	writeDyn(dynData, d, DT_FLAGS, DF_BIND_NOW)
+	d = d + 16
+	writeDyn(dynData, d, DT_BIND_NOW, 0)
+	d = d + 16
+	writeDyn(dynData, d, DT_NULL, 0)
+}
+
+// writeDyn writes one Elf64_Dyn (d_tag, d_val), each 8 bytes little-endian.
+func writeDyn(dst @[]uint8, off int, tag int, val int) {
+	writeLE(dst, off + 0, tag, 8)
+	writeLE(dst, off + 8, val, 8)
+}
+
+// LinkDynElf links inputPaths into a dynamically-linked aarch64 ELF executable at
+// outPath, entering at entryName.  Undefined externals become dynamic imports from
+// libc.so.6, resolved at load by ld-linux-aarch64.so.1.  Returns "" or an error.
+func LinkDynElf(inputPaths @[]@[]char, entryName *[]readonly char, machine int, base uint,
+		outPath *[]readonly char) @[]readonly char {
+	if machine != EM_AARCH64 { return "dynamic linking is aarch64-only for now" }
+
+	var objs @[]@InputObject = make_slice(@InputObject, len(inputPaths))
+	var nObj int = 0
+	var archives @[]@[]@InputObject = make_slice(@[]@InputObject, len(inputPaths))
+	var nArch int = 0
+	for i := 0; i < len(inputPaths); i++ {
+		data, ok := readFile(inputPaths[i])
+		if !ok { return buf.Concat("cannot read input file: ", inputPaths[i]) }
+		// bnlint:allow managed-to-raw-assign - a live read-only view of the input bytes
+		var raw *[]readonly uint8 = data
+		if len(raw) >= 4 && raw[0] == 0x7f && raw[1] == 0x45 && raw[2] == 0x4c && raw[3] == 0x46 {
+			obj, perr := parseObjectBytes(raw, inputPaths[i])
+			if len(perr) != 0 { return perr }
+			objs[nObj] = obj
+			nObj = nObj + 1
+		} else if arMagicOk(raw) {
+			members, aerr := parseArchiveBytes(raw, inputPaths[i])
+			if len(aerr) != 0 { return aerr }
+			archives[nArch] = members
+			nArch = nArch + 1
+		} else {
+			return buf.Concat("input is not an ELF object or an archive: ", inputPaths[i])
+		}
+	}
+	var program @[]@InputObject = selectMembers(objs[0:nObj], archives[0:nArch])
+	for i := 0; i < len(program); i++ {
+		if program[i].Machine != machine {
+			return buf.Concat("object machine does not match the target: ", program[i].Path)
+		}
+	}
+
+	var imports @[]@[]char = collectImports(program)
+	dynObj, libOff := buildDynStubs(imports, "libc.so.6", machine)
+
+	var allObjs @[]@InputObject = make_slice(@InputObject, len(program) + 1)
+	for i := 0; i < len(program); i++ { allObjs[i] = program[i] }
+	allObjs[len(program)] = dynObj
+
+	t, rerr := Resolve(allObjs)
+	if len(rerr) != 0 { return rerr }
+	var lr @LayoutResult = Layout(allObjs, base)
+
+	oo, ss, found := t.Lookup(entryName)
+	if !found { return buf.Concat("entry symbol not defined: ", entryName) }
+	entryAddr, ok := symbolAddr(t, lr, oo, ss)
+	if !ok { return buf.Concat("entry symbol has no address: ", entryName) }
+
+	patchDynSections(dynObj, lr, imports, libOff)
+	var perr @[]readonly char = Relocate(t, lr)
+	if len(perr) != 0 { return perr }
+
+	var interpVa uint = secVaddr(dynObj, lr, dsInterp)
+	var dynVa uint = secVaddr(dynObj, lr, dsDynamic)
+	return EmitDynElfExec(lr.Sections, entryAddr, machine, interpVa,
+			len(dynObj.Sections[dsInterp].Data), dynVa, dynEntryCount * 16, outPath)
+}

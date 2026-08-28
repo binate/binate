@@ -16,10 +16,11 @@ package "pkg/binate/link"
 
 // Mach-O executable constants (the object-file constants live in parse_macho.bn).
 const (
-	MACHO_MH_EXECUTE int = 2         // filetype: a demand-paged executable
-	MACHO_MH_NOUNDEFS int = 0x1      // header flag: no undefined symbols (static)
-	MACHO_LC_UNIXTHREAD int = 0x5    // load command: initial thread/register state
-	MACHO_ARM_THREAD_STATE64 int = 6 // thread-state flavor for arm64
+	MACHO_MH_EXECUTE int = 2           // filetype: a demand-paged executable
+	MACHO_MH_NOUNDEFS int = 0x1        // header flag: no undefined symbols (static)
+	MACHO_LC_UNIXTHREAD int = 0x5      // load command: initial thread/register state
+	MACHO_LC_CODE_SIGNATURE int = 0x1d // load command: pointer to the code signature
+	MACHO_ARM_THREAD_STATE64 int = 6   // thread-state flavor for arm64
 	// ARM_THREAD_STATE64 is 68 uint32s (x0..x28, fp, lr, sp, pc = 33 uint64, then
 	// cpsr + pad = 2 uint32); __pc sits at byte offset 256 within the state.
 	MACHO_ARM_THREAD_STATE64_COUNT int = 68
@@ -59,33 +60,35 @@ func writeSeg64(out @[]uint8, off int, name *[]readonly char, vmaddr uint, vmsiz
 // cmd + cmdsize + flavor + count (16) plus the 68-uint32 thread state (272).
 const machoUnixthreadSize int = 16 + MACHO_ARM_THREAD_STATE64_COUNT * 4
 
-// EmitMachoExec writes a static Mach-O executable for the laid-out output sections
-// (from Layout), entering at `entry`.  Sections map via __TEXT (read-only/exec) and
-// __DATA (read-write), with __PAGEZERO reserving everything below the image.  The
-// lowest real segment (__TEXT) starts at file offset 0 so it maps the mach header +
-// load commands (a runtime, or codesign, that walks the header from the mapped image
-// would otherwise fault).  Section file offsets keep fileoff congruent to vmaddr
-// modulo the page size, so segments are loadable at a non-page-aligned base.  Returns
-// "" on success or a non-empty error.  arm64 only.
-func EmitMachoExec(sections @[]OutputSection, entry uint, machine int,
+// EmitMachoExec writes a static, ad-hoc-code-signed Mach-O executable for the
+// laid-out output sections (from Layout), entering at `entry`.  Sections map via
+// __TEXT (read-only/exec) and __DATA (read-write), with __PAGEZERO reserving
+// everything below the image; the ad-hoc signature (see macho_codesign.bn) lives in a
+// trailing __LINKEDIT segment that an LC_CODE_SIGNATURE points at — modern macOS
+// refuses to run an unsigned executable.  The lowest real segment (__TEXT) starts at
+// file offset 0 so it maps the mach header + load commands (which the signature also
+// hashes).  identifier names the binary in its CodeDirectory (conventionally the
+// output basename).  Returns "" on success or a non-empty error.  arm64 only.
+func EmitMachoExec(sections @[]OutputSection, entry uint, machine int, identifier *[]readonly char,
 		path *[]readonly char) @[]readonly char {
 	if len(sections) == 0 { return "no sections to emit" }
 	if machine != EM_AARCH64 { return "Mach-O executable writer supports arm64 only" }
 	var pagesize int = linkPageSize
 
-	// Segment protection is fixed (__TEXT = RX, __DATA = RW), so groupStats' per-section
-	// permission union is unused here.
+	// Segment protection is fixed (__TEXT = RX, __DATA = RW, __LINKEDIT = R), so
+	// groupStats' per-section permission union is unused here.
 	roFound, _, roFileEnd, roMemEnd, _ := groupStats(sections, false)
 	rwFound, rwLo, rwFileEnd, rwMemEnd, _ := groupStats(sections, true)
 	// The entry lives in the read-only/exec group (.text); require it so __TEXT (which
 	// also maps the header) is the lowest real segment, matching the ELF writer.
 	if !roFound { return "no read-only/exec section to hold the entry point" }
 
-	// Command layout: __PAGEZERO + __TEXT (+ __DATA) + LC_UNIXTHREAD.
-	var nsegs int = 2 // __PAGEZERO + __TEXT
+	// Command layout: __PAGEZERO + __TEXT (+ __DATA) + __LINKEDIT + LC_UNIXTHREAD +
+	// LC_CODE_SIGNATURE.
+	var nsegs int = 3 // __PAGEZERO + __TEXT + __LINKEDIT
 	if rwFound { nsegs = nsegs + 1 }
-	var ncmds int = nsegs + 1
-	var sizeofcmds int = nsegs * 72 + machoUnixthreadSize
+	var ncmds int = nsegs + 2 // + LC_UNIXTHREAD + LC_CODE_SIGNATURE
+	var sizeofcmds int = nsegs * 72 + machoUnixthreadSize + 16 // 16 = LC_CODE_SIGNATURE
 	var hend int = 32 + sizeofcmds
 
 	// The image base is the lowest section (Layout assigns ascending addresses).  The
@@ -109,7 +112,28 @@ func EmitMachoExec(sections @[]OutputSection, entry uint, machine int,
 	}
 	if entry < base || entry >= memEnd { return "entry point is outside the loaded image" }
 
-	var totalFile int = dataStart + cast(int, fileEnd - base)
+	// Segment vm/file spans (computed up front so __LINKEDIT can sit above them all).
+	var textFile int = dataStart + cast(int, roFileEnd - base)
+	var textVm int = alignUp(dataStart + cast(int, roMemEnd - base), pagesize)
+	var maxVmEnd uint = segStart + cast(uint, textVm)
+	var dataFileOff int = 0
+	var dataVm int = 0
+	if rwFound {
+		dataFileOff = dataStart + cast(int, rwLo - base)
+		dataVm = alignUp(cast(int, rwMemEnd - rwLo), pagesize)
+		var dataVmEnd uint = rwLo + cast(uint, dataVm)
+		if dataVmEnd > maxVmEnd { maxVmEnd = dataVmEnd }
+	}
+
+	// The signature sits in __LINKEDIT at a page-aligned file offset past the section
+	// data; codeLimit (what the page hashes cover) is exactly that offset.
+	var sectionEndFile int = dataStart + cast(int, fileEnd - base)
+	var sigOff int = alignUp(sectionEndFile, pagesize)
+	var datasize int = alignUp(codeSignatureSize(sigOff, len(identifier)), 16)
+	var totalFile int = sigOff + datasize
+	var linkeditVmaddr uint = cast(uint, alignUp(cast(int, maxVmEnd), pagesize))
+	var linkeditVm int = alignUp(datasize, pagesize)
+
 	var out @[]uint8 = make_slice(uint8, totalFile)
 
 	// mach_header_64.
@@ -124,6 +148,7 @@ func EmitMachoExec(sections @[]OutputSection, entry uint, machine int,
 
 	var rx int = MACHO_VM_PROT_READ | MACHO_VM_PROT_EXECUTE
 	var rw int = MACHO_VM_PROT_READ | MACHO_VM_PROT_WRITE
+	var ro int = MACHO_VM_PROT_READ
 
 	// __PAGEZERO: [0, segStart), no access.
 	var lc int = 32
@@ -131,20 +156,20 @@ func EmitMachoExec(sections @[]OutputSection, entry uint, machine int,
 	lc = lc + 72
 
 	// __TEXT: maps file [0, textFile) to [segStart, ...) — the header prefix plus the
-	// ro/exec sections.  vmsize is page-rounded so __DATA can start on the next page.
-	var textFile int = dataStart + cast(int, roFileEnd - base)
-	var textVm int = alignUp(dataStart + cast(int, roMemEnd - base), pagesize)
+	// ro/exec sections.
 	writeSeg64(out, lc, "__TEXT", segStart, cast(uint, textVm), 0, textFile, rx, rx)
 	lc = lc + 72
 
 	// __DATA: the writable group at its own page-aligned vmaddr / congruent fileoff.
 	if rwFound {
-		var dataFileOff int = dataStart + cast(int, rwLo - base)
-		var dataVm int = alignUp(cast(int, rwMemEnd - rwLo), pagesize)
 		writeSeg64(out, lc, "__DATA", rwLo, cast(uint, dataVm), dataFileOff, cast(int, rwFileEnd - rwLo),
 				rw, rw)
 		lc = lc + 72
 	}
+
+	// __LINKEDIT: read-only, holds the code signature ([sigOff, sigOff+datasize)).
+	writeSeg64(out, lc, "__LINKEDIT", linkeditVmaddr, cast(uint, linkeditVm), sigOff, datasize, ro, ro)
+	lc = lc + 72
 
 	// LC_UNIXTHREAD: initial register state; only __pc is set (kernel jumps to it).
 	writeLE(out, lc + 0, MACHO_LC_UNIXTHREAD, 4)
@@ -152,6 +177,13 @@ func EmitMachoExec(sections @[]OutputSection, entry uint, machine int,
 	writeLE(out, lc + 8, MACHO_ARM_THREAD_STATE64, 4) // flavor
 	writeLE(out, lc + 12, MACHO_ARM_THREAD_STATE64_COUNT, 4) // count
 	writeLE(out, lc + 16 + MACHO_ARM_THREAD_STATE64_PC_OFF, cast(int, entry), 8) // __pc
+	lc = lc + machoUnixthreadSize
+
+	// LC_CODE_SIGNATURE: file range of the signature within __LINKEDIT.
+	writeLE(out, lc + 0, MACHO_LC_CODE_SIGNATURE, 4)
+	writeLE(out, lc + 4, 16, 4) // cmdsize
+	writeLE(out, lc + 8, sigOff, 4) // dataoff
+	writeLE(out, lc + 12, datasize, 4) // datasize
 
 	// Section data at dataStart + (Addr - base).
 	for i := 0; i < len(sections); i++ {
@@ -160,6 +192,9 @@ func EmitMachoExec(sections @[]OutputSection, entry uint, machine int,
 		var fo int = dataStart + cast(int, sections[i].Addr - base)
 		for j := 0; j < len(d); j++ { out[fo + j] = d[j] }
 	}
+
+	// Seal it: everything up to sigOff is now final, so hash it into the signature.
+	writeCodeSignature(out, sigOff, sigOff, identifier, textFile)
 
 	return writeFile(path, out)
 }

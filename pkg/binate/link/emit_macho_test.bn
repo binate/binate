@@ -1,18 +1,58 @@
 package "pkg/binate/link"
 
 import "pkg/binate/buf"
+import "pkg/binate/sha256"
 import "pkg/builtins/testing"
 
-// Structural tests for the static Mach-O executable writer.  The output can't be run
-// on a non-macOS host (and even on macOS needs code-signing, a later round), so these
-// re-parse the emitted bytes and check the load-critical invariants: the MH_EXECUTE
-// identity, __PAGEZERO / __TEXT segments, and the LC_UNIXTHREAD entry PC.
-// (mkOutSec is in emit_elf_test.bn; fail in parse_elf_test.bn; both same package.)
+// Structural tests for the static, ad-hoc-signed Mach-O executable writer.  The output
+// can't be *run* on a non-macOS host, so these re-parse the emitted bytes and check
+// the load-critical invariants — the MH_EXECUTE identity, __PAGEZERO/__TEXT/__LINKEDIT
+// segments, the LC_UNIXTHREAD entry PC, and the LC_CODE_SIGNATURE — and independently
+// re-verify the ad-hoc signature by recomputing every page hash with sha256.Sum256
+// (deterministic, so it runs anywhere).  (mkOutSec is in emit_elf_test.bn; fail in
+// parse_elf_test.bn; both same package.)
 
-// checkMachoExec re-parses an emitted Mach-O executable and verifies: the 64-bit
-// arm64 MH_EXECUTE identity; a __PAGEZERO segment at vmaddr 0; a __TEXT segment at
-// file offset 0 (so it maps the header); an optional __DATA segment; and an
-// LC_UNIXTHREAD whose __pc equals entry.  Returns "" on success or a message.
+// beU32 reads a big-endian 32-bit value (the code-signature blobs are big-endian).
+func beU32(b *[]readonly uint8, off int) int {
+	return (cast(int, b[off]) << 24) | (cast(int, b[off + 1]) << 16) | (cast(int, b[off + 2]) << 8) |
+			cast(int, b[off + 3])
+}
+
+// checkSignature re-verifies the ad-hoc signature at [sigOff, sigOff+sigSize): the
+// SuperBlob / CodeDirectory magics, codeLimit == sigOff, nCodeSlots == ceil(sigOff/
+// 4096), and each stored 32-byte code slot == SHA-256 of its page of data[0:sigOff].
+func checkSignature(data @[]uint8, rd *[]readonly uint8, sigOff int, sigSize int) @[]char {
+	if sigOff + sigSize > len(data) { return buf.CopyStr("signature runs past end of file") }
+	if beU32(rd, sigOff) != CS_MAGIC_EMBEDDED_SIGNATURE {
+		return buf.CopyStr("signature does not start with a CS_SuperBlob")
+	}
+	var cdOff int = sigOff + beU32(rd, sigOff + 16) // SuperBlob index[0].offset
+	if beU32(rd, cdOff) != CS_MAGIC_CODEDIRECTORY {
+		return buf.CopyStr("SuperBlob does not point at a CodeDirectory")
+	}
+	if beU32(rd, cdOff + 32) != sigOff { return buf.CopyStr("codeLimit != signature offset") }
+	var nCode int = beU32(rd, cdOff + 28)
+	if nCode != (sigOff + 4095) / 4096 { return buf.CopyStr("wrong nCodeSlots") }
+	var hashOff int = cdOff + beU32(rd, cdOff + 16)
+	for p := 0; p < nCode; p++ {
+		var lo int = p * 4096
+		var hi int = lo + 4096
+		if hi > sigOff { hi = sigOff }
+		// bnlint:allow managed-to-raw-assign - live borrow of one page
+		var page *[]readonly uint8 = data[lo:hi]
+		var want @[]uint8 = sha256.Sum256(page)
+		for j := 0; j < 32; j++ {
+			if data[hashOff + p * 32 + j] != want[j] { return buf.CopyStr("code slot hash mismatch") }
+		}
+	}
+	return buf.CopyStr("")
+}
+
+// checkMachoExec re-parses an emitted Mach-O executable and verifies: the 64-bit arm64
+// MH_EXECUTE identity; a __PAGEZERO segment at vmaddr 0; a __TEXT segment at file
+// offset 0 (so it maps the header); an optional __DATA segment; a __LINKEDIT segment;
+// an LC_UNIXTHREAD whose __pc equals entry; and an LC_CODE_SIGNATURE whose signature
+// re-verifies.  Returns "" on success or a message.
 func checkMachoExec(data @[]uint8, entry uint, wantData bool) @[]char {
 	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
 	var rd *[]readonly uint8 = data
@@ -26,7 +66,10 @@ func checkMachoExec(data @[]uint8, entry uint, wantData bool) @[]char {
 	var sawPagezero bool = false
 	var sawText bool = false
 	var sawData bool = false
+	var sawLinkedit bool = false
 	var pcOk bool = false
+	var sigOff int = 0
+	var sigSize int = 0
 	var lc int = 32
 	for c := 0; c < ncmds; c++ {
 		if lc + 8 > len(data) { return buf.CopyStr("load command out of range") }
@@ -40,20 +83,26 @@ func checkMachoExec(data @[]uint8, entry uint, wantData bool) @[]char {
 			if charsEqual(name, "__PAGEZERO") && vmaddr == 0 { sawPagezero = true }
 			if charsEqual(name, "__TEXT") && fileoff == 0 { sawText = true }
 			if charsEqual(name, "__DATA") { sawData = true }
+			if charsEqual(name, "__LINKEDIT") { sawLinkedit = true }
 		} else if cmd == MACHO_LC_UNIXTHREAD {
 			if lc + 16 + MACHO_ARM_THREAD_STATE64_PC_OFF + 8 > len(data) {
 				return buf.CopyStr("LC_UNIXTHREAD out of range")
 			}
 			var pc int = u64(rd, lc + 16 + MACHO_ARM_THREAD_STATE64_PC_OFF)
 			if cast(uint, pc) == entry { pcOk = true }
+		} else if cmd == MACHO_LC_CODE_SIGNATURE {
+			sigOff = u32(rd, lc + 8)
+			sigSize = u32(rd, lc + 12)
 		}
 		lc = lc + cmdsize
 	}
 	if !sawPagezero { return buf.CopyStr("no __PAGEZERO segment at vmaddr 0") }
 	if !sawText { return buf.CopyStr("no __TEXT segment mapping the header (fileoff 0)") }
 	if wantData != sawData { return buf.CopyStr("__DATA segment presence does not match expectation") }
+	if !sawLinkedit { return buf.CopyStr("no __LINKEDIT segment") }
 	if !pcOk { return buf.CopyStr("LC_UNIXTHREAD __pc does not equal the entry") }
-	return buf.CopyStr("")
+	if sigOff == 0 { return buf.CopyStr("no LC_CODE_SIGNATURE") }
+	return checkSignature(data, rd, sigOff, sigSize)
 }
 
 // A single .text section emits a well-formed static arm64 executable whose entry PC
@@ -66,7 +115,7 @@ func TestEmitMachoExecMinimal() testing.TestResult {
 	d[3] = cast(uint8, 0xd6) // RET (0xd65f03c0, little-endian)
 	var secs @[]OutputSection = make_slice(OutputSection, 1)
 	secs[0] = mkOutSec(".text", SF_READ | SF_EXEC, cast(uint, 0x400000), d, cast(uint, 4))
-	var err @[]readonly char = EmitMachoExec(secs, cast(uint, 0x400000), EM_AARCH64,
+	var err @[]readonly char = EmitMachoExec(secs, cast(uint, 0x400000), EM_AARCH64, "binate-test",
 			"/tmp/binate_macho_exec_min")
 	if len(err) != 0 { return fail("EmitMachoExec failed") }
 	data, ok := readFile("/tmp/binate_macho_exec_min")
@@ -88,7 +137,7 @@ func TestEmitMachoExecWithData() testing.TestResult {
 	var secs @[]OutputSection = make_slice(OutputSection, 2)
 	secs[0] = mkOutSec(".text", SF_READ | SF_EXEC, cast(uint, 0x400000), dt, cast(uint, 4))
 	secs[1] = mkOutSec(".data", SF_READ | SF_WRITE, cast(uint, 0x401000), dd, cast(uint, 8))
-	var err @[]readonly char = EmitMachoExec(secs, cast(uint, 0x400000), EM_AARCH64,
+	var err @[]readonly char = EmitMachoExec(secs, cast(uint, 0x400000), EM_AARCH64, "binate-test",
 			"/tmp/binate_macho_exec_data")
 	if len(err) != 0 { return fail("EmitMachoExec failed") }
 	data, ok := readFile("/tmp/binate_macho_exec_data")
@@ -103,7 +152,7 @@ func TestEmitMachoExecRejectsNonArm64() testing.TestResult {
 	var d @[]uint8 = make_slice(uint8, 4)
 	var secs @[]OutputSection = make_slice(OutputSection, 1)
 	secs[0] = mkOutSec(".text", SF_READ | SF_EXEC, cast(uint, 0x400000), d, cast(uint, 4))
-	var err @[]readonly char = EmitMachoExec(secs, cast(uint, 0x400000), EM_X86_64,
+	var err @[]readonly char = EmitMachoExec(secs, cast(uint, 0x400000), EM_X86_64, "binate-test",
 			"/tmp/binate_macho_exec_x64")
 	if len(err) == 0 { return fail("a non-arm64 target should be rejected") }
 	return ""

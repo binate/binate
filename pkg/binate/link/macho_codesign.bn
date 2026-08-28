@@ -1,0 +1,122 @@
+package "pkg/binate/link"
+
+import "pkg/binate/sha256"
+
+// Mach-O ad-hoc code-signing.  Modern macOS (arm64 especially) refuses to run an
+// unsigned executable, so the Mach-O exec writer embeds an ad-hoc signature: a
+// CS_SuperBlob holding a single CodeDirectory, placed in a __LINKEDIT segment and
+// pointed at by an LC_CODE_SIGNATURE load command.  "Ad-hoc" means no certificate —
+// the signature seals the code's own SHA-256 page hashes and nothing else, which is
+// exactly what a self-hosted linker can produce without a signing identity.
+//
+// Structure (all fields BIG-endian, matching what Apple's ld emits — verified by
+// disassembling a clang-signed arm64 binary):
+//   CS_SuperBlob { magic=0xfade0cc0, length, count=1, index[{type=0, offset=20}] }
+//   CS_CodeDirectory (version 0x20400, an 88-byte fixed header) {
+//     magic=0xfade0c02, length, version, flags=adhoc|linker-signed,
+//     hashOffset, identOffset=88, nSpecialSlots=0, nCodeSlots, codeLimit,
+//     hashSize=32, hashType=2(SHA-256), platform=0, pageSize=12(log2 4096),
+//     spare2, scatter, team, spare3, codeLimit64=0,
+//     execSegBase=0, execSegLimit, execSegFlags=1(MAIN_BINARY) }
+//   <identifier string, NUL-terminated>
+//   <nCodeSlots × 32-byte SHA-256 page hashes>
+// codeLimit is the file offset where the signature itself begins (so the signature
+// does not hash itself); each code slot i is SHA-256(file[i*4096 : min(.,codeLimit)]),
+// the last page hashed with its actual (possibly short) length.
+
+// Code-signing constants.
+const (
+	CS_MAGIC_EMBEDDED_SIGNATURE int = 0xfade0cc0
+	CS_MAGIC_CODEDIRECTORY int = 0xfade0c02
+	CSSLOT_CODEDIRECTORY int = 0
+	CS_ADHOC int = 0x2
+	CS_LINKER_SIGNED int = 0x20000
+	CS_HASHTYPE_SHA256 int = 2
+	CS_HASH_SIZE int = 32
+	CS_EXECSEG_MAIN_BINARY int = 0x1
+	CD_VERSION int = 0x20400
+	CD_HEADER_SIZE int = 88 // the version-0x20400 fixed header, before the identifier
+	CS_PAGE_LOG2 int = 12 // log2(4096)
+)
+
+// writeBE writes the low n bytes of value to dst at off, big-endian.
+func writeBE(dst @[]uint8, off int, value int, n int) {
+	for i := 0; i < n; i++ {
+		dst[off + i] = cast(uint8, (value >> cast(uint, 8 * (n - 1 - i))) & 0xff)
+	}
+}
+
+// codeSlots returns the number of 4096-byte code pages covering [0, codeLimit).
+func codeSlots(codeLimit int) int { return (codeLimit + 4095) / 4096 }
+
+// codeSignatureSize returns the byte size of the ad-hoc signature SuperBlob for the
+// given code limit and identifier length: SuperBlob header (12) + one index entry (8)
+// + CodeDirectory (88-byte header + identifier + NUL + nCodeSlots hashes).
+func codeSignatureSize(codeLimit int, identLen int) int {
+	var nCode int = codeSlots(codeLimit)
+	var cdLength int = CD_HEADER_SIZE + identLen + 1 + nCode * CS_HASH_SIZE
+	return 12 + 8 + cdLength
+}
+
+// writeCodeSignature writes the ad-hoc signature SuperBlob into out starting at
+// sigOff (which must equal codeLimit — the signature begins where the hashed code
+// ends).  out[0:codeLimit] must already be fully populated (header, load commands
+// with LC_CODE_SIGNATURE's dataoff/datasize baked in, section data, and zero
+// padding), because those bytes are what the page hashes seal.  execSegLimit is the
+// __TEXT segment size (the executable segment the entry lives in).
+func writeCodeSignature(out @[]uint8, sigOff int, codeLimit int, identifier *[]readonly char,
+		execSegLimit int) {
+	var identLen int = len(identifier)
+	var nCode int = codeSlots(codeLimit)
+	var hashOffset int = CD_HEADER_SIZE + identLen + 1 // code slot 0, relative to the CD
+	var cdLength int = hashOffset + nCode * CS_HASH_SIZE
+	var superLen int = 12 + 8 + cdLength
+
+	// CS_SuperBlob header + one-entry index.
+	writeBE(out, sigOff + 0, CS_MAGIC_EMBEDDED_SIGNATURE, 4)
+	writeBE(out, sigOff + 4, superLen, 4)
+	writeBE(out, sigOff + 8, 1, 4) // count
+	writeBE(out, sigOff + 12, CSSLOT_CODEDIRECTORY, 4) // index[0].type
+	writeBE(out, sigOff + 16, 20, 4) // index[0].offset (CD follows the 20-byte header)
+
+	// CS_CodeDirectory.
+	var cd int = sigOff + 20
+	writeBE(out, cd + 0, CS_MAGIC_CODEDIRECTORY, 4)
+	writeBE(out, cd + 4, cdLength, 4)
+	writeBE(out, cd + 8, CD_VERSION, 4)
+	writeBE(out, cd + 12, CS_ADHOC | CS_LINKER_SIGNED, 4)
+	writeBE(out, cd + 16, hashOffset, 4)
+	writeBE(out, cd + 20, CD_HEADER_SIZE, 4) // identOffset
+	writeBE(out, cd + 24, 0, 4) // nSpecialSlots
+	writeBE(out, cd + 28, nCode, 4) // nCodeSlots
+	writeBE(out, cd + 32, codeLimit, 4)
+	out[cd + 36] = cast(uint8, CS_HASH_SIZE)
+	out[cd + 37] = cast(uint8, CS_HASHTYPE_SHA256)
+	out[cd + 38] = cast(uint8, 0) // platform
+	out[cd + 39] = cast(uint8, CS_PAGE_LOG2)
+	writeBE(out, cd + 40, 0, 4) // spare2
+	writeBE(out, cd + 44, 0, 4) // scatterOffset
+	writeBE(out, cd + 48, 0, 4) // teamOffset
+	writeBE(out, cd + 52, 0, 4) // spare3
+	writeBE(out, cd + 56, 0, 8) // codeLimit64 (0 when codeLimit fits in 32 bits)
+	writeBE(out, cd + 64, 0, 8) // execSegBase (file offset of __TEXT)
+	writeBE(out, cd + 72, execSegLimit, 8)
+	writeBE(out, cd + 80, CS_EXECSEG_MAIN_BINARY, 8) // execSegFlags
+
+	// Identifier string (NUL-terminated) at CD + identOffset.
+	for i := 0; i < identLen; i++ { out[cd + CD_HEADER_SIZE + i] = cast(uint8, identifier[i]) }
+	out[cd + CD_HEADER_SIZE + identLen] = cast(uint8, 0)
+
+	// Code hashes: SHA-256 of each page of [0, codeLimit); the last page is hashed
+	// with its actual (possibly short) length.
+	for p := 0; p < nCode; p++ {
+		var lo int = p * 4096
+		var hi int = lo + 4096
+		if hi > codeLimit { hi = codeLimit }
+		// bnlint:allow managed-to-raw-assign - live borrow of the output buffer page
+		var page *[]readonly uint8 = out[lo:hi]
+		var digest @[]uint8 = sha256.Sum256(page)
+		var slot int = cd + hashOffset + p * CS_HASH_SIZE
+		for j := 0; j < CS_HASH_SIZE; j++ { out[slot + j] = digest[j] }
+	}
+}

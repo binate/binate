@@ -1,11 +1,15 @@
 #!/bin/sh
 # e2e/bnld-dynamic-linux-aarch64.sh — End-to-end proof that the Binate-native linker (bnld)
 # produces a RUNNABLE, DYNAMICALLY-linked aarch64 ELF that calls into libc, with no
-# clang/ld in the link.  A program whose _start does `mov x0,#42 ; bl exit` is
-# assembled with bnas and linked with `bnld -dynamic`: the undefined `exit` becomes a
-# dynamic import from libc.so.6, resolved at load by /lib/ld-linux-aarch64.so.1, and
-# libc's exit(42) ends the process — so the exit code proves the whole dynamic path
-# (PT_INTERP, .dynamic, .plt/.got.plt, the JUMP_SLOT bound by ld.so).
+# clang/ld in the link.  Programs are assembled with bnas and linked with `bnld
+# -dynamic`: undefined externals become dynamic imports from libc.so.6, resolved at
+# load by /lib/ld-linux-aarch64.so.1, and the exit code proves the whole dynamic path.
+#   * exit42 — `mov x0,#42 ; bl exit` → libc exit(42): the function-import (PLT +
+#     JUMP_SLOT) path; the exit code is the proof.
+#   * hello  — passes a .rodata string to libc puts, then exit(0): two imports + stdio.
+#   * datum  — GOT-loads the libc DATA symbol `stdout` and exits 42 iff non-null: the
+#     data-import (.got + GLOB_DAT) path — the __c_global mechanism — plus `exit` (PLT),
+#     so it also exercises the mixed PLT+GOT case.
 #
 # The build + link + structure check run everywhere (host-independent ELF byte
 # generation).  The RUN needs a glibc linux/arm64 loader.  CI has no native aarch64
@@ -112,6 +116,30 @@ _start:
 EOF
 echo "PASS: hello links to a dynamically-linked aarch64 ELF (imports puts + exit)"
 
+# ----- datum: GOT-load a libc DATA symbol (stdout) and exit 42 iff it is non-null —
+#       exercises a GLOB_DAT data import (the __c_global path), distinct from the
+#       PLT/JUMP_SLOT function imports above.  `stdout` (a FILE*) is a static libc
+#       datum that ld.so relocates when it loads libc, so it is non-null even without
+#       __libc_start_main.  `exit` is a PLT import, so this is the mixed PLT+GOT case. -----
+asm_link_dyn datum <<'EOF'
+.arch aarch64
+.section text
+.global _start
+.global stdout
+.global exit
+_start:
+	adrp x0, :got:stdout
+	ldr x0, [x0, #:got_lo12:stdout]
+	ldr x0, [x0]
+	cbz x0, Lzero
+	mov x0, #42
+	bl exit
+Lzero:
+	mov x0, #0
+	bl exit
+EOF
+echo "PASS: datum links to a dynamically-linked aarch64 ELF (GOT data import: stdout)"
+
 # ----- run: natively where the host can, else via Docker/qemu -----
 # CI has no native aarch64 Linux runner (the e2e matrix is x86-64 Linux + arm64
 # macOS), so the arm64 binary is run under a glibc arm64 Docker image via qemu — but
@@ -188,6 +216,17 @@ if [ "$RAN" = 1 ]; then
     echo "PASS: hello ran — printed via libc puts and exited 0"
 else
     echo "SKIP: hello not run here ($_skip_note) — build+structure verified"
+fi
+
+run_dyn datum
+if [ "$RAN" = 1 ]; then
+    if [ "$CODE" != 42 ]; then
+        echo "FAIL: datum expected exit 42 (libc stdout bound non-null via GLOB_DAT), got $CODE" >&2
+        exit 1
+    fi
+    echo "PASS: datum ran — GOT-loaded libc stdout (bound via GLOB_DAT) and exited 42"
+else
+    echo "SKIP: datum not run here ($_skip_note) — build+structure verified"
 fi
 
 echo "ALL PASS: bnld dynamic ELF linking (aarch64)"

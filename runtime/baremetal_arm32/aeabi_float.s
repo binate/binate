@@ -273,3 +273,20 @@ __aeabi_f2lz:
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToU64
 __aeabi_f2ulz:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToU64
+
+// ============================================================
+// Negate group — single-symbol libgcc members _arm_negdf2.o (dneg) /
+// _arm_negsf2.o (fneg).  The native backend lowers float negate inline (a
+// sign-bit flip), so it never calls these; they are provided only for the full
+// AEABI set (a linked C object may call them).  A double in r0:r1 / a float in
+// r0, result in the same, matching F64Neg/F32Neg — bare tail-calls.
+// ============================================================
+	.global __aeabi_dneg
+	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F64Neg
+__aeabi_dneg:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F64Neg
+
+	.global __aeabi_fneg
+	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F32Neg
+__aeabi_fneg:
+	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F32Neg

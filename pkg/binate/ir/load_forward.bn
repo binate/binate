@@ -1,26 +1,41 @@
 package "pkg/binate/ir"
 
 import "pkg/binate/iropcode"
+import "pkg/binate/types"
 import "pkg/stdx/slices"
 
-// Load-forwarding (redundant-load elimination) — a phi-free companion to mem2reg
-// (mem2reg.bn) that works for AGGREGATE slots too.  It forwards every load of a
-// non-escaping alloca that has EXACTLY ONE store dominating all its loads to the
-// stored value, then deletes the alloca / store / loads.  This coalesces the
-// two slice-header loads gen emits for `len(s)` (loop guard) and `s[i]`
-// (access) onto one SSA value, which loop-BCE (Phase 3) needs to prove the guard
+// Load-forwarding — a phi-free companion to mem2reg (mem2reg.bn) for AGGREGATE
+// slots.  It coalesces the two slice-header loads gen emits for `len(s)` (loop
+// guard) and `s[i]` (access) onto ONE SSA value so loop-BCE can prove the guard
 // bound equals the bounds-check length.
 //
-// Soundness spine: escape analysis bars any aliasing write / address leak, so
-// only `OP_STORE(A, …)` writes A; a single store dominating every load means
-// each load provably read exactly that value.  A store BETWEEN a would-be
-// forwarded load and its def is a second store, so it can never be crossed
-// (defeating the reslice-shrink case).  Binate's refcounting is explicit and
-// operand-based — plain load/store carry no implicit inc/dec — so rewriting a
-// load-use to the stored value leaves the RefInc/RefDec sequence byte-identical.
-// (Managed slices in a bounds-checked loop nonetheless escape via the check's
-// fault pad, so this fires mainly for raw slices and arrays — see
-// explorations/plan-load-forwarding-phase2b.md.)
+// Two materialization strategies:
+//   * STORE-FORWARDING (non-managed <=16B by-value slots — scalars, raw slices,
+//     small structs): rewrite every load to the single stored value V and delete
+//     the alloca/store/loads.  Sound because a <=16B value is first-class in every
+//     backend.
+//   * REDUNDANT-LOAD-ELIMINATION (managed slices @[]T, either word size): store-
+//     forwarding to V would be wrong for a >16B by-address slice (V may be a
+//     by-address param — an LLVM `ptr` — so a backend would `extractvalue` a value
+//     out of an ADDRESS), and a managed slice's cleanup fault-pad load must be
+//     coalesced too.  Insert one materializing OP_LOAD(A) right after the store and
+//     rewrite every load — normal AND pad — to IT; a load result is by-value in
+//     every backend.  Keep the alloca/store/materializing-load.  Used for ALL
+//     managed slices (not just >16B) so the store-forwarding path never handles a
+//     slot with cleanup pad loads.  (A >16B NON-slice aggregate — a large struct —
+//     is simply declined: correct, just unoptimized.)
+//
+// Soundness spine: escape analysis bars any aliasing write / address leak, so only
+// the one store writes A; that store dominating every load (and every fault-pad
+// load's fault point) means each load provably read exactly V.  Binate refcounting
+// is explicit + operand-based (plain load/store carry no implicit inc/dec), so
+// rewriting a load-use — or inserting a plain OP_LOAD — is refcount-neutral.
+//
+// Managed slices are loaded in their bounds-check cleanup FAULT PAD (for RefDec),
+// which naively looks like an escape; forwardEscapes permits that plain pad load
+// and the pad's RefDec is rewritten to the same slice value (V, or the
+// materializing load), so the refcount trajectory is byte-identical.  Fault pads
+// are VM-only; compiled backends ignore them.
 
 // forwardLoads runs load-forwarding over every non-extern func.  Invoked by
 // RunOptPasses at -O1+, after promoteScalars.
@@ -34,16 +49,29 @@ func forwardLoads(m @Module) {
 	}
 }
 
-// forwardLoadsFunc forwards all eligible single-store slots in one function.
+// forwardLoadsFunc forwards all eligible single-store slots in one function,
+// dispatching each to store-forwarding or RLE by its analysis.  RLE runs first (it
+// inserts instructions, so it needs live block positions); store-forwarding then
+// runs position-independently (it keys off instruction ids), so the two passes do
+// not interfere despite sharing f.Blocks.
 func forwardLoadsFunc(f @Func) {
 	if len(f.Blocks) == 0 {
 		return
 	}
 	var d @DomInfo = ComputeDom(f)
+
+	// Store-forwarding accumulators (load-id -> stored value; deleted allocas).
 	var gReplID @[]int
 	var gReplVal @[]@Instr
 	var gDeletedAlloca @[]int
-	var any bool = false
+	var anyStore bool = false
+
+	// RLE accumulators (parallel per-alloca arrays).
+	var gRleAlloca @[]@Instr
+	var gRleStoreBlk @[]int
+	var gRleStorePos @[]int
+	var gRleLoads @[]@[]int
+	var anyRle bool = false
 
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var blk @Block = f.Blocks[bi]
@@ -52,65 +80,73 @@ func forwardLoadsFunc(f @Func) {
 			if instr.Op != iropcode.OP_ALLOC {
 				continue
 			}
-			if allocaEscapes(f, instr) {
+			if forwardEscapes(f, instr) {
 				continue
 			}
 			var res @fwdResult = analyzeForwardAlloca(f, d, instr)
 			if !res.ok {
 				continue
 			}
-			for k := 0; k < len(res.loadIDs); k++ {
-				gReplID = slices.Append[int](gReplID, res.loadIDs[k])
-				gReplVal = slices.Append[@Instr](gReplVal, res.val)
+			if res.useRLE {
+				gRleAlloca = slices.Append[@Instr](gRleAlloca, instr)
+				gRleStoreBlk = slices.Append[int](gRleStoreBlk, res.storeBlk)
+				gRleStorePos = slices.Append[int](gRleStorePos, res.storePos)
+				gRleLoads = slices.Append[@[]int](gRleLoads, res.loadIDs)
+				anyRle = true
+			} else {
+				for k := 0; k < len(res.loadIDs); k++ {
+					gReplID = slices.Append[int](gReplID, res.loadIDs[k])
+					gReplVal = slices.Append[@Instr](gReplVal, res.val)
+				}
+				gDeletedAlloca = slices.Append[int](gDeletedAlloca, instr.ID)
+				anyStore = true
 			}
-			gDeletedAlloca = slices.Append[int](gDeletedAlloca, instr.ID)
-			any = true
 		}
 	}
 
-	if !any {
-		return
+	if anyRle {
+		applyRLE(f, gRleAlloca, gRleStoreBlk, gRleStorePos, gRleLoads)
 	}
-
-	// Reuse mem2reg's mutation phase with no phis and no grounding: it builds the
-	// load-id -> value repl map, deletes the alloca/store/loads, rewrites all
-	// uses, and runs the no-surviving-use fail-loud assertion.
-	var noPhi @[]@Instr
-	var noPhiBlock @[]int
-	var noGroundL @[]@Instr
-	var noGroundV @[]@Instr
-	var noZero @[]@Instr
-	applyPromotion(f, d.NumBlocks, noPhi, noPhiBlock, gReplID, gReplVal, noGroundL, noGroundV, noZero,
-			gDeletedAlloca)
+	if anyStore {
+		var noPhi @[]@Instr
+		var noPhiBlock @[]int
+		var noGroundL @[]@Instr
+		var noGroundV @[]@Instr
+		var noZero @[]@Instr
+		applyPromotion(f, d.NumBlocks, noPhi, noPhiBlock, gReplID, gReplVal, noGroundL, noGroundV, noZero,
+				gDeletedAlloca)
+	}
 }
 
-// fwdResult is one alloca's analysis: whether it is forwardable, its loads (all
-// forwarded to `val`), and the single stored value they read.
+// fwdResult is one alloca's analysis: whether it is forwardable, which strategy
+// (useRLE), its loads (all forwarded — normal + fault-pad), the single stored
+// value (store-forwarding target), and the store's position (RLE insertion point).
 type fwdResult struct {
-	ok      bool
-	loadIDs @[]int
-	val     @Instr
+	ok       bool
+	useRLE   bool
+	loadIDs  @[]int
+	val      @Instr
+	storeBlk int
+	storePos int
 }
 
-// analyzeForwardAlloca decides whether alloca a is forwardable: exactly one
-// store, at least one load, the store dominates every load (same block ⇒ store
-// textually before the load — Dominates(b,b) is order-blind), and the stored
-// value's type matches the load type (aggregates match; a scalar mismatch bails
-// rather than forwarding a wrong-typed value).
+// analyzeForwardAlloca decides whether alloca a is forwardable and how.  It
+// requires exactly one store, at least one load, the store dominating every normal
+// load (same block ⇒ store textually before), and a matching stored-value type.
+// For a managed slice it additionally collects the cleanup fault-pad loads and
+// requires the store to dominate each pad's fault point.  useRLE is set for any
+// managed slice; a >16B non-slice aggregate (large struct) is declined outright.
 func analyzeForwardAlloca(f @Func, d @DomInfo, a @Instr) @fwdResult {
 	var res @fwdResult = make(fwdResult)
 	res.ok = false
 
-	// A >16B by-address aggregate (managed slice, large struct) must NOT be
-	// store-forwarded.  Its stored value can be a by-address param — an LLVM
-	// `ptr byval` — and rewriting the slot's loads to it makes a backend
-	// `extractvalue` a value out of an ADDRESS: invalid IR (clang rejects it) /
-	// wrong-code.  Only <=16B (by-value) types are first-class values that are
-	// safe to forward to their stored value.  IsByvalParam is the same predicate
-	// gen uses to pick byval lowering, so this is the exact representation
-	// boundary.  (The managed-slice RLE path re-enables the >16B managed case via
-	// a materializing load instead.)
-	if a.TypeArg != nil && a.TypeArg.IsByvalParam() {
+	var isMS bool = isManagedSlice(a.TypeArg)
+	var byAddr bool = a.TypeArg != nil && a.TypeArg.IsByvalParam()
+	// A >16B by-address aggregate must not be store-forwarded (its stored value can
+	// be a by-address param — forwarding a load to it makes a backend extractvalue
+	// a value out of a `ptr`).  A managed slice re-enables forwarding via RLE below;
+	// any other >16B aggregate (large struct) is declined — correct, unoptimized.
+	if byAddr && !isMS {
 		return res
 	}
 
@@ -148,7 +184,7 @@ func analyzeForwardAlloca(f @Func, d @DomInfo, a @Instr) @fwdResult {
 	if needsGrounding(val, a.TypeArg) {
 		return res
 	}
-	// The single store must dominate every load.
+	// The single store must dominate every normal load.
 	for k := 0; k < len(loadIDs); k++ {
 		if loadBlks[k] == storeBlk {
 			if loadPoss[k] <= storePos {
@@ -159,8 +195,199 @@ func analyzeForwardAlloca(f @Func, d @DomInfo, a @Instr) @fwdResult {
 		}
 	}
 
+	// Managed slice: also forward the cleanup fault-pad loads.  Require the store to
+	// dominate each pad's fault point so the pad provably reads V, not the
+	// zero-filled slot.  (forwardEscapes already barred any non-load pad use.)
+	if isMS {
+		for pi := 0; pi < len(f.FaultPads); pi++ {
+			var pad @Block = f.FaultPads[pi]
+			var padLoadCount int = 0
+			for ii := 0; ii < len(pad.Instrs); ii++ {
+				var instr @Instr = pad.Instrs[ii]
+				if instr.Op == iropcode.OP_LOAD && len(instr.Args) >= 1 && instr.Args[0] == a {
+					loadIDs = slices.Append[int](loadIDs, instr.ID)
+					padLoadCount = padLoadCount + 1
+				}
+			}
+			if padLoadCount > 0 && !storeDominatesPad(f, d, storeBlk, storePos, pad) {
+				return res
+			}
+		}
+	}
+
 	res.ok = true
+	res.useRLE = isMS
 	res.loadIDs = loadIDs
 	res.val = val
+	res.storeBlk = storeBlk
+	res.storePos = storePos
 	return res
+}
+
+// isManagedSlice reports whether t is (after peeling wrappers) a managed slice
+// (@[]T) — the only slot kind gen loads into a cleanup fault pad for RefDec.
+func isManagedSlice(t @types.Type) bool {
+	if t == nil {
+		return false
+	}
+	var r @types.Type = peelToRepr(t)
+	return r != nil && r.Kind == types.TYP_MANAGED_SLICE
+}
+
+// forwardEscapes is allocaEscapes relaxed for load-forwarding, but ONLY for a
+// managed SLICE: a plain OP_LOAD of such an A in a FAULT PAD (its cleanup RefDec
+// read) is not an escape — analyzeForwardAlloca collects and forwards it with the
+// normal loads.  The relaxation is gated on isManagedSlice because that is the only
+// slot kind the pad-forwarding handles; other managed values (managed pointers,
+// iface/func values) ALSO have cleanup pad loads, but those are not collected, so
+// they must keep the strict "any pad appearance ⇒ escape" rule or store-forwarding
+// would delete their alloca and pad load while leaving the pad's RefDec dangling.
+// Every non-pad escape (a store's value operand, GET_FIELD/ELEM_PTR, a phi entry)
+// is barred exactly as allocaEscapes.
+func forwardEscapes(f @Func, a @Instr) bool {
+	var relaxPad bool = isManagedSlice(a.TypeArg)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		if blockUsesAllocaNonLoadStore(f.Blocks[bi], a) {
+			return true
+		}
+	}
+	for pi := 0; pi < len(f.FaultPads); pi++ {
+		var pad @Block = f.FaultPads[pi]
+		if relaxPad {
+			if padUsesAllocaNonLoad(pad, a) {
+				return true
+			}
+		} else if blockReferencesAlloca(pad, a) {
+			return true
+		}
+	}
+	return false
+}
+
+// padUsesAllocaNonLoad reports whether pad b references A as anything other than
+// the Args[0] pointer of a plain OP_LOAD (a store, any other operand position, or a
+// phi entry) — which would be a real escape even in a cleanup pad.
+func padUsesAllocaNonLoad(b @Block, a @Instr) bool {
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var instr @Instr = b.Instrs[ii]
+		for k := 0; k < len(instr.Args); k++ {
+			if instr.Args[k] != a {
+				continue
+			}
+			if !(instr.Op == iropcode.OP_LOAD && k == 0) {
+				return true
+			}
+		}
+		for k := 0; k < len(instr.Phis); k++ {
+			if instr.Phis[k].Val == a {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// storeDominatesPad reports whether the store at (storeBlk, storePos) dominates
+// every fault point that lands in pad P — each faulting op in f.Blocks whose
+// PadBlock is P (pointer identity: a `@Block` and the faulting op's `*Block`
+// back-ref bit_cast to the same payload address).  Required so the pad's forwarded
+// load provably reads the stored value, not the zero-filled slot.  Returns false
+// (bail) if P has no locatable fault point, or any is not dominated.
+func storeDominatesPad(f @Func, d @DomInfo, storeBlk int, storePos int, pad @Block) bool {
+	var padKey int = bit_cast(int, pad)
+	var found bool = false
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if instr.PadBlock == nil {
+				continue
+			}
+			if bit_cast(int, instr.PadBlock) != padKey {
+				continue
+			}
+			found = true
+			if bi == storeBlk {
+				if ii <= storePos {
+					return false // fault point at/before the store
+				}
+			} else if !d.Dominates(storeBlk, bi) {
+				return false
+			}
+		}
+	}
+	return found
+}
+
+// applyRLE materializes each RLE slot's value with one OP_LOAD inserted right after
+// its store, rewrites every existing load (normal + fault-pad) to that
+// materializing load, and deletes the rewritten loads — keeping the alloca, store,
+// and new load.  (See the file header for why RLE, not store-forwarding, for a
+// >16B by-address managed slice.)
+func applyRLE(f @Func, allocas @[]@Instr, storeBlks @[]int, storePoss @[]int,
+		loadIDsPer @[]@[]int) {
+	var cap int = f.NextID
+	// load-id -> materializing load; and the set of rewritten (deleted) loads.
+	var replByID @[]@Instr
+	var deletedLoad @[]bool
+	for i := 0; i < cap; i++ {
+		var none @Instr
+		replByID = slices.Append[@Instr](replByID, none)
+		deletedLoad = slices.Append[bool](deletedLoad, false)
+	}
+	var l0s @[]@Instr
+	for i := 0; i < len(allocas); i++ {
+		var a @Instr = allocas[i]
+		var l0 @Instr = newInstr(f, iropcode.OP_LOAD, a.TypeArg)
+		l0.Args = makeArgs1(a)
+		l0s = slices.Append[@Instr](l0s, l0)
+		for k := 0; k < len(loadIDsPer[i]); k++ {
+			var lid int = loadIDsPer[i][k]
+			replByID[lid] = l0
+			deletedLoad[lid] = true
+		}
+	}
+	// Rebuild f.Blocks: drop the rewritten loads; insert each L0 right after its
+	// store (the store dominates every load, so it precedes them in its block).
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		var kept @[]@Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if instr.ID >= 0 && instr.ID < cap && deletedLoad[instr.ID] {
+				continue
+			}
+			kept = slices.Append[@Instr](kept, instr)
+			for i := 0; i < len(allocas); i++ {
+				if storeBlks[i] == bi && storePoss[i] == ii {
+					kept = slices.Append[@Instr](kept, l0s[i])
+				}
+			}
+		}
+		blk.Instrs = kept
+	}
+	// Rebuild each fault pad: drop the rewritten cleanup loads.
+	for pi := 0; pi < len(f.FaultPads); pi++ {
+		var pad @Block = f.FaultPads[pi]
+		var keptPad @[]@Instr
+		for ii := 0; ii < len(pad.Instrs); ii++ {
+			var instr @Instr = pad.Instrs[ii]
+			if instr.ID >= 0 && instr.ID < cap && deletedLoad[instr.ID] {
+				continue
+			}
+			keptPad = slices.Append[@Instr](keptPad, instr)
+		}
+		pad.Instrs = keptPad
+	}
+	// Rewrite every remaining use of a rewritten load to its materializing load,
+	// then fail loud if any use of a deleted load survives.  No alloca is deleted
+	// here, so allocaDeleted is all-false.
+	rewriteUsesInBlocks(f.Blocks, replByID, cap)
+	rewriteUsesInBlocks(f.FaultPads, replByID, cap)
+	var noAllocaDeleted @[]bool
+	for i := 0; i < cap; i++ {
+		noAllocaDeleted = slices.Append[bool](noAllocaDeleted, false)
+	}
+	assertNoSurvivingUses(f.Blocks, replByID, noAllocaDeleted, cap)
+	assertNoSurvivingUses(f.FaultPads, replByID, noAllocaDeleted, cap)
 }

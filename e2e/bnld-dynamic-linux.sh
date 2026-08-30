@@ -7,6 +7,9 @@
 #   * exit42 — `mov edi,42 ; call exit` → libc exit(42); the exit code proves the path.
 #   * hello  — passes a .rodata string (via a RIP-relative lea, an internal relocation)
 #              to libc puts, then exit(0): TWO imports, a data argument, and stdio.
+#   * datum  — GOT-loads the libc DATA symbol `stdout` (mov rax,[rip+stdout@GOTPCREL])
+#              and exits 42 iff non-null: the data-import (.got + GLOB_DAT) path — the
+#              __c_global mechanism — plus `exit` (PLT), so also the mixed PLT+GOT case.
 #
 # This is the x86-64 sibling of bnld-dynamic-linux-aarch64.sh.  The build + link +
 # structure check run everywhere; the RUN happens NATIVELY on an x86-64 Linux host —
@@ -107,6 +110,31 @@ _start:
 EOF
 echo "PASS: hello links to a dynamically-linked x86-64 ELF (imports puts + exit)"
 
+# ----- datum: GOT-load a libc DATA symbol (stdout) via `mov rax,[rip+stdout@GOTPCREL]`
+#       and exit 42 iff it is non-null — exercises a GLOB_DAT data import (the
+#       __c_global path), distinct from the PLT/JUMP_SLOT function imports above.
+#       `stdout` (a FILE*) is a static libc datum ld.so relocates when it loads libc,
+#       so it is non-null even without __libc_start_main.  `exit` is a PLT import, so
+#       this is the mixed PLT+GOT case. -----
+asm_link_dyn datum <<'EOF'
+.arch x64
+.section text
+.global _start
+.global stdout
+.global exit
+_start:
+	mov rax, [rip + stdout@GOTPCREL]
+	mov rax, [rax]
+	test rax, rax
+	jz Lzero
+	mov edi, 42
+	call exit
+Lzero:
+	mov edi, 0
+	call exit
+EOF
+echo "PASS: datum links to a dynamically-linked x86-64 ELF (GOT data import: stdout)"
+
 # ----- run: natively on an x86-64 Linux host (the CI Linux runner — no Docker) -----
 # A default local run on a non-x86-64 host SKIPs; Docker (linux/amd64) is used only on
 # a Linux CI lane or an explicit BINATE_E2E_DOCKER=1 opt-in, never a default local run.
@@ -176,6 +204,17 @@ if [ "$RAN" = 1 ]; then
     echo "PASS: hello ran — printed via libc puts and exited 0"
 else
     echo "SKIP: hello not run here ($_skip_note) — build+structure verified"
+fi
+
+run_dyn datum
+if [ "$RAN" = 1 ]; then
+    if [ "$CODE" != 42 ]; then
+        echo "FAIL: datum expected exit 42 (libc stdout bound non-null via GLOB_DAT), got $CODE" >&2
+        exit 1
+    fi
+    echo "PASS: datum ran — GOT-loaded libc stdout (bound via GLOB_DAT) and exited 42"
+else
+    echo "SKIP: datum not run here ($_skip_note) — build+structure verified"
 fi
 
 echo "ALL PASS: bnld dynamic ELF linking (x86-64)"

@@ -10,6 +10,9 @@
 #   * hello  — write(1, msg, 22) via ADRP+ADD to a .rodata string, then _exit(0): two
 #     imports, a data argument, and stdio — plus the rodata path (a __const section
 #     before __text) that exercises section-relative symbol addressing.
+#   * datum  — GOT-loads the libSystem DATA symbol ___stdoutp and exits 42 iff non-null:
+#     the data-import path (__got slot + POINTER bind, no stub, the load kept pointing
+#     at the slot) plus a called import — the mixed function+data case.
 #
 # Static Mach-O does not run on macOS arm64 (the kernel mandates dyld), so this is the
 # path to a bnld-linked binary that runs on this platform.  The build + link +
@@ -115,6 +118,29 @@ _start:
 EOF
 echo "PASS: hello links to a dynamically-linked arm64 Mach-O (imports _write + _exit)"
 
+# ----- datum: GOT-load the libSystem DATA symbol ___stdoutp (a FILE*) and exit 42 iff
+#       non-null — the data-import path (a __got slot + POINTER bind, no stub, the load
+#       kept pointing at the slot), plus _exit (a called import), so also the mixed
+#       function+data case.  ___stdoutp is a libSystem datum dyld binds at load. -----
+asm_link_macho datum <<'EOF'
+.arch aarch64
+.section text
+.global _start
+.global ___stdoutp
+.global _exit
+_start:
+	adrp x0, :got:___stdoutp
+	ldr x0, [x0, #:got_lo12:___stdoutp]
+	ldr x0, [x0]
+	cbz x0, Lzero
+	mov w0, #42
+	bl _exit
+Lzero:
+	mov w0, #0
+	bl _exit
+EOF
+echo "PASS: datum links to a dynamically-linked arm64 Mach-O (GOT data import: ___stdoutp)"
+
 # ----- run: natively on macOS arm64 (the macos-latest CI lane); SKIP elsewhere. -----
 # A Mach-O cannot run in a Linux container, so there is no Docker path: the run is
 # native-or-skip.
@@ -140,6 +166,13 @@ if [ "$CAN_RUN" = 1 ]; then
         exit 1
     fi
     echo "PASS: hello ran — printed via libSystem write and exited 0"
+
+    "$TMP/datum"; _code=$?
+    if [ "$_code" != 42 ]; then
+        echo "FAIL: datum expected exit 42 (libSystem ___stdoutp bound non-null via the GOT), got $_code" >&2
+        exit 1
+    fi
+    echo "PASS: datum ran — GOT-loaded libSystem ___stdoutp (bound by dyld) and exited 42"
 else
     echo "SKIP: Mach-O binaries not run here ($_skip_note) — build+structure verified"
 fi

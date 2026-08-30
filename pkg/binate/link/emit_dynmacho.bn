@@ -1,0 +1,214 @@
+package "pkg/binate/link"
+
+// Dynamic Mach-O executable writer (arm64).  It extends the static EmitMachoExec
+// shape — __PAGEZERO / __TEXT / __LINKEDIT, the "lowest real segment maps the mach
+// header" trick, an ad-hoc code signature — with the machinery a dyld-loaded
+// executable needs: a __DATA_CONST segment holding the __got (bound at load), and the
+// load commands LC_DYLD_INFO_ONLY (the bind stream), LC_SYMTAB, LC_LOAD_DYLINKER,
+// LC_LOAD_DYLIB, LC_BUILD_VERSION, LC_UUID, and LC_MAIN (entry) in place of the static
+// LC_UNIXTHREAD.  The synthesized __got + stubs + bind stream come from dynmacho.bn;
+// this file lays out segments/linkedit and writes bytes.  16 KB pages (macOS arm64).
+// See explorations/plan-dynamic-linking.md ("M2 recipe").  arm64 only.
+
+// Dynamic Mach-O load commands / flags not already in emit_macho.bn.
+const (
+	MACHO_LC_DYLD_INFO_ONLY int = 0x80000022
+	MACHO_LC_LOAD_DYLINKER int = 0xe
+	MACHO_LC_LOAD_DYLIB int = 0xc
+	MACHO_LC_MAIN int = 0x80000028
+	MACHO_LC_BUILD_VERSION int = 0x32
+	MACHO_LC_UUID int = 0x1b
+	MACHO_SG_READ_ONLY int = 0x10            // segment flag: made read-only after fixups
+	MACHO_PLATFORM_MACOS int = 1
+	MACHO_MH_DYLDLINK int = 0x4
+	MACHO_MH_TWOLEVEL int = 0x80
+	MACHO_MH_PIE int = 0x200000
+	// minOS/SDK 11.0 (0xb0000 = 11<<16): arm64 macOS floor, so the binary runs on
+	// macOS 11+.
+	machoMinOS int = 0xb0000
+	machoDynPage int = 0x4000 // macOS arm64 segments are 16 KB-aligned
+)
+
+// writeSeg64Flags is writeSeg64 with a non-zero segment `flags` field (for
+// __DATA_CONST's SG_READ_ONLY).
+func writeSeg64Flags(out @[]uint8, off int, name *[]readonly char, vmaddr uint, vmsize uint,
+		fileoff int, filesize int, maxprot int, initprot int, flags int) {
+	writeSeg64(out, off, name, vmaddr, vmsize, fileoff, filesize, maxprot, initprot)
+	writeLE(out, off + 68, flags, 4) // overwrite the flags field writeSeg64 left 0
+}
+
+// writeDylibName fills the lc_str name of a LC_LOAD_DYLINKER / LC_LOAD_DYLIB command:
+// the lc_str.offset field is always at lc+8 (the first field after cmd/cmdsize) and
+// holds strOff, the byte offset from the command start where the string begins (12 for
+// LC_LOAD_DYLINKER, 24 for LC_LOAD_DYLIB after its timestamp/version fields).
+func writeDylibName(out @[]uint8, lc int, strOff int, name *[]readonly char) {
+	writeLE(out, lc + 8, strOff, 4) // lc_str.offset
+	for i := 0; i < len(name); i++ { out[lc + strOff + i] = cast(uint8, name[i]) }
+	// trailing NUL + padding stay 0 (out is zero-initialized)
+}
+
+// EmitDynMachoExec writes a dynamically-linked, ad-hoc-signed arm64 Mach-O for the
+// laid-out read-only sections (program text + the synthesized stubs), entering at
+// `entry`.  gotVaddr/gotCount describe the __got (in __DATA_CONST, one 8-byte slot per
+// import, zero-filled — dyld binds them via bindOps); symtab/nsyms + strtab are the
+// companion symbol table; identifier names the CodeDirectory.  Writable program data
+// is not yet supported (a __DATA segment) — rejected for now.  Returns "" or an error.
+func EmitDynMachoExec(sections @[]OutputSection, entry uint, machine int, gotVaddr uint,
+		gotCount int, bindOps @[]uint8, symtab @[]uint8, nsyms int, strtab @[]uint8,
+		identifier *[]readonly char, path *[]readonly char) @[]readonly char {
+	if len(sections) == 0 { return "no sections to emit" }
+	if machine != EM_AARCH64 { return "dynamic Mach-O writer supports arm64 only" }
+	var pagesize int = machoDynPage
+
+	roFound, _, roFileEnd, roMemEnd, _ := groupStats(sections, false)
+	rwFound, _, _, _, _ := groupStats(sections, true)
+	if !roFound { return "no read-only/exec section to hold the entry point" }
+	if rwFound { return "writable program data in a dynamic Mach-O is not yet supported" }
+
+	// Dylib/linker path command sizes (lc_str-terminated, 8-padded).
+	var szDylinker int = alignUp(12 + len(machoInterp()) + 1, 8)
+	var szDylib int = alignUp(24 + len(machoLibSystem()) + 1, 8)
+
+	// __PAGEZERO + __TEXT + __DATA_CONST + __LINKEDIT, then the dynamic commands.
+	var nsegs int = 4
+	// + DYLD_INFO, SYMTAB, BUILD_VERSION, UUID, LOAD_DYLINKER, LOAD_DYLIB, MAIN, CODE_SIGNATURE.
+	var ncmds int = nsegs + 8
+	var sizeofcmds int = nsegs * 72 + 48 + 24 + 24 + 24 + szDylinker + szDylib + 24 + 16
+	var hend int = 32 + sizeofcmds
+
+	var base uint = sections[0].Addr
+	var dataStart int = alignUp(hend, pagesize) + cast(int, base % cast(uint, pagesize))
+	if base < cast(uint, dataStart) { return "load base too low to hold the Mach-O header" }
+	var segStart uint = base - cast(uint, dataStart)
+	for i := 0; i < len(sections); i++ {
+		if sections[i].Addr < base { return "a section address is below the load base" }
+	}
+	if entry < base || entry >= roMemEnd { return "entry point is outside the loaded image" }
+	if gotVaddr < roMemEnd { return "the __got overlaps the text segment" }
+
+	var rx int = MACHO_VM_PROT_READ | MACHO_VM_PROT_EXECUTE
+	var rw int = MACHO_VM_PROT_READ | MACHO_VM_PROT_WRITE
+	var ro int = MACHO_VM_PROT_READ
+
+	// __TEXT spans the header prefix + the read-only sections.
+	var textFile int = dataStart + cast(int, roFileEnd - base)
+	var textVm int = alignUp(dataStart + cast(int, roMemEnd - base), pagesize)
+
+	// __DATA_CONST holds the __got (one 8-byte slot per import) at gotVaddr
+	// (file-congruent to base), sized up to whole pages — so a large import count spans
+	// as many pages as it needs rather than silently overrunning a single page.
+	var gotFileOff int = dataStart + cast(int, gotVaddr - base)
+	var gotVm int = alignUp(gotCount * machoPtrSize, pagesize)
+	if gotVm == 0 { gotVm = pagesize } // keep a valid, non-zero __DATA_CONST
+
+	// __LINKEDIT: bind stream, symbol table, string table, then the code signature.
+	var leVaddr uint = gotVaddr + cast(uint, gotVm)
+	var leFileOff int = gotFileOff + gotVm
+	var bindOff int = leFileOff
+	var symOff int = alignUp(bindOff + len(bindOps), 8)
+	var strOff int = symOff + nsyms * 16
+	var strEnd int = strOff + len(strtab)
+	var sigOff int = alignUp(strEnd, 16)
+	var datasize int = alignUp(codeSignatureSize(sigOff, len(identifier)), 16)
+	var totalFile int = sigOff + datasize
+	var leFileSize int = totalFile - leFileOff
+	var leVm int = alignUp(leFileSize, pagesize)
+
+	var out @[]uint8 = make_slice(uint8, totalFile)
+
+	// mach_header_64 (dynamic: DYLDLINK | TWOLEVEL | PIE, undefined symbols allowed).
+	writeLE(out, 0, 0xfeedfacf, 4)
+	writeLE(out, 4, MACHO_CPU_ARM64, 4)
+	writeLE(out, 8, 0, 4) // cpusubtype ARM64_ALL
+	writeLE(out, 12, MACHO_MH_EXECUTE, 4)
+	writeLE(out, 16, ncmds, 4)
+	writeLE(out, 20, sizeofcmds, 4)
+	writeLE(out, 24, MACHO_MH_DYLDLINK | MACHO_MH_TWOLEVEL | MACHO_MH_PIE, 4)
+	writeLE(out, 28, 0, 4)
+
+	var lc int = 32
+	writeSeg64(out, lc, "__PAGEZERO", cast(uint, 0), segStart, 0, 0, 0, 0)
+	lc = lc + 72
+	writeSeg64(out, lc, "__TEXT", segStart, cast(uint, textVm), 0, textFile, rx, rx)
+	lc = lc + 72
+	writeSeg64Flags(out, lc, "__DATA_CONST", gotVaddr, cast(uint, gotVm), gotFileOff, gotVm, rw, rw,
+			MACHO_SG_READ_ONLY)
+	lc = lc + 72
+	writeSeg64(out, lc, "__LINKEDIT", leVaddr, cast(uint, leVm), leFileOff, leFileSize, ro, ro)
+	lc = lc + 72
+
+	// LC_DYLD_INFO_ONLY: only the bind stream is populated.
+	writeLE(out, lc + 0, MACHO_LC_DYLD_INFO_ONLY, 4)
+	writeLE(out, lc + 4, 48, 4)
+	writeLE(out, lc + 16, bindOff, 4) // bind_off
+	writeLE(out, lc + 20, len(bindOps), 4) // bind_size
+	lc = lc + 48
+
+	// LC_SYMTAB.
+	writeLE(out, lc + 0, MACHO_LC_SYMTAB, 4)
+	writeLE(out, lc + 4, 24, 4)
+	writeLE(out, lc + 8, symOff, 4)
+	writeLE(out, lc + 12, nsyms, 4)
+	writeLE(out, lc + 16, strOff, 4)
+	writeLE(out, lc + 20, len(strtab), 4)
+	lc = lc + 24
+
+	// LC_BUILD_VERSION (platform macOS; minos/sdk), ntools=0.
+	writeLE(out, lc + 0, MACHO_LC_BUILD_VERSION, 4)
+	writeLE(out, lc + 4, 24, 4)
+	writeLE(out, lc + 8, MACHO_PLATFORM_MACOS, 4)
+	writeLE(out, lc + 12, machoMinOS, 4)
+	writeLE(out, lc + 16, machoMinOS, 4)
+	writeLE(out, lc + 20, 0, 4) // ntools
+	lc = lc + 24
+
+	// LC_UUID (a fixed identifier — bnld does not compute a content hash).
+	writeLE(out, lc + 0, MACHO_LC_UUID, 4)
+	writeLE(out, lc + 4, 24, 4)
+	for i := 0; i < 16; i++ { out[lc + 8 + i] = cast(uint8, 0xb0 + i) }
+	lc = lc + 24
+
+	// LC_LOAD_DYLINKER (/usr/lib/dyld).
+	writeLE(out, lc + 0, MACHO_LC_LOAD_DYLINKER, 4)
+	writeLE(out, lc + 4, szDylinker, 4)
+	writeDylibName(out, lc, 12, machoInterp())
+	lc = lc + szDylinker
+
+	// LC_LOAD_DYLIB (/usr/lib/libSystem.B.dylib): timestamp 0, current/compat 1.0.0.
+	writeLE(out, lc + 0, MACHO_LC_LOAD_DYLIB, 4)
+	writeLE(out, lc + 4, szDylib, 4)
+	writeLE(out, lc + 12, 0, 4) // timestamp
+	writeLE(out, lc + 16, 0x10000, 4) // current_version 1.0.0
+	writeLE(out, lc + 20, 0x10000, 4) // compatibility_version 1.0.0
+	writeDylibName(out, lc, 24, machoLibSystem())
+	lc = lc + szDylib
+
+	// LC_MAIN: entryoff is the entry's file offset (= entry - segStart).
+	writeLE(out, lc + 0, MACHO_LC_MAIN, 4)
+	writeLE(out, lc + 4, 24, 4)
+	writeLE(out, lc + 8, cast(int, entry - segStart), 8) // entryoff
+	writeLE(out, lc + 16, 0, 8) // stacksize (default)
+	lc = lc + 24
+
+	// LC_CODE_SIGNATURE.
+	writeLE(out, lc + 0, MACHO_LC_CODE_SIGNATURE, 4)
+	writeLE(out, lc + 4, 16, 4)
+	writeLE(out, lc + 8, sigOff, 4)
+	writeLE(out, lc + 12, datasize, 4)
+
+	// Section data at dataStart + (Addr - base).  The __got page stays zero (dyld
+	// binds the slots); the linkedit tables follow.
+	for i := 0; i < len(sections); i++ {
+		var d @[]uint8 = sections[i].Data
+		if len(d) == 0 { continue }
+		var fo int = dataStart + cast(int, sections[i].Addr - base)
+		for j := 0; j < len(d); j++ { out[fo + j] = d[j] }
+	}
+	for i := 0; i < len(bindOps); i++ { out[bindOff + i] = bindOps[i] }
+	for i := 0; i < len(symtab); i++ { out[symOff + i] = symtab[i] }
+	for i := 0; i < len(strtab); i++ { out[strOff + i] = strtab[i] }
+
+	// Seal it: hash [0, sigOff) into the ad-hoc signature.
+	writeCodeSignature(out, sigOff, sigOff, identifier, textFile)
+	return writeFile(path, out)
+}

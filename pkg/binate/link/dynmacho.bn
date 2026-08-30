@@ -1,0 +1,270 @@
+package "pkg/binate/link"
+
+import "pkg/binate/buf"
+
+// Dynamic Mach-O linking (arm64).  The macOS analogue of dynlink.bn: a
+// dynamically-linked Mach-O resolves its undefined externals (e.g. libSystem's
+// `_exit`) from shared libraries at load via /usr/lib/dyld, instead of erroring on
+// them.  As on ELF, each import gets a __TEXT stub that jumps through a __got slot;
+// dyld binds the slot to the real address at load (a BIND opcode in LC_DYLD_INFO_ONLY
+// — non-lazy, the Mach-O analogue of DF_BIND_NOW, so no __stub_helper / stub-binder).
+// The program's `bl _exit` retargets to the stub through the ordinary Resolve →
+// Layout → Relocate pipeline: a synthesized "dynamic-stubs" object *defines* each
+// import at its stub.  The __got + the loader-facing tables (bind opcodes, symtab,
+// LC_LOAD_DYLINKER/DYLIB, LC_MAIN, LC_BUILD_VERSION, the ad-hoc code signature) are
+// emitted by the writer.  See explorations/plan-dynamic-linking.md ("M2 recipe") for
+// the validated byte-level recipe.  arm64 only.
+
+// Mach-O dynamic-linking constants.
+const (
+	// Dyld info bind opcodes (the high nibble is the opcode, the low nibble an
+	// immediate operand).
+	BIND_OPCODE_DONE int = 0x00
+	BIND_OPCODE_SET_DYLIB_ORDINAL_IMM int = 0x10
+	BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM int = 0x40
+	BIND_OPCODE_SET_TYPE_IMM int = 0x50
+	BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB int = 0x70
+	BIND_OPCODE_DO_BIND int = 0x90
+	BIND_TYPE_POINTER int = 1
+	// nlist_64 constants: an imported symbol is undefined + external, with the
+	// providing dylib's ordinal (1 for the first LC_LOAD_DYLIB) in n_desc's high byte.
+	MACHO_LIBSYSTEM_ORDINAL int = 1
+	machoPtrSize int = 8            // a __got slot / pointer
+	machoStubSize int = 12          // adrp x16 ; ldr x16,[x16,#off] ; br x16
+	machoNlistSize int = 16
+)
+
+// machoInterp is the dynamic linker a hosted arm64 Mach-O loads (LC_LOAD_DYLINKER).
+func machoInterp() *[]readonly char { return "/usr/lib/dyld" }
+
+// machoLibSystem is the libc-providing dylib a hosted arm64 Mach-O links (LC_LOAD_DYLIB).
+func machoLibSystem() *[]readonly char { return "/usr/lib/libSystem.B.dylib" }
+
+// writeUleb writes value (non-negative) to out at off as an unsigned LEB128 varint
+// and returns the offset past it.
+func writeUleb(out @[]uint8, off int, value int) int {
+	var v int = value
+	var p int = off
+	for {
+		var b int = v & 0x7f
+		v = v >> 7
+		if v != 0 {
+			out[p] = cast(uint8, b | 0x80)
+			p = p + 1
+		} else {
+			out[p] = cast(uint8, b)
+			return p + 1
+		}
+	}
+}
+
+// buildMachoBind builds the LC_DYLD_INFO_ONLY bind stream: for each import, bind its
+// __got slot (segment segIndex, offset i*8) to the named symbol from libSystem.  A
+// non-lazy POINTER bind, so dyld resolves it at load.  Returns the opcode bytes.
+func buildMachoBind(imports @[]@[]char, segIndex int) @[]uint8 {
+	// Upper bound: 2 header opcodes + per import (1 flags + name + NUL + 1 seg + 5 uleb
+	// + 1 do_bind) + 1 done.
+	var cap int = 3
+	for i := 0; i < len(imports); i++ { cap = cap + len(imports[i]) + 9 }
+	var out @[]uint8 = make_slice(uint8, cap)
+	var p int = 0
+	out[p] = cast(uint8, BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | MACHO_LIBSYSTEM_ORDINAL)
+	p = p + 1
+	out[p] = cast(uint8, BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER)
+	p = p + 1
+	for i := 0; i < len(imports); i++ {
+		out[p] = cast(uint8, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM)
+		p = p + 1
+		for j := 0; j < len(imports[i]); j++ { out[p] = cast(uint8, imports[i][j]); p = p + 1 }
+		out[p] = cast(uint8, 0) // NUL-terminate the symbol name
+		p = p + 1
+		out[p] = cast(uint8, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segIndex)
+		p = p + 1
+		p = writeUleb(out, p, i * machoPtrSize)
+		out[p] = cast(uint8, BIND_OPCODE_DO_BIND)
+		p = p + 1
+	}
+	out[p] = cast(uint8, BIND_OPCODE_DONE)
+	p = p + 1
+	return out[0:p]
+}
+
+// buildMachoSymtab builds the symbol table (one UND external nlist_64 per import) and
+// the matching string table (a leading NUL, then each NUL-terminated name).  dyld
+// binds by name via the bind opcodes; the symtab is the conventional companion.
+// Returns (nlist bytes, strtab bytes).
+func buildMachoSymtab(imports @[]@[]char) (@[]uint8, @[]uint8) {
+	var n int = len(imports)
+	var syms @[]uint8 = make_slice(uint8, n * machoNlistSize)
+	var strTotal int = 1
+	for i := 0; i < n; i++ { strTotal = strTotal + len(imports[i]) + 1 }
+	var strs @[]uint8 = make_slice(uint8, strTotal)
+	var sp int = 1 // strs[0] is the empty string (a leading NUL)
+	for i := 0; i < n; i++ {
+		var e int = i * machoNlistSize
+		writeLE(syms, e + 0, sp, 4) // n_strx
+		syms[e + 4] = cast(uint8, MACHO_N_EXT) // n_type: undefined external
+		// n_sect(1) stays 0; n_desc(2) carries the dylib ordinal in its high byte.
+		writeLE(syms, e + 6, MACHO_LIBSYSTEM_ORDINAL << 8, 2)
+		// n_value(8) stays 0.
+		for j := 0; j < len(imports[i]); j++ { strs[sp] = cast(uint8, imports[i][j]); sp = sp + 1 }
+		sp = sp + 1 // NUL
+	}
+	return syms, strs
+}
+
+// encMachoStub writes the 12-byte arm64 PLT-style stub at out[off:off+12]: it jumps
+// through the import's __got slot (adrp x16,slot@page ; ldr x16,[x16,#slot_lo12] ; br
+// x16).  With the non-lazy bind the slot already holds the resolved address.  Returns
+// "" or a range error (unreachable in a real executable — __TEXT and __DATA_CONST are
+// a few pages apart — but a loud failure if that changes).
+func encMachoStub(out @[]uint8, off int, stubVa uint, gotSlot uint) @[]readonly char {
+	var pageMask int = 0 - 0x1000
+	var pages int = ((cast(int, gotSlot) & pageMask) - (cast(int, stubVa) & pageMask)) >> 12
+	if pages > 0xfffff || pages < (0 - 0x100000) {
+		return "Mach-O stub ADRP page offset out of range"
+	}
+	var lo int = cast(int, gotSlot & cast(uint, 0xfff))
+	writeLE(out, off + 0, encAdrp(16, stubVa, gotSlot), 4)
+	writeLE(out, off + 4, encLdr64(16, 16, lo), 4) // ldr x16, [x16, #lo]
+	writeLE(out, off + 8, encBr(16), 4)
+	return ""
+}
+
+// buildMachoStubs synthesizes the "dynamic-stubs" object: one executable __stubs
+// section (kindText) holding an as-yet-unpatched stub per import, and a global symbol
+// per import defined at its stub — so the program's `bl <import>` resolves through the
+// stub via Resolve/Relocate.  The stubs' page/GOT references are patched by
+// patchMachoStubs once Layout has assigned addresses.  Returns the object.
+func buildMachoStubs(imports @[]@[]char, machine int) @InputObject {
+	var n int = len(imports)
+	var secs @[]InputSection = make_slice(InputSection, 1)
+	secs[0] = mkDynSection("__stubs", SF_READ | SF_EXEC, 4, make_slice(uint8, n * machoStubSize))
+	var syms @[]InputSymbol = make_slice(InputSymbol, n)
+	for i := 0; i < n; i++ {
+		var sym InputSymbol
+		sym.Name = buf.CopyStr(imports[i])
+		sym.SecIndex = 0
+		sym.Value = cast(uint, i * machoStubSize)
+		sym.Binding = BIND_GLOBAL
+		syms[i] = sym
+	}
+	var obj @InputObject = make(InputObject)
+	obj.Path = buf.CopyStr("<dynamic-stubs>")
+	obj.Machine = machine
+	obj.Sections = secs
+	obj.Symbols = syms
+	obj.Relocs = make_slice(InputReloc, 0)
+	return obj
+}
+
+// patchMachoStubs fills each stub (now that Layout placed the __stubs section) to jump
+// through its __got slot at gotVaddr + i*8.  stubObj is the buildMachoStubs object;
+// lr the layout.  Returns "" or a stub-encoding error.
+func patchMachoStubs(stubObj @InputObject, lr @LayoutResult, gotVaddr uint,
+		n int) @[]readonly char {
+	var stubVaBase uint = secVaddr(stubObj, lr, 0)
+	stubData, stubOff := outData(stubObj, lr, 0)
+	for i := 0; i < n; i++ {
+		var stubVa uint = stubVaBase + cast(uint, i * machoStubSize)
+		var gotSlot uint = gotVaddr + cast(uint, i * machoPtrSize)
+		var e @[]readonly char = encMachoStub(stubData, stubOff + i * machoStubSize, stubVa, gotSlot)
+		if len(e) != 0 { return e }
+	}
+	return ""
+}
+
+// machoLayoutEnd returns the highest virtual address end across all output sections —
+// the placed image's top, above which the synthesized __got is put.
+func machoLayoutEnd(lr @LayoutResult) uint {
+	var end uint = cast(uint, 0)
+	for i := 0; i < len(lr.Sections); i++ {
+		var e uint = lr.Sections[i].Addr + lr.Sections[i].Size
+		if e > end { end = e }
+	}
+	return end
+}
+
+// machoIdent returns the last path component of p (the CodeDirectory identifier,
+// conventionally the output basename).
+func machoIdent(p *[]readonly char) @[]char {
+	var start int = 0
+	for i := 0; i < len(p); i++ { if p[i] == '/' { start = i + 1 } }
+	var out @[]char = make_slice(char, len(p) - start)
+	for i := start; i < len(p); i++ { out[i - start] = p[i] }
+	return out
+}
+
+// LinkDynMacho links inputPaths (arm64 Mach-O objects) into a dynamically-linked,
+// ad-hoc-signed Mach-O executable at outPath, entering at entryName.  Undefined
+// externals become dynamic imports from libSystem, bound at load by /usr/lib/dyld: a
+// __TEXT stub per import jumps through a __got slot dyld binds.  Reuses Resolve →
+// Layout → Relocate (a synthesized stubs object defines each import at its stub) then
+// EmitDynMachoExec.  Data (GOT) imports are not yet supported (a follow-up); base is
+// the code base (segStart = base - header size).  Returns "" or an error.  arm64 only.
+func LinkDynMacho(inputPaths @[]@[]char, entryName *[]readonly char, machine int, base uint,
+		outPath *[]readonly char) @[]readonly char {
+	if machine != EM_AARCH64 { return "dynamic Mach-O linking supports arm64 only" }
+
+	var program @[]@InputObject = make_slice(@InputObject, len(inputPaths))
+	var nObj int = 0
+	for i := 0; i < len(inputPaths); i++ {
+		data, ok := readFile(inputPaths[i])
+		if !ok { return buf.Concat("cannot read input file: ", inputPaths[i]) }
+		// bnlint:allow managed-to-raw-assign - a live read-only view of the input bytes
+		var raw *[]readonly uint8 = data
+		if len(raw) >= 4 && raw[0] == 0xcf && raw[1] == 0xfa && raw[2] == 0xed && raw[3] == 0xfe {
+			obj, perr := parseMachoBytes(raw, inputPaths[i])
+			if len(perr) != 0 { return perr }
+			program[nObj] = obj
+			nObj = nObj + 1
+		} else {
+			return buf.Concat("dynamic Mach-O linking needs Mach-O objects: ", inputPaths[i])
+		}
+	}
+	program = program[0:nObj]
+	for i := 0; i < len(program); i++ {
+		if program[i].Machine != machine {
+			return buf.Concat("object machine does not match the target: ", program[i].Path)
+		}
+	}
+
+	imports, _ := collectImports(program)
+	kinds, cerr := classifyImports(program, imports)
+	if len(cerr) != 0 { return cerr }
+	for i := 0; i < len(kinds); i++ {
+		if kinds[i] == impGot {
+			return buf.Concat("data (GOT) import not yet supported for Mach-O: ", imports[i])
+		}
+	}
+
+	var stubObj @InputObject = buildMachoStubs(imports, machine)
+	var allObjs @[]@InputObject = make_slice(@InputObject, len(program) + 1)
+	for i := 0; i < len(program); i++ { allObjs[i] = program[i] }
+	allObjs[len(program)] = stubObj
+
+	t, rerr := Resolve(allObjs)
+	if len(rerr) != 0 { return rerr }
+	var lr @LayoutResult = Layout(allObjs, base)
+
+	oo, ss, found := t.Lookup(entryName)
+	if !found { return buf.Concat("entry symbol not defined: ", entryName) }
+	entryAddr, eok := symbolAddr(t, lr, oo, ss)
+	if !eok { return buf.Concat("entry symbol has no address: ", entryName) }
+
+	var perr @[]readonly char = Relocate(t, lr)
+	if len(perr) != 0 { return perr }
+
+	// Place the __got on the first 16 KB page above the laid-out image, then wire the
+	// stubs to it.
+	var gotVaddr uint = cast(uint, alignUp(cast(int, machoLayoutEnd(lr)), machoDynPage))
+	var serr @[]readonly char = patchMachoStubs(stubObj, lr, gotVaddr, len(imports))
+	if len(serr) != 0 { return serr }
+
+	// __DATA_CONST is the 3rd segment (__PAGEZERO, __TEXT, __DATA_CONST), so the bind
+	// stream names segment index 2.
+	var bindOps @[]uint8 = buildMachoBind(imports, 2)
+	symtab, strtab := buildMachoSymtab(imports)
+	return EmitDynMachoExec(lr.Sections, entryAddr, machine, gotVaddr, len(imports), bindOps, symtab,
+			len(imports), strtab, machoIdent(outPath), outPath)
+}

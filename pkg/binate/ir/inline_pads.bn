@@ -1,0 +1,274 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/stdx/slices"
+
+// Fault-pad handling for the inliner (Inc 3a/3b).  A recoverable fault op
+// (bounds/div/shift/nil check) carries a cleanup PAD that the VM runs on a
+// fault: it RefDecs the managed values live at the fault, then OP_UNWIND_RETURN
+// unwinds the frame (dispatching the fault onward to the caller's call-site
+// pad).  Compiled backends ignore pads (abort on fault); only the VM uses them.
+//
+// Inlining a fault-containing callee collapses callee+caller into ONE frame, so
+// a fault at a cloned op must run BOTH the callee-side cleanup AND the caller's
+// call-site cleanup, then unwind ONCE.  Two cases:
+//   * EMPTY callee pad (no managed value live at the fault -> just
+//     OP_UNWIND_RETURN): no callee cleanup to preserve, so the cloned op reuses
+//     the caller's call-site pad directly (Inc 3a) — cloneInstrFields sets
+//     PadBlock = callSitePad.
+//   * NON-EMPTY single-block callee pad (managed-ptr local/param live at the
+//     fault -> straight-line RefDecs then OP_UNWIND_RETURN): the pad is cloned
+//     into the caller's FaultPads with its RefDec operands remapped to the
+//     cloned callee values, and its terminal OP_UNWIND_RETURN replaced by an
+//     OP_JUMP into the caller's call-site pad — chaining callee cleanup ->
+//     caller cleanup -> a single unwind (Inc 3b).  The RefDec sequence is a
+//     faithful clone of the callee pad's, so refcounting balances by
+//     construction (same ops, same order, one fewer frame pop).
+// Multi-block pads (a managed-slice / iface / func-value RefDec branches into
+// further pad blocks) are NOT handled — inlinableCallee rejects them (a later
+// increment).
+//
+// PadBlock is a raw `*Block` back-ref (it breaks the Instr->Block->Instr
+// refcount cycle), but a block CFG target (Block1) is a managed `@Block`, so the
+// cloned pad's chain-jump needs the call-site pad's @Block handle — recovered
+// from Func.FaultPads by payload-address identity (faultPadHandle).
+
+// isEmptyPad reports whether a fault pad is empty — exactly one instr, the
+// terminal OP_UNWIND_RETURN — i.e. no managed value was live at the fault, so
+// there is no callee-side cleanup to clone (the Inc 3a direct-reuse case).
+func isEmptyPad(pad *Block) bool {
+	return len(pad.Instrs) == 1 && pad.Instrs[0].Op == iropcode.OP_UNWIND_RETURN
+}
+
+// padSingleBlockInlinable reports whether a NON-empty fault pad is a single
+// straight-line block Inc 3b can clone: its last instr is OP_UNWIND_RETURN (so
+// it does not branch into further pad blocks) and every preceding cleanup instr
+// is a non-faulting, non-call op whose operands are all remappable through the
+// callee's dense value space (params / in-callee values / pad-internal values,
+// all id < callee.NextID).  A pad that branches (managed-slice / iface /
+// func-value cleanup) ends in a BRANCH, not OP_UNWIND_RETURN, and is rejected.
+func padSingleBlockInlinable(pad *Block, callee @Func) bool {
+	var n int = len(pad.Instrs)
+	if n == 0 {
+		return false
+	}
+	if pad.Instrs[n - 1].Op != iropcode.OP_UNWIND_RETURN {
+		return false // branches -> multi-block pad -> not handled yet
+	}
+	for k := 0; k < n - 1; k++ {
+		var pi @Instr = pad.Instrs[k]
+		if pi.PadBlock != nil {
+			return false // pads don't nest faults (defensive)
+		}
+		if isCallFamilyOp(pi.Op) {
+			return false // a dtor runs via OP_REFDEC, not a call (defensive)
+		}
+		if len(pi.Phis) != 0 {
+			return false
+		}
+		for a := 0; a < len(pi.Args); a++ {
+			var av @Instr = pi.Args[a]
+			if av == nil {
+				continue
+			}
+			if av.IsGlobalRef {
+				continue // a global operand is valid in the caller unchanged
+			}
+			if av.ID < 0 || av.ID >= callee.NextID {
+				return false // operand not remappable
+			}
+		}
+	}
+	return true
+}
+
+// faultPadHandle recovers the managed @Block for a raw `*Block` pad back-ref by
+// scanning f.FaultPads for the same payload address (bit_cast identity — the
+// same idiom load_forward.bn uses to match a faulting op's *Block PadBlock to a
+// pad @Block).  Returns nil if not found (should not happen: a call-site pad
+// lives in the caller's FaultPads and survives the inlined call's deletion).
+func faultPadHandle(f @Func, target *Block) @Block {
+	var key int = bit_cast(int, target)
+	for i := 0; i < len(f.FaultPads); i++ {
+		if bit_cast(int, f.FaultPads[i]) == key {
+			return f.FaultPads[i]
+		}
+	}
+	return nil
+}
+
+// cloneSingleBlockPad clones a non-empty single-block callee fault pad into f's
+// FaultPads: each cleanup instr is copied with its operands remapped through
+// `remap` (the same dense value map the body clone populated, so the cloned
+// RefDecs target the cloned callee locals), and the terminal OP_UNWIND_RETURN is
+// replaced by an OP_JUMP into `callSitePad` so the cloned pad chains into the
+// caller's call-site cleanup + single unwind.  Pad values are straight-line
+// (defs precede uses), so one forward pass suffices; a pad-internal value's
+// clone is recorded in `remap` for later refs within the same pad.  Pad cleanup
+// instrs are never fault ops, so cloneInstrFields's callSitePad arg is unused
+// (nil).
+func cloneSingleBlockPad(f @Func, srcPad *Block, remap @[]@Instr, cap int,
+		callSitePad @Block) @Block {
+	var pad @Block = AddFaultPad(f, "inl_pad")
+	var built @[]@Instr
+	for k := 0; k < len(srcPad.Instrs); k++ {
+		var src @Instr = srcPad.Instrs[k]
+		if src.Op == iropcode.OP_UNWIND_RETURN {
+			var jmp @Instr = newVoidInstr(iropcode.OP_JUMP)
+			jmp.Block1 = callSitePad
+			built = slices.Append[@Instr](built, jmp)
+			continue
+		}
+		var noPad *Block
+		var c @Instr = cloneInstrFields(f, src, noPad)
+		for a := 0; a < len(c.Args); a++ {
+			c.Args[a] = remapOperand(c.Args[a], remap, cap)
+		}
+		if src.ID >= 0 {
+			remap[src.ID] = c
+		}
+		built = slices.Append[@Instr](built, c)
+	}
+	pad.Instrs = built
+	return pad
+}
+
+// fixupInlinedPads rewires every cloned NON-empty-pad fault op — cloneInstrFields
+// left its PadBlock pointing at the CALLEE pad as a marker — to a freshly-cloned
+// caller pad chained into the call-site pad.  Empty-pad fault ops (PadBlock ==
+// callSitePad) and non-fault ops (PadBlock == nil) are untouched.  Fault ops
+// that share one callee pad clone it once (dedup by payload address).  Runs
+// AFTER the body clone, when `remap` covers every cloned callee value the pads'
+// RefDecs reference.
+func fixupInlinedPads(f @Func, instrs @[]@Instr, remap @[]@Instr, cap int, callSitePad *Block) {
+	var handle @Block = faultPadHandle(f, callSitePad)
+	var siteKey int = bit_cast(int, callSitePad)
+	var srcKeys @[]int
+	var clones @[]@Block
+	for i := 0; i < len(instrs); i++ {
+		var c @Instr = instrs[i]
+		if c.PadBlock == nil {
+			continue
+		}
+		var padKey int = bit_cast(int, c.PadBlock)
+		if padKey == siteKey {
+			continue // Inc 3a empty-pad reuse — nothing to clone
+		}
+		var cloned @Block = nil
+		for j := 0; j < len(srcKeys); j++ {
+			if srcKeys[j] == padKey {
+				cloned = clones[j]
+				break
+			}
+		}
+		if cloned == nil {
+			cloned = cloneSingleBlockPad(f, c.PadBlock, remap, cap, handle)
+			srcKeys = slices.Append[int](srcKeys, padKey)
+			clones = slices.Append[@Block](clones, cloned)
+		}
+		// A managed @Block assigns into the raw *Block back-ref (a borrow;
+		// f.FaultPads owns the pad) — same as attachFaultPad's faultOp.PadBlock.
+		c.PadBlock = cloned
+	}
+}
+
+// assertUniqueIDs marks every value-producing instr's dense SSA id across
+// `blocks` in the shared `seen` set, failing loud on an out-of-range or
+// duplicate id (a missed clone renumber -> silent VM/native miscompile).  Called
+// for f.Blocks and f.FaultPads with one `seen` (a value never appears in both).
+func assertUniqueIDs(f @Func, blocks @[]@Block, seen @[]bool) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var id int = blk.Instrs[ii].ID
+			if id < 0 {
+				continue
+			}
+			if id >= f.NextID {
+				panic("inliner: instr ID out of range after inlining (missed renumber)")
+			}
+			if seen[id] {
+				panic("inliner: duplicate SSA ID after inlining (missed renumber -> silent-miscompile risk)")
+			}
+			seen[id] = true
+		}
+	}
+}
+
+// markDefinedIDs sets defined[id] = true for every value-producing instr across
+// `blocks` (used to build the in-scope value set for assertPadOperandsInScope).
+func markDefinedIDs(blocks @[]@Block, defined @[]bool, nextID int) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var id int = blk.Instrs[ii].ID
+			if id >= 0 && id < nextID {
+				defined[id] = true
+			}
+		}
+	}
+}
+
+// assertPadOperandsInScope fails loud if any fault-pad instr references an operand
+// not defined within f — a param, an f.Blocks / f.FaultPads value, or a global-ref
+// — i.e. a dangling operand a bad pad clone left pointing into the callee.
+// assertUniqueIDs / assertPadRefsResolvable do NOT catch this: a dangling alloca
+// operand is caught downstream by mem2reg, but a dangling plain SSA value (e.g. a
+// managed-slice temp) would be silent without this check.
+func assertPadOperandsInScope(f @Func) {
+	var defined @[]bool = make_slice(bool, f.NextID)
+	for i := 0; i < len(f.Params); i++ {
+		var pid int = f.Params[i].ID
+		if pid >= 0 && pid < f.NextID {
+			defined[pid] = true
+		}
+	}
+	markDefinedIDs(f.Blocks, defined, f.NextID)
+	markDefinedIDs(f.FaultPads, defined, f.NextID)
+	for pi := 0; pi < len(f.FaultPads); pi++ {
+		var pad @Block = f.FaultPads[pi]
+		for ii := 0; ii < len(pad.Instrs); ii++ {
+			var pin @Instr = pad.Instrs[ii]
+			for a := 0; a < len(pin.Args); a++ {
+				var av @Instr = pin.Args[a]
+				if av == nil {
+					continue
+				}
+				if av.IsGlobalRef {
+					continue
+				}
+				if av.ID < 0 || av.ID >= f.NextID || !defined[av.ID] {
+					panic("inliner: fault-pad operand not defined in f after inlining (dangling)")
+				}
+			}
+		}
+	}
+}
+
+// assertPadRefsResolvable fails loud if any faulting op in f.Blocks carries a
+// PadBlock that is NOT one of f's own FaultPads (by payload identity) — i.e. a
+// cloned fault op still dangling at a CALLEE pad because fixupInlinedPads missed
+// it.  The VM resolves PadBlock against f.FaultPads, so a dangling ref would
+// silently drop the fault handler.
+func assertPadRefsResolvable(f @Func) {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var pb *Block = blk.Instrs[ii].PadBlock
+			if pb == nil {
+				continue
+			}
+			var key int = bit_cast(int, pb)
+			var found bool = false
+			for pi := 0; pi < len(f.FaultPads); pi++ {
+				if bit_cast(int, f.FaultPads[pi]) == key {
+					found = true
+					break
+				}
+			}
+			if !found {
+				panic("inliner: fault op PadBlock not in f.FaultPads (dangling callee pad)")
+			}
+		}
+	}
+}

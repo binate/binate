@@ -13,6 +13,9 @@
 #   * datum  — GOT-loads the libSystem DATA symbol ___stdoutp and exits 42 iff non-null:
 #     the data-import path (__got slot + POINTER bind, no stub, the load kept pointing
 #     at the slot) plus a called import — the mixed function+data case.
+#   * wdata  — mutates a .data global and a .bss global at runtime and exits with their
+#     sum (42): the writable __DATA segment (program .data/.bss sharing it with the
+#     __got, whose slot sits after the program .data, so a non-zero bind offset).
 #
 # Static Mach-O does not run on macOS arm64 (the kernel mandates dyld), so this is the
 # path to a bnld-linked binary that runs on this platform.  The build + link +
@@ -141,6 +144,41 @@ Lzero:
 EOF
 echo "PASS: datum links to a dynamically-linked arm64 Mach-O (GOT data import: ___stdoutp)"
 
+# ----- wdata: writable program data.  A .data global (40) and a .bss global (0) are
+#       mutated at runtime and summed to 42, then _exit(42).  This exercises the
+#       writable __DATA segment: program .data/.bss share it with the __got, and _exit
+#       is a called import whose __got slot sits AFTER the program .data (so the bind
+#       offset is non-zero — the segment-relative __got offset).  A read-only-data
+#       binary would fault on the stores; exit 42 proves .data + .bss are writable. -----
+asm_link_macho wdata <<'EOF'
+.arch aarch64
+.section data
+dval:
+	.uint32 40
+.section bss
+bval:
+	.zero 4
+.section text
+.global _start
+.global _exit
+_start:
+	adrp x0, dval
+	add x0, x0, #:lo12:dval
+	ldr w1, [x0]
+	add w1, w1, #1
+	str w1, [x0]
+	ldr w1, [x0]
+	adrp x2, bval
+	add x2, x2, #:lo12:bval
+	ldr w3, [x2]
+	add w3, w3, #1
+	str w3, [x2]
+	ldr w3, [x2]
+	add w0, w1, w3
+	bl _exit
+EOF
+echo "PASS: wdata links to a dynamically-linked arm64 Mach-O (writable __DATA: .data + .bss)"
+
 # ----- run: natively on macOS arm64 (the macos-latest CI lane); SKIP elsewhere. -----
 # A Mach-O cannot run in a Linux container, so there is no Docker path: the run is
 # native-or-skip.
@@ -173,6 +211,13 @@ if [ "$CAN_RUN" = 1 ]; then
         exit 1
     fi
     echo "PASS: datum ran — GOT-loaded libSystem ___stdoutp (bound by dyld) and exited 42"
+
+    "$TMP/wdata"; _code=$?
+    if [ "$_code" != 42 ]; then
+        echo "FAIL: wdata expected exit 42 (.data + .bss writable in __DATA), got $_code" >&2
+        exit 1
+    fi
+    echo "PASS: wdata ran — mutated a .data and a .bss global in __DATA and exited 42"
 else
     echo "SKIP: Mach-O binaries not run here ($_skip_note) — build+structure verified"
 fi

@@ -135,6 +135,36 @@ Lzero:
 EOF
 echo "PASS: datum links to a dynamically-linked x86-64 ELF (GOT data import: stdout)"
 
+# ----- wdata: writable program data.  A .data global (40) and a .bss global (0) are
+#       mutated at runtime and summed to 42, then exit(42).  A read-only-data binary
+#       would fault on the stores; exit 42 proves .data + .bss are writable (the RW
+#       PT_LOAD, .bss zero-filled with memsz > filesz). -----
+asm_link_dyn wdata <<'EOF'
+.arch x64
+.section data
+dval:
+	.uint32 40
+.section bss
+bval:
+	.zero 4
+.section text
+.global _start
+.global exit
+_start:
+	mov eax, [rip + dval]
+	add eax, 1
+	mov [rip + dval], eax
+	mov ecx, [rip + dval]
+	mov edx, [rip + bval]
+	add edx, 1
+	mov [rip + bval], edx
+	mov edx, [rip + bval]
+	add ecx, edx
+	mov edi, ecx
+	call exit
+EOF
+echo "PASS: wdata links to a dynamically-linked x86-64 ELF (writable .data + .bss)"
+
 # ----- run: natively on an x86-64 Linux host (the CI Linux runner — no Docker) -----
 # A default local run on a non-x86-64 host SKIPs; Docker (linux/amd64) is used only on
 # a Linux CI lane or an explicit BINATE_E2E_DOCKER=1 opt-in, never a default local run.
@@ -215,6 +245,17 @@ if [ "$RAN" = 1 ]; then
     echo "PASS: datum ran — GOT-loaded libc stdout (bound via GLOB_DAT) and exited 42"
 else
     echo "SKIP: datum not run here ($_skip_note) — build+structure verified"
+fi
+
+run_dyn wdata
+if [ "$RAN" = 1 ]; then
+    if [ "$CODE" != 42 ]; then
+        echo "FAIL: wdata expected exit 42 (.data + .bss writable), got $CODE" >&2
+        exit 1
+    fi
+    echo "PASS: wdata ran — mutated a .data and a .bss global and exited 42"
+else
+    echo "SKIP: wdata not run here ($_skip_note) — build+structure verified"
 fi
 
 # ----- multi-lib -l: relink exit42, additionally naming a SECOND shared library via

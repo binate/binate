@@ -140,6 +140,39 @@ Lzero:
 EOF
 echo "PASS: datum links to a dynamically-linked aarch64 ELF (GOT data import: stdout)"
 
+# ----- wdata: writable program data.  A .data global (40) and a .bss global (0) are
+#       mutated at runtime and summed to 42, then exit(42).  A read-only-data binary
+#       would fault on the stores; exit 42 proves .data + .bss are writable (the RW
+#       PT_LOAD, .bss zero-filled with memsz > filesz). -----
+asm_link_dyn wdata <<'EOF'
+.arch aarch64
+.section data
+dval:
+	.uint32 40
+.section bss
+bval:
+	.zero 4
+.section text
+.global _start
+.global exit
+_start:
+	adrp x0, dval
+	add x0, x0, #:lo12:dval
+	ldr w1, [x0]
+	add w1, w1, #1
+	str w1, [x0]
+	ldr w1, [x0]
+	adrp x2, bval
+	add x2, x2, #:lo12:bval
+	ldr w3, [x2]
+	add w3, w3, #1
+	str w3, [x2]
+	ldr w3, [x2]
+	add w0, w1, w3
+	bl exit
+EOF
+echo "PASS: wdata links to a dynamically-linked aarch64 ELF (writable .data + .bss)"
+
 # ----- run: natively where the host can, else via Docker/qemu -----
 # CI has no native aarch64 Linux runner (the e2e matrix is x86-64 Linux + arm64
 # macOS), so the arm64 binary is run under a glibc arm64 Docker image via qemu — but
@@ -227,6 +260,17 @@ if [ "$RAN" = 1 ]; then
     echo "PASS: datum ran — GOT-loaded libc stdout (bound via GLOB_DAT) and exited 42"
 else
     echo "SKIP: datum not run here ($_skip_note) — build+structure verified"
+fi
+
+run_dyn wdata
+if [ "$RAN" = 1 ]; then
+    if [ "$CODE" != 42 ]; then
+        echo "FAIL: wdata expected exit 42 (.data + .bss writable), got $CODE" >&2
+        exit 1
+    fi
+    echo "PASS: wdata ran — mutated a .data and a .bss global and exited 42"
+else
+    echo "SKIP: wdata not run here ($_skip_note) — build+structure verified"
 fi
 
 # ----- multi-lib -l: relink exit42, additionally naming a SECOND shared library via

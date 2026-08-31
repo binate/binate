@@ -63,6 +63,8 @@ func inlineCallsInFunc(m @Module, f @Func) {
 	// Parallel lists: an inlined call's result ID -> its cloned return value.
 	var callIDs @[]int
 	var retVals @[]@Instr
+	// Phase 1: single-block callees — a per-block instruction splice, no CFG
+	// change (the cloned body replaces the call in-place).
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var blk @Block = f.Blocks[bi]
 		var changed bool = false
@@ -70,7 +72,7 @@ func inlineCallsInFunc(m @Module, f @Func) {
 		for ii := 0; ii < len(blk.Instrs); ii++ {
 			var instr @Instr = blk.Instrs[ii]
 			var callee @Func = inlinableCallee(m, f, instr)
-			if callee == nil {
+			if callee == nil || len(callee.Blocks) != 1 {
 				kept = slices.Append[@Instr](kept, instr)
 				continue
 			}
@@ -93,13 +95,36 @@ func inlineCallsInFunc(m @Module, f @Func) {
 			blk.Instrs = kept
 		}
 	}
+	// Phase 2: multi-block callees — a CFG split, one at a time (f.Blocks shifts
+	// as blocks are added, so re-scan for the next site each round).  Each inline
+	// deletes its call, so the loop terminates after the finite number of
+	// multi-block calls; the guard is a defensive cap against a logic error.
+	for guard := 0; guard < 1000000; guard = guard + 1 {
+		var sbi int
+		var sii int
+		var scallee @Func
+		sbi, sii, scallee = findMultiBlockSite(m, f)
+		if sbi < 0 {
+			break
+		}
+		var call @Instr = f.Blocks[sbi].Instrs[sii]
+		var retVal @Instr = inlineMultiBlockSite(f, sbi, sii, scallee, call)
+		if call.ID >= 0 {
+			callIDs = slices.Append[int](callIDs, call.ID)
+			retVals = slices.Append[@Instr](retVals, retVal)
+		}
+		anyInlined = true
+	}
 	if !anyInlined {
 		return
 	}
 	// Whole-function use-replacement: every use of an inlined call's result
-	// becomes its cloned return value.  cap = the post-clone f.NextID; the
-	// cloned return values have fresh IDs in range and are never themselves
-	// replacement keys, so chaseRepl returns them directly (no chaining).
+	// becomes its cloned return value.  cap = the post-clone f.NextID.  A
+	// returned value CAN itself be a replacement key — e.g. `a(b())` where `a`
+	// returns its param, so a's retVal is b's (original) result — so the chain is
+	// followed transitively by chaseRepl (acyclic: a retVal is either a fresh
+	// clone, which is never a key, or an earlier call's result that resolves in
+	// turn).
 	var cap int = f.NextID
 	var replByID @[]@Instr = make_slice(@Instr, cap)
 	for k := 0; k < len(callIDs); k++ {
@@ -111,8 +136,30 @@ func inlineCallsInFunc(m @Module, f @Func) {
 	assertInlinedFuncWellFormed(f)
 }
 
+// findMultiBlockSite returns the (block index, instr index, callee) of the first
+// inlinable MULTI-block call in f, or (-1, -1, nil).  Used by Phase 2's
+// re-scanning loop (single-block callees are handled by Phase 1).
+func findMultiBlockSite(m @Module, f @Func) (int, int, @Func) {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var callee @Func = inlinableCallee(m, f, blk.Instrs[ii])
+			if callee != nil && len(callee.Blocks) > 1 {
+				return bi, ii, callee
+			}
+		}
+	}
+	return -1, -1, nil
+}
+
 // inlinableCallee returns the callee Func if `instr` is a direct OP_CALL that
-// qualifies for Inc 1 inlining into f, else nil.
+// qualifies for inlining into f (single- OR multi-block), else nil.  The shape
+// requirements: same-package non-extern, not self, total size under the
+// threshold, leaf (no call ops), no faulting op (no PadBlock), no phis, EXACTLY
+// one OP_RETURN site, every block ends in JUMP/BRANCH/RETURN, arity matches, ≤1
+// scalar result, and every value operand is a param or an in-callee value (so
+// it is remappable).  Callers dispatch on len(callee.Blocks): Phase 1 handles
+// single-block (splice), Phase 2 multi-block (CFG split).
 func inlinableCallee(m @Module, f @Func, instr @Instr) @Func {
 	if instr.Op != iropcode.OP_CALL {
 		return nil
@@ -124,16 +171,8 @@ func inlinableCallee(m @Module, f @Func, instr @Instr) @Func {
 	if callee == f {
 		return nil // no self-inline
 	}
-	if len(callee.Blocks) != 1 {
-		return nil // Inc 1: single-block callees only
-	}
-	var cblk @Block = callee.Blocks[0]
-	var n int = len(cblk.Instrs)
-	if n == 0 || n > InlineSizeThreshold {
+	if len(callee.Blocks) == 0 {
 		return nil
-	}
-	if cblk.Instrs[n - 1].Op != iropcode.OP_RETURN {
-		return nil // terminator must be a return
 	}
 	if len(callee.Params) != len(instr.Args) {
 		return nil // arity mismatch (defensive)
@@ -144,25 +183,46 @@ func inlinableCallee(m @Module, f @Func, instr @Instr) @Func {
 	if len(callee.Results) == 1 && !isScalarResultType(callee.Results[0]) {
 		return nil // single aggregate return (sret/retbuf) deferred
 	}
-	// Body must be leaf (no calls), no faulting op (no pad), and reference only
-	// params + its own in-block values (so every operand is remappable).
-	for ii := 0; ii < n; ii++ {
-		var bi @Instr = cblk.Instrs[ii]
-		if isCallFamilyOp(bi.Op) {
-			return nil
+	var total int = 0
+	var returnCount int = 0
+	for cbj := 0; cbj < len(callee.Blocks); cbj++ {
+		var cblk @Block = callee.Blocks[cbj]
+		var n int = len(cblk.Instrs)
+		if n == 0 {
+			return nil // malformed (empty block)
 		}
-		if bi.PadBlock != nil {
-			return nil
+		total = total + n
+		var term int = cblk.Instrs[n - 1].Op
+		if term != iropcode.OP_JUMP && term != iropcode.OP_BRANCH && term != iropcode.OP_RETURN {
+			return nil // UNREACHABLE / UNWIND / non-terminator-last not handled
 		}
-		if bi.Block1 != nil || bi.Block2 != nil || len(bi.Phis) != 0 {
-			return nil // no intra-callee control flow in a single block (defensive)
-		}
-		for k := 0; k < len(bi.Args); k++ {
-			var a @Instr = bi.Args[k]
-			if a == nil || a.IsGlobalRef || a.ID < 0 || a.ID >= callee.NextID {
-				return nil // operand not a param or in-callee value -> not remappable
+		for k := 0; k < n; k++ {
+			var bi @Instr = cblk.Instrs[k]
+			if bi.Op == iropcode.OP_RETURN {
+				returnCount = returnCount + 1
+			}
+			if isCallFamilyOp(bi.Op) {
+				return nil
+			}
+			if bi.PadBlock != nil {
+				return nil
+			}
+			if len(bi.Phis) != 0 {
+				return nil // no phis expected before mem2reg; bail if present
+			}
+			for a := 0; a < len(bi.Args); a++ {
+				var av @Instr = bi.Args[a]
+				if av == nil || av.IsGlobalRef || av.ID < 0 || av.ID >= callee.NextID {
+					return nil // operand not a param/in-callee value -> not remappable
+				}
 			}
 		}
+	}
+	if total > InlineSizeThreshold {
+		return nil
+	}
+	if returnCount != 1 {
+		return nil // Inc 1/2: exactly one return site (multiple -> Inc 4)
 	}
 	return callee
 }
@@ -241,6 +301,24 @@ func cloneInlinedBody(f @Func, callee @Func, call @Instr) (@[]@Instr, @Instr) {
 // Block1/Block2/Phis/PadBlock (single block, leaf, no faults), so those
 // reference fields are left nil.
 func cloneInstr(f @Func, src @Instr, remap @[]@Instr, cap int) @Instr {
+	var c @Instr = cloneInstrFields(f, src)
+	for k := 0; k < len(c.Args); k++ {
+		c.Args[k] = remapOperand(c.Args[k], remap, cap)
+	}
+	return c
+}
+
+// cloneInstrFields copies src's scalar/type/payload fields into a fresh instr
+// with a fresh caller ID (or -1 for a void instr), and a SHALLOW copy of its
+// Args (same operand objects — the caller remaps them).  It does NOT copy
+// Block1/Block2/Phis/PadBlock (the caller sets CFG edges; Inc-eligible callees
+// have no phis/pads) nor the param-slot markers ParamIndex/IsByvalParamRef
+// (deliberately cleared so an inlined local isn't emitted as the caller's
+// "argument N" in DWARF — they default to 0/false on a fresh instr).  Shared by
+// the single-block splice (cloneInstr, one-pass remap) and the multi-block
+// two-pass clone (inline_multiblock.bn, which remaps Args + CFG edges after all
+// clones exist).
+func cloneInstrFields(f @Func, src @Instr) @Instr {
 	var c @Instr = make(Instr)
 	c.Op = src.Op
 	c.Typ = src.Typ
@@ -262,7 +340,7 @@ func cloneInstr(f @Func, src @Instr, remap @[]@Instr, cap int) @Instr {
 	if len(src.Args) > 0 {
 		var na @[]@Instr = make_slice(@Instr, len(src.Args))
 		for k := 0; k < len(src.Args); k++ {
-			na[k] = remapOperand(src.Args[k], remap, cap)
+			na[k] = src.Args[k]
 		}
 		c.Args = na
 	}

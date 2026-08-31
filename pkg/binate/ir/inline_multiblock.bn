@@ -1,0 +1,130 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/stdx/slices"
+
+// ============================================================
+// Within-package function inliner — Inc 2 (multi-block callees)
+// ============================================================
+//
+// Inlining a multi-block callee needs CFG surgery the single-block splice
+// (inline_calls.bn) avoids: split the caller block at the OP_CALL, clone the
+// callee's whole block set into fresh caller blocks, jump the pre-call part to
+// the cloned entry, and route the callee's (single) return to a continuation
+// block holding the post-call instrs.  The pass runs BEFORE mem2reg, so no phis
+// exist in either function — there is no phi-predecessor rewiring, which is what
+// makes this tractable.  Scope (Inc 2): leaf, no-fault, exactly one OP_RETURN
+// site, ≤1 scalar result (multiple return sites -> Inc 4; fault pads -> Inc 3).
+
+// calleeBlockIndex returns the index of block b within callee.Blocks, or -1.
+// Used to map a callee CFG edge (Block1/Block2) to its cloned block.
+func calleeBlockIndex(callee @Func, b @Block) int {
+	for i := 0; i < len(callee.Blocks); i++ {
+		if callee.Blocks[i] == b {
+			return i
+		}
+	}
+	return -1
+}
+
+// inlineMultiBlockSite inlines the multi-block callee at f.Blocks[bi].Instrs[ii]
+// (the OP_CALL `call`), returning the cloned return value (nil for a void
+// return).  Preconditions (guaranteed by inlinableCallee): callee is leaf,
+// no-fault, has exactly one OP_RETURN, every block ends in JUMP/BRANCH/RETURN,
+// and every value operand is a param or an in-callee value.
+func inlineMultiBlockSite(f @Func, bi int, ii int, callee @Func, call @Instr) @Instr {
+	var callerBlk @Block = f.Blocks[bi]
+	// Continuation block C: the caller instrs AFTER the call (including the
+	// caller block's original terminator).  Built first so the cloned return
+	// can jump to it.
+	var cont @Block = AddBlock(f, "inlcont")
+	var contInstrs @[]@Instr
+	for j := ii + 1; j < len(callerBlk.Instrs); j++ {
+		contInstrs = slices.Append[@Instr](contInstrs, callerBlk.Instrs[j])
+	}
+	cont.Instrs = contInstrs
+	// One fresh cloned block per callee block (index-aligned with callee.Blocks),
+	// so a CFG edge callee.Blocks[j] maps to clonedBlocks[j].
+	var nb int = len(callee.Blocks)
+	var clonedBlocks @[]@Block = make_slice(@Block, nb)
+	for cbj := 0; cbj < nb; cbj++ {
+		clonedBlocks[cbj] = AddBlock(f, "inl")
+	}
+	// Value/param remap, keyed by the callee's dense ID space: [0, nParams) =
+	// param placeholder -> caller arg; [nParams, NextID) = in-callee value ->
+	// its clone (filled in pass A).
+	var cap int = callee.NextID
+	var valRemap @[]@Instr = make_slice(@Instr, cap)
+	for p := 0; p < len(callee.Params); p++ {
+		valRemap[callee.Params[p].ID] = call.Args[p]
+	}
+	// Pass A: clone every callee instr (fields + fresh ID for values, -1 for
+	// void); operands/CFG edges are remapped in pass B (cross-block references
+	// need every clone to exist first).  A cloned OP_RETURN is created as-is here
+	// and rewritten to an OP_JUMP in pass B.
+	for cbj := 0; cbj < nb; cbj++ {
+		var cblk @Block = callee.Blocks[cbj]
+		var built @[]@Instr
+		for k := 0; k < len(cblk.Instrs); k++ {
+			var src @Instr = cblk.Instrs[k]
+			var c @Instr = cloneInstrFields(f, src)
+			if src.ID >= 0 {
+				valRemap[src.ID] = c
+			}
+			built = slices.Append[@Instr](built, c)
+		}
+		clonedBlocks[cbj].Instrs = built
+	}
+	// Pass B: remap operands (Args) + CFG edges (Block1/Block2) on every clone,
+	// and convert the single cloned OP_RETURN into an OP_JUMP to C, capturing the
+	// return value.
+	var retVal @Instr = nil
+	for cbj := 0; cbj < nb; cbj++ {
+		var cblk @Block = callee.Blocks[cbj]
+		var cloned @Block = clonedBlocks[cbj]
+		for k := 0; k < len(cblk.Instrs); k++ {
+			var src @Instr = cblk.Instrs[k]
+			var c @Instr = cloned.Instrs[k]
+			for a := 0; a < len(c.Args); a++ {
+				c.Args[a] = remapOperand(c.Args[a], valRemap, cap)
+			}
+			if src.Op == iropcode.OP_RETURN {
+				// Route the return to the continuation; its value flows to the
+				// call-result uses (retargeted by the whole-function sweep).
+				if len(src.Args) >= 1 {
+					retVal = remapOperand(src.Args[0], valRemap, cap)
+				}
+				c.Op = iropcode.OP_JUMP
+				var noArgs @[]@Instr
+				c.Args = noArgs
+				c.Block1 = cont
+			} else {
+				c.Block1 = remapBlock(src.Block1, callee, clonedBlocks)
+				c.Block2 = remapBlock(src.Block2, callee, clonedBlocks)
+			}
+		}
+	}
+	// Rewire the caller block: keep the pre-call instrs, then jump to the cloned
+	// entry.  The call (at ii) and the post-call instrs (now in C) are removed.
+	var pre @[]@Instr
+	for j := 0; j < ii; j++ {
+		pre = slices.Append[@Instr](pre, callerBlk.Instrs[j])
+	}
+	var entryJump @Instr = newVoidInstr(iropcode.OP_JUMP)
+	entryJump.Block1 = clonedBlocks[0]
+	pre = slices.Append[@Instr](pre, entryJump)
+	callerBlk.Instrs = pre
+	return retVal
+}
+
+// remapBlock maps a callee CFG target to its cloned block; nil stays nil.
+func remapBlock(b @Block, callee @Func, clonedBlocks @[]@Block) @Block {
+	if b == nil {
+		return nil
+	}
+	var idx int = calleeBlockIndex(callee, b)
+	if idx < 0 {
+		return b // defensive: not a callee block (shouldn't happen)
+	}
+	return clonedBlocks[idx]
+}

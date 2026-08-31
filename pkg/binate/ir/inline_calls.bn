@@ -1,0 +1,314 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// ============================================================
+// Within-package function inliner (Inc 1)
+// ============================================================
+//
+// An -O1+ IR pass (run FIRST in RunOptPasses, before mem2reg) that clones a
+// small same-package callee's body into the caller at a direct OP_CALL site,
+// deleting the call — the native<->clang codegen-gap closer (clang inlines
+// small same-package callees within a TU; the native backend inlines nothing).
+//
+// Refcount correctness needs NO reconstruction: refcounts are explicit
+// OP_REFINC/OP_REFDEC void instrs and self-balancing per side (callee entry-
+// RefIncs a managed param and scope-exit-RefDecs it; Axiom-3 RefIncs each
+// managed return value; the caller already has an end-of-statement OP_REFDEC of
+// the call result).  A faithful clone-and-substitute — preserving the callee's
+// RefInc/RefDec instrs verbatim and substituting the caller's arg for each param
+// — composes with the caller's existing result-RefDec to stay refcount-exact.
+// (Design + adversarial review: explorations/plan-within-package-inliner.md.)
+//
+// Because operands are OBJECT references (not integer IDs), cloning is an
+// object->object remap + a per-clone ID renumber (value-producing clones get a
+// fresh nextID(caller); void clones keep ID -1).  verify.bn does NOT check ID
+// uniqueness or operand scope and is not run after opt, so a missed renumber
+// miscompiles SILENTLY on the VM/native — the pass ships its own post-condition
+// assertion (assertInlinedFuncWellFormed).
+//
+// Inc 1 scope (the simplest, zero-CFG-surgery case): the callee is a
+// single-block, leaf (no calls -> no recursion, no nested inlining), no-faulting-
+// op (no PadBlock -> no fault-pad cloning) function returning at most one SCALAR
+// result (a single struct/array return rides sret/retbuf and is deferred), whose
+// body references only its params and its own in-block values.  Later increments
+// add multi-block callees, fault pads, multiple return sites, multi-value
+// returns, and non-leaf callees.
+
+// InlineSizeThreshold is the maximum instruction count (including the terminator)
+// of a callee body for it to be inlined.  Conservative to start; tuneable — a
+// bigger value inlines larger callees at the cost of code growth.
+const InlineSizeThreshold int = 15
+
+// inlineCalls inlines qualifying direct calls throughout the module.
+func inlineCalls(m @Module) {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @Func = m.Funcs[fi]
+		if f.IsExtern {
+			continue
+		}
+		inlineCallsInFunc(m, f)
+	}
+}
+
+// inlineCallsInFunc inlines every qualifying OP_CALL in f.  Inc 1 callees are
+// leaf, so inlining introduces no new calls — one pass over f's blocks suffices.
+// The OP_CALL result's uses are retargeted to the cloned return value in a final
+// whole-function sweep (the caller's end-of-statement result-RefDec may sit in a
+// later block than the call).
+func inlineCallsInFunc(m @Module, f @Func) {
+	var anyInlined bool = false
+	// Parallel lists: an inlined call's result ID -> its cloned return value.
+	var callIDs @[]int
+	var retVals @[]@Instr
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		var changed bool = false
+		var kept @[]@Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			var callee @Func = inlinableCallee(m, f, instr)
+			if callee == nil {
+				kept = slices.Append[@Instr](kept, instr)
+				continue
+			}
+			// Splice the cloned body in place of the call (before it); drop the
+			// call (its own fault pad is orphaned — never branched to, safe).
+			var body @[]@Instr
+			var retVal @Instr
+			body, retVal = cloneInlinedBody(f, callee, instr)
+			for bj := 0; bj < len(body); bj++ {
+				kept = slices.Append[@Instr](kept, body[bj])
+			}
+			if instr.ID >= 0 {
+				callIDs = slices.Append[int](callIDs, instr.ID)
+				retVals = slices.Append[@Instr](retVals, retVal)
+			}
+			changed = true
+			anyInlined = true
+		}
+		if changed {
+			blk.Instrs = kept
+		}
+	}
+	if !anyInlined {
+		return
+	}
+	// Whole-function use-replacement: every use of an inlined call's result
+	// becomes its cloned return value.  cap = the post-clone f.NextID; the
+	// cloned return values have fresh IDs in range and are never themselves
+	// replacement keys, so chaseRepl returns them directly (no chaining).
+	var cap int = f.NextID
+	var replByID @[]@Instr = make_slice(@Instr, cap)
+	for k := 0; k < len(callIDs); k++ {
+		if retVals[k] != nil {
+			replByID[callIDs[k]] = retVals[k]
+		}
+	}
+	rewriteUsesInBlocks(f.Blocks, replByID, cap)
+	assertInlinedFuncWellFormed(f)
+}
+
+// inlinableCallee returns the callee Func if `instr` is a direct OP_CALL that
+// qualifies for Inc 1 inlining into f, else nil.
+func inlinableCallee(m @Module, f @Func, instr @Instr) @Func {
+	if instr.Op != iropcode.OP_CALL {
+		return nil
+	}
+	var callee @Func = LookupModuleFunc(m, instr.StrVal)
+	if callee == nil || callee.IsExtern {
+		return nil
+	}
+	if callee == f {
+		return nil // no self-inline
+	}
+	if len(callee.Blocks) != 1 {
+		return nil // Inc 1: single-block callees only
+	}
+	var cblk @Block = callee.Blocks[0]
+	var n int = len(cblk.Instrs)
+	if n == 0 || n > InlineSizeThreshold {
+		return nil
+	}
+	if cblk.Instrs[n - 1].Op != iropcode.OP_RETURN {
+		return nil // terminator must be a return
+	}
+	if len(callee.Params) != len(instr.Args) {
+		return nil // arity mismatch (defensive)
+	}
+	if len(callee.Results) > 1 {
+		return nil // multi-value return deferred
+	}
+	if len(callee.Results) == 1 && !isScalarResultType(callee.Results[0]) {
+		return nil // single aggregate return (sret/retbuf) deferred
+	}
+	// Body must be leaf (no calls), no faulting op (no pad), and reference only
+	// params + its own in-block values (so every operand is remappable).
+	for ii := 0; ii < n; ii++ {
+		var bi @Instr = cblk.Instrs[ii]
+		if isCallFamilyOp(bi.Op) {
+			return nil
+		}
+		if bi.PadBlock != nil {
+			return nil
+		}
+		if bi.Block1 != nil || bi.Block2 != nil || len(bi.Phis) != 0 {
+			return nil // no intra-callee control flow in a single block (defensive)
+		}
+		for k := 0; k < len(bi.Args); k++ {
+			var a @Instr = bi.Args[k]
+			if a == nil || a.IsGlobalRef || a.ID < 0 || a.ID >= callee.NextID {
+				return nil // operand not a param or in-callee value -> not remappable
+			}
+		}
+	}
+	return callee
+}
+
+// isCallFamilyOp reports whether op is any call/dispatch op (disqualifies a
+// callee from Inc 1's "leaf" requirement).
+func isCallFamilyOp(op int) bool {
+	return op == iropcode.OP_CALL || op == iropcode.OP_CALL_INDIRECT || op == iropcode.OP_C_CALL ||
+			op == iropcode.OP_CALL_FUNC_VALUE || op == iropcode.OP_CALL_HANDLE ||
+			op == iropcode.OP_CALL_IFACE_METHOD || op == iropcode.OP_SAT_LOOKUP
+}
+
+// isScalarResultType reports whether a single result type is a scalar (fits the
+// register-return path) — i.e. NOT an aggregate that rides sret/retbuf or a
+// multi-word by-address representation.  Peels transparent wrappers first.
+func isScalarResultType(t @types.Type) bool {
+	if t == nil {
+		return false
+	}
+	var r @types.Type = peelTransparent(t)
+	if r == nil {
+		return false
+	}
+	// WHITELIST the single-register scalar kinds; everything else — the
+	// aggregates that ride sret/retbuf (slice/mslice/array/struct/func-value/
+	// iface-value), a TYP_NAMED that peelTransparent could not resolve (nil
+	// Underlying), and any not-yet-added Kind — is conservatively NOT inlinable
+	// in Inc 1 (default-reject, so a future aggregate kind can't slip through as
+	// a register value).  char/uint8/int32/... are all TYP_INT with a width.
+	return r.Kind == types.TYP_INT || r.Kind == types.TYP_FLOAT || r.Kind == types.TYP_BOOL ||
+			r.Kind == types.TYP_POINTER || r.Kind == types.TYP_MANAGED_PTR
+}
+
+// cloneInlinedBody clones callee's single block (minus the terminal OP_RETURN)
+// into fresh instrs with the caller's args substituted for the callee's params,
+// and returns (cloned body instrs in order, cloned return value or nil for a
+// void return).  Value-producing clones get fresh caller IDs; void clones keep
+// ID -1.  Operand remap and param substitution are keyed by the callee's dense
+// ID space: index [0, len(Params)) is a param placeholder -> the caller's arg;
+// index [len(Params), callee.NextID) is an in-block value -> its clone.
+func cloneInlinedBody(f @Func, callee @Func, call @Instr) (@[]@Instr, @Instr) {
+	var cblk @Block = callee.Blocks[0]
+	var n int = len(cblk.Instrs)
+	var cap int = callee.NextID
+	var remap @[]@Instr = make_slice(@Instr, cap)
+	// Pre-map each param placeholder ID -> the caller's argument object.
+	for i := 0; i < len(callee.Params); i++ {
+		remap[callee.Params[i].ID] = call.Args[i]
+	}
+	var body @[]@Instr
+	var retVal @Instr = nil
+	for ii := 0; ii < n; ii++ {
+		var src @Instr = cblk.Instrs[ii]
+		if ii == n - 1 {
+			// Terminal OP_RETURN: not cloned; capture the (remapped) return value.
+			if len(src.Args) >= 1 {
+				retVal = remapOperand(src.Args[0], remap, cap)
+			}
+			break
+		}
+		var c @Instr = cloneInstr(f, src, remap, cap)
+		if src.ID >= 0 {
+			remap[src.ID] = c
+		}
+		body = slices.Append[@Instr](body, c)
+	}
+	return body, retVal
+}
+
+// cloneInstr allocates a fresh instr copying src's scalar/type/payload fields,
+// remapping its operands, and assigning a fresh caller ID (or -1 for a void
+// instr).  Param-slot markers (ParamIndex / IsByvalParamRef) are deliberately
+// NOT copied — the clone is an ordinary local, not the caller's "argument N"
+// (they default to 0 / false on a fresh instr; keeping them would emit bogus
+// `arg: N` DWARF at -O1 -g for a managed-param accessor).  Inc 1 callees have no
+// Block1/Block2/Phis/PadBlock (single block, leaf, no faults), so those
+// reference fields are left nil.
+func cloneInstr(f @Func, src @Instr, remap @[]@Instr, cap int) @Instr {
+	var c @Instr = make(Instr)
+	c.Op = src.Op
+	c.Typ = src.Typ
+	c.IntVal = src.IntVal
+	c.StrVal = src.StrVal
+	c.BoolVal = src.BoolVal
+	c.Index = src.Index
+	c.IfaceUpcastSlotOffset = src.IfaceUpcastSlotOffset
+	c.TypeArg = src.TypeArg
+	c.CFixedArgs = src.CFixedArgs
+	c.RetbufSize = src.RetbufSize
+	c.Line = src.Line
+	c.IsGlobalRef = src.IsGlobalRef
+	if src.ID >= 0 {
+		c.ID = nextID(f)
+	} else {
+		c.ID = -1
+	}
+	if len(src.Args) > 0 {
+		var na @[]@Instr = make_slice(@Instr, len(src.Args))
+		for k := 0; k < len(src.Args); k++ {
+			na[k] = remapOperand(src.Args[k], remap, cap)
+		}
+		c.Args = na
+	}
+	return c
+}
+
+// remapOperand maps a callee operand to its clone / substituted arg via the
+// dense ID-keyed remap; returns the operand unchanged if not a remap key
+// (defensive — inlinableCallee has already rejected non-remappable operands).
+func remapOperand(a @Instr, remap @[]@Instr, cap int) @Instr {
+	if a == nil {
+		return nil
+	}
+	if a.ID >= 0 && a.ID < cap && remap[a.ID] != nil {
+		return remap[a.ID]
+	}
+	return a
+}
+
+// assertInlinedFuncWellFormed fails loud if inlining left the func's SSA ID
+// space malformed: every value-producing instr in f.Blocks must have a UNIQUE
+// ID in [0, f.NextID).  This guards the highest-severity remap bug — a missed
+// clone renumber, which collides two live values onto one frame/register slot
+// and miscompiles SILENTLY on the VM/native (verify.bn checks neither ID
+// uniqueness nor operand scope and is not run after opt).  It does NOT check
+// operand scope/dominance; the current inliner can't produce a dangling operand
+// (remapOperand covers the callee's whole dense ID space and the caller's
+// operands are untouched), so ID-uniqueness is the load-bearing net.  A
+// stronger operand-scope check (every operand a param / caller value / in-blocks
+// instr) is a reasonable future hardening.
+func assertInlinedFuncWellFormed(f @Func) {
+	var seen @[]bool = make_slice(bool, f.NextID)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var id int = blk.Instrs[ii].ID
+			if id < 0 {
+				continue
+			}
+			if id >= f.NextID {
+				panic("inliner: instr ID out of range after inlining (missed renumber)")
+			}
+			if seen[id] {
+				panic("inliner: duplicate SSA ID after inlining (missed renumber -> silent-miscompile risk)")
+			}
+			seen[id] = true
+		}
+	}
+}

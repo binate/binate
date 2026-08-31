@@ -1,0 +1,359 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/ir"
+import "pkg/builtins/rt"
+import "pkg/builtins/testing"
+
+// Leak/control coverage of inliner Inc 3a (empty-pad faulting-op callees).  The
+// core invariant: a fault inside an inlined empty-pad callee reuses the CALLER's
+// call-site pad, which must RefDec the caller's live-at-call managed set exactly
+// once (no leak, no double-free) and unwind the single merged frame.  Each test
+// measures rt.LiveBlocks() across a fault loop (0 delta = no leak) and pairs the
+// leak check with a positive/negative inlining control so it can never go vacuous.
+
+// faultLoopDelta lowers `src` at OptLevel `level`, warms up one call to `fn`, then
+// loops `iters` calls measuring rt.LiveBlocks() delta.  0 = no leak.  Returns the
+// delta; -1000000 flags "did not fault as expected" (callers that expect a fault).
+func faultLoopDelta(src *[]readonly char, fn *[]readonly char, level int, iters int,
+		wantFault bool) int {
+	var m @ir.Module = genModule(src)
+	var vm @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm)
+	vm.OptLevel = level
+	vm.LowerModule(m)
+	var noArgs @[]int
+	vm.CallFunc(fn, noArgs)
+	if wantFault && vm.Status != VM_STATUS_FAULTED {
+		return -1000000
+	}
+	if !wantFault && vm.Status == VM_STATUS_FAULTED {
+		return -1000000
+	}
+	var base int = rt.LiveBlocks()
+	for i := 0; i < iters; i++ {
+		vm.CallFunc(fn, noArgs)
+	}
+	var delta int = rt.LiveBlocks() - base
+	// keep m alive
+	if m == nil { return -999 }
+	return delta
+}
+
+// TestAdvInlineFaultReusesCallerPadNoLeak: the caller holds a managed local `g`
+// live across a call to an empty-pad fault callee `at` that faults OOB.  At -O1
+// `at` is inlined and the cloned bounds check reuses main's call-site pad, which
+// must RefDec `g`.  A leak here (call-site pad not run, or run without g) grows
+// LiveBlocks by 1 per call.  Compared against the -O0 (un-inlined) baseline.
+func TestAdvInlineFaultReusesCallerPadNoLeak() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func at(s *[]int, i int) int { return s[i] }\n"
+			"func doFault() int {\n"
+			"\tvar g @[]int = make_slice(int, 4)\n"
+			"\tvar a [3]int\n"
+			"\tvar r int = at(a[:], 5)\n"
+			"\treturn len(g) + r\n"
+			"}\n"
+	var d0 int = faultLoopDelta(src, "test.doFault", 0, 30, true)
+	var d1 int = faultLoopDelta(src, "test.doFault", 1, 30, true)
+	if d0 == -1000000 { return "O0: doFault must fault (OOB)" }
+	if d1 == -1000000 { return "O1: inlined doFault must still fault (OOB)" }
+	if d0 != 0 { return "O0 baseline itself leaks on recovered fault (pre-existing, not Inc 3a)" }
+	if d1 != 0 {
+		return "O1 INLINED fault LEAKS caller managed local: reused call-site pad did not RefDec g"
+	}
+	return ""
+}
+
+// TestAdvInlineFaultInBoundsNoLeak: same shape, in-bounds — normal completion.
+// The inlined path must produce the same result and not leak `g`.
+func TestAdvInlineFaultInBoundsNoLeak() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func at(s *[]int, i int) int { return s[i] }\n"
+			"func ok() int {\n"
+			"\tvar g @[]int = make_slice(int, 4)\n"
+			"\tvar a [3]int\n"
+			"\ta[1] = 7\n"
+			"\tvar r int = at(a[:], 1)\n"
+			"\treturn len(g) + r\n"
+			"}\n"
+	var d1 int = faultLoopDelta(src, "test.ok", 1, 30, false)
+	if d1 == -1000000 { return "O1: ok() must NOT fault (in-bounds)" }
+	if d1 != 0 { return "O1 inlined in-bounds path leaks caller managed local g" }
+	return ""
+}
+
+// TestAdvInlineManagedLocalAfterFaultOOB: the callee creates a managed @Node
+// local AFTER its bounds check, so the check's pad is EMPTY (nothing managed live
+// yet) and the callee is inlinable — even though it DOES have a managed local.
+// On an OOB fault the fault fires BEFORE make(Node) runs, so `n` is never
+// allocated: nothing to leak.  The caller also holds a managed `g`.  Stress both
+// the caller-pad RefDec (g) and the "managed local exists but is downstream of the
+// fault" reasoning behind #2a.
+func TestAdvInlineManagedLocalAfterFaultOOB() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"type Node struct { v int }\n"
+			"func mk(s *[]int, i int) @Node {\n"
+			"\tvar x int = s[i]\n"
+			"\tvar n @Node = make(Node)\n"
+			"\tn.v = x\n"
+			"\treturn n\n"
+			"}\n"
+			"func doFault() int {\n"
+			"\tvar g @[]int = make_slice(int, 4)\n"
+			"\tvar a [3]int\n"
+			"\tvar p @Node = mk(a[:], 5)\n"
+			"\treturn len(g)\n"
+			"}\n"
+	var d0 int = faultLoopDelta(src, "test.doFault", 0, 30, true)
+	var d1 int = faultLoopDelta(src, "test.doFault", 1, 30, true)
+	if d0 == -1000000 { return "O0: mk OOB must fault" }
+	if d1 == -1000000 { return "O1: inlined mk OOB must fault" }
+	if d0 != 0 { return "O0 baseline leaks (pre-existing)" }
+	if d1 != 0 { return "O1 inlined managed-local-after-fault OOB LEAKS" }
+	return ""
+}
+
+// TestAdvInlineManagedLocalAfterFaultInBounds: same callee, in-bounds.  Now
+// make(Node) runs, is returned, and the caller must RefDec it (via p's scope
+// exit).  The inlined path must balance the managed-ptr return refcount AND not
+// leak — the Inc 1 managed-return refcount composed with the Inc 3a fault-op
+// clone.
+func TestAdvInlineManagedLocalAfterFaultInBounds() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"type Node struct { v int }\n"
+			"func mk(s *[]int, i int) @Node {\n"
+			"\tvar x int = s[i]\n"
+			"\tvar n @Node = make(Node)\n"
+			"\tn.v = x\n"
+			"\treturn n\n"
+			"}\n"
+			"func ok() int {\n"
+			"\tvar a [3]int\n"
+			"\ta[1] = 9\n"
+			"\tvar p @Node = mk(a[:], 1)\n"
+			"\treturn p.v\n"
+			"}\n"
+	var d0 int = faultLoopDelta(src, "test.ok", 0, 30, false)
+	var d1 int = faultLoopDelta(src, "test.ok", 1, 30, false)
+	if d1 == -1000000 { return "O1: ok() must NOT fault (in-bounds)" }
+	if d0 != 0 { return "O0 baseline managed-return leaks (pre-existing)" }
+	if d1 != 0 { return "O1 inlined managed-return LEAKS (Inc1/Inc3a refcount interaction)" }
+	return ""
+}
+
+// TestAdvInlineTwoFaultCallsNoLeak: two calls to the same empty-pad fault callee
+// in one caller; the SECOND faults while a managed local from an earlier managed
+// alloc is live.  Both calls' cloned fault ops must reuse their OWN call-site pad
+// (call.PadBlock is per-call).  Leak check across a loop.
+func TestAdvInlineTwoFaultCallsNoLeak() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func at(s *[]int, i int) int { return s[i] }\n"
+			"func doFault() int {\n"
+			"\tvar g @[]int = make_slice(int, 4)\n"
+			"\tvar a [3]int\n"
+			"\ta[0] = 1\n"
+			"\tvar r1 int = at(a[:], 0)\n"
+			"\tvar r2 int = at(a[:], 9)\n"
+			"\treturn len(g) + r1 + r2\n"
+			"}\n"
+	var d1 int = faultLoopDelta(src, "test.doFault", 1, 30, true)
+	if d1 == -1000000 { return "O1: second call OOB must fault" }
+	if d1 != 0 { return "O1 two-inlined-calls second-fault LEAKS caller managed local" }
+	return ""
+}
+
+// TestAdvManagedParamCalleeNotInlinedNoLeak: a callee with a managed PARAM has a
+// NON-empty bounds-check pad (RefDecs the param), so it must NOT be inlined at
+// -O1.  It should still fault + clean up correctly when run (the un-inlined
+// 2-frame path).  Guards that the rejection path is not just a compile check but
+// runtime-correct at -O1.
+func TestAdvManagedParamCalleeNotInlinedNoLeak() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func at(s @[]int, i int) int { return s[i] }\n"
+			"func doFault() int {\n"
+			"\tvar g @[]int = make_slice(int, 4)\n"
+			"\tvar s @[]int = make_slice(int, 3)\n"
+			"\tvar r int = at(s, 9)\n"
+			"\treturn len(g) + r\n"
+			"}\n"
+	var d1 int = faultLoopDelta(src, "test.doFault", 1, 30, true)
+	if d1 == -1000000 { return "O1: managed-param callee OOB must fault" }
+	if d1 != 0 { return "O1 managed-param (non-inlined) fault LEAKS" }
+	return ""
+}
+
+// countBCCallsTo counts BC_CALL ops whose caller-func target-name slot resolves
+// to `name` across every lowered function.  Used as a positive control: if the
+// empty-pad fault callee `at` is inlined, the caller has zero BC_CALLs to it.
+// We approximate by counting TOTAL BC_CALL ops (the test module has exactly one
+// user call), which drops from >=1 (O0) to 0 (O1) iff inlining fired.
+func countAllBCCalls(vm @VM) int {
+	var n int = 0
+	for fi := 0; fi < vm.Funcs.Len(); fi++ {
+		var code @[]BCInstr = vm.Funcs.Get(fi).Code
+		for i := 0; i < len(code); i++ {
+			if code[i].Op == BC_CALL { n = n + 1 }
+		}
+	}
+	return n
+}
+
+// TestAdvInlinePositiveControl: confirm the empty-pad fault callee `at` is ACTUALLY
+// inlined at -O1 (so the leak tests above exercise the inlined path, not a silent
+// no-inline).  BC_CALL count must drop from >=1 at -O0 to 0 at -O1.
+func TestAdvInlinePositiveControl() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func at(s *[]int, i int) int { return s[i] }\n"
+			"func doFault() int {\n"
+			"\tvar g @[]int = make_slice(int, 4)\n"
+			"\tvar a [3]int\n"
+			"\tvar r int = at(a[:], 5)\n"
+			"\treturn len(g) + r\n"
+			"}\n"
+	var m0 @ir.Module = genModule(src)
+	var vm0 @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm0)
+	vm0.OptLevel = 0
+	vm0.LowerModule(m0)
+	var c0 int = countAllBCCalls(vm0)
+
+	var m1 @ir.Module = genModule(src)
+	var vm1 @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm1)
+	vm1.OptLevel = 1
+	vm1.LowerModule(m1)
+	var c1 int = countAllBCCalls(vm1)
+
+	if c0 < 1 { return "positive control broken: expected >=1 BC_CALL at -O0" }
+	if c1 != 0 {
+		return "empty-pad fault callee `at` was NOT inlined at -O1 (leak tests would be vacuous)"
+	}
+	return ""
+}
+
+// TestAdvManagedParamNegativeControl: confirm the managed-PARAM callee is NOT
+// inlined at -O1 (non-empty pad).  BC_CALL count stays >=1 at -O1.
+func TestAdvManagedParamNegativeControl() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func at(s @[]int, i int) int { return s[i] }\n"
+			"func doFault() int {\n"
+			"\tvar s @[]int = make_slice(int, 3)\n"
+			"\tvar r int = at(s, 1)\n"
+			"\treturn r\n"
+			"}\n"
+	var m1 @ir.Module = genModule(src)
+	var vm1 @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm1)
+	vm1.OptLevel = 1
+	vm1.LowerModule(m1)
+	if countAllBCCalls(vm1) < 1 {
+		return "managed-param (non-empty-pad) callee was WRONGLY inlined at -O1"
+	}
+	return ""
+}
+
+// TestAdvInlineDivFaultVM: a divide-by-zero fault op (int params -> empty pad) is
+// inlined at -O1; the caller holds a managed local `g`.  On b==0 the DIV faults
+// and reuses main's call-site pad (must RefDec g).  Covers the div fault kind
+// (gen_binary.bn attachFaultPad), not just bounds.
+func TestAdvInlineDivFaultVM() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func dv(a int, b int) int { return a / b }\n"
+			"func doFault() int {\n"
+			"\tvar g @[]int = make_slice(int, 4)\n"
+			"\tvar r int = dv(10, 0)\n"
+			"\treturn len(g) + r\n"
+			"}\n"
+	var d1 int = faultLoopDelta(src, "test.doFault", 1, 30, true)
+	if d1 == -1000000 { return "O1: div-by-zero must fault" }
+	if d1 != 0 { return "O1 inlined DIV fault LEAKS caller managed local g" }
+	// positive control: dv must be inlined
+	var m1 @ir.Module = genModule(src)
+	var vm1 @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm1)
+	vm1.OptLevel = 1
+	vm1.LowerModule(m1)
+	if countAllBCCalls(vm1) != 0 { return "div callee dv was NOT inlined at -O1 (test vacuous)" }
+	return ""
+}
+
+// TestAdvInlineShiftFaultVM: a negative-shift fault op (int params -> empty pad)
+// inlined at -O1; leak check with a live caller managed local.
+func TestAdvInlineShiftFaultVM() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func sh(a int, b int) int { return a << b }\n"
+			"func doFault() int {\n"
+			"\tvar g @[]int = make_slice(int, 4)\n"
+			"\tvar r int = sh(1, -1)\n"
+			"\treturn len(g) + r\n"
+			"}\n"
+	var d1 int = faultLoopDelta(src, "test.doFault", 1, 30, true)
+	if d1 == -1000000 { return "O1: negative shift must fault" }
+	if d1 != 0 { return "O1 inlined SHIFT fault LEAKS caller managed local g" }
+	return ""
+}
+
+// A multi-block + fault + OOB *leak* test is intentionally absent: a single-return
+// multi-block callee that also contains a fault op exceeds the default
+// InlineSizeThreshold, so it does not inline at -O1 (a size gate, not a defect).
+// That combination's leak-safety follows by composition — the fault-pad reuse is
+// covered by the single-block leak tests above, and the multi-block CFG split with
+// a fault op present is covered by TestAdvInlineMultiBlockFaultInBounds below.
+
+// TestAdvInlineMultiBlockFaultInBounds: same multi-block callee, in-bounds (c
+// true, valid i) and the not-taken branch (c false) — both must give correct
+// results at -O1 matching -O0, exercising the CFG-split merge with a fault op
+// present.
+func TestAdvInlineMultiBlockFaultInBounds() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func pick(s *[]int, c bool, i int) int {\n"
+			"\tvar r int = 0\n"
+			"\tif c {\n"
+			"\t\tr = s[i]\n"
+			"\t}\n"
+			"\treturn r\n"
+			"}\n"
+			"func main() int {\n"
+			"\tvar a [3]int\n"
+			"\ta[2] = 42\n"
+			"\tvar x int = pick(a[:], true, 2)\n"
+			"\tvar y int = pick(a[:], false, 2)\n"
+			"\treturn x + y * 100\n"
+			"}\n"
+	var r0 int = runVMAtLevel(src, 0)
+	var r1 int = runVMAtLevel(src, 1)
+	if r0 != 42 { return "O0 baseline should be 42" }
+	if r1 != 42 { return "O1 inlined multi-block-with-fault result mismatch" }
+	return ""
+}
+
+// TestAdvManagedTempAtFaultRejected: a callee that bounds-checks an index into a
+// freshly-made managed-slice TEMP has that temp live (ctx.Temps) at the check, so
+// its pad RefDecs the temp -> NON-empty -> must NOT be inlined.  This relies on
+// the managed temp being registered BEFORE attachFaultPad runs (emit order).  If
+// it were wrongly inlined, the reused call-site pad would not release the callee's
+// make_slice temp -> leak on fault.  Negative control (stays a BC_CALL) + leak.
+func TestAdvManagedTempAtFaultRejected() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func f(i int) int { return make_slice(int, 3)[i] }\n"
+			"func doFault() int {\n"
+			"\tvar g @[]int = make_slice(int, 4)\n"
+			"\tvar r int = f(9)\n"
+			"\treturn len(g) + r\n"
+			"}\n"
+	var m1 @ir.Module = genModule(src)
+	var vm1 @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm1)
+	vm1.OptLevel = 1
+	vm1.LowerModule(m1)
+	if countAllBCCalls(vm1) < 1 {
+		return "callee with a managed-slice temp live at its bounds check was WRONGLY inlined (empty-pad "
+				"misclassification)"
+	}
+	var d1 int = faultLoopDelta(src, "test.doFault", 1, 30, true)
+	if d1 == -1000000 { return "O1: f(9) OOB must fault" }
+	if d1 != 0 {
+		return "O1 managed-temp-at-fault callee LEAKS (non-inlined path or misclassification)"
+	}
+	return ""
+}

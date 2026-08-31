@@ -5,7 +5,7 @@ import "pkg/binate/types"
 import "pkg/stdx/slices"
 
 // ============================================================
-// Within-package function inliner (Inc 1)
+// Within-package function inliner
 // ============================================================
 //
 // An -O1+ IR pass (run FIRST in RunOptPasses, before mem2reg) that clones a
@@ -29,13 +29,16 @@ import "pkg/stdx/slices"
 // miscompiles SILENTLY on the VM/native — the pass ships its own post-condition
 // assertion (assertInlinedFuncWellFormed).
 //
-// Inc 1 scope (the simplest, zero-CFG-surgery case): the callee is a
-// single-block, leaf (no calls -> no recursion, no nested inlining), no-faulting-
-// op (no PadBlock -> no fault-pad cloning) function returning at most one SCALAR
-// result (a single struct/array return rides sret/retbuf and is deferred), whose
-// body references only its params and its own in-block values.  Later increments
-// add multi-block callees, fault pads, multiple return sites, multi-value
-// returns, and non-leaf callees.
+// Scope so far: a leaf (no calls -> no recursion, no nested inlining) callee
+// with EXACTLY ONE return site, returning at most one SCALAR result (a single
+// struct/array return rides sret/retbuf and is deferred), whose body references
+// only its params and its own in-callee values.  Single-block callees splice
+// in place (Inc 1); multi-block callees split the caller block and clone the
+// callee's CFG (Inc 2, inline_multiblock.bn).  Faulting ops are allowed only
+// with an EMPTY cleanup pad (Inc 3a): the cloned fault op reuses the caller's
+// call-site pad, so there is no callee-side RefDec to preserve.  Later
+// increments add non-empty-pad fault cloning, multiple return sites, multi-value
+// / aggregate returns, and non-leaf callees.
 
 // InlineSizeThreshold is the maximum instruction count (including the terminator)
 // of a callee body for it to be inlined.  Conservative to start; tuneable — a
@@ -155,11 +158,12 @@ func findMultiBlockSite(m @Module, f @Func) (int, int, @Func) {
 // inlinableCallee returns the callee Func if `instr` is a direct OP_CALL that
 // qualifies for inlining into f (single- OR multi-block), else nil.  The shape
 // requirements: same-package non-extern, not self, total size under the
-// threshold, leaf (no call ops), no faulting op (no PadBlock), no phis, EXACTLY
-// one OP_RETURN site, every block ends in JUMP/BRANCH/RETURN, arity matches, ≤1
-// scalar result, and every value operand is a param or an in-callee value (so
-// it is remappable).  Callers dispatch on len(callee.Blocks): Phase 1 handles
-// single-block (splice), Phase 2 multi-block (CFG split).
+// threshold, leaf (no call ops), any faulting op has an EMPTY pad (and the call
+// site itself has a pad — Inc 3a), no phis, EXACTLY one OP_RETURN site, every
+// block ends in JUMP/BRANCH/RETURN, arity matches, ≤1 scalar result, and every
+// value operand is a param or an in-callee value (so it is remappable).  Callers
+// dispatch on len(callee.Blocks): Phase 1 handles single-block (splice), Phase 2
+// multi-block (CFG split).
 func inlinableCallee(m @Module, f @Func, instr @Instr) @Func {
 	if instr.Op != iropcode.OP_CALL {
 		return nil
@@ -205,7 +209,18 @@ func inlinableCallee(m @Module, f @Func, instr @Instr) @Func {
 				return nil
 			}
 			if bi.PadBlock != nil {
-				return nil
+				// Inc 3a: a faulting op is allowed ONLY if its cleanup pad is
+				// EMPTY (just OP_UNWIND_RETURN — no callee-local RefDecs), and the
+				// call site itself has a pad.  Then the cloned fault op reuses the
+				// caller's call-site pad (caller's live-at-call cleanup + unwind)
+				// and nothing is skipped.  A non-empty pad (managed local/param
+				// live at the fault) needs real pad cloning — a later increment.
+				if instr.PadBlock == nil {
+					return nil
+				}
+				if len(bi.PadBlock.Instrs) != 1 || bi.PadBlock.Instrs[0].Op != iropcode.OP_UNWIND_RETURN {
+					return nil
+				}
 			}
 			if len(bi.Phis) != 0 {
 				return nil // no phis expected before mem2reg; bail if present
@@ -283,7 +298,7 @@ func cloneInlinedBody(f @Func, callee @Func, call @Instr) (@[]@Instr, @Instr) {
 			}
 			break
 		}
-		var c @Instr = cloneInstr(f, src, remap, cap)
+		var c @Instr = cloneInstr(f, src, remap, cap, call.PadBlock)
 		if src.ID >= 0 {
 			remap[src.ID] = c
 		}
@@ -300,8 +315,8 @@ func cloneInlinedBody(f @Func, callee @Func, call @Instr) (@[]@Instr, @Instr) {
 // `arg: N` DWARF at -O1 -g for a managed-param accessor).  Inc 1 callees have no
 // Block1/Block2/Phis/PadBlock (single block, leaf, no faults), so those
 // reference fields are left nil.
-func cloneInstr(f @Func, src @Instr, remap @[]@Instr, cap int) @Instr {
-	var c @Instr = cloneInstrFields(f, src)
+func cloneInstr(f @Func, src @Instr, remap @[]@Instr, cap int, callSitePad *Block) @Instr {
+	var c @Instr = cloneInstrFields(f, src, callSitePad)
 	for k := 0; k < len(c.Args); k++ {
 		c.Args[k] = remapOperand(c.Args[k], remap, cap)
 	}
@@ -318,7 +333,7 @@ func cloneInstr(f @Func, src @Instr, remap @[]@Instr, cap int) @Instr {
 // the single-block splice (cloneInstr, one-pass remap) and the multi-block
 // two-pass clone (inline_multiblock.bn, which remaps Args + CFG edges after all
 // clones exist).
-func cloneInstrFields(f @Func, src @Instr) @Instr {
+func cloneInstrFields(f @Func, src @Instr, callSitePad *Block) @Instr {
 	var c @Instr = make(Instr)
 	c.Op = src.Op
 	c.Typ = src.Typ
@@ -332,6 +347,14 @@ func cloneInstrFields(f @Func, src @Instr) @Instr {
 	c.RetbufSize = src.RetbufSize
 	c.Line = src.Line
 	c.IsGlobalRef = src.IsGlobalRef
+	// Inc 3a: a cloned faulting op (bounds/div/shift/nil check) reuses the
+	// CALLER's call-site pad — the caller's live-at-call RefDecs + unwind.  This
+	// is correct only because inlinableCallee restricts fault-containing callees
+	// to EMPTY pads (no callee-local cleanup to preserve), so nothing is skipped
+	// by not cloning the callee pad.  A non-faulting op keeps PadBlock nil.
+	if src.PadBlock != nil {
+		c.PadBlock = callSitePad
+	}
 	if src.ID >= 0 {
 		c.ID = nextID(f)
 	} else {

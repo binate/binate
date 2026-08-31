@@ -16,6 +16,9 @@
 #   * wdata  — mutates a .data global and a .bss global at runtime and exits with their
 #     sum (42): the writable __DATA segment (program .data/.bss sharing it with the
 #     __got, whose slot sits after the program .data, so a non-zero bind offset).
+#   * weakabs — GOT-loads a WEAK, genuinely-absent import and exits 42 iff it bound to 0:
+#     the weak-import path (BIND_SYMBOL_FLAGS_WEAK_IMPORT / N_WEAK_REF), which dyld binds
+#     to 0 rather than aborting the load as it would for an absent strong import.
 #
 # Static Mach-O does not run on macOS arm64 (the kernel mandates dyld), so this is the
 # path to a bnld-linked binary that runs on this platform.  The build + link +
@@ -179,6 +182,30 @@ _start:
 EOF
 echo "PASS: wdata links to a dynamically-linked arm64 Mach-O (writable __DATA: .data + .bss)"
 
+# ----- weakabs: a WEAK undefined import that no library provides.  GOT-load a weak,
+#       genuinely-absent symbol and exit 42 iff it bound to 0.  A weak import carries
+#       BIND_SYMBOL_FLAGS_WEAK_IMPORT, so dyld binds it to 0 instead of failing the load;
+#       a STRONG import of an absent symbol would abort the process at load (exit 134).
+#       So exit 42 proves the weak marking end to end (asm .weak -> N_WEAK_REF -> the
+#       linker's weak bind).  _exit is a normal (present) import. -----
+asm_link_macho weakabs <<'EOF'
+.arch aarch64
+.section text
+.global _start
+.weak _bnld_absent_weak_xyz
+.global _exit
+_start:
+	adrp x0, :got:_bnld_absent_weak_xyz
+	ldr x0, [x0, #:got_lo12:_bnld_absent_weak_xyz]
+	cbz x0, Lzero
+	mov w0, #7
+	bl _exit
+Lzero:
+	mov w0, #42
+	bl _exit
+EOF
+echo "PASS: weakabs links to a dynamically-linked arm64 Mach-O (weak import: _bnld_absent_weak_xyz)"
+
 # ----- run: natively on macOS arm64 (the macos-latest CI lane); SKIP elsewhere. -----
 # A Mach-O cannot run in a Linux container, so there is no Docker path: the run is
 # native-or-skip.
@@ -218,6 +245,13 @@ if [ "$CAN_RUN" = 1 ]; then
         exit 1
     fi
     echo "PASS: wdata ran — mutated a .data and a .bss global in __DATA and exited 42"
+
+    "$TMP/weakabs"; _code=$?
+    if [ "$_code" != 42 ]; then
+        echo "FAIL: weakabs expected exit 42 (absent weak import bound to 0), got $_code" >&2
+        exit 1
+    fi
+    echo "PASS: weakabs ran — an absent weak import bound to 0 (not a load failure) and exited 42"
 else
     echo "SKIP: Mach-O binaries not run here ($_skip_note) — build+structure verified"
 fi

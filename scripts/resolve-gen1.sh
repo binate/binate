@@ -136,10 +136,16 @@ GEN1_TMP="$WORK/bnc"
 # runtime); only the compiler's own source (pkg/binate) comes from
 # the checkout via `--prepend "$BINATE_DIR"`.  Identical to build-compilers.sh
 # build_gen1 and e2e/os-args.sh — the shape this script exists to deduplicate.
+# Transitional Linux gen1-link shim (BUILDER bnc-0.0.14 emits the iv-dispatch
+# thunks STRONG); accept the ODR-identical dups.  Remove at BUILDER >= bnc-0.0.15.
+# Full rationale: scripts/lib/build-compilers.sh build_gen1 + claude-todo.
+gen1_dupthunk_flag=""
+[ "$(uname -s)" = Linux ] && gen1_dupthunk_flag="--cflag -Wl,--allow-multiple-definition"
 if ! "$BUILDER" \
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
         -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
         --build-dir "$WORK/build" \
+        $gen1_dupthunk_flag \
         -o "$GEN1_TMP" \
         "$BINATE_DIR/cmd/bnc" >"$WORK/log" 2>&1 || [ ! -x "$GEN1_TMP" ]; then
     echo "resolve-gen1: gen1 build failed:" >&2

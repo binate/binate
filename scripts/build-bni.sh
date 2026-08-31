@@ -109,10 +109,16 @@ echo "  Stage 1: BUILDER → gen1 ..."
 # BUILDER's frozen bundle only (--base "$BUILDER_LIB" --prepend "$BINATE_DIR");
 # the bnc source cone may only use features the BUILDER has, so no source
 # fallback.  Full rationale: scripts/lib/build-compilers.sh build_gen1.
+# Transitional Linux gen1-link shim (BUILDER bnc-0.0.14 emits the iv-dispatch
+# thunks STRONG); accept the ODR-identical dups.  Remove at BUILDER >= bnc-0.0.15.
+# Full rationale: scripts/lib/build-compilers.sh build_gen1 + claude-todo.
+gen1_dupthunk_flag=""
+[ "$(uname -s)" = Linux ] && gen1_dupthunk_flag="--cflag -Wl,--allow-multiple-definition"
 "$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
     --build-dir "$GEN1_DIR/build" \
+    $gen1_dupthunk_flag \
     -o "$GEN1_BNC" \
     "$BINATE_DIR/cmd/bnc"
 

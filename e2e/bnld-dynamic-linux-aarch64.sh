@@ -229,4 +229,59 @@ else
     echo "SKIP: datum not run here ($_skip_note) — build+structure verified"
 fi
 
+# ----- multi-lib -l: relink exit42, additionally naming a SECOND shared library via
+#       `-l`.  This proves bnld reads that library's OWN SONAME (its DT_SONAME) and
+#       records THAT as a DT_NEEDED — libm is the vehicle: bnld is handed a libm.so (a
+#       symlink to the real libm.so.6) and must emit "libm.so.6" (the SONAME), NOT
+#       "libm.so" (the filename).  bnld reads the .so as bytes (no execution), so it
+#       needs an *aarch64* libm.so.6: the host's when running natively on aarch64, else
+#       one copied out of the arm64 Docker image.  Gated on CAN_RUN (the same condition
+#       under which an aarch64 libm.so.6 is obtainable); SKIP otherwise. -----
+if [ "$CAN_RUN" = 1 ]; then
+    LIBM_DIR="$TMP/libm"
+    mkdir -p "$LIBM_DIR"
+    _libm_ok=0
+    if [ "$RUN_KIND" = native ]; then
+        for _c in /lib/aarch64-linux-gnu/libm.so.6 /usr/lib/aarch64-linux-gnu/libm.so.6 /lib64/libm.so.6; do
+            [ -e "$_c" ] && { ln -sf "$_c" "$LIBM_DIR/libm.so"; _libm_ok=1; break; }
+        done
+    else
+        _cid="$(docker create --platform linux/arm64 debian:stable-slim)"
+        if docker cp "$_cid:/lib/aarch64-linux-gnu/libm.so.6" "$LIBM_DIR/libm.so.6" > /dev/null 2>&1; then
+            ln -sf libm.so.6 "$LIBM_DIR/libm.so"
+            _libm_ok=1
+        fi
+        docker rm "$_cid" > /dev/null 2>&1 || true
+    fi
+    if [ "$_libm_ok" = 1 ]; then
+        if ! "$BNLD" -target linux-aarch64 -dynamic -L "$LIBM_DIR" -lm -o "$TMP/exit42lm" "$TMP/exit42.o" \
+                > "$TMP/exit42lm.link.log" 2>&1; then
+            echo "FAIL: bnld could not link exit42 with -lm" >&2
+            cat "$TMP/exit42lm.link.log" >&2
+            exit 1
+        fi
+        if ! grep -q "libc.so.6" "$TMP/exit42lm"; then
+            echo "FAIL: exit42lm should still name libc.so.6 (DT_NEEDED)" >&2
+            exit 1
+        fi
+        if ! grep -q "libm.so.6" "$TMP/exit42lm"; then
+            echo "FAIL: -lm should add libm.so.6 (its SONAME) as a DT_NEEDED" >&2
+            exit 1
+        fi
+        echo "PASS: -lm adds libm.so.6 as a second DT_NEEDED (read from its SONAME, not the filename)"
+        run_dyn exit42lm
+        if [ "$RAN" = 1 ]; then
+            if [ "$CODE" != 42 ]; then
+                echo "FAIL: exit42lm expected exit 42, got $CODE" >&2
+                exit 1
+            fi
+            echo "PASS: exit42lm ran with two DT_NEEDED libs (libc + libm) and exited 42"
+        fi
+    else
+        echo "SKIP: multi-lib -l — could not obtain an aarch64 libm.so.6"
+    fi
+else
+    echo "SKIP: multi-lib -l not exercised here ($_skip_note)"
+fi
+
 echo "ALL PASS: bnld dynamic ELF linking (aarch64)"

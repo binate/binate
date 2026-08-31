@@ -1,0 +1,118 @@
+package "pkg/binate/link"
+
+import "pkg/binate/buf"
+
+// Reading a shared library's SONAME (parse_so.bn).  A dynamically-linked executable
+// records each shared library it needs by that library's SONAME — the self-name a
+// linked .so carries in its own DT_SONAME (e.g. "libc.so.6", not the "libc.so"
+// development symlink used to find it).  bnld resolves a `-l<name>` to a lib<name>.so
+// on the search path, then reads that file's SONAME here to emit the matching
+// DT_NEEDED.  Only what that needs is parsed: the program headers (for PT_DYNAMIC and
+// the PT_LOAD map that turns a .dynamic vaddr into a file offset) and the .dynamic
+// array (for DT_SONAME + DT_STRTAB).  ELF64 little-endian only (the two hosted ELF
+// targets); a 32-bit or big-endian object is rejected.
+
+// ELF64 program-header (Elf64_Phdr) field offsets; each entry is 56 bytes.
+const (
+	phEntSize int = 56
+	phType int = 0     // p_type (4)
+	phOffset int = 8   // p_offset (8)
+	phVaddr int = 16   // p_vaddr (8)
+	phFilesz int = 32  // p_filesz (8)
+)
+
+// readSoname reads the SONAME of an ELF64 shared object (its DT_SONAME string).  data
+// is the whole file; path labels errors.  Returns (soname, "") on success, or ("",
+// err).  A file that is not an ELF64 LE dynamic object, or one carrying no DT_SONAME,
+// is an error (a shared library used as a `-l` input must name itself).
+func readSoname(data *[]readonly uint8, path *[]readonly char) (@[]char, @[]readonly char) {
+	var empty @[]char = ""
+	if len(data) < 64 { return empty, buf.Concat("file too small for an ELF64 header: ", path) }
+	if data[0] != 0x7f || data[1] != 0x45 || data[2] != 0x4c || data[3] != 0x46 {
+		return empty, buf.Concat("not an ELF file (bad magic): ", path)
+	}
+	if data[4] != ELFCLASS64 { return empty, buf.Concat("not an ELF64 shared object: ", path) }
+	if data[5] != ELFDATA2LSB { return empty, buf.Concat("not a little-endian ELF object: ", path) }
+
+	phoff, phoffOk := readOff(data, 32) // e_phoff
+	var phentsize int = u16(data, 54) // e_phentsize
+	var phnum int = u16(data, 56) // e_phnum
+	if !phoffOk || phoff == 0 || phnum == 0 {
+		return empty, buf.Concat("shared object has no program headers: ", path)
+	}
+	if phentsize < phEntSize {
+		return empty, buf.Concat("unsupported program-header entry size: ", path)
+	}
+	if !rangeOk(phoff, phnum * phentsize, len(data)) {
+		return empty, buf.Concat("program-header table out of range: ", path)
+	}
+
+	// The .dynamic array's file range (PT_DYNAMIC).  PT_LOAD segments are scanned
+	// separately (vaddrToFileOff) when mapping the string-table vaddr to a file offset.
+	dynOff, dynSize, dynFound := findDynamic(data, phoff, phentsize, phnum)
+	if !dynFound { return empty, buf.Concat("not a dynamic ELF (no PT_DYNAMIC): ", path) }
+	if !rangeOk(dynOff, dynSize, len(data)) {
+		return empty, buf.Concat("PT_DYNAMIC out of range: ", path)
+	}
+
+	// Walk the .dynamic array (Elf64_Dyn: d_tag(8), d_val(8)) for DT_SONAME (the
+	// SONAME's offset within DT_STRTAB) and DT_STRTAB (the string table's vaddr).
+	var haveSoname bool = false
+	var sonameOff int = 0
+	var haveStrtab bool = false
+	var strtabVa int = 0
+	var nEnt int = dynSize / 16
+	for i := 0; i < nEnt; i++ {
+		var e int = dynOff + i * 16
+		var tag int = u64(data, e)
+		var val int = u64(data, e + 8)
+		if tag == DT_NULL { break }
+		if tag == DT_SONAME { haveSoname = true; sonameOff = val }
+		if tag == DT_STRTAB { haveStrtab = true; strtabVa = val }
+	}
+	if !haveSoname { return empty, buf.Concat("shared object has no DT_SONAME: ", path) }
+	if !haveStrtab { return empty, buf.Concat("shared object has no DT_STRTAB: ", path) }
+
+	// DT_STRTAB is a vaddr; map it to a file offset via the PT_LOAD covering it, then
+	// read the NUL-terminated SONAME at that offset + the DT_SONAME string offset.
+	strFileOff, mapOk := vaddrToFileOff(data, phoff, phentsize, phnum, strtabVa)
+	if !mapOk { return empty, buf.Concat("DT_STRTAB vaddr not in any PT_LOAD: ", path) }
+	var nameOff int = strFileOff + sonameOff
+	if nameOff < 0 || nameOff >= len(data) {
+		return empty, buf.Concat("DT_SONAME offset out of range: ", path)
+	}
+	var name @[]char = readCStr(data, nameOff, len(data))
+	if len(name) == 0 { return empty, buf.Concat("shared object has an empty SONAME: ", path) }
+	return name, ""
+}
+
+// findDynamic returns the file offset and size of the PT_DYNAMIC segment (the
+// .dynamic array), plus whether one was found.
+func findDynamic(data *[]readonly uint8, phoff int, phentsize int, phnum int) (int, int, bool) {
+	for i := 0; i < phnum; i++ {
+		var ph int = phoff + i * phentsize
+		if u32(data, ph + phType) != PT_DYNAMIC { continue }
+		off, offOk := readOff(data, ph + phOffset)
+		sz, szOk := readOff(data, ph + phFilesz)
+		if !offOk || !szOk { return 0, 0, false }
+		return off, sz, true
+	}
+	return 0, 0, false
+}
+
+// vaddrToFileOff maps a virtual address to a file offset via the PT_LOAD segment that
+// contains it: fileoff = p_offset + (vaddr - p_vaddr) for the PT_LOAD whose [p_vaddr,
+// p_vaddr+p_filesz) contains vaddr.  Returns (off, true) or (0, false).
+func vaddrToFileOff(data *[]readonly uint8, phoff int, phentsize int, phnum int,
+		vaddr int) (int, bool) {
+	for i := 0; i < phnum; i++ {
+		var ph int = phoff + i * phentsize
+		if u32(data, ph + phType) != PT_LOAD { continue }
+		off, offOk := readOff(data, ph + phOffset)
+		va, vaOk := readOff(data, ph + phVaddr)
+		sz, szOk := readOff(data, ph + phFilesz)
+		if !offOk || !vaOk || !szOk { continue }
+		if vaddr >= va && vaddr < va + sz { return off + (vaddr - va), true }
+	}
+	return 0, false
+}

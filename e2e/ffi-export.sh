@@ -66,7 +66,10 @@ summary() {
     exit 0
 }
 
-WANT="42 42 42 99"
+# Shared arithmetic-export prefix (ffi_add ffi_mul ffi_sub ffi_sub2); each driver
+# appends its own tail (the exports it actually calls).
+WANT_BASE="42 42 42 99"
+WANT="$WANT_BASE 1 0"  # check_backend driver: + ffi_sgn(-5) ffi_sgn(5)
 
 if ! command -v "$CLANG" >/dev/null 2>&1; then
     skip "ffi-export (no C compiler '$CLANG' available)"
@@ -133,6 +136,19 @@ func bumpCounter() int {
 
 #[c_export("ffi_counter")]
 func GetCounter() int { return counter }
+
+// A NARROW SIGNED param exported to C.  A C caller passes a negative int32 in w0 with
+// bits[32:63] zeroed (an aarch64 w-write clears the high half), so a native callee that
+// spills the whole x0 and, at -O1+, tests it with a 64-bit signed compare sees a large
+// POSITIVE value unless it sign-extends the narrow reg param on entry.  Guards the
+// #[c_export] register-param normalization (regression: ffi_sgn(-5) returned 0).
+#[c_export("ffi_sgn")]
+func Sgn(x int32) int {
+	if x < cast(int32, 0) {
+		return 1
+	}
+	return 0
+}
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -142,10 +158,12 @@ extern int ffi_add(int, int);
 extern int ffi_mul(int, int);
 extern int ffi_sub(int, int);
 extern int ffi_sub2(int, int);
+extern long ffi_sgn(int);
 int main(void) {
-    printf("%d %d %d %d\n",
+    printf("%d %d %d %d %ld %ld\n",
            ffi_add(20, 22), ffi_mul(6, 7),
-           ffi_sub(50, 8), ffi_sub2(100, 1));
+           ffi_sub(50, 8), ffi_sub2(100, 1),
+           ffi_sgn(-5), ffi_sgn(5));
     return 0;
 }
 EOF
@@ -229,7 +247,7 @@ EOF
         return
     fi
     got="$("$work/run" 2>&1)"
-    want="$WANT 40 1"
+    want="$WANT_BASE 40 1"  # library driver: + ffi_base ffi_counter (no ffi_sgn call)
     if [ "$got" = "$want" ]; then
         pass "library: bn_init + #[c_export] calls from a C driver (base=40 -> inits ran; counter=1 -> run-once): '$got'"
     else
@@ -242,6 +260,11 @@ check_backend "llvm" "" 1
 # Native backend — real link+run coverage of the second-symbol emission when the
 # host's native backend can emit the facade; self-skips otherwise.
 check_backend "native" "--backend native" 0
+# Native at -O2 — exercises the #[c_export] narrow register-param sign-extension: at -O1+
+# mem2reg promotes the param, so ffi_sgn(-5) must still be 1 (a plain 64-bit reload of an
+# un-extended negative int32 reads positive).  Self-skips if the host native backend cannot
+# emit the facade.
+check_backend "native-O2" "--backend native -O2" 0
 # The --library archive: init-once-via-bn_init + call the exports from a real .a.
 check_library
 

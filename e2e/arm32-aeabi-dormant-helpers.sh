@@ -18,9 +18,10 @@
 # backends, so the LLVM path fully covers the helpers.
 #
 # Auto-discovered by .github/workflows/e2e-tests.yml.  SKIPs unless a
-# qemu-system-arm + clang(arm-none-eabi) toolchain is present (the e2e CI image
-# installs clang but not qemu, so it skips there; it runs locally / wherever the
-# conformance arm32 toolchain is installed).
+# qemu-system-arm + clang(arm-none-eabi) + lld toolchain is present.  The e2e
+# workflow installs these for the arm32 scripts on the Linux lane, so it RUNS
+# there; it SKIPs on macOS (targeted to linux-x64) and anywhere the toolchain is
+# absent.
 #
 # Exit 0 on pass (including a graceful SKIP when the toolchain is absent);
 # non-zero with diagnostics on failure.
@@ -53,6 +54,12 @@ if ! echo 'int main(void){return 0;}' | "$CLANG" -target arm-none-eabi -mfloat-a
     exit 0
 fi
 rm -f /tmp/_bn_e2e_probe.o
+# The baremetal link uses ld.lld (clang -fuse-ld=lld); the compile-only probe above
+# would pass without it and then FAIL at the link, so gate on it too.
+if ! command -v ld.lld >/dev/null 2>&1; then
+    echo "SKIP: ld.lld (lld) not found (needed to link the arm32-baremetal probe)"
+    exit 0
+fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/binate_e2e_aeabi.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -268,6 +275,9 @@ fi
 echo "FAIL: arm32 AEABI dormant-helper output mismatch" >&2
 echo "--- got ---"  >&2; printf '%s\n' "$GOT"  >&2
 echo "--- want ---" >&2; printf '%s\n' "$WANT" >&2
-# show the first differing line for convenience
-diff <(printf '%s\n' "$WANT") <(printf '%s\n' "$GOT") 2>/dev/null | head -12 >&2
+# show the first differing lines for convenience (temp files, not <(...), so the
+# diagnostic works under a POSIX /bin/sh — e.g. dash on the Linux CI runner)
+printf '%s\n' "$WANT" > "$TMP/want"
+printf '%s\n' "$GOT"  > "$TMP/got"
+diff "$TMP/want" "$TMP/got" 2>/dev/null | head -12 >&2
 exit 1

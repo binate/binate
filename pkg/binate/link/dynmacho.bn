@@ -28,6 +28,17 @@ const (
 	BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB int = 0x70
 	BIND_OPCODE_DO_BIND int = 0x90
 	BIND_TYPE_POINTER int = 1
+	// Dyld info rebase opcodes (same high-nibble opcode / low-nibble immediate split as
+	// bind).  dyld ADDS the image's load slide to each rebased pointer, so a PIE Mach-O's
+	// absolute in-image pointers survive ASLR.  arm64 macOS requires PIE, so a bnld
+	// executable with any such pointer (vtables, type info, static-data addresses — every
+	// R_AARCH64_ABS64 site) needs these; without them the pointers keep their unslid
+	// value and dereferencing one faults.
+	REBASE_OPCODE_DONE int = 0x00
+	REBASE_OPCODE_SET_TYPE_IMM int = 0x10
+	REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB int = 0x20
+	REBASE_OPCODE_DO_REBASE_IMM_TIMES int = 0x50
+	REBASE_TYPE_POINTER int = 1
 	// BIND_SYMBOL_FLAGS_WEAK_IMPORT (a low-nibble immediate on
 	// SET_SYMBOL_TRAILING_FLAGS_IMM) marks a weak import: dyld binds it to 0 if no
 	// library provides it, instead of failing the load.
@@ -99,6 +110,68 @@ func buildMachoBind(imports @[]@[]char, segIndex int, gotSegOff int, binds @[]in
 		p = p + 1
 	}
 	out[p] = cast(uint8, BIND_OPCODE_DONE)
+	p = p + 1
+	return out[0:p]
+}
+
+// collectMachoRebaseSites returns the virtual address of every absolute in-image pointer
+// bnld patched — one per R_AARCH64_ABS64 relocation.  bnld rejects a direct ABS64
+// reference to an import (those must go through the __got), so every ABS64 target is a
+// defined in-image symbol whose stored address dyld must slide.  All such sites lie in
+// the writable __DATA segment: their host sections (rodata_relro / .data) are SF_WRITE,
+// so Layout groups them there — the caller relies on that to turn each into a
+// segment-relative rebase offset.
+func collectMachoRebaseSites(t @SymbolTable, lr @LayoutResult) @[]uint64 {
+	var n int = 0
+	for o := 0; o < len(t.Objs); o++ {
+		var obj @InputObject = t.Objs[o]
+		for r := 0; r < len(obj.Relocs); r++ {
+			var rel InputReloc = obj.Relocs[r]
+			if rel.Kind != R_AARCH64_ABS64 { continue }
+			if rel.SecIndex < 0 || rel.SecIndex >= len(obj.Sections) { continue }
+			if obj.Sections[rel.SecIndex].OutIndex < 0 { continue }
+			n = n + 1
+		}
+	}
+	var sites @[]uint64 = make_slice(uint64, n)
+	var k int = 0
+	for o := 0; o < len(t.Objs); o++ {
+		var obj @InputObject = t.Objs[o]
+		for r := 0; r < len(obj.Relocs); r++ {
+			var rel InputReloc = obj.Relocs[r]
+			if rel.Kind != R_AARCH64_ABS64 { continue }
+			if rel.SecIndex < 0 || rel.SecIndex >= len(obj.Sections) { continue }
+			var outIdx int = obj.Sections[rel.SecIndex].OutIndex
+			if outIdx < 0 { continue }
+			var secOff uint = obj.Sections[rel.SecIndex].OutOffset
+			sites[k] = lr.Sections[outIdx].Addr + cast(uint64, secOff) + cast(uint64, rel.Offset)
+			k = k + 1
+		}
+	}
+	return sites
+}
+
+// buildMachoRebase encodes the LC_DYLD_INFO rebase opcode stream: set the POINTER type
+// once, then for each site set its (segment, offset) and rebase one slot.  segOffsets are
+// byte offsets within segment segIndex (the writable __DATA); they need not be sorted,
+// since every site resets the cursor with SET_SEGMENT_AND_OFFSET.  Returns an empty slice
+// when there is nothing to rebase.
+func buildMachoRebase(segOffsets @[]int, segIndex int) @[]uint8 {
+	if len(segOffsets) == 0 { return make_slice(uint8, 0) }
+	// Upper bound: 1 type opcode + per site (1 set-seg + a <=10-byte uleb + 1 do-rebase)
+	// + 1 done.
+	var out @[]uint8 = make_slice(uint8, 2 + len(segOffsets) * 12)
+	var p int = 0
+	out[p] = cast(uint8, REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER)
+	p = p + 1
+	for i := 0; i < len(segOffsets); i++ {
+		out[p] = cast(uint8, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segIndex)
+		p = p + 1
+		p = writeUleb(out, p, segOffsets[i])
+		out[p] = cast(uint8, REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1)
+		p = p + 1
+	}
+	out[p] = cast(uint8, REBASE_OPCODE_DONE)
 	p = p + 1
 	return out[0:p]
 }
@@ -305,10 +378,22 @@ func LinkDynMacho(inputPaths @[]@[]char, entryName *[]readonly char, machine int
 	// segment index 2.  The __got may not be at the segment start — program .data
 	// precedes it in __DATA — so the bind offsets are relative to the __got's position
 	// within the writable segment (its vaddr minus the segment's base vaddr).
-	_, rwLo, _, _, _ := groupStats(lr.Sections, true)
+	_, rwLo, _, rwMemEnd, _ := groupStats(lr.Sections, true)
 	var gotSegOff int = cast(int, secVaddr(dynObj, lr, dmGot) - rwLo)
 	var bindOps @[]uint8 = buildMachoBind(imports, 2, gotSegOff, binds)
+	// Rebase every absolute in-image pointer (ABS64 site) by the load slide.  All sit in
+	// the writable __DATA segment (index 2, as the bind stream also names), so the rebase
+	// offset is relative to that segment's base vaddr (rwLo).
+	var rebaseSites @[]uint64 = collectMachoRebaseSites(t, lr)
+	var rebaseOffs @[]int = make_slice(int, len(rebaseSites))
+	for i := 0; i < len(rebaseSites); i++ {
+		if rebaseSites[i] < rwLo || rebaseSites[i] >= rwMemEnd {
+			return "internal error: an absolute-pointer rebase site is outside __DATA"
+		}
+		rebaseOffs[i] = cast(int, rebaseSites[i] - rwLo)
+	}
+	var rebaseOps @[]uint8 = buildMachoRebase(rebaseOffs, 2)
 	symtab, strtab := buildMachoSymtab(imports, binds)
-	return EmitDynMachoExec(lr.Sections, entryAddr, machine, bindOps, symtab, len(imports), strtab,
-			machoIdent(outPath), outPath)
+	return EmitDynMachoExec(lr.Sections, entryAddr, machine, rebaseOps, bindOps, symtab, len(imports),
+			strtab, machoIdent(outPath), outPath)
 }

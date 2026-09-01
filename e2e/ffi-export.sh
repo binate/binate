@@ -69,7 +69,7 @@ summary() {
 # Shared arithmetic-export prefix (ffi_add ffi_mul ffi_sub ffi_sub2); each driver
 # appends its own tail (the exports it actually calls).
 WANT_BASE="42 42 42 99"
-WANT="$WANT_BASE 1 0"  # check_backend driver: + ffi_sgn(-5) ffi_sgn(5)
+WANT="$WANT_BASE 1 0 1 0"  # check_backend driver: + ffi_sgn(-5) ffi_sgn(5) ffi_ro(-3) ffi_ro(3)
 
 if ! command -v "$CLANG" >/dev/null 2>&1; then
     skip "ffi-export (no C compiler '$CLANG' available)"
@@ -149,6 +149,17 @@ func Sgn(x int32) int {
 	}
 	return 0
 }
+
+// A narrow SIGNED param behind a `readonly` qualifier: the TYP_READONLY wrapper
+// must be peeled for machine width/signedness (SubWordNarrow), else a C caller's
+// negative int8 is zero-extended and read positive (ffi_ro(-3) -> 0 not 1).
+#[c_export("ffi_ro")]
+func FRo(x readonly int8) int {
+	if x < cast(int8, 0) {
+		return 1
+	}
+	return 0
+}
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -159,11 +170,13 @@ extern int ffi_mul(int, int);
 extern int ffi_sub(int, int);
 extern int ffi_sub2(int, int);
 extern long ffi_sgn(int);
+extern long ffi_ro(int);
 int main(void) {
-    printf("%d %d %d %d %ld %ld\n",
+    printf("%d %d %d %d %ld %ld %ld %ld\n",
            ffi_add(20, 22), ffi_mul(6, 7),
            ffi_sub(50, 8), ffi_sub2(100, 1),
-           ffi_sgn(-5), ffi_sgn(5));
+           ffi_sgn(-5), ffi_sgn(5),
+           ffi_ro(-3), ffi_ro(3));
     return 0;
 }
 EOF

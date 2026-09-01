@@ -8,12 +8,11 @@
 # oversized constants, ...) are exercised, not just bugs in the code it emits.
 #
 # Each tool is cross-built for arm32-linux (`bnc --target arm32-linux`) and run
-# under qemu-arm on a tiny input.  Covered: bni, bnas, bnlint, bnfmt.  bnc and bnld
-# are intentionally OMITTED until pkg/binate/link is ILP32-portable — it holds
-# 64-bit Mach-O addresses in word-sized `int`/`uint`, so cmd/bnld (and cmd/bnc,
-# which embeds the Mach-O emitter / self-signer) do not yet compile for arm32.
-# See explorations/plan-arm32-toolchain-smoke.md and the "link/bnld … 64-bit
-# address on ILP32" todo; add bnc + bnld here once that lands.
+# under qemu-arm on a tiny input.  Covers all six: bni, bnas, bnlint, bnfmt, bnc
+# (compile a program and run the result), and bnld (assemble an object with bnas,
+# link it, structure-check the ELF).  bnc + bnld became arm32-buildable once the
+# link address-width fix landed (b2c68b22b — 64-bit Mach-O addresses moved from
+# word-sized int/uint to uint64).  See explorations/plan-arm32-toolchain-smoke.md.
 #
 # Auto-discovered by .github/workflows/e2e-tests.yml.  SKIPs (exit 0) unless a
 # qemu-arm(-static) + a WORKING arm-linux-gnueabihf cross-toolchain (clang that can
@@ -138,6 +137,49 @@ if xbuild bnas; then
     else
         echo "FAIL: bnas assemble"
         tail -3 "$TMP/bnas.err" | sed 's/^/    /'
+        FAIL=$((FAIL + 1))
+    fi
+fi
+
+# --- bnc: --version + compile a program and run the result -----------------
+if xbuild bnc; then
+    check "bnc --version" "bnc-" "$QEMU_ARM" "$TMP/bnc_a32" --version
+    # Compile for arm32-linux EXPLICITLY.  bnc runs emulated (arm32) under qemu but
+    # execs the NATIVE clang (the runner's arch) for assemble + link; a default host
+    # build lets clang pick its own default triple, i.e. the runner's arch, not arm32.
+    # --target makes bnc drive clang's arm-linux-gnueabihf cross-triple, so the output
+    # is an arm32 binary we can then run under qemu.  (This leans on qemu-user passing
+    # the execve of a native clang through to the host — standard, but qemu-version
+    # sensitive; a break there would surface as a bnc-compile FAIL, not a SKIP.)
+    if "$QEMU_ARM" "$TMP/bnc_a32" --target arm32-linux -I "$A32_I" -L "$A32_L" \
+            -o "$TMP/hello_bnc" "$TMP/hello.bn" >"$TMP/bnc.err" 2>&1; then
+        check "bnc compile+run" "smoke-ok" "$QEMU_ARM" "$TMP/hello_bnc"
+    else
+        echo "FAIL: bnc compile"
+        tail -3 "$TMP/bnc.err" | sed 's/^/    /'
+        FAIL=$((FAIL + 1))
+    fi
+fi
+
+# --- bnld: assemble a tiny object with bnas, link it, structure-check the ELF ---
+# bnld targets 64-bit outputs, so it links an x64 object (from bnas) and we
+# structure-check the ELF header rather than run it under qemu-arm.  The header
+# checks — magic, EI_CLASS=2 (ELF64), e_type=2 (ET_EXEC) — are the point: a bnld
+# ILP32 bug that truncates a 64-bit header field would still start with the magic,
+# so magic alone is not enough (cf. check_elf in e2e/bnld-linux.sh).
+if xbuild bnld; then
+    printf '.arch x64\n.section text\n.global _start\n_start:\n\tmov edi, 42\n\tmov eax, 60\n\tsyscall\n' > "$TMP/exit42.s"
+    if "$QEMU_ARM" "$TMP/bnas_a32" -arch x64 -o "$TMP/exit42.o" "$TMP/exit42.s" >"$TMP/bnld.err" 2>&1 \
+            && "$QEMU_ARM" "$TMP/bnld_a32" -o "$TMP/exit42" "$TMP/exit42.o" >>"$TMP/bnld.err" 2>&1 \
+            && [ "$(od -An -tx1 -N4 "$TMP/exit42"    | tr -d ' \n')" = "7f454c46" ] \
+            && [ "$(od -An -tu1 -j4  -N1 "$TMP/exit42" | tr -d ' \n')" = "2" ] \
+            && [ "$(od -An -tu1 -j16 -N1 "$TMP/exit42" | tr -d ' \n')" = "2" ] \
+            && [ -x "$TMP/exit42" ]; then
+        echo "PASS: bnld link (bnas x64 .o -> ELF64 ET_EXEC)"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: bnld link"
+        tail -3 "$TMP/bnld.err" | sed 's/^/    /'
         FAIL=$((FAIL + 1))
     fi
 fi

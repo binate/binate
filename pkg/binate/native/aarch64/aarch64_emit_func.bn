@@ -105,6 +105,36 @@ func normalizeNarrowRegParam(a @asm.Assembler, reg int, t @types.Type) {
 	}
 }
 
+// emitCExportRegNorm emits the #[c_export] C-entry prefix: for each GP scalar parameter
+// passed in an argument register, sign-/zero-extend it in place.  It mirrors
+// spillIncomingParams' parameter walk (float-scalar, HFA, and aggregate params are not GP
+// narrow scalars and are skipped, so the argReg mapping matches the one the mangled entry
+// spills).  Emitted as the c_export C-entry thunk (before the mangled `sym`, which the
+// caller branches to): a C caller entering at the alias, whose high argument-register bits
+// AAPCS64 leaves unspecified, runs these extends; a native caller entering at `sym` skips
+// them — native calls already pass narrow args sign-/zero-extended in the full register.
+func emitCExportRegNorm(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
+		paramTypes @[]@types.Type) {
+	for pi := 0; pi < len(f.Params); pi++ {
+		var p @ir.Param = f.Params[pi]
+		if common.IsFloatScalarTyp(p.Typ) {
+			continue
+		}
+		var hfaN int
+		hfaN, _ = types.HfaClassify(p.Typ)
+		if rm.CC.HfaAggregates && hfaN > 0 {
+			continue
+		}
+		if common.IsAggregateTyp(p.Typ) {
+			continue
+		}
+		var regStart int = rm.CC.CallArgRegStart(paramTypes, pi)
+		if regStart >= 0 {
+			normalizeNarrowRegParam(a, argReg(regStart), p.Typ)
+		}
+	}
+}
+
 // emitFunc lowers one function. Prologue saves FP/LR and allocates
 // the local stack frame; epilogue reverses.
 func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[]ir.StringConst) {
@@ -113,33 +143,48 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 	// so the pkgName arg is ignored. Kept for API stability with
 	// bare-name callers (none currently in pkg/binate/ir's output).
 	var sym @[]char = symFor(pkgName, f.Name)
+	// Target-conditional CC (aarch64CC): Darwin stacks every vararg + packs
+	// narrow stack args tight; Linux/AAPCS64 fills variadic registers first +
+	// rounds stack args to 8.  The V-variant arg-dispatch helpers consult
+	// VariadicStackOnly; non-variadic calls reduce to the base helpers.
+	var rm @common.RegMap = common.NewRegMap(aarch64CC())
+	var paramTypes @[]@types.Type = make_slice(@types.Type, len(f.Params))
+	for pi := 0; pi < len(f.Params); pi++ {
+		paramTypes[pi] = f.Params[pi].Typ
+	}
+	// #[c_export("name")] C-entry thunk: emit the unmangled C name(s) as a label, then a
+	// narrow-argument normalization, then a branch to the mangled `sym` — so a C caller
+	// (entering at the alias) sign-/zero-extends the narrow argument registers whose high
+	// bits AAPCS64 leaves unspecified and jumps into the body, while a native caller
+	// (entering at `sym`, already passing extended narrow args) skips it.  The branch is
+	// load-bearing: when the normalization is non-empty the alias is a distinct, smaller
+	// symbol than `sym`, and ld64 links per-symbol atoms without keeping them adjacent — a
+	// bare fall-through would land in inter-atom padding.  When the normalization is empty
+	// the alias and `sym` share the entry offset (one atom), so no branch is emitted.
+	// symPrefixed (NOT symFor) applies only the object-format link prefix — Mach-O's leading
+	// '_', empty on ELF — leaving the name un-bn_-mangled, like the __c_call callee path.  A
+	// C export is a strong global regardless of the function's own linkage.
+	for ci := 0; ci < len(f.CExportNames); ci++ {
+		var alias @[]char = symPrefixed(f.CExportNames[ci])
+		a.DefineLabel(alias)
+		a.SetGlobal(alias)
+	}
+	if len(f.CExportNames) > 0 {
+		var preOff uint = a.CurrentOffset()
+		emitCExportRegNorm(a, rm, f, paramTypes)
+		if a.CurrentOffset() > preOff {
+			aarch64.B(a, sym)
+		}
+	}
 	a.DefineLabel(sym)
-	// IsLinkOnce (dtors / copy helpers, emitted into every module
-	// that needs them) gets a Mach-O weak definition so ld
-	// deduplicates across the linked .o set. LLVM uses
+	// IsLinkOnce (dtors / copy helpers, emitted into every module that needs them) gets a
+	// Mach-O weak definition so ld deduplicates across the linked .o set. LLVM uses
 	// `linkonce_odr` for the same role.
 	if f.IsLinkOnce {
 		a.SetWeak(sym)
 	} else {
 		a.SetGlobal(sym)
 	}
-	// #[c_export("name")] adds an unmangled C symbol at the function's entry
-	// (the SAME section offset as `sym` — no bytes are emitted yet) in addition
-	// to the mangled `sym`.  symPrefixed (NOT symFor) applies only the
-	// object-format link prefix — Mach-O's leading '_', empty on ELF — leaving
-	// the name un-bn_-mangled, exactly like the __c_call callee path.  A C export
-	// is a strong global regardless of the function's own linkage.
-	for ci := 0; ci < len(f.CExportNames); ci++ {
-		var alias @[]char = symPrefixed(f.CExportNames[ci])
-		a.DefineLabel(alias)
-		a.SetGlobal(alias)
-	}
-
-	// Target-conditional CC (aarch64CC): Darwin stacks every vararg + packs
-	// narrow stack args tight; Linux/AAPCS64 fills variadic registers first +
-	// rounds stack args to 8.  The V-variant arg-dispatch helpers consult
-	// VariadicStackOnly; non-variadic calls reduce to the base helpers.
-	var rm @common.RegMap = common.NewRegMap(aarch64CC())
 	var frameSize int = rm.PlanFrame(f)
 
 	// Prologue:
@@ -168,10 +213,6 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 	// which is now at [sp + frameSize + 16 + i*8] from the callee's
 	// perspective: +frameSize undoes our `sub sp`, +16 undoes our
 	// stp fp,lr push.
-	var paramTypes @[]@types.Type = make_slice(@types.Type, len(f.Params))
-	for pi := 0; pi < len(f.Params); pi++ {
-		paramTypes[pi] = f.Params[pi].Typ
-	}
 	var stackArgsBase int = frameSize + 16
 	// AAPCS NSRN: float-scalar params arrive in D(NSRN) (separate from
 	// the GP NGRN budget tracked by CallArgRegStart). Walk parameters in
@@ -336,9 +377,6 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 			var off int = rm.LookupSpill(p.ID)
 			if off < 0 { continue }
 			if regStart >= 0 {
-				if len(f.CExportNames) > 0 {
-					normalizeNarrowRegParam(a, argReg(regStart), p.Typ)
-				}
 				aarch64.Str(a, true, argReg(regStart), aarch64.MemImm(aarch64.SP, off))
 			} else {
 				var tmp int = scratchReg(rm)

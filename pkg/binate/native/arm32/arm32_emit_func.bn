@@ -48,31 +48,63 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 	// symFor → mangle.FuncName treats dotted names as pre-qualified, so the
 	// pkgName arg is ignored.  main.__entry folds to the reserved bn_entry.
 	var sym @[]char = symFor(pkgName, f.Name)
-	a.DefineLabel(sym)
-	// IsLinkOnce (dtors / copy helpers, emitted into every module that needs
-	// them) gets a weak definition so the linker deduplicates across the
-	// linked .o set.  LLVM uses linkonce_odr for the same role.
-	if f.IsLinkOnce {
-		a.SetWeak(sym)
-	} else {
-		a.SetGlobal(sym)
+	// AAPCS32 (soft-float): 4 GP arg registers, 64-bit args in even-aligned
+	// register pairs, 8-byte stack alignment, floats in GP registers.
+	var rm @common.RegMap = common.NewRegMap(common.AAPCS32())
+	var frameSize int = rm.PlanFrame(f)
+	// Parameter dispatch types (shared by the #[c_export] prefix below and the param-spill
+	// loop).  When this function returns via sret (SretSlotOff >= 0), every user param shifts
+	// by one GP register — param 0 arrives in R1, not R0 (R0 holds the hidden buffer pointer)
+	// — modeled by a synthesised pointer-typed leading entry so CallArgRegStart returns the
+	// actual reg index (pi + 1).
+	var sretShift bool = rm.SretSlotOff >= 0
+	var nDispatch int = len(f.Params)
+	if sretShift {
+		nDispatch = nDispatch + 1
 	}
-	// #[c_export("name")] adds an unmangled C symbol at the function's entry
-	// (the SAME section offset as `sym` — no bytes are emitted yet) in addition
-	// to the mangled `sym`.  symPrefixed (NOT symFor) applies only the
-	// object-format link prefix (ELF-bare on arm32), leaving the name
-	// un-bn_-mangled — exactly the __c_call callee discipline.  A C export is a
-	// strong global regardless of the function's own linkage.
+	var paramTypes @[]@types.Type = make_slice(@types.Type, nDispatch)
+	if sretShift {
+		paramTypes[0] = types.MakePointerType(types.TypUint8())
+		for pi := 0; pi < len(f.Params); pi++ {
+			paramTypes[pi + 1] = f.Params[pi].Typ
+		}
+	} else {
+		for pi := 0; pi < len(f.Params); pi++ {
+			paramTypes[pi] = f.Params[pi].Typ
+		}
+	}
+	// #[c_export("name")] C-entry thunk: emit the unmangled C name(s) as a label, then a
+	// narrow-argument normalization, then a branch to the mangled `sym` — so a C caller
+	// (entering at the alias) sign-/zero-extends the narrow argument registers whose high bits
+	// AAPCS32 leaves unspecified and jumps into the body, while a native caller (entering at
+	// `sym`, already passing extended narrow args) skips it.  The branch keeps the alias a
+	// self-contained atom independent of the mangled entry's placement (matching the aa64/x64
+	// backends, whose ld64 splits per-symbol atoms).  When the normalization is empty (int32
+	// is word-sized on AAPCS32, so most narrow args do not need it) the alias and `sym` share
+	// the entry offset and no branch is emitted.  symPrefixed (NOT symFor) applies only the
+	// object-format link prefix (ELF-bare on arm32), leaving the name un-bn_-mangled — the
+	// __c_call callee discipline.  A C export is a strong global regardless of linkage.
 	for ci := 0; ci < len(f.CExportNames); ci++ {
 		var alias @[]char = symPrefixed(f.CExportNames[ci])
 		a.DefineLabel(alias)
 		a.SetGlobal(alias)
 	}
-
-	// AAPCS32 (soft-float): 4 GP arg registers, 64-bit args in even-aligned
-	// register pairs, 8-byte stack alignment, floats in GP registers.
-	var rm @common.RegMap = common.NewRegMap(common.AAPCS32())
-	var frameSize int = rm.PlanFrame(f)
+	if len(f.CExportNames) > 0 {
+		var preOff uint = a.CurrentOffset()
+		emitCExportRegNormArm32(a, rm, f, paramTypes, sretShift)
+		if a.CurrentOffset() > preOff {
+			arm32.B(a, arm32.COND_AL, sym)
+		}
+	}
+	a.DefineLabel(sym)
+	// IsLinkOnce (dtors / copy helpers, emitted into every module that needs them) gets a
+	// weak definition so the linker deduplicates across the linked .o set.  LLVM uses
+	// linkonce_odr for the same role.
+	if f.IsLinkOnce {
+		a.SetWeak(sym)
+	} else {
+		a.SetGlobal(sym)
+	}
 
 	// Prologue (establishes the frame-pointer chain so a stacktrace can walk it):
 	//   push {fp, lr}          ; frame record: [fp]=caller fp, [fp+4]=ret addr
@@ -105,32 +137,11 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 	// Incoming stack args sit in the caller's outgoing-args area, now at
 	// [sp + frameSize + SAVED_BYTES + i*4] from the callee's perspective:
 	// +frameSize undoes our `sub sp`, +SAVED_BYTES undoes the entry push.
-	//
-	// When this function returns via sret (SretSlotOff >= 0), every user param
-	// shifts by one GP register — param 0 arrives in R1, not R0 (R0 holds the
-	// hidden buffer pointer stashed above).  Model the shift the same way
-	// emitCall does: synthesise a pointer-typed leading entry in paramTypes so
-	// CallArgRegStart returns the user param's actual reg index (pi + 1).
-	var sretShift bool = rm.SretSlotOff >= 0
-	var nDispatch int = len(f.Params)
-	if sretShift { nDispatch = nDispatch + 1 }
-	var paramTypes @[]@types.Type = make_slice(@types.Type, nDispatch)
-	if sretShift {
-		paramTypes[0] = types.MakePointerType(types.TypUint8())
-		for pi := 0; pi < len(f.Params); pi++ {
-			paramTypes[pi + 1] = f.Params[pi].Typ
-		}
-	} else {
-		for pi := 0; pi < len(f.Params); pi++ {
-			paramTypes[pi] = f.Params[pi].Typ
-		}
-	}
 	var stackArgsBase int = frameSize + SAVED_BYTES
 	for pi := 0; pi < len(f.Params); pi++ {
 		var dispatchIdx int = pi
 		if sretShift { dispatchIdx = pi + 1 }
-		emitSpillParam(a, rm, f.Params[pi], paramTypes, dispatchIdx, stackArgsBase,
-				len(f.CExportNames) > 0)
+		emitSpillParam(a, rm, f.Params[pi], paramTypes, dispatchIdx, stackArgsBase)
 	}
 
 	for bi := 0; bi < len(f.Blocks); bi++ {
@@ -217,10 +228,42 @@ func normalizeNarrowRegParamArm32(a @asm.Assembler, reg int, t @types.Type) {
 	}
 }
 
+// emitCExportRegNormArm32 emits the #[c_export] C-entry prefix: for each GP scalar parameter
+// passed in an argument register, sign-/zero-extend it in place.  Mirrors emitSpillParam's
+// classification — hard-float scalars (VFP), 64-bit pairs, and aggregates are not GP narrow
+// scalars and are skipped, and the sret shift (a hidden R0 buffer pointer shifts every user
+// param to R1..) is applied via paramTypes/dispatchIdx — so the argReg mapping matches the
+// one the mangled entry spills.  Emitted BEFORE the mangled `sym` label so a C caller
+// (entering at the alias) runs it and falls through, while a native caller (at `sym`) skips
+// it.
+func emitCExportRegNormArm32(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
+		paramTypes @[]@types.Type, sretShift bool) {
+	for pi := 0; pi < len(f.Params); pi++ {
+		var p @ir.Param = f.Params[pi]
+		if types.Arm32HardFloat() && common.IsFloatScalarTyp(p.Typ) {
+			continue
+		}
+		if isPair64Typ(p.Typ) {
+			continue
+		}
+		if common.IsAggregateTyp(p.Typ) {
+			continue
+		}
+		var dispatchIdx int = pi
+		if sretShift {
+			dispatchIdx = pi + 1
+		}
+		var regStart int = rm.CC.CallArgRegStart(paramTypes, dispatchIdx)
+		if regStart >= 0 {
+			normalizeNarrowRegParamArm32(a, argReg(regStart), p.Typ)
+		}
+	}
+}
+
 // float32 param rides the scalar single-word path like an int32; a float64 param
 // arrives as a register pair like an int64 (soft-float — no FP register file).
 func emitSpillParam(a @asm.Assembler, rm @common.RegMap, p @ir.Param, paramTypes @[]@types.Type,
-		dispatchIdx int, stackArgsBase int, cExport bool) {
+		dispatchIdx int, stackArgsBase int) {
 	var regStart int = rm.CC.CallArgRegStart(paramTypes, dispatchIdx)
 	var stackOff int = rm.CC.CallArgStackOff(paramTypes, dispatchIdx)
 	// Hard-float (AAPCS-VFP): a float scalar param arrives in a VFP register (S/D,
@@ -250,9 +293,6 @@ func emitSpillParam(a @asm.Assembler, rm @common.RegMap, p @ir.Param, paramTypes
 	var off int = rm.LookupSpill(p.ID)
 	if off < 0 { return }
 	if regStart >= 0 {
-		if cExport {
-			normalizeNarrowRegParamArm32(a, argReg(regStart), p.Typ)
-		}
 		emitFrameStore(a, argReg(regStart), off)
 	} else if stackOff >= 0 {
 		var tmp int = scratchReg(rm)

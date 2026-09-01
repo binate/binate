@@ -1,6 +1,7 @@
 package "pkg/binate/ir"
 
 import "pkg/binate/iropcode"
+import "pkg/binate/types"
 import "pkg/stdx/slices"
 
 // ============================================================
@@ -10,11 +11,13 @@ import "pkg/stdx/slices"
 // Inlining a multi-block callee needs CFG surgery the single-block splice
 // (inline_calls.bn) avoids: split the caller block at the OP_CALL, clone the
 // callee's whole block set into fresh caller blocks, jump the pre-call part to
-// the cloned entry, and route the callee's (single) return to a continuation
-// block holding the post-call instrs.  The pass runs BEFORE mem2reg, so no phis
-// exist in either function — there is no phi-predecessor rewiring, which is what
-// makes this tractable.  Scope (Inc 2): leaf, no-fault, exactly one OP_RETURN
-// site, ≤1 scalar result (multiple return sites -> Inc 4; fault pads -> Inc 3).
+// the cloned entry, and route the callee's return(s) to a continuation block
+// holding the post-call instrs.  The pass runs BEFORE mem2reg, so no phis exist
+// in either function — there is no phi-predecessor rewiring, which is what makes
+// this tractable.  Scope: leaf, ≤1 scalar result.  MULTIPLE return sites (Inc 4)
+// merge through a return-value alloca SLOT rather than a phi (keeping the
+// pre-mem2reg alloca/store/load shape); fault pads are cloned + chained by
+// fixupInlinedPads (Inc 3b).
 
 // calleeBlockIndex returns the index of block b within callee.Blocks, or -1.
 // Used to map a callee CFG edge (Block1/Block2) to its cloned block.
@@ -76,8 +79,32 @@ func inlineMultiBlockSite(f @Func, bi int, ii int, callee @Func, call @Instr) @I
 		clonedBlocks[cbj].Instrs = built
 	}
 	// Pass B: remap operands (Args) + CFG edges (Block1/Block2) on every clone,
-	// and convert the single cloned OP_RETURN into an OP_JUMP to C, capturing the
-	// return value.
+	// and convert each cloned OP_RETURN into a jump to the continuation C.  With
+	// EXACTLY ONE return site the (remapped) return value flows straight to the
+	// call-result uses.  With MULTIPLE return sites (Inc 4) the values are merged
+	// through a fresh return SLOT (alloca): each return stores its value then
+	// jumps, and C loads the slot.  The slot keeps the pre-mem2reg alloca/store/
+	// load shape (no phi introduced at inline time; mem2reg promotes it later) and
+	// is dominance-safe — it lives in the caller's pre-call region, which
+	// dominates every cloned block and C.
+	var returnCount int = 0
+	for cbj := 0; cbj < nb; cbj++ {
+		var lb @Block = callee.Blocks[cbj]
+		if lb.Instrs[len(lb.Instrs) - 1].Op == iropcode.OP_RETURN {
+			returnCount = returnCount + 1
+		}
+	}
+	var mergeSlot bool = returnCount > 1 && len(callee.Results) >= 1
+	var slot @Instr = nil
+	if mergeSlot {
+		// A managed-typed slot is a raw scratch cell: OP_STORE/OP_LOAD are pure bit
+		// copies (no implicit refcount), and the value's +1 flows store -> load ->
+		// caller unchanged.  This relies on Binate's explicit-refcount model — a
+		// backend must NOT implicitly RefDec a managed alloca slot at frame
+		// teardown; if one ever did, this scratch slot would be double-freed.
+		slot = newInstr(f, iropcode.OP_ALLOC, types.MakePointerType(callee.Results[0]))
+		slot.TypeArg = callee.Results[0]
+	}
 	var retVal @Instr = nil
 	for cbj := 0; cbj < nb; cbj++ {
 		var cblk @Block = callee.Blocks[cbj]
@@ -89,20 +116,51 @@ func inlineMultiBlockSite(f @Func, bi int, ii int, callee @Func, call @Instr) @I
 				c.Args[a] = remapOperand(c.Args[a], valRemap, cap)
 			}
 			if src.Op == iropcode.OP_RETURN {
-				// Route the return to the continuation; its value flows to the
-				// call-result uses (retargeted by the whole-function sweep).
+				var rv @Instr = nil
 				if len(src.Args) >= 1 {
-					retVal = remapOperand(src.Args[0], valRemap, cap)
+					rv = remapOperand(src.Args[0], valRemap, cap)
 				}
-				c.Op = iropcode.OP_JUMP
-				var noArgs @[]@Instr
-				c.Args = noArgs
-				c.Block1 = cont
+				if mergeSlot {
+					// store rv -> slot, then jump to C.  OP_RETURN is the block's
+					// last instr, so appending the jump makes it the terminator.
+					c.Op = iropcode.OP_STORE
+					c.Typ = nil
+					c.ID = -1
+					c.Args = makeArgs2(slot, rv)
+					c.Block1 = nil
+					var jmp @Instr = newVoidInstr(iropcode.OP_JUMP)
+					jmp.Block1 = cont
+					cloned.Instrs = slices.Append[@Instr](cloned.Instrs, jmp)
+				} else {
+					// Single return -> its value IS the call result directly;
+					// multi-return void -> just jump (retVal stays nil).
+					if rv != nil {
+						retVal = rv
+					}
+					c.Op = iropcode.OP_JUMP
+					var noArgs @[]@Instr
+					c.Args = noArgs
+					c.Block1 = cont
+				}
 			} else {
 				c.Block1 = remapBlock(src.Block1, callee, clonedBlocks)
 				c.Block2 = remapBlock(src.Block2, callee, clonedBlocks)
 			}
 		}
+	}
+	// For multiple return sites with a result, C loads the merged slot as the
+	// call's value (rewritten into the post-call uses by the whole-function
+	// sweep).  Prepend it so it dominates C's post-call instrs.
+	if mergeSlot {
+		var ld @Instr = newInstr(f, iropcode.OP_LOAD, callee.Results[0])
+		ld.Args = makeArgs1(slot)
+		var newCont @[]@Instr
+		newCont = slices.Append[@Instr](newCont, ld)
+		for j := 0; j < len(cont.Instrs); j++ {
+			newCont = slices.Append[@Instr](newCont, cont.Instrs[j])
+		}
+		cont.Instrs = newCont
+		retVal = ld
 	}
 	// Clone + chain any non-empty callee fault pads across all cloned blocks
 	// (Inc 3b), now that valRemap covers every cloned callee value the pads'
@@ -115,11 +173,15 @@ func inlineMultiBlockSite(f @Func, bi int, ii int, callee @Func, call @Instr) @I
 		}
 	}
 	fixupInlinedPads(f, allCloned, valRemap, cap, call.PadBlock)
-	// Rewire the caller block: keep the pre-call instrs, then jump to the cloned
-	// entry.  The call (at ii) and the post-call instrs (now in C) are removed.
+	// Rewire the caller block: keep the pre-call instrs, add the return slot (for
+	// a multi-return result), then jump to the cloned entry.  The call (at ii) and
+	// the post-call instrs (now in C) are removed.
 	var pre @[]@Instr
 	for j := 0; j < ii; j++ {
 		pre = slices.Append[@Instr](pre, callerBlk.Instrs[j])
+	}
+	if slot != nil {
+		pre = slices.Append[@Instr](pre, slot)
 	}
 	var entryJump @Instr = newVoidInstr(iropcode.OP_JUMP)
 	entryJump.Block1 = clonedBlocks[0]

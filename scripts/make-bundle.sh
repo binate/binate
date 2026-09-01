@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build a release bundle tarball for one platform.
 #
-# A bundle is the self-contained toolchain a release ships: the four
+# A bundle is the self-contained toolchain a release ships: the release
 # binaries plus the standard library and runtime, packed so a consumer
 # can use it without a Binate source checkout.  This is the same
 # artifact `BUILDER` is pinned to (see BUILDER_VERSION /
@@ -16,7 +16,7 @@
 # --strip-components=1:
 #
 #   <version>-<platform>/
-#     bin/{bnc,bni,bnas,bnlint,bnfmt}   the release binaries
+#     bin/{bnc,bni,bnas,bnlint,bnfmt,bnld}  the release binaries
 #     bin/binate-paths            search-path helper (see BUNDLE-HOWTO.md)
 #     lib/runtime/                bare-metal target startup (baremetal_arm32/)
 #     lib/ifaces/{core,stdlib}/   .bni interfaces (builtins + stdlib)
@@ -26,7 +26,7 @@
 # BUNDLE-HOWTO.md for how a consumer points -I/-L at it.  bnfmt is
 # self-contained (it parses and re-prints source syntax), so it needs no lib/.
 #
-# Building each binary goes through scripts/build-{bnc,bni,bnas,bnlint,bnfmt}.sh,
+# Building each binary goes through scripts/build-{bnc,bni,bnas,bnlint,bnfmt,bnld}.sh,
 # which resolve a BUILDER via scripts/fetch-builder.sh (a prebuilt bnc-*
 # release bundle).
 
@@ -36,7 +36,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/make-bundle.sh [--version <ver>] [--platform <plat>] [--out-dir <dir>]
 
-Build a release bundle tarball (bin/{bnc,bni,bnas,bnlint,bnfmt} + lib/) for one
+Build a release bundle tarball (bin/{bnc,bni,bnas,bnlint,bnfmt,bnld} + lib/) for one
 platform, writing <out-dir>/<version>-<platform>.tar.gz (+ .sha256).
 
 Options:
@@ -141,7 +141,7 @@ echo "  source:  $BINATE_DIR"
 echo "  output:  $out"
 echo
 
-# Build the four release binaries directly into the staged bin/.  Each
+# Build the release binaries directly into the staged bin/.  Each
 # script manages its own mktemp scratch and writes only to its -o path,
 # so this is safe to run concurrently with other work / worktrees.
 echo "==> building binaries"
@@ -152,7 +152,8 @@ echo "==> building binaries"
 "$SCRIPT_DIR/build-bnas.sh"   -o "$dest/bin/bnas"   $BUILD_TARGET_OPT
 "$SCRIPT_DIR/build-bnlint.sh" -o "$dest/bin/bnlint" $BUILD_TARGET_OPT
 "$SCRIPT_DIR/build-bnfmt.sh"  -o "$dest/bin/bnfmt"  $BUILD_TARGET_OPT
-for b in bnc bni bnas bnlint bnfmt; do
+"$SCRIPT_DIR/build-bnld.sh"   -o "$dest/bin/bnld"   $BUILD_TARGET_OPT
+for b in bnc bni bnas bnlint bnfmt bnld; do
     test -x "$dest/bin/$b" || { echo "make-bundle: missing binary: $b" >&2; exit 1; }
 done
 

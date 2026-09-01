@@ -1,6 +1,6 @@
 # Using a Binate toolchain bundle
 
-A release bundle (e.g. `bnc-0.0.7`) is a self-contained toolchain: the four
+A release bundle (e.g. `bnc-0.0.7`) is a self-contained toolchain: the release
 binaries plus the standard library and runtime, with no Binate source checkout
 required. It is the same artifact `BUILDER` is pinned to — see `BUILDER_VERSION`
 and `scripts/fetch-builder.sh`, which downloads and verifies it.
@@ -17,6 +17,7 @@ bin/
   bnas     assembler:   .s → .o
   bnlint   static analyzer: memory-safety lints
   bnfmt    formatter:   canonically re-prints .bn / .bni source (self-contained)
+  bnld     linker:      .o (+ .a) → executable (ELF / Mach-O; static + dynamic)
   binate-paths  prints the -I/-L search paths for lib/ (see below)
 lib/
   ifaces/core/      .bni for the builtins (pkg/builtins/*)

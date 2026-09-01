@@ -14,10 +14,11 @@
 #
 # Modes:
 #   (no flags)             print the default tool's binary path (bnc).
-#   --tool <bnc|bni|bnas|bnlint|bnfmt>
+#   --tool <bnc|bni|bnas|bnlint|bnfmt|bnld>
 #                          print that tool's binary path.  Exits non-zero
 #                          if the resolved bundle doesn't ship the tool
-#                          (e.g. bnfmt in bundles cut before release.yml
+#                          (e.g. bnld in bundles cut before it was added, or
+#                          bnfmt in bundles cut before release.yml
 #                          added it) — so callers can fall back to a
 #                          source build.
 #   --lib                  print the stdlib root (the bundle's `lib/`).
@@ -33,7 +34,7 @@
 # matching GitHub release and extract it.  Asset name follows the
 # release workflow's convention:
 # `bnc-X.Y.Z-<host-os>-<host-arch>.tar.gz`, containing
-# `bin/{bnc,bni,bnas,bnlint,bnfmt}` and `lib/`.  Verifies sha256
+# `bin/{bnc,bni,bnas,bnlint,bnfmt,bnld}` and `lib/`.  Verifies sha256
 # against the release's SHA256SUMS manifest before extracting.  Cache
 # hits skip the download (and the re-verify — the cache is trusted on
 # hit).
@@ -61,7 +62,7 @@ while [ $# -gt 0 ]; do
 done
 
 case "$tool" in
-    bnc|bni|bnas|bnlint|bnfmt) ;;
+    bnc|bni|bnas|bnlint|bnfmt|bnld) ;;
     *) echo "fetch-builder: unknown --tool: $tool" >&2; exit 2 ;;
 esac
 

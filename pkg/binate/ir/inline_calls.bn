@@ -30,15 +30,16 @@ import "pkg/stdx/slices"
 // assertion (assertInlinedFuncWellFormed).
 //
 // Scope so far: a leaf (no calls -> no recursion, no nested inlining) callee
-// with EXACTLY ONE return site, returning at most one SCALAR result (a single
-// struct/array return rides sret/retbuf and is deferred), whose body references
-// only its params and its own in-callee values.  Single-block callees splice
-// in place (Inc 1); multi-block callees split the caller block and clone the
-// callee's CFG (Inc 2, inline_multiblock.bn).  Faulting ops are allowed only
-// with an EMPTY cleanup pad (Inc 3a): the cloned fault op reuses the caller's
-// call-site pad, so there is no callee-side RefDec to preserve.  Later
-// increments add non-empty-pad fault cloning, multiple return sites, multi-value
-// / aggregate returns, and non-leaf callees.
+// returning at most one value (a scalar OR a by-value data aggregate — struct /
+// slice / managed-slice / array — that rides sret/retbuf; Inc 5a), whose body
+// references only its params and its own in-callee values.  Single-block callees
+// splice in place (Inc 1); multi-block callees split the caller block and clone
+// the callee's CFG (Inc 2, inline_multiblock.bn), with MULTIPLE return sites
+// merged through a return-value alloca slot (Inc 4).  Faulting ops are allowed
+// with an EMPTY cleanup pad (Inc 3a: the cloned fault op reuses the caller's
+// call-site pad) or a single-block NON-empty pad (Inc 3b: the pad is cloned and
+// chained into the call-site pad by fixupInlinedPads).  Later increments add
+// multi-VALUE (tuple) returns and non-leaf callees.
 
 // InlineSizeThreshold is the maximum instruction count (including the terminator)
 // of a callee body for it to be inlined.  Conservative to start; tuneable — a
@@ -158,12 +159,14 @@ func findMultiBlockSite(m @Module, f @Func) (int, int, @Func) {
 // inlinableCallee returns the callee Func if `instr` is a direct OP_CALL that
 // qualifies for inlining into f (single- OR multi-block), else nil.  The shape
 // requirements: same-package non-extern, not self, total size under the
-// threshold, leaf (no call ops), any faulting op has an EMPTY pad (and the call
-// site itself has a pad — Inc 3a), no phis, EXACTLY one OP_RETURN site, every
-// block ends in JUMP/BRANCH/RETURN, arity matches, ≤1 scalar result, and every
-// value operand is a param or an in-callee value (so it is remappable).  Callers
-// dispatch on len(callee.Blocks): Phase 1 handles single-block (splice), Phase 2
-// multi-block (CFG split).
+// threshold, leaf (no call ops), any faulting op has an empty or single-block
+// cleanup pad (and the call site itself has a pad — Inc 3a/3b), no phis, at least
+// one OP_RETURN site (multiple merge through a slot — Inc 4), every block ends in
+// JUMP/BRANCH/RETURN, arity matches, at most one inlinable-typed result (scalar
+// or a by-value data aggregate — Inc 5a), and every value operand is a param or
+// an in-callee value (so it is remappable).  Callers dispatch on
+// len(callee.Blocks): Phase 1 handles single-block (splice), Phase 2 multi-block
+// (CFG split).
 func inlinableCallee(m @Module, f @Func, instr @Instr) @Func {
 	if instr.Op != iropcode.OP_CALL {
 		return nil
@@ -182,10 +185,10 @@ func inlinableCallee(m @Module, f @Func, instr @Instr) @Func {
 		return nil // arity mismatch (defensive)
 	}
 	if len(callee.Results) > 1 {
-		return nil // multi-value return deferred
+		return nil // multi-value return (tuple) -> Inc 5b
 	}
-	if len(callee.Results) == 1 && !isScalarResultType(callee.Results[0]) {
-		return nil // single aggregate return (sret/retbuf) deferred
+	if len(callee.Results) == 1 && !isInlinableResultType(callee.Results[0]) {
+		return nil // func-value / iface-value result (cross-mode vtable) deferred
 	}
 	var total int = 0
 	var returnCount int = 0
@@ -254,10 +257,20 @@ func isCallFamilyOp(op int) bool {
 			op == iropcode.OP_CALL_IFACE_METHOD || op == iropcode.OP_SAT_LOOKUP
 }
 
-// isScalarResultType reports whether a single result type is a scalar (fits the
-// register-return path) — i.e. NOT an aggregate that rides sret/retbuf or a
-// multi-word by-address representation.  Peels transparent wrappers first.
-func isScalarResultType(t @types.Type) bool {
+// isInlinableResultType reports whether a single result type is one the inliner
+// can route through the merge slot / direct retVal: the single-register scalar
+// kinds PLUS the by-value DATA aggregates (struct / slice / managed-slice /
+// array) that ride sret/retbuf (Inc 5a).  At the IR level the OP_RETURN carries
+// the aggregate VALUE as Args[0], which flows to the call-result uses exactly
+// like a scalar, and OP_STORE/OP_LOAD copy it bit-for-bit through an
+// aggregate-typed slot with no implicit refcount.  An aggregate whose cleanup
+// needs a dtor CALL (a struct with a managed field, a managed-slice of managed
+// elements) is separately rejected by the leaf filter, so no managed dtor is
+// dropped.  EXCLUDED: func-value / iface-value results (their cross-mode vtable
+// substitution is not handled) and a TYP_NAMED peelTransparent could not resolve
+// (nil Underlying).  Default-reject so a future kind can't slip through as an
+// unhandled register value.  char/uint8/int32/... are all TYP_INT with a width.
+func isInlinableResultType(t @types.Type) bool {
 	if t == nil {
 		return false
 	}
@@ -265,14 +278,9 @@ func isScalarResultType(t @types.Type) bool {
 	if r == nil {
 		return false
 	}
-	// WHITELIST the single-register scalar kinds; everything else — the
-	// aggregates that ride sret/retbuf (slice/mslice/array/struct/func-value/
-	// iface-value), a TYP_NAMED that peelTransparent could not resolve (nil
-	// Underlying), and any not-yet-added Kind — is conservatively NOT inlinable
-	// in Inc 1 (default-reject, so a future aggregate kind can't slip through as
-	// a register value).  char/uint8/int32/... are all TYP_INT with a width.
 	return r.Kind == types.TYP_INT || r.Kind == types.TYP_FLOAT || r.Kind == types.TYP_BOOL ||
-			r.Kind == types.TYP_POINTER || r.Kind == types.TYP_MANAGED_PTR
+			r.Kind == types.TYP_POINTER || r.Kind == types.TYP_MANAGED_PTR || r.Kind == types.TYP_STRUCT ||
+			r.Kind == types.TYP_SLICE || r.Kind == types.TYP_MANAGED_SLICE || r.Kind == types.TYP_ARRAY
 }
 
 // cloneInlinedBody clones callee's single block (minus the terminal OP_RETURN)

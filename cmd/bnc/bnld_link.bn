@@ -1,0 +1,141 @@
+package "main"
+
+import "pkg/binate/asm/assemble"
+import "pkg/binate/buf"
+import "pkg/binate/link"
+import "pkg/stdx/fmt"
+
+// The `--linker bnld` path: link a program with the self-hosted linker
+// (pkg/binate/link) instead of clang.  ELF only for now — linux-x64 / linux-aarch64;
+// macOS (Mach-O) and arm32 are not yet supported here and require clang.
+//
+// bnld does not link the platform C runtime's crt1/Scrt1.o (finding it means
+// replicating clang's sysroot/multiarch probing).  Instead we assemble our own tiny
+// `_start` and add it to the link: crt1's sole job is to call libc's
+// __libc_start_main, so we do exactly that.  __libc_start_main (imported from
+// libc.so.6, which bnld links dynamically) performs full libc init (TLS, errno, malloc
+// arena, stdio) and calls `main` — the Binate entry, emitted under the C symbol `main`
+// by pkg/builtins/startup.  We are shedding the C linker/driver, not libc: linking libc
+// dynamically is the sanctioned C interface on a hosted system.
+
+// hostedStartX64 is the process-entry assembly for a bnld-linked hosted x86-64 ELF: a
+// tiny `_start` that calls __libc_start_main(main, argc, argv, init=0, fini=0,
+// rtld_fini, stack_end).  At entry ld.so leaves rsp -> argc, [rsp+8] -> argv, rdx =
+// rtld_fini; SysV passes the 7th arg (stack_end) on the stack, hence the align + two
+// pushes.
+func hostedStartX64() *[]readonly char {
+	return ".arch x64\n"
+			".section text\n"
+			".global _start\n"
+			".global main\n"
+			".global __libc_start_main\n"
+			"_start:\n"
+			" xor ebp, ebp\n"
+			" mov r9, rdx\n"
+			" pop rsi\n"
+			" mov rdx, rsp\n"
+			" and rsp, -16\n"
+			" push rax\n"
+			" push rsp\n"
+			" lea rdi, [rip + main]\n"
+			" xor ecx, ecx\n"
+			" xor r8d, r8d\n"
+			" call __libc_start_main\n"
+			"Lhang:\n"
+			" jmp Lhang\n"
+}
+
+// hostedStartAarch64 is the process-entry assembly for a bnld-linked hosted aarch64
+// ELF: a tiny `_start` that calls __libc_start_main(main, argc, argv, init=0, fini=0,
+// rtld_fini, stack_end) — all seven args in x0..x6.  At entry ld.so leaves sp -> argc,
+// [sp,#8] -> argv, x0 = rtld_fini.
+func hostedStartAarch64() *[]readonly char {
+	return ".arch aarch64\n"
+			".section text\n"
+			".global _start\n"
+			".global main\n"
+			".global __libc_start_main\n"
+			"_start:\n"
+			" mov x29, #0\n"
+			" mov x30, #0\n"
+			" mov x5, x0\n"
+			" ldr x1, [sp]\n"
+			" add x2, sp, #8\n"
+			" mov x6, sp\n"
+			" adrp x0, main\n"
+			" add x0, x0, #:lo12:main\n"
+			" mov x3, #0\n"
+			" mov x4, #0\n"
+			" bl __libc_start_main\n"
+			"Lhang:\n"
+			" b Lhang\n"
+}
+
+// linkWithBnld links oFiles into `output` with bnld instead of clang: it assembles the
+// hosted `_start` for the target, then dynamically links the objects against libc.
+// Supports ELF linux-x64 / linux-aarch64 only; returns false with a diagnostic for any
+// other target (the caller then exits).
+func linkWithBnld(cli CLIArgs, oFiles @[]@[]char, output *[]readonly char) bool {
+	// Extra link inputs / shared libraries are not plumbed through the bnld path yet.
+	// Reject them loudly rather than silently dropping them (they would just vanish).
+	if len(cli.LinkAfterObjs) > 0 {
+		fmt.Print("error: --linker bnld does not support --link-after-objs yet ",
+				"(use --linker clang for extra link inputs)\n")
+		return false
+	}
+	if !streq(nativeObjFormatForTarget(), "elf") {
+		fmt.Print("error: --linker bnld supports ELF targets only ",
+				"(linux-x64 / linux-aarch64); macOS (Mach-O) is not yet supported\n")
+		return false
+	}
+	var arch *[]readonly char = nativeArchForTarget()
+	var machine int = 0
+	var startAsm *[]readonly char = ""
+	if streq(arch, "x86_64") {
+		machine = link.EM_X86_64
+		startAsm = hostedStartX64()
+	} else if streq(arch, "aarch64") {
+		machine = link.EM_AARCH64
+		startAsm = hostedStartAarch64()
+	} else {
+		fmt.Print("error: --linker bnld supports x86_64 and aarch64 only (got arch '", arch, "')\n")
+		return false
+	}
+
+	// Assemble our _start (bnld links no crt1) into a scratch object next to the other
+	// intermediates.  Namespaced `bnrt_start_<output>` so it cannot collide with a
+	// package object, nor with another target's concurrent build to a different output.
+	var dir *[]readonly char = "/tmp"
+	if len(cli.BuildDir) > 0 {
+		// bnlint:allow managed-to-raw-assign - cli (and its BuildDir) outlives this borrow
+		dir = cli.BuildDir
+	}
+	var obase *[]readonly char = output
+	for i := 0; i < len(output); i++ {
+		if output[i] == '/' { obase = output[i + 1:] }
+	}
+	var stem @[]char = buf.Concat(buf.Concat(buf.Concat(dir, "/"), "bnrt_start_"), obase)
+	var sPath @[]char = buf.Concat(stem, ".s")
+	var oPath @[]char = buf.Concat(stem, ".o")
+	writeFile(sPath, startAsm)
+	sok, smsg := assemble.AssembleFile(sPath, oPath, arch, "linux")
+	if !cli.KeepObjs { remove(sPath) } // the .s is consumed by assembly; drop it on all paths
+	if !sok {
+		fmt.Print("error: assembling the bnld startup: ", smsg, "\n")
+		return false
+	}
+
+	// Link the program objects + our _start, dynamic against libc (the implicit
+	// libc.so.6 DT_NEEDED).  -l shared libraries are not plumbed here yet.
+	var inputs @[]@[]char = make_slice(@[]char, len(oFiles) + 1)
+	for i := 0; i < len(oFiles); i++ { inputs[i] = oFiles[i] }
+	inputs[len(oFiles)] = oPath
+	var lerr @[]readonly char = link.LinkDynElf(inputs, "_start", machine, cast(uint, 0x400000),
+			output, make_slice(@[]char, 0))
+	if !cli.KeepObjs { remove(oPath) }
+	if len(lerr) != 0 {
+		fmt.Print("error: bnld link failed: ", lerr, "\n")
+		return false
+	}
+	return true
+}

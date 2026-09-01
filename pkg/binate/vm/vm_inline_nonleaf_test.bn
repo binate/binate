@@ -1,0 +1,173 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/builtins/testing"
+
+// Exec / leak / termination coverage of NON-leaf inline callees: a
+// callee that itself CALLs another function is inlined, its cloned direct calls
+// are exposed to the fixpoint re-scan (transitive inlining), a call CYCLE is
+// refused (the recursion guard — else the re-scan would loop forever), and
+// per-function code growth is bounded (the growth budget).  Runs the bytecode VM
+// so correctness (result value) and refcount balance (rt.LiveBlocks delta) are
+// observed directly, paired with a countAllBCCalls control so no case is
+// vacuous.  (countAllBCCalls / faultLoopDelta / runVMAtLevel live in the sibling
+// inliner test files.)
+
+// TestInlineNonLeafTransitiveExec: main -> g -> h, all small direct-call bodies.
+// At -O1 g inlines into main carrying its cloned `h` call, which the fixpoint
+// re-scan then inlines too (transitive) — AND h inlines into g's own definition.
+// So ZERO BC_CALLs remain module-wide (only the fixpoint re-scan drives main's
+// count to 0; without it the cloned h-call in main would survive).  Result is
+// unchanged: h(5)=6, g(5)=6*2=12.
+func TestInlineNonLeafTransitiveExec() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func h(x int) int { return x + 1 }\n"
+			"func g(x int) int { return h(x) * 2 }\n"
+			"func main() int { return g(5) }\n"
+	var m0 @ir.Module = genModule(src)
+	var vm0 @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm0)
+	vm0.OptLevel = 0
+	vm0.LowerModule(m0)
+	var c0 int = countAllBCCalls(vm0)
+	var m1 @ir.Module = genModule(src)
+	var vm1 @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm1)
+	vm1.OptLevel = 1
+	vm1.LowerModule(m1)
+	var c1 int = countAllBCCalls(vm1)
+	if c0 < 2 {
+		return "setup: -O0 should have >=2 BC_CALLs (main->g and g->h)"
+	}
+	if c1 != 0 {
+		return "non-leaf transitive inlining should remove ALL BC_CALLs at -O1"
+	}
+	var r0 int = runVMAtLevel(src, 0)
+	var r1 int = runVMAtLevel(src, 1)
+	if r0 != 12 { return "O0 baseline g(5)=(5+1)*2 should be 12" }
+	if r1 != 12 { return "O1 transitively-inlined result should be 12" }
+	return ""
+}
+
+// TestInlineNonLeafManagedNoLeak: a non-leaf callee `outer` holds a MANAGED
+// param `p` LIVE across an internal call `inner`, so that call carries a
+// non-empty single-block cleanup pad (RefDec p).  Inlining `outer` must clone
+// p's entry-RefInc / exit-RefDec AND that internal call's pad faithfully so the
+// caller value `q` neither leaks nor double-frees across
+// repeated runs (rt.LiveBlocks delta 0).  (`inner` takes p.v as an int rather
+// than the managed p itself: passing a managed value AS a call arg pushes even a
+// forwarder over InlineSizeThreshold, so that shape never inlines — this shape
+// still exercises the managed-live-across-an-inlined-call pad path.)
+// countAllBCCalls confirms the calls actually inlined (else the leak test is
+// vacuous).
+func TestInlineNonLeafManagedNoLeak() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"type Node struct { v int }\n"
+			"func inner(x int) int { return x + 1 }\n"
+			"func outer(p @Node) int { return inner(p.v) }\n"
+			"func run() int {\n"
+			"\tvar q @Node = make(Node)\n"
+			"\treturn outer(q)\n"
+			"}\n"
+			"func main() int {\n"
+			"\tvar q @Node = make(Node)\n"
+			"\treturn outer(q)\n"
+			"}\n"
+	var m1 @ir.Module = genModule(src)
+	var vm1 @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm1)
+	vm1.OptLevel = 1
+	vm1.LowerModule(m1)
+	if countAllBCCalls(vm1) != 0 {
+		return "non-leaf managed callees should fully inline at -O1 (leak test vacuous)"
+	}
+	var d0 int = faultLoopDelta(src, "test.run", 0, 30, false)
+	var d1 int = faultLoopDelta(src, "test.run", 1, 30, false)
+	if d0 != 0 { return "O0 baseline itself leaks q (pre-existing, not inlining)" }
+	if d1 != 0 {
+		return "O1 inlined non-leaf managed path leaks q (param refcount ops not cloned faithfully)"
+	}
+	var r0 int = runVMAtLevel(src, 0)
+	var r1 int = runVMAtLevel(src, 1)
+	if r0 != 1 { return "O0 baseline outer(q)=inner(q.v)=inner(0) should be 1" }
+	if r1 != 1 { return "O1 inlined non-leaf managed result should be 1" }
+	return ""
+}
+
+// TestInlineRecursionGuardTerminatesExec: isEven / isOdd are mutually recursive
+// (a direct-call cycle) and small enough to otherwise be inline candidates, so
+// WITHOUT the recursion guard the -O1 fixpoint re-scan would inline the cycle
+// forever and hang LowerModule.  `classify` is NOT on the cycle: inlining it into
+// main exposes calls to BOTH cycle members, one of which the guard has marked
+// recursive — the guard must refuse it so the re-scan terminates.  The test
+// merely COMPLETING (plus a correct result) is the termination proof.
+func TestInlineRecursionGuardTerminatesExec() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\n"
+			"func isEven(n int) int {\n"
+			"\tif n == 0 { return 1 }\n"
+			"\treturn isOdd(n - 1)\n"
+			"}\n"
+			"func isOdd(n int) int {\n"
+			"\tif n == 0 { return 0 }\n"
+			"\treturn isEven(n - 1)\n"
+			"}\n"
+			"func classify(n int) int { return isEven(n) + isOdd(n) }\n"
+			"func main() int { return classify(6) }\n"
+	// The danger is a HANG here (infinite inline expansion), which the recursion
+	// guard prevents; reaching the assertions at all is the real check.
+	var r0 int = runVMAtLevel(src, 0)
+	var r1 int = runVMAtLevel(src, 1)
+	if r0 != 1 { return "O0 baseline classify(6)=isEven(6)+isOdd(6)=1+0 should be 1" }
+	if r1 != 1 { return "O1 (recursion-guarded) classify(6) should still be 1" }
+	return ""
+}
+
+// buildManyCallsSrc builds `main` returning h(0) + h(0) + ... (`count` calls) so
+// inlining every call into one small function would exceed the per-function
+// growth budget.  h is a one-local helper — comfortably under InlineSizeThreshold
+// (so it inlines) yet large enough that `count` copies overflow the budget.
+func buildManyCallsSrc(count int) @[]char {
+	var s @[]char = buf.CopyStr(
+			"package \"test\"\n"
+					"func h(x int) int { var a int = x + 1\n"
+					"\treturn a + x }\n"
+					"func main() int { return h(0)")
+	for i := 1; i < count; i++ {
+		s = buf.Concat(s, " + h(0)")
+	}
+	s = buf.Concat(s, " }\n")
+	return s
+}
+
+// TestInlineGrowthBudget: many calls to one small non-recursive leaf helper.
+// Absent the growth budget every call would inline (h is leaf, non-recursive,
+// under threshold), driving the module BC_CALL count to 0; the budget stops
+// inlining into `main` once it has grown enough, leaving some calls behind.  The
+// pair of controls makes it precise: c1 < c0 proves h DOES inline (not blocked by
+// the size threshold), while c1 > 0 proves the budget capped it before finishing.
+// The result is unchanged either way.
+func TestInlineGrowthBudget() testing.TestResult {
+	var src @[]char = buildManyCallsSrc(40)
+	var m0 @ir.Module = genModule(src)
+	var vm0 @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm0)
+	vm0.OptLevel = 0
+	vm0.LowerModule(m0)
+	var c0 int = countAllBCCalls(vm0)
+	var m1 @ir.Module = genModule(src)
+	var vm1 @VM = NewVM(1024 * 1024)
+	registerTestExterns(vm1)
+	vm1.OptLevel = 1
+	vm1.LowerModule(m1)
+	var c1 int = countAllBCCalls(vm1)
+	if c0 < 40 { return "setup: -O0 should have >=40 BC_CALLs (the 40 h calls)" }
+	if c1 >= c0 {
+		return "h must inline at -O1 (c1 < c0), else it hit the size threshold not the budget"
+	}
+	if c1 == 0 { return "the growth budget should leave SOME calls un-inlined (c1 > 0)" }
+	var r0 int = runVMAtLevel(src, 0)
+	var r1 int = runVMAtLevel(src, 1)
+	if r0 != r1 { return "growth-budget inlining changed the result" }
+	return ""
+}

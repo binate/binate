@@ -1,7 +1,5 @@
 package "pkg/binate/ir"
 
-import "pkg/binate/iropcode"
-import "pkg/binate/types"
 import "pkg/stdx/slices"
 
 // ============================================================
@@ -29,95 +27,157 @@ import "pkg/stdx/slices"
 // miscompiles SILENTLY on the VM/native — the pass ships its own post-condition
 // assertion (assertInlinedFuncWellFormed).
 //
-// Scope so far: a leaf (no calls -> no recursion, no nested inlining) callee
-// returning at most one value (a scalar OR a by-value data aggregate — struct /
-// slice / managed-slice / array — that rides sret/retbuf; Inc 5a), whose body
+// Scope: a same-package callee returning a scalar, a by-value data aggregate
+// (struct / slice / managed-slice / array riding sret/retbuf), OR
+// multiple values (packed into a tuple at each return), whose body
 // references only its params and its own in-callee values.  Single-block callees
-// splice in place (Inc 1); multi-block callees split the caller block and clone
-// the callee's CFG (Inc 2, inline_multiblock.bn), with MULTIPLE return sites
-// merged through a return-value alloca slot (Inc 4).  Faulting ops are allowed
-// with an EMPTY cleanup pad (Inc 3a: the cloned fault op reuses the caller's
-// call-site pad) or a single-block NON-empty pad (Inc 3b: the pad is cloned and
-// chained into the call-site pad by fixupInlinedPads).  Later increments add
-// multi-VALUE (tuple) returns and non-leaf callees.
+// splice in place; multi-block callees split the caller block and clone
+// the callee's CFG (inline_multiblock.bn), with MULTIPLE return sites
+// merged through a return-value alloca slot.  Faulting ops are allowed
+// with an EMPTY cleanup pad (the cloned fault op reuses the caller's
+// call-site pad) or a single-block NON-empty pad (the pad is cloned and
+// chained into the call-site pad by fixupInlinedPads).  NON-leaf callees are
+// inlined too: a body's own DIRECT OP_CALLs are cloned along and exposed to
+// a fixpoint re-scan for transitive inlining, guarded against call cycles
+// (inline_recursion.bn) and code blow-up (the per-function growth budget).
 
 // InlineSizeThreshold is the maximum instruction count (including the terminator)
 // of a callee body for it to be inlined.  Conservative to start; tuneable — a
 // bigger value inlines larger callees at the cost of code growth.
 const InlineSizeThreshold int = 15
 
-// inlineCalls inlines qualifying direct calls throughout the module.
+// InlineGrowthFactor / InlineGrowthFloor together bound per-function code growth
+// from transitive inlining: a function is inlined into only until its
+// instruction count reaches max(InlineGrowthFloor, origSize * InlineGrowthFactor);
+// past that, remaining call sites are left as real calls.  Generous by design —
+// a backstop against pathological DAG blow-up (diamond re-inlining), NOT a knob
+// for the common case, which the per-callee InlineSizeThreshold and the
+// recursion guard already bound.  A hit is not logged (the IR pass does no I/O —
+// it is BUILDER-compiled); TestInlineGrowthBudget demonstrates the cap.
+const (
+	InlineGrowthFactor int = 4
+	InlineGrowthFloor int = 256
+)
+
+// InlineRoundCap bounds the fixpoint re-scan as a defensive backstop
+// against a logic error — normal termination is a round that inlines nothing.
+const InlineRoundCap int = 100000
+
+// inlineCalls inlines qualifying direct calls throughout the module.  The
+// recursion analysis is computed once up front (a module-wide direct-call-cycle
+// scan) and consulted for every candidate so a callee on a cycle is never
+// inlined (otherwise the transitive re-scan would loop forever).
 func inlineCalls(m @Module) {
+	var ia @inlineAnalysis = computeRecursiveFuncs(m)
 	for fi := 0; fi < len(m.Funcs); fi++ {
 		var f @Func = m.Funcs[fi]
 		if f.IsExtern {
 			continue
 		}
-		inlineCallsInFunc(m, f)
+		inlineCallsInFunc(m, f, ia)
 	}
 }
 
-// inlineCallsInFunc inlines every qualifying OP_CALL in f.  Inc 1 callees are
-// leaf, so inlining introduces no new calls — one pass over f's blocks suffices.
-// The OP_CALL result's uses are retargeted to the cloned return value in a final
-// whole-function sweep (the caller's end-of-statement result-RefDec may sit in a
-// later block than the call).
-func inlineCallsInFunc(m @Module, f @Func) {
+// funcInstrCount returns f's total instruction count over its Blocks (fault pads
+// excluded — the growth budget bounds emitted code, and a callee charges its
+// block-instr count, matching inlinableCallee's `total`).
+func funcInstrCount(f @Func) int {
+	var total int = 0
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		total = total + len(f.Blocks[bi].Instrs)
+	}
+	return total
+}
+
+// inlineCallsInFunc inlines every qualifying OP_CALL in f.  A NON-leaf callee
+// brings its own calls along when cloned, so the two phases run under a
+// FIXPOINT loop: inlining a body exposes fresh call sites that the next round
+// re-scans (transitive inlining).  Termination is guaranteed by the recursion
+// guard (no callee on a direct-call cycle is ever inlined, so expansion follows
+// the finite acyclic remainder) and bounded by the per-function growth budget;
+// InlineRoundCap is a defensive backstop.  Every inlined call's result uses are
+// retargeted to its cloned return value in ONE final whole-function sweep after
+// all rounds (the caller's end-of-statement result-RefDec may sit in a later
+// block, and a later round's clone can chain onto an earlier round's — chaseRepl
+// resolves the chain).
+func inlineCallsInFunc(m @Module, f @Func, ia @inlineAnalysis) {
+	// Per-function code-growth budget: stop inlining into f once it
+	// reaches this size, leaving any remaining sites as real calls.
+	var origSize int = funcInstrCount(f)
+	var budget int = origSize * InlineGrowthFactor
+	if budget < InlineGrowthFloor {
+		budget = InlineGrowthFloor
+	}
+	var curSize int = origSize
 	var anyInlined bool = false
-	// Parallel lists: an inlined call's result ID -> its cloned return value.
+	// Parallel lists: an inlined call's result ID -> its cloned return value,
+	// accumulated across ALL rounds and applied together in the final sweep.
 	var callIDs @[]int
 	var retVals @[]@Instr
-	// Phase 1: single-block callees — a per-block instruction splice, no CFG
-	// change (the cloned body replaces the call in-place).
-	for bi := 0; bi < len(f.Blocks); bi++ {
-		var blk @Block = f.Blocks[bi]
-		var changed bool = false
-		var kept @[]@Instr
-		for ii := 0; ii < len(blk.Instrs); ii++ {
-			var instr @Instr = blk.Instrs[ii]
-			var callee @Func = inlinableCallee(m, f, instr)
-			if callee == nil || len(callee.Blocks) != 1 {
-				kept = slices.Append[@Instr](kept, instr)
-				continue
+	for round := 0; round < InlineRoundCap; round = round + 1 {
+		var roundInlined bool = false
+		// Phase 1: single-block callees — a per-block instruction splice, no CFG
+		// change (the cloned body replaces the call in-place).
+		for bi := 0; bi < len(f.Blocks); bi++ {
+			var blk @Block = f.Blocks[bi]
+			var changed bool = false
+			var kept @[]@Instr
+			for ii := 0; ii < len(blk.Instrs); ii++ {
+				var instr @Instr = blk.Instrs[ii]
+				var callee @Func = inlinableCallee(m, f, ia, instr)
+				if callee == nil || len(callee.Blocks) != 1 {
+					kept = slices.Append[@Instr](kept, instr)
+					continue
+				}
+				if curSize + funcInstrCount(callee) > budget {
+					kept = slices.Append[@Instr](kept, instr)
+					continue // growth budget hit — leave it a real call
+				}
+				// Splice the cloned body in place of the call (before it); drop the
+				// call (its own fault pad is orphaned — never branched to, safe).
+				var body @[]@Instr
+				var retVal @Instr
+				body, retVal = cloneInlinedBody(f, callee, instr)
+				for bj := 0; bj < len(body); bj++ {
+					kept = slices.Append[@Instr](kept, body[bj])
+				}
+				if instr.ID >= 0 {
+					callIDs = slices.Append[int](callIDs, instr.ID)
+					retVals = slices.Append[@Instr](retVals, retVal)
+				}
+				curSize = curSize + funcInstrCount(callee)
+				changed = true
+				roundInlined = true
+				anyInlined = true
 			}
-			// Splice the cloned body in place of the call (before it); drop the
-			// call (its own fault pad is orphaned — never branched to, safe).
-			var body @[]@Instr
-			var retVal @Instr
-			body, retVal = cloneInlinedBody(f, callee, instr)
-			for bj := 0; bj < len(body); bj++ {
-				kept = slices.Append[@Instr](kept, body[bj])
+			if changed {
+				blk.Instrs = kept
 			}
-			if instr.ID >= 0 {
-				callIDs = slices.Append[int](callIDs, instr.ID)
+		}
+		// Phase 2: multi-block callees — a CFG split, one at a time (f.Blocks
+		// shifts as blocks are added, so re-scan for the next site each time).
+		// Only sites that fit the remaining budget are returned.
+		for {
+			var sbi int
+			var sii int
+			var scallee @Func
+			sbi, sii, scallee = findMultiBlockSite(m, f, ia, budget - curSize)
+			if sbi < 0 {
+				break
+			}
+			var call @Instr = f.Blocks[sbi].Instrs[sii]
+			var retVal @Instr = inlineMultiBlockSite(f, sbi, sii, scallee, call)
+			if call.ID >= 0 {
+				callIDs = slices.Append[int](callIDs, call.ID)
 				retVals = slices.Append[@Instr](retVals, retVal)
 			}
-			changed = true
+			curSize = curSize + funcInstrCount(scallee)
+			roundInlined = true
 			anyInlined = true
 		}
-		if changed {
-			blk.Instrs = kept
+		if !roundInlined {
+			break // a full round inlined nothing — fixpoint reached
 		}
-	}
-	// Phase 2: multi-block callees — a CFG split, one at a time (f.Blocks shifts
-	// as blocks are added, so re-scan for the next site each round).  Each inline
-	// deletes its call, so the loop terminates after the finite number of
-	// multi-block calls; the guard is a defensive cap against a logic error.
-	for guard := 0; guard < 1000000; guard = guard + 1 {
-		var sbi int
-		var sii int
-		var scallee @Func
-		sbi, sii, scallee = findMultiBlockSite(m, f)
-		if sbi < 0 {
-			break
-		}
-		var call @Instr = f.Blocks[sbi].Instrs[sii]
-		var retVal @Instr = inlineMultiBlockSite(f, sbi, sii, scallee, call)
-		if call.ID >= 0 {
-			callIDs = slices.Append[int](callIDs, call.ID)
-			retVals = slices.Append[@Instr](retVals, retVal)
-		}
-		anyInlined = true
 	}
 	if !anyInlined {
 		return
@@ -148,149 +208,21 @@ func inlineCallsInFunc(m @Module, f @Func) {
 }
 
 // findMultiBlockSite returns the (block index, instr index, callee) of the first
-// inlinable MULTI-block call in f, or (-1, -1, nil).  Used by Phase 2's
-// re-scanning loop (single-block callees are handled by Phase 1).
-func findMultiBlockSite(m @Module, f @Func) (int, int, @Func) {
+// inlinable MULTI-block call in f whose body fits within `maxCharge` instrs (the
+// remaining growth budget), or (-1, -1, nil).  Used by Phase 2's re-scanning
+// loop (single-block callees are handled by Phase 1); the budget filter makes
+// the loop terminate once the remaining budget can't fit any multi-block callee.
+func findMultiBlockSite(m @Module, f @Func, ia @inlineAnalysis, maxCharge int) (int, int, @Func) {
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var blk @Block = f.Blocks[bi]
 		for ii := 0; ii < len(blk.Instrs); ii++ {
-			var callee @Func = inlinableCallee(m, f, blk.Instrs[ii])
-			if callee != nil && len(callee.Blocks) > 1 {
+			var callee @Func = inlinableCallee(m, f, ia, blk.Instrs[ii])
+			if callee != nil && len(callee.Blocks) > 1 && funcInstrCount(callee) <= maxCharge {
 				return bi, ii, callee
 			}
 		}
 	}
 	return -1, -1, nil
-}
-
-// inlinableCallee returns the callee Func if `instr` is a direct OP_CALL that
-// qualifies for inlining into f (single- OR multi-block), else nil.  The shape
-// requirements: same-package non-extern, not self, total size under the
-// threshold, leaf (no call ops), any faulting op has an empty or single-block
-// cleanup pad (and the call site itself has a pad — Inc 3a/3b), no phis, at least
-// one OP_RETURN site (multiple merge through a slot — Inc 4), every block ends in
-// JUMP/BRANCH/RETURN, arity matches, at most one inlinable-typed result (scalar
-// or a by-value data aggregate — Inc 5a), and every value operand is a param or
-// an in-callee value (so it is remappable).  Callers dispatch on
-// len(callee.Blocks): Phase 1 handles single-block (splice), Phase 2 multi-block
-// (CFG split).
-func inlinableCallee(m @Module, f @Func, instr @Instr) @Func {
-	if instr.Op != iropcode.OP_CALL {
-		return nil
-	}
-	var callee @Func = LookupModuleFunc(m, instr.StrVal)
-	if callee == nil || callee.IsExtern {
-		return nil
-	}
-	if callee == f {
-		return nil // no self-inline
-	}
-	if len(callee.Blocks) == 0 {
-		return nil
-	}
-	if len(callee.Params) != len(instr.Args) {
-		return nil // arity mismatch (defensive)
-	}
-	// Every result must be an inlinable type — a scalar or a by-value data
-	// aggregate (Inc 5a); func-value / iface-value results (cross-mode vtable) are
-	// excluded.  Multiple results (Inc 5b) are packed into a tuple value at each
-	// return by buildTupleInstrs, so the call's OP_EXTRACT uses read a real tuple.
-	for ri := 0; ri < len(callee.Results); ri++ {
-		if !isInlinableResultType(callee.Results[ri]) {
-			return nil
-		}
-	}
-	var total int = 0
-	var returnCount int = 0
-	for cbj := 0; cbj < len(callee.Blocks); cbj++ {
-		var cblk @Block = callee.Blocks[cbj]
-		var n int = len(cblk.Instrs)
-		if n == 0 {
-			return nil // malformed (empty block)
-		}
-		total = total + n
-		var term int = cblk.Instrs[n - 1].Op
-		if term != iropcode.OP_JUMP && term != iropcode.OP_BRANCH && term != iropcode.OP_RETURN {
-			return nil // UNREACHABLE / UNWIND / non-terminator-last not handled
-		}
-		for k := 0; k < n; k++ {
-			var bi @Instr = cblk.Instrs[k]
-			if bi.Op == iropcode.OP_RETURN {
-				returnCount = returnCount + 1
-			}
-			if isCallFamilyOp(bi.Op) {
-				return nil
-			}
-			if bi.PadBlock != nil {
-				// A faulting op is inlinable when the call site has a pad (to
-				// chain/reuse) AND the callee pad is either EMPTY (Inc 3a: the
-				// cloned op reuses the caller's call-site pad directly) or a single
-				// straight-line block (Inc 3b: cloneSingleBlockPad copies it into
-				// the caller and chains it into the call-site pad).  A multi-block
-				// (branching) pad — managed-slice / iface / func-value cleanup —
-				// ends in a BRANCH, not OP_UNWIND_RETURN, and is rejected (a later
-				// increment).
-				if instr.PadBlock == nil {
-					return nil
-				}
-				if !isEmptyPad(bi.PadBlock) && !padSingleBlockInlinable(bi.PadBlock, callee) {
-					return nil
-				}
-			}
-			if len(bi.Phis) != 0 {
-				return nil // no phis expected before mem2reg; bail if present
-			}
-			for a := 0; a < len(bi.Args); a++ {
-				var av @Instr = bi.Args[a]
-				if av == nil || av.IsGlobalRef || av.ID < 0 || av.ID >= callee.NextID {
-					return nil // operand not a param/in-callee value -> not remappable
-				}
-			}
-		}
-	}
-	if total > InlineSizeThreshold {
-		return nil
-	}
-	if returnCount < 1 {
-		return nil // no return site (all blocks loop) -> nothing to splice
-	}
-	// Multiple return sites are handled by the multi-block path's merge slot
-	// (Inc 4); a single-block callee always has exactly one return.
-	return callee
-}
-
-// isCallFamilyOp reports whether op is any call/dispatch op (disqualifies a
-// callee from Inc 1's "leaf" requirement).
-func isCallFamilyOp(op int) bool {
-	return op == iropcode.OP_CALL || op == iropcode.OP_CALL_INDIRECT || op == iropcode.OP_C_CALL ||
-			op == iropcode.OP_CALL_FUNC_VALUE || op == iropcode.OP_CALL_HANDLE ||
-			op == iropcode.OP_CALL_IFACE_METHOD || op == iropcode.OP_SAT_LOOKUP
-}
-
-// isInlinableResultType reports whether a single result type is one the inliner
-// can route through the merge slot / direct retVal: the single-register scalar
-// kinds PLUS the by-value DATA aggregates (struct / slice / managed-slice /
-// array) that ride sret/retbuf (Inc 5a).  At the IR level the OP_RETURN carries
-// the aggregate VALUE as Args[0], which flows to the call-result uses exactly
-// like a scalar, and OP_STORE/OP_LOAD copy it bit-for-bit through an
-// aggregate-typed slot with no implicit refcount.  An aggregate whose cleanup
-// needs a dtor CALL (a struct with a managed field, a managed-slice of managed
-// elements) is separately rejected by the leaf filter, so no managed dtor is
-// dropped.  EXCLUDED: func-value / iface-value results (their cross-mode vtable
-// substitution is not handled) and a TYP_NAMED peelTransparent could not resolve
-// (nil Underlying).  Default-reject so a future kind can't slip through as an
-// unhandled register value.  char/uint8/int32/... are all TYP_INT with a width.
-func isInlinableResultType(t @types.Type) bool {
-	if t == nil {
-		return false
-	}
-	var r @types.Type = peelTransparent(t)
-	if r == nil {
-		return false
-	}
-	return r.Kind == types.TYP_INT || r.Kind == types.TYP_FLOAT || r.Kind == types.TYP_BOOL ||
-			r.Kind == types.TYP_POINTER || r.Kind == types.TYP_MANAGED_PTR || r.Kind == types.TYP_STRUCT ||
-			r.Kind == types.TYP_SLICE || r.Kind == types.TYP_MANAGED_SLICE || r.Kind == types.TYP_ARRAY
 }
 
 // cloneInlinedBody clones callee's single block (minus the terminal OP_RETURN)
@@ -315,7 +247,7 @@ func cloneInlinedBody(f @Func, callee @Func, call @Instr) (@[]@Instr, @Instr) {
 		var src @Instr = cblk.Instrs[ii]
 		if ii == n - 1 {
 			// Terminal OP_RETURN: not cloned; capture the (remapped) return value.
-			// A MULTI-value return (Inc 5b) packs its N remapped values into a
+			// A MULTI-value return packs its N remapped values into a
 			// tuple whose OP_EXTRACT'ing uses the sweep then reads.
 			if len(src.Args) > 1 {
 				var vals @[]@Instr = make_slice(@Instr, len(src.Args))
@@ -339,7 +271,7 @@ func cloneInlinedBody(f @Func, callee @Func, call @Instr) (@[]@Instr, @Instr) {
 		body = slices.Append[@Instr](body, c)
 	}
 	// Clone + chain any non-empty callee fault pads now that remap covers every
-	// cloned callee value the pads' RefDecs reference (Inc 3b); empty-pad fault
+	// cloned callee value the pads' RefDecs reference; empty-pad fault
 	// ops already reuse call.PadBlock and are left untouched.
 	fixupInlinedPads(f, body, remap, cap, call.PadBlock)
 	return body, retVal
@@ -350,7 +282,7 @@ func cloneInlinedBody(f @Func, callee @Func, call @Instr) (@[]@Instr, @Instr) {
 // instr).  Param-slot markers (ParamIndex / IsByvalParamRef) are deliberately
 // NOT copied — the clone is an ordinary local, not the caller's "argument N"
 // (they default to 0 / false on a fresh instr; keeping them would emit bogus
-// `arg: N` DWARF at -O1 -g for a managed-param accessor).  Inc 1 callees have no
+// `arg: N` DWARF at -O1 -g for a managed-param accessor).  Single-block leaf callees have no
 // Block1/Block2/Phis/PadBlock (single block, leaf, no faults), so those
 // reference fields are left nil.
 func cloneInstr(f @Func, src @Instr, remap @[]@Instr, cap int, callSitePad *Block) @Instr {
@@ -364,7 +296,7 @@ func cloneInstr(f @Func, src @Instr, remap @[]@Instr, cap int, callSitePad *Bloc
 // cloneInstrFields copies src's scalar/type/payload fields into a fresh instr
 // with a fresh caller ID (or -1 for a void instr), and a SHALLOW copy of its
 // Args (same operand objects — the caller remaps them).  It does NOT copy
-// Block1/Block2/Phis/PadBlock (the caller sets CFG edges; Inc-eligible callees
+// Block1/Block2/Phis/PadBlock (the caller sets CFG edges; inlinable callees
 // have no phis/pads) nor the param-slot markers ParamIndex/IsByvalParamRef
 // (deliberately cleared so an inlined local isn't emitted as the caller's
 // "argument N" in DWARF — they default to 0/false on a fresh instr).  Shared by
@@ -387,10 +319,10 @@ func cloneInstrFields(f @Func, src @Instr, callSitePad *Block) @Instr {
 	c.IsGlobalRef = src.IsGlobalRef
 	// A cloned faulting op (bounds/div/shift/nil check) needs its cleanup pad
 	// wired for the merged frame.  EMPTY callee pad -> reuse the caller's
-	// call-site pad directly (Inc 3a: nothing callee-side to preserve).
+	// call-site pad directly (nothing callee-side to preserve).
 	// NON-EMPTY pad -> leave PadBlock pointing at the CALLEE pad as a marker;
 	// fixupInlinedPads (run after the body clone, when remap is complete) clones
-	// it into the caller and chains it into callSitePad (Inc 3b).  A non-faulting
+	// it into the caller and chains it into callSitePad.  A non-faulting
 	// op keeps PadBlock nil.
 	if src.PadBlock != nil {
 		if isEmptyPad(src.PadBlock) {

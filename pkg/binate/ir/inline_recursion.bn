@@ -1,0 +1,139 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/stdx/containers/table"
+import "pkg/stdx/slices"
+
+// Recursion analysis for the inliner (non-leaf, transitively-inlined callees).
+//
+// Non-leaf inlining lets a callee that itself CALLs other functions be inlined; the cloned
+// body carries its own direct OP_CALLs, which the fixpoint re-scan then exposes
+// as fresh inline sites (transitive inlining).  That re-scan would loop forever
+// on a call CYCLE — A calls B calls A, or any strongly-connected component — so
+// no function that participates in a direct-call cycle may ever be inlined.
+//
+// computeRecursiveFuncs marks every such function once per module.  The marking
+// is sound-and-sufficient by the standard DFS back-edge property: every cycle
+// contains at least one back edge, and we mark that back edge's TARGET; refusing
+// to inline any marked function therefore breaks every cycle (an inline
+// expansion can never traverse a full cycle, so it follows only the finite
+// acyclic remainder and terminates).  Marking just the back-edge targets — not
+// every node on the cycle — suffices for that guarantee and is cheaper.
+
+// inlineAnalysis carries the module-wide facts the inliner consults for every
+// candidate callee.  `recursive` is the set of functions on a direct-call cycle
+// (keyed by canonical Func.Name); a name present in the set must never be
+// inlined.  Bundled into a struct so the three inliner entry points
+// (inlineCallsInFunc / inlinableCallee / findMultiBlockSite) take one param.
+type inlineAnalysis struct {
+	recursive @table.Table[*[]readonly char, bool, FuncSigHasher, FuncSigEq]
+}
+
+// isRecursive reports whether the function named `name` participates in a
+// direct-call cycle (and so must not be inlined).
+func (ia @inlineAnalysis) isRecursive(name *[]readonly char) bool {
+	return ia.recursive.Has(name)
+}
+
+// computeRecursiveFuncs builds the direct-call graph over m's non-extern
+// functions and returns an inlineAnalysis marking every function that is the
+// target of a DFS back edge (hence on a cycle).  Runs once per module (in
+// inlineCalls) — O(V + E) after an O(instrs) adjacency build.
+func computeRecursiveFuncs(m @Module) @inlineAnalysis {
+	var n int = len(m.Funcs)
+	// name -> index over module funcs (same zero-size policies as FuncSigIndex).
+	var idx @table.Table[*[]readonly char, int, FuncSigHasher, FuncSigEq] = table.NewTable[
+			*[]readonly char, int, FuncSigHasher, FuncSigEq](
+					FuncSigHasher{}, FuncSigEq{})
+	for i := 0; i < n; i++ {
+		if !idx.Has(m.Funcs[i].Name) {
+			idx.Put(m.Funcs[i].Name, i)
+		}
+	}
+	// Adjacency: adj[i] = the module-func indices i directly OP_CALLs.  Only
+	// direct calls create inline-expansion edges (indirect / iface / c-calls are
+	// never inlined), so only they can form an inlining cycle.
+	var adj @[]@[]int = make_slice(@[]int, n)
+	for i := 0; i < n; i++ {
+		var f @Func = m.Funcs[i]
+		if f.IsExtern {
+			continue
+		}
+		var outs @[]int
+		for bi := 0; bi < len(f.Blocks); bi++ {
+			var blk @Block = f.Blocks[bi]
+			for ii := 0; ii < len(blk.Instrs); ii++ {
+				var instr @Instr = blk.Instrs[ii]
+				if instr.Op != iropcode.OP_CALL {
+					continue
+				}
+				var ci int
+				var ok bool
+				ci, ok = idx.Get(instr.StrVal)
+				if ok {
+					outs = slices.Append[int](outs, ci)
+				}
+			}
+		}
+		adj[i] = outs
+	}
+	var recur @[]bool = markCycleTargets(adj, n)
+	var rset @table.Table[*[]readonly char, bool, FuncSigHasher, FuncSigEq] = table.NewTable[
+			*[]readonly char, bool, FuncSigHasher, FuncSigEq](
+					FuncSigHasher{}, FuncSigEq{})
+	for i := 0; i < n; i++ {
+		if recur[i] {
+			rset.Put(m.Funcs[i].Name, true)
+		}
+	}
+	var ia @inlineAnalysis = make(inlineAnalysis)
+	ia.recursive = rset
+	return ia
+}
+
+// markCycleTargets runs an ITERATIVE DFS over the adjacency `adj` (n nodes) and
+// returns a bool slice marking every node that is the target of a back edge —
+// i.e. a node found while already on the current DFS stack (colored gray).  Each
+// such node lies on a cycle, and marking back-edge targets is enough to break
+// every cycle for inlining (see the file header).  The DFS is iterative (an
+// explicit stack, not host recursion) so a deep call chain can't overflow the
+// runtime stack; the stack never holds more than n gray frames, so a size-n
+// preallocation is exact.
+func markCycleTargets(adj @[]@[]int, n int) @[]bool {
+	var recur @[]bool = make_slice(bool, n)
+	var color @[]int = make_slice(int, n) // 0 = white, 1 = gray (on stack), 2 = black
+	var stkNode @[]int = make_slice(int, n)
+	var stkNext @[]int = make_slice(int, n) // per-frame next-child cursor
+	for s := 0; s < n; s++ {
+		if color[s] != 0 {
+			continue
+		}
+		var sp int = 0
+		stkNode[0] = s
+		stkNext[0] = 0
+		color[s] = 1
+		sp = 1
+		for sp > 0 {
+			var top int = sp - 1
+			var u int = stkNode[top]
+			var cur int = stkNext[top]
+			if cur >= len(adj[u]) {
+				color[u] = 2 // all children explored — pop u
+				sp = sp - 1
+				continue
+			}
+			stkNext[top] = cur + 1
+			var v int = adj[u][cur]
+			if color[v] == 0 {
+				stkNode[sp] = v // tree edge — descend into v
+				stkNext[sp] = 0
+				color[v] = 1
+				sp = sp + 1
+			} else if color[v] == 1 {
+				recur[v] = true // back edge into a gray node — v is on a cycle
+			}
+			// color[v] == 2: cross / forward edge to a finished node — ignore.
+		}
+	}
+	return recur
+}

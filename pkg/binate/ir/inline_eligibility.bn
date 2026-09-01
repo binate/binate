@@ -1,0 +1,156 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// Inliner eligibility predicates (extracted from inline_calls.bn): the shape
+// gate that decides whether a direct OP_CALL's callee may be inlined, plus the
+// call-family and result-type classifiers it consults.
+
+// inlinableCallee returns the callee Func if `instr` is a direct OP_CALL that
+// qualifies for inlining into f (single- OR multi-block), else nil.  The shape
+// requirements: same-package non-extern, not self, not on a direct-call cycle
+// (the recursion guard — else the transitive re-scan loops forever), total
+// size under the threshold, non-leaf permitted but only via DIRECT OP_CALLs
+// (an indirect / iface / c-call in the body still disqualifies, since it
+// can't be transitively inlined and its clone is not yet validated), any
+// faulting op OR internal call has an empty or single-block cleanup pad (and the
+// call site itself has a pad), no phis, at least one OP_RETURN site
+// (multiple merge through a slot), every block ends in JUMP/BRANCH/
+// RETURN, arity matches, at most one inlinable-typed result (scalar or a
+// by-value data aggregate), and every value operand is a param or an
+// in-callee value (so it is remappable).  Callers dispatch on len(callee.Blocks):
+// Phase 1 handles single-block (splice), Phase 2 multi-block (CFG split).
+func inlinableCallee(m @Module, f @Func, ia @inlineAnalysis, instr @Instr) @Func {
+	if instr.Op != iropcode.OP_CALL {
+		return nil
+	}
+	var callee @Func = LookupModuleFunc(m, instr.StrVal)
+	if callee == nil || callee.IsExtern {
+		return nil
+	}
+	if callee == f {
+		return nil // no self-inline
+	}
+	if ia.isRecursive(callee.Name) {
+		return nil // on a direct-call cycle — never inline (would expand forever)
+	}
+	if len(callee.Blocks) == 0 {
+		return nil
+	}
+	if len(callee.Params) != len(instr.Args) {
+		return nil // arity mismatch (defensive)
+	}
+	// Every result must be an inlinable type — a scalar or a by-value data
+	// aggregate; func-value / iface-value results (cross-mode vtable) are
+	// excluded.  Multiple results are packed into a tuple value at each
+	// return by buildTupleInstrs, so the call's OP_EXTRACT uses read a real tuple.
+	for ri := 0; ri < len(callee.Results); ri++ {
+		if !isInlinableResultType(callee.Results[ri]) {
+			return nil
+		}
+	}
+	var total int = 0
+	var returnCount int = 0
+	for cbj := 0; cbj < len(callee.Blocks); cbj++ {
+		var cblk @Block = callee.Blocks[cbj]
+		var n int = len(cblk.Instrs)
+		if n == 0 {
+			return nil // malformed (empty block)
+		}
+		total = total + n
+		var term int = cblk.Instrs[n - 1].Op
+		if term != iropcode.OP_JUMP && term != iropcode.OP_BRANCH && term != iropcode.OP_RETURN {
+			return nil // UNREACHABLE / UNWIND / non-terminator-last not handled
+		}
+		for k := 0; k < n; k++ {
+			var bi @Instr = cblk.Instrs[k]
+			if bi.Op == iropcode.OP_RETURN {
+				returnCount = returnCount + 1
+			}
+			if isCallFamilyOp(bi.Op) && bi.Op != iropcode.OP_CALL {
+				// A NON-leaf callee is permitted, but only via DIRECT OP_CALLs:
+				// those are cloned verbatim (their arg-passing + result refcount
+				// ops come along faithfully) and the fixpoint re-scan can inline
+				// them transitively.  The dynamic-dispatch call kinds
+				// (OP_CALL_INDIRECT / _IFACE_METHOD / _FUNC_VALUE / _HANDLE /
+				// _C_CALL / OP_SAT_LOOKUP) still disqualify: they can't be
+				// transitively inlined, and cloning them raises cross-mode-vtable /
+				// c-ABI questions not yet validated.
+				return nil
+			}
+			if bi.PadBlock != nil {
+				// A faulting op OR an internal direct call is inlinable when the
+				// call site has a pad (to chain/reuse) AND the op's pad is either
+				// EMPTY (the cloned op reuses the caller's call-site pad
+				// directly) or a single straight-line block
+				// (cloneSingleBlockPad copies it into the caller and chains it into
+				// the call-site pad).  A call carries a call-site cleanup pad of
+				// the same shape as a fault pad, so this handles both.  A
+				// multi-block (branching) pad — managed-slice / iface / func-value
+				// cleanup — ends in a BRANCH, not OP_UNWIND_RETURN, and is rejected
+				// (a later increment).
+				if instr.PadBlock == nil {
+					return nil
+				}
+				if !isEmptyPad(bi.PadBlock) && !padSingleBlockInlinable(bi.PadBlock, callee) {
+					return nil
+				}
+			}
+			if len(bi.Phis) != 0 {
+				return nil // no phis expected before mem2reg; bail if present
+			}
+			for a := 0; a < len(bi.Args); a++ {
+				var av @Instr = bi.Args[a]
+				if av == nil || av.IsGlobalRef || av.ID < 0 || av.ID >= callee.NextID {
+					return nil // operand not a param/in-callee value -> not remappable
+				}
+			}
+		}
+	}
+	if total > InlineSizeThreshold {
+		return nil
+	}
+	if returnCount < 1 {
+		return nil // no return site (all blocks loop) -> nothing to splice
+	}
+	// Multiple return sites are handled by the multi-block path's merge slot;
+	// a single-block callee always has exactly one return.
+	return callee
+}
+
+// isCallFamilyOp reports whether op is any call/dispatch op (disqualifies a
+// callee from the leaf-body requirement).
+func isCallFamilyOp(op int) bool {
+	return op == iropcode.OP_CALL || op == iropcode.OP_CALL_INDIRECT || op == iropcode.OP_C_CALL ||
+			op == iropcode.OP_CALL_FUNC_VALUE || op == iropcode.OP_CALL_HANDLE ||
+			op == iropcode.OP_CALL_IFACE_METHOD || op == iropcode.OP_SAT_LOOKUP
+}
+
+// isInlinableResultType reports whether a single result type is one the inliner
+// can route through the merge slot / direct retVal: the single-register scalar
+// kinds PLUS the by-value DATA aggregates (struct / slice / managed-slice /
+// array) that ride sret/retbuf.  At the IR level the OP_RETURN carries
+// the aggregate VALUE as Args[0], which flows to the call-result uses exactly
+// like a scalar, and OP_STORE/OP_LOAD copy it bit-for-bit through an
+// aggregate-typed slot with no implicit refcount.  No managed dtor is dropped:
+// the callee's own refcount ops are cloned verbatim (the non-leaf path clones a
+// direct OP_CALL dtor faithfully too), and a dtor dispatched via a handle/iface call
+// (OP_CALL_HANDLE etc.) or a branching managed-slice/iface cleanup keeps the
+// callee non-inlinable (the non-direct-call gate / the multi-block-pad gate).
+// EXCLUDED: func-value / iface-value results (their cross-mode vtable
+// substitution is not handled) and a TYP_NAMED peelTransparent could not resolve
+// (nil Underlying).  Default-reject so a future kind can't slip through as an
+// unhandled register value.  char/uint8/int32/... are all TYP_INT with a width.
+func isInlinableResultType(t @types.Type) bool {
+	if t == nil {
+		return false
+	}
+	var r @types.Type = peelTransparent(t)
+	if r == nil {
+		return false
+	}
+	return r.Kind == types.TYP_INT || r.Kind == types.TYP_FLOAT || r.Kind == types.TYP_BOOL ||
+			r.Kind == types.TYP_POINTER || r.Kind == types.TYP_MANAGED_PTR || r.Kind == types.TYP_STRUCT ||
+			r.Kind == types.TYP_SLICE || r.Kind == types.TYP_MANAGED_SLICE || r.Kind == types.TYP_ARRAY
+}

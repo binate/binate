@@ -35,7 +35,7 @@ BIN="$TMP/canary"
 cat > "$SRC" <<'CANARY'
 package "main"
 
-import "pkg/stdx/fmt"
+import "pkg/std/fmt"
 
 func main() {
 	fmt.Println("hello, binate")

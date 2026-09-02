@@ -91,6 +91,39 @@ X64BIN="$OUTBIN"
 build_and_check aarch64-linux 183 "/lib/ld-linux-aarch64.so.1"
 AA64BIN="$OUTBIN"
 
+# ----- --link-after-objs: an extra object must flow through the bnld path into the link.
+#       Build bnas, assemble a data-only object, relink tiny.bn (x86_64-linux) with
+#       --link-after-objs, and check the result is still a valid dynamic ELF — proving the
+#       extra object linked in (bnld classifies it as an object, not a shared library). -----
+BNAS="$TMP/bnas"
+if ! "$BINATE_DIR/scripts/build-bnas.sh" -o "$BNAS" > "$TMP/build_bnas.log" 2>&1; then
+    echo "FAIL: could not build bnas" >&2; cat "$TMP/build_bnas.log" >&2; exit 1
+fi
+cat > "$TMP/extra.s" <<'AS'
+.arch x64
+.section data
+.global bnld_extra_datum
+bnld_extra_datum:
+	.ascii "extra\0"
+AS
+if ! "$BNAS" -arch x64 -o "$TMP/extra.o" "$TMP/extra.s" > "$TMP/extra.asm.log" 2>&1; then
+    echo "FAIL: bnas could not assemble the extra object" >&2; cat "$TMP/extra.asm.log" >&2; exit 1
+fi
+_lao_iface="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target x86_64-linux)"
+_lao_impl="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
+if ! "$BNC" --backend native --target x86_64-linux --linker bnld --link-after-objs "$TMP/extra.o" \
+        -I "$_lao_iface" -L "$_lao_impl" --build-dir "$TMP" -o "$TMP/tiny_lao" "$TMP/tiny.bn" \
+        > "$TMP/lao.log" 2>&1; then
+    echo "FAIL: bnc --linker bnld --link-after-objs failed" >&2; cat "$TMP/lao.log" >&2; exit 1
+fi
+if [ "$(od -An -tx1 -N4 "$TMP/tiny_lao" | tr -d ' \n')" != "7f454c46" ]; then
+    echo "FAIL: --link-after-objs output is not an ELF file" >&2; exit 1
+fi
+if ! grep -q "libc.so.6" "$TMP/tiny_lao"; then
+    echo "FAIL: --link-after-objs output does not name libc.so.6" >&2; exit 1
+fi
+echo "PASS: x86_64-linux — bnc --linker bnld --link-after-objs linked an extra object into the image"
+
 # ----- run gating: native x86-64 Linux, else Docker (CI Linux or BINATE_E2E_DOCKER) -----
 DOCKER_OK=0
 if [ -n "${CI:-}" ] && [ "$(uname -s)" = Linux ]; then DOCKER_OK=1; fi

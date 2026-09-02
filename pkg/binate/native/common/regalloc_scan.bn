@@ -1,0 +1,187 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/stdx/slices"
+
+// The linear-scan register assignment: it consumes the Stage-0 range-list
+// intervals (regalloc_interval.bn) and the clobber points, and decides, per
+// allocatable SSA value, a physical register or "spilled".  Arch-neutral —
+// it reads only the intervals, the clobber positions, and a per-arch
+// register-class descriptor (opaque physical register numbers); the backend
+// maps the result onto its emitter.  Whole-interval assignment: one register
+// for a value's entire [Start, End) extent (dead holes just waste the
+// register for now; interval splitting to reclaim them is a later
+// refinement).
+//
+// The clobber rule is the correctness core.  A returning call destroys every
+// caller-saved register, so a value LIVE ACROSS a clobber cannot sit in one:
+// it must take a callee-saved register (saved/restored around the call by the
+// prologue) or spill.  A value that is merely an argument to the call (dead
+// after it) or the call's own result (born after it) does NOT span the
+// clobber and may use a caller-saved register freely.
+
+// RegClassDesc is the per-arch register inventory the scan allocates from.
+// The registers are opaque physical numbers (e.g. aarch64 X9..X15); the scan
+// never interprets them.
+type RegClassDesc struct {
+	// CallerSaved is the caller-saved allocatable pool — destroyed by any
+	// returning call, so only values NOT live across a clobber may use it.
+	CallerSaved @[]int
+	// CalleeSaved is the callee-saved allocatable pool — preserved across a
+	// call (the prologue saves/restores whichever are used), so a value live
+	// across a clobber takes one of these.  Empty in a caller-saved-only
+	// bring-up; the value then spills instead.
+	CalleeSaved @[]int
+	// ExtraClobberOps are ops whose lowering clobbers caller-saved on THIS
+	// backend but not universally — beyond common.EmitsReturningBl (e.g. x64
+	// OP_REFINC, arm32 int64 / soft-float AEABI libcalls).  Empty for aarch64.
+	ExtraClobberOps @[]int
+}
+
+// RegAssignment is one value's allocation decision: a physical register, or
+// Reg < 0 for "spilled" (it stays in its PlanFrame stack slot).
+type RegAssignment struct {
+	ID  int
+	Reg int
+}
+
+// isClobberOp reports whether op destroys caller-saved registers on this
+// backend: a universal returning call, or an arch-specific extra.
+func isClobberOp(op int, desc RegClassDesc) bool {
+	if EmitsReturningBl(op) { return true }
+	for i := 0; i < len(desc.ExtraClobberOps); i++ {
+		if desc.ExtraClobberOps[i] == op { return true }
+	}
+	return false
+}
+
+// ClobberPositions returns the sorted linear positions of every clobber op in
+// f (reachable blocks only).  Because positions are assigned in RPO order and
+// blocks are walked in that order, the result is already ascending.  Kept
+// separate from the scan so a bring-up assertion can re-derive clobber points
+// independently of the allocation predicate.
+func ClobberPositions(f @ir.Func, lv @LivenessInfo, desc RegClassDesc) @[]int {
+	var out @[]int
+	for k := 0; k < len(lv.RPO); k++ {
+		var b int = lv.RPO[k]
+		var blk @ir.Block = f.Blocks[b]
+		var from int = lv.BlockFrom[b]
+		for j := 0; j < len(blk.Instrs); j++ {
+			if isClobberOp(blk.Instrs[j].Op, desc) {
+				out = slices.Append[int](out, from + j)
+			}
+		}
+	}
+	return out
+}
+
+// spansClobber reports whether interval iv is live ACROSS any clobber — i.e.
+// born before the clobber (Start < P) and still live just after it
+// (Covers(P+1)).  A value that dies at the clobber (a call argument) or is
+// born at it (the call result) does not span it.  clobbers is ascending.
+func spansClobber(iv @LiveInterval, clobbers @[]int) bool {
+	var s int = iv.Start()
+	var e int = iv.End()
+	for i := 0; i < len(clobbers); i++ {
+		var p int = clobbers[i]
+		if p <= s { continue }
+		if p >= e { break } // sorted: no later clobber lies within the interval
+		if iv.Covers(p + 1) { return true }
+	}
+	return false
+}
+
+// LinearScan assigns each interval a register or marks it spilled.  Intervals
+// must be sorted by Start (BuildIntervals returns them so).  clobbers is the
+// ascending clobber-position list (ClobberPositions).  An interval that spans
+// a clobber takes a callee-saved register (or spills if none free); one that
+// does not prefers a caller-saved register (leaving callee-saved for spanning
+// intervals), falling back to callee-saved, then spill under pressure.
+func LinearScan(intervals @[]@LiveInterval, clobbers @[]int, desc RegClassDesc) @[]RegAssignment {
+	var freeCaller @[]int = copyInts(desc.CallerSaved)
+	var freeCallee @[]int = copyInts(desc.CalleeSaved)
+	// Active intervals holding a register, as parallel arrays (End / Reg /
+	// whether the reg came from the callee-saved pool).
+	var actEnd @[]int
+	var actReg @[]int
+	var actCallee @[]bool
+	var result @[]RegAssignment
+
+	for i := 0; i < len(intervals); i++ {
+		var iv @LiveInterval = intervals[i]
+		var start int = iv.Start()
+
+		// Expire intervals that end at or before this one's start, returning
+		// their registers to the pool they came from.
+		var nEnd @[]int
+		var nReg @[]int
+		var nCallee @[]bool
+		for a := 0; a < len(actEnd); a++ {
+			if actEnd[a] <= start {
+				if actCallee[a] {
+					freeCallee = slices.Append[int](freeCallee, actReg[a])
+				} else {
+					freeCaller = slices.Append[int](freeCaller, actReg[a])
+				}
+			} else {
+				nEnd = slices.Append[int](nEnd, actEnd[a])
+				nReg = slices.Append[int](nReg, actReg[a])
+				nCallee = slices.Append[bool](nCallee, actCallee[a])
+			}
+		}
+		actEnd = nEnd
+		actReg = nReg
+		actCallee = nCallee
+
+		var reg int = -1
+		var fromCallee bool = false
+		if spansClobber(iv, clobbers) {
+			// Must survive the call: callee-saved only.
+			if len(freeCallee) > 0 {
+				reg = freeCallee[len(freeCallee) - 1]
+				freeCallee = dropLast(freeCallee)
+				fromCallee = true
+			}
+		} else if len(freeCaller) > 0 {
+			reg = freeCaller[len(freeCaller) - 1]
+			freeCaller = dropLast(freeCaller)
+		} else if len(freeCallee) > 0 {
+			reg = freeCallee[len(freeCallee) - 1]
+			freeCallee = dropLast(freeCallee)
+			fromCallee = true
+		}
+
+		if reg >= 0 {
+			actEnd = slices.Append[int](actEnd, iv.End())
+			actReg = slices.Append[int](actReg, reg)
+			actCallee = slices.Append[bool](actCallee, fromCallee)
+		}
+		var ra RegAssignment
+		ra.ID = iv.ID
+		ra.Reg = reg
+		result = slices.Append[RegAssignment](result, ra)
+	}
+	return result
+}
+
+// AssignedReg returns the register assigned to id, or -1 if id is spilled or
+// not in the assignment list.
+func AssignedReg(assignments @[]RegAssignment, id int) int {
+	for i := 0; i < len(assignments); i++ {
+		if assignments[i].ID == id { return assignments[i].Reg }
+	}
+	return -1
+}
+
+// copyInts returns a fresh copy of s (so the scan's mutable free pools do not
+// alias the descriptor's slices).
+func copyInts(s @[]int) @[]int {
+	var out @[]int = make_slice(int, len(s))
+	for i := 0; i < len(s); i++ { out[i] = s[i] }
+	return out
+}
+
+// dropLast returns s without its last element (s must be non-empty).
+func dropLast(s @[]int) @[]int {
+	return s[0:len(s) - 1]
+}

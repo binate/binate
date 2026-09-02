@@ -1,0 +1,362 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// The register-allocator analysis substrate: a CFG linearization over a
+// phi-free @ir.Func plus the converged live-in/live-out sets that the
+// interval builder (regalloc_interval.bn) consumes.  The native backend
+// runs ir.EliminatePhis before emission, so the IR reaching here has no
+// OP_PHI — the phi copies are OP_COPY moves that all carry the phi's SSA
+// id (one id, several defs).  Nothing here changes emission; it is pure
+// analysis, built once and extended by the linear-scan assignment in a
+// later increment.
+//
+// A backward dataflow FIXPOINT computes liveness (not a single def-use
+// pass): a loop-carried value used before it is redefined in the latch is
+// live around the whole back-edge, and only the fixpoint captures that.
+// A first-def-to-last-use interval would free the register mid-loop and
+// the latch OP_COPY would clobber a value the header still reads.
+
+// LivenessInfo bundles the linearization and liveness of one function.
+// All sets are indexed by SSA id in [0, NextID); block-indexed arrays are
+// indexed by position in f.Blocks.
+type LivenessInfo struct {
+	// NextID is f.NextID at analysis time — the exclusive upper bound of
+	// every SSA id, and the length of the per-id arrays below.
+	NextID int
+	// NumBlocks is len(f.Blocks).
+	NumBlocks int
+	// WordBytes is the target pointer/int size (8 for aa64/x64, 4 for
+	// arm32).  It gates the allocatable universe (an int64 on a 32-bit
+	// target is a register pair, left spilled in this increment).
+	WordBytes int
+
+	// Reachable[b] reports whether block b is reachable from the entry
+	// (block 0).  Unreachable blocks are still emitted by the backend but
+	// their values are never register-allocated (they keep their spill
+	// slots), so this analysis skips them.
+	Reachable @[]bool
+	// RPO lists the reachable block indices in reverse-postorder (entry
+	// first).  Linear positions are assigned in this order, so a block's
+	// instructions occupy a contiguous [BlockFrom, BlockTo) span and RPO
+	// order matches increasing position.
+	RPO @[]int
+	// BlockFrom[b] / BlockTo[b] are the half-open linear-position span of
+	// block b's instructions ([from, from+len(Instrs))), or -1/-1 for an
+	// unreachable block.
+	BlockFrom @[]int
+	BlockTo   @[]int
+	// NumPos is the total number of linear positions assigned (the sum of
+	// reachable blocks' instruction counts); positions run [0, NumPos).
+	NumPos int
+
+	// Allocatable[id] reports whether SSA id is a register-allocatable
+	// scalar (see isAllocatableType): a non-void, non-aggregate, non-float
+	// value that is not an alloca and not a 32-bit-target int64.  Seeded
+	// from scalar params and from defs in reachable blocks.
+	Allocatable @[]bool
+
+	// LiveIn[b] / LiveOut[b] are the converged liveness of allocatable ids
+	// at block b's entry / exit, id-indexed bool sets.
+	LiveIn  @[]@[]bool
+	LiveOut @[]@[]bool
+}
+
+// isAllocatableType reports whether a scalar of type t can live in a GP
+// register across its lifetime under the register allocator.  Excludes
+// void, aggregates (structs/arrays/slices/iface/func values — they live
+// in memory), float scalars (a separate FP file, not modeled yet), and a
+// 64-bit scalar on a 32-bit target (a register pair, spilled for now).
+//
+// Precondition: wordBytes is the active types-target pointer/int size — the
+// same target t.SizeOf() reads.  The caller (a backend) sets both together;
+// if they disagreed, the wide-int test below (SizeOf > wordBytes) would
+// misfire on a plain pointer.
+func isAllocatableType(t @types.Type, wordBytes int) bool {
+	if t == nil { return false }
+	if t.Kind == types.TYP_VOID { return false }
+	if IsAggregateTyp(t) { return false }
+	if IsFloatScalarTyp(t) { return false }
+	if wordBytes == 4 && t.SizeOf() > wordBytes { return false }
+	return true
+}
+
+// isAllocatableDef reports whether instruction ins produces a
+// register-allocatable value.  An OP_ALLOC is excluded even though its
+// result is a scalar pointer: an alloca names a stack region whose address
+// is materialized on demand (add rd, sp, #off), never held as a value.
+func isAllocatableDef(ins @ir.Instr, wordBytes int) bool {
+	if ins.ID < 0 { return false }
+	if ins.Op == iropcode.OP_ALLOC { return false }
+	return isAllocatableType(ins.Typ, wordBytes)
+}
+
+// ComputeLiveness linearizes f and computes its live-in/live-out sets.
+// f must be phi-free (post ir.EliminatePhis).  Requires the types target
+// to be set (SizeOf is consulted); backends set it before emission.
+func ComputeLiveness(f @ir.Func, wordBytes int) @LivenessInfo {
+	var lv @LivenessInfo = make(LivenessInfo)
+	var n int = len(f.Blocks)
+	lv.NumBlocks = n
+	lv.NextID = f.NextID
+	lv.WordBytes = wordBytes
+	if n == 0 {
+		// A bodyless func (extern) still has parameters that bump NextID, so
+		// honor the documented per-id array invariant: Allocatable is length
+		// NextID (all false — no reachable defs).  The block-indexed arrays
+		// stay empty (NumBlocks == 0), which every consumer handles by
+		// iterating the empty RPO.
+		lv.Allocatable = make_slice(bool, lv.NextID)
+		return lv
+	}
+
+	var succs @[]@[]int = buildSuccs(f)
+	computeReachableRPO(lv, succs)
+	assignPositions(lv, f)
+	seedAllocatable(lv, f, wordBytes)
+	livenessFixpoint(lv, f, succs, wordBytes)
+	return lv
+}
+
+// buildSuccs reads each block's terminator to build its successor list
+// (block indices), mirroring the CFG contract in ir/dom.bn: OP_JUMP → one
+// target (Block1); OP_BRANCH → two (Block1/Block2, deduplicated); every
+// other terminator (OP_RETURN / OP_UNREACHABLE / OP_UNWIND_RETURN) → none.
+func buildSuccs(f @ir.Func) @[]@[]int {
+	var n int = len(f.Blocks)
+	var succs @[]@[]int
+	for i := 0; i < n; i++ {
+		var e @[]int
+		succs = slices.Append[@[]int](succs, e)
+	}
+	for i := 0; i < n; i++ {
+		var b @ir.Block = f.Blocks[i]
+		var ni int = len(b.Instrs)
+		if ni == 0 { continue }
+		var term @ir.Instr = b.Instrs[ni - 1]
+		if term.Op == iropcode.OP_JUMP {
+			var t int = blockIndexOf(f, term.Block1)
+			if t >= 0 { succs[i] = slices.Append[int](succs[i], t) }
+		} else if term.Op == iropcode.OP_BRANCH {
+			var t1 int = blockIndexOf(f, term.Block1)
+			var t2 int = blockIndexOf(f, term.Block2)
+			if t1 >= 0 { succs[i] = slices.Append[int](succs[i], t1) }
+			if t2 >= 0 && t2 != t1 { succs[i] = slices.Append[int](succs[i], t2) }
+		}
+	}
+	return succs
+}
+
+// blockIndexOf returns i with f.Blocks[i] == target by reference identity
+// (@Block is a managed pointer), or -1 if target is not a block of f.
+func blockIndexOf(f @ir.Func, target @ir.Block) int {
+	if target == nil { return -1 }
+	for i := 0; i < len(f.Blocks); i++ {
+		if f.Blocks[i] == target { return i }
+	}
+	return -1
+}
+
+// computeReachableRPO fills lv.Reachable and lv.RPO via an iterative DFS
+// from the entry (explicit stack, so a deep CFG cannot overflow), emitting
+// postorder and then reversing it.
+func computeReachableRPO(lv @LivenessInfo, succs @[]@[]int) {
+	var n int = lv.NumBlocks
+	var visited @[]bool = make_slice(bool, n)
+	var postorder @[]int
+	var stackNode @[]int
+	var stackIdx @[]int
+	visited[0] = true
+	stackNode = slices.Append[int](stackNode, 0)
+	stackIdx = slices.Append[int](stackIdx, 0)
+	for len(stackNode) > 0 {
+		var top int = len(stackNode) - 1
+		var node int = stackNode[top]
+		var ci int = stackIdx[top]
+		if ci < len(succs[node]) {
+			stackIdx[top] = ci + 1
+			var s int = succs[node][ci]
+			if !visited[s] {
+				visited[s] = true
+				stackNode = slices.Append[int](stackNode, s)
+				stackIdx = slices.Append[int](stackIdx, 0)
+			}
+		} else {
+			postorder = slices.Append[int](postorder, node)
+			stackNode = popIntTail(stackNode)
+			stackIdx = popIntTail(stackIdx)
+		}
+	}
+	lv.Reachable = visited
+	// Reverse postorder → entry-first RPO.
+	var rpo @[]int
+	for i := len(postorder) - 1; i >= 0; i-- {
+		rpo = slices.Append[int](rpo, postorder[i])
+	}
+	lv.RPO = rpo
+}
+
+// popIntTail drops the last element of s (s must be non-empty).  An O(1)
+// reslice of the shared backing; the DFS only ever grows the stack again via
+// slices.Append, which reallocates, so the shortened view never aliases a
+// later push.
+func popIntTail(s @[]int) @[]int {
+	return s[0:len(s) - 1]
+}
+
+// assignPositions walks RPO order and gives each reachable block a
+// contiguous linear span [BlockFrom, BlockTo).  Unreachable blocks get
+// -1/-1 and no positions.
+func assignPositions(lv @LivenessInfo, f @ir.Func) {
+	var n int = lv.NumBlocks
+	lv.BlockFrom = make_slice(int, n)
+	lv.BlockTo = make_slice(int, n)
+	for i := 0; i < n; i++ {
+		lv.BlockFrom[i] = -1
+		lv.BlockTo[i] = -1
+	}
+	var pos int = 0
+	for k := 0; k < len(lv.RPO); k++ {
+		var b int = lv.RPO[k]
+		lv.BlockFrom[b] = pos
+		pos = pos + len(f.Blocks[b].Instrs)
+		lv.BlockTo[b] = pos
+	}
+	lv.NumPos = pos
+}
+
+// seedAllocatable marks every register-allocatable scalar id: scalar
+// params (live-in from the ABI at entry) and scalar defs in reachable
+// blocks.  Values defined only in unreachable blocks are intentionally
+// left non-allocatable — the backend still emits those blocks, but their
+// values stay in their spill slots.
+func seedAllocatable(lv @LivenessInfo, f @ir.Func, wordBytes int) {
+	lv.Allocatable = make_slice(bool, lv.NextID)
+	for pi := 0; pi < len(f.Params); pi++ {
+		var p @ir.Param = f.Params[pi]
+		if p.ID >= 0 && p.ID < lv.NextID && isAllocatableType(p.Typ, wordBytes) {
+			lv.Allocatable[p.ID] = true
+		}
+	}
+	for k := 0; k < len(lv.RPO); k++ {
+		var b @ir.Block = f.Blocks[lv.RPO[k]]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			if isAllocatableDef(ins, wordBytes) && ins.ID < lv.NextID {
+				lv.Allocatable[ins.ID] = true
+			}
+		}
+	}
+}
+
+// livenessFixpoint computes LiveIn/LiveOut by iterating the backward
+// dataflow equations to convergence:
+//   LiveOut[b] = union over s in succ(b) of LiveIn[s]
+//   LiveIn[b]  = upwardUse[b] ∪ (LiveOut[b] − def[b])
+// where upwardUse[b] is the ids used in b before any def of them in b, and
+// def[b] the ids defined in b.  Only allocatable ids participate.  Blocks
+// are visited in postorder (successors before predecessors) so most
+// updates propagate in a single sweep; iteration repeats until stable.
+func livenessFixpoint(lv @LivenessInfo, f @ir.Func, succs @[]@[]int, wordBytes int) {
+	var n int = lv.NumBlocks
+	var nid int = lv.NextID
+	var def @[]@[]bool
+	var upwardUse @[]@[]bool
+	lv.LiveIn = make_empty_bool_sets(n, nid)
+	lv.LiveOut = make_empty_bool_sets(n, nid)
+	def = make_empty_bool_sets(n, nid)
+	upwardUse = make_empty_bool_sets(n, nid)
+
+	for k := 0; k < len(lv.RPO); k++ {
+		var b int = lv.RPO[k]
+		computeBlockDefUse(lv, f.Blocks[b], def[b], upwardUse[b], wordBytes)
+	}
+
+	var changed bool = true
+	for changed {
+		changed = false
+		// Postorder = RPO reversed: visit successors before predecessors.
+		for k := len(lv.RPO) - 1; k >= 0; k-- {
+			var b int = lv.RPO[k]
+			// LiveOut[b] = union of successors' LiveIn.
+			for si := 0; si < len(succs[b]); si++ {
+				var s int = succs[b][si]
+				if !lv.Reachable[s] { continue }
+				for id := 0; id < nid; id++ {
+					if lv.LiveIn[s][id] && !lv.LiveOut[b][id] {
+						lv.LiveOut[b][id] = true
+						changed = true
+					}
+				}
+			}
+			// LiveIn[b] = upwardUse[b] ∪ (LiveOut[b] − def[b]).
+			for id := 0; id < nid; id++ {
+				var live bool = upwardUse[b][id] || (lv.LiveOut[b][id] && !def[b][id])
+				if live && !lv.LiveIn[b][id] {
+					lv.LiveIn[b][id] = true
+					changed = true
+				}
+			}
+		}
+	}
+}
+
+// computeBlockDefUse fills def / upwardUse for one block with a forward
+// scan: an id used before it is (re)defined in the block is upward-exposed
+// (its value comes from a predecessor); an id defined anywhere in the block
+// is in def.  Only allocatable ids are recorded.
+func computeBlockDefUse(lv @LivenessInfo, b @ir.Block, def @[]bool, upwardUse @[]bool,
+		wordBytes int) {
+	var definedSoFar @[]bool = make_slice(bool, lv.NextID)
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var ins @ir.Instr = b.Instrs[ii]
+		if ins.Op == iropcode.OP_PHI {
+			// This analysis reads value operands only from ins.Args, but a phi
+			// carries its inputs in ins.Phis (live on the predecessor edges,
+			// not here).  ir.EliminatePhis must run before native emission, so
+			// a phi reaching here is a contract violation, not a shape to
+			// silently mishandle (which would drop the phi inputs' liveness).
+			panic(
+					"internal error: register-allocator liveness saw an OP_PHI; "
+							"ir.EliminatePhis must run before native emission")
+		}
+		for ai := 0; ai < len(ins.Args); ai++ {
+			var u int = useIdOf(lv, ins.Args[ai])
+			if u >= 0 && !definedSoFar[u] { upwardUse[u] = true }
+		}
+		var d int = defIdOf(lv, ins, wordBytes)
+		if d >= 0 {
+			definedSoFar[d] = true
+			def[d] = true
+		}
+	}
+}
+
+// defIdOf returns the allocatable id ins defines, or -1.
+func defIdOf(lv @LivenessInfo, ins @ir.Instr, wordBytes int) int {
+	if !isAllocatableDef(ins, wordBytes) { return -1 }
+	if ins.ID >= lv.NextID { return -1 }
+	if !lv.Allocatable[ins.ID] { return -1 }
+	return ins.ID
+}
+
+// useIdOf returns the allocatable id an operand references, or -1 (an
+// aggregate/alloca/float operand, or one out of range).
+func useIdOf(lv @LivenessInfo, arg @ir.Instr) int {
+	if arg == nil { return -1 }
+	if arg.ID < 0 || arg.ID >= lv.NextID { return -1 }
+	if !lv.Allocatable[arg.ID] { return -1 }
+	return arg.ID
+}
+
+// make_empty_bool_sets returns n freshly-zeroed id-indexed bool sets.
+func make_empty_bool_sets(n int, nid int) @[]@[]bool {
+	var sets @[]@[]bool
+	for i := 0; i < n; i++ {
+		sets = slices.Append[@[]bool](sets, make_slice(bool, nid))
+	}
+	return sets
+}

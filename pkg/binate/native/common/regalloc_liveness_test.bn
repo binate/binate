@@ -1,0 +1,209 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// oneInstr wraps v in a 1-element instruction slice (e.g. a single return
+// value) — the register-allocator tests' analogue of common_test's
+// makeNoInstrs.
+func oneInstr(v @ir.Instr) @[]@ir.Instr {
+	var r @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	r[0] = v
+	return r
+}
+
+// blockIndexByLabel returns the index of the first block whose base label
+// (the part before ir.AddBlock's ".<index>" uniquifier) equals base, or -1
+// — so tests locate a block by name without hard-coding indices, even after
+// ir.EliminatePhis inserts split blocks.
+func blockIndexByLabel(f @ir.Func, base *[]readonly char) int {
+	for i := 0; i < len(f.Blocks); i++ {
+		if labelHasBase(f.Blocks[i].Label, base) { return i }
+	}
+	return -1
+}
+
+// labelHasBase reports whether a block label is `base` followed by the
+// ".<index>" uniquifier AddBlock appends (e.g. "post.3" has base "post").
+func labelHasBase(lbl *[]readonly char, base *[]readonly char) bool {
+	if len(lbl) < len(base) + 1 { return false }
+	for k := 0; k < len(base); k++ {
+		if lbl[k] != base[k] { return false }
+	}
+	return lbl[len(base)] == '.'
+}
+
+// Tests for the register-allocator analysis substrate: the allocatable
+// universe, CFG linearization (+unreachable handling), and the backward
+// liveness fixpoint.
+
+// isAllocatableType admits GP scalars and excludes aggregates, floats, and
+// a 64-bit scalar on a 32-bit target.
+func TestAllocatableTypeAdmitsScalars() testing.TestResult {
+	setTarget64()
+	if !isAllocatableType(types.TypInt(), 8) { return "int is register-allocatable" }
+	if !isAllocatableType(types.TypBool(), 8) { return "bool is register-allocatable" }
+	if !isAllocatableType(types.TypInt64(), 8) { return "int64 fits a 64-bit register" }
+	return ""
+}
+
+func TestAllocatableTypeExcludesAggregatesAndFloats() testing.TestResult {
+	setTarget64()
+	if isAllocatableType(MakeManagedSliceTypeForTest(), 8) {
+		return "a managed-slice is an aggregate, not register-allocatable"
+	}
+	if isAllocatableType(types.TypFloat64(), 8) {
+		return "a float scalar lives in the FP file, not a GP register"
+	}
+	if isAllocatableType(nil, 8) { return "nil type is not allocatable" }
+	return ""
+}
+
+// int64 on a 32-bit target is a register pair — left spilled in this
+// increment, so not (yet) allocatable.
+func TestAllocatableTypeExcludesWideIntOn32() testing.TestResult {
+	setTarget32()
+	if isAllocatableType(types.TypInt64(), 4) {
+		return "int64 on a 32-bit target is a register pair, not allocatable yet"
+	}
+	if !isAllocatableType(types.TypInt(), 4) { return "a 32-bit int fits one register" }
+	setTarget64()
+	return ""
+}
+
+// Linearization gives each block a contiguous [From, To) position span and
+// counts total positions.
+func TestLivenessLinearPositions() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	var _ @ir.Instr = b.EmitConstInt(1, types.TypInt())
+	var _ @ir.Instr = b.EmitConstInt(2, types.TypInt())
+	b.EmitReturn(makeNoInstrs())
+
+	var lv @LivenessInfo = ComputeLiveness(f, 8)
+	if !lv.Reachable[0] { return "entry must be reachable" }
+	if lv.BlockFrom[0] != 0 { return "entry starts at position 0" }
+	if lv.BlockTo[0] != 3 { return "entry has 3 instructions -> [0,3)" }
+	if lv.NumPos != 3 { return "total positions should be 3" }
+	return ""
+}
+
+// A block with no edge into it is unreachable: not in RPO, no positions,
+// and the analysis does not seed its values.
+func TestLivenessUnreachableBlock() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var dead @ir.Block = ir.AddBlock(f, "dead")
+	var exit @ir.Block = ir.AddBlock(f, "exit")
+	entry.EmitJump(exit)
+	var deadV @ir.Instr = dead.EmitConstInt(7, types.TypInt())
+	dead.EmitJump(exit)
+	exit.EmitReturn(makeNoInstrs())
+
+	var lv @LivenessInfo = ComputeLiveness(f, 8)
+	if !lv.Reachable[0] { return "entry reachable" }
+	if !lv.Reachable[2] { return "exit reachable via entry's jump" }
+	if lv.Reachable[1] { return "dead block has no predecessor -> unreachable" }
+	if lv.BlockFrom[1] != -1 { return "unreachable block gets no linear position" }
+	if lv.Allocatable[deadV.ID] {
+		return "a value defined only in an unreachable block is not allocated"
+	}
+	return ""
+}
+
+// A value defined in one block and used in a successor is live-out of the
+// definer and live-in to the user (the core of the dataflow).
+func TestLivenessLiveAcrossBlocks() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var next @ir.Block = ir.AddBlock(f, "next")
+	var a @ir.Instr = entry.EmitConstInt(1, types.TypInt())
+	entry.EmitJump(next)
+	var bsum @ir.Instr = next.EmitBinop(iropcode.OP_ADD, a, a, types.TypInt())
+	next.EmitReturn(oneInstr(bsum))
+
+	var lv @LivenessInfo = ComputeLiveness(f, 8)
+	if !lv.Allocatable[a.ID] { return "a is an allocatable scalar" }
+	if !lv.LiveOut[0][a.ID] { return "a must be live-out of entry (used in next)" }
+	if !lv.LiveIn[1][a.ID] { return "a must be live-in to next" }
+	if lv.LiveOut[1][a.ID] { return "a is dead after its use in next" }
+	return ""
+}
+
+// The loop-carried case at the LIVENESS level: a loop-invariant value used
+// by the header guard every iteration must be live around the back-edge
+// (live-out of the latch, live-in to the header).  This is the whole reason
+// the analysis iterates to a fixpoint — in this CFG's postorder the latch is
+// visited before the header, so a single sweep leaves the latch's live-out
+// empty; only a second iteration propagates the header's live-in back across
+// the back-edge.  A single-pass regression fails this test.
+func TestLivenessFixpointLoopCarried() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "loop", makeNoParams(), makeNoResults())
+	var pre @ir.Block = ir.AddBlock(f, "pre")
+	var header @ir.Block = ir.AddBlock(f, "header")
+	var body @ir.Block = ir.AddBlock(f, "body")
+	var post @ir.Block = ir.AddBlock(f, "post")
+	var exit @ir.Block = ir.AddBlock(f, "exit")
+
+	var bound @ir.Instr = pre.EmitConstInt(10, types.TypInt())
+	var initV @ir.Instr = pre.EmitConstInt(0, types.TypInt())
+	pre.EmitJump(header)
+	var phi @ir.Instr = header.EmitPhi(types.TypInt(), twoPE(pre, initV, pre, initV))
+	var cond @ir.Instr = header.EmitBinop(iropcode.OP_LT, phi, bound, types.TypBool())
+	header.EmitBranch(cond, body, exit)
+	body.EmitJump(post)
+	var one @ir.Instr = post.EmitConstInt(1, types.TypInt())
+	var step @ir.Instr = post.EmitBinop(iropcode.OP_ADD, phi, one, types.TypInt())
+	post.EmitJump(header)
+	phi.Phis = twoPE(pre, initV, post, step)
+	exit.EmitReturn(makeNoInstrs())
+
+	var boundID int = bound.ID
+	var phiID int = phi.ID
+	ir.EliminatePhis(f)
+	var lv @LivenessInfo = ComputeLiveness(f, 8)
+
+	var headerIdx int = blockIndexByLabel(f, "header")
+	var postIdx int = blockIndexByLabel(f, "post")
+	if headerIdx < 0 || postIdx < 0 { return "header and post blocks must survive" }
+	if !lv.LiveIn[headerIdx][boundID] { return "the bound is used by the header guard -> live-in" }
+	if !lv.LiveOut[postIdx][boundID] {
+		return "the bound must be live-out of the latch (fixpoint around the back-edge)"
+	}
+	if !lv.LiveOut[postIdx][phiID] {
+		return "the induction id must be live-out of the latch (re-entered via the header)"
+	}
+	return ""
+}
+
+// upwardUse must be used-BEFORE-defined: a value defined then used within the
+// same block is NOT upward-exposed, so it is neither live-in to that block
+// nor live-out of its predecessor.  Dropping that guard would wrongly mark it
+// live across the predecessor edge.
+func TestLivenessUpwardUseGuard() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var next @ir.Block = ir.AddBlock(f, "next")
+	var t @ir.Instr = entry.EmitConstInt(5, types.TypInt())
+	entry.EmitJump(next)
+	var u @ir.Instr = next.EmitBinop(iropcode.OP_ADD, t, t, types.TypInt())
+	var w @ir.Instr = next.EmitBinop(iropcode.OP_ADD, u, u, types.TypInt())
+	next.EmitReturn(oneInstr(w))
+
+	var lv @LivenessInfo = ComputeLiveness(f, 8)
+	// t is used in next before being (it isn't) redefined -> live-in to next,
+	// live-out of entry.
+	if !lv.LiveIn[1][t.ID] { return "t is used in next -> live-in" }
+	if !lv.LiveOut[0][t.ID] { return "t is live-out of entry (used in next)" }
+	// u is defined then used inside next -> NOT upward-exposed.
+	if lv.LiveIn[1][u.ID] { return "u is defined before use in next -> not live-in" }
+	if lv.LiveOut[0][u.ID] { return "u must not be live across the entry->next edge" }
+	return ""
+}

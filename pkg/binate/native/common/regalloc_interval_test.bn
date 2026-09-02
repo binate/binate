@@ -1,0 +1,270 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+import "pkg/stdx/slices"
+
+// twoPE builds a 2-entry phi operand list.
+func twoPE(b1 @ir.Block, v1 @ir.Instr, b2 @ir.Block, v2 @ir.Instr) @[]ir.PhiEntry {
+	var p1 ir.PhiEntry
+	p1.Block = b1
+	p1.Val = v1
+	var p2 ir.PhiEntry
+	p2.Block = b2
+	p2.Val = v2
+	var es @[]ir.PhiEntry = make_slice(ir.PhiEntry, 2)
+	es[0] = p1
+	es[1] = p2
+	return es
+}
+
+// Start / End report an interval's first-range start and last-range end.
+func TestIntervalStartEnd() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	var a @ir.Instr = b.EmitConstInt(1, types.TypInt())
+	var s @ir.Instr = b.EmitBinop(iropcode.OP_ADD, a, a, types.TypInt())
+	b.EmitReturn(oneInstr(s))
+
+	var lv @LivenessInfo = ComputeLiveness(f, 8)
+	var ivs @[]@LiveInterval = BuildIntervals(f, lv)
+	var ai int = IntervalIndexForID(ivs, a.ID)
+	if ai < 0 { return "a must have an interval" }
+	// a is defined at position 0 and last used by the ADD at position 1.
+	if ivs[ai].Start() != 0 { return "a's interval starts at its definition (position 0)" }
+	if ivs[ai].End() != 2 { return "a's interval ends just past its use at position 1" }
+	return ""
+}
+
+// A straight-line chain with four values still needed when a fifth is
+// produced forces five simultaneously-live intervals — the register
+// pressure a real allocator must spill against.  The interval model must
+// report that overlap.
+func TestIntervalStraightLinePressure() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	var a @ir.Instr = b.EmitConstInt(1, types.TypInt())
+	var bb @ir.Instr = b.EmitConstInt(2, types.TypInt())
+	var c @ir.Instr = b.EmitConstInt(3, types.TypInt())
+	var d @ir.Instr = b.EmitConstInt(4, types.TypInt())
+	var s1 @ir.Instr = b.EmitBinop(iropcode.OP_ADD, a, bb, types.TypInt())
+	var s2 @ir.Instr = b.EmitBinop(iropcode.OP_ADD, s1, c, types.TypInt())
+	var s3 @ir.Instr = b.EmitBinop(iropcode.OP_ADD, s2, d, types.TypInt())
+	b.EmitReturn(oneInstr(s3))
+
+	var lv @LivenessInfo = ComputeLiveness(f, 8)
+	var ivs @[]@LiveInterval = BuildIntervals(f, lv)
+
+	var maxLive int = 0
+	for p := 0; p < lv.NumPos; p++ {
+		var c2 int = LiveCountAt(ivs, p)
+		if c2 > maxLive { maxLive = c2 }
+	}
+	if maxLive != 5 {
+		return "peak pressure of this chain should be exactly 5 simultaneously-live values"
+	}
+	var probs @[]@[]char = ValidateIntervals(f, lv, ivs)
+	if len(probs) != 0 { return "straight-line intervals should validate clean" }
+	return ""
+}
+
+// A counted loop `for i:=0; i<n; i++`: after ir.EliminatePhis the induction
+// id `i` is written by an OP_COPY in the pre-header and another in the latch
+// (one SSA id, two defs), and the bound `n` is loop-invariant (defined in
+// the pre-header, read by the header guard every iteration).  Both must be
+// live ACROSS the latch — a first-def-to-last-use interval would free their
+// registers mid-loop and the back-edge would read clobbered values.  Only
+// the liveness fixpoint captures this.
+func TestIntervalLoopCarriedLiveness() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "loop", makeNoParams(), makeNoResults())
+	var pre @ir.Block = ir.AddBlock(f, "pre")
+	var header @ir.Block = ir.AddBlock(f, "header")
+	var body @ir.Block = ir.AddBlock(f, "body")
+	var post @ir.Block = ir.AddBlock(f, "post")
+	var exit @ir.Block = ir.AddBlock(f, "exit")
+
+	var bound @ir.Instr = pre.EmitConstInt(10, types.TypInt())
+	var initV @ir.Instr = pre.EmitConstInt(0, types.TypInt())
+	pre.EmitJump(header)
+
+	var phi @ir.Instr = header.EmitPhi(types.TypInt(), twoPE(pre, initV, pre, initV))
+	var cond @ir.Instr = header.EmitBinop(iropcode.OP_LT, phi, bound, types.TypBool())
+	header.EmitBranch(cond, body, exit)
+
+	body.EmitJump(post)
+
+	var one @ir.Instr = post.EmitConstInt(1, types.TypInt())
+	var step @ir.Instr = post.EmitBinop(iropcode.OP_ADD, phi, one, types.TypInt())
+	post.EmitJump(header)
+	phi.Phis = twoPE(pre, initV, post, step)
+
+	exit.EmitReturn(makeNoInstrs())
+
+	var phiID int = phi.ID
+	var boundID int = bound.ID
+	ir.EliminatePhis(f)
+
+	var lv @LivenessInfo = ComputeLiveness(f, 8)
+	var ivs @[]@LiveInterval = BuildIntervals(f, lv)
+
+	var postIdx int = blockIndexByLabel(f, "post")
+	if postIdx < 0 { return "the latch block 'post' should survive phi elimination" }
+	var probe int = lv.BlockTo[postIdx] - 1 // the latch terminator, after the copy
+
+	// The header's terminator (branch) position: a naive first-def-to-last-use
+	// interval that ended at the header's *use* of the induction id would drop
+	// coverage exactly here — the position the register frees mid-loop.
+	var headerIdx int = blockIndexByLabel(f, "header")
+	if headerIdx < 0 { return "the header block should survive phi elimination" }
+	var headerExit int = lv.BlockTo[headerIdx] - 1
+
+	var pi int = IntervalIndexForID(ivs, phiID)
+	if pi < 0 { return "the induction id must have an interval" }
+	if !ivs[pi].Covers(probe) {
+		return "the induction id must be live across the latch (loop-carried)"
+	}
+	if !ivs[pi].Covers(headerExit) {
+		return "the induction id must be live across the whole loop body (past the header branch)"
+	}
+	var bi int = IntervalIndexForID(ivs, boundID)
+	if bi < 0 { return "the loop-invariant bound must have an interval" }
+	if !ivs[bi].Covers(probe) {
+		return "the loop-invariant bound must be live across the latch (fixpoint, not def-use)"
+	}
+	if !ivs[bi].Covers(headerExit) {
+		return "the loop-invariant bound must be live past the header branch every iteration"
+	}
+
+	// The strengthened validator is liveness-driven, so this also proves no
+	// pass-through position is left uncovered.
+	var probs @[]@[]char = ValidateIntervals(f, lv, ivs)
+	if len(probs) != 0 { return "loop intervals should validate clean" }
+	return ""
+}
+
+// The induction id has a genuine dead HOLE inside one block: the increment
+// is computed in the body (`iNext = i + 1`, the last read of the old i),
+// then a phi-independent instruction runs while i is dead, then the
+// phi-elimination copy redefines i live-out to the header.  The range-list
+// must express that as two ranges with a gap AT the dead instruction —
+// independent of block linearization (unlike a hole that is merely an
+// artifact of where the exit block lands in RPO).
+func TestIntervalLoopCarriedHasHole() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "loop", makeNoParams(), makeNoResults())
+	var pre @ir.Block = ir.AddBlock(f, "pre")
+	var header @ir.Block = ir.AddBlock(f, "header")
+	var body @ir.Block = ir.AddBlock(f, "body")
+	var exit @ir.Block = ir.AddBlock(f, "exit")
+
+	var bound @ir.Instr = pre.EmitConstInt(10, types.TypInt())
+	var initV @ir.Instr = pre.EmitConstInt(0, types.TypInt())
+	pre.EmitJump(header)
+	var phi @ir.Instr = header.EmitPhi(types.TypInt(), twoPE(pre, initV, pre, initV))
+	var cond @ir.Instr = header.EmitBinop(iropcode.OP_LT, phi, bound, types.TypBool())
+	header.EmitBranch(cond, body, exit)
+	// Increment in the body (last read of i), then a phi-independent
+	// instruction; ir.EliminatePhis inserts `copy i<-iNext` at the body's
+	// end (before the jump), so i is dead across the filler.
+	var one @ir.Instr = body.EmitConstInt(1, types.TypInt())
+	var iNext @ir.Instr = body.EmitBinop(iropcode.OP_ADD, phi, one, types.TypInt())
+	var filler @ir.Instr = body.EmitBinop(iropcode.OP_ADD, bound, bound, types.TypInt())
+	body.EmitJump(header)
+	phi.Phis = twoPE(pre, initV, body, iNext)
+	exit.EmitReturn(oneInstr(filler))
+
+	var phiID int = phi.ID
+	ir.EliminatePhis(f)
+	var lv @LivenessInfo = ComputeLiveness(f, 8)
+	var ivs @[]@LiveInterval = BuildIntervals(f, lv)
+
+	var pi int = IntervalIndexForID(ivs, phiID)
+	if pi < 0 { return "the induction id must have an interval" }
+	if len(ivs[pi].Ranges) < 2 {
+		return "the induction id's lifetime has a dead hole -> at least two ranges"
+	}
+	// The gap must land inside the body block (a real dead-instruction hole),
+	// not be an artifact of exit-block placement in the linear order.
+	var bodyIdx int = blockIndexByLabel(f, "body")
+	var bodyFrom int = lv.BlockFrom[bodyIdx]
+	var bodyTo int = lv.BlockTo[bodyIdx]
+	var sawBodyGap bool = false
+	for r := 1; r < len(ivs[pi].Ranges); r++ {
+		var gapStart int = ivs[pi].Ranges[r - 1].End
+		var gapEnd int = ivs[pi].Ranges[r].Start
+		if gapEnd > gapStart && gapStart >= bodyFrom && gapEnd <= bodyTo {
+			sawBodyGap = true
+		}
+	}
+	if !sawBodyGap { return "the induction id must have a dead-hole gap inside the body block" }
+
+	var probs @[]@[]char = ValidateIntervals(f, lv, ivs)
+	if len(probs) != 0 { return "intervals with a hole should still validate clean" }
+	return ""
+}
+
+// clampRangesEnd keeps only the parts of ranges strictly before `cut`,
+// dropping all coverage at positions >= cut — a deliberate corruption for the
+// validator test below.
+func clampRangesEnd(ranges @[]LiveRange, cut int) @[]LiveRange {
+	var out @[]LiveRange
+	for r := 0; r < len(ranges); r++ {
+		var rg LiveRange = ranges[r]
+		if rg.Start >= cut { continue }
+		if rg.End > cut { rg.End = cut }
+		out = slices.Append[LiveRange](out, rg)
+	}
+	return out
+}
+
+// The strengthened validator must CATCH a dropped live range at a
+// pass-through position — the exact clobber a naive interval would cause.
+// The loop-invariant bound is live across the whole loop but has NO def/use
+// in the body, so truncating its interval before the body is invisible to
+// the def/use coverage checks; only the liveness-boundary check flags it.
+func TestValidatorCatchesLivenessHole() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "loop", makeNoParams(), makeNoResults())
+	var pre @ir.Block = ir.AddBlock(f, "pre")
+	var header @ir.Block = ir.AddBlock(f, "header")
+	var body @ir.Block = ir.AddBlock(f, "body")
+	var post @ir.Block = ir.AddBlock(f, "post")
+	var exit @ir.Block = ir.AddBlock(f, "exit")
+
+	var bound @ir.Instr = pre.EmitConstInt(10, types.TypInt())
+	var initV @ir.Instr = pre.EmitConstInt(0, types.TypInt())
+	pre.EmitJump(header)
+	var phi @ir.Instr = header.EmitPhi(types.TypInt(), twoPE(pre, initV, pre, initV))
+	var cond @ir.Instr = header.EmitBinop(iropcode.OP_LT, phi, bound, types.TypBool())
+	header.EmitBranch(cond, body, exit)
+	body.EmitJump(post)
+	var one @ir.Instr = post.EmitConstInt(1, types.TypInt())
+	var step @ir.Instr = post.EmitBinop(iropcode.OP_ADD, phi, one, types.TypInt())
+	post.EmitJump(header)
+	phi.Phis = twoPE(pre, initV, post, step)
+	exit.EmitReturn(makeNoInstrs())
+
+	var boundID int = bound.ID
+	ir.EliminatePhis(f)
+	var lv @LivenessInfo = ComputeLiveness(f, 8)
+	var ivs @[]@LiveInterval = BuildIntervals(f, lv)
+
+	if len(ValidateIntervals(f, lv, ivs)) != 0 { return "the baseline loop should validate clean" }
+
+	// Drop the bound's coverage from the body onward — a pass-through region
+	// where it has no def/use, so the def/use checks cannot notice.
+	var bi int = IntervalIndexForID(ivs, boundID)
+	if bi < 0 { return "the bound must have an interval" }
+	var bodyIdx int = blockIndexByLabel(f, "body")
+	ivs[bi].Ranges = clampRangesEnd(ivs[bi].Ranges, lv.BlockFrom[bodyIdx])
+
+	if len(ValidateIntervals(f, lv, ivs)) == 0 {
+		return "the validator must flag a value uncovered where liveness says it is live"
+	}
+	return ""
+}

@@ -1,0 +1,293 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/stdx/slices"
+
+// Live intervals for the register allocator, built from the liveness
+// fixpoint (regalloc_liveness.bn).  Each interval is a SORTED LIST of live
+// ranges (LLVM LiveInterval / Wimmer style), not a single [start,end): a
+// value can be live in disjoint stretches with dead holes between them —
+// e.g. a loop-carried OP_COPY id is live into the latch up to the point
+// the old value is consumed, dead until the copy redefines it, then live
+// again across the back-edge.  One SSA id → one interval → (in a later
+// increment) one register spanning all its ranges; the holes are where the
+// register is free for something else.  The range-list is the durable
+// representation interval splitting later refines.
+
+// LiveRange is a half-open span [Start, End) of linear positions in which a
+// value is live.  Positions are the ones ComputeLiveness assigns
+// (BlockFrom[b] + instruction index).
+type LiveRange struct {
+	Start int
+	End   int
+}
+
+// LiveInterval is one allocatable SSA value's lifetime: its id plus the
+// sorted, non-overlapping list of ranges it is live in.  A later increment
+// adds an assigned register / spill decision here.
+type LiveInterval struct {
+	ID     int
+	Ranges @[]LiveRange
+}
+
+// Covers reports whether pos falls in any of the interval's ranges.
+func (iv @LiveInterval) Covers(pos int) bool {
+	for i := 0; i < len(iv.Ranges); i++ {
+		if pos >= iv.Ranges[i].Start && pos < iv.Ranges[i].End { return true }
+	}
+	return false
+}
+
+// Start returns the interval's first range start, or -1 if it has no
+// ranges (a value that is never live).
+func (iv @LiveInterval) Start() int {
+	if len(iv.Ranges) == 0 { return -1 }
+	return iv.Ranges[0].Start
+}
+
+// End returns the interval's last range end, or -1 if it has no ranges.
+func (iv @LiveInterval) End() int {
+	if len(iv.Ranges) == 0 { return -1 }
+	return iv.Ranges[len(iv.Ranges) - 1].End
+}
+
+// BuildIntervals constructs one LiveInterval per allocatable id that is
+// live somewhere, from the converged liveness in lv.  f must be the same
+// phi-free function lv was computed from.  The result is sorted by first
+// range start (the order a linear scan consumes).
+func BuildIntervals(f @ir.Func, lv @LivenessInfo) @[]@LiveInterval {
+	var wordBytes int = lv.WordBytes
+	// Raw (unsorted, possibly overlapping/adjacent) ranges per id.
+	var rawByID @[]@[]LiveRange
+	for id := 0; id < lv.NextID; id++ {
+		var e @[]LiveRange
+		rawByID = slices.Append[@[]LiveRange](rawByID, e)
+	}
+
+	for k := 0; k < len(lv.RPO); k++ {
+		var b int = lv.RPO[k]
+		collectBlockRanges(lv, f.Blocks[b], b, rawByID, wordBytes)
+	}
+
+	// Coalesce each id's raw ranges into a sorted, non-overlapping list.
+	var out @[]@LiveInterval
+	for id := 0; id < lv.NextID; id++ {
+		if len(rawByID[id]) == 0 { continue }
+		var iv @LiveInterval = make(LiveInterval)
+		iv.ID = id
+		iv.Ranges = coalesceRanges(rawByID[id])
+		out = slices.Append[@LiveInterval](out, iv)
+	}
+	sortIntervalsByStart(out)
+	return out
+}
+
+// collectBlockRanges walks block b backward, emitting this block's live
+// ranges for every allocatable id into rawByID.  A value live at block exit
+// starts (in this block) at its def, or at block entry if defined earlier;
+// a value used but not live-out is live from block entry to just past its
+// last use; a value defined and never used gets a one-position home.
+func collectBlockRanges(lv @LivenessInfo, blk @ir.Block, b int, rawByID @[]@[]LiveRange,
+		wordBytes int) {
+	var from int = lv.BlockFrom[b]
+	var to int = lv.BlockTo[b]
+	// liveEnd[id]: exclusive end up to which id is currently known live in
+	// this block, or 0 for "not live" (a real end is always >= 1).
+	var liveEnd @[]int = make_slice(int, lv.NextID)
+	for id := 0; id < lv.NextID; id++ {
+		if lv.LiveOut[b][id] { liveEnd[id] = to }
+	}
+	for j := len(blk.Instrs) - 1; j >= 0; j-- {
+		var ins @ir.Instr = blk.Instrs[j]
+		var pos int = from + j
+		var d int = defIdOf(lv, ins, wordBytes)
+		if d >= 0 {
+			if liveEnd[d] != 0 {
+				emitRawRange(rawByID, d, pos, liveEnd[d])
+				liveEnd[d] = 0
+			} else {
+				// Dead def: no live-out, no later use — a minimal home so
+				// the value still owns a range.
+				emitRawRange(rawByID, d, pos, pos + 1)
+			}
+		}
+		for ai := 0; ai < len(ins.Args); ai++ {
+			var u int = useIdOf(lv, ins.Args[ai])
+			if u >= 0 && liveEnd[u] == 0 {
+				liveEnd[u] = pos + 1
+			}
+		}
+	}
+	// Ids still live after the backward scan are live-in (used, not defined
+	// in this block, or live-through): live from block entry to liveEnd.
+	for id := 0; id < lv.NextID; id++ {
+		if liveEnd[id] != 0 {
+			emitRawRange(rawByID, id, from, liveEnd[id])
+		}
+	}
+}
+
+// emitRawRange appends [start, end) to id's raw range list (skipping empty
+// ranges).
+func emitRawRange(rawByID @[]@[]LiveRange, id int, start int, end int) {
+	if end <= start { return }
+	var r LiveRange
+	r.Start = start
+	r.End = end
+	rawByID[id] = slices.Append[LiveRange](rawByID[id], r)
+}
+
+// coalesceRanges sorts raw ranges by start and merges overlapping or
+// adjacent ones (next.Start <= cur.End), yielding a sorted, non-overlapping
+// list.  Adjacent merge is intended: contiguous blocks produce [a,b) and
+// [b,c) for a value live across the block boundary, which is one continuous
+// range [a,c); a genuine dead hole leaves a gap (next.Start > cur.End) and
+// is preserved.
+func coalesceRanges(raw @[]LiveRange) @[]LiveRange {
+	var sorted @[]LiveRange = sortRangesByStart(raw)
+	var out @[]LiveRange
+	if len(sorted) == 0 { return out }
+	var cur LiveRange = sorted[0]
+	for i := 1; i < len(sorted); i++ {
+		var nxt LiveRange = sorted[i]
+		if nxt.Start <= cur.End {
+			if nxt.End > cur.End { cur.End = nxt.End }
+		} else {
+			out = slices.Append[LiveRange](out, cur)
+			cur = nxt
+		}
+	}
+	out = slices.Append[LiveRange](out, cur)
+	return out
+}
+
+// sortRangesByStart returns raw sorted ascending by Start (insertion sort;
+// per-value range counts are small).
+func sortRangesByStart(raw @[]LiveRange) @[]LiveRange {
+	var s @[]LiveRange = make_slice(LiveRange, len(raw))
+	for i := 0; i < len(raw); i++ { s[i] = raw[i] }
+	for i := 1; i < len(s); i++ {
+		var key LiveRange = s[i]
+		var j int = i - 1
+		for j >= 0 && s[j].Start > key.Start {
+			s[j + 1] = s[j]
+			j = j - 1
+		}
+		s[j + 1] = key
+	}
+	return s
+}
+
+// sortIntervalsByStart sorts ivs ascending by first-range start (insertion
+// sort), the order a linear scan processes intervals.
+func sortIntervalsByStart(ivs @[]@LiveInterval) {
+	for i := 1; i < len(ivs); i++ {
+		var key @LiveInterval = ivs[i]
+		var j int = i - 1
+		for j >= 0 && ivs[j].Start() > key.Start() {
+			ivs[j + 1] = ivs[j]
+			j = j - 1
+		}
+		ivs[j + 1] = key
+	}
+}
+
+// IntervalIndexForID returns the index in ivs of the interval for id, or -1.
+func IntervalIndexForID(ivs @[]@LiveInterval, id int) int {
+	for i := 0; i < len(ivs); i++ {
+		if ivs[i].ID == id { return i }
+	}
+	return -1
+}
+
+// LiveCountAt returns how many intervals cover position pos — the register
+// pressure at pos (the number of values simultaneously live there).
+func LiveCountAt(ivs @[]@LiveInterval, pos int) int {
+	var c int = 0
+	for i := 0; i < len(ivs); i++ {
+		if ivs[i].Covers(pos) { c = c + 1 }
+	}
+	return c
+}
+
+// ValidateIntervals checks the intervals against f and the liveness in three
+// ways: (1) each interval is well-formed (ranges sorted, non-overlapping,
+// non-empty); (2) every allocatable def/use point is covered; and, crucially,
+// (3) each interval covers everywhere the LIVENESS says the value is live —
+// including the pass-through positions with no direct def/use, which is the
+// invariant a linear scan actually depends on.  Check (3) is driven from
+// lv.LiveIn/LiveOut, INDEPENDENTLY of the def/use extraction the builder uses,
+// so a dropped live range shows up here even where the builder and its
+// extractor share a blind spot.  Returns human-readable problems; empty means
+// valid.  Intended for tests and a debug-time self-check, not the hot emit path.
+func ValidateIntervals(f @ir.Func, lv @LivenessInfo, ivs @[]@LiveInterval) @[]@[]char {
+	var problems @[]@[]char
+	// Well-formedness: ranges sorted, non-overlapping, non-empty.
+	for i := 0; i < len(ivs); i++ {
+		var iv @LiveInterval = ivs[i]
+		var prev int = -1
+		for r := 0; r < len(iv.Ranges); r++ {
+			var rg LiveRange = iv.Ranges[r]
+			if rg.End <= rg.Start {
+				problems = slices.Append[@[]char](problems, "interval has an empty or inverted range")
+			}
+			if rg.Start < prev {
+				problems = slices.Append[@[]char](problems, "interval ranges out of order or overlapping")
+			}
+			prev = rg.End
+		}
+	}
+	// Coverage of def/use points: every allocatable def and use in a
+	// reachable block must be covered by its value's interval at that position.
+	for k := 0; k < len(lv.RPO); k++ {
+		var b int = lv.RPO[k]
+		var blk @ir.Block = f.Blocks[b]
+		var from int = lv.BlockFrom[b]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var ins @ir.Instr = blk.Instrs[j]
+			var pos int = from + j
+			var d int = defIdOf(lv, ins, lv.WordBytes)
+			if d >= 0 && !coveredByID(ivs, d, pos) {
+				problems = slices.Append[@[]char](problems,
+						"a value's definition is not covered by its interval")
+			}
+			for ai := 0; ai < len(ins.Args); ai++ {
+				var u int = useIdOf(lv, ins.Args[ai])
+				if u >= 0 && !coveredByID(ivs, u, pos) {
+					problems = slices.Append[@[]char](problems, "a value's use is not covered by its interval")
+				}
+			}
+		}
+	}
+	// Liveness-boundary coverage (the independent check): a value live on entry
+	// to a block must be covered at that block's first position, and a value
+	// live on exit must be covered at its last (terminator) position.  A
+	// linear-scan hole at a pass-through position — the failure mode that
+	// clobbers a loop-carried value — is invisible to the def/use checks above
+	// but caught here, since a value merely passing through a block is live-in
+	// and/or live-out with no def/use of its own inside it.
+	for k := 0; k < len(lv.RPO); k++ {
+		var b int = lv.RPO[k]
+		var from int = lv.BlockFrom[b]
+		var to int = lv.BlockTo[b]
+		if to <= from { continue } // empty block: no positions to check
+		for id := 0; id < lv.NextID; id++ {
+			if lv.LiveIn[b][id] && !coveredByID(ivs, id, from) {
+				problems = slices.Append[@[]char](problems,
+						"a value live on block entry is not covered by its interval")
+			}
+			if lv.LiveOut[b][id] && !coveredByID(ivs, id, to - 1) {
+				problems = slices.Append[@[]char](problems,
+						"a value live on block exit is not covered by its interval")
+			}
+		}
+	}
+	return problems
+}
+
+// coveredByID reports whether the interval for id exists and covers pos.
+func coveredByID(ivs @[]@LiveInterval, id int, pos int) bool {
+	var idx int = IntervalIndexForID(ivs, id)
+	if idx < 0 { return false }
+	return ivs[idx].Covers(pos)
+}

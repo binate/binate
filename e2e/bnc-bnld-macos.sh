@@ -99,7 +99,9 @@ build_run() {
 
 # native: no clang at all.  llvm (default backend): clang COMPILES the object (bnld drops
 # its __compact_unwind), but bnld — not ld — LINKs it.
-build_run "--backend native" native
-build_run "" llvm
+# Use the explicit `--target aarch64-darwin` key (on this Apple-Silicon host it matches the
+# implicit host target, and it is the same key that cross-builds a macOS Mach-O from Linux).
+build_run "--backend native --target aarch64-darwin" native
+build_run "--target aarch64-darwin" llvm
 
 echo "ALL PASS: bnc --linker bnld on macOS, native + LLVM backends (self-hosted final link, no ld)"

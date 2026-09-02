@@ -106,7 +106,7 @@ build_gen1() {
     # new BUILDER with weak_odr thunks removes the need.
     gen1_dupthunk_flag=""
     [ "$(uname -s)" = Linux ] && gen1_dupthunk_flag="--cflag -Wl,--allow-multiple-definition"
-    build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --cflag -O2 $gen1_dupthunk_flag --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR" --prepend "$BINATE_DIR/ifaces/toolchain")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --cflag -O2 $gen1_dupthunk_flag --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"

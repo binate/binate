@@ -147,6 +147,11 @@ build_list() {   # $1 = iface | impl
         if [ "$1" = iface ]; then
             printf '%s\n' "$BASE/ifaces/core"
             printf '%s\n' "$BASE/ifaces/stdlib"
+            # Toolchain-package interfaces shipped for driver authors (e.g.
+            # pkg/binate/link, whose impl is injected by bnld, not compiled from
+            # the bundle).  Absent in a BUILDER lib and older bundles; the loader
+            # skips a nonexistent -I dir, so listing it unconditionally is safe.
+            printf '%s\n' "$BASE/ifaces/toolchain"
         else
             printf '%s\n' "$BASE/impls/core/common"
             printf '%s\n' "$BASE/impls/core/libc"

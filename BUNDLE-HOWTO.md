@@ -22,6 +22,7 @@ bin/
 lib/
   ifaces/core/      .bni for the builtins (pkg/builtins/*)
   ifaces/stdlib/    .bni for the stdlib    (pkg/std/*: strconv, errors, math/…)
+  ifaces/toolchain/ .bni for shipped toolchain packages (pkg/binate/link — for bnld drivers)
   impls/core/       core impls: common, libc
   impls/stdlib/     stdlib implementations: common, libc
   runtime/          baremetal_arm32/ (bare-metal target startup + linker script)
@@ -49,7 +50,7 @@ bundle.) It expands to the standard set — paths are colon-separated and
 repeatable (cc-style), and the first `-I` entry doubles as the "source root":
 
 ```
--I  $LIB:$LIB/ifaces/core:$LIB/ifaces/stdlib
+-I  $LIB:$LIB/ifaces/core:$LIB/ifaces/stdlib:$LIB/ifaces/toolchain
 -L  $LIB:$LIB/impls/core/common:$LIB/impls/core/libc:$LIB/impls/stdlib
 ```
 
@@ -63,6 +64,9 @@ What each entry covers:
 - `ifaces/core` + `impls/core/*` — the builtins (`pkg/builtins/*`).
 - `ifaces/stdlib` + `impls/stdlib` — the bundled stdlib
   (`pkg/std/strconv`, `pkg/std/errors`, …).
+- `ifaces/toolchain` — interfaces of tier-2 toolchain packages shipped for
+  driver authors (currently `pkg/binate/link`, whose compiled impl bnld injects
+  into an interpreted driver — no impl ships).  No matching `impls/` entry.
 - `$LIB` (the bare root) — resolves nothing in a bundle (it's there for the
   source tree, where `pkg/binate/*` lives at the root); harmless to keep.
 

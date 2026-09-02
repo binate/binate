@@ -34,6 +34,25 @@ import "pkg/binate/types"
 func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[]ir.StringConst) {
 	var sym @[]char = symFor(pkgName, f.Name)
 	var rm @common.RegMap = common.NewRegMap(common.SysV_AMD64())
+	// Register allocation (before PlanFrame, which reserves the callee-saved
+	// save area): home scalar SSA values in the callee-saved pool RBX/R12..R15
+	// — disjoint from the R10..RDI scratch pool, so the existing operand-reload
+	// / op-internal-scratch path is untouched, and callee-saved so a homed
+	// value survives calls.  A leaf / all-spilled function homes nothing and
+	// keeps the pure spill-everything path.  f is phi-free here
+	// (common.EmitObject runs ir.EliminatePhis before EmitFunc), so the
+	// liveness pass is valid.  CallerSaved is deliberately EMPTY: with no
+	// caller-saved pool, LinearScan draws every home register from CalleeSaved,
+	// so every homed value is callee-saved — it survives calls with no
+	// clobber-spill AND is recorded in rm.SavedRegs (so the prologue/epilogue
+	// save/restore it).  That is what makes the clobber machinery
+	// (spansClobber / ClobberPositions) inert here.  Populating CallerSaved
+	// would activate that path: a call-spanning value could then take an
+	// unsaved caller-saved home and be clobbered across the call, so that step
+	// must come with the clobber-spill handling (a later stage), not on its own.
+	var rdesc common.RegClassDesc
+	rdesc.CalleeSaved = x64AllocatablePool()
+	rm.AllocateRegisters(f, 8, rdesc)
 	var frameSize int = rm.PlanFrame(f)
 	// #[c_export("name")] C-entry thunk: emit the unmangled C name(s) as a label, then a
 	// narrow-argument normalization, then a branch to the mangled `sym` — so a C caller
@@ -72,6 +91,16 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 
 	emitPrologue(a, frameSize)
 
+	// Save the callee-saved registers the allocator used, into the frame's
+	// save area (at SavedRegsOff, inside `sub rsp`).  Done before any param
+	// lands in a home register, so the caller's register values are preserved
+	// first.  The epilogue restores.  Addressed off RSP like every other spill
+	// slot in this backend (RSP is stable across the body — no dynamic alloca).
+	for si := 0; si < len(rm.SavedRegs); si++ {
+		x64.Mov(a, x64.Mem(x64.RSP, rm.SavedRegsOff + 8 * si, x64.SZ64),
+				x64.Reg(rm.SavedRegs[si], x64.SZ64))
+	}
+
 	// SysV-AMD64 sret: a function returning an aggregate > 16
 	// bytes (or a multi-return tuple > 16 bytes) receives the
 	// hidden buffer pointer in RDI.  Stash it at SP+SretSlotOff
@@ -108,8 +137,24 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 	// terminated function would carry 5 bytes of unreachable
 	// epilogue dead code in its .text.
 	if !endsWithReturn(f) {
-		emitEpilogueAndRet(a, frameSize)
+		emitEpilogueAndRet(a, rm)
 	}
+}
+
+// x64AllocatablePool returns the registers the linear-scan allocator homes
+// scalar values in: the SysV-AMD64 callee-saved bank RBX, R12, R13, R14, R15
+// (RBP is the frame pointer, so it is excluded).  Callee-saved so a homed
+// value survives every call (preserved by our own prologue/epilogue and by
+// callees), and disjoint from the R10..RDI scratch pool so operand reloads and
+// op-internal scratch are unaffected.
+func x64AllocatablePool() @[]int {
+	var p @[]int = make_slice(int, 5)
+	p[0] = x64.RBX
+	p[1] = x64.R12
+	p[2] = x64.R13
+	p[3] = x64.R14
+	p[4] = x64.R15
+	return p
 }
 
 // spillScalarStackArgX64 loads an incoming SCALAR stack argument into dst, sized AND
@@ -373,11 +418,25 @@ func spillIncomingParams(a @asm.Assembler, rm @common.RegMap, f @ir.Func, frameS
 		// Scalar (or pointer): one 8-byte spill slot.
 		var spillOff int = rm.LookupSpill(p.ID)
 		if spillOff < 0 { continue }
+		var phome int = rm.LookupHome(p.ID)
 		if regStart >= 0 {
-			x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64), x64.Reg(argReg(regStart), x64.SZ64))
+			if phome >= 0 {
+				// Register-allocated param: move it from its arg register to
+				// its home register (off the volatile arg regs before the
+				// first clobbering op).
+				x64.Mov(a, x64.Reg(phome, x64.SZ64), x64.Reg(argReg(regStart), x64.SZ64))
+			} else {
+				x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64), x64.Reg(argReg(regStart), x64.SZ64))
+			}
 		} else if stackOff >= 0 {
-			spillScalarStackArgX64(a, x64.RAX, x64.RSP, stackArgsBase + stackOff, rm.CC, p.Typ)
-			x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+			if phome >= 0 {
+				// Register-allocated param arriving on the incoming-args stack:
+				// load it (sized / sign-extended) straight into its home register.
+				spillScalarStackArgX64(a, phome, x64.RSP, stackArgsBase + stackOff, rm.CC, p.Typ)
+			} else {
+				spillScalarStackArgX64(a, x64.RAX, x64.RSP, stackArgsBase + stackOff, rm.CC, p.Typ)
+				x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+			}
 		}
 	}
 }
@@ -404,11 +463,18 @@ func emitPrologue(a @asm.Assembler, frameSize int) {
 	}
 }
 
-// emitEpilogueAndRet tears down the frame and returns.  Uses the
-// `mov rsp, rbp` form rather than `add rsp, frameSize` so a function
-// that adjusted rsp internally (e.g. a future alloca) still
-// recovers the correct sp.  Matches what gcc -O0 / clang -O0 emit.
-func emitEpilogueAndRet(a @asm.Assembler, frameSize int) {
+// emitEpilogueAndRet restores the allocator's callee-saved registers, tears
+// down the frame, and returns.  The restores read the save area off RSP
+// (still at the frame base here) before `mov rsp, rbp` recovers rsp — matching
+// how the prologue saved them and how every other spill slot in this backend
+// is addressed.  The `mov rsp, rbp` form (rather than `add rsp, frameSize`)
+// lets a function that adjusted rsp internally (e.g. a future alloca) still
+// recover the correct sp.  Matches what gcc -O0 / clang -O0 emit.
+func emitEpilogueAndRet(a @asm.Assembler, rm @common.RegMap) {
+	for i := 0; i < len(rm.SavedRegs); i++ {
+		x64.Mov(a, x64.Reg(rm.SavedRegs[i], x64.SZ64),
+				x64.Mem(x64.RSP, rm.SavedRegsOff + 8 * i, x64.SZ64))
+	}
 	x64.Mov(a, x64.Reg(x64.RSP, x64.SZ64), x64.Reg(x64.RBP, x64.SZ64))
 	x64.Pop(a, x64.Reg(x64.RBP, x64.SZ64))
 	x64.Ret(a)

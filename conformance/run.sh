@@ -36,16 +36,44 @@ VERBOSE=0
 QUIET=0
 CHECK_XPASS=0
 EXACT=0
+SHARD_SPEC=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -v|--verbose)     VERBOSE=1; shift ;;
         -q|--quiet)       QUIET=1; shift ;;
         --check-xpass)    CHECK_XPASS=1; shift ;;
         --exact)          EXACT=1; shift ;;
+        --shard)          SHARD_SPEC="$2"; shift 2 ;;
         *)                break ;;
     esac
 done
 export VERBOSE QUIET CHECK_XPASS EXACT
+
+# --shard I/N runs only the 1/N slice of the (filtered) test set assigned to
+# shard I (1-based) — used by CI to fit a slow mode's suite under the per-job
+# timeout by splitting it across N parallel jobs.  Tests are round-robined by a
+# stable cursor (see in_shard); the loop order is deterministic, so every shard
+# runs a disjoint slice and the N shards together cover the whole suite.  Default
+# 1/1 = unsharded (run everything).
+SHARD_IDX=1
+SHARD_COUNT=1
+if [ -n "$SHARD_SPEC" ]; then
+    SHARD_IDX="${SHARD_SPEC%%/*}"
+    SHARD_COUNT="${SHARD_SPEC##*/}"
+fi
+SHARD_CURSOR=0
+
+# in_shard reports whether the CURRENT eligible (filter-passing) test belongs to
+# this shard, advancing the shared cursor.  Called exactly once per eligible test
+# in each loop, in EVERY shard run, so the cursor→shard mapping is identical
+# across shards (each test lands in the same shard regardless of which shard is
+# executing).  A no-op that always returns true when unsharded.
+in_shard() {
+    [ "$SHARD_COUNT" -le 1 ] && return 0
+    r=$(( SHARD_CURSOR % SHARD_COUNT ))
+    SHARD_CURSOR=$(( SHARD_CURSOR + 1 ))
+    [ "$r" -eq $(( SHARD_IDX - 1 )) ]
+}
 
 # filter_match NAME FILTER... — return 0 if NAME passes the filter set.
 # Substring match (NAME contains FILTER) by default; exact (NAME = FILTER)
@@ -421,6 +449,8 @@ for bn in "$SCRIPT_DIR"/*.bn; do
         skipped=$((skipped + 1))
         continue
     fi
+    # Shard selection: skip tests not assigned to this shard (no-op if unsharded).
+    in_shard || continue
     expected="$SCRIPT_DIR/${name}.expected"
     errorfile="$SCRIPT_DIR/${name}.error"
     # Per-mode overrides: NNN_name.{expected,error}.<MODE> takes
@@ -470,6 +500,8 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]*_*/; do
         skipped=$((skipped + 1))
         continue
     fi
+    # Shard selection: skip tests not assigned to this shard (no-op if unsharded).
+    in_shard || continue
 
     main_bn="$dir/main.bn"
     expected="$dir/expected"
@@ -550,6 +582,8 @@ for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DIR/spe
         skipped=$((skipped + 1))
         continue
     fi
+    # Shard selection: skip tests not assigned to this shard (no-op if unsharded).
+    in_shard || continue
     expected="$SCRIPT_DIR/${name}.expected"
     errorfile="$SCRIPT_DIR/${name}.error"
     if [ -f "$SCRIPT_DIR/${name}.expected.${HOST_ARCH}" ]; then

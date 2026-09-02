@@ -9,26 +9,25 @@ import "pkg/stdx/slices"
 // guard) and `s[i]` (access) onto ONE SSA value so loop-BCE can prove the guard
 // bound equals the bounds-check length.
 //
-// Two materialization strategies:
-//   * STORE-FORWARDING (non-managed <=16B by-value slots — scalars): rewrite every
-//     load to the single stored value V and delete the alloca/store/loads.  Sound
-//     for a value whose OP_LOAD produces a VALUE.  An interface value / function
-//     value (raw OR managed) is instead a 16-byte ADDRESS-aggregate whose OP_LOAD
-//     keeps the slot address, so substituting V is unsound — declined by
-//     analyzeForwardAlloca.  (KNOWN GAP: a small non-managed STRUCT / ARRAY and a
-//     raw SLICE are the same by-address class per types' isAggregateLoadTyp /
-//     IsAggregateTyp and are still store-forwarded here; latent, tracked — the
-//     principled fix keys the decline on by-address-ness itself.)
-//   * REDUNDANT-LOAD-ELIMINATION (managed slices @[]T, either word size): store-
-//     forwarding to V would be wrong for a >16B by-address slice (V may be a
-//     by-address param — an LLVM `ptr` — so a backend would `extractvalue` a value
-//     out of an ADDRESS), and a managed slice's cleanup fault-pad load must be
-//     coalesced too.  Insert one materializing OP_LOAD(A) right after the store and
-//     rewrite every load — normal AND pad — to IT; a load result is by-value in
-//     every backend.  Keep the alloca/store/materializing-load.  Used for ALL
-//     managed slices (not just >16B) so the store-forwarding path never handles a
-//     slot with cleanup pad loads.  (A >16B NON-slice aggregate — a large struct —
-//     is simply declined: correct, just unoptimized.)
+// A slot is eligible only when it is by-value-representable OR a slice; the choice
+// of strategy is keyed on BY-ADDRESS-ness (whether its OP_LOAD yields the slot
+// value or the slot address — types' isAggregateLoadTyp / IsAggregateTyp, mirrored
+// here by isBitCastMemoryLoweredKind):
+//   * STORE-FORWARDING (BY-VALUE slots — scalars): rewrite every load to the single
+//     stored value V and delete the alloca/store/loads.  Sound because a load of a
+//     by-value slot produces exactly V.
+//   * REDUNDANT-LOAD-ELIMINATION (slices — raw *[]T AND managed @[]T, any word
+//     size): a slice is a by-address aggregate — its OP_LOAD keeps the slot ADDRESS
+//     — so store-forwarding to V is unsound (a backend would `extractvalue` a value
+//     out of an address, and the VM read the wrong bytes).  Instead insert one
+//     materializing OP_LOAD(A) right after the store and rewrite every load —
+//     normal AND (for a managed slice) cleanup fault-pad — to IT; a load result is
+//     by-value in every backend.  Keep the alloca/store/materializing-load.
+//   * DECLINED: every other by-address aggregate — a STRUCT, ARRAY, interface value,
+//     or function value (raw or managed).  These need no slice-header coalescing,
+//     so they are simply left unoptimized rather than RLE'd; store-forwarding them
+//     is unsound (the -O1+ VM read a nil interface / garbage func pointer /
+//     reclaimed-SP struct).
 //
 // Soundness spine: escape analysis bars any aliasing write / address leak, so only
 // the one store writes A; that store dominating every load (and every fault-pad
@@ -146,27 +145,31 @@ func analyzeForwardAlloca(f @Func, d @DomInfo, a @Instr) @fwdResult {
 	res.ok = false
 
 	var isMS bool = isManagedSlice(a.TypeArg)
-	// An interface value or function value (raw `*I`/`*func` OR managed
-	// `@I`/`@func`) is a 16-byte ADDRESS-aggregate: its OP_LOAD keeps the slot
-	// ADDRESS, not a value copy (unlike a scalar / raw slice / small by-value
-	// struct).  Store-forwarding rewrites each load to the STORED VALUE and deletes
-	// the slot, which substitutes a value where an address is expected — at -O1+
-	// the VM then read a nil interface value / a garbage func data pointer, and any
-	// slot-keyed dtor RefDec dangled.  Decline; only a managed SLICE forwards, via
-	// the address-preserving RLE path below.  Keeps this pass to its documented
-	// scope: non-managed <=16B BY-VALUE slots.
+	// Store-forwarding rewrites every load of the slot to the single stored value V
+	// and DELETES the slot.  That is sound only for a slot whose OP_LOAD produces a
+	// VALUE.  A BY-ADDRESS aggregate — struct, array, interface value, or function
+	// value (raw OR managed) — instead loads the slot ADDRESS (kept by-address on
+	// the VM and native; cf. types' isAggregateLoadTyp / IsAggregateTyp, and the
+	// isBitCastMemoryLoweredKind set used here), so substituting V hands a consumer
+	// a value where an address is expected: at -O1+ the VM read a nil interface / a
+	// garbage func data pointer / a reclaimed-SP struct.  Decline it.  A SLICE (raw
+	// or managed) is the one by-address aggregate this pass still forwards — its
+	// slice-header coalescing is what loop-BCE consumes — but ALWAYS via the
+	// address-preserving RLE path below (useRLE), never store-forwarding.  So the
+	// store-forwarding path is left with exactly the by-VALUE scalar slots.
 	var pt @types.Type = peelTransparent(a.TypeArg)
-	if pt != nil &&
-			(isIfaceValueKind(pt) || pt.Kind == types.TYP_FUNC_VALUE ||
-					pt.Kind == types.TYP_MANAGED_FUNC_VALUE) {
-		return res
-	}
-	var byAddr bool = a.TypeArg != nil && a.TypeArg.IsByvalParam()
-	// A >16B by-address aggregate must not be store-forwarded (its stored value can
-	// be a by-address param — forwarding a load to it makes a backend extractvalue
-	// a value out of a `ptr`).  A managed slice re-enables forwarding via RLE below;
-	// any other >16B aggregate (large struct) is declined — correct, unoptimized.
-	if byAddr && !isMS {
+	// isSlice off the peeled representation (peelTransparent == isManagedSlice's
+	// peelToRepr) so a named-distinct / alias / `readonly`-wrapped slice is still
+	// recognized and routed to RLE — isSliceType peels only `readonly` and would
+	// miss `type Buf *[]T`, sending it down the unsound store-forwarding path.
+	var isSlice bool = pt != nil && (pt.Kind == types.TYP_SLICE || pt.Kind == types.TYP_MANAGED_SLICE)
+	// INVARIANT: isBitCastMemoryLoweredKind must cover every by-address load kind
+	// (types' isAggregateLoadTyp / IsAggregateTyp) EXCEPT raw TYP_SLICE — today it
+	// does (it is that set minus raw slice; raw slice is caught by `isSlice`).  A
+	// new by-address kind added to isAggregateLoadTyp but NOT here (and not a slice)
+	// would slip this gate and be store-forwarded — the 1054-class unsoundness.  The
+	// TestForward*Declined per-kind tests are the tripwire; keep them in sync.
+	if pt != nil && isBitCastMemoryLoweredKind(pt) && !isSlice {
 		return res
 	}
 
@@ -236,7 +239,7 @@ func analyzeForwardAlloca(f @Func, d @DomInfo, a @Instr) @fwdResult {
 	}
 
 	res.ok = true
-	res.useRLE = isMS
+	res.useRLE = isSlice
 	res.loadIDs = loadIDs
 	res.val = val
 	res.storeBlk = storeBlk

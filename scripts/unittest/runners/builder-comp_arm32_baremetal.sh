@@ -70,9 +70,25 @@ runner_test() {
         rm -rf "$bdir"
         return 1
     fi
-    "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 16M \
-        -nographic -semihosting -no-reboot \
-        -kernel "$testbin" 2>&1
+    # Forward run.sh's per-test skip / shard filters to the compiled runner via the
+    # QEMU command line: the `virt` machine exposes `-append` through semihosting
+    # SYS_GET_CMDLINE, which pkg/builtins/startup installs as os.Args(), so the
+    # generated runner honors --skip / --shard-index / --shard-count exactly as
+    # cmd/bni --test does (SKIP_FILTER / TEST_SHARD_* are set by run.sh from the
+    # <pkg>.skip.<mode> / <pkg>.split.<mode> markers).
+    append=""
+    [ -n "$SKIP_FILTER" ] && append="$append --skip $SKIP_FILTER"
+    [ -n "$TEST_SHARD_COUNT" ] && \
+        append="$append --shard-index $TEST_SHARD_IDX --shard-count $TEST_SHARD_COUNT"
+    if [ -n "$append" ]; then
+        "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 16M \
+            -nographic -semihosting -no-reboot \
+            -kernel "$testbin" -append "$append" 2>&1
+    else
+        "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 16M \
+            -nographic -semihosting -no-reboot \
+            -kernel "$testbin" 2>&1
+    fi
     rc=$?
     rm -rf "$bdir"
     return $rc

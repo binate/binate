@@ -39,6 +39,11 @@ if ! "$BINATE_DIR/scripts/build-bnld.sh" -o "$BNLD" > "$TMP/build_bnld.log" 2>&1
     exit 1
 fi
 
+# The driver's imports (pkg/binate/link, buf, pkg/std/*) resolve from the standard search
+# dirs — supplied to bnld as flags from binate-paths.sh, NOT a formula baked into bnld.
+IFACE_DIRS="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
+IMPL_DIRS="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
+
 # check_elf <path> <name>: the driver's output must be a static ELF64 ET_EXEC.
 check_elf() {
     _p="$1"; _n="$2"
@@ -51,23 +56,29 @@ check_elf() {
     if [ ! -x "$_p" ]; then echo "FAIL: $_n is not owner-executable" >&2; exit 1; fi
 }
 
-# drv_link <name>: assemble the stdin .s with bnas, then link it via the INTERPRETED
-# driver (bnld -driver), and structure-check the result.
+# drv_link <name> <bnas-arch> <bnld-target> <want-e_machine>: assemble the stdin .s with
+# bnas for <bnas-arch>, link it via the INTERPRETED driver (bnld -driver) for <bnld-target>,
+# and structure-check the result (static ELF64 ET_EXEC with the expected e_machine — so the
+# driver selected the right machine for the target).
 drv_link() {
-    _name="$1"
+    _name="$1"; _arch="$2"; _target="$3"; _emach="$4"
     cat > "$TMP/$_name.s"
-    if ! "$BNAS" -arch x64 -o "$TMP/$_name.o" "$TMP/$_name.s" > "$TMP/$_name.asm.log" 2>&1; then
+    if ! "$BNAS" -arch "$_arch" -o "$TMP/$_name.o" "$TMP/$_name.s" > "$TMP/$_name.asm.log" 2>&1; then
         echo "FAIL: bnas could not assemble $_name" >&2; cat "$TMP/$_name.asm.log" >&2; exit 1
     fi
-    if ! "$BNLD" -driver "$DRIVER" -I "$BINATE_DIR" -target linux-x64 \
+    if ! "$BNLD" -driver "$DRIVER" -I "$IFACE_DIRS" --impl-path "$IMPL_DIRS" -target "$_target" \
             -o "$TMP/$_name" "$TMP/$_name.o" > "$TMP/$_name.link.log" 2>&1; then
         echo "FAIL: bnld -driver could not link $_name" >&2; cat "$TMP/$_name.link.log" >&2; exit 1
     fi
     check_elf "$TMP/$_name" "$_name"
-    echo "PASS: $_name linked via the interpreted driver → static ELF64 (compiled link.*)"
+    _got="$(od -An -tu1 -j18 -N1 "$TMP/$_name" | tr -d ' \n')" # e_machine low byte
+    if [ "$_got" != "$_emach" ]; then
+        echo "FAIL: $_name e_machine=$_got, want $_emach" >&2; exit 1
+    fi
+    echo "PASS: $_name linked via the interpreted driver → static ELF64 (e_machine $_emach)"
 }
 
-drv_link exit42 <<'EOF'
+drv_link exit42 x64 linux-x64 62 <<'EOF'
 .arch x64
 .section text
 .global _start
@@ -77,7 +88,7 @@ _start:
 	syscall
 EOF
 
-drv_link hello <<'EOF'
+drv_link hello x64 linux-x64 62 <<'EOF'
 .arch x64
 .section rodata
 msg:
@@ -93,6 +104,19 @@ _start:
 	mov eax, 60
 	xor edi, edi
 	syscall
+EOF
+
+# aarch64: same driver, linux-aarch64 target — proves the driver's machine selection and
+# link.Link's aarch64 path produce a valid arm64 ELF (e_machine 183).  The RUN of a
+# driver-agnostic aarch64 static ELF is already covered by bnld-linux-aarch64.sh.
+drv_link exit42_aa aarch64 linux-aarch64 183 <<'EOF'
+.arch aarch64
+.section text
+.global _start
+_start:
+	mov x0, #42
+	mov x8, #93
+	svc #0
 EOF
 
 # ----- init-driver: a driver whose OWN top-level var initializer must run before Drive.
@@ -117,7 +141,7 @@ func Drive(objs @[]@[]char, out @[]char, target @[]char) @[]char {
 	return buf.CopyStr("")
 }
 BN
-if ! "$BNLD" -driver "$TMP/init_driver.bn" -I "$BINATE_DIR" -target linux-x64 \
+if ! "$BNLD" -driver "$TMP/init_driver.bn" -I "$IFACE_DIRS" --impl-path "$IMPL_DIRS" -target linux-x64 \
         -o "$TMP/exit42_init" "$TMP/exit42.o" > "$TMP/init.link.log" 2>&1; then
     echo "FAIL: bnld -driver (init-driver) could not link — package init likely did not run" >&2
     cat "$TMP/init.link.log" >&2

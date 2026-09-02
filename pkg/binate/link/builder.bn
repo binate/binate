@@ -1,0 +1,480 @@
+package "pkg/binate/link"
+
+import "pkg/binate/buf"
+import "pkg/stdx/slices"
+
+// LayoutBuilder is the stateful engine a bnld driver drives to place input sections
+// at addresses, define symbols, group sections into segments, and (later) emit —
+// the substrate that expresses everything a GNU ld linker script can, within what we
+// support internally.  A driver reads its inputs into @[]@InputObject, calls
+// SetInputs, then issues placement primitives (DefineRegion / SetDot / BeginSection /
+// Place / SymbolAtDot / ...); Result freezes the laid-out sections + the layout-defined
+// absolute symbols.  Relocation and emit are separate steps that consume Result.
+//
+// Addresses are assigned EAGERLY (Dot advances as sections/inputs are placed), so a
+// driver can read Dot() / LoadAddrOf() mid-layout; only the output-section bytes are
+// materialized lazily (at EndSection).  The first error is latched in `err` and makes
+// every later primitive a no-op; Result returns it.
+
+// Region is a named memory region (a linker-script MEMORY entry).  Next is the single
+// allocation cursor: a section placed `> REGION` draws its VMA from Next and advances
+// it; a section placed `AT> REGION` draws its LMA from the same Next and advances it —
+// so a ROM→RAM-copy `.data`'s flash LMA lands right after the `.text`/`.rodata` that
+// also live in flash.  Next starts at Origin.
+type Region struct {
+	Name   @[]char
+	Origin uint64
+	Length uint64
+	Attrs  int
+	Next   uint64
+}
+
+// AbsSym is an absolute symbol the layout defines (DefineSymbol / SymbolAtDot) — e.g.
+// `_estack`, `__bss_end`, `_sidata`.  Value is an absolute VMA (correct for the
+// static / bare-metal / freestanding, non-PIE scope scripted layout targets).  These
+// are injected into the symbol table after addresses freeze so relocations and the
+// entry lookup see them.
+type AbsSym struct {
+	Name  @[]char
+	Value uint64
+}
+
+// segState records a program-header segment (a linker-script PHDRS entry) and the
+// output-section indices assigned to it.  Recorded in v1; consumed by explicit-PHDRS
+// emit (a later step).
+type segState struct {
+	Name    @[]char
+	Ptype   int
+	Flags   int
+	SecIdxs @[]int
+}
+
+// chunk is one span of bytes to copy into an output section at byte offset Off within
+// it.  Alignment padding, `PadTo` zero-fill, and NOBITS reservations leave gaps that
+// materialization zero-fills, so a chunk is recorded only for actual bytes.
+type chunk struct {
+	Off  uint64
+	Data @[]uint8
+}
+
+// secState is one output section under construction.  VmaStart / LmaStart freeze at the
+// section's first content op (or EndSection).  HasData distinguishes a PROGBITS-style
+// section (materialized to Size bytes) from a pure NOBITS one (empty Data, Size reserved).
+type secState struct {
+	Name           @[]char
+	Flags          int
+	Align          int
+	VmaStart       uint64
+	LmaStart       uint64
+	Size           uint64
+	HasData        bool
+	Started        bool
+	VmaRegion      int
+	LmaRegion      int
+	HasLmaExplicit bool
+	LmaExplicit    uint64
+	Chunks         @[]chunk
+}
+
+// Section is a handle to an output section (returned by BeginSection), used by
+// LoadAddrOf and AssignSection.
+type Section struct {
+	Idx int
+}
+
+// Segment is a handle to a program-header segment (returned by DefineSegment), used by
+// AssignSection.
+type Segment struct {
+	Idx int
+}
+
+// LayoutBuilder holds the whole scripted-layout state.
+type LayoutBuilder struct {
+	Machine      int
+	inputs       @[]@InputObject
+	consumed     @[]@[]bool
+	regions      @[]Region
+	secs         @[]secState
+	segs         @[]segState
+	abs          @[]AbsSym
+	dot          uint64
+	entry        @[]char
+	entryAddr    uint64
+	hasEntryAddr bool
+	err          @[]char
+	cur          int // index of the open section, or -1
+}
+
+// NewLayout creates an empty builder targeting machine (an EM_* value).
+func NewLayout(machine int) @LayoutBuilder {
+	var b @LayoutBuilder = make(LayoutBuilder)
+	b.Machine = machine
+	b.inputs = make_slice(@InputObject, 0)
+	b.consumed = make_slice(@[]bool, 0)
+	b.regions = make_slice(Region, 0)
+	b.secs = make_slice(secState, 0)
+	b.segs = make_slice(segState, 0)
+	b.abs = make_slice(AbsSym, 0)
+	b.dot = cast(uint64, 0)
+	b.entry = make_slice(char, 0)
+	b.entryAddr = cast(uint64, 0)
+	b.hasEntryAddr = false
+	b.err = make_slice(char, 0)
+	b.cur = -1
+	return b
+}
+
+// fail latches the first error message.
+func (b @LayoutBuilder) fail(msg @[]char) {
+	if len(b.err) == 0 { b.err = msg }
+}
+
+// Error returns the latched error ("" if none).
+func (b @LayoutBuilder) Error() @[]readonly char { return b.err }
+
+// SetInputs gives the builder the pool of objects that Place/Keep glob over.  Each
+// input section is placed at most once (consume-once), claimed by the first matching
+// pattern.
+func (b @LayoutBuilder) SetInputs(objs @[]@InputObject) {
+	b.inputs = objs
+	var c @[]@[]bool = make_slice(@[]bool, len(objs))
+	for o := 0; o < len(objs); o++ {
+		c[o] = make_slice(bool, len(objs[o].Sections))
+	}
+	b.consumed = c
+}
+
+// DefineRegion adds a named memory region (a MEMORY entry).
+func (b @LayoutBuilder) DefineRegion(name *[]readonly char, origin uint64, length uint64,
+		attrs int) {
+	var r Region
+	r.Name = buf.CopyStr(name)
+	r.Origin = origin
+	r.Length = length
+	r.Attrs = attrs
+	r.Next = origin
+	b.regions = slices.Append[Region](b.regions, r)
+}
+
+// regionIndex returns the index of the region named name, or -1.
+func (b @LayoutBuilder) regionIndex(name *[]readonly char) int {
+	for i := 0; i < len(b.regions); i++ {
+		if charsEqual(b.regions[i].Name, name) { return i }
+	}
+	return -1
+}
+
+// Dot returns the current location counter (VMA).
+func (b @LayoutBuilder) Dot() uint64 { return b.dot }
+
+// SetDot sets the location counter to an absolute VMA.
+func (b @LayoutBuilder) SetDot(addr uint64) { b.dot = addr }
+
+// AlignDot rounds the location counter up to a multiple of n.
+func (b @LayoutBuilder) AlignDot(n int) { b.dot = alignUpU64(b.dot, n) }
+
+// SetDotToRegion sets the location counter to a region's current allocation cursor.
+func (b @LayoutBuilder) SetDotToRegion(name *[]readonly char) {
+	var i int = b.regionIndex(name)
+	if i < 0 { b.fail(buf.Concat("unknown region: ", name)); return }
+	b.dot = b.regions[i].Next
+}
+
+// BeginSection opens a new output section (VMA taken from the current Dot unless a
+// region/address is set) and returns its handle.
+//
+// A single return statement is deliberate: a function that returns a by-value struct
+// (Section coerces to `[1 x i64]`) from more than one `return` site was miscompiled —
+// each site emitted a `%v-1.agrp` return-coercion alloca and LLVM rejected the duplicate
+// SSA name.  The in-tree codegen is fixed (commit a5a4253ad), but the frozen BUILDER that
+// compiles this file for gen1 still has the bug, so a single return stays here until a
+// BUILDER carrying the fix is cut.
+func (b @LayoutBuilder) BeginSection(name *[]readonly char, flags int) Section {
+	var h Section
+	if b.cur >= 0 {
+		b.fail("BeginSection: previous section not ended")
+		h.Idx = b.cur
+	} else {
+		var s secState
+		s.Name = buf.CopyStr(name)
+		s.Flags = flags
+		s.Align = 1
+		s.VmaStart = cast(uint64, 0)
+		s.LmaStart = cast(uint64, 0)
+		s.Size = cast(uint64, 0)
+		s.HasData = false
+		s.Started = false
+		s.VmaRegion = -1
+		s.LmaRegion = -1
+		s.HasLmaExplicit = false
+		s.LmaExplicit = cast(uint64, 0)
+		s.Chunks = make_slice(chunk, 0)
+		b.secs = slices.Append[secState](b.secs, s)
+		b.cur = len(b.secs) - 1
+		h.Idx = b.cur
+	}
+	return h
+}
+
+// SectionAtRegion routes the open section's VMA to a region (`> REGION`): Dot moves to
+// the region's cursor.
+func (b @LayoutBuilder) SectionAtRegion(name *[]readonly char) {
+	if b.cur < 0 { b.fail("SectionAtRegion: no open section"); return }
+	if b.secs[b.cur].Started { b.fail("SectionAtRegion: section already has content"); return }
+	var i int = b.regionIndex(name)
+	if i < 0 { b.fail(buf.Concat("unknown region: ", name)); return }
+	b.secs[b.cur].VmaRegion = i
+	b.dot = b.regions[i].Next
+}
+
+// SectionLoadRegion routes the open section's LMA to a region (`AT> REGION`): its bytes
+// load from that region's cursor even though the section runs at a different VMA.
+func (b @LayoutBuilder) SectionLoadRegion(name *[]readonly char) {
+	if b.cur < 0 { b.fail("SectionLoadRegion: no open section"); return }
+	if b.secs[b.cur].Started { b.fail("SectionLoadRegion: section already has content"); return }
+	var i int = b.regionIndex(name)
+	if i < 0 { b.fail(buf.Concat("unknown region: ", name)); return }
+	b.secs[b.cur].LmaRegion = i
+}
+
+// SectionLoadAddr sets the open section's LMA to an explicit address (`AT(addr)`).
+func (b @LayoutBuilder) SectionLoadAddr(lma uint64) {
+	if b.cur < 0 { b.fail("SectionLoadAddr: no open section"); return }
+	if b.secs[b.cur].Started { b.fail("SectionLoadAddr: section already has content"); return }
+	b.secs[b.cur].HasLmaExplicit = true
+	b.secs[b.cur].LmaExplicit = lma
+}
+
+// SectionAlign aligns the open section's start (and records its alignment).
+func (b @LayoutBuilder) SectionAlign(n int) {
+	if b.cur < 0 { b.fail("SectionAlign: no open section"); return }
+	if b.secs[b.cur].Started { b.fail("SectionAlign: section already has content"); return }
+	if n > b.secs[b.cur].Align { b.secs[b.cur].Align = n }
+	b.dot = alignUpU64(b.dot, n)
+}
+
+// ensureStarted freezes the open section's VMA and LMA start at the current Dot (called
+// at the first content op, or EndSection).
+func (b @LayoutBuilder) ensureStarted() {
+	if b.cur < 0 { return }
+	if b.secs[b.cur].Started { return }
+	b.secs[b.cur].VmaStart = b.dot
+	var lma uint64 = b.dot
+	if b.secs[b.cur].HasLmaExplicit {
+		lma = b.secs[b.cur].LmaExplicit
+	} else if b.secs[b.cur].LmaRegion >= 0 {
+		lma = b.regions[b.secs[b.cur].LmaRegion].Next
+	}
+	b.secs[b.cur].LmaStart = lma
+	b.secs[b.cur].Started = true
+}
+
+// Place appends every not-yet-consumed input section whose name matches pattern
+// (a `*(GLOB)` form, e.g. "*(.text*)") to the open section, in pool order (SetInputs
+// object order, then in-object section order), honoring each input's own alignment.
+// keep marks the match as never-GC'd (GC is not implemented in v1; accepted for shape).
+func (b @LayoutBuilder) Place(pattern *[]readonly char, keep bool) {
+	if b.cur < 0 { b.fail("Place: no open section"); return }
+	b.ensureStarted()
+	var glob *[]readonly char = stripPattern(pattern)
+	for o := 0; o < len(b.inputs); o++ {
+		var obj @InputObject = b.inputs[o]
+		for s := 0; s < len(obj.Sections); s++ {
+			if b.consumed[o][s] { continue }
+			if !globMatch(glob, obj.Sections[s].Name) { continue }
+			b.consumed[o][s] = true
+			var a int = obj.Sections[s].Align
+			if a < 1 { a = 1 }
+			b.dot = alignUpU64(b.dot, a)
+			var off uint64 = b.dot - b.secs[b.cur].VmaStart
+			obj.Sections[s].OutIndex = b.cur
+			obj.Sections[s].OutOffset = cast(uint, off)
+			if obj.Sections[s].Type != SHT_NOBITS {
+				var c chunk
+				c.Off = off
+				// Copy at most Size bytes: a malformed input with len(Data) > Size
+				// must not overrun the next input's span in the output section.
+				var cdata @[]uint8 = obj.Sections[s].Data
+				if len(cdata) > cast(int, obj.Sections[s].Size) {
+					cdata = cdata[0:cast(int, obj.Sections[s].Size)]
+				}
+				c.Data = cdata
+				b.secs[b.cur].Chunks = slices.Append[chunk](b.secs[b.cur].Chunks, c)
+				b.secs[b.cur].HasData = true
+			}
+			b.dot = b.dot + cast(uint64, obj.Sections[s].Size)
+			if a > b.secs[b.cur].Align { b.secs[b.cur].Align = a }
+		}
+	}
+	b.secs[b.cur].Size = b.dot - b.secs[b.cur].VmaStart
+}
+
+// EmitData appends literal bytes to the open section (BYTE/SHORT/LONG/QUAD, boot
+// signatures, hand-built tables).
+func (b @LayoutBuilder) EmitData(bytes @[]uint8) {
+	if b.cur < 0 { b.fail("EmitData: no open section"); return }
+	b.ensureStarted()
+	var off uint64 = b.dot - b.secs[b.cur].VmaStart
+	var c chunk
+	c.Off = off
+	c.Data = bytes
+	b.secs[b.cur].Chunks = slices.Append[chunk](b.secs[b.cur].Chunks, c)
+	b.secs[b.cur].HasData = true
+	b.dot = b.dot + cast(uint64, len(bytes))
+	b.secs[b.cur].Size = b.dot - b.secs[b.cur].VmaStart
+}
+
+// PadTo advances the open section to absolute VMA addr, filling the gap with fill (a
+// zero fill relies on materialization's zero-fill; a nonzero fill records fill bytes).
+func (b @LayoutBuilder) PadTo(addr uint64, fill uint8) {
+	if b.cur < 0 { b.fail("PadTo: no open section"); return }
+	b.ensureStarted()
+	if addr < b.dot { b.fail("PadTo: target is before the current location"); return }
+	if fill != 0 && addr > b.dot {
+		var n int = cast(int, addr - b.dot)
+		var off uint64 = b.dot - b.secs[b.cur].VmaStart
+		var data @[]uint8 = make_slice(uint8, n)
+		for i := 0; i < n; i++ { data[i] = fill }
+		var c chunk
+		c.Off = off
+		c.Data = data
+		b.secs[b.cur].Chunks = slices.Append[chunk](b.secs[b.cur].Chunks, c)
+	}
+	b.secs[b.cur].HasData = true
+	b.dot = addr
+	b.secs[b.cur].Size = b.dot - b.secs[b.cur].VmaStart
+}
+
+// DefineSymbol defines an absolute symbol with an explicit value.
+func (b @LayoutBuilder) DefineSymbol(name *[]readonly char, value uint64) {
+	var s AbsSym
+	s.Name = buf.CopyStr(name)
+	s.Value = value
+	b.abs = slices.Append[AbsSym](b.abs, s)
+}
+
+// SymbolAtDot defines an absolute symbol equal to the current location counter.
+func (b @LayoutBuilder) SymbolAtDot(name *[]readonly char) {
+	if b.cur >= 0 { b.ensureStarted() }
+	var s AbsSym
+	s.Name = buf.CopyStr(name)
+	s.Value = b.dot
+	b.abs = slices.Append[AbsSym](b.abs, s)
+}
+
+// LoadAddrOf returns a section's load address (LOADADDR) — valid once the section has
+// started (its start is frozen at the first content op or EndSection).
+func (b @LayoutBuilder) LoadAddrOf(sec Section) uint64 {
+	if sec.Idx < 0 || sec.Idx >= len(b.secs) {
+		b.fail("LoadAddrOf: invalid section")
+		return cast(uint64, 0)
+	}
+	return b.secs[sec.Idx].LmaStart
+}
+
+// DefineSegment declares a program-header segment (a PHDRS entry) and returns its handle.
+func (b @LayoutBuilder) DefineSegment(name *[]readonly char, ptype int, flags int) Segment {
+	var g segState
+	g.Name = buf.CopyStr(name)
+	g.Ptype = ptype
+	g.Flags = flags
+	g.SecIdxs = make_slice(int, 0)
+	b.segs = slices.Append[segState](b.segs, g)
+	var h Segment
+	h.Idx = len(b.segs) - 1
+	return h
+}
+
+// AssignSection assigns an output section to a segment.
+func (b @LayoutBuilder) AssignSection(sec Section, seg Segment) {
+	if seg.Idx < 0 || seg.Idx >= len(b.segs) { b.fail("AssignSection: invalid segment"); return }
+	if sec.Idx < 0 || sec.Idx >= len(b.secs) { b.fail("AssignSection: invalid section"); return }
+	b.segs[seg.Idx].SecIdxs = slices.Append[int](b.segs[seg.Idx].SecIdxs, sec.Idx)
+}
+
+// SetEntry sets the program entry to a symbol name.
+func (b @LayoutBuilder) SetEntry(name *[]readonly char) {
+	b.entry = buf.CopyStr(name)
+	b.hasEntryAddr = false
+}
+
+// SetEntryAddr sets the program entry to an absolute address.
+func (b @LayoutBuilder) SetEntryAddr(addr uint64) {
+	b.entryAddr = addr
+	b.hasEntryAddr = true
+	b.entry = make_slice(char, 0)
+}
+
+// EndSection finalizes the open section: freezes its size, advances the region cursor(s)
+// it drew from, and checks region overflow.
+func (b @LayoutBuilder) EndSection() {
+	if b.cur < 0 { b.fail("EndSection: no open section"); return }
+	b.ensureStarted()
+	var i int = b.cur
+	b.secs[i].Size = b.dot - b.secs[i].VmaStart
+	if b.secs[i].VmaRegion >= 0 {
+		var ri int = b.secs[i].VmaRegion
+		if b.dot > b.regions[ri].Origin + b.regions[ri].Length {
+			b.fail(buf.Concat("region overflowed (VMA): ", b.regions[ri].Name))
+		}
+		b.regions[ri].Next = b.dot
+	}
+	if b.secs[i].LmaRegion >= 0 && b.secs[i].LmaRegion != b.secs[i].VmaRegion {
+		var ri int = b.secs[i].LmaRegion
+		var lmaEnd uint64 = b.secs[i].LmaStart + b.secs[i].Size
+		if lmaEnd > b.regions[ri].Origin + b.regions[ri].Length {
+			b.fail(buf.Concat("region overflowed (LMA): ", b.regions[ri].Name))
+		}
+		b.regions[ri].Next = lmaEnd
+	}
+	b.cur = -1
+}
+
+// buildOutputs materializes the finalized sections into OutputSections (copying chunk
+// bytes; zero-filling alignment/pad/NOBITS gaps).  A section with no byte content is a
+// NOBITS section (empty Data, Size reserved).
+func (b @LayoutBuilder) buildOutputs() @[]OutputSection {
+	var outs @[]OutputSection = make_slice(OutputSection, len(b.secs))
+	for i := 0; i < len(b.secs); i++ {
+		var os OutputSection
+		os.Name = b.secs[i].Name
+		os.Flags = b.secs[i].Flags
+		os.Align = b.secs[i].Align
+		os.Addr = b.secs[i].VmaStart
+		os.Lma = b.secs[i].LmaStart
+		os.Size = b.secs[i].Size
+		if b.secs[i].HasData {
+			var data @[]uint8 = make_slice(uint8, cast(int, b.secs[i].Size))
+			for c := 0; c < len(b.secs[i].Chunks); c++ {
+				var off int = cast(int, b.secs[i].Chunks[c].Off)
+				var src @[]uint8 = b.secs[i].Chunks[c].Data
+				var n int = len(src)
+				if off + n > len(data) { n = len(data) - off }
+				for j := 0; j < n; j++ { data[off + j] = src[j] }
+			}
+			os.Data = data
+		} else {
+			os.Data = make_slice(uint8, 0)
+		}
+		outs[i] = os
+	}
+	return outs
+}
+
+// Result freezes the layout: the output sections (in creation order, VMA in Addr, LMA
+// in Lma) and "" on success, or an empty result and the latched error.  The
+// layout-defined absolute symbols are available via AbsSyms.
+func (b @LayoutBuilder) Result() (@LayoutResult, @[]readonly char) {
+	if b.cur >= 0 { b.fail("Result: a section is still open (missing EndSection)") }
+	var lr @LayoutResult = make(LayoutResult)
+	if len(b.err) != 0 {
+		lr.Sections = make_slice(OutputSection, 0)
+		return lr, b.err
+	}
+	lr.Sections = b.buildOutputs()
+	return lr, ""
+}
+
+// AbsSyms returns the absolute symbols the layout defined (for injection into the
+// symbol table before relocation).
+func (b @LayoutBuilder) AbsSyms() @[]AbsSym { return b.abs }

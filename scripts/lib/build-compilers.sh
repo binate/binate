@@ -94,19 +94,7 @@ build_gen1() {
     # conformance, perf), so leaving it at clang's -O0 default makes the whole
     # suite several × slower.  The one-time -O2 build cost (once per runner_setup)
     # is dwarfed by the faster per-test compiles across the lane.
-    # TRANSITIONAL — remove once BUILDER_VERSION >= bnc-0.0.15 (tracked in
-    # claude-todo "gen1 build fails on Linux ... gated on a BUILDER cut").  The
-    # pinned BUILDER (bnc-0.0.14) predates 883f761ce and emits the iv-dispatch
-    # thunks (stdx/hash.FnHasher / stdx/cmp.FnEq __bn_thunk_* on uint8) as STRONG,
-    # not weak_odr; ir, token and asm each emit them, so GNU ld rejects the
-    # duplicates and this BUILDER->gen1 link fails on Linux.  The dups are
-    # ODR-identical, so accept them AT THIS LINK ONLY.  Linux-gated: macOS ld64
-    # both tolerates the dups and rejects this GNU flag, so it stays off there
-    # (which also keeps the macOS gen1 link strict as a collision backstop).  A
-    # new BUILDER with weak_odr thunks removes the need.
-    gen1_dupthunk_flag=""
-    [ "$(uname -s)" = Linux ] && gen1_dupthunk_flag="--cflag -Wl,--allow-multiple-definition"
-    build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR" --prepend "$BINATE_DIR/ifaces/toolchain")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --cflag -O2 $gen1_dupthunk_flag --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR" --prepend "$BINATE_DIR/ifaces/toolchain")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --cflag -O2 --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
         echo "$build_out"

@@ -37,8 +37,10 @@ if [ ! -s "$FWD" ]; then
 fi
 
 # Collect every in-tree Binate source file (a forwarder .bni has no import line, so
-# it is naturally never a violation; testdata fixtures are excluded).
-find cmd pkg ifaces impls conformance examples e2e \
+# it is naturally never a violation; testdata fixtures are excluded).  perf/ carries
+# real .bn programs that import stdlib packages, so it must be scanned too — a perf
+# benchmark importing a forwarder is as much a violation as any other in-tree file.
+find cmd pkg ifaces impls conformance examples e2e perf \
     -type f \( -name '*.bn' -o -name '*.bni' \) -not -path '*/testdata/*' 2>/dev/null \
     | sort > "$LIST"
 

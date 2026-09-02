@@ -178,3 +178,29 @@ bn_F2_3_pkg8_semihost1_12_SemihostExit:
 	// honor SYS_EXIT_EXTENDED — gives the program a stable halt point.
 sh_exit_spin:
 	b       sh_exit_spin
+
+// ============================================================
+// semihost.SemihostGetCmdline(buf *uint8, cap int) int — fetch the host
+// command line via SYS_GET_CMDLINE (0x15).  The parameter block is
+// {buffer, length}: on entry length = buffer capacity, on return length =
+// the actual command-line length and the buffer holds it (NUL-terminated).
+// r0 = 0 on success, -1 on failure.  On QEMU's virt machine the command
+// line is the `-append` string.  Returns the length, or -1 on failure.
+// ============================================================
+	.global bn_F2_3_pkg8_semihost1_18_SemihostGetCmdline
+bn_F2_3_pkg8_semihost1_18_SemihostGetCmdline:
+	// r0 = buf ptr, r1 = cap (bytes).  Build the {ptr, len} block on the stack.
+	push    {r0, r1}        // stack: [ptr, len]
+	mov     r1, sp          // r1 = &{ptr, len}
+	mov     r0, #0x15       // SYS_GET_CMDLINE
+	svc     #0x123456
+	cmp     r0, #0
+	bne     sh_cmdline_fail
+	ldr     r0, [sp, #4]    // success: return the updated length field
+	add     sp, sp, #8
+	bx      lr
+sh_cmdline_fail:
+	movw    r0, #0xffff
+	movt    r0, #0xffff     // r0 = 0xffffffff = -1
+	add     sp, sp, #8
+	bx      lr

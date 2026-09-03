@@ -69,7 +69,9 @@ summary() {
 # Shared arithmetic-export prefix (ffi_add ffi_mul ffi_sub ffi_sub2); each driver
 # appends its own tail (the exports it actually calls).
 WANT_BASE="42 42 42 99"
-WANT="$WANT_BASE 1 0 1 0"  # check_backend driver: + ffi_sgn(-5) ffi_sgn(5) ffi_ro(-3) ffi_ro(3)
+# check_backend driver: + ffi_sgn(-5) ffi_sgn(5) ffi_ro(-3) ffi_ro(3)
+#   + ffi_stack_sgn(-5 on stack) ffi_stack_sgn(5 on stack)
+WANT="$WANT_BASE 1 0 1 0 1 0"
 
 if ! command -v "$CLANG" >/dev/null 2>&1; then
     skip "ffi-export (no C compiler '$CLANG' available)"
@@ -178,6 +180,22 @@ func RetU8(x int) uint8 { return cast(uint8, x) }
 
 #[c_export("ffi_retbool")]
 func RetBool(x int) bool { return x != 0 }
+
+// A narrow SIGNED param passed on the STACK: nine int32 params exceed the argument
+// registers (six GP on SysV x64, eight on AAPCS64), so the ninth (a8) is stack-passed on
+// both.  A C caller may store a full word into a8's 8-byte slot whose high bits are junk
+// (the driver forces exactly that); a native callee that spilled the whole slot would, at
+// -O1+ under a 64-bit signed compare, read that junk and see a large POSITIVE value.
+// Returns 1 iff a8 is a negative int32 — the stack sibling of ffi_sgn's register check,
+// guarding the #[c_export] STACK-arg normalization.  Only a8 is inspected.
+#[c_export("ffi_stack_sgn")]
+func StackSgn(a0 int32, a1 int32, a2 int32, a3 int32, a4 int32, a5 int32,
+		a6 int32, a7 int32, a8 int32) int {
+	if a8 < cast(int32, 0) {
+		return 1
+	}
+	return 0
+}
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -189,12 +207,21 @@ extern int ffi_sub(int, int);
 extern int ffi_sub2(int, int);
 extern long ffi_sgn(int);
 extern long ffi_ro(int);
+/* Deliberately declared with WIDE (long) params so the C caller stores full 64-bit words
+   into the stack-arg slots — the low 32 bits are the intended int32, the high bits are junk.
+   This is the "C leaves the narrow stack slot's high bytes dirty" case; the callee reads
+   int32.  0xFFFFFFFBL == 0x00000000FFFFFFFB: low 32 = -5 (int32), high 32 = 0, so a buggy
+   full-8-byte reload reads a large POSITIVE value.  ffi_stack_sgn returns 1 iff its 9th
+   (stack-passed) arg is a negative int32. */
+extern long ffi_stack_sgn(long, long, long, long, long, long, long, long, long);
 int main(void) {
-    printf("%d %d %d %d %ld %ld %ld %ld\n",
+    printf("%d %d %d %d %ld %ld %ld %ld %ld %ld\n",
            ffi_add(20, 22), ffi_mul(6, 7),
            ffi_sub(50, 8), ffi_sub2(100, 1),
            ffi_sgn(-5), ffi_sgn(5),
-           ffi_ro(-3), ffi_ro(3));
+           ffi_ro(-3), ffi_ro(3),
+           ffi_stack_sgn(0, 0, 0, 0, 0, 0, 0, 0, 0xFFFFFFFBL),
+           ffi_stack_sgn(0, 0, 0, 0, 0, 0, 0, 0, 5L));
     return 0;
 }
 EOF

@@ -7,6 +7,14 @@
 # promoted home.  In-tree code must import the pkg/std/* home DIRECTLY, not the
 # pkg/stdx/* forwarder; this check fails if any file imports a forwarder.
 #
+# EXCEPTION — the BUILDER-compiled surface (cmd/bnc + its transitive pkg/binate
+# deps) is compiled by the pinned BUILDER against its OWN bundled stdlib, which
+# still carries the pkg/stdx/* path but not the pkg/std/* home, so a BUILDER-tree
+# import of the pkg/std home fails the gen1 build.  Those files legitimately keep
+# importing the forwarder until a BUILDER carrying the promoted package is cut
+# (then they migrate and the forwarder is removed).  is_builder_tree below lists
+# that surface; today only cmd/bnc relies on it (for pkg/stdx/flags).
+#
 # Forwarders are auto-discovered (below), so the check re-arms automatically when a
 # future promotion adds one and passes trivially when none exist.
 #
@@ -70,11 +78,42 @@ trap 'rm -f "$FWD" "$LIST" "$IMPORTS" "$CANDS"' EXIT
 awk -F'\t' 'FNR==NR { fwd[$1] = $2; next } ($2 in fwd) { print $1 "\t" $2 "\t" fwd[$2] }' \
     "$FWD" "$IMPORTS" > "$CANDS"
 
+# is_builder_tree <repo-relative-path>: file is in the BUILDER-compiled surface
+# (cmd/bnc + its transitive pkg/binate deps), which cannot yet use pkg/std.
+is_builder_tree() {
+    case "$1" in
+        cmd/bnc/*) return 0 ;;
+        pkg/binate/asm/*|pkg/binate/asm.bni) return 0 ;;
+        pkg/binate/ast/*|pkg/binate/ast.bni) return 0 ;;
+        pkg/binate/bignum/*|pkg/binate/bignum.bni) return 0 ;;
+        pkg/binate/buf/*|pkg/binate/buf.bni) return 0 ;;
+        pkg/binate/buildcfg/*|pkg/binate/buildcfg.bni) return 0 ;;
+        pkg/binate/codegen/*|pkg/binate/codegen.bni) return 0 ;;
+        pkg/binate/debug/*|pkg/binate/debug.bni) return 0 ;;
+        pkg/binate/ir/*|pkg/binate/ir.bni) return 0 ;;
+        pkg/binate/irdata/*|pkg/binate/irdata.bni) return 0 ;;
+        pkg/binate/iropcode/*|pkg/binate/iropcode.bni) return 0 ;;
+        pkg/binate/lexer/*|pkg/binate/lexer.bni) return 0 ;;
+        pkg/binate/link/*|pkg/binate/link.bni) return 0 ;;
+        pkg/binate/loader/*|pkg/binate/loader.bni) return 0 ;;
+        pkg/binate/mangle/*|pkg/binate/mangle.bni) return 0 ;;
+        pkg/binate/native/*|pkg/binate/native.bni) return 0 ;;
+        pkg/binate/parser/*|pkg/binate/parser.bni) return 0 ;;
+        pkg/binate/sha256/*|pkg/binate/sha256.bni) return 0 ;;
+        pkg/binate/stringutils/*|pkg/binate/stringutils.bni) return 0 ;;
+        pkg/binate/token/*|pkg/binate/token.bni) return 0 ;;
+        pkg/binate/types/*|pkg/binate/types.bni) return 0 ;;
+        pkg/binate/version/*|pkg/binate/version.bni) return 0 ;;
+    esac
+    return 1
+}
+
 violations=0
 TAB=$(printf '\t')
 while IFS="$TAB" read -r f imp std; do
     [ -z "$imp" ] && continue
     rel="${f#"$BINATE_DIR"/}"
+    is_builder_tree "$rel" && continue
     printf '%s: imports forwarder "%s" — use "%s"\n' "$rel" "$imp" "$std"
     violations=$((violations + 1))
 done < "$CANDS"
@@ -82,6 +121,7 @@ done < "$CANDS"
 if [ "$violations" -gt 0 ]; then
     echo "=== $violations forwarder-import violation(s) ==="
     echo "The pkg/stdx/* forwarders are temporary; import the pkg/std/* home directly."
+    echo "(The BUILDER-compiled tree is exempt — see the header of this script.)"
     exit 1
 fi
 exit 0

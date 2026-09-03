@@ -1,8 +1,9 @@
 #!/bin/sh
 # Build the self-hosted formatter (bnfmt).
 #
-# Convenience wrapper around the BUILDER → gen1 bnc → cmd/bnfmt build
-# (fetch-builder.sh downloads the BUILDER bnc; no bootstrap/Go needed).
+# Convenience wrapper that builds gen2 (BUILDER → gen1 → gen2, via build-bnc.sh)
+# and compiles cmd/bnfmt with it.  gen2 is a fully from-tree bnc; see the
+# gen1/gen2 definitions in scripts/lib/build-compilers.sh.
 # Not used by the test/conformance harness; those have their own
 # build helpers in scripts/lib/build-compilers.sh.
 #
@@ -15,8 +16,8 @@
 #   ./scripts/build-bnfmt.sh -o <path> --debug # -O0 -g (slower, debuggable)
 #   ./scripts/build-bnfmt.sh -h                # help
 #
-# --target <key> cross-compiles Stage 2 for a bnc --target key (e.g.
-# aarch64-linux, x86_64-darwin); omitted builds for the host arch.
+# --target <key> cross-compiles the tool (gen2 stays host and cross-emits) for a
+# bnc --target key (e.g. aarch64-linux, x86_64-darwin); omitted builds host arch.
 #
 # After building:
 #   <path> <file.bn>            format to stdout (one file)
@@ -87,65 +88,34 @@ echo "  source root:    $BINATE_DIR"
 echo "  build scratch:  $BUILD_DIR"
 echo
 
-BUILDER="$("$BINATE_DIR/scripts/fetch-builder.sh")"
-BUILDER_LIB="$("$BINATE_DIR/scripts/fetch-builder.sh" --lib)"
+# Build gen2 — a fully from-tree bnc — then compile the tool with it.  gen2 is
+# BUILDER → gen1 → gen2 (all handled by build-bnc.sh: BUILDER compiles cmd/bnc
+# against the BUILDER stdlib → gen1; gen1 recompiles cmd/bnc against the TREE
+# stdlib → gen2).  Building the tool with gen2 (not gen1) keeps the
+# from-tree-bnc / tree-stdlib pairing clean (see scripts/lib/build-compilers.sh)
+# and lets the tool build pick up the tree's own codegen improvements/fixes.
+# gen2 is always a host binary; --target applies only to the tool compile below.
+GEN2_BNC="$BUILD_DIR/gen2-bnc"
+echo "  Building gen2 (BUILDER → gen1 → gen2) ..."
+"$SCRIPT_DIR/build-bnc.sh" -o "$GEN2_BNC" >&2
 
-# Two-step BUILDER → gen1 → final build, so any difference between the
-# BUILDER's compiled-in mangled-symbol literals and current-source's
-# literals can't reach the released binary.  gen1 is a cmd/bnc built
-# by the BUILDER and linked against the BUILDER's C runtime (its OLD
-# self-references resolve there); gen1's compiled-in codegen is
-# CURRENT source's codegen, so its OUTPUTS use the current literals.
-# The final binary is then emitted by gen1 from current source,
-# linked against the checkout's C runtime — fully consistent.
-
-GEN1_DIR="$BUILD_DIR/gen1"
-GEN1_BNC="$GEN1_DIR/bnc"
-mkdir -p "$GEN1_DIR/build"
-
-echo "  Stage 1: BUILDER → gen1 ..."
-# Stage 1's -I/-L resolve cmd/bnc's builtin + stdlib deps from the
-# BUILDER's frozen bundle only (--base "$BUILDER_LIB" --prepend "$BINATE_DIR");
-# the bnc source cone may only use features the BUILDER has, so no source
-# fallback.  Full rationale: scripts/lib/build-compilers.sh build_gen1.
-"$BUILDER" \
-    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR" --prepend "$BINATE_DIR/ifaces/toolchain")" \
-    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
-    --build-dir "$GEN1_DIR/build" \
-    -o "$GEN1_BNC" \
-    "$BINATE_DIR/cmd/bnc"
-
-echo "  Stage 2: gen1 → bnfmt ..."
-# Cross-compile: when --target names a non-host target, gen1 (a host binary,
-# built above) cross-EMITS the final bnfmt for that target.  The one key drives
-# both bnc's #[build(...)] stdlib gating (target-specific impls, e.g. os's
-# syscalls) and its clang cross-triple/flags (appendTargetFlags).  Passed to
-# binate-paths too so any per-target search extras apply (a no-op for the hosted
-# linux/macos targets, which #[build]-gate impls in place; matters for
-# baremetal).  Empty --target = host build, byte-identical to before.
-# Stage 1 is NOT cross-targeted: gen1 must run on THIS host.
+echo "  Compiling bnfmt with gen2 ..."
+# --target: gen2 (host) cross-EMITS the tool for a non-host target — the key drives
+# bnc's #[build(...)] stdlib gating (target-specific impls, e.g. os's syscalls) and
+# its clang cross-triple/flags, and is passed to binate-paths for any per-target
+# search extras (a no-op for the hosted linux/macos targets; matters for baremetal).
+# Empty --target = host build.
 TARGET_OPT=""
 [ -n "$TARGET" ] && TARGET_OPT="--target $TARGET"
-if [ -n "$DBG_FLAG" ]; then
-    "$GEN1_BNC" \
-        -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $TARGET_OPT)" \
-        -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $TARGET_OPT)" \
-        --build-dir "$BUILD_DIR" \
-        --cflag "$CFLAGS" \
-        $TARGET_OPT \
-        "$DBG_FLAG" \
-        -o "$OUT" \
-        "$BINATE_DIR/cmd/bnfmt"
-else
-    "$GEN1_BNC" \
-        -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $TARGET_OPT)" \
-        -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $TARGET_OPT)" \
-        --build-dir "$BUILD_DIR" \
-        --cflag "$CFLAGS" \
-        $TARGET_OPT \
-        -o "$OUT" \
-        "$BINATE_DIR/cmd/bnfmt"
-fi
+"$GEN2_BNC" \
+    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $TARGET_OPT)" \
+    -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $TARGET_OPT)" \
+    --build-dir "$BUILD_DIR" \
+    --cflag "$CFLAGS" \
+    $TARGET_OPT \
+    ${DBG_FLAG:+$DBG_FLAG} \
+    -o "$OUT" \
+    "$BINATE_DIR/cmd/bnfmt"
 
 echo
 echo "Built: $OUT"

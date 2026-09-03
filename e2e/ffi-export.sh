@@ -160,6 +160,24 @@ func FRo(x readonly int8) int {
 	}
 	return 0
 }
+
+// Narrow RETURNS: the callee must extend a sub-`int`-width result per the
+// platform C ABI, because a clang caller at -O1+ trusts the callee (AssertS/Zext)
+// and skips its own re-extension — so an un-extended i8/i16/i1 return surfaces as
+// dirty upper bits / a wrong value.  Each derives its narrow result from a WIDER
+// argument (cast truncation) so the natural codegen would leave nonzero upper
+// bits without the signext/zeroext fix.  Read at -O2 by the narrow-returns driver.
+#[c_export("ffi_reti8")]
+func RetI8(x int) int8 { return cast(int8, x) }
+
+#[c_export("ffi_reti16")]
+func RetI16(x int) int16 { return cast(int16, x) }
+
+#[c_export("ffi_retu8")]
+func RetU8(x int) uint8 { return cast(uint8, x) }
+
+#[c_export("ffi_retbool")]
+func RetBool(x int) bool { return x != 0 }
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -180,6 +198,61 @@ int main(void) {
     return 0;
 }
 EOF
+
+# --- a C driver that reads NARROW-width returns at -O2 --------------------
+# Compiled at -O2 so clang trusts the callee's ABI extension (AssertS/Zext) and
+# omits its own re-extension of each sub-`int` result — at -O0 clang re-extends
+# on the caller side and would MASK an un-extended callee return.  Each result is
+# widened to int and printed, so a callee that failed to sign/zero-extend shows
+# dirty upper bits as a wrong value.
+cat > "$TMP/driver_narrow.c" <<'EOF'
+#include <stdio.h>
+extern signed char ffi_reti8(int);
+extern short ffi_reti16(int);
+extern unsigned char ffi_retu8(int);
+extern _Bool ffi_retbool(int);
+int main(void) {
+    int a = ffi_reti8(507);       /* trunc -> 0xFB   = -5   (signed)   */
+    int b = ffi_reti16(0x1FF80);  /* trunc -> 0xFF80 = -128 (signed)   */
+    int c = ffi_retu8(456);       /* trunc -> 0xC8   = 200  (unsigned) */
+    int d = ffi_retbool(507);     /* nonzero -> true = 1               */
+    printf("%d %d %d %d\n", a, b, c, d);
+    return 0;
+}
+EOF
+WANT_NARROW="-5 -128 200 1"
+
+# check_narrow_returns <label> <extra-bnc-flags> <required>
+#   Like check_backend, but links the -O2 narrow-returns driver and checks the
+#   sub-`int` return extension.  Same required/skip semantics.
+check_narrow_returns() {
+    label="narrow-$1"; extra="$2"; required="$3"
+    work="$TMP/$label"
+    mkdir -p "$work"
+    if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
+            $extra --build-dir "$work" --pkg ffiexp >"$work/pkg.log" 2>&1 \
+            || [ ! -f "$work/ffiexp.o" ]; then
+        if [ "$required" -eq 1 ]; then
+            fail "$label: compile of facade (--pkg ffiexp) produced no object" \
+                 "$(tail -5 "$work/pkg.log")"
+        else
+            skip "$label: native --pkg unavailable for this host (no object emitted)"
+        fi
+        return
+    fi
+    if ! "$CLANG" -w -O2 "$TMP/driver_narrow.c" "$work/ffiexp.o" -o "$work/run" 2>"$work/link.err" \
+            || [ ! -x "$work/run" ]; then
+        fail "$label: link of -O2 narrow-returns driver + facade object failed" \
+             "$(head -6 "$work/link.err")"
+        return
+    fi
+    got="$("$work/run" 2>&1)"
+    if [ "$got" = "$WANT_NARROW" ]; then
+        pass "$label: -O2 C caller reads sign/zero-extended narrow #[c_export] returns: '$got'"
+    else
+        fail "$label: narrow-return output mismatch (got '$got', want '$WANT_NARROW')"
+    fi
+}
 
 # check_backend <label> <extra-bnc-flags> <required>
 #   Compile the facade with the given backend flags, link the C driver against
@@ -278,6 +351,13 @@ check_backend "native" "--backend native" 0
 # un-extended negative int32 reads positive).  Self-skips if the host native backend cannot
 # emit the facade.
 check_backend "native-O2" "--backend native -O2" 0
+# Narrow sub-`int` returns read by an -O2 clang caller — the LLVM callee must
+# carry signext/zeroext on the c_export define (a plain -O2 caller trusts it and
+# skips re-extension).  LLVM is required; native self-skips when the host backend
+# can't emit the facade (native returns over-satisfy, so it must pass when it runs).
+check_narrow_returns "llvm" "" 1
+check_narrow_returns "native" "--backend native" 0
+
 # The --library archive: init-once-via-bn_init + call the exports from a real .a.
 check_library
 

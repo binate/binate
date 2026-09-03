@@ -12,12 +12,14 @@
 # link is the BUILDER_VERSION-resolved binary (a bnc-X.Y.Z bundle
 # resolved via scripts/fetch-builder.sh).
 #
-#   builder-comp             BUILDER compiles cmd/bnc, which compiles .bn to native
-#   builder-comp-int         builder-comp compiles cmd/bni → binary, binary runs .bn via bytecode VM
-#   builder-comp-int-int     builder-comp-int interprets cmd/bni, which interprets .bn
-#   builder-comp-comp        builder-comp compiles cmd/bnc → gen1, gen1 compiles .bn
-#   builder-comp-comp-int    gen1 compiles cmd/bni → binary, binary runs .bn via bytecode VM
-#   builder-comp-comp-comp   builder-comp-comp builds gen1, gen1 → gen2, gen2 compiles .bn
+#   (gen1 = BUILDER-built cmd/bnc; gen2 = gen1-built; genN = gen(N-1)-built —
+#    see scripts/lib/build-compilers.sh for the canonical definition.)
+#   builder-comp             BUILDER compiles cmd/bnc → gen1, gen1 compiles .bn to native
+#   builder-comp-int         gen1 compiles cmd/bni → binary, binary runs .bn via bytecode VM
+#   builder-comp-int-int     the builder-comp-int bni interprets cmd/bni, which interprets .bn
+#   builder-comp-comp        gen1 compiles cmd/bnc → gen2, gen2 compiles .bn
+#   builder-comp-comp-int    gen2 compiles cmd/bni → binary, binary runs .bn via bytecode VM
+#   builder-comp-comp-comp   gen2 compiles cmd/bnc → gen3, gen3 compiles .bn
 #
 # Test formats:
 #   Single-file: NNN_name.bn + NNN_name.expected (positive: run and compare output)

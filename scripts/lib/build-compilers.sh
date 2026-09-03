@@ -2,6 +2,24 @@
 # Shared helpers for building gen1/gen2 compilers and compiled interpreters.
 # Source this from runner scripts.
 #
+# BOOTSTRAP GENERATIONS (canonical terminology, used across the build/test
+# scripts).  A "generation" is a bnc built from CURRENT-TREE cmd/bnc source;
+# generations differ by which compiler built them and which stdlib that build
+# resolved against:
+#
+#   BUILDER  the pinned prebuilt bnc (scripts/fetch-builder.sh) + its own frozen
+#            stdlib bundle; not built here.
+#   gen1     BUILDER compiles cmd/bnc, stdlib resolved from the BUILDER bundle
+#            (only pkg/binate comes from the tree) — so gen1's cone stays
+#            BUILDER-compatible.
+#   gen2     gen1 compiles cmd/bnc, stdlib resolved from the TREE.
+#   genN     gen(N-1) compiles cmd/bnc against the tree.
+#
+# Invariant: BUILDER stdlib is used in exactly one build — gen1's.  Every later
+# from-tree build (gen2+, and the bni/bnlint/bnas/bnld/bnfmt tools) uses TREE
+# stdlib.  The conformance modes count the same way: builder-comp = gen1,
+# builder-comp-comp = gen2, builder-comp-comp-comp = gen3.
+#
 # All compiler binaries and build directories for one runner_setup live
 # under a single unique session directory (mktemp -d).  This keeps
 # concurrent test runs in different worker sessions from colliding in the

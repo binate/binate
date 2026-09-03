@@ -1,8 +1,8 @@
 #!/bin/sh
-# Runner: builder-comp-comp-int — gen1 compiler compiles cmd/bni → binary, binary interprets test.bn via bytecode VM.
+# Runner: builder-comp-comp-int — gen2 compiler compiles cmd/bni → binary, binary interprets test.bn via bytecode VM.
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
-runner_setup() { build_gen1; build_interp "$GEN1_COMPILER"; }
+runner_setup() { build_gen1; build_gen2; build_interp "$GEN2_COMPILER"; }
 
 runner_exec() {
     bn="$1"; root="$2"

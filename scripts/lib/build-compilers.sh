@@ -140,6 +140,25 @@ build_gen2() {
     echo "Gen2 compiler ready: $GEN2_COMPILER"
 }
 
+# Build gen3 compiler (gen2 compiles cmd/bnc → gen3 binary).  gen3 verifies the
+# gen2→gen3 self-host fixpoint: it should behave identically to gen2.
+# Requires GEN2_COMPILER to be set (call build_gen2 first).  Sets GEN3_COMPILER.
+# Built --cflag -O2 for the same reason as gen1/gen2 (drives the comp-comp-comp
+# lane's per-test compiles).
+build_gen3() {
+    _ensure_compilers_dir
+    GEN3_COMPILER="$_COMPILERS_DIR/gen3_compiler"
+    GEN3_BUILD_DIR="$(_new_build_dir)"
+    echo "Building gen3 compiler (-O2)..."
+    build_out=$("$GEN2_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --cflag -O2 --build-dir "$GEN3_BUILD_DIR" -o "$GEN3_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    if [ ! -x "$GEN3_COMPILER" ]; then
+        echo "ERROR: Failed to build gen3 compiler:"
+        echo "$build_out"
+        exit 1
+    fi
+    echo "Gen3 compiler ready: $GEN3_COMPILER"
+}
+
 # Build a bnc binary using the native AArch64 backend — current-tree
 # cmd/bnc compiled via the LLVM path (GEN1_COMPILER) with --backend
 # native, asking it to compile cmd/bnc itself.  Dependency modules
@@ -232,7 +251,7 @@ build_interp_arm32() {
 # redundant with the session-dir rm but kept as a belt-and-suspenders in
 # case a caller pointed a path elsewhere.
 cleanup_compilers() {
-    rm -f "$GEN1_COMPILER" "$GEN2_COMPILER" "$COMPILED_INTERP" "$BNC_NATIVE"
+    rm -f "$GEN1_COMPILER" "$GEN2_COMPILER" "$GEN3_COMPILER" "$COMPILED_INTERP" "$BNC_NATIVE"
     for d in $BUILD_DIRS; do
         rm -rf "$d"
     done

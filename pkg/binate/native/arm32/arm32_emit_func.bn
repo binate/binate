@@ -3,6 +3,7 @@ package "pkg/binate/native/arm32"
 import "pkg/binate/asm"
 import "pkg/binate/asm/arm32"
 import "pkg/binate/ir"
+import "pkg/binate/iropcode"
 import "pkg/binate/native/common"
 import "pkg/binate/types"
 
@@ -51,6 +52,55 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 	// AAPCS32 (soft-float): 4 GP arg registers, 64-bit args in even-aligned
 	// register pairs, 8-byte stack alignment, floats in GP registers.
 	var rm @common.RegMap = common.NewRegMap(common.AAPCS32())
+	// Register allocation (before PlanFrame): home scalar SSA values in the
+	// CALLER-saved bank R0..R3.  Unlike aarch64/x64 (callee-saved homes), arm32
+	// has no free callee-saved register — R4..R10 are the scratch pool and R11
+	// is the frame pointer — so homes are caller-saved and CalleeSaved is empty.
+	// Caller-saved homes need NO prologue/epilogue save/restore, but they ARE
+	// destroyed by any returning call, so the clobber machinery is ACTIVE here:
+	// Int64OpsClobber + SoftFloatOpsClobber mark arm32's AEABI libcalls (int64
+	// mul/div/rem/shl/shr and int64<->float cast, plus — under soft-float —
+	// float arith/compare/cast) as clobbers on top of common.EmitsReturningBl,
+	// so the allocator only homes a value in R0..R3 when it is NOT live across
+	// any such op (spansClobber); a call-spanning value spills.  Since R0..R3
+	// are also the arg/return registers, param landing uses spill-then-reload
+	// (below) and emitCall parallel-moves homed args into place.  f is phi-free
+	// here (EliminatePhis ran in EmitObject).  wordBytes=4 (ILP32), so int64 is
+	// non-allocatable (a register pair) and never homed.
+	var rdesc common.RegClassDesc
+	rdesc.CallerSaved = arm32AllocatablePool()
+	rdesc.Int64OpsClobber = true
+	rdesc.SoftFloatOpsClobber = !types.Arm32HardFloat()
+	rm.AllocateRegisters(f, 4, rdesc)
+	// Caller-saved homes (R0..R3) OVERLAP the argument / target / return
+	// registers, so a value homed in R0..R3 that is marshalled INTO those
+	// registers would be clobbered by the marshalling itself.  Two families do
+	// that marshalling, and BOTH can shuffle >1 value through R0..R3 (a
+	// multi-value permutation the naive per-value `mov` order can corrupt):
+	//   - a call's argument-and-target setup (every common.EmitsReturningBl op —
+	//     direct / indirect / handle / iface / c-call, plus make / box /
+	//     make-slice / refdec / the guard calls; the target address of an
+	//     indirect / handle / iface call is one of its Args); and
+	//   - OP_RETURN's value pack (a multi-return tuple places its fields in the
+	//     R0..R3 return registers — e.g. fields homed in r3,r2,r1 moving to
+	//     r0,r1,r2 is a cycle that `mov r1,r2; mov r2,r1` corrupts).
+	// Rather than teach every marshalling path a parallel move, simply do NOT
+	// home the values it consumes: un-home the arguments of every such op.  They
+	// revert to the spill-everything path (PlanFrame reserved their slots), so
+	// the marshalling reads them from memory (disjoint from R0..R3).  Values
+	// never used as a call/return operand (loop counters, locals) still home,
+	// and a call/return RESULT still homes (landed by the home-aware collection).
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var eb @ir.Block = f.Blocks[bi]
+		for ei := 0; ei < len(eb.Instrs); ei++ {
+			var ei2 @ir.Instr = eb.Instrs[ei]
+			if common.EmitsReturningBl(ei2.Op) || ei2.Op == iropcode.OP_RETURN {
+				for ea := 0; ea < len(ei2.Args); ea++ {
+					if ei2.Args[ea] != nil { rm.UnhomeID(ei2.Args[ea].ID) }
+				}
+			}
+		}
+	}
 	var frameSize int = rm.PlanFrame(f)
 	// Parameter dispatch types (shared by the #[c_export] prefix below and the param-spill
 	// loop).  When this function returns via sret (SretSlotOff >= 0), every user param shifts
@@ -144,6 +194,24 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 		emitSpillParam(a, rm, f.Params[pi], paramTypes, dispatchIdx, stackArgsBase)
 	}
 
+	// Register-allocated (homed) scalar params: spillIncomingParams above wrote
+	// EVERY param to its stack slot (reading the incoming arg registers, never
+	// writing R0..R3), so the incoming values are now safely in memory.  Load
+	// each homed param from its slot into its home register.  This spill-then-
+	// reload avoids the register shuffle a direct arg-reg -> home-reg landing
+	// would hit (homes overlap the arg registers R0..R3): the spill phase above
+	// touches no R0..R3, so no incoming arg value is clobbered before it is
+	// saved; this phase reads only memory and writes homes.
+	for pi := 0; pi < len(f.Params); pi++ {
+		var phome int = rm.LookupHome(f.Params[pi].ID)
+		if phome >= 0 {
+			var poff int = rm.LookupSpill(f.Params[pi].ID)
+			if poff >= 0 {
+				emitFrameLoad(a, phome, poff)
+			}
+		}
+	}
+
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var b @ir.Block = f.Blocks[bi]
 		if bi > 0 {
@@ -160,6 +228,24 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 
 	// Safety net: emit an epilogue if the IR didn't end with OP_RETURN.
 	emitEpilogueAndRet(a, frameSize)
+}
+
+// arm32AllocatablePool returns the registers the linear-scan allocator homes
+// scalar values in: the AAPCS32 caller-saved bank R0..R3.  These are also the
+// argument/return registers, so a homed value is destroyed by any returning
+// call — the active clobber model (Int64OpsClobber / SoftFloatOpsClobber, plus
+// common.EmitsReturningBl) keeps a call-spanning value out of them — and param
+// / arg placement must route around them (spill-then-reload for incoming
+// params; emitCall's parallel move for outgoing args).  R4..R10 are the scratch
+// pool and R11 is the frame pointer, so no callee-saved register is free for a
+// home; the caller-saved choice needs no prologue save/restore.
+func arm32AllocatablePool() @[]int {
+	var p @[]int = make_slice(int, 4)
+	p[0] = arm32.R0
+	p[1] = arm32.R1
+	p[2] = arm32.R2
+	p[3] = arm32.R3
+	return p
 }
 
 // emitSpillParam stores one incoming parameter to its frame slot so later uses

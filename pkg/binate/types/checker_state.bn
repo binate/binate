@@ -1,0 +1,363 @@
+package "pkg/binate/types"
+
+import "pkg/binate/ast"
+
+// Checker holds all type-checker state.  It is exposed to importers only as
+// the opaque handle `type Checker` (in the .bni); these fields are internal
+// and reached from outside the package through the accessor methods below
+// (Interpreted / SetInterpreted / Pending / PendingMark / Scope) and the
+// checker driver methods (NewChecker, CheckPackage, CheckerErrors, ...).
+type Checker struct {
+	Errors   @[]CheckError
+	Scope    @Scope
+	FuncRet  @[]@Type
+	Packages @[]@PkgEntry
+	Iota     int
+	InLoop   bool // true inside for loops (break + continue valid)
+	InSwitch bool // true inside switch (break valid, continue not)
+	// Interpreted: true when this Checker checks code for the bytecode VM /
+	// REPL (an interpreted context), where `__c_call` (native-only FFI) can
+	// never run — so checkCCall rejects it as a type error, at the frontend,
+	// rather than failing later at lowering.  Off for cmd/bnc, where `__c_call`
+	// compiles to a real C call.  Injected packages load interface-only, so
+	// their `.bn` `__c_call` never reaches the checker; this therefore flags
+	// only interpreted code's own `__c_call`.
+	Interpreted bool
+	// CCallSyms / CGlobalSyms record the verbatim C symbols named by __c_call
+	// and __c_global respectively, across the whole compile.  A C symbol is
+	// either a function OR a data object, never both, so a symbol appearing in
+	// both is a contradiction: the emitted LLVM module would carry a
+	// `declare <ret> @sym(...)` AND a `@sym = external global <T>`, which is
+	// ill-formed (a redefinition the verifier/linker rejects).  checkCCall /
+	// checkCGlobal cross-check these to reject the clash with a clean
+	// diagnostic.  Compiled-mode only (left empty under Interpreted, where both
+	// builtins are already rejected outright).
+	CCallSyms   @[]@[]char
+	CGlobalSyms @[]@[]char
+	// InGroupBareMember: true only while checking a BARE-repeat group member
+	// (`const ( B0 int = 1 << iota; B1; B2 )`), which re-uses the preceding
+	// member's initializer AST node at a new iota.  The signedness-aware
+	// const-value fold + ExprType stamp (which IR-gen's genConstGroup reads for
+	// explicit members) are suppressed for these: the shared node carries one
+	// ExprType id, so stamping it per-member would overwrite an earlier member's
+	// value.  An EXPLICIT grouped member has its own node and IS stamped.
+	InGroupBareMember bool
+
+	// AllowRedef: when true, suppresses the bni-vs-bn signature
+	// match check that normally fires whenever a function name is
+	// already in local scope.  Set by REPL entry points
+	// (CheckDeclInScope) so re-typing a func at the prompt isn't
+	// reported as a "bni declared X" mismatch.  Off by default;
+	// the compile-time path keeps the check active.
+	AllowRedef bool
+
+	// AllowSelf: when true, `Self` is a valid type expression.
+	// Set transiently while resolving an interface method's
+	// signature (argument and result types only).  Off everywhere
+	// else — including inside interface alias targets, interface
+	// extension parent lists, and ordinary func / var / type /
+	// struct declarations.  A TEXPR_SELF reference reached with
+	// AllowSelf=false produces a type error.
+	AllowSelf bool
+
+	// AllowUniverseRecv: when true, methods may be declared on
+	// universe primitives (`int`, `bool`, `char`, etc.).  Set by
+	// Check / CheckPackage when the source file's package is the
+	// carve-out package (currently `pkg/builtins/lang`).  Off everywhere
+	// else — user packages can't extend `int`.
+	AllowUniverseRecv bool
+
+	// BuildingIfaceScope: true only while buildScopeFromFile resolves a
+	// package's `.bni` into its exported-symbol surface (LoadPackageInterface).
+	// That pass builds type IDENTITY for the surface — it resolves each `.bni`
+	// signature's generic instantiations — but it runs BEFORE the package's own
+	// `impl` declarations are collected into c.Impls (impls are collected in the
+	// CheckPackage pass, from the merged decl list).  So a `.bni` that names a
+	// generic instantiated on a type the SAME `.bni` `impl`s (e.g. `func Make()
+	// @Box[Item]` above `impl Item : Sizer`) would constraint-check `Box[Item]`
+	// against an Impls list that doesn't yet contain `Item : Sizer` and be
+	// wrongly rejected.  While this flag is set, instantiation resolution is
+	// treated as non-user-facing: the type is built and cached but its
+	// constraints are NOT checked and NOT latched, so the authoritative check
+	// happens later in CheckPackage (where c.Impls is populated) at the first
+	// real user-facing resolution of the same (decl, args).  Mirrors the
+	// speculative-instantiation deferral instantiateGenericDeclWithArgs already
+	// uses for internal re-instantiation.
+	BuildingIfaceScope bool
+
+	// CollectingDecls: true while collectDecls resolves a package's (or a single
+	// file's) declarations into scope — the batch CheckPackage / single-file Check
+	// path, NOT the REPL.  collectDeclsBody records each `impl` inline in source
+	// order, but a generic instantiation is constraint-checked the moment a
+	// signature that names it is resolved — so an instantiation whose type-arg's
+	// `impl` is declared LATER (a `func F() @Box[Item]` above `impl Item : Sizer`,
+	// or the same across a func vs. an interface method) would be checked against
+	// an incomplete c.Impls and wrongly rejected.  Top-level decls are
+	// order-independent, so while this flag is set instantiation resolution is
+	// non-user-facing (built and cached for identity, check skipped and NOT
+	// latched); recheckDeferredConstraints re-fires the checks after collectDeclsBody
+	// has recorded every impl.  Same deferral mechanism as BuildingIfaceScope.
+	CollectingDecls bool
+
+	// PendingChecks: the generic-instantiation constraint checks deferred during
+	// the current batch collection (recorded while CollectingDecls is set), replayed
+	// by recheckDeferredConstraints once collectDeclsBody has recorded every impl.
+	// See PendingConstraintCheck.
+	PendingChecks @[]@PendingConstraintCheck
+
+	// PackageScope: the file/package-level scope, captured at the
+	// start of pass-2 body checking.  Originally used by Phase 1's
+	// checkFuncLit to reparent literal bodies and reject captures;
+	// Phase 2 removes that reparenting in favour of capture analysis.
+	// The field is kept because other code paths reference it as the
+	// package-level lookup root.
+	PackageScope @Scope
+
+	// FileScopeNames / FileScopes: the per-file import scopes for the
+	// package currently being checked (multi-file CheckPackage path only),
+	// keyed by source-file path (a decl's Pos.File).  Built by
+	// buildFileScopes; consulted per decl in collectDeclsBody / checkDecls /
+	// resolveConstByName so a qualifier in file F resolves against only F's
+	// imports.  Empty in single-file / REPL mode (imports go straight into
+	// the one package scope as before).
+	FileScopeNames @[]@[]char
+	FileScopes     @[]@Scope
+
+	// CaptureStack: active function-literal capture frames.  Pushed
+	// on entry to a literal body in checkFuncLit, popped on exit;
+	// each successful Ident lookup walks the stack from innermost
+	// to outermost and records a capture on every frame the
+	// resolution crosses.  Empty stack means we're
+	// not inside any literal body — captures are a no-op.
+	CaptureStack @[]@CaptureFrame
+
+	// Type registry: maps ResolvedTypeID → Type.
+	// Populated during type checking; queried by downstream tools (linter, etc.).
+	ExprTypes    @[]@Type
+	NumExprTypes int
+
+	// Impls: collected `impl T : Iface, ...` declarations. Collection
+	// only resolves the receiver type and interface names; satisfaction
+	// checks land in a follow-up slice.
+	Impls @[]@Impl
+
+	// GenericTypeDecls: AST decls for generic struct declarations
+	// (DECL_TYPE with non-empty TypeParams).  Pass 1 stashes the AST
+	// here instead of resolving the struct body (T is unbound at decl
+	// time); use sites
+	// `Name[T1, T2]` look up by Name and instantiate fresh,
+	// caching the result in GenericInstantiations.
+	GenericTypeDecls @[]@ast.Decl
+
+	// GenericTypeDeclPkgs: parallel array carrying each entry's
+	// defining package's short-name — empty for the current
+	// (main) package, the import alias for entries registered
+	// from an imported .bni.
+	// lookupGenericTypeDeclPkg uses this to disambiguate
+	// `Pair[int]` from `otherpkg.Pair[int]`.
+	GenericTypeDeclPkgs @[]@[]char
+
+	// GenericIfaceDecls: AST decls for generic interface
+	// declarations (DECL_INTERFACE with non-empty TypeParams).
+	// Same pattern as GenericTypeDecls — Pass 1 stashes the AST
+	// instead of resolving the method set (T is unbound at decl time);
+	// use sites `Name[T1, T2]` look up by Name and instantiate
+	// fresh, caching alongside structs in GenericInstantiations.
+	GenericIfaceDecls @[]@ast.Decl
+
+	// GenericIfaceDeclPkgs: parallel pkg-pairing for
+	// GenericIfaceDecls.
+	GenericIfaceDeclPkgs @[]@[]char
+
+	// GenericTypeDeclScopes / GenericIfaceDeclScopes: parallel to
+	// GenericTypeDecls / GenericIfaceDecls — the DEFINING-FILE import scope
+	// each generic decl's body must resolve its package-qualified field/method
+	// types against.  Recorded because a generic body is resolved LAZILY at the
+	// (possibly cross-package) instantiation site, where the use-site c.Scope
+	// would otherwise bind a qualifier to the consumer's imports (wrong package
+	// → wrong layout).  The @Scope survives past checkPackageImpl (file scopes
+	// are only dropped from the FileScope arrays; the object + its SYM_PKG
+	// PkgPath→lookupPackage mapping stay live via c.Packages).
+	GenericTypeDeclScopes  @[]@Scope
+	GenericIfaceDeclScopes @[]@Scope
+
+	// ImportedGenericMethodDecls / ImportedGenericMethodDeclPkgs: parallel arrays
+	// of generic-receiver method decls (`func (b @Box[T]) Get() T`) imported from
+	// a `.bni` (with their DEFINING package path).  A LOCAL generic type's methods
+	// attach to its scope placeholder (collectGenericMethodDecl) and are copied at
+	// instantiation; an IMPORTED generic type has no consumer-scope placeholder, so
+	// its methods are stashed here at `.bni` load (bni_scope) and resolved with the
+	// concrete args at each instantiation (copyPlaceholderMethods's imported path),
+	// keyed by defining package + receiver base type name.  Bodies (needed for the
+	// consumer to monomorphize) ride the AST decl, as for generic functions.
+	ImportedGenericMethodDecls    @[]@ast.Decl
+	ImportedGenericMethodDeclPkgs @[]@[]char
+
+	// GenericInstantiations: cache of (decl, type-args) →
+	// instantiated @Type so `List[int]` produces the same @Type
+	// across uses (Identical-comparison works).  Indexed in
+	// insertion order; lookup walks the list.
+	GenericInstantiations @[]@GenericInstantiation
+
+	// Tier 3 forward references — pending decl tracking.  When
+	// TentativeMode is set, ALL errors during the body check
+	// route to TentativeErrors instead of the user-visible
+	// Errors slice.  errUndefined ALSO captures the name in
+	// TentativeMissing.  After the body check, the REPL driver
+	// uses this to decide:
+	//   - TentativeMissing non-empty → park the decl (the
+	//     missing names are why; the cascading errors that
+	//     followed them are noise).
+	//   - TentativeMissing empty but TentativeErrors non-empty
+	//     → real errors with no missing-name blame; migrate
+	//     them to Errors so the user sees them.
+	TentativeMode    bool
+	TentativeMissing @[]@[]char
+	TentativeErrors  @[]CheckError
+	Pending          @[]@PendingDecl
+
+	// PendingMark is the length of Pending at the entry to the
+	// most recent CheckDeclInScope call.  IsDeclPending() reports
+	// whether Pending grew during that call (covering both the
+	// single-decl case and DECL_GROUP per-member parking — where
+	// TentativeMissing alone wouldn't, since the group loop
+	// resets it per member).  REPL driver also walks
+	// `Pending[PendingMark:]` to iterate every decl that just
+	// parked, for per-decl "X parked (pending: ...)" announcements.
+	PendingMark int
+
+	// ExpectedFVType is a transient hint set by callers of
+	// checkExpr that already know the destination type's
+	// function-value form — VarDecl with `var f @func()`, return
+	// statements whose function returns @func, etc.  When set to
+	// a TYP_MANAGED_FUNC_VALUE / TYP_FUNC_VALUE, checkFuncLit
+	// consults it to resolve a literal whose signature matches
+	// as the requested form rather than the default *func.  IR-
+	// gen reads the literal's resolved type to choose stack-
+	// alloc (raw *func) vs heap-alloc (managed @func).  Nil
+	// outside the narrow set-and-clear windows.
+	ExpectedFVType @Type
+
+	// BorrowPosKind is a transient marker (like ExpectedFVType) for the
+	// implicit interface value-borrow (iface.construct.value-borrow): it is set
+	// to POS_BORROWING for the extent of checking a source at a BORROWING
+	// construction position (a call argument or a var/`:=` initializer), and left
+	// at the default POS_STORING everywhere else (assignment, field/element
+	// store, return).  canBorrowValueIntoRawIface reads it to admit a
+	// NON-addressable value source (a materialised stack temporary) only where
+	// the borrow cannot outlive it; a composite literal's elements inherit the
+	// enclosing literal's kind because the field persists across the recursive
+	// checkExpr (set/restore keeps it leaf-granular — a nested call argument
+	// re-sets it).
+	BorrowPosKind int
+
+	// ConstResolving / ConstResolved drive dependency-ordered
+	// resolution of top-level consts in pass 1 (resolveTopLevelConsts).
+	// ConstResolving is the active depth-first stack, used to detect a
+	// `const A = B; const B = A` cycle; ConstResolved memoizes names
+	// whose real type+value have been recorded so re-entry is a no-op.
+	// Both are reset per sweep and used only on the batch path.
+	ConstResolving @[]@[]char
+	ConstResolved  @[]@[]char
+
+	// VarVisiting / VarOrdered drive the dependency-order topological
+	// sort of a package's top-level `var x T = expr` initializers
+	// (resolveTopLevelVarOrder, check_var_resolve.bn).  VarVisiting is the
+	// active depth-first path stack — a back-edge into it is a
+	// `var a = b; var b = a` initialization cycle; VarOrdered is the
+	// accumulating post-order result, which also serves as the visited
+	// ("done") set.  Both are transient: reset at the start of each
+	// package's sweep and used only on the batch path.
+	VarVisiting @[]@[]char
+	VarOrdered  @[]@[]char
+
+	// VarInitOrderPaths / VarInitOrders record, per package, the
+	// dependency order of that package's top-level init-vars, so IR-gen's
+	// buildInitBody emits the `<name> = <value>` assignments in an order
+	// where each initializer's package-var dependencies run first —
+	// instead of filename-then-source order, under which a cross-file or
+	// forward reference silently reads a zero value.  ONE Checker instance
+	// checks every package before any IR-gen runs, so a scalar order field
+	// would be clobbered across packages; these parallel arrays are keyed
+	// by package path.  VarInitOrder(path) reads them back.
+	VarInitOrderPaths @[]@[]char
+	VarInitOrders     @[]@[]@[]char
+
+	// ReplDeclMode is set while CheckDeclInScope checks a single REPL
+	// decl.  The batch-path dependency-ordered const sweep
+	// (resolveTopLevelConsts) must NOT run there — a REPL const that
+	// references a not-yet-entered name has to PARK (Tier-3 pending
+	// machinery), not eagerly error; collectDeclsBody forward-registers
+	// const placeholders for that path instead.  This is distinct from
+	// TentativeMode, which is false during the REPL's pass-1 collectDecls
+	// (it's only set for the pass-2 body check), and from AllowRedef,
+	// which is about `.bni`/`.bn` redefinition tolerance.
+	ReplDeclMode bool
+
+	// GenericInstDepth is the current nesting depth of generic
+	// instantiation (instantiateGenericDeclWithArgs).  Bounds
+	// infinitely-growing instantiation chains (`type Box[T] struct {
+	// inner @Box[Wrap[T]] }`) — each level has different type args, so
+	// the placeholder cache never hits; the depth bound rejects them
+	// with a clean diagnostic instead of overflowing the stack.
+	GenericInstDepth int
+
+	// GenericIfacePopulating is the stack of instantiated generic
+	// interfaces whose extension clause is currently being resolved.
+	// resolveInterfaceExtension consults it to detect an inheritance
+	// cycle across distinct instantiated interfaces (`interface P[T] :
+	// Q[T]` + `interface Q[T] : P[T]`): the back-edge parent resolves
+	// to an interface still on this stack, so it is reported and
+	// dropped — keeping the Parents graph acyclic so the ancestor-
+	// closure walks (ifaceFullMethods / isDescendantInterface) can't
+	// loop.  (Direct self-extension is caught separately by name.)
+	GenericIfacePopulating @[]@Type
+
+	// curPkgShort / curPkgPath: the package currently being checked /
+	// whose .bni is being loaded — the short last-segment name and the
+	// full path respectively.  curPkgShort stamps Pkg onto each
+	// TYP_INTERFACE (cross-package iface identity is (Pkg, Name));
+	// curPkgPath path-qualifies a named struct's Type.Name for mangling
+	// (must equal IR-gen's per-module package path for the same module).
+	// Per-checker (was package-global): the Check* entry points save the
+	// prior value, set it for the pass, and restore on exit, so nested
+	// checks (REPL-inside-compile) and concurrent checkers don't collide.
+	curPkgShort @[]char
+	curPkgPath  @[]char
+}
+
+// Interpreted reports whether this Checker checks code destined for an
+// interpreted context (the bytecode VM / REPL), where the native-only
+// `__c_call` FFI can never run and is rejected at the frontend.  It is off for
+// cmd/bnc, where `__c_call` lowers to a real C call.
+func (c @Checker) Interpreted() bool {
+	return c.Interpreted
+}
+
+// SetInterpreted marks this Checker as checking for an interpreted context (see
+// Interpreted).  An embedder that runs the checked code on the bytecode VM /
+// REPL sets it before checking.
+func (c @Checker) SetInterpreted(v bool) {
+	c.Interpreted = v
+}
+
+// Pending returns the parked declarations that could not fully resolve at
+// first-check time (see PendingDecl).  The REPL driver walks these to retry
+// them and to announce the ones still parked.
+func (c @Checker) Pending() @[]@PendingDecl {
+	return c.Pending
+}
+
+// PendingMark is the len(Pending) snapshot taken when the current declaration
+// began checking; entries at or beyond this index were parked by that
+// declaration (see Pending).
+func (c @Checker) PendingMark() int {
+	return c.PendingMark
+}
+
+// Scope returns the checker's current symbol scope.  The REPL resolves symbols
+// through it (Scope.Lookup) after a check leaves the main file's scope
+// installed.
+func (c @Checker) Scope() @Scope {
+	return c.Scope
+}

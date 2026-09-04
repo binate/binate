@@ -14,8 +14,8 @@
 # bnfmt is fetched from the CHECK_TOOLS_VERSION bundle when that release ships one
 # (`fetch-builder.sh --check-tools --tool bnfmt`, mirroring lint.sh's bnlint fetch).
 # CHECK_TOOLS_VERSION may be a pre-release ahead of the BUILDER (see
-# plan-check-tools-version.md).  The current CHECK_TOOLS_VERSION (bnc-0.0.12-pre3)
-# ships a bnfmt, so the bundled binary is used directly.  A bundle WITHOUT a bnfmt
+# plan-check-tools-version.md).  The current CHECK_TOOLS_VERSION ships a bnfmt, so
+# the bundled binary is used directly.  A bundle WITHOUT a bnfmt
 # (as bnc-0.0.10 was) falls back to building bnfmt from source and caching the
 # binary keyed on a hash of its build inputs (its own package plus the
 # parser/lexer/ast/token/buf it depends on): that run rebuilds only when bnfmt's
@@ -93,16 +93,61 @@ if [ -z "$bnfmt" ] || [ ! -x "$bnfmt" ]; then
 	fi
 fi
 
-unformatted=""
-for f in $(find $ROOTS \( -name '*.bn' -o -name '*.bni' \) 2>/dev/null | LC_ALL=C sort); do
-	"$bnfmt" --check "$f" >/dev/null 2>&1 || unformatted="$unformatted $f"
-done
+# One `bnfmt --check` over ALL in-scope files, instead of a fork per file (~1,500
+# execs).  bnfmt processes every file -- one file's failure does not skip the rest
+# -- and names each offending file on stderr as `<path>: not formatted` (or, for an
+# unparseable file, `<path>: <error>`), exiting non-zero if any failed.  The file
+# set is tens of KB of paths, far under ARG_MAX, so a single invocation suffices.
+files="$(find $ROOTS \( -name '*.bn' -o -name '*.bni' \) 2>/dev/null | LC_ALL=C sort)"
 
-if [ -n "$unformatted" ]; then
-	echo "The following files are not bnfmt-formatted"
-	echo "(fix: scripts/build-bnfmt.sh -o /tmp/bnfmt && /tmp/bnfmt -w <file>):"
-	for f in $unformatted; do echo "  $f"; done
-	echo ""
-	echo "=== bnfmt-format failed ==="
+# The single invocation below relies on unquoted word-splitting of $files, which
+# is safe only because Binate source paths carry no whitespace or shell-glob
+# character.  Enforce that precondition loudly: a mis-split path would reach bnfmt
+# as fragments it cannot open, and bnfmt treats an unopenable file as empty (=
+# "already formatted") -- so a stray path would be silently DROPPED and the check
+# would pass over an unchecked file.  Also fail on an empty set (a broken checkout)
+# rather than invoke bnfmt with no paths (whose usage error would be mis-read as an
+# offending file named "usage").
+if [ -z "$files" ]; then
+	echo "bnfmt-format: found no .bn/.bni files under: $ROOTS" >&2
 	exit 1
 fi
+if printf '%s\n' "$files" | grep -qE '[[:blank:]]|[][*?]'; then
+	echo "bnfmt-format: a source path contains whitespace or a shell-glob character;" >&2
+	echo "the batched word-split cannot pass it safely.  Offending path(s):" >&2
+	printf '%s\n' "$files" | grep -nE '[[:blank:]]|[][*?]' >&2
+	exit 1
+fi
+
+errfile="$(mktemp)" || { echo "bnfmt-format: mktemp failed" >&2; exit 1; }
+
+# $files is a newline-separated list of colon-free, glob-free paths; the intended
+# word-splitting passes them all as separate arguments (matching the old loop).
+"$bnfmt" --check $files 2>"$errfile" >/dev/null
+status=$?
+
+if [ "$status" -eq 0 ]; then
+	rm -f "$errfile"
+	exit 0
+fi
+
+# Non-zero exit: at least one file is unformatted or unparseable.  Every stderr
+# line is `<path>: <reason>`; the path is the text before the first `: ` (in-tree
+# paths contain no colon).  Dedup -- a parse error can emit several lines per file.
+unformatted="$(sed 's/: .*//' "$errfile" | LC_ALL=C sort -u | sed '/^$/d')"
+
+if [ -z "$unformatted" ]; then
+	# Non-zero exit but no `<path>:` lines to parse: an unexpected bnfmt failure.
+	echo "bnfmt-format: bnfmt --check failed unexpectedly:" >&2
+	cat "$errfile" >&2
+	rm -f "$errfile"
+	exit 1
+fi
+rm -f "$errfile"
+
+echo "The following files are not bnfmt-formatted"
+echo "(fix: scripts/build-bnfmt.sh -o /tmp/bnfmt && /tmp/bnfmt -w <file>):"
+for f in $unformatted; do echo "  $f"; done
+echo ""
+echo "=== bnfmt-format failed ==="
+exit 1

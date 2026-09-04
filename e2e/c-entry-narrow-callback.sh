@@ -14,7 +14,12 @@
 # backend therefore hands `__c_entry(f)` a WEAK `__centry.<mangled f>` thunk that
 # re-canonicalizes the narrow argument registers, then branches to f's entry.
 # This test drives exactly that dirty-upper case from C and checks f sees the
-# canonical value.
+# canonical value.  It covers two narrow arguments: one passed in a REGISTER
+# (re-canonicalized by the thunk) and — via a 9-parameter callback whose 9th
+# argument is stack-passed on both SysV x64 and AAPCS64 — one on the STACK, which
+# the thunk does NOT touch (it normalizes registers only) but the callback's own
+# mangled-entry spill sizes-and-extends unconditionally.  The stack callback is not
+# #[c_export], so it exercises the non-c_export __c_entry stack path specifically.
 #
 # The dirty-upper argument is injected the same way e2e/c-subword-return.sh does
 # for a sub-word RETURN: the C caller declares the callback as taking a 64-bit
@@ -79,9 +84,11 @@ summary() {
     exit 0
 }
 
-# cb returns 111 iff it saw its int32 argument as the canonical 5 (upper bits
-# re-normalized); a dirty-upper argument that leaks into the compare yields 222.
-WANT="111"
+# cb / cbStack each return 111 iff they saw their int32 argument as the canonical 5
+# (upper bits re-normalized); a dirty-upper argument that leaks into the compare yields
+# 222.  cb takes its argument in a REGISTER (normalized by the __c_entry thunk); cbStack's
+# inspected argument is STACK-passed (normalized by the callback's own mangled-entry spill).
+WANT="$(printf '111\n111')"
 
 if ! command -v "$CLANG" >/dev/null 2>&1; then
     skip "c-entry-narrow-callback (no C compiler '$CLANG' available)"
@@ -99,6 +106,19 @@ cat > "$TMP/ccall.c" <<'EOF'
  * This is the argument-side analogue of c-subword-return.sh's dirty-upper RETURN
  * technique. */
 int call_i32_cb(int (*cb)(long long), long long dirty) { return cb(dirty); }
+
+/* Stack-arg variant: a 9-int-parameter callback whose 9th argument is STACK-passed
+ * on both SysV x64 (6 GP arg regs) and AAPCS64 (8).  Each parameter is declared
+ * `long long` so its stack slot carries a full 64-bit word — the low 32 bits are the
+ * real int32 argument, the upper bits are the dirty junk.  The __c_entry thunk
+ * normalizes only the argument REGISTERS; the stack-passed narrow argument is
+ * canonicalized by the callback's own mangled-entry spill (the unconditional sub-word
+ * stack-arg extension).  Only the 9th argument (a8) is inspected by the callback. */
+int call_i32_stack_cb(int (*cb)(long long, long long, long long, long long, long long,
+                                long long, long long, long long, long long),
+                      long long a8dirty) {
+    return cb(0, 0, 0, 0, 0, 0, 0, 0, a8dirty);
+}
 EOF
 
 # --- the Binate program: hand cb to C via __c_entry, check the value ----------
@@ -117,12 +137,29 @@ func cb(x int32) int32 {
 	return 222
 }
 
+// A narrow (int32) callback whose 9th parameter is STACK-passed on both SysV x64 (6 GP arg
+// regs) and AAPCS64 (8).  cbStack is NOT #[c_export], so this exercises the non-c_export
+// __c_entry stack path: the adaptation thunk normalizes only the argument REGISTERS, so a8's
+// dirty upper bits are canonicalized by cbStack's own mangled-entry spill (the unconditional
+// sub-word stack-arg extension).  Only a8 is inspected.
+func cbStack(a0 int32, a1 int32, a2 int32, a3 int32, a4 int32, a5 int32,
+		a6 int32, a7 int32, a8 int32) int32 {
+	if a8 == 5 {
+		return 111
+	}
+	return 222
+}
+
 func main() {
 	// A non-canonical int32 5: low 32 bits = 5, upper 32 bits = 0xBEEF (dirty).
 	var hi int64 = cast(int64, 0xBEEF)
 	var dirty int64 = (hi << 48) | 5
+	// Register-arg callback: the __c_entry thunk re-canonicalizes the argument register.
 	var r int32 = __c_call("call_i32_cb", int32, __c_entry(cb), dirty)
 	testing.Println(cast(int, r))
+	// Stack-arg callback: a8 lands on the stack; cbStack's mangled-entry spill extends it.
+	var r2 int32 = __c_call("call_i32_stack_cb", int32, __c_entry(cbStack), dirty)
+	testing.Println(cast(int, r2))
 }
 EOF
 

@@ -368,6 +368,65 @@ EOF
     fi
 }
 
+# check_library_alloc — a --library archive whose closure ALLOCATES must stay
+# self-contained.  On aarch64 the portable Binate rt.MemZero is #[build]-gated
+# off in favour of a hand-asm .s, so `bnc --library` must archive that .s object
+# alongside the closure; otherwise the rt member references MemZero (via
+# rt.Alloc) but nothing defines it, and a caller's link fails undefined.  The
+# shared ffiexp facade above is deliberately allocation-free, so this uses its
+# own tiny allocating facade.
+check_library_alloc() {
+    work="$TMP/library_alloc"
+    mkdir -p "$work" "$TMP/if2" "$TMP/im2/allocx"
+    cat > "$TMP/if2/allocx.bni" <<'EOF'
+package "allocx"
+
+func Sum(n int) int
+EOF
+    cat > "$TMP/im2/allocx/lib.bn" <<'EOF'
+package "allocx"
+
+// Allocates managed memory (make_slice -> rt.Alloc -> rt.MemZero), so the
+// archived closure references MemZero and the archive must define it.
+#[c_export("allocx_sum")]
+func Sum(n int) int {
+	var s @[]int = make_slice(int, n)
+	for i := 0; i < n; i++ { s[i] = i }
+	var total int = 0
+	for i := 0; i < n; i++ { total = total + s[i] }
+	return total
+}
+EOF
+    if ! "$GEN1" -I "$TMP/if2:$IFACE" -L "$TMP/im2:$IMPL" \
+            --build-dir "$work" -o "$work/liballocx.a" --library allocx >"$work/lib.log" 2>&1 \
+            || [ ! -f "$work/liballocx.a" ]; then
+        fail "library-alloc: --library allocx produced no archive" "$(tail -5 "$work/lib.log")"
+        return
+    fi
+    cat > "$work/driver.c" <<'EOF'
+#include <stdio.h>
+extern void bn_init(void);
+extern int allocx_sum(int);
+int main(void) {
+    bn_init();
+    printf("%d\n", allocx_sum(5));  /* 0+1+2+3+4 = 10 */
+    return 0;
+}
+EOF
+    if ! "$CLANG" -w "$work/driver.c" "$work/liballocx.a" -o "$work/run" \
+            2>"$work/link.err" || [ ! -x "$work/run" ]; then
+        fail "library-alloc: link of C driver + allocating --library archive failed" \
+             "$(head -8 "$work/link.err")"
+        return
+    fi
+    got="$("$work/run" 2>&1)"
+    if [ "$got" = "10" ]; then
+        pass "library-alloc: allocating closure archived self-contained (rt.MemZero resolved): '$got'"
+    else
+        fail "library-alloc: output mismatch (got '$got', want '10')"
+    fi
+}
+
 # LLVM backend (default) — always required.
 check_backend "llvm" "" 1
 # Native backend — real link+run coverage of the second-symbol emission when the
@@ -387,5 +446,7 @@ check_narrow_returns "native" "--backend native" 0
 
 # The --library archive: init-once-via-bn_init + call the exports from a real .a.
 check_library
+# An allocating --library closure must archive self-contained (rt.MemZero).
+check_library_alloc
 
 summary

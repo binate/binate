@@ -19,20 +19,20 @@ import "pkg/binate/types"
 // narrow STACK-passed arg needs no thunk help: the mangled entry's own spill
 // (spillScalarStackArg{,X64} / emitFrameLoadSized) sizes-and-extends every sub-word
 // stack arg UNCONDITIONALLY, canonicalizing the C caller's dirty high slot bytes at
-// the point every caller lands — so a callback whose ONLY narrow param is stack-
-// passed still gets a thunk (see funcHasNarrowGPParam) but it is a harmless
-// no-op-then-branch.
+// the point every caller lands.  So the thunk is emitted ONLY for a target with a
+// narrow REGISTER param (funcHasNarrowGPRegParam / CEntryRegNormWalk); a target whose
+// only narrow params are stack-passed is referenced degenerate (no thunk).
 
 // collectCEntryThunkTargets scans mod for OP_C_ENTRY instructions, marks each
-// whose target has a narrow GP integer/bool parameter (relative to wordBytes) so
-// the backend references its thunk (ins.CEntryThunk = true), and returns the
+// whose target has a narrow GP integer/bool parameter passed in a REGISTER (per
+// funcHasNarrowGPRegParam, using cc's arg-assignment) so the backend references its
+// thunk (ins.CEntryThunk = true), and returns the
 // deduplicated set of those targets (as @ir.Func — real or synthetic) for the
 // backend to emit thunks for.  Returns (targets, false) — recording an emit
 // error on `a` — only if an OP_C_ENTRY names a function the module has no
 // signature for (the checker admits only declared functions, so that is an
 // internal inconsistency, not a case to wave through as degenerate).
-func collectCEntryThunkTargets(a @asm.Assembler, wordBytes int,
-		mod @ir.Module) (@[]@ir.Func, bool) {
+func collectCEntryThunkTargets(a @asm.Assembler, cc CallConv, mod @ir.Module) (@[]@ir.Func, bool) {
 	var targets @[]@ir.Func
 	for fi := 0; fi < len(mod.Funcs); fi++ {
 		var f @ir.Func = mod.Funcs[fi]
@@ -54,7 +54,7 @@ func collectCEntryThunkTargets(a @asm.Assembler, wordBytes int,
 					var none @[]@ir.Func
 					return none, false
 				}
-				if funcHasNarrowGPParam(tf, wordBytes) {
+				if funcHasNarrowGPRegParam(tf, cc) {
 					ins.CEntryThunk = true
 					targets = appendCEntryTargetUnique(targets, tf)
 				}
@@ -93,28 +93,99 @@ func cEntryNameEq(a *[]readonly char, b *[]readonly char) bool {
 	return true
 }
 
-// funcHasNarrowGPParam reports whether any of tf's parameters is a narrow GP
-// integer/bool scalar under a target word size of wordBytes bytes.
-func funcHasNarrowGPParam(tf @ir.Func, wordBytes int) bool {
-	for pi := 0; pi < len(tf.Params); pi++ {
-		if cEntryParamNeedsThunk(tf.Params[pi].Typ, wordBytes) { return true }
+// CEntryRegNormWalk classifies f's parameters for #[c_export] / __c_entry argument-REGISTER
+// normalization.  It returns two parallel lists — for each parameter that is a narrow GP
+// integer/bool scalar PASSED IN A GP ARGUMENT REGISTER (not on the stack), the GP
+// argument-register index (as CallArgRegStart yields; the backend maps it to a physical
+// register via argReg) and the parameter's type (for the extend width / signedness).  It is
+// the SINGLE source of truth shared by the thunk-emission DECISION (funcHasNarrowGPRegParam
+// -> collectCEntryThunkTargets) and the actual register normalization
+// (emitCExportRegNorm{,X64,Arm32}), so the two can never disagree about which registers a
+// target's thunk touches — a disagreement that dropped a needed thunk would re-expose the
+// narrow-register-arg dirty-bits bug.  A narrow STACK-passed arg is deliberately NOT returned:
+// the mangled entry's own sub-word stack-arg spill canonicalizes it unconditionally, so it
+// needs no thunk.  cEntryParamNeedsThunk already excludes floats (a separate register file),
+// aggregates, and word-size scalars.  The sret shift — a hidden return-buffer pointer
+// occupying the FIRST GP ARGUMENT register, shifting every user param by one — applies only
+// where the target puts sret in a GP arg reg (SysV RDI, AAPCS32 R0: cc.SretInGpArgReg), NOT
+// on AAPCS64 (sret is the dedicated X8, no arg shift), and only when f actually sret-returns;
+// it is derived here from cc so every caller agrees.
+func CEntryRegNormWalk(f @ir.Func, cc CallConv) (@[]int, @[]@types.Type) {
+	var sretShift bool = cc.SretInGpArgReg &&
+			(cc.FuncReturnsBigAggregate(f) || cc.FuncReturnsBigMultiReturn(f))
+	var nDispatch int = len(f.Params)
+	if sretShift {
+		nDispatch = nDispatch + 1
 	}
-	return false
+	var paramTypes @[]@types.Type = make_slice(@types.Type, nDispatch)
+	if sretShift {
+		paramTypes[0] = types.MakePointerType(types.TypUint8())
+		for pi := 0; pi < len(f.Params); pi++ {
+			paramTypes[pi + 1] = f.Params[pi].Typ
+		}
+	} else {
+		for pi := 0; pi < len(f.Params); pi++ {
+			paramTypes[pi] = f.Params[pi].Typ
+		}
+	}
+	var regStarts @[]int
+	var regTypes @[]@types.Type
+	for pi := 0; pi < len(f.Params); pi++ {
+		if !cEntryParamNeedsThunk(f.Params[pi].Typ, cc.WordBytes) {
+			continue
+		}
+		var dispatchIdx int = pi
+		if sretShift {
+			dispatchIdx = pi + 1
+		}
+		var regStart int = cc.CallArgRegStart(paramTypes, dispatchIdx)
+		if regStart >= 0 {
+			regStarts = appendInt(regStarts, regStart)
+			regTypes = appendType(regTypes, f.Params[pi].Typ)
+		}
+	}
+	return regStarts, regTypes
+}
+
+// funcHasNarrowGPRegParam reports whether f has a narrow GP integer/bool parameter passed in
+// a GP argument REGISTER (see CEntryRegNormWalk) — i.e. whether a __c_entry to f needs an
+// adaptation thunk.  A target whose only narrow params are stack-passed returns false: those
+// args are canonicalized by f's own mangled-entry spill, so it is referenced degenerate (no
+// thunk).
+func funcHasNarrowGPRegParam(f @ir.Func, cc CallConv) bool {
+	var regStarts @[]int
+	regStarts, _ = CEntryRegNormWalk(f, cc)
+	return len(regStarts) > 0
+}
+
+// appendInt grows an @[]int by one — the vec/slices helpers are not in this package's import
+// set, and the CEntryRegNormWalk lists hold one entry per register-passed narrow-arg param (a
+// short list).
+func appendInt(dst @[]int, v int) @[]int {
+	var out @[]int = make_slice(int, len(dst) + 1)
+	for i := 0; i < len(dst); i++ { out[i] = dst[i] }
+	out[len(dst)] = v
+	return out
+}
+
+// appendType grows an @[]@types.Type by one — the @[]int twin for CEntryRegNormWalk's parallel
+// param-type list.
+func appendType(dst @[]@types.Type, v @types.Type) @[]@types.Type {
+	var out @[]@types.Type = make_slice(@types.Type, len(dst) + 1)
+	for i := 0; i < len(dst); i++ { out[i] = dst[i] }
+	out[len(dst)] = v
+	return out
 }
 
 // cEntryParamNeedsThunk reports whether a parameter of type t is a narrow GP
 // integer/bool scalar under a target whose word size is wordBytes bytes — a
-// parameter a C caller may leave with dirty high bits.  It classifies by TYPE, not
-// argument LOCATION, so it fires on both register- and stack-passed narrow params.
-// Only a REGISTER-passed one truly needs the thunk (the mangled entry spills its
-// register un-re-extended); a STACK-passed one is already canonicalized by the
-// mangled entry's own sub-word stack-arg spill, so its thunk is a harmless
-// no-op-then-branch.  (Restricting this to register-passed params would drop those
-// redundant thunks but needs the CallConv register/stack split here — a possible
-// follow-up, not required for correctness.)  Floats (a separate register file) and
-// aggregates (passed by reference / in multiple registers) are excluded, matching
-// the float/aggregate skips in normalizeNarrowRegParam{,X64,Arm32}; pointers are
-// word-size, so the `< wordBytes` bound already excludes them.  The bool trap:
+// parameter a C caller may leave with dirty high bits.  This is the TYPE-level half
+// of the classification; CEntryRegNormWalk adds the argument-LOCATION check (only a
+// REGISTER-passed such param needs the thunk — a stack-passed one is canonicalized by
+// the mangled-entry spill).  Floats (a separate register file) and aggregates (passed
+// by reference / in multiple registers) are excluded, matching the float/aggregate
+// skips in normalizeNarrowRegParam{,X64,Arm32}; pointers are word-size, so the
+// `< wordBytes` bound already excludes them.  The bool trap:
 // SubWordNarrow reports bool non-narrow (it is not IsInteger), but a bool param IS a
 // 1-byte GP arg the C-entry path still zero-extends, so keying off SizeOf (which is
 // 1 for bool) — not SubWordNarrow — correctly flags it.

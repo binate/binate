@@ -28,20 +28,24 @@ import "pkg/std/fmt"
 //
 //   1. BL discipline.  No emitter may read a pool-allocated reg after
 //      a BL/BLR (the call clobbers X16/X17 from the linker side AND
-//      X9..X15 by AAPCS).  Today this is enforced uniformly because
-//      every BL site in this package is followed by `rm.ResetRegs()`
-//      — see arm64_call.bn, arm64_call_indirect.bn, arm64_emit.bn's
-//      memcpy / MakeManagedSlice sites, arm64_ops.bn's RefDec slow
-//      path.  Tests pin the per-arg reset in emitCall/emitReturn so a
-//      future refactor doesn't quietly drop it.
+//      X9..X15 by AAPCS).  Within an op this holds because emitters
+//      read their operands before the BL (or ResetRegs after it — see
+//      arm64_call.bn, arm64_call_indirect.bn, arm64_emit.bn's memcpy /
+//      MakeManagedSlice sites).  ACROSS ops the retained value cache
+//      (within-block retention) could otherwise carry a register past a
+//      clobbering call, so spillAndReset drops the whole cache after any
+//      instruction that emitted a branch or is an EmitsReturningBl op
+//      (which covers arm64_ops.bn's RefDec slow path, whose ZeroRefDestroy
+//      BL has no internal ResetRegs).  Tests pin the per-arg reset in
+//      emitCall/emitReturn so a future refactor doesn't quietly drop it.
 //   2. X16/X17 direct-use discipline.  emitCall (stack-arg load) and
 //      emitCallIndirect (fn_ptr stash + stack-arg load) reference
 //      X16/X17 directly outside the pool.  These uses are safe
 //      because emitCall/emitCallIndirect call `rm.ResetRegs()` per
-//      arg, which keeps the pool's `m.Next` below 7 in their loops
-//      and therefore never hands out X16/X17 from the pool inside
-//      those ops.  Any new op that wants to mix direct X16/X17 use
-//      with high pool pressure must apply the same per-arg reset.
+//      arg, which clears the occupancy claim set so allocReg keeps
+//      handing out X9..X15 (never the X16/X17 last-resort slots)
+//      inside those ops.  Any new op that wants to mix direct X16/X17
+//      use with high pool pressure must apply the same per-arg reset.
 //
 // Index 9 still panics; that signals an op pattern wants 10+
 // simultaneously-live scratches and structurally needs a different
@@ -75,13 +79,52 @@ func regPool(i int) int {
 // diagnostic value is high relative to the cost of an extra parameter.
 var currentEmitOp int
 
+// allocReg hands out a pool register (X9..X17) for the currently-emitting
+// instruction, occupancy-aware for within-block value retention: it prefers a
+// genuinely FREE register (one holding no retained value), and only under
+// register pressure evicts a retained value — whose spill slot still holds it,
+// so eviction is loss-free.  Registers this instruction already claimed
+// (CurUsed) are never handed out again (nor is a still-needed operand
+// evicted).  The returned register is marked used here.
+func allocReg(m @common.RegMap) int {
+	// Prefer a genuinely FREE cacheable register (X9..X15, regPool 0..6): not
+	// claimed by this instruction, holding no retained value.
+	for i := 0; i <= 6; i = i + 1 {
+		var r int = regPool(i)
+		if !m.IsUsed(r) && m.RegHeldBy(r) < 0 {
+			m.MarkUsed(r)
+			return r
+		}
+	}
+	// Under register pressure, evict a retained value from a cacheable register
+	// (its spill slot still holds it, so this is loss-free) and reuse it.
+	for i := 0; i <= 6; i = i + 1 {
+		var r int = regPool(i)
+		if !m.IsUsed(r) {
+			m.EvictReg(r)
+			m.MarkUsed(r)
+			return r
+		}
+	}
+	// Last resort for a >7-live-scratch instruction: X16 (regPool 7), never
+	// retained.  X17 (regPool 8) is deliberately NOT allocated to a value — the
+	// assembler materialises a large `[sp,#imm]` LDR/STR base into X17, so a
+	// value parked there would collide (rt=X17); keeping values out of X17
+	// makes that conflict unreachable.
+	if !m.IsUsed(regPool(7)) {
+		m.MarkUsed(regPool(7))
+		return regPool(7)
+	}
+	// Every allocatable pool register is claimed by the current instruction:
+	// the pre-existing exhaustion case, reported by regPool's own panic.
+	return regPool(9)
+}
+
 // scratchReg hands out an ephemeral register (not registered in the
 // id→reg map). Used when we need working registers that won't outlive
 // the current instruction.
 func scratchReg(m @common.RegMap) int {
-	var r int = regPool(m.Next)
-	m.Next = m.Next + 1
-	return r
+	return allocReg(m)
 }
 
 // nextReg allocates a register to hold SSA id's result.  A
@@ -93,8 +136,7 @@ func scratchReg(m @common.RegMap) int {
 func nextReg(m @common.RegMap, id int) int {
 	var home int = m.LookupHome(id)
 	if home >= 0 { return home }
-	var r int = regPool(m.Next)
-	m.Next = m.Next + 1
+	var r int = allocReg(m)
 	return m.AssignReg(id, r)
 }
 
@@ -111,16 +153,25 @@ func getOperand(a @asm.Assembler, m @common.RegMap, id int) int {
 	// lifetime — return it directly, with no reload.
 	var home int = m.LookupHome(id)
 	if home >= 0 { return home }
+	// A retained value cached in a pool register (within-block retention) —
+	// read it from the register, no reload.  Mark the register used so this
+	// instruction's later scratch/result allocation won't reuse it.
 	var r int = m.LookupReg(id)
-	if r >= 0 { return r }
+	if r >= 0 {
+		m.MarkUsed(r)
+		return r
+	}
 	var allocOff int = m.LookupAlloc(id)
 	if allocOff >= 0 {
+		// An alloca address is `sp + off`, constant for the whole function, so
+		// caching it (nextReg) for within-block reuse is always valid.
 		var rd int = nextReg(m, id)
 		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(allocOff))
 		return rd
 	}
 	var off int = m.LookupSpill(id)
 	if off >= 0 {
+		// Reload the spilled value and cache it (nextReg) for within-block reuse.
 		var rd int = nextReg(m, id)
 		aarch64.Ldr(a, true, rd, aarch64.MemImm(aarch64.SP, off))
 		return rd
@@ -154,7 +205,7 @@ func emitValOperand(a @asm.Assembler, pkgName *[]readonly char, m @common.RegMap
 // stack slot (if any) and clears the register map. Called after every
 // instruction — the "spill everything" policy means each op loads
 // operands, computes, then hands off to memory.
-func spillAndReset(a @asm.Assembler, m @common.RegMap, ins @ir.Instr) {
+func spillAndReset(a @asm.Assembler, m @common.RegMap, ins @ir.Instr, branchEmitted bool) {
 	if ins.ID >= 0 {
 		var reg int = m.LookupReg(ins.ID)
 		if reg >= 0 {
@@ -164,5 +215,26 @@ func spillAndReset(a @asm.Assembler, m @common.RegMap, ins @ir.Instr) {
 			}
 		}
 	}
-	m.ResetRegs()
+	// Within-block value retention: keep the IDs/Regs cache live ACROSS
+	// instructions so a later use reads a register (getOperand's LookupReg hit)
+	// instead of reloading its spill slot.  The store above still runs for
+	// every result, so a value stays recoverable from its slot after it is
+	// evicted under register pressure or when the block ends.
+	//
+	// X16/X17 (AAPCS IP0/IP1) are never retained: call / closure / shim
+	// emitters use them directly, bypassing the pool, so a value parked there
+	// could be clobbered without an eviction.
+	m.EvictReg(aarch64.X16)
+	m.EvictReg(aarch64.X17)
+	// A returning BL clobbers every caller-saved pool register (X9..X17); so
+	// does any instruction that emitted a branch to an inline block the runtime
+	// mainline skips (a bounds-check / refcount-inline fail path, or an inline
+	// dtor BL — its fixup count grew).  Drop the whole cache after either so a
+	// later instruction reloads from slots rather than reading a clobbered
+	// register.  This runs after each instruction, so it also covers the
+	// EmitsReturningBl ops whose BL has no internal ResetRegs (e.g.
+	// emitRefDecInline's ZeroRefDestroy call).
+	if branchEmitted || common.EmitsReturningBl(ins.Op) {
+		m.ResetRegs()
+	}
 }

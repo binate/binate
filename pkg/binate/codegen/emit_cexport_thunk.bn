@@ -1,0 +1,252 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/ir"
+import "pkg/binate/mangle"
+import "pkg/binate/stringutils"
+import "pkg/binate/types"
+import "pkg/std/strings"
+
+// A #[c_export] function is reachable from C under each export name.  When none
+// of its parameters needs C-ABI adaptation, the export name is a plain alias of
+// the mangled definition (emitCExportAlias): the definition itself is a correct
+// C entry.  But a parameter that is a >16-byte by-value aggregate is passed
+// DIFFERENTLY by the two conventions on x86-64 (and arm32): Binate's internal
+// convention hands it over as a single pointer in a GP register
+// (types.IsByvalParam / writeParamTypeLLVM's plain `ptr`), while the platform C
+// ABI passes it by value in the SysV MEMORY class (on the stack).  A C caller
+// following the platform convention therefore does NOT match the mangled
+// definition — a silent mis-ABI.  On aarch64 the conventions coincide (a >16-byte
+// aggregate rides a pointer in a register under AAPCS64 too), so no adaptation is
+// needed there.
+//
+// For such a function this file emits a small C-ABI ENTRY THUNK under the export
+// name instead of an alias: the thunk declares the true C-ABI signature and
+// forwards to the mangled internal definition, mapping each parameter from its C
+// form to its internal form.  Scalars and pointers forward straight through (same
+// LLVM type; LLVM re-assigns the registers).  A >16-byte aggregate is declared
+// `ptr byval(<T>)` (C) and forwarded as plain `ptr` (internal) — the same pointer.
+// One subtlety: because a >16-byte aggregate consumes a GP register internally but
+// NONE in the C ABI (MEMORY class), it shifts the register cursor, so a ≤16-byte
+// aggregate that follows one can be REGISTER-class in C yet MEMORY-class
+// internally; the thunk spills that param's incoming coerced value to an alloca and
+// forwards `ptr byval` of it.  See emitCExportThunk for the full case list.
+//
+// This handles the LLVM x86-64 target; the arm32 LLVM target and the native
+// backends do not yet adapt this inbound direction (cExportNeedsThunk gates on
+// x86-64), so a >16-byte by-value #[c_export] param there stays a plain alias.
+
+// emitCExportEntries emits, per #[c_export("name")] on f, either a C-ABI entry
+// thunk (when a parameter needs adaptation) or a plain alias.  Externs have no
+// body to export.
+func emitCExportEntries(out *strings.Builder, f @ir.Func, funcRetTypes *[]FuncRetType) {
+	if f.IsExtern {
+		return
+	}
+	var thunked bool = cExportNeedsThunk(f)
+	for i := 0; i < len(f.CExportNames); i++ {
+		if thunked {
+			emitCExportThunk(out, f, f.CExportNames[i], funcRetTypes)
+		} else {
+			emitCExportAlias(out, f, f.CExportNames[i])
+		}
+	}
+}
+
+// cExportNeedsThunk reports whether f has a parameter whose C-ABI passing form
+// differs from Binate's internal form and so requires an adapting entry thunk.
+// Today that is exactly a >16-byte by-value aggregate on x86-64, where the C ABI
+// passes it in the SysV MEMORY class but the internal convention passes a pointer.
+// aarch64's conventions coincide (no thunk); the arm32 LLVM leg is a later
+// increment.
+func cExportNeedsThunk(f @ir.Func) bool {
+	if !targetIsX64() {
+		return false
+	}
+	for i := 0; i < len(f.Params); i++ {
+		if f.Params[i].Typ.IsByvalParam() {
+			return true
+		}
+	}
+	return false
+}
+
+// emitCExportThunk emits a C-ABI entry thunk named cname that forwards to f's
+// mangled definition.  A parameter is declared in the platform C form
+// (SysVArgInMemoryC) and forwarded in Binate's internal form (SysVArgInMemory).
+// The two diverge ONLY for aggregates, and only because a >16-byte aggregate rides
+// a GP register internally (a pointer) but consumes NONE in the C ABI (it goes to
+// the MEMORY class / stack) — so the C register cursor is always ≤ the internal
+// one.  Three cases result:
+//   - a >16-byte aggregate: declared `ptr byval(<T>)` (C), forwarded as plain
+//     `ptr` (the same pointer, internal indirect form);
+//   - a ≤16-byte aggregate that straddles the register file in BOTH conventions:
+//     `ptr byval(<T>)` on both sides — passes straight through;
+//   - a ≤16-byte aggregate that is REGISTER-class in C (lower cursor) but
+//     MEMORY-class internally (higher cursor, after a >16-byte aggregate shifted
+//     it): declared as the coerced `[N x iW]`, spilled to an alloca, and forwarded
+//     `ptr byval(<T>)` of that slot.  (The reverse — C memory, internal register —
+//     cannot happen, since the C cursor never exceeds the internal one.)
+// Every scalar / pointer forwards straight through (same LLVM type; LLVM re-assigns
+// the registers).  The return (including sret) is forwarded unchanged, since the
+// internal and C sret thresholds coincide on x86-64.
+func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
+		funcRetTypes *[]FuncRetType) {
+	var mangled @[]char = mangle.FuncName(modulePkgName, f.Name)
+
+	// Match the mangled definition's return shape (emitFuncDbg): a large aggregate
+	// / large multi-return returns via sret; everything else returns by value.
+	var useSret bool = false
+	var sretRetType @[]char
+	if len(f.Results) == 1 && needsSret(f.Results[0]) {
+		useSret = true
+		sretRetType = llvmType(f.Results[0])
+	} else if multiRetNeedsSret(f) {
+		useSret = true
+		sretRetType = llvmType(f.MultiReturnType)
+	}
+
+	var retTyp @[]char = "void"
+	if !useSret && len(f.Results) > 0 {
+		retTyp = lookupRetType(funcRetTypes, mangled)
+	}
+
+	out.Write("define ")
+	// A sub-`int`-width scalar return carries the platform extension attribute,
+	// exactly as the mangled definition does (see cabiIntExtAttr).
+	if !useSret && len(f.Results) == 1 && !aggRetCoerced(f.Results[0]) {
+		out.Write(cabiIntExtAttr(f.Results[0]))
+	}
+	out.Write(retTyp)
+	out.WriteByte(' ')
+	writeLLVMQuotedName(out, cname)
+	out.WriteByte('(')
+
+	var defArgTypes @[]@types.Type = defineArgTypes(f, useSret)
+	var defSretOff int = 0
+	if useSret {
+		out.Write("ptr sret(")
+		out.Write(sretRetType)
+		out.Write(") align 8 %ca.sret")
+		if len(f.Params) > 0 {
+			out.Write(", ")
+		}
+		defSretOff = 1
+	}
+	// Parameters in the platform C form.  A >16-byte aggregate is C MEMORY class
+	// (byval); a ≤16-byte aggregate that straddles the register file under the C
+	// cursor (aggMemClassMaybeC, cabi) is also byval; everything else is coerced /
+	// scalar / pointer.  (SysVArgInMemoryC reports FALSE for a >16-byte aggregate —
+	// it only tracks that aggregate's cursor effect — so the IsByvalParam check
+	// must come first, matching codegen's own byval path.)
+	for i := 0; i < len(f.Params); i++ {
+		if i > 0 {
+			out.Write(", ")
+		}
+		if f.Params[i].Typ.IsByvalParam() || aggMemClassMaybeC(defArgTypes, i + defSretOff, true) {
+			writeByvalMemType(out, f.Params[i].Typ) // C ABI: ptr byval(<T>) align 8
+		} else {
+			writeParamTypeLLVM(out, f.Params[i].Typ) // coerced [N x iW] / scalar / pointer
+		}
+		out.Write(" %ca")
+		stringutils.WriteInt(out, i)
+	}
+	out.WriteByte(')')
+	writeFnDefineAttrs(out)
+	out.Write(" {\nentry:\n")
+
+	// Spill each C-register aggregate that the internal convention passes as
+	// MEMORY-class byval: materialize the incoming register value in an alloca so it
+	// can be forwarded as `ptr byval`.  (See the case list on the doc comment.)  The
+	// STORED value type must be the SAME spelling the incoming param was declared
+	// with (writeParamTypeLLVM) — the coerced `[N x iW]` for a struct/array, but the
+	// first-class `%BnSlice` / `%BnIfaceValue` / `%BnFuncValue` for a 2-word slice /
+	// interface / function value (aggParamCoerced is false for those) — or LLVM
+	// rejects the store as a type mismatch.  The alloca is the aggregate's own type;
+	// both spellings occupy its bytes exactly.
+	for i := 0; i < len(f.Params); i++ {
+		if cExportThunkParamSpills(f, i, defArgTypes, defSretOff) {
+			// The alloca is sized to the STORED value type, NOT the aggregate's
+			// natural type: a coerced struct/array stores `[N x iW]` (N·8 bytes,
+			// rounded up), which OVER-RUNS a natural-sized slot when SizeOf is not a
+			// word multiple (e.g. a 12-byte {i32,i32,i32}).  At -O2, SROA then treats
+			// the trailing eightbyte as out-of-bounds and drops it — a silent
+			// miscompile.  Allocating the store type keeps store and slot the same
+			// size; the `ptr byval(<T>)` forward reads only SizeOf(T) ≤ that.  (Same
+			// rule as writeAggParamAllocaDecl.)
+			out.Write("  %ca")
+			stringutils.WriteInt(out, i)
+			out.Write(".slot = alloca ")
+			writeParamTypeLLVM(out, f.Params[i].Typ)
+			out.Write(", align 8\n  store ")
+			writeParamTypeLLVM(out, f.Params[i].Typ)
+			out.Write(" %ca")
+			stringutils.WriteInt(out, i)
+			out.Write(", ptr %ca")
+			stringutils.WriteInt(out, i)
+			out.Write(".slot\n")
+		}
+	}
+
+	if useSret || len(f.Results) == 0 {
+		out.Write("  call void @")
+	} else {
+		out.Write("  %r = call ")
+		out.Write(retTyp)
+		out.Write(" @")
+	}
+	out.Write(mangled)
+	out.WriteByte('(')
+	if useSret {
+		out.Write("ptr sret(")
+		out.Write(sretRetType)
+		out.Write(") %ca.sret")
+		if len(f.Params) > 0 {
+			out.Write(", ")
+		}
+	}
+	// Arguments in Binate's internal form.
+	for i := 0; i < len(f.Params); i++ {
+		if i > 0 {
+			out.Write(", ")
+		}
+		if f.Params[i].Typ.IsByvalParam() {
+			out.Write("ptr %ca") // >16-byte aggregate: internal plain pointer
+			stringutils.WriteInt(out, i)
+		} else if aggMemClass(defArgTypes, i + defSretOff) {
+			// ≤16-byte aggregate the internal convention passes MEMORY-class byval.
+			writeByvalMemType(out, f.Params[i].Typ)
+			out.Write(" %ca")
+			stringutils.WriteInt(out, i)
+			if cExportThunkParamSpills(f, i, defArgTypes, defSretOff) {
+				out.Write(".slot") // forward the spilled copy, not the register value
+			}
+		} else {
+			writeParamTypeLLVM(out, f.Params[i].Typ)
+			out.Write(" %ca")
+			stringutils.WriteInt(out, i)
+		}
+	}
+	out.Write(")\n")
+	if useSret || len(f.Results) == 0 {
+		out.Write("  ret void\n")
+	} else {
+		out.Write("  ret ")
+		out.Write(retTyp)
+		out.Write(" %r\n")
+	}
+	out.Write("}\n")
+}
+
+// cExportThunkParamSpills reports whether parameter i must be spilled: a ≤16-byte
+// aggregate that the C ABI passes in registers (coerced) but the internal
+// convention passes as MEMORY-class byval (because a preceding >16-byte aggregate
+// shifted the register cursor).  Such a parameter arrives as a coerced value and
+// must be materialized in memory to forward as `ptr byval`.  A >16-byte aggregate
+// (IsByvalParam) is never spilled — it arrives as a pointer already.
+func cExportThunkParamSpills(f @ir.Func, i int, defArgTypes @[]@types.Type, defSretOff int) bool {
+	if f.Params[i].Typ.IsByvalParam() {
+		return false
+	}
+	return aggMemClass(defArgTypes, i + defSretOff) &&
+			!aggMemClassMaybeC(defArgTypes, i + defSretOff, true)
+}

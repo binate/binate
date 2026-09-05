@@ -196,6 +196,22 @@ func StackSgn(a0 int32, a1 int32, a2 int32, a3 int32, a4 int32, a5 int32,
 	}
 	return 0
 }
+
+// A >16-byte struct passed BY VALUE.  Binate's internal convention hands a
+// >16-byte aggregate over as a single pointer-in-register, but the platform C ABI
+// passes it by value (SysV MEMORY / on the stack on x86-64; split across r0-r3 +
+// stack on arm32).  Without an adapting entry thunk the mangled definition reads a
+// pointer where a C caller placed value bytes — garbage / a crash.  aarch64's
+// conventions coincide (a >16-byte aggregate rides a pointer both ways), so it
+// stays a plain alias.  Returns a mix of the fields so a wrong read is visible.
+type FfiBig struct {
+	a int64
+	b int64
+	c int64
+}
+
+#[c_export("ffi_bigstruct")]
+func BigStruct(x FfiBig) int64 { return x.a * cast(int64, 100) + x.b * cast(int64, 10) + x.c }
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -278,6 +294,54 @@ check_narrow_returns() {
         pass "$label: -O2 C caller reads sign/zero-extended narrow #[c_export] returns: '$got'"
     else
         fail "$label: narrow-return output mismatch (got '$got', want '$WANT_NARROW')"
+    fi
+}
+
+# --- a C driver that passes a >16-byte struct BY VALUE --------------------
+# A conforming C caller passes the 24-byte struct per the platform ABI (SysV
+# MEMORY / on the stack on x86-64).  Without the #[c_export] entry thunk the
+# mangled definition reads a pointer where the bytes are — garbage or a crash.
+cat > "$TMP/driver_bigagg.c" <<'EOF'
+#include <stdio.h>
+struct FfiBig { long a, b, c; };
+extern long ffi_bigstruct(struct FfiBig);
+int main(void) {
+    struct FfiBig x = {1, 2, 3};
+    printf("%ld\n", ffi_bigstruct(x));   /* expect 1*100 + 2*10 + 3 = 123 */
+    return 0;
+}
+EOF
+WANT_BIGAGG="123"
+
+# check_bigagg <label> <extra-bnc-flags> <required>
+#   Links the >16-byte by-value-struct driver and checks the callee read the
+#   fields correctly.  Same required/skip semantics as check_narrow_returns.
+check_bigagg() {
+    label="bigagg-$1"; extra="$2"; required="$3"
+    work="$TMP/$label"
+    mkdir -p "$work"
+    if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
+            $extra --build-dir "$work" --pkg ffiexp >"$work/pkg.log" 2>&1 \
+            || [ ! -f "$work/ffiexp.o" ]; then
+        if [ "$required" -eq 1 ]; then
+            fail "$label: compile of facade (--pkg ffiexp) produced no object" \
+                 "$(tail -5 "$work/pkg.log")"
+        else
+            skip "$label: native --pkg unavailable for this host (no object emitted)"
+        fi
+        return
+    fi
+    if ! "$CLANG" -w "$TMP/driver_bigagg.c" "$work/ffiexp.o" -o "$work/run" 2>"$work/link.err" \
+            || [ ! -x "$work/run" ]; then
+        fail "$label: link of big-struct driver + facade object failed" \
+             "$(head -6 "$work/link.err")"
+        return
+    fi
+    got="$("$work/run" 2>&1)"
+    if [ "$got" = "$WANT_BIGAGG" ]; then
+        pass "$label: C passes a >16-byte struct by value; callee reads its fields: '$got'"
+    else
+        fail "$label: big-struct-by-value output mismatch (got '$got', want '$WANT_BIGAGG')"
     fi
 }
 
@@ -443,6 +507,13 @@ check_backend "native-O2" "--backend native -O2" 0
 # can't emit the facade (native returns over-satisfy, so it must pass when it runs).
 check_narrow_returns "llvm" "" 1
 check_narrow_returns "native" "--backend native" 0
+
+# >16-byte struct passed BY VALUE — the LLVM path adapts via an entry thunk on
+# x86-64 (a plain alias on aarch64, where the conventions coincide).  On an aarch64
+# host this exercises the alias path; on an x86-64 host, the thunk.  The native
+# backend does not yet adapt this inbound direction, so there is no native bigagg
+# check — it would exercise the still-unfixed native path on an x86-64 host.
+check_bigagg "llvm" "" 1
 
 # The --library archive: init-once-via-bn_init + call the exports from a real .a.
 check_library

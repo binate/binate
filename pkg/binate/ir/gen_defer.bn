@@ -1,24 +1,314 @@
 package "pkg/binate/ir"
 
 import "pkg/binate/ast"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
 
-// IR-gen for defer statements (§14.13).
+// IR-gen for defer statements (§14.13) — fixed frame slots (proposal-defer §6).
 //
-// Lowering (fixed frame slots, per proposal-defer §6): a function-entry pre-pass
-// allocates, per lexical defer, an armed bool + typed operand slots in the entry
-// block (nil/false-initialized), registering the managed operand slots in
-// ctx.Vars so the existing whole-function cleanup (emitDecForManagedLocals) and
-// the VM fault pads (emitPadCleanup) release them.  Executing the defer stores
-// its eagerly-evaluated, call-ready operands and sets armed.  Each function exit
-// runs the pending deferred calls LIFO (armed-gated) BEFORE the whole-function
-// managed-local release.  A VM-isolated fault runs the operand releases but no
-// deferred calls (stmt.defer.no-abort).
+// A function-entry pre-pass (registerFuncDefers) walks the body for lexical
+// defer statements — NOT descending into function literals, whose defers belong
+// to their own lifted function — and, for each, allocates in the ENTRY block an
+// armed bool (false-init) plus one typed operand slot per stored value
+// (nil-init'd; managed / managed-field-struct slots are registered in ctx.Vars
+// so the existing whole-function cleanup and the VM fault pads release them).
+// Executing the defer (genDeferStmt) evaluates its callee/receiver/arguments
+// EAGERLY, stores them call-ready into the slots (managed values acquired via
+// emitStoreManagedSlot), and sets armed.  Each function exit runs the pending
+// deferred calls LIFO, armed-gated, BEFORE the whole-function managed-local
+// release (emitPendingDefers, gen_defer_exit.bn).  A VM-isolated fault releases
+// the operand slots (the pads' emitDecForManagedLocals) but runs no deferred
+// calls — stmt.defer.no-abort.
 //
-// The lowering is added incrementally; until it lands, genDeferStmt aborts
-// loudly rather than silently dropping the deferred call (the checker has
-// already accepted only valid defers, so only a valid defer can reach here).
+// Operand coercion is split (see coerceArgEager / coerceArgDelivery in
+// gen_call.bn): the opcode/untyped-keyed coercions run EAGERLY at the store (a
+// value reloaded from a slot is OP_LOAD and could never re-trigger them); the
+// borrow/copy deliveries run at the call from the reloaded value — so a
+// managed→raw operand retains its pre-conversion managed value and delivers the
+// raw borrow at call time (stmt.defer).
 
-// genDeferStmt lowers a STMT_DEFER.
-func genDeferStmt(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
-	panic("defer codegen not yet implemented")
+// Deferred-call shapes.
+const (
+	DEFER_DIRECT int = iota // free / package function: OP_CALL(sym, args)
+	DEFER_METHOD            // static method: OP_CALL(sym, recv :: args)
+	DEFER_IFACE             // interface method: OP_CALL_IFACE_METHOD(recv, args, idx)
+	DEFER_FUNCVAL           // function-value call: OP_CALL_FUNC_VALUE(fv, args)
+	DEFER_PANIC             // defer panic(msg): rt.Panic(msg) + unreachable
+)
+
+// Operand roles — how the stored value is produced at the defer site and
+// delivered at the call.
+const (
+	// OPROLE_ARG — an argument: coerceArgEager at store, coerceArgDelivery at call.
+	OPROLE_ARG int = iota
+	// OPROLE_RECEIVER — a static-method receiver: applyReceiverConversion at
+	// store, coerceArgDelivery at call.
+	OPROLE_RECEIVER
+	// OPROLE_PASSTHRU — an iface receiver / func value: stored + loaded as-is.
+	OPROLE_PASSTHRU
+	// OPROLE_VARIADIC_PACK is the single trailing `*[]T` argument packed from
+	// individual trailing args (func.variadic.pack): packed EAGERLY at the defer
+	// site into a frame-lived backing array via emitVariadicTail, stored as the
+	// raw {data,len} header, loaded as-is at the call.  (A spread `xs...` operand
+	// is NOT this — it is an ordinary ARG bound to the `*[]T` param, so a managed
+	// @[]T spread rides the managed→raw retention path.)
+	OPROLE_VARIADIC_PACK
+)
+
+// DeferOperand is one eagerly-evaluated value retained for a deferred call.
+type DeferOperand struct {
+	Role     int
+	Slot     @Instr // typed alloca in the entry block
+	SlotTyp  @types.Type // the stored value's type
+	ParamTyp @types.Type // the callee param type (delivery target); nil for PASSTHRU
+	// IsManagedToRaw: an @[]T/@T argument bound to a raw *[]T param.  The
+	// pre-conversion managed value is stored (SlotTyp = the managed type); the
+	// raw borrow is derived at the call (EmitManagedToRaw).
+	IsManagedToRaw bool
+	// Managed: the slot holds a managed value (or a managed-field struct) and is
+	// registered in ctx.Vars, so emitDecForManagedLocals releases it after the
+	// deferred calls run (and the VM fault pads release it on an isolated fault).
+	Managed bool
+	// ElemTyp is the variadic element type for an OPROLE_VARIADIC_PACK operand.
+	ElemTyp @types.Type
+	// BackingSlot is the pre-allocated, entry-depth `[N]ElemTyp` backing array
+	// for an OPROLE_VARIADIC_PACK operand (nil when N == 0).  Pre-allocating it at
+	// function-entry depth (and registering it in ctx.Vars when its elements are
+	// managed) is what keeps its elements alive until the deferred call runs and
+	// releases them once afterward — packing into a defer-site temp would free
+	// them at the defer statement's end instead.
+	BackingSlot @Instr
+}
+
+// DeferSite is the per-lexical-defer record built by the entry pre-pass.
+type DeferSite struct {
+	Stmt      @ast.Stmt // identity key (matched by `same` at gen time)
+	ArmedSlot @Instr // bool alloca in the entry block, false-init
+	Shape     int
+	Sym       @[]char // DIRECT / METHOD symbol
+	MethodIdx int // IFACE vtable slot
+	ResultTyp @types.Type // deferred call's result type (for discarded-result release)
+	RecvOp    @DeferOperand // METHOD/IFACE/FUNCVAL/PANIC first operand; nil for DIRECT
+	ArgOps    @[]@DeferOperand
+	// BorrowSlots are pre-allocated, entry-depth snapshot slots for the managed
+	// VALUE operands boxed into an interface argument (an implicit value-borrow
+	// into an iface/`*any` param).  One per such operand, in operand-evaluation
+	// order (fixed args, then variadic-pack elements); consumed via
+	// ctx.DeferBorrowSlots/Cursor at store time.  Like DeferOperand.BackingSlot, a
+	// defer-site temp would free the snapshot's managed content at block exit,
+	// before the deferred call runs.
+	BorrowSlots @[]@Instr
+}
+
+// registerFuncDefers is the entry pre-pass: it walks `body` for lexical defer
+// statements and builds a DeferSite (with entry-block slots) for each, appended
+// to ctx.Defers in lexical order.  Call after param setup, before genBlock.
+func registerFuncDefers(ctx @GenContext, entry @Block, body @ast.Stmt) {
+	walkDefersStmt(ctx, entry, body)
+}
+
+// walkDefersStmt recurses the statement tree collecting STMT_DEFER, mirroring
+// genStmt's statement recursion.  It visits only STATEMENTS (block bodies, if
+// branches, loop bodies, switch/type-switch case bodies), never expressions —
+// so a defer inside a function literal (which lives in an expression) is not
+// reached here; that literal gets its own pre-pass when it is lowered.
+func walkDefersStmt(ctx @GenContext, entry @Block, s @ast.Stmt) {
+	if s == nil { return }
+	if s.Kind == ast.STMT_DEFER {
+		buildDeferSite(ctx, entry, s)
+		return
+	}
+	for i := 0; i < len(s.Stmts); i++ {
+		walkDefersStmt(ctx, entry, s.Stmts[i])
+	}
+	if s.Body != nil { walkDefersStmt(ctx, entry, s.Body) }
+	if s.Else != nil { walkDefersStmt(ctx, entry, s.Else) }
+	if s.Init != nil { walkDefersStmt(ctx, entry, s.Init) }
+	if s.Post != nil { walkDefersStmt(ctx, entry, s.Post) }
+	for i := 0; i < len(s.Cases); i++ {
+		var cc @ast.CaseClause = s.Cases[i]
+		if cc == nil { continue }
+		for j := 0; j < len(cc.Body); j++ {
+			walkDefersStmt(ctx, entry, cc.Body[j])
+		}
+	}
+}
+
+// buildDeferSite classifies the deferred call, resolves its dispatch key and
+// operand/param types, allocates the armed flag + operand slots in the entry
+// block (nil-init'd, managed slots registered in ctx.Vars), and appends the
+// DeferSite to ctx.Defers.  It aborts loudly on a not-yet-supported shape
+// (variadic callee, generic-instantiation call, unresolved method) rather than
+// miscompiling.
+func buildDeferSite(ctx @GenContext, entry @Block, stmt @ast.Stmt) {
+	var e @ast.Expr = stmt.X
+	var site @DeferSite = make(DeferSite)
+	site.Stmt = stmt
+	site.ArmedSlot = entry.EmitAlloc(types.TypBool())
+	entry.EmitStore(site.ArmedSlot, entry.EmitConstBool(false))
+
+	var shape int = classifyDeferShape(ctx, e)
+	site.Shape = shape
+
+	if shape == DEFER_PANIC {
+		buildDeferPanic(ctx, entry, site, e)
+	} else if shape == DEFER_DIRECT {
+		buildDeferDirect(ctx, entry, site, e)
+	} else if shape == DEFER_METHOD {
+		buildDeferMethod(ctx, entry, site, e)
+	} else if shape == DEFER_IFACE {
+		buildDeferIface(ctx, entry, site, e)
+	} else {
+		buildDeferFuncVal(ctx, entry, site, e)
+	}
+	ctx.Defers = slices.Append[@DeferSite](ctx.Defers, site)
+}
+
+// classifyDeferShape picks the deferred-call shape from CHECKER-resolved types
+// only.  It must NOT use the gen-time predicates (isMethodCallSel /
+// getSelectorType / isInterfaceMethodCall) — those consult ctx.Vars, which the
+// function-entry pre-pass has not populated yet (the body is not gen'd), so an
+// IDENT receiver would misclassify.  It aborts on shapes not yet handled by the
+// defer lowering (generic-instantiation calls).
+func classifyDeferShape(ctx @GenContext, e @ast.Expr) int {
+	if e == nil { panic("internal error: defer of nil call") }
+	// panic(...) — a call of the predeclared panic.
+	if e.X != nil && e.X.Kind == ast.EXPR_IDENT && streq(e.X.Name, "panic") {
+		return DEFER_PANIC
+	}
+	// Generic-instantiation call `g[T](...)` — not yet supported for defer.
+	if e.X != nil && e.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		var gt @types.Type = deferCalleeType(ctx, e.X)
+		if gt == nil || (gt.Kind != types.TYP_FUNC_VALUE && gt.Kind != types.TYP_MANAGED_FUNC_VALUE) {
+			panic("defer of a generic-instantiation call is not yet supported")
+		}
+		return DEFER_FUNCVAL
+	}
+	if e.X != nil && e.X.Kind == ast.EXPR_SELECTOR {
+		// obj.something(...): distinguish a func-value FIELD, an interface
+		// method, and a static method — from the receiver's checker type.  A
+		// package-qualified callee (`pkg.F`) has a receiver expr with no value
+		// type (it names a package), so recvTyp is nil → a direct call.
+		var recvTyp @types.Type = deferCalleeType(ctx, e.X.X)
+		if recvTyp == nil {
+			// pkg.F / pkg.funcValueVar / a method expression T.M — a direct call
+			// unless the whole callee resolves to a func value (pkg-level @func var).
+			var ct @types.Type = deferCalleeType(ctx, e.X)
+			if ct != nil && (ct.Kind == types.TYP_FUNC_VALUE || ct.Kind == types.TYP_MANAGED_FUNC_VALUE) {
+				return DEFER_FUNCVAL
+			}
+			return DEFER_DIRECT
+		}
+		var rb @types.Type = peelTransparent(recvTyp)
+		// Interface-value receiver (or a pointer to one) → vtable dispatch.
+		if ifaceReceiverBase(rb) { return DEFER_IFACE }
+		// A struct FIELD of func-value type is a function-value call, not a method.
+		if rb != nil && rb.Kind == types.TYP_STRUCT && structFieldIsFuncValue(rb, e.X.Name) {
+			return DEFER_FUNCVAL
+		}
+		return DEFER_METHOD
+	}
+	// Non-selector callee: a local/parameter/expr whose resolved type is a func
+	// value (`fv()`, `(func(){...})()`, `getFn()()`), else a direct call by name.
+	var ct @types.Type = deferCalleeType(ctx, e.X)
+	if ct != nil && (ct.Kind == types.TYP_FUNC_VALUE || ct.Kind == types.TYP_MANAGED_FUNC_VALUE) {
+		return DEFER_FUNCVAL
+	}
+	return DEFER_DIRECT
+}
+
+// ifaceReceiverBase reports whether a peeled receiver type is an interface value
+// or a pointer to one (the vtable-dispatch receiver shapes).
+func ifaceReceiverBase(rb @types.Type) bool {
+	if rb == nil { return false }
+	if rb.Kind == types.TYP_INTERFACE_VALUE || rb.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		return true
+	}
+	if (rb.Kind == types.TYP_POINTER || rb.Kind == types.TYP_MANAGED_PTR) && rb.Elem != nil {
+		var inner @types.Type = peelTransparent(rb.Elem)
+		return inner != nil &&
+				(inner.Kind == types.TYP_INTERFACE_VALUE || inner.Kind == types.TYP_INTERFACE_VALUE_MANAGED)
+	}
+	return false
+}
+
+// structFieldIsFuncValue reports whether struct type `st` has a field `name`
+// whose type is a function value (so `s.name()` is a func-value call, not a
+// method call).
+func structFieldIsFuncValue(st @types.Type, name *[]readonly char) bool {
+	for i := 0; i < len(st.Fields); i++ {
+		if streq(st.Fields[i].Name, name) {
+			var ft @types.Type = peelTransparent(st.Fields[i].Type)
+			return ft != nil && (ft.Kind == types.TYP_FUNC_VALUE || ft.Kind == types.TYP_MANAGED_FUNC_VALUE)
+		}
+	}
+	return false
+}
+
+// deferCalleeType returns the callee expression's resolved type via the checker
+// (peelTransparent), or nil.
+func deferCalleeType(ctx @GenContext, x @ast.Expr) @types.Type {
+	if x == nil || ctx.Checker == nil || x.ResolvedTypeID == 0 { return nil }
+	return peelTransparent(ctx.Checker.ExprType(x.ResolvedTypeID))
+}
+
+// deferResultTyp collapses a callee's result-type list to the single result
+// type a call op carries (void / scalar / multi-return struct).
+func deferResultTyp(results @[]@types.Type, mrt @types.Type) @types.Type {
+	if len(results) == 0 { return types.TypVoid() }
+	if len(results) == 1 { return results[0] }
+	if mrt != nil { return mrt }
+	return makeMultiReturnStructType(results)
+}
+
+// newDeferArgOp classifies argument `i` (checker type argTyp) against paramTyp,
+// allocates its entry slot, registers it for cleanup if managed, and returns the
+// operand.
+func newDeferArgOp(ctx @GenContext, entry @Block, argTyp @types.Type,
+		paramTyp @types.Type) @DeferOperand {
+	var op @DeferOperand = make(DeferOperand)
+	op.Role = OPROLE_ARG
+	op.ParamTyp = paramTyp
+	var pt @types.Type = peelTransparent(paramTyp)
+	if pt != nil && pt.Kind == types.TYP_SLICE && isManagedSliceType(argTyp) {
+		// @[]T argument to a raw *[]T param: retain the pre-conversion managed
+		// value; deliver the raw borrow at the call.
+		op.IsManagedToRaw = true
+		op.SlotTyp = argTyp
+	} else {
+		// Stored call-ready in the param's type (coerceArgEager yields a
+		// param-typed value).
+		op.SlotTyp = paramTyp
+	}
+	allocDeferOperand(ctx, entry, op)
+	return op
+}
+
+// allocDeferOperand allocates op's entry-block slot, nil-inits it and registers
+// it in ctx.Vars if it holds a managed value / managed-field struct.
+func allocDeferOperand(ctx @GenContext, entry @Block, op @DeferOperand) {
+	op.Slot = entry.EmitAlloc(op.SlotTyp)
+	var st @types.Type = peelTransparent(op.SlotTyp)
+	op.Managed = isManagedPtrType(st) || isManagedSliceType(st) || isManagedIfaceValueType(st) ||
+			isManagedFuncValueType(st) || needsStructCopy(st)
+	if op.Managed {
+		// nil/zero-init at entry so a return taken before this defer executes
+		// sweeps a nil no-op slot (backends do not zero allocas), and register
+		// for the whole-function / fault-pad release.
+		entry.EmitStore(op.Slot, entry.EmitConstNil(op.SlotTyp))
+		defineDeferSlotVar(ctx, op.Slot, op.SlotTyp)
+	}
+}
+
+// defineDeferSlotVar registers a defer operand slot as an anonymous
+// function-scope managed local, so emitDecForManagedLocals (return + fall-off +
+// VM fault pads) releases it.  Appended at entry depth — below any block's
+// savedVarLen — so block-exit truncation never drops it.
+func defineDeferSlotVar(ctx @GenContext, slot @Instr, typ @types.Type) {
+	var vs VarSlot
+	vs.Name = "<defer-operand>"
+	vs.Ptr = slot
+	vs.Typ = typ
+	vs.IsParam = false
+	ctx.Vars = slices.Append[VarSlot](ctx.Vars, vs)
 }

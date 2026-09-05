@@ -1,0 +1,274 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Defer operand store (at the defer site) and LIFO run (at each function exit).
+// See gen_defer.bn for the overall model.
+
+// storeDeferOperands evaluates a deferred call's callee/receiver/arguments
+// EAGERLY and stores them, call-ready, into their pre-allocated slots.
+func storeDeferOperands(ctx @GenContext, b @Block, site @DeferSite, e @ast.Expr) @Block {
+	// Evaluate operands under snapshot-borrow mode so an implicit interface-value
+	// box of a value source captures its value now (§14.13 stmt.defer), not at
+	// exit.  Restored before returning.
+	var savedSnap bool = ctx.SnapshotBorrows
+	var savedBorrowSlots @[]@Instr = ctx.DeferBorrowSlots
+	var savedBorrowCursor int = ctx.DeferBorrowCursor
+	ctx.SnapshotBorrows = true
+	ctx.DeferBorrowSlots = site.BorrowSlots
+	ctx.DeferBorrowCursor = 0
+	b = storeDeferOperandsInner(ctx, b, site, e)
+	// Every pre-allocated borrow slot must have been consumed — else the pre-pass
+	// prediction diverged from the store-time boxing (a slot/value type mismatch
+	// risk).  Abort loudly rather than miscompile.
+	if ctx.DeferBorrowCursor != len(site.BorrowSlots) {
+		panic(
+				"internal error: defer borrow-slot cursor did not consume all "
+						"pre-allocated slots (pre-pass / store divergence)")
+	}
+	ctx.SnapshotBorrows = savedSnap
+	ctx.DeferBorrowSlots = savedBorrowSlots
+	ctx.DeferBorrowCursor = savedBorrowCursor
+	return b
+}
+
+// storeDeferOperandsInner is the body of storeDeferOperands (see there).
+func storeDeferOperandsInner(ctx @GenContext, b @Block, site @DeferSite, e @ast.Expr) @Block {
+	if site.Shape == DEFER_METHOD {
+		b = storeRecvOp(ctx, b, site.RecvOp, e.X)
+	} else if site.Shape == DEFER_IFACE {
+		b = storePassthruOp(ctx, b, site.RecvOp, e.X.X)
+	} else if site.Shape == DEFER_FUNCVAL {
+		b = storePassthruOp(ctx, b, site.RecvOp, e.X)
+	}
+	// Argument operands, in source order.  For DEFER_PANIC there is a single
+	// message operand backed by e.Args[0] (or the empty string).
+	if site.Shape == DEFER_PANIC && len(e.Args) == 0 {
+		b = storeEmptyPanicMsg(ctx, b, site.ArgOps[0])
+		return b
+	}
+	for i := 0; i < len(site.ArgOps); i++ {
+		var op @DeferOperand = site.ArgOps[i]
+		if op.Role == OPROLE_VARIADIC_PACK {
+			// The pack operand is the last; it consumes all remaining trailing
+			// args (e.Args[i:]).
+			b = storeVariadicPackOp(ctx, b, op, e, i)
+		} else {
+			b = storeArgOp(ctx, b, op, e.Args[i])
+		}
+	}
+	return b
+}
+
+// storeVariadicPackOp packs the trailing individual arguments e.Args[fixed:] into
+// a fresh frame-lived `*[]T` backing (emitVariadicTail — the same packing a
+// normal variadic call uses, EAGERLY at the defer site) and stores the raw
+// {data,len} header.  The backing array (and any value/string `*any` boxes it
+// contains, which borrow frame-lived allocas) outlive the wait to the call.
+func storeVariadicPackOp(ctx @GenContext, b @Block, op @DeferOperand, e @ast.Expr,
+		fixed int) @Block {
+	var trailing @[]@ast.Expr
+	for i := fixed; i < len(e.Args); i++ {
+		trailing = slices.Append[@ast.Expr](trailing, e.Args[i])
+	}
+	var packed @Instr = emitVariadicTailInto(ctx, b, op.ElemTyp, trailing, op.BackingSlot)
+	b = ctx.CurBlock
+	b = emitStoreManagedSlot(ctx, b, op.Slot, packed, op.SlotTyp, true)
+	return b
+}
+
+// storeArgOp evaluates an argument and stores it call-ready.  A managed→raw
+// operand retains its pre-conversion managed value; every other argument runs
+// the eager (opcode/untyped-keyed) coercions now and stores the param-typed
+// value.
+func storeArgOp(ctx @GenContext, b @Block, op @DeferOperand, argExpr @ast.Expr) @Block {
+	var val @Instr = genExprOrFuncRef(ctx, b, argExpr, op.ParamTyp)
+	b = ctx.CurBlock
+	if !op.IsManagedToRaw {
+		val = coerceArgEager(ctx, b, val, op.ParamTyp)
+		b = ctx.CurBlock
+	}
+	if needsStructCopy(op.SlotTyp) && isStructOrArrayAlloc(val) {
+		val = b.EmitLoad(val, val.TypeArg)
+	}
+	b = emitStoreManagedSlot(ctx, b, op.Slot, val, op.SlotTyp, true)
+	return b
+}
+
+// storeEmptyPanicMsg stores an empty message string for `defer panic()`.
+func storeEmptyPanicMsg(ctx @GenContext, b @Block, op @DeferOperand) @Block {
+	var empty @[]char
+	var val @Instr = b.EmitConstString(empty)
+	val = coerceArgEager(ctx, b, val, op.ParamTyp)
+	b = ctx.CurBlock
+	b = emitStoreManagedSlot(ctx, b, op.Slot, val, op.SlotTyp, true)
+	return b
+}
+
+// storeRecvOp evaluates a static-method receiver (eager, with the receiver
+// conversion applied at the defer site so a pointer-receiver method captures the
+// receiver ADDRESS) and stores it.  Mirrors genMethodCall's receiver evaluation,
+// including the explicit-deref `(*p).m()` form.
+func storeRecvOp(ctx @GenContext, b @Block, op @DeferOperand, sel @ast.Expr) @Block {
+	var recv @Instr
+	if sel.X != nil && sel.X.Kind == ast.EXPR_UNARY && sel.X.Op == cast(int, token.STAR) {
+		recv = genExpr(ctx, b, sel.X.X)
+	} else {
+		recv = genExpr(ctx, b, sel.X)
+	}
+	b = ctx.CurBlock
+	var val @Instr = applyReceiverConversion(ctx, b, recv, op.ParamTyp, sel.X)
+	b = ctx.CurBlock
+	if needsStructCopy(op.SlotTyp) && isStructOrArrayAlloc(val) {
+		val = b.EmitLoad(val, val.TypeArg)
+	}
+	b = emitStoreManagedSlot(ctx, b, op.Slot, val, op.SlotTyp, true)
+	return b
+}
+
+// storePassthruOp evaluates an iface receiver or a func value and stores it
+// as-is (emitStoreManagedSlot acquires slot ownership for a managed value).
+func storePassthruOp(ctx @GenContext, b @Block, op @DeferOperand, valExpr @ast.Expr) @Block {
+	var val @Instr = genExpr(ctx, b, valExpr)
+	b = ctx.CurBlock
+	b = emitStoreManagedSlot(ctx, b, op.Slot, val, op.SlotTyp, true)
+	return b
+}
+
+// emitPendingDefers emits the LIFO run of this function's pending deferred calls
+// at a normal exit — reverse lexical order, each armed-gated — BEFORE the
+// caller's whole-function managed-local release.  Returns the continuation block
+// the caller emits the release + return into.  Emitted at every normal void /
+// value exit; NOT on a panic/trap/VM-fault (stmt.defer.no-abort).
+func emitPendingDefers(ctx @GenContext, b @Block) @Block {
+	for i := len(ctx.Defers) - 1; i >= 0; i-- {
+		var d @DeferSite = ctx.Defers[i]
+		var armed @Instr = b.EmitLoad(d.ArmedSlot, types.TypBool())
+		var thenB @Block = AddBlock(ctx.Func, "defer.run")
+		var contB @Block = AddBlock(ctx.Func, "defer.cont")
+		b.EmitBranch(armed, thenB, contB)
+		emitDeferRun(ctx, thenB, d, contB)
+		b = contB
+	}
+	return b
+}
+
+// emitDeferRun emits, into the armed block `thenB`, the reconstructed deferred
+// call from its stored operands, releases a discarded managed result, and jumps
+// to `contB` (unless the call terminates the block, e.g. a deferred panic).
+func emitDeferRun(ctx @GenContext, thenB @Block, d @DeferSite, contB @Block) {
+	if d.Shape == DEFER_PANIC {
+		emitDeferPanic(thenB, d)
+		return // rt.Panic + unreachable terminate thenB; contB carries the not-armed path
+	}
+	var args @[]@Instr = buildDeferCallArgs(ctx, thenB, d)
+	var result @Instr = nil
+	if d.Shape == DEFER_DIRECT {
+		result = thenB.EmitCall(d.Sym, args, d.ResultTyp)
+	} else if d.Shape == DEFER_METHOD {
+		result = thenB.EmitCall(d.Sym, args, d.ResultTyp)
+	} else if d.Shape == DEFER_IFACE {
+		var iv @Instr = thenB.EmitLoad(d.RecvOp.Slot, d.RecvOp.SlotTyp)
+		result = thenB.EmitCallIfaceMethod(iv, args, d.MethodIdx, d.ResultTyp)
+	} else {
+		var fv @Instr = thenB.EmitLoad(d.RecvOp.Slot, d.RecvOp.SlotTyp)
+		result = thenB.EmitCallFuncValue(fv, args, d.ResultTyp)
+	}
+	// The call's result is discarded; a managed result is released immediately,
+	// before the next pending deferred call runs (stmt.defer).  No OP_SP_RESTORE
+	// between deferred calls: growth is bounded by the static defer count and
+	// reclaimed by the function's own return (BC_RETURN resets vm.SP).
+	thenB = releaseDeferResult(ctx, thenB, result, d.ResultTyp)
+	thenB.EmitJump(contB)
+}
+
+// buildDeferCallArgs loads and delivers the argument operands (plus, for a
+// static method, the leading receiver) for the exit-time call.
+func buildDeferCallArgs(ctx @GenContext, thenB @Block, d @DeferSite) @[]@Instr {
+	var args @[]@Instr
+	if d.Shape == DEFER_METHOD {
+		args = slices.Append[@Instr](args, exitDeliverOp(ctx, thenB, d.RecvOp))
+	}
+	for i := 0; i < len(d.ArgOps); i++ {
+		args = slices.Append[@Instr](args, exitDeliverOp(ctx, thenB, d.ArgOps[i]))
+	}
+	return args
+}
+
+// exitDeliverOp reloads an operand from its slot and delivers it to the call:
+// EmitManagedToRaw for a retained managed→raw slice, else the delivery-phase
+// coercions (a managed-field struct callee copy, the @Iface deliver-ref).
+// None of these split the block.
+func exitDeliverOp(ctx @GenContext, thenB @Block, op @DeferOperand) @Instr {
+	var loaded @Instr = thenB.EmitLoad(op.Slot, op.SlotTyp)
+	if op.IsManagedToRaw {
+		return thenB.EmitManagedToRaw(loaded)
+	}
+	return coerceArgDelivery(ctx, thenB, loaded, op.ParamTyp)
+}
+
+// emitDeferPanic emits `defer panic(msg)` at exit: rt.Panic(msg) + unreachable.
+// The armed deferred panic terminates thenB; earlier-scheduled defers sit on the
+// contB chain and run only if this one was not armed (stmt.defer.no-abort).
+func emitDeferPanic(thenB @Block, d @DeferSite) {
+	var op @DeferOperand = d.ArgOps[0]
+	var msg @Instr = thenB.EmitLoad(op.Slot, op.SlotTyp)
+	if op.IsManagedToRaw {
+		msg = thenB.EmitManagedToRaw(msg)
+	}
+	thenB.EmitCall("pkg/builtins/rt.Panic", makeArgs1(msg), types.TypVoid())
+	thenB.EmitUnreachable()
+}
+
+// releaseDeferResult RefDecs a discarded managed result of a deferred call (all
+// managed kinds, incl. a managed-field struct via emitStructDtor).  Threads the
+// block: a slice / @Iface / @func RefDec splits for a null-guard.
+func releaseDeferResult(ctx @GenContext, b @Block, result @Instr, typ @types.Type) @Block {
+	if result == nil || typ == nil { return b }
+	var st @types.Type = peelTransparent(typ)
+	if isManagedPtrType(st) {
+		emitManagedPtrRefDec(ctx.Func, b, result)
+		return b
+	}
+	if isManagedSliceType(st) {
+		return emitManagedSliceRefDec(ctx.Func, b, result)
+	}
+	if isManagedIfaceValueType(st) {
+		return emitManagedIfaceValueRefDec(ctx.Func, b, result)
+	}
+	if isManagedFuncValueType(st) {
+		return emitManagedFuncValueRefDec(ctx.Func, b, result)
+	}
+	if needsStructCopy(st) {
+		var slot @Instr = b.EmitAlloc(st)
+		b.EmitStore(slot, result)
+		emitStructDtor(ctx.Func, b, slot, st)
+		return b
+	}
+	return b
+}
+
+// genDeferStmt lowers a STMT_DEFER: it finds the pre-registered DeferSite, stores
+// the eagerly-evaluated operands into their slots, and sets the armed flag.
+func genDeferStmt(ctx @GenContext, b @Block, stmt @ast.Stmt) @Block {
+	var site @DeferSite = findDeferSite(ctx, stmt)
+	if site == nil {
+		panic("internal error: defer statement has no pre-registered DeferSite")
+	}
+	var e @ast.Expr = stmt.X
+	b = storeDeferOperands(ctx, b, site, e)
+	b.EmitStore(site.ArmedSlot, b.EmitConstBool(true))
+	b = emitTempCleanup(ctx, b)
+	return b
+}
+
+// findDeferSite returns the DeferSite registered for `stmt` (identity match).
+func findDeferSite(ctx @GenContext, stmt @ast.Stmt) @DeferSite {
+	for i := 0; i < len(ctx.Defers); i++ {
+		if same(ctx.Defers[i].Stmt, stmt) { return ctx.Defers[i] }
+	}
+	return nil
+}

@@ -1,0 +1,121 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// The two-phase split of coerceArg (gen_call.bn): coerceArgEager runs the
+// opcode/untyped-keyed coercions where an argument is first produced;
+// coerceArgDelivery runs the type-keyed borrow/copy deliveries and is safe to
+// replay from a value reloaded from a slot.  `defer` (gen_defer.bn) runs the two
+// phases at different program points — eager at the defer site, delivery at the
+// call — so composing them equals a single-pass coerceArg.
+
+// coerceArgEager applies the argument coercions that depend on the argument's
+// IR OPCODE / untyped-ness — string-literal→char-slice, nil→typed-slice, a
+// plain (no-managed-field) aggregate alloca→value load, and untyped-scalar
+// width narrowing.  These MUST run where the argument is first produced (they
+// cannot fire on a value later reloaded from a slot, which is `OP_LOAD` with a
+// concrete type).  `defer` runs this at the defer site (eager operand
+// evaluation, §14.13); the normal call path runs it as the first half of
+// coerceArg.  It does NOT do the borrow/copy deliveries (managed→raw, managed
+// struct copy, @Iface deliver-ref) — those are coerceArgDelivery, safe to run
+// later from a load.
+func coerceArgEager(ctx @GenContext, b @Block, arg @Instr, paramTyp @types.Type) @Instr {
+	if paramTyp == nil { return arg }
+	// Classify the param against its PEELED representation type (named-distinct /
+	// alias / readonly stripped).  isSliceType / peelReadonly see through readonly
+	// but NOT named-distinct, so an un-peeled gate SKIPS the slice coercions below
+	// for a named-distinct slice param (`type Str *[]readonly char`) — the checker
+	// accepts the call, but the callee then reads a bare string pointer / an
+	// un-narrowed managed slice as a {data,len,...} aggregate (a silent garbage
+	// value).  Named-distinct is layout-transparent, so the peeled slice type
+	// drives the same materialization.
+	var pt @types.Type = peelTransparent(paramTyp)
+	// String literal -> *[]readonly char / @[]char when the param is a slice.
+	// Gating on the bare paramTyp.Kind passed the bare string-literal pointer
+	// where the callee reads a {data,len,...} aggregate by address.
+	if arg.Op == iropcode.OP_CONST_STRING && isSliceType(pt) {
+		arg = b.EmitStringToChars(arg, pt)
+		noteSPGrowingResult(ctx, arg)
+		if arg.Op == iropcode.OP_RODATA_MSLICE_COPY {
+			// A string literal coerced to a mutable @[]char param is a FRESH owned
+			// copy (refcount 1) — borrowed by the callee for the call, then a
+			// leftover temp; register it so end-of-statement cleanup RefDecs it,
+			// else it leaks one allocation per call.  The @[]readonly char /
+			// *[]readonly char coercions alias the static rodata (immortal — no
+			// refcount, no cleanup), so only the copy form registers.
+			registerTemp(ctx, arg)
+		}
+	}
+	// nil -> the param's slice type (zeroed BnSlice/BnManagedSlice).
+	if arg.Op == iropcode.OP_CONST_NIL && isSliceType(pt) {
+		arg.Typ = pt
+	}
+	// A PLAIN (no-managed-field) struct/array passed BY VALUE arrives as an
+	// OP_ALLOC pointer (a composite literal `T{...}`, or a by-value aggregate
+	// var/global); load the VALUE so the callee receives the aggregate, not
+	// the alloca POINTER (which it would read field-by-field as garbage on
+	// LLVM + native; the VM tolerates it).  No RefInc/copy — there are no
+	// managed fields.  A pointer param (`f(&x)`) doesn't match
+	// isAggregateAllocToLoad, so its address is still passed as-is.  A
+	// managed-field aggregate takes the coerceArgDelivery copy path instead.
+	if !needsStructCopy(paramTyp) && isAggregateAllocToLoad(arg, paramTyp) {
+		arg = b.EmitLoad(arg, arg.TypeArg)
+	}
+	// Narrow an untyped scalar LITERAL argument to the param's width
+	// (e.g. an untyped-float 0.5 passed to a float32 param fptruncs to
+	// single precision).  No-op for already-typed / non-scalar args.
+	arg = coerceScalarWidth(ctx, b, arg, paramTyp)
+	return arg
+}
+
+// coerceArgDelivery applies the coercions that DELIVER a borrow/copy to the
+// callee and are safe to run from a reloaded value (they key on the value's
+// TYPE, not its producing opcode): @[]T/@T→raw-slice, a managed-field struct
+// value→callee copy, and the @Iface deliver-ref.  `defer` runs this at the
+// function exit — from the operands reloaded from their slots (§14.13) — so a
+// managed→raw operand's pre-conversion managed backing is retained across the
+// wait and the borrow is delivered at call time.  The normal call path runs it
+// as the second half of coerceArg.
+func coerceArgDelivery(ctx @GenContext, b @Block, arg @Instr, paramTyp @types.Type) @Instr {
+	if paramTyp == nil { return arg }
+	var pt @types.Type = peelTransparent(paramTyp)
+	// @[]T -> *[]T when the param is a raw slice.  The managed-slice temp stays
+	// in the cleanup list — it's borrowed by the raw slice during the call and
+	// RefDec'd at end of statement.
+	if pt != nil && pt.Kind == types.TYP_SLICE && isManagedSliceType(arg.Typ) {
+		arg = b.EmitManagedToRaw(arg)
+	}
+	// RefInc managed fields for a struct/array arg passed by value, so the
+	// callee's scope cleanup dtor's its own parameter copy without dropping
+	// the caller's.
+	if needsStructCopy(paramTyp) {
+		if isStructOrArrayAlloc(arg) {
+			var tmpPtr @Instr = arg
+			emitStructCopy(ctx.Func, b, tmpPtr, paramTyp)
+			arg = b.EmitLoad(tmpPtr, arg.TypeArg)
+		} else {
+			var tmpSlot @Instr = b.EmitAlloc(paramTyp)
+			b.EmitStore(tmpSlot, arg)
+			emitStructCopy(ctx.Func, b, tmpSlot, paramTyp)
+			arg = b.EmitLoad(tmpSlot, paramTyp)
+		}
+	}
+	// Move model for a managed interface-value argument: the callee param
+	// carries no entry RefInc and RefDec's at scope exit, so the caller hands
+	// it exactly one ref.  A fresh @Iface (a box or call result) is MOVED in
+	// via consumeTemp — its ref transfers and it is NOT cleaned post-call
+	// (which the bytecode VM can't do for a 2-word value on transient vm.SP).
+	// A borrowed @Iface (a load) is RefInc'd so the callee's release doesn't
+	// drop the caller's own reference.
+	if isManagedIfaceValueType(paramTyp) && isManagedIfaceValueType(arg.Typ) {
+		if isFreshManagedIfaceValue(arg) {
+			consumeTemp(ctx, arg)
+		} else {
+			emitManagedIfaceValueRefInc(ctx.Func, b, arg)
+		}
+	}
+	return arg
+}
+
+// genCall generates IR for a function call, including the panic builtin.

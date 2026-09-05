@@ -1,0 +1,356 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// genDecl generates IR for a variable or local-const declaration,
+// handling init values and type coercion.
+//
+// A local `const C T = V` is materialized exactly like `var C T = V`:
+// the value is bound to the name (read back through lookupVar) and its
+// immutability is already enforced by the type checker, so codegen
+// treats the two identically.  Without the DECL_CONST arm a local const
+// reaches genDecl, matches nothing, and silently vanishes — every later
+// read then falls to the 0 placeholder in genExpr's EXPR_IDENT path,
+// materializing 0 for every type.  Routing it through the var-init path
+// also gives it that path's typed-literal width coercion (e.g. a
+// float32 const narrows correctly) and lexical block scoping (the const
+// rides ctx.Vars, which genBlock saves/restores per block).
+func genDecl(ctx @GenContext, b @Block, d @ast.Decl) {
+	// A func-local grouped decl (`const ( … )` / `var ( … )` / `type ( … )`)
+	// parses to DECL_GROUP; genLocalGroupDecl lowers it per member kind.
+	if d.Kind == ast.DECL_GROUP {
+		ctx.CurBlock = genLocalGroupDecl(ctx, b, d)
+		return
+	}
+	if d.Kind == ast.DECL_VAR || d.Kind == ast.DECL_CONST {
+		// Also register a local const's compile-time value in Module.Consts
+		// (in addition to the var-slot materialization below), so a later
+		// `var a [C]int` resolves its dimension via evalConstExpr /
+		// lookupConst — which are module-scoped and otherwise can't see a
+		// function-local const.  genFunc truncates these per function.
+		if d.Kind == ast.DECL_CONST && !isBlank(d.Name) {
+			genConst(ctx.Gc, ctx.Checker, d)
+		}
+		// Blank identifier: evaluate initializer for side effects,
+		// but don't allocate storage or register a name.
+		if isBlank(d.Name) {
+			if d.Value != nil {
+				genExpr(ctx, b, d.Value)
+			}
+			return
+		}
+		var typ @types.Type = types.TypInt() // default
+		// True once a literal initializer has pinned `typ` to its own slot
+		// type below; it suppresses the general "slot type = value type"
+		// refinement after lowering, which must NOT override the string case
+		// (the lowered value is a string constant, not the @[]readonly char
+		// slot it converts into).
+		var typFromLiteral bool = false
+		if d.TypeRef != nil {
+			typ = resolveTypeExpr(ctx.Gc, d.TypeRef)
+		} else if d.Value != nil {
+			// `var x = expr` / `const C = expr` (no explicit type): infer
+			// the slot type from the initializer, mirroring the type-
+			// checker's defaultTypeForExpr so the storage slot matches the
+			// declared type.  String → @[]readonly char; char literal →
+			// char (uint8).  Untyped-float / untyped-bool / untyped-int and
+			// every other non-literal initializer (call result, func/closure
+			// literal, composite, …) are refined from the lowered value's
+			// type below.
+			if d.Value.Kind == ast.EXPR_STRING_LIT {
+				typ = types.MakeManagedSliceType(
+						types.MakeReadonlyType(types.TypUint8()))
+				typFromLiteral = true
+			} else if d.Value.Kind == ast.EXPR_CHAR_LIT {
+				typ = types.TypChar()
+				typFromLiteral = true
+			} else if d.Value.Kind == ast.EXPR_FLOAT_LIT {
+				typ = types.TypFloat64()
+				typFromLiteral = true
+			} else if d.Value.Kind == ast.EXPR_BOOL_LIT {
+				typ = types.TypBool()
+				typFromLiteral = true
+			}
+		}
+		// Peel transparent wrappers so the no-initializer nil-init dispatch
+		// below keys off the underlying kind.  A named distinct managed-slice /
+		// slice / func-value / iface-value / managed-ptr (e.g. `type Buf @[]int`)
+		// has Kind TYP_NAMED, so an unpeeled `typ.Kind ==` test would skip its
+		// nil-store and leave the local holding stack garbage on a backend that
+		// does not zero-fill the alloca (the LLVM backend; native + the VM zero
+		// it).  Computed for every decl but only consulted on the no-value path.
+		var peeledDeclTyp @types.Type = peelTransparent(typ)
+		if d.Value != nil {
+			// Inferred bare func reference (`var f = add`): the checker decays
+			// a TYP_FUNC reference to @func (defaultType), the managed-by-
+			// default flavour.  IR-gen recomputes the slot type, so synthesize
+			// the matching @func from the callee signature here — then the
+			// func-ref emission below fires and registers f as @func instead of
+			// the int default (which mis-lowers `f(...)` to a `main.f` symbol).
+			if d.TypeRef == nil && isFuncRefExpr(d.Value) {
+				var inferRefName @[]char = funcRefName(ctx.Gc, d.Value)
+				// A local/global VAR of the same name shadows the function
+				// (the checker resolves the reference to the var), so only
+				// synthesize when no such var is in scope — otherwise this is
+				// an ordinary value load, not a func reference.
+				if lookupVarType(ctx, inferRefName) == nil && lookupFuncExists(ctx.Gc, inferRefName) {
+					typ = managedFuncValueTypeForName(ctx.Gc, inferRefName)
+				}
+			}
+			// Function-reference assigned to a function-value type:
+			// `var f *func(int) int = add` (or `@func(...)`). The
+			// type-checker validated the signature match; here we
+			// detect the pattern and emit OP_FUNC_VALUE instead of
+			// the generic genExpr path (which would treat `add` as
+			// an ident and return a zero placeholder).
+			if (typ.Kind == types.TYP_FUNC_VALUE || typ.Kind == types.TYP_MANAGED_FUNC_VALUE) &&
+					isFuncRefExpr(d.Value) {
+				var fnName @[]char = funcRefName(ctx.Gc, d.Value)
+				if lookupFuncExists(ctx.Gc, fnName) {
+					defineFuncValueVar(ctx, b, d.Name, fnName, typ)
+					return
+				}
+			}
+			// A generic-function instantiation as a func value (`var f =
+			// glib.Ident[int]` / `var f @func(int) int = glib.Ident[int]`).
+			// isFuncRefExpr rejects the EXPR_INSTANTIATE_OR_INDEX shape, so
+			// emit the specialized instance and bind f to its func value.
+			// Inferred: f decays to the managed-by-default @func, matching the
+			// bare-ref case above; an explicit func-value type wins.
+			if d.Value.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+				var giName @[]char = genericFuncInstanceName(ctx, d.Value)
+				if len(giName) > 0 {
+					var fvTyp @types.Type = managedFuncValueTypeForName(ctx.Gc, giName)
+					if typ.Kind == types.TYP_FUNC_VALUE || typ.Kind == types.TYP_MANAGED_FUNC_VALUE {
+						fvTyp = typ
+					}
+					defineFuncValueVar(ctx, b, d.Name, giName, fvTyp)
+					return
+				}
+			}
+			// Route through genExprOrFuncRef so the var's declared `typ` reaches
+			// EXPR_INT_LIT and narrower-than-default-int targets
+			// (uint8/16/32, int8/16) get the literal at the right
+			// width rather than via the magnitude heuristic.
+			var val @Instr = genExprOrFuncRef(ctx, b, d.Value, typ)
+			b = ctx.CurBlock
+			// No explicit type: an untyped FLOAT / BOOL initializer takes
+			// its default concrete type (float64 / bool), mirroring the
+			// checker's defaultType — for a literal AND an expression like
+			// `0.5 + 0.5`.  Without this the int default (above) leaves a
+			// float/bool value in an int slot: `var x = 0.5` / `const C =
+			// 0.5` miscompiled (int slot + sitofp).  Untyped-int keeps int.
+			if d.TypeRef == nil && val.Typ != nil {
+				if val.Typ.Kind == types.TYP_UNTYPED_FLOAT {
+					typ = types.TypFloat64()
+				} else if val.Typ.Kind == types.TYP_UNTYPED_BOOL {
+					typ = types.TypBool()
+				} else if val.Typ.Kind == types.TYP_UNTYPED_INT {
+					typ = types.TypInt()
+				} else if !typFromLiteral && val.Typ.Kind != types.TYP_FUNC {
+					// General inference for a non-literal initializer: the slot
+					// type is the initializer's own concrete type.  Without
+					// this the slot stays at the int default, so `var f = mk()`
+					// (mk returns @func) registers f as int — a func-value call
+					// through f then mis-lowers to a direct call to a symbol
+					// named after the variable (`main.f`) — and an inferred
+					// struct/slice/iface var stores a multi-word value into a
+					// too-small int slot.  A bare TYP_FUNC (e.g. `var f = add`
+					// referencing a top-level function) is excluded: it is not a
+					// storable func-value, and whether such a reference decays
+					// to `*func` is an unsettled inference-semantics question.
+					typ = val.Typ
+				}
+			}
+			// Array/struct composite lit returns an alloca — use directly
+			// only when the declared type matches the alloca's kind.
+			// Otherwise (e.g. `var p *T = &localStruct`, where typ is a
+			// pointer but val is a struct alloca), reusing the alloca
+			// would alias p with the struct, so fall through to the
+			// normal path that creates a fresh slot for p.  Both sides peel
+			// IR-transparent wrappers (readonly / named-distinct / alias)
+			// before the kind match: a named-distinct slot `var r Row = Row{...}`
+			// (typ is TYP_NAMED) still holds the array BY VALUE, and the literal
+			// alloca's TypeArg is the peeled array, so the unpeeled `typ.Kind ==
+			// val.TypeArg.Kind` would miss and the alloca POINTER would be stored
+			// into the slot (every element reads back garbage).
+			if val.Op == iropcode.OP_ALLOC && val.TypeArg != nil {
+				var peeledTyp @types.Type = peelTransparent(typ)
+				var peeledArg @types.Type = peelTransparent(val.TypeArg)
+				if peeledArg != nil &&
+						(peeledArg.Kind == types.TYP_ARRAY || peeledArg.Kind == types.TYP_STRUCT) {
+					if peeledTyp != nil && peeledTyp.Kind == peeledArg.Kind {
+						// The literal alloca becomes this var's durable storage, so
+						// take it off the end-of-statement temp list genCompositeLit /
+						// genArrayLit registered it on (else a managed-field literal is
+						// both temp-dtor'd and var-dtor'd — a double-free).  No-op for
+						// a value-only literal (never registered).
+						consumeTemp(ctx, val)
+						defineVar(ctx, d.Name, val, typ)
+						return
+					}
+				}
+			}
+			// String literal assigned to *[]readonly char or @[]char: convert via string_to_chars
+			if isCharSliceType(typ) {
+				if val.Op == iropcode.OP_CONST_STRING {
+					val = b.EmitStringToChars(val, typ)
+					noteSPGrowingResult(ctx, val)
+				}
+			}
+			// String literal assigned to [N]char / [N]readonly char:
+			// convert via OP_RODATA_ARRAY (memcpy from rodata).
+			if isCharArrayType(typ) {
+				if val.Op == iropcode.OP_CONST_STRING {
+					val = b.EmitRodataArray(val.StrVal, typ)
+					noteSPGrowingResult(ctx, val)
+				}
+			}
+			// @[]T → *[]T conversion
+			if typ.Kind == types.TYP_SLICE && val.Typ != nil && val.Typ.Kind == types.TYP_MANAGED_SLICE {
+				// Temp stays in cleanup — RefDec at end of statement
+				val = b.EmitManagedToRaw(val)
+			}
+			// *T / @T → *Iface (raw interface value) construction. The
+			// type-checker validated that an impl exists matching
+			// (sourceNamedType, ifaceName); IR-gen looks the impl up
+			// in m.Impls and emits OP_IFACE_VALUE pointing at its
+			// `__ivt.<...>` global. @Iface (managed) lands with the
+			// refcount-aware path.
+			if (typ.Kind == types.TYP_INTERFACE_VALUE || typ.Kind == types.TYP_INTERFACE_VALUE_MANAGED) &&
+					val.Typ != nil {
+				// Iface-value sources go through OP_IFACE_UPCAST
+				// (vtable swap) instead of wrapAsIfaceValue (which
+				// only handles *T / @T sources).
+				if (val.Typ.Kind == types.TYP_INTERFACE_VALUE ||
+						val.Typ.Kind == types.TYP_INTERFACE_VALUE_MANAGED) &&
+						!ifaceValueTypesAgree(ctx.Gc.Mod, val.Typ, typ) {
+					val = b.EmitIfaceUpcast(ctx.Gc.Mod, val, "", typ)
+					noteSPGrowingResult(ctx, val)
+				} else {
+					// d.Value's un-stripped checker type keeps a name-less box's
+					// element-`readonly` in its identity (see wrapAsIfaceValue).
+					var iv @Instr = wrapAsIfaceValue(ctx, b, val, typ,
+							ctx.Checker.ExprType(d.Value.ResolvedTypeID))
+					if iv != nil {
+						val = iv
+						noteSPGrowingResult(ctx, val)
+					}
+				}
+			}
+			// Coerce nil to proper slice/managed-slice type
+			if val.Op == iropcode.OP_CONST_NIL && val.Typ != nil && val.Typ.Kind == types.TYP_NIL {
+				if typ.Kind == types.TYP_SLICE || typ.Kind == types.TYP_MANAGED_SLICE ||
+						typ.Kind == types.TYP_FUNC_VALUE || typ.Kind == types.TYP_MANAGED_FUNC_VALUE {
+					val.Typ = typ
+				}
+			}
+			// Ensure value width matches declared type
+			val = ensureWidth(ctx, b, val, typ)
+			// Acquire-and-store through the shared dispatcher: a fresh
+			// producer is moved (consumeTemp), a borrow is RefInc'd, and a
+			// managed struct/array's fields are RefInc'd via emitStructCopy.
+			// The uniform move-a-fresh model is what @func / @Iface always
+			// required (a fresh box / call result is not a registered cleanup
+			// temp, so an unconditional RefInc would over-retain); it is
+			// equally correct for @T / @[]T (a fresh producer owns its single
+			// ref, transferred to the slot).  isInit: a fresh slot, no old
+			// value to release.
+			var ptr @Instr = b.EmitAlloc(typ)
+			b = emitStoreManagedSlot(ctx, b, ptr, val, typ, true)
+			defineVar(ctx, d.Name, ptr, typ)
+		} else if peeledDeclTyp.Kind == types.TYP_SLICE ||
+				peeledDeclTyp.Kind == types.TYP_MANAGED_SLICE || peeledDeclTyp.Kind == types.TYP_FUNC_VALUE ||
+				peeledDeclTyp.Kind == types.TYP_MANAGED_FUNC_VALUE ||
+				peeledDeclTyp.Kind == types.TYP_INTERFACE_VALUE ||
+				peeledDeclTyp.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+			// Initialize uninitialized slices, function values, and
+			// interface values to nil (zeroed). Multi-word values must
+			// be zero-initialized explicitly because their backends
+			// rely on memcpy/memset of the full storage rather than a
+			// single-register store. For interface values: pins the
+			// no-init form so a subsequent dispatch through the iv
+			// hits a deterministic null vtable load (SEGV) rather
+			// than LLVM-undef UB on the alloca.
+			var ptr @Instr = b.EmitAlloc(typ)
+			var nilVal @Instr = b.EmitConstNil(typ)
+			b.EmitStore(ptr, nilVal)
+			defineVar(ctx, d.Name, ptr, typ)
+		} else if peeledDeclTyp.Kind == types.TYP_MANAGED_PTR {
+			// Initialize uninitialized managed pointers to nil so
+			// refcount_dec on first assignment doesn't hit garbage
+			var ptr @Instr = b.EmitAlloc(typ)
+			var nilVal @Instr = b.EmitConstNil(typ)
+			b.EmitStore(ptr, nilVal)
+			defineVar(ctx, d.Name, ptr, typ)
+		} else if peeledDeclTyp.Kind == types.TYP_POINTER {
+			// A bare no-init RAW pointer `var p *T` must be zeroed to nil
+			// (spec decl.var.zero-init).  It is a single-word, refcount-free
+			// pointer, so neither the scalar default-init path (IsScalar is
+			// false for pointers) nor codegen's struct/array alloca zero-fill
+			// covers it — without this store the LLVM backend (and native)
+			// read the stale stack slot, so `present(p)` / a deref sees
+			// garbage (the VM happens to zero the slot).  Emit the null store
+			// in the IR so all backends agree.
+			var ptr @Instr = b.EmitAlloc(typ)
+			var nilVal @Instr = b.EmitConstNil(typ)
+			b.EmitStore(ptr, nilVal)
+			defineVar(ctx, d.Name, ptr, typ)
+		} else {
+			var ptr @Instr = b.EmitAlloc(typ)
+			// Zero-init structs/arrays that contain managed fields.
+			// Without this, a subsequent field assignment loads the
+			// uninitialized old value and RefDec's a garbage refptr,
+			// possibly freeing a stranger's allocation. (LLVM hides
+			// this via dead-load elimination on uninitialized allocas;
+			// the bytecode VM doesn't, so the IR must be explicit.)
+			if needsStructCopy(typ) {
+				var nilVal @Instr = b.EmitConstNil(typ)
+				b.EmitStore(ptr, nilVal)
+			} else if typ.IsScalar() {
+				// A default-initialized SCALAR local must be zero
+				// (spec decl.var.zero-init).  The LLVM backend's emitAlloc
+				// only zero-fills struct/array OP_ALLOCs, so a scalar slot
+				// would otherwise be read as stack garbage (the VM zeroes it,
+				// so the IR must carry the store for the backends to agree).
+				// A plain (managed-free) struct/array needs no store — codegen
+				// emitAlloc fieldwise-zeroes it.
+				var z @Instr
+				if typ.IsBool() {
+					z = b.EmitConstBool(false)
+				} else if typ.IsFloat() {
+					z = b.EmitConstFloat("0", typ)
+				} else {
+					z = b.EmitConstInt(0, typ)
+				}
+				b.EmitStore(ptr, z)
+			}
+			defineVar(ctx, d.Name, ptr, typ)
+		}
+	}
+}
+
+// managedFuncValueTypeForName builds the @func (TYP_MANAGED_FUNC_VALUE) type
+// matching the signature of the registered function `name`.  It gives an
+// inferred bare func-reference local (`var f = add`) its managed-by-default
+// slot type, mirroring the checker's defaultType decay of a TYP_FUNC reference
+// to @func.  Captures don't apply (a top-level function has none).
+func managedFuncValueTypeForName(gc @GenCtx, name *[]readonly char) @types.Type {
+	var sig FuncSig
+	sig, _ = lookupFuncSig(gc, name)
+	var ptypes @[]@types.Type = sig.Params
+	var params @[]@types.Param = make_slice(@types.Param, len(ptypes))
+	for i := 0; i < len(ptypes); i++ {
+		var p @types.Param = make(types.Param)
+		p.Type = ptypes[i]
+		// Variadic-ness lives on the last param (func.variadic.identity), so the
+		// decayed @func type matches the checker's defaultType decay.
+		if sig.IsVariadic && i == len(ptypes) - 1 {
+			p.IsVariadic = true
+		}
+		params[i] = p
+	}
+	return types.MakeManagedFuncValueType(params, sig.Results)
+}

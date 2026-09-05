@@ -1,0 +1,248 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Per-shape defer-site builders (classify -> resolve dispatch key + operand/param
+// types -> pre-allocate entry-depth slots).  Split from gen_defer.bn (which holds
+// the pre-pass core + operand-slot helpers) for file length; see there for the
+// overall model.
+
+// buildDeferDirect resolves a direct call's symbol + signature and builds its arg
+// operands.
+func buildDeferDirect(ctx @GenContext, entry @Block, site @DeferSite, e @ast.Expr) {
+	var name @[]char
+	if e.X != nil && (e.X.Kind == ast.EXPR_IDENT || e.X.Kind == ast.EXPR_SELECTOR) {
+		name = funcRefName(ctx.Gc, e.X)
+	}
+	if len(name) == 0 { panic("defer of an unresolved direct call") }
+	var sig FuncSig
+	var found bool
+	sig, found = lookupFuncSig(ctx.Gc, name)
+	if !found { panic("defer of an unknown function") }
+	site.Sym = name
+	site.ResultTyp = deferResultTyp(sig.Results, sig.MultiReturnType)
+	buildDeferArgs(ctx, entry, site, e, sig.Params, 0, sig.IsVariadic, e.Spread)
+}
+
+// buildDeferArgs builds the argument operands, binding user args to the callee
+// param types starting at paramBase (1 past a leading receiver param).  For a
+// non-variadic callee each user arg is one operand.  For a variadic callee the
+// leading fixed args bind positionally and the trailing args become the single
+// `*[]T` variadic argument — either a spread operand `xs...` (one ordinary ARG
+// bound to the `*[]T` param, so a managed @[]T rides the managed→raw path) or
+// individual args packed at the defer site (an OPROLE_VARIADIC_PACK operand).
+func buildDeferArgs(ctx @GenContext, entry @Block, site @DeferSite, e @ast.Expr,
+		paramTypes @[]@types.Type, paramBase int, isVariadic bool, spread bool) {
+	if !isVariadic {
+		for i := 0; i < len(e.Args); i++ {
+			var pIdx int = paramBase + i
+			var paramTyp @types.Type = nil
+			if pIdx < len(paramTypes) { paramTyp = paramTypes[pIdx] }
+			var argTyp @types.Type = deferCalleeType(ctx, e.Args[i])
+			var op @DeferOperand = newDeferArgOp(ctx, entry, argTyp, paramTyp)
+			site.ArgOps = slices.Append[@DeferOperand](site.ArgOps, op)
+			maybeAllocDeferBorrowSlot(ctx, entry, site, e.Args[i], paramTyp)
+		}
+		return
+	}
+	// Variadic: the variadic param is the last, at paramTypes[numParams-1]; the
+	// user's fixed args bind to paramTypes[paramBase .. numParams-2].
+	var numParams int = len(paramTypes)
+	var variadicParamTyp @types.Type = paramTypes[numParams - 1]
+	var numFixed int = numParams - 1 - paramBase
+	for i := 0; i < numFixed; i++ {
+		var argTyp @types.Type = deferCalleeType(ctx, e.Args[i])
+		var op @DeferOperand = newDeferArgOp(ctx, entry, argTyp, paramTypes[paramBase + i])
+		site.ArgOps = slices.Append[@DeferOperand](site.ArgOps, op)
+		maybeAllocDeferBorrowSlot(ctx, entry, site, e.Args[i], paramTypes[paramBase + i])
+	}
+	if spread {
+		// `xs...`: the single trailing operand bound directly to the `*[]T` param.
+		var sArgTyp @types.Type = deferCalleeType(ctx, e.Args[numFixed])
+		var sOp @DeferOperand = newDeferArgOp(ctx, entry, sArgTyp, variadicParamTyp)
+		site.ArgOps = slices.Append[@DeferOperand](site.ArgOps, sOp)
+		return
+	}
+	// Individual trailing args packed into a `*[]T` header over a backing array.
+	var elemTyp @types.Type = variadicParamTyp.SliceElem()
+	if elemTyp == nil { elemTyp = variadicParamTyp }
+	var pop @DeferOperand = make(DeferOperand)
+	pop.Role = OPROLE_VARIADIC_PACK
+	pop.ElemTyp = elemTyp
+	pop.SlotTyp = variadicParamTyp
+	pop.ParamTyp = variadicParamTyp
+	allocDeferOperand(ctx, entry, pop)
+	// Pre-allocate the backing array at entry depth so its (possibly managed)
+	// elements live until the deferred call runs at exit — registered in ctx.Vars
+	// (nil-init'd) when they are managed, so the whole-function cleanup / fault
+	// pads release them exactly once, after the deferred calls.
+	var nTrailing int = len(e.Args) - numFixed
+	if nTrailing > 0 {
+		var arrTyp @types.Type = types.MakeArrayType(elemTyp, nTrailing)
+		var backing @Instr = entry.EmitAlloc(arrTyp)
+		if needsStructCopy(arrTyp) {
+			entry.EmitStore(backing, entry.EmitConstNil(arrTyp))
+			defineDeferSlotVar(ctx, backing, arrTyp)
+		}
+		pop.BackingSlot = backing
+	}
+	// Pre-allocate a borrow-snapshot slot for each trailing element that boxes a
+	// managed value into the variadic element's iface type (`...*any`) — in
+	// element order, after the fixed-arg borrow slots (matching the store-time
+	// consumption order: fixed args, then the pack's elements).
+	for i := numFixed; i < len(e.Args); i++ {
+		maybeAllocDeferBorrowSlot(ctx, entry, site, e.Args[i], elemTyp)
+	}
+	site.ArgOps = slices.Append[@DeferOperand](site.ArgOps, pop)
+}
+
+// deferArgBorrowVt returns the borrow-temp type an argument needs when it boxes a
+// managed-content VALUE into an interface parameter — replicating the exact
+// condition genExprOrFuncRef's value-borrow path uses to enroll a managed
+// snapshot temp (an interface-value param, a borrowable non-string-literal value
+// source, and a defaulted borrow type that owns a managed reference).  Returns
+// nil otherwise.  MUST stay in lockstep with that path (gen_util.bn) so the
+// pre-allocated slots match one-for-one what the store consumes.
+func deferArgBorrowVt(ctx @GenContext, argExpr @ast.Expr, paramTyp @types.Type) @types.Type {
+	if paramTyp == nil || argExpr == nil { return nil }
+	var pt @types.Type = peelTransparent(paramTyp)
+	if pt == nil || pt.Kind != types.TYP_INTERFACE_VALUE { return nil }
+	if argExpr.Kind == ast.EXPR_STRING_LIT { return nil }
+	if ctx.Checker == nil || argExpr.ResolvedTypeID == 0 { return nil }
+	var srcT @types.Type = ctx.Checker.ExprType(argExpr.ResolvedTypeID)
+	if !isBorrowableValueSource(srcT) { return nil }
+	var vt @types.Type = defaultedBorrowType(srcT)
+	if !borrowTempNeedsCleanup(vt) { return nil }
+	return vt
+}
+
+// maybeAllocDeferBorrowSlot pre-allocates + nil-inits + registers (entry depth) a
+// borrow-snapshot slot for an argument that needs one (deferArgBorrowVt), and
+// appends it to site.BorrowSlots.  A no-op otherwise.
+func maybeAllocDeferBorrowSlot(ctx @GenContext, entry @Block, site @DeferSite, argExpr @ast.Expr,
+		paramTyp @types.Type) {
+	var vt @types.Type = deferArgBorrowVt(ctx, argExpr, paramTyp)
+	if vt == nil { return }
+	var slot @Instr = entry.EmitAlloc(vt)
+	entry.EmitStore(slot, entry.EmitConstNil(vt))
+	defineDeferSlotVar(ctx, slot, vt)
+	site.BorrowSlots = slices.Append[@Instr](site.BorrowSlots, slot)
+}
+
+// buildDeferMethod resolves a static method call's mangled symbol + signature,
+// builds the receiver operand (converted eagerly at store) and the arg operands.
+func buildDeferMethod(ctx @GenContext, entry @Block, site @DeferSite, e @ast.Expr) {
+	var sel @ast.Expr = e.X
+	var recvExprTyp @types.Type = deferMethodRecvType(ctx, sel)
+	var recvBaseName @[]char = baseNamedTypeName(recvExprTyp)
+	var qual @[]char = buildMethodQualName(ctx.Gc.PkgPath, recvBaseName, sel.Name)
+	ensureMethodsForInstName(ctx.Gc, recvBaseName)
+	var sig FuncSig
+	var found bool
+	sig, found = lookupFuncSig(ctx.Gc, qual)
+	if !found { panic("defer of an unresolved method call") }
+	site.Sym = qual
+	site.ResultTyp = deferResultTyp(sig.Results, sig.MultiReturnType)
+	var recvParamTyp @types.Type = nil
+	if len(sig.Params) > 0 { recvParamTyp = sig.Params[0] }
+	var rop @DeferOperand = make(DeferOperand)
+	rop.Role = OPROLE_RECEIVER
+	rop.ParamTyp = recvParamTyp
+	rop.SlotTyp = recvParamTyp
+	allocDeferOperand(ctx, entry, rop)
+	site.RecvOp = rop
+	buildDeferArgs(ctx, entry, site, e, sig.Params, 1, sig.IsVariadic, e.Spread)
+}
+
+// deferMethodRecvType returns the receiver's base type for a method selector,
+// looking through an explicit deref `(*p).m()` to the pointee (mirrors
+// genMethodCall's recvBaseTypeName derivation).
+func deferMethodRecvType(ctx @GenContext, sel @ast.Expr) @types.Type {
+	var t @types.Type = deferCalleeType(ctx, sel.X)
+	if sel.X != nil && sel.X.Kind == ast.EXPR_UNARY && sel.X.Op == cast(int, token.STAR) {
+		var pt @types.Type = peelTransparent(t)
+		if pt != nil && (pt.Kind == types.TYP_POINTER || pt.Kind == types.TYP_MANAGED_PTR) &&
+				pt.Elem != nil {
+			return pt.Elem
+		}
+	}
+	return t
+}
+
+// buildDeferIface resolves an interface method's vtable slot + signature, builds
+// the iface receiver operand (stored whole) and the arg operands.
+func buildDeferIface(ctx @GenContext, entry @Block, site @DeferSite, e @ast.Expr) {
+	var sel @ast.Expr = e.X
+	var ifaceTyp @types.Type = peelTransparent(deferCalleeType(ctx, sel.X))
+	if ifaceTyp == nil || ifaceTyp.Elem == nil { panic("defer of an unresolved interface call") }
+	var idx int
+	var resultTypes @[]@types.Type
+	var paramTypes @[]@types.Type
+	var isVariadic bool
+	// The checker's interface-value type carries the QUOTED package path
+	// (`"main"`); the module interface registry keys on the unquoted short name.
+	var ifPkg @[]char = unquote(ifaceTyp.Elem.Pkg)
+	idx, resultTypes, paramTypes, isVariadic = findInterfaceMethod(ctx.Gc.Mod, ifPkg,
+			ifaceTyp.Elem.Name, sel.Name)
+	if idx < 0 { panic("defer of an unresolved interface method") }
+	site.MethodIdx = idx
+	site.ResultTyp = deferResultTyp(resultTypes, nil)
+	var rop @DeferOperand = make(DeferOperand)
+	rop.Role = OPROLE_PASSTHRU
+	rop.SlotTyp = deferCalleeType(ctx, sel.X)
+	allocDeferOperand(ctx, entry, rop)
+	site.RecvOp = rop
+	buildDeferArgs(ctx, entry, site, e, paramTypes, 0, isVariadic, e.Spread)
+}
+
+// buildDeferFuncVal builds the func-value operand (stored whole) and the arg
+// operands from the func-value type's param list.
+func buildDeferFuncVal(ctx @GenContext, entry @Block, site @DeferSite, e @ast.Expr) {
+	var fvTyp @types.Type = deferCalleeType(ctx, e.X)
+	if fvTyp == nil { panic("defer of an unresolved function-value call") }
+	var paramTypes @[]@types.Type
+	var isVariadic bool
+	paramTypes, isVariadic = funcValueParamTypes(fvTyp)
+	site.ResultTyp = deferResultTyp(fvTyp.Results, nil)
+	var fop @DeferOperand = make(DeferOperand)
+	fop.Role = OPROLE_PASSTHRU
+	fop.SlotTyp = fvTyp
+	allocDeferOperand(ctx, entry, fop)
+	site.RecvOp = fop
+	buildDeferArgs(ctx, entry, site, e, paramTypes, 0, isVariadic, e.Spread)
+}
+
+// funcValueParamTypes extracts a function type's parameter TYPES (its Params is
+// a @[]@Param carrying names) and reports whether its final parameter is
+// variadic.
+func funcValueParamTypes(fvTyp @types.Type) (@[]@types.Type, bool) {
+	var out @[]@types.Type
+	var variadic bool = false
+	for i := 0; i < len(fvTyp.Params); i++ {
+		out = slices.Append[@types.Type](out, fvTyp.Params[i].Type)
+		if fvTyp.Params[i].IsVariadic { variadic = true }
+	}
+	return out, variadic
+}
+
+// buildDeferPanic builds the single message operand for `defer panic(msg)`.
+func buildDeferPanic(ctx @GenContext, entry @Block, site @DeferSite, e @ast.Expr) {
+	site.ResultTyp = types.TypVoid()
+	var msgTyp @types.Type = types.MakeSliceType(types.MakeReadonlyType(types.TypChar()))
+	if len(e.Args) == 0 {
+		// panic() with no message: still needs a slot for the empty string.
+		var op0 @DeferOperand = make(DeferOperand)
+		op0.Role = OPROLE_ARG
+		op0.ParamTyp = msgTyp
+		op0.SlotTyp = msgTyp
+		allocDeferOperand(ctx, entry, op0)
+		site.ArgOps = slices.Append[@DeferOperand](site.ArgOps, op0)
+		return
+	}
+	var argTyp @types.Type = deferCalleeType(ctx, e.Args[0])
+	var op @DeferOperand = newDeferArgOp(ctx, entry, argTyp, msgTyp)
+	site.ArgOps = slices.Append[@DeferOperand](site.ArgOps, op)
+}

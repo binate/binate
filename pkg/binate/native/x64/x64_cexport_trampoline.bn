@@ -1,0 +1,146 @@
+package "pkg/binate/native/x64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// funcHasByvalParamX64 reports whether f has a >16-byte by-value aggregate
+// parameter — the case whose SysV-AMD64 C-ABI form (MEMORY class, on the stack)
+// differs from Binate's internal single-pointer form and so needs an adapting
+// entry, not the in-place narrow-register prefix.
+func funcHasByvalParamX64(f @ir.Func) bool {
+	for i := 0; i < len(f.Params); i++ {
+		if f.Params[i].Typ.IsByvalParam() {
+			return true
+		}
+	}
+	return false
+}
+
+// emitCExportBigAggTrampolineX64 emits the #[c_export] C entry for a function with
+// a >16-byte by-value aggregate parameter.  The narrow-register prefix + jmp model
+// cannot serve here: SysV passes a >16-byte aggregate by value on the stack
+// (consuming no GP register), while the mangled definition `sym` expects a pointer
+// in a GP register, which shifts every later parameter's register/stack slot.  So
+// the entry becomes an adapter TRAMPOLINE: it reads each argument from its C-ABI
+// position and places it at `sym`'s internal position, then calls `sym` and
+// returns its result.
+//
+// A >16-byte aggregate is handed to `sym` as a POINTER to the incoming C-stack
+// bytes (sym's own prologue memcpys the aggregate out of it — see
+// spillIncomingParams — so the pointer need only be live across that prologue,
+// which it is).  Scalars / ≤16-byte GP aggregates are copied word-for-word from
+// their C slot to their internal slot; a narrow scalar is sign/zero-extended so a
+// C caller's dirty high bits do not reach `sym`.  Floats stay put: the FP argument
+// cursor is not shifted by a >16-byte GP aggregate, so a register float already
+// sits in the XMM register `sym` expects.
+//
+// The register writes never clobber a still-needed source because phase 1 stashes
+// the incoming GP argument registers to a scratch frame first; phase 2 then reads
+// only from scratch or the incoming-args stack.  A native caller enters at `sym`
+// and skips all of this.
+func emitCExportBigAggTrampolineX64(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
+		sym *[]readonly char) {
+	var cc common.CallConv = rm.CC
+	var ccC common.CallConv = cc.ForCBoundary()
+
+	// Dispatch param list: an sret buffer pointer (a large-aggregate return via the
+	// hidden RDI slot) takes dispatch slot 0 and shifts each user param by one, as
+	// spillIncomingParams / emitCall model it.
+	var sret bool = rm.SretSlotOff >= 0
+	var nDispatch int = len(f.Params)
+	if sret {
+		nDispatch = nDispatch + 1
+	}
+	var paramTypes @[]@types.Type = make_slice(@types.Type, nDispatch)
+	var base int = 0
+	if sret {
+		paramTypes[0] = types.MakePointerType(types.TypUint8())
+		base = 1
+	}
+	for pi := 0; pi < len(f.Params); pi++ {
+		paramTypes[base + pi] = f.Params[pi].Typ
+	}
+
+	// Frame: [rsp+0 .. outBytes) = sym's outgoing stack args; [rsp+outBytes .. +48)
+	// = scratch for the (up to six) incoming GP argument registers.  outBytes is
+	// 16-aligned (CallStackBytes) and 48 is a multiple of 16, so rsp stays
+	// 16-aligned at `call sym`.  [rbp + 16 + cOff] reads the caller's incoming stack
+	// args (16 = pushed return address + saved rbp).
+	var outBytes int = cc.CallStackBytes(paramTypes)
+	var scratchBase int = outBytes
+	var frameSz int = outBytes + 48
+	var stackArgsBase int = 16
+
+	x64.Push(a, x64.Reg(x64.RBP, x64.SZ64))
+	x64.Mov(a, x64.Reg(x64.RBP, x64.SZ64), x64.Reg(x64.RSP, x64.SZ64))
+	x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frameSz))
+
+	// Phase 1: stash the incoming GP argument registers so phase 2 can overwrite
+	// them freely.
+	for r := 0; r < cc.NumGpArgRegs; r++ {
+		x64.Mov(a, x64.Mem(x64.RSP, scratchBase + 8 * r, x64.SZ64), x64.Reg(argReg(r), x64.SZ64))
+	}
+
+	// Phase 2: place each param at its internal outgoing position.
+	for i := 0; i < nDispatch; i++ {
+		var t @types.Type = paramTypes[i]
+		var nReg int = cc.CallArgRegStart(paramTypes, i)
+		var nOff int = cc.CallArgStackOff(paramTypes, i)
+
+		if common.IsFloatScalarTyp(t) {
+			// Register float: already in its XMM reg (the FP cursor is unshifted).
+			// Stack float (FP regs exhausted): copy the 8-byte slot across.
+			if nOff >= 0 {
+				var cOff int = ccC.CallArgStackOff(paramTypes, i)
+				x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.RBP, stackArgsBase + cOff, x64.SZ64))
+				x64.Mov(a, x64.Mem(x64.RSP, nOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+			}
+			continue
+		}
+
+		if t.IsByvalParam() {
+			// >16-byte aggregate: C passes it by value on the stack; hand `sym` the
+			// ADDRESS of those incoming bytes.
+			var cOff int = ccC.CallArgStackOff(paramTypes, i)
+			if nReg >= 0 {
+				x64.Lea(a, x64.Reg(argReg(nReg), x64.SZ64), x64.Mem(x64.RBP, stackArgsBase + cOff, x64.SZ64))
+			} else {
+				x64.Lea(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.RBP, stackArgsBase + cOff, x64.SZ64))
+				x64.Mov(a, x64.Mem(x64.RSP, nOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+			}
+			continue
+		}
+
+		// GP scalar or ≤16-byte GP aggregate: SysV places all its words in
+		// consecutive GP registers OR wholly on the stack (never split).  Route each
+		// word through RAX so a narrow scalar can be extended in flight.
+		var nWords int = common.ArgWords(t)
+		var cReg int = ccC.CallArgRegStart(paramTypes, i)
+		var cOff int = ccC.CallArgStackOff(paramTypes, i)
+		var isScalar bool = !common.IsAggregateTyp(t)
+		for w := 0; w < nWords; w++ {
+			if cReg >= 0 {
+				x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.RSP, scratchBase + 8 * (cReg + w), x64.SZ64))
+			} else {
+				x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.RBP, stackArgsBase + cOff + 8 * w, x64.SZ64))
+			}
+			if isScalar {
+				// No-op for word-size / pointer; sign/zero-extends a narrow scalar.
+				normalizeNarrowRegParamX64(a, x64.RAX, t)
+			}
+			if nReg >= 0 {
+				x64.Mov(a, x64.Reg(argReg(nReg + w), x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+			} else {
+				x64.Mov(a, x64.Mem(x64.RSP, nOff + 8 * w, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+			}
+		}
+	}
+
+	x64.Call(a, sym)
+	x64.Mov(a, x64.Reg(x64.RSP, x64.SZ64), x64.Reg(x64.RBP, x64.SZ64))
+	x64.Pop(a, x64.Reg(x64.RBP, x64.SZ64))
+	x64.Ret(a)
+}

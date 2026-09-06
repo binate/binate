@@ -508,12 +508,13 @@ check_backend "native-O2" "--backend native -O2" 0
 check_narrow_returns "llvm" "" 1
 check_narrow_returns "native" "--backend native" 0
 
-# >16-byte struct passed BY VALUE — the LLVM path adapts via an entry thunk on
-# x86-64 (a plain alias on aarch64, where the conventions coincide).  On an aarch64
-# host this exercises the alias path; on an x86-64 host, the thunk.  The native
-# backend does not yet adapt this inbound direction, so there is no native bigagg
-# check — it would exercise the still-unfixed native path on an x86-64 host.
+# >16-byte struct passed BY VALUE — both backends adapt.  LLVM: an entry thunk on
+# x86-64 / arm32, a plain alias on aarch64 (conventions coincide).  Native: an
+# adapter trampoline on x86-64, a plain entry on aarch64.  On an aarch64 host these
+# exercise the alias/direct path; on an x86-64 host, the thunk / trampoline.  (The
+# native check self-skips where the host native backend can't emit the facade.)
 check_bigagg "llvm" "" 1
+check_bigagg "native" "--backend native" 0
 
 # The --library archive: init-once-via-bn_init + call the exports from a real .a.
 check_library

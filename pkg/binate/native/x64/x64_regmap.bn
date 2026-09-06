@@ -3,6 +3,7 @@ package "pkg/binate/native/x64"
 import "pkg/binate/asm"
 import "pkg/binate/asm/x64"
 import "pkg/binate/ir"
+import "pkg/binate/iropcode"
 import "pkg/binate/native/common"
 import "pkg/std/fmt"
 
@@ -50,13 +51,44 @@ func regPool(i int) int {
 // hit the saturation point.
 var currentEmitOp int
 
+// allocReg hands out a pool register (R10..RDI) for the currently-emitting
+// instruction, occupancy-aware for within-block value retention: it prefers a
+// genuinely FREE register (one holding no retained value), and only under
+// register pressure evicts a retained value — whose spill slot still holds it,
+// so eviction is loss-free.  Registers this instruction already claimed
+// (CurUsed) are never handed out again.  The returned register is marked used.
+//
+// Retention is only ever carried across retention-safe ops (see retentionSafe
+// below); the emit loop resets the cache before every other op,
+// so an op that hardcodes an ISA-forced pool register (RCX/RDX for shift/div,
+// R8/R9/R11 for float, RDI for the memcpy-shaped paths) always runs against the
+// empty pool its hand-written register dance assumes.
+func allocReg(m @common.RegMap) int {
+	for i := 0; i <= 6; i = i + 1 {
+		var r int = regPool(i)
+		if !m.IsUsed(r) && m.RegHeldBy(r) < 0 {
+			m.MarkUsed(r)
+			return r
+		}
+	}
+	for i := 0; i <= 6; i = i + 1 {
+		var r int = regPool(i)
+		if !m.IsUsed(r) {
+			m.EvictReg(r)
+			m.MarkUsed(r)
+			return r
+		}
+	}
+	// Every pool register is claimed by the current instruction: the
+	// pre-existing exhaustion case, reported by regPool's own panic.
+	return regPool(7)
+}
+
 // scratchReg hands out an ephemeral register (not registered in the
 // id→reg map).  Used when we need a working register that won't
 // outlive the current instruction.
 func scratchReg(m @common.RegMap) int {
-	var r int = regPool(m.Next)
-	m.Next = m.Next + 1
-	return r
+	return allocReg(m)
 }
 
 // nextReg allocates a register to hold SSA id's result.  A
@@ -68,8 +100,7 @@ func scratchReg(m @common.RegMap) int {
 func nextReg(m @common.RegMap, id int) int {
 	var home int = m.LookupHome(id)
 	if home >= 0 { return home }
-	var r int = regPool(m.Next)
-	m.Next = m.Next + 1
+	var r int = allocReg(m)
 	return m.AssignReg(id, r)
 }
 
@@ -85,7 +116,13 @@ func getOperand(a @asm.Assembler, m @common.RegMap, id int) int {
 	var home int = m.LookupHome(id)
 	if home >= 0 { return home }
 	var r int = m.LookupReg(id)
-	if r >= 0 { return r }
+	if r >= 0 {
+		// A retained value cached in a pool register (within-block retention).
+		// Mark it used so this instruction's later scratch/result allocation
+		// won't reuse it.
+		m.MarkUsed(r)
+		return r
+	}
 	var allocOff int = m.LookupAlloc(id)
 	if allocOff >= 0 {
 		var rd int = nextReg(m, id)
@@ -126,7 +163,7 @@ func emitValOperand(a @asm.Assembler, pkgName *[]readonly char, m @common.RegMap
 // its stack slot (if any) and clears the register map.  Called after
 // every instruction — the "spill everything" policy means each op
 // loads operands, computes, then hands off to memory.
-func spillAndReset(a @asm.Assembler, m @common.RegMap, ins @ir.Instr) {
+func spillAndReset(a @asm.Assembler, m @common.RegMap, ins @ir.Instr, branchEmitted bool) {
 	if ins.ID >= 0 {
 		var reg int = m.LookupReg(ins.ID)
 		if reg >= 0 {
@@ -136,5 +173,66 @@ func spillAndReset(a @asm.Assembler, m @common.RegMap, ins @ir.Instr) {
 			}
 		}
 	}
-	m.ResetRegs()
+	// Within-block value retention: keep the IDs/Regs cache live ACROSS
+	// instructions so a later use reads a register instead of reloading its
+	// slot.  The store above still runs for every result, so a value stays
+	// recoverable from its slot after eviction or at block end.  Drop the whole
+	// cache after a returning call (clobbers every caller-saved pool register)
+	// or an instruction that emitted a branch to an inline block the mainline
+	// skips.  Ops that hardcode ISA-forced pool registers are handled on the way
+	// IN, by the emit loop's reset-before-non-retention-safe-op.
+	if branchEmitted || common.EmitsReturningBl(ins.Op) {
+		m.ResetRegs()
+	}
+}
+
+// retentionSafe reports whether OP `op`'s emitter may have the retained value
+// cache flow THROUGH it: its emitter allocates working registers only via the
+// occupancy-aware getOperand / nextReg / scratchReg (or fixed XMM scratch, for
+// the float ops), never hardcodes an ISA-forced pool register, and makes no
+// round-robin pool-slot assumption — so it never silently overwrites a pool
+// register holding an unrelated retained value.  Every other op is a barrier:
+// the emit loop resets the cache before it, so a shift (RCX), div/rem
+// (RAX/RDX), or a memcpy-shaped managed/rodata/iface/stackframe/call path runs
+// against the empty pool its hand-written register dance assumes.  The listed
+// ops are the clean integer binops (emitBinop's non-shift/div path), compares,
+// casts, unops, copies, and the pointer/load/store/alloc/extract ops; the
+// float binop/compare/neg forms use fixed XMM scratch plus those allocators.
+//
+// One exception rides in OP_CAST: the unsigned-int64 <-> float lowering
+// (emitUint64ToDouble / emitDoubleToUint64) picks GP scratch via
+// pickScratchGP / pickTwoScratchGP, which avoid only src/rd and are NOT
+// occupancy-aware, so they CAN overwrite a pool register holding another
+// retained value.  That is currently harmless only because both lowerings
+// always emit a branch, which trips branchEmitted and forces a post-op cache
+// reset (spillAndReset) — the clobbered value reloads from its spill slot.
+// TODO: make pickScratchGP/pickTwoScratchGP occupancy-aware (evict like
+// allocReg) so OP_CAST's safety no longer rides on that incidental branch.
+func retentionSafe(op int) bool {
+	if op == iropcode.OP_ADD { return true }
+	if op == iropcode.OP_SUB { return true }
+	if op == iropcode.OP_MUL { return true }
+	if op == iropcode.OP_AND { return true }
+	if op == iropcode.OP_OR { return true }
+	if op == iropcode.OP_XOR { return true }
+	if op == iropcode.OP_LAND { return true }
+	if op == iropcode.OP_LOR { return true }
+	if op == iropcode.OP_EQ { return true }
+	if op == iropcode.OP_NE { return true }
+	if op == iropcode.OP_LT { return true }
+	if op == iropcode.OP_LE { return true }
+	if op == iropcode.OP_GT { return true }
+	if op == iropcode.OP_GE { return true }
+	if op == iropcode.OP_CAST { return true }
+	if op == iropcode.OP_NEG { return true }
+	if op == iropcode.OP_NOT { return true }
+	if op == iropcode.OP_BITNOT { return true }
+	if op == iropcode.OP_ALLOC { return true }
+	if op == iropcode.OP_GET_FIELD_PTR { return true }
+	if op == iropcode.OP_GET_ELEM_PTR { return true }
+	if op == iropcode.OP_EXTRACT { return true }
+	if op == iropcode.OP_LOAD { return true }
+	if op == iropcode.OP_COPY { return true }
+	if op == iropcode.OP_STORE { return true }
+	return false
 }

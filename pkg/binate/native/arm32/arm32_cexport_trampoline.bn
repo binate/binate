@@ -1,0 +1,191 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// funcHasByvalParamArm32 reports whether f has a >16-byte by-value aggregate
+// parameter — the case whose AAPCS32 C-ABI form (by value, split across r0-r3 and
+// the stack) differs from Binate's internal single-pointer form and so needs an
+// adapting entry, not the in-place narrow-register prefix.
+func funcHasByvalParamArm32(f @ir.Func) bool {
+	for i := 0; i < len(f.Params); i++ {
+		if f.Params[i].Typ.IsByvalParam() {
+			return true
+		}
+	}
+	return false
+}
+
+// emitCExportBigAggTrampolineArm32 emits the #[c_export] C entry for a function
+// with a >16-byte by-value aggregate parameter.  AAPCS32 passes such an aggregate
+// BY VALUE, split across the core registers r0-r3 and the stack, but the mangled
+// definition `sym` expects a single pointer in a register (its prologue memcpys the
+// pointee — see arm32_spill_aggregate.bn), which shifts every later param's slot.
+// So the entry becomes an adapter TRAMPOLINE: it GATHERS each >16-byte aggregate's
+// split words into a contiguous frame slot and hands `sym` a pointer to it, remaps
+// the other GP args from their C slot to their internal slot, then calls `sym`.
+//
+// Floats ride the VFP registers on hard-float (arm32-linux) and are NOT shifted by
+// a >16-byte GP aggregate, so a register float already sits in the VFP register
+// `sym` expects — the trampoline never touches VFP, so it passes through untouched
+// (as does a float return).  A stack-passed float (VFP bank exhausted, or soft-
+// float where a float is a GP word) is copied by the general word path.  Register
+// writes never clobber a live source: phase 1 stages the incoming GP argument
+// registers to the frame, phase 2 reads only from that staging or the incoming
+// stack.  A native caller enters at `sym` and skips all of this.
+func emitCExportBigAggTrampolineArm32(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
+		sym *[]readonly char) {
+	var cc common.CallConv = rm.CC
+	var ccC common.CallConv = cc.ForCBoundary()
+	var w int = wordBytes()
+
+	// Dispatch param list: an sret buffer pointer (a large-aggregate return via the
+	// hidden R0 slot) takes dispatch slot 0 and shifts each user param by one.
+	var sret bool = rm.SretSlotOff >= 0
+	var nDispatch int = len(f.Params)
+	if sret {
+		nDispatch = nDispatch + 1
+	}
+	var paramTypes @[]@types.Type = make_slice(@types.Type, nDispatch)
+	var pbase int = 0
+	if sret {
+		paramTypes[0] = types.MakePointerType(types.TypUint8())
+		pbase = 1
+	}
+	for pi := 0; pi < len(f.Params); pi++ {
+		paramTypes[pbase + pi] = f.Params[pi].Typ
+	}
+
+	// Frame (sp-relative, below the {r4,lr} save):
+	//   [sp+0 .. outBytes)         sym's outgoing stack args
+	//   [sp+stageOff .. +16)       staging for the four incoming GP arg regs r0-r3
+	//   [sp+gatherOff .. )         a contiguous copy per >16-byte aggregate
+	// frameSz is rounded to StackAlign (8) so sp stays 8-aligned at `bl sym`.  The
+	// incoming stack args sit at [sp + frameSz + savedBytes + cOff] (savedBytes = the
+	// {r4,lr} push).
+	var outBytes int = cc.CallStackBytes(paramTypes)
+	var stageOff int = outBytes
+	var gatherOff int = stageOff + cc.NumGpArgRegs * w
+	var gatherBytes int = 0
+	for i := 0; i < nDispatch; i++ {
+		if paramTypes[i].IsByvalParam() {
+			gatherBytes = gatherBytes + cc.ArgWords(paramTypes[i]) * w
+		}
+	}
+	var frameSz int = gatherOff + gatherBytes
+	if frameSz % cc.StackAlign != 0 {
+		frameSz = frameSz + (cc.StackAlign - frameSz % cc.StackAlign)
+	}
+	var savedBytes int = 8 // {r4, lr}
+	var inBase int = frameSz + savedBytes
+
+	// {r4, lr}: lr because `bl` clobbers it; r4 is the callee-saved word shuttle (IP
+	// is reserved as the frame helpers' address scratch, so it cannot double as the
+	// value shuttle).  Return is `pop {r4, pc}`.
+	arm32.Push(a, arm32.COND_AL, 0x4010)
+	if frameSz > 0 {
+		emitSpAdjust(a, false, frameSz)
+	}
+	// Phase 1: stage r0-r3 so phase-2 writes can overwrite them freely.
+	for r := 0; r < cc.NumGpArgRegs; r++ {
+		emitFrameStore(a, argReg(r), stageOff + w * r)
+	}
+
+	// Phase 2.
+	var gatherCursor int = gatherOff
+	for i := 0; i < nDispatch; i++ {
+		var t @types.Type = paramTypes[i]
+		var nReg int = cc.CallArgRegStart(paramTypes, i)
+		var nOff int = cc.CallArgStackOff(paramTypes, i)
+
+		if types.Arm32HardFloat() && common.IsFloatScalarTyp(t) {
+			// Hard-float: a float scalar rides a VFP register, unshifted by a GP
+			// aggregate.  Register float: already in the VFP register sym expects —
+			// leave it.  Stack float (VFP bank exhausted): copy its word(s) to the
+			// internal offset.  On SOFT-float a float rides the GP registers/stack
+			// exactly like an int of its width, so it must NOT take this branch — it
+			// falls through to the GP scalar path below (matching emitSpillParam's
+			// `Arm32HardFloat() && IsFloatScalarTyp` peel).
+			if nOff >= 0 {
+				var cOff int = ccC.CallArgStackOff(paramTypes, i)
+				var fw int = cc.ArgWords(t)
+				for wi := 0; wi < fw; wi++ {
+					emitBaseLoad(a, arm32.R4, arm32.SP, inBase + cOff + w * wi, arm32.IP)
+					emitFrameStore(a, arm32.R4, nOff + w * wi)
+				}
+			}
+			continue
+		}
+
+		var nWords int = cc.ArgWords(t)
+		var cReg int = ccC.CallArgRegStart(paramTypes, i)
+		var cOff int = ccC.CallArgStackOff(paramTypes, i)
+		// C-ABI register/stack split for this param (AAPCS may split an aggregate
+		// across r0-r3 and the stack, unlike SysV).
+		var cRegWords int = 0
+		if cReg >= 0 {
+			cRegWords = nWords
+			if cOff >= 0 {
+				cRegWords = cc.NumGpArgRegs - cReg
+			}
+		}
+
+		if t.IsByvalParam() {
+			// Gather the split words into a contiguous slot, then hand `sym` a
+			// pointer to it (sym's prologue memcpys the aggregate out of the slot).
+			var slot int = gatherCursor
+			gatherCursor = gatherCursor + nWords * w
+			for wi := 0; wi < nWords; wi++ {
+				if wi < cRegWords {
+					emitFrameLoad(a, arm32.R4, stageOff + w * (cReg + wi))
+				} else {
+					emitBaseLoad(a, arm32.R4, arm32.SP, inBase + cOff + w * (wi - cRegWords), arm32.IP)
+				}
+				emitFrameStore(a, arm32.R4, slot + w * wi)
+			}
+			if nReg >= 0 {
+				emitFrameAddr(a, argReg(nReg), slot)
+			} else {
+				emitFrameAddr(a, arm32.R4, slot)
+				emitFrameStore(a, arm32.R4, nOff)
+			}
+			continue
+		}
+
+		// GP scalar or ≤16-byte GP aggregate.
+		var isScalar bool = !common.IsAggregateTyp(t)
+		for wi := 0; wi < nWords; wi++ {
+			if wi < cRegWords {
+				emitFrameLoad(a, arm32.R4, stageOff + w * (cReg + wi))
+			} else {
+				emitBaseLoad(a, arm32.R4, arm32.SP, inBase + cOff + w * (wi - cRegWords), arm32.IP)
+			}
+			if isScalar {
+				normalizeNarrowRegParamArm32(a, arm32.R4, t)
+			}
+			// Internal placement: SysV never splits ≤16 aggs but AAPCS can, so a word
+			// may land in a register or on the stack depending on the internal split.
+			var iRegWords int = 0
+			if nReg >= 0 {
+				iRegWords = nWords
+				if nOff >= 0 {
+					iRegWords = cc.NumGpArgRegs - nReg
+				}
+			}
+			if wi < iRegWords {
+				arm32.Mov(a, arm32.COND_AL, false, argReg(nReg + wi), arm32.Reg(arm32.R4))
+			} else {
+				emitFrameStore(a, arm32.R4, nOff + w * (wi - iRegWords))
+			}
+		}
+	}
+
+	arm32.Bl(a, arm32.COND_AL, sym)
+	if frameSz > 0 {
+		emitSpAdjust(a, true, frameSz)
+	}
+	arm32.Pop(a, arm32.COND_AL, 0x8010) // {r4, pc}
+}

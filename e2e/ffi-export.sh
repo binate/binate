@@ -212,6 +212,35 @@ type FfiBig struct {
 
 #[c_export("ffi_bigstruct")]
 func BigStruct(x FfiBig) int64 { return x.a * cast(int64, 100) + x.b * cast(int64, 10) + x.c }
+
+// A >16-byte aggregate (forces the entry thunk on x86-64 / arm32) FOLLOWED by an
+// x86-64 SSE (float) aggregate.  On x86-64 the SSE aggregate rides XMM (SSE-split)
+// under BOTH the C ABI and Binate's internal convention, so the thunk must declare
+// AND forward it SSE-split — not the GP `[N x i64]` coercion, which read it from a
+// GP register the C caller never used (a silent miscompile that still compiled).
+// aarch64 stays a plain alias (a >16 aggregate rides a pointer both ways; the HFA
+// rides v0/v1), so this also confirms the alias path for a float aggregate param.
+type FfiVec2 struct { x float32; y float32 }
+
+#[c_export("ffi_bigvec")]
+func BigVec(big FfiBig, v FfiVec2) int64 {
+	return big.a + big.b + big.c + cast(int64, cast(int, v.x)) + cast(int64, cast(int, v.y))
+}
+
+// A MIXED int+float aggregate in the "register-class in C / memory-class
+// internally" straddle: the >16 `big` (internal pointer, +1 GP) plus five int64
+// args fill the internal GP file, so `mix` {i64,f64} goes memory-class internally
+// (a byval pointer); but `big` is SysV MEMORY in C (0 GP), so `mix` stays
+// register-class in C, passed SSE-split (its i64 in a GP reg, its f64 in XMM).  The
+// thunk must receive it SSE-split, reconstruct it, and forward a byval pointer —
+// reading the GP form would return garbage for mix.f.  Uses both fields so either
+// half being misread shows.
+type FfiMix struct { i int64; f float64 }
+
+#[c_export("ffi_bigmix")]
+func BigMix(big FfiBig, a int64, b int64, c int64, d int64, e int64, mix FfiMix) int64 {
+	return big.a + big.b + big.c + a + b + c + d + e + mix.i + cast(int64, cast(int, mix.f))
+}
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -304,14 +333,31 @@ check_narrow_returns() {
 cat > "$TMP/driver_bigagg.c" <<'EOF'
 #include <stdio.h>
 struct FfiBig { long a, b, c; };
+struct FfiVec2 { float x, y; };
+struct FfiMix { long i; double f; };
 extern long ffi_bigstruct(struct FfiBig);
+extern long ffi_bigvec(struct FfiBig, struct FfiVec2);
+extern long ffi_bigmix(struct FfiBig, long, long, long, long, long, struct FfiMix);
 int main(void) {
     struct FfiBig x = {1, 2, 3};
     printf("%ld\n", ffi_bigstruct(x));   /* expect 1*100 + 2*10 + 3 = 123 */
+    /* A >16 struct (forces the thunk) FOLLOWED by a float aggregate: on x86-64
+       the vec rides XMM, so the thunk must handle it SSE-split. 10+20+30+4+5. */
+    struct FfiBig b = {10, 20, 30};
+    struct FfiVec2 v = {4.0f, 5.0f};
+    printf("%ld\n", ffi_bigvec(b, v));   /* expect 60 + 4 + 5 = 69 */
+    /* A MIXED {i64,f64} aggregate in the register-class-in-C / memory-internally
+       straddle (>16 big + 5 int64s fill the internal GP file): the thunk must
+       receive `mix` SSE-split (i64 in GP, f64 in XMM) and reconstruct it. */
+    struct FfiBig b2 = {1, 2, 3};
+    struct FfiMix m = {6, 7.0};
+    printf("%ld\n", ffi_bigmix(b2, 2, 3, 4, 5, 6, m));  /* 6 + 20 + 6 + 7 = 39 */
     return 0;
 }
 EOF
-WANT_BIGAGG="123"
+WANT_BIGAGG="123
+69
+39"
 
 # check_bigagg <label> <extra-bnc-flags> <required>
 #   Links the >16-byte by-value-struct driver and checks the callee read the

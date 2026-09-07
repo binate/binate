@@ -13,7 +13,8 @@ import "pkg/std/fmt"
 // Frame layout, lookups, and type predicates live in pkg/binate/native/common.
 // This file owns the pieces that touch ARM registers or emit instructions:
 // the scratch-register pool, the Ldr-on-use reload in getOperand, and the
-// Str-on-result spill in spillAndReset.  Mirrors aarch64_regmap.bn.
+// result spill — deferred by lazy spill (handleResult / spillDirtyLive /
+// storeDirtyOnEvict).  Mirrors aarch64_regmap.bn.
 
 // regPool is the callee-saved scratch set we hand out to values.  R0-R3 are
 // reserved for args/returns; R4-R10 are the ONLY allocatable scratches —
@@ -94,6 +95,7 @@ func allocReg(m @common.RegMap) int {
 	for i := 0; i <= 6; i = i + 1 {
 		var r int = regPool(i)
 		if !m.IsUsed(r) {
+			storeDirtyOnEvict(m, r)
 			m.EvictReg(r)
 			m.MarkUsed(r)
 			return r
@@ -113,10 +115,11 @@ func scratchReg(m @common.RegMap) int {
 
 // nextReg allocates a register to hold SSA id's result.  A register-allocated
 // value computes directly into its stable HOME register (caller-saved, R0..R3)
-// — bypassing the transient scratch pool, so it is not stored back by
-// spillAndReset and survives ResetRegs / block boundaries.  A spilled value
-// takes a scratch-pool register and is recorded in the transient map
-// (spillAndReset then stores it to its slot).  Homes are caller-saved, so
+// — bypassing the transient scratch pool, so it is not spilled and survives
+// ResetRegs / block boundaries.  A spilled value takes a scratch-pool register
+// and is recorded in the transient map; its store to the slot is deferred (lazy
+// spill) until it is evicted or dropped while live — see handleResult.  Homes
+// are caller-saved, so
 // (unlike aarch64/x64) the prologue/epilogue does NOT save/restore them; the
 // allocator only homes a value there when it is not live across a clobber
 // (ClobberPositions), so no call can destroy a homed value.
@@ -174,31 +177,63 @@ func emitValOperand(a @asm.Assembler, pkgName *[]readonly char, m @common.RegMap
 	return getOperand(a, m, ins.ID)
 }
 
-// spillAndReset stores the result of a just-emitted instruction to its stack
-// slot (if any) and clears the register map.  Called after every instruction
-// — the "spill everything" policy means each op loads operands, computes,
-// then hands off to memory.
-func spillAndReset(a @asm.Assembler, m @common.RegMap, ins @ir.Instr, branchEmitted bool) {
-	if ins.ID >= 0 {
-		var reg int = m.LookupReg(ins.ID)
-		if reg >= 0 {
-			var off int = m.LookupSpill(ins.ID)
-			if off >= 0 {
-				emitFrameStore(a, reg, off)
-			}
-		}
+// storeDirtyOnEvict spills the value in register `reg` to its slot when it is a
+// DIRTY (lazy-spilled, not-yet-stored) cached value, then marks it clean, so a
+// later reload reads the correct value.  Called before every eviction of a
+// register whose current occupant is about to be clobbered.  The IsDirty
+// early-out makes it a no-op for an already-stored value; a dirty value always
+// has a spill slot (only isAllocatableDef results are marked dirty) and runs on
+// the lazy path with CurAsm set, so the fail-loud only trips on an invariant
+// break.
+func storeDirtyOnEvict(m @common.RegMap, reg int) {
+	var id int = m.RegHeldBy(reg)
+	if id < 0 { return }
+	if !m.IsDirty(id) { return }
+	var off int = m.LookupSpill(id)
+	if off < 0 || m.CurAsm == nil {
+		panic("storeDirtyOnEvict: dirty value must have a spill slot and CurAsm set")
 	}
-	// Within-block value retention: keep the IDs/Regs cache live ACROSS
-	// instructions so a later use reads a register (getOperand's LookupReg hit)
-	// instead of reloading its spill slot.  The store above still runs for every
-	// result, so a value stays recoverable from its slot after eviction or at
-	// block end.  Drop the whole cache after any instruction that emitted a
-	// branch (an inline fail-path the mainline skips desyncs the emit-time cache
-	// from the mainline register state) or is a returning-call op.  The R4..R10
-	// pool is callee-saved so a retained value technically survives a call, but
-	// resetting there is the conservative, uniform choice the other backends
-	// make; a later pass could retain across calls for extra reuse.
-	if branchEmitted || common.EmitsReturningBl(ins.Op) {
-		m.ResetRegs()
+	emitFrameStore(m.CurAsm, reg, off)
+	m.ClearDirty(id)
+}
+
+// spillDirtyLive writes every DIRTY cached value that is LIVE at this program
+// point (in liveSet) to its spill slot and marks it clean, just before the
+// cache is dropped by a reset.  Dirty values NOT in liveSet are dead here and
+// are left for the reset to drop unstored — eliding their store is the point.
+// liveSet is live-BEFORE for a pre-op barrier (operands must reach their slots)
+// and live-AFTER for a post-op / block-end drop.
+func spillDirtyLive(a @asm.Assembler, m @common.RegMap, liveSet @[]bool) {
+	var ids @[]int = m.DirtyIDs
+	for k := 0; k < len(ids); k++ {
+		var id int = ids[k]
+		if id >= len(liveSet) { continue }
+		if !liveSet[id] { continue }
+		var reg int = m.LookupReg(id)
+		var off int = m.LookupSpill(id)
+		if reg >= 0 && off >= 0 {
+			emitFrameStore(a, reg, off)
+		}
+		m.ClearDirty(id)
+	}
+}
+
+// handleResult records a just-emitted instruction's result.  A register-
+// allocatable scalar (a 32-bit value on this ILP32 target) is marked DIRTY
+// (lazy spill — store deferred to eviction / a drop-while-live, and elided when
+// used only from its register); a non-allocatable result (aggregate / float /
+// int64 pair) keeps the eager store.  A homed result (no cache entry) and a
+// void instruction are no-ops.
+func handleResult(a @asm.Assembler, m @common.RegMap, ins @ir.Instr) {
+	if ins.ID < 0 { return }
+	var reg int = m.LookupReg(ins.ID)
+	if reg < 0 { return }
+	if common.IsAllocatableDef(ins, 4) {
+		m.MarkDirty(ins.ID)
+		return
+	}
+	var off int = m.LookupSpill(ins.ID)
+	if off >= 0 {
+		emitFrameStore(a, reg, off)
 	}
 }

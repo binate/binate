@@ -40,6 +40,44 @@ const FP_PC_MASK int = 0x8800
 // nor the final SP position, so every spill/param/stack-arg offset is unchanged.
 const SAVED_BYTES int = 40
 
+// arm32RetentionSafe reports whether the retained value cache may flow THROUGH
+// op `ins`'s emitter: a 32-bit-integer op (not float, not an int64 pair) whose
+// lowering allocates working registers only via the occupancy-aware allocReg
+// (getOperand / nextReg / scratchReg) and never resets the cache or writes a
+// pool register directly.  Float / int64 ops lower via AEABI libcalls that
+// reset, so they are excluded by type even though they share these op codes.
+func arm32RetentionSafe(ins @ir.Instr) bool {
+	if instrIsFloat(ins) { return false }
+	if instrIs64(ins) { return false }
+	var op int = ins.Op
+	if op == iropcode.OP_ADD { return true }
+	if op == iropcode.OP_SUB { return true }
+	if op == iropcode.OP_MUL { return true }
+	if op == iropcode.OP_AND { return true }
+	if op == iropcode.OP_OR { return true }
+	if op == iropcode.OP_XOR { return true }
+	if op == iropcode.OP_LAND { return true }
+	if op == iropcode.OP_LOR { return true }
+	if op == iropcode.OP_EQ { return true }
+	if op == iropcode.OP_NE { return true }
+	if op == iropcode.OP_LT { return true }
+	if op == iropcode.OP_LE { return true }
+	if op == iropcode.OP_GT { return true }
+	if op == iropcode.OP_GE { return true }
+	if op == iropcode.OP_CAST { return true }
+	if op == iropcode.OP_NEG { return true }
+	if op == iropcode.OP_NOT { return true }
+	if op == iropcode.OP_BITNOT { return true }
+	if op == iropcode.OP_ALLOC { return true }
+	if op == iropcode.OP_GET_FIELD_PTR { return true }
+	if op == iropcode.OP_GET_ELEM_PTR { return true }
+	if op == iropcode.OP_EXTRACT { return true }
+	if op == iropcode.OP_LOAD { return true }
+	if op == iropcode.OP_COPY { return true }
+	if op == iropcode.OP_STORE { return true }
+	return false
+}
+
 // emitFunc lowers one function.  The prologue saves the callee-saved
 // registers + LR and allocates the local stack frame; the epilogue reverses
 // (popping PC to return).  Mirrors aarch64_emit_func.bn but with the AAPCS32
@@ -102,6 +140,12 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 		}
 	}
 	var frameSize int = rm.PlanFrame(f)
+	// Lazy spill (dead-store elimination): stamp the assembler back-channel so
+	// allocReg can spill a dirty value it must evict, and precompute the
+	// per-instruction live-before sets that gate which dirty values to spill at
+	// each cache-drop point (vs. drop unstored — a dead store).
+	rm.CurAsm = a
+	var liveBefore @[]@[]@[]bool = common.ComputeLiveBeforeAll(f, 4)
 	// Parameter dispatch types (shared by the #[c_export] prefix below and the param-spill
 	// loop).  When this function returns via sret (SretSlotOff >= 0), every user param shifts
 	// by one GP register — param 0 arrives in R1, not R0 (R0 holds the hidden buffer pointer)
@@ -228,18 +272,45 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 		// Each block starts with a fresh regmap.  Cross-block values flow
 		// through spill slots.
 		rm.ResetRegs()
+		var lb @[]@[]bool = liveBefore[bi]
 		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
 			// Fresh current-instruction claim set; the retained value cache
-			// (IDs/Regs) carries forward from prior instructions in this block
-			// so a use reads a register instead of reloading.  fixupsBefore lets
-			// spillAndReset tell whether this instruction emitted a branch (an
-			// inline fail-path), which desyncs the carried cache.
+			// (IDs/Regs) carries forward within the block so a use reads a
+			// register instead of reloading.
 			rm.ClearUsed()
+			// Pre-op barrier: an op whose emitter drops the register cache
+			// mid-emission (an internal rm.ResetRegs, reloading its operands from
+			// their slots) or writes a pool register outside allocReg must find
+			// the values live INTO it already spilled.  This is a safe-by-default
+			// ALLOWLIST: retention flows THROUGH only the proven-clean 32-bit
+			// integer ops (arm32RetentionSafe — arithmetic/compare/cast/load/store
+			// /copy/alloc/pointer, all scratched via allocReg); everything else
+			// barriers — the soft-float and int64-pair libcall families (which
+			// reset), the returning-BL family, OP_RETURN, the rodata byte-store
+			// loops, and any new op — so a missed reset-y op can never drop a
+			// dirty value.
+			if !arm32RetentionSafe(ins) {
+				spillDirtyLive(a, rm, lb[ii])
+				rm.ResetRegs()
+			}
 			var fixupsBefore int = a.Sections[a.Current].NumFixups
-			emitInstr(a, pkgName, sym, rm, strings, b.Instrs[ii])
+			emitInstr(a, pkgName, sym, rm, strings, ins)
 			var branchEmitted bool = a.Sections[a.Current].NumFixups != fixupsBefore
-			spillAndReset(a, rm, b.Instrs[ii], branchEmitted)
+			// Record the result: allocatable 32-bit scalar dirty-marked (deferred
+			// / elided store), non-allocatable eagerly stored.
+			handleResult(a, rm, ins)
+			// A returning BL clobbers the caller-saved scratch, and a branch to a
+			// skipped inline block desyncs the cache — spill the values live OUT
+			// of this op, then drop the cache.
+			if branchEmitted || common.EmitsReturningBl(ins.Op) {
+				spillDirtyLive(a, rm, lb[ii + 1])
+				rm.ResetRegs()
+			}
 		}
+		// Block end: spill the dirty values live OUT of the block; the next
+		// block's entry ResetRegs drops the dead remainder unstored.
+		spillDirtyLive(a, rm, lb[len(b.Instrs)])
 	}
 
 	// Safety net: emit an epilogue if the IR didn't end with OP_RETURN.

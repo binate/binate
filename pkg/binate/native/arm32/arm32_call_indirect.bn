@@ -293,16 +293,23 @@ func shimArgTypesArm32(cc common.CallConv, ins @ir.Instr, nCallArgs int,
 }
 
 // emitShimUserArgsArm32 marshals a handle/shim call's user args (ins.Args[1..])
-// into their AAPCS32 slots per the shim ABI: a by-address aggregate rides
-// BY-ADDRESS as ONE pointer word (reg or stack) — the shim loads + re-expands it,
-// matching the LLVM cross-package shim's i8*-per-aggregate contract — and every
-// other arg via the shared emitCallArg (a float scalar via the soft-float GP path,
-// a 64-bit-pair scalar via its two value-words).  `argTypes` is shimArgTypesArm32's
-// synthetic list; user arg ai occupies slot ai+prefixSlots.  Per-arg ResetRegs
-// keeps the tight R4..R10 scratch pool from saturating on long arg lists.  Shared
-// by emitCallFuncValue and emitCallIfaceMethod.
+// onto the dispatch seam.  Shared by emitCallFuncValue and emitCallIfaceMethod, so
+// the two seam arg layouts can't drift.  Per-arg ResetRegs keeps the tight R4..R10
+// scratch pool from saturating on long arg lists.
+//
+// SOFT-float places the args POSITIONALLY (emitShimUserArgsFlatArm32) — the flat
+// all-integer contract of spec abi/03 §3.3.  HARD-float still routes them through the
+// AAPCS32 machinery (even-register-pair alignment, float scalars in VFP) pending the
+// Phase-B GP-bit-image seam rework: a by-address aggregate rides ONE pointer word and
+// every other arg goes via the shared emitCallArg (a float scalar via VFP, a
+// 64-bit-pair scalar via its two even-aligned value-words).  `argTypes` is
+// shimArgTypesArm32's synthetic list; user arg ai occupies slot ai+prefixSlots.
 func emitShimUserArgsArm32(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
 		ins @ir.Instr, argTypes @[]@types.Type, prefixSlots int, nCallArgs int) {
+	if !types.Arm32HardFloat() {
+		emitShimUserArgsFlatArm32(a, pkgName, rm, ins, prefixSlots, nCallArgs)
+		return
+	}
 	for ai := 0; ai < nCallArgs; ai++ {
 		var arg @ir.Instr = ins.Args[ai + 1]
 		if common.IsAggregateTyp(arg.Typ) && isByAddressAggArm32(rm.CC, arg.Typ) {
@@ -333,6 +340,86 @@ func emitShimUserArgsArm32(a @asm.Assembler, pkgName *[]readonly char, rm @commo
 		if a.HasError { return }
 		rm.ResetRegs()
 	}
+}
+
+// emitShimUserArgsFlatArm32 places a handle/shim call's user args (ins.Args[1..])
+// onto the dispatch seam under the POSITIONAL all-integer contract (spec abi/03
+// §3.3): a flat sequence of 32-bit slots with NO AAPCS §6.5 C.3 even-register-pair
+// alignment — slot g is R(g) for g < NumGpArgRegs, else the outgoing-args stack at
+// (g - NumGpArgRegs) * WordBytes.  An aggregate of any size rides ONE pointer slot
+// (its data-region address — the shim re-expands a small one and passes an
+// indirect-large one through); a 64-bit scalar (int64 / uint64 / float64 on
+// soft-float) splits into TWO CONSECUTIVE slots (low word, then high word — which may
+// straddle R3 and the stack), matching the LLVM pre-split i32/i32 shim signature and
+// the VM's argSlots; every other scalar rides one slot.  The shim reads back from the
+// identical flat cursor (shimInWordsForTypeArm32, no incoming pad — see
+// seamIncomingEvenPairArm32).  This is the SOFT-float path; the hard-float seam still
+// routes floats through VFP pending the Phase-B rework (emitShimUserArgsArm32).
+func emitShimUserArgsFlatArm32(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr, prefixSlots int, nCallArgs int) {
+	var slot int = prefixSlots
+	for ai := 0; ai < nCallArgs; ai++ {
+		var arg @ir.Instr = ins.Args[ai + 1]
+		var pt @types.Type = arg.Typ
+		if common.IsAggregateTyp(pt) {
+			// By-address small OR indirect-large aggregate: one pointer slot.  Both
+			// pass the data-region pointer; the shim distinguishes them on its OUTGOING
+			// side (re-expand vs pass-through), but the seam slot is one pointer either way.
+			var ptr int = getOperand(a, rm, arg.ID)
+			if ptr < 0 {
+				a.SetError("native arm32: shim aggregate arg not materializable (P4)")
+				return
+			}
+			placeSeamWordArm32(a, rm, ptr, slot)
+			slot = slot + 1
+			rm.ResetRegs()
+			continue
+		}
+		if isPair64Typ(pt) {
+			// A 64-bit scalar (int64 / uint64 / float64 on soft-float) splits into two
+			// consecutive seam slots (lo, hi) — no even-pair alignment.  load64 returns
+			// its words in scratch-pool registers, so placing them into the arg regs is
+			// a clobber-safe down-move; a straddling pair puts hi on the stack.
+			var lo int
+			var hi int
+			lo, hi = load64(a, rm, arg)
+			if lo < 0 {
+				a.SetError("native arm32: 64-bit shim arg not materializable (P4)")
+				return
+			}
+			placeSeamWordArm32(a, rm, lo, slot)
+			placeSeamWordArm32(a, rm, hi, slot + 1)
+			slot = slot + 2
+			rm.ResetRegs()
+			continue
+		}
+		// A 32-bit scalar / pointer (a soft-float float32 rides one GP slot as its bit
+		// image, like an int32).
+		var src int = emitValOperand(a, pkgName, rm, arg)
+		if src < 0 {
+			a.SetError("native arm32: shim call arg operand not materializable (P4)")
+			return
+		}
+		placeSeamWordArm32(a, rm, src, slot)
+		slot = slot + 1
+		rm.ResetRegs()
+	}
+}
+
+// placeSeamWordArm32 moves srcReg into flat dispatch-seam slot `slot`: arg register
+// R(slot) for slot < NumGpArgRegs, else the outgoing-args stack at
+// (slot - NumGpArgRegs) * WordBytes.  The positional seam lets a 64-bit scalar's pair
+// straddle the reg/stack boundary (lo in R3, hi on the stack) — unlike an AAPCS32
+// direct call, which even-aligns the pair — so each word is placed independently.
+// emitFrameStore materializes the SP offset in IP past the 12-bit immediate.
+func placeSeamWordArm32(a @asm.Assembler, rm @common.RegMap, srcReg int, slot int) {
+	if slot < rm.CC.NumGpArgRegs {
+		if srcReg != argReg(slot) {
+			arm32.Mov(a, arm32.COND_AL, false, argReg(slot), arm32.Reg(srcReg))
+		}
+		return
+	}
+	emitFrameStore(a, srcReg, (slot - rm.CC.NumGpArgRegs) * rm.CC.WordBytes)
 }
 
 // collectShimReturnArm32 collects a handle/shim call's return value after the BLX

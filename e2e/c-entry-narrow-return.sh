@@ -9,12 +9,15 @@
 # lowers each narrow ARG itself), so f's define IS the C-ABI entry.  A clang caller
 # at -O1+ TRUSTS the callee to sign/zero-extend a sub-`int` RETURN (AssertS/Zext)
 # and elides its own re-extension — so if f's define lacks the `signext`/`zeroext`
-# return attribute, the caller reads dirty upper bits.  bnc gated that attribute on
-# `#[c_export]` only, so a __c_entry-ONLY target (not also exported) leaked dirty
-# bits: this test's callbacks return int8/int16/uint8 derived from a WIDER argument
-# (cast truncation), read at -O2 by a C driver.  Verified while writing: without the
-# fix the driver prints `507 130944 456` (the raw untruncated args) instead of
-# `-5 -128 200`.  This is the return-side analogue of c-entry-narrow-callback.sh
+# return attribute, the caller reads dirty upper bits.  bnc extends every sub-`int`
+# scalar return unconditionally (matching the native backends' full-width canonical
+# returns), so a __c_entry target's define is C-correct in every compile; this test
+# guards that end-to-end.  Its callbacks return int8/int16/uint8 derived from a WIDER
+# argument (cast truncation), read at -O2 by a C driver.  Verified while writing
+# (against an earlier gating that leaked): without the extension the driver prints
+# `507 130944 456` (the raw untruncated args) instead of `-5 -128 200`.  The
+# separate-compilation counterpart is c-entry-narrow-return-separate.sh; this is the
+# return-side analogue of c-entry-narrow-callback.sh
 # (which covers the ARGUMENT side) and the __c_entry analogue of ffi-export.sh's
 # #[c_export] narrow-returns driver.
 #

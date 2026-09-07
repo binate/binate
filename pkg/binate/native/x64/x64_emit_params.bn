@@ -1,0 +1,283 @@
+package "pkg/binate/native/x64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Incoming-parameter spilling for the SysV-AMD64 prologue: land each register /
+// stack parameter into its frame slot (or home register), with narrow-scalar
+// re-extension and the #[c_export] C-entry register normalization.  Split from
+// x64_emit_func.bn (which keeps the per-function body/prologue/epilogue) along
+// the natural parameter-handling boundary.
+
+// spillScalarStackArgX64 loads an incoming SCALAR stack argument into dst, sized AND
+// sign-/zero-extended to the arg's canonical footprint.  SysV rounds every stack arg up to
+// an 8-byte slot (StackArgNaturalSize returns 0), but a narrow integer / bool arg is loaded
+// at its natural size and sign-/zero-extended (per the arg's signedness) rather than as a
+// full 8-byte word.  This normalizes the entry against a C caller (a #[c_export] entry, or a
+// function reached through a `__c_entry` callback pointer) that stores only the arg's low
+// natural-size bytes and leaves the rest of the slot junk — otherwise that junk lands in the
+// 64-bit canonical home and corrupts a promoted / 64-bit-compare use.  It is done
+// UNCONDITIONALLY (not gated on the entry kind): a native caller stores the full extended
+// word (x64_call.bn's SZ64 stack-arg store), so the narrow-size load reproduces the same
+// value — idempotent, one-for-one instruction swap, no extra cost.  Doing it here (at the
+// mangled entry every caller reaches) also covers a non-#[c_export] `__c_entry` target whose
+// callback thunk normalizes only the argument REGISTERS.  Floats and aggregates are excluded:
+// a float's high slot bits never reach a GP use, and an aggregate is not a scalar stack arg.
+// On the packed convention (AAPCS64_Darwin) StackArgNaturalSize already returns the natural
+// size, so this branch is inert.
+func spillScalarStackArgX64(a @asm.Assembler, dst int, base int, off int, cc common.CallConv,
+		t @types.Type) {
+	var natSize int = cc.StackArgNaturalSize(t, false)
+	if natSize == 0 && !common.IsAggregateTyp(t) && !common.IsFloatScalarTyp(t) {
+		var sz int = t.SizeOf()
+		if sz > 0 && sz < 8 {
+			natSize = sz
+		}
+	}
+	var signed bool
+	_, signed = common.SubWordNarrow(t, 64)
+	if natSize == 1 {
+		if signed {
+			x64.Movsx(a, x64.Reg(dst, x64.SZ64), x64.Mem(base, off, x64.SZ8))
+		} else {
+			x64.Movzx(a, x64.Reg(dst, x64.SZ64), x64.Mem(base, off, x64.SZ8))
+		}
+	} else if natSize == 2 {
+		if signed {
+			x64.Movsx(a, x64.Reg(dst, x64.SZ64), x64.Mem(base, off, x64.SZ16))
+		} else {
+			x64.Movzx(a, x64.Reg(dst, x64.SZ64), x64.Mem(base, off, x64.SZ16))
+		}
+	} else if natSize == 4 {
+		if signed {
+			x64.Movsxd(a, x64.Reg(dst, x64.SZ64), x64.Mem(base, off, x64.SZ32))
+		} else {
+			x64.Mov(a, x64.Reg(dst, x64.SZ32), x64.Mem(base, off, x64.SZ32))
+		}
+	} else {
+		x64.Mov(a, x64.Reg(dst, x64.SZ64), x64.Mem(base, off, x64.SZ64))
+	}
+}
+
+// normalizeNarrowRegParamX64 sign-/zero-extends an incoming GP register parameter to its
+// type width before spill — the register twin of spillScalarStackArgX64's stack case.
+// Applied ONLY to #[c_export] functions: a non-native (C) caller may leave a narrow reg
+// arg's high bits UNSPECIFIED (SysV), and a native callee spills the whole register, so a
+// promoted -O1+ use would read garbage.  Idempotent for a native caller; no-op for word/
+// pointer params.  (Raw func pointer handed to C as a callback is not covered.)
+func normalizeNarrowRegParamX64(a @asm.Assembler, reg int, t @types.Type) {
+	var sz int = t.SizeOf()
+	if sz <= 0 || sz >= 8 {
+		return
+	}
+	var signed bool
+	_, signed = common.SubWordNarrow(t, 64)
+	if sz == 1 {
+		if signed {
+			x64.Movsx(a, x64.Reg(reg, x64.SZ64), x64.Reg(reg, x64.SZ8))
+		} else {
+			x64.Movzx(a, x64.Reg(reg, x64.SZ64), x64.Reg(reg, x64.SZ8))
+		}
+	} else if sz == 2 {
+		if signed {
+			x64.Movsx(a, x64.Reg(reg, x64.SZ64), x64.Reg(reg, x64.SZ16))
+		} else {
+			x64.Movzx(a, x64.Reg(reg, x64.SZ64), x64.Reg(reg, x64.SZ16))
+		}
+	} else if sz == 4 {
+		if signed {
+			x64.Movsxd(a, x64.Reg(reg, x64.SZ64), x64.Reg(reg, x64.SZ32))
+		} else {
+			x64.Mov(a, x64.Reg(reg, x64.SZ32), x64.Reg(reg, x64.SZ32))
+		}
+	}
+}
+
+// emitCExportRegNormX64 emits the #[c_export] C-entry prefix: for each narrow GP scalar
+// parameter passed in an argument register, sign-/zero-extend it in place.  The register set
+// (and the SysV sret shift — a hidden RDI buffer pointer shifts every user param by one arg
+// register) comes from common.CEntryRegNormWalk, the same classification the __c_entry
+// thunk-emission decision uses, so the argReg mapping matches the mangled entry's spill.
+// Emitted as the c_export C-entry thunk (before the mangled `sym`, which the caller branches
+// to): a C caller entering at the alias, whose high argument-register bits the SysV ABI leaves
+// unspecified, runs these extends; a native caller entering at `sym` skips them.
+func emitCExportRegNormX64(a @asm.Assembler, rm @common.RegMap, f @ir.Func) {
+	var regStarts @[]int
+	var regTypes @[]@types.Type
+	regStarts, regTypes = common.CEntryRegNormWalk(f, rm.CC)
+	for i := 0; i < len(regStarts); i++ {
+		normalizeNarrowRegParamX64(a, argReg(regStarts[i]), regTypes[i])
+	}
+}
+
+// spillIncomingParams writes each function parameter's entry-time
+// value (an arg register or a caller-pushed stack slot) into the
+// param's spill slot — and, for aggregates, into its data region —
+// so later uses going through getOperand → spill-reload see the
+// right bytes.  Mirrors arm64's emitFunc param-spill loop but uses
+// SysV-AMD64 dispatch via the (now-correct) CallConv classifier:
+// SysV has no reg/stack split, so for any aggregate exactly one of
+// regStart >= 0 (all eightbytes in GP arg regs) or stackOff >= 0
+// (MEMORY-class on the stack) is true.
+//
+// Stack args live in the caller's outgoing-args area, which is at
+// [rsp + frameSize + 16] from the callee's perspective: +frameSize
+// undoes our `sub rsp`, +16 undoes the caller's `call` (pushed
+// 8-byte return address) and our `push rbp` (another 8).  RAX is the
+// shuttle for the stack-arg copy (not in regPool, not a GP arg reg,
+// dead pre-body).
+//
+// Float scalar params arrive in XMM(NSRN); we MOVQ them through a
+// GP scratch to the spill slot so getOperand → spill-reload finds
+// them in the same 8-byte-GP form every other float value uses.
+func spillIncomingParams(a @asm.Assembler, rm @common.RegMap, f @ir.Func, frameSize int) {
+	if len(f.Params) == 0 { return }
+	// SysV-AMD64 sret: when the function returns an aggregate via the
+	// hidden RDI buffer (rm.SretSlotOff >= 0), every user param shifts
+	// by one register — `tag` (param 0) arrives in RSI, not RDI.
+	// Model the shift the same way emitCall does: synthesise a
+	// pointer-typed leading entry in paramTypes so CallArgRegStart
+	// returns the user param's actual reg index (i + 1).
+	var sretShift bool = rm.SretSlotOff >= 0
+	var nDispatch int = len(f.Params)
+	if sretShift { nDispatch = nDispatch + 1 }
+	var paramTypes @[]@types.Type = make_slice(@types.Type, nDispatch)
+	if sretShift {
+		paramTypes[0] = types.MakePointerType(types.TypUint8())
+		for pi := 0; pi < len(f.Params); pi++ {
+			paramTypes[pi + 1] = f.Params[pi].Typ
+		}
+	} else {
+		for pi := 0; pi < len(f.Params); pi++ {
+			paramTypes[pi] = f.Params[pi].Typ
+		}
+	}
+	var stackArgsBase int = frameSize + 16
+	// NSRN: float-scalar params arrive in XMM(NSRN), separate from
+	// the GP NGRN budget tracked by CallArgRegStart.  Walk params in
+	// order so NSRN matches the caller's per-call counting.
+	var nsrn int = 0
+	for pi := 0; pi < len(f.Params); pi++ {
+		var p @ir.Param = f.Params[pi]
+		if common.IsFloatScalarTyp(p.Typ) {
+			var spillOff int = rm.LookupSpill(p.ID)
+			if spillOff >= 0 {
+				if nsrn < rm.CC.NumFpArgRegs {
+					// MOVQ XMM(nsrn) → RAX (scratch), then store to slot.
+					// RAX is dead pre-body — see the doc-comment above —
+					// so we don't disturb anything else.
+					x64.Movq_xmm_to_gp(a, x64.RAX, x64.XMM0 + nsrn)
+					x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+				} else {
+					// FP arg registers exhausted: this float arrived on the
+					// incoming-args stack (8-byte slot).  Shuttle it through
+					// RAX into the spill slot, like a GP stack arg.
+					var dispatchIdx int = pi
+					if sretShift { dispatchIdx = pi + 1 }
+					var fStackOff int = rm.CC.CallArgStackOff(paramTypes, dispatchIdx)
+					if fStackOff >= 0 {
+						spillScalarStackArgX64(a, x64.RAX, x64.RSP, stackArgsBase + fStackOff, rm.CC, p.Typ)
+						x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+					}
+				}
+			}
+			nsrn = nsrn + 1
+			continue
+		}
+		// User param i lives at dispatch slot i (no sret) or i+1
+		// (sret — the hidden buffer pointer takes slot 0).
+		var dispatchIdx int = pi
+		if sretShift { dispatchIdx = pi + 1 }
+		var regStart int = rm.CC.CallArgRegStart(paramTypes, dispatchIdx)
+		var stackOff int = rm.CC.CallArgStackOff(paramTypes, dispatchIdx)
+		if common.IsAggregateTyp(p.Typ) {
+			var dataOff int = rm.LookupAlloc(p.ID)
+			var sz int = rm.LookupAllocSize(p.ID)
+			if dataOff < 0 || sz <= 0 { continue }
+			var nWords int = common.ArgWords(p.Typ)
+			// Indirect-large: pkg/codegen emits the function param
+			// as plain `ptr`, LLVM hands us a pointer to caller's
+			// struct in the arg reg.  Memcpy from *ptr into the
+			// local data region so downstream `paramSlots[i]`
+			// references (which resolve to RSP + dataOff) read
+			// the right bytes.
+			if rm.CC.IndirectLargeAggregates && p.Typ.SizeOf() > rm.CC.AggregateInRegMax {
+				// Load the byval pointer into RAX.
+				if regStart >= 0 {
+					x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Reg(argReg(regStart), x64.SZ64))
+				} else if stackOff >= 0 {
+					x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.RSP, stackArgsBase + stackOff, x64.SZ64))
+				}
+				// Copy struct words from *RAX to RSP+dataOff via R11.
+				for w := 0; w < nWords; w++ {
+					x64.Mov(a, x64.Reg(x64.R11, x64.SZ64), x64.Mem(x64.RAX, 8 * w, x64.SZ64))
+					x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8 * w, x64.SZ64), x64.Reg(x64.R11, x64.SZ64))
+				}
+				var spillOff int = rm.LookupSpill(p.ID)
+				if spillOff >= 0 {
+					x64.Lea(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.RSP, dataOff, x64.SZ64))
+					x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+				}
+				continue
+			}
+			if rm.CC.PassesSseInRegs(p.Typ) && stackOff < 0 {
+				// In-register SSE aggregate: spill each eightbyte from its
+				// XMM / GP arg reg to the data region by class (the callee
+				// mirror of emitSseAggregateArg).  Advance NSRN by the XMM
+				// count consumed so a later float / SSE param lands right.  A
+				// MEMORY-class SSE aggregate has stackOff >= 0 and falls to the
+				// stack-copy branch below, consuming no XMM.
+				nsrn = nsrn + spillSseAggregateParam(a, rm, p.Typ, regStart, nsrn, dataOff)
+			} else if regStart >= 0 {
+				// All eightbytes in GP arg regs (SysV doesn't split).
+				for w := 0; w < nWords; w++ {
+					x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8 * w, x64.SZ64),
+							x64.Reg(argReg(regStart + w), x64.SZ64))
+				}
+			} else if stackOff >= 0 {
+				// MEMORY class: copy from caller's outgoing-args area
+				// to our data region via RAX.
+				for w := 0; w < nWords; w++ {
+					x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+							x64.Mem(x64.RSP, stackArgsBase + stackOff + 8 * w, x64.SZ64))
+					x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8 * w, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+				}
+			}
+			// Spill slot holds a pointer to the data region — matches
+			// OP_MAKE_SLICE / aggregate-CALL-return form so downstream
+			// OP_STORE / OP_EXTRACT find the bytes uniformly.
+			var spillOff int = rm.LookupSpill(p.ID)
+			if spillOff >= 0 {
+				x64.Lea(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.RSP, dataOff, x64.SZ64))
+				x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+			}
+			continue
+		}
+		// Scalar (or pointer): one 8-byte spill slot.
+		var spillOff int = rm.LookupSpill(p.ID)
+		if spillOff < 0 { continue }
+		var phome int = rm.LookupHome(p.ID)
+		if regStart >= 0 {
+			if phome >= 0 {
+				// Register-allocated param: move it from its arg register to
+				// its home register (off the volatile arg regs before the
+				// first clobbering op).
+				x64.Mov(a, x64.Reg(phome, x64.SZ64), x64.Reg(argReg(regStart), x64.SZ64))
+			} else {
+				x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64), x64.Reg(argReg(regStart), x64.SZ64))
+			}
+		} else if stackOff >= 0 {
+			if phome >= 0 {
+				// Register-allocated param arriving on the incoming-args stack:
+				// load it (sized / sign-extended) straight into its home register.
+				spillScalarStackArgX64(a, phome, x64.RSP, stackArgsBase + stackOff, rm.CC, p.Typ)
+			} else {
+				spillScalarStackArgX64(a, x64.RAX, x64.RSP, stackArgsBase + stackOff, rm.CC, p.Typ)
+				x64.Mov(a, x64.Mem(x64.RSP, spillOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
+			}
+		}
+	}
+}

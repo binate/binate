@@ -14,7 +14,8 @@ import "pkg/std/fmt"
 // Frame layout, lookups, and type predicates live in pkg/binate/native/common.
 // This file owns the pieces that touch SysV-AMD64 registers or emit
 // instructions: the scratch-register pool, the MOV-on-use reload in
-// getOperand, and the MOV-on-result spill in spillAndReset.
+// getOperand, and the result spill — deferred by lazy spill (see handleResult /
+// spillDirtyLive / storeDirtyOnEvict).
 //
 // Scratch pool design:
 //   - RDI/RSI/RDX/RCX/R8/R9 are the SysV-AMD64 arg registers.  We
@@ -74,6 +75,7 @@ func allocReg(m @common.RegMap) int {
 	for i := 0; i <= 6; i = i + 1 {
 		var r int = regPool(i)
 		if !m.IsUsed(r) {
+			storeDirtyOnEvict(m, r)
 			m.EvictReg(r)
 			m.MarkUsed(r)
 			return r
@@ -82,6 +84,73 @@ func allocReg(m @common.RegMap) int {
 	// Every pool register is claimed by the current instruction: the
 	// pre-existing exhaustion case, reported by regPool's own panic.
 	return regPool(7)
+}
+
+// storeDirtyOnEvict spills the value in arch-register `reg` to its slot when it
+// is a DIRTY (lazy-spilled, not-yet-stored) cached value, then marks it clean,
+// so a later reload reads the correct value.  Called before every eviction of
+// a pool register whose current occupant is about to be clobbered.  The
+// IsDirty early-out makes it a no-op for a non-dirty (already-stored) value; a
+// dirty value always has a spill slot (only isAllocatableDef results are marked
+// dirty, and PlanFrame slots every such result) and runs on the lazy-spill path
+// with CurAsm set, so the fail-loud below only trips on a real invariant break.
+func storeDirtyOnEvict(m @common.RegMap, reg int) {
+	var id int = m.RegHeldBy(reg)
+	if id < 0 { return }
+	if !m.IsDirty(id) { return }
+	// A dirty value is always an allocatable result (PlanFrame slotted it) on a
+	// backend that stamped the CurAsm back-channel.  A missing slot or nil CurAsm
+	// would silently drop a live value on reuse of its register — fail loud.
+	var off int = m.LookupSpill(id)
+	if off < 0 || m.CurAsm == nil {
+		panic("storeDirtyOnEvict: dirty value must have a spill slot and CurAsm set")
+	}
+	x64.Mov(m.CurAsm, x64.Mem(x64.RSP, off, x64.SZ64), x64.Reg(reg, x64.SZ64))
+	m.ClearDirty(id)
+}
+
+// spillDirtyLive writes every DIRTY cached value that is LIVE at this program
+// point (in liveSet, an id-indexed bool set) to its spill slot and marks it
+// clean, just before the cache is dropped by a reset.  Dirty values NOT in
+// liveSet are dead here and are left for the reset to drop unstored — eliding
+// their store is the point of the optimization.  liveSet is the live-BEFORE
+// set for a pre-op barrier (its operands must reach their slots) and the
+// live-AFTER set for a post-op / block-end drop.
+func spillDirtyLive(a @asm.Assembler, m @common.RegMap, liveSet @[]bool) {
+	// Snapshot: ClearDirty rebuilds DirtyIDs, so iterate the old slice.
+	var ids @[]int = m.DirtyIDs
+	for k := 0; k < len(ids); k++ {
+		var id int = ids[k]
+		if id >= len(liveSet) { continue }
+		if !liveSet[id] { continue }
+		var reg int = m.LookupReg(id)
+		var off int = m.LookupSpill(id)
+		if reg >= 0 && off >= 0 {
+			x64.Mov(a, x64.Mem(x64.RSP, off, x64.SZ64), x64.Reg(reg, x64.SZ64))
+		}
+		m.ClearDirty(id)
+	}
+}
+
+// handleResult records a just-emitted instruction's result.  A register-
+// allocatable scalar is marked DIRTY: its store is deferred (lazy spill) to
+// eviction / a drop-while-live, and elided entirely when the value is used only
+// from its register.  A non-allocatable result (aggregate / float / wide-int)
+// is outside the liveness universe that drives lazy spill, so it keeps the
+// eager store to its slot on definition.  A homed result (no cache entry) and a
+// void instruction are no-ops.
+func handleResult(a @asm.Assembler, m @common.RegMap, ins @ir.Instr) {
+	if ins.ID < 0 { return }
+	var reg int = m.LookupReg(ins.ID)
+	if reg < 0 { return }
+	if common.IsAllocatableDef(ins, 8) {
+		m.MarkDirty(ins.ID)
+		return
+	}
+	var off int = m.LookupSpill(ins.ID)
+	if off >= 0 {
+		x64.Mov(a, x64.Mem(x64.RSP, off, x64.SZ64), x64.Reg(reg, x64.SZ64))
+	}
 }
 
 // scratchReg hands out an ephemeral register (not registered in the
@@ -94,9 +163,10 @@ func scratchReg(m @common.RegMap) int {
 // nextReg allocates a register to hold SSA id's result.  A
 // register-allocated value computes directly into its stable HOME register
 // (callee-saved, RBX/R12..R15) — bypassing the transient scratch pool, so it
-// is not stored back by spillAndReset and survives ResetRegs / block
-// boundaries.  A spilled value takes a scratch-pool register and is recorded
-// in the transient map (spillAndReset then stores it to its slot).
+// is not spilled and survives ResetRegs / block boundaries.  A spilled value
+// takes a scratch-pool register and is recorded in the transient map; its store
+// to the slot is deferred (lazy spill) until it is evicted or dropped while
+// live — see handleResult.
 func nextReg(m @common.RegMap, id int) int {
 	var home int = m.LookupHome(id)
 	if home >= 0 { return home }
@@ -157,33 +227,6 @@ func emitValOperand(a @asm.Assembler, pkgName *[]readonly char, m @common.RegMap
 		return rd
 	}
 	return getOperand(a, m, ins.ID)
-}
-
-// spillAndReset stores the result of a just-emitted instruction to
-// its stack slot (if any) and clears the register map.  Called after
-// every instruction — the "spill everything" policy means each op
-// loads operands, computes, then hands off to memory.
-func spillAndReset(a @asm.Assembler, m @common.RegMap, ins @ir.Instr, branchEmitted bool) {
-	if ins.ID >= 0 {
-		var reg int = m.LookupReg(ins.ID)
-		if reg >= 0 {
-			var off int = m.LookupSpill(ins.ID)
-			if off >= 0 {
-				x64.Mov(a, x64.Mem(x64.RSP, off, x64.SZ64), x64.Reg(reg, x64.SZ64))
-			}
-		}
-	}
-	// Within-block value retention: keep the IDs/Regs cache live ACROSS
-	// instructions so a later use reads a register instead of reloading its
-	// slot.  The store above still runs for every result, so a value stays
-	// recoverable from its slot after eviction or at block end.  Drop the whole
-	// cache after a returning call (clobbers every caller-saved pool register)
-	// or an instruction that emitted a branch to an inline block the mainline
-	// skips.  Ops that hardcode ISA-forced pool registers are handled on the way
-	// IN, by the emit loop's reset-before-non-retention-safe-op.
-	if branchEmitted || common.EmitsReturningBl(ins.Op) {
-		m.ResetRegs()
-	}
 }
 
 // retentionSafe reports whether OP `op`'s emitter may have the retained value

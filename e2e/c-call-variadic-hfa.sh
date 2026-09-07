@@ -11,18 +11,14 @@
 # clang's va_arg — which reads the composite from the stack — got garbage.  This
 # test drives that path through a real C callee:
 #
-#   - a 2xfloat32 HFA (8 bytes) as the variadic arg (with a fixed scalar `n`
-#     before the `...`, proving the fixed arg keeps its register while the HFA
-#     stacks);
+#   - a 2xfloat32 HFA (8 bytes) as the sole variadic arg;
+#   - a FIXED HFA (rides v0/v1) followed by variadic HFAs (stack), proving the
+#     boundary is respected in both directions (this also exercises a fixed
+#     by-value aggregate param in a variadic call-site signature);
 #   - a variadic double scalar followed by a variadic HFA (the FP cursor is
 #     closed once for both);
 #   - a 4xfloat32 HFA (16 bytes, hfaN=4) and a 2xfloat64 HFA (16 bytes, hfaW=8),
 #     the wider member-count / member-width shapes.
-#
-# (The fixed-HFA-in-v-registers vs variadic-HFA-on-stack classification is pinned
-# arch-independently by the pkg/binate/native/common walker unit tests; a fixed
-# AGGREGATE param before `...` is not exercised here because it trips a separate,
-# pre-existing LLVM-backend gap in the variadic call-site signature.)
 #
 # Every callee returns a value that sums to 42, so a wrong placement for any
 # argument perturbs one number.
@@ -84,6 +80,7 @@ summary() {
 WANT="42
 42
 42
+42
 42"
 
 if ! command -v "$CLANG" >/dev/null 2>&1; then
@@ -104,6 +101,16 @@ struct D2 { double p, q; };         /* 2xfloat64 HFA, 16 bytes */
 int sum_v2(int n, ...) {
     va_list ap; va_start(ap, n);
     float t = 0.0f;
+    for (int i = 0; i < n; i++) { struct V2 v = va_arg(ap, struct V2); t += v.x + v.y; }
+    va_end(ap);
+    return (int)t;
+}
+
+/* A FIXED V2 (rides v0/v1) then n variadic V2s (stack) — the boundary case, and
+   a fixed by-value aggregate param before `...` in a variadic signature. */
+int fixed_then_var(struct V2 fixed, int n, ...) {
+    float t = fixed.x + fixed.y;
+    va_list ap; va_start(ap, n);
     for (int i = 0; i < n; i++) { struct V2 v = va_arg(ap, struct V2); t += v.x + v.y; }
     va_end(ap);
     return (int)t;
@@ -159,6 +166,18 @@ func main() {
 	b.x = 9.0
 	b.y = 12.0
 	testing.Println(cast(int, __c_call("sum_v2", int32, cast(int32, 2), ..., a, b)))
+
+	// FIXED HFA (v0/v1) then two variadic HFAs (stack): 1+2 + 10+11 + 9+9 = 42.
+	var fx V2
+	fx.x = 1.0
+	fx.y = 2.0
+	var c V2
+	c.x = 10.0
+	c.y = 11.0
+	var d V2
+	d.x = 9.0
+	d.y = 9.0
+	testing.Println(cast(int, __c_call("fixed_then_var", int32, fx, cast(int32, 2), ..., c, d)))
 
 	// Variadic double scalar then a variadic HFA: 20 + 10+12 = 42.
 	var e V2

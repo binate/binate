@@ -75,7 +75,7 @@ summary() {
     exit 0
 }
 
-WANT="$(printf '111\n1')"
+WANT="$(printf '111\n111\n1')"
 
 if ! command -v "$CLANG" >/dev/null 2>&1; then
     skip "dispatch-seam-narrow (no C compiler '$CLANG' available)"
@@ -94,6 +94,9 @@ func Callee(x int32) int
 // MakeArgFV returns a func value whose vtable/shim are NATIVE (built in this
 // package's object) — exercises the native SHIM's incoming-arg handling.
 func MakeArgFV() @func(int32) int
+// MakeClosureFV returns a CAPTURING closure whose shim is NATIVE — exercises the
+// native CLOSURE shim's incoming-arg handling (a separate marshalling path).
+func MakeClosureFV() @func(int32) int
 // CheckResult is a NATIVE seam caller: it dispatches fv() and decides on the
 // full value of the narrow result.
 func CheckResult(fv @func() int32) int
@@ -110,6 +113,19 @@ func Callee(x int32) int {
 
 func MakeArgFV() @func(int32) int {
 	return Callee
+}
+
+func MakeClosureFV() @func(int32) int {
+	var base int = 100
+	// Captures base -> a native capturing closure (closure shim).  Decides on the
+	// FULL value of x, so a dirty high half (from a foreign dispatch caller the
+	// closure shim failed to re-extend) flips the answer.
+	return func(x int32) int {
+		if x == 5 {
+			return base + 11
+		}
+		return base + 122
+	}
 }
 
 func CheckResult(fv @func() int32) int {
@@ -160,6 +176,11 @@ func main() {
 	var w int64 = __c_call("dirty64", int64)
 	var argFV @func(int32) int = nat.MakeArgFV()
 	testing.Println(argFV(cast(int32, w)))       // want 111; native-shim bug -> 222
+
+	// ARG direction through a native CAPTURING CLOSURE (separate shim path): same
+	// dirty-upper int32, want 111; closure-shim bug -> 222.
+	var cloFV @func(int32) int = nat.MakeClosureFV()
+	testing.Println(cloFV(cast(int32, w)))       // want 111; closure-shim bug -> 222
 
 	// RESULT direction: native CheckResult collects a dirty-upper int32 result
 	// from an LLVM shim.

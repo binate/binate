@@ -85,6 +85,16 @@ func call1(base float64, n int32, x int32) int64 {
 func call2(base0 float64, base1 float64, n int32, x int32) int64 {
 	return __c_call("vfn2", int64, base0, base1, n, ..., x)
 }
+
+// A fixed FLOAT32 before `...` — the 4-byte single-GP-word case (a named float32
+// param is NOT C-promoted, unlike a variadic-tail float).  Under AAPCS-VFP the
+// variadic call sends it to r0 (4 bytes), not s0; n -> r1, x -> r2.  This
+// exercises the float32 materialization path (getOperand, single word) that the
+// double cases (load64, 8-byte pair) do not.
+#[c_export("bn_call3")]
+func call3(base float32, n int32, x int32) int64 {
+	return __c_call("vfn3", int64, base, n, ..., x)
+}
 BN
 
 echo "Compiling facade (--backend native --target arm32-linux)..."
@@ -120,17 +130,29 @@ long long vfn2(double base0, double base1, int n, ...) {
     return (long long)(base0 * 1000.0) + (long long)(base1 * 100.0) + n * 10 + x;
 }
 
+/* A fixed float32 `base` before `...`: read from r0 (4 bytes), not s0. */
+long long vfn3(float base, int n, ...) {
+    va_list ap; va_start(ap, n);
+    int x = va_arg(ap, int);
+    va_end(ap);
+    return (long long)(base * 100.0f) + n * 10 + x;
+}
+
 extern long long bn_call1(double, int, int);
 extern long long bn_call2(double, double, int, int);
+extern long long bn_call3(float, int, int);
 
 int main(void) {
     int fails = 0;
     long long r1 = bn_call1(3.5, 2, 7);          /* 350 + 20 + 7 = 377 */
     long long r2 = bn_call2(1.5, 2.25, 4, 9);    /* 1500 + 225 + 40 + 9 = 1774 */
+    long long r3 = bn_call3(2.5f, 3, 8);         /* 250 + 30 + 8 = 288 */
     printf("  vfn1: got=%lld want=377\n", r1);
     printf("  vfn2: got=%lld want=1774\n", r2);
+    printf("  vfn3: got=%lld want=288\n", r3);
     if (r1 != 377)  { fails++; }
     if (r2 != 1774) { fails++; }
+    if (r3 != 288)  { fails++; }
     if (fails) { printf("%d FAILURE(S)\n", fails); return 1; }
     printf("ALL PASS\n"); return 0;
 }

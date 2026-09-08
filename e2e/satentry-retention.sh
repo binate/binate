@@ -6,7 +6,7 @@
 # `impl T : J` emits a weak per-`(T,J)` `__satentry` record.  Each package emits a
 # `__pkg_satfrag` graph node listing its own `__pkg_satentries` array plus STRONG
 # symrefs to its direct dependencies' `__pkg_satfrag` nodes.  The main module's
-# node is pinned from `__entry` (LLVM `@llvm.used`; native a real LEA/ADRP reloc
+# node is pinned from `bn_init` (LLVM `@llvm.used`; native a real LEA/ADRP reloc
 # via the `rt.BuildSatRegistry(&__pkg_satfrag)` call), and the strong dep chain
 # then retains the whole graph — so each package's `__pkg_satentries`, and thus its
 # `__satentry` nodes, survives dead-strip.  This test compiles a program with an

@@ -1,6 +1,5 @@
 package "pkg/binate/vm"
 
-import "pkg/binate/types"
 import "pkg/builtins/rt"
 import "pkg/std/strconv"
 
@@ -244,6 +243,12 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 				// in a helper): dispatch through the per-function shim and store
 				// the result.  See execExternCall in vm_extern.bn.
 				execExternCall(vm, f, regs, callArgs, instr, nSlots)
+				if callFaultPending(vm) {
+					// A VM callback re-entered by this extern faulted and its unwind was
+					// consumed inside the nested execFunc, leaving Status = FAULTED; continue
+					// the unwind in this frame instead of proceeding on the garbage result.
+					pc = consumeFaultToPad(vm, f, pc)
+				}
 				continue
 			}
 			// VM function call: push frame, switch context
@@ -307,9 +312,12 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 			var nro int = 0
 			var pushed bool = false
 			nfi, nro, pushed = execCallFuncValue(vm, instr, pc, funcIdx, regsOff, regs)
-			if vm.FaultRaised {
-				// A nil function value raised a recoverable fault; dispatch to this
-				// call op's cleanup pad instead of switching frames.
+			if callFaultPending(vm) {
+				// A nil function value raised a recoverable fault, OR a compiled callee
+				// re-entered a VM callback that faulted (swallowed inside the nested
+				// execFunc, leaving Status = FAULTED); dispatch to this call op's cleanup
+				// pad instead of switching frames.  A successful frame push leaves Status
+				// = CONTINUE, so this never fires on the pushed path below.
 				pc = consumeFaultToPad(vm, f, pc)
 				continue
 			}
@@ -331,9 +339,12 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 			var mnro int = 0
 			var mpushed bool = false
 			mnfi, mnro, mpushed = execCallIfaceMethod(vm, instr, pc, funcIdx, regsOff, regs)
-			if vm.FaultRaised {
-				// A nil interface value raised a recoverable fault; dispatch to this
-				// call op's cleanup pad instead of switching frames.
+			if callFaultPending(vm) {
+				// A nil interface value raised a recoverable fault, OR a compiled callee
+				// re-entered a VM callback that faulted (swallowed inside the nested
+				// execFunc, leaving Status = FAULTED); dispatch to this call op's cleanup
+				// pad instead of switching frames.  A successful frame push leaves Status
+				// = CONTINUE, so this never fires on the pushed path below.
 				pc = consumeFaultToPad(vm, f, pc)
 				continue
 			}
@@ -376,23 +387,12 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 			continue
 		}
 		if instr.Op == BC_REFDEC_INLINE_FAST {
-			// Inline-fast-path RefDec: nil-check + decrement always
-			// inline (no rt.RefDec call).  Slow path picks one of:
-			//   * No-dtor (Src2 == 0): rt.Free(ptr).
-			//   * VM-side dtor (handle.data is a VMClosureRec):
-			//     iterative push — inline here because it mutates
-			//     execLoop's frame locals (funcIdx, f, code,
-			//     regsOff, regs, frameBase, pc).  BC_RETURN pops the
-			//     frame and frees ptr via freeOnPop, so no host
-			//     C-stack recursion through the dtor field graph
-			//     (which is what blows the stack at -int-int depths).
-			//   * Cross-mode dtor: handed off to
-			//     refDecCrossModeDispatch in vm_exec_helpers.bn.
-			//     That path can't mutate loop state safely (it
-			//     calls back through native), so it lives in a
-			//     separate function.
-			// Src2 register holds a function-value handle pointer
-			// (emitManagedPtrRefDec emits OP_FUNC_HANDLE for it).
+			// Inline-fast-path RefDec: nil-check + immortal-check + decrement stay
+			// inline (no rt.RefDec call), the overwhelmingly common outcome.  Only
+			// when the count reaches zero do we hand off to execRefDecZeroDtor for the
+			// cold destructor dispatch (no-dtor free / VM-side or closure dtor push /
+			// cross-mode hand-off).  Src2 holds the dtor's function-value handle
+			// (emitManagedPtrRefDec emits OP_FUNC_HANDLE for it), or -1 when absent.
 			var ptr *uint8 = bit_cast(*uint8, regs[instr.Src1])
 			if ptr == nil { continue }
 			var hd *int = bit_cast(*int, bit_cast(int, ptr) - MANAGED_HDR)
@@ -401,85 +401,19 @@ func execLoop(vm @VM, funcIdx int, regsOff int) int64 {
 			if hd[0] != 0 { continue }
 			var dtorHandle int = 0
 			if instr.Src2 >= 0 { dtorHandle = regs[instr.Src2] }
-			if dtorHandle == compiledClosureDtorMark {
-				// ptr is a capturing closure's COMPILED_CLOSURE record
-				// (only IsClosure callees mark their vtable dtor slot
-				// with the sentinel).  The rec owns the heap closure
-				// struct at rec[3]; func-value copies RefInc/RefDec the
-				// rec, not the struct, so the struct sits at refcount 1
-				// and must be released now (the last copy is dying) or
-				// it and its captured managed values leak.  Free the
-				// rec, then RefDec the struct; at zero run its dtor
-				// (iterative push, like the VM_CLOSURE_REC arm below) so
-				// captures are released and the struct freed.
-				var ccRec *int = bit_cast(*int, ptr)
-				var csAddr int = ccRec[3]
-				var ccFnIdx int = ccRec[2]
-				rt.Free(ptr)
-				if csAddr == 0 { continue }
-				var csHd *int = bit_cast(*int, csAddr - MANAGED_HDR)
-				if csHd[0] < 0 { continue } // immortal closure struct
-				csHd[0] = csHd[0] - 1
-				if csHd[0] != 0 { continue }
-				var ccFunc @VMFunc = vm.Funcs.Get(ccFnIdx - 1)
-				if len(ccFunc.ClosureStructDtorName) == 0 {
-					// No managed captures: just free the struct.
-					rt.Free(bit_cast(*uint8, csAddr))
-					continue
-				}
-				var dIdx int = vm.LookupFunc(ccFunc.ClosureStructDtorName)
-				if dIdx < 0 {
-					vmPanic("vm: closure-struct dtor not found")
-				}
-				var ccDtor @VMFunc = vm.Funcs.Get(dIdx)
-				// Enter the dtor's cleanup context BEFORE the push (§6): pushFrame then
-				// gives it the FULL stack (the red zone), and a cascade deeper than the
-				// whole stack overflows with CleanupDepth > 0 → fatal, not a second
-				// unwind.  The pop (BC_RETURN, freeOnPop != 0) balances it.
-				vm.CleanupDepth = vm.CleanupDepth + 1
-				var ccRegsOff int = pushFrame(vm, ccDtor, pc, funcIdx, regsOff, vm.SP, -1)
-				var ccHdr *int = stackPtr(vm, ccRegsOff - FRAME_HDR)
-				ccHdr[5] = csAddr
-				var ccRegs *int = stackPtr(vm, ccRegsOff)
-				ccRegs[0] = csAddr
-				funcIdx = dIdx
-				regsOff = ccRegsOff
+			// A VM-side dtor is run by PUSHING its frame (pushed=true); switch
+			// execLoop's frame locals to it here.  BC_RETURN pops it and frees ptr via
+			// freeOnPop, so there is no host C-stack recursion through the dtor graph.
+			var rdNfi int = 0
+			var rdNro int = 0
+			var rdPushed bool = false
+			rdNfi, rdNro, rdPushed = execRefDecZeroDtor(vm, ptr, dtorHandle, pc, funcIdx, regsOff)
+			if rdPushed {
+				funcIdx = rdNfi
+				regsOff = rdNro
 				f, code, regs, frameBase = frameLocals(vm, funcIdx, regsOff)
 				pc = 0
-				continue
 			}
-			if dtorHandle == 0 {
-				rt.Free(ptr)
-				continue
-			}
-			var handlePtr *int = bit_cast(*int, dtorHandle)
-			var dataAddr int = handlePtr[types.FuncValueDataIndex()]
-			if dataAddr != 0 {
-				var closureRec *int = bit_cast(*int, dataAddr)
-				if closureRec[0] == rt.DATA_KIND_VM_CLOSURE_REC {
-					var fnIdx int = closureRec[2]
-					if fnIdx == 0 {
-						vmPanic("vm: BC_REFDEC dtor closure rec has nil func_idx")
-					}
-					var dtorFunc @VMFunc = vm.Funcs.Get(fnIdx - 1)
-					// Enter the dtor's cleanup context BEFORE the push (§6) so pushFrame
-					// gives it the FULL stack (the red zone); a cascade deeper than the
-					// whole stack overflows with CleanupDepth > 0 → fatal.  The pop
-					// (BC_RETURN, freeOnPop != 0) balances it.
-					vm.CleanupDepth = vm.CleanupDepth + 1
-					var newRegsOff int = pushFrame(vm, dtorFunc, pc, funcIdx, regsOff, vm.SP, -1)
-					var newHdr *int = stackPtr(vm, newRegsOff - FRAME_HDR)
-					newHdr[5] = bit_cast(int, ptr)
-					var newRegs *int = stackPtr(vm, newRegsOff)
-					newRegs[0] = bit_cast(int, ptr)
-					funcIdx = fnIdx - 1
-					regsOff = newRegsOff
-					f, code, regs, frameBase = frameLocals(vm, funcIdx, regsOff)
-					pc = 0
-					continue
-				}
-			}
-			refDecCrossModeDispatch(handlePtr[types.FuncValueVtableIndex()], dataAddr, ptr)
 			continue
 		}
 		if execFuncRefOp(vm, f, regs, instr) { continue }

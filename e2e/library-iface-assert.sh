@@ -5,7 +5,7 @@
 #
 # A library artifact has no `__entry` (the program entry point where the
 # whole-program path wires the registry fill), so its registry must be built from
-# `bn_init` instead — walking the facade's `_pkg_satfrag` graph node.  Without
+# `bn_init` instead — walking the facade's `__pkg_satfrag` graph node.  Without
 # that, rt.BuildSatRegistry never runs in a library and EVERY interface
 # assertion/satisfaction lookup MISSES: the comma-ok assertion below returns
 # ok=false and the export yields the -1 sentinel.

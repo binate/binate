@@ -1,14 +1,14 @@
 #!/bin/sh
 # e2e/satentry-retention.sh — End-to-end test that the decentralized per-package
-# `_pkg_satfrag` graph retains every package's `__satentry.<T,J>` nodes across the
+# `__pkg_satfrag` graph retains every package's `__satentry.<T,J>` nodes across the
 # linker's dead-strip (RTTI, plan-rtti-decentralize.md).
 #
 # `impl T : J` emits a weak per-`(T,J)` `__satentry` record.  Each package emits a
-# `_pkg_satfrag` graph node listing its own `_pkg_satentries` array plus STRONG
-# symrefs to its direct dependencies' `_pkg_satfrag` nodes.  The main module's
+# `__pkg_satfrag` graph node listing its own `__pkg_satentries` array plus STRONG
+# symrefs to its direct dependencies' `__pkg_satfrag` nodes.  The main module's
 # node is pinned from `__entry` (LLVM `@llvm.used`; native a real LEA/ADRP reloc
-# via the `rt.BuildSatRegistry(&_pkg_satfrag)` call), and the strong dep chain
-# then retains the whole graph — so each package's `_pkg_satentries`, and thus its
+# via the `rt.BuildSatRegistry(&__pkg_satfrag)` call), and the strong dep chain
+# then retains the whole graph — so each package's `__pkg_satentries`, and thus its
 # `__satentry` nodes, survives dead-strip.  This test compiles a program with an
 # `impl` and asserts, via `nm`, that the graph AND the `__satentry` nodes — BOTH
 # the program's OWN and a cross-package DEPENDENCY's (`builtins/lang`, always
@@ -110,10 +110,10 @@ check_retention() {
         return
     fi
     syms="$("$NM" -a "$bin" 2>/dev/null)"
-    # The `_pkg_satfrag` graph must survive: main's node is pinned (the retention
+    # The `__pkg_satfrag` graph must survive: main's node is pinned (the retention
     # anchor), and the strong dep-symref chain keeps every package's node alive.
-    if ! printf '%s\n' "$syms" | grep -q '_pkg_satfrag'; then
-        fail "$label _pkg_satfrag graph dead-stripped" "no *_pkg_satfrag in nm output"
+    if ! printf '%s\n' "$syms" | grep -q '__pkg_satfrag'; then
+        fail "$label __pkg_satfrag graph dead-stripped" "no *__pkg_satfrag in nm output"
         return
     fi
     # The program's OWN impl node (Thing : Greeter) must survive.
@@ -122,15 +122,15 @@ check_retention() {
         return
     fi
     # A cross-package DEPENDENCY node (builtins/lang) must survive — retained via
-    # the strong `_pkg_satfrag` dep-symref chain from main (main's node strongly
-    # references lang's node, which references lang's `_pkg_satentries`).
+    # the strong `__pkg_satfrag` dep-symref chain from main (main's node strongly
+    # references lang's node, which references lang's `__pkg_satentries`).
     if ! printf '%s\n' "$syms" | grep -q 'satentry.*builtins4_lang'; then
         fail "$label dependency __satentry dead-stripped" \
             "no builtins/lang __satentry retained via the frag dep chain"
         return
     fi
     node_count="$(printf '%s\n' "$syms" | grep -c '__satentry\.')"
-    pass "$label (_pkg_satfrag graph + $node_count __satentry nodes survive dead-strip)"
+    pass "$label (__pkg_satfrag graph + $node_count __satentry nodes survive dead-strip)"
 }
 
 check_retention "llvm"                 # default backend (deps + main via LLVM)

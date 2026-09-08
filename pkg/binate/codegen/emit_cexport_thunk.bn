@@ -2,6 +2,7 @@ package "pkg/binate/codegen"
 
 import "pkg/binate/ir"
 import "pkg/binate/mangle"
+import "pkg/binate/native/common"
 import "pkg/binate/stringutils"
 import "pkg/binate/types"
 import "pkg/std/strings"
@@ -49,16 +50,24 @@ func emitCExportEntries(out *strings.Builder, f @ir.Func, funcRetTypes *[]FuncRe
 	}
 }
 
-// cExportNeedsThunk reports whether f has a parameter whose C-ABI passing form
-// differs from Binate's internal form and so requires an adapting entry thunk.
-// That is a >16-byte by-value aggregate on the targets whose C ABI passes such an
-// aggregate by value rather than as the internal single pointer: x86-64 (SysV
-// MEMORY class, `ptr byval`) and arm32 (AAPCS32, by-value coerced `[N x iW]`).
-// aarch64's conventions coincide (a >16-byte aggregate rides a pointer both ways),
-// so it never needs a thunk.  A >16-byte param is also what shifts the register
-// cursor and so is the only trigger — a ≤16-byte straddle only arises alongside
-// one.
+// cExportNeedsThunk reports whether f's C entry must ADAPT some part of the C ABI
+// to Binate's internal form and so requires an adapting entry thunk rather than a
+// plain alias.  Two independent triggers:
+//
+//   - the RETURN diverges (cExportRetNeedsAdapt) — a multi-value tuple the C ABI
+//     sret's but the internal convention keeps in registers.  This trigger fires
+//     on EVERY target, aarch64 included, and needs no parameter adaptation.
+//   - a PARAMETER diverges — a >16-byte by-value aggregate on the targets whose C
+//     ABI passes it by value rather than as the internal single pointer: x86-64
+//     (SysV MEMORY class, `ptr byval`) and arm32 (AAPCS32, by-value coerced
+//     `[N x iW]`).  aarch64's parameter conventions coincide (a >16-byte
+//     aggregate rides a pointer both ways).  A >16-byte param is also what shifts
+//     the register cursor, so it is the only param trigger — a ≤16-byte straddle
+//     only arises alongside one.
 func cExportNeedsThunk(f @ir.Func) bool {
+	if cExportRetNeedsAdapt(f) {
+		return true
+	}
 	if !targetIsX64() && types.GetTarget().PointerSize != 4 {
 		return false
 	}
@@ -68,6 +77,88 @@ func cExportNeedsThunk(f @ir.Func) bool {
 		}
 	}
 	return false
+}
+
+// cExportRetNeedsAdapt reports whether f's RETURN convention differs between the
+// platform C ABI (what a C caller of the export uses) and Binate's internal
+// convention (what the mangled definition emits), so the C entry must ADAPT the
+// return rather than expose the internal one directly.  Two divergences:
+//
+//   - sret: a multi-value tuple the C ABI returns via a hidden sret buffer
+//     (cMultiRetNeedsSret) while the internal convention keeps it in the return
+//     registers as a first-class aggregate (!multiRetNeedsSret).  The internal
+//     register budget (FuncReturnsBigMultiReturn — up to 8 GP on aarch64, 3 on
+//     x86-64, 4 on arm32, matching clang's FCA-return lowering) is WIDER than the
+//     C struct-return budget (> 16-byte / > 4-byte → memory), so the internal
+//     convention register-returns a tuple the C ABI sret's.
+//   - in-register packing (cExportMultiRetInRegCoerced): both return in registers
+//     but the C ABI PACKS sub-word fields per eightbyte where the internal FCA
+//     spreads them.
+//
+// A single aggregate return uses the C cutoff (needsSret) on both sides and the
+// same coercion, so it never diverges; and whenever the internal convention
+// itself sret's the tuple, the narrower C budget does too, so both forward the
+// same sret buffer with no adaptation.
+func cExportRetNeedsAdapt(f @ir.Func) bool {
+	return (cMultiRetNeedsSret(f) && !multiRetNeedsSret(f)) || cExportMultiRetInRegCoerced(f)
+}
+
+// cExportMultiRetInRegCoerced reports whether f's multi-value return is returned
+// IN registers by BOTH the C ABI and the internal convention, but the C ABI PACKS
+// sub-word fields per eightbyte where the internal first-class aggregate spreads
+// them (e.g. aarch64 (int32,int32): clang packs into x0, the FCA uses w0/w1) — so
+// the C entry must present clang's eightbyte-coerced form, reinterpreted from the
+// internal return.  NOT the sret case (cMultiRetNeedsSret) nor an HFA
+// (common.CMultiReturnTupleReturnsHfaInFpRegs — the FCA already matches clang's
+// FP-register return).
+// The trigger is a field narrower than a register word: a tuple of word-sized
+// fields (the common (T, @Error)) needs no repack and stays a plain alias.
+func cExportMultiRetInRegCoerced(f @ir.Func) bool {
+	if len(f.Results) <= 1 {
+		return false
+	}
+	return common.CMultiReturnTupleInRegCoerced(f.MultiReturnType)
+}
+
+// writeCMultiReturnCoercedType writes clang's C struct-return coerced type for f's
+// in-register multi-value tuple `t`: the x86-64 SSE eightbyte form
+// (sysvReturnLLTy) when any eightbyte classifies SSE, else the GP `[N x iW]`
+// coercion (aggCoerceLLTy) — the SAME spelling a single named-aggregate return of
+// the tuple's layout uses, which clang agrees with.  The SSE test classifies the
+// eightbytes directly (tupleReturnHasSseEightbyteX64) rather than via SysVInSse,
+// which excludes the ANONYMOUS multi-return tuple from the coerced-kind set.  Only
+// valid for the register-return coercion cases (not sret, not HFA — so
+// aggCoerceLLTy takes its GP branch, never the SIMD one).
+func writeCMultiReturnCoercedType(out *strings.Builder, t @types.Type) {
+	if targetIsX64() && tupleReturnHasSseEightbyteX64(t) {
+		sysvReturnLLTy(out, t)
+	} else {
+		aggCoerceLLTy(out, t)
+	}
+}
+
+// tupleReturnHasSseEightbyteX64 reports whether any eightbyte of the multi-return
+// tuple `t` classifies as an x86-64 SSE (float) eightbyte — so the C struct-return
+// coerced form places it in an XMM register.  Classifies structurally
+// (SysVClassify), so it applies to the anonymous tuple that SysVInSse excludes.
+func tupleReturnHasSseEightbyteX64(t @types.Type) bool {
+	var cl @[]int = types.SysVClassify(t)
+	for eb := 0; eb < len(cl); eb++ {
+		if cl[eb] == types.EB_SSE {
+			return true
+		}
+	}
+	return false
+}
+
+// cMultiRetNeedsSret reports whether a C caller of a #[c_export] returning f's
+// multi-value tuple receives it via a hidden sret buffer.  Thin @ir.Func wrapper
+// over the shared common.CMultiReturnTupleNeedsSret, which both backends consult.
+func cMultiRetNeedsSret(f @ir.Func) bool {
+	if len(f.Results) <= 1 {
+		return false
+	}
+	return common.CMultiReturnTupleNeedsSret(f.MultiReturnType)
 }
 
 // emitCExportThunk emits a C-ABI entry thunk named cname that forwards to f's
@@ -86,51 +177,91 @@ func cExportNeedsThunk(f @ir.Func) bool {
 //     coerced `[N x iW]`, spilled, forwarded `ptr byval(<T>)` of the slot;
 //   - a ≤16-byte aggregate classified the same way by both conventions: forwarded
 //     straight through (coerced value, or an x86-64 both-memory byval pointer).
-// Every scalar / pointer forwards straight through (same LLVM type; LLVM re-assigns
-// the registers).  The return (including sret) is forwarded unchanged — the
-// internal and C sret thresholds coincide on both targets.
+// Every scalar / pointer forwards straight through (same LLVM type; LLVM
+// re-assigns the registers).  The RETURN is forwarded unchanged when the C and
+// internal conventions agree, but a divergent multi-value tuple
+// (cExportRetNeedsAdapt) is ADAPTED — two shapes: (1) retAdapt, the C ABI sret's a
+// tuple the internal convention register-returns → declare the sret buffer, call
+// the register-returning def, STORE the first-class aggregate into the buffer; (2)
+// cRegCoerce, both register-return but the C ABI packs sub-word fields per
+// eightbyte → declare clang's coerced return type and REINTERPRET the internal
+// return through a memory slot.  So the sret decision is split — cUseSret governs
+// the C-facing signature, intUseSret the internal call.
 func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
 		funcRetTypes *[]FuncRetType) {
 	var mangled @[]char = mangle.FuncName(modulePkgName, f.Name)
 
-	// Match the mangled definition's return shape (emitFuncDbg): a large aggregate
-	// / large multi-return returns via sret; everything else returns by value.
-	var useSret bool = false
+	// The C-facing return convention (cUseSret) can differ from the mangled
+	// definition's internal one (intUseSret): a single large aggregate sret's on
+	// both sides (needsSret), but a multi-value tuple in the divergence window
+	// sret's in C (cMultiRetNeedsSret) yet rides the return registers internally
+	// (multiRetNeedsSret) — retAdapt.  A single result's decision is identical both
+	// ways, so retAdapt is only ever a multi-return.  cRegCoerce is the register-
+	// return packing divergence — no sret either side, but the C form is coerced.
+	var singleSret bool = len(f.Results) == 1 && needsSret(f.Results[0])
+	var cUseSret bool = singleSret || cMultiRetNeedsSret(f)
+	var intUseSret bool = singleSret || multiRetNeedsSret(f)
+	var retAdapt bool = cUseSret && !intUseSret
+	var cRegCoerce bool = cExportMultiRetInRegCoerced(f)
+	// coerceFromSret (x86-64): the C ABI register-returns a tuple the internal
+	// convention sret's (> 3 narrow GP words the C ABI packs into ≤ 2 eightbytes).
+	// The body writes a LOCAL buffer the entry then reloads in clang's coerced form.
+	var coerceFromSret bool = cRegCoerce && intUseSret
 	var sretRetType @[]char
-	if len(f.Results) == 1 && needsSret(f.Results[0]) {
-		useSret = true
-		sretRetType = llvmType(f.Results[0])
-	} else if multiRetNeedsSret(f) {
-		useSret = true
-		sretRetType = llvmType(f.MultiReturnType)
+	if cUseSret || intUseSret {
+		if singleSret {
+			sretRetType = llvmType(f.Results[0])
+		} else {
+			sretRetType = llvmType(f.MultiReturnType)
+		}
 	}
 
+	// retTyp is the value the INTERNAL mangled call returns — void when it returns
+	// via sret (or has no results), else its by-value / first-class-aggregate type
+	// (lookupRetType).  It also spells the C-facing declared return type when the C
+	// ABI returns by value in the SAME form (!cUseSret && !cRegCoerce).
 	var retTyp @[]char = "void"
-	if !useSret && len(f.Results) > 0 {
+	if !intUseSret && len(f.Results) > 0 {
 		retTyp = lookupRetType(funcRetTypes, mangled)
 	}
 
 	out.Write("define ")
 	// A sub-`int`-width scalar return carries the platform extension attribute,
 	// exactly as the mangled definition does (see cabiIntExtAttr).
-	if !useSret && len(f.Results) == 1 && !aggRetCoerced(f.Results[0]) {
+	if !cUseSret && len(f.Results) == 1 && !aggRetCoerced(f.Results[0]) {
 		out.Write(cabiIntExtAttr(f.Results[0]))
 	}
-	out.Write(retTyp)
+	if cUseSret {
+		out.Write("void")
+	} else if cRegCoerce {
+		writeCMultiReturnCoercedType(out, f.MultiReturnType)
+	} else {
+		out.Write(retTyp)
+	}
 	out.WriteByte(' ')
 	writeLLVMQuotedName(out, cname)
 	out.WriteByte('(')
 
-	var defArgTypes @[]@types.Type = defineArgTypes(f, useSret)
-	var defSretOff int = 0
-	if useSret {
+	// Two register cursors: the C-facing declaration/arrival (cDefArgTypes/cSretOff,
+	// with the sret buffer pointer prepended iff cUseSret) and the internal forward
+	// (intDefArgTypes/intSretOff).  They coincide unless retAdapt, where only the C
+	// side carries the sret slot — which on SretInGpArgReg targets (x86-64/arm32)
+	// shifts the GP cursor and thus a following aggregate's memory-class decision.
+	var cDefArgTypes @[]@types.Type = defineArgTypes(f, cUseSret)
+	var cSretOff int = 0
+	var intDefArgTypes @[]@types.Type = defineArgTypes(f, intUseSret)
+	var intSretOff int = 0
+	if intUseSret {
+		intSretOff = 1
+	}
+	if cUseSret {
 		out.Write("ptr sret(")
 		out.Write(sretRetType)
 		out.Write(") align 8 %ca.sret")
 		if len(f.Params) > 0 {
 			out.Write(", ")
 		}
-		defSretOff = 1
+		cSretOff = 1
 	}
 	// Parameters in the platform C form (writeCAbiParamType, shared with the
 	// __c_call declare): a >16-byte aggregate is `ptr byval` on x86-64 but a
@@ -140,7 +271,7 @@ func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
 		if i > 0 {
 			out.Write(", ")
 		}
-		if cExportThunkParamCSse(f, i, defArgTypes, defSretOff) {
+		if cExportThunkParamCSse(f, i, cDefArgTypes, cSretOff) {
 			// x86-64 SSE (float) aggregate the C ABI passes SSE-split in XMM/GP:
 			// declare it SSE-split (one param per eightbyte), not the GP
 			// `[N x i64]` — writeCAbiParamType would have the thunk read it from a
@@ -149,7 +280,7 @@ func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
 			// that reconstructs to a byval below.)
 			sysvWriteThunkSseParams(out, i, f.Params[i].Typ)
 		} else {
-			writeCAbiParamType(out, f.Params[i].Typ, defArgTypes, i + defSretOff)
+			writeCAbiParamType(out, f.Params[i].Typ, cDefArgTypes, i + cSretOff)
 			// A sub-`int` scalar param carries the platform C extension attribute
 			// (`i8 signext` / `i8 zeroext`) here, matching what clang emits for the
 			// same C prototype (and the __c_call declare, writeCCallParamType).  The
@@ -169,6 +300,15 @@ func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
 	writeFnDefineAttrs(out)
 	out.Write(" {\nentry:\n")
 
+	if coerceFromSret {
+		// The C ABI returns the tuple in registers but the body sret's it: give the
+		// body a LOCAL buffer (sized to the coerced form, ≥ the tuple) to write, then
+		// reload it packed below.  The C caller passed no sret pointer.
+		out.Write("  %ca.sret = alloca ")
+		writeCMultiReturnCoercedType(out, f.MultiReturnType)
+		out.Write(", align 8\n")
+	}
+
 	// Spill each param that arrives as a VALUE but the internal convention forwards
 	// as a pointer: a >16-byte aggregate on arm32 (arrives coerced `[N x iW]`, needs
 	// a `ptr`), or a ≤16-byte x86-64 aggregate that is register-class in C but
@@ -184,8 +324,8 @@ func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
 	// `ptr` forward reads only SizeOf(T) ≤ the slot.  (Same rule as
 	// writeAggParamAllocaDecl.)
 	for i := 0; i < len(f.Params); i++ {
-		if cExportThunkParamCSse(f, i, defArgTypes, defSretOff) &&
-				aggMemClass(defArgTypes, i + defSretOff) {
+		if cExportThunkParamCSse(f, i, cDefArgTypes, cSretOff) &&
+				aggMemClass(intDefArgTypes, i + intSretOff) {
 			// x86-64 SSE aggregate that is register-class in C (arrives SSE-split)
 			// but MEMORY-class internally (a preceding >16-byte aggregate shifted
 			// the GP cursor): reconstruct the split eightbytes into the slot, then
@@ -193,13 +333,13 @@ func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
 			// branch.  The plain (single-value) spill below can't apply — the param
 			// arrives as several `%ca<i>.ag<eb>` values, not one `%ca<i>`.
 			sysvWriteThunkSseSpill(out, i, f.Params[i].Typ)
-		} else if cExportThunkParamSpills(f, i, defArgTypes, defSretOff) {
+		} else if cExportThunkParamSpills(f, i, cDefArgTypes, cSretOff, intDefArgTypes, intSretOff) {
 			out.Write("  %ca")
 			stringutils.WriteInt(out, i)
 			out.Write(".slot = alloca ")
-			writeCAbiParamType(out, f.Params[i].Typ, defArgTypes, i + defSretOff)
+			writeCAbiParamType(out, f.Params[i].Typ, cDefArgTypes, i + cSretOff)
 			out.Write(", align 8\n  store ")
-			writeCAbiParamType(out, f.Params[i].Typ, defArgTypes, i + defSretOff)
+			writeCAbiParamType(out, f.Params[i].Typ, cDefArgTypes, i + cSretOff)
 			out.Write(" %ca")
 			stringutils.WriteInt(out, i)
 			out.Write(", ptr %ca")
@@ -208,7 +348,7 @@ func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
 		}
 	}
 
-	if useSret || len(f.Results) == 0 {
+	if intUseSret || len(f.Results) == 0 {
 		out.Write("  call void @")
 	} else {
 		out.Write("  %r = call ")
@@ -217,7 +357,7 @@ func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
 	}
 	out.Write(mangled)
 	out.WriteByte('(')
-	if useSret {
+	if intUseSret {
 		out.Write("ptr sret(")
 		out.Write(sretRetType)
 		out.Write(") %ca.sret")
@@ -233,18 +373,18 @@ func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
 		if f.Params[i].Typ.IsByvalParam() {
 			out.Write("ptr %ca") // >16-byte aggregate: internal plain pointer
 			stringutils.WriteInt(out, i)
-			if cExportThunkParamSpills(f, i, defArgTypes, defSretOff) {
+			if cExportThunkParamSpills(f, i, cDefArgTypes, cSretOff, intDefArgTypes, intSretOff) {
 				out.Write(".slot") // arm32: forward the materialized copy (x64: the byval ptr)
 			}
-		} else if aggMemClass(defArgTypes, i + defSretOff) {
+		} else if aggMemClass(intDefArgTypes, i + intSretOff) {
 			// ≤16-byte aggregate the internal convention passes MEMORY-class byval.
 			writeByvalMemType(out, f.Params[i].Typ)
 			out.Write(" %ca")
 			stringutils.WriteInt(out, i)
-			if cExportThunkParamSpills(f, i, defArgTypes, defSretOff) {
+			if cExportThunkParamSpills(f, i, cDefArgTypes, cSretOff, intDefArgTypes, intSretOff) {
 				out.Write(".slot") // forward the spilled copy, not the register value
 			}
-		} else if cExportThunkParamIsSse(f, i, defArgTypes, defSretOff) {
+		} else if cExportThunkParamIsSse(f, i, cDefArgTypes, cSretOff, intDefArgTypes, intSretOff) {
 			// x86-64 in-register SSE aggregate: forward the SSE-split values
 			// straight to the internal define's matching SSE-split params (same
 			// per-eightbyte types the C ABI delivered).
@@ -256,7 +396,39 @@ func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
 		}
 	}
 	out.Write(")\n")
-	if useSret || len(f.Results) == 0 {
+	if retAdapt {
+		// The C ABI returns the tuple via the sret buffer, but the internal
+		// definition returned it as a first-class aggregate in %r: store it into
+		// the caller's buffer at the tuple's field offsets, then return void.
+		out.Write("  store ")
+		out.Write(retTyp)
+		out.Write(" %r, ptr %ca.sret\n  ret void\n")
+	} else if coerceFromSret {
+		// The body wrote the tuple into the local buffer (its sret pointer): reload
+		// clang's eightbyte-coerced form and return it.
+		out.Write("  %rc = load ")
+		writeCMultiReturnCoercedType(out, f.MultiReturnType)
+		out.Write(", ptr %ca.sret\n  ret ")
+		writeCMultiReturnCoercedType(out, f.MultiReturnType)
+		out.Write(" %rc\n")
+	} else if cRegCoerce {
+		// Both return in registers, but the C ABI packs the tuple's sub-word
+		// fields per eightbyte where the internal aggregate %r spreads them.
+		// Reinterpret through a shared slot: store the internal form, load clang's
+		// coerced form (same bytes; the coerced type is >= the tuple size, so its
+		// trailing padding lanes read the slot's uninitialized tail — undefined,
+		// exactly as clang leaves them).  align 8 covers both LP64 (i64) and the
+		// 8-aligned ILP32 coercion words.
+		out.Write("  %ca.rslot = alloca ")
+		writeCMultiReturnCoercedType(out, f.MultiReturnType)
+		out.Write(", align 8\n  store ")
+		out.Write(retTyp)
+		out.Write(" %r, ptr %ca.rslot\n  %rc = load ")
+		writeCMultiReturnCoercedType(out, f.MultiReturnType)
+		out.Write(", ptr %ca.rslot\n  ret ")
+		writeCMultiReturnCoercedType(out, f.MultiReturnType)
+		out.Write(" %rc\n")
+	} else if cUseSret || len(f.Results) == 0 {
 		out.Write("  ret void\n")
 	} else {
 		out.Write("  ret ")
@@ -275,15 +447,18 @@ func emitCExportThunk(out *strings.Builder, f @ir.Func, cname *[]readonly char,
 // `ptr byval`.  It does NOT spill when the C ABI already hands over a pointer: an
 // x86-64 >16-byte aggregate (`ptr byval`) or a ≤16-byte aggregate that is
 // memory-class in C too — those forward the incoming pointer directly.
-func cExportThunkParamSpills(f @ir.Func, i int, defArgTypes @[]@types.Type, defSretOff int) bool {
+// The two cursors (cArgTypes/cOff vs intArgTypes/intOff) coincide unless the
+// return is being adapted (retAdapt), where only the C side carries the sret slot.
+func cExportThunkParamSpills(f @ir.Func, i int, cArgTypes @[]@types.Type, cOff int,
+		intArgTypes @[]@types.Type, intOff int) bool {
 	var at @types.Type = f.Params[i].Typ
 	// The internal convention forwards this param as a pointer: a >16-byte aggregate
 	// (plain `ptr`) or an x86-64 ≤16-byte MEMORY-class straddle (`ptr byval`).
-	var forwardIndirect bool = at.IsByvalParam() || aggMemClass(defArgTypes, i + defSretOff)
+	var forwardIndirect bool = at.IsByvalParam() || aggMemClass(intArgTypes, i + intOff)
 	// The C ABI already hands it over AS a pointer only for an x86-64 byval: a
 	// >16-byte aggregate, or a ≤16-byte straddle that is memory-class in C too.
 	var cAbiByvalPtr bool = (targetIsX64() && at.IsByvalParam()) ||
-			aggMemClassMaybeC(defArgTypes, i + defSretOff, true)
+			aggMemClassMaybeC(cArgTypes, i + cOff, true)
 	return forwardIndirect && !cAbiByvalPtr
 }
 
@@ -311,7 +486,7 @@ func cExportThunkParamCSse(f @ir.Func, i int, defArgTypes @[]@types.Type, defSre
 // internally — a mixed int+float aggregate whose GP eightbyte no longer fits the
 // internal GP file) is declared SSE-split but reconstructed to a `ptr byval` for
 // the internal define (sysvWriteThunkSseSpill + the aggMemClass forward branch).
-func cExportThunkParamIsSse(f @ir.Func, i int, defArgTypes @[]@types.Type, defSretOff int) bool {
-	return cExportThunkParamCSse(f, i, defArgTypes, defSretOff) &&
-			!aggMemClass(defArgTypes, i + defSretOff)
+func cExportThunkParamIsSse(f @ir.Func, i int, cArgTypes @[]@types.Type, cOff int,
+		intArgTypes @[]@types.Type, intOff int) bool {
+	return cExportThunkParamCSse(f, i, cArgTypes, cOff) && !aggMemClass(intArgTypes, i + intOff)
 }

@@ -1,0 +1,111 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// #[c_export] multi-value-RETURN C-ABI adaptation (aarch64).
+//
+// A #[c_export] function returning a multi-value tuple presents Binate's INTERNAL
+// return convention (fields in X0../D0.. by the register-count rule).  A C caller
+// uses the platform C struct-return ABI, which diverges for two shapes (see
+// common.CMultiReturnTuple*): the C ABI SRET's a tuple the internal convention
+// register-returns, or it PACKS sub-word fields per eightbyte where the internal
+// convention spreads them.  Neither the in-place narrow-register prefix nor a
+// tail-branch can serve — the adaptation happens AFTER the body returns — so the C
+// entry becomes a TRAMPOLINE: it calls the mangled body, then repacks the returned
+// tuple into the C form (store the field-per-register result to a buffer via
+// storeMultiReturnTupleFieldsAA64 — at the sret buffer the caller passed in X8, or
+// a local slot it then reloads as clang's coerced words).
+//
+// On aarch64 the C and internal ARGUMENT conventions coincide (the sret buffer
+// rides X8, a dedicated register, not a GP arg register, so it shifts nothing), so
+// register args pass straight through; only stack args (a > 8-GP/FP function) are
+// copied into the body's outgoing-args area, and narrow register args are
+// normalized exactly as emitCExportRegNorm does for the non-trampoline entry.
+
+// cExportRetTrampolineKindAA64 classifies f's #[c_export] return adaptation:
+// common.CRET_ADAPT_NONE (alias / narrow-prefix entry suffices), _SRET (store the
+// register result into the caller's X8 buffer), or _COERCE (repack into clang's
+// eightbyte-packed words).  Only a multi-value return can diverge.
+func cExportRetTrampolineKindAA64(f @ir.Func, cc common.CallConv) int {
+	if len(f.Results) <= 1 || f.MultiReturnType == nil {
+		return common.CRET_ADAPT_NONE
+	}
+	return cc.CExportMultiReturnAdaptKind(f.MultiReturnType)
+}
+
+// emitCExportRetTrampolineAA64 emits the C-entry trampoline for a #[c_export]
+// whose multi-value return needs C-ABI adaptation (kind 1 or 2 above).  It runs
+// under the export alias label(s) (already defined by the caller) and ends with
+// RET; a native caller enters at `sym` (defined immediately after) and skips it.
+func emitCExportRetTrampolineAA64(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
+		sym *[]readonly char) {
+	var cc common.CallConv = rm.CC
+	var t @types.Type = f.MultiReturnType
+	var kind int = cExportRetTrampolineKindAA64(f, cc)
+
+	var paramTypes @[]@types.Type = make_slice(@types.Type, len(f.Params))
+	for pi := 0; pi < len(f.Params); pi++ {
+		paramTypes[pi] = f.Params[pi].Typ
+	}
+	// Frame: [SP .. outBytes) = the body's outgoing stack args; [SP+saveOff .. +16)
+	// = the sret-buffer stash / coercion repack slot; [SP+fpLrOff .. +16) = saved
+	// FP/LR.  outBytes is 16-aligned (CallStackBytes), so every offset and frameSz
+	// stay 16-aligned — SP is 16-aligned at BL.
+	var outBytes int = cc.CallStackBytes(paramTypes)
+	var saveOff int = outBytes
+	var fpLrOff int = outBytes + 16
+	var frameSz int = outBytes + 32
+
+	aarch64.Sub(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(frameSz))
+	aarch64.Stp(a, true, aarch64.FP, aarch64.LR, aarch64.MemImm(aarch64.SP, fpLrOff))
+	aarch64.Add(a, true, aarch64.FP, aarch64.SP, aarch64.Imm(fpLrOff))
+
+	// Copy incoming stack args (at the caller's SP, now SP+frameSz) down to the
+	// body's outgoing-args area at SP.  Register args (X0..X7 / V0..V7) are already
+	// where the body expects them — the conventions coincide on aarch64 — so only
+	// the stack tail moves.  X9 is scratch (not an argument register).
+	var off int = 0
+	for off < outBytes {
+		aarch64.Ldr(a, true, aarch64.X9, aarch64.MemImm(aarch64.SP, frameSz + off))
+		aarch64.Str(a, true, aarch64.X9, aarch64.MemImm(aarch64.SP, off))
+		off = off + 8
+	}
+
+	// Stash the C sret buffer (X8) across the body call — the body is register-
+	// returning and would leave X8 undefined.
+	if kind == common.CRET_ADAPT_SRET {
+		aarch64.Str(a, true, aarch64.X8, aarch64.MemImm(aarch64.SP, saveOff))
+	}
+
+	// Sign/zero-extend narrow register args in place, exactly as the non-trampoline
+	// entry (emitCExportRegNorm) — the body reads full registers.  Stack narrow args
+	// are canonicalized by the body's own parameter spill.
+	emitCExportRegNorm(a, rm, f)
+
+	aarch64.Bl(a, sym)
+
+	if kind == common.CRET_ADAPT_SRET {
+		// Sret: store the field-per-register result into the caller's buffer, and
+		// return its address in X0 (AAPCS64 §6.9 indirect-result convention).
+		aarch64.Ldr(a, true, aarch64.X9, aarch64.MemImm(aarch64.SP, saveOff))
+		storeMultiReturnTupleFieldsAA64(a, t, aarch64.X9, 0, aarch64.X10)
+		aarch64.Mov(a, true, aarch64.X0, aarch64.Reg(aarch64.X9))
+	} else {
+		// In-register coercion: store the field-per-register result into the local
+		// slot at its field offsets, then reload clang's eightbyte-packed words into
+		// the GP return registers (a non-HFA in-register tuple returns in X0..).
+		storeMultiReturnTupleFieldsAA64(a, t, aarch64.SP, saveOff, aarch64.X10)
+		var words int = (t.SizeOf() + 7) / 8
+		for w := 0; w < words; w++ {
+			aarch64.Ldr(a, true, argReg(w), aarch64.MemImm(aarch64.SP, saveOff + 8 * w))
+		}
+	}
+
+	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR, aarch64.MemImm(aarch64.SP, fpLrOff))
+	aarch64.Add(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(frameSz))
+	aarch64.Ret(a)
+}

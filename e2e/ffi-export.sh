@@ -241,6 +241,50 @@ type FfiMix struct { i int64; f float64 }
 func BigMix(big FfiBig, a int64, b int64, c int64, d int64, e int64, mix FfiMix) int64 {
 	return big.a + big.b + big.c + a + b + c + d + e + mix.i + cast(int64, cast(int, mix.f))
 }
+
+// MULTI-VALUE returns crossing the C boundary.  A conforming C caller reads each
+// tuple as the C struct it declares; the entry must present the platform C
+// struct-return ABI, which diverges from Binate's internal multi-return
+// convention in several ways (register-vs-sret budget, sub-word packing, HFA):
+//   - Mret3i (24B, 3x i64): the internal convention register-returns it (fits the
+//     GP return budget) but the C ABI sret's it (> 16B) — the entry must store the
+//     register result into the caller's sret buffer.
+//   - Mret2i (8B, 2x i32): both register-return, but the C ABI packs the two i32s
+//     into ONE eightbyte where the internal convention spreads them — the entry
+//     must present the coerced (packed) form.
+//   - Mret4i (16B, 4x i32): on x86-64 the internal 3-GP-word budget sret's it while
+//     the C ABI register-returns it in 2 eightbytes (coerce-from-sret); on aarch64
+//     it is a sub-word packing coerce.
+//   - Mret3f (24B, 3x f64): an aarch64 / arm32-hard-float HFA (returned in FP
+//     registers both ways → plain alias); on x86-64 it is a > 16B sret.
+// Read back by driver_multiret.c across whichever host arch runs the e2e.
+#[c_export("mret3i")]
+func Mret3i() (int64, int64, int64) {
+	return cast(int64, 10), cast(int64, 20), cast(int64, 30)
+}
+
+#[c_export("mret2i")]
+func Mret2i() (int32, int32) { return cast(int32, 7), cast(int32, 9) }
+
+#[c_export("mret4i")]
+func Mret4i() (int32, int32, int32, int32) {
+	return cast(int32, 1), cast(int32, 2), cast(int32, 3), cast(int32, 4)
+}
+
+#[c_export("mret3f")]
+func Mret3f() (float64, float64, float64) {
+	return cast(float64, 1), cast(float64, 2), cast(float64, 3)
+}
+
+// MIXED int+float word-sized tuples: on aarch64 a non-HFA composite returns
+// WHOLLY in GP registers, but the internal convention puts the float field in a D
+// register — so even these all-8-byte tuples must be repacked.  (float64, @Error)
+// is the value-or-error idiom; here (int64,float64) / (float64,int64) stand in.
+#[c_export("mretif")]
+func Mretif() (int64, float64) { return cast(int64, 5), cast(float64, 6) }
+
+#[c_export("mretfi")]
+func Mretfi() (float64, int64) { return cast(float64, 8), cast(int64, 9) }
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -388,6 +432,73 @@ check_bigagg() {
         pass "$label: C passes a >16-byte struct by value; callee reads its fields: '$got'"
     else
         fail "$label: big-struct-by-value output mismatch (got '$got', want '$WANT_BIGAGG')"
+    fi
+}
+
+# --- a C driver that reads MULTI-VALUE returns by struct ------------------
+# Each #[c_export] tuple is declared as the C struct a conforming caller uses;
+# the entry must adapt the internal multi-return convention to the platform C
+# struct-return ABI (sret / eightbyte-packing / HFA — see the facade comments).
+cat > "$TMP/driver_multiret.c" <<'EOF'
+#include <stdio.h>
+struct M3i { long a, b, c; };
+struct M2i { int a, b; };
+struct M4i { int a, b, c, d; };
+struct M3f { double a, b, c; };
+struct Mif { long a; double b; };
+struct Mfi { double a; long b; };
+extern struct M3i mret3i(void);
+extern struct M2i mret2i(void);
+extern struct M4i mret4i(void);
+extern struct M3f mret3f(void);
+extern struct Mif mretif(void);
+extern struct Mfi mretfi(void);
+int main(void) {
+    struct M3i a = mret3i(); printf("%ld %ld %ld\n", a.a, a.b, a.c);
+    struct M2i b = mret2i(); printf("%d %d\n", b.a, b.b);
+    struct M4i c = mret4i(); printf("%d %d %d %d\n", c.a, c.b, c.c, c.d);
+    struct M3f d = mret3f(); printf("%.0f %.0f %.0f\n", d.a, d.b, d.c);
+    struct Mif e = mretif(); printf("%ld %.0f\n", e.a, e.b);
+    struct Mfi f = mretfi(); printf("%.0f %ld\n", f.a, f.b);
+    return 0;
+}
+EOF
+WANT_MULTIRET="10 20 30
+7 9
+1 2 3 4
+1 2 3
+5 6
+8 9"
+
+# check_multiret <label> <extra-bnc-flags> <required>
+#   Links the multi-value-return driver and checks the C caller reads each tuple
+#   correctly.  Same required/skip semantics as check_bigagg.
+check_multiret() {
+    label="multiret-$1"; extra="$2"; required="$3"
+    work="$TMP/$label"
+    mkdir -p "$work"
+    if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
+            $extra --build-dir "$work" --pkg ffiexp >"$work/pkg.log" 2>&1 \
+            || [ ! -f "$work/ffiexp.o" ]; then
+        if [ "$required" -eq 1 ]; then
+            fail "$label: compile of facade (--pkg ffiexp) produced no object" \
+                 "$(tail -5 "$work/pkg.log")"
+        else
+            skip "$label: native --pkg unavailable for this host (no object emitted)"
+        fi
+        return
+    fi
+    if ! "$CLANG" -w "$TMP/driver_multiret.c" "$work/ffiexp.o" -o "$work/run" 2>"$work/link.err" \
+            || [ ! -x "$work/run" ]; then
+        fail "$label: link of multi-return driver + facade object failed" \
+             "$(head -6 "$work/link.err")"
+        return
+    fi
+    got="$("$work/run" 2>&1)"
+    if [ "$got" = "$WANT_MULTIRET" ]; then
+        pass "$label: C reads #[c_export] multi-value returns by struct: '$(echo "$got" | tr '\n' '/')'"
+    else
+        fail "$label: multi-return output mismatch (got '$got', want '$WANT_MULTIRET')"
     fi
 }
 
@@ -561,6 +672,12 @@ check_narrow_returns "native" "--backend native" 0
 # native check self-skips where the host native backend can't emit the facade.)
 check_bigagg "llvm" "" 1
 check_bigagg "native" "--backend native" 0
+
+# MULTI-VALUE returns read by struct — both backends adapt the tuple to the C
+# struct-return ABI (sret / eightbyte-packing / HFA, per the host arch).  LLVM is
+# required; native self-skips when the host backend can't emit the facade.
+check_multiret "llvm" "" 1
+check_multiret "native" "--backend native" 0
 
 # The --library archive: init-once-via-bn_init + call the exports from a real .a.
 check_library

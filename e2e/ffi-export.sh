@@ -16,6 +16,11 @@
 # that variant self-skips).  So the native second-symbol emission gets real
 # link-and-run coverage, not just an in-memory symbol-table assertion.
 #
+# Beyond the #[c_export] names, the facade also covers MULTI-VALUE returns crossing
+# the C boundary two ways: called directly by C name (check_multiret) and reached
+# THROUGH a __c_entry callback pointer (check_centry) — both must adapt Binate's
+# internal multi-return convention to the platform C struct-return ABI.
+#
 # The exported functions are PURE COMPUTE (no I/O, no allocation), so the object
 # is self-contained: it needs neither runtime I/O shims nor a Binate
 # main/runtime, so the C driver owns main() and links the object directly,
@@ -285,6 +290,36 @@ func Mretif() (int64, float64) { return cast(int64, 5), cast(float64, 6) }
 
 #[c_export("mretfi")]
 func Mretfi() (float64, int64) { return cast(float64, 8), cast(int64, 9) }
+
+// PADDED tuple: (int32,int64) has an interior pad between the sub-word i32 and the
+// i64, so its per-field-coerced boundary return type differs STRUCTURALLY from the
+// raw padded aggregate (the pad shifts the i64 into the next return register).  A
+// thunk that forwards the raw padded type instead of the coerced boundary form
+// reads the second field from the wrong register — the exact regression class.
+#[c_export("mretpad")]
+func Mretpad() (int32, int64) { return cast(int32, 11), cast(int64, 22) }
+
+// __c_entry POINTERS to multi-return functions: each getter hands C the address
+// of a callback that returns a divergent tuple, so C invokes it THROUGH the
+// pointer.  This must present the same platform struct-return ABI the #[c_export]
+// entries do — the pointer names the weak __centry.<mangled> return-adaptation
+// thunk (or the mangled entry directly when the return needs no adaptation).
+// Reuses the Mret* targets above; a getter returns *uint8 (C void*), a pure
+// compile-time symbol address, so the facade stays self-contained.
+#[c_export("get_cb_mret3i")]
+func GetCbMret3i() *uint8 { return __c_entry(Mret3i) }
+
+#[c_export("get_cb_mret2i")]
+func GetCbMret2i() *uint8 { return __c_entry(Mret2i) }
+
+#[c_export("get_cb_mret4i")]
+func GetCbMret4i() *uint8 { return __c_entry(Mret4i) }
+
+#[c_export("get_cb_mretif")]
+func GetCbMretif() *uint8 { return __c_entry(Mretif) }
+
+#[c_export("get_cb_mretpad")]
+func GetCbMretpad() *uint8 { return __c_entry(Mretpad) }
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -447,12 +482,14 @@ struct M4i { int a, b, c, d; };
 struct M3f { double a, b, c; };
 struct Mif { long a; double b; };
 struct Mfi { double a; long b; };
+struct Mpad { int a; long b; };
 extern struct M3i mret3i(void);
 extern struct M2i mret2i(void);
 extern struct M4i mret4i(void);
 extern struct M3f mret3f(void);
 extern struct Mif mretif(void);
 extern struct Mfi mretfi(void);
+extern struct Mpad mretpad(void);
 int main(void) {
     struct M3i a = mret3i(); printf("%ld %ld %ld\n", a.a, a.b, a.c);
     struct M2i b = mret2i(); printf("%d %d\n", b.a, b.b);
@@ -460,6 +497,7 @@ int main(void) {
     struct M3f d = mret3f(); printf("%.0f %.0f %.0f\n", d.a, d.b, d.c);
     struct Mif e = mretif(); printf("%ld %.0f\n", e.a, e.b);
     struct Mfi f = mretfi(); printf("%.0f %ld\n", f.a, f.b);
+    struct Mpad g = mretpad(); printf("%d %ld\n", g.a, g.b);
     return 0;
 }
 EOF
@@ -468,7 +506,46 @@ WANT_MULTIRET="10 20 30
 1 2 3 4
 1 2 3
 5 6
-8 9"
+8 9
+11 22"
+
+# --- a C driver that invokes multi-return callbacks THROUGH __c_entry pointers ---
+# Each get_cb_* returns a void* naming the callback's C entry; C casts it to the
+# right struct-returning function-pointer type and calls it.  The entry must adapt
+# the internal multi-return convention to the platform struct-return ABI just as a
+# direct #[c_export] call does — but reached through the __c_entry pointer (the weak
+# __centry.<mangled> thunk), the case #[c_export]-only wiring used to miss.
+cat > "$TMP/driver_centry.c" <<'EOF'
+#include <stdio.h>
+struct M3i { long a, b, c; };
+struct M2i { int a, b; };
+struct M4i { int a, b, c, d; };
+struct Mif { long a; double b; };
+struct Mpad { int a; long b; };
+typedef struct M3i (*cb_m3i)(void);
+typedef struct M2i (*cb_m2i)(void);
+typedef struct M4i (*cb_m4i)(void);
+typedef struct Mif (*cb_mif)(void);
+typedef struct Mpad (*cb_mpad)(void);
+extern void *get_cb_mret3i(void);
+extern void *get_cb_mret2i(void);
+extern void *get_cb_mret4i(void);
+extern void *get_cb_mretif(void);
+extern void *get_cb_mretpad(void);
+int main(void) {
+    struct M3i a = ((cb_m3i)get_cb_mret3i())(); printf("%ld %ld %ld\n", a.a, a.b, a.c);
+    struct M2i b = ((cb_m2i)get_cb_mret2i())(); printf("%d %d\n", b.a, b.b);
+    struct M4i c = ((cb_m4i)get_cb_mret4i())(); printf("%d %d %d %d\n", c.a, c.b, c.c, c.d);
+    struct Mif d = ((cb_mif)get_cb_mretif())(); printf("%ld %.0f\n", d.a, d.b);
+    struct Mpad e = ((cb_mpad)get_cb_mretpad())(); printf("%d %ld\n", e.a, e.b);
+    return 0;
+}
+EOF
+WANT_CENTRY="10 20 30
+7 9
+1 2 3 4
+5 6
+11 22"
 
 # check_multiret <label> <extra-bnc-flags> <required>
 #   Links the multi-value-return driver and checks the C caller reads each tuple
@@ -499,6 +576,40 @@ check_multiret() {
         pass "$label: C reads #[c_export] multi-value returns by struct: '$(echo "$got" | tr '\n' '/')'"
     else
         fail "$label: multi-return output mismatch (got '$got', want '$WANT_MULTIRET')"
+    fi
+}
+
+# check_centry <label> <extra-bnc-flags> <required>
+#   Links the __c_entry-pointer driver and checks C reads each tuple correctly when
+#   the multi-return callback is invoked THROUGH the __c_entry pointer (the entry is
+#   the weak __centry.<mangled> return-adaptation thunk).  Same required/skip
+#   semantics as check_multiret.
+check_centry() {
+    label="centry-$1"; extra="$2"; required="$3"
+    work="$TMP/$label"
+    mkdir -p "$work"
+    if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
+            $extra --build-dir "$work" --pkg ffiexp >"$work/pkg.log" 2>&1 \
+            || [ ! -f "$work/ffiexp.o" ]; then
+        if [ "$required" -eq 1 ]; then
+            fail "$label: compile of facade (--pkg ffiexp) produced no object" \
+                 "$(tail -5 "$work/pkg.log")"
+        else
+            skip "$label: native --pkg unavailable for this host (no object emitted)"
+        fi
+        return
+    fi
+    if ! "$CLANG" -w "$TMP/driver_centry.c" "$work/ffiexp.o" -o "$work/run" 2>"$work/link.err" \
+            || [ ! -x "$work/run" ]; then
+        fail "$label: link of __c_entry driver + facade object failed" \
+             "$(head -6 "$work/link.err")"
+        return
+    fi
+    got="$("$work/run" 2>&1)"
+    if [ "$got" = "$WANT_CENTRY" ]; then
+        pass "$label: C invokes multi-return callbacks via __c_entry: '$(echo "$got" | tr '\n' '/')'"
+    else
+        fail "$label: __c_entry callback output mismatch (got '$got', want '$WANT_CENTRY')"
     fi
 }
 
@@ -678,6 +789,12 @@ check_bigagg "native" "--backend native" 0
 # required; native self-skips when the host backend can't emit the facade.
 check_multiret "llvm" "" 1
 check_multiret "native" "--backend native" 0
+
+# MULTI-VALUE returns reached THROUGH a __c_entry callback pointer — the entry the
+# pointer names must adapt the tuple to the C struct-return ABI too (the weak
+# __centry.<mangled> thunk), the case #[c_export]-only return wiring used to miss.
+check_centry "llvm" "" 1
+check_centry "native" "--backend native" 0
 
 # The --library archive: init-once-via-bn_init + call the exports from a real .a.
 check_library

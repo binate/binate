@@ -1,0 +1,279 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// SROA (scalar replacement of aggregates) — Phase 0: eligibility analysis only.
+//
+// The native↔LLVM -O2 gap is dominated by aggregate-header copy traffic: the
+// native backends materialize slice / struct locals in stack slots and copy
+// them field-by-field slot→slot, where LLVM keeps the scalarized fields in
+// registers.  SROA scalar-replaces an eligible aggregate alloca with one alloca
+// per field, after which mem2reg (promoteScalars) promotes the non-managed
+// fields to SSA and the copies collapse.  Design: explorations/plan-ir-sroa.md.
+//
+// This file is the analysis + a fail-loud validator — NO IR mutation.  It
+// identifies which aggregate allocas are splittable (the L1 + L2 contract
+// below) and classifies them managed / non-managed (the Phase 1 vs Phase 2
+// split).  The rewrite is a later phase that consumes collectSroaCandidates.
+//
+// THE IR MODEL this rests on (verified against the gen path):
+//   - A STRUCT local is field-accessed via OP_GET_FIELD_PTR(alloca, constIdx)
+//     then load/store (gen_selector.bn / gen_selector_ptr.bn); it is
+//     whole-OP_LOAD'd / whole-OP_STORE'd only for a whole-value use (init from
+//     a composite, copy, return, by-value arg, &s).
+//   - A SLICE local is whole-OP_LOAD'd to a value, and len / element / data are
+//     read via OP_EXTRACT on that value (ir_ops.bn EmitSliceLen /
+//     EmitSliceElemPtr); it is whole-OP_STORE'd on assignment.
+// So splittability is a TWO-LEVEL check: L1 over the alloca's uses, L2 over the
+// values produced by whole loads of it.
+//
+// NESTING: the analysis classifies an alloca purely by ITS OWN uses and is
+// agnostic to whether a field is itself an aggregate.  Field-by-field access of
+// a nested aggregate reads/writes through an inner OP_GET_FIELD_PTR whose base
+// is the outer field-ptr (not the alloca), so fieldPtrUsedOnlyAsLoadStore pins
+// the outer slot; whole-load/store of a nested field leaves the outer slot
+// splittable but yields a nested-aggregate field slot that scalar-only mem2reg
+// cannot promote.  Recursing to a fixpoint over such nested field slots is a
+// concern of the eventual rewrite phase, not of this analysis.
+
+// isSroaAggregateType reports whether t (peeled) is an aggregate SROA can
+// scalar-replace: a struct, or a slice (raw *[]T or managed @[]T).  Arrays are
+// excluded — their element access is a dynamic OP_GET_ELEM_PTR on the slot, and
+// scalar-replacing an [N]T would explode into N field slots; they are not the
+// header-copy traffic SROA targets.
+func isSroaAggregateType(t @types.Type) bool {
+	t = peelTransparent(t)
+	if t == nil {
+		return false
+	}
+	return t.Kind == types.TYP_STRUCT || t.Kind == types.TYP_SLICE || t.Kind == types.TYP_MANAGED_SLICE
+}
+
+// isSroaAggregateAlloca reports whether instr is an OP_ALLOC of an SROA
+// aggregate type (its element type, TypeArg, is struct / slice).
+func isSroaAggregateAlloca(instr @Instr) bool {
+	if instr.Op != iropcode.OP_ALLOC {
+		return false
+	}
+	return isSroaAggregateType(instr.TypeArg)
+}
+
+// sroaAggregateContainsManaged reports whether the aggregate type t holds any
+// managed reference (transitively): a managed pointer / slice / func-value /
+// interface value, directly or inside a nested struct or array element.  Drives
+// the Phase 1 (non-managed, hazard-free) vs Phase 2 (managed, refcount + fault-
+// pad rework) split: a non-managed aggregate's field slots are all mem2reg-
+// promotable and the slot never appears in a FaultPad.  A raw slice *[]T is
+// itself non-managed (it borrows; its header owns no refcount), so its element
+// type is irrelevant here; a managed slice @[]T is caught directly.
+func sroaAggregateContainsManaged(t @types.Type) bool {
+	t = peelTransparent(t)
+	if t == nil {
+		return false
+	}
+	if isManagedScalarType(t) {
+		return true
+	}
+	if t.Kind == types.TYP_STRUCT {
+		for i := 0; i < len(t.Fields); i++ {
+			if sroaAggregateContainsManaged(t.Fields[i].Type) {
+				return true
+			}
+		}
+		return false
+	}
+	if t.Kind == types.TYP_ARRAY {
+		return sroaAggregateContainsManaged(t.Elem)
+	}
+	return false
+}
+
+// collectSroaCandidates returns every aggregate alloca in f that SROA may
+// scalar-replace: an OP_ALLOC of a struct / slice whose uses satisfy both L1
+// (its alloca uses are only whole load/store + const-index field-ptr, and it
+// never appears in a FaultPad) and L2 (every whole-loaded value's uses are all
+// OP_EXTRACT).  Phase 0: pure analysis, no IR mutation.  The managed / non-
+// managed axis (Phase 1 vs Phase 2) is orthogonal — see
+// sroaAggregateContainsManaged.
+func collectSroaCandidates(f @Func) @[]@Instr {
+	var out @[]@Instr
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if !isSroaAggregateAlloca(instr) {
+				continue
+			}
+			if !sroaAllocaL1OK(f, instr) {
+				continue
+			}
+			if !sroaLoadedValuesAllExtract(f, instr) {
+				continue
+			}
+			out = slices.Append[@Instr](out, instr)
+		}
+	}
+	return out
+}
+
+// sroaAllocaL1OK reports whether every use of aggregate alloca `a` is an
+// L1-splittable use: the Args[0] pointer of a whole OP_LOAD or whole OP_STORE,
+// or a (constant-index) OP_GET_FIELD_PTR whose own result is used only as a
+// load/store Args[0].  ANY other appearance pins the slot: the alloca as a value
+// operand (its address escaping via a call arg, OP_RETURN, or an OP_STORE
+// Args[1]), a dynamic OP_GET_ELEM_PTR, a PhiEntry.Val, or ANY appearance inside
+// a FaultPad (matching mem2reg — and mandatory for a managed aggregate, whose
+// refcount cleanup reads the whole value in pads).
+func sroaAllocaL1OK(f @Func, a @Instr) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		if !blockAllocaUsesAreL1(f, f.Blocks[bi], a) {
+			return false
+		}
+	}
+	for pi := 0; pi < len(f.FaultPads); pi++ {
+		if blockReferencesAlloca(f.FaultPads[pi], a) {
+			return false
+		}
+	}
+	return true
+}
+
+// blockAllocaUsesAreL1 reports whether every appearance of `a` within block b is
+// a valid L1 use (see sroaAllocaL1OK).  A field-ptr use is validated one level
+// deeper by fieldPtrUsedOnlyAsLoadStore.
+func blockAllocaUsesAreL1(f @Func, b @Block, a @Instr) bool {
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var instr @Instr = b.Instrs[ii]
+		if instr == a {
+			continue // the alloca definition itself is not a use
+		}
+		for k := 0; k < len(instr.Phis); k++ {
+			if instr.Phis[k].Val == a {
+				return false
+			}
+		}
+		for k := 0; k < len(instr.Args); k++ {
+			if instr.Args[k] != a {
+				continue
+			}
+			var okLoad bool = instr.Op == iropcode.OP_LOAD && k == 0
+			var okStore bool = instr.Op == iropcode.OP_STORE && k == 0
+			if okLoad || okStore {
+				continue
+			}
+			if instr.Op == iropcode.OP_GET_FIELD_PTR && k == 0 && fieldPtrUsedOnlyAsLoadStore(f, instr) {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+// fieldPtrUsedOnlyAsLoadStore reports whether the result of field-ptr instr fp
+// is used only as the Args[0] pointer of a plain load/store, and never inside a
+// FaultPad.  If fp's address itself escapes (a call arg, &s.x, a phi entry), the
+// owning slot cannot be scalar-replaced.  Reuses the mem2reg use classifiers
+// (blockUsesAllocaNonLoadStore treats anything but a load/store Args[0] as an
+// escape; blockReferencesAlloca flags any pad appearance).
+func fieldPtrUsedOnlyAsLoadStore(f @Func, fp @Instr) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		if blockUsesAllocaNonLoadStore(f.Blocks[bi], fp) {
+			return false
+		}
+	}
+	for pi := 0; pi < len(f.FaultPads); pi++ {
+		if blockReferencesAlloca(f.FaultPads[pi], fp) {
+			return false
+		}
+	}
+	return true
+}
+
+// sroaLoadedValuesAllExtract reports whether, for EVERY whole OP_LOAD(a) in f,
+// every use of the loaded value is an OP_EXTRACT.  A non-extract use (a by-value
+// call arg, an OP_RETURN, box(), or storing the value elsewhere) means the
+// loaded aggregate value must survive whole — and there is no primitive to
+// rebuild an aggregate value from scalars on the real backends (OP_INSERT does
+// not exist; OP_STRUCT_LIT is unlowered) — so the slot is pinned un-splittable.
+func sroaLoadedValuesAllExtract(f @Func, a @Instr) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var ld @Instr = blk.Instrs[ii]
+			if ld.Op != iropcode.OP_LOAD {
+				continue
+			}
+			if len(ld.Args) < 1 || ld.Args[0] != a {
+				continue
+			}
+			if !valueUsesAllExtract(f, ld) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// valueUsesAllExtract reports whether every use of value v across f's blocks AND
+// fault pads is an OP_EXTRACT reading v as Args[0].  Any other use (including a
+// phi entry, or any pad reference) returns false.
+func valueUsesAllExtract(f @Func, v @Instr) bool {
+	if !blocksValueUsesAllExtract(f.Blocks, v) {
+		return false
+	}
+	if !blocksValueUsesAllExtract(f.FaultPads, v) {
+		return false
+	}
+	return true
+}
+
+// blocksValueUsesAllExtract is valueUsesAllExtract restricted to one block list.
+func blocksValueUsesAllExtract(blocks @[]@Block, v @Instr) bool {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if instr == v {
+				continue
+			}
+			for k := 0; k < len(instr.Args); k++ {
+				if instr.Args[k] != v {
+					continue
+				}
+				if instr.Op != iropcode.OP_EXTRACT || k != 0 {
+					return false
+				}
+			}
+			for k := 0; k < len(instr.Phis); k++ {
+				if instr.Phis[k].Val == v {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// validateSroaCandidates re-verifies, fail-loud, that every alloca in `cands`
+// still satisfies the SROA splittability contract (aggregate type + L1 + L2)
+// against f's current IR.  Phase 0 performs no rewrite, so this is a self-check
+// on the analysis; the eventual rewrite phase will call it as a precondition
+// guard before mutating.  A violation is an analysis bug that would become a
+// miscompile once the rewrite exists, so it panics rather than skipping.
+func validateSroaCandidates(f @Func, cands @[]@Instr) {
+	for i := 0; i < len(cands); i++ {
+		var a @Instr = cands[i]
+		if !isSroaAggregateAlloca(a) {
+			panic("ir SROA: candidate is not an aggregate alloca")
+		}
+		if !sroaAllocaL1OK(f, a) {
+			panic("ir SROA: candidate fails L1 (alloca-use) check")
+		}
+		if !sroaLoadedValuesAllExtract(f, a) {
+			panic("ir SROA: candidate fails L2 (loaded-value-use) check")
+		}
+	}
+}

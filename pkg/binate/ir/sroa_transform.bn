@@ -1,0 +1,320 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// SROA rewrite — Phase 1 (increment 1): NON-MANAGED, FIELD-PTR-ONLY STRUCTS.
+//
+// Consumes the Phase-0 eligibility analysis (sroa.bn).  For a splittable,
+// non-managed struct alloca that is accessed ONLY via constant-index
+// OP_GET_FIELD_PTR (never loaded/stored as a whole aggregate), this creates one
+// scalar alloca per field and rewrites each field-ptr onto its field slot, then
+// deletes the aggregate alloca.  mem2reg (promoteScalars, run right after this
+// in RunOptPasses) then promotes the non-managed field slots to SSA, collapsing
+// the field-by-field stack traffic the native backends would otherwise emit for
+// a local struct.
+//
+// SCOPE of this increment — deliberately narrow, for soundness:
+//   - Non-managed structs only (a managed field would need refcount / fault-pad
+//     handling; those never reach here — sroaAggregateContainsManaged excludes
+//     them, and a non-managed struct never appears in a FaultPad).
+//   - Field-ptr-only: a candidate must have NO whole OP_LOAD / OP_STORE of the
+//     aggregate.  Whole-value scalarization (`OP_STORE(slot, val)` →
+//     per-field `OP_EXTRACT(val,i)`) is NOT always sound — a whole store's value
+//     can be a byval-param-ref (a `ptr`, not an extractable aggregate value, so
+//     OP_EXTRACT on it is invalid IR) — so it is a later increment.
+//   - Structs only; raw slices are a later increment.
+//
+// The common local-struct shape IS field-ptr-only: gen builds a composite
+// literal and reads fields via OP_GET_FIELD_PTR + load/store (gen_composite.bn,
+// gen_selector.bn); it whole-loads / whole-stores a struct only for a by-value
+// use (return, by-value arg, copy) — which this increment leaves alone.
+//
+// Zero-init is preserved: gen zero-inits struct locals implicitly (the backend
+// zero-fills a struct OP_ALLOC), and a field never explicitly stored becomes a
+// field slot with no reaching store — which mem2reg forwards as a materialized
+// zero (its undef-load-to-zero behavior), exactly matching the original.
+
+// runSroa applies field-ptr-only struct scalar replacement to every non-extern
+// func in the module.  Invoked by RunOptPasses at -O1+, BEFORE promoteScalars.
+func runSroa(m @Module) {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @Func = m.Funcs[fi]
+		if f.IsExtern {
+			continue
+		}
+		sroaFunc(f)
+	}
+}
+
+// sroaFunc scalar-replaces every splittable field-ptr-only non-managed struct
+// alloca in f.
+func sroaFunc(f @Func) {
+	if len(f.Blocks) == 0 {
+		return
+	}
+	var cands @[]@Instr = collectSroaStructCandidates(f)
+	if len(cands) == 0 {
+		return
+	}
+	validateSroaCandidates(f, cands) // fail-loud precondition guard (L1 + L2)
+
+	// Per-alloca field slots, keyed by the ORIGINAL alloca id.  New instrs (the
+	// field allocas) get ids >= the original NextID; the id-keyed tables below
+	// are sized to that original NextID, so new ids fall outside them.
+	var origCap int = f.NextID
+	var fieldsOf @[]@[]@Instr = instrListTable(origCap)
+	var isCand @[]bool = boolTable(origCap)
+	for ci := 0; ci < len(cands); ci++ {
+		var a @Instr = cands[ci]
+		isCand[a.ID] = true
+		fieldsOf[a.ID] = makeFieldAllocas(f, a)
+	}
+
+	// deleted[id]: the candidate alloca and each of its field-ptrs are removed
+	// (the alloca becomes its field allocas; a field-ptr's load/store consumers
+	// are rewritten to the field slot).  repl[fieldPtr.id] = field alloca.
+	var deleted @[]bool = boolTable(origCap)
+	var repl @[]@Instr = instrTable(f.NextID)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if instrIsCandAlloca(instr, isCand, origCap) {
+				deleted[instr.ID] = true
+				continue
+			}
+			if isFieldPtrOfCand(instr, isCand, origCap) {
+				deleted[instr.ID] = true
+				repl[instr.ID] = fieldsOf[instr.Args[0].ID][instr.Index]
+			}
+		}
+	}
+
+	rebuildSroaBlocks(f, isCand, fieldsOf, deleted, origCap)
+	rewriteUsesInBlocks(f.Blocks, repl, f.NextID)
+	rewriteUsesInBlocks(f.FaultPads, repl, f.NextID)
+	assertNoSurvivingSroaUses(f, deleted, origCap)
+}
+
+// collectSroaStructCandidates filters the Phase-0 candidate set to this
+// increment's scope: a struct alloca with no managed field, accessed only via
+// constant-index field-ptrs (no whole load/store).
+func collectSroaStructCandidates(f @Func) @[]@Instr {
+	var out @[]@Instr
+	var all @[]@Instr = collectSroaCandidates(f)
+	for i := 0; i < len(all); i++ {
+		var a @Instr = all[i]
+		var t @types.Type = peelTransparent(a.TypeArg)
+		if t == nil || t.Kind != types.TYP_STRUCT {
+			continue
+		}
+		if sroaAggregateContainsManaged(a.TypeArg) {
+			continue
+		}
+		if !structFieldsAllPromotable(t) {
+			continue
+		}
+		if !structOnlyFieldPtrAccessed(f, a) {
+			continue
+		}
+		out = slices.Append[@Instr](out, a)
+	}
+	return out
+}
+
+// isScalarPromotableType reports whether an OP_ALLOC of type t is one mem2reg
+// can promote a phi of: int (<= target word), bool, or a raw pointer.  Float /
+// managed / aggregate are excluded.  The shared promotable-type predicate for
+// mem2reg's isPromotableAlloca AND SROA's structFieldsAllPromotable, so SROA
+// splits a struct only when mem2reg will then promote every field slot (and
+// zero-forward any field with no reaching store, recovering the deleted struct
+// alloca's implicit backend zero-fill; a non-promotable field slot would read
+// stack garbage).
+func isScalarPromotableType(t @types.Type) bool {
+	t = peelToRepr(t)
+	if t == nil {
+		return false
+	}
+	if t.Kind == types.TYP_INT {
+		return t.Width <= types.TypInt().Width
+	}
+	if t.Kind == types.TYP_BOOL {
+		return true
+	}
+	if t.Kind == types.TYP_POINTER {
+		return true
+	}
+	return false
+}
+
+// structFieldsAllPromotable reports whether EVERY field of struct type t is a
+// mem2reg-promotable scalar (int <= word / bool / raw pointer).  Required for
+// zero-init safety: SROA deletes the struct alloca (and with it the backend's
+// implicit whole-struct zero-fill), so a field never explicitly stored must be
+// recovered as zero — which happens ONLY when mem2reg promotes that field slot
+// and zero-forwards its undef load.  A non-promotable field (float, aggregate,
+// wide int, managed) would leave a residual field alloca that is NOT zero-filled
+// (the backend zero-fills only struct/array allocas, not scalars), so an
+// unwritten read of it would return stack garbage.  Broadening beyond
+// all-promotable fields (e.g. explicit per-field zero-init) is a follow-up.
+func structFieldsAllPromotable(t @types.Type) bool {
+	t = peelTransparent(t)
+	if t == nil {
+		return false
+	}
+	for i := 0; i < len(t.Fields); i++ {
+		if !isScalarPromotableType(t.Fields[i].Type) {
+			return false
+		}
+	}
+	return true
+}
+
+// structOnlyFieldPtrAccessed reports whether candidate alloca a is used ONLY via
+// constant-index OP_GET_FIELD_PTR (never a whole OP_LOAD or OP_STORE of the whole
+// aggregate).  a has already passed L1, so its only alloca uses are whole
+// load/store and field-ptrs; this rejects the whole-load/store cases, whose
+// scalarization is not always sound (see the file header) and is a later
+// increment.
+func structOnlyFieldPtrAccessed(f @Func, a @Instr) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if len(instr.Args) < 1 || instr.Args[0] != a {
+				continue
+			}
+			if instr.Op != iropcode.OP_GET_FIELD_PTR {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// makeFieldAllocas creates one OP_ALLOC per field of struct alloca a, typed by
+// the field's declared type (the same index OP_GET_FIELD_PTR uses).
+func makeFieldAllocas(f @Func, a @Instr) @[]@Instr {
+	var t @types.Type = peelTransparent(a.TypeArg)
+	var out @[]@Instr
+	for i := 0; i < len(t.Fields); i++ {
+		var ft @types.Type = stripConstForIR(t.Fields[i].Type)
+		var fa @Instr = newInstr(f, iropcode.OP_ALLOC, types.MakePointerType(ft))
+		fa.TypeArg = ft
+		fa.Line = a.Line
+		out = slices.Append[@Instr](out, fa)
+	}
+	return out
+}
+
+// rebuildSroaBlocks rewrites each block's instruction list: a candidate alloca
+// becomes its field allocas, a dropped field-ptr is removed, everything else is
+// kept in order.
+func rebuildSroaBlocks(f @Func, isCand @[]bool, fieldsOf @[]@[]@Instr, deleted @[]bool,
+		origCap int) {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		var kept @[]@Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			if instrIsCandAlloca(instr, isCand, origCap) {
+				kept = appendAll(kept, fieldsOf[instr.ID])
+				continue
+			}
+			if instr.ID >= 0 && instr.ID < origCap && deleted[instr.ID] {
+				continue // a dropped field-ptr; its uses are rewritten via repl
+			}
+			kept = slices.Append[@Instr](kept, instr)
+		}
+		blk.Instrs = kept
+	}
+}
+
+// appendAll appends every element of src to dst and returns the result.
+func appendAll(dst @[]@Instr, src @[]@Instr) @[]@Instr {
+	for i := 0; i < len(src); i++ {
+		dst = slices.Append[@Instr](dst, src[i])
+	}
+	return dst
+}
+
+// assertNoSurvivingSroaUses fails loud if any operand still references a deleted
+// (SROA-removed) alloca / field-ptr after the rewrite — such a reference would
+// be a miscompile (the analysis under-approximated an escape, or an id was not
+// unique).
+func assertNoSurvivingSroaUses(f @Func, deleted @[]bool, origCap int) {
+	assertNoSurvivingSroaUsesIn(f.Blocks, deleted, origCap)
+	assertNoSurvivingSroaUsesIn(f.FaultPads, deleted, origCap)
+}
+
+// assertNoSurvivingSroaUsesIn is assertNoSurvivingSroaUses over one block list.
+func assertNoSurvivingSroaUsesIn(blocks @[]@Block, deleted @[]bool, origCap int) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @Instr = blk.Instrs[ii]
+			for k := 0; k < len(instr.Args); k++ {
+				checkNoSurvivingSroaUse(instr.Args[k], deleted, origCap)
+			}
+			for k := 0; k < len(instr.Phis); k++ {
+				checkNoSurvivingSroaUse(instr.Phis[k].Val, deleted, origCap)
+			}
+		}
+	}
+}
+
+// checkNoSurvivingSroaUse panics if v is a deleted (SROA-removed) instruction.
+func checkNoSurvivingSroaUse(v @Instr, deleted @[]bool, origCap int) {
+	if v == nil || v.ID < 0 || v.ID >= origCap {
+		return
+	}
+	if deleted[v.ID] {
+		panic("ir SROA: a deleted instruction is still referenced after rewrite")
+	}
+}
+
+// boolTable returns a length-n @[]bool initialized to false.
+func boolTable(n int) @[]bool {
+	var out @[]bool
+	for i := 0; i < n; i++ {
+		out = slices.Append[bool](out, false)
+	}
+	return out
+}
+
+// instrTable returns a length-n @[]@Instr initialized to nil.
+func instrTable(n int) @[]@Instr {
+	var out @[]@Instr
+	for i := 0; i < n; i++ {
+		var none @Instr
+		out = slices.Append[@Instr](out, none)
+	}
+	return out
+}
+
+// instrListTable returns a length-n @[]@[]@Instr of empty lists.
+func instrListTable(n int) @[]@[]@Instr {
+	var out @[]@[]@Instr
+	for i := 0; i < n; i++ {
+		var empty @[]@Instr
+		out = slices.Append[@[]@Instr](out, empty)
+	}
+	return out
+}
+
+// instrIsCandAlloca reports whether instr is a candidate alloca (by original id).
+func instrIsCandAlloca(instr @Instr, isCand @[]bool, origCap int) bool {
+	return instr.Op == iropcode.OP_ALLOC && instr.ID >= 0 && instr.ID < origCap && isCand[instr.ID]
+}
+
+// isFieldPtrOfCand reports whether instr is a const-index OP_GET_FIELD_PTR whose
+// base (Args[0]) is a candidate alloca.
+func isFieldPtrOfCand(instr @Instr, isCand @[]bool, origCap int) bool {
+	if instr.Op != iropcode.OP_GET_FIELD_PTR || len(instr.Args) < 1 {
+		return false
+	}
+	var a @Instr = instr.Args[0]
+	return a != nil && a.ID >= 0 && a.ID < origCap && isCand[a.ID]
+}

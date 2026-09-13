@@ -1,0 +1,133 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/mangle"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+import "pkg/std/strings"
+
+// Per-function packed-dispatch shim (`__shimP.<mangled>`) — the func-value
+// vtable's slot-2 call_packed target for the arm32 (AAPCS32) backend.  The
+// arm32 twin of aarch64_funcvalue_packed.bn / x64_funcvalue_packed.bn: the
+// bytecode VM caller invokes it with the user args as a PACKED int-slot array +
+// count + retbuf, and __shimP GATHERS those words into `__shim`'s incoming
+// all-int dispatch ABI and branches/calls `__shim`, which does the real AAPCS32
+// re-marshalling.  __shimP does NO re-marshalling.
+//
+//   entry (call_packed):  R0=data, R1=argsPtr, R2=nSlots (unused; W static),
+//                         R3=retbuf
+//   __shim scalar shape:  R0=data, R1=arg0, R2=arg1, R3=arg2, [SP+..]=arg3..
+//   __shim aggregate shape (R0-sret-stays): R0=retbuf, R1=data, R2=arg0, R3=arg1,
+//                         [SP+..]=arg2..
+//
+// The INCOMING dispatch seam is FLAT (contiguous words) — arm32's even-register
+// pair alignment for int64/8-aligned aggregates is applied only on `__shim`'s
+// OUTGOING side (see arm32_funcvalue_marshal.bn: "the INCOMING side is the
+// positional seam and is always FLAT"), so a positional slot->word copy is
+// correct with no even-align handling here.  Words are cc.WordBytes (4) on
+// ILP32.  W (= shimInWordsArm32) is compile-time fixed (== the VM's nSlots), so
+// the gather is straight-line: W <= reg budget tail-branches to `__shim`; W >
+// budget frames a spill (push {r4,lr} + SUB sp) and BLs.
+
+// funcvalPackedRetbufShapeArm32 reports whether `__shim` uses the
+// aggregate/retbuf ENTRY shape (R0=retbuf, R1=data, user args from R2) vs the
+// scalar shape (R0=data, user args from R1).  Matches emitFuncValueShimBody /
+// emitFuncvalSpillShimArm32: any >=1-byte aggregate return (sret >4 B or pack
+// <=4 B) or ANY multi-return passes a retbuf in R0.  (A 0-byte aggregate is
+// void-like — IsAggregateReturnTyp is false — and takes the scalar shape.)
+func funcvalPackedRetbufShapeArm32(fvTyp @types.Type) bool {
+	if len(fvTyp.Results) > 1 { return true }
+	if len(fvTyp.Results) == 1 && fvTyp.Results[0] != nil {
+		return types.IsAggregateReturnTyp(fvTyp.Results[0])
+	}
+	return false
+}
+
+// shimPackedSymForArm32 returns the label for a function's packed shim:
+// "<mangled-fn>__shimP" (sibling of shimSymFor's __shim).
+func shimPackedSymForArm32(pkgName *[]readonly char, fnName *[]readonly char) @[]char {
+	var fn @[]char = symFor(pkgName, fnName)
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(fn)
+	cb.Write("__shimP")
+	return buf.CopyStr(cb.String())
+}
+
+// emitFuncValuePackedShimsArm32 emits `__shimP.<mangled>` for every NON-universal
+// func-value reference (a universal trampoline has no __shim and is dispatched
+// VM-side via TrampolinePacked, so its vtable slot 2 keeps the raw function).
+func emitFuncValuePackedShimsArm32(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Module) {
+	var seen @[]@[]char
+	var sigs @[]@types.Type
+	seen, sigs = collectFuncValueRefs(mod)
+	if len(seen) == 0 { return }
+	a.SetSection("text", -1)
+	var cc common.CallConv = common.AAPCS32()
+	for i := 0; i < len(seen); i++ {
+		if mangle.IsUniversalTrampoline(mangle.FuncName(pkgName, seen[i])) {
+			continue
+		}
+		var shimLabel @[]char = shimSymFor(pkgName, seen[i])
+		var packedLabel @[]char = shimPackedSymForArm32(pkgName, seen[i])
+		a.DefineLabel(packedLabel)
+		a.SetWeak(packedLabel)
+		emitOnePackedShimArm32(a, cc, shimLabel, sigs[i])
+	}
+}
+
+// emitOnePackedShimArm32 emits one `__shimP` body: gather the packed words into
+// `__shim`'s incoming ABI and branch/call `__shim`.  See the file header.
+func emitOnePackedShimArm32(a @asm.Assembler, cc common.CallConv, shimLabel @[]char,
+		fvTyp @types.Type) {
+	var aggShape bool = funcvalPackedRetbufShapeArm32(fvTyp)
+	var prefix int = 1
+	if aggShape { prefix = 2 }
+	var w int = shimInWordsArm32(cc, fvTyp, prefix)
+	var userBudget int = cc.NumGpArgRegs - prefix
+
+	if w <= userBudget {
+		// Register-only: IP (caller-saved intra-procedure scratch) holds argsPtr;
+		// no frame, so IP survives to the tail-branch (and is dead after it).
+		arm32.Mov(a, arm32.COND_AL, false, arm32.IP, arm32.Reg(arm32.R1))
+		if aggShape {
+			// R0=retbuf, R1=data: set R1=data (R0 still holds data) then R0=retbuf.
+			arm32.Mov(a, arm32.COND_AL, false, arm32.R1, arm32.Reg(arm32.R0))
+			arm32.Mov(a, arm32.COND_AL, false, arm32.R0, arm32.Reg(arm32.R3))
+		}
+		a.SetGlobal(shimLabel)
+		for u := 0; u < w; u++ {
+			arm32.Ldr(a, arm32.COND_AL, argReg(prefix + u), arm32.MemImm(arm32.IP, cc.WordBytes * u))
+		}
+		arm32.B(a, arm32.COND_AL, shimLabel)
+		return
+	}
+
+	// Spill: R4 (callee-saved, saved by the frame) holds argsPtr across the SUB
+	// sp + BL; IP is the memory->memory shuttle.  push {r4,lr} keeps SP 8-aligned
+	// (AAPCS32); the inner SUB (8-rounded) reserves the outgoing-args area where
+	// `__shim`'s spill shim reads incoming stack word g=prefix+u at [SP +
+	// (g-NumGpArgRegs)*WordBytes] = [SP + (u-userBudget)*WordBytes].
+	var spillWords int = w - userBudget
+	var innerBytes int = (spillWords * cc.WordBytes + 7) / 8 * 8
+	arm32.Push(a, arm32.COND_AL, packShimPushMask())
+	arm32.Mov(a, arm32.COND_AL, false, arm32.R4, arm32.Reg(arm32.R1))
+	if aggShape {
+		arm32.Mov(a, arm32.COND_AL, false, arm32.R1, arm32.Reg(arm32.R0))
+		arm32.Mov(a, arm32.COND_AL, false, arm32.R0, arm32.Reg(arm32.R3))
+	}
+	emitSpAdjust(a, false, innerBytes)
+	a.SetGlobal(shimLabel)
+	for u := 0; u < userBudget; u++ {
+		arm32.Ldr(a, arm32.COND_AL, argReg(prefix + u), arm32.MemImm(arm32.R4, cc.WordBytes * u))
+	}
+	for u := userBudget; u < w; u++ {
+		arm32.Ldr(a, arm32.COND_AL, arm32.IP, arm32.MemImm(arm32.R4, cc.WordBytes * u))
+		arm32.Str(a, arm32.COND_AL, arm32.IP, arm32.MemImm(arm32.SP, cc.WordBytes * (u - userBudget)))
+	}
+	arm32.Bl(a, arm32.COND_AL, shimLabel)
+	emitSpAdjust(a, true, innerBytes)
+	arm32.Pop(a, arm32.COND_AL, packShimPopMask())
+}

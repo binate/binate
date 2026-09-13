@@ -24,9 +24,13 @@ import "pkg/stdx/slices"
 //     caller cleanup -> a single unwind.  The RefDec sequence is a
 //     faithful clone of the callee pad's, so refcounting balances by
 //     construction (same ops, same order, one fewer frame pop).
-// Multi-block pads (a managed-slice / iface / func-value RefDec branches into
-// further pad blocks) are NOT handled — inlinableCallee rejects them (a later
-// increment).
+// Multi-block pads (an iface / func-value RefDec, or the stack-overflow
+// pre-check's pad, branches on a null-data guard into further pad blocks) ARE
+// handled:
+// cloneInlinablePad clones the whole pad sub-CFG (every block reachable from the
+// entry via BRANCH/JUMP), remapping both operands and branch targets, and rewrites
+// every terminal OP_UNWIND_RETURN into an OP_JUMP into the call-site pad — so the
+// chained cleanup still ends in a single unwind.
 //
 // PadBlock is a raw `*Block` back-ref (it breaks the Instr->Block->Instr
 // refcount cycle), but a block CFG target (Block1) is a managed `@Block`, so the
@@ -40,42 +44,119 @@ func isEmptyPad(pad *Block) bool {
 	return len(pad.Instrs) == 1 && pad.Instrs[0].Op == iropcode.OP_UNWIND_RETURN
 }
 
-// padSingleBlockInlinable reports whether a NON-empty fault pad is a single
-// straight-line block the inliner can clone: its last instr is OP_UNWIND_RETURN (so
-// it does not branch into further pad blocks) and every preceding cleanup instr
-// is a non-faulting, non-call op whose operands are all remappable through the
-// callee's dense value space (params / in-callee values / pad-internal values,
-// all id < callee.NextID).  A pad that branches (managed-slice / iface /
-// func-value cleanup) ends in a BRANCH, not OP_UNWIND_RETURN, and is rejected.
-func padSingleBlockInlinable(pad *Block, callee @Func) bool {
-	var n int = len(pad.Instrs)
-	if n == 0 {
+// containsAddr reports whether the payload-address `a` is already in `addrs`.
+func containsAddr(addrs @[]int, a int) bool {
+	for i := 0; i < len(addrs); i++ {
+		if addrs[i] == a {
+			return true
+		}
+	}
+	return false
+}
+
+// addrInFaultPads reports whether `addr` is the payload address of one of
+// callee's fault-pad blocks (identity by address, the faultPadHandle idiom).
+func addrInFaultPads(callee @Func, addr int) bool {
+	for i := 0; i < len(callee.FaultPads); i++ {
+		if bit_cast(int, callee.FaultPads[i]) == addr {
+			return true
+		}
+	}
+	return false
+}
+
+// collectPadBlocks returns every block of the fault pad rooted at `entryRaw` —
+// the blocks reachable from the entry by following BRANCH/JUMP terminator targets
+// until OP_UNWIND_RETURN — as callee.FaultPads @Block handles in FaultPads
+// emission order (which is topological: a value is defined before its use, and pad
+// blocks are emitted in program order, so cloning in this order sees every
+// operand's clone already recorded).  Returns EMPTY if the pad is malformed for
+// cloning: a block with no terminator, or a terminator target that is NOT a
+// callee fault-pad block (a cleanup pad only ever branches within itself).
+func collectPadBlocks(callee @Func, entryRaw *Block) @[]@Block {
+	var reach @[]int
+	var frontier @[]int
+	frontier = slices.Append[int](frontier, bit_cast(int, entryRaw))
+	var fi int = 0
+	for fi < len(frontier) {
+		var addr int = frontier[fi]
+		fi = fi + 1
+		if containsAddr(reach, addr) {
+			continue
+		}
+		if !addrInFaultPads(callee, addr) {
+			return make_slice(@Block, 0) // target outside the pad -> not clonable
+		}
+		reach = slices.Append[int](reach, addr)
+		var blk *Block = bit_cast(*Block, addr)
+		var n int = len(blk.Instrs)
+		if n == 0 {
+			return make_slice(@Block, 0) // malformed (no terminator)
+		}
+		var term @Instr = blk.Instrs[n - 1]
+		if term.Block1 != nil {
+			frontier = slices.Append[int](frontier, bit_cast(int, term.Block1))
+		}
+		if term.Block2 != nil {
+			frontier = slices.Append[int](frontier, bit_cast(int, term.Block2))
+		}
+	}
+	var result @[]@Block
+	for i := 0; i < len(callee.FaultPads); i++ {
+		if containsAddr(reach, bit_cast(int, callee.FaultPads[i])) {
+			result = slices.Append[@Block](result, callee.FaultPads[i])
+		}
+	}
+	return result
+}
+
+// padInlinable reports whether a NON-empty fault pad — single- OR multi-block —
+// can be cloned into the caller: every block reachable from the pad entry ends in
+// JUMP / BRANCH / OP_UNWIND_RETURN, and every cleanup instr is a non-faulting,
+// non-call op with no phis whose operands are all remappable through the callee's
+// dense value space (params / in-callee values / pad-internal values, id <
+// callee.NextID).  A branching pad (an iface / func-value cleanup, or the
+// stack-check pad — a managed-slice cleanup is straight-line, not branching) is now
+// accepted — cloneInlinablePad clones its whole sub-CFG.  A pad whose blocks escape
+// callee.FaultPads, or that carries a nested fault / call / phi / non-remappable
+// operand, is rejected.
+func padInlinable(pad *Block, callee @Func) bool {
+	var blocks @[]@Block = collectPadBlocks(callee, pad)
+	if len(blocks) == 0 {
 		return false
 	}
-	if pad.Instrs[n - 1].Op != iropcode.OP_UNWIND_RETURN {
-		return false // branches -> multi-block pad -> not handled yet
-	}
-	for k := 0; k < n - 1; k++ {
-		var pi @Instr = pad.Instrs[k]
-		if pi.PadBlock != nil {
-			return false // pads don't nest faults (defensive)
-		}
-		if isCallFamilyOp(pi.Op) {
-			return false // a dtor runs via OP_REFDEC, not a call (defensive)
-		}
-		if len(pi.Phis) != 0 {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @Block = blocks[bi]
+		var n int = len(blk.Instrs)
+		if n == 0 {
 			return false
 		}
-		for a := 0; a < len(pi.Args); a++ {
-			var av @Instr = pi.Args[a]
-			if av == nil {
-				continue
+		var term int = blk.Instrs[n - 1].Op
+		if term != iropcode.OP_UNWIND_RETURN && term != iropcode.OP_JUMP && term != iropcode.OP_BRANCH {
+			return false
+		}
+		for k := 0; k < n; k++ {
+			var pi @Instr = blk.Instrs[k]
+			if pi.PadBlock != nil {
+				return false // pads don't nest faults (defensive)
 			}
-			if av.IsGlobalRef {
-				continue // a global operand is valid in the caller unchanged
+			if isCallFamilyOp(pi.Op) {
+				return false // a dtor runs via OP_REFDEC, not a call (defensive)
 			}
-			if av.ID < 0 || av.ID >= callee.NextID {
-				return false // operand not remappable
+			if len(pi.Phis) != 0 {
+				return false
+			}
+			for a := 0; a < len(pi.Args); a++ {
+				var av @Instr = pi.Args[a]
+				if av == nil {
+					continue
+				}
+				if av.IsGlobalRef {
+					continue // a global operand is valid in the caller unchanged
+				}
+				if av.ID < 0 || av.ID >= callee.NextID {
+					return false // operand not remappable
+				}
 			}
 		}
 	}
@@ -97,40 +178,82 @@ func faultPadHandle(f @Func, target *Block) @Block {
 	return nil
 }
 
-// cloneSingleBlockPad clones a non-empty single-block callee fault pad into f's
-// FaultPads: each cleanup instr is copied with its operands remapped through
-// `remap` (the same dense value map the body clone populated, so the cloned
-// RefDecs target the cloned callee locals), and the terminal OP_UNWIND_RETURN is
-// replaced by an OP_JUMP into `callSitePad` so the cloned pad chains into the
-// caller's call-site cleanup + single unwind.  Pad values are straight-line
-// (defs precede uses), so one forward pass suffices; a pad-internal value's
-// clone is recorded in `remap` for later refs within the same pad.  Pad cleanup
-// instrs are never fault ops, so cloneInstrFields's callSitePad arg is unused
-// (nil).
-func cloneSingleBlockPad(f @Func, srcPad *Block, remap @[]@Instr, cap int,
-		callSitePad @Block) @Block {
-	var pad @Block = AddFaultPad(f, "inl_pad")
-	var built @[]@Instr
-	for k := 0; k < len(srcPad.Instrs); k++ {
-		var src @Instr = srcPad.Instrs[k]
-		if src.Op == iropcode.OP_UNWIND_RETURN {
-			var jmp @Instr = newVoidInstr(iropcode.OP_JUMP)
-			jmp.Block1 = callSitePad
-			built = slices.Append[@Instr](built, jmp)
-			continue
+// clonePadTarget maps a pad terminator's CFG target `t` to its freshly-created
+// clone block (matched by payload address in the parallel srcKeys/cloneBlocks
+// lists).  A target that is not a pad-internal block is returned unchanged
+// (defensive — collectPadBlocks has already verified the pad's targets stay
+// within it).
+func clonePadTarget(t @Block, srcKeys @[]int, cloneBlocks @[]@Block) @Block {
+	var key int = bit_cast(int, t)
+	for i := 0; i < len(srcKeys); i++ {
+		if srcKeys[i] == key {
+			return cloneBlocks[i]
 		}
-		var noPad *Block
-		var c @Instr = cloneInstrFields(f, src, noPad)
-		for a := 0; a < len(c.Args); a++ {
-			c.Args[a] = remapOperand(c.Args[a], remap, cap)
-		}
-		if src.ID >= 0 {
-			remap[src.ID] = c
-		}
-		built = slices.Append[@Instr](built, c)
 	}
-	pad.Instrs = built
-	return pad
+	return t
+}
+
+// cloneInlinablePad clones a non-empty callee fault pad — single- OR multi-block —
+// rooted at `entryRaw` into f's FaultPads, returning the clone of the entry block
+// (which fixupInlinedPads wires into the faulting op's PadBlock).  Each cleanup
+// instr is copied with its operands remapped through `remap` (the same dense value
+// map the body clone populated, so the cloned RefDecs target the cloned callee
+// locals); each block's terminator has its CFG targets remapped to the cloned pad
+// blocks; and every terminal OP_UNWIND_RETURN becomes an OP_JUMP into
+// `callSitePad`, chaining callee cleanup -> caller call-site cleanup -> a single
+// unwind.  Blocks are cloned in FaultPads emission order (topological), so a
+// pad-internal value's clone is recorded in `remap` before any later block refs
+// it.  Pad cleanup instrs are never fault ops, so cloneInstrFields's callSitePad
+// arg is unused (nil).
+func cloneInlinablePad(f @Func, callee @Func, entryRaw *Block, remap @[]@Instr, cap int,
+		callSitePad @Block) @Block {
+	var srcBlocks @[]@Block = collectPadBlocks(callee, entryRaw)
+	// Pass 1: pre-create one clone block per source block, so a terminator can be
+	// rewired to any (possibly later) block's clone.
+	var srcKeys @[]int
+	var cloneBlocks @[]@Block
+	for i := 0; i < len(srcBlocks); i++ {
+		srcKeys = slices.Append[int](srcKeys, bit_cast(int, srcBlocks[i]))
+		cloneBlocks = slices.Append[@Block](cloneBlocks, AddFaultPad(f, "inl_pad"))
+	}
+	// Pass 2: clone each block's instrs, remapping operands and terminator targets.
+	for i := 0; i < len(srcBlocks); i++ {
+		var src @Block = srcBlocks[i]
+		var dst @Block = cloneBlocks[i]
+		var built @[]@Instr
+		for k := 0; k < len(src.Instrs); k++ {
+			var ins @Instr = src.Instrs[k]
+			if ins.Op == iropcode.OP_UNWIND_RETURN {
+				var jmp @Instr = newVoidInstr(iropcode.OP_JUMP)
+				jmp.Block1 = callSitePad
+				built = slices.Append[@Instr](built, jmp)
+				continue
+			}
+			var noPad *Block
+			var c @Instr = cloneInstrFields(f, ins, noPad)
+			for a := 0; a < len(c.Args); a++ {
+				c.Args[a] = remapOperand(c.Args[a], remap, cap)
+			}
+			if ins.Block1 != nil {
+				c.Block1 = clonePadTarget(ins.Block1, srcKeys, cloneBlocks)
+			}
+			if ins.Block2 != nil {
+				c.Block2 = clonePadTarget(ins.Block2, srcKeys, cloneBlocks)
+			}
+			if ins.ID >= 0 {
+				remap[ins.ID] = c
+			}
+			built = slices.Append[@Instr](built, c)
+		}
+		dst.Instrs = built
+	}
+	var entryKey int = bit_cast(int, entryRaw)
+	for i := 0; i < len(srcKeys); i++ {
+		if srcKeys[i] == entryKey {
+			return cloneBlocks[i]
+		}
+	}
+	return cloneBlocks[0]
 }
 
 // fixupInlinedPads rewires every cloned NON-empty-pad fault op — cloneInstrFields
@@ -140,7 +263,8 @@ func cloneSingleBlockPad(f @Func, srcPad *Block, remap @[]@Instr, cap int,
 // that share one callee pad clone it once (dedup by payload address).  Runs
 // AFTER the body clone, when `remap` covers every cloned callee value the pads'
 // RefDecs reference.
-func fixupInlinedPads(f @Func, instrs @[]@Instr, remap @[]@Instr, cap int, callSitePad *Block) {
+func fixupInlinedPads(f @Func, callee @Func, instrs @[]@Instr, remap @[]@Instr, cap int,
+		callSitePad *Block) {
 	var handle @Block = faultPadHandle(f, callSitePad)
 	var siteKey int = bit_cast(int, callSitePad)
 	var srcKeys @[]int
@@ -162,7 +286,7 @@ func fixupInlinedPads(f @Func, instrs @[]@Instr, remap @[]@Instr, cap int, callS
 			}
 		}
 		if cloned == nil {
-			cloned = cloneSingleBlockPad(f, c.PadBlock, remap, cap, handle)
+			cloned = cloneInlinablePad(f, callee, c.PadBlock, remap, cap, handle)
 			srcKeys = slices.Append[int](srcKeys, padKey)
 			clones = slices.Append[@Block](clones, cloned)
 		}

@@ -1,0 +1,159 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/mangle"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+import "pkg/std/strings"
+
+// Per-function packed-dispatch shim (`__shimP.<mangled>`) — the func-value
+// vtable's slot-2 `call_packed` target for a compiled func value.  The bytecode
+// VM caller invokes it with the user args as a PACKED int-slot array (its
+// register window, zero-copy) + count + retbuf, so cross-mode dispatch carries
+// ANY arg/return shape without the fixed-arity `_call_shim_*` ceiling.
+//
+// `__shimP` does NOT re-marshal to the underlying's real ABI — that is
+// `__shim`'s job (aarch64_funcvalue_shim.bn / _spill.bn), with all its FP /
+// narrow / aggregate / spill handling.  `__shimP` only GATHERS the packed words
+// into `__shim`'s INCOMING all-int dispatch ABI and calls `__shim`:
+//
+//   entry (call_packed):  X0=data, X1=argsPtr, X2=nSlots (unused; W is static),
+//                         X3=retbuf
+//   __shim scalar shape:  X0=data, X1=arg0, .., X7=arg6, [SP+..]=arg7..
+//   __shim aggregate shape: X0=retbuf, X1=data, X2=arg0, .., [SP+..]=arg(6)..
+//
+// The count of INCOMING dispatch words W (= sum of shimInWordsForTypeAA64) is
+// COMPILE-TIME fixed by the signature (and equals the VM's nSlots), so the gather
+// is straight-line (no dynamic spill).  W <= register budget → set the lead regs,
+// load W words, tail-branch to `__shim` (its return becomes ours).  W > budget →
+// a frame places the overflow words on the outgoing stack (where `__shim`'s spill
+// shim reads its incoming stack args), BL `__shim`, unwind, RET.
+
+// funcvalPackedRetbufShapeAA64 reports whether the func value's `__shim` uses the
+// aggregate/retbuf ENTRY shape (X0=retbuf, X1=data, user args from X2) versus the
+// scalar shape (X0=data, user args from X1).  MUST match the shape classification
+// in emitFuncValueShims / emitFuncvalSpillShimAA64 (its `srcPrefix == 2` set):
+// pack / sret / HFA-return / small+big multi-return all pass retbuf in X0.
+func funcvalPackedRetbufShapeAA64(cc common.CallConv, fvTyp @types.Type) bool {
+	var retSz int = shimReturnSize(fvTyp)
+	var retIsAgg bool = shimReturnIsAggregate(fvTyp)
+	var retIsHfa bool = len(fvTyp.Results) == 1 && cc.ReturnsHfaInRegs(fvTyp.Results[0])
+	var useSret bool = retSz > 16 && !retIsHfa
+	var isMultiRet bool = len(fvTyp.Results) > 1
+	var useSretMulti bool = isMultiRet && isBigMultiReturnAA64(fvTyp)
+	var usePackMulti bool = isMultiRet && !useSretMulti
+	var usePack bool = retIsAgg && retSz >= 1 && retSz <= 16 && !retIsHfa
+	return usePack || useSret || retIsHfa || usePackMulti || useSretMulti
+}
+
+// funcvalPackedWordsAA64 is the total INCOMING dispatch-word count W the packed
+// shim gathers — the same per-arg shimInWordsForTypeAA64 the register-only shim
+// budgets on, summed over every user param.  Equals the VM caller's nSlots.
+func funcvalPackedWordsAA64(cc common.CallConv, fvTyp @types.Type) int {
+	var w int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		w = w + shimInWordsForTypeAA64(cc, fvTyp.Params[pi].Type)
+	}
+	return w
+}
+
+// shimPackedSymFor returns the Mach-O label for a function's packed shim:
+// "_<mangled-fn>__shimP" (sibling of shimSymFor's "__shim").
+func shimPackedSymFor(pkgName *[]readonly char, fnName *[]readonly char) @[]char {
+	var fn @[]char = symFor(pkgName, fnName)
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(fn)
+	cb.Write("__shimP")
+	return buf.CopyStr(cb.String())
+}
+
+// emitFuncValuePackedShims emits `__shimP.<mangled>` for every NON-universal
+// func-value reference in the module.  A universal trampoline (its `data` IS the
+// closure record) has no `__shim` to forward to and is dispatched VM-side via
+// TrampolinePacked, so it gets no packed shim — its vtable slot 2 keeps the raw
+// function (emitFuncValueVtables).  Driven by the emitter after
+// emitFuncValueShims (so `__shim` labels exist to branch to) and before
+// emitFuncValueVtables (so the packed label exists for the slot-2 relocation).
+func emitFuncValuePackedShims(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Module) {
+	var seen @[]@[]char
+	var sigs @[]@types.Type
+	seen, sigs = collectFuncValueRefs(mod)
+	if len(seen) == 0 { return }
+	a.SetSection("text", -1)
+	var cc common.CallConv = aarch64CC()
+	for i := 0; i < len(seen); i++ {
+		if mangle.IsUniversalTrampoline(mangle.FuncName(pkgName, seen[i])) {
+			continue
+		}
+		var shimLabel @[]char = shimSymFor(pkgName, seen[i])
+		var packedLabel @[]char = shimPackedSymFor(pkgName, seen[i])
+		a.DefineLabel(packedLabel)
+		a.SetWeak(packedLabel)
+		emitOnePackedShimAA64(a, cc, shimLabel, sigs[i])
+	}
+	a.Align(4)
+}
+
+// emitOnePackedShimAA64 emits one `__shimP` body: gather the packed words into
+// `__shim`'s incoming ABI and branch/call `__shim`.  See the file header.
+func emitOnePackedShimAA64(a @asm.Assembler, cc common.CallConv, shimLabel @[]char,
+		fvTyp @types.Type) {
+	var aggShape bool = funcvalPackedRetbufShapeAA64(cc, fvTyp)
+	var prefix int = 1
+	if aggShape { prefix = 2 }
+	var w int = funcvalPackedWordsAA64(cc, fvTyp)
+	var userBudget int = cc.NumGpArgRegs - prefix
+
+	// Save argsPtr (X1) before the lead-reg shuffle / arg loads clobber X1.  X9
+	// is caller-saved and not an arg reg, so it survives until the last load
+	// (and is dead by the branch/call to __shim).
+	aarch64.Mov(a, true, aarch64.X9, aarch64.Reg(aarch64.X1))
+	if aggShape {
+		// Aggregate shape: X0=retbuf, X1=data.  Set X1=data (X0 still holds data)
+		// BEFORE overwriting X0 with retbuf.
+		aarch64.Mov(a, true, aarch64.X1, aarch64.Reg(aarch64.X0))
+		aarch64.Mov(a, true, aarch64.X0, aarch64.Reg(aarch64.X3))
+	}
+	// Scalar shape: X0=data already; X3 (retbuf) / X2 (nSlots) unused.
+
+	// Mirror __shim's SetGlobal-before-branch: __shim is weak_odr, so the linker
+	// may keep another TU's copy; a plain local branch could dangle.  SetGlobal
+	// leaves the weak binding weak (it only ensures the symref resolves).
+	a.SetGlobal(shimLabel)
+	if w <= userBudget {
+		// Register-only: load W words into argReg(prefix)..argReg(prefix+W-1),
+		// then TAIL-BRANCH — __shim's return becomes __shimP's return.
+		for u := 0; u < w; u++ {
+			aarch64.Ldr(a, true, argReg(prefix + u), aarch64.MemImm(aarch64.X9, 8 * u))
+		}
+		aarch64.B(a, shimLabel)
+		return
+	}
+
+	// Spill: a frame places the > budget words on the outgoing stack (where
+	// __shim's spill shim reads its incoming stack args, dispatch word g at
+	// [SP + (g-8)*8]; g = prefix+u, so u >= userBudget lands at [SP +
+	// (u-userBudget)*8]).  BL (not tail-branch): LR must survive and the frame
+	// tear down before RET.
+	var spillWords int = w - userBudget
+	var spillBytes int = (spillWords * 8 + 15) / 16 * 16
+	aarch64.Stp(a, true, aarch64.FP, aarch64.LR, aarch64.MemPre(aarch64.SP, -16))
+	aarch64.Mov(a, true, aarch64.FP, aarch64.Reg(aarch64.SP))
+	aarch64.Sub(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(spillBytes))
+	for u := 0; u < userBudget; u++ {
+		aarch64.Ldr(a, true, argReg(prefix + u), aarch64.MemImm(aarch64.X9, 8 * u))
+	}
+	for u := userBudget; u < w; u++ {
+		aarch64.Ldr(a, true, aarch64.X16, aarch64.MemImm(aarch64.X9, 8 * u))
+		aarch64.Str(a, true, aarch64.X16, aarch64.MemImm(aarch64.SP, (u - userBudget) * 8))
+	}
+	aarch64.Bl(a, shimLabel)
+	// X0 holds __shim's scalar result (a retbuf callee wrote through X0=retbuf);
+	// carry it back through the uniform i64 call_packed return.
+	aarch64.Add(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(spillBytes))
+	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR, aarch64.MemPost(aarch64.SP, 16))
+	aarch64.Ret(a)
+}

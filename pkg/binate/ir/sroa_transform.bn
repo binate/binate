@@ -77,10 +77,12 @@ func sroaFunc(f @Func) {
 	var origCap int = f.NextID
 	var isCand @[]bool = boolTable(origCap)
 	var fieldsOf @[]@[]@Instr = instrListTable(origCap)
+	var zeroInitsOf @[]@[]@Instr = instrListTable(origCap)
 	for ci := 0; ci < len(cands); ci++ {
 		var a @Instr = cands[ci]
 		isCand[a.ID] = true
 		fieldsOf[a.ID] = makeFieldAllocas(f, a)
+		zeroInitsOf[a.ID] = makeFieldZeroInits(f, fieldsOf[a.ID])
 	}
 
 	// Plan the rewrite: mark dropped instrs, build per-field loads for whole
@@ -96,7 +98,7 @@ func sroaFunc(f @Func) {
 	var repl @[]@Instr = instrTable(f.NextID)
 	fillReplacements(f, isCand, fieldsOf, deleted, loadExp, repl, origCap)
 
-	rebuildSroaBlocks(f, isCand, fieldsOf, deleted, loadExp, se, origCap)
+	rebuildSroaBlocks(f, isCand, fieldsOf, zeroInitsOf, deleted, loadExp, se, origCap)
 	rewriteUsesInBlocks(f.Blocks, repl, f.NextID)
 	rewriteUsesInBlocks(f.FaultPads, repl, f.NextID)
 	assertNoSurvivingSroaUses(f, deleted, origCap)
@@ -131,7 +133,109 @@ func collectSroaAggregateCandidates(f @Func) @[]@Instr {
 		}
 		out = slices.Append[@Instr](out, a)
 	}
+	// Phase 2: managed slices `@[]T` whose element needs no destruction.  These
+	// are excluded from collectSroaCandidates' non-managed set (and its
+	// pad-pinning L1), so collect them here with a pad-AWARE L1/L2 that admits the
+	// refcount spine's whole-load+extract in FaultPads.
+	out = appendAll(out, collectManagedSliceCandidates(f))
 	return out
+}
+
+// collectManagedSliceCandidates returns the managed-slice allocas eligible for
+// Phase-2 scalar replacement: a `@[]T` local whose element type needs no
+// destruction (so its refcount spine is just a whole-load + extract-2 of the
+// refptr + OP_REFDEC — no whole-value-address elem-dtor escape), used only via
+// whole load/store (incl. the refcount spine's whole-load+extract in FaultPads,
+// which Phase 1's pad-pinning L1 would reject), with extractable whole stores.
+func collectManagedSliceCandidates(f @Func) @[]@Instr {
+	var out @[]@Instr
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var a @Instr = blk.Instrs[ii]
+			if a.Op != iropcode.OP_ALLOC {
+				continue
+			}
+			var t @types.Type = peelTransparent(a.TypeArg)
+			if t == nil || t.Kind != types.TYP_MANAGED_SLICE {
+				continue
+			}
+			if !managedSliceElemScalarReplaceable(t) {
+				continue
+			}
+			if !managedAllocaUsesOK(f, a) {
+				continue
+			}
+			if !managedLoadedValuesAllExtract(f, a) {
+				continue
+			}
+			if !aggregateWholeStoresExtractable(f, a) {
+				continue
+			}
+			out = slices.Append[@Instr](out, a)
+		}
+	}
+	return out
+}
+
+// managedSliceElemScalarReplaceable reports whether managed-slice type t's
+// element needs NO destruction — the condition under which its RefDec is a plain
+// whole-load + extract-2(refptr) + OP_REFDEC (emitManagedSliceRefDec's non-dtor
+// arm), rather than storing the whole value to a scratch and passing its ADDRESS
+// to an elem dtor (which is a whole-value use that L2 would pin anyway).
+func managedSliceElemScalarReplaceable(t @types.Type) bool {
+	if t.Elem == nil {
+		return false
+	}
+	return !t.Elem.NeedsDestruction()
+}
+
+// managedAllocaUsesOK is the L1 check for a managed-slice candidate, treating
+// FaultPad appearances like block appearances (whole load/store — the refcount
+// spine's whole-load is allowed) rather than pinning them.  Reuses the Phase-0
+// per-block classifier.
+func managedAllocaUsesOK(f @Func, a @Instr) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		if !blockAllocaUsesAreL1(f, f.Blocks[bi], a) {
+			return false
+		}
+	}
+	for pi := 0; pi < len(f.FaultPads); pi++ {
+		if !blockAllocaUsesAreL1(f, f.FaultPads[pi], a) {
+			return false
+		}
+	}
+	return true
+}
+
+// managedLoadedValuesAllExtract is L2 for a managed-slice candidate: every whole
+// OP_LOAD of a — in blocks AND FaultPads — must have its value used only by
+// OP_EXTRACT (valueUsesAllExtract already scans blocks + pads for the uses).
+func managedLoadedValuesAllExtract(f @Func, a @Instr) bool {
+	if !managedLoadsAllExtractIn(f, f.Blocks, a) {
+		return false
+	}
+	if !managedLoadsAllExtractIn(f, f.FaultPads, a) {
+		return false
+	}
+	return true
+}
+
+// managedLoadsAllExtractIn checks the whole loads of a within one block list.
+func managedLoadsAllExtractIn(f @Func, blocks @[]@Block, a @Instr) bool {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var ld @Instr = blk.Instrs[ii]
+			if ld.Op != iropcode.OP_LOAD || len(ld.Args) < 1 || ld.Args[0] != a {
+				continue
+			}
+			if !valueUsesAllExtract(f, ld) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // isScalarPromotableType reports whether an OP_ALLOC of type t is one mem2reg
@@ -242,6 +346,32 @@ func makeFieldAllocas(f @Func, a @Instr) @[]@Instr {
 	return out
 }
 
+// makeFieldZeroInits returns explicit nil-store prologue instrs for each field
+// slot that mem2reg will NOT promote and the backend will NOT zero-fill — i.e. a
+// MANAGED-pointer field (a managed slice's refptr).  Without this, an unwritten
+// such field (a nil `var s @[]T` never assigned) would read stack garbage, and
+// the refcount spine would OP_REFDEC a wild pointer.  The stores are RAW (a
+// managed OP_ALLOC slot is a pure bit-copy cell, no implicit refcount), emitted
+// at the alloca's position so they dominate every use.  Promotable fields
+// (data/len/backinglen) need none — mem2reg zero-forwards their undef loads.
+func makeFieldZeroInits(f @Func, fieldAllocas @[]@Instr) @[]@Instr {
+	var out @[]@Instr
+	for i := 0; i < len(fieldAllocas); i++ {
+		var fa @Instr = fieldAllocas[i]
+		if !isManagedScalarType(fa.TypeArg) {
+			continue
+		}
+		var zero @Instr = newInstr(f, iropcode.OP_CONST_NIL, fa.TypeArg)
+		zero.Line = fa.Line
+		var st @Instr = newVoidInstr(iropcode.OP_STORE)
+		st.Args = makeArgs2(fa, zero)
+		st.Line = fa.Line
+		out = slices.Append[@Instr](out, zero)
+		out = slices.Append[@Instr](out, st)
+	}
+	return out
+}
+
 // aggregateFieldTypes returns the per-field types of aggregate type t, in the
 // index order OP_EXTRACT / OP_GET_FIELD_PTR use: a raw slice is {*uint8, int}; a
 // struct is its declared field types.
@@ -250,6 +380,16 @@ func aggregateFieldTypes(t @types.Type) @[]@types.Type {
 	var out @[]@types.Type
 	if t != nil && t.Kind == types.TYP_SLICE {
 		out = slices.Append[@types.Type](out, types.MakePointerType(types.TypUint8()))
+		out = slices.Append[@types.Type](out, types.TypInt())
+		return out
+	}
+	if t != nil && t.Kind == types.TYP_MANAGED_SLICE {
+		// {data:*uint8, len:int, refptr:@ptr, backinglen:int} — the refptr
+		// (MSLICE_FIELD_BACKING) is a managed pointer (mem2reg won't promote it;
+		// it stays in memory as a raw-copy cell + gets an explicit nil zero-init).
+		out = slices.Append[@types.Type](out, types.MakePointerType(types.TypUint8()))
+		out = slices.Append[@types.Type](out, types.TypInt())
+		out = slices.Append[@types.Type](out, types.MakeManagedPtrType(nil))
 		out = slices.Append[@types.Type](out, types.TypInt())
 		return out
 	}

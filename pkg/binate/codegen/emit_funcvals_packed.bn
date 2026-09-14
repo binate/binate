@@ -1,0 +1,161 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/stringutils"
+import "pkg/binate/types"
+import "pkg/std/strings"
+
+// The per-function `@__shimP.<mangled>` packed-dispatch shim — the func-value
+// vtable's slot-2 call_packed target for the LLVM backend, the codegen twin of
+// the native aarch64/x64/arm32 `__shimP`.  The bytecode VM caller invokes it
+// (via rt._call_shim_scalar64, i.e. i8* data + 7 i64) with the user args as a
+// PACKED int-slot array + count + retbuf, so cross-mode dispatch carries ANY
+// arg/return shape.  Signature as invoked:
+//
+//   define i64 @__shimP.<m>(i8* %data, i64 %pa0..%pa6)   ; pa0=argsPtr, pa1=nSlots
+//                                                        ; (unused), pa2=retbuf
+//
+// `__shimP` reconstructs `@__shim`'s DECLARED typed arg list from the packed slot
+// array and calls `@__shim` (which does the real re-marshalling).  A direct call
+// must match `__shim`'s param types, so per param it loads the slot(s) at their
+// shim type (i8* for a by-address aggregate arg, i32+i32 for a split 64-bit
+// scalar on ILP32, the int-slot type for a scalar — the SAME writeShimParamDecl /
+// shimParamType / is64ScalarShimSplit the shim itself uses, so the arg list can't
+// drift), naming them %a<i>[_lo/_hi] exactly as writeShimParamDecl references
+// them.  The slot cursor advances by packedShimSlotWords (2 for a split-64, else
+// 1), matching the VM's argSlots layout; slot k is at [%args + k*PointerSize].
+//
+// Return: `__shimP` returns the scalar result as i64 bits via a uniform
+// store-to-a-zeroed-i64-slot + reload (handles integer / pointer / int-ified
+// float returns — all <=8 bytes — without per-type dispatch); an aggregate /
+// multi-return callee (isAggregateReturn, which subsumes every coerced-aggregate
+// return) writes through %retbuf and `__shimP` returns 0.
+// The register/spill split the native backends need is N/A here — LLVM's own call
+// lowering spills over-budget args — so this is one straight IR body per arity.
+
+// packedShimSlotWords is the number of packed int-slots a shim param of type t
+// occupies: 2 for a 64-bit scalar split across two i32 slots on ILP32
+// (is64ScalarShimSplit), else 1 (a scalar, or a by-address aggregate pointer).
+// Matches the VM's argSlots slot layout the packed args are copied from.
+func packedShimSlotWords(t @types.Type) int {
+	if is64ScalarShimSplit(t) { return 2 }
+	return 1
+}
+
+// emitFuncValuePackedShim emits @__shimP.<mangled> for func-value type fvTyp.
+func emitFuncValuePackedShim(out *strings.Builder, mangled @[]char, fvTyp @types.Type) {
+	var wordBytes int = types.GetTarget().PointerSize
+	var agg bool = isAggregateReturn(fvTyp)
+	// @__shimP.<m> needs its OWN `$__shimP.<m> = comdat any` to match its bare
+	// `comdat` attr (writeComdatAttr) on ELF — NOT writeShimComdatDecl, which
+	// would re-declare `$__shim.<m>` (already emitted for the sibling __shim) and
+	// leave @__shimP's comdat undefined.
+	writeComdatDecl(out, catSym("__shimP.", mangled))
+	out.Write("define weak_odr i64 @__shimP.")
+	out.Write(mangled)
+	out.Write("(i8* %data, i64 %pa0, i64 %pa1, i64 %pa2, i64 %pa3, i64 %pa4, i64 %pa5, i64 %pa6)")
+	writeFnDefineAttrs(out)
+	writeComdatAttr(out)
+	out.Write(" {\n  ")
+	out.Write("%args = inttoptr i64 %pa0 to i8*\n  ")
+	if agg {
+		out.Write("%rb = inttoptr i64 %pa2 to i8*\n  ")
+	}
+	emitPackedArgLoads(out, fvTyp, wordBytes)
+
+	if agg {
+		// Aggregate / multi-return: retbuf-shaped __shim (void, writes %rb).
+		out.Write("call void @__shim.")
+		out.Write(mangled)
+		out.Write("(i8* %rb, i8* %data")
+		emitShimCallArgRefs(out, fvTyp)
+		out.Write(")\n  ret i64 0\n}\n")
+		return
+	}
+	if len(fvTyp.Results) == 0 {
+		// Void scalar-shape __shim (returns void).
+		out.Write("call void @__shim.")
+		out.Write(mangled)
+		out.Write("(i8* %data")
+		emitShimCallArgRefs(out, fvTyp)
+		out.Write(")\n  ret i64 0\n}\n")
+		return
+	}
+	// Scalar non-void: call __shim, then store its result into a zeroed i64 slot
+	// and reload as i64 (uniform coercion of any scalar / pointer / int-ified-float
+	// result — all <=8 bytes on this path — to the call_packed i64 return).
+	out.Write("%r = call ")
+	writeShimResultLLVM(out, fvTyp)
+	out.Write(" @__shim.")
+	out.Write(mangled)
+	out.Write("(i8* %data")
+	emitShimCallArgRefs(out, fvTyp)
+	out.Write(
+			")\n  %rslot = alloca i64\n  store i64 0, i64* %rslot\n  %rslotp = bitcast i64* %rslot to ")
+	writeShimResultLLVM(out, fvTyp)
+	out.Write("*\n  store ")
+	writeShimResultLLVM(out, fvTyp)
+	out.Write(" %r, ")
+	writeShimResultLLVM(out, fvTyp)
+	out.Write("* %rslotp\n  %ri = load i64, i64* %rslot\n  ret i64 %ri\n}\n")
+	return
+}
+
+// emitShimCallArgRefs writes the `, <type> %a<i>` (or split `, i32 %a<i>_lo, i32
+// %a<i>_hi`) reference list for the call to @__shim — the SAME text
+// writeShimParamDecl emits for __shim's own signature, so the two can't drift;
+// the %a<i>[_lo/_hi] SSA values are defined by emitPackedArgLoads.
+func emitShimCallArgRefs(out *strings.Builder, fvTyp @types.Type) {
+	for i := 0; i < len(fvTyp.Params); i++ {
+		writeShimParamDecl(out, fvTyp.Params[i].Type, i)
+	}
+	return
+}
+
+// emitPackedArgLoads emits the loads that define each param's %a<i>[_lo/_hi] from
+// the packed slot array %args.  A split 64-bit scalar (ILP32) loads two i32 slots
+// (%a<i>_lo, %a<i>_hi); every other param loads one slot at its shim param type
+// (shimParamType: i8* for a by-address aggregate, the int-slot type for a scalar).
+func emitPackedArgLoads(out *strings.Builder, fvTyp @types.Type, wordBytes int) {
+	var c int = 0
+	for i := 0; i < len(fvTyp.Params); i++ {
+		var t @types.Type = fvTyp.Params[i].Type
+		if is64ScalarShimSplit(t) {
+			emitPackedLoadOne(out, "i32", i, "_lo", c * wordBytes)
+			emitPackedLoadOne(out, "i32", i, "_hi", (c + 1) * wordBytes)
+		} else {
+			emitPackedLoadOne(out, shimParamType(t), i, "", c * wordBytes)
+		}
+		c = c + packedShimSlotWords(t)
+	}
+	return
+}
+
+// emitPackedLoadOne emits `%a<i><suf> = load <ty> from [%args + off]`, via an i8
+// getelementptr + bitcast to <ty>*.  <suf> is "" (single slot) or "_lo"/"_hi".
+func emitPackedLoadOne(out *strings.Builder, ty @[]char, i int, suf @[]readonly char, off int) {
+	out.Write("%pp")
+	stringutils.WriteInt(out, i)
+	out.Write(suf)
+	out.Write(" = getelementptr i8, i8* %args, i64 ")
+	stringutils.WriteInt(out, off)
+	out.Write("\n  %ppc")
+	stringutils.WriteInt(out, i)
+	out.Write(suf)
+	out.Write(" = bitcast i8* %pp")
+	stringutils.WriteInt(out, i)
+	out.Write(suf)
+	out.Write(" to ")
+	out.Write(ty)
+	out.Write("*\n  %a")
+	stringutils.WriteInt(out, i)
+	out.Write(suf)
+	out.Write(" = load ")
+	out.Write(ty)
+	out.Write(", ")
+	out.Write(ty)
+	out.Write("* %ppc")
+	stringutils.WriteInt(out, i)
+	out.Write(suf)
+	out.Write("\n  ")
+	return
+}

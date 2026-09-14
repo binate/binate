@@ -51,6 +51,25 @@ func genCompositeLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 
 	var structPtr @Instr = b.EmitAlloc(typ)
 
+	// Register the literal alloca as an end-of-statement cleanup temp BEFORE the
+	// field loop, not after.  Two reasons: (1) a fresh managed-field struct literal
+	// is neither a named local nor a call-result temp, so nothing else RefDecs its
+	// managed fields to balance the copy every consumer (return / by-value arg /
+	// field-init / method receiver / assignment) takes — a leak per occurrence
+	// (emitTempCleanupBody's OP_ALLOC arm dtors it, mirroring
+	// registerManagedCallResult).  (2) Registering it here means a RECOVERABLE VM
+	// fault WHILE a LATER field is being evaluated dispatches a pad that covers the
+	// partial aggregate: each managed field is MOVED in as the loop goes
+	// (emitStoreManagedSlot isInit -> consumeTemp, leaving ctx.Temps), so a fault
+	// after some fields are moved would otherwise leak them.  The dtor RefDecs every
+	// managed field; the not-yet-filled ones are null (pushFrame zero-fills the
+	// frame), so RefDec(null) no-ops.  A consumer that instead REUSES the alloca as
+	// durable storage (the var-init fast paths in genShortVar / genDecl)
+	// consumeTemp's it, transferring ownership to the var.
+	if needsStructCopy(typ) {
+		registerTemp(ctx, structPtr)
+	}
+
 	// Initialize all fields: from keyed or positional elements, or zero.
 	// Fields come from the peeled struct type (the underlying struct's
 	// layout), so a named wrapper `type NS S` finds S's fields, not the
@@ -124,19 +143,6 @@ func genCompositeLit(ctx @GenContext, b @Block, e @ast.Expr) @Instr {
 		// OP_EXTRACT runs on a nil constant (which the bytecode VM mis-lowers).
 		b = emitStoreManagedSlot(ctx, b, fieldPtr, val, fields[i].Type, true)
 	}
-
-	// A fresh managed-field struct literal is neither a named local nor a
-	// registered call-result temp, so nothing would RefDec its managed fields to
-	// balance the copy every consumer (return / by-value arg / field-init /
-	// method receiver / assignment) takes for its own ownership — a leak per
-	// occurrence.  Register the literal alloca as an end-of-statement cleanup temp
-	// (emitTempCleanupBody's OP_ALLOC arm dtors it), mirroring how a call-result
-	// struct is registered by registerManagedCallResult.  A consumer that instead
-	// REUSES the alloca as durable storage (the var-init fast paths in genShortVar
-	// / genDecl) consumeTemp's it, transferring ownership to the var.
-	if needsStructCopy(typ) {
-		registerTemp(ctx, structPtr)
-	}
 	return structPtr
 }
 
@@ -174,6 +180,19 @@ func coerceCompositeElement(ctx @GenContext, b @Block, val @Instr, elemTyp @type
 // so the alloca, length, and element type all reflect the real array layout.
 func genArrayLit(ctx @GenContext, b @Block, e @ast.Expr, arrTyp @types.Type) @Instr {
 	var arrPtr @Instr = b.EmitAlloc(arrTyp)
+
+	// Register the array alloca for cleanup BEFORE the element loop (same as the
+	// struct-literal case in genCompositeLit): a fresh array literal with managed
+	// elements needs its elements RefDec'd to balance the copy a consumer takes,
+	// AND — since each element is MOVED in as the loop goes (emitStoreManagedSlot
+	// isInit -> consumeTemp) — a recoverable VM fault while evaluating a LATER
+	// element must release the elements moved so far, via a pad that covers the
+	// partial array.  The dtor RefDecs every element; the not-yet-filled ones are
+	// null (the alloca is zero-initialised), so RefDec(null) no-ops.  The var-init
+	// fast paths consumeTemp it when they reuse the alloca as the variable's storage.
+	if needsStructCopy(arrTyp) {
+		registerTemp(ctx, arrPtr)
+	}
 
 	var elemTyp @types.Type = arrTyp.Elem
 	if elemTyp == nil {
@@ -227,14 +246,6 @@ func genArrayLit(ctx @GenContext, b @Block, e @ast.Expr, arrTyp @types.Type) @In
 		// including an OP_CONST_NIL zero-init — is moved (consumeTemp), so no
 		// RefInc / OP_EXTRACT runs on a nil constant.
 		b = emitStoreManagedSlot(ctx, b, elemPtr, val, elemTyp, true)
-	}
-
-	// Same as the struct-literal case (genCompositeLit): a fresh array literal
-	// with managed elements is registered as an end-of-statement cleanup temp so
-	// its elements' RefDec balances the copy a consumer takes; the var-init fast
-	// paths consumeTemp it when they reuse the alloca as the variable's storage.
-	if needsStructCopy(arrTyp) {
-		registerTemp(ctx, arrPtr)
 	}
 	return arrPtr
 }
@@ -334,6 +345,17 @@ func genManagedSliceLit(ctx @GenContext, b @Block, e @ast.Expr, sliceTyp @types.
 	var nInstr @Instr = b.EmitConstInt(n, types.TypInt())
 	var slice @Instr = b.EmitMakeSlice(elemTyp, nInstr)
 	noteSPGrowingResult(ctx, slice)
+	// Register the slice for cleanup BEFORE the element loop (same rationale as
+	// genCompositeLit / genArrayLit): balances the ownership every consumer takes,
+	// AND — since each managed element is acquired/moved into the backing as the
+	// loop goes — a recoverable VM fault while evaluating a LATER element releases
+	// the elements filled so far via a pad covering the partial slice.  The
+	// element dtor RefDecs each backing slot; the not-yet-filled ones are null
+	// (make_slice zero-fills), so RefDec(null) no-ops.  A consumer that MOVES the
+	// literal (var init, slot store, return of a fresh producer) consumeTemp's it,
+	// transferring ownership.  The RODATA fast path above returns a static immortal
+	// slice and needs no temp (it returns before reaching here).
+	registerTemp(ctx, slice)
 
 	// Store each element via slice-set semantics: extract data ptr,
 	// GEP to the element, store.
@@ -388,20 +410,6 @@ func genManagedSliceLit(ctx @GenContext, b @Block, e @ast.Expr, sliceTyp @types.
 		}
 		b.EmitSliceSet(slice, idx, val, elemTyp)
 	}
-	// A fresh managed-slice literal is neither a named local nor a registered
-	// call-result temp, so nothing would balance the ownership every consumer
-	// takes: the return path RefInc's the backing (gen_return.bn) and a managed
-	// element is acquired into each slot, but with no cleanup temp the backing —
-	// and each element's acquired ref — leaks per occurrence (the "@[]@I literal
-	// element leak").  Register the slice as an end-of-statement cleanup temp
-	// (emitTempCleanupBody's isManagedSliceType arm RefDec's it, running the
-	// element dtor once the backing hits refcount 1), mirroring how a call-result
-	// slice is registered by registerManagedCallResult and a struct/array literal
-	// by genCompositeLit / genArrayLit.  A consumer that MOVES the literal (a var
-	// init, a slot store, a return of a fresh producer) consumeTemp's it via
-	// emitStoreManagedSlot / the fresh-producer path, transferring ownership.  The
-	// RODATA fast path above returns a static immortal slice and needs no temp.
-	registerTemp(ctx, slice)
 	return slice
 }
 

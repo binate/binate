@@ -40,22 +40,34 @@ func execFunc(vm @VM, funcIdx int, args @[]int) int64 {
 
 	var result int64 = execLoop(vm, funcIdx, regsOff)
 
-	// If result is an aggregate ADDRESS pointing into the callee's stack
-	// region, copy it to caller space before popping.  A 64-bit SCALAR result
-	// is never an address in that range: on ILP32 its int64 value is either far
-	// above any (low, < 2 GB) stack address or negative, so the range test is
-	// false and the value passes through untouched.  Addresses are host words,
-	// so compare/copy through the low word.
+	// A retbuf-returning callee (aggregate / multi-return, ResultUsesRetbuf)
+	// yields the result image's ADDRESS, packed contiguously at the top of the
+	// callee frame we are about to pop.  Relocate the image down to the caller's
+	// stack top so it survives the pop, and hand back that new address.  Copy the
+	// callee's natural result-image byte count (ResultRetbufBytes) — the exact
+	// width TrampolineAggregate/Packed read back out — so results of any size
+	// round-trip (no arbitrary ceiling).  A scalar / void callee returns a VALUE,
+	// never an in-frame address, so ResultUsesRetbuf is false and the word passes
+	// through untouched (this also leaves a scalar value that happens to fall in
+	// the stack-address range alone — unlike a bare range test).  The range test
+	// is retained as a guard: on a recoverable fault the callee packs no image and
+	// its result word is garbage, which must not be relocated.  Addresses are host
+	// words, so compare/copy through the low word.
 	var sbase int = bit_cast(int, vm.Stack)
 	var lo64 int64 = cast(int64, sbase + savedSP)
 	var hi64 int64 = cast(int64, sbase + vm.SP)
-	if result >= lo64 && result < hi64 {
+	if f.ResultUsesRetbuf && result >= lo64 && result < hi64 {
 		var addr int = cast(int, result)
-		var sz int = sbase + vm.SP - addr
-		if sz > 64 { sz = 64 }
+		var sz int = f.ResultRetbufBytes
 		rt.MemCopy(bit_cast(*uint8, sbase + savedSP), bit_cast(*uint8, addr), sz)
 		result = cast(int64, sbase + savedSP)
-		savedSP = savedSP + sz
+		// Advance vm.SP by the 8-ROUNDED image size, NOT the natural sz: vm.SP must
+		// stay 8-aligned or the next pushFrame writes a frame header through an
+		// `*int` at an unaligned address, which DATA-ABORTs on a strict-alignment
+		// arm host (see frameExtent).  The rounded advance equals AggregateReturnSize,
+		// so a CallFuncAggregate consumer reading that (rounded) size stays in-bounds
+		// — the extra bytes it then copies are result tail-padding (don't-care).
+		savedSP = savedSP + ((sz + 7) & ~7)
 	}
 
 	vm.SP = savedSP
@@ -117,102 +129,6 @@ func vmPollPoint(vm @VM, funcIdx int, resumePC int, regsOff int) {
 	} else if req == POLL_BREAK {
 		vm.Status = VM_STATUS_BROKE
 	}
-}
-
-// execStringOp dispatches BC_LOAD_STR / BC_STRING_COPY_MS /
-// BC_STRING_COPY_ARR. These don't touch execLoop's control-flow
-// state (pc, funcIdx, frameBase) — they only read instr / f /
-// regs and push managed-slice headers / array buffers onto vm.SP.
-// Returns true if instr.Op was one of these and the dispatch was
-// handled; false otherwise so execLoop falls through to the next
-// arm.
-func execStringOp(vm @VM, f @VMFunc, regs *int, instr BCInstr) bool {
-	switch instr.Op {
-	case BC_LOAD_STR:
-		// Return a stable pointer directly to the i-th
-		// managed-slice header inside f.Strings's backing
-		// (which is alive for the lifetime of the VMFunc /
-		// module). Previously we copied the header onto
-		// vm.SP per call — that turned `for { f("foo") }`-
-		// style loops into vm.Stack overflows at ~262K
-		// iterations because pushManagedSlice never popped.
-		//
-		// f.Strings is a 4-word managed slice: {data, len,
-		// refptr, backingLen}. The `data` field (first
-		// word) points at an array of @[]char headers (32
-		// bytes each). Hand-compute the offset because
-		// Binate's `&slice[i]` is currently restricted to
-		// slice-of-struct in genIndexPtr.
-		var stringsField *int = bit_cast(*int, &f.Strings)
-		var dataPtr int = stringsField[0]
-		// Each header is a 4-word @[]char managed-slice ({data, len,
-		// refptr, backingLen}) — 4 target words, so the i-th header sits
-		// at i*4 words.  A hardcoded 32 (4*8, LP64) overshot on a 32-bit
-		// host, reading the 2nd+ string literal's header from past the
-		// array (a null data ptr → an empty / dropped write).
-		var hdrPtr int = dataPtr + instr.Imm * 4 * REG_SLOT
-		if instr.Aux == 1 {
-			regs[instr.Dst] = hdrPtr
-		} else {
-			var p *int = bit_cast(*int, hdrPtr)
-			regs[instr.Dst] = p[0]
-		}
-		return true
-	case BC_STRING_COPY_MS:
-		// Stage 2b: allocate a fresh managed-slice copy of the
-		// literal. Refcount 1; independent of rodata.
-		var str @[]char = f.Strings[instr.Imm]
-		var strHdr int = pushManagedSlice(vm, bit_cast(*uint8, &str))
-		var hdrP *int = bit_cast(*int, strHdr)
-		var srcPtr int = hdrP[0]
-		var strLen int = hdrP[1]
-		var ms rt.ManagedSlice = rt.MakeManagedSlice(1, strLen)
-		if strLen > 0 {
-			rt.MemCopy(ms.Data, bit_cast(*uint8, srcPtr), strLen)
-		}
-		var msAddr *int = stackPtr(vm, vm.SP)
-		vm.SP = vm.SP + 4 * REG_SLOT
-		msAddr[0] = bit_cast(int, ms.Data)
-		msAddr[1] = ms.Len
-		msAddr[2] = bit_cast(int, ms.Refptr)
-		msAddr[3] = ms.BackingLen
-		regs[instr.Dst] = bit_cast(int, msAddr)
-		return true
-	case BC_STRING_COPY_ARR:
-		// Stage 2c Phase 1: copy a string literal into a fresh
-		// stack buffer of size Aux, zero-padded. Returns pointer
-		// to the buffer; OP_STORE memcpys it into the target alloca.
-		var arrLen int = instr.Aux
-		// A large materialization can push vm.SP past the stack.  Check BOTH growths
-		// upfront — the transient pushManagedSlice header (4 words) and the array
-		// buffer — and raise the recoverable "stack overflow" fault (this op carries
-		// a cleanup pad, attachSPGrowthPad) instead of writing past vm.Stack's end.
-		if wouldFrameOverflow(vm, 4 * REG_SLOT + ((arrLen + 7) & ~7)) {
-			setFault(vm, "runtime error: stack overflow")
-			return true
-		}
-		var str @[]char = f.Strings[instr.Imm]
-		var strHdr int = pushManagedSlice(vm, bit_cast(*uint8, &str))
-		var hdrP *int = bit_cast(*int, strHdr)
-		var srcPtr int = hdrP[0]
-		var strLen int = hdrP[1]
-		var bufAddr int = bit_cast(int, vm.Stack) + vm.SP
-		// Advance vm.SP by the array size ROUNDED UP to 8 (the buffer itself is
-		// only arrLen bytes; the [arrLen, rounded) tail is unused padding).  An
-		// odd arrLen (e.g. [3]char) would otherwise leave vm.SP unaligned within
-		// the statement, so a frame pushed before the end-of-statement SP_RESTORE
-		// reclaims it lands an unaligned header — a data abort on strict-align arm.
-		vm.SP = vm.SP + ((arrLen + 7) & ~7)
-		rt.MemZero(bit_cast(*uint8, bufAddr), arrLen)
-		var copyLen int = strLen
-		if copyLen > arrLen { copyLen = arrLen }
-		if copyLen > 0 {
-			rt.MemCopy(bit_cast(*uint8, bufAddr), bit_cast(*uint8, srcPtr), copyLen)
-		}
-		regs[instr.Dst] = bufAddr
-		return true
-	}
-	return false
 }
 
 // narrowToWidth reduces v to a `bits`-wide integer held in a host word:

@@ -1,0 +1,187 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// Per-function MaxStmtTempGrowth: the worst-case bytes vm.SP can grow above the
+// frame base between two OP_SP_RESTOREs.  Because SP_RESTORE resets vm.SP to the
+// absolute frame base, vm.SP at any point is frameExtent + (sum of the SP-growing
+// ops executed since the last SP_RESTORE on the current path).  The maximum of
+// that sum over all points and all control-flow paths is MaxStmtTempGrowth;
+// pushFrame reserves it on top of frameExtent (R3) so no statement can overrun
+// vm.Stack.  A single statement's growth can span several blocks with NO
+// intervening SP_RESTORE (a short-circuit `&&`/`||` whose operands grow vm.SP, a
+// ternary), so this is a forward dataflow over the CFG, not a linear scan.
+
+// opGrowthBytes is the total durable vm.SP growth a single IR op contributes to
+// its statement's region: the per-op inventory (spGrowthBytes), plus the two
+// call-context growths that need lowering context — the cross-mode
+// arg-substitution scratch (argSubstBytes) and, at an OP_RETURN, the callee-side
+// return-image build (types.AggregateReturnSize(f.Results), the packed result
+// image BC_RETURN writes on the callee's own stack before copy-back).
+func opGrowthBytes(vm @VM, instr @ir.Instr, f @ir.Func) int {
+	var g int = spGrowthBytes(instr)
+	g = g + argSubstBytes(vm, instr)
+	if instr.Op == iropcode.OP_RETURN {
+		g = g + types.AggregateReturnSize(f.Results)
+	}
+	return g
+}
+
+// argSubstBytes is the cross-mode arg-substitution scratch for a call: when a
+// cross-mode call marshals a bytecode-impl interface arg to a native callee, each
+// iface-carrying arg SLOT is copied onto vm.SP (substArgSlotIface,
+// vm_iface_crossmode.bn) as align8(SizeOf) bytes that persist to the next
+// SP_RESTORE.  This mirrors buildArgIfaceLayout's slot enumeration exactly (same
+// start, the slot<7 cap, ifaceVtOffsetsFor gate and argSlots stride), summing the
+// per-slot copy sizes.  It fires only for the cross-mode call shapes that build a
+// layout: OP_CALL_IFACE_METHOD / OP_CALL_FUNC_VALUE (Args[0] is the callee /
+// receiver, so start=1) and an extern-targeted OP_CALL (start=0); every other op
+// (a vm-func OP_CALL, OP_CALL_INDIRECT, OP_CALL_HANDLE, non-call ops) grows 0.
+// The runtime-sized `...*any` slice-of-iface scratch (substituteSliceIfaceArgs)
+// is NOT included — it keeps a runtime check (a separate concern).
+func argSubstBytes(vm @VM, instr @ir.Instr) int {
+	var op int = instr.Op
+	var start int = -1
+	if op == iropcode.OP_CALL_IFACE_METHOD || op == iropcode.OP_CALL_FUNC_VALUE {
+		start = 1
+	} else if op == iropcode.OP_CALL && callTargetIsExtern(vm, instr) {
+		start = 0
+	}
+	if start < 0 {
+		return 0
+	}
+	var total int = 0
+	var slot int = 0
+	for k := start; k < len(instr.Args); k++ {
+		var t @types.Type = instr.Args[k].Typ
+		if slot < 7 {
+			var offsets @[]int = ifaceVtOffsetsFor(t)
+			if len(offsets) > 0 {
+				total = total + (t.SizeOf() + 7) / 8 * 8
+			}
+		}
+		slot = slot + argSlots(t)
+	}
+	return total
+}
+
+// raiseEntryResidual raises entryResidual[idx-of-target] to at least `residual`,
+// returning whether it changed anything.  target is a CFG successor (@Block);
+// its index is found by identity within blocks.
+func raiseEntryResidual(blocks @[]@ir.Block, target @ir.Block, residual int,
+		entryResidual @[]int) bool {
+	if target == nil {
+		return false
+	}
+	var t int = bit_cast(int, target)
+	for i := 0; i < len(blocks); i++ {
+		if bit_cast(int, blocks[i]) == t {
+			if residual > entryResidual[i] {
+				entryResidual[i] = residual
+				return true
+			}
+			return false
+		}
+	}
+	return false
+}
+
+// computeMaxStmtTempGrowth returns f's MaxStmtTempGrowth (see file header) via a
+// forward max-dataflow: entryResidual[b] = max over predecessors of their exit
+// residual; a block's exit residual is the growth accumulated since its last
+// SP_RESTORE.  Residuals are monotone non-decreasing and bounded by the total
+// op growth, so the fixpoint converges; if it somehow does not within the
+// iteration cap, fall back to that total (an always-safe over-reservation)
+// rather than risk an under-reservation.
+func computeMaxStmtTempGrowth(vm @VM, f @ir.Func) int {
+	var blocks @[]@ir.Block = f.Blocks
+	var n int = len(blocks)
+	if n == 0 {
+		return 0
+	}
+	// Fault-pad cleanup blocks (f.FaultPads) run within this SAME frame during
+	// recoverable-fault unwinding, but they are kept off f.Blocks (the compiled
+	// backends skip them), so the body dataflow below does not scan them.
+	// Ignoring them is sound ONLY because a pad never grows vm.SP — its ops are
+	// RefDec / void dtor calls / null-guard branches / extract / bitcast / alloc,
+	// none of which bump vm.SP (unwind dtor FRAMES ride the StackRedZone, which is
+	// a separate reservation, not per-statement temp growth).  Enforce that
+	// invariant loudly: if a future pad ever grows vm.SP, this reservation would
+	// silently under-count it (its true entry residual is the fault point's
+	// growth, not 0), so fail here and force it to be modeled (seed each pad's
+	// entry residual from its attaching op) rather than corrupt the stack.
+	for pi := 0; pi < len(f.FaultPads); pi++ {
+		var pad @ir.Block = f.FaultPads[pi]
+		for pj := 0; pj < len(pad.Instrs); pj++ {
+			if opGrowthBytes(vm, pad.Instrs[pj], f) != 0 {
+				vmPanic("vm: fault-pad op grows vm.SP; MaxStmtTempGrowth must model fault-pad growth")
+			}
+		}
+	}
+	// conservative = sum of ALL op growth: a guaranteed-safe upper bound used as
+	// the non-convergence fallback.  Safe as an upper bound because well-formed IR
+	// has no SP_RESTORE-free growth cycle (every SP-growing statement — including
+	// loop cond / body / post — emits an OP_SP_RESTORE), so the true per-region
+	// max never exceeds the whole-function sum.
+	var conservative int = 0
+	for i := 0; i < n; i++ {
+		var blk @ir.Block = blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			conservative = conservative + opGrowthBytes(vm, blk.Instrs[j], f)
+		}
+	}
+	// entryResidual defaults to 0 (correct for the entry block; raised by
+	// propagation for the rest).
+	var entryResidual @[]int = make_slice(int, n)
+	var maxPeak int = 0
+	var changed bool = true
+	var iter int = 0
+	var limit int = n + 4
+	for changed && iter < limit {
+		changed = false
+		iter = iter + 1
+		maxPeak = 0
+		for i := 0; i < n; i++ {
+			var blk @ir.Block = blocks[i]
+			var cur int = entryResidual[i]
+			var peak int = cur
+			for j := 0; j < len(blk.Instrs); j++ {
+				var instr @ir.Instr = blk.Instrs[j]
+				if instr.Op == iropcode.OP_SP_RESTORE {
+					cur = 0
+				} else {
+					cur = cur + opGrowthBytes(vm, instr, f)
+					if cur > peak {
+						peak = cur
+					}
+				}
+			}
+			if peak > maxPeak {
+				maxPeak = peak
+			}
+			// Propagate the block's exit residual (cur) to its CFG successors.
+			var last int = len(blk.Instrs) - 1
+			if last >= 0 {
+				var term @ir.Instr = blk.Instrs[last]
+				if term.Op == iropcode.OP_JUMP {
+					if raiseEntryResidual(blocks, term.Block1, cur, entryResidual) {
+						changed = true
+					}
+				} else if term.Op == iropcode.OP_BRANCH {
+					if raiseEntryResidual(blocks, term.Block1, cur, entryResidual) {
+						changed = true
+					}
+					if raiseEntryResidual(blocks, term.Block2, cur, entryResidual) {
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	if changed {
+		return conservative
+	}
+	return maxPeak
+}

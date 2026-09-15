@@ -1,0 +1,102 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// SP-growth inventory: how many bytes each IR op grows vm.SP by, durably, until
+// the end-of-statement OP_SP_RESTORE reclaims it.  The per-function
+// MaxStmtTempGrowth reservation sums this over each OP_SP_RESTORE-delimited
+// region so a frame can pre-reserve its worst-case temp growth at pushFrame and
+// never overrun vm.Stack mid-statement.  This is VM-only: compiled backends use
+// the OS stack and never touch vm.SP.
+
+// spGrowthBytes returns the durable per-statement vm.SP growth (in bytes) for a
+// single IR op.  It MUST be an upper bound on the corresponding bytecode
+// handler's `vm.SP +=` — over-counting only widens the (safe) frame-entry
+// reservation, but under-counting risks writing past vm.Stack.  Non-growing ops
+// (and nil) return 0.
+//
+// This is a pure function of (op, result type).  Two call-related growths are
+// NOT computable from the ir.Instr alone and are DEFERRED to the MaxStmtTempGrowth
+// computation (R2), which has the lowering context in hand:
+//
+//   - The callee-side return-image build: BC_RETURN grows the callee's OWN vm.SP
+//     by the packed result image before copying it back to the caller
+//     (vm_exec_return.bn: `vm.SP += totalSize`, and packMultiReturn).  That is a
+//     per-FUNCTION term, types.AggregateReturnSize(f.Results), added to the return
+//     statement's region.  (The CALLER side — copying the returned image INTO the
+//     caller's frame — IS covered here, by the call ops below.)
+//   - The cross-mode arg-substitution scratch: a cross-mode call marshalling a
+//     bytecode-impl interface arg to a native callee grows the CALLER's vm.SP by
+//     substArgSlotIface's per-slot copy (vm_iface_crossmode.bn) and, for `...*any`,
+//     substituteSliceIfaceArgs (vm_iface_native_vt.bn).  The static per-slot part
+//     is a per-CALL term (sum over the call's ArgIfaceLayout slots of
+//     align8(ByteSize)); the `...*any` part is runtime-sized (kept as a runtime
+//     check).  Both need the call's ArgIfaceLayout, built during lowering, so they
+//     live in R2, not here.  (See the cross-mode-arg-substitution todo entry.)
+//
+// Handler cross-reference (keep in sync with these `vm.SP +=` sites):
+//   OP_MAKE_SLICE -> BC_MAKE_SLICE: 4 words (vm_exec_helpers.bn).
+//   OP_IFACE_VALUE -> BC_IFACE_VALUE[_DYN]: 2 words (vm_exec_iface.bn).
+//   OP_IFACE_UPCAST -> BC_IFACE_UPCAST: 2 words (vm_exec_iface.bn).
+//   OP_FUNC_VALUE -> BC_FUNC_VALUE: 2 words (vm_exec_funcref.bn).
+//   OP_RODATA_MSLICE_COPY -> BC_STRING_COPY_MS: 8 words (a 4-word
+//     pushManagedSlice header, which persists to SP_RESTORE, + a 4-word result).
+//   OP_RODATA_ARRAY -> BC_STRING_COPY_ARR: 4 words + align8(arrLen)
+//     (pushManagedSlice header + the zero-padded buffer).
+//   OP_CALL / _INDIRECT / _C_CALL / _FUNC_VALUE / _HANDLE / _IFACE_METHOD: the
+//     callee's return image is copied back into the caller's frame (mirroring
+//     lowerReturn's predicates) — an isMultiWordField / isVMAddressAggregate
+//     result grows the caller by align8(SizeOf); scalar / pointer / 64-bit
+//     register-pair returns grow 0.  (This is only the RETURN-IMAGE part of a
+//     call's caller-side growth; cross-mode arg-substitution scratch is the R2
+//     term noted above.)
+func spGrowthBytes(instr @ir.Instr) int {
+	if instr == nil { return 0 }
+	var op int = instr.Op
+	if op == iropcode.OP_MAKE_SLICE { return 4 * REG_SLOT }
+	if op == iropcode.OP_IFACE_VALUE { return 2 * REG_SLOT }
+	if op == iropcode.OP_IFACE_UPCAST { return 2 * REG_SLOT }
+	if op == iropcode.OP_FUNC_VALUE { return 2 * REG_SLOT }
+	if op == iropcode.OP_RODATA_MSLICE_COPY { return 8 * REG_SLOT }
+	if op == iropcode.OP_RODATA_ARRAY {
+		var arrLen int = 0
+		var at @types.Type = vmUnwrapNamed(instr.Typ)
+		if at != nil && at.Kind == types.TYP_ARRAY {
+			arrLen = at.ArrayLen
+		}
+		return 4 * REG_SLOT + ((arrLen + 7) & ~7)
+	}
+	if spIsCallOp(op) {
+		return spCallReturnImageBytes(instr.Typ)
+	}
+	return 0
+}
+
+// spIsCallOp reports whether op is one of the call ops whose callee may copy an
+// aggregate return image back into the caller's frame (growing the caller's
+// vm.SP).  A scalar/void return from any of these grows nothing — that is
+// decided by the result type in spCallReturnImageBytes, not here.
+func spIsCallOp(op int) bool {
+	return op == iropcode.OP_CALL || op == iropcode.OP_CALL_INDIRECT || op == iropcode.OP_C_CALL ||
+			op == iropcode.OP_CALL_FUNC_VALUE || op == iropcode.OP_CALL_HANDLE ||
+			op == iropcode.OP_CALL_IFACE_METHOD
+}
+
+// spCallReturnImageBytes returns the caller-side RETURN-IMAGE vm.SP growth for a
+// call whose result type is resultTyp (the cross-mode arg-substitution scratch is
+// a separate R2 term — see the file header).  It mirrors lowerReturn's copy-back
+// decision exactly
+// (using the SAME isMultiWordField / isVMAddressAggregate predicates), so the
+// reservation matches the runtime: a struct / array / slice / managed-slice /
+// iface-value / func-value result is copied back as align8(SizeOf) bytes (a
+// multi-return result is a makeMultiReturnStructType struct, so it takes this
+// path too); every scalar, pointer, or 64-bit register-pair return grows 0.
+func spCallReturnImageBytes(resultTyp @types.Type) int {
+	if resultTyp == nil { return 0 }
+	if isMultiWordField(resultTyp) || isVMAddressAggregate(resultTyp) {
+		return (resultTyp.SizeOf() + 7) / 8 * 8
+	}
+	return 0
+}

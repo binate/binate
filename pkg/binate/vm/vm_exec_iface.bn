@@ -29,13 +29,19 @@ func ifaceVtIsNative(vm @VM, vtIdxPlus int) bool {
 // sizes is unsound (it would miscompile floats, HFAs, and 32-bit targets).
 // Instead it resolves the PARALLEL shim vtable (registered raw-@__ivt-addr →
 // @__ivtshim-addr by RegisterPackageVtables), reads the method's function-value
-// HANDLE from slot, and dispatches through the handle's marshaling shim — the
-// same retbuf-style convention dispatchExternBinding uses.  The shim takes the
-// receiver as its first arg (a0); user args ride a1.. as the by-address slots
-// the bytecode already packs.  Writes regs[instr.Dst] in place; the caller
-// `continue`s (no VM frame is pushed).
-func dispatchCompiledIfaceMethod(vm @VM, regs *int, instr BCInstr, iv *int,
-		layout @ArgIfaceLayout) {
+// HANDLE from slot, and dispatches through the handle's CALL_PACKED slot (slot 2) —
+// the method's per-signature __shimP, the uniform packed-int-slot entry carrying ANY
+// arg/return shape, exactly as the func-value / extern cross-mode paths.  The packed
+// args are [receiver, user args...]: the receiver (the method's first param) is
+// packed slot 0, matching how __shimP / the impl shim reads it.  Writes regs[instr.Dst]
+// in place; the caller `continue`s (no VM frame is pushed).
+//
+// callArgs is execLoop's hoisted scratch buffer, reused to build the packed
+// [receiver, args...] array off vm.Stack (no reservation growth): the receiver (the
+// iv data ptr) and the callArgBase user-arg window are not contiguous in regs, so the
+// receiver must be prepended into a fresh contiguous slot array.
+func dispatchCompiledIfaceMethod(vm @VM, regs *int, instr BCInstr, iv *int, layout @ArgIfaceLayout,
+		callArgs @[]int) {
 	var shimVtAddr int = lookupShimVtable(vm, iv[types.IfaceValueVtableIndex()])
 	if shimVtAddr == 0 {
 		// The iface value carries a native @__ivt with no registered shim
@@ -48,14 +54,15 @@ func dispatchCompiledIfaceMethod(vm @VM, regs *int, instr BCInstr, iv *int,
 	// The Aux retbuf field (its WIDE low sub-field) = the aggregate retbuf size
 	// (stamped at IR-gen via types.AggregateReturnSize from the method's full result
 	// list) with the scalar64 flag in its bit 0: retbufFieldBytes > 0 = retbuf-shaped
-	// shim; else retbufFieldScalar64 = a bare 64-bit scalar return (register PAIR on
+	// return; else retbufFieldScalar64 = a bare 64-bit scalar return (register PAIR on
 	// ILP32); else a one-word scalar.  Mirrors isAggregateReturn.  The field is wide
 	// (not the old 16-bit high half) so a ≥64 KB aggregate return does not
 	// under-reserve.
 	var retbufField int = ifaceMethodAuxRetbufField(instr.Aux)
 	var retbufSize int = retbufFieldBytes(retbufField)
-	// Slot holds the method's @__handle ({vtable, data}); the marshaling shim is
-	// vtable.call, exactly as a function-value / extern dispatch reads it.
+	// Slot holds the method's @__handle ({vtable, data}); slot 2 of its vtable is the
+	// call_packed target (the method's __shimP), exactly as a function-value / extern
+	// dispatch reads it.
 	var handle *int = bit_cast(*int, shimVt[slot])
 	if bit_cast(int, handle) == 0 {
 		// A null shim slot means the impl-vtable slot collector couldn't resolve the impl
@@ -65,82 +72,68 @@ func dispatchCompiledIfaceMethod(vm @VM, regs *int, instr BCInstr, iv *int,
 		vmPanic("vm: compiled iface method slot has no shim handle")
 	}
 	var vtable *int = bit_cast(*int, handle[types.FuncValueVtableIndex()])
-	var fnPtr *uint8 = bit_cast(*uint8, vtable[1])
+	var callPacked int = vtable[types.FuncValueVtableCallPackedIndex()]
+	if callPacked == 0 {
+		vmPanic("vm: compiled iface method's vtable.call_packed is nil")
+	}
+	var callPackedFn *uint8 = bit_cast(*uint8, callPacked)
 	var dataPtr *uint8 = bit_cast(*uint8, handle[types.FuncValueDataIndex()])
-	// Imm's low 16 bits are the user-arg slot count; the high bits carry the
+	// Imm's low bits are the user-arg slot count; the high bits carry the
 	// argument-interface-layout index (masked off here; the layout is passed in).
 	var n int = ifaceMethodImmSlots(instr.Imm)
-	if n > 6 {
-		// The shim primitives carry 7 arg slots (a0..a6); the receiver takes
-		// a0, leaving 6 for user args.  A wider method can't be dispatched
-		// until the primitives widen — fail loudly rather than drop args.
-		vmPanic("vm: compiled iface method has >6 user arg slots (unsupported)")
+	// Build the packed [receiver, user args...] slot array in callArgs (off vm.Stack):
+	// receiver at slot 0, the n callArgBase user-arg slots at 1..n.  n+1 packed slots;
+	// callArgs holds 64, the practical ceiling (this replaces the old >6 cap — the
+	// SHAPE is now unlimited, only the scratch buffer bounds the arity).
+	if n + 1 > len(callArgs) {
+		vmPanic("vm: compiled iface method arg slots exceed the dispatch buffer")
 	}
-	// a0 = receiver (the iv data ptr); a1.. = user args (1 by-address slot each;
-	// the shim marshals each to the native ABI).
-	var a0 int = iv[types.IfaceValueDataIndex()]
-	var a1 int = 0
-	var a2 int = 0
-	var a3 int = 0
-	var a4 int = 0
-	var a5 int = 0
-	var a6 int = 0
-	if n > 0 { a1 = regs[instr.Src2 + 0] }
-	if n > 1 { a2 = regs[instr.Src2 + 1] }
-	if n > 2 { a3 = regs[instr.Src2 + 2] }
-	if n > 3 { a4 = regs[instr.Src2 + 3] }
-	if n > 4 { a5 = regs[instr.Src2 + 4] }
-	if n > 5 { a6 = regs[instr.Src2 + 5] }
-	// Cross-mode iface-arg substitution: this method runs
-	// as native code (the receiver's vtable came from an injected COMPILED package),
-	// so a bytecode-impl iface USER arg (top-level OR nested in a by-value aggregate)
-	// would reach it with a VM-index vtable word native code cannot dereference.  For
-	// each user-arg slot the caller's layout lists, swap in the impl's native
-	// handle-vtable COPY — the receiver a0 is never a bytecode index here (it is the
-	// native iface value that routed us to this path).  User args pack at a1.. (a0 is
-	// the receiver), so layout slot k maps to a(k+1).  No injected stdlib iface method
-	// takes an iface arg, so this fires only for an embedder-injected native package
-	// whose iface method does; the identical func-value sibling substitution is
-	// exercised by conformance.
+	callArgs[0] = iv[types.IfaceValueDataIndex()]
+	for i := 0; i < n; i++ {
+		callArgs[i + 1] = regs[instr.Src2 + i]
+	}
+	// Cross-mode iface-arg substitution over the USER-arg slots: this method runs as
+	// native code (the receiver's vtable came from an injected COMPILED package), so a
+	// bytecode-impl iface USER arg (top-level OR nested in a by-value aggregate) would
+	// reach it with a VM-index vtable word native code cannot dereference.  For each
+	// user-arg slot the layout lists, swap in the impl's native handle-vtable COPY —
+	// the receiver (slot 0) is never a bytecode index here (it is the native iface
+	// value that routed us to this path).  User args live at callArgs[1..], so
+	// substituteLayoutArgs indexes from &callArgs[1] (layout slot k → callArgs[k+1]).
+	// No injected stdlib iface method takes an iface arg, so this fires only for an
+	// embedder-injected native package whose iface method does; the identical
+	// func-value sibling substitution is exercised by conformance.
 	if layout != nil {
-		for i := 0; i < len(layout.Slots); i++ {
-			var e @ArgSlotIfaceLayout = layout.Slots[i]
-			if e.Slot == 0 {
-				a1 = substArgSlotIface(vm, a1, e)
-			} else if e.Slot == 1 {
-				a2 = substArgSlotIface(vm, a2, e)
-			} else if e.Slot == 2 {
-				a3 = substArgSlotIface(vm, a3, e)
-			} else if e.Slot == 3 {
-				a4 = substArgSlotIface(vm, a4, e)
-			} else if e.Slot == 4 {
-				a5 = substArgSlotIface(vm, a5, e)
-			} else if e.Slot == 5 {
-				a6 = substArgSlotIface(vm, a6, e)
-			}
-		}
+		substituteLayoutArgs(vm, &callArgs[1], layout)
 	}
+	// Invoke call_packed through the existing rt._call_shim_scalar64 indirect-call
+	// vehicle: its fixed arity places (data, argsPtr, nSlots, retbuf) in the first arg
+	// registers on every target ABI (call_packed(data, args, nSlots, retbuf)).
+	var argsPtr int = bit_cast(int, &callArgs[0])
+	var nPacked int = n + 1
 	if retbufSize > 0 {
-		// Aggregate return: the shim writes the natural-typed result through
-		// a retbuf (its first param).  retbufSize (types.AggregateReturnSize)
-		// is rounded up to a whole number of 8-byte words -- a conservative
-		// over-allocation shared by every backend and the VM regardless of
-		// target word size -- so it is the true byte count to reserve on
-		// vm.Stack.
+		// Aggregate return: call_packed writes the natural-typed result through a
+		// retbuf.  retbufSize (types.AggregateReturnSize) is rounded up to a whole
+		// number of 8-byte words — a conservative over-allocation shared by every
+		// backend and the VM regardless of target word size — so it is the true byte
+		// count to reserve on vm.Stack.  The i64 return is unused (call_packed
+		// returns 0).
 		var retbuf *uint8 = bit_cast(*uint8, bit_cast(int, vm.Stack) + vm.SP)
 		vm.SP = vm.SP + retbufSize
-		rt._call_shim_aggregate(fnPtr, retbuf, dataPtr, a0, a1, a2, a3, a4, a5, a6)
+		rt._call_shim_scalar64(callPackedFn, dataPtr, argsPtr, nPacked, bit_cast(int, retbuf), 0, 0, 0, 0)
 		if instr.Dst >= 0 { regs[instr.Dst] = bit_cast(int, retbuf) }
 		return
 	}
 	if retbufFieldScalar64(retbufField) {
-		// 64-bit scalar return: the shim declares i64; read both words via the
-		// wide primitive and split into the destination register pair (ILP32).
+		// 64-bit scalar return: read the full i64 (retbuf null) and split into the
+		// destination register pair (ILP32).
 		storeScalar64Result(regs, instr.Dst,
-				rt._call_shim_scalar64(fnPtr, dataPtr, a0, a1, a2, a3, a4, a5, a6))
+				rt._call_shim_scalar64(callPackedFn, dataPtr, argsPtr, nPacked, 0, 0, 0, 0, 0))
 		return
 	}
-	var result int = rt._call_shim_scalar(fnPtr, dataPtr, a0, a1, a2, a3, a4, a5, a6)
+	// One-word scalar return: narrow the i64 to the host word (retbuf null).
+	var result int = cast(int, rt._call_shim_scalar64(callPackedFn, dataPtr, argsPtr, nPacked, 0, 0, 0,
+			0, 0))
 	if instr.Dst >= 0 { regs[instr.Dst] = result }
 }
 

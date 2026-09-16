@@ -1,82 +1,69 @@
 package "pkg/binate/vm"
 
+import "pkg/binate/types"
 import "pkg/builtins/rt"
 
-// dispatchExternBinding routes a registered extern call through the
-// compiled-side function value's vtable.call (the per-function shim),
-// packing args into the always-shim convention's fixed 7-int register
-// bank.  Mirrors dispatchCompiledFuncValue (vm_exec_helpers.bn).
+// dispatchExternBinding routes a registered extern call through the compiled-side
+// function value's vtable CALL_PACKED slot (slot 2): a uniform packed-int-slot entry
+// (the callee's per-signature __shimP, since a registered extern is native) that
+// carries ANY arg/return shape.  Mirrors dispatchCompiledFuncValue (vm_exec_funcref.bn)
+// — the packed user args are read zero-copy from the contiguous callArgBase register
+// window at &regs[Src1], so there is NO 7-slot cap (any arity is carried).  Slot 1
+// (call) is the real-ABI per-signature entry compiled callers use; the VM never
+// touches it here.
 //
-// Returns int64 so a 64-bit scalar return carries its full register pair; a
-// one-word scalar / retbuf pointer rides the low word (the caller narrows via
-// cast(int, ...)).  Branches on b.RetbufSize (the aggregate RETBUF size from
-// types.AggregateReturnSize: 0 for a scalar return, the rounded retbuf byte size
-// for an aggregate — agreeing with codegen's isAggregateReturn) and the caller-
-// supplied `scalar64` flag (from the bytecode instruction, since b.RetbufSize is
-// 0 for a bare 64-bit scalar and so cannot signal it):
-//   - RetbufSize > 0: aggregate dispatch via rt._call_shim_aggregate.  Allocates
-//     a retbuf of RetbufSize bytes on vm.Stack, passes its address as the shim's
-//     first argument, returns the retbuf address (the bytecode caller's
-//     aggregate-return convention).
-//   - scalar64: a bare int64/uint64/float64 return on ILP32 — the shim declares
-//     i64, so dispatch via the wide rt._call_shim_scalar64 and return both words.
-//   - otherwise: one-word scalar dispatch via rt._call_shim_scalar (returns in
-//     X0/r0); caller writes to instr.Dst.
+// Returns int64: call_packed yields a scalar result as i64 bits (both words carry a
+// bare 64-bit scalar; a one-word scalar rides the low word — the caller's
+// storeExternResult splits or narrows per the scalar64 flag), or writes an aggregate
+// through the retbuf and returns 0 (the caller reads the aggregate from the returned
+// retbuf address).  Branches on b.RetbufSize — the aggregate RETBUF size from
+// types.AggregateReturnSize: 0 for a scalar return, the 8-rounded retbuf byte size for
+// an aggregate, agreeing with codegen's isAggregateReturn.
 //
-// Works in both native and bytecode dispatch contexts: when run
-// natively, the rt._call_shim_* helpers lower to direct LLVM
-// indirect calls to the shim; when run as bytecode (a nested-VM
-// scenario where pkg/binate/vm itself runs as bytecode in an outer VM),
-// the bytecode emits BC_CALL_INDIRECT, which the outer native
-// execLoop's BC_CALL_INDIRECT handler dispatches via
-// dispatchNativeIndirect's Imm==8 / Imm==9 arms.
-func dispatchExternBinding(vm @VM, b ExternBinding, args @[]int, scalar64 bool,
-		layout @ArgIfaceLayout, sliceIfaceBits int) int64 {
+// Invokes call_packed through the EXISTING rt._call_shim_scalar64 indirect-call
+// vehicle: its fixed arity places (data, argsPtr, nSlots, retbuf) in the first arg
+// registers on every target ABI (call_packed(data, args, nSlots, retbuf)).  Works in
+// both native and bytecode dispatch contexts: run natively the helper lowers to a
+// direct indirect call to __shimP; run as bytecode (a nested-VM scenario where
+// pkg/binate/vm itself runs as bytecode in an outer VM) it emits BC_CALL_INDIRECT,
+// which the outer native execLoop's dispatchNativeIndirect handles.
+func dispatchExternBinding(vm @VM, b ExternBinding, regs *int, instr BCInstr,
+		layout @ArgIfaceLayout, nSlots int) int64 {
 	if b.VtableAddr == 0 {
 		vmPanic("vm: registered extern has nil vtable")
 	}
 	var vtable *int = bit_cast(*int, b.VtableAddr)
-	var callPtr int = vtable[1]
-	if callPtr == 0 {
-		vmPanic("vm: registered extern has nil vtable.call")
+	var callPacked int = vtable[types.FuncValueVtableCallPackedIndex()]
+	if callPacked == 0 {
+		vmPanic("vm: registered extern has nil vtable.call_packed")
 	}
-	var fnPtr *uint8 = bit_cast(*uint8, callPtr)
+	var callPackedFn *uint8 = bit_cast(*uint8, callPacked)
 	var dataPtr *uint8 = bit_cast(*uint8, b.DataAddr)
-	var nArgs int = len(args)
-	// Cross-mode interface-arg substitution: before
-	// packing a0..a6, rewrite any interface arg whose vtable word is a VM index
-	// (a bytecode impl) — top-level OR nested in a by-value aggregate — to a COPY
-	// carrying the impl's native handle-vtable, so this injected-native callee's
-	// RefDec / method dispatch re-enters the VM instead of dereferencing the
-	// index.  Only the slots the caller's static arg types listed (layout) are
-	// considered; scalars are never touched.  nil layout = no interface args.
+	// The packed user args are the contiguous callArgBase register window at
+	// &regs[Src1], nSlots slots of REG_SLOT bytes each — exactly the packed int-slot
+	// array call_packed reads (zero-copy).  Cross-mode iface-arg substitution runs IN
+	// PLACE on that window (the callArgBase slots are dedicated packed-arg temporaries,
+	// like the func-value Src2 window): substituteLayoutArgs rewrites any interface arg
+	// whose vtable word is a VM index (a bytecode impl — top-level OR nested in a
+	// by-value aggregate) to a COPY carrying the impl's native handle-vtable, so this
+	// injected-native callee's RefDec / method dispatch re-enters the VM instead of
+	// dereferencing the index; substituteSliceIfaceArgs does the same for `...*any`
+	// slice ELEMENTS (the per-slot bitmap rides instr.Src2).  nil layout = no interface
+	// args; a scalar slot is never touched.
+	var argsBase *int = bit_cast(*int, bit_cast(int, regs) + instr.Src1 * REG_SLOT)
 	if layout != nil {
-		substituteLayoutArgs(vm, args, layout)
+		substituteLayoutArgs(vm, argsBase, layout)
 	}
-	if sliceIfaceBits != 0 {
-		substituteSliceIfaceArgs(vm, args, sliceIfaceBits)
+	if instr.Src2 != 0 {
+		substituteSliceIfaceArgs(vm, argsBase, instr.Src2)
 	}
 	if vm.FaultRaised {
 		// A cross-mode arg substitution overflowed the VM scratch stack and raised a
-		// recoverable fault (substituteSliceIfaceArgs); abort before packing a0..a6 or
-		// calling the native shim.  execLoop's post-execExternCall callFaultPending
-		// check unwinds this call op's cleanup pad, releasing the in-flight moved args.
+		// recoverable fault (substituteSliceIfaceArgs); abort before dispatch.  execLoop's
+		// post-execExternCall callFaultPending check unwinds this call op's cleanup pad,
+		// releasing the in-flight moved args.
 		return 0
 	}
-	var a0 int = 0
-	var a1 int = 0
-	var a2 int = 0
-	var a3 int = 0
-	var a4 int = 0
-	var a5 int = 0
-	var a6 int = 0
-	if nArgs > 0 { a0 = args[0] }
-	if nArgs > 1 { a1 = args[1] }
-	if nArgs > 2 { a2 = args[2] }
-	if nArgs > 3 { a3 = args[3] }
-	if nArgs > 4 { a4 = args[4] }
-	if nArgs > 5 { a5 = args[5] }
-	if nArgs > 6 { a6 = args[6] }
 	// Publish THIS vm to the installed rt.SatLookup fallback (satFallbackFn) for the
 	// duration of the native callee, so an injected-native `x.(*J)` on a bytecode-
 	// boxed value resolves through this vm's satentry registry rather than MISSing
@@ -84,24 +71,24 @@ func dispatchExternBinding(vm @VM, b ExternBinding, args @[]int, scalar64 bool,
 	// re-enter the vm (a handle), which may dispatch another extern.
 	var savedVmAddr int = g_crossModeVmAddr
 	g_crossModeVmAddr = bit_cast(int, vm)
+	var argsPtr int = bit_cast(int, argsBase)
 	var result int64 = 0
 	if b.RetbufSize > 0 {
-		// Aggregate path: allocate the retbuf (RetbufSize bytes, already
-		// rounded to N*8) on vm.Stack, call the shim, return the retbuf
-		// address.  Bytecode caller's aggregate-return convention reads the
-		// multi-word value from there.
+		// Aggregate path: reserve the retbuf (RetbufSize bytes, already rounded to
+		// N*8) on vm.Stack, invoke call_packed (which writes the natural-typed result
+		// through it), and return the retbuf address.  The bytecode caller's
+		// aggregate-return convention reads the multi-word value from there; the i64
+		// return is unused (call_packed returns 0).
 		var retbuf *uint8 = bit_cast(*uint8, bit_cast(int, vm.Stack) + vm.SP)
 		vm.SP = vm.SP + b.RetbufSize
-		rt._call_shim_aggregate(fnPtr, retbuf, dataPtr, a0, a1, a2, a3, a4, a5, a6)
+		rt._call_shim_scalar64(callPackedFn, dataPtr, argsPtr, nSlots, bit_cast(int, retbuf), 0, 0, 0, 0)
 		result = cast(int64, bit_cast(int, retbuf))
-	} else if scalar64 {
-		// 64-bit scalar return on ILP32: the shim declares i64, so read both
-		// words via the wide primitive.  b.RetbufSize is 0 for a scalar (it is
-		// registry-side, from AggregateReturnSize, which excludes scalars), so
-		// the flag must ride the bytecode instruction — see the BC_CALL arm.
-		result = rt._call_shim_scalar64(fnPtr, dataPtr, a0, a1, a2, a3, a4, a5, a6)
 	} else {
-		result = cast(int64, rt._call_shim_scalar(fnPtr, dataPtr, a0, a1, a2, a3, a4, a5, a6))
+		// Scalar return (one-word OR bare 64-bit): call_packed returns the scalar as
+		// i64 bits (retbuf null).  The one-word-vs-64-bit distinction is entirely in
+		// the caller's storeExternResult (narrow vs register-pair split), so no branch
+		// here — the full i64 is returned verbatim.
+		result = rt._call_shim_scalar64(callPackedFn, dataPtr, argsPtr, nSlots, 0, 0, 0, 0, 0)
 	}
 	g_crossModeVmAddr = savedVmAddr
 	return result
@@ -109,24 +96,18 @@ func dispatchExternBinding(vm @VM, b ExternBinding, args @[]int, scalar64 bool,
 
 // execExternCall handles execLoop's BC_CALL extern arm (calleeFuncIdx < 0): an
 // extern dispatch that returns INLINE (no VM frame pushed), so it factors out of
-// the dispatch loop cleanly.  Packs the masked nSlots args from the hoisted
-// callArgs buffer, dispatches via execExtern (int64 return), and stores the
-// result — a 64-bit scalar splits into the register pair, everything else rides
-// the low word (storeExternResult).  nSlots > 7 fails loud: the shim carries
-// only 7 user-arg slots (a0..a6), and 7 < len(callArgs) also bounds the buffer.
-func execExternCall(vm @VM, f @VMFunc, regs *int, callArgs @[]int, instr BCInstr, nSlots int) {
-	if nSlots > 7 {
-		vmPanic("vm: extern call has >7 arg slots (unsupported)")
-	}
-	for i := 0; i < nSlots; i++ {
-		callArgs[i] = regs[instr.Src1 + i]
-	}
+// the dispatch loop cleanly.  Dispatches via execExtern (int64 return) — which reads
+// the args zero-copy from the callArgBase register window and invokes the callee's
+// call_packed, carrying ANY arg count / return shape — then stores the result: a
+// 64-bit scalar splits into the register pair, everything else rides the low word
+// (storeExternResult, per the packed Imm's scalar64 flag).
+func execExternCall(vm @VM, f @VMFunc, regs *int, instr BCInstr, nSlots int) {
 	// The cross-mode argument interface-vtable layout for THIS call site rides a
 	// free field of instr.Imm as a 1-based index into the caller f's ArgIfaceLayouts
 	// (0 = no interface args); resolve it here where f is in hand and pass the layout
 	// down to the marshalling choke point.
 	var layout @ArgIfaceLayout = argIfaceLayoutFor(f, callImmLayout(instr.Imm))
-	var result int64 = execExtern(vm, f.Names[instr.Aux], callArgs, instr, layout)
+	var result int64 = execExtern(vm, f.Names[instr.Aux], regs, instr, layout, nSlots)
 	storeExternResult(regs, instr.Dst, result, callImmScalar64(instr.Imm))
 }
 
@@ -134,22 +115,21 @@ func execExternCall(vm @VM, f @VMFunc, regs *int, callArgs @[]int, instr BCInstr
 // the executing VM's Externs registry (populated at VM-init time
 // via RegisterExtern — the host registers its packages plus the VM's
 // own trampolines, see pkg/binate/interp).  On hit, routes through
-// dispatchExternBinding (which calls the per-function shim via
-// rt._call_shim_*); on miss, aborts with a diagnostic.
-func execExtern(vm @VM, name *[]readonly char, args @[]int, instr BCInstr,
-		layout @ArgIfaceLayout) int64 {
+// dispatchExternBinding (which invokes the callee's per-signature __shimP via the
+// call_packed slot); on miss, aborts with a diagnostic.
+func execExtern(vm @VM, name *[]readonly char, regs *int, instr BCInstr, layout @ArgIfaceLayout,
+		nSlots int) int64 {
 	var bindIdx int = vm.LookupExtern(name)
 	if bindIdx >= 0 {
-		// callImmScalar64(instr.Imm): the bytecode instruction carries the
-		// 64-bit-scalar-return flag (the binding's RetbufSize can't — it is 0
-		// for a scalar), selecting the wide _call_shim_scalar64 in the dispatch.
-		// layout: the caller's per-call-site argument interface-vtable layout
-		// (resolved by execExternCall) driving the cross-mode iface-arg substitution
-		// (substituteLayoutArgs); nil when the call has no iface args.  instr.Src2:
-		// the per-slot slice-of-iface bitmap for the nested-element substitution
-		// (substituteSliceIfaceArgs) — carried in Src2, not Imm (see lowerCallOp).
-		return dispatchExternBinding(vm, vm.Externs[bindIdx], args, callImmScalar64(instr.Imm), layout,
-				instr.Src2)
+		// regs + instr.Src1: the contiguous callArgBase window holding the packed
+		// user-arg slots (read zero-copy by dispatchExternBinding).  nSlots: the packed
+		// slot count.  layout: the caller's per-call-site argument interface-vtable
+		// layout (resolved by execExternCall) driving the cross-mode iface-arg
+		// substitution (substituteLayoutArgs); nil when the call has no iface args.
+		// instr.Src2: the per-slot slice-of-iface bitmap for the nested-element
+		// substitution (substituteSliceIfaceArgs) — carried in Src2, not Imm (see
+		// lowerCallOp).
+		return dispatchExternBinding(vm, vm.Externs[bindIdx], regs, instr, layout, nSlots)
 	}
 	vmPanicName("vm: extern not found: ", name)
 	return 0

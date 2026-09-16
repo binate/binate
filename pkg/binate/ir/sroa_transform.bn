@@ -69,15 +69,20 @@ func runSroa(m @Module) {
 // one link per pass, so a fixed small cap would silently leave a deep chain's
 // outer allocas un-split.
 //
-// The bound is instead the aggregate-alloca count at entry (+1 to observe the
-// terminating false pass): every progress pass removes at least one aggregate
-// alloca and adds none (field slots are always scalars — a managed slice splits
-// to {*uint8,int,@ptr,int}, a struct to promotable scalars), so that count is an
-// exact upper bound on productive passes — this never truncates legitimate work,
-// yet still caps a hypothetical analysis bug that reported progress without
-// shrinking the IR.
+// The bound is the total count of by-value aggregate NODES across f's aggregate
+// allocas (each contributes aggregateNodeCount — itself plus its transitively-
+// nested aggregate fields), +1 to observe the terminating false pass.  A nested-
+// aggregate field splits into a field slot that is ITSELF an aggregate (a struct
+// with a nested struct / raw-slice field), so a progress pass CAN add aggregate
+// allocas — but only strictly shallower ones (a by-value type cannot contain
+// itself; recursion goes through managed pointers, which are leaves).  Counting
+// only top-level allocas would under-count: a depth-D nest is one alloca yet
+// needs D passes.  The node count covers both axes — a depth-D nest is D nodes,
+// and a copy CHAIN of k links (peeled one per pass, see above) is k allocas = k
+// nodes.  The cap never truncates legitimate work, yet still stops a hypothetical
+// analysis bug that reported progress without shrinking the IR.
 func sroaFuncToFixpoint(f @Func) {
-	var maxPasses int = countSroaAggregateAllocas(f) + 1
+	var maxPasses int = sroaFixpointPassBound(f) + 1
 	for i := 0; i < maxPasses; i++ {
 		if !sroaFunc(f) {
 			return
@@ -85,18 +90,36 @@ func sroaFuncToFixpoint(f @Func) {
 	}
 }
 
-// countSroaAggregateAllocas counts the aggregate (struct / slice) allocas in f's
-// blocks — the exact upper bound on how many progress passes sroaFuncToFixpoint
-// can make, since each removes at least one and none are ever created.
-func countSroaAggregateAllocas(f @Func) int {
+// sroaFixpointPassBound sums aggregateNodeCount over f's aggregate allocas — an
+// upper bound on how many progress passes sroaFuncToFixpoint can make, since each
+// splits at least one aggregate node and never regenerates one.
+func sroaFixpointPassBound(f @Func) int {
 	var n int = 0
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var blk @Block = f.Blocks[bi]
 		for ii := 0; ii < len(blk.Instrs); ii++ {
-			if isSroaAggregateAlloca(blk.Instrs[ii]) {
-				n = n + 1
+			var instr @Instr = blk.Instrs[ii]
+			if isSroaAggregateAlloca(instr) {
+				n = n + aggregateNodeCount(instr.TypeArg)
 			}
 		}
+	}
+	return n
+}
+
+// aggregateNodeCount returns the number of by-value aggregate nodes in t: 0 for a
+// non-splittable leaf (scalar / managed pointer / array / func-value /
+// iface-value), else 1 (t itself) plus the count over its field types.  By-value
+// aggregates cannot recurse (that would be infinite size — recursion goes through
+// managed pointers, which are leaves), so this terminates.
+func aggregateNodeCount(t @types.Type) int {
+	if !isSroaAggregateType(t) {
+		return 0
+	}
+	var fts @[]@types.Type = aggregateFieldTypes(t)
+	var n int = 1
+	for i := 0; i < len(fts); i++ {
+		n = n + aggregateNodeCount(fts[i])
 	}
 	return n
 }
@@ -326,13 +349,34 @@ func fieldNeedsZeroConstInit(t @types.Type) bool {
 	return tr.Kind == types.TYP_INT && tr.Width > types.TypInt().Width
 }
 
+// fieldIsBackendZeroFilledAggregate reports whether a split-out field of type t is
+// an AGGREGATE the backend zero-fills at its own alloca — so after the split the
+// field slot is zero-initialized with no explicit init (unlike a non-promotable
+// scalar).  MUST MIRROR pkg/binate/native/common.IsAggregateTyp, which is also the
+// LLVM (emit_helpers.bn) + native emitAlloc zero-fill set: struct / array / raw +
+// managed slice / func-value / iface-value.  (In the non-managed SROA path only the
+// non-managed variants occur — a managed field is excluded upstream by
+// sroaAggregateContainsManaged — but mirroring the full set keeps this in lockstep
+// with the backend predicate.)  ir must not import native/common; keep in sync.
+func fieldIsBackendZeroFilledAggregate(t @types.Type) bool {
+	var tr @types.Type = peelTransparent(t)
+	if tr == nil {
+		return false
+	}
+	return tr.Kind == types.TYP_STRUCT || tr.Kind == types.TYP_ARRAY || tr.Kind == types.TYP_SLICE ||
+			tr.Kind == types.TYP_MANAGED_SLICE || tr.Kind == types.TYP_FUNC_VALUE ||
+			tr.Kind == types.TYP_MANAGED_FUNC_VALUE || tr.Kind == types.TYP_INTERFACE_VALUE ||
+			tr.Kind == types.TYP_INTERFACE_VALUE_MANAGED
+}
+
 // aggregateFieldsScalarReplaceable reports whether EVERY field of NON-MANAGED
 // aggregate type t can be safely split into its own alloca: a mem2reg-promotable
-// scalar (zero-forwarded), or a float / oversized-int scalar that gets an explicit
-// zero-const init (fieldNeedsZeroConstInit / makeFieldZeroInits).  A raw slice's
-// fields are {*uint8, int} — always promotable.  A nested-AGGREGATE field (struct
-// / array / another slice) is NOT admitted yet: after the split its field alloca
-// IS backend-zero-filled, but that broadening is a separate step.
+// scalar (zero-forwarded), a float / oversized-int scalar given an explicit
+// zero-const init (fieldNeedsZeroConstInit / makeFieldZeroInits), or a nested
+// AGGREGATE the backend zero-fills at its own alloca (fieldIsBackendZeroFilled-
+// Aggregate — no init needed; the SROA fixpoint then recurses into a nested
+// struct / raw-slice slot to flatten it further).  A raw slice's fields are
+// {*uint8, int} — always promotable.
 func aggregateFieldsScalarReplaceable(t @types.Type) bool {
 	t = peelTransparent(t)
 	if t == nil {
@@ -343,7 +387,8 @@ func aggregateFieldsScalarReplaceable(t @types.Type) bool {
 	}
 	for i := 0; i < len(t.Fields); i++ {
 		var ft @types.Type = t.Fields[i].Type
-		if !isScalarPromotableType(ft) && !fieldNeedsZeroConstInit(ft) {
+		if !isScalarPromotableType(ft) && !fieldNeedsZeroConstInit(ft) &&
+				!fieldIsBackendZeroFilledAggregate(ft) {
 			return false
 		}
 	}
@@ -393,85 +438,4 @@ func isExtractableAggregateValue(val @Instr) bool {
 	// ABI-coerced — so a `var s *[]T = make_slice(...)` init store is extractable
 	// and its raw-slice local can be scalar-replaced.
 	return val.Op == iropcode.OP_MANAGED_TO_RAW
-}
-
-// makeFieldAllocas creates one OP_ALLOC per field of aggregate alloca a, typed by
-// the field's type (the same index OP_GET_FIELD_PTR / OP_EXTRACT use).  For a raw
-// slice the two fields are {data: *uint8, len: int} — the types its OP_EXTRACT
-// consumers use (EmitSliceElemPtr extracts field 0 as *uint8, EmitSliceLen field
-// 1 as int).  For a struct, the declared field types in order.
-func makeFieldAllocas(f @Func, a @Instr) @[]@Instr {
-	var fieldTyps @[]@types.Type = aggregateFieldTypes(peelTransparent(a.TypeArg))
-	var out @[]@Instr
-	for i := 0; i < len(fieldTyps); i++ {
-		var ft @types.Type = stripConstForIR(fieldTyps[i])
-		var fa @Instr = newInstr(f, iropcode.OP_ALLOC, types.MakePointerType(ft))
-		fa.TypeArg = ft
-		fa.Line = a.Line
-		out = slices.Append[@Instr](out, fa)
-	}
-	return out
-}
-
-// makeFieldZeroInits returns explicit nil-store prologue instrs for each field
-// slot that mem2reg will NOT promote and the backend will NOT zero-fill — i.e. a
-// MANAGED-pointer field (a managed slice's refptr).  Without this, an unwritten
-// such field (a nil `var s @[]T` never assigned) would read stack garbage, and
-// the refcount spine would OP_REFDEC a wild pointer.  The stores are RAW (a
-// managed OP_ALLOC slot is a pure bit-copy cell, no implicit refcount), emitted
-// at the alloca's position so they dominate every use.  Promotable fields
-// (data/len/backinglen) need none — mem2reg zero-forwards their undef loads.
-func makeFieldZeroInits(f @Func, fieldAllocas @[]@Instr) @[]@Instr {
-	var out @[]@Instr
-	for i := 0; i < len(fieldAllocas); i++ {
-		var fa @Instr = fieldAllocas[i]
-		// A managed slot gets a nil; a non-managed non-promotable scalar (float /
-		// oversized-int, admitted by aggregateFieldsScalarReplaceable) gets its
-		// typed zero const.  Promotable scalars (mem2reg zero-forward) and
-		// aggregates (backend zero-fill) need nothing.
-		var zero @Instr
-		if isManagedScalarType(fa.TypeArg) {
-			zero = newInstr(f, iropcode.OP_CONST_NIL, fa.TypeArg)
-		} else if fieldNeedsZeroConstInit(fa.TypeArg) {
-			zero = makeZeroConst(f, fa.TypeArg)
-		} else {
-			continue
-		}
-		zero.Line = fa.Line
-		var st @Instr = newVoidInstr(iropcode.OP_STORE)
-		st.Args = makeArgs2(fa, zero)
-		st.Line = fa.Line
-		out = slices.Append[@Instr](out, zero)
-		out = slices.Append[@Instr](out, st)
-	}
-	return out
-}
-
-// aggregateFieldTypes returns the per-field types of aggregate type t, in the
-// index order OP_EXTRACT / OP_GET_FIELD_PTR use: a raw slice is {*uint8, int}; a
-// struct is its declared field types.
-func aggregateFieldTypes(t @types.Type) @[]@types.Type {
-	t = peelTransparent(t)
-	var out @[]@types.Type
-	if t != nil && t.Kind == types.TYP_SLICE {
-		out = slices.Append[@types.Type](out, types.MakePointerType(types.TypUint8()))
-		out = slices.Append[@types.Type](out, types.TypInt())
-		return out
-	}
-	if t != nil && t.Kind == types.TYP_MANAGED_SLICE {
-		// {data:*uint8, len:int, refptr:@ptr, backinglen:int} — the refptr
-		// (MSLICE_FIELD_BACKING) is a managed pointer (mem2reg won't promote it;
-		// it stays in memory as a raw-copy cell + gets an explicit nil zero-init).
-		out = slices.Append[@types.Type](out, types.MakePointerType(types.TypUint8()))
-		out = slices.Append[@types.Type](out, types.TypInt())
-		out = slices.Append[@types.Type](out, types.MakeManagedPtrType(nil))
-		out = slices.Append[@types.Type](out, types.TypInt())
-		return out
-	}
-	if t != nil && t.Kind == types.TYP_STRUCT {
-		for i := 0; i < len(t.Fields); i++ {
-			out = slices.Append[@types.Type](out, t.Fields[i].Type)
-		}
-	}
-	return out
 }

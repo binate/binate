@@ -29,14 +29,15 @@ import "pkg/stdx/slices"
 // So splittability is a TWO-LEVEL check: L1 over the alloca's uses, L2 over the
 // values produced by whole loads of it.
 //
-// NESTING: the analysis classifies an alloca purely by ITS OWN uses and is
-// agnostic to whether a field is itself an aggregate.  Field-by-field access of
-// a nested aggregate reads/writes through an inner OP_GET_FIELD_PTR whose base
-// is the outer field-ptr (not the alloca), so fieldPtrUsedOnlyAsLoadStore pins
-// the outer slot; whole-load/store of a nested field leaves the outer slot
-// splittable but yields a nested-aggregate field slot that scalar-only mem2reg
-// cannot promote.  Recursing to a fixpoint over such nested field slots is a
-// concern of the eventual rewrite phase, not of this analysis.
+// NESTING: a field that is itself an aggregate is handled by RECURSION.
+// Field-by-field access of a nested aggregate reads/writes through an inner
+// OP_GET_FIELD_PTR whose base is the outer field-ptr (not the alloca);
+// fieldPtrChainScalarReplaceable recurses through that chain, so the outer slot
+// is still splittable and becomes per-field slots — one of them the nested
+// aggregate.  The SROA fixpoint re-collects that nested field slot and splits it
+// on a later pass, one nesting level per pass, until the whole nest is scalars
+// mem2reg can promote.  The eligibility gate (aggregateFieldsScalarReplaceable)
+// admits a nested-aggregate field because the backend zero-fills its slot.
 
 // isSroaAggregateType reports whether t (peeled) is an aggregate SROA can
 // scalar-replace: a struct, or a slice (raw *[]T or managed @[]T).  Arrays are
@@ -120,12 +121,13 @@ func collectSroaCandidates(f @Func) @[]@Instr {
 
 // sroaAllocaL1OK reports whether every use of aggregate alloca `a` is an
 // L1-splittable use: the Args[0] pointer of a whole OP_LOAD or whole OP_STORE,
-// or a (constant-index) OP_GET_FIELD_PTR whose own result is used only as a
-// load/store Args[0].  ANY other appearance pins the slot: the alloca as a value
-// operand (its address escaping via a call arg, OP_RETURN, or an OP_STORE
-// Args[1]), a dynamic OP_GET_ELEM_PTR, a PhiEntry.Val, or ANY appearance inside
-// a FaultPad (matching mem2reg — and mandatory for a managed aggregate, whose
-// refcount cleanup reads the whole value in pads).
+// or a (constant-index) OP_GET_FIELD_PTR whose own result chain is
+// scalar-replaceable — used only as a load/store Args[0], or as the base of a
+// deeper nested field-ptr (o.inner.x), recursively.  ANY other appearance pins
+// the slot: the alloca as a value operand (its address escaping via a call arg,
+// OP_RETURN, or an OP_STORE Args[1]), a dynamic OP_GET_ELEM_PTR, a PhiEntry.Val,
+// or ANY appearance inside a FaultPad (matching mem2reg — and mandatory for a
+// managed aggregate, whose refcount cleanup reads the whole value in pads).
 func sroaAllocaL1OK(f @Func, a @Instr) bool {
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		if !blockAllocaUsesAreL1(f, f.Blocks[bi], a) {
@@ -141,8 +143,8 @@ func sroaAllocaL1OK(f @Func, a @Instr) bool {
 }
 
 // blockAllocaUsesAreL1 reports whether every appearance of `a` within block b is
-// a valid L1 use (see sroaAllocaL1OK).  A field-ptr use is validated one level
-// deeper by fieldPtrUsedOnlyAsLoadStore.
+// a valid L1 use (see sroaAllocaL1OK).  A field-ptr use is validated by
+// fieldPtrChainScalarReplaceable, which recurses through nested field access.
 func blockAllocaUsesAreL1(f @Func, b @Block, a @Instr) bool {
 	for ii := 0; ii < len(b.Instrs); ii++ {
 		var instr @Instr = b.Instrs[ii]
@@ -163,7 +165,7 @@ func blockAllocaUsesAreL1(f @Func, b @Block, a @Instr) bool {
 			if okLoad || okStore {
 				continue
 			}
-			if instr.Op == iropcode.OP_GET_FIELD_PTR && k == 0 && fieldPtrUsedOnlyAsLoadStore(f, instr) {
+			if instr.Op == iropcode.OP_GET_FIELD_PTR && k == 0 && fieldPtrChainScalarReplaceable(f, instr) {
 				continue
 			}
 			return false
@@ -172,20 +174,59 @@ func blockAllocaUsesAreL1(f @Func, b @Block, a @Instr) bool {
 	return true
 }
 
-// fieldPtrUsedOnlyAsLoadStore reports whether the result of field-ptr instr fp
-// is used only as the Args[0] pointer of a plain load/store, and never inside a
-// FaultPad.  If fp's address itself escapes (a call arg, &s.x, a phi entry), the
-// owning slot cannot be scalar-replaced.  Reuses the mem2reg use classifiers
-// (blockUsesAllocaNonLoadStore treats anything but a load/store Args[0] as an
-// escape; blockReferencesAlloca flags any pad appearance).
-func fieldPtrUsedOnlyAsLoadStore(f @Func, fp @Instr) bool {
-	for bi := 0; bi < len(f.Blocks); bi++ {
-		if blockUsesAllocaNonLoadStore(f.Blocks[bi], fp) {
+// fieldPtrChainScalarReplaceable reports whether the result of field-ptr instr
+// fp is consumed only by uses that keep fp's owning slot scalar-replaceable: the
+// Args[0] pointer of a plain load/store, OR the Args[0] base of an inner
+// constant-index OP_GET_FIELD_PTR whose own result chain recursively satisfies
+// the same.  The recursive case is nested struct field access (o.inner.x): the
+// inner field-ptr's base is the outer field-ptr, and after the split the rewrite
+// redirects that base onto the outer field's slot (rewriteUsesInBlocks /
+// chaseRepl), so the inner field-ptr becomes a plain field-ptr on the slot and
+// the fixpoint scalar-replaces it on a later pass.  Any other use — the address
+// escaping via a call arg, &s.x, a phi entry, or a dynamic OP_GET_ELEM_PTR, or
+// ANY FaultPad appearance — pins the slot.
+func fieldPtrChainScalarReplaceable(f @Func, fp @Instr) bool {
+	for pi := 0; pi < len(f.FaultPads); pi++ {
+		if blockReferencesAlloca(f.FaultPads[pi], fp) {
 			return false
 		}
 	}
-	for pi := 0; pi < len(f.FaultPads); pi++ {
-		if blockReferencesAlloca(f.FaultPads[pi], fp) {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		if !blockFieldPtrChainOK(f, f.Blocks[bi], fp) {
+			return false
+		}
+	}
+	return true
+}
+
+// blockFieldPtrChainOK reports whether every appearance of field-ptr result fp
+// within block b is a scalar-replaceable chain use (see
+// fieldPtrChainScalarReplaceable): a load/store Args[0], or an inner field-ptr
+// base whose own chain is scalar-replaceable.  Any other arg use, or a phi
+// entry, pins the slot.
+func blockFieldPtrChainOK(f @Func, b @Block, fp @Instr) bool {
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var instr @Instr = b.Instrs[ii]
+		if instr == fp {
+			continue // the field-ptr definition itself is not a use
+		}
+		for k := 0; k < len(instr.Phis); k++ {
+			if instr.Phis[k].Val == fp {
+				return false
+			}
+		}
+		for k := 0; k < len(instr.Args); k++ {
+			if instr.Args[k] != fp {
+				continue
+			}
+			var okLoad bool = instr.Op == iropcode.OP_LOAD && k == 0
+			var okStore bool = instr.Op == iropcode.OP_STORE && k == 0
+			if okLoad || okStore {
+				continue
+			}
+			if instr.Op == iropcode.OP_GET_FIELD_PTR && k == 0 && fieldPtrChainScalarReplaceable(f, instr) {
+				continue
+			}
 			return false
 		}
 	}

@@ -1,0 +1,182 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+
+// AggLoadElidable reports whether the aggregate `OP_LOAD` `ld` in function `f` may
+// SKIP its private materialization region (reserved by PlanFrame) and instead ALIAS
+// its source pointer — so `emitAggLoad`'s no-region path leaves `ld`'s spill slot
+// pointing at the source and a downstream struct-copy reads the source DIRECTLY.
+// That removes one full-width aggregate copy (the src->temp half of src->temp->dst).
+// See explorations/plan-native-aggcopy-fusion.md.
+//
+// A false positive is silent memory corruption — a use-after-free if the source is
+// freed before a use, a wrong value if it is overwritten — so this defaults hard to
+// "not elidable" and only the provably-safe shape is accepted:
+//
+//   S-alloca: `ld` loads WHOLE from a stack `OP_ALLOC` `A` whose address is CONFINED
+//     to whole load/store of `A` (never taken, never a value operand, never in a
+//     fault pad). Then `A` is a non-escaping frame slot: it is never freed, and the
+//     ONLY writer of its bytes is a direct `OP_STORE` to `A`. So `refdec`/`refinc`,
+//     calls, and stores to OTHER slots between the load and its uses cannot disturb
+//     `A`'s bytes. Aliasing is safe as long as no store to `A` (a reassignment of the
+//     source) falls between `ld` and its last use. (Captures `b = a`, `b.s = a`.)
+//
+// Additionally every use of `ld`'s value must be a read-only consumer in the SAME
+// block, after `ld`: a cross-block use, a fault-pad use, or a use that writes through
+// the value (as an `OP_STORE` destination) or takes its address is conservatively
+// rejected. The raw-pointer "load then immediately store, nothing between" case
+// (`*dst = *src`) is a separate, adjacency-based shape not handled here.
+func AggLoadElidable(f @ir.Func, ld @ir.Instr) bool {
+	if ld.Op != iropcode.OP_LOAD { return false }
+	if !IsAggregateTyp(ld.Typ) { return false }
+	if len(ld.Args) < 1 { return false }
+	var src @ir.Instr = ld.Args[0]
+	if src == nil || src.Op != iropcode.OP_ALLOC { return false }
+
+	// Locate ld's block and index.
+	var blk @ir.Block = nil
+	var li int = -1
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			if b.Instrs[ii] == ld {
+				blk = b
+				li = ii
+			}
+		}
+	}
+	if blk == nil || li < 0 { return false }
+
+	// Reject any use of ld outside its own block, or inside a fault pad: the
+	// same-block use-range analysis below cannot reason about those.
+	if valueUsedInOtherBlockOrPad(f, blk, ld) { return false }
+
+	// Every same-block use must be a read-only consumer at/after li; get the last.
+	var lastUse int = lastReadOnlyUseIndex(blk, li, ld)
+	if lastUse < 0 { return false }
+
+	// The source alloca's address must be confined to whole load/store (non-escaping,
+	// written only by a direct store to it).
+	if !allocaAddrConfinedToLoadStore(f, src) { return false }
+
+	// No reassignment of the source (a store to src) may fall strictly between the
+	// load and its last use.
+	if storeToDestStrictlyBetween(blk, li, lastUse, src) { return false }
+	return true
+}
+
+// valueUsedInOtherBlockOrPad reports whether value v is referenced in any block
+// other than `home`, or in any fault pad.  Fault pads are VM-only (native never
+// emits them), so a pad reference is treated conservatively as a use that blocks
+// elision rather than reasoned about.
+func valueUsedInOtherBlockOrPad(f @ir.Func, home @ir.Block, v @ir.Instr) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		if f.Blocks[bi] == home { continue }
+		if blockReferencesValue(f.Blocks[bi], v) { return true }
+	}
+	for pi := 0; pi < len(f.FaultPads); pi++ {
+		if blockReferencesValue(f.FaultPads[pi], v) { return true }
+	}
+	return false
+}
+
+// blockReferencesValue reports whether any instruction in b (other than v's own
+// definition) names v as an argument or a phi entry.
+func blockReferencesValue(b @ir.Block, v @ir.Instr) bool {
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var ins @ir.Instr = b.Instrs[ii]
+		if ins == v { continue }
+		for k := 0; k < len(ins.Args); k++ {
+			if ins.Args[k] == v { return true }
+		}
+		for k := 0; k < len(ins.Phis); k++ {
+			if ins.Phis[k].Val == v { return true }
+		}
+	}
+	return false
+}
+
+// lastReadOnlyUseIndex scans blk after index li and returns the index of the last
+// instruction that reads ld as a value, or -1 if ld has no use or any use is NOT a
+// read-only consumer.  A use is disqualifying (returns -1) when ld appears as an
+// `OP_STORE` destination (Args[0]) — a write through the value — or as the base of a
+// field/element pointer (an aggregate value is not an address), or as a phi entry.
+func lastReadOnlyUseIndex(blk @ir.Block, li int, ld @ir.Instr) int {
+	var last int = -1
+	for ii := li + 1; ii < len(blk.Instrs); ii++ {
+		var ins @ir.Instr = blk.Instrs[ii]
+		for k := 0; k < len(ins.Phis); k++ {
+			if ins.Phis[k].Val == ld { return -1 }
+		}
+		var uses bool = false
+		for k := 0; k < len(ins.Args); k++ {
+			if ins.Args[k] != ld { continue }
+			uses = true
+			if ins.Op == iropcode.OP_STORE && k == 0 { return -1 }
+			if ins.Op == iropcode.OP_GET_FIELD_PTR || ins.Op == iropcode.OP_GET_ELEM_PTR {
+				return -1
+			}
+			// A `__c_call` argument is NOT read-only for a large by-value aggregate:
+			// where the C ABI passes it indirectly (AAPCS64 passes a pointer with NO
+			// caller copy), the load's private materialization region IS the
+			// caller-owned copy the ABI requires, and a C callee may write through it.
+			// Aliasing the source would let the callee corrupt it.  Refuse elision for
+			// any `__c_call` value use (conservative across targets/sizes).
+			if ins.Op == iropcode.OP_C_CALL { return -1 }
+		}
+		if uses { last = ii }
+	}
+	return last
+}
+
+// allocaAddrConfinedToLoadStore reports whether every appearance of alloca `a` in
+// f — across all blocks AND all fault pads — is the Args[0] pointer of a whole
+// `OP_LOAD` or whole `OP_STORE`.  Any other appearance (a value operand, a call
+// argument, an `OP_STORE` value `Args[1]`, a field/element-ptr base, a phi entry, or
+// any fault-pad reference) means `a`'s address escapes or `a`'s bytes may be written
+// indirectly, so the confinement — and with it the "only a direct store to `a`
+// writes `a`" guarantee this elision relies on — does not hold.
+func allocaAddrConfinedToLoadStore(f @ir.Func, a @ir.Instr) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		if !blockAllocaOnlyLoadStore(f.Blocks[bi], a) { return false }
+	}
+	for pi := 0; pi < len(f.FaultPads); pi++ {
+		if blockReferencesValue(f.FaultPads[pi], a) { return false }
+	}
+	return true
+}
+
+// blockAllocaOnlyLoadStore is allocaAddrConfinedToLoadStore restricted to one block.
+func blockAllocaOnlyLoadStore(b @ir.Block, a @ir.Instr) bool {
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var ins @ir.Instr = b.Instrs[ii]
+		if ins == a { continue }
+		for k := 0; k < len(ins.Phis); k++ {
+			if ins.Phis[k].Val == a { return false }
+		}
+		for k := 0; k < len(ins.Args); k++ {
+			if ins.Args[k] != a { continue }
+			var okLoad bool = ins.Op == iropcode.OP_LOAD && k == 0
+			var okStore bool = ins.Op == iropcode.OP_STORE && k == 0
+			if !okLoad && !okStore { return false }
+		}
+	}
+	return true
+}
+
+// storeToDestStrictlyBetween reports whether any `OP_STORE` whose destination
+// (Args[0]) is `dst` occurs at an index strictly between li and lastUse.  Such a
+// store reassigns the source between the load and a later use, so aliasing would
+// read the overwritten bytes.  The load index and the last-use index are excluded:
+// the last use only reads the source (a self-store `store dst, ld` at lastUse would
+// alias to a no-op).
+func storeToDestStrictlyBetween(blk @ir.Block, li int, lastUse int, dst @ir.Instr) bool {
+	for ii := li + 1; ii < lastUse; ii++ {
+		var ins @ir.Instr = blk.Instrs[ii]
+		if ins.Op == iropcode.OP_STORE && len(ins.Args) >= 1 && ins.Args[0] == dst {
+			return true
+		}
+	}
+	return false
+}

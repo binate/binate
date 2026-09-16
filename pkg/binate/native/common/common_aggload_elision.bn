@@ -22,17 +22,21 @@ import "pkg/binate/iropcode"
 //     `A`'s bytes. Aliasing is safe as long as no store to `A` (a reassignment of the
 //     source) falls between `ld` and its last use. (Captures `b = a`, `b.s = a`.)
 //
+//   S-adjacent: the source is anything else — a raw `*T` deref, a heap element — so
+//     nothing is assumed about it. Aliasing is safe only when NOTHING that could write
+//     or free memory falls between the load and its last use: every intervening
+//     instruction must be a pure read / address-computation / register op. (Captures
+//     `*dst = *src`, whose store follows the load with at most the destination-address
+//     computation between.)
+//
 // Additionally every use of `ld`'s value must be a read-only consumer in the SAME
-// block, after `ld`: a cross-block use, a fault-pad use, or a use that writes through
-// the value (as an `OP_STORE` destination) or takes its address is conservatively
-// rejected. The raw-pointer "load then immediately store, nothing between" case
-// (`*dst = *src`) is a separate, adjacency-based shape not handled here.
+// block, after `ld`: a cross-block use, a fault-pad use, a use that writes through the
+// value (as an `OP_STORE` destination) or takes its address, or a `__c_call` argument
+// use is conservatively rejected.
 func AggLoadElidable(f @ir.Func, ld @ir.Instr) bool {
 	if ld.Op != iropcode.OP_LOAD { return false }
 	if !IsAggregateTyp(ld.Typ) { return false }
 	if len(ld.Args) < 1 { return false }
-	var src @ir.Instr = ld.Args[0]
-	if src == nil || src.Op != iropcode.OP_ALLOC { return false }
 
 	// Locate ld's block and index.
 	var blk @ir.Block = nil
@@ -56,14 +60,47 @@ func AggLoadElidable(f @ir.Func, ld @ir.Instr) bool {
 	var lastUse int = lastReadOnlyUseIndex(blk, li, ld)
 	if lastUse < 0 { return false }
 
-	// The source alloca's address must be confined to whole load/store (non-escaping,
-	// written only by a direct store to it).
-	if !allocaAddrConfinedToLoadStore(f, src) { return false }
+	var src @ir.Instr = ld.Args[0]
 
-	// No reassignment of the source (a store to src) may fall strictly between the
-	// load and its last use.
-	if storeToDestStrictlyBetween(blk, li, lastUse, src) { return false }
-	return true
+	// (S-alloca) source is a confined, non-escaping stack alloca: it is never freed
+	// and is written only by a direct store to it, so refcount ops, calls, and stores
+	// to OTHER slots between the load and its uses cannot disturb it — only a store to
+	// the source alloca (a reassignment) is a barrier.
+	if src != nil && src.Op == iropcode.OP_ALLOC && allocaAddrConfinedToLoadStore(f, src) &&
+			!storeToDestStrictlyBetween(blk, li, lastUse, src) {
+		return true
+	}
+
+	// (S-adjacent) source is anything else (a raw `*T` deref, a heap element, ...) —
+	// nothing is assumed about it, so it is safe to alias only when NOTHING that could
+	// write or free memory falls between the load and its last use.  Every intervening
+	// instruction must be a pure read / address-computation / register op (see
+	// opIsPureBetween); a store, call, refcount op, allocation, or aggregate
+	// materializer forces materialization.  Captures `*dst = *src`.
+	//
+	// A SUB-WORD-aligned aggregate (AlignOf < 4) is excluded: the packed layout can
+	// place it at a non-word-aligned address (e.g. a 3-byte struct at byte offset 1),
+	// and a consumer that reads it word-wise (an aggregate call argument / return
+	// marshal) would fault on strict-align arm32.  The materialization region is always
+	// word-aligned, so such an aggregate must keep materializing.  (S-alloca is
+	// unaffected: alloca frame slots are 8-byte aligned, so their address is always
+	// word-aligned regardless of the aggregate's own alignment.)
+	//
+	// Size cap <= 16 bytes: for an UNKNOWN source the alias defers the read to the
+	// consuming store, so `*dst = *src` where dst overlaps src must still read all of
+	// src before writing dst (spec stmt.assign.parallel is RHS-first).  The elided
+	// copy is overlap-safe only when it loads the whole aggregate before storing.
+	// emitStructCopy routes every backend through an overlap-safe load-all-then-store
+	// helper (emitAggMemcpySafe{Aarch64,X64,Arm32}); on arm32 that is one LDM covering
+	// all words, which the register pool bounds to <= 16 bytes = 4 arm32 words.  Beyond
+	// 16 bytes the copy interleaves loads and stores, so such loads keep materializing.
+	// (S-alloca is unaffected: an alloca source never overlaps the store destination,
+	// so any size copies safely.)
+	if ld.Typ != nil && ld.Typ.AlignOf() >= 4 && ld.Typ.SizeOf() <= 16 &&
+			onlyPureOpsStrictlyBetween(blk, li, lastUse) {
+		return true
+	}
+	return false
 }
 
 // valueUsedInOtherBlockOrPad reports whether value v is referenced in any block
@@ -177,6 +214,55 @@ func storeToDestStrictlyBetween(blk @ir.Block, li int, lastUse int, dst @ir.Inst
 		if ins.Op == iropcode.OP_STORE && len(ins.Args) >= 1 && ins.Args[0] == dst {
 			return true
 		}
+	}
+	return false
+}
+
+// onlyPureOpsStrictlyBetween reports whether every instruction strictly between li
+// and lastUse in blk is pure — a read / address-computation / register op that cannot
+// write memory or free anything (opIsPureBetween).  Used by the S-adjacent shape,
+// whose source is unknown: any impure op between the load and a use could overwrite
+// or free the source before the use reads it.
+func onlyPureOpsStrictlyBetween(blk @ir.Block, li int, lastUse int) bool {
+	for ii := li + 1; ii < lastUse; ii++ {
+		if !opIsPureBetween(blk.Instrs[ii].Op) { return false }
+	}
+	return true
+}
+
+// opIsPureBetween reports whether `op` provably neither writes memory nor frees
+// anything, so it is safe between an aggregate load and its consuming use even when
+// the load's source is unknown.  This is a WHITELIST (default false): reads and
+// address computations (load / extract / field- and elem-ptr), scalar constants,
+// pure register arithmetic / comparison / conversion, and read-only checks.
+// Everything NOT listed — every store, call, refcount op, allocation, aggregate
+// materializer (make / make_slice / const-nil / rodata / struct-lit / iface / func
+// value / box), deref, phi, control op — is treated as a barrier.
+func opIsPureBetween(op int) bool {
+	// Reads and pure address computation.
+	if op == iropcode.OP_LOAD || op == iropcode.OP_EXTRACT || op == iropcode.OP_GET_FIELD_PTR ||
+			op == iropcode.OP_GET_ELEM_PTR || op == iropcode.OP_DATA_SYM_ADDR ||
+			op == iropcode.OP_MANAGED_TO_RAW {
+		return true
+	}
+	// Scalar constants (aggregate OP_CONST_NIL is excluded — it writes a region).
+	if op == iropcode.OP_CONST_INT || op == iropcode.OP_CONST_FLOAT || op == iropcode.OP_CONST_BOOL {
+		return true
+	}
+	// Read-only checks (may fault-abort, which prevents the use; never write).
+	if op == iropcode.OP_BOUNDS_CHECK || op == iropcode.OP_NIL_CHECK || op == iropcode.OP_DIV_CHECK ||
+			op == iropcode.OP_SHIFT_CHECK || op == iropcode.OP_STACK_CHECK {
+		return true
+	}
+	// Pure register arithmetic / bitwise / comparison / conversion.
+	if op == iropcode.OP_ADD || op == iropcode.OP_SUB || op == iropcode.OP_MUL ||
+			op == iropcode.OP_DIV || op == iropcode.OP_REM || op == iropcode.OP_AND ||
+			op == iropcode.OP_OR || op == iropcode.OP_XOR || op == iropcode.OP_SHL ||
+			op == iropcode.OP_SHR || op == iropcode.OP_BITNOT || op == iropcode.OP_NEG ||
+			op == iropcode.OP_NOT || op == iropcode.OP_EQ || op == iropcode.OP_NE || op == iropcode.OP_LT ||
+			op == iropcode.OP_LE || op == iropcode.OP_GT || op == iropcode.OP_GE || op == iropcode.OP_CAST ||
+			op == iropcode.OP_BIT_CAST {
+		return true
 	}
 	return false
 }

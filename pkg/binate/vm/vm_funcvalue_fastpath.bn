@@ -1,0 +1,133 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/types"
+
+// VM-function-value FAST PATH + its overflow/nil PRE-CHECK.  A same-vm VM function
+// value called from bytecode is dispatched by pushing its callee frame directly
+// (like a direct BC_CALL) instead of round-tripping through the native
+// TrampolinePacked -> execFunc; a pre-delivery OP_STACK_CHECK_FV catches a nil value
+// or a callee-frame overflow while the moved args are still owned.  execCallFuncValue
+// (vm_exec_funcref.bn) and the BC_STACK_CHECK_FV handler (vm_exec.bn) call in here.
+
+// vmTrampolinePackedCall returns (and caches on the vm) the native TrampolinePacked
+// entry that ensureHandle writes into EVERY VM function value's vtable call_packed
+// slot — the thunk-IDENTITY value the func-value fast path compares against.  It
+// mirrors ensureHandle's `vt.CallPacked = tpVtable[1]` exactly (tpVtable = the
+// registered TrampolinePacked binding's vtable), so the comparison is precise.
+// Returns 0 when TrampolinePacked is not registered — no VM function value can exist
+// then, and no real func value's call_packed slot is 0, so the fast path declines.
+func vmTrampolinePackedCall(vm @VM) int {
+	if vm.TrampolinePackedCall == 0 {
+		var idx int = vm.LookupExtern("pkg/binate/vm.TrampolinePacked")
+		if idx < 0 {
+			return 0
+		}
+		vm.TrampolinePackedCall = bit_cast(*int, vm.Externs[idx].VtableAddr)[1]
+	}
+	return vm.TrampolinePackedCall
+}
+
+// vmFuncValueFnIdx returns the callee index of the same-vm VM function value fv (its
+// closure record's fnIdx), or -1 if fv is NOT a same-vm VM function value — i.e. a
+// native / compiled func value, a cross-VM VM func value, or a malformed record.
+// Recognition is by THUNK IDENTITY (fv's vtable call_packed slot equals this vm's
+// TrampolinePacked entry), never by peeking the untagged closure `data`; only after
+// that match does it read the record (rec[1] must be this vm; rec[2]-1 in range).
+// Both the func-value fast path (execCallFuncValue) and its overflow pre-check
+// (stackCheckFuncValue) resolve the callee through this ONE helper, so they can never
+// disagree about which values take the direct-push fast path.  fv must be non-nil.
+func vmFuncValueFnIdx(vm @VM, fv *int) int {
+	var tpCall int = vmTrampolinePackedCall(vm)
+	if tpCall == 0 {
+		return -1
+	}
+	var vtableAddr int = fv[types.FuncValueVtableIndex()]
+	if vtableAddr == 0 {
+		return -1
+	}
+	var vtable *int = bit_cast(*int, vtableAddr)
+	if vtable[types.FuncValueVtableCallPackedIndex()] != tpCall {
+		return -1
+	}
+	var data int = fv[types.FuncValueDataIndex()]
+	if data == 0 {
+		return -1
+	}
+	var rec *int = bit_cast(*int, data)
+	if rec[1] != bit_cast(int, vm) {
+		return -1
+	}
+	var fnIdx int = rec[2] - 1
+	if fnIdx < 0 || fnIdx >= vm.Funcs.Len() {
+		return -1
+	}
+	return fnIdx
+}
+
+// stackCheckFuncValue is the BC_STACK_CHECK_FV pre-check: given the func-value
+// operand's register value (regs[Src1]), it raises a recoverable fault (returning
+// true) if calling it would orphan the caller's still-owned moved args:
+//   - a NIL func value ({vtable:0,data:0}, or a zero register word) → "call of nil
+//     function value", BEFORE the args are consumed so this op's args-owning pad
+//     releases them;
+//   - a same-vm VM callee (the direct-push fast path) whose reserved frame
+//     (frameReserve) would overflow the VM stack → "stack overflow".
+// The overflow check is EXACT: the fast path pushes at the current SP with no
+// marshalling growth, so frameReserve(callee) at vm.SP predicts the push precisely.
+// A native / compiled / cross-VM func value pushes no recoverable VM frame here (its
+// shim / trampoline does), so vmFuncValueFnIdx returns -1 and this returns false —
+// mirroring exactly which values execCallFuncValue fast-paths.  Mirrors
+// BC_STACK_CHECK for direct calls.
+func stackCheckFuncValue(vm @VM, fvAddr int) bool {
+	if fvAddr == 0 {
+		setFault(vm, "runtime error: call of nil function value")
+		return true
+	}
+	var fv *int = bit_cast(*int, fvAddr)
+	if fv[types.FuncValueVtableIndex()] == 0 {
+		setFault(vm, "runtime error: call of nil function value")
+		return true
+	}
+	var fnIdx int = vmFuncValueFnIdx(vm, fv)
+	if fnIdx < 0 {
+		return false
+	}
+	if wouldFrameOverflow(vm, frameReserve(vm.Funcs.Get(fnIdx))) {
+		setFault(vm, "runtime error: stack overflow")
+		return true
+	}
+	return false
+}
+
+// fastPushVmFuncValue pushes a same-vm VM function value's callee frame directly,
+// bypassing the native trampoline.  rec is the VM closure record (rec[1] == vm,
+// rec[2]-1 == fnIdx, already validated).  It mirrors execFunc's push+arg-copy and
+// the BC_CALL frame switch: build the callee argv (captures then the packed user
+// args from the &regs[Src2] window, via closureArgvPacked — NO iface substitution,
+// so the VM callee gets VM-native args), push the frame with callerDst = instr.Dst
+// (so BC_RETURN writes the scalar / 64-bit-pair / relocated-aggregate result into
+// regs[Dst]), copy argv into the callee's leading param slots, and return the new
+// (funcIdx, regsOff, pushed=true) for execLoop to switch to.  On a pushFrame
+// overflow it returns pushed=false with FaultRaised set; execLoop's
+// BC_CALL_FUNC_VALUE arm then unwinds this call op's pad (the pre-delivery
+// OP_STACK_CHECK_FV normally catches the overflow earlier, with an args-owning pad).
+func fastPushVmFuncValue(vm @VM, rec *int, fnIdx int, instr BCInstr, pc int, funcIdx int,
+		regsOff int, regs *int) (int, int, bool) {
+	var callee @VMFunc = vm.Funcs.Get(fnIdx)
+	var nArgs int = funcValueImmSlots(instr.Imm)
+	var argsPtr *int = bit_cast(*int, bit_cast(int, regs) + instr.Src2 * REG_SLOT)
+	var argv @[]int = closureArgvPacked(vm, rec, fnIdx, argsPtr, nArgs)
+	var newRegsOff int = pushFrame(vm, callee, pc, funcIdx, regsOff, vm.SP, instr.Dst)
+	if vm.FaultRaised {
+		return 0, 0, false
+	}
+	var newRegs *int = stackPtr(vm, newRegsOff)
+	var n int = len(argv)
+	if n > callee.NumParamSlots {
+		n = callee.NumParamSlots
+	}
+	for i := 0; i < n; i++ {
+		newRegs[i] = argv[i]
+	}
+	return fnIdx, newRegsOff, true
+}

@@ -91,6 +91,60 @@ func sroaAggregateContainsManaged(t @types.Type) bool {
 	return false
 }
 
+// managedStructLeafEligible reports whether t (peeled) is a struct with at least
+// one managed field, EVERY managed field of which is a LEAF managed scalar whose
+// cleanup is a forwardable load+RefDec: a managed pointer, a managed slice with a
+// non-managed element (`@[]T`), a managed func-value, or a managed iface-value.
+// A field that is a nested managed-containing struct / array, or a managed slice
+// with a managed element (`@[]@T`), makes t INELIGIBLE — its cleanup is a
+// by-address / whole-value-address dtor call that would pin the split field slot
+// (deferred to a later increment).  BOTH the cleanup-shape choice (gen, at
+// -O1+) and the SROA candidate gate use this predicate, so the inline cleanup
+// and the split agree on exactly which structs.  Distinct from
+// sroaAggregateContainsManaged (which excludes ANY managed content): this ADMITS
+// the leaf-managed subset.
+func managedStructLeafEligible(t @types.Type) bool {
+	t = peelTransparent(t)
+	if t == nil || t.Kind != types.TYP_STRUCT {
+		return false
+	}
+	var hasManaged bool = false
+	for i := 0; i < len(t.Fields); i++ {
+		var ft @types.Type = t.Fields[i].Type
+		if ft == nil {
+			return false
+		}
+		if !ft.NeedsDestruction() {
+			continue // non-managed field — no cleanup, fine
+		}
+		hasManaged = true
+		if !isLeafManagedField(peelTransparent(ft)) {
+			return false
+		}
+	}
+	return hasManaged
+}
+
+// isLeafManagedField reports whether the peeled field type ft is a leaf managed
+// scalar the struct cleanup RefDecs via a forwardable load+RefDec (see
+// managedStructLeafEligible).
+func isLeafManagedField(ft @types.Type) bool {
+	if ft == nil {
+		return false
+	}
+	if ft.Kind == types.TYP_MANAGED_PTR || ft.Kind == types.TYP_MANAGED_FUNC_VALUE ||
+			ft.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		return true
+	}
+	if ft.Kind == types.TYP_MANAGED_SLICE {
+		// @[]T with a non-managed element: cleanup is extract-refptr + RefDec
+		// (forwardable).  @[]@T (managed element) calls the ms-dtor by address —
+		// not forwardable.
+		return ft.Elem != nil && !ft.Elem.NeedsDestruction()
+	}
+	return false
+}
+
 // collectSroaCandidates returns every aggregate alloca in f that SROA may
 // scalar-replace: an OP_ALLOC of a struct / slice whose uses satisfy both L1
 // (its alloca uses are only whole load/store + const-index field-ptr, and it
@@ -130,7 +184,7 @@ func collectSroaCandidates(f @Func) @[]@Instr {
 // managed aggregate, whose refcount cleanup reads the whole value in pads).
 func sroaAllocaL1OK(f @Func, a @Instr) bool {
 	for bi := 0; bi < len(f.Blocks); bi++ {
-		if !blockAllocaUsesAreL1(f, f.Blocks[bi], a) {
+		if !blockAllocaUsesAreL1(f, f.Blocks[bi], a, false) {
 			return false
 		}
 	}
@@ -145,7 +199,7 @@ func sroaAllocaL1OK(f @Func, a @Instr) bool {
 // blockAllocaUsesAreL1 reports whether every appearance of `a` within block b is
 // a valid L1 use (see sroaAllocaL1OK).  A field-ptr use is validated by
 // fieldPtrChainScalarReplaceable, which recurses through nested field access.
-func blockAllocaUsesAreL1(f @Func, b @Block, a @Instr) bool {
+func blockAllocaUsesAreL1(f @Func, b @Block, a @Instr, padAware bool) bool {
 	for ii := 0; ii < len(b.Instrs); ii++ {
 		var instr @Instr = b.Instrs[ii]
 		if instr == a {
@@ -165,7 +219,8 @@ func blockAllocaUsesAreL1(f @Func, b @Block, a @Instr) bool {
 			if okLoad || okStore {
 				continue
 			}
-			if instr.Op == iropcode.OP_GET_FIELD_PTR && k == 0 && fieldPtrChainScalarReplaceable(f, instr) {
+			if instr.Op == iropcode.OP_GET_FIELD_PTR && k == 0 &&
+					fieldPtrChainScalarReplaceable(f, instr, padAware) {
 				continue
 			}
 			return false
@@ -185,14 +240,24 @@ func blockAllocaUsesAreL1(f @Func, b @Block, a @Instr) bool {
 // the fixpoint scalar-replaces it on a later pass.  Any other use — the address
 // escaping via a call arg, &s.x, a phi entry, or a dynamic OP_GET_ELEM_PTR, or
 // ANY FaultPad appearance — pins the slot.
-func fieldPtrChainScalarReplaceable(f @Func, fp @Instr) bool {
+func fieldPtrChainScalarReplaceable(f @Func, fp @Instr, padAware bool) bool {
 	for pi := 0; pi < len(f.FaultPads); pi++ {
-		if blockReferencesAlloca(f.FaultPads[pi], fp) {
+		if padAware {
+			// Managed path: a field-ptr legitimately appears in a FaultPad — the
+			// inline per-field RefDec cleanup (emitStructFieldRefDecs on the
+			// alloca) — so admit it IFF its pad uses are load/store chains, the
+			// same check as a normal block.
+			if !blockFieldPtrChainOK(f, f.FaultPads[pi], fp, padAware) {
+				return false
+			}
+		} else if blockReferencesAlloca(f.FaultPads[pi], fp) {
+			// Non-managed path: any pad appearance is an escape (a non-managed
+			// aggregate never legitimately appears in a pad).
 			return false
 		}
 	}
 	for bi := 0; bi < len(f.Blocks); bi++ {
-		if !blockFieldPtrChainOK(f, f.Blocks[bi], fp) {
+		if !blockFieldPtrChainOK(f, f.Blocks[bi], fp, padAware) {
 			return false
 		}
 	}
@@ -204,7 +269,7 @@ func fieldPtrChainScalarReplaceable(f @Func, fp @Instr) bool {
 // fieldPtrChainScalarReplaceable): a load/store Args[0], or an inner field-ptr
 // base whose own chain is scalar-replaceable.  Any other arg use, or a phi
 // entry, pins the slot.
-func blockFieldPtrChainOK(f @Func, b @Block, fp @Instr) bool {
+func blockFieldPtrChainOK(f @Func, b @Block, fp @Instr, padAware bool) bool {
 	for ii := 0; ii < len(b.Instrs); ii++ {
 		var instr @Instr = b.Instrs[ii]
 		if instr == fp {
@@ -224,7 +289,8 @@ func blockFieldPtrChainOK(f @Func, b @Block, fp @Instr) bool {
 			if okLoad || okStore {
 				continue
 			}
-			if instr.Op == iropcode.OP_GET_FIELD_PTR && k == 0 && fieldPtrChainScalarReplaceable(f, instr) {
+			if instr.Op == iropcode.OP_GET_FIELD_PTR && k == 0 &&
+					fieldPtrChainScalarReplaceable(f, instr, padAware) {
 				continue
 			}
 			return false
@@ -310,17 +376,18 @@ func validateSroaCandidates(f @Func, cands @[]@Instr) {
 		if !isSroaAggregateAlloca(a) {
 			panic("ir SROA: candidate is not an aggregate alloca")
 		}
-		// A managed-slice (Phase 2) candidate uses the pad-AWARE L1/L2
-		// (managedAllocaUsesOK / managedLoadedValuesAllExtract in
-		// sroa_transform.bn), which admits the refcount spine's whole-load+extract
-		// in FaultPads; the non-managed L1 here would wrongly pin it on that.
+		// A managed (Phase 2) candidate — a managed slice, or a leaf-managed
+		// struct whose cleanup was reshaped to inline per-field RefDecs — uses the
+		// pad-AWARE L1/L2 (managedAllocaUsesOK / managedLoadedValuesAllExtract),
+		// which admits the refcount spine's field-ptr / whole-load+extract in
+		// FaultPads; the non-managed L1 here would wrongly pin it on that.
 		var t @types.Type = peelTransparent(a.TypeArg)
-		if t != nil && t.Kind == types.TYP_MANAGED_SLICE {
+		if (t != nil && t.Kind == types.TYP_MANAGED_SLICE) || managedStructLeafEligible(a.TypeArg) {
 			if !managedAllocaUsesOK(f, a) {
-				panic("ir SROA: managed-slice candidate fails L1 (alloca-use) check")
+				panic("ir SROA: managed candidate fails L1 (alloca-use) check")
 			}
 			if !managedLoadedValuesAllExtract(f, a) {
-				panic("ir SROA: managed-slice candidate fails L2 check")
+				panic("ir SROA: managed candidate fails L2 check")
 			}
 			continue
 		}

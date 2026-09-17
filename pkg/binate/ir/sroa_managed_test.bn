@@ -1,0 +1,148 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Tests for Phase-2 MANAGED-STRUCT scalar replacement (sroa_managed.bn +
+// gen_local_cleanup's emitManagedStructPtrDtor reshape + the nil-zero-init drop
+// in sroa_rewrite.bn).  Reuses noParams / noResults / noFields / oneRet / countOp
+// / instrInBlocks (other _test.bn in this package).
+
+// leafManagedStruct builds `struct { a int; ref @Inner }` — a non-managed int
+// field plus one leaf managed-pointer field.
+func leafManagedStruct() @types.Type {
+	var f0 @types.Field = make(types.Field)
+	f0.Name = "a"
+	f0.Type = types.TypInt()
+	var f1 @types.Field = make(types.Field)
+	f1.Name = "ref"
+	f1.Type = types.MakeManagedPtrType(types.MakeStructType("Inner", noFields))
+	var fields @[]@types.Field = make_slice(@types.Field, 2)
+	fields[0] = f0
+	fields[1] = f1
+	return types.MakeStructType("Holder", fields)
+}
+
+// A leaf-managed struct (int + @Inner) scalar-replaces: the int field slot
+// promotes away, the managed field slot survives as an unpromoted managed slot
+// with a nil zero-init (makeFieldZeroInits), and the cleanup's field load forwards
+// onto it.
+func TestSroaLeafManagedStructSplit() testing.TestResult {
+	var st @types.Type = leafManagedStruct()
+	var mpTyp @types.Type = types.MakeManagedPtrType(types.MakeStructType("Inner", noFields))
+	var f @Func = NewFunc("", "test", noParams, noResults)
+	var entry @Block = AddBlock(f, "entry")
+	var h @Instr = entry.EmitAlloc(st)
+	entry.EmitStore(entry.EmitGetFieldPtr(h, 0, types.TypInt()), entry.EmitConstInt(5, types.TypInt()))
+	var av @Instr = entry.EmitLoad(entry.EmitGetFieldPtr(h, 0, types.TypInt()), types.TypInt())
+	entry.EmitReturn(oneRet(av))
+	// scope-exit cleanup: RefDec h.ref (the inline reshape's field-ptr shape).
+	entry.EmitRefDec(entry.EmitLoad(entry.EmitGetFieldPtr(h, 1, mpTyp), mpTyp))
+
+	if !sroaFunc(f) {
+		return fail("SROA: a leaf-managed struct should be scalar-replaced")
+	}
+	if instrInBlocks(f, h) {
+		return fail("SROA: the whole Holder alloca should be gone")
+	}
+	if countOp(f, iropcode.OP_CONST_NIL) < 1 {
+		return fail("SROA: the managed field slot needs an explicit nil zero-init")
+	}
+	promoteFuncScalars(f)
+	// The int slot promotes; only the managed field slot survives.
+	if countOp(f, iropcode.OP_ALLOC) != 1 {
+		return fail("SROA + mem2reg: only the managed field slot should remain")
+	}
+	return ""
+}
+
+// The cleanup field-ptrs of a managed struct legitimately appear in a FAULT PAD
+// (emitManagedStructPtrDtor runs for the pad too); the pad-aware L1 must admit
+// them rather than pin the struct on the pad appearance.
+func TestSroaManagedStructFaultPadCleanupSplit() testing.TestResult {
+	var st @types.Type = leafManagedStruct()
+	var mpTyp @types.Type = types.MakeManagedPtrType(types.MakeStructType("Inner", noFields))
+	var f @Func = NewFunc("", "test", noParams, noResults)
+	var entry @Block = AddBlock(f, "entry")
+	var h @Instr = entry.EmitAlloc(st)
+	entry.EmitStore(entry.EmitGetFieldPtr(h, 0, types.TypInt()), entry.EmitConstInt(5, types.TypInt()))
+	entry.EmitReturn(
+			oneRet(entry.EmitLoad(entry.EmitGetFieldPtr(h, 0, types.TypInt()), types.TypInt())))
+	entry.EmitRefDec(entry.EmitLoad(entry.EmitGetFieldPtr(h, 1, mpTyp), mpTyp)) // block cleanup
+	var pad @Block = AddFaultPad(f, "pad")
+	pad.EmitRefDec(pad.EmitLoad(pad.EmitGetFieldPtr(h, 1, mpTyp), mpTyp)) // pad cleanup (field-ptr)
+	pad.EmitUnwindReturn()
+
+	if !sroaFunc(f) {
+		return fail("SROA: a managed struct with pad field-ptr cleanup should split")
+	}
+	if instrInBlocks(f, h) {
+		return fail("SROA: the Holder alloca should be gone (pad-aware L1)")
+	}
+	return ""
+}
+
+// A whole-store of OP_CONST_NIL (the `var h S` managed-struct zero-init) is
+// dropped in the rewrite — the candidate still splits, and no OP_EXTRACT of a nil
+// is emitted (makeFieldZeroInits + mem2reg cover the per-field zeros).
+func TestSroaManagedStructNilZeroInitDropped() testing.TestResult {
+	var st @types.Type = leafManagedStruct()
+	var mpTyp @types.Type = types.MakeManagedPtrType(types.MakeStructType("Inner", noFields))
+	var f @Func = NewFunc("", "test", noParams, noResults)
+	var entry @Block = AddBlock(f, "entry")
+	var h @Instr = entry.EmitAlloc(st)
+	entry.EmitStore(h, entry.EmitConstNil(st)) // whole-store nil zero-init
+	entry.EmitStore(entry.EmitGetFieldPtr(h, 0, types.TypInt()), entry.EmitConstInt(5, types.TypInt()))
+	entry.EmitReturn(
+			oneRet(entry.EmitLoad(entry.EmitGetFieldPtr(h, 0, types.TypInt()), types.TypInt())))
+	entry.EmitRefDec(entry.EmitLoad(entry.EmitGetFieldPtr(h, 1, mpTyp), mpTyp))
+
+	if !sroaFunc(f) {
+		return fail("SROA: a nil-zero-init managed struct should still split")
+	}
+	if instrInBlocks(f, h) {
+		return fail("SROA: the Holder alloca should be gone")
+	}
+	return ""
+}
+
+// A managed struct with a NON-leaf managed field — a nested managed-struct field
+// (its cleanup is a by-address elem-dtor call, not a forwardable load+RefDec) — is
+// INELIGIBLE and stays pinned (deferred to a later increment).
+func TestSroaNestedManagedStructFieldPinned() testing.TestResult {
+	// inner: struct { ref @Inner } (a managed-containing struct, itself a field)
+	var innerRef @types.Field = make(types.Field)
+	innerRef.Name = "ref"
+	innerRef.Type = types.MakeManagedPtrType(types.MakeStructType("Inner", noFields))
+	var innerFields @[]@types.Field = make_slice(@types.Field, 1)
+	innerFields[0] = innerRef
+	var innerStruct @types.Type = types.MakeStructType("Boxed", innerFields)
+
+	var f0 @types.Field = make(types.Field)
+	f0.Name = "a"
+	f0.Type = types.TypInt()
+	var f1 @types.Field = make(types.Field)
+	f1.Name = "nested"
+	f1.Type = innerStruct // a nested MANAGED-containing struct field — non-leaf
+	var fields @[]@types.Field = make_slice(@types.Field, 2)
+	fields[0] = f0
+	fields[1] = f1
+	var st @types.Type = types.MakeStructType("Outer", fields)
+
+	if managedStructLeafEligible(st) {
+		return fail("SROA: a struct with a nested managed-struct field must NOT be leaf-eligible")
+	}
+	var f @Func = NewFunc("", "test", noParams, noResults)
+	var entry @Block = AddBlock(f, "entry")
+	var h @Instr = entry.EmitAlloc(st)
+	entry.EmitStore(entry.EmitGetFieldPtr(h, 0, types.TypInt()), entry.EmitConstInt(5, types.TypInt()))
+	entry.EmitReturn(
+			oneRet(entry.EmitLoad(entry.EmitGetFieldPtr(h, 0, types.TypInt()), types.TypInt())))
+
+	sroaFunc(f)
+	if !instrInBlocks(f, h) {
+		return fail("SROA: a nested-managed-struct-field struct must stay pinned")
+	}
+	return ""
+}

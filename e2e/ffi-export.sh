@@ -247,6 +247,27 @@ func BigMix(big FfiBig, a int64, b int64, c int64, d int64, e int64, mix FfiMix)
 	return big.a + big.b + big.c + a + b + c + d + e + mix.i + cast(int64, cast(int, mix.f))
 }
 
+// The REVERSE straddle + an XMM-register clobber trap.  `mix` goes memory-class
+// internally (forward divergence: after big's internal pointer + five int64s the
+// internal GP file is full).  Then six f64 scalars saturate the C XMM file so
+// `ff` {f64,f64} is MEMORY-class in C but REGISTER-class internally (its internal
+// pointer freed GP, not XMM), and the trailing `m` rides the LAST C XMM register.
+// A naive thunk that reconstructs `ff` into live internal XMM registers overwrites
+// the incoming XMM that still holds `m` before reading it — dropping `m`.  The
+// x64 entry must read every incoming SSE value from a phase-1 XMM stash, not a
+// live register.  aarch64 stays a plain alias.
+type FfiVec2d struct { x float64; y float64 }
+
+#[c_export("ffi_bigclobber")]
+func BigClobber(big FfiBig, a int64, b int64, c int64, d int64, e int64, mix FfiMix,
+		g float64, h float64, i float64, j float64, k float64, l float64,
+		ff FfiVec2d, m float64) int64 {
+	return big.a + big.b + big.c + a + b + c + d + e + mix.i +
+			cast(int64, cast(int, mix.f)) + cast(int64, cast(int, g + h + i + j + k + l)) +
+			cast(int64, cast(int, ff.x)) + cast(int64, cast(int, ff.y)) +
+			cast(int64, cast(int, m))
+}
+
 // MULTI-VALUE returns crossing the C boundary.  A conforming C caller reads each
 // tuple as the C struct it declares; the entry must present the platform C
 // struct-return ABI, which diverges from Binate's internal multi-return
@@ -417,6 +438,9 @@ struct FfiMix { long i; double f; };
 extern long ffi_bigstruct(struct FfiBig);
 extern long ffi_bigvec(struct FfiBig, struct FfiVec2);
 extern long ffi_bigmix(struct FfiBig, long, long, long, long, long, struct FfiMix);
+struct FfiVec2d { double x, y; };
+extern long ffi_bigclobber(struct FfiBig, long, long, long, long, long, struct FfiMix,
+    double, double, double, double, double, double, struct FfiVec2d, double);
 int main(void) {
     struct FfiBig x = {1, 2, 3};
     printf("%ld\n", ffi_bigstruct(x));   /* expect 1*100 + 2*10 + 3 = 123 */
@@ -431,12 +455,19 @@ int main(void) {
     struct FfiBig b2 = {1, 2, 3};
     struct FfiMix m = {6, 7.0};
     printf("%ld\n", ffi_bigmix(b2, 2, 3, 4, 5, 6, m));  /* 6 + 20 + 6 + 7 = 39 */
+    /* Reverse straddle + XMM-clobber trap: mix memory-internal, six f64s, then a
+       memory-in-C/register-internal {f64,f64}, then a trailing f64 in the last C
+       XMM the reconstruct must not clobber. */
+    struct FfiVec2d ff = {7.0, 8.0};
+    printf("%ld\n", ffi_bigclobber(b2, 1, 1, 1, 1, 1, m, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, ff, 9.0));
+    /* 6 + 5 + 6 + 7 + (1*6=6) + 7 + 8 + 9 = 54 */
     return 0;
 }
 EOF
 WANT_BIGAGG="123
 69
-39"
+39
+54"
 
 # check_bigagg <label> <extra-bnc-flags> <required>
 #   Links the >16-byte by-value-struct driver and checks the callee read the

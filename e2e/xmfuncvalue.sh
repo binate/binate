@@ -61,6 +61,13 @@ func ApplyMR(f @func() (int, int)) int
 // ApplyScalar calls a scalar-returning function value and returns its result —
 // the TrampolineScalar control path.
 func ApplyScalar(f @func() int) int
+
+// CallN calls a scalar-returning function value n times and returns the last
+// result.  Driving a CAPTURING bytecode closure through the compiled->VM
+// TrampolineScalar repeatedly from a single native call means a per-call
+// over-release or leak of the closure's captured managed value accumulates into
+// an observable refcount imbalance.
+func CallN(f @func() int, n int) int
 EOF
 
 cat > "$L_ROOT/pkg/xmfv/xmfv.bn" <<'EOF'
@@ -75,6 +82,14 @@ func ApplyMR(f @func() (int, int)) int {
 
 func ApplyScalar(f @func() int) int {
 	return f()
+}
+
+func CallN(f @func() int, n int) int {
+	var r int = 0
+	for i := 0; i < n; i++ {
+		r = f()
+	}
+	return r
 }
 EOF
 
@@ -240,6 +255,35 @@ func main() {
 }
 EOF
 
+# ---- refcount-balance program: a bytecode CAPTURING closure into native code ----
+# A BYTECODE @Box is captured by a scalar closure, which is handed to native
+# xmfv.CallN; native code then calls that bytecode closure 5x through the
+# compiled->VM TrampolineScalar.  rt.Refcount samples (taken in the bytecode
+# program) bracket the cross-mode calls: the captured Box's refcount must be 1
+# (only the local), 2 (the closure captured it), then STILL 2 after the calls —
+# the native<-VM trampoline round-trip must neither over-release the captured
+# value (< 2 -> premature free) nor leak it (> 2).
+cat > "$TMP/prog2.bn" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+import "pkg/builtins/rt"
+import "pkg/xmfv"
+
+type Box struct { N int }
+
+func main() {
+	var c @Box = make(Box)
+	c.N = 42
+	var cp *uint8 = bit_cast(*uint8, c)
+	testing.Println(rt.Refcount(cp))               // 1 — only the local c
+	var f @func() int = func() int { return c.N }  // closure captures c -> 2
+	testing.Println(rt.Refcount(cp))               // 2
+	testing.Println(xmfv.CallN(f, 5))              // 42 (5 cross-mode calls)
+	testing.Println(rt.Refcount(cp))               // 2 — balanced, no over-release/leak
+}
+EOF
+
 # ---- build gen1, then the host (with the fixture on the search paths) ----
 build_gen1
 IFACES="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$I_ROOT")"
@@ -280,6 +324,17 @@ check_eq() {
 out=$("$HOST_BIN" "$TMP/prog.bn" "$IFACES" "$IMPLS" 2>&1) || true
 check_eq "cross-mode-funcvalue-dispatch" "$out" "11022
 7"
+
+# Captured-@func refcount balance (Class 7): the trampoline round-trip for a
+# native call to a captured bytecode @func must not perturb the captured managed
+# value's refcount.  A stray RefDec per call would drop the final sample below 2
+# (and, at 5 calls, free the Box mid-run -> wrong 42 / crash); a stray RefInc
+# would push it above 2.
+out=$("$HOST_BIN" "$TMP/prog2.bn" "$IFACES" "$IMPLS" 2>&1) || true
+check_eq "cross-mode-captured-funcvalue-refcount-balance" "$out" "1
+2
+42
+2"
 
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="

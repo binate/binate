@@ -3,13 +3,13 @@ package "pkg/binate/ir"
 import "pkg/binate/iropcode"
 import "pkg/binate/types"
 
-// Per-type-kind destructor body generators.  Split out of
+// Struct and array destructor body generators.  Split out of
 // gen_dtor_emit.bn at the natural "// ===" section markers so
-// neither file exceeds the file-length soft cap.  Orchestration
-// (generateDtors, ensureMsDtor, ensureArrayDtor, etc.) and
-// shared utilities (name/path helpers, emitDtorOrCopyCall) live
-// in gen_dtor_emit.bn; the per-type IR emission for each kind
-// lives here.
+// neither file exceeds the file-length soft cap; the managed-pointer /
+// func-value / iface-value / managed-slice bodies live in
+// gen_dtor_emit_ms.bn.  Orchestration (generateDtors, ensureMsDtor,
+// ensureArrayDtor, etc.) and shared utilities (name/path helpers,
+// emitDtorOrCopyCall) live in gen_dtor_emit.bn.
 
 // ============================================================
 // Struct destructor generation
@@ -88,16 +88,34 @@ func emitStructFieldRefDecs(f @Func, b @Block, structPtr @Instr, structTyp @type
 			var fieldVal @Instr = b.EmitLoad(fieldPtr, fieldTyp)
 			emitManagedPtrRefDec(f, b, fieldVal)
 		case types.TYP_MANAGED_SLICE:
-			// @[]T field: if elements need destruction, call managed-slice dtor;
-			// otherwise just RefDec the backing.
+			// @[]T field: run the element cleanup (destruction-needing element) or
+			// just RefDec the backing (non-destruction element).
 			var fieldPtr @Instr = b.EmitGetFieldPtr(structPtr, i, fieldTyp)
 			var fieldVal @Instr = b.EmitLoad(fieldPtr, fieldTyp)
 			if fieldTyp.Elem != nil && fieldTyp.Elem.NeedsDestruction() {
-				// Elements need destruction — call managed-slice dtor
-				var fieldRawPtr @Instr = b.EmitBitCast(fieldPtr, types.MakePointerType(types.TypUint8()))
-				var msArgs @[]@Instr = make_slice(@Instr, 1)
-				msArgs[0] = fieldRawPtr
-				b.EmitCallLocal(dtorNameForType(fieldTyp), msArgs, types.TypVoid())
+				if inlineNested {
+					// -O1+ forwardable @[]@T cleanup: extract refptr (slot 2) /
+					// backingLen (slot 3) from the LOADED field value and call the
+					// scalar-arg elems helper — the field-ptr is NOT bitcast (no escape),
+					// so the struct and this @[]@T field slot scalar-replace.
+					// registerPendingMsDtor ensures the elems helper is generated (the
+					// shared __dtor_T, which would otherwise ensure it, may be elided).
+					registerPendingMsDtor(f, fieldTyp)
+					var refptr @Instr = b.EmitExtract(fieldVal, 2, types.MakeManagedPtrType(nil))
+					var backingLen @Instr = b.EmitExtract(fieldVal, 3, types.TypInt())
+					var backingPtrRaw @Instr = b.EmitBitCast(refptr, types.MakePointerType(types.TypUint8()))
+					var elemsArgs @[]@Instr = make_slice(@Instr, 2)
+					elemsArgs[0] = backingPtrRaw
+					elemsArgs[1] = backingLen
+					b.EmitCallLocal(msElemsDtorName(fieldTyp), elemsArgs, types.TypVoid())
+				} else {
+					// Shared __dtor_T (by-address value — not a SROA candidate): keep the
+					// by-address ms-dtor call.
+					var fieldRawPtr @Instr = b.EmitBitCast(fieldPtr, types.MakePointerType(types.TypUint8()))
+					var msArgs @[]@Instr = make_slice(@Instr, 1)
+					msArgs[0] = fieldRawPtr
+					b.EmitCallLocal(dtorNameForType(fieldTyp), msArgs, types.TypVoid())
+				}
 			} else {
 				// No element destruction needed — just RefDec the backing
 				var refptr @Instr = b.EmitExtract(fieldVal, 2, types.MakeManagedPtrType(nil))
@@ -136,284 +154,6 @@ func emitStructFieldRefDecs(f @Func, b @Block, structPtr @Instr, structTyp @type
 		}
 	}
 	return b
-}
-
-// ============================================================
-// Managed-slice destructor generation
-// ============================================================
-
-// genManagedPtrDtor emits the `__dtor_mp_<T>` helper for a managed pointer `@T`:
-// given a pointer to a cell holding a `@T`, load the `@T` and RefDec it (its own
-// dtor — a struct dtor, or another mp/ms-dtor — runs at pointee refcount zero).
-// The drop of a `@(@T)` (e.g. `box(mp)` for `mp @Node`) calls this; mirrors
-// genManagedSliceDtor but with no element walk.
-func genManagedPtrDtor(pkgPath @[]char, name @[]char, mpTyp @types.Type) @Func {
-	var ptrParam @Param = make(Param)
-	ptrParam.Name = "ptr"
-	ptrParam.Typ = types.MakePointerType(types.TypUint8())
-	var params @[]@Param = make_slice(@Param, 1)
-	params[0] = ptrParam
-	var noResults @[]@types.Type
-
-	var f @Func = NewFunc(pkgPath, name, params, noResults)
-	f.IsLinkOnce = true
-	var entry @Block = AddBlock(f, "entry")
-
-	// Reference to parameter 0 — a *uint8 pointing at the cell (which holds a @T).
-	var rawPtr @Instr = newParamRef(f.Params[0])
-
-	// Bitcast to pointer-to-managed-pointer, load the @T value, RefDec it.
-	var mpPtrTyp @types.Type = types.MakePointerType(mpTyp)
-	var mpPtr @Instr = entry.EmitBitCast(rawPtr, mpPtrTyp)
-	var mpVal @Instr = entry.EmitLoad(mpPtr, mpTyp)
-	emitManagedPtrRefDec(f, entry, mpVal)
-
-	var noRetVals @[]@Instr
-	entry.EmitReturn(noRetVals)
-	return f
-}
-
-// genManagedFuncValueDtor emits the `__dtor_func` helper for a managed pointer to a
-// managed func-value (`@(@func())`): given a pointer to a cell holding a `@func()`,
-// load the `@func()` and RefDec its capture record.  The body is signature-
-// INDEPENDENT (emitManagedFuncValueRefDec fetches the dtor from the value's own
-// vtable), so ONE `__dtor_func` serves every func signature — genManagedFuncValueDtor
-// is called with a canonical `@func()` load type.  Unlike genManagedPtrDtor, the
-// RefDec splits the block on a null-data guard, so the return is emitted on the
-// continuation block it hands back.
-func genManagedFuncValueDtor(pkgPath @[]char, name @[]char, fvTyp @types.Type) @Func {
-	var ptrParam @Param = make(Param)
-	ptrParam.Name = "ptr"
-	ptrParam.Typ = types.MakePointerType(types.TypUint8())
-	var params @[]@Param = make_slice(@Param, 1)
-	params[0] = ptrParam
-	var noResults @[]@types.Type
-
-	var f @Func = NewFunc(pkgPath, name, params, noResults)
-	f.IsLinkOnce = true
-	var entry @Block = AddBlock(f, "entry")
-
-	// Reference to parameter 0 — a *uint8 pointing at the cell (which holds a @func()).
-	var rawPtr @Instr = newParamRef(f.Params[0])
-
-	// Bitcast to pointer-to-func-value, load the value, RefDec its capture record.
-	var fvPtrTyp @types.Type = types.MakePointerType(fvTyp)
-	var fvPtr @Instr = entry.EmitBitCast(rawPtr, fvPtrTyp)
-	var fvVal @Instr = entry.EmitLoad(fvPtr, fvTyp)
-	var cont @Block = emitManagedFuncValueRefDec(f, entry, fvVal)
-
-	var noRetVals @[]@Instr
-	cont.EmitReturn(noRetVals)
-	return f
-}
-
-// genManagedIfaceValueDtor emits the `__dtor_interface` helper for a managed pointer
-// to a managed iface-value (`@(@I)`): given a pointer to a cell holding a `@I`, load
-// the `@I` and RefDec its data slot.  The body is interface-INDEPENDENT
-// (emitManagedIfaceValueRefDec fetches the receiver dtor from the value's own vtable
-// at runtime), so ONE `__dtor_interface` serves every interface — called with a
-// canonical iface-value load type.  Like genManagedFuncValueDtor, the RefDec splits
-// the block on a null-data guard, so the return lands on the continuation block.
-func genManagedIfaceValueDtor(pkgPath @[]char, name @[]char, ivTyp @types.Type) @Func {
-	var ptrParam @Param = make(Param)
-	ptrParam.Name = "ptr"
-	ptrParam.Typ = types.MakePointerType(types.TypUint8())
-	var params @[]@Param = make_slice(@Param, 1)
-	params[0] = ptrParam
-	var noResults @[]@types.Type
-
-	var f @Func = NewFunc(pkgPath, name, params, noResults)
-	f.IsLinkOnce = true
-	var entry @Block = AddBlock(f, "entry")
-
-	// Reference to parameter 0 — a *uint8 pointing at the cell (which holds a @I).
-	var rawPtr @Instr = newParamRef(f.Params[0])
-
-	// Bitcast to pointer-to-iface-value, load the value, RefDec its data slot.
-	var ivPtrTyp @types.Type = types.MakePointerType(ivTyp)
-	var ivPtr @Instr = entry.EmitBitCast(rawPtr, ivPtrTyp)
-	var ivVal @Instr = entry.EmitLoad(ivPtr, ivTyp)
-	var cont @Block = emitManagedIfaceValueRefDec(f, entry, ivVal)
-
-	var noRetVals @[]@Instr
-	cont.EmitReturn(noRetVals)
-	return f
-}
-
-// genManagedSliceDtor generates a destructor for a managed-slice type @[]T.
-// It checks if the backing is the last reference, iterates elements to
-// clean them up, then RefDec's the backing allocation.
-func genManagedSliceDtor(pkgPath @[]char, name @[]char, msTyp @types.Type) @Func {
-	var ptrParam @Param = make(Param)
-	ptrParam.Name = "ptr"
-	ptrParam.Typ = types.MakePointerType(types.TypUint8())
-	var params @[]@Param = make_slice(@Param, 1)
-	params[0] = ptrParam
-	var noResults @[]@types.Type
-
-	var f @Func = NewFunc(pkgPath, name, params, noResults)
-	f.IsLinkOnce = true
-	var entry @Block = AddBlock(f, "entry")
-
-	// Reference to parameter 0
-	var rawPtr @Instr = newParamRef(f.Params[0])
-
-	// Bitcast to managed-slice pointer, load the 4-word value
-	var msPtrTyp @types.Type = types.MakePointerType(msTyp)
-	var msPtr @Instr = entry.EmitBitCast(rawPtr, msPtrTyp)
-	var msVal @Instr = entry.EmitLoad(msPtr, msTyp)
-
-	// Extract backing refptr
-	var refptr @Instr = entry.EmitExtract(msVal, 2, types.MakeManagedPtrType(nil))
-
-	// peelTransparent so a `readonly`/named/alias-wrapped element dispatches on
-	// its underlying kind below — mirroring genStructDtorWithName.  Without it a
-	// `@[]readonly @Node` element (kind TYP_READONLY) misses the TYP_MANAGED_PTR
-	// arm and falls to the generic `else`, emitting a call to an inline-only
-	// managed-pointer "dtor helper" (`__dtor_mp_Node`) that is never generated —
-	// an undefined-symbol link failure.
-	var elemTyp @types.Type = peelTransparent(msTyp.Elem)
-
-	// If elements don't need destruction, just RefDec the backing and return
-	if !elemTyp.NeedsDestruction() {
-		entry.EmitRefDec(refptr)
-		var noRetVals2 @[]@Instr
-		entry.EmitReturn(noRetVals2)
-		return f
-	}
-
-	// Managed element: delegate the refcount==1-guarded element loop + backing
-	// RefDec to the shared scalar-arg __dtor_ms_elems_<T> helper (ensureMsDtor
-	// emits it alongside this dtor), passing the backing pointer + length directly.
-	// The -O1+ inline cleanup calls that same helper, so the element-loop body is
-	// generated once and both cleanup shapes agree.
-	var backingLen @Instr = entry.EmitExtract(msVal, 3, types.TypInt())
-	var backingPtrRaw @Instr = entry.EmitBitCast(refptr, types.MakePointerType(types.TypUint8()))
-	var elemsArgs @[]@Instr = make_slice(@Instr, 2)
-	elemsArgs[0] = backingPtrRaw
-	elemsArgs[1] = backingLen
-	entry.EmitCallLocal(msElemsDtorName(msTyp), elemsArgs, types.TypVoid())
-
-	var noRetVals @[]@Instr
-	entry.EmitReturn(noRetVals)
-	return f
-}
-
-// emitMsElemsCleanup emits the managed-slice element cleanup into `entry`, given
-// the backing refptr (@ptr) and backingLen (int): if the backing's refcount is 1
-// (the last reference, so its elements are about to be freed), iterate the
-// backingLen elements calling each element's RefDec / dtor; then RefDec the
-// backing.  Returns the exit block (the caller emits the return).  This is the one
-// place the element loop is generated — genManagedSliceElemsDtor is its only
-// caller; the by-address __dtor_<T> and the -O1+ inline cleanup both reach it by
-// calling that helper.  refptr must be the BACKING start (slice-image slot 2), not
-// the data pointer, which after subslicing may point into the middle of the
-// backing.  The caller guarantees peelTransparent(elemTyp) NeedsDestruction.
-func emitMsElemsCleanup(f @Func, entry @Block, refptr @Instr, backingLen @Instr,
-		elemTyp @types.Type) @Block {
-	var backingPtr @Instr = entry.EmitBitCast(refptr, types.MakePointerType(types.TypUint8()))
-
-	// Check: refcount == 1 (last reference, safe to clean up elements)
-	var rcArgs @[]@Instr = make_slice(@Instr, 1)
-	rcArgs[0] = refptr
-	var rc @Instr = entry.EmitCall("pkg/builtins/rt.Refcount", rcArgs, types.TypInt())
-	var one @Instr = entry.EmitConstInt(1, types.TypInt())
-	var isLast @Instr = entry.EmitBinop(iropcode.OP_EQ, rc, one, types.TypBool())
-
-	var loopInit @Block = AddBlock(f, "ms_dtor_init")
-	var exitBlock @Block = AddBlock(f, "ms_dtor_exit")
-
-	entry.EmitBranch(isLast, loopInit, exitBlock)
-
-	// Loop counter via alloca
-	var iSlot @Instr = loopInit.EmitAlloc(types.TypInt())
-	var zero @Instr = loopInit.EmitConstInt(0, types.TypInt())
-	loopInit.EmitStore(iSlot, zero)
-
-	var loopCond @Block = AddBlock(f, "ms_dtor_cond")
-	loopInit.EmitJump(loopCond)
-
-	// Loop condition: i < backing_len
-	var iv @Instr = loopCond.EmitLoad(iSlot, types.TypInt())
-	var cmp @Instr = loopCond.EmitBinop(iropcode.OP_LT, iv, backingLen, types.TypBool())
-	var loopBody @Block = AddBlock(f, "ms_dtor_body")
-	loopCond.EmitBranch(cmp, loopBody, exitBlock)
-
-	// Loop body: compute element address, call element cleanup
-	var elemSize @Instr = loopBody.EmitConstInt(elemTyp.SizeOf(), types.TypInt())
-	var offset @Instr = loopBody.EmitBinop(iropcode.OP_MUL, iv, elemSize, types.TypInt())
-	var elemAddr @Instr = loopBody.EmitGetElemPtr(backingPtr, offset, types.TypUint8())
-	var elemRawPtr @Instr = loopBody.EmitBitCast(elemAddr, types.MakePointerType(types.TypUint8()))
-
-	switch elemTyp.Kind {
-	case types.TYP_MANAGED_PTR:
-		// Element is @T — load the pointer, RefDec with pointee dtor
-		var elemPtrTyp @types.Type = types.MakePointerType(elemTyp)
-		var typedElemPtr @Instr = loopBody.EmitBitCast(elemAddr, elemPtrTyp)
-		var elem @Instr = loopBody.EmitLoad(typedElemPtr, elemTyp)
-		emitManagedPtrRefDec(f, loopBody, elem)
-	case types.TYP_MANAGED_FUNC_VALUE:
-		// Element is @func — load it and RefDec its data slot (slot 1).
-		var elemFvPtrTyp @types.Type = types.MakePointerType(elemTyp)
-		var typedFvPtr @Instr = loopBody.EmitBitCast(elemAddr, elemFvPtrTyp)
-		var fvElem @Instr = loopBody.EmitLoad(typedFvPtr, elemTyp)
-		loopBody = emitManagedFuncValueRefDec(f, loopBody, fvElem)
-	case types.TYP_INTERFACE_VALUE_MANAGED:
-		// Element is @Iface — load it and RefDec its data slot (field 0).
-		var elemIvPtrTyp @types.Type = types.MakePointerType(elemTyp)
-		var typedIvPtr @Instr = loopBody.EmitBitCast(elemAddr, elemIvPtrTyp)
-		var ivElem @Instr = loopBody.EmitLoad(typedIvPtr, elemTyp)
-		loopBody = emitManagedIfaceValueRefDec(f, loopBody, ivElem)
-	default:
-		// Element is struct, @[]T, [N]T — call element type's dtor
-		emitDtorOrCopyCall(f, loopBody, elemDtorName(elemTyp), elemRawPtr, isElemDtorModuleLocal(elemTyp))
-	}
-
-	// Increment counter, loop back
-	var iNext @Instr = loopBody.EmitBinop(iropcode.OP_ADD, iv, one, types.TypInt())
-	loopBody.EmitStore(iSlot, iNext)
-	loopBody.EmitJump(loopCond)
-
-	// Exit: RefDec the backing allocation (no dtor — it's raw memory)
-	exitBlock.EmitRefDec(refptr)
-	return exitBlock
-}
-
-// genManagedSliceElemsDtor generates the scalar-arg element-cleanup helper
-// `__dtor_ms_elems_<T>(backingPtr *uint8, backingLen int)` for a managed slice
-// @[]@E — the shared body (emitMsElemsCleanup) the by-address __dtor_<T> AND the
-// -O1+ inline cleanup both call.  Taking the backing pointer + length as SCALARS
-// (rather than a 4-word slice image by address) is exactly what lets the inline
-// cleanup read them via extract-2 / extract-3 of the slice value and stay
-// SROA-forwardable.  Only generated for a destruction-needing element.
-func genManagedSliceElemsDtor(pkgPath @[]char, name @[]char, msTyp @types.Type) @Func {
-	var bpParam @Param = make(Param)
-	bpParam.Name = "backingPtr"
-	bpParam.Typ = types.MakePointerType(types.TypUint8())
-	var blParam @Param = make(Param)
-	blParam.Name = "backingLen"
-	blParam.Typ = types.TypInt()
-	var params @[]@Param = make_slice(@Param, 2)
-	params[0] = bpParam
-	params[1] = blParam
-	var noResults @[]@types.Type
-
-	var f @Func = NewFunc(pkgPath, name, params, noResults)
-	f.IsLinkOnce = true
-	var entry @Block = AddBlock(f, "entry")
-
-	var backingPtrRaw @Instr = newParamRef(f.Params[0])
-	var backingLen @Instr = newParamRef(f.Params[1])
-	// Reconstitute the @ptr refptr for the backing RefDec.  The param is a raw
-	// *uint8 (like every other dtor helper's param) so no managed-param
-	// auto-refcount convention interferes with the single explicit RefDec.
-	var refptr @Instr = entry.EmitBitCast(backingPtrRaw, types.MakeManagedPtrType(nil))
-	var elemTyp @types.Type = peelTransparent(msTyp.Elem)
-	var b @Block = emitMsElemsCleanup(f, entry, refptr, backingLen, elemTyp)
-
-	var noRetVals @[]@Instr
-	b.EmitReturn(noRetVals)
-	return f
 }
 
 // ============================================================

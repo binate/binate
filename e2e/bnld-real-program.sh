@@ -282,8 +282,11 @@ if command -v clang > /dev/null 2>&1; then
         cat "$TMP/compile_aa64.log" >&2
         exit 1
     fi
-    # A minimal aarch64 shim: it only needs to DEFINE _start + the libc symbols so
-    # the graph links (it is not run, so the stubs need not work).
+    # A minimal aarch64 shim: it only needs to DEFINE _start, the libc symbols, and
+    # rt.MemZero so the graph links (it is not run, so the stubs need not work).
+    # aarch64's rt.MemZero is a #[build]-gated-off hand-asm .s seam that only cmd/bnc's
+    # own link path assembles + includes (via assembleRtMemObj), so a manual bnld link
+    # of `bnc -c` objects must supply the symbol here alongside the libc stubs.
     cat > "$TMP/shim_aa64.s" <<'AAEOF'
 .arch aarch64
 .global bn_entry
@@ -307,6 +310,9 @@ write:
 	ret
 .global abort
 abort:
+	ret
+.global bn_F3_3_pkg8_builtins2_rt1_7_MemZero
+bn_F3_3_pkg8_builtins2_rt1_7_MemZero:
 	ret
 AAEOF
     if ! "$BNAS" -target linux-aarch64 -o "$TMP/shim_aa64.o" "$TMP/shim_aa64.s" \

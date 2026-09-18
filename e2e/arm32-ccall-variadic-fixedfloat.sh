@@ -95,6 +95,16 @@ func call2(base0 float64, base1 float64, n int32, x int32) int64 {
 func call3(base float32, n int32, x int32) int64 {
 	return __c_call("vfn3", int64, base, n, ..., x)
 }
+
+// A `...` with ZERO trailing varargs.  The `...` still makes the call variadic, so
+// the fixed double `base` must ride the GP pair r0:r1 (not d0) and `n` r2 — exactly
+// as if trailing varargs were present.  Before the explicit CVariadic flag, this
+// call was byte-identical in IR to the non-variadic `__c_call("vfn4", int64, base,
+// n)` and wrongly peeled `base` to VFP d0, so the variadic C callee read garbage.
+#[c_export("bn_call4")]
+func call4(base float64, n int32) int64 {
+	return __c_call("vfn4", int64, base, n, ...)
+}
 BN
 
 echo "Compiling facade (--backend native --target arm32-linux)..."
@@ -138,21 +148,31 @@ long long vfn3(float base, int n, ...) {
     return (long long)(base * 100.0f) + n * 10 + x;
 }
 
+/* A variadic callee with ZERO trailing varargs at the call site: still variadic, so
+   `base` rides r0:r1 (GP), not d0.  Reads only its fixed params (no va_arg). */
+long long vfn4(double base, int n, ...) {
+    return (long long)(base * 100.0) + n;
+}
+
 extern long long bn_call1(double, int, int);
 extern long long bn_call2(double, double, int, int);
 extern long long bn_call3(float, int, int);
+extern long long bn_call4(double, int);
 
 int main(void) {
     int fails = 0;
     long long r1 = bn_call1(3.5, 2, 7);          /* 350 + 20 + 7 = 377 */
     long long r2 = bn_call2(1.5, 2.25, 4, 9);    /* 1500 + 225 + 40 + 9 = 1774 */
     long long r3 = bn_call3(2.5f, 3, 8);         /* 250 + 30 + 8 = 288 */
+    long long r4 = bn_call4(2.5, 4);             /* 250 + 4 = 254 (zero trailing varargs) */
     printf("  vfn1: got=%lld want=377\n", r1);
     printf("  vfn2: got=%lld want=1774\n", r2);
     printf("  vfn3: got=%lld want=288\n", r3);
+    printf("  vfn4: got=%lld want=254\n", r4);
     if (r1 != 377)  { fails++; }
     if (r2 != 1774) { fails++; }
     if (r3 != 288)  { fails++; }
+    if (r4 != 254)  { fails++; }
     if (fails) { printf("%d FAILURE(S)\n", fails); return 1; }
     printf("ALL PASS\n"); return 0;
 }

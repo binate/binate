@@ -71,15 +71,29 @@ func spansClobber(iv @LiveInterval, clobbers @[]int) bool {
 // ascending clobber-position list (ClobberPositions).  An interval that spans
 // a clobber takes a callee-saved register (or spills if none free); one that
 // does not prefers a caller-saved register (leaving callee-saved for spanning
-// intervals), falling back to callee-saved, then spill under pressure.
-func LinearScan(intervals @[]@LiveInterval, clobbers @[]int, desc RegClassDesc) @[]RegAssignment {
+// intervals), falling back to callee-saved.
+//
+// useCounts is the id-indexed static spill cost (def+use count per id;
+// computeUseCounts): a higher count means more reloads if spilled, so it is
+// worth keeping in a register.  When the eligible pool is exhausted, rather than
+// always spilling the newcomer, the scan EVICTS the cheapest eligible active
+// (min useCount) IF that is cheaper than the current interval — spilling it and
+// handing the current its register — else spills the current.  Equal costs never
+// evict, so a uniform (or empty) useCounts reproduces the plain
+// spill-the-newcomer behavior exactly.
+func LinearScan(intervals @[]@LiveInterval, clobbers @[]int, desc RegClassDesc,
+		useCounts @[]int) @[]RegAssignment {
 	var freeCaller @[]int = copyInts(desc.CallerSaved)
 	var freeCallee @[]int = copyInts(desc.CalleeSaved)
-	// Active intervals holding a register, as parallel arrays (End / Reg /
-	// whether the reg came from the callee-saved pool).
+	// Active intervals holding a register, as parallel arrays: End / Reg /
+	// whether the reg came from the callee-saved pool / the interval's spill cost
+	// (useCount) / its index in result (so an evicted active can be marked
+	// spilled there).
 	var actEnd @[]int
 	var actReg @[]int
 	var actCallee @[]bool
+	var actCost @[]int
+	var actResIdx @[]int
 	// One RegAssignment per interval; size up front and fill by index rather
 	// than reallocating (and refcounting) the growing @[]RegAssignment on every
 	// interval.
@@ -92,7 +106,7 @@ func LinearScan(intervals @[]@LiveInterval, clobbers @[]int, desc RegClassDesc) 
 		// Expire intervals that end at or before this one's start, returning
 		// their registers to the pool they came from.  Compact the survivors in
 		// place (the active set is bounded by the register count, but rebuilding
-		// three fresh parallel slices every interval still churns allocations
+		// fresh parallel slices every interval still churns allocations
 		// and their dtors).
 		var w int = 0
 		for a := 0; a < len(actEnd); a++ {
@@ -106,16 +120,23 @@ func LinearScan(intervals @[]@LiveInterval, clobbers @[]int, desc RegClassDesc) 
 				actEnd[w] = actEnd[a]
 				actReg[w] = actReg[a]
 				actCallee[w] = actCallee[a]
+				actCost[w] = actCost[a]
+				actResIdx[w] = actResIdx[a]
 				w = w + 1
 			}
 		}
 		actEnd = actEnd[0:w]
 		actReg = actReg[0:w]
 		actCallee = actCallee[0:w]
+		actCost = actCost[0:w]
+		actResIdx = actResIdx[0:w]
+
+		var spans bool = spansClobber(iv, clobbers)
+		var costC int = spillCostOf(useCounts, iv.ID)
 
 		var reg int = -1
 		var fromCallee bool = false
-		if spansClobber(iv, clobbers) {
+		if spans {
 			// Must survive the call: callee-saved only.
 			if len(freeCallee) > 0 {
 				reg = freeCallee[len(freeCallee) - 1]
@@ -131,10 +152,48 @@ func LinearScan(intervals @[]@LiveInterval, clobbers @[]int, desc RegClassDesc) 
 			fromCallee = true
 		}
 
+		// No free register in the eligible pool: consider EVICTING the cheapest
+		// eligible active (spill it, take its register) when that is cheaper than
+		// spilling the current interval.  A clobber-spanning current interval needs
+		// a callee-saved register, so it may only evict a callee-saved holder; a
+		// non-spanning one may evict any active (it can use whatever class the freed
+		// register is).  The evicted value goes to memory — correct for any value,
+		// including a clobber-spanning one, which still survives the call in its slot.
+		var evictSlot int = -1
+		if reg < 0 {
+			var bestSlot int = -1
+			var bestCost int = 0
+			for a := 0; a < len(actEnd); a++ {
+				if spans && !actCallee[a] { continue }
+				if bestSlot < 0 || actCost[a] < bestCost {
+					bestSlot = a
+					bestCost = actCost[a]
+				}
+			}
+			if bestSlot >= 0 && bestCost < costC {
+				result[actResIdx[bestSlot]].Reg = -1 // the evicted active spills
+				reg = actReg[bestSlot]
+				fromCallee = actCallee[bestSlot]
+				evictSlot = bestSlot
+			}
+		}
+
 		if reg >= 0 {
-			actEnd = slices.Append[int](actEnd, iv.End())
-			actReg = slices.Append[int](actReg, reg)
-			actCallee = slices.Append[bool](actCallee, fromCallee)
+			if evictSlot >= 0 {
+				// Reuse the evicted active's slot — its register is now this
+				// interval's, held until this interval's end.
+				actEnd[evictSlot] = iv.End()
+				actReg[evictSlot] = reg
+				actCallee[evictSlot] = fromCallee
+				actCost[evictSlot] = costC
+				actResIdx[evictSlot] = i
+			} else {
+				actEnd = slices.Append[int](actEnd, iv.End())
+				actReg = slices.Append[int](actReg, reg)
+				actCallee = slices.Append[bool](actCallee, fromCallee)
+				actCost = slices.Append[int](actCost, costC)
+				actResIdx = slices.Append[int](actResIdx, i)
+			}
 		}
 		var ra RegAssignment
 		ra.ID = iv.ID
@@ -142,6 +201,38 @@ func LinearScan(intervals @[]@LiveInterval, clobbers @[]int, desc RegClassDesc) 
 		result[i] = ra
 	}
 	return result
+}
+
+// spillCostOf returns the static spill cost of id — its def+use count from
+// useCounts (id-indexed) — or 0 when id is out of range (an empty/short
+// useCounts makes every cost 0, so eviction never fires and the scan reduces to
+// spill-the-newcomer).
+func spillCostOf(useCounts @[]int, id int) int {
+	if id < 0 || id >= len(useCounts) { return 0 }
+	return useCounts[id]
+}
+
+// computeUseCounts returns the id-indexed count of instructions that define or
+// use each allocatable id (a def and each operand reference count 1) over the
+// reachable blocks — the static spill-cost proxy the scan evicts by.  Uses the
+// SAME defIdOf/useIdOf extraction as the interval builder, so the counted points
+// are exactly the allocatable def/use points.
+func computeUseCounts(f @ir.Func, lv @LivenessInfo) @[]int {
+	var counts @[]int = make_slice(int, lv.NextID)
+	for k := 0; k < len(lv.RPO); k++ {
+		var b int = lv.RPO[k]
+		var blk @ir.Block = f.Blocks[b]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var ins @ir.Instr = blk.Instrs[j]
+			var d int = defIdOf(lv, ins, lv.WordBytes)
+			if d >= 0 { counts[d] = counts[d] + 1 }
+			for ai := 0; ai < len(ins.Args); ai++ {
+				var u int = useIdOf(lv, ins.Args[ai])
+				if u >= 0 { counts[u] = counts[u] + 1 }
+			}
+		}
+	}
+	return counts
 }
 
 // AssignedReg returns the register assigned to id, or -1 if id is spilled or
@@ -176,7 +267,8 @@ func (m @RegMap) AllocateRegisters(f @ir.Func, wordBytes int, desc RegClassDesc)
 	var lv @LivenessInfo = ComputeLiveness(f, wordBytes)
 	var intervals @[]@LiveInterval = BuildIntervals(f, lv)
 	var clobbers @[]int = ClobberPositions(f, lv, desc)
-	var assignments @[]RegAssignment = LinearScan(intervals, clobbers, desc)
+	var useCounts @[]int = computeUseCounts(f, lv)
+	var assignments @[]RegAssignment = LinearScan(intervals, clobbers, desc, useCounts)
 
 	var usedSet @[]int
 	for i := 0; i < len(assignments); i++ {

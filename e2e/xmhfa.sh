@@ -65,17 +65,6 @@ func (m *Impl) Sum3(v D3) float64
 func (m *Impl) Sum4(v D4) float64
 func (m *Impl) Mk3(z float64) D3
 impl *Impl : HfaOps
-
-// A >6-user-arg method used as a CROSS-MODE PROOF: the a0..a6 overflow guard
-// fires only on the compiled cross-mode dispatch path (the VM's own bytecode
-// iface dispatch has no such limit), so its loud panic proves the fixture is
-// genuinely native-injected — were it lowered to bytecode, Sum7 would just
-// return, making the HFA checks above a false pass.
-interface Big {
-	Sum7(a int, b int, c int, d int, e int, f int, g int) int
-}
-func (m *Impl) Sum7(a int, b int, c int, d int, e int, f int, g int) int
-impl *Impl : Big
 EOF
 
 cat > "$L_ROOT/pkg/xmhfa/xmhfa.bn" <<'EOF'
@@ -91,9 +80,32 @@ func (m *Impl) Mk3(z float64) D3 {
 	r.c = m.Base
 	return r
 }
+EOF
 
-func (m *Impl) Sum7(a int, b int, c int, d int, e int, f int, g int) int {
-	return cast(int, m.Base) + a + b + c + d + e + f + g
+# Wide (>64-slot) cross-mode PROOF method, generated. The compiled cross-mode
+# iface-dispatch buffer holds 64 slots (receiver + args), so a call with WIDE_N
+# user args overflows it and panics ("arg slots exceed the dispatch buffer") — a
+# guard that fires ONLY on the compiled cross-mode path (the VM's bytecode iface
+# dispatch has no such limit). Its panic proves the fixture is genuinely
+# native-injected: a bytecode-lowered version would just return the sum, making
+# the HFA checks above a false pass. (9574f14ce replaced the old fixed >6 cap
+# with this 64-slot ceiling; this proof tracks the ceiling.)
+WIDE_N=64
+wide_params=$(for i in $(seq 1 "$WIDE_N"); do printf 'p%d int, ' "$i"; done | sed 's/, $//')
+wide_body=$(for i in $(seq 1 "$WIDE_N"); do printf 'p%d + ' "$i"; done | sed 's/ + $//')
+wide_args=$(seq 1 "$WIDE_N" | paste -sd, -)
+cat >> "$I_ROOT/pkg/xmhfa.bni" <<EOF
+
+interface Big {
+	SumWide($wide_params) int
+}
+func (m *Impl) SumWide($wide_params) int
+impl *Impl : Big
+EOF
+cat >> "$L_ROOT/pkg/xmhfa/xmhfa.bn" <<EOF
+
+func (m *Impl) SumWide($wide_params) int {
+	return cast(int, m.Base) + $wide_body
 }
 EOF
 
@@ -277,10 +289,10 @@ func main() {
 }
 EOF
 
-# Cross-mode PROOF: dispatching a >6-user-arg method must trip the compiled
-# cross-mode overflow guard (a loud panic), proving the fixture is genuinely
-# native-injected rather than lowered to bytecode (see the fixture .bni).
-cat > "$TMP/prog_overflow.bn" <<'EOF'
+# Cross-mode PROOF: dispatching a >64-slot method must trip the compiled
+# cross-mode dispatch-buffer overflow guard (a loud panic), proving the fixture
+# is genuinely native-injected rather than lowered to bytecode (see the fixture).
+cat > "$TMP/prog_overflow.bn" <<EOF
 package "main"
 
 import "pkg/builtins/testing"
@@ -289,7 +301,7 @@ import "pkg/xmhfa"
 func main() {
 	var im xmhfa.Impl = xmhfa.Impl{Base: 0.0}
 	var iv *xmhfa.Big = &im
-	testing.Println(iv.Sum7(1, 2, 3, 4, 5, 6, 7))
+	testing.Println(iv.SumWide($wide_args))
 }
 EOF
 
@@ -331,17 +343,17 @@ check_eq "cross-mode-hfa-dispatch" "$out" "110
 1334
 109"
 
-# Cross-mode proof: the >6-arg overflow guard fires only on the compiled
+# Cross-mode proof: the dispatch-buffer overflow guard fires only on the compiled
 # cross-mode path, so its panic proves the HFA dispatch above was genuinely
 # cross-mode (not a bytecode-lowered false pass).
 ov_out=$("$HOST_BIN" "$TMP/prog_overflow.bn" "$IFACES" "$IMPLS" 2>&1) || true
 case "$ov_out" in
-    *">6 user arg slots"*)
+    *"arg slots exceed the dispatch buffer"*)
         echo "PASS: cross-mode-hfa-proof (overflow guard)"
         PASSES=$((PASSES + 1)) ;;
     *)
         echo "FAIL: cross-mode-hfa-proof (overflow guard)"
-        echo "  expected a vmPanic containing '>6 user arg slots'"
+        echo "  expected a vmPanic containing 'arg slots exceed the dispatch buffer'"
         echo "  actual:   $(printf '%s' "$ov_out" | tr '\n' '|')"
         FAILS=$((FAILS + 1))
         FAIL_NAMES="$FAIL_NAMES cross-mode-hfa-proof" ;;

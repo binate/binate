@@ -17,8 +17,8 @@
 #       thunk's handle; a0 = the iv-data pointer the thunk derefs);
 #   (b) a method with MULTIPLE aggregate args (the a1/a2 by-address slots);
 #   (c) a method with a FLOAT arg (the shim's int-slot -> FP bitcast path);
-#   (d) the >6 user-arg overflow guard (a negative test — a loud vmPanic, not
-#       silent truncation).
+#   (d) the >64-arg-slot dispatch-buffer overflow guard (a negative test — a loud
+#       vmPanic, not silent truncation).
 #
 # The fixture's interface impls run as native machine code (the host links them
 # and injects their descriptor); the dispatching main runs as bytecode.  Gen1
@@ -89,17 +89,6 @@ type Mult struct {
 }
 func (m *Mult) Scale(f float64) int
 impl *Mult : Scaler
-
-// (d) A method with >6 user-arg words: cross-mode dispatch must trip the loud
-// overflow guard (the shim primitives carry only a0..a6 = receiver + 6 args).
-interface Many {
-	Sum7(a int, b int, c int, d int, e int, f int, g int) int
-}
-type Summer struct {
-	Tag int
-}
-func (s *Summer) Sum7(a int, b int, c int, d int, e int, f int, g int) int
-impl *Summer : Many
 
 // (e) An interface that EXTENDS another (interface embedding): the impl's concat
 // vtable lays the PARENT (Base) sub-block at a NON-ZERO slot offset
@@ -177,10 +166,6 @@ func (m *Mult) Scale(f float64) int {
 	return cast(int, f) * m.Factor
 }
 
-func (s *Summer) Sum7(a int, b int, c int, d int, e int, f int, g int) int {
-	return s.Tag + a + b + c + d + e + f + g
-}
-
 func (n *Node) BaseVal() int {
 	return n.V
 }
@@ -207,6 +192,35 @@ func (n VNode) VBaseVal() int {
 
 func (n VNode) VExtVal() int {
 	return n.V * 100
+}
+EOF
+
+# (d) Wide (>64-slot) cross-mode PROOF method, generated. The compiled cross-mode
+# iface-dispatch buffer holds 64 slots (receiver + args), so a call with WIDE_N
+# user args overflows it and panics ("arg slots exceed the dispatch buffer") — a
+# guard that fires ONLY on the compiled cross-mode path (the VM's bytecode iface
+# dispatch has no such limit). Its panic proves the fixture is genuinely
+# native-injected: a bytecode-lowered version would just return the sum.
+# (9574f14ce replaced the old fixed >6 cap with this 64-slot ceiling.)
+WIDE_N=64
+wide_params=$(for i in $(seq 1 "$WIDE_N"); do printf 'p%d int, ' "$i"; done | sed 's/, $//')
+wide_body=$(for i in $(seq 1 "$WIDE_N"); do printf 'p%d + ' "$i"; done | sed 's/ + $//')
+wide_args=$(seq 1 "$WIDE_N" | paste -sd, -)
+cat >> "$I_ROOT/pkg/xmiface.bni" <<EOF
+
+interface Many {
+	SumWide($wide_params) int
+}
+type Summer struct {
+	Tag int
+}
+func (s *Summer) SumWide($wide_params) int
+impl *Summer : Many
+EOF
+cat >> "$L_ROOT/pkg/xmiface/xmiface.bn" <<EOF
+
+func (s *Summer) SumWide($wide_params) int {
+	return s.Tag + $wide_body
 }
 EOF
 
@@ -379,17 +393,17 @@ func main() {
 }
 EOF
 
-cat > "$TMP/prog_overflow.bn" <<'EOF'
+cat > "$TMP/prog_overflow.bn" <<EOF
 package "main"
 
 import "pkg/builtins/testing"
 import "pkg/xmiface"
 
 func main() {
-	// (d) >6 user args: the cross-mode dispatch overflow guard must fire.
+	// (d) >64 arg slots: the cross-mode dispatch-buffer overflow guard must fire.
 	var summer xmiface.Summer = xmiface.Summer{Tag: 0}
 	var m *xmiface.Many = &summer
-	testing.Println(m.Sum7(1, 2, 3, 4, 5, 6, 7))
+	testing.Println(m.SumWide($wide_args))
 }
 EOF
 
@@ -478,21 +492,21 @@ check_eq "cross-mode-iface-parent-upcast" "$up_out" "70
 800
 8"
 
-# ----- negative shape (d): >6 user args must trip the loud overflow guard -----
+# ----- negative shape (d): >64 arg slots must trip the loud overflow guard -----
 # This guard lives ONLY on the native cross-mode path (dispatchCompiledIfaceMethod
-# — the VM's own bytecode iface dispatch has no a0..a6 limit), so the panic firing
-# also PROVES the fixture was genuinely native-injected: were it lowered to
-# bytecode instead, Sum7 would just return 28 and this program would print, not
-# panic.  Keep this check — it is what makes the whole test cross-mode, not a
+# — the VM's own bytecode iface dispatch has no dispatch-buffer limit), so the panic
+# firing also PROVES the fixture was genuinely native-injected: were it lowered to
+# bytecode instead, SumWide would just return its sum and this program would print,
+# not panic.  Keep this check — it is what makes the whole test cross-mode, not a
 # false pass through bytecode dispatch.
 ov_out=$("$HOST_BIN" "$TMP/prog_overflow.bn" "$IFACES" "$IMPLS" 2>&1) || true
 case "$ov_out" in
-    *">6 user arg slots"*)
+    *"arg slots exceed the dispatch buffer"*)
         echo "PASS: cross-mode-iface-overflow-guard"
         PASSES=$((PASSES + 1)) ;;
     *)
         echo "FAIL: cross-mode-iface-overflow-guard"
-        echo "  expected a vmPanic containing '>6 user arg slots'"
+        echo "  expected a vmPanic containing 'arg slots exceed the dispatch buffer'"
         echo "  actual:   $(printf '%s' "$ov_out" | tr '\n' '|')"
         FAILS=$((FAILS + 1))
         FAIL_NAMES="$FAIL_NAMES cross-mode-iface-overflow-guard" ;;

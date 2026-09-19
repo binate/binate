@@ -406,7 +406,7 @@ check_narrow_returns() {
             || [ ! -f "$work/ffiexp.o" ]; then
         if [ "$required" -eq 1 ]; then
             fail "$label: compile of facade (--pkg ffiexp) produced no object" \
-                 "$(tail -5 "$work/pkg.log")"
+                 "$(tail -40 "$work/pkg.log")"
         else
             skip "$label: native --pkg unavailable for this host (no object emitted)"
         fi
@@ -481,7 +481,7 @@ check_bigagg() {
             || [ ! -f "$work/ffiexp.o" ]; then
         if [ "$required" -eq 1 ]; then
             fail "$label: compile of facade (--pkg ffiexp) produced no object" \
-                 "$(tail -5 "$work/pkg.log")"
+                 "$(tail -40 "$work/pkg.log")"
         else
             skip "$label: native --pkg unavailable for this host (no object emitted)"
         fi
@@ -590,7 +590,7 @@ check_multiret() {
             || [ ! -f "$work/ffiexp.o" ]; then
         if [ "$required" -eq 1 ]; then
             fail "$label: compile of facade (--pkg ffiexp) produced no object" \
-                 "$(tail -5 "$work/pkg.log")"
+                 "$(tail -40 "$work/pkg.log")"
         else
             skip "$label: native --pkg unavailable for this host (no object emitted)"
         fi
@@ -624,7 +624,7 @@ check_centry() {
             || [ ! -f "$work/ffiexp.o" ]; then
         if [ "$required" -eq 1 ]; then
             fail "$label: compile of facade (--pkg ffiexp) produced no object" \
-                 "$(tail -5 "$work/pkg.log")"
+                 "$(tail -40 "$work/pkg.log")"
         else
             skip "$label: native --pkg unavailable for this host (no object emitted)"
         fi
@@ -659,7 +659,7 @@ check_backend() {
             || [ ! -f "$work/ffiexp.o" ]; then
         if [ "$required" -eq 1 ]; then
             fail "$label: compile of facade (--pkg ffiexp) produced no object" \
-                 "$(tail -5 "$work/pkg.log")"
+                 "$(tail -40 "$work/pkg.log")"
         else
             skip "$label: native --pkg unavailable for this host (no object emitted)"
         fi

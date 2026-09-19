@@ -1,0 +1,194 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/irsym"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Cross-package type-registration pre-passes.  Before a package's IR is
+// generated (GeneratePackage), every loaded package's interface and struct
+// TYPES must be registered into the module, so a reference that crosses package
+// boundaries resolves regardless of import order.  RegisterAllInterfaces
+// registers DECL_INTERFACE entries; RegisterStructTypes registers struct names
+// and populates their fields.  (Var globals and func externs are registered
+// elsewhere — registerVarGlobals and RegisterImports.)
+
+// RegisterAllInterfaces registers DECL_INTERFACE entries from every
+// loaded package (including transitive dependencies that the
+// importing TU doesn't reference directly). When an importing TU's IR-gen processes
+// an imported package's DECL_IMPL whose iface ref points at a
+// transitive package's alias (e.g., `impl *Hello : aliases.Hello`
+// where the importing TU imports neither aliases nor greeter
+// directly), canonicalIfacePkg / canonicalIfaceName must still
+// resolve the alias chain — which requires the alias's underlying
+// interface to be in the module's interface registry. Same pattern as
+// RegisterStructTypes for transitive struct visibility.
+func RegisterAllInterfaces(aliases @[]@[]char, paths @[]@[]char, files *[]@ast.File, gc @GenCtx) {
+	// Cross-package pre-pass: per-package paths (paths[k]) drive
+	// qualification, so gc carries no module-of-its-own path here
+	// (gc.PkgPath is empty — the importing module isn't GeneratePackage'd
+	// yet).  gc.Mod is the importing module, so interface-method type
+	// resolution sees the cross-package structs RegisterStructTypes
+	// registered into that same module.
+	// paths[k] is the import path of aliases[k]; passing it as the
+	// pkg for interface registration ensures two same-last-segment
+	// packages' interfaces don't collide on the alias slot.  The
+	// per-file pushFileImports installs the file's own imports so
+	// alias-target resolution inside collectInterfaceFromDecl
+	// (`interface X = pkg.Y` referencing pkg by source alias)
+	// resolves via THIS FILE'S imports — not whichever alias
+	// happened to win the global first-wins dedup.
+	for k := 0; k < len(aliases); k++ {
+		var path @[]char = paths[k]
+		var file @ast.File = files[k]
+		if file == nil || len(file.Decls) == 0 { continue }
+		var snap AliasMapSnapshot = pushFileImports(gc.Mod, file)
+		for i := 0; i < len(file.Decls); i++ {
+			var d @ast.Decl = file.Decls[i]
+			if d.Kind != ast.DECL_INTERFACE { continue }
+			if lookupModuleInterfaceIndex(gc.Mod, path, d.Name) >= 0 {
+				continue
+			}
+			collectInterfaceFromDecl(gc, d, path, file)
+		}
+		popFileImports(gc.Mod, snap)
+	}
+}
+
+// RegisterStructTypes registers struct type names and populates fields from
+// the given packages, without registering function signatures. Used to make
+// transitive dependency struct types available for field type resolution.
+func RegisterStructTypes(aliases @[]@[]char, paths @[]@[]char, files *[]@ast.File, gc @GenCtx) {
+	// Cross-package pre-pass (empty gc.PkgPath; see RegisterAllInterfaces).
+	// gc.Mod is the importing module: this pass populates that module's
+	// per-module Structs / TypeAliases tables (formerly the shared globals).
+	// Qualified-name construction uses paths[k] DIRECTLY (via
+	// buildQualName, which is a no-op on a non-alias prefix), so two
+	// packages sharing a last-segment short alias get distinct
+	// qualifiers (`pkg/alpha/widget.X` vs `pkg/beta/widget.X`)
+	// instead of colliding under the alias map.  Crucially, we do
+	// NOT populate the alias map here — that's the importing
+	// module's RegisterImports' job (its direct imports unambiguously
+	// bind aliases for that module's source).  Otherwise the broad
+	// registration's first-wins dedup would clobber the importing
+	// module's correct alias→path entries.
+	// Pass 1: register all struct type names
+	for k := 0; k < len(aliases); k++ {
+		var path @[]char = paths[k]
+		var file @ast.File = files[k]
+		if file == nil || len(file.Decls) == 0 { continue }
+		for i := 0; i < len(file.Decls); i++ {
+			var d @ast.Decl = file.Decls[i]
+			if d.Kind == ast.DECL_TYPE && d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+				var qualName @[]char = buildQualName(gc.Mod, path, d.Name)
+				if lookupStructIdx(gc, qualName) < 0 {
+					var ms irsym.ModuleStruct
+					ms.Name = qualName
+					var noFields @[]@types.Field
+					ms.Typ = types.MakeStructType(qualName, noFields)
+					gc.Mod.Structs = slices.Append[irsym.ModuleStruct](gc.Mod.Structs, ms)
+				}
+			}
+		}
+	}
+
+	// Register type aliases from all packages.  pushFileImports installs the
+	// file's OWN imports so a cross-package alias TARGET — `type X = sys.Y`, where
+	// `sys` is the imported file's source alias — resolves to the target's full
+	// package path.  Without it the target reads as the bare `sys.Y`, which misses
+	// lookupTypeAlias and falls to resolveTypeExpr's TypInt() fallback, so the
+	// alias (and every value typed through it) mis-lowers as a scalar i64 instead
+	// of the target's real layout.  ldr.Order is deps-first, so the target
+	// package's own types are already registered when a dependent's alias resolves
+	// here.  Mirrors the struct-field loop's pushFileImports below (which the
+	// alias loop previously lacked — the defect).
+	for k := 0; k < len(aliases); k++ {
+		var alias @[]char = aliases[k]
+		var path @[]char = paths[k]
+		var file @ast.File = files[k]
+		if file == nil || len(file.Decls) == 0 { continue }
+		var snap AliasMapSnapshot = pushFileImports(gc.Mod, file)
+		gc.Mod.CurrentImportAlias = alias
+		for i := 0; i < len(file.Decls); i++ {
+			var d @ast.Decl = file.Decls[i]
+			if isNonStructTypeDecl(d) {
+				var qualName @[]char = buildQualName(gc.Mod, path, d.Name)
+				if lookupTypeAlias(gc, qualName) == nil {
+					var ta irsym.ModuleTypeAlias
+					ta.Name = qualName
+					ta.Typ = typeDeclEntryType(gc, qualName, d)
+					gc.Mod.TypeAliases = slices.Append[irsym.ModuleTypeAlias](gc.Mod.TypeAliases, ta)
+				}
+			} else if d.Kind == ast.DECL_TYPE && d.TypeRef == nil && !d.IsAlias && len(d.TypeParams) == 0 {
+				// An opaque (forward-declared) type — `type X` with no body — reaches
+				// IR-gen only from a package available as a `.bni` alone: a compiled
+				// library injected as externs (an interpreted bnld driver's `link.*`),
+				// or any build against a precompiled package's interface.  Register its
+				// NAME as a distinct named type (Underlying nil — the layout stays with
+				// the defining package's compiled `.bn`) so a cross-package `@X` / `*X`
+				// reference resolves to the named type, whose name mangles method /
+				// dtor externs correctly, instead of hitting resolveTypeExpr's TypInt()
+				// fallback (which mis-lowers it to a scalar and mangles method calls with
+				// an `int` receiver).  Importers may only hold `@X` / `*X` and call
+				// methods, so no layout is needed here.  A from-source build registers
+				// the full struct in Pass 1 instead; the lookups below keep this from
+				// double-registering.
+				var qualName @[]char = buildQualName(gc.Mod, path, d.Name)
+				if lookupStructIdx(gc, qualName) < 0 && lookupTypeAlias(gc, qualName) == nil {
+					var ot @types.Type = types.MakeNamedType(qualName)
+					// Mark it opaque-exported so a managed `@X` drop RefDecs through the
+					// defining package's dtor (emitManagedPtrRefDec's opaque arm) rather
+					// than a null-dtor free that would leak X's managed fields.
+					ot.OpaqueExportPkg = buf.CopyStr(path)
+					var ta irsym.ModuleTypeAlias
+					ta.Name = qualName
+					ta.Typ = ot
+					gc.Mod.TypeAliases = slices.Append[irsym.ModuleTypeAlias](gc.Mod.TypeAliases, ta)
+				}
+			}
+		}
+		popFileImports(gc.Mod, snap)
+	}
+
+	// Pass 2: populate struct fields only.  pushFileImports installs
+	// the file's own imports so cross-package field types in the
+	// imported file (referencing other packages by source alias)
+	// resolve via THIS FILE'S imports — not whichever alias
+	// happened to win the global first-wins dedup.
+	// CurrentImportAlias is set to the *source* alias (for
+	// resolveTypeExpr's "try current import alias prefix" fallback
+	// in fields that reference unqualified same-package types).
+	for k := 0; k < len(aliases); k++ {
+		var alias @[]char = aliases[k]
+		var path @[]char = paths[k]
+		var file @ast.File = files[k]
+		if file == nil || len(file.Decls) == 0 { continue }
+		var snap AliasMapSnapshot = pushFileImports(gc.Mod, file)
+		gc.Mod.CurrentImportAlias = alias
+		for i := 0; i < len(file.Decls); i++ {
+			var d @ast.Decl = file.Decls[i]
+			if d.Kind == ast.DECL_TYPE && d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+				var qualName @[]char = buildQualName(gc.Mod, path, d.Name)
+				var si int = lookupStructIdx(gc, qualName)
+				if si >= 0 {
+					var existTyp @types.Type = gc.Mod.Structs[si].Typ
+					if len(existTyp.Fields) == 0 {
+						var fields @[]@types.Field
+						for j := 0; j < len(d.TypeRef.Fields); j++ {
+							var fd @ast.FieldDecl = d.TypeRef.Fields[j]
+							var f @types.Field = make(types.Field)
+							f.Name = fd.Name
+							f.Type = resolveTypeExpr(gc, fd.Type)
+							fields = slices.Append[@types.Field](fields, f)
+						}
+						existTyp.Fields = fields
+					}
+				}
+			}
+		}
+		popFileImports(gc.Mod, snap)
+	}
+	var emptyAlias @[]char
+	gc.Mod.CurrentImportAlias = emptyAlias
+}

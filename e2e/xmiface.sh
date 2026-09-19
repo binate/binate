@@ -224,6 +224,31 @@ func (s *Summer) SumWide($wide_params) int {
 }
 EOF
 
+# (f) A native FUNCTION with a `...*Areaer` variadic — packs a *[]*Areaer (raw
+# slice-of-raw-iface).  Called cross-mode with 7 leading int arg slots, the spread
+# slice lands at slot 7.  The elements are BYTECODE-impl Areaer values (VM-index
+# vtable word), so the native callee's rest[i].Area() dispatch only works if the
+# cross-mode path substituted each element's vtable word (the slice-of-iface
+# substitution).  Regression coverage for the removed slots<7 cap: without the fix
+# a slice at slot >= 7 was dropped -> the native deref SIGSEGVs / misdispatches.
+cat >> "$I_ROOT/pkg/xmiface.bni" <<'EOF'
+
+interface Areaer {
+	Area() int
+}
+func SumAreas(a int, b int, c int, d int, e int, f int, g int, rest ...*Areaer) int
+EOF
+cat >> "$L_ROOT/pkg/xmiface/xmiface.bn" <<'EOF'
+
+func SumAreas(a int, b int, c int, d int, e int, f int, g int, rest ...*Areaer) int {
+	var sum int = a + b + c + d + e + f + g
+	for i := 0; i < len(rest); i++ {
+		sum = sum + rest[i].Area()
+	}
+	return sum
+}
+EOF
+
 # ---- custom host: cmd/bni's runProgram + fixture in the VM inject-set ----
 # Adding xmiface.__Package() to interp.New's package set makes the run path
 # skip lowering pkg/xmiface (Interp.isCompiled) and dispatch its interface
@@ -441,6 +466,34 @@ func main() {
 }
 EOF
 
+# (f) Cross-mode `...*Areaer` spread at slot >= 7.  areaBox is a BYTECODE impl of the
+# native fixture's Areaer, so a *xmiface.Areaer made here carries a VM-index vtable
+# word; the 7 leading int args push the spread slice to slot 7.
+cat > "$TMP/prog_spread.bn" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+import "pkg/xmiface"
+
+type areaBox struct {
+	n int
+}
+func (b areaBox) Area() int {
+	return b.n
+}
+impl areaBox : xmiface.Areaer
+
+func main() {
+	var b1 areaBox = areaBox{n: 10}
+	var b2 areaBox = areaBox{n: 20}
+	var a1 *xmiface.Areaer = &b1
+	var a2 *xmiface.Areaer = &b2
+	// native SumAreas dispatches Area() on each bytecode-impl element — only correct
+	// if the slice elements' vtable words were substituted.  28 (ints) + 30 = 58.
+	testing.Println(xmiface.SumAreas(1, 2, 3, 4, 5, 6, 7, a1, a2))
+}
+EOF
+
 # ---- build gen1, then the host (with the fixture on the search paths) ----
 build_gen1
 IFACES="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$I_ROOT")"
@@ -511,6 +564,13 @@ case "$ov_out" in
         FAILS=$((FAILS + 1))
         FAIL_NAMES="$FAIL_NAMES cross-mode-iface-overflow-guard" ;;
 esac
+
+# ----- (f) cross-mode `...*Areaer` spread at slot >= 7: the slice ELEMENTS' vtable
+# words must be substituted so the native callee can dispatch Area() on each.  Seven
+# int args push the spread slice to slot 7 — the case the old slots<7 bitmap dropped
+# (a SIGSEGV / silent miscompile before the per-slot-list fix).  1+..+7 + 10+20 = 58.
+sp_out=$("$HOST_BIN" "$TMP/prog_spread.bn" "$IFACES" "$IMPLS" 2>&1) || true
+check_eq "cross-mode-iface-slice-spread-slot7" "$sp_out" "58"
 
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="

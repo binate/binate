@@ -1,0 +1,216 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Synthetic per-package init function generation.  When a package
+// has any top-level `var x T = expr` decls with non-nil
+// initializers, IR-gen emits a `<pkg>.__init` function whose body
+// runs each `x = expr` assignment in source declaration order.
+// The driver (cmd/bni for VM mode, an init dispatcher for
+// compiled mode) is responsible for calling it before main.
+//
+// Without this, top-level `var x int = 42` silently zero-inits
+// because the VM/compiled-mode lowering path doesn't consume the
+// `mg.Init` field that IR-gen previously stored — it only ever
+// captured int literals anyway.  Routing initializers through
+// genAssign (via a synthetic stmt list) gets the full expression
+// evaluator for free.
+
+// initFuncName returns the qualified name of the per-package init
+// function for the current module-gen context.  Always
+// `<gc.PkgPath>.__init`.
+func initFuncName(gc @GenCtx) @[]char {
+	return qualifyForCurrentModule(gc, "__init")
+}
+
+// appendInitVarDecls appends to `out` every package-level var decl reachable
+// from `decls` — a top-level DECL_VAR, plus each member of a `var ( ... )`
+// DECL_GROUP.  A var group is pure syntactic grouping (no iota semantics), so
+// its members initialize exactly like top-level vars; groups don't nest, but
+// the recursion is defensive.  Preserves source order (a group's members
+// appear where the group sits).
+func appendInitVarDecls(decls *[]@ast.Decl, out @[]@ast.Decl) @[]@ast.Decl {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d.Kind == ast.DECL_VAR {
+			out = slices.Append[@ast.Decl](out, d)
+		} else if d.Kind == ast.DECL_GROUP {
+			out = appendInitVarDecls(d.Decls, out)
+		}
+	}
+	return out
+}
+
+// initVarDecls returns the flat, source-ordered list of package-level var
+// decls (top-level + grouped members) — see appendInitVarDecls.
+func initVarDecls(decls *[]@ast.Decl) @[]@ast.Decl {
+	var out @[]@ast.Decl
+	return appendInitVarDecls(decls, out)
+}
+
+// hasInitDecls reports whether `decls` (typically file.Decls)
+// contains at least one `var x T = expr` with a non-nil
+// initializer expression — i.e., whether emitting an init
+// function for the package is worth the work.
+func hasInitDecls(decls *[]@ast.Decl) bool {
+	var vs @[]@ast.Decl = initVarDecls(decls)
+	for i := 0; i < len(vs); i++ {
+		// A blank init (`var _ = f()`) has no name to assign to but still
+		// runs its initializer for side effects, so it counts.
+		if vs[i].Value != nil { return true }
+	}
+	return false
+}
+
+// isBlankName returns true for the blank identifier `_`.  A blank-named var
+// binds no name, so its initializer has no assignment target — it is emitted
+// as a bare expression statement (side effects only), not a `name = value`
+// assignment.
+func isBlankName(name *[]readonly char) bool {
+	return len(name) == 1 && name[0] == cast(char, 95) // '_'
+}
+
+// buildInitBody walks `decls` and produces a stmt list of
+// `<name> = <value>` assignments, one per global with a non-nil
+// initializer.  When `order` is non-empty (the checker's dependency
+// order — see types.VarInitOrder), the assignments are emitted in that
+// order, so each initializer's
+// package-var dependencies run first regardless of filename/source
+// position.  An empty `order` falls back to source order, which still
+// gives intra-file ordering for `var b int = a + 1` after
+// `var a int = 5`.
+//
+// The emit is defensive: after emitting the ordered names, any init-var
+// NOT named in `order` is appended in source order.  A well-formed order
+// lists exactly the init-var set, so this only fires if the checker and
+// IR-gen ever disagree on that set — and then it emits the initializer
+// rather than silently dropping it (a lost init is a miscompile; a
+// mis-ordered one is at worst a zero-value read).
+func buildInitBody(decls *[]@ast.Decl, order @[]@[]char) @[]@ast.Stmt {
+	var vs @[]@ast.Decl = initVarDecls(decls)
+	var stmts @[]@ast.Stmt
+	var emitted @[]@[]char
+	for i := 0; i < len(order); i++ {
+		if nameInInitList(emitted, order[i]) { continue }
+		var d @ast.Decl = findInitVarDecl(vs, order[i])
+		if d == nil { continue }
+		stmts = slices.Append[@ast.Stmt](stmts, MakeInitAssignStmt(d))
+		emitted = slices.Append[@[]char](emitted, order[i])
+	}
+	for i := 0; i < len(vs); i++ {
+		var d @ast.Decl = vs[i]
+		if d.Value == nil { continue }
+		if isBlankName(d.Name) { continue }
+		if nameInInitList(emitted, d.Name) { continue }
+		stmts = slices.Append[@ast.Stmt](stmts, MakeInitAssignStmt(d))
+	}
+	// Blank-var initializers (`var _ = f()`) run for their side effects but
+	// have no name to assign to and cannot be a dependency target, so they are
+	// emitted as bare expression statements in a source-order TAIL — after
+	// every named var (which are in dependency order), so a blank that reads a
+	// package global sees it initialized.  (A blank ordered only against a
+	// named var through a function call it makes is the same deferred
+	// transitive-through-functions gap as for named vars.)
+	for i := 0; i < len(vs); i++ {
+		var d @ast.Decl = vs[i]
+		if d.Value == nil { continue }
+		if !isBlankName(d.Name) { continue }
+		stmts = slices.Append[@ast.Stmt](stmts, MakeInitExprStmt(d))
+	}
+	return stmts
+}
+
+// MakeInitExprStmt builds a bare expression statement that evaluates `d.Value`
+// for its side effects — used for a blank-identifier package var
+// (`var _ = f()`), which has no assignment target.  STMT_EXPR lowering
+// evaluates the value, discards the result, and drops managed temps (no leak).
+func MakeInitExprStmt(d @ast.Decl) @ast.Stmt {
+	var s @ast.Stmt = make(ast.Stmt)
+	s.Kind = ast.STMT_EXPR
+	s.Pos = d.Pos
+	s.X = d.Value
+	return s
+}
+
+// findInitVarDecl returns the init-var decl named `name` in `vs` (the flat
+// init-var list from initVarDecls: non-nil Value, non-blank), or nil.  Matches
+// the init-var predicate the checker's dependency-order pass uses, so the
+// ordered names resolve to exactly the emitted set.
+func findInitVarDecl(vs @[]@ast.Decl, name *[]readonly char) @ast.Decl {
+	for i := 0; i < len(vs); i++ {
+		var d @ast.Decl = vs[i]
+		if d.Value == nil { continue }
+		if isBlankName(d.Name) { continue }
+		if irutil.Streq(d.Name, name) { return d }
+	}
+	return nil
+}
+
+// nameInInitList reports whether `name` is present in `list`.
+func nameInInitList(list @[]@[]char, name *[]readonly char) bool {
+	for i := 0; i < len(list); i++ {
+		if irutil.Streq(list[i], name) { return true }
+	}
+	return false
+}
+
+// MakeInitAssignStmt builds an `<d.Name> = <d.Value>` assignment
+// statement.  Single-LHS, single-RHS, plain `=` (not `:=` or any
+// op-assign).  Public so the REPL can build a one-shot synthetic
+// to run a freshly-declared global's initializer right after
+// registering it.
+func MakeInitAssignStmt(d @ast.Decl) @ast.Stmt {
+	var lhs @ast.Expr = make(ast.Expr)
+	lhs.Kind = ast.EXPR_IDENT
+	lhs.Name = d.Name
+	lhs.Pos = d.Pos
+	var s @ast.Stmt = make(ast.Stmt)
+	s.Kind = ast.STMT_ASSIGN
+	s.Pos = d.Pos
+	s.Op = cast(int, token.ASSIGN)
+	s.Exprs = slices.Append[@ast.Expr](s.Exprs, lhs)
+	s.Exprs2 = slices.Append[@ast.Expr](s.Exprs2, d.Value)
+	return s
+}
+
+// generatePackageInit emits a `<pkg>.__init` function for the
+// module if `decls` has any non-trivial var initializers, and
+// adds it to `m`.  No-op (returns without touching `m`) when
+// there are no initializers — empty inits aren't worth a
+// round-trip through the call cache.
+//
+// Caller must have set up Module.GlobalVars etc. via the surrounding
+// GeneratePackage / GenModule pass — the synthetic body's
+// identifier lookups go through the global path.
+func generatePackageInit(gc @GenCtx, decls *[]@ast.Decl, m @ir.Module) {
+	if !hasInitDecls(decls) { return }
+	// The checker records a dependency order for the package's top-level
+	// init-vars (empty when < 2 init-vars or on the REPL path); buildInitBody
+	// falls back to source order for an empty order.  Nil-safe: a module built
+	// without a Checker (some unit tests) emits in source order.
+	var order @[]@[]char
+	if m.Checker != nil {
+		order = m.Checker.VarInitOrder(gc.PkgPath)
+	}
+	var body @[]@ast.Stmt = buildInitBody(decls, order)
+	var name @[]char = "__init"
+	var f @ir.Func = GenSyntheticFunc(gc, name, body)
+	// Register the init's qualified name in Module.FuncSigs so any
+	// caller lowered later (e.g. the compiled-mode init
+	// dispatcher) can resolve it the usual way.
+	var sig ir.FuncSig
+	sig.Name = initFuncName(gc)
+	var emptyParams @[]@types.Type
+	var emptyResults @[]@types.Type
+	sig.Params = emptyParams
+	sig.Results = emptyResults
+	setOrAppendFuncSig(gc, sig)
+	m.AddFunc(f)
+}

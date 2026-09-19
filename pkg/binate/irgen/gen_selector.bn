@@ -1,0 +1,462 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+import "pkg/binate/types"
+
+// ============================================================
+// Struct support
+// ============================================================
+
+// genCompositeBasePtr evaluates a composite-literal struct used as the
+// base of a field access (`Point{...}.field`) and returns the pointer to
+// its storage (genCompositeLit returns the struct's alloca).  A managed-
+// field composite rvalue is an anonymous temp that must be cleaned up, but
+// genCompositeLit already registers the literal alloca for end-of-statement
+// cleanup (like a struct-returning call result), so no registration is done
+// here — registering again would dtor the managed fields twice (a double-
+// free).  The field read's own managed-value handling is done by the
+// consumer, as for a struct variable.  Returns nil for a non-struct composite.
+func genCompositeBasePtr(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr {
+	var sp @ir.Instr = genExpr(ctx, b, e)
+	b = ctx.CurBlock
+	if sp == nil || sp.TypeArg == nil { return nil }
+	var structTyp @types.Type = irutil.PeelTransparent(sp.TypeArg)
+	if structTyp == nil || structTyp.Kind != types.TYP_STRUCT { return nil }
+	return sp
+}
+
+// genSelector generates IR for a selector expression
+// (struct field access, managed/raw ptr deref, package constant).
+//
+// A field READ is a deref, so each pointer this function FOLLOWS to reach the
+// field is nil-checked (emitNilCheckIfEnabled) before the GEP — opt-in
+// nil-pointer-deref checking (a no-op unless
+// GenCtx.EmitNilChecks is on).  A value-struct / element / composite / borrow-
+// copy base is NOT a followed pointer, so those GEPs are left unchecked.  (The
+// lvalue side — field writes / receivers — is instrumented separately in
+// genSelectorPtr; the two functions stay distinct because a read materializes a
+// value-struct base while a write must address it in place.)
+func genSelector(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr {
+	// e.X is the struct expression, e.Name is the field name
+	if e.X != nil && e.X.Kind == ast.EXPR_IDENT {
+		var ptr @ir.Instr = lookupVar(ctx, e.X.Name)
+		if ptr != nil {
+			var varTyp @types.Type = irutil.PeelTransparent(lookupVarType(ctx, e.X.Name))
+			if varTyp != nil && varTyp.Kind == types.TYP_STRUCT {
+				var si int = lookupStructIdx(ctx.Gc, varTyp.Name)
+				if si >= 0 {
+					var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+					var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+					var fieldPtr @ir.Instr = b.EmitGetFieldPtr(ptr, idx, ftyp)
+					return b.EmitLoad(fieldPtr, ftyp)
+				}
+			}
+			// Managed pointer: p.x where p is @Struct — load ptr, GEP for field
+			if isManagedPtrToStruct(varTyp) {
+				var structTyp @types.Type = irutil.PeelTransparent(varTyp.Elem)
+				var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+				if si >= 0 {
+					// Load the managed pointer (i8*)
+					var mptr @ir.Instr = b.EmitLoad(ptr, varTyp)
+					// Tag the pointer with the struct type for emitter
+					mptr.TypeArg = structTyp
+					var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+					var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+					// Emit GET_FIELD_PTR — emitter will bitcast i8* → %Struct* first
+					emitNilCheckIfEnabled(ctx, b, mptr)
+					var fieldPtr @ir.Instr = b.EmitGetFieldPtr(mptr, idx, ftyp)
+					return b.EmitLoad(fieldPtr, ftyp)
+				}
+			}
+			// Raw pointer: p.x where p is *Struct — same as managed pointer
+			if isRawPtrToStruct(varTyp) {
+				var structTyp @types.Type = irutil.PeelTransparent(varTyp.Elem)
+				var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+				if si >= 0 {
+					var rptr @ir.Instr = b.EmitLoad(ptr, varTyp)
+					rptr.TypeArg = structTyp
+					var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+					var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+					emitNilCheckIfEnabled(ctx, b, rptr)
+					var fieldPtr @ir.Instr = b.EmitGetFieldPtr(rptr, idx, ftyp)
+					return b.EmitLoad(fieldPtr, ftyp)
+				}
+			}
+		}
+	}
+	// Index selector: e.X is an index expression (e.g., pts[i].x or list[i].field)
+	if e.X != nil && e.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		// Field READ off an indexed element (`arr[i].f`) — a deref — so forDeref=true.
+		var elemPtr @ir.Instr = genIndexPtr(ctx, b, e.X, true)
+		// Re-sync: a type-assertion in the index base (`x.(*T).arr[i].field`)
+		// splits the block inside genIndexPtr (the assert's MISS-abort branch),
+		// so the GEP+load below must emit into the HIT continuation, not the
+		// stale pre-branch block (else the field load fails to dominate its use).
+		// A no-op for non-splitting bases.
+		b = ctx.CurBlock
+		if elemPtr != nil {
+			var elemTyp @types.Type = irutil.PeelTransparent(getIndexElemType(ctx, e.X))
+			if elemTyp != nil && elemTyp.Kind == types.TYP_STRUCT {
+				var si int = lookupStructIdx(ctx.Gc, elemTyp.Name)
+				if si >= 0 {
+					var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+					var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+					var fieldPtr @ir.Instr = b.EmitGetFieldPtr(elemPtr, idx, ftyp)
+					return b.EmitLoad(fieldPtr, ftyp)
+				}
+			}
+			// Managed pointer element: load @T from slot, then access field
+			if isManagedPtrToStruct(elemTyp) {
+				var mptr @ir.Instr = b.EmitLoad(elemPtr, elemTyp)
+				var structTyp @types.Type = irutil.PeelTransparent(elemTyp.Elem)
+				mptr.TypeArg = structTyp
+				var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+				if si >= 0 {
+					var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+					var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+					emitNilCheckIfEnabled(ctx, b, mptr)
+					var fieldPtr @ir.Instr = b.EmitGetFieldPtr(mptr, idx, ftyp)
+					return b.EmitLoad(fieldPtr, ftyp)
+				}
+			}
+			// Raw pointer element: load *T from slot, then access field
+			if isRawPtrToStruct(elemTyp) {
+				var rptr @ir.Instr = b.EmitLoad(elemPtr, elemTyp)
+				var structTyp @types.Type = irutil.PeelTransparent(elemTyp.Elem)
+				rptr.TypeArg = structTyp
+				var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+				if si >= 0 {
+					var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+					var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+					emitNilCheckIfEnabled(ctx, b, rptr)
+					var fieldPtr @ir.Instr = b.EmitGetFieldPtr(rptr, idx, ftyp)
+					return b.EmitLoad(fieldPtr, ftyp)
+				}
+			}
+		}
+		// Fallback: evaluate the index expression as a value
+		// Handles slice[i].field where element is managed ptr or struct
+		if elemPtr == nil {
+			var val @ir.Instr = genExpr(ctx, b, e.X)
+			b = ctx.CurBlock
+			if isManagedPtrToStruct(val.Typ) {
+				// Managed ptr element: deref and access field
+				var structTyp @types.Type = irutil.PeelTransparent(val.Typ).Elem
+				val.TypeArg = structTyp
+				var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+				if si >= 0 {
+					var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+					var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+					emitNilCheckIfEnabled(ctx, b, val)
+					var fieldPtr @ir.Instr = b.EmitGetFieldPtr(val, idx, ftyp)
+					return b.EmitLoad(fieldPtr, ftyp)
+				}
+			}
+			if isRawPtrToStruct(val.Typ) {
+				// Raw ptr element: deref and access field
+				var structTyp @types.Type = irutil.PeelTransparent(val.Typ).Elem
+				val.TypeArg = structTyp
+				var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+				if si >= 0 {
+					var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+					var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+					emitNilCheckIfEnabled(ctx, b, val)
+					var fieldPtr @ir.Instr = b.EmitGetFieldPtr(val, idx, ftyp)
+					return b.EmitLoad(fieldPtr, ftyp)
+				}
+			}
+			if val.Typ != nil && irutil.PeelTransparent(val.Typ).Kind == types.TYP_STRUCT {
+				// Struct value element: need to store to alloca, then GEP
+				var si int = lookupStructIdx(ctx.Gc, irutil.PeelTransparent(val.Typ).Name)
+				if si >= 0 {
+					var tmpAlloc @ir.Instr = b.EmitAlloc(val.Typ)
+					b.EmitStore(tmpAlloc, val)
+					var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+					var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+					var fieldPtr @ir.Instr = b.EmitGetFieldPtr(tmpAlloc, idx, ftyp)
+					return b.EmitLoad(fieldPtr, ftyp)
+				}
+			}
+		}
+	}
+	// Nested selector: e.X is itself a selector (e.g., r.max.x or list.next.val)
+	if e.X != nil && e.X.Kind == ast.EXPR_SELECTOR {
+		var innerTyp @types.Type = irutil.PeelTransparent(getSelectorType(ctx, e.X))
+		// Case 1a: inner selector returns a managed pointer (e.g., list.next is @Node)
+		// Need to load the managed ptr value, then deref and access field
+		if isManagedPtrToStruct(innerTyp) {
+			var mptr @ir.Instr = genSelector(ctx, b, e.X)
+			// Re-sync: an assert further down (`x.(S).mgdField.deeper`) splits the
+			// block inside genSelector (the MISS-abort branch), so the GEP+load below
+			// must emit into the HIT continuation.  A no-op for non-splitting bases.
+			b = ctx.CurBlock
+			var structTyp @types.Type = irutil.PeelTransparent(innerTyp.Elem)
+			mptr.TypeArg = structTyp
+			var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+			if si >= 0 {
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				emitNilCheckIfEnabled(ctx, b, mptr)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(mptr, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+		// Case 1b: inner selector returns a raw pointer (e.g., o.RawRef is *Node)
+		if isRawPtrToStruct(innerTyp) {
+			var rptr @ir.Instr = genSelector(ctx, b, e.X)
+			// Re-sync (see Case 1a): an assert base splits the block.
+			b = ctx.CurBlock
+			var structTyp @types.Type = irutil.PeelTransparent(innerTyp.Elem)
+			rptr.TypeArg = structTyp
+			var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+			if si >= 0 {
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				emitNilCheckIfEnabled(ctx, b, rptr)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(rptr, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+		// Case 2: inner selector returns a struct (e.g., r.max is Point)
+		// forDeref=true: this is a field READ (the field is loaded below).
+		var innerPtr @ir.Instr = genSelectorPtr(ctx, b, e.X, true)
+		// Re-sync: a type-assertion base (`x.(S).inner.leaf`) splits the block inside
+		// genSelectorPtr (the assert's MISS-abort branch), so the GEP+load below must
+		// emit into the HIT continuation, not the stale pre-branch block (else the
+		// load fails to dominate its use).  A no-op for non-splitting bases.
+		b = ctx.CurBlock
+		if innerPtr != nil {
+			if innerTyp != nil && innerTyp.Kind == types.TYP_STRUCT {
+				var si int = lookupStructIdx(ctx.Gc, innerTyp.Name)
+				if si >= 0 {
+					var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+					var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+					var fieldPtr @ir.Instr = b.EmitGetFieldPtr(innerPtr, idx, ftyp)
+					return b.EmitLoad(fieldPtr, ftyp)
+				}
+			}
+		}
+	}
+	// Call/builtin expression selector: e.g. getInner().Val or evalExpr(...).IntVal
+	if e.X != nil && (e.X.Kind == ast.EXPR_CALL || e.X.Kind == ast.EXPR_BUILTIN) {
+		var val @ir.Instr = genExpr(ctx, b, e.X)
+		b = ctx.CurBlock
+		// Raw-pointer-to-struct call/builtin result (`f().x` for `f() *T`) — GEP
+		// the field off the pointer + load, mirroring the deref / type-assert arms
+		// below.  Without this arm the selector falls through to the fallback and
+		// panics (unresolved selector in IR-gen).
+		if isRawPtrToStruct(val.Typ) {
+			var structTyp @types.Type = irutil.PeelTransparent(val.Typ).Elem
+			val.TypeArg = structTyp
+			var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+			if si >= 0 {
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				emitNilCheckIfEnabled(ctx, b, val)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(val, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+		if isManagedPtrToStruct(val.Typ) {
+			var structTyp @types.Type = irutil.PeelTransparent(val.Typ).Elem
+			val.TypeArg = structTyp
+			var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+			if si >= 0 {
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				emitNilCheckIfEnabled(ctx, b, val)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(val, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+		if val.Typ != nil && irutil.PeelTransparent(val.Typ).Kind == types.TYP_STRUCT {
+			var si int = lookupStructIdx(ctx.Gc, irutil.PeelTransparent(val.Typ).Name)
+			if si >= 0 {
+				var tmpAlloc @ir.Instr = b.EmitAlloc(val.Typ)
+				b.EmitStore(tmpAlloc, val)
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(tmpAlloc, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+	}
+	// Composite-literal base: `Point{...}.field`.  The composite
+	// materializes into a fresh alloca (registered for cleanup if it has
+	// managed fields) — GEP the field off it and load, mirroring the
+	// EXPR_IDENT struct case.  Without this arm the selector falls through
+	// to the EmitConstInt(0) fallback and silently reads 0.
+	if e.X != nil && e.X.Kind == ast.EXPR_COMPOSITE {
+		var sp @ir.Instr = genCompositeBasePtr(ctx, b, e.X)
+		b = ctx.CurBlock
+		if sp != nil {
+			var structTyp @types.Type = irutil.PeelTransparent(sp.TypeArg)
+			var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+			if si >= 0 {
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(sp, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+	}
+	// Explicit-deref base: `(*p).x` for p of pointer type.  The
+	// inner EXPR_UNARY's elem-typing (pkg/binate/ir/gen_expr.bn) was
+	// already extended in Slice P.2 to handle managed pointers, so
+	// `genExpr` returns either a struct value (when *p loads a T
+	// value) or a struct pointer (when *p loads a pointer-to-
+	// struct).  Mirror the EXPR_CALL pattern below — alloca +
+	// store + GEP + load for the struct-value case; GEP + load via
+	// the pointer for the pointer case.  Conformance 456.
+	if e.X != nil && e.X.Kind == ast.EXPR_UNARY && e.X.Op == cast(int, token.STAR) {
+		var val @ir.Instr = genExpr(ctx, b, e.X)
+		b = ctx.CurBlock
+		if isManagedPtrToStruct(val.Typ) {
+			var structTyp @types.Type = irutil.PeelTransparent(val.Typ).Elem
+			val.TypeArg = structTyp
+			var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+			if si >= 0 {
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				emitNilCheckIfEnabled(ctx, b, val)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(val, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+		if isRawPtrToStruct(val.Typ) {
+			var structTyp @types.Type = irutil.PeelTransparent(val.Typ).Elem
+			val.TypeArg = structTyp
+			var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+			if si >= 0 {
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				emitNilCheckIfEnabled(ctx, b, val)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(val, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+		if val.Typ != nil && irutil.PeelTransparent(val.Typ).Kind == types.TYP_STRUCT {
+			var si int = lookupStructIdx(ctx.Gc, irutil.PeelTransparent(val.Typ).Name)
+			if si >= 0 {
+				var tmpAlloc @ir.Instr = b.EmitAlloc(val.Typ)
+				b.EmitStore(tmpAlloc, val)
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(tmpAlloc, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+	}
+	// Type-assertion base: `x.(S).field` (value recovery) / `x.(*T).field` /
+	// `x.(@T).field` (pointer recovery).  `genExpr` on the EXPR_TYPE_ASSERT lowers
+	// through recoverPointer, which returns one of the same three shapes the deref
+	// arm above handles: a struct VALUE (a borrow load — alloca + store + GEP +
+	// load; the borrow is unregistered, so no dtor / double-free), a managed-ptr-
+	// to-struct, or a raw-ptr-to-struct (GEP + load through the pointer).  Without
+	// this arm the selector falls through to the fallback and crashes (unresolved
+	// selector in IR-gen).
+	if e.X != nil && e.X.Kind == ast.EXPR_TYPE_ASSERT {
+		var val @ir.Instr = genExpr(ctx, b, e.X)
+		b = ctx.CurBlock
+		if isManagedPtrToStruct(val.Typ) {
+			var structTyp @types.Type = irutil.PeelTransparent(val.Typ).Elem
+			val.TypeArg = structTyp
+			var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+			if si >= 0 {
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				emitNilCheckIfEnabled(ctx, b, val)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(val, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+		if isRawPtrToStruct(val.Typ) {
+			var structTyp @types.Type = irutil.PeelTransparent(val.Typ).Elem
+			val.TypeArg = structTyp
+			var si int = lookupStructIdx(ctx.Gc, structTyp.Name)
+			if si >= 0 {
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				emitNilCheckIfEnabled(ctx, b, val)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(val, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+		if val.Typ != nil && irutil.PeelTransparent(val.Typ).Kind == types.TYP_STRUCT {
+			var si int = lookupStructIdx(ctx.Gc, irutil.PeelTransparent(val.Typ).Name)
+			if si >= 0 {
+				var tmpAlloc @ir.Instr = b.EmitAlloc(val.Typ)
+				b.EmitStore(tmpAlloc, val)
+				var idx int = lookupFieldIndex(ctx.Gc, si, e.Name)
+				var ftyp @types.Type = lookupFieldType(ctx.Gc, si, e.Name)
+				var fieldPtr @ir.Instr = b.EmitGetFieldPtr(tmpAlloc, idx, ftyp)
+				return b.EmitLoad(fieldPtr, ftyp)
+			}
+		}
+	}
+	// Package-qualified constant: e.g. math.PI_APPROX
+	if e.X != nil && e.X.Kind == ast.EXPR_IDENT {
+		// If e.X.Name is not a local variable, try as package alias.
+		// Walk Module.Consts directly (see EXPR_IDENT in gen_expr.bn
+		// for why — same per-family dispatch).
+		var ptr @ir.Instr = lookupVar(ctx, e.X.Name)
+		if ptr == nil {
+			var qualName @[]char = buildQualNameHomed(ctx.Gc.Mod, e.X.Name, e.Name)
+			// Imported extern var read (precedes the const scan so a var
+			// name doesn't fall through to the EmitConstInt(0) fallback).
+			var gv @ir.Instr = lookupImportedGlobalRead(ctx.Gc, b, qualName)
+			if gv != nil { return gv }
+			for i := 0; i < len(ctx.Gc.Mod.Consts); i++ {
+				if !irutil.Streq(ctx.Gc.Mod.Consts[i].Name, qualName) { continue }
+				if ctx.Gc.Mod.Consts[i].Kind == CONST_BOOL {
+					return b.EmitConstBool(ctx.Gc.Mod.Consts[i].BoolVal)
+				}
+				if ctx.Gc.Mod.Consts[i].Kind == CONST_FLT {
+					var ftyp @types.Type = ctx.Gc.Mod.Consts[i].Typ
+					if ftyp == nil { ftyp = types.TypUntypedFloat() }
+					return b.EmitConstFloat(ctx.Gc.Mod.Consts[i].FltText, ftyp)
+				}
+				// A float const-EXPRESSION re-lowers its stashed AST (same
+				// as the in-package EXPR_IDENT read in gen_expr.bn) — the
+				// float-const path can't carry a folded result as exact
+				// text.
+				if ctx.Gc.Mod.Consts[i].Kind == CONST_EXPR {
+					return genExpr(ctx, b, ctx.Gc.Mod.Consts[i].Expr)
+				}
+				var ctyp @types.Type = ctx.Gc.Mod.Consts[i].Typ
+				if ctyp == nil { ctyp = types.TypUntypedInt() }
+				// EmitConstInt64: Val is int64 (a 64-bit named const keeps its full
+				// value; EmitConstInt would narrow through a host int on ILP32).
+				return b.EmitConstInt64(ctx.Gc.Mod.Consts[i].Val, ctyp)
+			}
+		}
+	}
+	// No selector arm matched (an unresolved `pkg.Name` at a value site, a field
+	// read whose struct isn't registered, etc.).  This is an internal-error
+	// catch-all, NOT a user-facing diagnostic: reaching it means an IR-gen
+	// resolution gap, i.e. a compiler bug.  In particular, a function reference
+	// (`pkg.Func` / method expression `T.M`) must be lowered via
+	// genExprOrFuncRef at its value site so it becomes an OP_FUNC_VALUE — every
+	// such site (var decl, call arg, return, assignment, struct field, and
+	// array / slice / managed-slice composite-literal elements) routes through
+	// that helper; a site that reached here with a bare genExpr on a func
+	// reference would be the bug.  Previously this returned a SILENT const-0,
+	// which masked the gap as a wrong VALUE (a func value over a null code
+	// pointer — SIGSEGV when called; the worst class).  Abort loudly instead:
+	// emit a runtime panic so such a regression is caught, not silently
+	// miscompiled.  (A compile-time rejection at the checker for a value-less
+	// const used as a value would be even better — see claude-todo.md.)
+	var panicMsg @ir.Instr = b.EmitConstString(
+			"internal error: unresolved selector in IR-gen (compiler bug)")
+	var panicMsgTyp @types.Type = types.MakeSliceType(
+			types.MakeReadonlyType(types.TypChar()))
+	panicMsg = coerceArg(ctx, b, panicMsg, panicMsgTyp)
+	b.EmitCall("pkg/builtins/rt.Panic", ir.MakeArgs1(panicMsg), types.TypVoid())
+	// Dead (rt.Panic aborts); genSelector must still return an @Instr.
+	return b.EmitConstInt(0, types.TypInt())
+}

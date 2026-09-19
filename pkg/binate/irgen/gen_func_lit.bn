@@ -1,0 +1,436 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/irsym"
+import "pkg/binate/types"
+import "pkg/std/fmt"
+import "pkg/std/os"
+import "pkg/std/strconv"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// IR generation for function literals.  Handles both non-capturing
+// literals and capturing closures via:
+//
+//   1. A per-(literal, capture-shape) closure struct type
+//      `__closure_<lit_id>` with one field per capture, layout
+//      driven by Decl.Captures order.
+//   2. Prepending captures-as-params to the lifted function so the
+//      body's references to capture names resolve through the
+//      normal local-name mechanism (defineVarParam) — no special
+//      capture-load IR ops needed.
+//   3. At the literal expression site: alloca the closure struct
+//      in the enclosing frame, store each capture's current value
+//      into a field, emit OP_FUNC_VALUE with the struct pointer
+//      as the data arg.
+//   4. Func.IsClosure + Func.ClosureStruct + Func.NumCaptureParams
+//      tell backends to emit a shim that reads the captures out of
+//      the data pointer before tail-calling the lifted body.
+//
+// B.3a status: CAP_MANAGED captures now supported for *func.
+// Closure struct is registered in Module.Structs so generateDtors
+// synthesizes a struct-dtor that RefDec's each managed field, and
+// the closure alloca is registered in ctx.Vars so the frame-end
+// emitDecForManagedLocals pass runs that dtor on it.  At the
+// capture site we RefInc each managed-captured value before
+// storing it into the field, balancing the dtor's later RefDec.
+// All literals still use the *func (stack-alloc) form; @func heap-
+// allocation lands in B.3b.
+
+// resetFuncLitState resets the per-package function-literal state at
+// the start of a GeneratePackage / GenModule call. The counter is
+// reset so each package gets its own `__funclit_<n>` ids; the lifted
+// funcs themselves register against the gen context's module
+// (@GenContext.Gc.Mod).  Also clears gc.Mod's B.4 method-value wrapper
+// dedup cache — per-module now, so this only affects the module being
+// (re)generated and never another live module's wrappers.
+func resetFuncLitState(gc @GenCtx) {
+	gc.FuncLitCounter = 0
+	var empty @[]@[]char
+	gc.Mod.MethodValueWrappers = empty
+}
+
+// genFuncLit lifts a function literal to a synthetic top-level
+// function and returns an OP_FUNC_VALUE pointing at it.  For
+// non-capturing literals the data slot is nil (Phase 1 shape);
+// for capturing literals the data slot points at an alloca'd
+// closure struct.
+func genFuncLit(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr {
+	var d @ast.Decl = e.DeclRef
+	if d == nil {
+		// Type-checker should have rejected, but be defensive.
+		return b.EmitConstInt(0, types.TypInt())
+	}
+
+	var captures @[]@ast.Capture = d.Captures
+
+	// Allocate a fresh synthetic name.  Counter is per-package; the
+	// `__funclit_` prefix makes lifted names easy to spot in IR /
+	// disassembly.
+	var n int = ctx.Gc.FuncLitCounter
+	ctx.Gc.FuncLitCounter = ctx.Gc.FuncLitCounter + 1
+	d.Name = synthFuncLitName(n)
+
+	// Pre-resolve capture types from the IR-gen view of the
+	// enclosing scope's local, then build the closure struct + the
+	// prepended-params list.  Non-capturing literals skip both.
+	var captureTypes @[]@types.Type = resolveCaptureTypes(ctx, captures)
+	var closureStruct @types.Type = nil
+	var capturesAsParams @[]@ir.Param
+	if len(captures) > 0 {
+		closureStruct = buildClosureStructType(d.Name, captures, captureTypes)
+		capturesAsParams = buildCapturesAsParams(captures, captureTypes)
+	}
+
+	// Register the FuncSig in Module.FuncSigs so call-site lookups
+	// resolve the synthetic name.  Captures are part of the lifted
+	// function's params (prepended), so the registered sig includes
+	// them — the shim that the backend generates is what reads
+	// captures out of the data pointer and supplies them.
+	registerLiftedFuncSigWithCaptures(ctx.Gc, d, captureTypes)
+
+	// Generate the function with captures-as-params prepended so
+	// body Idents like `x` (which the type-checker recorded as a
+	// capture) resolve to the prepended local.  Phase 1 path
+	// degenerates to nil prepended params.
+	var f @ir.Func = genFuncWithPrependedParams(ctx.Gc, ctx.Checker, d, capturesAsParams)
+	if len(captures) > 0 {
+		f.IsClosure = true
+		f.NumCaptureParams = len(captures)
+		f.ClosureStruct = closureStruct
+	}
+	ctx.Gc.Mod.AddFunc(f)
+
+	// Compute the user-visible function-value type.  B.3b: the
+	// checker's hint propagation (ExpectedFVType in pkg/binate/types)
+	// resolves the literal as @func(...) when the destination slot
+	// is @func with a matching signature; everywhere else the
+	// literal stays *func(...).  Read the resolved type back off
+	// the literal Expr so the choice flows through to IR-gen.
+	var isManagedFV bool = isManagedFuncValueLit(ctx.Checker, e)
+	var fnValTyp @types.Type = funcValueTypeFromDecl(ctx.Gc, d, isManagedFV)
+
+	if len(captures) == 0 {
+		// Phase 1 non-capturing path: data slot is nil regardless
+		// of the *func / @func flavour — the runtime layouts agree
+		// when data is nil, and there's no closure struct to heap-
+		// allocate.
+		var fv @ir.Instr = b.EmitFuncValue(d.Name, fnValTyp)
+		noteSPGrowingResult(ctx, fv)
+		return fv
+	}
+
+	// Capturing path.  Two flavours:
+	//   *func: stack-alloc closure struct in the enclosing frame;
+	//          frame-end emitDecForManagedLocals on the closure-
+	//          local runs the struct dtor.
+	//   @func: heap-alloc closure struct (EmitMake) — refcount-
+	//          managed; the @func value's data slot owns the
+	//          reference, and the standard managed-ptr RefDec on
+	//          the @func variable at frame end runs the closure-
+	//          struct dtor via the vtable's dtor slot.
+	// For B.3a, each CAP_MANAGED capture also RefInc's the value
+	// before the store so the closure struct owns its own
+	// reference; the matching RefDec runs from the struct dtor.
+	var closurePtr @ir.Instr
+	if isManagedFV {
+		closurePtr = b.EmitMake(closureStruct)
+	} else {
+		closurePtr = b.EmitAlloc(closureStruct)
+	}
+	for i := 0; i < len(captures); i++ {
+		var capValue @ir.Instr = genCaptureRead(ctx, b, captures[i], captureTypes[i])
+		emitCaptureRefInc(ctx, b, capValue, captureTypes[i])
+		var fieldPtr @ir.Instr = b.EmitGetFieldPtr(closurePtr, i, captureTypes[i])
+		b.EmitStore(fieldPtr, capValue)
+	}
+	// Register the closure struct so generateDtors synthesizes the
+	// dtor; needed for both flavours when the struct has any
+	// managed field (otherwise the dtor would be a no-op and we
+	// can skip).  For *func, also register the closure-local in
+	// ctx.Vars so emitDecForManagedLocals's frame-end pass invokes
+	// that dtor on the stack-alloc'd struct.  For @func, skip the
+	// ctx.Vars registration — the @func variable's own RefDec at
+	// frame end drives the cleanup (via the data slot's managed-
+	// ptr machinery + the vtable's dtor slot).
+	if closureStruct.NeedsDestruction() {
+		registerClosureStructForCleanup(ctx.Gc, closureStruct)
+		if !isManagedFV {
+			registerClosureLocalForCleanup(ctx, closurePtr, closureStruct, n)
+		} else {
+			// @func: the heap closure struct's only owner is the
+			// func value's data slot.  Under the VM that data slot
+			// is a COMPILED_CLOSURE record (not the struct itself),
+			// so the VM needs the dtor name to release the struct on
+			// rec free.  Same dtor generateDtors synthesizes above.
+			f.ClosureStructDtorName = qualifiedDtorNameForType(closureStruct)
+		}
+	}
+	if isManagedFV {
+		f.IsManagedFuncValue = true
+	}
+	var fv @ir.Instr = b.EmitFuncValueWithData(d.Name, closurePtr, fnValTyp)
+	noteSPGrowingResult(ctx, fv)
+	if isManagedFV {
+		// A fresh @func value OWNS its heap closure struct (EmitMake, rc 1) — and
+		// unlike the *func flavour it is NOT registered in ctx.Vars (the cleanup is
+		// normally driven by the @func VARIABLE's own frame-end RefDec).  Register
+		// the value as a cleanup temp so a fresh literal that is NOT bound to a
+		// variable — a directly-returned `return func(){...}`, a discarded literal —
+		// still gets released: a consumer (return delivery / assignment / arg) moves
+		// it out via consumeTemp, and if none does (or a fault unwinds before the
+		// move) the statement / scope / fault-pad cleanup RefDecs it, freeing the
+		// closure struct.  Without this a directly-returned capturing literal leaked
+		// its closure struct on a fault at the value return.  Same treatment a @func
+		// CALL RESULT already gets (registerManagedCallResult).
+		registerTemp(ctx, fv)
+	}
+	return fv
+}
+
+// isManagedFuncValueLit reports whether the literal Expr `e`
+// resolved (per the checker's ExprType registry) as the managed
+// `@func(...)` form rather than the default raw `*func(...)`.
+// Drives the stack-alloc vs heap-alloc decision at the literal
+// site (B.3b commit 2).
+func isManagedFuncValueLit(c @types.Checker, e @ast.Expr) bool {
+	if e == nil || c == nil { return false }
+	if e.ResolvedTypeID == 0 { return false }
+	var t @types.Type = c.ExprType(e.ResolvedTypeID)
+	if t == nil { return false }
+	// Peel a NAMED func-value type (`type Fn @func(...)`): the literal
+	// `var f Fn = func(...){...}` resolves as Fn (TYP_NAMED), but a
+	// named-MANAGED-func-value literal must still heap-alloc, so decide on the
+	// underlying flavour, not the named wrapper.  ResolveAlias first (and on
+	// each underlying) so an alias-of-named chain peels too.
+	t = t.ResolveAlias()
+	var depth int = 0
+	for t != nil && t.Kind == types.TYP_NAMED && t.Underlying != nil && depth < 64 {
+		t = t.Underlying.ResolveAlias()
+		depth = depth + 1
+	}
+	if t == nil { return false }
+	return t.Kind == types.TYP_MANAGED_FUNC_VALUE
+}
+
+// resolveCaptureTypes resolves each capture to its IR-gen-canonical
+// type by looking up the captured local in the enclosing GenContext.
+// We deliberately do NOT use the checker's ExprType here, because the
+// checker and IR-gen disagree on the representation of named struct
+// (and named non-struct) types: the checker wraps them in TYP_NAMED,
+// while IR-gen's resolveTypeExpr strips the wrapper down to TYP_STRUCT
+// (or to the underlying primitive for `type Celsius int`).  Plumbing
+// the checker's view into the closure body's prepended params would
+// make the body's selectors / refcount classifiers miss the type-
+// shape checks they pass for non-captured locals (the latent bug
+// where `p.N` through a captured `p *Box` returned 0).  Looking up
+// via the enclosing IR-gen scope keeps captured params shape-
+// identical to non-captured params.
+func resolveCaptureTypes(ctx @GenContext, captures @[]@ast.Capture) @[]@types.Type {
+	var out @[]@types.Type
+	if len(captures) == 0 { return out }
+	out = make_slice(@types.Type, len(captures))
+	for i := 0; i < len(captures); i++ {
+		var t @types.Type = lookupVarType(ctx, captures[i].Name)
+		if t == nil && ctx.Checker != nil {
+			// Defensive fallback — the type-checker recorded the
+			// capture so the name must resolve in the enclosing
+			// scope.  Reaching here would be a checker/IR-gen
+			// mismatch, but the checker's view is at least non-nil.
+			t = ctx.Checker.ExprType(captures[i].ResolvedTypeID)
+		}
+		out[i] = t
+	}
+	return out
+}
+
+// buildClosureStructType synthesizes the closure struct type for
+// the literal `__funclit_<n>`.  One field per capture, named after
+// the capture for debuggability, typed per the resolved Type.
+func buildClosureStructType(litName @[]char, captures @[]@ast.Capture,
+		captureTypes @[]@types.Type) @types.Type {
+	var fields @[]@types.Field = make_slice(@types.Field, len(captures))
+	for i := 0; i < len(captures); i++ {
+		var fld @types.Field = make(types.Field)
+		fld.Name = captures[i].Name
+		fld.Type = captureTypes[i]
+		fields[i] = fld
+	}
+	var nameBuf @strings.Builder = strings.NewBuilder()
+	nameBuf.Write("__closure_")
+	nameBuf.Write(litName)
+	return types.MakeStructType(buf.CopyStr(nameBuf.String()), fields)
+}
+
+// buildCapturesAsParams produces the @[]@Param list to prepend to
+// the lifted function's params.  Each param carries the capture's
+// resolved type; the Param IDs are placeholders (the real IDs are
+// assigned by NewParam inside genFuncWithPrependedParams).
+func buildCapturesAsParams(captures @[]@ast.Capture, captureTypes @[]@types.Type) @[]@ir.Param {
+	var out @[]@ir.Param
+	if len(captures) == 0 { return out }
+	out = make_slice(@ir.Param, len(captures))
+	for i := 0; i < len(captures); i++ {
+		var p @ir.Param = make(ir.Param)
+		p.Name = captures[i].Name
+		p.Typ = captureTypes[i]
+		out[i] = p
+	}
+	return out
+}
+
+// genCaptureRead emits IR to load the current value of a captured
+// name at the literal's expression site — i.e., from the
+// enclosing function's scope.  Captures are by value, so this
+// is a one-shot read at construction time, not a re-read at call
+// time.
+func genCaptureRead(ctx @GenContext, b @ir.Block, cap @ast.Capture, typ @types.Type) @ir.Instr {
+	var slot @ir.Instr = lookupVar(ctx, cap.Name)
+	if slot == nil {
+		// Type-checker recorded the capture, so the name must
+		// resolve in the enclosing IR-gen context.  Reaching here
+		// indicates a checker/IR-gen mismatch.
+		fmt.Println("ir/gen_func_lit: capture name not found in enclosing scope")
+		os.Exit(1)
+	}
+	return b.EmitLoad(slot, typ)
+}
+
+// emitCaptureRefInc emits the refcount-acquire side of a managed
+// capture: RefInc for @T captures, the managed-slice refptr's
+// RefInc for @[]T, etc.  For non-managed captures (CAP_VAL,
+// CAP_RAW_PTR) it's a no-op — the caller can call it
+// unconditionally and rely on the kind switch.  Used by the B.3a
+// path in genFuncLit; the matching RefDec runs from the closure-
+// struct dtor at frame-end cleanup.
+func emitCaptureRefInc(ctx @GenContext, b @ir.Block, val @ir.Instr, t @types.Type) {
+	if t == nil { return }
+	var rt @types.Type = t.ResolveAlias()
+	if rt == nil { return }
+	if rt.Kind == types.TYP_MANAGED_PTR {
+		b.EmitRefInc(val)
+		return
+	}
+	if rt.Kind == types.TYP_MANAGED_SLICE {
+		emitManagedSliceRefInc(ctx.Func, b, val)
+		return
+	}
+	if rt.Kind == types.TYP_MANAGED_FUNC_VALUE {
+		// A captured @func must acquire a ref to its capture record,
+		// balancing the RefDec the closure struct's dtor runs (@func is
+		// NeedsDestruction).  Without this the captured @func is
+		// under-retained: its record is freed when the source @func's
+		// own scope ends, and the closure dtor then RefDec's freed
+		// memory (use-after-free, seen via guard-malloc as a SIGSEGV in
+		// __dtor_closure_*).  Mirrors emitManagedFuncValueRefInc at the
+		// other copy sites (var-init / assignment / param / return /
+		// struct-elem).
+		emitManagedFuncValueRefInc(ctx.Func, b, val)
+		return
+	}
+	// @Iface captures aren't reachable through the type-checker's
+	// CAP_MANAGED classification today (interface values are not
+	// addressable as plain locals in cmd/bnc's tree); add the
+	// branch here once they are.  See claude-todo.md.
+}
+
+// registerClosureStructForCleanup adds the closure struct type to
+// gc.Mod.Structs so generateDtors synthesizes its struct-dtor (which
+// walks the managed fields and emits RefDec for each).  Duplicate
+// registrations are guarded by Name equality — every literal site
+// has a unique `__closure___funclit_<n>` name within a package, but
+// gen_module's later re-entry on imports could otherwise double-
+// register the same struct.
+func registerClosureStructForCleanup(gc @GenCtx, closureStruct @types.Type) {
+	for i := 0; i < len(gc.Mod.Structs); i++ {
+		if irutil.Streq(gc.Mod.Structs[i].Name, closureStruct.Name) { return }
+	}
+	var ms irsym.ModuleStruct
+	ms.Name = closureStruct.Name
+	ms.Typ = closureStruct
+	ms.Fields = closureStruct.Fields
+	gc.Mod.Structs = slices.Append[irsym.ModuleStruct](gc.Mod.Structs, ms)
+}
+
+// registerClosureLocalForCleanup registers the alloca'd closure
+// struct in the enclosing function's ctx.Vars so the standard
+// frame-end emitDecForManagedLocals pass invokes the struct dtor
+// on it.  The synthetic name `__closure_local_<n>` is per-literal-
+// id (n is the gc.FuncLitCounter value from genFuncLit), guaranteed
+// unique within the enclosing function.  defineVar's IsParam=false
+// is what emitStructDtor needs to actually run.
+func registerClosureLocalForCleanup(ctx @GenContext, closurePtr @ir.Instr,
+		closureStruct @types.Type, n int) {
+	var nameBuf @strings.Builder = strings.NewBuilder()
+	nameBuf.Write("__closure_local_")
+	nameBuf.Write(strconv.Itoa(n))
+	defineVar(ctx, buf.CopyStr(nameBuf.String()), closurePtr, closureStruct)
+}
+
+// synthFuncLitName builds the bare synthetic name for the n-th
+// function literal in the current package: `__funclit_<n>`.
+func synthFuncLitName(n int) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("__funclit_")
+	cb.Write(strconv.Itoa(n))
+	return buf.CopyStr(cb.String())
+}
+
+// registerLiftedFuncSigWithCaptures adds a FuncSig entry to
+// Module.FuncSigs for the synthetic function so subsequent call-site
+// lookups resolve it.  For closures, captureTypes prepend to the
+// sig's Params list (matching the lifted function's signature
+// after capture prepending — what the per-shape shim will call).
+func registerLiftedFuncSigWithCaptures(gc @GenCtx, d @ast.Decl, captureTypes @[]@types.Type) {
+	var sig ir.FuncSig
+	sig.Name = qualifyForCurrentModule(gc, d.Name)
+	var sigParams @[]@types.Type
+	for j := 0; j < len(captureTypes); j++ {
+		sigParams = slices.Append[@types.Type](sigParams, captureTypes[j])
+	}
+	for j := 0; j < len(d.Params); j++ {
+		sigParams = slices.Append[@types.Type](sigParams, irResolveParamType(gc, d.Params[j]))
+	}
+	sig.Params = sigParams
+	sig.IsVariadic = declIsVariadic(d)
+	var sigResults @[]@types.Type
+	for j := 0; j < len(d.Results); j++ {
+		sigResults = slices.Append[@types.Type](sigResults, resolveTypeExpr(gc, d.Results[j]))
+	}
+	sig.Results = sigResults
+	if len(sigResults) > 1 {
+		sig.MultiReturnType = irutil.MakeMultiReturnStructType(sigResults)
+	}
+	ir.RegisterFuncSig(gc.Mod, sig)
+}
+
+// funcValueTypeFromDecl builds the function-value type matching the
+// literal's user-declared signature.  Captures are an implementation
+// detail and are NOT part of the user-visible function-value type.
+// `isManaged` picks between `@func(...)` (TYP_MANAGED_FUNC_VALUE)
+// and `*func(...)` (TYP_FUNC_VALUE); B.3b commit 2 — checker's
+// ExpectedFVType hint propagation surfaces here via
+// isManagedFuncValueLit.
+func funcValueTypeFromDecl(gc @GenCtx, d @ast.Decl, isManaged bool) @types.Type {
+	var params @[]@types.Param = make_slice(@types.Param, len(d.Params))
+	for i := 0; i < len(d.Params); i++ {
+		var p @types.Param = make(types.Param)
+		p.Name = d.Params[i].Name
+		p.Type = irResolveParamType(gc, d.Params[i])
+		p.IsVariadic = d.Params[i].Variadic
+		params[i] = p
+	}
+	var results @[]@types.Type
+	for i := 0; i < len(d.Results); i++ {
+		results = slices.Append[@types.Type](results, resolveTypeExpr(gc, d.Results[i]))
+	}
+	if isManaged {
+		return types.MakeManagedFuncValueType(params, results)
+	}
+	return types.MakeFuncValueType(params, results)
+}

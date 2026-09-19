@@ -1,0 +1,457 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/iropcode"
+import "pkg/binate/token"
+import "pkg/binate/types"
+
+// genIf generates IR for an if/else statement with then, else, and merge blocks.
+func genIf(ctx @GenContext, b @ir.Block, stmt @ast.Stmt) @ir.Block {
+	var cond @ir.Instr = genExpr(ctx, b, stmt.X)
+	b = ctx.CurBlock
+	b = emitTempCleanup(ctx, b)
+	var thenBlk @ir.Block = ir.AddBlock(ctx.Func, "if.then")
+	var mergeBlk @ir.Block = ir.AddBlock(ctx.Func, "if.merge")
+
+	if stmt.Else != nil {
+		var elseBlk @ir.Block = ir.AddBlock(ctx.Func, "if.else")
+		b.EmitBranch(cond, thenBlk, elseBlk)
+		var thenEnd @ir.Block = genBlock(ctx, thenBlk, stmt.Body)
+		if len(thenEnd.Instrs) == 0 || !thenEnd.Instrs[len(thenEnd.Instrs) - 1].IsTerminator() {
+			thenEnd.EmitJump(mergeBlk)
+		}
+		var elseEnd @ir.Block = genBlock(ctx, elseBlk, stmt.Else)
+		if len(elseEnd.Instrs) == 0 || !elseEnd.Instrs[len(elseEnd.Instrs) - 1].IsTerminator() {
+			elseEnd.EmitJump(mergeBlk)
+		}
+	} else {
+		b.EmitBranch(cond, thenBlk, mergeBlk)
+		var thenEnd @ir.Block = genBlock(ctx, thenBlk, stmt.Body)
+		if len(thenEnd.Instrs) == 0 || !thenEnd.Instrs[len(thenEnd.Instrs) - 1].IsTerminator() {
+			thenEnd.EmitJump(mergeBlk)
+		}
+	}
+
+	return mergeBlk
+}
+
+// genFor generates IR for a for loop (init/cond/post or for-in).
+func genFor(ctx @GenContext, b @ir.Block, stmt @ast.Stmt) @ir.Block {
+	// For-in loop: for v in collection / for i, v in collection
+	if stmt.ForVal != nil {
+		return genForIn(ctx, b, stmt)
+	}
+
+	var condBlk @ir.Block = ir.AddBlock(ctx.Func, "for.cond")
+	var bodyBlk @ir.Block = ir.AddBlock(ctx.Func, "for.body")
+	var postBlk @ir.Block = ir.AddBlock(ctx.Func, "for.post")
+	var exitBlk @ir.Block = ir.AddBlock(ctx.Func, "for.exit")
+
+	// Init
+	if stmt.Init != nil {
+		b = genStmt(ctx, b, stmt.Init)
+	}
+	b.EmitJump(condBlk)
+
+	// Condition
+	// Save the original condBlk — genExpr may change ctx.CurBlock (e.g., short-circuit)
+	// but post must jump back to the start of condition evaluation.
+	var condStart @ir.Block = condBlk
+	if stmt.X != nil {
+		var cond @ir.Instr = genExpr(ctx, condBlk, stmt.X)
+		condBlk = ctx.CurBlock
+		condBlk = emitTempCleanup(ctx, condBlk)
+		condBlk.EmitBranch(cond, bodyBlk, exitBlk)
+	} else {
+		condBlk.EmitJump(bodyBlk)
+	}
+
+	// Body (with break/continue targets).  BreakVarLen/ContinueVarLen pin the
+	// scope level so a break/continue in the body RefDec's the body's managed
+	// locals before jumping (exitBlk/postBlk are raw — they do not clean up).
+	var savedBreak @ir.Block = ctx.BreakTo
+	var savedContinue @ir.Block = ctx.ContinueTo
+	var savedBreakVL int = ctx.BreakVarLen
+	var savedContinueVL int = ctx.ContinueVarLen
+	ctx.BreakTo = exitBlk
+	ctx.ContinueTo = postBlk
+	ctx.BreakVarLen = len(ctx.Vars)
+	ctx.ContinueVarLen = len(ctx.Vars)
+	var bodyEnd @ir.Block = genBlock(ctx, bodyBlk, stmt.Body)
+	ctx.BreakTo = savedBreak
+	ctx.ContinueTo = savedContinue
+	ctx.BreakVarLen = savedBreakVL
+	ctx.ContinueVarLen = savedContinueVL
+	if len(bodyEnd.Instrs) == 0 || !bodyEnd.Instrs[len(bodyEnd.Instrs) - 1].IsTerminator() {
+		bodyEnd.EmitJump(postBlk)
+	}
+
+	// Post — jump back to condStart (not condBlk, which may point to short-circuit merge)
+	if stmt.Post != nil {
+		// The post-statement can split its block — a struct/pointer field inc-dec
+		// (`t.n++`) splits it internally, and a type-assertion in the post (`x.(*T).n
+		// = ...`) splits it via the MISS-abort branch.  Thread ctx.CurBlock in and
+		// take genStmt's returned continuation, so the back-jump below is emitted from
+		// the live end block, not the stale pre-split postBlk (else the increment /
+		// the loop back-edge is stranded — the loop runs once and later statements are
+		// dropped).  Mirrors the for-init handling above.
+		ctx.CurBlock = postBlk
+		postBlk = genStmt(ctx, postBlk, stmt.Post)
+	}
+	if len(postBlk.Instrs) == 0 || !postBlk.Instrs[len(postBlk.Instrs) - 1].IsTerminator() {
+		postBlk.EmitJump(condStart)
+	}
+
+	return exitBlk
+}
+
+// genForIn generates IR for a for-in loop over a collection (array or slice).
+func genForIn(ctx @GenContext, b @ir.Block, stmt @ast.Stmt) @ir.Block {
+	// Evaluate the collection (stmt.X)
+	var collection @ir.Instr = genExpr(ctx, b, stmt.X)
+	b = ctx.CurBlock
+
+	// Peel transparent wrappers: a named array (`type Row [3]int`) or named
+	// slice (`type Buf @[]int`) is TYP_NAMED with a nil `.Elem`, so reading the
+	// kind / ArrayLen / element type off the raw collection.Typ would mis-route
+	// a named array to the slice path (EmitSliceLen on an array) and default a
+	// named slice's element to TypInt (mis-striding a non-int element).
+	var collSt @types.Type = nil
+	if collection.Typ != nil { collSt = irutil.PeelTransparent(collection.Typ) }
+
+	// Get the collection length
+	var length @ir.Instr
+	var isArray bool = false
+	if collSt != nil && collSt.Kind == types.TYP_ARRAY {
+		isArray = true
+		length = b.EmitConstInt(collSt.ArrayLen, types.TypInt())
+	} else {
+		length = b.EmitSliceLen(collection)
+	}
+
+	// Determine element type
+	var elemTyp @types.Type = types.TypInt()
+	if collSt != nil && collSt.Elem != nil {
+		elemTyp = collSt.Elem
+	}
+
+	// Get the collection alloca for array GEP
+	var arrPtr @ir.Instr = nil
+	if isArray && stmt.X.Kind == ast.EXPR_IDENT {
+		arrPtr = lookupVar(ctx, stmt.X.Name)
+	}
+
+	// Create index variable: alloca i64, init to 0
+	var idxPtr @ir.Instr = b.EmitAlloc(types.TypInt())
+	var zero @ir.Instr = b.EmitConstInt(0, types.TypInt())
+	b.EmitStore(idxPtr, zero)
+
+	var condBlk @ir.Block = ir.AddBlock(ctx.Func, "forin.cond")
+	var bodyBlk @ir.Block = ir.AddBlock(ctx.Func, "forin.body")
+	var postBlk @ir.Block = ir.AddBlock(ctx.Func, "forin.post")
+	var exitBlk @ir.Block = ir.AddBlock(ctx.Func, "forin.exit")
+	b.EmitJump(condBlk)
+
+	// Condition: idx < length
+	var idx @ir.Instr = condBlk.EmitLoad(idxPtr, types.TypInt())
+	var cond @ir.Instr = condBlk.EmitBinop(iropcode.OP_LT, idx, length, types.TypBool())
+	condBlk.EmitBranch(cond, bodyBlk, exitBlk)
+
+	// Body: load element at index
+	var bodyIdx @ir.Instr = bodyBlk.EmitLoad(idxPtr, types.TypInt())
+	var elem @ir.Instr
+	if isArray && arrPtr != nil {
+		var elemPtr @ir.Instr = bodyBlk.EmitGetElemPtr(arrPtr, bodyIdx, elemTyp)
+		elem = bodyBlk.EmitLoad(elemPtr, elemTyp)
+	} else {
+		elem = bodyBlk.EmitSliceGet(collection, bodyIdx, elemTyp)
+	}
+
+	// The value (and key) variable is a fresh per-iteration binding.  Record
+	// the scope depth so the value var's per-iteration acquire is matched by
+	// a per-iteration RELEASE below: the value var copy-OWNS its element
+	// (`for v in s` is `var v = s[i]` each trip — emitStoreManagedSlot RefIncs
+	// the borrowed element), so a release per iteration is required.  Without
+	// it an N-element loop RefIncs N times but RefDecs once: a leak of N-1.
+	var savedVarLen int = len(ctx.Vars)
+	// `break` routes through breakBlk so the current iteration's value var is
+	// released before the loop exits (continue / normal fall-through release
+	// it at postBlk).
+	var breakBlk @ir.Block = ir.AddBlock(ctx.Func, "forin.break")
+
+	// Bind the value variable.  The element was loaded as a BORROW
+	// (EmitLoad / EmitSliceGet, no RefInc); emitStoreManagedSlot acquires it
+	// (RefInc a managed scalar, emitStructCopy a managed struct).  isInit: a
+	// fresh slot each iteration, no old value.  A blank `_` value is never
+	// read, so skip the bind rather than register a phantom managed scope var.
+	if !isBlank(stmt.ForVal.Name) {
+		var valPtr @ir.Instr = bodyBlk.EmitAlloc(elemTyp)
+		bodyBlk = emitStoreManagedSlot(ctx, bodyBlk, valPtr, elem, elemTyp, true)
+		defineVar(ctx, stmt.ForVal.Name, valPtr, elemTyp)
+	}
+
+	// Define key variable if present (always int — non-managed).
+	if stmt.ForKey != nil {
+		var keyPtr @ir.Instr = bodyBlk.EmitAlloc(types.TypInt())
+		bodyBlk.EmitStore(keyPtr, bodyIdx)
+		defineVar(ctx, stmt.ForKey.Name, keyPtr, types.TypInt())
+	}
+
+	// Generate body.  BreakVarLen/ContinueVarLen are taken HERE — after the
+	// value/key vars are bound — so a break/continue in the body RefDec's only
+	// the body's managed locals; the loop's per-iteration value var is released
+	// by breakBlk/postBlk (at the lower savedVarLen), so the two are disjoint
+	// (no double-release).
+	var savedBreak @ir.Block = ctx.BreakTo
+	var savedContinue @ir.Block = ctx.ContinueTo
+	var savedBreakVL int = ctx.BreakVarLen
+	var savedContinueVL int = ctx.ContinueVarLen
+	ctx.BreakTo = breakBlk
+	ctx.ContinueTo = postBlk
+	ctx.BreakVarLen = len(ctx.Vars)
+	ctx.ContinueVarLen = len(ctx.Vars)
+	var bodyEnd @ir.Block = genBlock(ctx, bodyBlk, stmt.Body)
+	ctx.BreakTo = savedBreak
+	ctx.ContinueTo = savedContinue
+	ctx.BreakVarLen = savedBreakVL
+	ctx.ContinueVarLen = savedContinueVL
+	if len(bodyEnd.Instrs) == 0 || !bodyEnd.Instrs[len(bodyEnd.Instrs) - 1].IsTerminator() {
+		bodyEnd.EmitJump(postBlk)
+	}
+
+	// Post: release the per-iteration loop var(s) — RefDec the managed value
+	// var (the int key is a no-op) — then increment the index and loop back.
+	// Both normal fall-through and `continue` land here; the value released is
+	// whatever v currently holds (the bound element, or a body reassignment).
+	postBlk = emitDecForScopeVars(ctx, postBlk, savedVarLen)
+	var postIdx @ir.Instr = postBlk.EmitLoad(idxPtr, types.TypInt())
+	var one @ir.Instr = postBlk.EmitConstInt(1, types.TypInt())
+	var nextIdx @ir.Instr = postBlk.EmitBinop(iropcode.OP_ADD, postIdx, one, types.TypInt())
+	postBlk.EmitStore(idxPtr, nextIdx)
+	postBlk.EmitJump(condBlk)
+
+	// Break: release the current iteration's loop var(s), then exit.  The
+	// cond-fail path reaches exitBlk directly — the last completed iteration
+	// released its value at postBlk, so nothing is live to release there.
+	var breakEnd @ir.Block = emitDecForScopeVars(ctx, breakBlk, savedVarLen)
+	breakEnd.EmitJump(exitBlk)
+
+	// The loop var(s) are released per-iteration above, not at the enclosing
+	// block's exit — drop them from the enclosing scope.
+	ctx.Vars = ctx.Vars[:savedVarLen]
+
+	return exitBlk
+}
+
+// genIncDec generates IR for increment/decrement statements (`i++` / `i--`),
+// for ANY integer lvalue — an identifier, an element (`a[i]++`), a field
+// (`p.f++`), or a dereference (`(*p)++`).  The checker's STMT_INC_DEC arm
+// restricts X to an integer lvalue, so there are no managed/slice/struct
+// complications: compute a pointer to the storage, then read-modify-write
+// (load, ±1, store) through it.  Each non-ident lvalue reuses the same
+// address helper genAssign uses for the matching `=` target — without these
+// arms `a[i]++` / `p.f++` / `(*p)++` would lower to nothing (silent no-op).
+func genIncDec(ctx @GenContext, b @ir.Block, stmt @ast.Stmt) @ir.Block {
+	var x @ast.Expr = stmt.X
+	var ptr @ir.Instr = nil
+	var typ @types.Type = nil
+	if x.Kind == ast.EXPR_IDENT {
+		ptr = lookupVar(ctx, x.Name)
+		typ = lookupVarType(ctx, x.Name)
+	} else if x.Kind == ast.EXPR_SELECTOR {
+		// `s.field++`: read-modify-write derefs the field's pointer, so forDeref=true.
+		ptr = genSelectorPtr(ctx, b, x, true)
+		b = ctx.CurBlock
+		typ = getSelectorType(ctx, x)
+	} else if x.Kind == ast.EXPR_UNARY && x.Op == cast(int, token.STAR) {
+		// (*p)++: read-modify-write through the dereferenced pointer.  Peel the
+		// pointer type (named-distinct) and accept a managed pointer; un-peeled, a
+		// named pointer (`type P *int`) is TYP_NAMED, typ stayed nil, and the
+		// increment was silently not generated.
+		ptr = genExpr(ctx, b, x.X)
+		b = ctx.CurBlock
+		var pk @types.Type = nil
+		if ptr != nil && ptr.Typ != nil { pk = irutil.PeelTransparent(ptr.Typ) }
+		if pk != nil && (pk.Kind == types.TYP_POINTER || pk.Kind == types.TYP_MANAGED_PTR) {
+			typ = pk.Elem
+		}
+	} else if x.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		// a[i]++ / s[i]++: GEP an in-place element pointer (bounds-checked).
+		// Read-modify-write derefs the element pointer, so forDeref=true.
+		ptr = genIndexPtr(ctx, b, x, true)
+		b = ctx.CurBlock
+		if ptr != nil && ptr.Typ != nil {
+			typ = ptr.Typ.Elem
+		}
+	}
+	if ptr == nil || typ == nil {
+		return b
+	}
+	var cur @ir.Instr = b.EmitLoad(ptr, typ)
+	var one @ir.Instr = b.EmitConstInt(1, typ)
+	var result @ir.Instr
+	if stmt.Op == cast(int, token.INC) {
+		result = b.EmitBinop(iropcode.OP_ADD, cur, one, typ)
+	} else {
+		result = b.EmitBinop(iropcode.OP_SUB, cur, one, typ)
+	}
+	b.EmitStore(ptr, result)
+	return b
+}
+
+// genSwitch generates IR for a switch statement as a chain of if-else comparisons.
+//
+// A tagless `switch { ... }` (no tag expression — the if/else-if form, §14.10)
+// is `switch true`: each case expression is itself the bool condition, so there
+// is no tag value to compare against.  stmt.X is nil there; genExpr on it would
+// null-deref, so skip it.  The checker (checkSwitchStmt) guarantees a tagless
+// switch's case exprs are bool, so they can drive the branch directly.
+func genSwitch(ctx @GenContext, b @ir.Block, stmt @ast.Stmt) @ir.Block {
+	var tagless bool = stmt.X == nil
+	var switchVal @ir.Instr = nil
+	if !tagless {
+		switchVal = genExpr(ctx, b, stmt.X)
+		b = ctx.CurBlock
+	}
+	b = emitTempCleanup(ctx, b)
+	var exitBlk @ir.Block = ir.AddBlock(ctx.Func, "switch.exit")
+
+	// A `break` inside a switch case exits the SWITCH (stmt.switch.break, §14.10
+	// — Go-like), not an enclosing loop.  Point ctx.BreakTo at the switch exit for
+	// the case bodies; ctx.ContinueTo is left untouched so a `continue` still
+	// targets the enclosing loop.  genCaseBody's terminator check then stops
+	// emitting any statements after the break.  BreakVarLen pins the scope depth
+	// the break unwinds to: STMT_BREAK RefDecs ctx.Vars[BreakVarLen:] before
+	// jumping, and genCaseBody drops case-body locals on a break WITHOUT dec'ing,
+	// so BreakVarLen must be the var count at switch entry — set it here, else the
+	// break dec's from a stale value (an enclosing loop's lower count, or 0) and
+	// over-releases locals the break does not exit.  Both restored on EVERY return
+	// path below (including the default case's early return).
+	var savedBreak @ir.Block = ctx.BreakTo
+	var savedBreakVL int = ctx.BreakVarLen
+	ctx.BreakTo = exitBlk
+	ctx.BreakVarLen = len(ctx.Vars)
+
+	// Build chain of if-else blocks for each case
+	var curBlk @ir.Block = b
+	for i := 0; i < len(stmt.Cases); i++ {
+		var cc @ast.CaseClause = stmt.Cases[i]
+		if len(cc.Exprs) == 0 {
+			// Default case — generate body in current block
+			var bodyBlk @ir.Block = ir.AddBlock(ctx.Func, "switch.default")
+			curBlk.EmitJump(bodyBlk)
+			genCaseBody(ctx, bodyBlk, cc.Body, exitBlk)
+			ctx.BreakTo = savedBreak
+			ctx.BreakVarLen = savedBreakVL
+			return exitBlk
+		}
+
+		// Case with expression(s)
+		var caseBlk @ir.Block = ir.AddBlock(ctx.Func, "switch.case")
+		var nextBlk @ir.Block = ir.AddBlock(ctx.Func, "switch.next")
+
+		// Compare switchVal to each case expression (OR them together)
+		var cond @ir.Instr = nil
+		for j := 0; j < len(cc.Exprs); j++ {
+			// Tagged: the case value is compared to the tag.  A constant
+			// integer case against an integer tag is emitted as a TYPED const
+			// at the tag's type/width (evalConstExpr folds the case at compile
+			// time).  Two reasons:
+			//   1. An untyped integer literal otherwise stays host-int-width
+			//      (i64 on LP64); against a sub-word tag (char / int8 / int16 /
+			//      int32) the equality lowers to a width-mismatched icmp
+			//      ("icmp eq i8 %tag, <i64-defined const>") -- invalid LLVM.
+			//   2. Emitting the const by VALUE avoids narrowing a negative case
+			//      via a sub-word OP_CAST, which the bytecode VM mishandles --
+			//      `case -8` over an int8 tag read the case as 248, silently
+			//      taking the wrong branch.
+			// A non-constant case keeps its checker-assigned (already
+			// tag-compatible) type via genExpr.
+			var caseVal @ir.Instr = nil
+			if !tagless && switchVal.Typ != nil && switchVal.Typ.IsInteger() {
+				var cv int
+				var isConst bool
+				cv, isConst = evalConstExpr(ctx.Gc, cc.Exprs[j], 0)
+				if isConst {
+					caseVal = curBlk.EmitConstInt64(cast(int64, cv), switchVal.Typ)
+				}
+			}
+			if caseVal == nil {
+				// genExpr may split blocks (its emitted value can land in a
+				// new ctx.CurBlock); the const path above only appends to
+				// curBlk, so resync curBlk from ctx.CurBlock ONLY here.
+				caseVal = genExpr(ctx, curBlk, cc.Exprs[j])
+				curBlk = ctx.CurBlock
+			}
+			// Tagless: the case expr IS the bool condition.  Tagged: compare
+			// the case value against the tag value.  A comparable AGGREGATE tag
+			// (struct / array — including a char-array tag with a string-literal
+			// case) compares field/element-wise via genAggregateEq, NOT a raw OP_EQ
+			// (which would compare aggregate bytes — or a rodata pointer for a string
+			// literal — as if scalar).
+			var eq @ir.Instr = caseVal
+			if !tagless {
+				var aggTyp @types.Type = aggregateEqType(switchVal.Typ)
+				if aggTyp != nil {
+					eq = genAggregateEq(ctx, curBlk, iropcode.OP_EQ, switchVal, caseVal, aggTyp)
+				} else {
+					eq = curBlk.EmitBinop(iropcode.OP_EQ, switchVal, caseVal, types.TypBool())
+				}
+			}
+			if cond == nil {
+				cond = eq
+			} else {
+				cond = curBlk.EmitBinop(iropcode.OP_LOR, cond, eq, types.TypBool())
+			}
+		}
+		curBlk.EmitBranch(cond, caseBlk, nextBlk)
+
+		genCaseBody(ctx, caseBlk, cc.Body, exitBlk)
+
+		curBlk = nextBlk
+	}
+
+	// If no default case, jump from last next block to exit
+	if len(curBlk.Instrs) == 0 || !curBlk.Instrs[len(curBlk.Instrs) - 1].IsTerminator() {
+		curBlk.EmitJump(exitBlk)
+	}
+
+	ctx.BreakTo = savedBreak
+	ctx.BreakVarLen = savedBreakVL
+	return exitBlk
+}
+
+// genCaseBody generates one switch-case (or default) body as its own
+// variable scope, mirroring genBlock.  Locals declared in the case
+// must be RefDec'd at the case's own exit and dropped from ctx.Vars —
+// NOT left to the enclosing function's cleanup.  Without the scope
+// reset, a managed local declared here lingers in ctx.Vars and gets
+// RefDec'd on every later exit path (sibling cases, the switch's
+// fall-through `return`s), where its alloca holds a stale value from
+// an earlier call that did run this case — a spurious RefDec that
+// frees a still-live allocation.  Returns the block flow continues in.
+func genCaseBody(ctx @GenContext, bodyBlk @ir.Block, body @[]@ast.Stmt,
+		exitBlk @ir.Block) @ir.Block {
+	var savedVarLen int = len(ctx.Vars)
+	var endBlk @ir.Block = bodyBlk
+	for j := 0; j < len(body); j++ {
+		endBlk = genStmt(ctx, endBlk, body[j])
+		if len(endBlk.Instrs) > 0 && endBlk.Instrs[len(endBlk.Instrs) - 1].IsTerminator() {
+			// Terminated (return/break/continue): the terminator
+			// handles its own cleanup; just drop this scope's vars.
+			ctx.Vars = ctx.Vars[:savedVarLen]
+			return endBlk
+		}
+	}
+	// Normal fall-off: RefDec this scope's managed locals, then exit.
+	endBlk = emitDecForScopeVars(ctx, endBlk, savedVarLen)
+	ctx.Vars = ctx.Vars[:savedVarLen]
+	if len(endBlk.Instrs) == 0 || !endBlk.Instrs[len(endBlk.Instrs) - 1].IsTerminator() {
+		endBlk.EmitJump(exitBlk)
+	}
+	return endBlk
+}

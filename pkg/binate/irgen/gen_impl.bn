@@ -1,0 +1,474 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/types"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// IR-gen for impl declarations: walks DECL_IMPL entries to
+// construct an ImplInfo per (impl, interface) pair, looking up
+// each referenced interface in the per-module registry built by
+// collectInterfaceFromDecl (gen_iface_registry.bn).  ImplInfos
+// go on m.Impls; codegen later emits a vtable global per entry.
+
+// The Module being generated is reached by context-light IR-gen
+// helpers (wrapAsIfaceValue, findImplVtableName) via the per-
+// compilation gen context — @GenContext.Gc.Mod — so they can walk
+// m.Impls without threading m through every call.
+
+// collectImplsFromDecl appends an ImplInfo to m.Impls for each
+// `impl R : I1, I2, ...` interface in d, plus one ImplInfo per
+// distinct ancestor of those interfaces (transitive registration —
+// `impl T : Child` also satisfies `Closer` if `Child : Closer`).
+// Each emitted
+// ImplInfo holds the qualified method-func names for the OWN
+// methods of its target interface; the recursive concat layout
+// is assembled at codegen time by walking the parent chain.
+//
+// Receiver type-name is extracted via recvTypeName (the same
+// helper genMethod uses).  The impl declaration itself lives in
+// the current package (`pkgShort`); either or both of the
+// receiver and the interface may live in different packages
+// (Slices 2.7 / 2.9), reflected in RecvPkg / IfacePkg on the
+// resulting ImplInfo.  RecvPkg drives the canonical vtable
+// mangling AND the qualified function names emitted into
+// MethodFuncs (so dispatch resolves through the receiver's
+// defining package's symbols regardless of where the impl was
+// declared).  The receiver short name + defining package are
+// resolved by recvBaseNameAndPkg (gen_impl_recvname.bn), which peels
+// a local type-alias receiver to its target (bug 754).
+func collectImplsFromDecl(gc @GenCtx, d @ast.Decl, pkgShort *[]readonly char, m @ir.Module) {
+	if d == nil || d.Kind != ast.DECL_IMPL {
+		return
+	}
+	// A parameterized-receiver impl (`impl @Table[K,V,H,E] : iter.Iterable[...]`) is a
+	// TEMPLATE: its concrete (instantiated-receiver, instantiated-iface) rows are
+	// synthesized on demand at each boxing site (ensureGenericImplInfo), not here.
+	// Resolving its receiver statically has no concrete type args in scope, so every
+	// binder falls to resolveTypeExpr's TypInt() fallback and it instantiates a bogus
+	// all-`int` receiver (e.g. Table[int,int,int,int]) with dead dtor/copy/reflect
+	// symbols.  Mirror the checker's collectImplDecl, which routes these to the
+	// generic-impl path and returns rather than resolving the receiver.
+	if receiverGenericInstBase(d.TypeRef) != nil {
+		return
+	}
+	var recvName @[]char
+	var aliasBasePkg @[]char
+	recvName, aliasBasePkg = recvBaseNameAndPkg(gc, d.TypeRef)
+	if len(recvName) == 0 {
+		return
+	}
+	// Slice 2.9: derive the receiver's defining package. An alias receiver
+	// resolved above already carries its target's package (aliasBasePkg); else
+	// a qualified receiver (`impl *hello.Hello : ...`) carries ref.Pkg, and a
+	// same-package receiver (`impl *Hello : ...`) defaults to the impl's package.
+	var recvPkg @[]char = aliasBasePkg
+	if len(recvPkg) == 0 {
+		recvPkg = ir.ResolveImportPkg(gc.Mod, recvTypePkg(d.TypeRef))
+	}
+	if len(recvPkg) == 0 {
+		recvPkg = buf.CopyStr(pkgShort)
+	}
+	// The receiver's base value type — the boxed dynamic type — held for
+	// this type's TypeInfo record (its SizeOf/AlignOf are read at codegen,
+	// not here: struct fields aren't laid out yet at collection).  Same for
+	// every (R, I) row of this impl (they share the receiver).
+	var recvTyp @types.Type = recvBaseValueType(gc, d.TypeRef)
+	// Key the slot-0 destructor on the boxed VALUE type (the pointee), not the
+	// receiver's own name: a named-distinct managed pointer receiver (`type MS @S`)
+	// has recvName "MS", but its owning @Iface must run the POINTEE's dtor (`__dtor_S`
+	// for a struct pointee, or the pointee's structural managed drop for a nameless
+	// pointee like `@([2]@Leaf)`) on drop — `__dtor_MS` is never emitted, so keying on
+	// recvName would leave a null slot 0 and LEAK the pointee.  `dtorRecvName` supplies
+	// the struct pointee's name (peeled off the declared receiver ref, which — unlike
+	// recvBaseValueType — has resolved names at collection time); boxSlot0DtorName then
+	// handles the managed / nameless pointee shapes structurally.  For a non-named
+	// receiver the pointee name == recvName, so this is inert.
+	var dtorRecvName @[]char = recvName
+	var dtorBase @types.Type = peelToNamedBase(irutil.PeelTransparent(resolveTypeExpr(gc, d.TypeRef)))
+	if dtorBase != nil && len(dtorBase.Name) > 0 {
+		dtorRecvName = shortTypeName(dtorBase.Name)
+	}
+	var dtorName @[]char = boxSlot0DtorName(m, recvPkg, dtorRecvName, recvTyp)
+
+	// Walk each listed interface plus its ancestor closure,
+	// deduping by canonical (Pkg, Name) so an interface listed
+	// twice (e.g. `impl T : Child, Parent` where Parent is
+	// reachable from Child) is registered once.  The dedup also
+	// spans previously-collected impl decls in the same module
+	// so two siblings that both transitively imply a common
+	// ancestor (e.g., `impl T : Orderable` + `impl T : Hashable`,
+	// both extending Comparable) don't emit the (T, Comparable)
+	// vtable twice.
+	var seenPkgs @[]@[]char
+	var seenNames @[]@[]char
+	for i := 0; i < len(d.Interfaces); i++ {
+		var ref @ast.TypeExpr = d.Interfaces[i]
+		if ref == nil {
+			continue
+		}
+		// Slice 6c-full: `impl R : Container[int]` — instantiate
+		// the named generic iface and use the mangled name as the
+		// iface key (`<pkg>.Container__bn_inst__int`).
+		// Pre-resolve ref to (refIfacePkg, refIfaceName) so the rest
+		// of the loop works uniformly for both TEXPR_NAMED and
+		// TEXPR_INSTANTIATE.
+		var refIfacePkg @[]char
+		var refIfaceName @[]char
+		if ref.Kind == ast.TEXPR_NAMED {
+			// Slice 2.7: an `impl R : pkg.Iface` (cross-package
+			// interface) carries ref.Pkg; impl decls on a same-
+			// package interface have ref.Pkg empty and default to
+			// the impl's own package.
+			if len(ref.Pkg) > 0 {
+				refIfacePkg = ir.ResolveImportPkg(gc.Mod, ref.Pkg)
+			} else {
+				refIfacePkg = buf.CopyStr(pkgShort)
+			}
+			refIfaceName = ref.Name
+		} else if ref.Kind == ast.TEXPR_INSTANTIATE {
+			// Slice 7c: `impl Foo : pkg.Container[int]` looks up
+			// the generic iface decl under the import alias;
+			// same-package `impl Foo : Container[int]` uses
+			// pkgShort (the impl decl's own package).
+			if ref.Base == nil { continue }
+			if ref.Base.Kind != ast.TEXPR_NAMED { continue }
+			var lookupPkg @[]char
+			if len(ref.Base.Pkg) > 0 {
+				lookupPkg = ir.ResolveImportPkg(gc.Mod, ref.Base.Pkg)
+			} else {
+				lookupPkg = buf.CopyStr(pkgShort)
+			}
+			var gd @ast.Decl = lookupGenericIfaceDeclPkg(gc, lookupPkg, ref.Base.Name)
+			if gd == nil { continue }
+			var argTypes @[]@types.Type
+			for ai := 0; ai < len(ref.TypeArgs); ai++ {
+				argTypes = slices.Append[@types.Type](argTypes, resolveTypeExpr(gc, ref.TypeArgs[ai]))
+			}
+			// Key the impl's interface ref on the generic's DEFINING
+			// package (lookupPkg), matching ensureInstantiatedInterface's
+			// keying — so a consumer-side `impl R : pkg.Container[int]`
+			// records its (R, I) vtable under the same iface package that
+			// use-sites (ifaceTypeForName) resolve against.  Using pkgShort
+			// here would key the vtable in the consumer's namespace and the
+			// use-site reference (keyed on the defining pkg) would miss it.
+			refIfacePkg = buf.CopyStr(lookupPkg)
+			refIfaceName = ensureInstantiatedInterface(gc, gd, argTypes, lookupPkg)
+		} else {
+			continue
+		}
+		// Resolve aliases to canonical identity before recording
+		// or chasing parents — the impl-table is keyed on the
+		// canonical form, and dispatch / codegen agree on that.
+		var canonPkg @[]char = ir.CanonicalIfacePkg(m, refIfacePkg, refIfaceName)
+		var canonName @[]char = ir.CanonicalIfaceName(m, refIfacePkg, refIfaceName)
+
+		// The listed interface itself.
+		if !containsPkgName(seenPkgs, seenNames, canonPkg, canonName) &&
+				!moduleHasImpl(m, recvPkg, recvName, canonPkg, canonName) {
+			seenPkgs = slices.Append[@[]char](seenPkgs, canonPkg)
+			seenNames = slices.Append[@[]char](seenNames, canonName)
+			m.Impls = slices.Append[@ir.ImplInfo](m.Impls,
+					makeOwnMethodsImplInfo(m, recvPkg, recvName, dtorName, canonPkg, canonName, recvTyp))
+		}
+		// Each ancestor of the listed interface.
+		var aPkgs @[]@[]char = IfaceAncestorClosurePkgs(m, canonPkg, canonName)
+		var aNames @[]@[]char = IfaceAncestorClosure(m, canonPkg, canonName)
+		for j := 0; j < len(aPkgs); j++ {
+			if containsPkgName(seenPkgs, seenNames, aPkgs[j], aNames[j]) {
+				continue
+			}
+			if moduleHasImpl(m, recvPkg, recvName, aPkgs[j], aNames[j]) {
+				continue
+			}
+			seenPkgs = slices.Append[@[]char](seenPkgs, aPkgs[j])
+			seenNames = slices.Append[@[]char](seenNames, aNames[j])
+			m.Impls = slices.Append[@ir.ImplInfo](m.Impls,
+					makeOwnMethodsImplInfo(m, recvPkg, recvName, dtorName, aPkgs[j], aNames[j], recvTyp))
+		}
+	}
+}
+
+// recvBaseValueType resolves the receiver type expression `te` and returns
+// its BASE VALUE type — the receiver peeled of its pointer/managed wrapper,
+// i.e. the boxed dynamic type whose layout a value assertion `x.(T)` needs.
+// Returns the SHARED types.Type object (not a copy): for a `*T`/`@T` receiver
+// resolveTypeExpr wraps the module's struct object in a pointer type without
+// copying, so the peeled Elem is that same object — whose fields get
+// populated in place by a later pass, making its SizeOf correct at codegen.
+// The `rt == nil` check is a defensive guard: resolveTypeExpr does not return
+// nil for a real named/instantiate receiver (an unresolvable one already
+// failed type-checking upstream; its own fallback is TypInt(), not nil), so a
+// nil here would be a should-never-happen — the guard keeps a nil out of the
+// type registered for this receiver's TypeInfo rather than deferring the crash
+// to a SizeOf read.
+func recvBaseValueType(gc @GenCtx, te @ast.TypeExpr) @types.Type {
+	var rt @types.Type = resolveTypeExpr(gc, te)
+	if rt == nil { return nil }
+	// Peel a named-distinct wrapper (`type MS @S` / `type PS *S`) to detect a POINTER
+	// receiver whose boxed value type is the POINTEE.  A named-distinct pointer is
+	// TYP_NAMED, so an un-peeled kind check treats the whole named pointer as the
+	// value type — wrong size, AND its owning @Iface slot-0 dtor keys on the
+	// never-emitted `__dtor_<named>`, leaking the pointee's managed fields.  A plain
+	// named STRUCT value receiver peels to a struct (not a pointer), so it is left
+	// as-is and keeps its own name/identity.
+	var peeled @types.Type = irutil.PeelTransparent(rt)
+	if peeled != nil && (peeled.Kind == types.TYP_POINTER || peeled.Kind == types.TYP_MANAGED_PTR) {
+		return peeled.Elem
+	}
+	return rt
+}
+
+// moduleHasImpl reports whether m.Impls already has an entry
+// for the (recvPkg, recvName) × (ifacePkg, ifaceName) pair.
+// Used by collectImplsFromDecl's dedup to prevent two impl
+// decls for the same receiver type whose interface ancestor
+// closures share a common interface (e.g., Orderable and
+// Hashable both extending Comparable) from emitting the same
+// (R, I) vtable twice.
+func moduleHasImpl(m @ir.Module, recvPkg *[]readonly char, recvName *[]readonly char,
+		ifacePkg *[]readonly char, ifaceName *[]readonly char) bool {
+	if m == nil { return false }
+	for i := 0; i < len(m.Impls); i++ {
+		var info @ir.ImplInfo = m.Impls[i]
+		if info == nil { continue }
+		if !irutil.CharEq(info.RecvPkg, recvPkg) { continue }
+		if !irutil.CharEq(info.RecvTypeName, recvName) { continue }
+		if !irutil.CharEq(info.IfacePkg, ifacePkg) { continue }
+		if !irutil.CharEq(info.IfaceName, ifaceName) { continue }
+		return true
+	}
+	return false
+}
+
+// makeOwnMethodsImplInfo builds an ImplInfo for the (R, I) pair
+// identified by (recvPkg, recvName) × (ifacePkg, ifaceName).  The
+// ImplInfo's MethodFuncs entries correspond to I's OWN methods
+// only (in declaration order) — inherited methods are emitted via
+// the parent's own ImplInfo at codegen time, which is what makes
+// the concat vtable layout work.  Slice E.3.
+func makeOwnMethodsImplInfo(m @ir.Module, recvPkg @[]char, recvName @[]char, dtorName @[]char,
+		ifacePkg @[]char, ifaceName @[]char, recvTyp @types.Type) @ir.ImplInfo {
+	var info @ir.ImplInfo = make(ir.ImplInfo)
+	info.RecvPkg = recvPkg
+	info.RecvTypeName = buf.CopyStr(recvName)
+	info.IfacePkg = ifacePkg
+	info.IfaceName = ifaceName
+	info.DtorFuncName = dtorName
+	// The receiver's per-type RTTI facts (recvTyp / dtorName) live in the
+	// per-type registry, not on this per-(type,iface) row — register the type's
+	// TypeInfo entry here, coupled 1:1 with this ImplInfo's creation (callers
+	// always append the returned info).  A second call for the same type is a
+	// no-op (registerTypeInfo dedups).
+	ir.RegisterTypeInfo(m, recvPkg, recvName, recvTyp, dtorName)
+	var methodNames @[]@[]char = ir.LookupModuleInterface(m, ifacePkg, ifaceName)
+	for j := 0; j < len(methodNames); j++ {
+		var qualified @[]char = methodFuncName(recvPkg, recvName, methodNames[j])
+		info.MethodFuncs = slices.Append[@[]char](info.MethodFuncs, qualified)
+	}
+	return info
+}
+
+// collectImportedImplsFromDecl is the cross-package counterpart of
+// collectImplsFromDecl: it appends to m.ImportedImpls (not m.Impls)
+// so codegen doesn't try to re-emit the vtable in this TU. The
+// vtable global lives in the imported package's TU with weak_odr
+// linkage; this entry exists only so findImplVtableName at use
+// sites here in the importing TU can produce the canonical symbol
+// name that the linker resolves to it.
+//
+// pkgShort is the import alias's pkg-short (e.g., "hello" for an
+// `import "pkg/hello"`) — equals the impl declaration's package.
+// MethodFuncs and DtorFuncName are deliberately left empty: those
+// drive vtable emission, which is the imported TU's job.
+//
+// TEXPR_INSTANTIATE interface refs (`impl R : Container[int]` declared
+// in the imported package) are handled too, mirroring
+// collectImplsFromDecl's instantiate branch: the instantiated iface is
+// keyed on the generic's DEFINING package so the symbol the consumer
+// references here matches the one the library TU emitted.  gc is needed
+// for the generic-iface decl lookup and type-arg / instantiation
+// resolution.
+func collectImportedImplsFromDecl(gc @GenCtx, d @ast.Decl, pkgShort *[]readonly char,
+		m @ir.Module) {
+	if d == nil || d.Kind != ast.DECL_IMPL {
+		return
+	}
+	// A parameterized-receiver impl (`impl @Table[K,V,H,E] : ...`) is a template whose
+	// concrete rows are synthesized on demand at each boxing site (ensureGenericImplInfo),
+	// so it registers no ImportedImpls row.  recvBaseNameAndPkg already returns an empty
+	// name for a generic-instantiation receiver (recvTypeName does not peel TEXPR_INSTANTIATE),
+	// so the len(recvName)==0 guard below skips it either way; this makes the skip explicit
+	// rather than implicit, matching collectImplsFromDecl and the checker's collectImplDecl.
+	if receiverGenericInstBase(d.TypeRef) != nil {
+		return
+	}
+	var recvName @[]char
+	var aliasBasePkg @[]char
+	recvName, aliasBasePkg = recvBaseNameAndPkg(gc, d.TypeRef)
+	if len(recvName) == 0 {
+		return
+	}
+	// RecvPkg must key on the RECEIVER's defining package, not the package
+	// the `impl` was written in.  A local alias receiver resolved above carries
+	// its target's package (aliasBasePkg).  Otherwise, for a qualified receiver
+	// (`impl *widget.Widget : shape.Talker` declared in pkg/glue) recvTypePkg
+	// yields the receiver alias (`widget`), resolved here to its full path; an
+	// unqualified receiver (`impl *Widget : ...` in the receiver's own package)
+	// defaults to the impl's package.  Mirrors collectImplsFromDecl's local-TU
+	// derivation — without it a third-package impl keys RecvPkg on pkg/glue
+	// while the construction site looks up pkg/widget, so the (R, I) vtable is
+	// never found -> null-vtable crash at dispatch.
+	var recvPkg @[]char = aliasBasePkg
+	if len(recvPkg) == 0 {
+		recvPkg = ir.ResolveImportPkg(m, recvTypePkg(d.TypeRef))
+	}
+	if len(recvPkg) == 0 {
+		recvPkg = ir.ResolveImportPkg(m, pkgShort)
+	}
+	for i := 0; i < len(d.Interfaces); i++ {
+		var ref @ast.TypeExpr = d.Interfaces[i]
+		if ref == nil {
+			continue
+		}
+		var refIfacePkg @[]char
+		var refIfaceName @[]char
+		if ref.Kind == ast.TEXPR_NAMED {
+			if len(ref.Pkg) > 0 {
+				refIfacePkg = ir.ResolveImportPkg(m, ref.Pkg)
+			} else {
+				refIfacePkg = ir.ResolveImportPkg(m, pkgShort)
+			}
+			refIfaceName = ref.Name
+		} else if ref.Kind == ast.TEXPR_INSTANTIATE {
+			// `impl R : Container[int]` in the imported package: look up
+			// the generic iface decl under its defining package and
+			// instantiate so the (R, I) entry keys on the same iface
+			// package the library TU emitted under.
+			if ref.Base == nil { continue }
+			if ref.Base.Kind != ast.TEXPR_NAMED { continue }
+			var lookupPkg @[]char
+			if len(ref.Base.Pkg) > 0 {
+				lookupPkg = ir.ResolveImportPkg(m, ref.Base.Pkg)
+			} else {
+				lookupPkg = ir.ResolveImportPkg(m, pkgShort)
+			}
+			var gd @ast.Decl = lookupGenericIfaceDeclPkg(gc, lookupPkg, ref.Base.Name)
+			if gd == nil { continue }
+			var argTypes @[]@types.Type
+			for ai := 0; ai < len(ref.TypeArgs); ai++ {
+				argTypes = slices.Append[@types.Type](argTypes, resolveTypeExpr(gc, ref.TypeArgs[ai]))
+			}
+			refIfacePkg = buf.CopyStr(lookupPkg)
+			refIfaceName = ensureInstantiatedInterface(gc, gd, argTypes, lookupPkg)
+		} else {
+			continue
+		}
+		var info @ir.ImplInfo = make(ir.ImplInfo)
+		info.RecvPkg = buf.CopyStr(recvPkg)
+		info.RecvTypeName = buf.CopyStr(recvName)
+		info.IfacePkg = ir.CanonicalIfacePkg(m, refIfacePkg, refIfaceName)
+		info.IfaceName = ir.CanonicalIfaceName(m, refIfacePkg, refIfaceName)
+		// Dedup: the same (R, I) pair may be reached via the consumer's
+		// direct imports AND the transitive closure (RegisterImportedImpls);
+		// codegen emits one `external constant` decl per m.ImportedImpls entry
+		// with no symbol-level dedup, so a duplicate would be a redefinition.
+		if !moduleHasImportedImpl(m, info.RecvPkg, info.RecvTypeName, info.IfacePkg, info.IfaceName) {
+			m.ImportedImpls = slices.Append[@ir.ImplInfo](m.ImportedImpls, info)
+		}
+		// Wire the ANCESTOR closure of the listed interface, mirroring the
+		// local collectImplsFromDecl walk: an imported `impl R : Sub`
+		// (Sub : Base) also satisfies Base, so the consumer must reference the
+		// (R, Base) vtable too -- the impl's home package emits it (its own
+		// ancestor walk) -- or a cross-package `*Base = &r` upcast nil-vtables
+		// at dispatch (the imported counterpart of the iface.extend.upcast
+		// construction case 048).
+		var aPkgs @[]@[]char = IfaceAncestorClosurePkgs(m, info.IfacePkg, info.IfaceName)
+		var aNames @[]@[]char = IfaceAncestorClosure(m, info.IfacePkg, info.IfaceName)
+		for j := 0; j < len(aPkgs); j++ {
+			if moduleHasImportedImpl(m, info.RecvPkg, info.RecvTypeName, aPkgs[j], aNames[j]) {
+				continue
+			}
+			var anc @ir.ImplInfo = make(ir.ImplInfo)
+			anc.RecvPkg = buf.CopyStr(info.RecvPkg)
+			anc.RecvTypeName = buf.CopyStr(info.RecvTypeName)
+			anc.IfacePkg = buf.CopyStr(aPkgs[j])
+			anc.IfaceName = buf.CopyStr(aNames[j])
+			m.ImportedImpls = slices.Append[@ir.ImplInfo](m.ImportedImpls, anc)
+		}
+	}
+}
+
+// moduleHasImportedImpl reports whether m.ImportedImpls already has an entry for
+// the (recvPkg, recvName) x (ifacePkg, ifaceName) pair — the ImportedImpls
+// counterpart of moduleHasImpl, used to dedup the direct-import and transitive-
+// closure collection paths.
+func moduleHasImportedImpl(m @ir.Module, recvPkg *[]readonly char, recvName *[]readonly char,
+		ifacePkg *[]readonly char, ifaceName *[]readonly char) bool {
+	if m == nil { return false }
+	for i := 0; i < len(m.ImportedImpls); i++ {
+		var info @ir.ImplInfo = m.ImportedImpls[i]
+		if info == nil { continue }
+		if !irutil.CharEq(info.RecvPkg, recvPkg) { continue }
+		if !irutil.CharEq(info.RecvTypeName, recvName) { continue }
+		if !irutil.CharEq(info.IfacePkg, ifacePkg) { continue }
+		if !irutil.CharEq(info.IfaceName, ifaceName) { continue }
+		return true
+	}
+	return false
+}
+
+// RegisterImportedImpls collects the impls of the given packages into
+// m.ImportedImpls so a generic body monomorphized at the consumer can upcast a
+// receiver to an interface defined in a TRANSITIVELY-imported package: the
+// upcast needs the imported impl's vtable symbol wired (findImplVtableName), and
+// codegen emits the matching `external constant` decl that links to the impl's
+// owning TU.  collectImportedImplsFromDecl normally runs only over the
+// consumer's DIRECT imports (registerImportFieldsAndFuncs); without this a
+// transitive-package upcast inside a monomorphized generic body produced a nil
+// vtable (SIGSEGV).  Deduped (collectImportedImplsFromDecl skips a pair already
+// present) and locally-covered entries are skipped at codegen.
+func RegisterImportedImpls(aliases @[]@[]char, paths @[]@[]char, files *[]@ast.File, gc @GenCtx) {
+	for k := 0; k < len(aliases); k++ {
+		var file @ast.File = files[k]
+		if file == nil || len(file.Decls) == 0 { continue }
+		for i := 0; i < len(file.Decls); i++ {
+			var d @ast.Decl = file.Decls[i]
+			if d.Kind == ast.DECL_IMPL {
+				collectImportedImplsFromDecl(gc, d, paths[k], gc.Mod)
+			}
+		}
+	}
+}
+
+// implDtorFuncName builds the qualified dtor name for an impl's
+// receiver struct: `<pkgShort>.__dtor_<recvName>`. Same pattern as
+// dtorNameForType for a TYP_STRUCT. The function may not exist
+// for the receiver type (NeedsDestruction == false); codegen /
+// VM lower handle the absence by emitting a null slot 0.
+func implDtorFuncName(pkgShort *[]readonly char, recvName *[]readonly char) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(pkgShort)
+	cb.Write(".__dtor_")
+	irutil.WriteStructLeafToken(cb, recvName)
+	return buf.CopyStr(cb.String())
+}
+
+// methodFuncName builds the IR-level qualified name for a method:
+// `<pkgShort>.<recvTypeName>.<methodName>`. Mirrors methodQualName
+// in gen_method.bn — kept separate to avoid coupling the impl
+// codepath to the method-decl codepath.
+func methodFuncName(pkgShort *[]readonly char, recvName @[]char, methodName @[]char) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(pkgShort)
+	cb.WriteByte('.')
+	cb.Write(recvName)
+	cb.WriteByte('.')
+	cb.Write(methodName)
+	return buf.CopyStr(cb.String())
+}

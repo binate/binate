@@ -1,0 +1,128 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/irsym"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// RegisterSelfTypes registers type definitions from a package's own
+// .bni file: struct types, type aliases, and constants that are
+// declared in the .bni but not redefined in the .bn files.  The
+// .bn-side compiler still has to see them so cross-file references
+// inside the same package resolve at IR-gen.
+func RegisterSelfTypes(c @types.Checker, bniFile @ast.File, gc @GenCtx) {
+	if bniFile == nil { return }
+
+	// gc is the threaded per-compilation context; gc.Mod is the module
+	// GeneratePackage will fill — RegisterSelfTypes runs just before it on
+	// that same module — so self structs/aliases land in the module's own
+	// per-module tables.  gc.Mod.PkgPath isn't set until GeneratePackage, so
+	// set gc.PkgPath to the .bni's package name (the SAME fully-qualified
+	// value GeneratePackage will use) for the duration of this pass — keeping
+	// qualifyForCurrentModule / lookupStructIdx consistent — then restore it.
+	var savedPkgPath @[]char = gc.PkgPath
+	gc.PkgPath = mangle.PkgPathFromQuoted(bniFile.PkgName)
+	// Install the .bni's OWN imports so a cross-package alias/field TARGET
+	// (`type X = sys.Y`, where `sys` is this file's source alias) resolves to the
+	// target's full package path — without it the target reads as the bare `sys.Y`,
+	// misses lookupTypeAlias, and falls to resolveTypeExpr's TypInt() scalar
+	// fallback, mis-lowering the self type as i64.  Mirrors the per-file
+	// pushFileImports in RegisterImports / RegisterStructTypes.
+	var selfSnap AliasMapSnapshot = pushFileImports(gc.Mod, bniFile)
+
+	// Pass 1: register struct type names (so self-references resolve)
+	for i := 0; i < len(bniFile.Decls); i++ {
+		var d @ast.Decl = bniFile.Decls[i]
+		if d.Kind == ast.DECL_TYPE && d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+			if lookupStructIdx(gc, d.Name) < 0 {
+				var qn @[]char = qualifyForCurrentModule(gc, d.Name)
+				var ms irsym.ModuleStruct
+				ms.Name = qn
+				var noFields3 @[]@types.Field
+				ms.Typ = types.MakeStructType(qn, noFields3)
+				gc.Mod.Structs = slices.Append[irsym.ModuleStruct](gc.Mod.Structs, ms)
+			}
+		} else if d.Kind == ast.DECL_TYPE && d.IsForward && len(d.TypeParams) == 0 {
+			// An opaque-EXPORTED type: `type X` with no body in THIS package's .bni,
+			// whose full struct lives in the .bn.  Pre-register the struct name stamped
+			// opaque-exported (GeneratePackage's field pass fills its fields from the
+			// .bn), so gen_dtor_emit force-emits X's public dtor even when X needs no
+			// destruction.  That is the opaque-export guarantee: an importer holding an
+			// opaque `@X` can always RefDec through a real dtor (emitManagedPtrRefDec's
+			// opaque arm) instead of a null-dtor free that leaks X's managed fields.
+			if lookupStructIdx(gc, d.Name) < 0 {
+				var qn @[]char = qualifyForCurrentModule(gc, d.Name)
+				var ms irsym.ModuleStruct
+				ms.Name = qn
+				var noFieldsOpq @[]@types.Field
+				var st @types.Type = types.MakeStructType(qn, noFieldsOpq)
+				st.OpaqueExportPkg = buf.CopyStr(gc.PkgPath)
+				ms.Typ = st
+				gc.Mod.Structs = slices.Append[irsym.ModuleStruct](gc.Mod.Structs, ms)
+			}
+		}
+	}
+
+	// Pass 2: populate struct fields, register type aliases and constants
+	for i := 0; i < len(bniFile.Decls); i++ {
+		var d @ast.Decl = bniFile.Decls[i]
+
+		// Struct field population.  A generic struct decl is skipped — its fields
+		// stay in AST form until an instantiation resolves them under the right
+		// type-param context (ensureInstantiatedStruct); resolving them here with no
+		// binders would spuriously instantiate a bogus all-`int` version of any
+		// generic-typed field.  Mirrors gen_module's second pass and gen_import.
+		if d.Kind == ast.DECL_TYPE && d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+			if len(d.TypeParams) > 0 {
+				continue
+			}
+			var si int = lookupStructIdx(gc, d.Name)
+			if si >= 0 && len(d.TypeRef.Fields) > 0 {
+				var styp @types.Type = gc.Mod.Structs[si].Typ
+				if len(styp.Fields) == 0 {
+					var fields @[]@types.Field
+					for j := 0; j < len(d.TypeRef.Fields); j++ {
+						var f @types.Field = make(types.Field)
+						f.Name = d.TypeRef.Fields[j].Name
+						f.Type = resolveTypeExpr(gc, d.TypeRef.Fields[j].Type)
+						fields = slices.Append[@types.Field](fields, f)
+					}
+					styp.Fields = fields
+					gc.Mod.Structs[si].Fields = fields
+				}
+			}
+		}
+
+		// Type aliases and named distinct non-struct types
+		// (e.g., the alias `type X = int`, the distinct `type Type int`).
+		if isNonStructTypeDecl(d) {
+			// Check if already registered
+			var aliasFound bool = false
+			for j := 0; j < len(gc.Mod.TypeAliases); j++ {
+				if irutil.CharEq(gc.Mod.TypeAliases[j].Name, d.Name) {
+					aliasFound = true
+				}
+			}
+			if !aliasFound {
+				var ta irsym.ModuleTypeAlias
+				ta.Name = buf.CopyStr(d.Name)
+				ta.Typ = typeDeclEntryType(gc, ta.Name, d)
+				gc.Mod.TypeAliases = slices.Append[irsym.ModuleTypeAlias](gc.Mod.TypeAliases, ta)
+			}
+		}
+
+		// Constants
+		if d.Kind == ast.DECL_CONST {
+			genConst(gc, c, d)
+		}
+		if d.Kind == ast.DECL_GROUP {
+			genConstGroup(gc, c, d)
+		}
+	}
+	popFileImports(gc.Mod, selfSnap)
+	gc.PkgPath = savedPkgPath
+}

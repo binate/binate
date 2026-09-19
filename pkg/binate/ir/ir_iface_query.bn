@@ -1,0 +1,263 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/buf"
+import "pkg/std/strings"
+
+// Interface-registry query helpers: read a module.Interfaces registry to
+// answer vtable-shape questions.  Data-model queries (used by the backends
+// and by irgen), so they live in ir.
+
+// IfaceFullVtableSize returns the total number of slots in a
+// `(R, X)` vtable for the interface (pkg, name) under the concat
+// layout:
+//   size(X) = 2 (any-block: dtor slot + *TypeInfo slot)
+//           + sum(size(P) for P in X.Parents)
+//           + len(X's own methods)
+// The any-block is two words — slot 0 the dtor handle, slot 1 the
+// concrete type's *TypeInfo (RTTI, spec §7.13.8/§7.13.14) — so own
+// methods begin two slots past each (nested) any-block.
+// Returns 0 if the interface isn't registered (caller falls back).
+func IfaceFullVtableSize(m @Module, pkg *[]readonly char, name *[]readonly char) int {
+	var idx int = ResolveModuleInterface(m, pkg, name)
+	if idx < 0 { return 0 }
+	var n int = 2
+	for i := 0; i < len(m.Interfaces[idx].ParentPkgs); i++ {
+		n = n + IfaceFullVtableSize(m, m.Interfaces[idx].ParentPkgs[i], m.Interfaces[idx].ParentNames[i])
+	}
+	n = n + len(m.Interfaces[idx].MethodNames)
+	return n
+}
+
+// IfaceParentNames is the companion to IfaceParentPkgs.
+func IfaceParentNames(m @Module, pkg *[]readonly char, name *[]readonly char) @[]@[]char {
+	var idx int = ResolveModuleInterface(m, pkg, name)
+	if idx < 0 {
+		var empty @[]@[]char
+		return empty
+	}
+	return m.Interfaces[idx].ParentNames
+}
+
+// IfaceParentPkgs returns the canonical-pkg list of the interface
+// (pkg, name)'s declared parents, in declaration order.  Empty if
+// not registered or no parents.
+func IfaceParentPkgs(m @Module, pkg *[]readonly char, name *[]readonly char) @[]@[]char {
+	var idx int = ResolveModuleInterface(m, pkg, name)
+	if idx < 0 {
+		var empty @[]@[]char
+		return empty
+	}
+	return m.Interfaces[idx].ParentPkgs
+}
+
+// IfaceParentSlotOffset returns the absolute slot index at which
+// target's full vtable starts within src's concat-laid-out
+// vtable, or -1 if target is not a (transitive) parent of src.
+// Slots 0-1 of src's vtable are src's own any-block (dtor, then
+// *TypeInfo); each parent's full vtable is inlined recursively in
+// declaration order.  Used by codegen / VM to lower OP_IFACE_UPCAST.
+//
+// Universe `any`: every iv is implicitly upcastable to
+// `*any` / `@any`, with offset 0 — the source vtable's any-block
+// (dtor + *TypeInfo) is exactly the two-word `any` vtable (any has
+// no methods, so only the any-block matters).  Returning 0 here
+// means the OP_IFACE_UPCAST lowering reuses the source iv's vtable
+// pointer unchanged; the result is bit-identical to the source,
+// just type-relabeled.
+func IfaceParentSlotOffset(m @Module, srcPkg *[]readonly char, srcName *[]readonly char,
+		targetPkg *[]readonly char, targetName *[]readonly char) int {
+	if len(targetPkg) == 0 && irutil.CharEq(targetName, "any") {
+		return 0
+	}
+	// Same canonical interface — e.g. a managed<->raw decay (`@X -> *X`),
+	// which still routes through the upcast path because
+	// ifaceValueTypesAgree distinguishes managed vs raw on Kind.  X's
+	// vtable IS the target's, so the offset is 0 (like upcasting to
+	// `any`).  Without this the parent-chain walk returns -1 (X is not
+	// its own parent), and the upcast lowerings would feed -1 to a vtable
+	// GEP — silent corruption.  The lowerings now hard-assert offset >= 0,
+	// so a valid upcast MUST resolve same-interface to 0 here.
+	if irutil.CharEq(CanonicalIfacePkg(m, srcPkg, srcName),
+			CanonicalIfacePkg(m, targetPkg, targetName)) &&
+			irutil.CharEq(CanonicalIfaceName(m, srcPkg, srcName),
+					CanonicalIfaceName(m, targetPkg, targetName)) {
+		return 0
+	}
+	return parentSlotOffsetFromBase(m, srcPkg, srcName, targetPkg, targetName, 0)
+}
+
+// IfaceOwnMethodNames returns the OWN method names of the
+// interface (pkg, name), in declaration order — the same list
+// IR-gen records during DECL_INTERFACE collection.  Inherited
+// methods are not included; walk parents (via IfaceParentPkgs /
+// IfaceParentNames) for the full set.
+func IfaceOwnMethodNames(m @Module, pkg *[]readonly char, name *[]readonly char) @[]@[]char {
+	return LookupModuleInterface(m, pkg, name)
+}
+
+// LookupVtableSlotName returns the symbol name a vtable slot
+// for `methodFuncName` should point at: the thunk's name if the
+// method is a value-receiver method that has a generated thunk
+// in m.Funcs, otherwise `methodFuncName` itself.  Single source
+// of truth for the codegen vtable emitter and the VM
+// vtable-lowering pass — both call this so the LLVM global and
+// vm.IfaceVtables agree on which symbol fills each slot.
+func LookupVtableSlotName(m @Module, methodFuncName @[]char) @[]char {
+	if m == nil { return methodFuncName }
+	var thunkName @[]char = ThunkNameForMethod(methodFuncName)
+	if LookupModuleFunc(m, thunkName) != nil {
+		return thunkName
+	}
+	return methodFuncName
+}
+
+// CanonicalIfaceName resolves an interface (pkg, name) through the
+// alias chain and returns the chain tail's name. If the input
+// doesn't refer to a registered interface, returns a fresh copy of
+// the input name — at worst the symbol mangles on the impl-site
+// reference.
+func CanonicalIfaceName(m @Module, pkg *[]readonly char, name *[]readonly char) @[]char {
+	var idx int = ResolveModuleInterface(m, pkg, name)
+	if idx < 0 {
+		return buf.CopyStr(name)
+	}
+	return buf.CopyStr(m.Interfaces[idx].Name)
+}
+
+// CanonicalIfacePkg returns the canonical package short-name for
+// the chain-tail of (pkg, name). Used by the vtable
+// mangling (`__ivt.bn_V...`)
+// to ensure aliases collapse to the underlying interface's
+// package. If lookup fails, returns the input pkg unchanged.
+func CanonicalIfacePkg(m @Module, pkg *[]readonly char, name *[]readonly char) @[]char {
+	var idx int = ResolveModuleInterface(m, pkg, name)
+	if idx < 0 {
+		return buf.CopyStr(pkg)
+	}
+	return buf.CopyStr(m.Interfaces[idx].Pkg)
+}
+
+// LookupModuleInterface returns the cached method-name list for the
+// interface (pkg, name), or an empty slice if not found. Follows
+// alias chains. Lookup is keyed on (Pkg, Name).
+func LookupModuleInterface(m @Module, pkg *[]readonly char, name *[]readonly char) @[]@[]char {
+	var idx int = ResolveModuleInterface(m, pkg, name)
+	if idx < 0 {
+		var empty @[]@[]char
+		return empty
+	}
+	return m.Interfaces[idx].MethodNames
+}
+
+// parentSlotOffsetFromBase mirrors findInterfaceMethodFromBase but
+// returns the offset of target's vtable origin (its any-block
+// slot) within the outermost vtable.  The walk does NOT inspect
+// own methods — only the parent chain — because target is the
+// origin of a sub-vtable, not a method.
+func parentSlotOffsetFromBase(m @Module, srcPkg *[]readonly char, srcName *[]readonly char,
+		targetPkg *[]readonly char, targetName *[]readonly char, base int) int {
+	var idx int = ResolveModuleInterface(m, srcPkg, srcName)
+	if idx < 0 { return -1 }
+	// Skip src's own two-word any-block (dtor + *TypeInfo) to reach
+	// the first inlined parent sub-vtable.
+	var cursor int = base + 2
+	for i := 0; i < len(m.Interfaces[idx].ParentPkgs); i++ {
+		var pPkg @[]char = m.Interfaces[idx].ParentPkgs[i]
+		var pName @[]char = m.Interfaces[idx].ParentNames[i]
+		var canonPkg @[]char = CanonicalIfacePkg(m, pPkg, pName)
+		var canonName @[]char = CanonicalIfaceName(m, pPkg, pName)
+		if irutil.CharEq(canonPkg, targetPkg) && irutil.CharEq(canonName, targetName) {
+			return cursor
+		}
+		var r int = parentSlotOffsetFromBase(m, canonPkg, canonName, targetPkg, targetName, cursor)
+		if r >= 0 { return r }
+		cursor = cursor + IfaceFullVtableSize(m, canonPkg, canonName)
+	}
+	return -1
+}
+
+// ResolveModuleInterface returns the index in m.Interfaces of
+// the entry for (pkg, name), following any alias chain. Returns -1
+// on not-found or cycle (defensive cap at 32 hops). Lookup is
+// keyed on (Pkg, Name) so cross-package interface refs
+// resolve to the imported package's entry without colliding with
+// a same-named local interface.
+func ResolveModuleInterface(m @Module, pkg *[]readonly char, name *[]readonly char) int {
+	var found int = LookupModuleInterfaceIndex(m, pkg, name)
+	if found < 0 { return -1 }
+	var curPkg @[]char = buf.CopyStr(pkg)
+	var curName @[]char = buf.CopyStr(name)
+	for hop := 0; hop < 32; hop++ {
+		var alias @[]char = m.Interfaces[found].AliasTarget
+		if len(alias) == 0 { return found }
+		curPkg = m.Interfaces[found].AliasTargetPkg
+		curName = alias
+		found = LookupModuleInterfaceIndex(m, curPkg, curName)
+		if found < 0 { return -1 }
+	}
+	return -1
+}
+
+// ThunkNameForMethod returns the qualified IR-level name for
+// the iv-dispatch thunk of a value-receiver method.  Input is
+// the method's qualified name `<recvPkg>.<recvName>.<method>`;
+// output inserts `__bn_thunk_` before the method part:
+// `<recvPkg>.<recvName>.__bn_thunk_<method>`.  The `__bn_`
+// prefix marks compiler-generated names.
+func ThunkNameForMethod(methodFuncName *[]readonly char) @[]char {
+	var lastDot int = -1
+	for i := 0; i < len(methodFuncName); i++ {
+		if methodFuncName[i] == '.' { lastDot = i }
+	}
+	var cb @strings.Builder = strings.NewBuilder()
+	if lastDot < 0 {
+		// Defensive: unqualified method name.  Prefix the whole
+		// name with the synthetic marker.
+		cb.Write("__bn_thunk_")
+		cb.Write(methodFuncName)
+		return buf.CopyStr(cb.String())
+	}
+	for i := 0; i <= lastDot; i++ {
+		cb.WriteByte(methodFuncName[i])
+	}
+	cb.Write("__bn_thunk_")
+	for i := lastDot + 1; i < len(methodFuncName); i++ {
+		cb.WriteByte(methodFuncName[i])
+	}
+	return buf.CopyStr(cb.String())
+}
+
+// LookupModuleInterfaceIndex returns the index of the entry in
+// m.Interfaces matching (pkg, name), or -1 if absent. No alias-
+// chain resolution.  The pkg argument is expanded from an import
+// alias to the full package path (resolveImportPkg) so a use-site
+// reference written with the short alias matches the interface's
+// full-path-keyed registry entry (full-path mangling — see
+// pkg/binate/mangle).
+func LookupModuleInterfaceIndex(m @Module, pkg *[]readonly char, name *[]readonly char) int {
+	var fpkg @[]char = ResolveImportPkg(m, pkg)
+	for i := 0; i < len(m.Interfaces); i++ {
+		if !irutil.CharEq(m.Interfaces[i].Pkg, fpkg) { continue }
+		if !irutil.CharEq(m.Interfaces[i].Name, name) { continue }
+		return i
+	}
+	return -1
+}
+
+// ResolveImportPkg maps an import alias to its full package path via
+// m's import-alias map (m.ImportAliasNames / m.ImportAliasPaths — parallel
+// arrays keyed alias short-name -> full path).  Returns a copy of the input
+// unchanged when it isn't a known import alias — covering same-package
+// references, names that are already full paths, and the universe package.
+// This is the single point where the short source-level alias becomes the
+// full path in the IR namespace (full-path mangling; see pkg/binate/mangle).
+func ResolveImportPkg(m @Module, alias *[]readonly char) @[]char {
+	for i := 0; i < len(m.ImportAliasNames); i++ {
+		if irutil.Streq(m.ImportAliasNames[i], alias) {
+			return m.ImportAliasPaths[i]
+		}
+	}
+	return buf.CopyStr(alias)
+}

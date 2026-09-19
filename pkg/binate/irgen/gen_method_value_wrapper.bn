@@ -1,0 +1,193 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Method-value WRAPPER synthesis: the hand-built closure Func that forwards a
+// bound receiver + user args to the underlying method.  The call-site lowering
+// (genMethodValue) and helpers live in gen_method_value.bn.
+
+// synthMethodValueWrapper hand-builds the wrapper Func.  Its
+// params are [receiver, user_args...]; body is a single block
+// that calls the underlying method with all params and returns
+// the result.  Marked IsClosure so the B.2 closure machinery
+// emits the per-shape shim in each backend.
+func synthMethodValueWrapper(gc @GenCtx, wrapperName @[]char, methodQName @[]char,
+		recvTyp @types.Type, m @types.Method) {
+	var noResults @[]@types.Type
+	var emptyParams @[]@ir.Param
+	var f @ir.Func = ir.NewFunc(gc.PkgPath, wrapperName, emptyParams, noResults)
+	f.Line = 0 // synthetic
+	f.Mod = gc.Mod // so the forward pre-check pad can register a param's struct dtor
+
+	// Receiver param + each user param.
+	var params @[]@ir.Param
+	var recvParam @ir.Param = ir.NewParam(f, "recv", recvTyp)
+	params = slices.Append[@ir.Param](params, recvParam)
+	for i := 1; i < len(m.FuncType.Params); i++ {
+		var up @ir.Param = ir.NewParam(f, m.FuncType.Params[i].Name, m.FuncType.Params[i].Type)
+		params = slices.Append[@ir.Param](params, up)
+	}
+	f.Params = params
+	f.Results = m.FuncType.Results
+	if len(m.FuncType.Results) > 1 {
+		f.MultiReturnType = irutil.MakeMultiReturnStructType(m.FuncType.Results)
+	}
+	f.IsClosure = true
+	f.NumCaptureParams = 1
+	f.ClosureStruct = buildMethodValueClosureStruct(gc.PkgPath, wrapperName, recvTyp)
+
+	// Body: a single entry block with the forward call.  Mirror
+	// genFunc's param-handling: alloca + store each param into a
+	// slot so the VM's reg machinery (which expects param values
+	// to land in regs[paramID] after the entry-block stores) sees
+	// the same shape it sees for normal user-written functions.
+	// Then load each slot to produce the arg Instrs for the
+	// underlying call.
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var paramSlots @[]@ir.Instr = make_slice(@ir.Instr, len(params))
+	for i := 0; i < len(params); i++ {
+		var slot @ir.Instr = entry.EmitAlloc(params[i].Typ)
+		slot.ParamIndex = i + 1
+		// The incoming receiver/param value: a by-ID OP_PARAM placeholder whose
+		// store into its slot memcpy's from the `ptr byval(<T>)` pointer for a
+		// byval-aggregate param (e.g. a > 16-byte sret value receiver captured by
+		// value) — newParamRef sets that flag off the param type.
+		var pr @ir.Instr = ir.NewParamRef(params[i])
+		entry.EmitStore(slot, pr)
+		paramSlots[i] = slot
+	}
+	var args @[]@ir.Instr = make_slice(@ir.Instr, len(params))
+	for i := 0; i < len(params); i++ {
+		args[i] = entry.EmitLoad(paramSlots[i], params[i].Typ)
+	}
+	// Materialize-capture bridge: when the closure captured the receiver BY
+	// VALUE (a non-ident value receiver on a pointer-receiver method — see
+	// genMethodValue), `recvTyp` is the VALUE type but the method still takes
+	// `*T`.  Alloca the captured value in the wrapper frame and pass its address
+	// (valid for this synchronous call).  Mirrors applyReceiverConversion's
+	// value→pointer path.  A no-op for a directly-captured `*T` / `@T` receiver
+	// (recvTyp is a pointer kind, not named), which passes through unchanged.
+	var methodRecvTyp @types.Type = m.FuncType.Params[0].Type
+	if len(args) > 0 && recvTyp != nil && methodRecvTyp != nil && isNamedTypeKind(recvTyp) &&
+			methodRecvTyp.Kind == types.TYP_POINTER {
+		var recvSlot @ir.Instr = entry.EmitAlloc(recvTyp)
+		entry.EmitStore(recvSlot, args[0])
+		args[0] = recvSlot
+	}
+	// A VALUE-struct receiver with managed fields is CONSUMED by the method (the
+	// move model — dtor'd at the method's scope exit, no entry RefInc), so RefInc
+	// its fields into an OWNED copy before forwarding, exactly as genMethodCall
+	// does.  The wrapper's receiver is only a shallow view of the closure's captured
+	// struct (writeCaptures copies the capture bytes, no RefInc), so without this
+	// the method's exit dtor over-releases the closure's fields — a double-free /
+	// use-after-free on a later call.  Mutually exclusive with the value→pointer
+	// capture bridge above (that path has methodRecvTyp a POINTER — not
+	// needsStructCopy — which the method borrows).  recvCopySlot (nil unless this
+	// fires) is the copy the wrapper OWNS: released by the forward pre-check's pad on
+	// overflow (the method never dtors it then).
+	//
+	// GATE on `methodRecvTyp` (the method's declared receiver): it is a value struct
+	// only when the method CONSUMES the receiver by value — the move-model case that
+	// needs the copy.  A value receiver on a POINTER method has methodRecvTyp == `*T`
+	// (not needsStructCopy) and was already handled by the capture bridge above (an
+	// address the method borrows), so this must NOT fire for it — gating on `recvTyp`
+	// instead would wrongly fire (recvTyp is the value struct there) and double-handle
+	// the receiver.  But COPY with `recvTyp` (the wrapper's receiver PARAM type =
+	// params[0].Typ): for a GENERIC receiver genMethodValue remapped the captured type
+	// to its IR-gen mangled name (`Box__bn_inst__int`), while methodRecvTyp still
+	// carries the checker's raw `Box[int]` (an invalid backend identifier).  The pad,
+	// closure struct, and paramSlots all use the remapped type, so the copy must too.
+	var recvCopySlot @ir.Instr = nil
+	if len(args) > 0 && needsStructCopy(methodRecvTyp) {
+		recvCopySlot = entry.EmitAlloc(recvTyp)
+		entry.EmitStore(recvCopySlot, args[0])
+		emitStructCopy(f, entry, recvCopySlot, recvTyp)
+		// The __copy CALL emitStructCopy just emitted pushes a VM frame that can
+		// overflow (a narrow window: the wrapper frame fit but leaves less than the
+		// copy's frame).  Pad that call so the overflow releases the wrapper's OWNED
+		// moved params (idx >= 1) instead of orphaning them.  recvCopySlot is nil in
+		// THIS pad: at the copy call its managed fields are not yet RefInc'd (the copy
+		// IS the RefInc — a push overflow faults before its body runs), so releasing it
+		// would over-release the closure's shared captured fields.  The forward
+		// pre-check below installs the fuller pad (params + recvCopySlot) once the copy
+		// has made recvCopySlot owned.  The two pads sit on different ops; exactly one
+		// faults per execution, so no value is released twice.
+		attachMethodValueForwardPad(f, entry, params, paramSlots, nil)
+		args[0] = entry.EmitLoad(recvCopySlot, recvTyp)
+	}
+	// Recoverable-stack-overflow pre-check for the forward: the wrapper forwards its
+	// owned @Iface / managed-field-struct params (and the value-struct receiver copy)
+	// to the method BY MOVE, so if the method's frame push overflows it never starts
+	// to release them.  Fault BEFORE the forward — attachMethodValueForwardPad then
+	// releases those owned values instead of orphaning them (the param loads, capture
+	// bridge, and receiver copy above are all SP-neutral, so the check reads the
+	// vm.SP the push will use).  VM-only: the compiled backends no-op OP_STACK_CHECK.
+	entry.EmitStackCheck(methodQName)
+	attachMethodValueForwardPad(f, entry, params, paramSlots, recvCopySlot)
+	if len(m.FuncType.Results) == 0 {
+		// Void return.
+		var voidArgs @[]@ir.Instr
+		entry.EmitCall(methodQName, args, types.TypVoid())
+		attachEmptyFaultPad(f, entry)
+		entry.EmitReturn(voidArgs)
+	} else if len(m.FuncType.Results) == 1 {
+		var callResult @ir.Instr = entry.EmitCall(methodQName, args, m.FuncType.Results[0])
+		attachEmptyFaultPad(f, entry)
+		var retVals @[]@ir.Instr = make_slice(@ir.Instr, 1)
+		retVals[0] = callResult
+		entry.EmitReturn(retVals)
+	} else {
+		// Multi-return forward: extract each result field from the
+		// packed call-result tuple and re-return them as N separate
+		// values through EmitReturnTyped — mirroring gen_return.bn's
+		// `return f(...)` path (genReturnStmt).  Handing EmitReturn a
+		// SINGLE packed-struct arg instead would misroute the native
+		// backends' OP_RETURN to the single-aggregate handler, which
+		// getOperand's the tuple as a POINTER; but a multi-return call
+		// result keeps its bytes DIRECTLY in the spill slot (see
+		// common.SpillHoldsAggregatePointer), so that handler
+		// dereferences the first field's value as an address → SIGSEGV.
+		// The extracted N-value shape routes to emitMultiReturnPack /
+		// the ≤64-byte tuple packers instead, which read each field at
+		// its spill offset.
+		var callResult @ir.Instr = entry.EmitCall(methodQName, args, f.MultiReturnType)
+		attachEmptyFaultPad(f, entry)
+		var retVals @[]@ir.Instr = make_slice(@ir.Instr, len(m.FuncType.Results))
+		for i := 0; i < len(m.FuncType.Results); i++ {
+			var fldTyp @types.Type = m.FuncType.Results[i]
+			if callResult.Typ != nil && i < len(callResult.Typ.Fields) {
+				fldTyp = callResult.Typ.Fields[i].Type
+			}
+			retVals[i] = entry.EmitExtract(callResult, i, fldTyp)
+		}
+		entry.EmitReturnTyped(retVals, f.MultiReturnType)
+	}
+
+	// Register the FuncSig so any cross-package call-site
+	// lookups resolve the synthetic name.
+	registerMethodValueWrapperSig(gc, f)
+	gc.Mod.AddFunc(f)
+}
+
+// registerMethodValueWrapperSig adds a FuncSig entry to
+// Module.FuncSigs for the wrapper.  Mirrors
+// registerLiftedFuncSigWithCaptures (gen_func_lit.bn).
+func registerMethodValueWrapperSig(gc @GenCtx, f @ir.Func) {
+	var sig ir.FuncSig
+	sig.Name = qualifyForCurrentModule(gc, f.Name)
+	var sigParams @[]@types.Type
+	for j := 0; j < len(f.Params); j++ {
+		sigParams = slices.Append[@types.Type](sigParams, f.Params[j].Typ)
+	}
+	sig.Params = sigParams
+	sig.Results = f.Results
+	if len(f.Results) > 1 {
+		sig.MultiReturnType = f.MultiReturnType
+	}
+	ir.RegisterFuncSig(gc.Mod, sig)
+}

@@ -1,0 +1,105 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/buf"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Any-block support for interface-value boxing: recognizing the universe `any`,
+// synthesizing a (T, any) ImplInfo on demand (with the right slot-0 dtor for a
+// name-less owning pointee), and the receiver-name helpers wrapAsIfaceValue uses
+// to key that row.  The boxing entry point (wrapAsIfaceValue) and the type-expr
+// resolvers live in gen_iface.bn.
+
+// isUniverseAny reports whether `iface` is the universe `any`
+// interface (TYP_INTERFACE with Pkg="" and Name="any").  Used by
+// wrapAsIfaceValue to recognize when to synthesize an ImplInfo on
+// the fly (plan §6).
+func isUniverseAny(iface @types.Type) bool {
+	if iface == nil { return false }
+	if iface.Kind != types.TYP_INTERFACE { return false }
+	if len(iface.Pkg) != 0 { return false }
+	return irutil.CharEq(iface.Name, "any")
+}
+
+// boxSlot0DtorName returns the slot-0 destructor symbol for an interface value whose
+// boxed dynamic type has pointee/value type `recvTyp` and nominal struct name
+// `structName` (the POINTEE's name — for a named-distinct pointer receiver, that is the
+// underlying struct's name, NOT the named wrapper's).  A struct pointee keys on its
+// per-type impl-dtor (`implDtorFuncName`); a managed slice / managed ptr / managed func-
+// value / managed-iface / ARRAY pointee has no nominal impl-dtor and keys on the
+// pointee's STRUCTURAL drop instead — `__dtor_ms_<elem>` (RefDec the backing) for a
+// managed slice, `__dtor_mp_<T>` for a managed ptr, `__dtor_arr<N>_<elem>` for an array,
+// the single `__dtor_func` for a managed func-value.  Else the owning managed box finds a
+// null slot 0 and LEAKS the pointee (§9 / FU2).
+//
+// The ARRAY case is UNCONDITIONAL — it does NOT gate on the element being destructible.
+// It must not: this helper is called for the own-impl path at impl-COLLECTION time, where
+// a struct element's destructibility is unknown (fields aren't laid out yet), so a
+// `NeedsDestruction()` guard here would answer "false" for an array-of-destructible-struct
+// (`@([N]S)`, S with a managed field) and fall through to `__dtor_<wrapper>` → a null slot
+// 0 → leak every element's field.  Whether the array's dtor is actually LIVE is decided by
+// codegen's dtor-EMISSION gating (post-layout): a destructible array emits `__dtor_arrN_S`
+// (real slot); a plain `@([N]int)` emits nothing, so implDtorSlotSym yields a null slot 0
+// (correct — its box is freed with nothing to deep-clean).  dtorNameForType resolves a
+// named-distinct / readonly / alias recvTyp to the same symbol the dtor emitter produced.
+//
+// The dtor body is generated in THIS module (generateDtors → m.PkgPath), so `f.Name` is
+// `QualifyName(m.PkgPath, "__dtor_...")`; implDtorSlotSym matches DtorFuncName verbatim,
+// so qualify to m.PkgPath — NOT recvPkg (a name-less identity's `rt` qualifier), where no
+// dtor lives.  A raw `*any` box or a borrowing raw-slice pointee never emits a body
+// (registerPending* runs only on the owning managed path), so the slot stays null
+// (correct: those borrow their data).
+//
+// Shared by the erased-`any` path (ensureAnyImplInfo, called at BOXING time) and the
+// named-distinct own-impl path (collectImplsFromDecl, called at COLLECTION time) so both
+// agree on every pointee shape — a divergence here is exactly a leak.
+func boxSlot0DtorName(m @ir.Module, recvPkg *[]readonly char, structName *[]readonly char,
+		recvTyp @types.Type) @[]char {
+	var dtorName @[]char = implDtorFuncName(recvPkg, structName)
+	var recvBase @types.Type = irutil.PeelTransparent(recvTyp)
+	if recvBase != nil &&
+			(recvBase.Kind == types.TYP_SLICE || recvBase.Kind == types.TYP_MANAGED_SLICE ||
+					recvBase.Kind == types.TYP_MANAGED_PTR || recvBase.Kind == types.TYP_MANAGED_FUNC_VALUE ||
+					recvBase.Kind == types.TYP_INTERFACE_VALUE_MANAGED || recvBase.Kind == types.TYP_ARRAY) {
+		dtorName = mangle.QualifyName(m.PkgPath, irutil.DtorNameForType(recvTyp))
+	}
+	return dtorName
+}
+
+// ensureAnyImplInfo appends a (recvPkg.recvName, any) ImplInfo to
+// m.Impls if no entry for that pair already exists.  The synthesized
+// info carries the receiver's dtor in DtorFuncName (or empty if T
+// has no dtor) and an empty MethodFuncs (since `any` has no methods).
+// Codegen's vtable emitter then produces `__ivt.bn_V...`
+// as `[2 x i8*]` with slot 0 = dtor (or null) and slot 1 =
+// *TypeInfo (a null placeholder until RTTI is populated).
+func ensureAnyImplInfo(m @ir.Module, recvPkg *[]readonly char, recvName *[]readonly char,
+		recvTyp @types.Type) {
+	var emptyPkg @[]char
+	var anyName @[]char = "any"
+	for i := 0; i < len(m.Impls); i++ {
+		var info @ir.ImplInfo = m.Impls[i]
+		if info == nil { continue }
+		if !irutil.CharEq(info.RecvPkg, recvPkg) { continue }
+		if !irutil.CharEq(info.RecvTypeName, recvName) { continue }
+		if !irutil.CharEq(info.IfacePkg, emptyPkg) { continue }
+		if !irutil.CharEq(info.IfaceName, anyName) { continue }
+		return
+	}
+	var dtorName @[]char = boxSlot0DtorName(m, recvPkg, recvName, recvTyp)
+	var info @ir.ImplInfo = make(ir.ImplInfo)
+	info.RecvPkg = buf.CopyStr(recvPkg)
+	info.RecvTypeName = buf.CopyStr(recvName)
+	info.IfacePkg = emptyPkg
+	info.IfaceName = buf.CopyStr(anyName)
+	info.DtorFuncName = dtorName
+	// Per-type RTTI facts (recvTyp / dtorName) go in the per-type registry, not
+	// on this (T, any) row — register coupled 1:1 with this ImplInfo append.
+	ir.RegisterTypeInfo(m, recvPkg, recvName, recvTyp, dtorName)
+	m.Impls = slices.Append[@ir.ImplInfo](m.Impls, info)
+}

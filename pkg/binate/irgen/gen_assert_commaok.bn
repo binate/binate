@@ -1,0 +1,156 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// Comma-ok concrete type-assertion lowering (`v, ok := x.(*T)` / `x.(@T)`, spec
+// §11.12 `iface.assert` in the two-result form).  Unlike the expression form
+// (gen_assert.genTypeAssert, which panics on a miss), this yields a two-field
+// {recovered, ok} value: a HIT gives {boxed pointer, true}; any MISS — an unset
+// (null) vtable or a wrong dynamic type — gives {nil, false}.
+//
+// The recovered pointer is a BORROW (no RefInc): the destructure site
+// (genShortVar / genMultiAssign) copy-RefInc's the extracted component for its
+// target (Axiom 3), balanced by that target's scope-exit release.  Registering
+// an owned temp here instead would be WRONG — the hit block's recovered value
+// is undefined on the miss path, so an unconditional end-of-statement RefDec of
+// it would release a garbage pointer.  So: no RefInc, no temp registration; the
+// {recovered, ok} struct is a plain value the destructure consumes.
+//
+// The struct is materialized with the standard alloca-merge idiom (EmitAlloc +
+// per-branch EmitGetFieldPtr/store + EmitLoad at the merge) rather than a struct
+// literal: OP_STRUCT_LIT is not lowered by the LLVM/native backends.
+
+// genTypeAssertCommaOk lowers a comma-ok EXPR_TYPE_ASSERT to a {recovered, ok}
+// struct value (field 0 = recovered `*T`/`@T`, field 1 = bool), leaving IR-gen
+// positioned in the merge block.  The result is shaped for genShortVar /
+// genMultiAssign's TYP_STRUCT destructure (multiReturnFieldTypes + EmitExtract).
+func genTypeAssertCommaOk(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr {
+	var recoveredTyp @types.Type = resolveTypeExpr(ctx.Gc, e.TypeRef)
+	var iv @ir.Instr = genExpr(ctx, b, e.X)
+	return assertCommaOkOn(ctx, ctx.CurBlock, iv, recoveredTyp)
+}
+
+// assertCommaOkOn lowers a comma-ok assertion on an ALREADY-EVALUATED interface
+// value `iv` (rather than an EXPR_TYPE_ASSERT), returning the {recovered, ok}
+// struct value at the merge block.  It splits the operand evaluation off from the
+// comma-ok body so a type switch (genTypeSwitch) — which evaluates its scrutinee
+// ONCE and asserts it against each case target — can reuse the exact assert
+// machinery without re-evaluating (and re-running the side effects of) the
+// scrutinee.  Dispatches to the concrete or interface variant by the recovered
+// target type.
+func assertCommaOkOn(ctx @GenContext, b @ir.Block, iv @ir.Instr,
+		recoveredTyp @types.Type) @ir.Instr {
+	if isInterfaceValueRecovery(recoveredTyp) {
+		return assertInterfaceCommaOkOn(ctx, b, iv, recoveredTyp)
+	}
+	return assertConcreteCommaOkOn(ctx, b, iv, recoveredTyp)
+}
+
+// assertConcreteCommaOkOn is the concrete-target `v, ok := iv.(*T)` / `.(@T)`
+// core over a pre-evaluated `iv`: a `*TypeInfo` identity compare against
+// `&__typeinfo.<T>`, materializing {recovered, ok} via the alloca-merge idiom.
+func assertConcreteCommaOkOn(ctx @GenContext, b @ir.Block, iv @ir.Instr,
+		recoveredTyp @types.Type) @ir.Instr {
+	var rawPtr @types.Type = types.MakePointerType(types.TypUint8())
+	var structTyp @types.Type = commaOkAssertStructType(recoveredTyp)
+
+	var f @ir.Func = ctx.Func
+	var slot @ir.Instr = b.EmitAlloc(structTyp)
+
+	// The vtable word (interface value index 1).  A null vtable is the `unset`
+	// state (spec iface.assert.absent): no dynamic type, a guaranteed miss.
+	var vtable @ir.Instr = b.EmitExtract(iv, types.IfaceValueVtableIndex(), rawPtr)
+	var vtNull @ir.Instr = b.EmitBinop(iropcode.OP_EQ, vtable, b.EmitConstNil(rawPtr), types.TypBool())
+	var missBlk @ir.Block = ir.AddBlock(f, "assert.ok.miss")
+	var checkBlk @ir.Block = ir.AddBlock(f, "assert.ok.check")
+	b.EmitBranch(vtNull, missBlk, checkBlk)
+
+	// checkBlk: compare the dynamic `*TypeInfo` (vtable slot 1) against
+	// `&__typeinfo.<T>` — a nominal identity compare (§11.12: exact type).
+	var slot1 @ir.Instr = checkBlk.EmitIfaceTypeInfo(iv)
+	var want @ir.Instr = checkBlk.EmitDataSymAddr(typeInfoSymFor(ctx, recoveredTyp), types.TypUint8())
+	var wrong @ir.Instr = checkBlk.EmitBinop(iropcode.OP_NE, slot1, want, types.TypBool())
+	var hitBlk @ir.Block = ir.AddBlock(f, "assert.ok.hit")
+	checkBlk.EmitBranch(wrong, missBlk, hitBlk)
+
+	var mergeBlk @ir.Block = ir.AddBlock(f, "assert.ok.merge")
+
+	// missBlk (reached from a null vtable OR a wrong type): {zero, false}.  The
+	// recovered field is dead on the miss path (ok is false), but must still be a
+	// valid IR value of recoveredTyp for the struct store + merge load — and for a
+	// SCALAR value-recovery target that is a typed zero, NOT EmitConstNil (which
+	// lowers a non-aggregate to `inttoptr 0 to i8*`, mistyping the scalar field).
+	storeCommaOkResult(missBlk, slot, recoveredTyp, emitRecoveredMiss(missBlk, recoveredTyp),
+			missBlk.EmitConstBool(false))
+	missBlk.EmitJump(mergeBlk)
+
+	// hitBlk: recover the boxed value (a borrow — no RefInc) and flag ok.  A
+	// pointer target extracts the data slot verbatim; a slice target loads the
+	// slice header through it (emitRecoveredValue).  It stays a BORROW here: the
+	// destructure (genShortVar/genMultiAssign) and the type-switch binder store
+	// (emitStoreManagedSlot) copy-acquire, so a RefInc here would double-count.
+	var recovered @ir.Instr = emitRecoveredValue(hitBlk, iv, recoveredTyp)
+	storeCommaOkResult(hitBlk, slot, recoveredTyp, recovered, hitBlk.EmitConstBool(true))
+	hitBlk.EmitJump(mergeBlk)
+
+	ctx.CurBlock = mergeBlk
+	return mergeBlk.EmitLoad(slot, structTyp)
+}
+
+// emitRecoveredMiss builds the dead placeholder for the recovered field on a
+// comma-ok / type-switch MISS.  For a scalar value-recovery target it must be a
+// typed zero: EmitConstNil lowers a non-aggregate to `inttoptr 0 to i8*`, an i8*
+// that would mistype the scalar struct field.  For a pointer / slice / iface
+// target the nil image is exactly right.
+func emitRecoveredMiss(b @ir.Block, recoveredTyp @types.Type) @ir.Instr {
+	if recoveredTyp != nil {
+		// IsInteger / IsBool / IsFloat see through a named scalar (`type Money int`),
+		// so a named-scalar value-recovery miss gets a typed zero too.
+		if recoveredTyp.IsInteger() {
+			return b.EmitConstInt(0, recoveredTyp)
+		}
+		if recoveredTyp.IsBool() {
+			return b.EmitConstBool(false)
+		}
+		if recoveredTyp.IsFloat() {
+			return b.EmitConstFloat("0.0", recoveredTyp)
+		}
+	}
+	return b.EmitConstNil(recoveredTyp)
+}
+
+// commaOkAssertStructType builds the anonymous {recovered, bool} result struct
+// for a comma-ok assertion — the shape makeMultiReturnStructType produces for a
+// two-result function, so the existing multi-return destructure handles it.
+func commaOkAssertStructType(recoveredTyp @types.Type) @types.Type {
+	var results @[]@types.Type = make_slice(@types.Type, 2)
+	results[0] = recoveredTyp
+	results[1] = types.TypBool()
+	return irutil.MakeMultiReturnStructType(results)
+}
+
+// storeCommaOkResult writes the recovered value (field 0) and ok flag (field 1)
+// into the {recovered, ok} struct at `slot` (an anonymous-struct alloca, whose
+// Binate field indices are the LLVM indices — no padding remap).
+func storeCommaOkResult(b @ir.Block, slot @ir.Instr, recoveredTyp @types.Type, recovered @ir.Instr,
+		ok @ir.Instr) {
+	b.EmitStore(b.EmitGetFieldPtr(slot, 0, recoveredTyp), recovered)
+	b.EmitStore(b.EmitGetFieldPtr(slot, 1, types.TypBool()), ok)
+}
+
+// genMultiValueSource evaluates the single RHS of a multi-target assignment
+// (`a, b := rhs` / `a, b = rhs`).  A 2-target comma-ok type assertion
+// synthesizes a {recovered, ok} struct (genTypeAssertCommaOk — no panic); every
+// other RHS is an ordinary multi-return expression (a call), evaluated normally.
+func genMultiValueSource(ctx @GenContext, b @ir.Block, e @ast.Expr, nTargets int) @ir.Instr {
+	if nTargets == 2 && e.Kind == ast.EXPR_TYPE_ASSERT {
+		return genTypeAssertCommaOk(ctx, b, e)
+	}
+	return genExpr(ctx, b, e)
+}

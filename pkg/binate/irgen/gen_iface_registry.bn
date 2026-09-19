@@ -1,0 +1,205 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/irsym"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Module-local interface registry: name → ordered method-name
+// list, plus result-type / alias / parent metadata.  Built up
+// during GeneratePackage / GenModule's first pass via
+// collectInterfaceFromDecl; consumed by impl-collection
+// (gen_impl.bn) and the use-site dispatch helpers
+// (gen_iface.bn, gen_iface_extends.bn).
+
+// (irsym.ModuleInterface — the registry entry type — and the @Module.Interfaces
+// field that holds the registry live in ir.bni, so the exported @Module
+// carries them and the backends can read interface metadata.)
+
+// collectInterfaceFromDecl records a DECL_INTERFACE's method names
+// (in source order — matches the slot ordering codegen uses for
+// the vtable global). Alias forms (`interface X = Y`) record the
+// target name only; methods are read via alias-following lookups
+// (lookupModuleInterface / findInterfaceMethod). pkgShort is the
+// short package name where this interface is declared; same-package
+// callers pass the module package path, RegisterImport passes the
+// import's alias.  file is the AST file the
+// decl was parsed from — recorded alongside a stashed generic decl so
+// ensureInstantiatedInterface can resolve the deferred method
+// signatures against the generic's own imports (see genericIfaceDeclFiles).
+func collectInterfaceFromDecl(gc @GenCtx, d @ast.Decl, pkgShort *[]readonly char, file @ast.File) {
+	if d == nil || d.Kind != ast.DECL_INTERFACE {
+		return
+	}
+	// Generic interface decls (TypeParams non-empty): stash the
+	// AST decl in gc.GenericIfaceDecls for use sites
+	// (ensureInstantiatedInterface) and impl-collection
+	// (collectImplsFromDecl's TEXPR_INSTANTIATE branch) to find.
+	// Each instantiation needs its own irsym.ModuleInterface with
+	// substituted method types — that happens lazily.  Registering
+	// the bare generic decl under the source-text name with
+	// unresolved T-typed methods would create stale data that
+	// downstream vtable / impl-satisfaction passes would
+	// mis-interpret.
+	if len(d.TypeParams) > 0 {
+		gc.GenericIfaceDecls = slices.Append[@ast.Decl](gc.GenericIfaceDecls, d)
+		gc.GenericIfaceDeclPkgs = slices.Append[@[]char](
+				gc.GenericIfaceDeclPkgs, buf.CopyStr(pkgShort))
+		gc.GenericIfaceDeclFiles = slices.Append[@ast.File](
+				gc.GenericIfaceDeclFiles, file)
+		return
+	}
+	// Resolve the declaring package to its full path so the
+	// interface identity matches full-path use-site references and
+	// the vtable mangling (full-path mangling — see pkg/binate/mangle).
+	// (The generic-decl registry above keeps the raw alias, which it
+	// queries with the same alias — a separate, internally-consistent
+	// namespace.)
+	var rpkg @[]char = ir.ResolveImportPkg(gc.Mod, pkgShort)
+	var mi irsym.ModuleInterface
+	mi.Pkg = buf.CopyStr(rpkg)
+	mi.Name = buf.CopyStr(d.Name)
+	if d.IsAlias {
+		// Interface alias. Target is a TEXPR_NAMED
+		// produced by parseInterfaceRef; copy its Name into
+		// AliasTarget so lookups can follow. For cross-package
+		// alias targets, also store the target's
+		// package; otherwise default to this interface's own
+		// package (alias to a same-package iface).
+		if d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_NAMED {
+			mi.AliasTarget = buf.CopyStr(d.TypeRef.Name)
+			if len(d.TypeRef.Pkg) > 0 {
+				mi.AliasTargetPkg = ir.ResolveImportPkg(gc.Mod, d.TypeRef.Pkg)
+			} else {
+				mi.AliasTargetPkg = buf.CopyStr(rpkg)
+			}
+		}
+		gc.Mod.Interfaces = slices.Append[irsym.ModuleInterface](
+				gc.Mod.Interfaces, mi)
+		return
+	}
+	// Register this interface's identity (Pkg + Name) in the registry
+	// BEFORE resolving its method and parent signatures.  A method
+	// whose return type is this very interface — a self-reference like
+	// `Unwrap() @Error` — resolves that type via resolveTypeExpr →
+	// isInterfaceTypeExpr, which consults gc.Mod.Interfaces; with no
+	// entry the lookup misses and `@Error` degrades to a managed
+	// pointer (MakeManagedPtrType).  The dispatch shim would then carry
+	// an `i8*` return while the method body returns a `%BnIfaceValue`,
+	// an in-module ABI mismatch.  The fully-populated entry overwrites
+	// this stub at the end.
+	var selfIdx int = len(gc.Mod.Interfaces)
+	gc.Mod.Interfaces = slices.Append[irsym.ModuleInterface](
+			gc.Mod.Interfaces, mi)
+	// Resolve method and parent signatures with the active-package
+	// context pointing at this interface's own package, so a self-
+	// referential return type (`Unwrap() @Error`) resolves against the
+	// stub above even in the cross-package RegisterAllInterfaces pre-
+	// pass — there gc.PkgPath is not yet this package, and
+	// isInterfaceTypeExpr / ifaceTypeForName fall back to
+	// CurrentImportAlias for a bare name.
+	var savedImportAlias @[]char = gc.Mod.CurrentImportAlias
+	gc.Mod.CurrentImportAlias = buf.CopyStr(pkgShort)
+	for i := 0; i < len(d.Decls); i++ {
+		var m @ast.Decl = d.Decls[i]
+		if m == nil || m.Kind != ast.DECL_FUNC {
+			continue
+		}
+		mi.MethodNames = slices.Append[@[]char](mi.MethodNames, buf.CopyStr(m.Name))
+		// Resolve result + param types in the SAME loop (same
+		// CurrentImportAlias context, after the self-stub append) so a
+		// self-referential result/param type resolves to this interface, not
+		// a degraded managed pointer.  Results flattened like params so a
+		// 0- or >=2-result method carries all its types.
+		for j := 0; j < len(m.Results); j++ {
+			mi.MethodResultsFlat = slices.Append[@types.Type](
+					mi.MethodResultsFlat, resolveTypeExpr(gc, m.Results[j]))
+		}
+		mi.MethodResultCounts = slices.Append[int](mi.MethodResultCounts, len(m.Results))
+		for j := 0; j < len(m.Params); j++ {
+			mi.MethodParamsFlat = slices.Append[@types.Type](
+					mi.MethodParamsFlat, irResolveParamType(gc, m.Params[j]))
+		}
+		mi.MethodParamCounts = slices.Append[int](mi.MethodParamCounts, len(m.Params))
+		mi.MethodParamVariadic = slices.Append[bool](mi.MethodParamVariadic, declIsVariadic(m))
+	}
+	// Record this interface's parents (in declaration order).
+	// collectInterfaceParents handles both plain (`: Parent`) and
+	// instantiated-generic (`: Container[int]`) parent refs.
+	mi.ParentPkgs, mi.ParentNames = collectInterfaceParents(gc, d, rpkg, pkgShort)
+	gc.Mod.CurrentImportAlias = savedImportAlias
+	// Overwrite the identity stub appended above with the now-complete
+	// entry (method names/results, parents).
+	gc.Mod.Interfaces[selfIdx] = mi
+}
+
+// collectInterfaceParents resolves d's extension clause (d.Interfaces)
+// to parallel (pkg, name) arrays for irsym.ModuleInterface.ParentPkgs /
+// ParentNames, in declaration order.  Each parent ref is either a
+// TEXPR_NAMED (`: Parent` / `: pkg.Parent`) or a TEXPR_INSTANTIATE
+// (`: Container[int]`); the latter is instantiated lazily via
+// ensureInstantiatedInterface and recorded under its mangled name so
+// the concat-vtable layout and the ancestor-closure walk
+// in collectImplsFromDecl reach the right (R, I) pair.  rpkg is the
+// declaring interface's resolved package (used for same-package parent
+// refs); pkgShort is the alias used to look up same-package generic
+// parent decls.  Callers set CurrentImportAlias and (for generic
+// instantiation) the type-param substitution context before calling, so
+// resolveTypeExpr resolves type-args correctly — `Container[T]` inside
+// `WideBox[int]` resolves to `Container[int]`.
+func collectInterfaceParents(gc @GenCtx, d @ast.Decl, rpkg *[]readonly char,
+		pkgShort *[]readonly char) (@[]@[]char, @[]@[]char) {
+	var parentPkgs @[]@[]char
+	var parentNames @[]@[]char
+	for i := 0; i < len(d.Interfaces); i++ {
+		var ref @ast.TypeExpr = d.Interfaces[i]
+		if ref == nil { continue }
+		var parentPkg @[]char
+		var parentName @[]char
+		if ref.Kind == ast.TEXPR_NAMED {
+			if len(ref.Pkg) > 0 {
+				parentPkg = ir.ResolveImportPkg(gc.Mod, ref.Pkg)
+			} else {
+				parentPkg = buf.CopyStr(rpkg)
+			}
+			parentName = buf.CopyStr(ref.Name)
+		} else if ref.Kind == ast.TEXPR_INSTANTIATE {
+			// Parent ref may be qualified
+			// (`interface Sub : pkg.Container[int]`); use
+			// lookupGenericIfaceDeclPkg with the right alias.
+			if ref.Base == nil { continue }
+			if ref.Base.Kind != ast.TEXPR_NAMED { continue }
+			var lookupPkg @[]char
+			if len(ref.Base.Pkg) > 0 {
+				lookupPkg = ir.ResolveImportPkg(gc.Mod, ref.Base.Pkg)
+			} else {
+				lookupPkg = buf.CopyStr(pkgShort)
+			}
+			var gd @ast.Decl = lookupGenericIfaceDeclPkg(gc, lookupPkg, ref.Base.Name)
+			if gd == nil { continue }
+			var argTypes @[]@types.Type
+			for ai := 0; ai < len(ref.TypeArgs); ai++ {
+				argTypes = slices.Append[@types.Type](argTypes, resolveTypeExpr(gc, ref.TypeArgs[ai]))
+			}
+			parentPkg = buf.CopyStr(lookupPkg)
+			parentName = ensureInstantiatedInterface(gc, gd, argTypes, lookupPkg)
+		} else {
+			continue
+		}
+		parentPkgs = slices.Append[@[]char](parentPkgs, parentPkg)
+		parentNames = slices.Append[@[]char](parentNames, parentName)
+	}
+	return parentPkgs, parentNames
+}
+
+// IfaceMethodCount returns the number of methods declared on the
+// interface identified by canonical (pkg, name), following alias
+// chains. Returns 0 if the interface isn't registered. Used by
+// codegen to size the array type when declaring an
+// imported vtable as `external constant [N+1 x i8*]`.
+func IfaceMethodCount(m @ir.Module, pkg *[]readonly char, name *[]readonly char) int {
+	return len(ir.LookupModuleInterface(m, pkg, name))
+}

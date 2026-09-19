@@ -1,0 +1,479 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/iropcode"
+import "pkg/binate/token"
+import "pkg/binate/types"
+
+// genBuiltin generates IR for builtin keyword expressions
+// (cast, bit_cast, len, make, make_slice, box).
+func genBuiltin(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr {
+	if e.Op == cast(int, token.CAST) || e.Op == cast(int, token.BIT_CAST) ||
+			e.Op == cast(int, token.UNSAFE_CAST) {
+		if len(e.Args) >= 1 {
+			var targetTyp @types.Type = resolveTypeExpr(ctx.Gc, e.TypeRef)
+			// When the cast operand is an integer literal that fits the
+			// target type, emit it at the target type directly.
+			// Otherwise `cast(uint64, 0x0102030405060708)` on a
+			// 32-bit target would first lower the literal at the
+			// untyped-int default (i32), truncating it to
+			// 0x05060708 before the widening cast ever runs.
+			// Fires for the value-conversion casts (CAST / UNSAFE_CAST);
+			// BIT_CAST requires same-width operands so its literal
+			// is already correctly typed by the type checker.
+			var val @ir.Instr = nil
+			if e.Op == cast(int, token.CAST) || e.Op == cast(int, token.UNSAFE_CAST) {
+				val = genIntLitWithHint(ctx, b, e.Args[0], targetTyp)
+			}
+			if val == nil {
+				val = genExpr(ctx, b, e.Args[0])
+			}
+			b = ctx.CurBlock
+			if e.Op == cast(int, token.CAST) {
+				var castSrc @types.Type = irutil.PeelTransparent(val.Typ)
+				var castDst @types.Type = irutil.PeelTransparent(targetTyp)
+				// Interface WIDENING (concrete pointer -> interface value): construct
+				// the {data, vtable} pair — the safe conversion `cast` now performs
+				// (the checker verified satisfaction).  Same lowering unsafe_cast uses.
+				if isIfaceValueKind(castDst) && !isIfaceValueKind(castSrc) {
+					var wrapped @ir.Instr = wrapAsIfaceValue(ctx, b, val, targetTyp, val.Typ)
+					if wrapped == nil {
+						panic(
+								"internal error: cast widening to an interface value produced "
+										"no value (non-pointer operand or missing impl vtable); the "
+										"checker should have rejected it")
+					}
+					registerIfaceBox(ctx, wrapped, castDst)
+					return wrapped
+				}
+				// Interface UPCAST (interface value -> interface value, sub -> super):
+				// the checker accepts only the assignable (widening) direction — a
+				// sub-interface widens to a super-interface / `any`; narrowing is
+				// rejected there.  Identical iface types are trivial; otherwise emit the
+				// vtable-substituting upcast (the same OP_IFACE_UPCAST assignment uses).
+				if isIfaceValueKind(castSrc) && isIfaceValueKind(castDst) {
+					if ifaceValueTypesAgree(ctx.Gc.Mod, val.Typ, targetTyp) {
+						return val
+					}
+					var iv @ir.Instr = b.EmitIfaceUpcast(ctx.Gc.Mod, val, "", targetTyp)
+					noteSPGrowingResult(ctx, iv)
+					return iv
+				}
+				// Interface NARROWING (iface -> concrete): the checker rejects it for
+				// CONCRETE types, but a `cast(T, x)` in a GENERIC body whose T
+				// instantiates to a narrowing substitutes it only HERE (definition-time
+				// saw an abstract type parameter).  `cast` cannot recover a concrete type
+				// from an interface value -- fail loud (an OP_CAST would mis-declare the
+				// 2-word %BnIfaceValue).
+				if isIfaceValueKind(castSrc) || isIfaceValueKind(castDst) {
+					panic(
+							"internal error: cast to recover a concrete type from an interface "
+									"value (narrowing) is not supported; this reached codegen via a "
+									"generic type parameter -- recover with `x.(T)` / unsafe_cast")
+				}
+				return genCastValueConversion(b, val, targetTyp)
+			}
+			if e.Op == cast(int, token.UNSAFE_CAST) {
+				// unsafe_cast is a superset of cast (spec §8.7); its interface
+				// conversions are the part cast cannot do:
+				//   - NARROWING (interface value -> concrete `@T`/`*T`/value): extract
+				//     the data word UNCHECKED (no runtime type check, unlike `x.(T)`),
+				//     taking NO reference — refcount-neutral; a binding to an owning
+				//     location co-owns via its own copy-RefInc.
+				//   - WIDENING (concrete pointer -> interface value): construct the
+				//     {data, vtable} pair (RefInc for a managed target — the safe
+				//     conversion cast performs; the checker verified satisfaction).
+				// Every non-interface conversion reuses cast's value conversion.
+				var ucSrc @types.Type = irutil.PeelTransparent(val.Typ)
+				var ucDst @types.Type = irutil.PeelTransparent(targetTyp)
+				// Interface -> interface is rejected by the checker for CONCRETE
+				// types, but a `unsafe_cast(B, x)` in a GENERIC body whose A/B both
+				// instantiate to interface values substitutes them only HERE (the
+				// definition-time check saw abstract parameters).  Guard again on the
+				// concrete types -- EmitCast(iface, iface) would mis-declare the 2-word
+				// %BnIfaceValue as a 1-word pointer (mirrors the CAST arm's backstop).
+				if isIfaceValueKind(ucSrc) && isIfaceValueKind(ucDst) {
+					panic(
+							"internal error: unsafe_cast between interface values is not "
+									"supported (an interface value is a 2-word {data, vtable}); this "
+									"reached codegen via a generic type parameter bound to an "
+									"interface -- recover with a type assertion `x.(I)` instead")
+				}
+				if isIfaceValueKind(ucSrc) && !isIfaceValueKind(ucDst) {
+					return emitRecoveredValue(b, val, targetTyp)
+				}
+				if isIfaceValueKind(ucDst) && !isIfaceValueKind(ucSrc) {
+					var wrapped @ir.Instr = wrapAsIfaceValue(ctx, b, val, targetTyp, val.Typ)
+					if wrapped == nil {
+						panic(
+								"internal error: unsafe_cast widening to an interface value "
+										"produced no value (non-pointer operand or missing impl vtable); "
+										"the checker should have rejected it")
+					}
+					registerIfaceBox(ctx, wrapped, ucDst)
+					return wrapped
+				}
+				return genCastValueConversion(b, val, targetTyp)
+			}
+			// A bit_cast that involves an aggregate stored BY ADDRESS (native/VM) /
+			// BY-VALUE first-class (LLVM), or that crosses the by-address/by-value
+			// storage boundary, cannot use a register OP_BIT_CAST — route it through a
+			// scratch round-trip (bitCastNeedsMemory).  A same-representation scalar /
+			// pointer / raw-slice reinterpret stays a direct OP_BIT_CAST.
+			var bcSrc @types.Type = irutil.PeelTransparent(val.Typ)
+			var bcDst @types.Type = irutil.PeelTransparent(targetTyp)
+			// A same-size check the definition-time checker could NOT make: a
+			// `bit_cast(T, x)` in a GENERIC body sees an abstract T, so a T
+			// instantiated to a DIFFERENT-size type than x reaches here unchecked.
+			// bit_cast requires equal size (spec §8.6) — fail loud rather than
+			// round-trip mismatched sizes (which would read past / short of the
+			// stored bytes).  For non-generic code the checker already guarantees
+			// equal size, so this never fires there.
+			if bcSrc != nil && bcDst != nil && bcSrc.SizeOf() != bcDst.SizeOf() {
+				panic(
+						"bit_cast requires the source and target to be the same size "
+								"(this different-size bit_cast reached codegen via a generic type "
+								"parameter, which the definition-time checker could not size)")
+			}
+			if bitCastNeedsMemory(bcSrc, bcDst) {
+				return emitBitCastViaMemory(b, val, val.Typ, targetTyp)
+			}
+			return b.EmitBitCast(val, targetTyp)
+		}
+	}
+	if e.Op == cast(int, token.LEN) {
+		if len(e.Args) >= 1 {
+			var arg @ir.Instr = genExpr(ctx, b, e.Args[0])
+			b = ctx.CurBlock
+			// For arrays, len is a compile-time constant.  Peel transparent
+			// wrappers (readonly / named / alias) first: a named array
+			// (`type Row [3]int`) carries its length on the underlying
+			// TYP_ARRAY, not the TYP_NAMED wrapper (whose ArrayLen is 0), so
+			// an un-peeled read would return len 0 and then fall through to
+			// EmitSliceLen on a non-slice (invalid IR).
+			var argSt @types.Type = nil
+			if arg.Typ != nil { argSt = irutil.PeelTransparent(arg.Typ) }
+			if argSt != nil && argSt.Kind == types.TYP_ARRAY {
+				return b.EmitConstInt(argSt.ArrayLen, types.TypInt())
+			}
+			// A bare string literal lowers to OP_CONST_STRING — a
+			// `*readonly uint8` data pointer, not a {ptr,len} slice — so
+			// its length is compile-time known (the unescaped byte count).
+			// Fold it like the array case; EmitSliceLen would extract a
+			// length field the bare pointer doesn't have (invalid IR on
+			// compiled backends, a garbage read on the VM).
+			if arg.Op == iropcode.OP_CONST_STRING {
+				return b.EmitConstInt(len(arg.StrVal), types.TypInt())
+			}
+			return b.EmitSliceLen(arg)
+		}
+	}
+	if e.Op == cast(int, token.PRESENT) {
+		if len(e.Args) >= 1 {
+			var arg @ir.Instr = genExpr(ctx, b, e.Args[0])
+			b = ctx.CurBlock
+			return b.EmitPresent(arg, arg.Typ)
+		}
+	}
+	if e.Op == cast(int, token.SAME) {
+		if len(e.Args) >= 2 {
+			var a @ir.Instr = genExpr(ctx, b, e.Args[0])
+			b = ctx.CurBlock
+			var other @ir.Instr = genExpr(ctx, b, e.Args[1])
+			b = ctx.CurBlock
+			return b.EmitSame(a, other, a.Typ)
+		}
+	}
+	if e.Op == cast(int, token.UNSAFE_INDEX) {
+		// unsafe_index(coll, idx): same lowering as coll[idx] but with
+		// the bounds check skipped. Synthesize an EXPR_INSTANTIATE_OR_INDEX
+		// node and call genIndex with checked=false.
+		var proxy @ast.Expr = make(ast.Expr)
+		proxy.Kind = ast.EXPR_INSTANTIATE_OR_INDEX
+		proxy.Pos = e.Pos
+		proxy.X = e.Args[0]
+		var idxArgs @[]@ast.Expr = make_slice(@ast.Expr, 1)
+		idxArgs[0] = e.Args[1]
+		proxy.Args = idxArgs
+		return genIndex(ctx, b, proxy, false) // unchecked
+	}
+	if e.Op == cast(int, token.UNSAFE_DIV) || e.Op == cast(int, token.UNSAFE_REM) {
+		// unsafe_div(a, b) / unsafe_rem(a, b): the same integer divide /
+		// remainder as `/` / `%`, but WITHOUT the OP_DIV_CHECK guard —
+		// the opt-out for hot paths the caller has already proven safe
+		// (the divisor analogue of unsafe_index skipping the bounds
+		// check). Mirrors genBinary's operand widening, then emits the
+		// bare binop with no EmitDivCheck.
+		var lhs @ir.Instr = genExpr(ctx, b, e.Args[0])
+		b = ctx.CurBlock
+		var rhs @ir.Instr = genExpr(ctx, b, e.Args[1])
+		b = ctx.CurBlock
+		var resultTyp @types.Type = widenType(lhs.Typ, rhs.Typ)
+		lhs = ensureWidth(ctx, b, lhs, resultTyp)
+		rhs = ensureWidth(ctx, b, rhs, resultTyp)
+		var op int = iropcode.OP_DIV
+		if e.Op == cast(int, token.UNSAFE_REM) { op = iropcode.OP_REM }
+		return b.EmitBinop(op, lhs, rhs, resultTyp)
+	}
+	if e.Op == cast(int, token.UNSAFE_SHL) || e.Op == cast(int, token.UNSAFE_SHR) {
+		// unsafe_shl(v, n) / unsafe_shr(v, n): the same integer shift as
+		// `<<` / `>>`, but WITHOUT the overshift guard (emitGuardedShift) and
+		// WITHOUT the negative-count check (emitShiftCheckGuard) — the opt-out
+		// for hot paths the caller has proven keep the count in [0, width).
+		// Like a regular shift the result type is the LEFT (value) operand's;
+		// the count is reconciled to that width and the bare hardware shift is
+		// emitted (target-defined for a count outside [0, width)).
+		var sv @ir.Instr = genExpr(ctx, b, e.Args[0])
+		b = ctx.CurBlock
+		var sn @ir.Instr = genExpr(ctx, b, e.Args[1])
+		b = ctx.CurBlock
+		var shiftTyp @types.Type = sv.Typ
+		sv = ensureWidth(ctx, b, sv, shiftTyp)
+		sn = ensureWidth(ctx, b, sn, shiftTyp)
+		var sop int = iropcode.OP_SHL
+		if e.Op == cast(int, token.UNSAFE_SHR) { sop = iropcode.OP_SHR }
+		return b.EmitBinop(sop, sv, sn, shiftTyp)
+	}
+	if e.Op == cast(int, token.SIZEOF) {
+		// Compile-time constant: the type's size in bytes. Returns
+		// a uint-typed constant.
+		var targetTyp @types.Type = resolveTypeExpr(ctx.Gc, e.TypeRef)
+		return b.EmitConstInt(targetTyp.SizeOf(), types.TypUint())
+	}
+	if e.Op == cast(int, token.ALIGNOF) {
+		// Compile-time constant: the type's alignment in bytes.
+		var targetTyp @types.Type = resolveTypeExpr(ctx.Gc, e.TypeRef)
+		return b.EmitConstInt(targetTyp.AlignOf(), types.TypUint())
+	}
+	if e.Op == cast(int, token.RAW_FUNC_ADDR) {
+		// _raw_func_addr(F) (to be renamed _func_handle): emit
+		// OP_FUNC_HANDLE.  Result is a *uint8 pointing at a
+		// 16-byte {vtable_ptr, data_ptr} handle (the bnc-emitted
+		// static `@__handle.F` natively, or a heap handle in
+		// bytecode for vm-local functions).
+		if len(e.Args) >= 1 {
+			var arg @ast.Expr = e.Args[0]
+			var name @[]char
+			if arg.Kind == ast.EXPR_IDENT {
+				name = arg.Name
+			}
+			if arg.Kind == ast.EXPR_SELECTOR && arg.X != nil && arg.X.Kind == ast.EXPR_IDENT {
+				name = buildQualNameHomed(ctx.Gc.Mod, arg.X.Name, arg.Name)
+			}
+			return b.EmitFuncHandle(name)
+		}
+	}
+	// The foreign-function-boundary builtins (__c_call / __c_global / __c_entry)
+	// are lowered by genFFIBuiltin (gen_builtin_ffi.bn), grouped there to keep
+	// this file under the length cap.
+	var ffiResult @ir.Instr
+	var ffiHandled bool
+	ffiResult, ffiHandled = genFFIBuiltin(ctx, b, e)
+	if ffiHandled {
+		return ffiResult
+	}
+	if e.Op == cast(int, token.MAKE) {
+		// make(T) — allocate @T for any type T
+		var targetTyp @types.Type = resolveTypeExpr(ctx.Gc, e.TypeRef)
+		var result @ir.Instr = b.EmitMake(targetTyp)
+		registerTemp(ctx, result)
+		return result
+	}
+	if e.Op == cast(int, token.MAKE_SLICE) {
+		// make_slice(T, n) — T is element type, n is size. Returns @[]T (managed-slice).
+		var elemTyp @types.Type = resolveTypeExpr(ctx.Gc, e.TypeRef)
+		var length @ir.Instr = genExpr(ctx, b, e.Args[0])
+		b = ctx.CurBlock
+		var result @ir.Instr = b.EmitMakeSlice(elemTyp, length)
+		registerTemp(ctx, result)
+		noteSPGrowingResult(ctx, result)
+		return result
+	}
+	if e.Op == cast(int, token.BOX) {
+		if len(e.Args) >= 1 {
+			var val @ir.Instr = genExpr(ctx, b, e.Args[0])
+			b = ctx.CurBlock
+			// For alloca results, the elem type is in TypeArg (not the pointer type in Typ)
+			var innerTyp @types.Type = val.Typ
+			if val.Op == iropcode.OP_ALLOC && val.TypeArg != nil {
+				innerTyp = val.TypeArg
+			} else if val.Op == iropcode.OP_CONST_STRING {
+				// A bare string literal defaults to @[]readonly char (the checker's
+				// defaultType(TYP_UNTYPED_STRING) — check_builtin.bn box arm types
+				// box("...") as @(@[]readonly char)).  Materialise the managed-slice
+				// view of rodata and box THAT, so the 4-word payload matches the
+				// checker's type — boxing the bare OP_CONST_STRING *readonly char
+				// pointer would emit a 1-word cell a later deref over-reads (and
+				// RefDecs a garbage refptr).  The rodata backing is immortal (nil
+				// refptr), so the box's managed-slice RefInc/dtor are no-ops.
+				var charSliceTyp @types.Type = types.MakeManagedSliceType(
+						types.MakeReadonlyType(types.TypChar()))
+				val = b.EmitStringToChars(val, charSliceTyp)
+				b = ctx.CurBlock
+				innerTyp = charSliceTyp
+				noteSPGrowingResult(ctx, val)
+			} else {
+				// Default an untyped constant operand to its concrete type.  box takes
+				// ANY value, so `box(42)` / `box(2.5)` reaches IR-gen with no type
+				// context; boxing it as `@untyped int` yields a DEGENERATE box — its
+				// `@untyped-int` → `@any` coercion finds no concrete identity, so no
+				// `__typeinfo` is emitted and a later `case int:` misses.  Mirror the
+				// checker's defaultType (check_builtin.bn box arm), which already types
+				// the box EXPRESSION `@int`; the boxed value must agree.
+				var defaulted @types.Type = defaultUntypedType(innerTyp)
+				if defaulted != innerTyp {
+					innerTyp = defaulted
+					val.Typ = defaulted
+				}
+			}
+			var ptrTyp @types.Type = types.MakeManagedPtrType(innerTyp)
+			var result @ir.Instr = b.EmitBox(val, ptrTyp)
+			// The boxed cell holds a bit-copy of val, which shares val's managed
+			// references WITHOUT a RefInc — so when the source local/temp is
+			// RefDec'd at scope/statement exit the shared referent is freed while
+			// the box still points at it (a use-after-free).  Acquire the box's own
+			// reference so it OWNS its payload (balanced by the managed-ptr dtor,
+			// which runs the pointee's cleanup and RefDec's it when the box frees):
+			//   - a struct/array with managed fields: emitStructCopy RefIncs each
+			//     managed field of the copy (the box result points at the payload,
+			//     the struct pointer emitStructCopy expects);
+			//   - a bare managed SLICE (`box(s)` for `s @[]char`): RefInc the shared
+			//     backing (balanced by the `@(@[]T)` dtor — emitManagedPtrRefDec's
+			//     managed-slice arm).
+			//   - a bare managed FUNC-value (`box(f)` for `f @func()`): RefInc the
+			//     shared capture record (balanced by the `@(@func())` dtor --
+			//     emitManagedPtrRefDec's func-value arm, `__dtor_func`).
+			//   - a bare managed IFACE-value (`box(iv)` for `iv @I`): RefInc the
+			//     iface value's data slot (balanced by the `@(@I)` dtor --
+			//     emitManagedPtrRefDec's iface-value arm, `__dtor_interface`).
+			if needsStructCopy(innerTyp) {
+				emitStructCopy(ctx.Func, b, result, innerTyp)
+			} else if irutil.IsManagedSliceType(innerTyp) {
+				emitManagedSliceRefInc(ctx.Func, b, val)
+			} else if irutil.IsManagedPtrType(innerTyp) {
+				// box(mp) for a bare managed PTR (`mp @Node`): RefInc the pointee so the
+				// box owns it (balanced by the `@(@T)` dtor -- emitManagedPtrRefDec's
+				// managed-ptr arm).
+				b.EmitRefInc(val)
+			} else if irutil.IsManagedFuncValueType(innerTyp) {
+				// box(f) for a bare managed FUNC-value: RefInc the capture record so
+				// the box owns it (balanced by the `@(@func())` dtor).
+				emitManagedFuncValueRefInc(ctx.Func, b, val)
+			} else if irutil.IsManagedIfaceValueType(innerTyp) {
+				// box(iv) for a bare managed IFACE-value: RefInc the data slot so the
+				// box owns it (balanced by the `@(@I)` dtor, `__dtor_interface`).
+				emitManagedIfaceValueRefInc(ctx.Func, b, val)
+			}
+			registerTemp(ctx, result)
+			return result
+		}
+	}
+	return b.EmitConstInt(0, types.TypInt())
+}
+
+// defaultUntypedType maps an untyped constant kind to its concrete default —
+// TYP_UNTYPED_INT → int, TYP_UNTYPED_FLOAT → float64, TYP_UNTYPED_BOOL → bool —
+// mirroring the checker's defaultType (checker_util.bn) at the IR-gen box site,
+// where an untyped literal operand has no destination to concretize it.  Any
+// already-concrete type passes through unchanged.
+func defaultUntypedType(t @types.Type) @types.Type {
+	if t == nil {
+		return t
+	}
+	if t.Kind == types.TYP_UNTYPED_INT {
+		return types.TypInt()
+	}
+	if t.Kind == types.TYP_UNTYPED_FLOAT {
+		return types.TypFloat64()
+	}
+	if t.Kind == types.TYP_UNTYPED_BOOL {
+		return types.TypBool()
+	}
+	return t
+}
+
+// isSliceOrArrayKind reports whether kind is a raw slice, managed slice, or array
+// (the length-carrying containers whose element retype must preserve element size).
+func isSliceOrArrayKind(kind int) bool {
+	return kind == types.TYP_SLICE || kind == types.TYP_MANAGED_SLICE || kind == types.TYP_ARRAY
+}
+
+// genCastValueConversion lowers the value-conversion cases shared by `cast` and
+// `unsafe_cast` (the non-interface conversions): float->int saturation, the
+// @[]T -> *[]T managed-slice decay, and the general OP_CAST (numeric width /
+// sign conversion, pointer relabel, readonly drop).  Interface-value operands
+// never reach here — cast rejects them and unsafe_cast narrows/widens them at
+// the call site.
+func genCastValueConversion(b @ir.Block, val @ir.Instr, targetTyp @types.Type) @ir.Instr {
+	// Float -> int saturates to the target's range + NaN->0; the hardware
+	// converts disagree on out-of-range/NaN, so normalize in shared IR.
+	if isFloatToIntCast(val.Typ, targetTyp) {
+		return emitGuardedFloatToInt(b, val, targetTyp)
+	}
+	// `cast(*[]T, m)` where m is @[]T: the managed->raw slice decay (spec §7.6) is
+	// a {data,len} field EXTRACTION, not a bit-reinterpret — %BnManagedSlice (4
+	// words) and %BnSlice (2 words) differ in layout.  Emit the same
+	// OP_MANAGED_TO_RAW the implicit decay uses; a plain OP_CAST mis-declares the
+	// result's LLVM type (`%BnManagedSlice` used as `%BnSlice`).
+	if irutil.IsManagedSliceType(val.Typ) && peelReadonly(targetTyp).Kind == types.TYP_SLICE {
+		return b.EmitManagedToRaw(val)
+	}
+	// Defense: OP_CAST can relabel only a SAME-KIND aggregate (struct A<->B same
+	// layout, @[]T<->@[]S same element size) or a scalar/pointer conversion.  A cast
+	// that involves an aggregate of a DIFFERENT kind (array -> managed-slice -- the
+	// MAJOR -- , aggregate <-> scalar, ...) mis-lowers to garbage.  The cast checker
+	// gates concrete casts to the safe set, so this only fires for an outlawed shape
+	// reached via a GENERIC type parameter -- fail loud rather than emit garbage.
+	var cs @types.Type = irutil.PeelTransparent(val.Typ)
+	var cd @types.Type = irutil.PeelTransparent(targetTyp)
+	if cs != nil && cd != nil {
+		if cs.Kind != cd.Kind &&
+				(irutil.IsBitCastMemoryLoweredKind(cs) || irutil.IsBitCastMemoryLoweredKind(cd)) {
+			panic(
+					"internal error: cast between mismatched aggregate/scalar shapes reached "
+							"codegen (an array/struct/managed-slice cast to a different kind); this "
+							"is not a safe cast -- use bit_cast for a same-size reinterpret or "
+							"construct the value explicitly")
+		}
+		// Same-kind slice/array with DIFFERENT-size elements: the relabel keeps `len`
+		// (the element COUNT), so a wider/narrower element reads or writes past the
+		// backing (out of bounds).  Only a same-element-size retype is a safe cast.
+		if cs.Kind == cd.Kind && isSliceOrArrayKind(cs.Kind) && cs.Elem != nil && cd.Elem != nil &&
+				cs.Elem.SizeOf() != cd.Elem.SizeOf() {
+			panic(
+					"internal error: cast between same-kind slices/arrays with different-size "
+							"elements reached codegen (via a generic type parameter); the len "
+							"invariant would be violated -- use bit_cast or construct explicitly")
+		}
+	}
+	return b.EmitCast(val, targetTyp)
+}
+
+// emitBitCastViaMemory lowers a same-size bit_cast that involves an aggregate
+// (managed slice / struct / array / func-value / interface value) as a scratch
+// round-trip: store the source value's bytes into a stack slot, then reload them
+// at the target type.  This realizes a same-size reinterpret uniformly across
+// every backend — including an aggregate<->scalar reinterpret across the
+// by-address/by-value storage boundary — without a first-class OP_BIT_CAST that
+// the backends cannot form for an aggregate.  It is a bitwise copy with NO
+// refcount traffic: the scratch slot is a raw unmanaged OP_ALLOC (owns nothing),
+// OP_STORE is a raw store and OP_LOAD BORROWS its result (no RefInc), so managed
+// words are copied verbatim — matching bit_cast's "takes no reference" contract
+// (the programmer owns the reference-count consequences).  The slot uses the
+// stricter of the two alignments; the checker has verified the sizes are equal.
+func emitBitCastViaMemory(b @ir.Block, val @ir.Instr, srcTyp @types.Type,
+		dstTyp @types.Type) @ir.Instr {
+	var slotTyp @types.Type = srcTyp
+	if dstTyp.AlignOf() > srcTyp.AlignOf() {
+		slotTyp = dstTyp
+	}
+	var slot @ir.Instr = b.EmitAlloc(slotTyp)
+	var srcPtr @ir.Instr = b.EmitBitCast(slot, types.MakePointerType(srcTyp))
+	b.EmitStore(srcPtr, val)
+	var dstPtr @ir.Instr = b.EmitBitCast(slot, types.MakePointerType(dstTyp))
+	return b.EmitLoad(dstPtr, dstTyp)
+}

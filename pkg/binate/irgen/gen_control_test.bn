@@ -1,0 +1,488 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/buf"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+import "pkg/std/strconv"
+import "pkg/std/strings"
+
+func TestGenCompoundAssign() testing.TestResult {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("package \"test\"\n")
+	cb.Write("func main() {")
+	cb.Write(" var x int = 10; x += 5; _ = x }\n")
+	var m @ir.Module = genFromSource(buf.CopyStr(cb.String()))
+	var entry @ir.Block = m.Funcs[0].Blocks[0]
+	var addCount int = 0
+	var storeCount int = 0
+	for i := 0; i < len(entry.Instrs); i++ {
+		if entry.Instrs[i].Op == iropcode.OP_ADD { addCount = addCount + 1 }
+		if entry.Instrs[i].Op == iropcode.OP_STORE { storeCount = storeCount + 1 }
+	}
+	if storeCount < 2 {
+		return fail(buf.Concat(
+				"expected >=2 stores, got ", strconv.Itoa(storeCount)))
+	}
+	if addCount < 1 { return fail("expected at least 1 add for compound assign") }
+	return ""
+}
+
+// Phase 3.2: read-only string→slice assignments lower to OP_RODATA_SLICE
+// (raw target) or OP_RODATA_MSLICE (managed target), not OP_STRING_TO_CHARS.
+func TestAssignStringToChars() testing.TestResult {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("package \"test\"\n")
+	cb.Write("func foo() *[]readonly char {\n")
+	cb.Write("\tvar s *[]readonly char\n\ts = \"hello\"\n")
+	cb.Write("\treturn s\n}\n")
+	var src @[]char = buf.CopyStr(cb.String())
+	var m @ir.Module = genFromSource(src)
+	if len(m.Funcs) < 1 { return fail("expected at least 1 func") }
+	var fn @ir.Func = m.Funcs[0]
+	var found bool = false
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			if blk.Instrs[j].Op == iropcode.OP_RODATA_SLICE {
+				found = true
+			}
+		}
+	}
+	if !found {
+		return fail(
+				"no iropcode.OP_RODATA_SLICE found for string-to-*[]readonly char")
+	}
+	return ""
+}
+
+func TestNilToSliceAssign() testing.TestResult {
+	var src *[]readonly char = "package \"test\"\nfunc foo() {\n\tvar s *[]int\n\ts = nil\n}\n"
+	var m @ir.Module = genFromSource(src)
+	if len(m.Funcs) < 1 { return fail("expected at least 1 func") }
+	var fn @ir.Func = m.Funcs[0]
+	var foundSliceNil bool = false
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var instr @ir.Instr = blk.Instrs[j]
+			if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 2 {
+				if instr.Args[1].Op == iropcode.OP_CONST_NIL && instr.Args[1].Typ != nil {
+					if instr.Args[1].Typ.Kind == types.TYP_SLICE {
+						foundSliceNil = true
+					}
+				}
+			}
+		}
+	}
+	if !foundSliceNil {
+		return fail(
+				"nil assigned to slice should re-emit as TYP_SLICE")
+	}
+	return ""
+}
+
+func TestSliceElemRefcount() testing.TestResult {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("package \"test\"\n")
+	cb.Write("type Node struct { Val int }\n")
+	cb.Write("func foo() {\n")
+	cb.Write("\tvar s @[]@Node = make_slice(@Node, 2)\n")
+	cb.Write("\tvar n @Node = make(Node)\n")
+	cb.Write("\ts[0] = n\n}\n")
+	var src @[]char = buf.CopyStr(cb.String())
+	var m @ir.Module = genFromSource(src)
+	if len(m.Funcs) < 1 { return fail("expected at least 1 func") }
+	var fn @ir.Func = m.Funcs[0]
+	// Slice get/set lower to OP_EXTRACT + OP_GET_ELEM_PTR +
+	// OP_LOAD/STORE. Check that refcounting ops
+	// (RefInc/RefDec) are still emitted for managed elements.
+	var incCount int = 0
+	var decCount int = 0
+	var storeCount int = 0
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var op int = blk.Instrs[j].Op
+			if op == iropcode.OP_REFINC { incCount = incCount + 1 }
+			if op == iropcode.OP_REFDEC { decCount = decCount + 1 }
+			if op == iropcode.OP_STORE { storeCount = storeCount + 1 }
+		}
+	}
+	if decCount < 1 {
+		return fail(buf.Concat(
+				"expected >=1 iropcode.OP_REFDEC, got ", strconv.Itoa(decCount)))
+	}
+	if incCount < 1 {
+		return fail(buf.Concat(
+				"expected >=1 iropcode.OP_REFINC, got ", strconv.Itoa(incCount)))
+	}
+	if storeCount < 1 {
+		return fail(buf.Concat(
+				"expected >=1 iropcode.OP_STORE, got ", strconv.Itoa(storeCount)))
+	}
+	return ""
+}
+
+// A self-aliasing slice-element store `s[i] = s[i]` of a managed element must
+// ACQUIRE the new value before RELEASING the old occupant.  At refcount 1 the
+// reverse order frees the element before re-RefInc'ing it — a use-after-free.
+// The slice arm (no slot pointer) hand-orders emitAcquireManagedScalar then
+// EmitSliceGet-old + RefDec; this pins the ordering at the IR level, which a
+// runtime test cannot reliably catch (a freed-but-unreused block reads intact).
+// A LOCAL slice is used so make_slice is moved (consumeTemp, no RefInc) and the
+// self-alias's RefInc / RefDec are the FIRST inc / dec emitted; the scope-exit
+// slice RefDec comes after.
+func TestSliceElemSelfAssignAcquiresBeforeReleases() testing.TestResult {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("package \"test\"\n")
+	cb.Write("type Node struct { Val int }\n")
+	cb.Write("func foo() {\n")
+	cb.Write("\tvar s @[]@Node = make_slice(@Node, 1)\n")
+	cb.Write("\ts[0] = s[0]\n}\n")
+	var m @ir.Module = genFromSource(buf.CopyStr(cb.String()))
+	if len(m.Funcs) < 1 { return fail("expected at least 1 func") }
+	var fn @ir.Func = m.Funcs[0]
+	// First RefInc / RefDec by global emission order across all blocks.
+	var incIdx int = -1
+	var decIdx int = -1
+	var ord int = 0
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			if blk.Instrs[j].Op == iropcode.OP_REFINC && incIdx < 0 { incIdx = ord }
+			if blk.Instrs[j].Op == iropcode.OP_REFDEC && decIdx < 0 { decIdx = ord }
+			ord = ord + 1
+		}
+	}
+	if incIdx < 0 { return fail("expected a RefInc acquiring the new element") }
+	if decIdx < 0 { return fail("expected a RefDec releasing the old element") }
+	if incIdx > decIdx {
+		return fail(
+				"slice-element self-assign must acquire (RefInc) before releasing "
+						"(RefDec); release-before-acquire is a self-alias use-after-free")
+	}
+	return ""
+}
+
+func TestManagedPtrDeclNilInit() testing.TestResult {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("package \"test\"\nimport \"pkg/binate/ast\"\n")
+	cb.Write("func foo() {\n")
+	cb.Write("\tvar d @ast.Decl\n\td = nil\n}\n")
+	var src @[]char = buf.CopyStr(cb.String())
+	var m @ir.Module = genFromSourcePkg(src)
+	if len(m.Funcs) < 1 { return fail("expected at least 1 func") }
+	var fn @ir.Func = m.Funcs[0]
+	var foundNilStore bool = false
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var instr @ir.Instr = blk.Instrs[j]
+			if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 2 {
+				if instr.Args[1].Op == iropcode.OP_CONST_NIL {
+					foundNilStore = true
+				}
+			}
+		}
+	}
+	if !foundNilStore {
+		return fail(
+				"managed ptr decl should init with nil store")
+	}
+	return ""
+}
+
+// A deref-store `*p = <untyped literal>` must coerce the RHS to the POINTEE
+// width, not store it at the literal's default `int` width — else a wide store
+// clobbers neighbor bytes and (on strict-alignment / no-exception-vector targets
+// like native arm32 bare-metal) Data-Aborts into a hang (599_addr_of_slice_elem).
+// The IDENT and SELECTOR assign arms already ensureWidth; this pins the STAR arm.
+// uint8 / uint16 pointees are fixed-width, so the assertion is target-independent.
+func TestDerefStoreCoercesRhsToPointeeWidth() testing.TestResult {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("package \"test\"\n")
+	cb.Write("func f(p *uint8, q *uint16) {\n")
+	cb.Write("\t*p = 99\n")
+	cb.Write("\t*q = 99\n")
+	cb.Write("}\n")
+	var src @[]char = buf.CopyStr(cb.String())
+	var m @ir.Module = genFromSource(src)
+	var fn @ir.Func = findFunc(m, "f")
+	var byteStores int = 0
+	var halfStores int = 0
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var instr @ir.Instr = blk.Instrs[j]
+			if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 2 && instr.Args[1].Typ != nil {
+				var sz int = instr.Args[1].Typ.SizeOf()
+				if sz == 1 { byteStores = byteStores + 1 }
+				if sz == 2 { halfStores = halfStores + 1 }
+			}
+		}
+	}
+	if byteStores < 1 {
+		return fail("*p = 99 (p *uint8) must store a 1-byte value, not a wide int")
+	}
+	if halfStores < 1 {
+		return fail("*q = 99 (q *uint16) must store a 2-byte value, not a wide int")
+	}
+	return ""
+}
+
+// Assigning &local into a raw-pointer slice element must store
+// the alloca pointer directly. Previously the codegen unconditionally
+// loaded the struct value from the alloca (correct only when the
+// slot holds a struct), so &local was silently converted to *&local —
+// storing the first word of the struct instead of the pointer.
+func TestRawPtrSliceElemAssignAddrOf() testing.TestResult {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("package \"test\"\n")
+	cb.Write("type Item struct { Val int }\n")
+	cb.Write("func put(items *[]*Item) {\n")
+	cb.Write("\tvar it Item\n")
+	cb.Write("\tit.Val = 42\n")
+	cb.Write("\titems[0] = &it\n")
+	cb.Write("}\n")
+	var src @[]char = buf.CopyStr(cb.String())
+	var m @ir.Module = genFromSource(src)
+	var fn @ir.Func = findFunc(m, "put")
+	if fn == nil { return fail("expected put func") }
+	// The alloca for `it` must not be followed by an OP_LOAD
+	// that feeds the slice-set. Find the alloca for Item, then
+	// scan instructions that consume it and make sure none are
+	// an OP_LOAD.
+	var itAlloc @ir.Instr = nil
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var ins @ir.Instr = blk.Instrs[j]
+			if ins.Op != iropcode.OP_ALLOC { continue }
+			if ins.TypeArg == nil { continue }
+			if ins.TypeArg.Kind != types.TYP_STRUCT { continue }
+			itAlloc = ins
+		}
+	}
+	if itAlloc == nil { return fail("expected alloca for Item") }
+	// No OP_LOAD in the function should take itAlloc as arg — the
+	// &it expression should flow directly into the slice-set.
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var ins @ir.Instr = blk.Instrs[j]
+			if ins.Op != iropcode.OP_LOAD { continue }
+			if len(ins.Args) > 0 && ins.Args[0].ID == itAlloc.ID {
+				return fail("unexpected iropcode.OP_LOAD of Item alloca in slice assign")
+			}
+		}
+	}
+	return ""
+}
+
+// Same as above but for an array (not a slice) of raw pointers.
+// Exercises the array branch of genAssign's
+// EXPR_INSTANTIATE_OR_INDEX path.
+func TestRawPtrArrayElemAssignAddrOf() testing.TestResult {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("package \"test\"\n")
+	cb.Write("type Item struct { Val int }\n")
+	cb.Write("func put() {\n")
+	cb.Write("\tvar arr [2]*Item\n")
+	cb.Write("\tvar it Item\n")
+	cb.Write("\tit.Val = 42\n")
+	cb.Write("\tarr[0] = &it\n")
+	cb.Write("}\n")
+	var src @[]char = buf.CopyStr(cb.String())
+	var m @ir.Module = genFromSource(src)
+	var fn @ir.Func = findFunc(m, "put")
+	if fn == nil { return fail("expected put func") }
+	// Find the Item alloca (not the array alloca: Kind check).
+	var itAlloc @ir.Instr = nil
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var ins @ir.Instr = blk.Instrs[j]
+			if ins.Op != iropcode.OP_ALLOC { continue }
+			if ins.TypeArg == nil { continue }
+			if ins.TypeArg.Kind != types.TYP_STRUCT { continue }
+			itAlloc = ins
+		}
+	}
+	if itAlloc == nil { return fail("expected alloca for Item") }
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var ins @ir.Instr = blk.Instrs[j]
+			if ins.Op != iropcode.OP_LOAD { continue }
+			if len(ins.Args) > 0 && ins.Args[0].ID == itAlloc.ID {
+				return fail("unexpected iropcode.OP_LOAD of Item alloca in array assign")
+			}
+		}
+	}
+	return ""
+}
+
+// Single-assign into a managed-aggregate ARRAY element (`arr[i] = w` where
+// the element is a struct BY VALUE holding a managed field) save-copy-
+// destroys via the generated `__copy_` helper.  Pre-fix the single-assign
+// array-element path handled the four managed SCALAR element kinds but had
+// no needsStructCopy arm, so a managed-aggregate element was plain-stored.
+// funcByName / hasCallTo live in gen_assign_multi_test.bn (same package).
+func TestSingleAssignArrayElemAggregateCopies() testing.TestResult {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("package \"test\"\n")
+	cb.Write("type Node struct { Val int }\n")
+	cb.Write("type Wrap struct { b @Node }\n")
+	cb.Write("func foo() int {\n")
+	cb.Write("\tvar arr [2]Wrap\n")
+	cb.Write("\tvar w Wrap\n\tw.b = make(Node)\n")
+	cb.Write("\tarr[0] = w\n")
+	cb.Write("\treturn 0\n}\n")
+	var m @ir.Module = genFromSource(buf.CopyStr(cb.String()))
+	var fn @ir.Func = funcByName(m, "foo")
+	if fn == nil { return fail("foo not found in module") }
+	if !hasCallTo(fn, "__copy_") {
+		return fail(
+				"aggregate array-element single-assign must call the __copy_ helper")
+	}
+	return ""
+}
+
+// Single-assign through a raw pointer element (`p[i] = v` where p is `*T`)
+// must obey Axiom 5 for a managed-SCALAR element: RefDec the overwritten
+// value and acquire the new one.  Pre-fix the INSTANTIATE_OR_INDEX
+// TYP_POINTER arm was a bare GEP+store (no refcounting), unlike the adjacent
+// array arm and the multi-assign pointer sibling.  Compare against a
+// no-store baseline with identical params so the delta isolates the
+// assignment's refcount ops (robust to any param-entry/exit convention).
+// funcByName / countOpInFunc live in gen_assign_multi_test.bn (same package).
+func TestRawPtrIndexAssignManagedRefcounts() testing.TestResult {
+	var stored @ir.Module = genFromSource(
+			"package \"test\"\n"
+					"type Node struct { Val int }\n"
+					"func foo(p *@Node, q @Node) { p[0] = q }\n")
+	var noop @ir.Module = genFromSource(
+			"package \"test\"\n"
+					"type Node struct { Val int }\n"
+					"func foo(p *@Node, q @Node) { _ = q }\n")
+	var fs @ir.Func = funcByName(stored, "foo")
+	var fb @ir.Func = funcByName(noop, "foo")
+	if fs == nil { return fail("foo not found (stored)") }
+	if fb == nil { return fail("foo not found (baseline)") }
+	if countOpInFunc(fs, iropcode.OP_REFINC) <= countOpInFunc(fb, iropcode.OP_REFINC) {
+		return fail("raw-ptr index assign must acquire the new element")
+	}
+	if countOpInFunc(fs, iropcode.OP_REFDEC) <= countOpInFunc(fb, iropcode.OP_REFDEC) {
+		return fail("raw-ptr index assign must RefDec the overwritten element")
+	}
+	return ""
+}
+
+// Single-assign of a managed-AGGREGATE element through a raw pointer
+// (`p[i] = w` where p is `*Wrap` and Wrap holds a managed field) save-copy-
+// destroys via the generated `__copy_` helper, mirroring the array arm.
+func TestRawPtrIndexAssignAggregateCopies() testing.TestResult {
+	var m @ir.Module = genFromSource(
+			"package \"test\"\n"
+					"type Node struct { Val int }\n"
+					"type Wrap struct { b @Node }\n"
+					"func foo(p *Wrap, w Wrap) { p[0] = w }\n")
+	var fn @ir.Func = funcByName(m, "foo")
+	if fn == nil { return fail("foo not found in module") }
+	if !hasCallTo(fn, "__copy_") {
+		return fail("raw-ptr index assign of an aggregate must call __copy_")
+	}
+	return ""
+}
+
+// hasStructLoad reports whether `fn` emits any OP_LOAD whose result is a struct
+// value (used to tell an aggregate VALUE copy from a pointer/address store).  An
+// OP_LOAD carries its result type in `Typ` (TypeArg is the alloca element type,
+// set only on OP_ALLOC), so this inspects `Typ`.
+func hasStructLoad(fn @ir.Func) bool {
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var ins @ir.Instr = blk.Instrs[j]
+			if ins.Op == iropcode.OP_LOAD && ins.Typ != nil && ins.Typ.Kind == types.TYP_STRUCT {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// `RP = &VS` (assign the address of a struct GLOBAL to a pointer var) must store
+// the address, NOT load the struct value out of the IsGlobalRef.  The
+// dest-type-blind isStructOrArrayAlloc(rhs) gate loaded the struct's first word
+// (null) and stored that; the dest-type-aware isAggregateAllocToLoad(rhs, varTyp)
+// gate sees a pointer destination and stores the address as-is.
+func TestAssignAddrOfStructGlobalStoresAddress() testing.TestResult {
+	var m @ir.Module = genFromSource(
+			"package \"test\"\n"
+					"type Node struct { Val int }\n"
+					"var VS Node\n"
+					"var RP *Node\n"
+					"func put() { RP = &VS }\n")
+	var fn @ir.Func = funcByName(m, "put")
+	if fn == nil { return fail("put not found in module") }
+	if hasStructLoad(fn) {
+		return fail("RP = &VS must store the address, not load the struct value")
+	}
+	return ""
+}
+
+// Control for the fix above: `x = VS` (whole-struct copy FROM a global) has an
+// aggregate destination, so it MUST still load the struct value.  Guards against
+// an over-broad fix (e.g. excluding every IsGlobalRef from the load) that would
+// re-break whole-aggregate copy from a global.
+func TestAssignWholeStructFromGlobalLoadsValue() testing.TestResult {
+	var m @ir.Module = genFromSource(
+			"package \"test\"\n"
+					"type Node struct { Val int }\n"
+					"var VS Node\n"
+					"func copyit() {\n"
+					"\tvar x Node\n"
+					"\tx = VS\n"
+					"}\n")
+	var fn @ir.Func = funcByName(m, "copyit")
+	if fn == nil { return fail("copyit not found in module") }
+	if !hasStructLoad(fn) {
+		return fail("x = VS (whole-struct copy from a global) must load the struct value")
+	}
+	return ""
+}
+
+// hasOp reports whether `fn` emits any instruction with opcode `op`.
+func hasOp(fn @ir.Func, op int) bool {
+	for i := 0; i < len(fn.Blocks); i++ {
+		var blk @ir.Block = fn.Blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			if blk.Instrs[j].Op == op { return true }
+		}
+	}
+	return false
+}
+
+// `(*p)[i] = v` (write an element through a pointer-to-array) must GEP the
+// element pointer through p and store — pre-fix the `*p` deref base couldn't be
+// recovered as an array pointer, so the TYP_ARRAY arm skipped the store entirely
+// (silent data loss).  The element GEP is the distinguishing signal (parameter
+// setup emits allocas/stores but no OP_GET_ELEM_PTR).
+func TestDerefPtrToArrayElemAssignEmitsElemPtrStore() testing.TestResult {
+	var m @ir.Module = genFromSource(
+			"package \"test\"\n"
+					"func put(p *([3]int)) { (*p)[0] = 99 }\n")
+	var fn @ir.Func = funcByName(m, "put")
+	if fn == nil { return fail("put not found in module") }
+	if !hasOp(fn, iropcode.OP_GET_ELEM_PTR) {
+		return fail("(*p)[0] = 99 must GEP the element pointer (store was dropped)")
+	}
+	if !hasOp(fn, iropcode.OP_STORE) {
+		return fail("(*p)[0] = 99 must emit a store through the element pointer")
+	}
+	return ""
+}

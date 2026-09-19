@@ -1,0 +1,224 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// IV-dispatch receiver thunks for value-receiver impls.
+//
+// In interface-value dispatch with value receivers, an iv data
+// slot stores a pointer; a vtable slot pointing at a value-receiver method
+// would receive that pointer where the function expects the
+// value.  The fix is a per-(R, I, method) thunk that takes
+// `*readonly T`, derefs to load the value, and tail-calls the
+// value-receiver method.  Pointer-receiver impls get no
+// thunk — the iv data slot already matches.
+//
+// This pass walks `m.Impls` after method bodies are
+// generated, generates the thunks it needs, and rewrites
+// the affected MethodFuncs entries to point at thunk
+// names instead.  Both LLVM codegen and the bytecode VM
+// then dispatch through the thunk uniformly.
+
+// generateIvDispatchThunks walks every value-receiver method in
+// m.Funcs and synthesizes a per-method thunk for it.  The thunk
+// is a small `*readonly T` → load → call → return wrapper.
+// Consumers (codegen, vm/lower) consult LookupVtableSlotName to
+// decide whether a vtable slot should point at the thunk or
+// the underlying method.  Idempotent: a thunk that already
+// exists isn't re-generated.
+//
+// We thunk every value-receiver method (not just those reached
+// via current m.Impls) because the same method can be reached
+// via parent-interface vtable slots that emit_impls /
+// vm/lower's recursive layout walks reconstruct names for —
+// and those reconstructed lookups need a thunk to be findable
+// even when this module's m.Impls doesn't directly list the
+// (R, parent) pair.
+func generateIvDispatchThunks(m @ir.Module) {
+	if m == nil { return }
+	// Snapshot the funcs slice up-front: AddFunc may grow
+	// m.Funcs, and we don't want to re-thunk our own thunks.
+	var existing int = len(m.Funcs)
+	for i := 0; i < existing; i++ {
+		var f @ir.Func = m.Funcs[i]
+		if f == nil || !needsRecvThunk(f) { continue }
+		var thunkName @[]char = ir.ThunkNameForMethod(f.Name)
+		if ir.LookupModuleFunc(m, thunkName) != nil { continue }
+		m.AddFunc(genIvRecvThunk(m, thunkName, f))
+	}
+}
+
+// needsRecvThunk reports whether f needs an iv-dispatch
+// receiver-thunk wrapper.  Conditions:
+//   1. f is a method (qualified name has the methodQualName
+//      shape `<pkgShort>.<TypeName>.<MethodName>`, i.e., at
+//      least two dots).  Free functions whose first param
+//      happens to be value-typed don't get thunks; they're
+//      not iv-dispatch targets.
+//   2. f's first param (the receiver) is value-typed (not
+//      pointer / managed pointer).
+// Any result arity is thunked: a multi-return method's thunk extracts the packed
+// MultiReturnType struct and re-returns it typed (see genIvRecvThunk) — without a
+// thunk, iv dispatch would pass the data-slot pointer where the method expects the
+// receiver VALUE, silently miscompiling a multi-return value-receiver dispatch.
+func needsRecvThunk(f @ir.Func) bool {
+	if f == nil || len(f.Params) == 0 { return false }
+	if f.IsExtern { return false }
+	if !nameLooksLikeMethod(f.Name) { return false }
+	var recvTyp @types.Type = f.Params[0].Typ
+	if recvTyp == nil { return false }
+	if recvTyp.Kind == types.TYP_POINTER { return false }
+	if recvTyp.Kind == types.TYP_MANAGED_PTR { return false }
+	// A named-distinct POINTER receiver — raw (`type PS *S`) or managed
+	// (`type PMS @S`) — with a value receiver (`func (p PS) m()`) is pointer-shaped:
+	// a named-distinct pointer is boxed into an interface value by storing the
+	// pointer DIRECTLY in the iv data slot (it is NOT value-borrowed — see
+	// isBorrowableValueSource), so the slot already matches the method's receiver.
+	// A deref thunk would load `*(data)` (the pointee) as the receiver and corrupt
+	// it.  Codegen-only: the checker's receiverShape keeps the named pointer
+	// value-classified so it does NOT inherit its underlying's interface impls.
+	var peeledRecv @types.Type = irutil.PeelTransparent(recvTyp)
+	if peeledRecv != nil &&
+			(peeledRecv.Kind == types.TYP_POINTER || peeledRecv.Kind == types.TYP_MANAGED_PTR) {
+		return false
+	}
+	return true
+}
+
+// nameLooksLikeMethod reports whether `name` has the
+// `<pkgShort>.<TypeName>.<MethodName>` shape produced by
+// methodQualName — i.e., at least two `.` separators.
+// Free-function qualified names have one (`<pkgShort>.<name>`),
+// so the dot count distinguishes them.
+func nameLooksLikeMethod(name *[]readonly char) bool {
+	var dots int = 0
+	for i := 0; i < len(name); i++ {
+		if name[i] == '.' {
+			dots = dots + 1
+			if dots >= 2 { return true }
+		}
+	}
+	return false
+}
+
+// genIvRecvThunk synthesizes an @Func that takes `*readonly T`
+// (where T is f's value-typed first param) and forwards to f
+// after loading the receiver value through the pointer.
+// Subsequent params, if any, are passed through unchanged.
+func genIvRecvThunk(m @ir.Module, name @[]char, f @ir.Func) @ir.Func {
+	var origRecvTyp @types.Type = f.Params[0].Typ
+	var ptrRecvTyp @types.Type = types.MakePointerType(
+			types.MakeReadonlyType(origRecvTyp))
+
+	// Build the thunk's param list: pointer receiver first,
+	// then any user args from f (positions 1..).
+	var params @[]@ir.Param
+	var ptrParam @ir.Param = make(ir.Param)
+	ptrParam.Name = "__recv_ptr"
+	ptrParam.Typ = ptrRecvTyp
+	params = slices.Append[@ir.Param](params, ptrParam)
+	for i := 1; i < len(f.Params); i++ {
+		params = slices.Append[@ir.Param](params, f.Params[i])
+	}
+
+	var thunk @ir.Func = ir.NewFunc(m.PkgPath, name, params, f.Results)
+	// weak_odr, like the monomorphized functions this thunk dispatches to: a
+	// value-receiver impl on a GENERIC type (e.g. stdlib hash.FnHasher[K] /
+	// cmp.FnEq[K]) is monomorphized — and its iv-dispatch thunk emitted — in EVERY
+	// package that instantiates it for the same type args, so two such packages
+	// linked together (e.g. token + ir both using mapfn.MapFn keyed by the same
+	// type) would otherwise hit a duplicate `__bn_thunk_*` symbol.  The thunk body
+	// is identical across those packages (same monomorphization), so merging is
+	// correct; for a non-generic impl (emitted once) weak_odr is harmless.
+	thunk.IsLinkOnce = true
+	if f.MultiReturnType != nil {
+		thunk.MultiReturnType = f.MultiReturnType
+	}
+	// Back-ref to the module so the receiver-field RefInc below (emitStructCopy →
+	// registerPendingStructDtor) can reach the module's dtor/copy work-lists, exactly
+	// as body-gen sets f.Mod for a user function (gen_func.bn).
+	thunk.Mod = m
+	var b @ir.Block = ir.AddBlock(thunk, "entry")
+
+	// Reference to the pointer-typed receiver param (param[0]).
+	var ptrRef @ir.Instr = ir.NewParamRef(thunk.Params[0])
+	// RefInc the receiver's managed fields before forwarding.  The value-receiver
+	// method owns its parameter copy (owning-copy convention) and RefDec's those
+	// fields on scope cleanup, so without this entry RefInc the callee drops the
+	// CALLER's ref — a net −1 per dispatch (an over-release: a silent reverse-leak
+	// while other refs keep the object alive, a use-after-free / double-free once the
+	// count reaches 0).  Mirrors coerceArg's by-value struct-copy RefInc on the regular
+	// call path (gen_call.bn); gated on needsStructCopy, so a scalar / no-managed-field
+	// receiver adds nothing.
+	if needsStructCopy(origRecvTyp) {
+		emitStructCopy(thunk, b, ptrRef, origRecvTyp)
+	}
+	// Load T from *readonly T.
+	var recvVal @ir.Instr = b.EmitLoad(ptrRef, origRecvTyp)
+
+	// Build call args: the loaded receiver, then forwarded
+	// pass-through params.  Byval-eligible aggregate params arrive
+	// at the thunk as `ptr byval(<T>) align 8 %v<paramID>` — the
+	// LLVM-level param is a pointer to the struct, not the struct
+	// value.  Load through it before forwarding so the inner call's
+	// arg has the struct type its byval-preamble alloca expects.
+	var args @[]@ir.Instr
+	args = slices.Append[@ir.Instr](args, recvVal)
+	for i := 1; i < len(thunk.Params); i++ {
+		var paramRef @ir.Instr = ir.NewParamRef(thunk.Params[i])
+		if thunk.Params[i].Typ.IsByvalParam() {
+			var loaded @ir.Instr = b.EmitLoad(paramRef, thunk.Params[i].Typ)
+			args = slices.Append[@ir.Instr](args, loaded)
+		} else {
+			args = slices.Append[@ir.Instr](args, paramRef)
+		}
+	}
+
+	// Determine the call's result type.  Multi-return uses the
+	// MultiReturnType struct; single-result is just that result;
+	// no results = void.
+	var resultTyp @types.Type
+	if len(f.Results) == 0 {
+		resultTyp = types.TypVoid()
+	} else if len(f.Results) == 1 {
+		resultTyp = f.Results[0]
+	} else {
+		resultTyp = thunk.MultiReturnType
+	}
+
+	if len(f.Results) == 0 {
+		b.EmitCall(f.Name, args, resultTyp)
+		var noVals @[]@ir.Instr
+		b.EmitReturn(noVals)
+	} else if len(f.Results) == 1 {
+		var callResult @ir.Instr = b.EmitCall(f.Name, args, resultTyp)
+		var vals @[]@ir.Instr = make_slice(@ir.Instr, 1)
+		vals[0] = callResult
+		b.EmitReturn(vals)
+	} else {
+		// Multi-return: f yields the packed MultiReturnType struct; EXTRACT each
+		// result field and re-return them TYPED by the thunk's MultiReturnType,
+		// mirroring gen_return.bn's `return f(...)` tuple-forwarding.  A bare
+		// EmitReturn of the packed struct mismatches the multi-value result
+		// signature (`ret` operand type != function result type — invalid IR).
+		// Ownership of managed result values transfers straight through: f returns
+		// owned values and the thunk hands them to its caller with no extra RefInc
+		// and no temp-cleanup dec, exactly as the single-return path does.
+		var callResult @ir.Instr = b.EmitCall(f.Name, args, resultTyp)
+		var vals @[]@ir.Instr
+		for i := 0; i < len(f.Results); i++ {
+			var srcTyp @types.Type = f.Results[i]
+			if callResult.Typ != nil && i < len(callResult.Typ.Fields) {
+				srcTyp = callResult.Typ.Fields[i].Type
+			}
+			var val @ir.Instr = b.EmitExtract(callResult, i, srcTyp)
+			vals = slices.Append[@ir.Instr](vals, val)
+		}
+		b.EmitReturnTyped(vals, thunk.MultiReturnType)
+	}
+	return thunk
+}

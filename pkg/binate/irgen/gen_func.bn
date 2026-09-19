@@ -1,0 +1,464 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// ============================================================
+// Function generation
+// ============================================================
+
+// genFunc generates a complete IR function from a function declaration AST node.
+func genFunc(gc @GenCtx, c @types.Checker, d @ast.Decl) @ir.Func {
+	var noPrepended @[]@ir.Param
+	return genFuncWithPrependedParams(gc, c, d, noPrepended)
+}
+
+// collectCExportNames extracts the C symbol name(s) from every `#[c_export(...)]`
+// annotation on a decl, surrounding quotes stripped.  Empty for a decl with no
+// c_export annotation.  buildcfg.DeclIncluded has already validated the argument
+// form (each a single string literal), so a non-string arg is skipped defensively
+// rather than re-reported here.
+func collectCExportNames(annots @[]@ast.Annotation) @[]@[]char {
+	var names @[]@[]char
+	for i := 0; i < len(annots); i++ {
+		var a @ast.Annotation = annots[i]
+		if !irutil.Streq(a.Name, "c_export") { continue }
+		for j := 0; j < len(a.Args); j++ {
+			var arg @ast.Expr = a.Args[j]
+			if arg == nil || arg.Kind != ast.EXPR_STRING_LIT { continue }
+			names = slices.Append[@[]char](names, stripStrLit(arg.Name))
+		}
+	}
+	return names
+}
+
+// stripStrLit returns the interior of a quoted string literal `lit` (whose text
+// includes its surrounding quotes) as an owned copy — e.g. `"foo"` -> `foo`.
+// Empty for a degenerate (< 2 char) literal.  No escape decoding: a C symbol
+// name is a plain identifier, and the name is left permissive regardless.
+func stripStrLit(lit *[]readonly char) @[]char {
+	var n int = len(lit)
+	if n < 2 {
+		return buf.CopyStr("")
+	}
+	return buf.CopyStr(lit[1:n - 1])
+}
+
+// genFuncWithPrependedParams is the body of genFunc, parameterized
+// by an additional list of params to prepend before the
+// d.Params-derived ones.  Used by closure-literal codegen:
+// captures are pre-resolved
+// Params built from Decl.Captures + the checker's ExprTypes
+// side-table, prepended here so the lifted body's defineVarParam
+// pass naturally registers their names as local variables.
+// Phase 1 / non-closure callers pass nil.
+func genFuncWithPrependedParams(gc @GenCtx, c @types.Checker, d @ast.Decl,
+		prepended @[]@ir.Param) @ir.Func {
+	// Build params
+	var params @[]@ir.Param
+	var noResults @[]@types.Type
+	var f @ir.Func = ir.NewFunc(gc.PkgPath, d.Name, params, noResults)
+	// Raw back-ref to the module being generated.  This is the only func-
+	// creation path whose body emission runs scope cleanup (emitStructDtor /
+	// emitStructCopy / emitManagedSliceRefDec), which register pending dtors;
+	// the registrars reach the module's work-lists through f.Mod.  Borrow
+	// (managed @Module → raw *Module), mirroring AddBlock's `b.Func = f` — no
+	// refcount cycle.  Set before genBlock so registrations during body-gen
+	// land on the right module.
+	f.Mod = gc.Mod
+	f.Line = d.Pos.Line
+	f.Exported = d.Exported
+	f.CExportNames = collectCExportNames(d.Annotations)
+
+	// Prepended params are already fully-built (Name + Typ + ID
+	// assigned via NewParam-by-the-caller).  Re-bind their owner
+	// to this Func by re-issuing IDs through NewParam, which is
+	// the only way to get monotonically-correct IDs scoped to f.
+	for i := 0; i < len(prepended); i++ {
+		var pp @ir.Param = prepended[i]
+		var np @ir.Param = ir.NewParam(f, pp.Name, pp.Typ)
+		params = slices.Append[@ir.Param](params, np)
+	}
+
+	if len(d.Params) > 0 {
+		for i := 0; i < len(d.Params); i++ {
+			var pd @ast.ParamDecl = d.Params[i]
+			var pt @types.Type = irResolveParamType(gc, pd)
+			var p @ir.Param = ir.NewParam(f, pd.Name, pt)
+			params = slices.Append[@ir.Param](params, p)
+		}
+	}
+	if len(params) > 0 {
+		f.Params = params
+	}
+
+	// Build results
+	if len(d.Results) > 0 {
+		var results @[]@types.Type
+		for i := 0; i < len(d.Results); i++ {
+			results = slices.Append[@types.Type](results, resolveTypeExpr(gc, d.Results[i]))
+		}
+		f.Results = results
+		// For multi-return, create an anonymous struct type
+		if len(results) > 1 {
+			f.MultiReturnType = irutil.MakeMultiReturnStructType(results)
+		}
+	}
+
+	// If no body, mark as extern (declaration only).  genFunc only ever sees
+	// OWN-package decls (from the merged .bni-prepended decl set), so a bodyless
+	// EXPORTED one is a function this package declares but does not compile a Binate
+	// body for on this arch — its definition is provided by a linked object (e.g.
+	// the hand-written aarch64 rt.MemZero `.s`, or a user package's own asm/C impl).
+	// Flag it ExternalDef so the package descriptor + func-value triple still list
+	// it (so the bytecode VM can bind it), while it stays IsExtern for body emission
+	// (a `declare`, no `define` to collide with the linked symbol) and the
+	// optimizer.  EXCEPT the compiler's own `_`-prefixed internal intrinsics
+	// (rt._call_*, debug._stack_frames, ...), which are lowered inline to a
+	// dedicated op with no linkable symbol — a descriptor symref to them would
+	// dangle.  (Imported-package declarations are created via RegisterImport, not
+	// genFunc, so they never get ExternalDef and remain descriptor-excluded.)
+	if d.Body == nil {
+		f.IsExtern = true
+		f.ExternalDef = f.Exported && !nameIsCompilerInternalFunc(d.Name)
+		return f
+	}
+
+	// Generate body
+	if d.Body != nil {
+		var entry @ir.Block = ir.AddBlock(f, "entry")
+
+		// Allocate stack slots for parameters.  Every param gets an
+		// alloca (the slot) and a store-of-param-into-slot.  For
+		// byval-eligible aggregate params the LLVM IR-level param is a
+		// `ptr byval(<T>)` pointer; the per-param byval handling — the
+		// IsByvalParamRef flag on the store's source placeholder, which
+		// makes OP_STORE's LLVM emit a memcpy from the byval pointer to
+		// the alloca so the callee gets its own copy — is set up below.
+		// Native backends ignore the flag and stash incoming bytes via
+		// a uniform alloca + store.
+		var paramSlots @[]@ir.Instr
+		for i := 0; i < len(f.Params); i++ {
+			var slot @ir.Instr = entry.EmitAlloc(f.Params[i].Typ)
+			// Tag the slot with its 1-based parameter index so the
+			// LLVM debug-info path can emit `arg: <N>` on the
+			// DILocalVariable.
+			slot.ParamIndex = i + 1
+			// Store the incoming param value (a by-ID OP_PARAM placeholder;
+			// newParamRef also sets the byval-memcpy flag for a byval-aggregate
+			// param) into its slot.
+			var paramRef @ir.Instr = ir.NewParamRef(f.Params[i])
+			entry.EmitStore(slot, paramRef)
+			paramSlots = slices.Append[@ir.Instr](paramSlots, slot)
+		}
+
+		var ctx @GenContext = make(GenContext)
+		ctx.Func = f
+		ctx.Gc = gc
+		ctx.Checker = c
+		ctx.ParamSlots = paramSlots
+		ctx.CurBlock = entry
+
+		// Register params as named variables (marked as params so slices aren't freed)
+		for i := 0; i < len(f.Params); i++ {
+			defineVarParam(ctx, f.Params[i].Name, paramSlots[i], f.Params[i].Typ)
+		}
+
+		// Increment refcount for managed pointer/slice params (callee owns a reference)
+		for i := 0; i < len(f.Params); i++ {
+			if irutil.IsManagedPtrType(f.Params[i].Typ) {
+				var ptrVal @ir.Instr = entry.EmitLoad(paramSlots[i], f.Params[i].Typ)
+				entry.EmitRefInc(ptrVal)
+			}
+			if irutil.IsManagedSliceType(f.Params[i].Typ) {
+				var sliceVal @ir.Instr = entry.EmitLoad(paramSlots[i], f.Params[i].Typ)
+				emitManagedSliceRefInc(f, entry, sliceVal)
+			}
+			if irutil.IsManagedFuncValueType(f.Params[i].Typ) {
+				var fvVal @ir.Instr = entry.EmitLoad(paramSlots[i], f.Params[i].Typ)
+				emitManagedFuncValueRefInc(f, entry, fvVal)
+			}
+			// NOTE: managed interface-value params get NO entry RefInc.
+			// They use the move model: the caller moves a fresh @Iface
+			// arg into the call (consumeTemp) or RefInc's a borrowed one
+			// at the call site (genCall / genMethod), and the param's
+			// scope-exit RefDec releases that single ref.  An entry RefInc
+			// would require the caller to retain+clean its arg COPY after
+			// the call, which the bytecode VM cannot do for a 2-word
+			// iface value passed on transient vm.SP (the call reclaims it).
+		}
+
+		// Local consts declared in the body are appended to Module.Consts
+		// (so resolveTypeExpr / evalConstExpr can read their compile-time
+		// value for an array dimension `[N]int`).  Save the length now and
+		// truncate after the body so a function's local consts don't leak
+		// into sibling functions; save/restore nests correctly for inner
+		// func literals.
+		// Function-entry pre-pass: allocate the armed flag + operand slots for
+		// every lexical defer in the body (registers managed operand slots into
+		// ctx.Vars, so this must precede genBlock — the slots then sit at entry
+		// depth, below any block's savedVarLen, and survive block-exit
+		// truncation to every function exit).
+		registerFuncDefers(ctx, entry, d.Body)
+		var hasDefers bool = len(ctx.Defers) > 0
+
+		var savedConstLen int = len(gc.Mod.Consts)
+		// When the function has defers, the outermost body block must NOT release
+		// its function-scope locals on a fall-off exit — the epilogue below runs
+		// the deferred calls first, while those locals are live (stmt.defer.exit),
+		// then releases them.  A defer-free function keeps the original behavior.
+		genBlockEx(ctx, entry, d.Body, hasDefers)
+		gc.Mod.Consts = gc.Mod.Consts[:savedConstLen]
+
+		// If block isn't terminated, add return or unreachable.  A void fall-off
+		// is a normal function exit: run the pending deferred calls (LIFO,
+		// armed-gated) BEFORE the whole-function managed-local release.
+		var isVoid bool = len(f.Results) == 0
+		if len(entry.Instrs) == 0 || !entry.Instrs[len(entry.Instrs) - 1].IsTerminator() {
+			if isVoid {
+				entry = emitPendingDefers(ctx, entry)
+				var noRetExprs *[]@ast.Expr
+				entry = emitDecForManagedLocals(ctx, entry, noRetExprs)
+				var noRetVals @[]@ir.Instr
+				entry.EmitReturn(noRetVals)
+			} else {
+				entry.EmitUnreachable()
+			}
+		}
+		// Also check all blocks.  Snapshot the count first: emitPendingDefers
+		// appends defer-runner blocks (all terminated), which must not be
+		// re-scanned as fresh fall-off exits.
+		var nBlocks int = len(f.Blocks)
+		for i := 0; i < nBlocks; i++ {
+			var blk @ir.Block = f.Blocks[i]
+			if len(blk.Instrs) == 0 || !blk.Instrs[len(blk.Instrs) - 1].IsTerminator() {
+				if isVoid {
+					blk = emitPendingDefers(ctx, blk)
+					var noRetExprs2 *[]@ast.Expr
+					blk = emitDecForManagedLocals(ctx, blk, noRetExprs2)
+					var noRetVals2 @[]@ir.Instr
+					blk.EmitReturn(noRetVals2)
+				} else {
+					blk.EmitUnreachable()
+				}
+			}
+		}
+	}
+
+	// Structural IR check (off by default; toggle via SetVerifyIR).  When
+	// on, aborts the compile with diagnostics if this finalized func is
+	// malformed — turning a silent IR-gen miscompile (e.g. a ctx.CurBlock
+	// desync that strands stores in a terminated block) into a loud,
+	// located failure.
+	ir.VerifyFuncOrAbort(f)
+	return f
+}
+
+// GenContext holds state during IR generation for one function.
+type GenContext struct {
+	Func @ir.Func
+	Gc   @GenCtx // the per-compilation gen context (copied from
+	// the gc threaded into genFunc); per-function gen
+	// reaches module-gen state through it (Gc.Mod).
+	Checker @types.Checker // the module's type-Checker (copied from m.Checker
+	// at GenContext creation); consulted for per-
+	// expression resolved types.  Nil-safe.
+	Vars       @[]VarSlot // named variable → alloca'd pointer
+	ParamSlots @[]@ir.Instr // param index → alloca'd pointer
+	BreakTo    @ir.Block // current break target
+	ContinueTo @ir.Block // current continue target
+	// len(Vars) at the point BreakTo/ContinueTo were set — the scope level of
+	// the break/continue target.  STMT_BREAK / STMT_CONTINUE RefDec the managed
+	// locals declared since then (Vars[BreakVarLen:]) before jumping, because the
+	// target block does not (genBlock/genCaseBody drop those vars without a dec
+	// on a terminator).  Without it a managed local declared before a
+	// break/continue leaks (never released).
+	BreakVarLen    int
+	ContinueVarLen int
+	CurBlock       @ir.Block // tracks current block (updated by short-circuit eval)
+	// Defers holds one DeferSite per lexical `defer` statement in this function,
+	// in lexical order, built by the function-entry pre-pass (registerFuncDefers,
+	// gen_defer.bn).  It is a function-level list — never truncated on block exit
+	// (unlike Vars) — so a defer registered while gen'ing a nested block survives
+	// to every function exit, where emitPendingDefers runs the armed ones LIFO.
+	Defers @[]@DeferSite
+	// SnapshotBorrows is set while EVALUATING a defer statement's operands
+	// (gen_defer_exit.bn), so an implicit interface-value box of a VALUE source
+	// (`defer Println(x)`) snapshots x's value at the defer site rather than
+	// borrowing the variable's address — which would read the value at CALL time
+	// (function exit), violating eager by-value operand evaluation (§14.13
+	// stmt.defer; proposal-defer §4 "no late-binding surprises").  It routes
+	// genBorrowSourceAddr through the materialize-a-temp path.  (Explicit late
+	// observation still goes through a pointer, as the proposal intends.)
+	SnapshotBorrows bool
+	// DeferBorrowSlots / DeferBorrowCursor thread the pre-allocated, entry-depth
+	// borrow-snapshot slots for the defer whose operands are currently being
+	// stored (set by storeDeferOperands).  When an implicit interface-value box of
+	// a managed-content VALUE operand materializes its snapshot temp
+	// (genExprOrFuncRef's value-borrow path), it consumes the next slot here
+	// instead of a fresh block-scoped temp — so the snapshot survives a
+	// nested/conditional defer to the deferred call at function exit rather than
+	// being freed at block exit.  Cursor advances once per managed borrow-temp, in
+	// operand-evaluation order; the pre-pass allocated them in the same order.
+	DeferBorrowSlots  @[]@ir.Instr
+	DeferBorrowCursor int
+	Temps             @[]@ir.Instr // managed temporaries to RefDec at end of statement
+	StmtGrewSP        bool // any vm.SP-growing IR op emitted this statement?
+	// Set by IR-gen when emitting OP_CALL / CALL_INDIRECT /
+	// CALL_FUNC_VALUE returning an aggregate, OP_MAKE_SLICE,
+	// OP_FUNC_VALUE, OP_RODATA_MSLICE_COPY, OP_RODATA_ARRAY.
+	// Read + cleared by emitTempCleanup at end of statement;
+	// when true, the cleanup emits OP_SP_RESTORE so the
+	// bytecode VM reclaims vm.Stack bytes the statement
+	// accumulated. The return-path cleanup
+	// (emitTempCleanupForReturn) MUST NOT emit OP_SP_RESTORE
+	// — doing so would truncate the about-to-be-returned
+	// aggregate's bytes before BC_RETURN's copy-back fires.
+	// LLVM and native backends treat OP_SP_RESTORE as a no-op.
+}
+
+// VarSlot tracks a name → SSA-pointer binding for a function-local variable
+// or parameter. Ptr is the OP_ALLOC instruction whose result holds the
+// variable's address; Typ is the variable's declared type. IsParam
+// distinguishes parameters (whose slice values aren't freed by the
+// epilogue, since they came from the caller).
+type VarSlot struct {
+	Name    *[]readonly char
+	Ptr     @ir.Instr
+	Typ     @types.Type
+	IsParam bool // true for function parameters (don't free slices)
+}
+
+// lookupVar searches locals (most recent first) then globals for a variable's alloca.
+func lookupVar(ctx @GenContext, name *[]readonly char) @ir.Instr {
+	// Search backwards for most recent definition (shadowing)
+	for i := len(ctx.Vars) - 1; i >= 0; i-- {
+		if irutil.Streq(ctx.Vars[i].Name, name) {
+			return ctx.Vars[i].Ptr
+		}
+	}
+	// Fall back to global variables
+	for i := 0; i < len(ctx.Gc.Mod.GlobalVars); i++ {
+		if irutil.Streq(ctx.Gc.Mod.GlobalVars[i].Name, name) {
+			// Return a pseudo-instruction representing the global pointer
+			var g @ir.Instr = make(ir.Instr)
+			g.ID = -1
+			g.Op = iropcode.OP_ALLOC
+			g.StrVal = ctx.Gc.Mod.GlobalVars[i].Name
+			g.Typ = types.MakePointerType(ctx.Gc.Mod.GlobalVars[i].Typ)
+			g.TypeArg = ctx.Gc.Mod.GlobalVars[i].Typ
+			g.IsGlobalRef = true
+			return g
+		}
+	}
+	return nil
+}
+
+// lookupImportedGlobalPtr returns an IsGlobalRef pointer to an imported
+// extern var (a `.bni`-declared `var X T` registered under its dotted
+// defining-pkg qualname during RegisterImport), or nil if qualName isn't
+// one.  Parallels lookupVar's same-package global fallback, but the
+// pointer carries the DOTTED name so codegen's GlobalName mangles it to
+// the owner's symbol (matching its definition), not the importing
+// module's package path.  Used for reads (lookupImportedGlobalRead) and
+// for write / address-of lvalues (genSelectorPtr).
+func lookupImportedGlobalPtr(gc @GenCtx, qualName *[]readonly char) @ir.Instr {
+	for i := 0; i < len(gc.Mod.GlobalVars); i++ {
+		if !irutil.Streq(gc.Mod.GlobalVars[i].Name, qualName) { continue }
+		var gp @ir.Instr = make(ir.Instr)
+		gp.ID = -1
+		gp.Op = iropcode.OP_ALLOC
+		gp.StrVal = gc.Mod.GlobalVars[i].Name
+		gp.Typ = types.MakePointerType(gc.Mod.GlobalVars[i].Typ)
+		gp.TypeArg = gc.Mod.GlobalVars[i].Typ
+		gp.IsGlobalRef = true
+		return gp
+	}
+	return nil
+}
+
+// lookupImportedGlobalRead loads the value of an imported extern var
+// (the read form of lookupImportedGlobalPtr; nil if qualName isn't one).
+func lookupImportedGlobalRead(gc @GenCtx, b @ir.Block, qualName *[]readonly char) @ir.Instr {
+	var gp @ir.Instr = lookupImportedGlobalPtr(gc, qualName)
+	if gp == nil { return nil }
+	return b.EmitLoad(gp, gp.TypeArg)
+}
+
+// genImportedVarLvalue returns the IsGlobalRef pointer for a package-
+// qualified imported var used as an lvalue (`&pkg.X` / `pkg.X = v`), or
+// nil if e isn't such a selector.  e.X must be a package alias (lookupVar
+// misses); the pointer carries the dotted defining-pkg name so codegen
+// mangles it to the owner's symbol.  The genSelectorPtr counterpart to
+// lookupImportedGlobalRead.
+func genImportedVarLvalue(ctx @GenContext, e @ast.Expr) @ir.Instr {
+	if e.X == nil || e.X.Kind != ast.EXPR_IDENT { return nil }
+	if lookupVar(ctx, e.X.Name) != nil { return nil }
+	return lookupImportedGlobalPtr(ctx.Gc, buildQualNameHomed(ctx.Gc.Mod, e.X.Name, e.Name))
+}
+
+// lookupVarType returns the declared type of a variable (local or global).
+func lookupVarType(ctx @GenContext, name *[]readonly char) @types.Type {
+	for i := len(ctx.Vars) - 1; i >= 0; i-- {
+		if irutil.Streq(ctx.Vars[i].Name, name) {
+			return ctx.Vars[i].Typ
+		}
+	}
+	// Fall back to global variables
+	for i := 0; i < len(ctx.Gc.Mod.GlobalVars); i++ {
+		if irutil.Streq(ctx.Gc.Mod.GlobalVars[i].Name, name) {
+			return ctx.Gc.Mod.GlobalVars[i].Typ
+		}
+	}
+	return nil
+}
+
+// defineVar adds a local variable to the current scope in the GenContext.
+func defineVar(ctx @GenContext, name *[]readonly char, ptr @ir.Instr, typ @types.Type) {
+	// Tag the alloca with the variable name for debug info
+	if ptr != nil && ptr.Op == iropcode.OP_ALLOC && len(ptr.StrVal) == 0 {
+		ptr.StrVal = buf.CopyStr(name)
+	}
+	var slot VarSlot
+	slot.Name = name
+	slot.Ptr = ptr
+	slot.Typ = typ
+	slot.IsParam = false
+	ctx.Vars = slices.Append[VarSlot](ctx.Vars, slot)
+}
+
+// defineFuncValueVar allocates a func-value slot of type `fvTyp`, constructs the
+// non-capturing func value for the top-level function `name` into it, and binds
+// `varName` to the slot.  The one home for the alloc→func-value→store→bind
+// sequence that a func-reference initializer produces, shared by `var` (genDecl)
+// and `:=` (genShortVar), for both a bare function reference (`add`) and a
+// generic-function instantiation (`glib.Ident[int]`).
+func defineFuncValueVar(ctx @GenContext, b @ir.Block, varName *[]readonly char, name @[]char,
+		fvTyp @types.Type) {
+	var ptr @ir.Instr = b.EmitAlloc(fvTyp)
+	var val @ir.Instr = b.EmitFuncValue(name, fvTyp)
+	noteSPGrowingResult(ctx, val)
+	b.EmitStore(ptr, val)
+	defineVar(ctx, varName, ptr, fvTyp)
+}
+
+// defineVarParam adds a function parameter variable to the scope (marked as param for cleanup).
+func defineVarParam(ctx @GenContext, name *[]readonly char, ptr @ir.Instr, typ @types.Type) {
+	// Tag the alloca with the variable name for debug info
+	if ptr != nil && ptr.Op == iropcode.OP_ALLOC && len(ptr.StrVal) == 0 {
+		ptr.StrVal = buf.CopyStr(name)
+	}
+	var slot VarSlot
+	slot.Name = name
+	slot.Ptr = ptr
+	slot.Typ = typ
+	slot.IsParam = true
+	ctx.Vars = slices.Append[VarSlot](ctx.Vars, slot)
+}

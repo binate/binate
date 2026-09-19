@@ -1,0 +1,232 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/types"
+
+// ============================================================
+// IR Generation: AST → IR Module
+//
+// Currently supports: function declarations, return statements,
+// integer arithmetic, variable declarations, assignments, if/else,
+// for loops.
+// ============================================================
+
+// irsym.ModuleConst.Kind selects which constant family a top-level const holds,
+// and thus which Emit* a read site dispatches to.  The non-int families
+// exist because `evalConstExpr` is integer-only: without a typed read-site
+// dispatch, a non-int top-level const fell through to EmitConstInt(0) —
+// both the wrong value and (e.g. an `i1` branch on a bool) malformed LLVM
+// IR.  Each family stashes its literal in its own irsym.ModuleConst slot so read
+// sites in gen_expr / gen_selector emit the matching constant: integers in
+// `Val`, bools in `BoolVal`, floats in `FltText` (raw literal text, parsed
+// by the backend), float const-expressions re-lowered from `Expr`.  Consts
+// are scalar-only (the checker rejects non-scalar const types), so there is
+// no string / composite family.  CONST_INT is the zero value, so producers
+// that only populate `Val` (the common int / iota case) need no explicit
+// Kind assignment.
+// bnlint:allow unused-const - iota enum; CONST_INT (0) is the implicit default
+const (
+	CONST_INT = 0  // integer / iota → EmitConstInt(Val)
+	CONST_BOOL = 1 // bool literal → EmitConstBool(BoolVal)
+	CONST_FLT = 2  // float literal → EmitConstFloat(FltText, Typ)
+	CONST_EXPR = 3 // float const-EXPRESSION → genExpr(Expr) at read site
+)
+
+// The per-module IR-gen lookup tables — irsym.ModuleConst / FuncSig /
+// irsym.ModuleStruct / irsym.ModuleGlobal / irsym.ModuleTypeAlias and the @Module.Consts /
+// FuncSigs / Structs / GlobalVars / TypeAliases fields that hold them —
+// are declared in ir.bni: they are field types of the exported @Module, so
+// two compilations in one process accumulate gen state on their own module
+// rather than a shared global.
+
+// The pending managed-slice / struct-array dtor work-lists — collected during
+// function-body IR gen, drained after — now live on @Module
+// (Module.Pending{Ms,Struct}Dtors + parallel *Names), reached from the
+// registrars via the func's @Func.Mod back-ref.  They moved off package-
+// globals so two compilations in one process accumulate dtor work on their own
+// module.
+
+// NewGenCtx creates a per-compilation gen context bound to module m,
+// seeding PkgPath from m.PkgPath (empty when m is nil or its path isn't
+// set yet — e.g. during import registration before GeneratePackage).
+// Callers that resolve against a different package (RegisterSelfTypes)
+// set gc.PkgPath explicitly after.
+func NewGenCtx(m @ir.Module) @GenCtx {
+	var gc @GenCtx = make(GenCtx)
+	gc.Mod = m
+	if m != nil {
+		gc.PkgPath = m.PkgPath
+	}
+	return gc
+}
+
+// qualifyForCurrentModule returns the canonical fully-qualified form
+// of a function name in the current module's context. Pass-through
+// for already-dotted names (cross-package references, methods,
+// qualified-dtor names like "ast.__dtor_File"). Bare names get
+// "<gc.PkgPath>." prepended. Outside any module-gen context (gc.PkgPath
+// empty), bare names are returned unchanged so legacy bare-name lookups
+// still match.
+//
+// Used to normalize both sides of the IR-internal name namespace:
+// each FuncSig.Name in Module.FuncSigs (storage) and the input to lookupFunc*
+// (consumption). Once both sides are normalized, the duplication that
+// used to live in each backend (modulePkgName + bare-name dance) lives
+// in IR alone.
+func qualifyForCurrentModule(gc @GenCtx, name *[]readonly char) @[]char {
+	return irutil.QualifyForPkgPath(gc.PkgPath, name)
+}
+
+// lookupTypeAlias searches Module.TypeAliases for a type alias by name.
+// lookupStructIdx returns the index of a struct in Module.Structs, or -1
+// if not found.  Own-module structs are registered under their fully-
+// qualified name (pkg/path.Name), so a bare lookup key is qualified to
+// the current module first — mirroring the func-sig lookups (lookupFuncSig).  A key that is
+// already qualified (an imported struct's dotted name) passes through
+// unchanged (QualifyName is idempotent on a dotted name); an empty
+// current module leaves the key bare.
+func lookupStructIdx(gc @GenCtx, name *[]readonly char) int {
+	var qname @[]char = qualifyForCurrentModule(gc, name)
+	for i := 0; i < len(gc.Mod.Structs); i++ {
+		if irutil.Streq(gc.Mod.Structs[i].Name, qname) {
+			return i
+		}
+	}
+	// Synthetic structs (anonymous / closure / multi-return tuples) are
+	// registered UNQUALIFIED, so fall back to the bare name when the
+	// qualifier changed it and the qualified form wasn't found.  Named
+	// (user) structs are always registered qualified, so they never
+	// reach this fallback — no false bare match.
+	if !irutil.Streq(qname, name) {
+		for i := 0; i < len(gc.Mod.Structs); i++ {
+			if irutil.Streq(gc.Mod.Structs[i].Name, name) {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// lookupFieldIndex returns the field index within a struct, or -1 if not found.
+func lookupFieldIndex(gc @GenCtx, si int, fieldName *[]readonly char) int {
+	var styp @types.Type = gc.Mod.Structs[si].Typ
+	if styp == nil || len(styp.Fields) == 0 { return -1 }
+	for i := 0; i < len(styp.Fields); i++ {
+		if irutil.Streq(styp.Fields[i].Name, fieldName) {
+			return i
+		}
+	}
+	return -1
+}
+
+// lookupFieldType returns the type of a named struct field, defaulting to int.
+func lookupFieldType(gc @GenCtx, si int, fieldName *[]readonly char) @types.Type {
+	var styp @types.Type = gc.Mod.Structs[si].Typ
+	if styp == nil || len(styp.Fields) == 0 { return types.TypInt() }
+	for i := 0; i < len(styp.Fields); i++ {
+		if irutil.Streq(styp.Fields[i].Name, fieldName) {
+			return styp.Fields[i].Type
+		}
+	}
+	return types.TypInt()
+}
+
+// lookupFuncResults returns the result types for a function in gc.Mod.FuncSigs.
+// Normalizes the input name so callers passing either bare or qualified forms find
+// the same entry (storage is always qualified post-Step-4).
+func lookupFuncResults(gc @GenCtx, name *[]readonly char) @[]@types.Type {
+	var qname @[]char = qualifyForCurrentModule(gc, name)
+	var idx int = ir.FuncSigIndexLookup(gc.Mod, qname)
+	if idx >= 0 {
+		return gc.Mod.FuncSigs.Get(idx).Results
+	}
+	var empty @[]@types.Type
+	return empty
+}
+
+// lookupFuncSig returns (sig, true) for a registered function `name`, or (zero,
+// false).  It qualifies + index-probes + copies the sig ONCE; call sites that need
+// several fields of a callee's signature (genCall / genMethodCall read Params,
+// IsVariadic, Results, and MultiReturnType) use this instead of the per-field
+// lookupFunc* wrappers, each of which re-qualifies (a throwaway compare-key
+// allocation), re-probes, and re-copies the sig for the same name.  A not-found
+// name yields the zero FuncSig, whose fields (empty Params/Results, false
+// IsVariadic, nil MultiReturnType) match what the wrappers return on a miss.
+func lookupFuncSig(gc @GenCtx, name *[]readonly char) (ir.FuncSig, bool) {
+	var qname @[]char = qualifyForCurrentModule(gc, name)
+	var idx int = ir.FuncSigIndexLookup(gc.Mod, qname)
+	if idx >= 0 {
+		return gc.Mod.FuncSigs.Get(idx), true
+	}
+	var empty ir.FuncSig
+	return empty, false
+}
+
+// setOrAppendFuncSig stores `sig` in gc.Mod.FuncSigs, replacing any
+// existing entry with the same Name (in place) or appending a new
+// one if no match.  Used by `GenDecl` so that re-typing a func at
+// the REPL prompt updates the IR-side sig table (otherwise the
+// FIRST-match `lookupFunc*` paths would still see the stale sig).
+func setOrAppendFuncSig(gc @GenCtx, sig ir.FuncSig) {
+	var idx int = ir.FuncSigIndexLookup(gc.Mod, sig.Name)
+	if idx >= 0 {
+		// Replace in place.  The index key BORROWS the stored sig's Name backing;
+		// the Set below overwrites FuncSigs[idx], dropping the old sig and freeing
+		// its Name `@[]char` (same bytes, but a DISTINCT allocation from the new
+		// sig's Name) — so the borrowed key would dangle.  Re-Put refreshes the
+		// stored key onto the new sig's live Name backing.  It MUST precede the
+		// Set: Put's probe compares against the currently-stored (old) key via
+		// streq, so the old backing must still be alive when Put runs.  Without
+		// this, a REPL method/func redefinition leaves a dangling index key, and a
+		// later same-name lookup misses on any allocator that clobbers freed memory
+		// (glibc happens to preserve the bytes; Darwin's does not), silently
+		// dropping the sig's params — e.g. a pointer-receiver method then passes its
+		// receiver by value and its mutations are lost.  Mirrors the vm.Funcs
+		// same-sig REPL-replace key refresh (LowerOneFunc).
+		gc.Mod.FuncSigIndex.Put(sig.Name, idx)
+		gc.Mod.FuncSigs.Set(idx, sig)
+		return
+	}
+	ir.RegisterFuncSig(gc.Mod, sig)
+}
+
+// lookupFuncExists returns true if a function signature exists in gc.Mod.FuncSigs.
+func lookupFuncExists(gc @GenCtx, name *[]readonly char) bool {
+	var qname @[]char = qualifyForCurrentModule(gc, name)
+	return ir.FuncSigIndexLookup(gc.Mod, qname) >= 0
+}
+
+// lookupConst searches gc.Mod.Consts for a constant by name, returning (value, type, found).
+func lookupConst(gc @GenCtx, name *[]readonly char) (int, @types.Type, bool) {
+	for i := 0; i < len(gc.Mod.Consts); i++ {
+		if irutil.Streq(gc.Mod.Consts[i].Name, name) {
+			// Val is int64; this feeds the host-int evalConstExpr fold, so narrow
+			// to int (its documented host-int semantics — matches the checker's
+			// evalConstIntValue reading sym.ConstVal).
+			return cast(int, gc.Mod.Consts[i].Val), gc.Mod.Consts[i].Typ, true
+		}
+	}
+	return 0, nil, false
+}
+
+// lookupConstBool returns the boolean value of a registered CONST_BOOL by
+// name (the second result is false if the name isn't a registered boolean
+// const).  evalConstBool uses it to fold a bool-const reference inside
+// another const's logical expression — e.g. `const C bool = !A`.
+func lookupConstBool(gc @GenCtx, name *[]readonly char) (bool, bool) {
+	for i := 0; i < len(gc.Mod.Consts); i++ {
+		if irutil.Streq(gc.Mod.Consts[i].Name, name) {
+			if gc.Mod.Consts[i].Kind == CONST_BOOL {
+				return gc.Mod.Consts[i].BoolVal, true
+			}
+			return false, false
+		}
+	}
+	return false, false
+}
+
+// InitModule creates a new module and clears IR gen state.
+// Call RegisterImport for each dependency before calling GeneratePackage.

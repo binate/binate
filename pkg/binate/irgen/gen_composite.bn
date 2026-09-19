@@ -1,0 +1,474 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// IR generation for composite literals — `T{...}`.  genCompositeLit handles
+// the struct form (positional or keyed fields) and dispatches the array /
+// raw-slice / managed-slice forms to genArrayLit / genRawSliceLit /
+// genManagedSliceLit (below).
+
+// genCompositeLit generates IR for a composite literal (struct or array).
+//
+// Dispatch is on the PEELED underlying kind, not on `e.TypeRef.Kind`, so a
+// named-distinct wrapper (`type Row [3]int; Row{...}`, `type NS S; NS{...}`,
+// `type Buf @[]int; Buf{...}`) lowers through the SAME path as its unnamed
+// form.  Keying off the syntactic TypeRef kind instead would route every
+// named wrapper (whose TypeRef is TEXPR_NAMED) to the struct branch, where
+// lookupStructIdx misses the non-struct wrapper and the literal silently
+// drops to a constant 0 — a wrong-code bug for every named array / slice /
+// struct literal.  The element type / length / field layout / refcount must
+// likewise come from the peeled type, never the wrapper.
+func genCompositeLit(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr {
+	if e.TypeRef == nil {
+		return b.EmitConstInt(0, types.TypInt())
+	}
+
+	var typ @types.Type = irutil.PeelTransparent(resolveTypeExpr(ctx.Gc, e.TypeRef))
+	if typ == nil {
+		return b.EmitConstInt(0, types.TypInt())
+	}
+
+	// Array composite literal: [N]T{...} (incl. named-distinct `type R [N]T`).
+	if typ.Kind == types.TYP_ARRAY {
+		return genArrayLit(ctx, b, e, typ)
+	}
+
+	// Managed-slice composite literal: @[]T{...} (incl. `type Buf @[]T`).
+	if typ.Kind == types.TYP_MANAGED_SLICE {
+		return genManagedSliceLit(ctx, b, e, typ)
+	}
+
+	// Raw-slice composite literal: *[]readonly T{...} (incl. `type S *[]T`).
+	if typ.Kind == types.TYP_SLICE {
+		return genRawSliceLit(ctx, b, e, typ)
+	}
+
+	if typ.Kind != types.TYP_STRUCT {
+		return b.EmitConstInt(0, types.TypInt())
+	}
+
+	var structPtr @ir.Instr = b.EmitAlloc(typ)
+
+	// Register the literal alloca as an end-of-statement cleanup temp BEFORE the
+	// field loop, not after.  Two reasons: (1) a fresh managed-field struct literal
+	// is neither a named local nor a call-result temp, so nothing else RefDecs its
+	// managed fields to balance the copy every consumer (return / by-value arg /
+	// field-init / method receiver / assignment) takes — a leak per occurrence
+	// (emitTempCleanupBody's OP_ALLOC arm dtors it, mirroring
+	// registerManagedCallResult).  (2) Registering it here means a RECOVERABLE VM
+	// fault WHILE a LATER field is being evaluated dispatches a pad that covers the
+	// partial aggregate: each managed field is MOVED in as the loop goes
+	// (emitStoreManagedSlot isInit -> consumeTemp, leaving ctx.Temps), so a fault
+	// after some fields are moved would otherwise leak them.  The dtor RefDecs every
+	// managed field; the not-yet-filled ones are null (pushFrame zero-fills the
+	// frame), so RefDec(null) no-ops.  A consumer that instead REUSES the alloca as
+	// durable storage (the var-init fast paths in genShortVar / genDecl)
+	// consumeTemp's it, transferring ownership to the var.
+	if needsStructCopy(typ) {
+		registerTemp(ctx, structPtr)
+	}
+
+	// Initialize all fields: from keyed or positional elements, or zero.
+	// Fields come from the peeled struct type (the underlying struct's
+	// layout), so a named wrapper `type NS S` finds S's fields, not the
+	// wrapper's (which has none).
+	var fields @[]@types.Field = typ.Fields
+	var isKeyed bool = len(e.Elems) > 0 && e.Elems[0].Key != nil
+	for i := 0; i < len(fields); i++ {
+		var fieldPtr @ir.Instr = b.EmitGetFieldPtr(structPtr, i, fields[i].Type)
+		var val @ir.Instr = nil
+		if isKeyed {
+			// Keyed: find element by field name
+			for j := 0; j < len(e.Elems); j++ {
+				if e.Elems[j].Key != nil && irutil.Streq(e.Elems[j].Key.Name, fields[i].Name) {
+					val = genExprOrFuncRef(ctx, b, e.Elems[j].Value, fields[i].Type)
+					b = ctx.CurBlock
+				}
+			}
+		} else {
+			// Positional: use element at index i if available
+			if i < len(e.Elems) {
+				val = genExprOrFuncRef(ctx, b, e.Elems[i].Value, fields[i].Type)
+				b = ctx.CurBlock
+			}
+		}
+		if val == nil {
+			// Zero-initialize: use nil for slices/pointers, 0 for scalars
+			if isNillableType(fields[i].Type) {
+				val = b.EmitConstNil(fields[i].Type)
+			} else {
+				val = b.EmitConstInt(0, fields[i].Type)
+			}
+		}
+		// String literal assigned to a char-slice field (*[]readonly char
+		// OR @[]char): convert OP_CONST_STRING to a proper slice
+		// value (raw → OP_RODATA_SLICE, managed → OP_RODATA_MSLICE_COPY).
+		// Without this, the managed-slice arm below tries to extract
+		// the refptr from a bare i8*, the per-field RefInc and the
+		// store both go wrong, and the Name field reads back as zero.
+		var ft @types.Type = fields[i].Type
+		if isCharSliceType(ft) {
+			if val.Op == iropcode.OP_CONST_STRING {
+				val = b.EmitStringToChars(val, fields[i].Type)
+				noteSPGrowingResult(ctx, val)
+			}
+		}
+		// String literal assigned to [N]char field: load rodata array.
+		if isCharArrayType(ft) {
+			if val.Op == iropcode.OP_CONST_STRING {
+				val = b.EmitRodataArray(val.StrVal, fields[i].Type)
+				noteSPGrowingResult(ctx, val)
+			}
+		}
+		// @[]T → *[]T conversion for raw slice field
+		if ft.Kind == types.TYP_SLICE && val.Typ != nil && val.Typ.Kind == types.TYP_MANAGED_SLICE {
+			// Temp stays in cleanup — RefDec at end of statement
+			val = b.EmitManagedToRaw(val)
+		}
+		// If the value is an aggregate alloca (from a nested composite lit —
+		// struct OR array), load the VALUE first; otherwise the alloca POINTER
+		// lands in the field slot instead of the aggregate value.
+		if isAggregateAllocToLoad(val, ft) {
+			val = b.EmitLoad(val, val.TypeArg)
+		}
+		// Narrow an untyped scalar LITERAL field value to the field's
+		// width (e.g. an untyped-float 0.5 into a float32 field fptruncs
+		// to single precision).  No-op for managed / struct / nil values.
+		val = coerceScalarWidth(ctx, b, val, fields[i].Type)
+		// Acquire-and-store through the shared dispatcher.  isInit: a fresh
+		// field slot, no old value to release.  A fresh producer — including
+		// an OP_CONST_NIL zero-init — is moved (consumeTemp), so no RefInc /
+		// OP_EXTRACT runs on a nil constant (which the bytecode VM mis-lowers).
+		b = emitStoreManagedSlot(ctx, b, fieldPtr, val, fields[i].Type, true)
+	}
+	return structPtr
+}
+
+// ============================================================
+// Array literal
+// ============================================================
+
+// coerceCompositeElement applies the element coercions shared by every
+// composite-element store — an array-literal element (genArrayLit) and a
+// variadic-pack element (emitVariadicTail) — so the two callers cannot drift and
+// a future coercion applies to both:
+//  1. narrow an untyped scalar literal to the element width (an 8-byte store into
+//     a 4-byte slot otherwise corrupts memory);
+//  2. give a string-literal char-slice element its full managed-slice header, not
+//     the bare OP_CONST_STRING data pointer (else the slot's len reads back 0);
+//  3. load a struct/array composite-literal element's value — it returns its
+//     alloca POINTER, which must not be stored into the aggregate-sized slot.
+// Returns the coerced value; none of the coercions split the block, so the
+// caller's `b` stays current.
+func coerceCompositeElement(ctx @GenContext, b @ir.Block, val @ir.Instr,
+		elemTyp @types.Type) @ir.Instr {
+	val = coerceScalarWidth(ctx, b, val, elemTyp)
+	if isCharSliceType(elemTyp) && val.Op == iropcode.OP_CONST_STRING {
+		val = b.EmitStringToChars(val, elemTyp)
+		noteSPGrowingResult(ctx, val)
+	}
+	if isAggregateAllocToLoad(val, elemTyp) {
+		val = b.EmitLoad(val, val.TypeArg)
+	}
+	return val
+}
+
+// genArrayLit generates IR for an array literal expression, allocating and
+// storing each element.  `arrTyp` is the PEELED array type (a named-distinct
+// `type R [N]T` wrapper has been peeled to its underlying [N]T by the caller),
+// so the alloca, length, and element type all reflect the real array layout.
+func genArrayLit(ctx @GenContext, b @ir.Block, e @ast.Expr, arrTyp @types.Type) @ir.Instr {
+	var arrPtr @ir.Instr = b.EmitAlloc(arrTyp)
+
+	// Register the array alloca for cleanup BEFORE the element loop (same as the
+	// struct-literal case in genCompositeLit): a fresh array literal with managed
+	// elements needs its elements RefDec'd to balance the copy a consumer takes,
+	// AND — since each element is MOVED in as the loop goes (emitStoreManagedSlot
+	// isInit -> consumeTemp) — a recoverable VM fault while evaluating a LATER
+	// element must release the elements moved so far, via a pad that covers the
+	// partial array.  The dtor RefDecs every element; the not-yet-filled ones are
+	// null (the alloca is zero-initialised), so RefDec(null) no-ops.  The var-init
+	// fast paths consumeTemp it when they reuse the alloca as the variable's storage.
+	if needsStructCopy(arrTyp) {
+		registerTemp(ctx, arrPtr)
+	}
+
+	var elemTyp @types.Type = arrTyp.Elem
+	if elemTyp == nil {
+		elemTyp = types.TypInt()
+	}
+
+	// Store each element.  An INDEXED element (`[N]T{k: v}`) places its value
+	// at the constant index k; an unkeyed element follows the previous index
+	// + 1 (Go array-literal semantics, so `[5]int{1: 10, 3: 30}` is
+	// {0,10,0,30,0} and `[3]int{1, 2}` is {1,2,0}).  Gaps stay zero because the
+	// array alloca is zero-initialised.  The checker (checkArrayLit) has
+	// already const-folded and bounds/duplicate-checked the indices.
+	var nextIdx int = 0
+	for i := 0; i < len(e.Elems); i++ {
+		var arrIdx int = nextIdx
+		if e.Elems[i].Key != nil {
+			// Read the checker's validated index (checkArrayLit stamped it after
+			// bounds/duplicate-checking) rather than re-folding the key here with
+			// a DIFFERENT folder (evalConstExpr): a disagreement would place the
+			// element at an index the checker never bound-checked against N → an
+			// out-of-bounds store.  Mirrors TypeExpr.LenVal.  The fallback re-fold
+			// covers any un-stamped key defensively (a validated keyed literal
+			// always stamps KeyKnown).
+			if e.Elems[i].KeyKnown {
+				arrIdx = e.Elems[i].KeyVal
+			} else {
+				var kv int
+				var kok bool
+				kv, kok = evalConstExpr(ctx.Gc, e.Elems[i].Key, 0)
+				if kok { arrIdx = kv }
+			}
+		}
+		nextIdx = arrIdx + 1
+		var idx @ir.Instr = b.EmitConstInt(arrIdx, types.TypInt())
+		var elemPtr @ir.Instr = b.EmitGetElemPtr(arrPtr, idx, elemTyp)
+		// genExprOrFuncRef, not plain genExpr: a function reference
+		// (`pkg.Func` / method expression `T.M`) as an element must
+		// lower to a real function value (OP_FUNC_VALUE), exactly as the
+		// struct-field path does.  Plain genExpr would route it to
+		// genSelector's catch-all fallback (an aborting panic), since no
+		// value site bound it to a func-value-typed slot.
+		var val @ir.Instr = genExprOrFuncRef(ctx, b, e.Elems[i].Value, elemTyp)
+		b = ctx.CurBlock
+		// Narrow untyped scalar literals, convert string-literal char-slice
+		// elements to a full slice header, and load composite-literal aggregate
+		// elements — the shared element-store coercions (coerceCompositeElement).
+		val = coerceCompositeElement(ctx, b, val, elemTyp)
+		// Acquire-and-store through the shared dispatcher: the array co-owns
+		// each managed element (its scope-exit dtor RefDec's it).  isInit: a
+		// freshly-alloc'd slot, no old value to release.  A fresh producer —
+		// including an OP_CONST_NIL zero-init — is moved (consumeTemp), so no
+		// RefInc / OP_EXTRACT runs on a nil constant.
+		b = emitStoreManagedSlot(ctx, b, elemPtr, val, elemTyp, true)
+	}
+	return arrPtr
+}
+
+// genRawSliceLit generates IR for a raw-slice composite literal
+// `*[]readonly T{e0, e1, ...}`. Stack-allocates an `[N]T` backing,
+// stores each element, then builds a `%BnSlice{data, N}` view of
+// the stack array. The view's lifetime is the enclosing scope —
+// the language's existing raw-slice-borrow rules keep this honest
+// (you can't return or otherwise escape a raw slice).
+//
+// Phase 3 fast path: when the element type is `const uint8` and
+// every element is a compile-time char/int literal that fits in a
+// byte, emit `OP_RODATA_SLICE` directly so codegen can alias a
+// shared static rodata global (zero-copy, zero stack frame use).
+//
+// `sliceTyp` is the PEELED raw-slice type (a named-distinct wrapper has
+// already been peeled to its underlying *[]T by the caller).
+func genRawSliceLit(ctx @GenContext, b @ir.Block, e @ast.Expr, sliceTyp @types.Type) @ir.Instr {
+	var elemTyp @types.Type = sliceTyp.Elem
+	if elemTyp == nil {
+		elemTyp = types.TypInt()
+	}
+	// Length-0 ⟹ no backing: an empty `*[]T{}` is the nil-equivalent
+	// {null, 0}, not a view over a freshly-allocated [0]T backing.
+	if len(e.Elems) == 0 {
+		return b.EmitConstNil(sliceTyp)
+	}
+	var bytes @[]char
+	var ok bool
+	bytes, ok = collectConstByteElems(e, elemTyp)
+	if ok {
+		return b.EmitRodataSlice(bytes, sliceTyp)
+	}
+	var n int = len(e.Elems)
+	// 1. Allocate a stack `[N]T` backing.
+	var arrTyp @types.Type = types.MakeArrayType(elemTyp, n)
+	var arrPtr @ir.Instr = b.EmitAlloc(arrTyp)
+	for i := 0; i < n; i++ {
+		var idx @ir.Instr = b.EmitConstInt(i, types.TypInt())
+		var elemPtr @ir.Instr = b.EmitGetElemPtr(arrPtr, idx, elemTyp)
+		// genExprOrFuncRef, not plain genExpr: a function reference
+		// (`pkg.Func` / method expression `T.M`) as an element must
+		// lower to a real function value (OP_FUNC_VALUE), exactly as the
+		// struct-field path does.  Plain genExpr would route it to
+		// genSelector's catch-all fallback (an aborting panic).  The
+		// element type is `readonly T` here; genExprOrFuncRef peels the
+		// transparent wrapper before its func-value-kind check.
+		var val @ir.Instr = genExprOrFuncRef(ctx, b, e.Elems[i].Value, elemTyp)
+		b = ctx.CurBlock
+		// Narrow an untyped scalar literal element to the element width
+		// (e.g. an untyped-float 0.5 in *[]float32{...} fptruncs to single
+		// precision) — without it codegen stores an 8-byte double through
+		// a 4-byte float slot (memory corruption).
+		val = coerceScalarWidth(ctx, b, val, elemTyp)
+		b.EmitStore(elemPtr, val)
+	}
+	// 2. Build a %BnSlice {data, N} view via alloca + field stores.
+	var sliceAlloca @ir.Instr = b.EmitAlloc(sliceTyp)
+	var rawPtrTyp @types.Type = types.MakePointerType(types.TypUint8())
+	var dataPtr @ir.Instr = b.EmitBitCast(arrPtr, rawPtrTyp)
+	var ptrField @ir.Instr = b.EmitGetFieldPtr(sliceAlloca, 0, rawPtrTyp)
+	b.EmitStore(ptrField, dataPtr)
+	var lenInstr @ir.Instr = b.EmitConstInt(n, types.TypInt())
+	var lenField @ir.Instr = b.EmitGetFieldPtr(sliceAlloca, 1, types.TypInt())
+	b.EmitStore(lenField, lenInstr)
+	return b.EmitLoad(sliceAlloca, sliceTyp)
+}
+
+// genManagedSliceLit generates IR for a managed-slice composite
+// literal `@[]T{e0, e1, ...}`. Allocates a fresh backing via
+// `MakeManagedSlice(sizeof(T), N)`, stores each element, and
+// returns the resulting %BnManagedSlice. Refcount-wise the result
+// is fresh (refcount=1) — same as `make_slice(T, N)` followed by
+// element initialization.
+//
+// Phase 3 fast path: same const-byte detection as genRawSliceLit
+// — when applicable, emit `OP_RODATA_MSLICE` so codegen aliases a
+// shared static `%BnManagedSlice` global instead of running the
+// MakeSlice + N stores at runtime.
+//
+// `sliceTyp` is the PEELED managed-slice type (a named-distinct wrapper
+// `type Buf @[]T` has already been peeled to its underlying @[]T by the
+// caller), so the element type / refcount come from the real slice.
+func genManagedSliceLit(ctx @GenContext, b @ir.Block, e @ast.Expr, sliceTyp @types.Type) @ir.Instr {
+	var elemTyp @types.Type = sliceTyp.Elem
+	if elemTyp == nil {
+		elemTyp = types.TypInt()
+	}
+	var bytes @[]char
+	var ok bool
+	bytes, ok = collectConstByteElems(e, elemTyp)
+	if ok {
+		return b.EmitRodataMSlice(bytes, sliceTyp)
+	}
+	var n int = len(e.Elems)
+	var nInstr @ir.Instr = b.EmitConstInt(n, types.TypInt())
+	var slice @ir.Instr = b.EmitMakeSlice(elemTyp, nInstr)
+	noteSPGrowingResult(ctx, slice)
+	// Register the slice for cleanup BEFORE the element loop (same rationale as
+	// genCompositeLit / genArrayLit): balances the ownership every consumer takes,
+	// AND — since each managed element is acquired/moved into the backing as the
+	// loop goes — a recoverable VM fault while evaluating a LATER element releases
+	// the elements filled so far via a pad covering the partial slice.  The
+	// element dtor RefDecs each backing slot; the not-yet-filled ones are null
+	// (make_slice zero-fills), so RefDec(null) no-ops.  A consumer that MOVES the
+	// literal (var init, slot store, return of a fresh producer) consumeTemp's it,
+	// transferring ownership.  The RODATA fast path above returns a static immortal
+	// slice and needs no temp (it returns before reaching here).
+	registerTemp(ctx, slice)
+
+	// Store each element via slice-set semantics: extract data ptr,
+	// GEP to the element, store.
+	for i := 0; i < n; i++ {
+		var idx @ir.Instr = b.EmitConstInt(i, types.TypInt())
+		// genExprOrFuncRef, not plain genExpr: a function reference
+		// (`pkg.Func` / method expression `T.M`) as an element must
+		// lower to a real function value (OP_FUNC_VALUE), exactly as the
+		// struct-field path does.  Plain genExpr would route it to
+		// genSelector's catch-all fallback (an aborting panic), since no
+		// value site bound it to a func-value-typed slot.
+		var val @ir.Instr = genExprOrFuncRef(ctx, b, e.Elems[i].Value, elemTyp)
+		b = ctx.CurBlock
+		// Narrow an untyped scalar literal element to the element width
+		// (e.g. an untyped-float 0.5 in @[]float32{...} fptruncs to single
+		// precision).  No-op for managed / struct / string values below.
+		val = coerceScalarWidth(ctx, b, val, elemTyp)
+		// Same conversion the var-decl / array-lit / array-index-
+		// assign / struct-field-init paths apply: a string literal
+		// stored into a char-slice element needs the full managed-
+		// slice header, not the bare data pointer of OP_CONST_STRING.
+		// Without this, an `@[]@[]char{"a","b",...}` literal stores
+		// 8-byte pointers into 32-byte slots and the slot's len
+		// reads back as 0 (silent empty output).
+		if isCharSliceType(elemTyp) && val.Op == iropcode.OP_CONST_STRING {
+			val = b.EmitStringToChars(val, elemTyp)
+			noteSPGrowingResult(ctx, val)
+		}
+		// Nested composite-lit element: a struct/array composite literal returns
+		// its alloca POINTER.  When the slice element type IS the aggregate (not
+		// a pointer to it), load the VALUE first — otherwise the struct-copy slot
+		// and EmitSliceSet below write the 8-byte alloca pointer into the
+		// aggregate-sized element, and the element reads back as the temp's
+		// address (silent wrong-code).  Mirrors genArrayLit's identical guard;
+		// a no-op for variable elements (genExpr already loads them).
+		if isAggregateAllocToLoad(val, elemTyp) {
+			val = b.EmitLoad(val, val.TypeArg)
+		}
+		// Acquire each managed element so the slice owns its reference (its
+		// scope-exit dtor RefDec's it); a fresh producer transfers ownership
+		// via consumeTemp instead.  A managed slice has no persistent slot
+		// pointer, so this can't route through emitStoreManagedSlot like the
+		// array / struct literals — a managed-aggregate element instead copies
+		// into a throwaway slot to RefInc its fields (EmitSliceSet then writes
+		// the same bytes into the element).
+		if irutil.IsManagedScalarType(elemTyp) {
+			emitAcquireManagedScalar(ctx, b, val, elemTyp)
+		} else if needsStructCopy(elemTyp) {
+			var copySlot @ir.Instr = b.EmitAlloc(elemTyp)
+			b.EmitStore(copySlot, val)
+			emitStructCopy(ctx.Func, b, copySlot, elemTyp)
+		}
+		b.EmitSliceSet(slice, idx, val, elemTyp)
+	}
+	return slice
+}
+
+// collectConstByteElems returns the byte sequence of a composite
+// literal whose target element type is `const uint8` and whose every
+// element is a compile-time char/int literal that fits in [0, 255].
+// Returns (bytes, true) on success; (nil, false) when the literal
+// doesn't qualify (different element type, mixed/runtime elements,
+// or out-of-range int literals).
+func collectConstByteElems(e @ast.Expr, elemTyp @types.Type) (@[]char, bool) {
+	if !isConstByteElemType(elemTyp) {
+		var none @[]char
+		return none, false
+	}
+	var n int = len(e.Elems)
+	var bytes @[]char = make_slice(char, n)
+	for i := 0; i < n; i++ {
+		var v @ast.Expr = e.Elems[i].Value
+		if v == nil {
+			var none @[]char
+			return none, false
+		}
+		var b int
+		if v.Kind == ast.EXPR_CHAR_LIT {
+			b = types.ParseCharLit(v.Name)
+		} else if v.Kind == ast.EXPR_INT_LIT {
+			b = parseIntLit(v.Name)
+			if b < 0 || b > 255 {
+				var none @[]char
+				return none, false
+			}
+		} else {
+			var none @[]char
+			return none, false
+		}
+		bytes[i] = cast(char, b)
+	}
+	return bytes, true
+}
+
+// isConstByteElemType reports whether `elemTyp` is `const uint8`
+// (or any const-wrapped 8-bit unsigned int after alias peeling).
+// The const wrapper is required: aliasing rodata is sound only for
+// read-only views.
+func isConstByteElemType(elemTyp @types.Type) bool {
+	for elemTyp != nil && elemTyp.Kind == types.TYP_ALIAS {
+		elemTyp = elemTyp.Target
+	}
+	if elemTyp == nil { return false }
+	if elemTyp.Kind != types.TYP_READONLY { return false }
+	var inner @types.Type = elemTyp.Elem
+	for inner != nil && inner.Kind == types.TYP_ALIAS {
+		inner = inner.Target
+	}
+	if inner == nil { return false }
+	return inner.Kind == types.TYP_INT && inner.Width == 8 && !inner.Signed
+}

@@ -1,0 +1,458 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/irsym"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// reflectPackageStructType returns the `reflect.Package` STRUCT type (the
+// TYP_NAMED wrapper peeled to its underlying struct), or nil if the checker
+// has no reflect type loaded.  It is the result-element shape of the
+// compiler-synthesized `__Package() @reflect.Package` accessor — the managed
+// pointer to this struct.  The checker path-qualifies reflect.Package's
+// fields (Option B step 3), so the mangler folds them to reflect's symbols.
+// Shared by the imported-package registration (RegisterImport) and the
+// current-package registration (registerCurrentModulePackageAccessor).
+func reflectPackageStructType(c @types.Checker) @types.Type {
+	if c == nil { return nil }
+	var reflectPkgTy @types.Type = c.PackageType("pkg/builtins/reflect", "Package")
+	if reflectPkgTy == nil { return nil }
+	if reflectPkgTy.Kind == types.TYP_NAMED && reflectPkgTy.Underlying != nil {
+		return reflectPkgTy.Underlying
+	}
+	return reflectPkgTy
+}
+
+// registerCurrentModulePackageAccessor registers the CURRENT module's
+// compiler-synthesized `__Package() @reflect.Package` accessor in Module.FuncSigs,
+// so an UNQUALIFIED `__Package()` call (a bare Ident, genCall's funcRefName
+// path) resolves its result type and lowers to a call of the local
+// `__Package` symbol — codegen's emit_pkg_descriptor.bn emits the matching
+// `define` in this same module.  Mirrors RegisterImport's registration of an
+// IMPORTED package's `__Package`, but keyed on the current module's qualified
+// name (so lookupFunc* — which normalize a bare name via
+// qualifyForCurrentModule — find it) and with no extern decl (the body is in
+// this TU).
+func registerCurrentModulePackageAccessor(gc @GenCtx, c @types.Checker) {
+	var reflectStruct @types.Type = reflectPackageStructType(c)
+	if reflectStruct == nil { return }
+	var pkgResults @[]@types.Type = make_slice(@types.Type, 1)
+	pkgResults[0] = types.MakeManagedPtrType(reflectStruct)
+	var pkgSig ir.FuncSig
+	pkgSig.Name = qualifyForCurrentModule(gc, "__Package")
+	pkgSig.Results = pkgResults
+	setOrAppendFuncSig(gc, pkgSig)
+
+	// Stash the full `func() @reflect.Package` func-value type on the
+	// module so the backends can self-list this accessor in the
+	// per-package reflect Functions table.  The backends can't re-derive
+	// reflect.Package (it lives in the checker), so they read this one
+	// object — making the __Package FunctionInfo entry byte-identical
+	// across LLVM and native by construction.
+	var noParams @[]@types.Param
+	gc.Mod.PackageAccessorSig = types.MakeFuncValueType(noParams, pkgResults)
+}
+
+// lastPathSegment is the local copy of cmd/bnc's shortName — IR
+// needs it for pushFileImports and avoids the cmd-only dependency.
+func lastPathSegment(p *[]readonly char) @[]char {
+	var last int = 0
+	for i := 0; i < len(p); i++ {
+		if p[i] == '/' { last = i + 1 }
+	}
+	return buf.CopyStr(p[last:])
+}
+
+// unquote strips surrounding quotes (delegates to mangle's helper).
+func unquote(s *[]readonly char) @[]char {
+	return mangle.PkgPathFromQuoted(s)
+}
+
+// RecordImportPath maps an import alias to its full package path
+// (the import path, e.g. `bni` → `cmd/bni`), so cross-package
+// qualified names expand to the full path used by the importee's
+// own compilation (see resolveImportPkg).  First write wins, so a
+// caller that knows the true import path should call this before
+// any file-based fallback runs.  No-op for an empty path.
+//
+// The path must be the IMPORT PATH, not the file's declared package
+// name: a cmd package declares `package "main"` but is imported by
+// its path (`cmd/bni`), and the importee compiles under that path —
+// so a `file.PkgName`-based mapping (`bni → main`) would mis-qualify
+// its symbols and collide with the importer's own `main`.
+func RecordImportPath(m @ir.Module, alias *[]readonly char, path *[]readonly char) {
+	if len(path) == 0 { return }
+	for i := 0; i < len(m.ImportAliasNames); i++ {
+		if irutil.Streq(m.ImportAliasNames[i], alias) { return }
+	}
+	m.ImportAliasNames = slices.Append[@[]char](m.ImportAliasNames, buf.CopyStr(alias))
+	m.ImportAliasPaths = slices.Append[@[]char](m.ImportAliasPaths, buf.CopyStr(path))
+}
+
+// registerImportsImpl registers multiple imported packages with cross-
+// package type resolution.  paths[k] is the import path for
+// aliases[k] (e.g. "pkg/binate/loader") — passed explicitly rather than
+// derived from file.PkgName so a cmd's `package "main"` still
+// qualifies under its import path.  regExterns is threaded to
+// registerImportFieldsAndFuncs (see there): true for the normal build path,
+// false for the REPL's mid-session import.
+func registerImportsImpl(aliases @[]@[]char, paths @[]@[]char, files *[]@ast.File, gc @GenCtx,
+		regExterns bool) {
+	// gc is the threaded per-compilation context for the import pre-pass.
+	// gc.Mod is the importing module; its PkgPath is still empty here
+	// (GeneratePackage hasn't run), matching the former ""-valued global
+	// during import registration — qualification uses the explicit import
+	// paths instead.
+	// Pass 0: record alias → full-path mappings before any
+	// buildQualName call so cross-package names expand correctly.
+	for k := 0; k < len(aliases); k++ {
+		RecordImportPath(gc.Mod, aliases[k], paths[k])
+	}
+	// Pass 1: register all struct type names from all imports.
+	// Generic struct decls (TypeParams non-empty) stash in
+	// gc.GenericTypeDecls under the import alias instead; per-(decl,
+	// args) instantiations land in Module.Structs lazily at use
+	// sites.
+	for k := 0; k < len(aliases); k++ {
+		var alias @[]char = aliases[k]
+		var file @ast.File = files[k]
+		if file == nil || len(file.Decls) == 0 { continue }
+		for i := 0; i < len(file.Decls); i++ {
+			var d @ast.Decl = file.Decls[i]
+			if d.Kind == ast.DECL_TYPE && d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+				if len(d.TypeParams) > 0 {
+					if lookupGenericTypeDeclPkg(gc, alias, d.Name) == nil {
+						gc.GenericTypeDecls = slices.Append[@ast.Decl](
+								gc.GenericTypeDecls, d)
+						gc.GenericTypeDeclPkgs = slices.Append[@[]char](
+								gc.GenericTypeDeclPkgs, buf.CopyStr(alias))
+						gc.GenericTypeDeclFiles = slices.Append[@ast.File](
+								gc.GenericTypeDeclFiles, file)
+					}
+					continue
+				}
+				var qualName @[]char = buildQualName(gc.Mod, alias, d.Name)
+				// Only add if not already registered
+				if lookupStructIdx(gc, qualName) < 0 {
+					var ms irsym.ModuleStruct
+					ms.Name = qualName
+					var noFields @[]@types.Field
+					ms.Typ = types.MakeStructType(qualName, noFields)
+					gc.Mod.Structs = slices.Append[irsym.ModuleStruct](gc.Mod.Structs, ms)
+				}
+			}
+		}
+	}
+
+	// Pass 2: populate struct fields, register functions and
+	// constants.  pushFileImports installs the imported file's own
+	// imports so cross-package refs inside it (impls naming aliases
+	// the imported file imports — e.g. hello's `impl *Hello :
+	// aliases.Hello` referencing pkg/aliases — and method signatures'
+	// types) resolve via THAT FILE'S aliases, not the importing
+	// module's.
+	for k := 0; k < len(aliases); k++ {
+		var alias @[]char = aliases[k]
+		var file @ast.File = files[k]
+		if file == nil || len(file.Decls) == 0 { continue }
+		var snap AliasMapSnapshot = pushFileImports(gc.Mod, file)
+		gc.Mod.CurrentImportAlias = alias
+		registerImportFieldsAndFuncs(gc, alias, file, gc.Mod, regExterns)
+		popFileImports(gc.Mod, snap)
+	}
+	var emptyAlias @[]char
+	gc.Mod.CurrentImportAlias = emptyAlias
+}
+
+// RegisterImports registers imported packages with cross-package type resolution
+// AND adds their extern Func entries so cross-package calls resolve at link time.
+func RegisterImports(aliases @[]@[]char, paths @[]@[]char, files *[]@ast.File, gc @GenCtx) {
+	registerImportsImpl(aliases, paths, files, gc, true)
+}
+
+// RegisterImportFuncSigs is RegisterImports WITHOUT adding the imported extern
+// Func entries (regExterns=false): it registers the callees' signatures
+// (variadic-ness, param/result types) for call-site resolution but leaves the
+// module's func table untouched.  The REPL's mid-session import uses it so a
+// following per-decl LowerOneFunc's baked indices stay in sync with the VM's func
+// table; the callee itself resolves through the VM's native extern table.
+func RegisterImportFuncSigs(aliases @[]@[]char, paths @[]@[]char, files *[]@ast.File, gc @GenCtx) {
+	registerImportsImpl(aliases, paths, files, gc, false)
+}
+
+// registerImportFieldsAndFuncs does the second pass of import registration:
+// populates struct fields and registers function signatures.
+// Assumes all struct names are already registered.
+func registerImportFieldsAndFuncs(gc @GenCtx, alias *[]readonly char, file @ast.File,
+		mod @ir.Module, regExterns bool) {
+	// regExterns=false registers the imported functions' SIGNATURES (Module.FuncSigs
+	// — enough for a call site to resolve variadic-ness, param, and return types)
+	// but does NOT add their EXTERN Func entries to mod.Funcs.  The REPL's
+	// mid-session import passes false: mod is the live session module whose func
+	// index space is already mirrored 1:1 into the VM's func table, and a
+	// per-decl LowerOneFunc that follows bakes indices against it — appending
+	// extern Funcs mid-session desyncs the two, so a later prompt's synthetic (e.g.
+	// a `var` initializer) calls a stale index and executes an unlowered extern as
+	// bytecode → SIGSEGV.  The mid-session callee resolves through the VM's native
+	// extern table instead (an injected package like pkg/builtins/testing), so the
+	// IR extern is unneeded there.  Every non-REPL caller passes true.
+	// Slice 2.7: register imported interfaces in the module's interface registry
+	// under the import alias's pkg, so `*alias.Iface` /
+	// `@alias.Iface` use sites resolve and findInterfaceMethod /
+	// findImplVtableName see the imported method set.
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if d.Kind == ast.DECL_INTERFACE {
+			collectInterfaceFromDecl(gc, d, alias, file)
+		}
+	}
+
+	// Slice 2.8: register imported impls so cross-package iv
+	// constructions in this TU can find the vtable's mangled name.
+	// The vtable global itself was emitted by the imported
+	// package's TU (with weak_odr linkage); we just need
+	// findImplVtableName to recognize the (R, I) pair and produce
+	// the same canonical symbol.
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if d.Kind == ast.DECL_IMPL {
+			collectImportedImplsFromDecl(gc, d, alias, mod)
+		}
+	}
+
+	// Populate struct fields.  Generic struct decls are skipped — their fields
+	// stay in AST form until an instantiation site resolves them under the right
+	// type-param context (ensureInstantiatedStruct).  Resolving them eagerly here
+	// has no binders in scope, so a generic-typed field (`Cursor`'s
+	// `t @Table[K,V,H,E]`) would degrade every param to the TypInt() fallback and
+	// spuriously register a bogus all-`int` instantiation (Table[int,int,int,int])
+	// with dead dtor/copy/reflect symbols.  Mirrors gen_module's second pass.
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if d.Kind == ast.DECL_TYPE && d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+			if len(d.TypeParams) > 0 {
+				continue
+			}
+			var qualName @[]char = buildQualName(gc.Mod, alias, d.Name)
+			var si int = lookupStructIdx(gc, qualName)
+			if si >= 0 {
+				var fields @[]@types.Field
+				for j := 0; j < len(d.TypeRef.Fields); j++ {
+					var fd @ast.FieldDecl = d.TypeRef.Fields[j]
+					var f @types.Field = make(types.Field)
+					f.Name = fd.Name
+					f.Type = resolveTypeExpr(gc, fd.Type)
+					fields = slices.Append[@types.Field](fields, f)
+				}
+				var existTyp @types.Type = gc.Mod.Structs[si].Typ
+				existTyp.Fields = fields
+			}
+		}
+	}
+
+	// Register type aliases
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if isNonStructTypeDecl(d) {
+			var qualName @[]char = buildQualName(gc.Mod, alias, d.Name)
+			var ta irsym.ModuleTypeAlias
+			ta.Name = qualName
+			ta.Typ = typeDeclEntryType(gc, qualName, d)
+			gc.Mod.TypeAliases = slices.Append[irsym.ModuleTypeAlias](gc.Mod.TypeAliases, ta)
+		}
+	}
+
+	// Register function and method signatures, and add extern funcs
+	// to the module so cross-package calls resolve.  Generic decls
+	// (TypeParams non-empty) carry their body in the imported .bni
+	// — stash them under the import alias so call-site
+	// monomorphization at the consumer can look them up via
+	// lookupGenericDeclPkg.
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if d.Kind != ast.DECL_FUNC {
+			continue
+		}
+		if len(d.TypeParams) > 0 {
+			if d.Recv == nil && lookupGenericDeclPkg(gc, alias, d.Name) == nil {
+				gc.GenericDecls = slices.Append[@ast.Decl](gc.GenericDecls, d)
+				gc.GenericDeclPkgs = slices.Append[@[]char](
+						gc.GenericDeclPkgs, buf.CopyStr(alias))
+				gc.GenericDeclFiles = slices.Append[@ast.File](
+						gc.GenericDeclFiles, file)
+			}
+			continue
+		}
+		if isGenericReceiverMethod(d) {
+			// Imported method on a generic type — its receiver `@Box[T]` can't
+			// resolve here (T is unbound), so DON'T register a (garbage) extern
+			// sig.  Stash it — keyed by the DEFINING package path, matching the
+			// instantiation's InstDefPkg — so the consumer emits it per
+			// instantiation at its use sites (ensureInstantiatedMethods), like a
+			// same-package generic-receiver method.
+			stashGenericMethodDecl(gc, d, buf.CopyStr(ir.ResolveImportPkg(gc.Mod, alias)), file)
+			continue
+		}
+		var qualName @[]char
+		var sigParams @[]@types.Type
+		var extParams @[]@ir.Param
+		if d.Recv != nil {
+			// Method: name as "<pkgPath>.<TypeName>.<MethodName>";
+			// receiver is Params[0].  Resolve the import alias to the
+			// full package path so the registered name matches the
+			// call-site form (genMethodCall qualifies the receiver's
+			// full-path-resolved type name).
+			qualName = methodQualName(ir.ResolveImportPkg(gc.Mod, alias), d)
+			var rt @types.Type = resolveTypeExpr(gc, d.Recv.Type)
+			sigParams = slices.Append[@types.Type](sigParams, rt)
+			var rp @ir.Param = make(ir.Param)
+			rp.Name = d.Recv.Name
+			rp.Typ = rt
+			extParams = slices.Append[@ir.Param](extParams, rp)
+		} else {
+			qualName = buildQualName(gc.Mod, alias, d.Name)
+		}
+		for j := 0; j < len(d.Params); j++ {
+			var pt @types.Type = irResolveParamType(gc, d.Params[j])
+			sigParams = slices.Append[@types.Type](sigParams, pt)
+			var p @ir.Param = make(ir.Param)
+			p.Name = d.Params[j].Name
+			p.Typ = pt
+			extParams = slices.Append[@ir.Param](extParams, p)
+		}
+
+		var sig ir.FuncSig
+		sig.Name = qualName
+		sig.Params = sigParams
+		sig.IsVariadic = declIsVariadic(d)
+		var sigResults @[]@types.Type
+		for j := 0; j < len(d.Results); j++ {
+			sigResults = slices.Append[@types.Type](sigResults, resolveTypeExpr(gc, d.Results[j]))
+		}
+		sig.Results = sigResults
+		if len(sigResults) > 1 {
+			sig.MultiReturnType = irutil.MakeMultiReturnStructType(sigResults)
+		}
+		ir.RegisterFuncSig(gc.Mod, sig)
+
+		var ef @ir.Func = ir.NewExternFunc(gc.PkgPath, qualName, extParams, sigResults)
+		if regExterns {
+			mod.AddFunc(ef)
+		}
+	}
+
+	// Every package has a compiler-generated `__Package() @reflect.Package`
+	// accessor (Phase B / codegen's emit_pkg_descriptor.bn).  It is not
+	// declared in the .bni, so register it here as an imported extern: a
+	// cross-package `pkg.__Package()` call then resolves (lookupFuncResults)
+	// and codegen emits the matching `declare`; the imported package's own
+	// compile emits the body.
+	var reflectStruct @types.Type = reflectPackageStructType(mod.Checker)
+	if reflectStruct != nil {
+		var pkgQual @[]char = buildQualName(gc.Mod, alias, "__Package")
+		var pkgResults @[]@types.Type = make_slice(@types.Type, 1)
+		pkgResults[0] = types.MakeManagedPtrType(reflectStruct)
+		var pkgSig ir.FuncSig
+		pkgSig.Name = pkgQual
+		pkgSig.Results = pkgResults
+		ir.RegisterFuncSig(gc.Mod, pkgSig)
+		if regExterns {
+			var pkgNoParams @[]@ir.Param
+			mod.AddFunc(ir.NewExternFunc(gc.PkgPath, pkgQual, pkgNoParams, pkgResults))
+		}
+	}
+
+	// Register constants
+	for i := 0; i < len(file.Decls); i++ {
+		var d @ast.Decl = file.Decls[i]
+		if d.Kind == ast.DECL_CONST {
+			if d.Value != nil {
+				var qualName @[]char = buildQualName(gc.Mod, alias, d.Name)
+				var mc irsym.ModuleConst
+				mc.Name = qualName
+				if d.TypeRef != nil {
+					mc.Typ = resolveTypeExpr(gc, d.TypeRef)
+				}
+				// Route through the same classifier chain the in-package
+				// producers (genConst) use, so an imported non-int const-
+				// EXPRESSION — a comparison (`1 < 2`), bool logic, or float
+				// arithmetic (`1.5 + 2.5`) — folds rather than falling to
+				// the integer-only evalConstExpr and reading back int 0 at
+				// the qualified (gen_selector) read site.
+				if classifyConstLit(&mc, d.Value) || classifyConstBoolExpr(gc, &mc, d.Value, 0) ||
+						classifyConstFloatExpr(gc, &mc, d.Value, 0) {
+					gc.Mod.Consts = slices.Append[irsym.ModuleConst](gc.Mod.Consts, mc)
+				} else {
+					var v int64
+					var ok bool
+					v, ok = importConstStampVal(gc, d.Value)
+					if !ok {
+						var ev int
+						ev, ok = evalConstExpr(gc, d.Value, 0)
+						v = cast(int64, ev)
+					}
+					if ok {
+						mc.Val = v
+						if mc.Typ == nil {
+							mc.Typ = importConstUntypedTyp(gc, d.Value)
+						}
+						gc.Mod.Consts = slices.Append[irsym.ModuleConst](gc.Mod.Consts, mc)
+					}
+				}
+			}
+		}
+		if d.Kind == ast.DECL_GROUP {
+			registerImportConstGroup(gc, alias, d)
+			// Grouped `.bni` var members (`var ( X int; Y int )`) are externs
+			// too — register each, mirroring the top-level var arm below.
+			for i := 0; i < len(d.Decls); i++ {
+				registerImportVarExtern(gc, alias, d.Decls[i])
+			}
+		}
+		// Imported extern var (`.bni` `var X T`): register a module
+		// global under the DEFINING-pkg dotted qualname so a qualified
+		// read (gen_selector) resolves and codegen emits an `external
+		// global` declaration linking to the owner's definition.  Unlike
+		// a const, a var has storage, so this is the global path, not a
+		// compile-time value.
+		if d.Kind == ast.DECL_VAR {
+			registerImportVarExtern(gc, alias, d)
+		}
+	}
+}
+
+// registerImportVarExtern registers a Module global (extern) for an imported
+// `.bni` var decl `d` — a top-level `var X T` or a `var ( ... )` group member —
+// under the defining-pkg dotted qualname, so a qualified read (gen_selector)
+// resolves and codegen emits an `external global` declaration linking to the
+// owner's definition.  No-op for a non-var (a grouped const/type member) or a
+// var without an explicit type (a `.bni` var must carry one — there is no
+// initializer to infer from).
+func registerImportVarExtern(gc @GenCtx, alias *[]readonly char, d @ast.Decl) {
+	if d.Kind != ast.DECL_VAR { return }
+	var typ @types.Type = nil
+	if d.TypeRef != nil {
+		typ = resolveTypeExpr(gc, d.TypeRef)
+	} else if gc.Mod.Checker != nil {
+		// The importer reads the DEP's MERGED file, whose var is the .bn
+		// DEFINITION — which may use an INFERRED type (`var X = 11`), leaving
+		// no TypeRef.  Recover the declared type from the checker's package
+		// scope, built from the .bni (which always carries the type).  Without
+		// this the extern is dropped and a qualified read aborts IR-gen with
+		// "unresolved selector".
+		var defPkg @[]char = ir.ResolveImportPkg(gc.Mod, alias)
+		typ = gc.Mod.Checker.PackageType(defPkg, d.Name)
+	}
+	if typ == nil { return }
+	var mg irsym.ModuleGlobal
+	mg.Name = buildQualName(gc.Mod, alias, d.Name)
+	mg.Typ = typ
+	mg.IsExtern = true
+	gc.Mod.GlobalVars = slices.Append[irsym.ModuleGlobal](gc.Mod.GlobalVars, mg)
+}

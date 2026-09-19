@@ -1,0 +1,309 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/irsym"
+import "pkg/binate/types"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// IR generation for methods on generic types (`gen.method.generic-recv`) and
+// parameterized-receiver impls (`gen.impl.generic-recv`).  A method whose
+// receiver names a generic-type instantiation — `func (it *Cursor[T]) Next()
+// (T, bool)` — carries its type parameters in the RECEIVER, not in the decl's
+// own TypeParams (which stay empty).  So the declaration-time concrete-method
+// passes (gen_module's signature/body passes, gen_register_import) — which key
+// their generic skip off `len(d.TypeParams) > 0` — do NOT skip these methods;
+// left alone they resolve the receiver with `T` unbound (falling back to int)
+// and mint a malformed `<pkg>..<Method>` name.  The passes must recognize such
+// methods by their receiver shape and skip them; the bodies are emitted per
+// instantiation instead (mirroring ensureInstantiated for generic functions).
+
+// receiverGenericInstBase peels the pointer/managed/const/paren wrappers off a
+// method-receiver TypeExpr and returns the base TEXPR_INSTANTIATE node when the
+// receiver names a generic-type instantiation (`*Cursor[T]`), or nil otherwise.
+// Mirrors the checker's receiverBaseInstantiation.
+func receiverGenericInstBase(te @ast.TypeExpr) @ast.TypeExpr {
+	var base @ast.TypeExpr = te
+	for base != nil {
+		if base.Kind == ast.TEXPR_POINTER || base.Kind == ast.TEXPR_MANAGED ||
+				base.Kind == ast.TEXPR_CONST || base.Kind == ast.TEXPR_PAREN {
+			base = base.Base
+		} else {
+			break
+		}
+	}
+	if base != nil && base.Kind == ast.TEXPR_INSTANTIATE {
+		return base
+	}
+	return nil
+}
+
+// isGenericReceiverMethod reports whether decl d is a method whose receiver is a
+// generic-type instantiation (`func (it *Cursor[T]) ...`).  These are skipped by
+// the declaration-time concrete-method passes and emitted per instantiation.
+func isGenericReceiverMethod(d @ast.Decl) bool {
+	return d.Recv != nil && receiverGenericInstBase(d.Recv.Type) != nil
+}
+
+// genericMethodRecvName returns the generic base type name of a generic-receiver
+// method (`func (it *Cursor[T]) ...` → "Cursor"), used to match a method against
+// the struct instantiation whose methods are being emitted.  Empty if d is not a
+// generic-receiver method.
+func genericMethodRecvName(d @ast.Decl) @[]char {
+	var inst @ast.TypeExpr = receiverGenericInstBase(d.Recv.Type)
+	if inst == nil || inst.Base == nil {
+		var empty @[]char
+		return empty
+	}
+	return inst.Base.Name
+}
+
+// stashGenericMethodDecl records a generic-receiver method decl (with its
+// defining package and file) for later per-instantiation emission.
+func stashGenericMethodDecl(gc @GenCtx, d @ast.Decl, pkg *[]readonly char, file @ast.File) {
+	gc.GenericMethodDecls = slices.Append[@ast.Decl](gc.GenericMethodDecls, d)
+	gc.GenericMethodDeclPkgs = slices.Append[@[]char](gc.GenericMethodDeclPkgs, buf.CopyStr(pkg))
+	gc.GenericMethodDeclFiles = slices.Append[@ast.File](gc.GenericMethodDeclFiles, file)
+}
+
+// joinMethodName builds the IR-level qualified method name for an instantiation:
+// `<struct-inst-name>.<method>` (e.g. `main.Box__bn_inst__int.Get`).  This is
+// exactly the key the direct-call site derives (baseNamedTypeName of the
+// instantiated receiver + "." + method), so the emitted body and the call agree.
+func joinMethodName(structInstName @[]char, methodName @[]char) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(structInstName)
+	cb.Write(".")
+	cb.Write(methodName)
+	return buf.CopyStr(cb.String())
+}
+
+// ensureMethodsForInstName emits the generic-receiver methods for the instantiated
+// struct named `instName`, if it is a recorded generic instantiation.  Called from
+// the pass-2 use sites (a method call on, or the boxing of, a value of the
+// instantiated type), where the method registry (pass-1 stash) and every other
+// FuncSig are already in place — unlike ensureInstantiatedStruct, which can run in
+// pass 1/2 before those exist.  A no-op for a non-instantiation name (deduped
+// downstream via EmittedInstantiations, so repeated use sites emit once).
+func ensureMethodsForInstName(gc @GenCtx, instName *[]readonly char) {
+	var si int = lookupStructIdx(gc, instName)
+	if si < 0 {
+		return
+	}
+	var ms irsym.ModuleStruct = gc.Mod.Structs[si]
+	if !ms.IsInstantiation || ms.InstDecl == nil {
+		return
+	}
+	ensureInstantiatedMethods(gc, ms.InstDecl, ms.InstDefPkg, ms.InstArgs)
+}
+
+// ensureInstantiatedMethods emits the monomorphized bodies of every method whose
+// receiver is the generic type `structDecl`, for the instantiation `args`, if not
+// already emitted.  Reached via ensureMethodsForInstName at each use site, so any
+// use of `Cursor[int]` pulls in its methods (deduped via EmittedInstantiations,
+// IsLinkOnce so every consumer's copy merges).
+func ensureInstantiatedMethods(gc @GenCtx, structDecl @ast.Decl, definingPkg @[]char,
+		args @[]@types.Type) {
+	var structInstName @[]char = instantiationMangledName(gc, structDecl, definingPkg, args)
+	for i := 0; i < len(gc.GenericMethodDecls); i++ {
+		if !irutil.Streq(gc.GenericMethodDeclPkgs[i], definingPkg) {
+			continue
+		}
+		var mdecl @ast.Decl = gc.GenericMethodDecls[i]
+		if !irutil.Streq(genericMethodRecvName(mdecl), structDecl.Name) {
+			continue
+		}
+		emitInstantiatedMethod(gc, mdecl, structDecl, structInstName, definingPkg, args,
+				gc.GenericMethodDeclFiles[i])
+	}
+}
+
+// emitInstantiatedMethod lowers one generic-receiver method for a concrete
+// instantiation.  It mirrors ensureInstantiated (generic functions): push the
+// type-param substitution context (the receiver binders → concrete args), build a
+// synthetic free-function Decl with the receiver PROMOTED to Params[0] (genFunc
+// ignores Recv), emit via genFunc under the defining file's imports, then override
+// the symbol to the defining-package-qualified `<struct-inst>.<method>` name and
+// register its FuncSig so call sites resolve it.
+func emitInstantiatedMethod(gc @GenCtx, mdecl @ast.Decl, structDecl @ast.Decl,
+		structInstName @[]char, definingPkg @[]char, args @[]@types.Type, defFile @ast.File) {
+	var methodInstName @[]char = joinMethodName(structInstName, mdecl.Name)
+	if instantiationAlreadyEmitted(gc, methodInstName) {
+		return
+	}
+	gc.EmittedInstantiations = slices.Append[@[]char](gc.EmittedInstantiations, methodInstName)
+
+	// Substitution context.  Within the method body only the RECEIVER BINDERS are
+	// in scope — they rename the type's params (`@Pair[A, B]` on `type Pair[K, V]`
+	// binds A→arg0, B→arg1; a SWAP `@Pair[V, K]` binds V→arg0, K→arg1).  So map the
+	// receiver binders FIRST (resolveTypeExpr's TEXPR_NAMED lookup takes the FIRST
+	// match), then the type's own param names as a fallback for the positions the
+	// receiver leaves un-renamed.  Putting the type's names first would let K→arg0
+	// shadow a swapped binder K→arg1.
+	var savedNames @[]@[]char = gc.CurrentTypeParamNames
+	var savedTypes @[]@types.Type = gc.CurrentTypeParamTypes
+	var newNames @[]@[]char
+	var newTypes @[]@types.Type
+	var recvInst @ast.TypeExpr = receiverGenericInstBase(mdecl.Recv.Type)
+	if recvInst != nil {
+		for i := 0; i < len(recvInst.TypeArgs) && i < len(args); i++ {
+			var binder @ast.TypeExpr = recvInst.TypeArgs[i]
+			if binder != nil && binder.Kind == ast.TEXPR_NAMED {
+				newNames = slices.Append[@[]char](newNames, binder.Name)
+				newTypes = slices.Append[@types.Type](newTypes, args[i])
+			}
+		}
+	}
+	for i := 0; i < len(structDecl.TypeParams); i++ {
+		newNames = slices.Append[@[]char](newNames, structDecl.TypeParams[i].Name)
+		if i < len(args) {
+			newTypes = slices.Append[@types.Type](newTypes, args[i])
+		} else {
+			newTypes = slices.Append[@types.Type](newTypes, types.TypVoid())
+		}
+	}
+	gc.CurrentTypeParamNames = newNames
+	gc.CurrentTypeParamTypes = newTypes
+
+	// Promote the receiver to Params[0] (genFunc ignores Recv), as genMethod does.
+	var synth @ast.Decl = make(ast.Decl)
+	synth.Kind = ast.DECL_FUNC
+	synth.Pos = mdecl.Pos
+	synth.Name = stripCurrentModuleQualifier(methodInstName)
+	var prepended @[]@ast.ParamDecl = make_slice(@ast.ParamDecl, len(mdecl.Params) + 1)
+	prepended[0] = mdecl.Recv
+	for i := 0; i < len(mdecl.Params); i++ {
+		prepended[i + 1] = mdecl.Params[i]
+	}
+	synth.Params = prepended
+	synth.Results = mdecl.Results
+	synth.Body = mdecl.Body
+
+	// Resolve the body against the defining file's imports + package (empty alias
+	// for a same-package generic, mirroring genCallInstantiate's convention).
+	var savedImportAlias @[]char = gc.Mod.CurrentImportAlias
+	var aliasSnap AliasMapSnapshot = SaveAliasMapState(gc.Mod)
+	if defFile != nil {
+		overlayFileImports(gc.Mod, aliasSnap, defFile)
+	}
+	gc.Mod.CurrentImportAlias = definingAliasFor(gc, definingPkg)
+
+	// Register the FuncSig BEFORE emitting the body, mirroring the non-generic
+	// pre-pass in genModule (which registers every func/method sig before any body
+	// so forward references and mutual recursion resolve).  A generic-receiver
+	// method is instead emitted lazily at its use site, and one such emission can
+	// re-enter and emit a SIBLING method NESTED inside this one's still-in-progress
+	// genFunc: M2's body calls sibling M3, M3's genFunc calls another sibling (or
+	// M2 itself), and that inner call re-triggers ensureInstantiatedMethods, which
+	// walks the method list and emits any not-yet-emitted sibling — including one
+	// whose body calls back into a method whose genFunc has not yet returned.  If
+	// the FuncSig were registered only AFTER genFunc, that nested sibling's call to
+	// the in-progress method would find NO params via lookupFuncSig (a zero
+	// FuncSig), so coerceArg would skip the by-value managed-struct argument copy
+	// (needsStructCopy sees a nil param type) — a missing RefInc that under-retains
+	// the argument and double-frees it.  Resolving the params from the synth decl
+	// here (the same helpers genFunc uses, under the same substitution + alias
+	// context) makes the signature visible for the entire nested emission.
+	var sig ir.FuncSig
+	sig.Name = buf.CopyStr(methodInstName)
+	var sigParams @[]@types.Type
+	for i := 0; i < len(synth.Params); i++ {
+		sigParams = slices.Append[@types.Type](sigParams, irResolveParamType(gc, synth.Params[i]))
+	}
+	sig.Params = sigParams
+	sig.IsVariadic = declIsVariadic(mdecl)
+	var sigResults @[]@types.Type
+	for i := 0; i < len(synth.Results); i++ {
+		sigResults = slices.Append[@types.Type](sigResults, resolveTypeExpr(gc, synth.Results[i]))
+	}
+	sig.Results = sigResults
+	if len(sigResults) > 1 {
+		sig.MultiReturnType = irutil.MakeMultiReturnStructType(sigResults)
+	}
+	ir.RegisterFuncSig(gc.Mod, sig)
+
+	var f @ir.Func = genFunc(gc, gc.Mod.Checker, synth)
+	RestoreAliasMapState(gc.Mod, aliasSnap)
+	gc.Mod.CurrentImportAlias = savedImportAlias
+
+	f.Name = buf.CopyStr(methodInstName)
+	f.IsLinkOnce = true
+	gc.Mod.AddFunc(f)
+
+	gc.CurrentTypeParamNames = savedNames
+	gc.CurrentTypeParamTypes = savedTypes
+}
+
+// definingAliasFor returns the CurrentImportAlias a monomorphized body should
+// resolve unqualified references against: empty for a same-package (local)
+// generic, else the defining package.  Mirrors genCallInstantiate's convention.
+func definingAliasFor(gc @GenCtx, definingPkg @[]char) @[]char {
+	if irutil.Streq(definingPkg, gc.PkgPath) {
+		var empty @[]char
+		return empty
+	}
+	return definingPkg
+}
+
+// ensureGenericImplInfo synthesizes, on demand, the concrete ImplInfo rows for a
+// monomorphized generic receiver boxing into an interface value —
+// `@Box[int] : Getter[int]` — the way ensureAnyImplInfo does for `any`.  The
+// static impl-collection path (collectImplsFromDecl) skips a parameterized-
+// receiver impl (`impl @Box[T] : Getter[T]`): its receiver name resolves empty
+// pre-instantiation, so no vtable row exists until a concrete boxing site
+// appears.  The checker has already verified the impl, so we mint the
+// (instantiated-receiver, instantiated-iface) row plus its ancestor-closure rows
+// here, mirroring collectImplsFromDecl.  MethodFuncs point at
+// <recvPkg>.<recvName>.<method> — exactly the names ensureInstantiatedMethods
+// emits — and DtorFuncName at the instantiated struct's dtor.
+func ensureGenericImplInfo(m @ir.Module, recvPkg @[]char, recvName @[]char,
+		ifacePkg *[]readonly char, ifaceName *[]readonly char, recvTyp @types.Type) {
+	var dtorName @[]char = implDtorFuncName(recvPkg, recvName)
+	var canonPkg @[]char = ir.CanonicalIfacePkg(m, ifacePkg, ifaceName)
+	var canonName @[]char = ir.CanonicalIfaceName(m, ifacePkg, ifaceName)
+	if !moduleHasImpl(m, recvPkg, recvName, canonPkg, canonName) {
+		m.Impls = slices.Append[@ir.ImplInfo](m.Impls,
+				makeOwnMethodsImplInfo(m, recvPkg, recvName, dtorName, canonPkg, canonName, recvTyp))
+	}
+	// Each ancestor of the listed interface satisfies the same receiver, so
+	// register a row for it too (upcast dispatch reads the ancestor's slot).
+	var aPkgs @[]@[]char = IfaceAncestorClosurePkgs(m, canonPkg, canonName)
+	var aNames @[]@[]char = IfaceAncestorClosure(m, canonPkg, canonName)
+	for j := 0; j < len(aPkgs); j++ {
+		if moduleHasImpl(m, recvPkg, recvName, aPkgs[j], aNames[j]) {
+			continue
+		}
+		m.Impls = slices.Append[@ir.ImplInfo](m.Impls,
+				makeOwnMethodsImplInfo(m, recvPkg, recvName, dtorName, aPkgs[j], aNames[j], recvTyp))
+	}
+}
+
+// nameIsGenericInst reports whether an IR-level type name is a generic
+// instantiation — it carries the `__bn_inst__` marker that
+// instantiationMangledName inserts.  Distinguishes a monomorphized receiver,
+// whose vtable row must be synthesized on demand, from an ordinary missing-impl
+// at a boxing site (user type names cannot contain this marker).
+func nameIsGenericInst(name *[]readonly char) bool {
+	var marker *[]readonly char = "__bn_inst__"
+	if len(name) < len(marker) {
+		return false
+	}
+	for i := 0; i + len(marker) <= len(name); i++ {
+		var match bool = true
+		for j := 0; j < len(marker); j++ {
+			if name[i + j] != marker[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}

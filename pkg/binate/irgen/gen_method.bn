@@ -1,0 +1,386 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// ============================================================
+// Method IR generation
+// ============================================================
+
+// methodQualName builds a method's IR-level qualified name,
+// "<pkg>.<TypeName>.<MethodName>". The mangler emits a length-prefix
+// `bn_F` symbol for this name downstream (see pkg/binate/mangle).
+//
+// pkg is the full package path; the definition's name then matches
+// the call-site name produced by buildMethodQualName / genMethodCall
+// (whose imported-type receivers carry the full-path-qualified type
+// name).  See pkg/binate/mangle.
+func methodQualName(pkg *[]readonly char, d @ast.Decl) @[]char {
+	var typeName @[]char = recvTypeName(d.Recv.Type)
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(pkg)
+	cb.WriteByte('.')
+	cb.Write(typeName)
+	cb.WriteByte('.')
+	cb.Write(d.Name)
+	return buf.CopyStr(cb.String())
+}
+
+// recvTypeName walks a receiver TypeExpr to find the base named type's
+// name. The type checker has already validated the shape (Stage 2), so
+// we expect to find a TEXPR_NAMED at the bottom; an empty result means
+// invalid input that slipped through.
+func recvTypeName(te @ast.TypeExpr) @[]char {
+	for te != nil {
+		if te.Kind == ast.TEXPR_NAMED {
+			return te.Name
+		}
+		if te.Kind == ast.TEXPR_POINTER || te.Kind == ast.TEXPR_MANAGED || te.Kind == ast.TEXPR_CONST ||
+				te.Kind == ast.TEXPR_PAREN {
+			te = te.Base
+		} else {
+			return ""
+		}
+	}
+	return ""
+}
+
+// recvTypePkg drills through pointer/managed/const wrappers to find
+// the receiver's qualifying package short-name (e.g. `hello` for
+// `*hello.Hello`). Returns empty for unqualified (same-package)
+// receivers.
+func recvTypePkg(te @ast.TypeExpr) @[]char {
+	var empty @[]char
+	for te != nil {
+		if te.Kind == ast.TEXPR_NAMED {
+			return te.Pkg
+		}
+		if te.Kind == ast.TEXPR_POINTER || te.Kind == ast.TEXPR_MANAGED || te.Kind == ast.TEXPR_CONST ||
+				te.Kind == ast.TEXPR_PAREN {
+			te = te.Base
+		} else {
+			return empty
+		}
+	}
+	return empty
+}
+
+// methodSig builds a FuncSig for a method declaration: name is the
+// fully-qualified form, params have the receiver prepended at index 0.
+func methodSig(gc @GenCtx, pkgShort *[]readonly char, d @ast.Decl) ir.FuncSig {
+	var sig ir.FuncSig
+	sig.Name = methodQualName(pkgShort, d)
+	var sigParams @[]@types.Type
+	sigParams = slices.Append[@types.Type](sigParams, resolveTypeExpr(gc, d.Recv.Type))
+	for j := 0; j < len(d.Params); j++ {
+		sigParams = slices.Append[@types.Type](sigParams, irResolveParamType(gc, d.Params[j]))
+	}
+	sig.Params = sigParams
+	sig.IsVariadic = declIsVariadic(d)
+	var sigResults @[]@types.Type
+	for j := 0; j < len(d.Results); j++ {
+		sigResults = slices.Append[@types.Type](sigResults, resolveTypeExpr(gc, d.Results[j]))
+	}
+	sig.Results = sigResults
+	if len(sigResults) > 1 {
+		sig.MultiReturnType = irutil.MakeMultiReturnStructType(sigResults)
+	}
+	return sig
+}
+
+// genMethod lowers a method declaration to an IR Func. It synthesizes
+// a free-function-shaped Decl with the receiver promoted to Params[0]
+// and the qualified name, then defers to genFunc for body emission.
+func genMethod(gc @GenCtx, c @types.Checker, d @ast.Decl, pkgShort *[]readonly char) @ir.Func {
+	var nd @ast.Decl = make(ast.Decl)
+	nd.Kind = ast.DECL_FUNC
+	// Carry the method's exported-ness (capitalized name) onto the lowered
+	// func: it is what puts the method into the package's reflect Functions
+	// table (emit_pkg_descriptor / addExportedFuncsToSeen filter on
+	// f.Exported) and force-emits its func-value triple — both required for
+	// the method to be reflectable and injectable.  f.Exported drives ONLY
+	// the table + triple emission, not symbol linkage.
+	nd.Exported = d.Exported
+	nd.Pos = d.Pos
+	nd.Name = methodQualName(pkgShort, d)
+	// Recv stays nil — the receiver lives in Params now.
+	var prepended @[]@ast.ParamDecl = make_slice(@ast.ParamDecl, len(d.Params) + 1)
+	prepended[0] = d.Recv
+	for i := 0; i < len(d.Params); i++ {
+		prepended[i + 1] = d.Params[i]
+	}
+	nd.Params = prepended
+	nd.Results = d.Results
+	nd.Body = d.Body
+	var f @ir.Func = genFunc(gc, c, nd)
+	// A method whose receiver is a universe primitive (the pkg/builtins/lang
+	// carve-out) is reached by DIRECT call, not a vtable, so flag it for the reflect
+	// Functions table + func-value handle force-emit (like IsStructDtor) — needed
+	// once lang is injected native-only so RegisterPackageFunctions binds
+	// `pkg/builtins/lang.int.String` etc.  Checked on the ORIGINAL d.Recv (nd.Recv is
+	// nil — the receiver was promoted into Params).
+	if irutil.IsUniversePrimitive(resolveTypeExpr(gc, d.Recv.Type)) {
+		f.IsPrimitiveMethod = true
+	}
+	return f
+}
+
+// ============================================================
+// Method call IR generation
+// ============================================================
+
+// isMethodCallSel reports whether a SELECTOR expression represents a
+// method call (obj.M) rather than a package-qualified function call
+// (pkg.Func). The disambiguation: if sel.X is an IDENT bound as a
+// variable in scope, or any non-IDENT expression, it's a method call;
+// if sel.X is an IDENT with no var binding, it's assumed to be a
+// package alias.
+func isMethodCallSel(ctx @GenContext, sel @ast.Expr) bool {
+	if sel.X == nil {
+		return false
+	}
+	// A method expression off a generic type INSTANTIATION (`Box[int].M(args)`) is
+	// a func-value call, not a method call — the receiver is the TYPE, not a value.
+	// The checker types the selector as a function value (checkSelectorExpr); read
+	// that RESOLVED type (side-effect-free) rather than re-resolving the instance
+	// here — this predicate runs for EVERY method call, and a resolve
+	// (typeArgExprToType) here corrupts IR-gen state (it self-hosting-miscompiles
+	// pkg/binate/types).  A value-index receiver (`arr[i].m`) is a bound method
+	// call; its selector is not func-value-typed, so this does not fire.  (A
+	// func-value FIELD call is already caught upstream by the func-value-callee
+	// check in genCall, before this predicate.)
+	if sel.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX && ctx.Checker != nil && sel.ResolvedTypeID != 0 {
+		var st @types.Type = ctx.Checker.ExprType(sel.ResolvedTypeID)
+		if st != nil && (st.Kind == types.TYP_FUNC_VALUE || st.Kind == types.TYP_MANAGED_FUNC_VALUE) {
+			return false
+		}
+	}
+	if sel.X.Kind != ast.EXPR_IDENT {
+		// Any non-ident receiver expression must evaluate to a value
+		// (field access, function-call result, index, etc.) — that's
+		// always a method call.
+		return true
+	}
+	// IDENT receiver: a variable in scope means method call; otherwise
+	// fall back to the existing pkg.Func path.
+	return lookupVar(ctx, sel.X.Name) != nil
+}
+
+// genMethodCall generates IR for a method call obj.M(args). The
+// receiver is evaluated and passed as Args[0]; user args follow.
+// The method is looked up by qualified name. For local types the
+// qualifier is the current module's short package name; for imported
+// types the type's stored Name is already qualified (`pkg.Type`), so
+// we use it as-is.
+func genMethodCall(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr {
+	var sel @ast.Expr = e.X
+
+	// Evaluate the receiver expression once.  For an explicit deref `(*p).m()`,
+	// evaluate the POINTER operand p rather than `*p`: applyReceiverConversion then
+	// passes p straight through as a `*T` receiver address (&*p == p — no load, no
+	// re-evaluation) or loads `*p` for a value receiver.  Evaluating `*p` here would
+	// (a) hand a `*T` method a mutable COPY whose writes are silently lost, and
+	// (b) force a SECOND evaluation of p to recover the address — double-running a
+	// side-effecting operand like `(*getPtr()).m()` (and mutating the wrong object,
+	// since the value came from the first evaluation and the address from the second).
+	var recv @ir.Instr
+	if sel.X != nil && sel.X.Kind == ast.EXPR_UNARY && sel.X.Op == cast(int, token.STAR) {
+		recv = genExpr(ctx, b, sel.X.X)
+	} else {
+		recv = genExpr(ctx, b, sel.X)
+	}
+	b = ctx.CurBlock
+
+	// Determine the receiver's base named type — we look one level
+	// through *T / @T to find the named type's name. The name may be
+	// unqualified ("Point") for local types or already qualified
+	// ("buf.CharBuf") for imported types.
+	var recvBaseTypeName @[]char = baseNamedTypeName(recv.Typ)
+	// `(*p).m()`: recv is the pointer p (evaluated above), but the receiver is the
+	// POINTEE.  A named-distinct pointer (`type PS *S`) is TYP_NAMED, so
+	// baseNamedTypeName(recv.Typ) returns the pointer alias's OWN name ("PS") and
+	// mangles a non-existent `PS.m`; resolve the base off the pointee instead.  A
+	// named pointer does NOT inherit the pointee's methods (the checker rejects
+	// `ps.m()` without an explicit deref), so only this form reaches them.
+	if sel.X != nil && sel.X.Kind == ast.EXPR_UNARY && sel.X.Op == cast(int, token.STAR) {
+		var pt @types.Type = irutil.PeelTransparent(recv.Typ)
+		if pt != nil && (pt.Kind == types.TYP_POINTER || pt.Kind == types.TYP_MANAGED_PTR) &&
+				pt.Elem != nil {
+			recvBaseTypeName = baseNamedTypeName(pt.Elem)
+		}
+	}
+	var qualName @[]char = buildMethodQualName(ctx.Gc.PkgPath, recvBaseTypeName, sel.Name)
+
+	// If the receiver is a generic instantiation, emit its methods now (a no-op
+	// otherwise) so qualName's FuncSig is registered before the lookups below —
+	// the method body is emitted lazily at this use site, not when the struct was
+	// laid out (which can precede the method registry / other FuncSigs).
+	ensureMethodsForInstName(ctx.Gc, recvBaseTypeName)
+
+	// Signature lookup for the PRE-arg fields (params + variadic-ness).  funcFound /
+	// results / MultiReturnType are re-read AFTER buildCallArgs below, NOT taken from
+	// this snapshot: a nested method call in the args can register a transitive
+	// callee's sig during buildCallArgs, and the transitive-extern fallback's
+	// decision must see that post-arg state (else it double-registers the extern —
+	// two `declare`s for one symbol, an "invalid redefinition" at link).
+	var sig ir.FuncSig
+	sig, _ = lookupFuncSig(ctx.Gc, qualName)
+	// Build args: receiver first, then user args.
+	var paramTypes @[]@types.Type = sig.Params
+	if len(paramTypes) > 0 {
+		recv = applyReceiverConversion(ctx, b, recv, paramTypes[0], sel.X)
+		b = ctx.CurBlock
+		// For value-struct receivers with managed fields, RefInc the
+		// fields before passing — same treatment as user args in
+		// genCall. Without this, the callee's scope-cleanup RefDec
+		// imbalances against the caller's, freeing the backing
+		// prematurely.
+		var rt @types.Type = paramTypes[0]
+		if needsStructCopy(rt) {
+			if isStructOrArrayAlloc(recv) {
+				var tmpPtr @ir.Instr = recv
+				emitStructCopy(ctx.Func, b, tmpPtr, rt)
+				recv = b.EmitLoad(tmpPtr, recv.TypeArg)
+			} else {
+				var tmpSlot @ir.Instr = b.EmitAlloc(rt)
+				b.EmitStore(tmpSlot, recv)
+				emitStructCopy(ctx.Func, b, tmpSlot, rt)
+				recv = b.EmitLoad(tmpSlot, rt)
+			}
+		}
+	}
+	var args @[]@ir.Instr
+	args = slices.Append[@ir.Instr](args, recv)
+	// User args bind to the user params — paramTypes[1:] (Params[0] is the
+	// receiver).  buildCallArgs handles all three shapes exactly as the direct
+	// and func-value call paths do: a non-variadic method binds each arg
+	// positionally (genExprOrFuncRef + coerceArg), a variadic method packs its
+	// trailing individual args into the single *[]T (func.variadic.pack) or
+	// forwards a spread operand's {data,len} (func.variadic.spread).  (genExprOrFuncRef,
+	// not bare genExpr, so a bare function-name arg to a func-value param is lifted
+	// to a func value rather than dispatching on null.)
+	var userParamTypes @[]@types.Type
+	for i := 1; i < len(paramTypes); i++ {
+		userParamTypes = slices.Append[@types.Type](userParamTypes, paramTypes[i])
+	}
+	var userArgs @[]@ir.Instr = buildCallArgs(ctx, b, e.Args, userParamTypes, sig.IsVariadic, e.Spread)
+	b = ctx.CurBlock
+	for i := 0; i < len(userArgs); i++ {
+		args = slices.Append[@ir.Instr](args, userArgs[i])
+	}
+
+	// Determine the result type from the method's signature.  Re-read the sig
+	// (buildCallArgs above may have registered a transitive callee's sig via a
+	// nested call), so funcFound / results / MultiReturnType reflect the post-arg
+	// state — matching the pre-refactor ordering and keeping the transitive-extern
+	// fallback below from firing on an already-registered method.
+	var funcFound bool
+	sig, funcFound = lookupFuncSig(ctx.Gc, qualName)
+	var resultTyp @types.Type = types.TypInt()
+	var results @[]@types.Type = sig.Results
+	if funcFound && len(results) == 0 {
+		resultTyp = types.TypVoid()
+	} else if len(results) == 1 {
+		resultTyp = results[0]
+	} else if len(results) > 1 {
+		if sig.MultiReturnType != nil {
+			resultTyp = sig.MultiReturnType
+		} else {
+			resultTyp = irutil.MakeMultiReturnStructType(results)
+		}
+	} else if ctx.Checker != nil && e.ResolvedTypeID != 0 {
+		// The method's signature is NOT in this module's FuncSigs — it's
+		// reached TRANSITIVELY (a directly-imported package's method returns a
+		// struct from a THIRD package, and we're chaining a method on that
+		// struct; e.g. os.FileInfo.ModTime() -> time.Point, then .ToUnix()).
+		// RegisterImports only registers DIRECT imports, so lookupFunc* miss
+		// it and resultTyp would otherwise default to TypInt() (i64), emitting
+		// `call i64 @<method>` + an invalid `extractvalue i64` for a multi-
+		// return.  The checker already resolved this chained call's type
+		// across packages — use it (mirrors gen_binary.bn / gen_expr.bn's
+		// ctx.Checker.ExprType fallback).  The mangled symbol is unaffected
+		// (buildMethodQualName needs no FuncSig).
+		var ct @types.Type = ctx.Checker.ExprType(e.ResolvedTypeID)
+		if ct != nil {
+			var transResults @[]@types.Type
+			if ct.Kind == types.TYP_VOID {
+				resultTyp = ct
+			} else if ct.Kind == types.TYP_FUNC {
+				// A MULTI-return call: checkCall returns the callee FuncType
+				// itself (check_expr.bn, "return the FuncType for multi-assign
+				// detection"), so build the multi-return struct from its
+				// results — exactly as the sig.MultiReturnType branch above.
+				transResults = ct.Results
+				resultTyp = irutil.MakeMultiReturnStructType(ct.Results)
+			} else {
+				// Single-return: ct IS the result type (the struct/scalar).
+				transResults = slices.Append[@types.Type](transResults, ct)
+				resultTyp = ct
+			}
+			// Also register the method as an extern (FuncSig + Func) so codegen
+			// emits its `declare` and later call sites resolve it the normal
+			// way — RegisterImports only declares DIRECT imports, so without
+			// this the call references an undeclared `@<method>` symbol.
+			//
+			// But NOT if this name is a same-module generic-method instantiation
+			// this module will DEFINE: a method's FuncSig is registered only AFTER
+			// its body is generated (emitInstantiatedMethod), so a re-entrant call
+			// reaching a method whose body is still being generated finds no
+			// FuncSig and lands here — yet that method is already recorded in
+			// EmittedInstantiations and will be defined.  Declaring it extern too
+			// would leave the module with both a `declare` and a `define` for the
+			// symbol (LLVM: "invalid redefinition").  The checker-derived resultTyp
+			// above is still used, and the call resolves to the local definition.
+			if !instantiationAlreadyEmitted(ctx.Gc, qualName) {
+				registerTransitiveMethodExtern(ctx, qualName, args, transResults)
+			}
+		}
+	}
+
+	var result @ir.Instr = b.EmitCall(qualName, args, resultTyp)
+	attachFaultPad(ctx, b) // call-site cleanup pad (Plan 2); see genCall's EmitCall site
+	registerManagedCallResult(ctx, result, resultTyp)
+	return result
+}
+
+// registerTransitiveMethodExtern registers a FuncSig + extern Func for a
+// method reached TRANSITIVELY — one whose package is not a direct import of
+// the current module (e.g. a directly-imported package's method returns a
+// struct from a THIRD package, and we chain a method on that struct).
+// RegisterImports only registers DIRECT imports, so codegen would emit no
+// `declare` for such a method and the call would reference an undeclared
+// symbol.  Param types come from the already-generated call args (receiver
+// first, then user args — exactly what the call passes); result types from
+// the checker.  Registering the FuncSig also means any LATER call to the same
+// method takes the normal lookupFunc* path (so this runs at most once per
+// method per module).  Name is passed with an empty pkgPath so the extern's
+// mangled symbol equals the call's (EmitCall uses the same qualName verbatim).
+func registerTransitiveMethodExtern(ctx @GenContext, qualName @[]char, args @[]@ir.Instr,
+		results @[]@types.Type) {
+	var sigParams @[]@types.Type
+	var extParams @[]@ir.Param
+	for i := 0; i < len(args); i++ {
+		var pt @types.Type = args[i].Typ
+		sigParams = slices.Append[@types.Type](sigParams, pt)
+		var p @ir.Param = make(ir.Param)
+		p.Typ = pt
+		extParams = slices.Append[@ir.Param](extParams, p)
+	}
+	var sig ir.FuncSig
+	sig.Name = qualName
+	sig.Params = sigParams
+	sig.Results = results
+	if len(results) > 1 {
+		sig.MultiReturnType = irutil.MakeMultiReturnStructType(results)
+	}
+	setOrAppendFuncSig(ctx.Gc, sig)
+	ctx.Gc.Mod.AddFunc(ir.NewExternFunc(make_slice(char, 0), qualName, extParams, results))
+}

@@ -1,0 +1,286 @@
+package "pkg/binate/ir"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/irsym"
+import "pkg/binate/types"
+import "pkg/std/fmt"
+import "pkg/std/os"
+import "pkg/stdx/slices"
+
+// Shared IR-construction/query utilities used by both the ir data-model
+// passes and the irgen generation package (which calls them as ir.<name>).
+
+// registerUniverseAny seeds m's interface registry with the universe `any`
+// interface (Pkg="", Name="any", empty method set).  Called from NewModule so
+// every module starts with `any` already visible to isInterfaceTypeExpr /
+// ifaceTypeForName / lookupModuleInterface.  `any` is the implicit universal
+// interface that every type satisfies.
+func registerUniverseAny(m @Module) {
+	var mi irsym.ModuleInterface
+	var emptyPkg @[]char
+	mi.Pkg = emptyPkg
+	mi.Name = "any"
+	m.Interfaces = slices.Append[irsym.ModuleInterface](m.Interfaces, mi)
+}
+
+// LookupModuleFunc returns the @Func with the given name in
+// m.Funcs, or nil.  Public so codegen / vm can reuse it
+// (pkg/binate/codegen has its own private copy from before this
+// helper existed; that copy can be dropped opportunistically).
+func LookupModuleFunc(m @Module, name *[]readonly char) @Func {
+	if m == nil { return nil }
+	for i := 0; i < len(m.Funcs); i++ {
+		if irutil.Streq(m.Funcs[i].Name, name) {
+			return m.Funcs[i]
+		}
+	}
+	return nil
+}
+
+// EmitManagedSliceRefDec cleans up a managed-slice value. If the element type
+// needs destruction, stores the value to a temp alloca and calls the dtor.
+// Otherwise just RefDec's the backing refptr.
+func EmitManagedSliceRefDec(f @Func, b @Block, sliceVal @Instr) @Block {
+	var refptr @Instr = b.EmitExtract(sliceVal, 2, types.MakeManagedPtrType(nil))
+
+	var elemTyp @types.Type
+	if sliceVal.Typ != nil {
+		elemTyp = sliceVal.Typ.Elem
+	}
+	if elemTyp == nil || !elemTyp.NeedsDestruction() {
+		b.EmitRefDec(refptr)
+		return b
+	}
+
+	RegisterPendingMsDtor(f, sliceVal.Typ)
+	if f.Mod != nil && f.Mod.OptLevel >= 1 {
+		// -O1+ SROA-forwardable cleanup: read ONLY the backing refptr (slice-image
+		// slot 2) and backingLen (slot 3) via extracts and call the scalar-arg
+		// __dtor_ms_elems_<T> helper — so sliceVal's only uses are extract-2 /
+		// extract-3 (no whole-value store), and a managed-element slice
+		// scalar-replaces (data/len promote; the extracts forward onto the split
+		// refptr/backinglen slots).  registerPendingMsDtor above ensures both the
+		// by-address dtor and this elems helper are generated into f.Mod.
+		var backingLen @Instr = b.EmitExtract(sliceVal, 3, types.TypInt())
+		var backingPtrRaw @Instr = b.EmitBitCast(refptr, types.MakePointerType(types.TypUint8()))
+		var elemsArgs @[]@Instr = make_slice(@Instr, 2)
+		elemsArgs[0] = backingPtrRaw
+		elemsArgs[1] = backingLen
+		b.EmitCallLocal(irutil.MsElemsDtorName(sliceVal.Typ), elemsArgs, types.TypVoid())
+		return b
+	}
+	// -O0: materialize the 4-word slice image on the stack and call the by-address
+	// dtor (unchanged — SROA does not run, so forwardability is moot here).
+	var msSlot @Instr = b.EmitAlloc(sliceVal.Typ)
+	b.EmitStore(msSlot, sliceVal)
+	var rawSlot @Instr = b.EmitBitCast(msSlot, types.MakePointerType(types.TypUint8()))
+	var dtorN @[]char = irutil.DtorNameForType(sliceVal.Typ)
+	var dtorArgs @[]@Instr = make_slice(@Instr, 1)
+	dtorArgs[0] = rawSlot
+	b.EmitCall(dtorN, dtorArgs, types.TypVoid())
+	return b
+}
+
+// EmitManagedPtrRefDec emits RefDec for a managed pointer value, passing the
+// pointee's struct destructor if the pointee type needs destruction.
+// Uses OP_FUNC_HANDLE (handle pointer end-to-end — the proper handle
+// shape, replacing the transitional OP_FUNC_ADDR/idx-form stop-gap):
+//
+//   * Native: lowered to `&__handle.F` cast to i8*.  ZeroRefDestroy
+//     calls _call_dtor(handle, ptr) → OP_CALL_HANDLE dispatches via
+//     handle.vtable.call.
+//   * Bytecode: BC_FUNC_HANDLE returns a *uint8 pointing at the
+//     function's 16-byte {vtable, data} handle.
+//     BC_REFDEC_INLINE_FAST's slow path inspects handle.data:
+//     DATA_KIND_VM_CLOSURE_REC → recover FnIdx and do iterative push
+//     (flat-stack, no host recursion); otherwise → cross-mode shim
+//     call (bounded by the cross-mode chain, not the dtor field
+//     graph).
+//
+// This makes dtor refs interop-correct: a managed value created in
+// native that crosses into a bytecode VM (or vice-versa) can have
+// its dtor resolved through the handle without depending on
+// per-VM-instance function indices.
+func EmitManagedPtrRefDec(f @Func, b @Block, ptrVal @Instr) {
+	var elemTyp @types.Type
+	if ptrVal.Typ != nil {
+		elemTyp = ptrVal.Typ.Elem
+	}
+	if elemTyp != nil {
+		if elemTyp.Kind == types.TYP_STRUCT {
+			if elemTyp.NeedsDestruction() {
+				var dtor @Instr = b.EmitFuncHandle(irutil.QualifiedDtorName(elemTyp.Name))
+				b.EmitRefDecDtor(ptrVal, dtor)
+				return
+			}
+		} else if elemTyp.Kind == types.TYP_NAMED && len(elemTyp.OpaqueExportPkg) > 0 {
+			// An opaque-exported managed type (imported via a `.bni` forward decl): its
+			// fields are not visible here to decide NeedsDestruction, but the defining
+			// package emits a public dtor for EVERY opaque-exported type (the
+			// opaque-export guarantee — gen_dtor_emit force-emits one even when the type
+			// needs no destruction), so RefDec THROUGH that dtor rather than a null-dtor
+			// free that would leak the type's managed fields.
+			var dtor @Instr = b.EmitFuncHandle(irutil.QualifiedDtorName(elemTyp.Name))
+			b.EmitRefDecDtor(ptrVal, dtor)
+			return
+		} else if irutil.PeelTransparent(elemTyp).Kind == types.TYP_MANAGED_SLICE {
+			// A managed pointer to a managed SLICE (`@(@[]T)`, e.g. `box(s)` for
+			// `s @[]char`; also a named-distinct `@(Buf)` for `type Buf @[]char`):
+			// when the cell's refcount hits zero the pointee's backing must be
+			// RefDec'd (and its managed elements cleaned) — the managed-slice dtor does
+			// exactly that (it loads the 4-word header at the cell pointer and RefDec's
+			// the backing).  Without this the cell frees but the backing leaks (box now
+			// retains it — see the box arm in gen_builtin.bn).  Peel the pointee so a
+			// named-distinct wrapper releases the SAME ms-dtor the box arm's RefInc
+			// acquired (else acquire peels but release doesn't → a silent leak).
+			var ms @types.Type = irutil.PeelTransparent(elemTyp)
+			// Register the ms-dtor so generateDtors emits it — but ONLY when a module
+			// is present.  This runs both during user-function IR-gen (f.Mod set, e.g.
+			// a box-result local's scope drop) AND while GENERATING a dtor body whose
+			// `@(@[]T)` field / element it drops (f.Mod nil — a synthesized dtor func).
+			// In the latter case the dtor-emission passes (generateNonStructDtors /
+			// ensureMsDtor / ensureArrayDtor) already ensured the pointee ms-dtor, so
+			// skip the module-less registration.
+			if f.Mod != nil {
+				RegisterPendingMsDtor(f, ms)
+			}
+			var dtor @Instr = b.EmitFuncHandle(irutil.DtorNameForType(ms))
+			b.EmitRefDecDtor(ptrVal, dtor)
+			return
+		} else if irutil.PeelTransparent(elemTyp).Kind == types.TYP_MANAGED_PTR {
+			// A managed pointer to a managed POINTER (`@(@T)`, e.g. `box(mp)` for
+			// `mp @Node`): when the cell's refcount hits zero the pointee `@T` must be
+			// RefDec'd (running T's dtor) — the mp-dtor does exactly that (load the @T
+			// at the cell, RefDec it).  Without this the cell frees but the pointee
+			// leaks (box now retains it).  Peel so a named-distinct wrapper releases the
+			// SAME mp-dtor the box arm's RefInc acquired.  Register only with a module
+			// (synthesized dtor bodies have the pointee ensured by the emission passes).
+			var mp @types.Type = irutil.PeelTransparent(elemTyp)
+			if f.Mod != nil {
+				RegisterPendingMpDtor(f, mp)
+			}
+			var dtor @Instr = b.EmitFuncHandle(irutil.DtorNameForType(mp))
+			b.EmitRefDecDtor(ptrVal, dtor)
+			return
+		} else if irutil.PeelTransparent(elemTyp).Kind == types.TYP_ARRAY {
+			// A managed pointer to an array-of-managed (`@([N]@Node)`, e.g. `box(arr)`
+			// for an array with managed elements): when the cell's refcount hits zero
+			// each managed element must be RefDec'd — the array dtor
+			// (`__dtor_arr<N>_<elem>`, genArrayDtor) iterates and does exactly that.
+			// Without this the cell frees but the elements leak (box already RefIncs
+			// them via emitStructCopy).  Register via the struct-dtor work-list, whose
+			// drain routes an array type through ensureArrayDtor; a synthesized
+			// (module-less) dtor body has the array dtor ensured by the emission passes.
+			// A plain array (no managed elements) falls through to a bare RefDec.
+			var arr @types.Type = irutil.PeelTransparent(elemTyp)
+			if arr.Elem != nil && arr.Elem.NeedsDestruction() {
+				if f.Mod != nil {
+					RegisterPendingStructDtor(f, arr)
+				}
+				var dtor @Instr = b.EmitFuncHandle(irutil.DtorNameForType(arr))
+				b.EmitRefDecDtor(ptrVal, dtor)
+				return
+			}
+		} else if irutil.PeelTransparent(elemTyp).Kind == types.TYP_MANAGED_FUNC_VALUE {
+			// A managed pointer to a managed FUNC-value (`@(@func())`, e.g. `box(f)`
+			// for `f @func()`): when the cell's refcount hits zero the captured record
+			// must be RefDec'd -- the func-value dtor `__dtor_func` loads the `@func()`
+			// at the cell and RefDec's its data slot (emitManagedFuncValueRefDec).
+			// Without this the cell frees but the capture leaks (box now retains it).
+			// The dtor is a single signature-independent body, flagged for emission via
+			// registerPendingFuncValueDtor; a module-less synthesized dtor body has it
+			// ensured by the emission passes.
+			if f.Mod != nil {
+				RegisterPendingFuncValueDtor(f)
+			}
+			var dtor @Instr = b.EmitFuncHandle(irutil.DtorNameForType(irutil.PeelTransparent(elemTyp)))
+			b.EmitRefDecDtor(ptrVal, dtor)
+			return
+		} else if irutil.PeelTransparent(elemTyp).Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+			// A managed pointer to a managed IFACE-value (`@(@I)`, e.g. `box(iv)` for
+			// `iv @Greeter`): when the cell's refcount hits zero the iface value's data
+			// slot must be RefDec'd -- the iface-value dtor `__dtor_interface` loads the
+			// `@I` at the cell and RefDec's it (emitManagedIfaceValueRefDec, which
+			// fetches the receiver dtor from the value's own vtable).  Without this the
+			// cell frees but the receiver leaks (box now retains it).  A single
+			// interface-independent body, flagged via registerPendingIfaceValueDtor.
+			if f.Mod != nil {
+				RegisterPendingIfaceValueDtor(f)
+			}
+			var dtor @Instr = b.EmitFuncHandle(irutil.DtorNameForType(irutil.PeelTransparent(elemTyp)))
+			b.EmitRefDecDtor(ptrVal, dtor)
+			return
+		}
+	}
+	b.EmitRefDec(ptrVal)
+}
+
+// RegisterPendingFuncValueDtor flags that the module needs the managed-func-value
+// dtor `__dtor_func` emitted (drop of a `@(@func())`).  One signature-independent
+// body, so a boolean flag rather than a per-type work-list.
+func RegisterPendingFuncValueDtor(f @Func) {
+	if f.Mod == nil {
+		fmt.Println("ir: registerPendingFuncValueDtor on a func with no module (f.Mod nil)")
+		os.Exit(1)
+	}
+	f.Mod.NeedsFuncValueDtor = true
+}
+
+// RegisterPendingIfaceValueDtor flags that the module needs the managed-iface-value
+// dtor `__dtor_interface` emitted (drop of a `@(@I)`).  One interface-independent
+// body, so a boolean flag rather than a per-type work-list.
+func RegisterPendingIfaceValueDtor(f @Func) {
+	if f.Mod == nil {
+		fmt.Println("ir: registerPendingIfaceValueDtor on a func with no module (f.Mod nil)")
+		os.Exit(1)
+	}
+	f.Mod.NeedsIfaceValueDtor = true
+}
+
+// RegisterPendingMpDtor records a managed-POINTER type `@T` that needs a
+// `__dtor_mp_<T>` helper — mirrors registerPendingMsDtor.  Used when the drop of a
+// `@(@T)` (a managed pointer to a managed value) references the pointee's mp-dtor.
+func RegisterPendingMpDtor(f @Func, mpTyp @types.Type) {
+	if f.Mod == nil {
+		fmt.Println("ir: registerPendingMpDtor on a func with no module (f.Mod nil)")
+		os.Exit(1)
+	}
+	var name @[]char = irutil.DtorNameForType(mpTyp)
+	if irutil.HasName(f.Mod.PendingMpDtorNames, name) { return }
+	f.Mod.PendingMpDtors = slices.Append[@types.Type](f.Mod.PendingMpDtors, mpTyp)
+	f.Mod.PendingMpDtorNames = slices.Append[@[]char](f.Mod.PendingMpDtorNames, name)
+}
+
+// RegisterPendingMsDtor records a managed-slice type that needs a dtor.  The
+// work-list lives on the func's module (f.Mod) — see registerPendingStructDtor
+// for the back-ref + nil-abort rationale.
+func RegisterPendingMsDtor(f @Func, msTyp @types.Type) {
+	if f.Mod == nil {
+		fmt.Println("ir: registerPendingMsDtor on a func with no module (f.Mod nil)")
+		os.Exit(1)
+	}
+	var name @[]char = irutil.DtorNameForType(msTyp)
+	if irutil.HasName(f.Mod.PendingMsDtorNames, name) { return }
+	f.Mod.PendingMsDtors = slices.Append[@types.Type](f.Mod.PendingMsDtors, msTyp)
+	f.Mod.PendingMsDtorNames = slices.Append[@[]char](f.Mod.PendingMsDtorNames, name)
+}
+
+// RegisterPendingStructDtor records a struct/array type that needs dtor and
+// copy functions generated. This handles types discovered during scope cleanup
+// that aren't in Module.Structs (e.g., array types used as local variables).
+// The work-list lives on the func's module (f.Mod), reached via the raw
+// back-ref set at body-gen creation; f.Mod is non-nil for every func whose
+// body runs scope cleanup, so a nil Mod is an IR-gen bug (a registering func
+// created off the genFuncWithPrependedParams path) — abort rather than drop
+// the registration silently, which would leak the type's dtor.
+func RegisterPendingStructDtor(f @Func, typ @types.Type) {
+	if f.Mod == nil {
+		fmt.Println("ir: registerPendingStructDtor on a func with no module (f.Mod nil)")
+		os.Exit(1)
+	}
+	var name @[]char = irutil.DtorNameForType(typ)
+	if irutil.HasName(f.Mod.PendingStructDtorNames, name) { return }
+	f.Mod.PendingStructDtors = slices.Append[@types.Type](f.Mod.PendingStructDtors, typ)
+	f.Mod.PendingStructDtorNames = slices.Append[@[]char](f.Mod.PendingStructDtorNames, name)
+}

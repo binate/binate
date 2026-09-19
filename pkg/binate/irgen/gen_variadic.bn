@@ -1,0 +1,203 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Variadic call lowering (func.variadic.pack).  When a variadic callee is
+// called with INDIVIDUAL trailing arguments, they are packed into a single raw
+// slice *[]T that views a caller-side STACK backing array — no heap allocation
+// (the whole point of the raw-*[]T design).  Variadic-ness is a front-end / type
+// property; by the time the args reach a backend the variadic argument is an
+// ordinary 2-word raw slice, so no backend change is needed.
+
+// funcTypeIsVariadic reports whether a func-kind types.Type's final parameter is
+// variadic (its Param.IsVariadic flag).  The flag rides the last param.
+func funcTypeIsVariadic(t @types.Type) bool {
+	if t == nil { return false }
+	var n int = len(t.Params)
+	if n == 0 { return false }
+	return t.Params[n - 1].IsVariadic
+}
+
+// emitVariadicTail packs zero-or-more trailing argument expressions into a single
+// raw slice *[]elemTyp (func.variadic.pack): a caller-side STACK array (via
+// EmitAlloc — no heap alloc) plus a {data, len} header.  Zero args yield the
+// empty slice {null, 0} (emptiness is len == 0; §7.7).
+//
+// A MANAGED element type makes the backing array a statement temp whose
+// per-element destructor releases the acquired copies at statement end (the
+// caller-acquire / callee-borrow discipline; func.variadic.pack managed Note).
+// The backing is registered BEFORE storing so a mid-pack early-return still
+// cleans the already-stored elements — uninitialized slots are null (EmitAlloc
+// zero-inits) and RefDec(null) no-ops.  A non-managed [N]T needs no cleanup.
+func emitVariadicTail(ctx @GenContext, b @ir.Block, elemTyp @types.Type,
+		trailing @[]@ast.Expr) @ir.Instr {
+	var noBacking @ir.Instr = nil
+	return emitVariadicTailInto(ctx, b, elemTyp, trailing, noBacking)
+}
+
+// emitVariadicTailInto is emitVariadicTail with an optional caller-supplied
+// `backing` array slot.  When `backing` is nil it allocates its own backing at
+// the current block and registers it as an end-of-statement temp (the normal
+// call path).  When `backing` is non-nil the caller owns the backing's lifetime
+// and this neither allocates nor registers it — used by the defer path, which
+// pre-allocates the backing at function-entry depth so its managed elements
+// survive to the deferred call and are released once afterward (a statement temp
+// would be freed at the defer statement's end).
+func emitVariadicTailInto(ctx @GenContext, b @ir.Block, elemTyp @types.Type, trailing @[]@ast.Expr,
+		backing @ir.Instr) @ir.Instr {
+	var sliceTyp @types.Type = types.MakeSliceType(elemTyp)
+	var n int = len(trailing)
+	if n == 0 {
+		return b.EmitConstNil(sliceTyp)
+	}
+	var arrTyp @types.Type = types.MakeArrayType(elemTyp, n)
+	var arrPtr @ir.Instr = backing
+	if arrPtr == nil {
+		arrPtr = b.EmitAlloc(arrTyp)
+		if needsStructCopy(arrTyp) {
+			registerTemp(ctx, arrPtr)
+		}
+	}
+	for i := 0; i < n; i++ {
+		var idx @ir.Instr = b.EmitConstInt(i, types.TypInt())
+		var elemPtr @ir.Instr = b.EmitGetElemPtr(arrPtr, idx, elemTyp)
+		var val @ir.Instr = genExprOrFuncRef(ctx, b, trailing[i], elemTyp)
+		b = ctx.CurBlock
+		// A packed element is coerced EXACTLY like an array-literal element (a
+		// reduced path silently miscompiles a string / composite-literal element)
+		// — the shared coerceCompositeElement: scalar-width narrow, string→chars,
+		// composite-aggregate load.
+		val = coerceCompositeElement(ctx, b, val, elemTyp)
+		// emitStoreManagedSlot ACQUIRES a managed element (moves a fresh temp /
+		// copies a borrowed value) and does a plain store for a non-managed
+		// element.  isInit=true: the slot was freshly allocated.
+		b = emitStoreManagedSlot(ctx, b, elemPtr, val, elemTyp, true)
+	}
+	// Build the 2-word {data, len} header over the backing array.
+	var sliceAlloca @ir.Instr = b.EmitAlloc(sliceTyp)
+	var rawPtrTyp @types.Type = types.MakePointerType(types.TypUint8())
+	var dataPtr @ir.Instr = b.EmitBitCast(arrPtr, rawPtrTyp)
+	var ptrField @ir.Instr = b.EmitGetFieldPtr(sliceAlloca, 0, rawPtrTyp)
+	b.EmitStore(ptrField, dataPtr)
+	var lenInstr @ir.Instr = b.EmitConstInt(n, types.TypInt())
+	var lenField @ir.Instr = b.EmitGetFieldPtr(sliceAlloca, 1, types.TypInt())
+	b.EmitStore(lenField, lenInstr)
+	return b.EmitLoad(sliceAlloca, sliceTyp)
+}
+
+// emitVariadicSpread lowers a spread argument `s...` (func.variadic.spread) into
+// the single raw slice *[]T the variadic callee borrows.  The operand is
+// evaluated once and its {data, len} forwarded DIRECTLY — no backing array, no
+// copy: a raw *[]T operand passes through unchanged; a managed @[]T operand
+// decays via EmitManagedToRaw, which extracts {data, len} WITHOUT retaining.  A
+// len == 0 operand yields the same empty variadic argument as zero individual
+// args (emptiness is len == 0; §7.7).
+//
+// Borrow lifetime (func.variadic.borrow): the operand is NOT consumeTemp'd and
+// NOT early-RefDec'd.  A FRESH managed operand (`f(makeSlice()...)`,
+// `f(@[]T{…}...)`) stays registered in ctx.Temps by genExpr's normal call-result
+// / composite-lit registration, so it is RefDec'd at STATEMENT END — after the
+// call — keeping the borrowed {data, len} valid for the callee.  Consuming or
+// releasing it here is a use-after-free.
+func emitVariadicSpread(ctx @GenContext, b @ir.Block, operand @ast.Expr) @ir.Instr {
+	var val @ir.Instr = genExpr(ctx, b, operand)
+	b = ctx.CurBlock
+	// @[]T -> *[]T: extract {data, len} (borrow, no RefInc — see above).  A raw
+	// *[]T is already the callee's param shape, so it forwards as-is.
+	if irutil.IsManagedSliceType(val.Typ) {
+		val = b.EmitManagedToRaw(val)
+	}
+	return val
+}
+
+// buildCallArgs evaluates a call's arguments into IR values (via genExprOrFuncRef
+// + coerceArg) — the shared arg-building for the direct (genCall) and func-value
+// (genFuncValueCallWithFn) call paths.  For a VARIADIC callee the leading
+// `len(paramTypes)-1` fixed arguments bind positionally and the trailing
+// argument(s) become the single *[]T variadic argument: either INDIVIDUAL args
+// packed into a fresh stack backing (emitVariadicTail) or, when `spread`, one
+// slice operand forwarded directly (emitVariadicSpread).  paramTypes is the
+// callee's parameter types (the last is *[]T for a variadic callee).  On return,
+// ctx.CurBlock is the current block (the caller re-reads it).
+func buildCallArgs(ctx @GenContext, b @ir.Block, argExprs @[]@ast.Expr, paramTypes @[]@types.Type,
+		isVariadic bool, spread bool) @[]@ir.Instr {
+	var args @[]@ir.Instr = evalCallArgs(ctx, b, argExprs, paramTypes, isVariadic, spread)
+	b = ctx.CurBlock
+	return deliverCallArgs(ctx, b, args, paramTypes, isVariadic)
+}
+
+// evalCallArgs evaluates each argument and applies the EAGER (representation-only,
+// non-owning) coercions, leaving each managed arg as a live ctx.Temps entry — NOT
+// yet delivered/consumed.  The variadic tail is packed here.  Split from delivery
+// (deliverCallArgs) so a caller (genCall) can interpose a stack pre-check between
+// the two phases, and so a recoverable fault DURING evaluation leaves every
+// already-evaluated arg still covered by a cleanup pad (per-arg eval+deliver
+// interleaving would orphan an earlier consumed arg on a later arg's fault).
+func evalCallArgs(ctx @GenContext, b @ir.Block, argExprs @[]@ast.Expr, paramTypes @[]@types.Type,
+		isVariadic bool, spread bool) @[]@ir.Instr {
+	var args @[]@ir.Instr
+	var numParams int = len(paramTypes)
+	if !isVariadic {
+		for i := 0; i < len(argExprs); i++ {
+			var pt @types.Type = nil
+			if i < numParams { pt = paramTypes[i] }
+			var arg @ir.Instr = genExprOrFuncRef(ctx, b, argExprs[i], pt)
+			b = ctx.CurBlock
+			arg = coerceArgEager(ctx, b, arg, pt)
+			b = ctx.CurBlock
+			args = slices.Append[@ir.Instr](args, arg)
+		}
+		return args
+	}
+	var k int = numParams - 1
+	for i := 0; i < k; i++ {
+		var arg @ir.Instr = genExprOrFuncRef(ctx, b, argExprs[i], paramTypes[i])
+		b = ctx.CurBlock
+		arg = coerceArgEager(ctx, b, arg, paramTypes[i])
+		b = ctx.CurBlock
+		args = slices.Append[@ir.Instr](args, arg)
+	}
+	var packed @ir.Instr
+	if spread {
+		// The checker guarantees exactly one trailing (spread) operand at index k.
+		packed = emitVariadicSpread(ctx, b, argExprs[k])
+	} else {
+		var elemTyp @types.Type = paramTypes[k].SliceElem()
+		if elemTyp == nil {
+			elemTyp = paramTypes[k]
+		}
+		var trailing @[]@ast.Expr
+		for i := k; i < len(argExprs); i++ {
+			trailing = slices.Append[@ast.Expr](trailing, argExprs[i])
+		}
+		packed = emitVariadicTail(ctx, b, elemTyp, trailing)
+	}
+	b = ctx.CurBlock
+	args = slices.Append[@ir.Instr](args, packed)
+	return args
+}
+
+// deliverCallArgs applies the DELIVERY (ownership) coercions — consumeTemp /
+// RefInc / managed-field-struct copy — to each already-evaluated FIXED arg in
+// place; the variadic packed `*[]T` tail (the last arg when isVariadic) takes no
+// delivery.  Delivery is SP-neutral, so it is safe to run after a stack pre-check.
+func deliverCallArgs(ctx @GenContext, b @ir.Block, args @[]@ir.Instr, paramTypes @[]@types.Type,
+		isVariadic bool) @[]@ir.Instr {
+	var numParams int = len(paramTypes)
+	var deliverCount int = len(args)
+	if isVariadic && deliverCount > 0 {
+		deliverCount = deliverCount - 1
+	}
+	for i := 0; i < deliverCount; i++ {
+		var pt @types.Type = nil
+		if i < numParams { pt = paramTypes[i] }
+		args[i] = coerceArgDelivery(ctx, b, args[i], pt)
+	}
+	return args
+}

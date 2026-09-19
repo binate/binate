@@ -1,0 +1,230 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// ============================================================
+// Return statement lowering
+// ============================================================
+//
+// genReturnStmt handles STMT_RETURN. Two shapes are supported:
+//
+//   - `return v1, ..., vN` — one expression per declared result.
+//     Per-expr literal-shape coercions (OP_CONST_NIL → retTyp,
+//     OP_CONST_STRING → string_to_chars, untyped-int width
+//     adjustment) and the @[]T → *[]T conversion fire here.
+//
+//   - `return f(...)` — single expression for a multi-return
+//     outer. The type checker validates that f's results match
+//     the outer's declared results (per-result AssignableTo).
+//     IR-gen emits one OP_CALL + one OP_EXTRACT per result; the
+//     literal-shape coercions don't apply (call results aren't
+//     literals), but the @[]T → *[]T conversion is still
+//     applied per extracted value to match the per-expr path.
+//
+// After either shape produces `vals`, the shared tail handles
+// ownership transfer (Axiom 3 RefInc, struct copy for managed
+// fields), local cleanup, and the actual EmitReturn /
+// EmitReturnTyped emission.
+
+func genReturnStmt(ctx @GenContext, b @ir.Block, stmt @ast.Stmt) @ir.Block {
+	if len(stmt.Exprs) == 0 {
+		// Run pending deferred calls, then dec all managed ptr locals, before the
+		// void return (stmt.defer.exit).
+		b = emitPendingDefers(ctx, b)
+		var noRetExprs *[]@ast.Expr
+		b = emitDecForManagedLocals(ctx, b, noRetExprs)
+		var noRetVals @[]@ir.Instr
+		b.EmitReturn(noRetVals)
+		return b
+	}
+
+	var vals @[]@ir.Instr
+	if len(stmt.Exprs) == 1 && len(ctx.Func.Results) > 1 {
+		// Single-expression return for a multi-return function:
+		// `return f(...)` where f returns the matching tuple.
+		// The existing RefInc/copy and temp-cleanup machinery
+		// below handles ownership transfer (extracted managed
+		// values live in the call's struct temp, the
+		// return-RefInc loop bumps for the caller, the temp dtor
+		// decs at end-of-statement).
+		var mr @ir.Instr = genExpr(ctx, b, stmt.Exprs[0])
+		b = ctx.CurBlock
+		for i := 0; i < len(ctx.Func.Results); i++ {
+			var resTyp @types.Type = ctx.Func.Results[i]
+			var srcTyp @types.Type = resTyp
+			if mr.Typ != nil && i < len(mr.Typ.Fields) {
+				srcTyp = mr.Typ.Fields[i].Type
+			}
+			var val @ir.Instr = b.EmitExtract(mr, i, srcTyp)
+			// Convert @[]T to *[]T if the outer return is raw.  Peel the
+			// declared result: a named raw-slice result (`type RS *[]int`)
+			// has Kind TYP_NAMED, so an unpeeled test skips the conversion
+			// and a 4-word @[]T is returned in a 2-word raw-slice slot
+			// (invalid `ret %BnManagedSlice` against a %BnSlice result type).
+			if irutil.PeelTransparent(resTyp).Kind == types.TYP_SLICE && irutil.IsManagedSliceType(val.Typ) {
+				val = b.EmitManagedToRaw(val)
+			}
+			vals = slices.Append[@ir.Instr](vals, val)
+		}
+	} else {
+		for i := 0; i < len(stmt.Exprs); i++ {
+			var retTypHint @types.Type = nil
+			if i < len(ctx.Func.Results) {
+				retTypHint = ctx.Func.Results[i]
+			}
+			var val @ir.Instr = genExprOrFuncRef(
+					ctx, b, stmt.Exprs[i], retTypHint)
+			b = ctx.CurBlock
+			if i < len(ctx.Func.Results) {
+				var retTyp @types.Type = ctx.Func.Results[i]
+				if val.Op == iropcode.OP_CONST_NIL && val.Typ != nil && val.Typ.Kind == types.TYP_NIL {
+					val.Typ = retTyp
+				}
+				// Convert string literal to *[]readonly char/@[]char.
+				// TODO: string → *[]readonly char is dubious (mutable
+				// view of read-only data); string → *[]readonly char
+				// would be safe. @[]char is ok since
+				// StringToChars copies.
+				if isCharSliceType(retTyp) {
+					if val.Op == iropcode.OP_CONST_STRING {
+						val = b.EmitStringToChars(val, retTyp)
+						noteSPGrowingResult(ctx, val)
+						// A MANAGED @[]char copy (OP_RODATA_MSLICE_COPY) is a fresh
+						// owning value; the Axiom-3 RefInc below over-retains it
+						// unless it is a registered cleanup temp that the scope-exit
+						// RefDec balances (the invariant the managed-slice arm relies
+						// on — see the @Iface note).  Without this it leaks one block
+						// per `return "..."`.  (The raw *[]readonly char alias —
+						// OP_RODATA_MSLICE — is not managed and is never RefInc'd.)
+						if val.Op == iropcode.OP_RODATA_MSLICE_COPY {
+							registerTemp(ctx, val)
+						}
+					}
+				}
+				// Convert @[]T to *[]T if function returns raw slice.  Peel
+				// the declared result first — a named raw-slice result has
+				// Kind TYP_NAMED, so an unpeeled test would skip the
+				// conversion and emit an invalid `ret %BnManagedSlice`
+				// against the %BnSlice result type.
+				if irutil.PeelTransparent(retTyp).Kind == types.TYP_SLICE &&
+						irutil.IsManagedSliceType(val.Typ) {
+					// Temp stays in cleanup — RefDec at end of stmt.
+					val = b.EmitManagedToRaw(val)
+				}
+				// Untyped scalar literals adopt the return type's width
+				// (untyped int → integer, untyped float → float; e.g. an
+				// untyped-float 0.5 returned at float32 fptruncs to single
+				// precision rather than emitting `ret float <double>`).
+				val = coerceScalarWidth(ctx, b, val, retTyp)
+			}
+			// Load struct/array value from alloca before returning
+			// — but ONLY when the function returns the struct/array
+			// value itself, not a pointer to it.  `return &h` for a
+			// function declared as `*T` keeps the alloca pointer as
+			// the SSA value; loading it would turn the pointer into
+			// the struct value and produce `ret %T %loaded` against
+			// a `define ptr` signature.  Surfaced by the .bni-
+			// forward-decl + .bn-struct-body pattern: cross-package
+			// opaque callers see the function as returning `ptr`, the body
+			// sees the full struct, and only the `return &local`
+			// shape mismatches at LLVM emit time.
+			if isStructOrArrayAlloc(val) {
+				// Peel the declared result type before the struct/array
+				// kind test: a named result (`func f() Row` over
+				// `type Row [3]int`) has Kind TYP_NAMED, so an unpeeled
+				// test skips the load and returns the alloca POINTER where
+				// the by-value array/struct is expected (silent garbage).
+				var retTyp @types.Type = nil
+				if i < len(ctx.Func.Results) {
+					retTyp = irutil.PeelTransparent(ctx.Func.Results[i])
+				}
+				var retIsStructOrArray bool = retTyp != nil &&
+						(retTyp.Kind == types.TYP_STRUCT || retTyp.Kind == types.TYP_ARRAY)
+				if retIsStructOrArray {
+					val = b.EmitLoad(val, val.TypeArg)
+				}
+			}
+			vals = slices.Append[@ir.Instr](vals, val)
+		}
+	}
+
+	// Run the pending deferred calls BEFORE the Axiom-3 delivery RefInc below, not
+	// after: a deferred call can raise a recoverable VM fault, whose cleanup pad
+	// (gen_defer_exit.bn) RefDecs the live managed set EXACTLY ONCE per value.  The
+	// return operands must therefore still be in their pre-delivery state (a fresh
+	// result is a live ctx.Temps entry; a returned local sits at its own refcount)
+	// when the defers run, so the pad releases each exactly once.  Doing the Axiom-3
+	// RefInc first would add a second, delivery-owned ref that the fault path never
+	// hands to a caller and the single-RefDec pad cannot reclaim — a leak of the
+	// return value on every deferred-call fault.  Defers cannot observe or change an
+	// operand (their own operands were captured eagerly at the defer site), so
+	// retaining after they run is equivalent for the normal path.  For a function
+	// with no defers this emits nothing and is a no-op, so non-defer returns are
+	// byte-identical.
+	b = emitPendingDefers(ctx, b)
+
+	// Axiom 3: always RefInc return values (slow path). Scope cleanup
+	// always RefDec's (no skip for returned locals).
+	for ri := 0; ri < len(vals); ri++ {
+		var rv @ir.Instr = vals[ri]
+		if rv.Typ != nil && irutil.IsManagedPtrType(rv.Typ) {
+			b.EmitRefInc(rv)
+		}
+		if rv.Typ != nil && irutil.IsManagedSliceType(rv.Typ) {
+			emitManagedSliceRefInc(ctx.Func, b, rv)
+		}
+		// @func: hand the caller an owned ref.  isFresh-guarded — a fresh
+		// returned literal / call result is not a temp, so always-RefInc
+		// would over-retain (the scope cleanup that balances it only
+		// RefDec's named locals); consumeTemp transfers the existing ref.
+		// A returned @func local RefInc's (the caller's copy) and is
+		// balanced by the local's scope-end RefDec.
+		if rv.Typ != nil && irutil.IsManagedFuncValueType(rv.Typ) {
+			if isFreshManagedFuncValue(rv) {
+				consumeTemp(ctx, rv)
+			} else {
+				emitManagedFuncValueRefInc(ctx.Func, b, rv)
+			}
+		}
+		// A fresh @Iface (a wrapAsIfaceValue box or a call result) already
+		// owns its data ref and is NOT a registered cleanup temp, so it is
+		// moved out via consumeTemp; a borrowed load (named local, param,
+		// field) is retained for the caller with RefInc, balanced by the
+		// local's scope-exit RefDec.  (Unlike @T / @[]T above, whose fresh
+		// values are always registered temps, so they RefInc
+		// unconditionally and let temp-cleanup balance.)
+		if rv.Typ != nil && irutil.IsManagedIfaceValueType(rv.Typ) {
+			if isFreshManagedIfaceValue(rv) {
+				consumeTemp(ctx, rv)
+			} else {
+				emitManagedIfaceValueRefInc(ctx.Func, b, rv)
+			}
+		}
+		// Struct/array with managed fields: always copy (slow path).
+		// Copy RefInc's managed fields for the caller's ownership.
+		// Scope dtor will RefDec them on the local.
+		if rv.Typ != nil && needsStructCopy(rv.Typ) {
+			var tmpSlot @ir.Instr = b.EmitAlloc(rv.Typ)
+			b.EmitStore(tmpSlot, rv)
+			emitStructCopy(ctx.Func, b, tmpSlot, rv.Typ)
+		}
+	}
+	// The return operands have acquired their owning references (Axiom 3 above,
+	// after the deferred calls ran); release the function's managed locals
+	// (stmt.defer.return / stmt.defer.exit).
+	b = emitDecForManagedLocals(ctx, b, stmt.Exprs)
+	b = emitTempCleanupForReturn(ctx, b)
+	if ctx.Func.MultiReturnType != nil {
+		b.EmitReturnTyped(vals, ctx.Func.MultiReturnType)
+	} else {
+		b.EmitReturn(vals)
+	}
+	return b
+}

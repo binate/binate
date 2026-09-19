@@ -3,14 +3,18 @@
 #
 # Checks non-test source files for excessive length.
 #   .bn  (implementation): 500 lines.
-#   .bni (interface):      1500 lines.  Interface files aggregate a package's
-#        whole API and can't be split the way an impl can, so they get a higher
-#        cap — but the cap still flags a runaway interface (the fix there is
-#        splitting into sub-interfaces).
+#   .bni (interface):      1454 lines.  A package's whole API lives in one
+#        interface file — the loader loads a single <pkg>.bni, so unlike an
+#        impl's .bn files a .bni cannot be split within its package.  The cap is
+#        therefore set to the current largest .bni (pkg/binate/ir.bni) as a
+#        ratchet: no interface may exceed the biggest one that already exists.
+#        It is lowered incrementally toward 1000 by splitting the largest .bni
+#        into sub-packages (re-exported via `expose`), then resetting the cap to
+#        the new maximum.
 # Test files (*_test.bn) are excluded — they may be longer.
 #
-# TODO: consider lowering the .bni cap toward 1000/1200; ir.bni (~1446 lines)
-# would need refactoring first.  See explorations/claude-todo.md.
+# TODO: continue lowering the .bni cap toward 1000 — split the largest .bni,
+# then reset this cap to the new max, and repeat.  See explorations/claude-todo.md.
 #
 # There is no warn/grace band: a file over its limit fails immediately, on the
 # first offender.  The limit is a forcing function against single-file blobs —
@@ -23,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 BN_LIMIT=500
-BNI_LIMIT=1500
+BNI_LIMIT=1454
 
 errors=0
 

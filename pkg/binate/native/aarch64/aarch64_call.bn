@@ -6,6 +6,7 @@ import "pkg/binate/ir"
 import "pkg/binate/iropcode"
 import "pkg/binate/native/common"
 import "pkg/binate/types"
+import "pkg/stdx/slices"
 
 // ============================================================
 // Direct function call lowering
@@ -61,6 +62,86 @@ func emitAggregateArg(a @asm.Assembler, rm @common.RegMap, arg @ir.Instr, regSta
 	}
 }
 
+// emitArgBankHomedScalarArgs pre-places every GP scalar call argument whose operand
+// is homed in the ARG BANK X0..X7.  Such an operand's home register IS an argument
+// register, so the marshalling loop's naive per-arg `mov argReg, home` would permute
+// and corrupt when two of them cross (or when one operand's home is another arg's
+// destination register).  Resolve all the register-destined ones as a single
+// PARALLEL MOVE (cycle-broken through X16), and store the rare stack-destined ones
+// straight from their homes (reads a home, writes memory — no permutation).  The
+// marshalling loop then SKIPS these args (isArgBankReg(home) guard) since they are
+// already in place.  MUST run before the loop, while every arg-bank home still holds
+// its operand's value.  Only GP scalars are homed (floats / aggregates are
+// non-allocatable), so no other argument kind participates.  argTypes / fixedCount /
+// callIsVariadic mirror the loop's CallArg*V placement so the two agree per arg.
+func emitArgBankHomedScalarArgs(a @asm.Assembler, rm @common.RegMap, args @[]@ir.Instr,
+		argTypes @[]@types.Type, argSlotBase int, fixedCount int, callIsVariadic bool,
+		uniformStackWord bool) {
+	var srcs @[]int
+	var dsts @[]int
+	for ai := 0; ai < len(args); ai++ {
+		var arg @ir.Instr = args[ai]
+		if common.IsFloatScalarTyp(arg.Typ) || common.IsAggregateTyp(arg.Typ) { continue }
+		var phome int = rm.LookupHome(arg.ID)
+		if phome < 0 || !isArgBankReg(phome) { continue }
+		// args[ai] occupies argTypes slot argSlotBase+ai (a shim ABI prepends
+		// retbuf/data/receiver prefix slots before the user args).
+		var slot int = argSlotBase + ai
+		var regStart int = rm.CC.CallArgRegStartV(argTypes, slot, fixedCount, callIsVariadic)
+		if regStart >= 0 {
+			srcs = slices.Append[int](srcs, phome)
+			dsts = slices.Append[int](dsts, argReg(regStart))
+		} else {
+			// Stack-passed arg-bank home (rare: > 8 GP args).  Store from the home
+			// now, before the parallel move below can clobber it.  Match the caller's
+			// own loop store width: a shim / indirect ABI passes every arg as a
+			// uniform 8-byte dispatch word (uniformStackWord); a direct call stores a
+			// narrow scalar at its natural width (StackArgStoreSize).
+			var stackOff int = rm.CC.CallArgStackOffV(argTypes, slot, fixedCount, callIsVariadic)
+			if stackOff >= 0 {
+				if uniformStackWord {
+					aarch64.Str(a, true, phome, aarch64.MemImm(aarch64.SP, stackOff))
+				} else {
+					aarch64.StrSized(a, rm.CC.StackArgStoreSize(arg.Typ, ai >= fixedCount), phome,
+							aarch64.MemImm(aarch64.SP, stackOff))
+				}
+			}
+		}
+	}
+	if len(dsts) == 0 { return }
+	// X17 (IP1) is the cycle-break temp — NOT X16.  In the shim marshalling paths
+	// (func-value / iface) X16 holds the handle pointer that the post-marshalling
+	// shim derivation still needs, so using X16 here would clobber it whenever the
+	// arg moves form a cycle.  X17 is free at every call site's pre-pass (the shim
+	// target is loaded into it only AFTER marshalling), never an argument register
+	// nor a home, and its assembler large-offset use is transient and already past
+	// by the pure reg-to-reg moves below.
+	var plan @[]int = common.PlanParallelMove(srcs, dsts, aarch64.X17)
+	for k := 0; k < len(plan); k = k + 2 {
+		aarch64.Mov(a, true, plan[k], aarch64.Reg(plan[k + 1]))
+	}
+}
+
+// emitParallelReg2 places two operand registers into two argument registers as a
+// parallel copy — {d0 <- s0, d1 <- s1} realized so neither clobbers the other's
+// source when they cross (s0 in d1 and s1 in d0).  For the runtime-call setup ops
+// (div/shift/bounds checks, refdec) whose operands can now be homed in the arg bank
+// X0..X7 (a home pool) and thus collide with the argument registers they marshal
+// into.  Cycle temp X16 — free at these sites (no handle pointer, unlike the shim
+// paths that must use X17).  Identity moves are dropped.
+func emitParallelReg2(a @asm.Assembler, s0 int, d0 int, s1 int, d1 int) {
+	var s @[]int = make_slice(int, 2)
+	var d @[]int = make_slice(int, 2)
+	s[0] = s0
+	d[0] = d0
+	s[1] = s1
+	d[1] = d1
+	var plan @[]int = common.PlanParallelMove(s, d, aarch64.X16)
+	for k := 0; k < len(plan); k = k + 2 {
+		aarch64.Mov(a, true, plan[k], aarch64.Reg(plan[k + 1]))
+	}
+}
+
 // emitCall moves args into X0..X7 and branches to the callee symbol.
 // ins.StrVal is the Binate-level call name; goes through
 // pkg/binate/mangle.FuncName for the C symbol.
@@ -91,6 +172,10 @@ func emitCall(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins
 	// per-CALL VfpBackfill float->GP rule, so it does not consume this flag today;
 	// it is passed for signature uniformity with the arm32 caller.
 	var callIsVariadic bool = ins.Op == iropcode.OP_C_CALL && ins.CVariadic
+	// Pre-place arg-bank-homed GP scalar args via a parallel move (see the helper):
+	// their homes ARE argument registers, so they cannot be marshalled by the naive
+	// per-arg move in the loop below, which SKIPS them.
+	emitArgBankHomedScalarArgs(a, rm, ins.Args, argTypes, 0, fixedCount, callIsVariadic, false)
 	// AAPCS NSRN: float scalar args go to D(NSRN), separate from the GP NGRN
 	// counter.  The first 8 land in D0..D7; a 9th+ float overflows to the
 	// outgoing-args stack (an 8-byte slot at CallArgStackOffV, which now
@@ -178,6 +263,14 @@ func emitCall(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins
 		if common.IsAggregateTyp(arg.Typ) {
 			emitAggregateArg(a, rm, arg, regStart, stackOff)
 		} else {
+			var phome int = rm.LookupHome(arg.ID)
+			if phome >= 0 && isArgBankReg(phome) {
+				// Homed in the arg bank: already placed by the parallel-move
+				// pre-pass (emitArgBankHomedScalarArgs).  Re-marshalling here would
+				// read the home AFTER the pre-pass moved the operand out of it.
+				rm.ResetRegs()
+				continue
+			}
 			var src int = emitValOperand(a, pkgName, rm, arg)
 			if src < 0 { continue }
 			if regStart >= 0 {
@@ -301,127 +394,4 @@ func emitCall(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins
 		return
 	}
 	collectMultiReturnFields(a, rm, ins, spillOff)
-}
-
-// collectMultiReturnFields spills a ≤64-byte multi-return tuple from its
-// AAPCS64 return registers into the call result's stack slot, by the
-// per-field register-class convention LLVM lowers a tuple by — integer /
-// aggregate words from X0.. (retGp), float scalars from D0.. (retFp).  So
-// `(int, float64)` collects X0 + D0 (not X0:X1) and `(float64, float64)`
-// collects D0,D1.  A float field read from a GP reg reads an X reg the callee
-// never wrote → 0 (conformance/683); the bits FMOV into a GP scratch, since
-// every native value lives in a GP spill slot (cf. collectScalarReturn).
-// Shared by the direct (emitCall), interface-method, function-value, and
-// call-indirect collects so the scheme can't drift between call shapes.
-func collectMultiReturnFields(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, spillOff int) {
-	storeMultiReturnTupleFieldsAA64(a, ins.Typ, aarch64.SP, spillOff, scratchReg(rm))
-}
-
-// storeMultiReturnTupleFieldsAA64 is the field-per-register-by-class store loop
-// shared by collectMultiReturnFields (the RegMap-driven caller collect) and the
-// func-value / closure / spill SHIM store-through-retbuf paths (which have no
-// RegMap).  It reproduces the AAPCS64 per-field register-class convention LLVM
-// lowers a tuple by: integer / aggregate words from X0.. (retGp), float scalars
-// from D0.. (retFp) FMOV'd through `scratch` (a GP reg distinct from the return
-// regs and `base`, since every native value lands in a GP slot) then stored at
-// the field's SIZE (so a sub-word field like (u16,u16,u16) does not clobber its
-// neighbor).  Each field lands at base+baseOff+FieldOffset.  A MANAGED field
-// rides the non-float GP path — a plain pointer-word store, ownership
-// transferring from the return reg into the slot (no RefInc/RefDec): the shim
-// forwards the callee's already-owned words, it does not own the tuple.
-func storeMultiReturnTupleFieldsAA64(a @asm.Assembler, tupleTyp @types.Type, base int, baseOff int,
-		scratch int) {
-	var retGp int = 0
-	var retFp int = 0
-	for fi := 0; fi < len(tupleTyp.Fields); fi++ {
-		var fldTyp @types.Type = tupleTyp.Fields[fi].Type
-		var fldOff int = baseOff + tupleTyp.FieldOffset(fi)
-		if common.IsFloatScalarTyp(fldTyp) {
-			// Increment retFp unconditionally (matching emitReturn's pack,
-			// which advances nsrn per float field regardless of the < 8
-			// guard) so the field→D-register mapping stays in lockstep with
-			// the pack side.  >8 float fields can't reach here (>64 bytes →
-			// sret), so the guarded FMOV never drops a live field.
-			if retFp < 8 {
-				aarch64.Fmov_fp_to_gp(a, scratch, aarch64.D0 + retFp)
-				var fldSz int = fldTyp.SizeOf()
-				if fldSz <= 0 { fldSz = 8 }
-				emitScalarStore(a, scratch, base, fldOff, fldSz)
-			}
-			retFp = retFp + 1
-		} else if common.IsAggregateTyp(fldTyp) {
-			// A 0-byte aggregate field (`struct{}` / `[0]T`) occupies NO return
-			// register and carries no bytes — LLVM's first-class `{...}` struct return
-			// places nothing for it, and the callee return lowering (emitReturn's pack)
-			// skips it the same way.  common.ArgWords reports 0 words for it, so the
-			// loop below stores nothing and does NOT consume a retGp slot; storing a
-			// junk word here would shift every later field's register by one —
-			// desyncing this store from the callee and the LLVM shim.
-			var nWords int = common.ArgWords(fldTyp)
-			for w := 0; w < nWords && retGp < 8; w++ {
-				aarch64.Str(a, true, argReg(retGp), aarch64.MemImm(base, fldOff + 8 * w))
-				retGp = retGp + 1
-			}
-		} else {
-			if retGp < 8 {
-				var fldSz int = fldTyp.SizeOf()
-				if fldSz <= 0 { fldSz = 8 }
-				emitScalarStore(a, argReg(retGp), base, fldOff, fldSz)
-				retGp = retGp + 1
-			}
-		}
-	}
-}
-
-// collectScalarReturn spills a single (non-multi-return) scalar call
-// result into ins's stack slot.  A float scalar arrives in D0 per
-// AAPCS64 — both LLVM-compiled callees and the native callee return it
-// there — so FMOV its bits back into a GP reg first, since every native
-// value lives in a GP spill slot.  Reading argReg(0) for a float would
-// collect X0, which the callee never wrote, so the result reads back 0.
-func collectScalarReturn(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, spillOff int) {
-	if common.IsFloatScalarTyp(ins.Typ) {
-		var ftmp int = scratchReg(rm)
-		aarch64.Fmov_fp_to_gp(a, ftmp, aarch64.D0)
-		aarch64.Str(a, true, ftmp, aarch64.MemImm(aarch64.SP, spillOff))
-		return
-	}
-	canonicalizeSubWordReturn(a, ins.Typ, argReg(0))
-	// A register-allocated result lands in its home register (callee-saved, so
-	// preserved across the very call that produced it); otherwise it spills.
-	var home int = rm.LookupHome(ins.ID)
-	if home >= 0 {
-		aarch64.Mov(a, true, home, aarch64.Reg(argReg(0)))
-	} else {
-		aarch64.Str(a, true, argReg(0), aarch64.MemImm(aarch64.SP, spillOff))
-	}
-}
-
-// canonicalizeSubWordReturn sign/zero-extends a sub-word (1/2/4-byte) INTEGER result
-// in register r to the full 64-bit register.  AAPCS64 only guarantees the low bits
-// of a sub-word result, so a FOREIGN (C / cross-ABI) callee returns a value whose
-// bits above the result width are unspecified (clang `signed char -1` -> `mov w0,#-1`
-// -> x0 = 0x00000000FFFFFFFF; an `(int)`-truncating callee leaves x0's upper 32
-// DIRTY), while every native VALUE is kept 64-bit-canonical (a Binate `int8 -1` is
-// 0xFFFF..FF).  aa64 compares and does arithmetic at 64 bits, so without re-extending
-// here a foreign int8/int16/int32 return used DIRECTLY (not via a widening cast,
-// which re-narrows) reads the wrong value: `if c_signed_char_func() == -1` /
-// `if c_int_func() == 5` is false on aarch64.  Mirrors x64_call.bn's
-// Movsx/Movzx/Movsxd.  FLOATS are skipped (their bits ride x0 verbatim via the
-// all-int shim; SXTW would corrupt a float32, which is also SizeOf 4); a >4-byte
-// int (int64 / pointer) is already full-width.
-func canonicalizeSubWordReturn(a @asm.Assembler, t @types.Type, r int) {
-	if t == nil { return }
-	if common.IsFloatScalarTyp(t) { return }
-	var sz int = t.SizeOf()
-	if sz != 1 && sz != 2 && sz != 4 { return }
-	var u @types.Type = types.StripWrappers(t)
-	var signed bool = u != nil && u.Signed
-	if sz == 1 {
-		if signed { aarch64.Sxtb(a, true, r, r) } else { aarch64.Uxtb(a, r, r) }
-	} else if sz == 2 {
-		if signed { aarch64.Sxth(a, true, r, r) } else { aarch64.Uxth(a, r, r) }
-	} else {
-		if signed { aarch64.Sxtw(a, r, r) } else { aarch64.Uxtw(a, r, r) }
-	}
 }

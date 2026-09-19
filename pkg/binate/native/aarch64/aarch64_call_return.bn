@@ -1,0 +1,136 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Call RETURN-value collection: spill a returning call's result out of the
+// AAPCS64 return registers (X0.. / D0..) into the call instruction's stack
+// slot.  Shared by the direct, interface-method, function-value, and
+// call-indirect collects so the register-class scheme can't drift between call
+// shapes.  Extracted from aarch64_call.bn for file-size hygiene.
+
+// collectMultiReturnFields spills a ≤64-byte multi-return tuple from its
+// AAPCS64 return registers into the call result's stack slot, by the
+// per-field register-class convention LLVM lowers a tuple by — integer /
+// aggregate words from X0.. (retGp), float scalars from D0.. (retFp).  So
+// `(int, float64)` collects X0 + D0 (not X0:X1) and `(float64, float64)`
+// collects D0,D1.  A float field read from a GP reg reads an X reg the callee
+// never wrote → 0 (conformance/683); the bits FMOV into a GP scratch, since
+// every native value lives in a GP spill slot (cf. collectScalarReturn).
+// Shared by the direct (emitCall), interface-method, function-value, and
+// call-indirect collects so the scheme can't drift between call shapes.
+func collectMultiReturnFields(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, spillOff int) {
+	storeMultiReturnTupleFieldsAA64(a, ins.Typ, aarch64.SP, spillOff, scratchReg(rm))
+}
+
+// storeMultiReturnTupleFieldsAA64 is the field-per-register-by-class store loop
+// shared by collectMultiReturnFields (the RegMap-driven caller collect) and the
+// func-value / closure / spill SHIM store-through-retbuf paths (which have no
+// RegMap).  It reproduces the AAPCS64 per-field register-class convention LLVM
+// lowers a tuple by: integer / aggregate words from X0.. (retGp), float scalars
+// from D0.. (retFp) FMOV'd through `scratch` (a GP reg distinct from the return
+// regs and `base`, since every native value lands in a GP slot) then stored at
+// the field's SIZE (so a sub-word field like (u16,u16,u16) does not clobber its
+// neighbor).  Each field lands at base+baseOff+FieldOffset.  A MANAGED field
+// rides the non-float GP path — a plain pointer-word store, ownership
+// transferring from the return reg into the slot (no RefInc/RefDec): the shim
+// forwards the callee's already-owned words, it does not own the tuple.
+func storeMultiReturnTupleFieldsAA64(a @asm.Assembler, tupleTyp @types.Type, base int, baseOff int,
+		scratch int) {
+	var retGp int = 0
+	var retFp int = 0
+	for fi := 0; fi < len(tupleTyp.Fields); fi++ {
+		var fldTyp @types.Type = tupleTyp.Fields[fi].Type
+		var fldOff int = baseOff + tupleTyp.FieldOffset(fi)
+		if common.IsFloatScalarTyp(fldTyp) {
+			// Increment retFp unconditionally (matching emitReturn's pack,
+			// which advances nsrn per float field regardless of the < 8
+			// guard) so the field→D-register mapping stays in lockstep with
+			// the pack side.  >8 float fields can't reach here (>64 bytes →
+			// sret), so the guarded FMOV never drops a live field.
+			if retFp < 8 {
+				aarch64.Fmov_fp_to_gp(a, scratch, aarch64.D0 + retFp)
+				var fldSz int = fldTyp.SizeOf()
+				if fldSz <= 0 { fldSz = 8 }
+				emitScalarStore(a, scratch, base, fldOff, fldSz)
+			}
+			retFp = retFp + 1
+		} else if common.IsAggregateTyp(fldTyp) {
+			// A 0-byte aggregate field (`struct{}` / `[0]T`) occupies NO return
+			// register and carries no bytes — LLVM's first-class `{...}` struct return
+			// places nothing for it, and the callee return lowering (emitReturn's pack)
+			// skips it the same way.  common.ArgWords reports 0 words for it, so the
+			// loop below stores nothing and does NOT consume a retGp slot; storing a
+			// junk word here would shift every later field's register by one —
+			// desyncing this store from the callee and the LLVM shim.
+			var nWords int = common.ArgWords(fldTyp)
+			for w := 0; w < nWords && retGp < 8; w++ {
+				aarch64.Str(a, true, argReg(retGp), aarch64.MemImm(base, fldOff + 8 * w))
+				retGp = retGp + 1
+			}
+		} else {
+			if retGp < 8 {
+				var fldSz int = fldTyp.SizeOf()
+				if fldSz <= 0 { fldSz = 8 }
+				emitScalarStore(a, argReg(retGp), base, fldOff, fldSz)
+				retGp = retGp + 1
+			}
+		}
+	}
+}
+
+// collectScalarReturn spills a single (non-multi-return) scalar call
+// result into ins's stack slot.  A float scalar arrives in D0 per
+// AAPCS64 — both LLVM-compiled callees and the native callee return it
+// there — so FMOV its bits back into a GP reg first, since every native
+// value lives in a GP spill slot.  Reading argReg(0) for a float would
+// collect X0, which the callee never wrote, so the result reads back 0.
+func collectScalarReturn(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, spillOff int) {
+	if common.IsFloatScalarTyp(ins.Typ) {
+		var ftmp int = scratchReg(rm)
+		aarch64.Fmov_fp_to_gp(a, ftmp, aarch64.D0)
+		aarch64.Str(a, true, ftmp, aarch64.MemImm(aarch64.SP, spillOff))
+		return
+	}
+	canonicalizeSubWordReturn(a, ins.Typ, argReg(0))
+	// A register-allocated result lands in its home register (callee-saved, so
+	// preserved across the very call that produced it); otherwise it spills.
+	var home int = rm.LookupHome(ins.ID)
+	if home >= 0 {
+		aarch64.Mov(a, true, home, aarch64.Reg(argReg(0)))
+	} else {
+		aarch64.Str(a, true, argReg(0), aarch64.MemImm(aarch64.SP, spillOff))
+	}
+}
+
+// canonicalizeSubWordReturn sign/zero-extends a sub-word (1/2/4-byte) INTEGER result
+// in register r to the full 64-bit register.  AAPCS64 only guarantees the low bits
+// of a sub-word result, so a FOREIGN (C / cross-ABI) callee returns a value whose
+// bits above the result width are unspecified (clang `signed char -1` -> `mov w0,#-1`
+// -> x0 = 0x00000000FFFFFFFF; an `(int)`-truncating callee leaves x0's upper 32
+// DIRTY), while every native VALUE is kept 64-bit-canonical (a Binate `int8 -1` is
+// 0xFFFF..FF).  aa64 compares and does arithmetic at 64 bits, so without re-extending
+// here a foreign int8/int16/int32 return used DIRECTLY (not via a widening cast,
+// which re-narrows) reads the wrong value: `if c_signed_char_func() == -1` /
+// `if c_int_func() == 5` is false on aarch64.  Mirrors x64_call.bn's
+// Movsx/Movzx/Movsxd.  FLOATS are skipped (their bits ride x0 verbatim via the
+// all-int shim; SXTW would corrupt a float32, which is also SizeOf 4); a >4-byte
+// int (int64 / pointer) is already full-width.
+func canonicalizeSubWordReturn(a @asm.Assembler, t @types.Type, r int) {
+	if t == nil { return }
+	if common.IsFloatScalarTyp(t) { return }
+	var sz int = t.SizeOf()
+	if sz != 1 && sz != 2 && sz != 4 { return }
+	var u @types.Type = types.StripWrappers(t)
+	var signed bool = u != nil && u.Signed
+	if sz == 1 {
+		if signed { aarch64.Sxtb(a, true, r, r) } else { aarch64.Uxtb(a, r, r) }
+	} else if sz == 2 {
+		if signed { aarch64.Sxth(a, true, r, r) } else { aarch64.Uxth(a, r, r) }
+	} else {
+		if signed { aarch64.Sxtw(a, r, r) } else { aarch64.Uxtw(a, r, r) }
+	}
+}

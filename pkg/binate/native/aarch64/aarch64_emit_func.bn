@@ -137,17 +137,21 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 	// survives calls.  A leaf / all-spilled function homes nothing and keeps
 	// the pure spill-everything path.  f is phi-free here (common.EmitObject
 	// runs ir.EliminatePhis before EmitFunc), so the liveness pass is valid.
-	// CallerSaved is deliberately EMPTY: with no caller-saved pool, LinearScan
-	// draws every home register from CalleeSaved, so every homed value is
-	// callee-saved — it survives calls with no clobber-spill AND is recorded in
-	// rm.SavedRegs (so the prologue/epilogue save/restore it).  That is what
-	// makes the clobber machinery (spansClobber / ClobberPositions) inert here.
-	// Populating CallerSaved would activate that path: a call-spanning value
-	// could then take an unsaved caller-saved home and be clobbered across the
-	// call, so that step must come with the clobber-spill handling (a later
-	// stage), not on its own.
+	// Home pools: the callee-saved bank X19..X28 PLUS the caller-saved argument
+	// bank X0..X7.  LinearScan gives a caller-saved home only to a NON-clobber-
+	// spanning value (one dead before / born after every call it reaches), so such
+	// a home surviving no call is correct — the call that clobbers it finds it dead
+	// — and AllocateRegisters records only callee-saved homes in rm.SavedRegs, so a
+	// caller-saved home costs no prologue save.  A value homed in X0..X7 has its
+	// home register IN the call-marshalling / return bank; the entry param landing
+	// (spill-then-reload) and every call/return marshalling site (a parallel move,
+	// emitArgBankHomedScalarArgs / emitArgBankHomedReturnValues) place such operands
+	// without the permutation a naive per-slot move would cause.  X0..X7 are NOT in
+	// the X9..X16 operand-reload / op-scratch pool, so a caller-saved home is never
+	// clobbered by scratch allocation.
 	var rdesc common.RegClassDesc
 	rdesc.CalleeSaved = aarch64AllocatablePool()
+	rdesc.CallerSaved = aarch64CallerSavedHomePool()
 	rm.AllocateRegisters(f, 8, rdesc)
 	var frameSize int = rm.PlanFrame(f)
 	// Lazy spill (dead-store elimination): stamp the assembler back-channel so
@@ -356,17 +360,24 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 			if off < 0 { continue }
 			var phome int = rm.LookupHome(p.ID)
 			if regStart >= 0 {
-				if phome >= 0 {
-					// Register-allocated param: move it from its arg register to
-					// its home register (off the volatile X0..X7 before the
+				if phome >= 0 && !isArgBankReg(phome) {
+					// Callee-saved home (X19..X28, disjoint from the arg bank):
+					// a direct arg-reg -> home-reg move can't permute, so land it
+					// straight into the home (off the volatile X0..X7 before the
 					// first clobbering op).
 					aarch64.Mov(a, true, phome, aarch64.Reg(argReg(regStart)))
 				} else {
+					// Spilled, OR homed in the arg bank X0..X7.  Store the incoming
+					// arg register to the slot WITHOUT writing any home register
+					// yet — an arg-bank home IS an arg register, so writing it here
+					// could clobber another param's not-yet-saved incoming value.
+					// Arg-bank homes are reloaded from the slot in the deferred
+					// pass below, after every incoming arg reg is safely in memory.
 					aarch64.Str(a, true, argReg(regStart), aarch64.MemImm(aarch64.SP, off))
 				}
-			} else if phome >= 0 {
-				// Register-allocated param arriving on the incoming-args stack:
-				// load it (sized / sign-extended) straight into its home register.
+			} else if phome >= 0 && !isArgBankReg(phome) {
+				// Callee-saved home, arriving on the incoming-args stack: load it
+				// (sized / sign-extended) straight into its home register.
 				spillScalarStackArg(a, phome, aarch64.MemImm(aarch64.SP, stackArgsBase + stackOff), rm.CC,
 						p.Typ)
 			} else {
@@ -376,6 +387,22 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 				rm.ResetRegs()
 			}
 		}
+	}
+
+	// Deferred reload of arg-bank homes (spill-then-reload param landing).  Every
+	// scalar param homed in the arg bank X0..X7 was stored to its slot above
+	// (never moved into its home there), so by now every incoming arg register is
+	// safely in memory.  Reload each such home from its slot — reading from memory,
+	// so no arg-reg -> arg-reg permutation is possible.  A homed param is always a
+	// GP scalar (floats / aggregates are non-allocatable, so LookupHome is -1 for
+	// them), hence no type check is needed; callee-saved homes (already landed by a
+	// direct move) are skipped by the arg-bank test.
+	for pi := 0; pi < len(f.Params); pi++ {
+		var phome int = rm.LookupHome(f.Params[pi].ID)
+		if phome < 0 || !isArgBankReg(phome) { continue }
+		var off int = rm.LookupSpill(f.Params[pi].ID)
+		if off < 0 { continue }
+		aarch64.Ldr(a, true, phome, aarch64.MemImm(aarch64.SP, off))
 	}
 
 	for bi := 0; bi < len(f.Blocks); bi++ {
@@ -447,5 +474,17 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 func aarch64AllocatablePool() @[]int {
 	var p @[]int = make_slice(int, 10)
 	for i := 0; i < 10; i++ { p[i] = aarch64.X19 + i }
+	return p
+}
+
+// aarch64CallerSavedHomePool returns the caller-saved registers the linear-scan
+// allocator homes NON-clobber-spanning scalar values in: the AAPCS argument bank
+// X0..X7.  Caller-saved (no prologue save), and only ever handed to values that
+// do not live across a call, so a call clobbering them is harmless.  Disjoint from
+// the X9..X17 scratch pool.  A value homed here is placed at calls/returns/entry by
+// a parallel move (its home is itself an argument register), never a naive move.
+func aarch64CallerSavedHomePool() @[]int {
+	var p @[]int = make_slice(int, 8)
+	for i := 0; i < 8; i++ { p[i] = aarch64.X0 + i }
 	return p
 }

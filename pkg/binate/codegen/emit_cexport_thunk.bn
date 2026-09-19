@@ -65,6 +65,11 @@ func emitCExportEntries(out *strings.Builder, f @ir.Func, funcRetTypes *[]FuncRe
 //   - x86-64 ≤16-byte aggregate that is register-class in C but MEMORY-class
 //     internally (a preceding >16-byte aggregate shifted the cursor): declared
 //     coerced `[N x iW]`, spilled, forwarded `ptr byval(<T>)` of the slot;
+//   - the MIRROR: an x86-64 ≤16-byte aggregate that is MEMORY-class in C but
+//     REGISTER-class internally (the C register file was exhausted first): declared
+//     `ptr byval(<T>)`, LOADED from that pointer, forwarded in the internal
+//     register form — SSE-split per eightbyte (cExportThunkParamCMemInternalSse) or
+//     the coerced `[N x iW]` by value (cExportThunkParamCMemInternalGp);
 //   - a ≤16-byte aggregate classified the same way by both conventions: forwarded
 //     straight through (coerced value, or an x86-64 both-memory byval pointer).
 // Every scalar / pointer forwards straight through (same LLVM type; LLVM
@@ -260,6 +265,20 @@ func emitCAbiAdapterThunk(out *strings.Builder, f @ir.Func, thunkName *[]readonl
 			out.Write(", ptr %ca")
 			stringutils.WriteInt(out, i)
 			out.Write(".slot\n")
+		} else if cExportThunkParamCMemInternalSse(f, i, cDefArgTypes, cSretOff, intDefArgTypes,
+				intSretOff) {
+			// C-MEMORY-class SSE aggregate (XMM exhausted, arrives `ptr byval %ca<i>`)
+			// forwarded to an SSE-SPLIT internal define: load each eightbyte from the
+			// byval pointer so the forward passes them SSE-split, matching the internal
+			// define's per-eightbyte params.
+			sysvWriteThunkCMemSseLoad(out, i, f.Params[i].Typ)
+		} else if cExportThunkParamCMemInternalGp(f, i, cDefArgTypes, cSretOff, intDefArgTypes,
+				intSretOff) {
+			// C-MEMORY-class GP aggregate (GP file exhausted, arrives `ptr byval %ca<i>`)
+			// forwarded to a REGISTER-class internal define: load the value from the byval
+			// pointer (via a coerced-sized alloca) so the forward passes it by value,
+			// matching the internal define's `[N x i64]` / first-class param.
+			sysvWriteThunkCMemGpLoad(out, i, f.Params[i].Typ)
 		}
 	}
 
@@ -304,6 +323,18 @@ func emitCAbiAdapterThunk(out *strings.Builder, f @ir.Func, thunkName *[]readonl
 			// straight to the internal define's matching SSE-split params (same
 			// per-eightbyte types the C ABI delivered).
 			sysvWriteThunkSseParams(out, i, f.Params[i].Typ)
+		} else if cExportThunkParamCMemInternalSse(f, i, cDefArgTypes, cSretOff, intDefArgTypes,
+				intSretOff) {
+			// C-MEMORY-class SSE aggregate: forward the eightbytes loaded from the
+			// byval pointer (sysvWriteThunkCMemSseLoad) SSE-split, matching the
+			// internal define's per-eightbyte SSE params.
+			sysvWriteThunkCMemSseArgs(out, i, f.Params[i].Typ)
+		} else if cExportThunkParamCMemInternalGp(f, i, cDefArgTypes, cSretOff, intDefArgTypes,
+				intSretOff) {
+			// C-MEMORY-class GP aggregate: forward the value loaded from the byval
+			// pointer (sysvWriteThunkCMemGpLoad) by value, matching the internal
+			// define's register-class `[N x i64]` / first-class param.
+			sysvWriteThunkCMemGpArg(out, i, f.Params[i].Typ)
 		} else {
 			writeParamTypeLLVM(out, f.Params[i].Typ)
 			out.Write(" %ca")
@@ -404,4 +435,50 @@ func cExportThunkParamCSse(f @ir.Func, i int, defArgTypes @[]@types.Type, defSre
 func cExportThunkParamIsSse(f @ir.Func, i int, cArgTypes @[]@types.Type, cOff int,
 		intArgTypes @[]@types.Type, intOff int) bool {
 	return cExportThunkParamCSse(f, i, cArgTypes, cOff) && !aggMemClass(intArgTypes, i + intOff)
+}
+
+// cExportThunkParamCMemInternalSse reports whether c_export-thunk param i is an
+// x86-64 SSE-class aggregate the C ABI passes MEMORY-class (its XMM file exhausted,
+// so it arrives as `ptr byval %ca<i>`) but the internal define takes SSE-SPLIT
+// (register-class).  The two conventions diverge because the internal convention
+// SSE-splits an SSE-class aggregate regardless of XMM occupancy while the C ABI
+// spills it once XMM is full.  For this param the thunk LOADS each eightbyte from
+// the byval pointer (sysvWriteThunkCMemSseLoad) and forwards them SSE-split
+// (sysvWriteThunkCMemSseArgs) — the complement of cExportThunkParamIsSse (register
+// both ways, straight-through) and the SseSpill case (register in C, MEMORY
+// internally).  Without this the forward would pass the byval `ptr %ca<i>` where the
+// internal define declares per-eightbyte SSE params — invalid IR clang rejects.
+func cExportThunkParamCMemInternalSse(f @ir.Func, i int, cArgTypes @[]@types.Type, cOff int,
+		intArgTypes @[]@types.Type, intOff int) bool {
+	var at @types.Type = f.Params[i].Typ
+	return types.SysVInSse(at) && !at.IsByvalParam() && !aggMemClass(intArgTypes, i + intOff) &&
+			aggMemClassMaybeC(cArgTypes, i + cOff, true)
+}
+
+// cExportThunkParamCMemInternalGp is the pure-GP (non-SSE) analogue of
+// cExportThunkParamCMemInternalSse: it reports whether c_export-thunk param i is an
+// x86-64 ≤16-byte GP aggregate the C ABI passes MEMORY-class (its GP file exhausted,
+// so it arrives `ptr byval %ca<i>`) but the internal define takes REGISTER-class by
+// value (the coerced `[N x i64]`).  The two conventions diverge because a >16-byte
+// aggregate consumes an internal GP (its pointer) but no C register, so with enough
+// args the C GP file can OUTRUN the internal one (the "internal-GP ≥ C-GP" intuition is
+// NOT airtight — a preceding register-in-C / memory-internally aggregate makes C-GP
+// overshoot), landing a following ≤16 GP aggregate C-memory / internal-register.  That
+// overshoot is capped at one word, so in practice only a 1-eightbyte GP struct/array
+// reaches here; a 2-eightbyte aggregate (16-byte struct, slice, iface-/func-value)
+// lands both-memory and takes the byval branch.  `aggMemClassMaybeC(...true)` is the SAME
+// predicate writeCAbiParamType uses to decide `ptr byval`, so it holds EXACTLY when the
+// param arrives as a byval pointer — which is true only for a ≤16 memory-class
+// aggregate (a stack-spilled SCALAR is passed by value, never memory-class:
+// sysvArgConsumes returns mem=false for every scalar; a >16 aggregate is handled by the
+// IsByvalParam branch, not this straddle predicate).  So no separate aggregate/scalar
+// gate is needed.  `!SysVInSse` scopes this to the GP row (the SSE row is the other
+// classifier, checked first); `!aggMemClass(int)` requires the internal side to be
+// register-class.  Without this the forward would pass the byval `ptr %ca<i>` where the
+// internal define declares `[N x i64]` — invalid IR clang rejects.
+func cExportThunkParamCMemInternalGp(f @ir.Func, i int, cArgTypes @[]@types.Type, cOff int,
+		intArgTypes @[]@types.Type, intOff int) bool {
+	var at @types.Type = f.Params[i].Typ
+	return !types.SysVInSse(at) && !at.IsByvalParam() && !aggMemClass(intArgTypes, i + intOff) &&
+			aggMemClassMaybeC(cArgTypes, i + cOff, true)
 }

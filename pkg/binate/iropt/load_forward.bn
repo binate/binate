@@ -17,9 +17,14 @@ import "pkg/stdx/slices"
 // of strategy is keyed on BY-ADDRESS-ness (whether its OP_LOAD yields the slot
 // value or the slot address — types' isAggregateLoadTyp / IsAggregateTyp, mirrored
 // here by isBitCastMemoryLoweredKind):
-//   * STORE-FORWARDING (BY-VALUE slots — scalars): rewrite every load to the single
-//     stored value V and delete the alloca/store/loads.  Sound because a load of a
-//     by-value slot produces exactly V.
+//   * STORE-FORWARDING (BY-VALUE slots — scalars, INCLUDING a managed pointer @T):
+//     rewrite every load to the single stored value V and delete the
+//     alloca/store/loads.  Sound because a load of a by-value slot produces exactly
+//     V.  A managed pointer @T is a single-word by-value value (not in
+//     isBitCastMemoryLoweredKind), so it store-forwards like any scalar — but it is
+//     also RefDec'd in a cleanup fault pad (via a plain load), so it gets the same
+//     pad-load relaxation as a managed slice (see below): its pad loads are
+//     collected and rewritten to V, and applyPromotion deletes them from the pad.
 //   * REDUNDANT-LOAD-ELIMINATION (slices — raw *[]T AND managed @[]T, any word
 //     size): a slice is a by-address aggregate — its OP_LOAD keeps the slot ADDRESS
 //     — so store-forwarding to V is unsound (a backend would `extractvalue` a value
@@ -39,11 +44,11 @@ import "pkg/stdx/slices"
 // is explicit + operand-based (plain load/store carry no implicit inc/dec), so
 // rewriting a load-use — or inserting a plain OP_LOAD — is refcount-neutral.
 //
-// Managed slices are loaded in their bounds-check cleanup FAULT PAD (for RefDec),
-// which naively looks like an escape; forwardEscapes permits that plain pad load
-// and the pad's RefDec is rewritten to the same slice value (V, or the
-// materializing load), so the refcount trajectory is byte-identical.  Fault pads
-// are VM-only; compiled backends ignore them.
+// Managed slices AND managed pointers are loaded in a cleanup FAULT PAD (for
+// RefDec), which naively looks like an escape; forwardEscapes permits that plain
+// pad load and the pad's RefDec is rewritten to the same value (V, or the
+// materializing load for a slice), so the refcount trajectory is byte-identical.
+// Fault pads are VM-only; compiled backends ignore them.
 
 // forwardLoads runs load-forwarding over every non-extern func.  Invoked by
 // RunOptPasses at -O1+, after promoteScalars.
@@ -141,14 +146,16 @@ type fwdResult struct {
 // analyzeForwardAlloca decides whether alloca a is forwardable and how.  It
 // requires exactly one store, at least one load, the store dominating every normal
 // load (same block ⇒ store textually before), and a matching stored-value type.
-// For a managed slice it additionally collects the cleanup fault-pad loads and
-// requires the store to dominate each pad's fault point.  useRLE is set for any
-// managed slice; a >16B non-slice aggregate (large struct) is declined outright.
+// For a managed slice OR a managed pointer it additionally collects the cleanup
+// fault-pad loads and requires the store to dominate each pad's fault point.
+// useRLE is set for any slice (managed pointers store-forward like scalars); a
+// >16B non-slice aggregate (large struct) is declined outright.
 func analyzeForwardAlloca(f @ir.Func, d @DomInfo, a @ir.Instr) @fwdResult {
 	var res @fwdResult = make(fwdResult)
 	res.ok = false
 
 	var isMS bool = isManagedSlice(a.TypeArg)
+	var isMP bool = irutil.IsManagedPtrType(a.TypeArg)
 	// Store-forwarding rewrites every load of the slot to the single stored value V
 	// and DELETES the slot.  That is sound only for a slot whose OP_LOAD produces a
 	// VALUE.  A BY-ADDRESS aggregate — struct, array, interface value, or function
@@ -222,10 +229,11 @@ func analyzeForwardAlloca(f @ir.Func, d @DomInfo, a @ir.Instr) @fwdResult {
 		}
 	}
 
-	// Managed slice: also forward the cleanup fault-pad loads.  Require the store to
-	// dominate each pad's fault point so the pad provably reads V, not the
-	// zero-filled slot.  (forwardEscapes already barred any non-load pad use.)
-	if isMS {
+	// Managed slice or managed pointer: also forward the cleanup fault-pad loads.
+	// Require the store to dominate each pad's fault point so the pad provably reads
+	// V, not the zero-filled slot.  (forwardEscapes already barred any non-load pad
+	// use.)
+	if isMS || isMP {
 		for pi := 0; pi < len(f.FaultPads); pi++ {
 			var pad @ir.Block = f.FaultPads[pi]
 			var padLoadCount int = 0
@@ -261,18 +269,19 @@ func isManagedSlice(t @types.Type) bool {
 	return r != nil && r.Kind == types.TYP_MANAGED_SLICE
 }
 
-// forwardEscapes is allocaEscapes relaxed for load-forwarding, but ONLY for a
-// managed SLICE: a plain OP_LOAD of such an A in a FAULT PAD (its cleanup RefDec
-// read) is not an escape — analyzeForwardAlloca collects and forwards it with the
-// normal loads.  The relaxation is gated on isManagedSlice because that is the only
-// slot kind the pad-forwarding handles; other managed values (managed pointers,
-// iface/func values) ALSO have cleanup pad loads, but those are not collected, so
-// they must keep the strict "any pad appearance ⇒ escape" rule or store-forwarding
-// would delete their alloca and pad load while leaving the pad's RefDec dangling.
-// Every non-pad escape (a store's value operand, GET_FIELD/ELEM_PTR, a phi entry)
-// is barred exactly as allocaEscapes.
+// forwardEscapes is allocaEscapes relaxed for load-forwarding, for a managed SLICE
+// or a managed POINTER: a plain OP_LOAD of such an A in a FAULT PAD (its cleanup
+// RefDec read) is not an escape — analyzeForwardAlloca collects and forwards it
+// with the normal loads (and applyPromotion / applyRLE deletes it from the pad).
+// The relaxation is gated on those two kinds because they are the ones the
+// pad-forwarding handles; other managed values (iface/func values) ALSO have
+// cleanup pad loads, but those are not collected, so they must keep the strict
+// "any pad appearance ⇒ escape" rule or forwarding would delete their alloca and
+// pad load while leaving the pad's RefDec dangling.  Every non-pad escape (a
+// store's value operand, GET_FIELD/ELEM_PTR, a phi entry) is barred exactly as
+// allocaEscapes.
 func forwardEscapes(f @ir.Func, a @ir.Instr) bool {
-	var relaxPad bool = isManagedSlice(a.TypeArg)
+	var relaxPad bool = isManagedSlice(a.TypeArg) || irutil.IsManagedPtrType(a.TypeArg)
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		if blockUsesAllocaNonLoadStore(f.Blocks[bi], a) {
 			return true

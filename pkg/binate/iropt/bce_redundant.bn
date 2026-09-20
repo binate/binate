@@ -1,0 +1,163 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/stdx/slices"
+
+// Redundant bounds-check elimination — drop an OP_BOUNDS_CHECK(idx, len) that a
+// DOMINATING check with the same (idx, len) values already proved, so a slot
+// indexed repeatedly is checked once, not per access.  The motivating shape is
+// `seed[0]` read/written/re-read in one function (fasta's genRandom): three
+// OP_BOUNDS_CHECK(const 0, EXTRACT(seed, 1)) that neither bceConstIndex (the
+// length is a runtime slice extent, not a constant) nor bceLoop (the index is a
+// constant, not an induction phi) removes.  Runs in RunOptPasses at -O1+, after
+// bceLoop, on the mem2reg / load-forwarding SSA form.
+//
+// Soundness: a check faults (aborts) when idx is out of [0, len); reaching a
+// later check means every dominating check already passed.  If a dominating
+// check C1 holds SSA values (idxV, lenV) equal to a dominated check C2's, then
+// C1 passing proves 0 <= idxV < lenV, which is exactly what C2 tests — so C2
+// cannot fault and is redundant.  In the faulting case C1 aborts first and C2 is
+// never reached, so dropping C2 changes no observable behavior on any path.
+// "Equal values" is bceSameValue (SSA identity / equal integer constant / same
+// field of the same SSA aggregate — all immutable in SSA), which is transitive,
+// so removing every dominated check leaves each covered by the one surviving
+// top-of-chain dominator (domination is transitive too).
+//
+// Removal repoints blk.Instrs at a fresh backing while blk.InstrsVec keeps
+// owning every original instr — the same drop discipline as bceConstIndex /
+// bceLoop, and it must likewise stay the LAST mutation before the backend reads
+// blk.Instrs (a later addInstr would resurrect the dropped checks from
+// InstrsVec).  A dropped check's VM fault pad is left orphaned in Func.FaultPads
+// (nothing in blk.Instrs maps to it, so it is never branched to); its now-unused
+// index/length operands are dead but pure (a const folds to an immediate; a
+// slice-length EXTRACT reads an already-live aggregate register), so they cost
+// at most a coalesced move, never a memory op.
+
+// bceRedundant runs redundant-check elimination over every non-extern func.
+func bceRedundant(m @ir.Module) {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @ir.Func = m.Funcs[fi]
+		if f.IsExtern {
+			continue
+		}
+		bceRedundantFunc(f)
+	}
+}
+
+// bceRedundantFunc drops the dominated redundant bounds checks in f.
+func bceRedundantFunc(f @ir.Func) {
+	if len(f.Blocks) == 0 {
+		return
+	}
+	var d @DomInfo = ComputeDom(f)
+
+	// Gather every bounds check with its block index and in-block position.
+	var checks @[]@ir.Instr
+	var checkBlk @[]int
+	var checkPos @[]int
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.Op == iropcode.OP_BOUNDS_CHECK && len(instr.Args) >= 2 {
+				checks = slices.Append[@ir.Instr](checks, instr)
+				checkBlk = slices.Append[int](checkBlk, bi)
+				checkPos = slices.Append[int](checkPos, ii)
+			}
+		}
+	}
+	var n int = len(checks)
+	if n < 2 {
+		return
+	}
+
+	// A check is redundant if some OTHER check with the same (idx, len) values
+	// dominates it.  Checks are void (ID -1), so the remove set is a list of
+	// instr handles matched by pointer identity, not an ID-indexed slice.
+	var remove @[]@ir.Instr
+	for j := 0; j < n; j++ {
+		for i := 0; i < n; i++ {
+			if i == j {
+				continue
+			}
+			if !bceCheckDominates(d, checkBlk[i], checkPos[i], checkBlk[j], checkPos[j]) {
+				continue
+			}
+			if bceSameValue(checks[i].Args[0], checks[j].Args[0]) &&
+					bceSameValue(checks[i].Args[1], checks[j].Args[1]) {
+				remove = slices.Append[@ir.Instr](remove, checks[j])
+				break
+			}
+		}
+	}
+	if len(remove) == 0 {
+		return
+	}
+
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		var hasRemoval bool = false
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			if instrInSet(blk.Instrs[ii], remove) {
+				hasRemoval = true
+			}
+		}
+		if !hasRemoval {
+			continue
+		}
+		var kept @[]@ir.Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			if instrInSet(blk.Instrs[ii], remove) {
+				continue
+			}
+			kept = slices.Append[@ir.Instr](kept, blk.Instrs[ii])
+		}
+		blk.Instrs = kept
+	}
+}
+
+// bceCheckDominates reports whether the check at (bi1, pos1) dominates the check
+// at (bi2, pos2): across blocks, block dominance; within a block, an earlier
+// textual position (a distinct check is never its own dominator).
+func bceCheckDominates(d @DomInfo, bi1 int, pos1 int, bi2 int, pos2 int) bool {
+	if bi1 == bi2 {
+		return pos1 < pos2
+	}
+	return d.Dominates(bi1, bi2)
+}
+
+// bceSameValue reports whether SSA operands a and b provably hold the same value:
+// the same SSA instr; two integer constants with equal value; or the same field
+// index extracted from the SSA-identical aggregate (e.g. a slice's length,
+// OP_EXTRACT(s, 1)).  All three are immutable in SSA form, so equality here means
+// equality at every program point.  The relation is reflexive, symmetric, and
+// transitive (used above to fold whole dominance chains onto one survivor).
+func bceSameValue(a @ir.Instr, b @ir.Instr) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if a.Op == iropcode.OP_CONST_INT && b.Op == iropcode.OP_CONST_INT {
+		return a.IntVal == b.IntVal
+	}
+	if a.Op == iropcode.OP_EXTRACT && b.Op == iropcode.OP_EXTRACT && a.Index == b.Index &&
+			len(a.Args) >= 1 && len(b.Args) >= 1 && a.Args[0] == b.Args[0] {
+		return true
+	}
+	return false
+}
+
+// instrInSet reports whether instr is in set by pointer identity.  The set (the
+// removable checks) is tiny, so a linear scan is cheaper than a keyed structure.
+func instrInSet(instr @ir.Instr, set @[]@ir.Instr) bool {
+	for k := 0; k < len(set); k++ {
+		if set[k] == instr {
+			return true
+		}
+	}
+	return false
+}

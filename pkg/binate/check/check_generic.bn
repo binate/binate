@@ -1,0 +1,361 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// Generic-FUNCTION instantiation and constraint checking.  When
+// `name[args...]` resolves to a generic function symbol, substitute
+// the type-args into its
+// signature (substituteTypeParams) and check each arg against its
+// constraint (typeSatisfiesConstraint).  Generic TYPE instantiation
+// (`Name[args]` -> @types.Type) lives in check_generic_type.bn.
+
+// instantiateGenericFunc substitutes e.Args (parsed as Expr nodes
+// with type-arg meaning — see typeArgFromExpr) into a generic
+// FUNC type's Params and Results.  Returns the instantiated FUNC
+// type or TypVoid() on error.
+func instantiateGenericFunc(c @Checker, e @ast.Expr, ft @types.Type) @types.Type {
+	if len(e.Args) != len(ft.TypeParams) {
+		addCheckError(c, e.Pos, "wrong number of type arguments to generic function")
+		return types.TypVoid()
+	}
+	// Pass 1: resolve every type argument.  Done before the
+	// constraint checks so a constraint that names another type
+	// parameter (`use[X any, T Container[X]]`) is substituted against
+	// the FULL resolved arg list in pass 2.  (The constraint type
+	// expression can only name an EARLIER-declared type param — a
+	// forward reference `use[T Container[X], X any]` is already
+	// rejected at decl time by installTypeParamScope's in-order
+	// scoping, before instantiation.)
+	var argTypes @[]@types.Type
+	for i := 0; i < len(e.Args); i++ {
+		var t @types.Type = typeArgFromExpr(c, e.Args[i])
+		if t == nil { t = types.TypVoid() }
+		argTypes = slices.Append[@types.Type](argTypes, t)
+	}
+	// Pass 2: constraint satisfaction.
+	// nil TpConstraint = `any` = no check.  Otherwise the type-arg
+	// must satisfy the constraint interface.  The constraint is first
+	// substituted with argTypes so a type-param-parameterized
+	// constraint (`Container[X]`) becomes the concrete `Container[int]`
+	// before the check — otherwise the unsubstituted `Container[X]`
+	// never matches and a valid instantiation is wrongly rejected.
+	for i := 0; i < len(e.Args); i++ {
+		var tparam @types.Type = ft.TypeParams[i]
+		if tparam != nil && tparam.TpConstraint != nil {
+			var constraint @types.Type = substituteTypeParams(c, tparam.TpConstraint, argTypes)
+			if !typeSatisfiesConstraint(c, argTypes[i], constraint) {
+				reportConstraintMiss(c, e.Args[i].Pos, argTypes[i], constraint)
+			}
+		}
+	}
+	var newParams @[]@types.Param
+	for i := 0; i < len(ft.Params); i++ {
+		var p @types.Param = make(types.Param)
+		p.Name = ft.Params[i].Name
+		p.Type = substituteTypeParams(c, ft.Params[i].Type, argTypes)
+		// Carry variadic-ness through instantiation.  IsVariadic rides the @Param
+		// wrapper, not inside .Type, so substituteTypeParams (which rebuilds .Type)
+		// does NOT preserve it — a variadic `func f[T](xs ...T)` would instantiate
+		// to a fixed-`*[]T` func without this copy (D-A's "survives per-param
+		// substitution" is only true after this line).
+		p.IsVariadic = ft.Params[i].IsVariadic
+		newParams = slices.Append[@types.Param](newParams, p)
+	}
+	var newResults @[]@types.Type
+	for i := 0; i < len(ft.Results); i++ {
+		newResults = slices.Append[@types.Type](newResults,
+				substituteTypeParams(c, ft.Results[i], argTypes))
+	}
+	// Reject an instantiation that forms an opaque VALUE: a (substituted) param
+	// or result that embeds an opaque type by value — `id[Opaque]` (param /
+	// return T) or `mk[Opaque]` (return T).  The call would pass or form an
+	// opaque value; `mk[Opaque]()` otherwise silently monomorphizes to an
+	// i64-returning function (colliding with `mk[int]`).  A type-param used only
+	// behind `*T` / `@T` stays legal.  Runs at the call site (pass 2), so the
+	// args are resolved — no forward-ref false-positive.
+	for i := 0; i < len(newParams); i++ {
+		requireSizedType(c, newParams[i].Type, e.Pos)
+	}
+	for i := 0; i < len(newResults); i++ {
+		requireSizedType(c, newResults[i], e.Pos)
+	}
+	return types.MakeFuncType(newParams, newResults)
+}
+
+// typeSatisfiesConstraint reports whether `t` has an `impl t : I`
+// declaration in scope, OR an `impl t : J` where J extends I
+// (interface inheritance — `impl int : Orderable` satisfies a
+// `Comparable` constraint because Orderable extends Comparable).
+// Walks c.Impls; matches via Identical on the receiver type and
+// (Pkg, Name) on the interface, with isDescendantInterface
+// covering the transitive case.
+//
+// Identical-only receiver matching keeps things simple: `f[int]`
+// matches `impl int : I`, not `impl *int : I`.  Receiver-kind
+// smoothing (matching `f[Foo]` against `impl *Foo : I`) is a
+// follow-up when a real use case appears.
+func typeSatisfiesConstraint(c @Checker, t @types.Type, iface @types.Type) bool {
+	if t == nil || iface == nil { return false }
+	if iface.Kind != types.TYP_INTERFACE { return false }
+	// A forwarded type parameter satisfies `iface` when its own
+	// declared bound is (or extends) `iface`: inside `outer[T
+	// Orderable]`, the call `inner[T]` (callee `inner[T Orderable]`)
+	// must accept T because T's bound IS Orderable.  The receiver
+	// here is a type param, not a concrete type, so no `impl` record
+	// can apply — consult TpConstraint instead.  A nil bound (`any`)
+	// satisfies no non-trivial constraint.  isDescendantInterface
+	// only walks parents (false for bound == iface), so the equal
+	// case is matched explicitly on (Pkg, Name).
+	if t.Kind == types.TYP_TYPE_PARAM {
+		var bound @types.Type = t.TpConstraint
+		if bound == nil || bound.Kind != types.TYP_INTERFACE { return false }
+		if types.CharEq(bound.Pkg, iface.Pkg) && types.CharEq(bound.Name, iface.Name) {
+			return true
+		}
+		return isDescendantInterface(bound, iface)
+	}
+	for i := 0; i < len(c.Impls); i++ {
+		var rec @Impl = c.Impls[i]
+		if rec == nil { continue }
+		// Generic blanket impl (`impl Wrap[K] : Hasher[K]`): its recorded
+		// receiver is the parameterized `Wrap[K]`, which is never Identical
+		// to a concrete instantiation `Wrap[int]`.  Substitute the impl's
+		// binders with the instantiation's args and check concretely — the
+		// same path the assignment/construction site uses.  Without this a
+		// generic policy type never satisfies a generic interface constraint
+		// (`bucketOf[int, Wrap[int]]` was rejected even though every
+		// `Wrap[τ]` implements `Hasher[τ]`).
+		if rec.Placeholder != nil {
+			if genericImplSatisfies(c, rec, t, iface) { return true }
+			continue
+		}
+		if !t.Identical(rec.RecvType) { continue }
+		if implCoversInterface(rec, iface) { return true }
+		// Walk the impl's interface list looking for any entry
+		// whose chain of parents reaches `iface`.
+		// isDescendantInterface already implements the transitive check.
+		for j := 0; j < len(rec.Interfaces); j++ {
+			var entry @types.Type = rec.Interfaces[j]
+			if entry == nil { continue }
+			if isDescendantInterface(entry, iface) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// reportConstraintMiss emits a "T does not satisfy I" error
+// pointing at the offending type-arg site.
+func reportConstraintMiss(c @Checker, pos token.Pos, t @types.Type, iface @types.Type) {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("type argument ")
+	cb.Write(t.TypeName())
+	cb.Write(" does not satisfy constraint ")
+	cb.Write(iface.TypeName())
+	addCheckError(c, pos, buf.CopyStr(cb.String()))
+}
+
+// typeArgFromExpr interprets an Expr-shape parse node as a type
+// expression.  The parser parses `f[int, *Point]`'s bracketed
+// args as Exprs (the syntactic shape is ambiguous with value
+// indexing), so we convert here.
+//
+// Accepts: EXPR_IDENT (unqualified named-type lookup), EXPR_SELECTOR
+// (a bare package-qualified named type `pkg.T`), and EXPR_UNARY(STAR, X)
+// (raw-pointer-to-type).  EXPR_TYPE carries a fully-parsed TypeExpr for
+// forms with no expression spelling (`@T`, `@[]T`, `*[]T`) — the parser
+// routes those through parseType (see parseBracketTypeArg) and we resolve
+// the TypeExpr directly here.
+func typeArgFromExpr(c @Checker, e @ast.Expr) @types.Type {
+	if e == nil { return types.TypVoid() }
+	if e.Kind == ast.EXPR_TYPE {
+		if e.TypeRef == nil { return types.TypVoid() }
+		return resolveTypeExpr(c, e.TypeRef)
+	}
+	if e.Kind == ast.EXPR_IDENT {
+		var sym @Symbol = c.Scope.Lookup(e.Name)
+		if sym == nil {
+			errUndefined(c, e.Pos, e.Name)
+			return types.TypVoid()
+		}
+		if sym.Kind != types.SYM_TYPE && sym.Kind != types.SYM_INTERFACE {
+			errNotAType(c, e.Pos, e.Name)
+			return types.TypVoid()
+		}
+		return sym.Type
+	}
+	// A bare package-qualified named type (`pkg.T`) parses as an EXPR_SELECTOR
+	// (the bracketed args are Exprs, and `pkg.T` with no `@`/`*`/`[]` qualifier
+	// is not routed through parseType, so it is not an EXPR_TYPE).  Resolve the
+	// package member and require it to be a type — the qualified analogue of the
+	// EXPR_IDENT case above.  (`pkg.T[..]` is an EXPR_INSTANTIATE_OR_INDEX, handled
+	// below; only the un-instantiated qualified type reaches here.)
+	if e.Kind == ast.EXPR_SELECTOR {
+		var qsym @Symbol = resolveQualifiedSym(c, e)
+		if qsym == nil {
+			errUndefined(c, e.Pos, e.Name)
+			return types.TypVoid()
+		}
+		if qsym.Kind != types.SYM_TYPE && qsym.Kind != types.SYM_INTERFACE {
+			errNotAType(c, e.Pos, e.Name)
+			return types.TypVoid()
+		}
+		return qsym.Type
+	}
+	if e.Kind == ast.EXPR_UNARY && e.Op == cast(int, token.STAR) {
+		var inner @types.Type = typeArgFromExpr(c, e.X)
+		return types.MakePointerType(inner)
+	}
+	// A generic instantiation as a type argument (`Foo[int]`, `pkg.Foo[int]`):
+	// resolve the head's generic decl and the arg types, then instantiate —
+	// mirroring resolveTypeInstantiation, but from the expression form the parser
+	// produces for a type argument (the head is e.X, the type args are e.Args).
+	if e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX && e.X != nil {
+		var headName @[]char
+		var declPkg @[]char
+		var ok bool = false
+		if e.X.Kind == ast.EXPR_IDENT {
+			headName = e.X.Name
+			ok = true
+		} else if e.X.Kind == ast.EXPR_SELECTOR && e.X.X != nil && e.X.X.Kind == ast.EXPR_IDENT {
+			// Same expose home-remap as resolveTypeInstantiation, so `fwd.Gen[X]`
+			// used as an explicit type ARGUMENT to a generic call reaches the
+			// exposed home decl instead of resolving `undefined`.
+			declPkg = resolveQualifiedGenericDeclPkg(c, e.X.X.Name, e.X.Name)
+			headName = e.X.Name
+			ok = true
+		}
+		if ok {
+			var d @ast.Decl = lookupGenericTypeDeclPkg(c, declPkg, headName)
+			var isIface bool = false
+			if d == nil {
+				d = lookupGenericIfaceDeclPkg(c, declPkg, headName)
+				isIface = d != nil
+			}
+			if d == nil {
+				errUndefined(c, e.Pos, headName)
+				return types.TypVoid()
+			}
+			if len(e.Args) != len(d.TypeParams) {
+				addCheckError(c, e.Pos, "wrong number of type arguments to generic type")
+				return types.TypVoid()
+			}
+			var argTypes @[]@types.Type
+			for i := 0; i < len(e.Args); i++ {
+				var at @types.Type = typeArgFromExpr(c, e.Args[i])
+				if at == nil { at = types.TypVoid() }
+				argTypes = slices.Append[@types.Type](argTypes, at)
+			}
+			return instantiateGenericDeclWithArgs(c, d, isIface, argTypes, e.Pos, true)
+		}
+	}
+	addCheckError(c, e.Pos,
+			"unsupported type-argument form (use a named type, pkg.T, *T, @T, @[]T, or *[]T)")
+	return types.TypVoid()
+}
+
+// substituteTypeParams walks t and replaces TYP_TYPE_PARAM nodes
+// with the args[TpIndex] entry.  Composite types (pointer, slice,
+// array, interface-value, etc.) are rebuilt with the substituted
+// element type.  An instantiated generic struct/interface whose own
+// type-arguments mention a type parameter (`Vec[T]`, or the
+// interface inside `@Container[T]`) is re-instantiated for the
+// substituted arguments (`Vec[int]` / `@Container[int]`) via the
+// shared cache, so it becomes the same canonical @types.Type a direct
+// mention produces.  Other kinds are returned unchanged.
+//
+// Assumes every TYP_TYPE_PARAM encountered is owned by the
+// generic decl being instantiated — i.e., its TpIndex is a valid
+// index into args.  This is true for FUNC types produced by
+// resolveFuncDeclType, which only introduces TYP_TYPE_PARAMs from
+// its own AST decl.
+//
+// c is used only to re-instantiate (the InstDecl branch); it may be
+// nil when t is known to contain no instantiated generic types
+// (e.g. the direct unit tests on the composite-kind walk).
+func substituteTypeParams(c @Checker, t @types.Type, args @[]@types.Type) @types.Type {
+	if t == nil { return nil }
+	if t.Kind == types.TYP_TYPE_PARAM {
+		if t.TpIndex >= 0 && t.TpIndex < len(args) {
+			return args[t.TpIndex]
+		}
+		return t
+	}
+	if t.InstDecl != nil {
+		var newArgs @[]@types.Type
+		var changed bool = false
+		for i := 0; i < len(t.InstArgs); i++ {
+			var na @types.Type = substituteTypeParams(c, t.InstArgs[i], args)
+			if !na.Identical(t.InstArgs[i]) { changed = true }
+			newArgs = slices.Append[@types.Type](newArgs, na)
+		}
+		if !changed { return t }
+		var d @ast.Decl = bit_cast(@ast.Decl, t.InstDecl)
+		// Re-instantiation during type-param substitution is INTERNAL (an
+		// impl-match probe / signature substitution), not a `Name[args]` the user
+		// wrote — so userFacing is false: it builds the type's identity but does
+		// NOT report a constraint miss (which would blame the generic's decl, a
+		// site the user never wrote).  Any real miss is caught at the user-facing
+		// site that drove this substitution (the decl-body use, or the concrete
+		// instantiation the user wrote).
+		return instantiateGenericDeclWithArgs(c, d, t.Kind == types.TYP_INTERFACE, newArgs, d.Pos, false)
+	}
+	if t.Kind == types.TYP_POINTER {
+		return types.MakePointerType(substituteTypeParams(c, t.Elem, args))
+	}
+	if t.Kind == types.TYP_MANAGED_PTR {
+		return types.MakeManagedPtrType(substituteTypeParams(c, t.Elem, args))
+	}
+	if t.Kind == types.TYP_SLICE {
+		return types.MakeSliceType(substituteTypeParams(c, t.Elem, args))
+	}
+	if t.Kind == types.TYP_MANAGED_SLICE {
+		return types.MakeManagedSliceType(substituteTypeParams(c, t.Elem, args))
+	}
+	if t.Kind == types.TYP_ARRAY {
+		return types.MakeArrayType(substituteTypeParams(c, t.Elem, args), t.ArrayLen)
+	}
+	if t.Kind == types.TYP_INTERFACE_VALUE {
+		return types.MakeInterfaceValueType(substituteTypeParams(c, t.Elem, args))
+	}
+	if t.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		return types.MakeManagedInterfaceValueType(
+				substituteTypeParams(c, t.Elem, args))
+	}
+	// Function types AND function-VALUE types (`*func(T)` / `@func(T)`) all carry
+	// their signature in Params/Results, so a type-param mentioned there must be
+	// substituted the same way — recurse into each and rebuild with the matching
+	// constructor.  Without the TYP_FUNC_VALUE / TYP_MANAGED_FUNC_VALUE cases a
+	// `*func(T)` field/param of a generic decl falls through unchanged, leaving T
+	// unresolved (`<unknown>`) at every instantiation.
+	if t.Kind == types.TYP_FUNC || t.Kind == types.TYP_FUNC_VALUE ||
+			t.Kind == types.TYP_MANAGED_FUNC_VALUE {
+		var newParams @[]@types.Param
+		for i := 0; i < len(t.Params); i++ {
+			var p @types.Param = make(types.Param)
+			p.Name = t.Params[i].Name
+			p.Type = substituteTypeParams(c, t.Params[i].Type, args)
+			p.IsVariadic = t.Params[i].IsVariadic
+			newParams = slices.Append[@types.Param](newParams, p)
+		}
+		var newResults @[]@types.Type
+		for i := 0; i < len(t.Results); i++ {
+			newResults = slices.Append[@types.Type](newResults, substituteTypeParams(c, t.Results[i], args))
+		}
+		if t.Kind == types.TYP_FUNC_VALUE {
+			return types.MakeFuncValueType(newParams, newResults)
+		}
+		if t.Kind == types.TYP_MANAGED_FUNC_VALUE {
+			return types.MakeManagedFuncValueType(newParams, newResults)
+		}
+		return types.MakeFuncType(newParams, newResults)
+	}
+	return t
+}

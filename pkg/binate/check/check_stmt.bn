@@ -1,0 +1,408 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/std/strings"
+
+// ============================================================
+// Statement Checking
+// ============================================================
+
+// checkStmt type-checks a single statement, dispatching by statement kind.
+func checkStmt(c @Checker, s @ast.Stmt) {
+	if s == nil {
+		return
+	}
+
+	if s.Kind == ast.STMT_BLOCK {
+		pushScope(c)
+		checkBlockStmt(c, s)
+		popScope(c)
+		return
+	}
+
+	if s.Kind == ast.STMT_EXPR {
+		checkExpr(c, s.X)
+		return
+	}
+
+	if s.Kind == ast.STMT_ASSIGN {
+		checkAssignStmt(c, s)
+		return
+	}
+
+	if s.Kind == ast.STMT_SHORT_VAR {
+		checkShortVarDecl(c, s)
+		return
+	}
+
+	if s.Kind == ast.STMT_INC_DEC {
+		var t @types.Type = checkExpr(c, s.X)
+		if !t.IsInteger() {
+			addCheckError(c, s.X.Pos, "inc/dec requires integer operand")
+		}
+		// Reject ++/-- on a readonly-typed LOCATION — a readonly local, a readonly
+		// struct field, or an element of a readonly array (now typed `readonly T`
+		// by checkIndexExpr).  Like the `=` / `+=` paths (check_assign.bn), a const
+		// location has no writable storage; without this `x++` / `s.f--` / `r[i]--`
+		// silently mutates the const at runtime.
+		if t != nil && t.IsReadonly() {
+			addCheckError(c, s.X.Pos, "cannot inc/dec const-typed location")
+		}
+		// Reject ++/-- on a const — like assignment, a const has no
+		// storage to mutate (unqualified `C++` and qualified `pkg.C++`).
+		// Without this the checker accepts it and, once a local const is
+		// materialized into a slot, ++/-- mutates the const at runtime.
+		if s.X.Kind == ast.EXPR_IDENT {
+			var sym @Symbol = c.Scope.Lookup(s.X.Name)
+			if sym != nil && sym.Kind == types.SYM_CONST {
+				var cb @strings.Builder = strings.NewBuilder()
+				cb.Write("cannot inc/dec const ")
+				cb.Write(s.X.Name)
+				addCheckError(c, s.X.Pos, buf.CopyStr(cb.String()))
+			}
+		}
+		var qm @Symbol = resolveQualifiedSym(c, s.X)
+		if qm != nil && qm.Kind == types.SYM_CONST {
+			var qcb @strings.Builder = strings.NewBuilder()
+			qcb.Write("cannot inc/dec const ")
+			qcb.Write(s.X.Name)
+			addCheckError(c, s.X.Pos, buf.CopyStr(qcb.String()))
+		}
+		return
+	}
+
+	if s.Kind == ast.STMT_RETURN {
+		checkReturnStmt(c, s)
+		return
+	}
+
+	if s.Kind == ast.STMT_IF {
+		var cond @types.Type = checkExpr(c, s.X)
+		if !cond.IsBool() {
+			addCheckError(c, s.X.Pos, "non-bool condition")
+		}
+		pushScope(c)
+		checkBlockStmt(c, s.Body)
+		popScope(c)
+		if s.Else != nil {
+			checkStmt(c, s.Else)
+		}
+		return
+	}
+
+	if s.Kind == ast.STMT_FOR {
+		checkForStmt(c, s)
+		return
+	}
+
+	if s.Kind == ast.STMT_SWITCH {
+		checkSwitchStmt(c, s)
+		return
+	}
+
+	if s.Kind == ast.STMT_TYPE_SWITCH {
+		checkTypeSwitchStmt(c, s)
+		return
+	}
+
+	if s.Kind == ast.STMT_DECL {
+		if s.DeclRef != nil {
+			if s.DeclRef.Kind == ast.DECL_VAR {
+				// Check for redeclaration of local vars in the current scope
+				if len(s.DeclRef.Name) > 0 {
+					var existing @Symbol = c.Scope.LookupLocal(s.DeclRef.Name)
+					if existing != nil {
+						var cb @strings.Builder = strings.NewBuilder()
+						cb.Write(s.DeclRef.Name)
+						cb.Write(" redeclared in this scope")
+						addCheckError(c, s.DeclRef.Pos, buf.CopyStr(cb.String()))
+					}
+				}
+				checkVarDecl(c, s.DeclRef)
+			}
+			if s.DeclRef.Kind == ast.DECL_CONST {
+				checkConstDecl(c, s.DeclRef)
+			}
+			if s.DeclRef.Kind == ast.DECL_TYPE {
+				collectTypeDecl(c, s.DeclRef)
+			}
+			// A grouped `const ( … )` / `var ( … )` / `type ( … )` inside a
+			// function body parses to DECL_GROUP, just like at package scope.
+			// checkGroupDecl defines the members into the current (function /
+			// block) scope and runs the const-group iota machinery — without
+			// this arm a func-local group's members are never defined and every
+			// use reports "undefined: <member>".
+			if s.DeclRef.Kind == ast.DECL_GROUP {
+				checkGroupDecl(c, s.DeclRef)
+			}
+		}
+		return
+	}
+
+	if s.Kind == ast.STMT_BREAK {
+		if !c.InLoop && !c.InSwitch {
+			addCheckError(c, s.Pos, "break outside loop or switch")
+		}
+		return
+	}
+
+	if s.Kind == ast.STMT_CONTINUE {
+		if !c.InLoop {
+			addCheckError(c, s.Pos, "continue outside loop")
+		}
+		return
+	}
+
+	if s.Kind == ast.STMT_DEFER {
+		checkDeferStmt(c, s)
+		return
+	}
+	// STMT_EMPTY — nothing to check
+}
+
+// checkDeferStmt type-checks a defer statement `defer <call>` (§14.13),
+// enforcing the three constraints: an enclosing function must exist
+// (stmt.defer — the REPL immediate-mode top-level `defer` is rejected here),
+// the operand must be a call (stmt.defer.call), and the defer must not appear
+// lexically inside a loop with no intervening function literal
+// (stmt.defer.no-loop).
+func checkDeferStmt(c @Checker, s @ast.Stmt) {
+	if !c.InFunc {
+		addCheckError(c, s.Pos, "defer requires an enclosing function")
+	}
+	if c.InLoopBody {
+		addCheckError(c, s.Pos,
+				"defer may not appear in a loop; "
+						"wrap the loop body in a function or call the cleanup explicitly")
+	}
+	// stmt.defer.call: the operand must be a call.  A real call parses to
+	// EXPR_CALL (including a call of the predeclared `panic`); the
+	// builtin-operation keyword forms (make/cast/__c_call/…) parse to
+	// EXPR_BUILTIN — special call shapes, not calls (§15.1) — and are rejected,
+	// as is any non-call expression.
+	if s.X == nil || s.X.Kind != ast.EXPR_CALL {
+		addCheckError(c, s.Pos, "defer requires a function, method, or "
+				"function-value call")
+		// Still type-check the operand (if any) so its own errors surface and
+		// downstream passes see a resolved type.
+		if s.X != nil {
+			checkExpr(c, s.X)
+		}
+		return
+	}
+	// Type-check the call normally (records ResolvedTypeID on the call + its
+	// subexpressions for IR-gen).
+	checkExpr(c, s.X)
+}
+
+// checkBlockStmt type-checks all statements in a block.
+func checkBlockStmt(c @Checker, s @ast.Stmt) {
+	if s == nil {
+		return
+	}
+	for i := 0; i < len(s.Stmts); i++ {
+		checkStmt(c, s.Stmts[i])
+	}
+}
+
+// checkReturnStmt validates return value count and types against the enclosing function signature.
+//
+// Each return expression is type-checked with the matching return-
+// slot type installed as the function-value hint, so a function-
+// literal whose signature matches the declared return type resolves
+// as the declared flavour (@func or *func) rather than the default
+// raw form.  Without the hint, `return func() { ... }` from a
+// function returning `@func()` would resolve the literal as
+// `*func()` and the assignability check would then fail (or, if
+// AssignableTo is permissive, the literal would be allocated on
+// the stack rather than the heap — same lifetime bug as
+// `func-value-escape` flags for the same shape).  B.3b of plan-
+// function-values-phase-2.md.
+func checkReturnStmt(c @Checker, s @ast.Stmt) {
+	if len(c.FuncRet) == 0 && len(s.Exprs) == 0 {
+		return
+	}
+	if len(s.Exprs) != len(c.FuncRet) {
+		// Single-expression return for a multi-return function:
+		// `return f(...)` where f returns the matching tuple. Mirrors
+		// the multi-return shape accepted by checkShortVarDecl above
+		// (checkCallExpr returns the callee's full func type for multi-
+		// return calls — a free function or a `*func`/`@func` value).
+		if len(s.Exprs) == 1 && len(c.FuncRet) > 1 {
+			var rhsType @types.Type = checkExpr(c, s.Exprs[0])
+			if hasExpandableResults(rhsType) && len(rhsType.Results) == len(c.FuncRet) {
+				for i := 0; i < len(c.FuncRet); i++ {
+					if !AssignableTo(rhsType.Results[i], c, c.FuncRet[i]) {
+						errCannotAssign(c, s.Exprs[0].Pos, rhsType.Results[i], c.FuncRet[i])
+					}
+				}
+				return
+			}
+		}
+		addCheckError(c, s.Pos, "wrong number of return values")
+		return
+	}
+	for i := 0; i < len(s.Exprs); i++ {
+		var rt @types.Type = checkExprWithFVHint(c, s.Exprs[i], c.FuncRet[i])
+		if !assignableOrBorrowsIface(c, s.Exprs[i], rt, c.FuncRet[i]) {
+			errCannotAssign(c, s.Exprs[i].Pos, rt, c.FuncRet[i])
+		}
+	}
+}
+
+// checkForStmt type-checks for loops (C-style and for-in range loops).
+func checkForStmt(c @Checker, s @ast.Stmt) {
+	pushScope(c)
+
+	if s.ForVal != nil {
+		// For-in
+		var iterType @types.Type = checkExpr(c, s.X)
+		var elemType @types.Type = forInElemType(c, s.X.Pos, iterType)
+		if s.ForKey != nil {
+			defineVar(c.Scope, s.ForKey.Name, types.TypInt())
+		}
+		if s.ForVal != nil {
+			// Binding the range value MATERIALIZES each element as a value, so an
+			// opaque (or cross-package opaque-export) element is rejected here
+			// (bug 211).  No-ops on a sized element.
+			requireSizedType(c, elemType, s.X.Pos)
+			defineVar(c.Scope, s.ForVal.Name, elemType)
+		}
+	} else {
+		if s.Init != nil {
+			checkStmt(c, s.Init)
+		}
+		if s.X != nil {
+			var cond @types.Type = checkExpr(c, s.X)
+			if !cond.IsBool() {
+				addCheckError(c, s.X.Pos, "non-bool condition")
+			}
+		}
+		if s.Post != nil {
+			checkStmt(c, s.Post)
+		}
+	}
+
+	var savedInLoop bool = c.InLoop
+	var savedInLoopBody bool = c.InLoopBody
+	c.InLoop = true
+	c.InLoopBody = true
+	checkBlockStmt(c, s.Body)
+	c.InLoop = savedInLoop
+	c.InLoopBody = savedInLoopBody
+	popScope(c)
+}
+
+// forInElemType returns the element type for a for-in range expression
+// (slice, managed-slice, or array).
+func forInElemType(c @Checker, pos token.Pos, t @types.Type) @types.Type {
+	// peelNamedBounded (not ResolveAlias) so a named-distinct slice/array
+	// (`type Buf @[]int`) is recognized as iterable: it is TYP_NAMED with its
+	// slice/array body on `.Underlying`, which ResolveAlias (TYP_ALIAS only)
+	// leaves intact.  Indexing a named slice already works, so for-in must too.
+	t = types.PeelNamedBounded(t)
+	if t == nil {
+		return types.TypVoid()
+	}
+	if t.Kind == types.TYP_SLICE || t.Kind == types.TYP_MANAGED_SLICE || t.Kind == types.TYP_ARRAY {
+		return t.Elem
+	}
+	addCheckError(c, pos, "cannot range over non-iterable type")
+	return types.TypVoid()
+}
+
+// checkSwitchStmt type-checks a switch statement, including case expression types.
+func checkSwitchStmt(c @Checker, s @ast.Stmt) {
+	var tagType @types.Type = nil
+	if s.X != nil {
+		tagType = checkExpr(c, s.X)
+		// A tagged switch matches each case with an implicit `==` against the tag,
+		// so the tag's type must support equality — reject a type parameter
+		// (comparison is not defined on it; expr.compare.typeparam) or a
+		// non-comparable aggregate here, exactly as an explicit `==` would, rather
+		// than letting genSwitch emit a raw compare (a silent VM miscompile).
+		// Checked once on the tag type; every case value is assignable to it.
+		if tagType != nil {
+			checkEqOperands(c, s.X.Pos, tagType, tagType)
+		}
+	}
+	var savedInSwitch bool = c.InSwitch
+	c.InSwitch = true // break is valid inside switch
+	for i := 0; i < len(s.Cases); i++ {
+		var cc @ast.CaseClause = s.Cases[i]
+		for j := 0; j < len(cc.Exprs); j++ {
+			var ct @types.Type = checkExpr(c, cc.Exprs[j])
+			if tagType != nil {
+				if !AssignableTo(ct, c, tagType) {
+					errTypeMismatch(c, cc.Exprs[j].Pos, ct, tagType)
+				}
+			} else if !ct.IsBool() {
+				// Tagless switch (§14.10, the `switch true` / if-else-if form):
+				// each case expression is itself the condition, so it must be
+				// bool.  IR-gen (genSwitch) relies on this — it drives the
+				// branch directly off the case expr.
+				addCheckError(c, cc.Exprs[j].Pos, "non-bool case in tagless switch")
+			}
+		}
+		pushScope(c)
+		for j := 0; j < len(cc.Body); j++ {
+			checkStmt(c, cc.Body[j])
+		}
+		popScope(c)
+	}
+	c.InSwitch = savedInSwitch
+}
+
+// checkTypeSwitchStmt type-checks a type switch `switch [v :=] x.(type) { case
+// K T: ... }` (§14.10).  The scrutinee must be an interface value; each case
+// clause's AssertTargetList is validated exactly like a single assertion's
+// target (assertTargetType, shared with checkTypeAssert — so value recovery is
+// rejected, `@T` needs `@I`, an interface target carries no readonly, etc.).  In
+// the binder form the bound variable is narrowed per case: a single-target
+// `case *T:` binds the recovered type (`*T`/`@T`/`*J`/`@J`); a multi-target
+// `case *A, @B:` or `default` binds the scrutinee's own interface-value type.
+// No exhaustiveness / duplicate-case / fallthrough checks (§14.10).
+func checkTypeSwitchStmt(c @Checker, s @ast.Stmt) {
+	var opType @types.Type = checkExpr(c, s.X)
+	var opKind int = ComparabilityKind(opType)
+	if opKind != types.TYP_INTERFACE_VALUE && opKind != types.TYP_INTERFACE_VALUE_MANAGED {
+		addCheckError(c, s.Pos, "type switch operand must be an interface value")
+		return
+	}
+	var savedInSwitch bool = c.InSwitch
+	c.InSwitch = true // break is valid inside a type switch
+	for i := 0; i < len(s.Cases); i++ {
+		var cc @ast.CaseClause = s.Cases[i]
+		// Validate every target (surfacing per-target errors even in the
+		// binderless form); keep the single-target case's recovered type for the
+		// binder's narrowed type.
+		var recovered @types.Type = nil
+		for j := 0; j < len(cc.Types); j++ {
+			var rt @types.Type = assertTargetType(c, opKind, cc.Types[j], cc.Types[j].Pos)
+			if j == 0 {
+				recovered = rt
+			}
+		}
+		pushScope(c)
+		// Bind the switch variable (binder form only), narrowed per §14.10.  A
+		// single-target case binds the recovered type; a multi-target or default
+		// case (and a single-target case whose target failed validation) binds the
+		// scrutinee's own interface-value type.
+		if len(s.Binder) > 0 {
+			var binderType @types.Type = opType
+			if len(cc.Types) == 1 && recovered != nil && recovered.Kind != types.TYP_VOID {
+				binderType = recovered
+			}
+			defineVar(c.Scope, s.Binder, binderType)
+		}
+		for j := 0; j < len(cc.Body); j++ {
+			checkStmt(c, cc.Body[j])
+		}
+		popScope(c)
+	}
+	c.InSwitch = savedInSwitch
+}

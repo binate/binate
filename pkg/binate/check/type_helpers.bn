@@ -1,0 +1,479 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+// MakeMethod constructs a Method record. FuncType must include the
+// receiver as Params[0].
+func MakeMethod(name @[]char, recvType @types.Type, funcType @types.Type) @types.Method {
+	var m @types.Method = make(types.Method)
+	m.Name = name
+	m.RecvType = recvType
+	m.FuncType = funcType
+	return m
+}
+
+// MakeTypeParamType creates a generic type-parameter placeholder.
+// Two type-params are the same type iff their Owner pointers and
+// Index match; the Name and Constraint are descriptive metadata
+// for error messages and constraint checks respectively.
+func MakeTypeParamType(name @[]char, owner *uint8, index int, constraint @types.Type) @types.Type {
+	var t @types.Type = make(types.Type)
+	t.Kind = types.TYP_TYPE_PARAM
+	t.Name = name
+	t.TpOwner = owner
+	t.TpIndex = index
+	t.TpConstraint = constraint
+	return t
+}
+
+// arrayLengthsMatch reports whether src and dst are both array types
+// (after peeling outer const/alias) with equal ArrayLen.  Used for the
+// general char-array copy in AssignableTo, which is EXACT-length per the
+// ratified spec §6.6 (a `[N]readonly char` value -- literal OR variable --
+// assigns to `[N]char` only when lengths match).
+func arrayLengthsMatch(src @types.Type, dst @types.Type) bool {
+	src = peelOuterConstAndAlias(src)
+	dst = peelOuterConstAndAlias(dst)
+	if src == nil || dst == nil { return false }
+	if src.Kind != types.TYP_ARRAY || dst.Kind != types.TYP_ARRAY { return false }
+	return src.ArrayLen == dst.ArrayLen
+}
+
+// defaultStringLitType returns the default type of a string literal in
+// an inference context (e.g., `x := "..."` with no explicit target):
+// @[]readonly char — a zero-copy managed-slice view into static data.
+func defaultStringLitType() @types.Type {
+	types.EnsureInit()
+	return types.MakeManagedSliceType(types.MakeReadonlyType(types.TypUint8()))
+}
+
+// distinctNamedInts reports whether a and b are two DIFFERENT predeclared
+// integer types (int, int8, int16, int32, int64, uint, …) — i.e. both TYP_INT
+// but with different names.  `Identical` compares only width + signedness, so
+// `int` and `int64` look identical on a 64-bit target (and `int` / `int32` on a
+// 32-bit one); this is the extra gate that keeps them DISTINCT for assignment,
+// comparison, and arithmetic (Go's rule: a cast is required to mix them).
+// Untyped int constants are TYP_UNTYPED_INT (not TYP_INT) and so are never
+// caught here — they still coerce to any integer type.
+func distinctNamedInts(a @types.Type, b @types.Type) bool {
+	return a != nil && b != nil && a.Kind == types.TYP_INT && b.Kind == types.TYP_INT &&
+			!types.CharEq(a.Name, b.Name)
+}
+
+// dropsConst reports whether src → dst would leak write capability
+// by dropping const somewhere "behind a reference."
+//
+// Outermost const is NOT a capability concern — `const T → T` at the
+// top level is a value copy (for any T, value or reference), and the
+// original const handle is unaffected. So the outer layer is permissive.
+//
+// Const on an element type (inside a pointer / slice / array) IS a
+// capability. Dropping it means a new handle could write to pointees
+// that the original handle promised not to. Strict.
+//
+// Called only when src and dst are already known structurally
+// compatible (per `Identical`).
+func dropsConst(src @types.Type, dst @types.Type) bool {
+	src = stripOuterConstAndAlias(src)
+	dst = stripOuterConstAndAlias(dst)
+	if src == nil || dst == nil { return false }
+	if src.Kind != dst.Kind { return false }
+	// Reference types: element is behind a handle — strict check.
+	if src.Kind == types.TYP_POINTER || src.Kind == types.TYP_MANAGED_PTR ||
+			src.Kind == types.TYP_SLICE || src.Kind == types.TYP_MANAGED_SLICE ||
+			src.Kind == types.TYP_ARRAY {
+		return DropsConstStrict(src.Elem, dst.Elem)
+	}
+	// Value types (int, bool, struct, string, func, …): outermost
+	// const is only about the holder, and we already stripped it.
+	return false
+}
+
+// isInterfaceValueType reports whether t is an interface value — a raw `*I`
+// (TYP_INTERFACE_VALUE) or a managed `@I` (TYP_INTERFACE_VALUE_MANAGED), the 2-word
+// `{data, vtable}` shape.  Pass a peeled type; this does not peel wrappers.
+func isInterfaceValueType(t @types.Type) bool {
+	if t == nil {
+		return false
+	}
+	return t.Kind == types.TYP_INTERFACE_VALUE || t.Kind == types.TYP_INTERFACE_VALUE_MANAGED
+}
+
+// isStringWritableArrayTarget reports whether a string literal may
+// initialize a fixed-size char-array destination. Length matching
+// is deferred to IR-gen time (the literal's StrVal isn't in this
+// type's hands).
+func isStringWritableArrayTarget(dst @types.Type) bool {
+	dst = peelOuterConstAndAlias(dst)
+	if dst == nil { return false }
+	if dst.Kind != types.TYP_ARRAY { return false }
+	var elem @types.Type
+	elem, _ = ElemHasConst(dst.Elem)
+	return isCharElem(elem)
+}
+
+// isStringWritableSliceTarget reports whether a string literal may
+// be assigned to a slice-typed destination. Allows all char-slice
+// shapes EXCEPT `*[]char` (non-const raw slice) — Stage 2a ratchet.
+func isStringWritableSliceTarget(dst @types.Type) bool {
+	dst = peelOuterConstAndAlias(dst)
+	if dst == nil { return false }
+	if dst.Kind != types.TYP_SLICE && dst.Kind != types.TYP_MANAGED_SLICE {
+		return false
+	}
+	var elem @types.Type
+	var elemIsConst bool
+	elem, elemIsConst = ElemHasConst(dst.Elem)
+	if !isCharElem(elem) { return false }
+	if dst.Kind == types.TYP_MANAGED_SLICE { return true }
+	// *[]char — rejected; *[]readonly char — allowed.
+	return elemIsConst
+}
+
+// isUntypedString reports whether t is an untyped string literal
+// (TYP_UNTYPED_STRING), peeling nothing — the kind is produced only for a bare
+// string-literal expression and never wrapped.
+func isUntypedString(t @types.Type) bool {
+	return t != nil && t.Kind == types.TYP_UNTYPED_STRING
+}
+
+// makeUntypedString returns a fresh TYP_UNTYPED_STRING carrying the literal's
+// unescaped byte length n.  Elem is `readonly char` so untypedStringNaturalArray
+// can reconstruct the [n]readonly char natural type for the contexts that need it.
+func makeUntypedString(n int) @types.Type {
+	types.EnsureInit()
+	var t @types.Type = make(types.Type)
+	t.Kind = types.TYP_UNTYPED_STRING
+	t.Elem = types.MakeReadonlyType(types.TypUint8())
+	t.ArrayLen = n
+	return t
+}
+
+// parseIntLiteral parses an integer literal string (decimal, hex, octal, or binary).
+func parseIntLiteral(s *[]readonly char) int {
+	if len(s) > 2 {
+		if s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+			return parseHexInt(s, 2)
+		}
+		if s[0] == '0' && (s[1] == 'o' || s[1] == 'O') {
+			return parseOctalInt(s, 2)
+		}
+		if s[0] == '0' && (s[1] == 'b' || s[1] == 'B') {
+			return parseBinaryInt(s, 2)
+		}
+	}
+	return parseDecimalInt(s, 0)
+}
+
+// relationalOperandOK reports whether t is acceptable as an operand of a
+// relational operator (< > <= >=).  Numeric types are; everything else
+// (pointers, slices, structs, interface/func values, bool, nil) is not —
+// ordering is defined only for numbers.  A type parameter / Self is NOT numeric,
+// so ordering is not defined on it (spec §13.6): to order values of a type
+// parameter, constrain it (e.g. `[T lang.Orderable]`) and call a method
+// (`a.Compare(b) < 0`).  Only the error type (TYP_VOID) falls through here, to
+// avoid cascading a diagnostic off an already-reported error.
+func relationalOperandOK(t @types.Type) bool {
+	if t.IsNumeric() {
+		return true
+	}
+	return ComparabilityKind(t) == types.TYP_VOID
+}
+
+// stringLitFitsArray reports whether a string literal's natural type src
+// (a fixed char array) fits a longer-or-equal char-array target dst — both
+// arrays (after peeling outer const/alias) with dst at least as long as src.
+// A shorter literal is allowed: the store copies the literal's bytes and
+// zero-pads the tail (a fixed-size string buffer init, §6.6).  An OVER-long
+// literal (src longer than dst) does not fit.  Used ONLY by
+// stringLitInitFitsArray, i.e. when the source is statically a string LITERAL
+// — never for a runtime `[N]readonly char` value (which stays exact-length).
+func stringLitFitsArray(src @types.Type, dst @types.Type) bool {
+	src = peelOuterConstAndAlias(src)
+	dst = peelOuterConstAndAlias(dst)
+	if src == nil || dst == nil { return false }
+	if src.Kind != types.TYP_ARRAY || dst.Kind != types.TYP_ARRAY { return false }
+	return dst.ArrayLen >= src.ArrayLen
+}
+
+// peelOuterConstAndAlias strips outer TYP_READONLY and TYP_ALIAS
+// wrappers from t. Helper for the string-target predicates and
+// raw-slice-literal element check.
+func peelOuterConstAndAlias(t @types.Type) @types.Type {
+	for t != nil {
+		if t.Kind == types.TYP_ALIAS {
+			t = t.Target
+		} else if t.Kind == types.TYP_READONLY {
+			t = t.Elem
+		} else {
+			return t
+		}
+	}
+	return t
+}
+
+// stripOuterConstAndAlias removes outer const and alias wrappers
+// (but not element-level const). Helper for dropsConst.
+func stripOuterConstAndAlias(t @types.Type) @types.Type {
+	for t != nil {
+		if t.Kind == types.TYP_ALIAS {
+			t = t.Target
+		} else if t.Kind == types.TYP_READONLY {
+			t = t.Elem
+		} else {
+			return t
+		}
+	}
+	return t
+}
+
+// isCharElem reports whether t (already peeled of alias/const)
+// is the char/uint8 element type — TYP_INT with Width 8, unsigned.
+func isCharElem(t @types.Type) bool {
+	if t == nil { return false }
+	return t.Kind == types.TYP_INT && t.Width == 8 && !t.Signed
+}
+
+// aggregateComparable reports whether a struct or array type supports == / !=
+// — i.e. every transitive field / element is itself comparable.  Comparability
+// bottoms out at scalars and pointers (which compare directly); a struct is
+// comparable iff all its fields are, and an array iff its element type is.
+// Slices, interface values, and function values are never comparable, so any
+// aggregate transitively containing one is not.  A type parameter / Self is
+// treated as comparable here so this predicate reports only the concrete
+// slice/iface/func case; a comparison whose comparability actually depends on a
+// type parameter is rejected up front by checkEqOperands via
+// containsByValueTypeParam (comparison is not defined on type parameters), so it
+// never reaches this predicate for that decision.  Termination is guaranteed: a
+// struct cannot contain itself (or any cycle) by value — only through a pointer,
+// which bottoms out without recursing.
+func AggregateComparable(t @types.Type) bool {
+	var k int = ComparabilityKind(t)
+	if k == types.TYP_INT || k == types.TYP_FLOAT || k == types.TYP_BOOL ||
+			k == types.TYP_UNTYPED_INT || k == types.TYP_UNTYPED_FLOAT || k == types.TYP_UNTYPED_BOOL ||
+			k == types.TYP_POINTER || k == types.TYP_MANAGED_PTR || k == types.TYP_NIL ||
+			k == types.TYP_VOID || k == types.TYP_TYPE_PARAM || k == types.TYP_SELF {
+		return true
+	}
+	if k == types.TYP_STRUCT {
+		var b @types.Type = types.PeelNamedBounded(t)
+		if b == nil {
+			return false
+		}
+		for i := 0; i < len(b.Fields); i++ {
+			if !AggregateComparable(b.Fields[i].Type) {
+				return false
+			}
+		}
+		return true
+	}
+	if k == types.TYP_ARRAY {
+		var b @types.Type = types.PeelNamedBounded(t)
+		if b == nil || b.Elem == nil {
+			return false
+		}
+		return AggregateComparable(b.Elem)
+	}
+	// slice, interface value, function value, or anything else: not comparable
+	return false
+}
+
+// comparabilityKind returns t's kind with alias, readonly, and
+// named-distinct wrappers resolved away — the kind the == / != operand
+// rules are applied to.  Returns TYP_VOID when t is nil.  Named types are
+// followed to their underlying, so `type Pt struct{…}` is treated as a
+// struct and `type Handle *T` as a pointer.
+func ComparabilityKind(t @types.Type) int {
+	var b @types.Type = types.PeelNamedBounded(t)
+	if b == nil {
+		return types.TYP_VOID
+	}
+	return b.Kind
+}
+
+// dropsConstStrict is the element-position variant of dropsConst:
+// const at any nested level counts as a capability promise, and
+// dropping it is rejected.
+func DropsConstStrict(src @types.Type, dst @types.Type) bool {
+	for src != nil && src.Kind == types.TYP_ALIAS { src = src.Target }
+	for dst != nil && dst.Kind == types.TYP_ALIAS { dst = dst.Target }
+	if src == nil || dst == nil { return false }
+
+	var srcC bool = src.Kind == types.TYP_READONLY
+	var dstC bool = dst.Kind == types.TYP_READONLY
+	if srcC && !dstC { return true }
+	if srcC { src = src.Elem }
+	if dstC { dst = dst.Elem }
+	for src != nil && src.Kind == types.TYP_ALIAS { src = src.Target }
+	for dst != nil && dst.Kind == types.TYP_ALIAS { dst = dst.Target }
+	if src == nil || dst == nil { return false }
+
+	if src.Kind != types.TYP_READONLY && dst.Kind == types.TYP_READONLY {
+		return false
+	}
+	if src.Kind != dst.Kind { return false }
+	if src.Kind == types.TYP_POINTER || src.Kind == types.TYP_MANAGED_PTR ||
+			src.Kind == types.TYP_SLICE || src.Kind == types.TYP_MANAGED_SLICE ||
+			src.Kind == types.TYP_ARRAY {
+		return DropsConstStrict(src.Elem, dst.Elem)
+	}
+	return false
+}
+
+// elemHasConst peels alias/const wrappers from an element type
+// and reports both the unwrapped type and whether any TYP_READONLY
+// was found along the way.
+func ElemHasConst(elem @types.Type) (@types.Type, bool) {
+	var hadConst bool = false
+	for elem != nil {
+		if elem.Kind == types.TYP_ALIAS {
+			elem = elem.Target
+		} else if elem.Kind == types.TYP_READONLY {
+			hadConst = true
+			elem = elem.Elem
+		} else {
+			break
+		}
+	}
+	return elem, hadConst
+}
+
+// funcSignaturesMatch reports whether a TYP_FUNC and a TYP_FUNC_VALUE
+// (or TYP_MANAGED_FUNC_VALUE) have identical signatures: same number
+// of params with identical types, same number of results with identical
+// types, and the same variadic-ness. Param names are ignored — function-value
+// types have anonymous params anyway.
+func funcSignaturesMatch(fn @types.Type, fv @types.Type) bool {
+	if fn == nil || fv == nil { return false }
+	if len(fn.Params) != len(fv.Params) { return false }
+	if len(fn.Results) != len(fv.Results) { return false }
+	for i := 0; i < len(fn.Params); i++ {
+		if !fn.Params[i].Type.Identical(fv.Params[i].Type) {
+			return false
+		}
+	}
+	for i := 0; i < len(fn.Results); i++ {
+		if !fn.Results[i].Identical(fv.Results[i]) {
+			return false
+		}
+	}
+	// A variadic func is assignable only to a matching variadic func-value type
+	// and vice versa (func.variadic.identity).
+	if types.FuncIsVariadic(fn) != types.FuncIsVariadic(fv) {
+		return false
+	}
+	return true
+}
+
+// isReadonlyCharArray reports whether t is a `[N]readonly char` array (TYP_ARRAY
+// with a const-char element).  This is a RUNTIME array type — a string literal is
+// untyped (TYP_UNTYPED_STRING), not this — so the AssignableTo arm that uses it
+// governs the legal `[N]readonly char → [N]char` value-copy of a runtime array, not
+// any string-literal decay.
+func isReadonlyCharArray(t @types.Type) bool {
+	t = peelOuterConstAndAlias(t)
+	if t == nil { return false }
+	if t.Kind != types.TYP_ARRAY { return false }
+	var elem @types.Type
+	var elemIsConst bool
+	elem, elemIsConst = ElemHasConst(t.Elem)
+	if !isCharElem(elem) { return false }
+	return elemIsConst
+}
+
+// isUnnamedCompositeKind reports whether k is an unnamed composite type
+// literal (slice/pointer/array/struct) — the kinds for which an unnamed
+// value freely crosses a named-distinct boundary (Go's rule).  Func-value
+// kinds are deliberately EXCLUDED: a named func-value type is NOMINAL for
+// func values (Option A / B2 — `type Fn @func(int)int; var f Fn = g` where g
+// is a `@func` value is rejected; Fn is constructible only from a func
+// reference/literal).  See conformance/regressions/named-func-value-reject-value.
+func isUnnamedCompositeKind(k int) bool {
+	return k == types.TYP_SLICE || k == types.TYP_MANAGED_SLICE || k == types.TYP_POINTER ||
+			k == types.TYP_MANAGED_PTR || k == types.TYP_ARRAY || k == types.TYP_STRUCT
+}
+
+// parseBinaryInt parses a binary integer from the string starting at the given index.
+func parseBinaryInt(s *[]readonly char, start int) int {
+	var v int = 0
+	for i := start; i < len(s); i++ {
+		v = v * 2 + cast(int, s[i]) - cast(int, '0')
+	}
+	return v
+}
+
+// parseDecimalInt parses a decimal integer from the string starting at the given index.
+func parseDecimalInt(s *[]readonly char, start int) int {
+	var v int = 0
+	for i := start; i < len(s); i++ {
+		v = v * 10 + cast(int, s[i]) - cast(int, '0')
+	}
+	return v
+}
+
+// parseHexInt parses a hexadecimal integer from the string starting at the given index.
+func parseHexInt(s *[]readonly char, start int) int {
+	var v int = 0
+	for i := start; i < len(s); i++ {
+		var d int = 0
+		if s[i] >= '0' && s[i] <= '9' {
+			d = cast(int, s[i]) - cast(int, '0')
+		} else if s[i] >= 'a' && s[i] <= 'f' {
+			d = cast(int, s[i]) - cast(int, 'a') + 10
+		} else if s[i] >= 'A' && s[i] <= 'F' {
+			d = cast(int, s[i]) - cast(int, 'A') + 10
+		}
+		v = v * 16 + d
+	}
+	return v
+}
+
+// parseOctalInt parses an octal integer from the string starting at the given index.
+func parseOctalInt(s *[]readonly char, start int) int {
+	var v int = 0
+	for i := start; i < len(s); i++ {
+		v = v * 8 + cast(int, s[i]) - cast(int, '0')
+	}
+	return v
+}
+
+// unescapedStrLen returns the byte count of a string literal's content
+// after stripping surrounding quotes and processing escape sequences.
+// Mirrors pkg/binate/ir/gen_util_literals.bn:unescapeStr but counts bytes
+// instead of allocating the result.
+func unescapedStrLen(s *[]readonly char) int {
+	if len(s) >= 2 && s[0] == '"' && s[len(s) - 1] == '"' {
+		s = s[1:len(s) - 1]
+	}
+	var n int = 0
+	var i int = 0
+	for i < len(s) {
+		if s[i] == '\\' && i + 1 < len(s) {
+			i = i + 1
+			if s[i] == 'n' || s[i] == 'r' || s[i] == 't' || s[i] == '\\' || s[i] == '"' || s[i] == '0' {
+				n = n + 1
+				i = i + 1
+				continue
+			}
+			if s[i] == 'x' && i + 2 < len(s) {
+				n = n + 1
+				i = i + 3
+				continue
+			}
+			if s[i] == 'u' && i + 4 < len(s) {
+				// `\u` expands to the UTF-8 encoding of its code point
+				// (1-3 bytes), so the natural-type length counts those
+				// bytes, not the six source characters.
+				n = n + types.Utf8ByteLen(uEscapeCodePoint(s, i))
+				i = i + 5
+				continue
+			}
+			n = n + 1
+			i = i + 1
+		} else {
+			n = n + 1
+			i = i + 1
+		}
+	}
+	return n
+}

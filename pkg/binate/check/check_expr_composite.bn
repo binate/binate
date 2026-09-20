@@ -1,0 +1,245 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+
+// Composite-literal type-checking, split out of check_expr.bn for
+// file-length hygiene. Same package; checkExpr / checkExprInner
+// in check_expr.bn dispatch into checkCompositeLit here.
+
+// stringLitInitFitsArray reports whether the value EXPRESSION valueExpr is a
+// string LITERAL (of untyped-string type valType) that initializes the char-array
+// target as a zero-padded buffer (§6.6, amended): a length-N string literal
+// initializes a `[M]readonly char` / `[M]char` when M >= N (the tail is
+// zero-padded; IR-gen copies + zero-fills length-agnostically).
+//
+// The zero-pad (M > N) is a string-LITERAL-only feature: a runtime `[N]readonly
+// char` array stays EXACT-length (AssignableTo's isReadonlyCharArray +
+// arrayLengthsMatch arm).  A string literal is untyped (TYP_UNTYPED_STRING), a
+// runtime array is TYP_ARRAY — distinct kinds — so gating on isUntypedString(valType)
+// admits only literals here.  Used at the init sites that have the source
+// expression: var-decl (explicit type) and struct-literal elements.
+//
+// A distinct named char-array type (`type Arr [N]char`) is a writable
+// char-array target too: peel its named wrapper to the underlying array before
+// the target predicates, mirroring AssignableTo's named-distinct transparency
+// for the EXACT-length case (the arm that recurses into dstN.Underlying so
+// arrayLengthsMatch applies).  Without the peel the permissive rule bailed on a
+// named target (peelOuterConstAndAlias stops at TYP_NAMED) even though the
+// exact-length one already accepted it — so `var b Arr = "ab"` was rejected
+// while `var b [N]char = "ab"` and `var b Arr = <N-char literal>` both worked.
+func stringLitInitFitsArray(valueExpr @ast.Expr, valType @types.Type, target @types.Type) bool {
+	if valueExpr == nil || valueExpr.Kind != ast.EXPR_STRING_LIT {
+		return false
+	}
+	if !isUntypedString(valType) { return false }
+	target = types.PeelNamedBounded(target)
+	if !isStringWritableArrayTarget(target) { return false }
+	return stringLitFitsArray(types.UntypedStringNaturalArray(valType), target)
+}
+
+// checkCompositeLit type-checks a composite literal (struct, array,
+// or managed-slice).
+func checkCompositeLit(c @Checker, e @ast.Expr) @types.Type {
+	// `[...]T{elems}`: inferred-length array literal — the ONLY context where
+	// `[...]` is valid (resolveTypeExpr rejects it in every other type position).
+	// Resolve the element type, fold the length from the element layout, build
+	// the concrete [N]T, stamp it on the node (so IR-gen resolves the same
+	// length — it can't re-fold a `...`), and validate the elements.
+	if e.TypeRef != nil && e.TypeRef.Kind == ast.TEXPR_ARRAY && e.TypeRef.LenInferred {
+		var ielemT @types.Type = resolveTypeExpr(c, e.TypeRef.Base)
+		var n int = inferArrayLitLen(c, e)
+		var iat @types.Type = types.MakeArrayType(ielemT, n)
+		requireSizedType(c, iat, e.Pos)
+		checkArrayLit(c, e, iat)
+		e.TypeRef.LenVal = n
+		e.TypeRef.LenKnown = true
+		return iat
+	}
+	var typ @types.Type = resolveTypeExpr(c, e.TypeRef)
+	capturePendingIfSized(c, typ)
+	// A composite literal FORMS a value of typ, so its layout must be
+	// available — reject forming an opaque (or opaque-embedding) value, e.g.
+	// `Opaque{}` / `Box[Opaque]{}`.  This is the choke point for opaque value
+	// formation in any expression context (var init, arg, return, discard).
+	// Runs in pass 2 (checkExpr) after capturePendingIfSized parks
+	// placeholders, so there is no forward-ref false-positive.
+	requireSizedType(c, typ, e.Pos)
+	// If the type is opaque to this package (bug 211), requireSizedType already
+	// rejected forming the value; skip element validation so a keyed literal
+	// `bx.Box{privateField: …}` doesn't additionally reveal the private field set
+	// (errNoSuchField) or type-check against a layout the importer can't see.
+	if isOpaqueValueType(c, typ) {
+		return typ
+	}
+	// Peel alias / const / named-distinct wrappers to the underlying
+	// composite SHAPE for element validation.  The literal's TYPE stays the
+	// original `typ` (returned below) — only the element checks key off the
+	// composite shape, so a NAMED array/slice/struct literal (e.g.
+	// `type Row [3]int; Row{...}`) is validated the same as the unnamed form
+	// (over-count + element type) instead of being silently accepted.
+	var xt @types.Type = types.PeelNamedBounded(typ)
+
+	if xt != nil && xt.Kind == types.TYP_STRUCT {
+		checkStructLit(c, e, xt)
+	}
+	if xt != nil && xt.Kind == types.TYP_ARRAY {
+		checkArrayLit(c, e, xt)
+	}
+	if xt != nil && xt.Kind == types.TYP_MANAGED_SLICE {
+		checkSliceLit(c, e, xt)
+	}
+	if xt != nil && xt.Kind == types.TYP_SLICE {
+		// Raw-slice composite literal: `*[]readonly T{...}` is
+		// allowed (rodata or stack backing); `*[]T{...}` (non-
+		// const element) is rejected — no sound mutable backing.
+		var elemIsConst bool
+		_, elemIsConst = ElemHasConst(xt.Elem)
+		if !elemIsConst {
+			addCheckError(c, e.Pos,
+					"raw-slice composite literal requires const elements; use *[]readonly T{...} or @[]T{...}")
+		} else {
+			checkSliceLit(c, e, xt)
+		}
+	}
+	return typ
+}
+
+// checkSliceLit validates managed-slice literal elements against
+// the slice's element type. (Raw slice literals are not supported
+// — the parser doesn't even produce them today; if it ever does,
+// the rule per the plan is: rejected unless elements are const.)
+func checkSliceLit(c @Checker, e @ast.Expr, st @types.Type) {
+	var elemTyp @types.Type = st.Elem
+	if elemTyp == nil { return }
+	for i := 0; i < len(e.Elems); i++ {
+		var vt @types.Type = checkExpr(c, e.Elems[i].Value)
+		if !assignableOrBorrowsIface(c, e.Elems[i].Value, vt, elemTyp) {
+			errCannotAssign(c, e.Elems[i].Value.Pos, vt, elemTyp)
+		}
+	}
+}
+
+// checkStructLit validates struct literal elements against the struct's field types.
+func checkStructLit(c @Checker, e @ast.Expr, st @types.Type) {
+	// Positional over-count: extra positional values beyond the field count
+	// are silently dropped by IR-gen — reject them (the benign analogue of
+	// the array over-count above).  Keyed literals (`S{a: 1}`) bind by name,
+	// so the count is not meaningful; gate on the literal being positional.
+	if len(e.Elems) > len(st.Fields) && e.Elems[0].Key == nil {
+		addCheckError(c, e.Pos, "too many values in struct literal")
+	}
+	for i := 0; i < len(e.Elems); i++ {
+		var el @ast.Element = e.Elems[i]
+		if el.Key != nil {
+			var f @types.Field = st.FieldByName(el.Key.Name)
+			if f == nil {
+				errNoSuchField(c, el.Key.Pos, st, el.Key.Name)
+				continue
+			}
+			var vt @types.Type = checkExpr(c, el.Value)
+			if !assignableOrBorrowsIface(c, el.Value, vt, f.Type) &&
+					!stringLitInitFitsArray(el.Value, vt, f.Type) {
+				errCannotAssign(c, el.Value.Pos, vt, f.Type)
+			}
+		} else {
+			// Positional element i fills field i; check its value is
+			// assignable to that field's type (the keyed branch above already
+			// does).  Guard i < len(Fields): the over-count case is reported
+			// above, and the loop still visits the extra elements.
+			var vt @types.Type = checkExpr(c, el.Value)
+			if i < len(st.Fields) && !assignableOrBorrowsIface(c, el.Value, vt, st.Fields[i].Type) &&
+					!stringLitInitFitsArray(el.Value, vt, st.Fields[i].Type) {
+				errCannotAssign(c, el.Value.Pos, vt, st.Fields[i].Type)
+			}
+		}
+	}
+}
+
+// inferArrayLitLen computes the length of a `[...]T{…}` inferred-length array
+// from its element layout, mirroring checkArrayLit's positional / keyed index
+// walk: an unkeyed element follows the previous index + 1; a keyed element
+// `k: v` places its value at the constant index k.  The length is the highest
+// index reached plus one — so `[...]int{1,2,3}` is 3, `[...]int{5: 1}` is 6, and
+// `[...]int{}` is 0.
+func inferArrayLitLen(c @Checker, e @ast.Expr) int {
+	var maxLen int = 0
+	var nextIdx int = 0
+	for i := 0; i < len(e.Elems); i++ {
+		var idx int = nextIdx
+		if e.Elems[i].Key != nil {
+			var kv int
+			var kok bool
+			kv, kok = evalConstIntValue(c, e.Elems[i].Key)
+			// A non-constant / negative key is diagnosed by checkArrayLit; for
+			// length inference treat it as the running position so the count
+			// stays sane (the diagnostic already fails the compile).
+			if kok && kv >= 0 {
+				idx = kv
+			}
+		}
+		if idx + 1 > maxLen {
+			maxLen = idx + 1
+		}
+		nextIdx = idx + 1
+	}
+	return maxLen
+}
+
+// checkArrayLit validates array literal elements against the array's element type.
+func checkArrayLit(c @Checker, e @ast.Expr, at @types.Type) {
+	// An INDEXED element (`[N]T{k: v}`) places its value at the constant index
+	// k; an unkeyed element follows the previous index + 1 (Go array-literal
+	// semantics — `[5]int{1: 10, 3: 30}` is {0,10,0,30,0}).  A purely positional
+	// literal keeps the over-count check (IR-gen stores element i at index i,
+	// so an over-count writes past the fixed-size alloca — memory-unsafety); a
+	// keyed literal's bounds are enforced per-element below (the element COUNT
+	// is not the measure — `[5]int{4: 1}` is one element at index 4).
+	var anyKey bool = false
+	for i := 0; i < len(e.Elems); i++ {
+		if e.Elems[i].Key != nil {
+			anyKey = true
+		}
+	}
+	if !anyKey && len(e.Elems) > at.ArrayLen {
+		addCheckError(c, e.Pos, "too many elements in array literal")
+	}
+	// seen[idx] guards against a duplicate index (`[3]int{0: 1, 0: 2}`).
+	var seen @[]bool = make_slice(bool, at.ArrayLen)
+	var nextIdx int = 0
+	for i := 0; i < len(e.Elems); i++ {
+		var idx int = nextIdx
+		if e.Elems[i].Key != nil {
+			var kt @types.Type = checkExpr(c, e.Elems[i].Key)
+			if kt != nil && !kt.IsInteger() {
+				addCheckError(c, e.Elems[i].Key.Pos, "array literal index must be an integer")
+			}
+			var kv int
+			var kok bool
+			kv, kok = evalConstIntValue(c, e.Elems[i].Key)
+			if !kok {
+				addCheckError(c, e.Elems[i].Key.Pos, "array literal index must be a constant")
+			} else {
+				idx = kv
+				// Stamp the validated index so IR-gen (genArrayLit) uses THIS
+				// value rather than re-folding the key with a different folder
+				// (evalConstExpr), which could disagree and store out of bounds.
+				e.Elems[i].KeyVal = kv
+				e.Elems[i].KeyKnown = true
+			}
+		}
+		if idx < 0 || idx >= at.ArrayLen {
+			addCheckError(c, e.Elems[i].Value.Pos, "array literal index out of bounds")
+		} else if seen[idx] {
+			addCheckError(c, e.Elems[i].Value.Pos, "duplicate index in array literal")
+		} else {
+			seen[idx] = true
+		}
+		var vt @types.Type = checkExpr(c, e.Elems[i].Value)
+		if !assignableOrBorrowsIface(c, e.Elems[i].Value, vt, at.Elem) {
+			errCannotAssign(c, e.Elems[i].Value.Pos, vt, at.Elem)
+		}
+		nextIdx = idx + 1
+	}
+}

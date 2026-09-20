@@ -1,0 +1,384 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+
+// ============================================================
+// Builtin Call Checking
+// ============================================================
+//
+// Type-checks calls to compiler builtins (make, make_slice, box,
+// cast, bit_cast, len, sizeof, alignof, _raw_func_addr,
+// unsafe_index). Builtins are dispatched in checkExpr via
+// EXPR_BUILTIN; this file owns the per-builtin shape rules.
+
+// checkBuiltinCall type-checks a builtin call (make, make_slice, box, cast, bit_cast, len).
+func checkBuiltinCall(c @Checker, e @ast.Expr) @types.Type {
+	if e.Op == cast(int, token.MAKE) {
+		// make(T) — returns @T for any type T, no size argument
+		// make(*[]T) returns @(*[]T), not @[]T (managed-slice)
+		var typ @types.Type = resolveTypeExpr(c, e.TypeRef)
+		if embedsOpaqueByValue(c, typ) {
+			addCheckError(c, e.Pos,
+					"cannot make a value of an opaque type"
+							" (its layout is not available here)")
+		}
+		return types.MakeManagedPtrType(typ)
+	}
+
+	if e.Op == cast(int, token.MAKE_SLICE) {
+		// make_slice(T, n) — T is element type, n is size. Returns @[]T (managed-slice).
+		var elemType @types.Type = resolveTypeExpr(c, e.TypeRef)
+		if embedsOpaqueByValue(c, elemType) {
+			addCheckError(c, e.Pos,
+					"cannot make_slice with an opaque element type"
+							" (its layout is not available here)")
+		}
+		if len(e.Args) != 1 {
+			addCheckError(c, e.Pos, "make_slice requires element type and size")
+			return types.TypVoid()
+		}
+		var at @types.Type = checkExpr(c, e.Args[0])
+		if !at.IsInteger() {
+			addCheckError(c, e.Args[0].Pos, "make_slice size must be integer")
+		}
+		return types.MakeManagedSliceType(elemType)
+	}
+
+	if e.Op == cast(int, token.BOX) {
+		if len(e.Args) != 1 {
+			addCheckError(c, e.Pos, "box requires exactly one argument")
+			return types.TypVoid()
+		}
+		var rawType @types.Type = checkExpr(c, e.Args[0])
+		var argType @types.Type = defaultType(rawType)
+		// `box(e)` default-types its argument exactly like `:=` / `var x = e`,
+		// so it needs the same const.default.int-width fit-check: without it
+		// `box(0xFFFFFFFFFFFFFFFF)` silently wraps the literal into @int (-1)
+		// instead of being rejected.
+		checkDefaultIntFits(c, e.Args[0].Pos, rawType, argType)
+		return types.MakeManagedPtrType(argType)
+	}
+
+	if e.Op == cast(int, token.CAST) {
+		var typ @types.Type = resolveTypeExpr(c, e.TypeRef)
+		// Casting FORMS a value of the target type, so a by-value opaque (or
+		// cross-package opaque-export) target is rejected (bug 211).  A handle
+		// target (@Box / *Box) is sized, so requireSizedType no-ops on it.
+		requireSizedType(c, typ, e.Pos)
+		if len(e.Args) == 1 {
+			var argType @types.Type = checkExpr(c, e.Args[0])
+			// Gate `cast` to its safe set (spec §8.5): everything assignable (incl.
+			// interface WIDENING) + numeric scalar + named<->underlying + aggregate
+			// leaf-wise retype, with constant operands fit-checked.  A cast outside
+			// the set is an error naming the right alternative (unsafe_cast /
+			// bit_cast / a type assertion / explicit construction).
+			checkCastSafeSet(c, e.Pos, e.Args[0], argType, typ)
+		}
+		return typ
+	}
+
+	if e.Op == cast(int, token.UNSAFE_CAST) {
+		var typ @types.Type = resolveTypeExpr(c, e.TypeRef)
+		// unsafe_cast forms a value of the target type, like cast — a by-value
+		// opaque target is rejected (a handle target is sized).
+		requireSizedType(c, typ, e.Pos)
+		if len(e.Args) == 1 {
+			var argType @types.Type = checkExpr(c, e.Args[0])
+			var srcIface bool = isInterfaceValueType(types.PeelNamedBounded(argType))
+			var dstIface bool = isInterfaceValueType(types.PeelNamedBounded(typ))
+			if srcIface && dstIface {
+				// Interface -> interface (super <-> sub) is NOT a data-word
+				// reinterpret: recovering a sub-interface needs the (concrete,
+				// sub-interface) vtable resolved at run time.  Out of unsafe_cast's
+				// scope (spec §8.7 covers interface -> concrete); use an assertion.
+				addCheckError(c, e.Pos,
+						"unsafe_cast does not convert between interface values; recover"
+								" with a type assertion `x.(I)` instead")
+			} else if srcIface {
+				// NARROWING: interface value -> concrete.  UNCHECKED (no runtime
+				// type check, unlike `x.(T)`) — accepted as the programmer's
+				// assertion; the recovery kind mirrors `x.(T)`, no further constraint.
+			} else if dstIface {
+				// WIDENING: concrete -> interface value.  Needs a vtable, so the
+				// operand must be a pointer that satisfies the interface (the safe
+				// widening cast performs; §8.5) — a bare value must `box` first.
+				var srcPeeled @types.Type = types.PeelNamedBounded(argType)
+				if srcPeeled != nil {
+					if srcPeeled.Kind != types.TYP_POINTER && srcPeeled.Kind != types.TYP_MANAGED_PTR {
+						addCheckError(c, e.Pos,
+								"unsafe_cast to an interface value needs a pointer operand"
+										" (`*T` or `@T`); box a value first")
+					} else if !AssignableTo(argType, c, typ) {
+						addCheckError(c, e.Pos,
+								"unsafe_cast operand does not satisfy the target interface"
+										" value (widening needs a satisfying `@T` / `*T`)")
+					}
+				}
+			} else {
+				// Non-interface: same rules as cast — a CONSTANT operand must fit an
+				// integer target (not laundered); runtime/non-integer are free.
+				checkCastConstFits(c, e.Args[0].Pos, typ, argType, e.Args[0])
+			}
+		}
+		return typ
+	}
+
+	if e.Op == cast(int, token.BIT_CAST) {
+		var typ @types.Type = resolveTypeExpr(c, e.TypeRef)
+		var srcType @types.Type = nil
+		if len(e.Args) == 1 {
+			srcType = checkExpr(c, e.Args[0])
+		}
+		checkBitCastShapes(c, e.Pos, srcType, typ)
+		return typ
+	}
+
+	if e.Op == cast(int, token.LEN) {
+		if len(e.Args) != 1 {
+			addCheckError(c, e.Pos, "len requires exactly one argument")
+			return types.TypInt()
+		}
+		var argType @types.Type = checkExpr(c, e.Args[0])
+		// A string literal is untyped; `len("abc")` is its decoded byte length (a
+		// compile-time constant, IR-gen folds it from OP_CONST_STRING).  Adopt the
+		// natural [N]readonly char array so the array arm below accepts it.
+		if isUntypedString(argType) {
+			argType = types.UntypedStringNaturalArray(argType)
+		}
+		// peelNamedBounded sees through alias / readonly / named-distinct so the
+		// TYP_ARRAY arm matches a named array type; IsSlice peels named itself.
+		argType = types.PeelNamedBounded(argType)
+		if argType != nil && !argType.IsSlice() && argType.Kind != types.TYP_ARRAY {
+			addCheckError(c, e.Args[0].Pos, "len argument must be slice or array")
+		}
+		return types.TypInt()
+	}
+
+	if e.Op == cast(int, token.PRESENT) {
+		if len(e.Args) != 1 {
+			addCheckError(c, e.Pos, "present requires exactly one argument")
+			return types.TypBool()
+		}
+		var argType @types.Type = checkExpr(c, e.Args[0])
+		// present(x): "does x hold something / is it set?" — defined on the
+		// nullable reference/view types: interface values, function values,
+		// pointers, and slices (len>0).  Value types (scalars, structs,
+		// arrays) are never unset, so they are rejected.
+		if argType != nil {
+			var k int = ComparabilityKind(argType)
+			if k != types.TYP_INTERFACE_VALUE && k != types.TYP_INTERFACE_VALUE_MANAGED &&
+					k != types.TYP_FUNC_VALUE && k != types.TYP_MANAGED_FUNC_VALUE && k != types.TYP_POINTER &&
+					k != types.TYP_MANAGED_PTR && k != types.TYP_SLICE && k != types.TYP_MANAGED_SLICE {
+				addCheckError(c, e.Args[0].Pos,
+						"present argument must be an interface value, function "
+								"value, pointer, or slice")
+			}
+		}
+		return types.TypBool()
+	}
+
+	if e.Op == cast(int, token.SAME) {
+		// same(a, b) bool — reference identity for pointers, interface
+		// values, and slices.  Both operands must have the same static
+		// type.  Func values (no canonical function identity) and value
+		// types (no referent) are rejected.
+		if len(e.Args) != 2 {
+			addCheckError(c, e.Pos, "same requires exactly two arguments")
+			return types.TypBool()
+		}
+		var aType @types.Type = checkExpr(c, e.Args[0])
+		var bType @types.Type = checkExpr(c, e.Args[1])
+		var ra @types.Type = nil
+		var rb @types.Type = nil
+		if aType != nil { ra = aType.ResolveAlias() }
+		if bType != nil { rb = bType.ResolveAlias() }
+		// Same static type (aliases transparent; named-distinct stay
+		// distinct).
+		if ra != nil && rb != nil && !ra.Identical(rb) {
+			addCheckError(c, e.Pos, "same: both operands must have the same type")
+			return types.TypBool()
+		}
+		// Eligible kind: pointer, interface value, or slice (resolving
+		// alias / readonly / named-distinct wrappers).
+		if aType != nil {
+			var k int = ComparabilityKind(aType)
+			if k != types.TYP_POINTER && k != types.TYP_MANAGED_PTR && k != types.TYP_INTERFACE_VALUE &&
+					k != types.TYP_INTERFACE_VALUE_MANAGED && k != types.TYP_SLICE &&
+					k != types.TYP_MANAGED_SLICE {
+				addCheckError(c, e.Args[0].Pos,
+						"same operands must be pointers, interface values, "
+								"or slices")
+			}
+		}
+		return types.TypBool()
+	}
+
+	if e.Op == cast(int, token.SIZEOF) || e.Op == cast(int, token.ALIGNOF) {
+		// sizeof/alignof take a type (via TypeRef), not an expression.
+		// The parser already enforces that shape. The type just needs
+		// to resolve; the value is computed at IR-gen time.
+		if e.TypeRef == nil {
+			addCheckError(c, e.Pos, "sizeof/alignof require a type argument")
+		} else {
+			var typ @types.Type = resolveTypeExpr(c, e.TypeRef)
+			if embedsOpaqueByValue(c, typ) {
+				addCheckError(c, e.Pos,
+						"cannot take sizeof/alignof of an opaque type"
+								" (its layout is not available here)")
+			}
+		}
+		return types.TypUint()
+	}
+
+	if e.Op == cast(int, token.RAW_FUNC_ADDR) {
+		// _func_handle(funcRef): argument must be a named-function
+		// reference — an Ident resolving to a SYM_FUNC in the local
+		// package, or a Selector pkg.Name where pkg is a SYM_PKG and
+		// Name resolves to a SYM_FUNC in that package's scope.  Result
+		// is *uint8 — a function-value handle pointer.  The token enum is still
+		// RAW_FUNC_ADDR for the transitional period during which the
+		// `_raw_func_addr` spelling remains accepted.
+		if len(e.Args) != 1 {
+			addCheckError(c, e.Pos, "_func_handle requires exactly one argument")
+			return types.MakePointerType(types.TypUint8())
+		}
+		var arg @ast.Expr = e.Args[0]
+		var ok bool = false
+		// fnSym is the resolved SYM_FUNC (nil for the __Package special case,
+		// which is never generic), used for the non-generic guard below.
+		var fnSym @Symbol = nil
+		if arg.Kind == ast.EXPR_IDENT {
+			var sym @Symbol = c.Scope.Lookup(arg.Name)
+			if sym != nil && sym.Kind == types.SYM_FUNC {
+				ok = true
+				fnSym = sym
+			}
+		}
+		if arg.Kind == ast.EXPR_SELECTOR && arg.X != nil && arg.X.Kind == ast.EXPR_IDENT {
+			var pkgSym @Symbol = c.Scope.Lookup(arg.X.Name)
+			if pkgSym != nil && pkgSym.Kind == types.SYM_PKG {
+				// Every package has a compiler-synthesized
+				// `__Package() @reflect.Package` accessor.  It is codegen-only —
+				// not a SYM_FUNC in the package scope — so accept it by
+				// name here, matching checkSelectorExpr's selector-
+				// resolution special case.  This lets the VM's extern
+				// registration take its handle (`_func_handle(
+				// pkg.__Package)`) so interpreted callers can dispatch
+				// `pkg.__Package()`.
+				if types.CharEq(arg.Name, "__Package") {
+					ok = true
+				}
+				var pkgScope @Scope = lookupPackage(c, pkgSym.PkgPath)
+				if pkgScope != nil {
+					var member @Symbol = pkgScope.Lookup(arg.Name)
+					if member != nil && member.Kind == types.SYM_FUNC {
+						ok = true
+						fnSym = member
+					}
+				}
+			}
+		}
+		if !ok {
+			addCheckError(c, arg.Pos, "_func_handle argument must be a named function")
+		} else if fnSym != nil && fnSym.Type != nil && len(fnSym.Type.TypeParams) > 0 {
+			// A generic function has no single emitted symbol to take a handle
+			// of — only per-instantiation monomorphizations exist.  Without this
+			// guard `_func_handle(GenericF)` type-checks, then codegen's
+			// lookupFuncValueType returns nil, the __shim/__vt/__handle triple is
+			// silently skipped, and the `@__handle.<…>` reference dangles at link.
+			// (Mirrors __c_entry's pkg.centry.eligible non-generic guard.)
+			addCheckError(c, arg.Pos, "_func_handle argument must be a non-generic function")
+		}
+		return types.MakePointerType(types.TypUint8())
+	}
+
+	if e.Op == cast(int, token.UNSAFE_INDEX) {
+		// unsafe_index(coll, idx): collection must be slice, array, or
+		// pointer; index must be integer. Result type = element type.
+		// Same shape as `coll[idx]` but documents that the caller is
+		// bypassing bounds checking.
+		if len(e.Args) != 2 {
+			addCheckError(c, e.Pos, "unsafe_index requires exactly two arguments")
+			return types.TypVoid()
+		}
+		var collType @types.Type = checkExpr(c, e.Args[0])
+		var idxType @types.Type = checkExpr(c, e.Args[1])
+		if !idxType.IsInteger() {
+			addCheckError(c, e.Args[1].Pos, "unsafe_index index must be integer")
+		}
+		collType = collType.ResolveAlias()
+		if collType == nil { return types.TypVoid() }
+		if collType.Kind == types.TYP_SLICE || collType.Kind == types.TYP_MANAGED_SLICE ||
+				collType.Kind == types.TYP_ARRAY || collType.Kind == types.TYP_POINTER {
+			return collType.Elem
+		}
+		addCheckError(c, e.Args[0].Pos, "unsafe_index collection must be slice, array, or pointer")
+		return types.TypVoid()
+	}
+
+	if e.Op == cast(int, token.UNSAFE_DIV) || e.Op == cast(int, token.UNSAFE_REM) {
+		// unsafe_div(a, b) / unsafe_rem(a, b): the guard-free counterparts
+		// of `/` and `%`. Both operands must be integer (no floats — `/`
+		// on floats is unguarded already, and `%` is integer-only); the
+		// result type is the same widened integer type as the guarded
+		// operator, so it reuses foldIntArith via the matching arith op.
+		if len(e.Args) != 2 {
+			addCheckError(c, e.Pos, "unsafe_div / unsafe_rem require exactly two arguments")
+			return types.TypVoid()
+		}
+		var at @types.Type = checkExpr(c, e.Args[0])
+		var bt @types.Type = checkExpr(c, e.Args[1])
+		if !at.IsInteger() || !bt.IsInteger() {
+			addCheckError(c, e.Pos, "unsafe_div / unsafe_rem require integer operands")
+			return types.TypVoid()
+		}
+		var arithOp int = cast(int, token.SLASH)
+		if e.Op == cast(int, token.UNSAFE_REM) {
+			arithOp = cast(int, token.PERCENT)
+		}
+		return foldIntArith(c, e.Pos, arithOp, at, bt)
+	}
+
+	if e.Op == cast(int, token.UNSAFE_SHL) || e.Op == cast(int, token.UNSAFE_SHR) {
+		// unsafe_shl(v, n) / unsafe_shr(v, n): the guard-free counterparts of
+		// `<<` / `>>` — no overshift guard and no negative-count check (the
+		// caller asserts the count is in [0, width)).  Both operands must be
+		// integer; like a regular shift the result type is the LEFT (value)
+		// operand's, so it reuses checkBinaryOp's shift arm for the result
+		// type.  The negative-constant-count compile error does NOT apply
+		// here — that is the whole point of opting out.
+		if len(e.Args) != 2 {
+			addCheckError(c, e.Pos, "unsafe_shl / unsafe_shr require exactly two arguments")
+			return types.TypVoid()
+		}
+		var vt @types.Type = checkExpr(c, e.Args[0])
+		var nt @types.Type = checkExpr(c, e.Args[1])
+		if !vt.IsInteger() || !nt.IsInteger() {
+			addCheckError(c, e.Pos, "unsafe_shl / unsafe_shr require integer operands")
+			return types.TypVoid()
+		}
+		var shiftOp int = cast(int, token.SHL)
+		if e.Op == cast(int, token.UNSAFE_SHR) {
+			shiftOp = cast(int, token.SHR)
+		}
+		return checkBinaryOp(c, e.Pos, shiftOp, vt, nt)
+	}
+
+	if e.Op == cast(int, token.C_CALL) {
+		return checkCCall(c, e)
+	}
+
+	if e.Op == cast(int, token.C_GLOBAL) {
+		return checkCGlobal(c, e)
+	}
+
+	if e.Op == cast(int, token.C_ENTRY) {
+		return checkCEntry(c, e)
+	}
+
+	addCheckError(c, e.Pos, "unknown builtin")
+	return types.TypVoid()
+}

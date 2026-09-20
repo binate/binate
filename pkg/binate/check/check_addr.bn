@@ -1,0 +1,332 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+
+// ============================================================
+// Addressability (lvalue analysis for the address-of operator)
+// ============================================================
+
+// isLiteralExprKind reports whether an expression kind is a literal with no
+// addressable storage — `&` of it is invalid (like `&` of a named const).
+// A func literal is included: `&func(){}` has no more storage than `&5`, and
+// (matching Go) is rejected as misleading — a func value is taken by naming the
+// literal directly, not by addressing it.  (A composite literal is NOT here:
+// `&Point{1,2}` is addressable — the literal has a backing alloca.)
+func isLiteralExprKind(k int) bool {
+	return k == ast.EXPR_INT_LIT || k == ast.EXPR_FLOAT_LIT || k == ast.EXPR_BOOL_LIT ||
+			k == ast.EXPR_CHAR_LIT || k == ast.EXPR_STRING_LIT || k == ast.EXPR_NIL_LIT ||
+			k == ast.EXPR_FUNC_LIT
+}
+
+// selectorIsMethodValue reports whether `e` is `obj.M` resolving to a METHOD
+// VALUE (a bound method — a computed func value with no storage), as opposed
+// to a struct FIELD access (which IS addressable).  Fields win over methods,
+// matching checkSelectorExpr; a package member (`pkg.M`) or method expression
+// (`T.M` on a type name) is not a method value on an object.  Reads obj's
+// already-resolved type from the expr-type cache rather than re-checking it,
+// so capture analysis isn't re-run.
+func selectorIsMethodValue(c @Checker, e @ast.Expr) bool {
+	if e == nil || e.Kind != ast.EXPR_SELECTOR || e.X == nil {
+		return false
+	}
+	if e.X.Kind == ast.EXPR_IDENT {
+		var s @Symbol = c.Scope.Lookup(e.X.Name)
+		if s != nil && (s.Kind == types.SYM_PKG || s.Kind == types.SYM_TYPE) {
+			return false
+		}
+	}
+	var origXt @types.Type = c.ExprType(e.X.ResolvedTypeID)
+	if origXt == nil {
+		return false
+	}
+	// Peel wrappers and auto-deref a pointer base, mirroring checkSelectorExpr.
+	var xt @types.Type
+	xt, _ = peelFieldAccessBase(origXt)
+	if xt == nil {
+		return false
+	}
+	var elem @types.Type = xt.PointerElem()
+	if elem != nil {
+		xt, _ = peelFieldAccessBase(elem)
+		if xt == nil {
+			return false
+		}
+	}
+	// A struct FIELD of the same name wins — `&obj.f` for a func-typed field
+	// is addressable (the field has storage).
+	if xt.Kind == types.TYP_STRUCT && xt.FieldByName(e.Name) != nil {
+		return false
+	}
+	var recvNamed @types.Type = origXt.ReceiverBaseNamed()
+	return recvNamed != nil && recvNamed.LookupMethod(e.Name) != nil
+}
+
+// isGenericFuncInstantiation reports whether an EXPR_INSTANTIATE_OR_INDEX node
+// is a generic-function instantiation `f[T]` (as opposed to an `a[i]` index):
+// its head is a bare ident or a package-qualified selector resolving to a
+// generic FUNC symbol.  Mirrors checkInstantiateOrIndex's interpretation so
+// addressability agrees with how the expression is type-checked.
+func isGenericFuncInstantiation(c @Checker, e @ast.Expr) bool {
+	if e == nil || e.X == nil {
+		return false
+	}
+	if e.X.Kind == ast.EXPR_IDENT {
+		var sym @Symbol = c.Scope.Lookup(e.X.Name)
+		return sym != nil && sym.Kind == types.SYM_FUNC && sym.Type != nil && len(sym.Type.TypeParams) > 0
+	}
+	if e.X.Kind == ast.EXPR_SELECTOR && e.X.X != nil && e.X.X.Kind == ast.EXPR_IDENT {
+		var pkgSym @Symbol = c.Scope.Lookup(e.X.X.Name)
+		if pkgSym != nil && pkgSym.Kind == types.SYM_PKG {
+			var pkgScope @Scope = lookupPackage(c, pkgSym.PkgPath)
+			if pkgScope != nil {
+				var sym @Symbol = pkgScope.Lookup(e.X.Name)
+				return sym != nil && sym.Kind == types.SYM_FUNC && sym.Type != nil &&
+						len(sym.Type.TypeParams) > 0
+			}
+		}
+	}
+	return false
+}
+
+// isAddressable reports whether `e` is an addressable lvalue — one whose
+// address `&e` may be taken because it has storage.  Addressable: a variable,
+// a struct-field / imported-variable selector, an array/slice/pointer index, a
+// dereference `*p`, or a composite literal (it has a backing alloca).
+// Everything else is a computed value with no storage: a literal (incl. a func
+// literal), a named const / function, a method value or method expression, a
+// call result, an arithmetic / unary expression, a slice / make / cast result.
+func isAddressable(c @Checker, e @ast.Expr) bool {
+	if e == nil {
+		return false
+	}
+	if e.Kind == ast.EXPR_IDENT {
+		var s @Symbol = c.Scope.Lookup(e.Name)
+		return s != nil && s.Kind == types.SYM_VAR
+	}
+	if e.Kind == ast.EXPR_SELECTOR {
+		return selectorIsAddressable(c, e)
+	}
+	if e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		// A generic-function instantiation `f[T]` shares this node kind with an
+		// `a[i]` index but is a function VALUE, not an lvalue — it has no storage,
+		// so it is NOT addressable.  Distinguish it exactly as the type-checker
+		// does (checkInstantiateOrIndex): head resolving to a generic FUNC symbol.
+		// Without this, `&f[T]` / `f[T] = x` / an implicit interface value-borrow
+		// of `f[T]` would be admitted and then mis-lowered (the address-of has no
+		// pointer to take).
+		if isGenericFuncInstantiation(c, e) {
+			return false
+		}
+		// `a[i]` indexing.  A SLICE / raw-pointer element is addressable through
+		// the shared backing regardless of whether the base expression is
+		// addressable (`getSlice()[i] = v` is legal — it writes the backing).  An
+		// ARRAY element is addressable only if the array (the base) is: an r-value
+		// array (`getArr()[i]`, a by-value call result) is a non-addressable
+		// temporary, so `&getArr()[i]` / `getArr()[i] = v` / a `*T`-method call on
+		// it must be rejected.
+		if e.X != nil {
+			var bt @types.Type = c.ExprType(e.X.ResolvedTypeID)
+			if bt != nil {
+				var pbt @types.Type
+				pbt, _ = peelFieldAccessBase(bt)
+				if pbt != nil && pbt.Kind == types.TYP_ARRAY {
+					return isAddressable(c, e.X)
+				}
+			}
+		}
+		return true
+	}
+	if e.Kind == ast.EXPR_UNARY {
+		return e.Op == cast(int, token.STAR) // only a dereference `*p`
+	}
+	return e.Kind == ast.EXPR_COMPOSITE
+}
+
+// selectorIsAddressable reports whether a selector `obj.X` / `pkg.X` is an
+// addressable lvalue: a struct FIELD access, or an imported VARIABLE.  A
+// package const / function, a method value (`obj.m`), or a method expression
+// (`T.m`) is not.
+func selectorIsAddressable(c @Checker, e @ast.Expr) bool {
+	if e.X == nil {
+		return false
+	}
+	if e.X.Kind == ast.EXPR_IDENT {
+		var s @Symbol = c.Scope.Lookup(e.X.Name)
+		if s != nil && s.Kind == types.SYM_PKG {
+			var member @Symbol = resolveQualifiedSym(c, e)
+			return member != nil && member.Kind == types.SYM_VAR
+		}
+		if s != nil && s.Kind == types.SYM_TYPE {
+			return false // `T.m` method expression — a func value, no storage
+		}
+	}
+	// `obj.X`: addressable iff X is a struct FIELD (not a method value).
+	var origXt @types.Type = c.ExprType(e.X.ResolvedTypeID)
+	if origXt == nil {
+		return false
+	}
+	var xt @types.Type
+	xt, _ = peelFieldAccessBase(origXt)
+	if xt == nil {
+		return false
+	}
+	var elem @types.Type = xt.PointerElem()
+	if elem != nil {
+		// Base is a pointer (@T / *T): the field is addressable THROUGH the
+		// pointer, regardless of whether the base EXPRESSION is addressable —
+		// `getPtr().f`, `p.f`.
+		xt, _ = peelFieldAccessBase(elem)
+		if xt == nil {
+			return false
+		}
+	} else {
+		// Base is a struct VALUE: `obj.f` is addressable only if `obj` itself is.
+		// A field of a non-addressable temporary (`getStruct().f`, an arithmetic
+		// result) has no storage, so `&getStruct().f` / `getStruct().f = v` must be
+		// rejected — the store would land in a discarded copy (and leak a managed
+		// field).
+		if !isAddressable(c, e.X) {
+			return false
+		}
+	}
+	return xt.Kind == types.TYP_STRUCT && xt.FieldByName(e.Name) != nil
+}
+
+// reportCannotAddr emits the most specific "cannot take the address of …"
+// diagnostic for the non-addressable operand of `&e` (e is the `&` unary).
+func reportCannotAddr(c @Checker, e @ast.Expr) {
+	var x @ast.Expr = e.X
+	if x == nil {
+		return
+	}
+	if isLiteralExprKind(x.Kind) {
+		addCheckError(c, e.Pos, "cannot take the address of a literal")
+		return
+	}
+	if x.Kind == ast.EXPR_IDENT {
+		var s @Symbol = c.Scope.Lookup(x.Name)
+		if s != nil && s.Kind == types.SYM_CONST {
+			errCannotAddrConst(c, e.Pos, x.Name)
+			return
+		}
+		if s != nil && s.Kind == types.SYM_FUNC {
+			errCannotAddrFunc(c, e.Pos, x.Name)
+			return
+		}
+	}
+	if x.Kind == ast.EXPR_SELECTOR {
+		var member @Symbol = resolveQualifiedSym(c, x)
+		if member != nil && member.Kind == types.SYM_CONST {
+			errCannotAddrConst(c, e.Pos, x.Name)
+			return
+		}
+		if member != nil && member.Kind == types.SYM_FUNC {
+			errCannotAddrFunc(c, e.Pos, x.Name)
+			return
+		}
+		if selectorIsMethodValue(c, x) {
+			addCheckError(c, e.Pos, "cannot take the address of a method value")
+			return
+		}
+	}
+	addCheckError(c, e.Pos, "cannot take the address of a non-addressable value")
+}
+
+// BorrowPosKind values (Checker.BorrowPosKind): whether the current construction
+// position permits materialising a non-addressable value-borrow temporary.  A
+// materialised temporary is released at the end of its statement (§18.4), so the
+// borrow is admitted only where it cannot outlive it.
+// bnlint:allow unused-const - iota enum: POS_STORING (0) is the default, matched implicitly
+const (
+	POS_STORING int = iota // assignment / field-element store / return — reject an rvalue borrow
+	POS_BORROWING          // call argument / var-init — admit (temp co-scopes)
+)
+
+// canBorrowValueIntoRawIface reports whether a VALUE-typed source (not a
+// pointer / managed pointer / interface value — those are AssignableTo's job)
+// may be implicitly borrowed to construct a RAW `*Iface`
+// (`iface.construct.value-borrow`, spec 11-interfaces §11.4).  It is the
+// expr-aware half AssignableTo cannot do: the type-only assignability chain has
+// no source expression, so the addressability / position gate lives here at the
+// construction site, mirroring the method-receiver auto-address gate
+// (checkResolvedMethodCall).  Two cases, both requiring the value's `*T` to
+// satisfy the interface (valuePtrSatisfies): an ADDRESSABLE lvalue borrows by an
+// implicit `&x` in any position; a NON-addressable rvalue (a literal /
+// expression / call result) is materialised into a statement temporary and
+// admitted only at a BORROWING position (argument / var-init, BorrowPosKind ==
+// POS_BORROWING) where the borrow cannot outlive it — a storing position
+// (assignment / field-element store / return) rejects it.  A managed `@Iface`
+// target is out of scope: a value → `@Iface` is never implicit (it would invent
+// a refcount), so only the raw `*Iface` path takes the borrow.
+func canBorrowValueIntoRawIface(c @Checker, srcExpr @ast.Expr, src @types.Type,
+		dst @types.Type) bool {
+	if c == nil || srcExpr == nil || src == nil || dst == nil {
+		return false
+	}
+	var d @types.Type = types.ResolveAliasAndConst(dst)
+	if d == nil || d.Kind != types.TYP_INTERFACE_VALUE {
+		return false // raw *Iface only; @Iface never takes an implicit value borrow
+	}
+	var srcResolved @types.Type = src.ResolveAlias()
+	if srcResolved == nil {
+		return false
+	}
+	// Pointer / managed / interface-value sources are handled by AssignableTo;
+	// only a genuine value source reaches the implicit borrow.
+	if srcResolved.Kind == types.TYP_POINTER || srcResolved.Kind == types.TYP_MANAGED_PTR ||
+			srcResolved.Kind == types.TYP_INTERFACE_VALUE ||
+			srcResolved.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		return false
+	}
+	var iface @types.Type = d.Elem
+	if iface == nil {
+		return false
+	}
+	if !valuePtrSatisfies(c, src, iface) {
+		return false // the value's *T has no impl for the interface
+	}
+	if isAddressable(c, srcExpr) {
+		return true // 2a: implicit &, legal in every position an explicit &x is
+	}
+	// 2b: a non-addressable rvalue is materialised into a temporary and borrowed;
+	// admitted only at a BORROWING position (argument / var-init) where the borrow
+	// cannot outlive the temporary — a storing position rejects it.
+	return c.BorrowPosKind == POS_BORROWING
+}
+
+// assignableOrBorrowsIface bundles the type-level AssignableTo check with the
+// implicit value-borrow fallback, for the construction sites that build a value
+// from a source expression (var/`:=` init, call argument, composite element,
+// assignment, return).  Callers pass the source EXPRESSION — needed for the
+// borrow's addressability test.  The comparison-only AssignableTo callers (`==`,
+// switch-tag) keep calling AssignableTo directly and never admit a borrow.  For
+// a non-interface target the borrow fallback is inert (returns false on the dst
+// kind), so this is a safe drop-in wherever an assignability check guards a
+// construction.
+func assignableOrBorrowsIface(c @Checker, srcExpr @ast.Expr, src @types.Type,
+		dst @types.Type) bool {
+	if src != nil && AssignableTo(src, c, dst) {
+		return true
+	}
+	return canBorrowValueIntoRawIface(c, srcExpr, src, dst)
+}
+
+// checkBorrowingArg checks `srcExpr` against target type `tgt` at a BORROWING
+// construction position (a call argument or a var/`:=` initializer): it checks
+// the expression (with the func-value hint) and whether it is
+// assignable-or-borrowable, with BorrowPosKind = POS_BORROWING for the whole
+// extent so a non-addressable value-borrow of the source — and of any composite
+// literal element within it (which is checked during checkExprWithFVHint and
+// inherits the field) — is admitted, restoring the prior kind afterward.
+// Returns the source's type and whether it is assignable-or-borrowable.
+func checkBorrowingArg(c @Checker, srcExpr @ast.Expr, tgt @types.Type) (@types.Type, bool) {
+	var saved int = c.BorrowPosKind
+	c.BorrowPosKind = POS_BORROWING
+	var st @types.Type = checkExprWithFVHint(c, srcExpr, tgt)
+	var ok bool = assignableOrBorrowsIface(c, srcExpr, st, tgt)
+	c.BorrowPosKind = saved
+	return st, ok
+}

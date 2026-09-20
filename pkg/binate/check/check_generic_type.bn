@@ -1,0 +1,459 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// Generic TYPE instantiation: resolving `Name[T1, T2, ...]` to a
+// concrete @types.Type (struct -> TYP_NAMED, interface -> TYP_INTERFACE),
+// with a (decl, args) cache and an in-progress placeholder
+// pre-registered before the body/parents are resolved so recursive
+// references resolve to it instead of overflowing the stack, plus the
+// per-decl lookups.  Generic-FUNCTION instantiation + constraint
+// checking lives in check_generic.bn.
+
+// resolveQualifiedGenericDeclPkg resolves the package qualifier of a
+// package-qualified generic reference `qualifier.name` to the package path under
+// which name's generic decl is registered (its DEFINING package):
+//
+//   1. the qualifier's import-alias target (`import h "pkg/std/hash"` -> the full
+//      path), falling back to the qualifier text itself when it names no package
+//      (a following registry lookup then reports `undefined`), then
+//   2. for an `expose` forwarder, remapped to the exposed member's HOME package —
+//      the generic decl is stashed under its home (where it is declared), not the
+//      forwarder, and the injected generic marker carries that home.  Empty home
+//      (a non-exposed reference — a native generic has no injected marker) leaves
+//      the qualifier's own path in place, so this is a no-op there.  Identity is
+//      unaffected: instantiation keys on the resolved decl's own package.
+//
+// Shared so a `pkg.Gen[...]` head resolves identically wherever it appears — a
+// type expression (resolveTypeInstantiation), an explicit type argument to a
+// generic CALL (typeArgFromExpr), or a method-expression head
+// (isGenericStructInstHead).  Without the shared remap the latter two silently
+// failed to reach an exposed generic (`undefined: Gen`), which made a
+// whole-generic-package `expose` forwarder useless.
+func resolveQualifiedGenericDeclPkg(c @Checker, qualifier @[]char, name *[]readonly char) @[]char {
+	var declPkg @[]char = qualifier
+	var psym @Symbol = c.Scope.Lookup(qualifier)
+	if psym != nil && psym.Kind == types.SYM_PKG {
+		declPkg = psym.PkgPath
+	}
+	var home @[]char = c.PackageMemberHome(declPkg, name)
+	if len(home) > 0 {
+		return home
+	}
+	return declPkg
+}
+
+// resolveTypeInstantiation resolves a `Name[T1, T2, ...]` type
+// expression to a concrete @types.Type by:
+//   1. looking up the generic struct decl via name + package
+//      (unqualified names only for Slice 5b — cross-package
+//      generics land in Slice 7),
+//   2. validating arg count against decl.TypeParams,
+//   3. checking the cache; reusing a prior instantiation when
+//      (decl, args) match by identity,
+//   4. otherwise installing a type-param scope, resolving the
+//      struct body fresh, wrapping in a TYP_NAMED, caching, and
+//      returning.
+func resolveTypeInstantiation(c @Checker, te @ast.TypeExpr) @types.Type {
+	var head @ast.TypeExpr = te.Base
+	if head == nil || head.Kind != ast.TEXPR_NAMED {
+		addCheckError(c, te.Pos, "generic instantiation requires a named-type head")
+		return types.TypVoid()
+	}
+	// Slice 7b/7c: pkg-qualified head.  Generic STRUCTS and INTERFACES are both
+	// stashed under the FULL package path, so resolve a qualified head's import
+	// alias to its path — two same-final-segment packages share a short name but
+	// not a path (the same-segment collision), and a custom alias (`import g
+	// "pkg/gen"; g.Holder[int]`) only reaches the decl once resolved.  An empty
+	// qualifier (same-package) is left empty so the curPkgPath fallback in
+	// lookupGeneric*DeclPkg handles it.
+	var declPkg @[]char
+	if len(head.Pkg) > 0 {
+		declPkg = resolveQualifiedGenericDeclPkg(c, head.Pkg, head.Name)
+	}
+	var d @ast.Decl = lookupGenericTypeDeclPkg(c, declPkg, head.Name)
+	var isIface bool = false
+	if d == nil {
+		d = lookupGenericIfaceDeclPkg(c, declPkg, head.Name)
+		isIface = d != nil
+	}
+	if d == nil {
+		errUndefined(c, head.Pos, head.Name)
+		return types.TypVoid()
+	}
+	if len(te.TypeArgs) != len(d.TypeParams) {
+		addCheckError(c, te.Pos, "wrong number of type arguments to generic type")
+		return types.TypVoid()
+	}
+	var argTypes @[]@types.Type
+	for i := 0; i < len(te.TypeArgs); i++ {
+		var at @types.Type = resolveTypeExpr(c, te.TypeArgs[i])
+		if at == nil { at = types.TypVoid() }
+		argTypes = slices.Append[@types.Type](argTypes, at)
+	}
+	// User-facing: a `Name[args]` type expression the user wrote — report a
+	// constraint miss here at te.Pos.
+	return instantiateGenericDeclWithArgs(c, d, isIface, argTypes, te.Pos, true)
+}
+
+// checkInstantiationConstraints verifies each concrete type-argument of a
+// generic struct/interface instantiation satisfies its type-parameter's
+// constraint -- the type-instantiation analogue of the check
+// instantiateGenericFunc performs for generic functions.  Without it
+// `type Box[T lang.Orderable] struct{...}` instantiated as `Box[NoOrder]`
+// (no `impl NoOrder : Orderable`) is wrongly accepted
+// (gen.satisfy.struct-iface-unchecked).
+//
+// Constraints are resolved under the generic decl's DEFINING-file scope and
+// package (its imports / same-package interface names) with the type-params
+// bound to their concrete args, so a constraint naming an earlier param
+// (`[X any, T Container[X]]`) resolves to the concrete `Container[arg]`.
+// Mirrors populateInstantiatedStruct's scope setup.  Generic type-param
+// constraints are not resolved at decl time (the body is resolved lazily at
+// instantiation), so this is their first resolution -- no double-reporting.
+//
+// usePos anchors the diagnostic at the instantiation site (the `Name[args]`
+// expression), matching the function path's use-site anchoring -- not at the
+// generic decl, which would be unhelpful and (because identical errors dedup
+// on position) could collapse distinct bad use-sites to one message.
+func checkInstantiationConstraints(c @Checker, d @ast.Decl, argTypes @[]@types.Type,
+		usePos token.Pos) {
+	if len(d.TypeParams) == 0 { return }
+	var savedScope @Scope = c.Scope
+	var savedPkgPath @[]char = c.curPkgPath
+	c.curPkgPath = genericTypeDeclPkg(c, d)
+	var defScope @Scope = lookupGenericDeclScope(c, d)
+	if defScope != nil {
+		c.Scope = NewScope(defScope)
+	} else {
+		pushScope(c)
+	}
+	for i := 0; i < len(d.TypeParams) && i < len(argTypes); i++ {
+		defineType(c.Scope, d.TypeParams[i].Name, argTypes[i])
+	}
+	for i := 0; i < len(d.TypeParams) && i < len(argTypes); i++ {
+		var constraint @types.Type = resolveTypeParamConstraint(c, d.TypeParams[i])
+		if constraint == nil { continue }
+		if !typeSatisfiesConstraint(c, argTypes[i], constraint) {
+			reportConstraintMiss(c, usePos, argTypes[i], constraint)
+		}
+	}
+	c.Scope = savedScope
+	c.curPkgPath = savedPkgPath
+}
+
+// instantiateGenericDeclWithArgs returns the cached instantiation of
+// generic decl d with the given concrete argTypes, building and
+// caching it on a miss.  isIface selects interface vs struct
+// construction.  Shared by resolveTypeInstantiation (the
+// `Name[args]` type-expression path) and substituteTypeParams
+// (re-instantiating a `Vec[T]`-shaped signature type when a generic
+// function is instantiated), so both routes land on the same cached
+// @types.Type and thus the same name-based identity.  usePos anchors any
+// constraint diagnostic at the instantiation site.
+//
+// The result @types.Type (with its final mangled name + InstDecl/InstArgs)
+// is created and registered in the cache BEFORE its body / parents are
+// resolved, so a recursive reference to the SAME (decl, args) during
+// that resolution — `type Node[T] struct { next @Node[T] }` (legit,
+// behind a pointer) or `interface N[T] : N[T]` (illegal, caught by the
+// self-extension guard) — resolves to this in-progress type instead of
+// re-entering and overflowing the stack.  An infinitely-GROWING chain
+// (`type Box[T] struct { inner @Box[Wrap[T]] }`) instead has different
+// args at every level, so the cache never hits; the GenericInstDepth
+// bound rejects it with a clean diagnostic.
+// userFacing is true when the instantiation stands for a `Name[args]` the USER
+// wrote (a type expression or an explicit type argument), so a constraint miss
+// should be reported at usePos.  It is false for an INTERNAL speculative
+// re-instantiation (substituteTypeParams re-instantiating a nested generic while
+// probing an impl-match / substituting a signature), which needs only the type's
+// identity — reporting there would blame a site the user never wrote (the very
+// leak that reddened false "K does not satisfy" on the doubly-constrained Table
+// impl walk).  Constraints are still verified for every real use: a bad generic
+// field/arg is caught at its user-facing decl-body site, and each concrete
+// instantiation the user writes is checked here.
+func instantiateGenericDeclWithArgs(c @Checker, d @ast.Decl, isIface bool, argTypes @[]@types.Type,
+		usePos token.Pos, userFacing bool) @types.Type {
+	// Defer the constraint check while building a package's `.bni` surface
+	// (BuildingIfaceScope) or collecting its decls (CollectingDecls): in both,
+	// c.Impls is not yet complete, so a check here would consult a partial impl
+	// set and wrongly reject an instantiation on a type impl'd later.  Resolve for
+	// identity only and leave the check unlatched.
+	var wasUserFacing bool = userFacing
+	if c.BuildingIfaceScope || c.CollectingDecls {
+		userFacing = false
+	}
+	// Record every deferred check so recheckDeferredConstraints can replay it — at
+	// THIS use site's position — once every impl is recorded.  Recording here
+	// (before the cache lookup, on any user-facing resolution) captures the deferred
+	// check regardless of the use-site's syntactic shape, so no site can be silently
+	// dropped.  Both deferral sources are recorded: a .bni-surface instantiation
+	// (BuildingIfaceScope) — including one nested in a signature's generic field,
+	// which CheckPackage's cache-hit re-resolution never re-populates and so would
+	// otherwise leak — is replayed by the SAME package's later collectDecls
+	// (LoadPackageInterface precedes CheckPackage; the pending list persists between
+	// them).
+	if (c.CollectingDecls || c.BuildingIfaceScope) && wasUserFacing {
+		recordPendingConstraintCheck(c, d, argTypes, usePos)
+	}
+	var cachedEntry @GenericInstantiation = lookupCachedInstantiationEntry(c, d, argTypes)
+	if cachedEntry != nil {
+		// A prior instantiation may have been SPECULATIVE (its user-facing
+		// diagnostics not yet reported).  The first user-facing use does the
+		// deferred check, so a real constraint miss / opaque-by-value method is
+		// never swallowed just because a probe populated the cache first.
+		if userFacing && !cachedEntry.ConstraintsChecked {
+			// Latch only when the diagnostics actually REACH the user: under
+			// TentativeMode (a REPL forward-ref probe) they route to
+			// c.TentativeErrors and are DISCARDED if the enclosing decl parks, so
+			// latching here would permanently skip the check for a later real use
+			// and silently accept a genuine miss.  Leaving it unlatched re-arms the
+			// check for the first surviving (non-tentative) use.
+			if !c.TentativeMode {
+				cachedEntry.ConstraintsChecked = true
+			}
+			checkInstantiationConstraints(c, d, argTypes, usePos)
+			if cachedEntry.Result != nil && cachedEntry.Result.Kind == types.TYP_INTERFACE {
+				requireInstantiatedIfaceMethodsSized(c, cachedEntry.Result, usePos)
+			}
+		}
+		return cachedEntry.Result
+	}
+	// Bound well below the native stack budget: each level adds several
+	// resolver frames, so a high cap (e.g. 1024) overflows the stack
+	// before the diagnostic fires.  128 is far above any realistic
+	// hand-written generic nesting.
+	if c.GenericInstDepth >= 128 {
+		addCheckError(c, d.Pos,
+				"generic instantiation nested too deeply (cyclic or unbounded type argument?)")
+		return types.TypVoid()
+	}
+	// Create the result shell with its final identity, then register it
+	// before populating (see the doc comment above for why).
+	var result @types.Type
+	if isIface {
+		// Identity by DEFINING package (full path), not the consumer's — see
+		// genericIfaceDeclPkg — so two same-final-segment packages' `C[int]`
+		// are distinct interfaces and an impl of one is not matched to the other.
+		result = types.MakeInterfaceType(genericIfaceDeclPkg(c, d),
+				mangleInstantiatedName(d.Name, argTypes))
+	} else {
+		result = types.MakeNamedType(
+				mangleInstantiatedName(
+						types.QualifyName(genericTypeDeclPkg(c, d), d.Name), argTypes))
+	}
+	result.InstDecl = bit_cast(*uint8, d)
+	result.InstArgs = argTypes
+	var entry @GenericInstantiation = make(GenericInstantiation)
+	entry.Decl = d
+	entry.TypeArgs = argTypes
+	entry.Result = result
+	c.GenericInstantiations = slices.Append[@GenericInstantiation](
+			c.GenericInstantiations, entry)
+
+	c.GenericInstDepth = c.GenericInstDepth + 1
+	// Constraint satisfaction (gen.satisfy, §12.4): each concrete type-arg must
+	// satisfy its type-parameter's constraint, exactly as instantiateGenericFunc
+	// enforces for generic FUNCTIONS.  Reported once per unique (decl, args) and
+	// only for a USER-FACING instantiation (see the header comment) -- so a
+	// repeated `Box[NoOrder]` reports the miss once and a speculative probe never
+	// reports.  Build (populate*) still proceeds after a miss so downstream
+	// field/method uses don't cascade.
+	if userFacing {
+		// Latch only when the diagnostics reach the user — see the cache-hit arm
+		// above: under TentativeMode a parked decl's tentative errors are
+		// discarded, so latching would strand a genuine miss for a later real use.
+		if !c.TentativeMode {
+			entry.ConstraintsChecked = true
+		}
+		checkInstantiationConstraints(c, d, argTypes, usePos)
+	}
+	if isIface {
+		// Mark this instantiated interface as in-progress so a parent
+		// reference that loops back to it (an inheritance cycle across
+		// distinct instantiations) is detected in resolveInterfaceExtension.
+		c.GenericIfacePopulating = slices.Append[@types.Type](
+				c.GenericIfacePopulating, result)
+		populateInstantiatedInterface(c, d, argTypes, result, userFacing)
+		c.GenericIfacePopulating = c.GenericIfacePopulating[0:len(c.GenericIfacePopulating) - 1]
+	} else {
+		populateInstantiatedStruct(c, d, argTypes, result)
+	}
+	c.GenericInstDepth = c.GenericInstDepth - 1
+	return result
+}
+
+// lookupGenericIfaceDeclPkg finds a generic interface decl registered under
+// (pkg, name).  Generic-iface decls are stashed under the FULL defining path
+// (curPkgPath) — the imported ones by buildScopeFromFile, the current package's
+// own by collectInterfaceDecl — so an unqualified (empty-pkg) request, which
+// names the current package's OWN generics, resolves via the curPkgPath
+// fallback below after the exact-key lookup misses.  Mirrors
+// lookupGenericTypeDeclPkg.  Slice 7c.
+func lookupGenericIfaceDeclPkg(c @Checker, pkg *[]readonly char, name *[]readonly char) @ast.Decl {
+	var d @ast.Decl = findGenericDeclKeyed(c.GenericIfaceDecls, c.GenericIfaceDeclPkgs, pkg, name)
+	if d != nil {
+		return d
+	}
+	if len(pkg) == 0 && len(c.curPkgPath) > 0 {
+		return findGenericDeclKeyed(c.GenericIfaceDecls, c.GenericIfaceDeclPkgs, c.curPkgPath, name)
+	}
+	return nil
+}
+
+// lookupGenericDeclScope returns the defining-file import scope recorded for a
+// generic struct/interface decl (parallel to GenericTypeDecls/GenericIfaceDecls),
+// or nil.  The generic's body must resolve its package-qualified field/method
+// types against THIS scope, not the use-site scope (which would bind a qualifier
+// to the consumer's imports → wrong package / wrong layout).
+func lookupGenericDeclScope(c @Checker, d @ast.Decl) @Scope {
+	for i := 0; i < len(c.GenericTypeDecls); i++ {
+		if same(c.GenericTypeDecls[i], d) {
+			return c.GenericTypeDeclScopes[i]
+		}
+	}
+	for i := 0; i < len(c.GenericIfaceDecls); i++ {
+		if same(c.GenericIfaceDecls[i], d) {
+			return c.GenericIfaceDeclScopes[i]
+		}
+	}
+	var none @Scope
+	return none
+}
+
+// lookupGenericTypeDeclPkg finds a generic struct decl
+// registered under (pkg, name).  Pkg empty matches same-package
+// entries; an import alias matches a decl stashed by
+// buildScopeFromFile when loading that package's .bni.
+// Slice 7b.
+//
+// Same-package fallback: an unqualified (empty-pkg) request also
+// names the current package's OWN generics.  buildScopeFromFile (the
+// .bni interface-scope builder) keys a package's generic type/iface
+// decls under its short name — so an importer's qualified
+// `pkg.Box[…]` resolves — but the package's own function / var / const
+// signatures in that same .bni reference those generics UNQUALIFIED
+// (empty pkg).  Without the fallback the signature head resolves to
+// `undefined` and the parameter/field type is recorded as `void`,
+// while the impl-side pass (which stashes the same decl under the
+// empty key via preRegisterTypeNames) records the real type — so the
+// .bni↔.bn signature-match check reports a `void` vs `Box[…]`
+// mismatch.  The fallback runs only after the exact-key lookup misses,
+// so every previously-resolving lookup is unchanged.
+func lookupGenericTypeDeclPkg(c @Checker, pkg *[]readonly char, name *[]readonly char) @ast.Decl {
+	var d @ast.Decl = findGenericDeclKeyed(c.GenericTypeDecls, c.GenericTypeDeclPkgs, pkg, name)
+	if d != nil {
+		return d
+	}
+	// Same-package fallback: an unqualified (empty-pkg) request names the
+	// current package's OWN generics, which are stashed under the full
+	// package path (curPkgPath) by both preRegisterTypeNames and
+	// buildScopeFromFile.  Runs only after the exact-key miss.
+	if len(pkg) == 0 && len(c.curPkgPath) > 0 {
+		return findGenericDeclKeyed(c.GenericTypeDecls, c.GenericTypeDeclPkgs, c.curPkgPath, name)
+	}
+	return nil
+}
+
+// findGenericDeclKeyed scans the parallel (decls, pkgs) stash lists for
+// the first entry whose source-text name equals `name` and whose
+// pkg-key equals `pkg`.  Returns nil on no match.  Shared by the
+// generic struct and generic interface lookups.
+func findGenericDeclKeyed(decls @[]@ast.Decl, pkgs @[]@[]char, pkg *[]readonly char,
+		name *[]readonly char) @ast.Decl {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d == nil { continue }
+		if !types.CharEq(d.Name, name) { continue }
+		var declPkg @[]char
+		if i < len(pkgs) {
+			declPkg = pkgs[i]
+		}
+		if !types.CharEq(declPkg, pkg) { continue }
+		return d
+	}
+	return nil
+}
+
+// genericTypeDeclPkg returns the full package path a generic struct decl was
+// stashed under (its DEFINING package), so the instantiated type's name is
+// qualified by the defining package — keeping aa.Box[int] and bb.Box[int]
+// (same short name, different packages) distinct.  Falls back to the current
+// package when d isn't found (e.g. a synthesized decl).
+func genericTypeDeclPkg(c @Checker, d @ast.Decl) @[]char {
+	for i := 0; i < len(c.GenericTypeDecls); i++ {
+		if c.GenericTypeDecls[i] == d {
+			if i < len(c.GenericTypeDeclPkgs) {
+				return c.GenericTypeDeclPkgs[i]
+			}
+		}
+	}
+	return c.curPkgPath
+}
+
+// genericIfaceDeclPkg returns the full defining-package path of a generic
+// INTERFACE decl (the iface analog of genericTypeDeclPkg), so an instantiated
+// generic interface's nominal (Pkg, Name) identity keys on where the interface
+// was DECLARED, not the consumer's package — otherwise two same-final-segment
+// packages' `C[int]` collide and an impl of one is wrongly matched against the
+// other.  Both the local and imported stashes key on the full path (curPkgPath),
+// so a registered empty entry (should not occur) falls back to curPkgPath.
+func genericIfaceDeclPkg(c @Checker, d @ast.Decl) @[]char {
+	for i := 0; i < len(c.GenericIfaceDecls); i++ {
+		if c.GenericIfaceDecls[i] == d {
+			if i < len(c.GenericIfaceDeclPkgs) && len(c.GenericIfaceDeclPkgs[i]) > 0 {
+				return c.GenericIfaceDeclPkgs[i]
+			}
+		}
+	}
+	return c.curPkgPath
+}
+
+// lookupCachedInstantiationEntry walks c.GenericInstantiations looking for a
+// (Decl, args) match — Decl pointer-equal AND each arg IdenticalStrict — and returns
+// the cache ENTRY (so callers can read/update ConstraintsChecked), or nil on miss.
+// The match is IdenticalStrict (readonly-SIGNIFICANT), not Identical: `Foo[readonly
+// T]` and `Foo[T]` are DISTINCT monomorphizations, so a `readonly` arg must not alias
+// a non-readonly one's cache slot (see IdenticalStrict).
+func lookupCachedInstantiationEntry(c @Checker, d @ast.Decl,
+		args @[]@types.Type) @GenericInstantiation {
+	for i := 0; i < len(c.GenericInstantiations); i++ {
+		var entry @GenericInstantiation = c.GenericInstantiations[i]
+		if entry == nil || entry.Decl != d { continue }
+		if len(entry.TypeArgs) != len(args) { continue }
+		var match bool = true
+		for j := 0; j < len(args); j++ {
+			if !entry.TypeArgs[j].IdenticalStrict(args[j]) {
+				match = false
+				continue
+			}
+		}
+		if match { return entry }
+	}
+	return nil
+}
+
+// mangleInstantiatedName produces a stable name for the
+// instantiated TYP_NAMED — primarily for diagnostics and any
+// downstream identity-by-name comparisons.  Mirrors the IR
+// layer's instantiation mangle so the two layers can match
+// when IR-gen for generic structs lands in Slice 5c.
+func mangleInstantiatedName(base @[]char, args @[]@types.Type) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(base)
+	cb.Write("[")
+	for i := 0; i < len(args); i++ {
+		if i > 0 { cb.Write(",") }
+		if args[i] != nil {
+			cb.Write(args[i].QualifiedTypeName())
+		}
+	}
+	cb.Write("]")
+	return buf.CopyStr(cb.String())
+}

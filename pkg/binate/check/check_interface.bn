@@ -1,0 +1,144 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// Interface-declaration type-checking. Phase 1 scope (per the user
+// ratification): definitions work — parser accepts and type-checker
+// validates. No usage yet (no `*Iface` / `@Iface` type expressions,
+// no `impl T : Iface` decls, no method dispatch).
+
+// collectInterfaceDecl validates an interface declaration and defines
+// the interface symbol in scope.
+//
+// Validation:
+//   - Method names must be unique within the interface.
+//   - Each method must have no receiver (parser enforces this — the
+//     parseInterfaceMethod path doesn't read a receiver — but we
+//     guard defensively here).
+//   - Each method's parameter and result types must resolve.
+//   - Interface name must not duplicate an existing top-level decl
+//     (caught by checkDuplicateDecls).
+func collectInterfaceDecl(c @Checker, d @ast.Decl) {
+	if d == nil || d.Kind != ast.DECL_INTERFACE {
+		return
+	}
+
+	// Generic interface decls: the
+	// method set references unbound T at decl time, so there's no
+	// stable TYP_INTERFACE to register here.  Stash the AST and
+	// defer building until a use site (`Name[T1, T2]`) instantiates
+	// it — same pattern as generic struct decls in Slice 5b.
+	// IR-gen for instantiated interfaces (vtable layout, dispatch)
+	// is Slice 6c territory; until that lands, declaring a value
+	// of a generic-interface-value type would fail at IR-gen time.
+	if len(d.TypeParams) > 0 {
+		c.GenericIfaceDecls = slices.Append[@ast.Decl](c.GenericIfaceDecls, d)
+		// Key on the current package's FULL path (matching the imported stash
+		// in bni_scope and the generic-struct stash), so the instantiated
+		// interface's nominal identity is by defining package, not short name
+		// — bare same-package lookups go through lookupGenericIfaceDeclPkg's
+		// curPkgPath fallback.
+		c.GenericIfaceDeclPkgs = slices.Append[@[]char](
+				c.GenericIfaceDeclPkgs, buf.CopyStr(c.curPkgPath))
+		// Record this generic's defining-file import scope so its method
+		// param/result types resolve against THIS file's imports at the
+		// instantiation site — kept in lockstep with GenericIfaceDecls so
+		// lookupGenericDeclScope never indexes past the parallel array (see
+		// populateInstantiatedInterface).
+		c.GenericIfaceDeclScopes = slices.Append[@Scope](
+				c.GenericIfaceDeclScopes, scopeForFile(c, d.Pos.File))
+		return
+	}
+
+	// Slice 2.4: interface alias form (`interface X = Y`).
+	// Resolve the target to its TYP_INTERFACE and register the
+	// alias name as another SYM_INTERFACE pointing at the same
+	// Type. Nominal-equivalent: MyStringer and Stringer refer
+	// to the same interface, share the same method set, and any
+	// `impl T : MyStringer` is indistinguishable from
+	// `impl T : Stringer` at satisfaction-check time.
+	if d.IsAlias {
+		if d.TypeRef == nil {
+			addCheckError(c, d.Pos, "interface alias missing target")
+			return
+		}
+		var target @types.Type = resolveTypeExprAllowInterface(c, d.TypeRef)
+		if target == nil || target.Kind != types.TYP_INTERFACE {
+			addCheckError(c, d.TypeRef.Pos, "interface alias target must be an interface")
+			return
+		}
+		defineInterface(c.Scope, d.Name, target)
+		return
+	}
+
+	var iface @types.Type = types.MakeInterfaceType(c.curPkgShort, d.Name)
+
+	// Define the interface symbol BEFORE resolving its own method
+	// signatures, so a self-referential method — one whose parameter or
+	// result type is this very interface (`Unwrap() @Error`,
+	// `next() @Node`) — resolves `@Self`-by-name against the in-scope
+	// interface rather than firing "undefined: <name>".  Methods are
+	// added to `iface` in place below, so the already-installed symbol
+	// (which points at the same Type object) sees the full method set.
+	// (`.bni`-declared interfaces are pre-registered by bni_scope.bn;
+	// this gives in-`.bn` interface decls the same self-visibility.)
+	defineInterface(c.Scope, d.Name, iface)
+
+	for i := 0; i < len(d.Decls); i++ {
+		var m @ast.Decl = d.Decls[i]
+		if m == nil || m.Kind != ast.DECL_FUNC {
+			addCheckError(c, d.Pos, "interface method must be a function signature")
+			continue
+		}
+		if m.Recv != nil {
+			addCheckError(c, m.Pos, "interface method may not declare a receiver")
+		}
+		if m.Body != nil {
+			addCheckError(c, m.Pos, "interface method may not have a body")
+		}
+
+		// Build the method's func type (no receiver — receiver is the
+		// interface value, supplied at dispatch time).  `Self` is
+		// valid in method arg/result types only — set AllowSelf
+		// across this single call and restore after.  Other
+		// surrounding work in this function (alias-target
+		// resolution, extension-parent resolution) runs with
+		// AllowSelf=false so `Self` is rejected in those slots.
+		var prevAllowSelf bool = c.AllowSelf
+		c.AllowSelf = true
+		var ft @types.Type = resolveFuncDeclType(c, m)
+		c.AllowSelf = prevAllowSelf
+
+		var method @types.Method = MakeMethod(m.Name, iface, ft)
+		if !iface.AddMethod(method) {
+			var cb @strings.Builder = strings.NewBuilder()
+			cb.Write("duplicate method `")
+			cb.Write(m.Name)
+			cb.Write("` in interface ")
+			cb.Write(d.Name)
+			addCheckError(c, m.Pos, buf.CopyStr(cb.String()))
+		}
+	}
+
+	// Resolve parent
+	// interfaces, validate them, and detect method-name conflicts
+	// across the ancestor closure.  Parents must already be in
+	// scope at this point (no pre-registration); a forward
+	// reference surfaces as "undefined name" via the existing
+	// resolveTypeExprAllowInterface path.
+	resolveInterfaceExtension(c, d, iface)
+}
+
+// defineInterface adds an interface symbol to the scope.
+func defineInterface(s @Scope, name @[]char, t @types.Type) {
+	var sym @Symbol = make(Symbol)
+	sym.Name = name
+	sym.Type = t
+	sym.Kind = types.SYM_INTERFACE
+	s.Define(sym)
+}

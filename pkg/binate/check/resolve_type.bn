@@ -1,0 +1,350 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// ============================================================
+// Type Resolution
+// ============================================================
+//
+// Converts AST type expressions (`ast.TypeExpr`) into resolved
+// `Type` values. Used by the checker (decl/expr/stmt) to bind
+// source-level type syntax to the package's symbol scope.
+
+// resolveTypeExpr resolves an AST type expression into a Type.
+//
+// Interface names: bare `Iface` is not a usable type expression.
+// Only `*Iface` / `@Iface`
+// are usable forms, which lower to TYP_INTERFACE_VALUE /
+// TYP_INTERFACE_VALUE_MANAGED here. The `*X` / `@X` cases use
+// resolveTypeExprAllowInterface for the base so an interface
+// symbol resolves to its TYP_INTERFACE; if the base is anything
+// else, regular pointer / managed-pointer behavior. Bare
+// interface names hitting the TEXPR_NAMED arm produce an error
+// pointing the user toward the `*` / `@` forms.
+func resolveTypeExpr(c @Checker, te @ast.TypeExpr) @types.Type {
+	if te == nil {
+		return types.TypVoid()
+	}
+
+	if te.Kind == ast.TEXPR_NAMED {
+		var t @types.Type = resolveNamedTypeExpr(c, te)
+		if t != nil && t.Kind == types.TYP_INTERFACE {
+			errInterfaceNotAType(c, te.Pos, te.Name)
+			return types.TypVoid()
+		}
+		return t
+	}
+	if te.Kind == ast.TEXPR_POINTER {
+		var base @types.Type = resolveTypeExprAllowInterface(c, te.Base)
+		if base != nil && base.Kind == types.TYP_INTERFACE {
+			return types.MakeInterfaceValueType(base)
+		}
+		return types.MakePointerType(base)
+	}
+	if te.Kind == ast.TEXPR_MANAGED {
+		var base @types.Type = resolveTypeExprAllowInterface(c, te.Base)
+		if base != nil && base.Kind == types.TYP_INTERFACE {
+			return types.MakeManagedInterfaceValueType(base)
+		}
+		return types.MakeManagedPtrType(base)
+	}
+	if te.Kind == ast.TEXPR_MANAGED_SLICE {
+		return types.MakeManagedSliceType(resolveTypeExpr(c, te.Base))
+	}
+	if te.Kind == ast.TEXPR_SLICE {
+		return types.MakeSliceType(resolveTypeExpr(c, te.Base))
+	}
+	if te.Kind == ast.TEXPR_ARRAY {
+		// `[...]T` is an inferred-length array, valid ONLY as a composite-literal
+		// head (where checkCompositeLit folds the length from the elements).  In
+		// any other type position — a var / param / field / return type — there
+		// is no element list to infer from, so reject it here.  (The literal-head
+		// path never calls resolveTypeExpr on the `[...]` node; it resolves the
+		// element type and infers the length directly.)
+		if te.LenInferred {
+			addCheckError(c, te.Pos, "[...] array length is only valid in a composite literal")
+			// Return the error sentinel (not a [0]T placeholder) so the
+			// surrounding context — e.g. a `var a [...]int = [...]int{…}` whose
+			// initializer resolves to a real [N]int — does not pile a follow-on
+			// "cannot assign" onto the primary diagnostic.
+			return types.TypError()
+		}
+		var length int = evalConstInt(c, te.Len)
+		// Stamp the resolved length on the AST node so IR-gen reads the
+		// checker's value instead of re-folding `Len` against its own const
+		// table (which a use site can outrun, folding the dim to a garbage
+		// size — see TypeExpr.LenVal in ast.bni).  Only stamp a genuinely
+		// known, non-negative length: evalConstInt also returns 0 for a dim
+		// that isn't foldable yet (pass 1, before the const's value is
+		// recorded), and that node is re-resolved later with the real value.
+		// Gate on evalConstIntValue's ok so a deferred 0 never clobbers a
+		// stamp, and a negative length (already diagnosed) isn't recorded.
+		var dimVal int
+		var dimOk bool
+		dimVal, dimOk = evalConstIntValue(c, te.Len)
+		if dimOk && dimVal >= 0 {
+			te.LenVal = dimVal
+			te.LenKnown = true
+		}
+		return types.MakeArrayType(resolveTypeExpr(c, te.Base), length)
+	}
+	if te.Kind == ast.TEXPR_STRUCT {
+		return resolveStructType(c, te)
+	}
+	if te.Kind == ast.TEXPR_PAREN {
+		return resolveTypeExpr(c, te.Base)
+	}
+	if te.Kind == ast.TEXPR_CONST {
+		return types.MakeReadonlyType(resolveTypeExpr(c, te.Base))
+	}
+	if te.Kind == ast.TEXPR_FUNC_VALUE {
+		return resolveFuncValueType(c, te, false)
+	}
+	if te.Kind == ast.TEXPR_MANAGED_FUNC_VALUE {
+		return resolveFuncValueType(c, te, true)
+	}
+	if te.Kind == ast.TEXPR_INSTANTIATE {
+		return resolveTypeInstantiation(c, te)
+	}
+	if te.Kind == ast.TEXPR_SELF {
+		// `Self` is valid only while we're resolving an interface
+		// method's argument / result types.  AllowSelf is set
+		// transiently by collectInterfaceDecl around that call;
+		// everywhere else, surface a clean error.  Return TypSelf()
+		// either way so downstream checks see a consistent shape
+		// (impl-collection's substituteSelf will replace it).
+		if !c.AllowSelf {
+			addCheckError(c, te.Pos, "`Self` is only valid inside interface method signatures")
+		}
+		return types.TypSelf()
+	}
+	addCheckError(c, te.Pos, "invalid type expression")
+	return types.TypVoid()
+}
+
+// resolveFuncValueType converts a TEXPR_FUNC_VALUE / TEXPR_MANAGED_FUNC_VALUE
+// AST node into the corresponding TYP_FUNC_VALUE / TYP_MANAGED_FUNC_VALUE
+// Type. Parameters in the source are anonymous (types only); we still
+// build Param structs for them with empty names so downstream code
+// (signature comparison, vtable type generation) can treat them
+// uniformly with named parameters from regular function declarations.
+func resolveFuncValueType(c @Checker, te @ast.TypeExpr, managed bool) @types.Type {
+	var params @[]@types.Param
+	for i := 0; i < len(te.ParamTypes); i++ {
+		var typ @types.Type = resolveTypeExpr(c, te.ParamTypes[i])
+		var p @types.Param = make(types.Param)
+		if te.VariadicParams && i == len(te.ParamTypes) - 1 {
+			// Variadic final param of `*func(...T)`: in-body type is *[]T
+			// (func.variadic.identity); te.ParamTypes[i] is the element T.
+			p.Type = types.MakeSliceType(typ)
+			p.IsVariadic = true
+		} else {
+			p.Type = typ
+		}
+		params = slices.Append[@types.Param](params, p)
+	}
+	var results @[]@types.Type
+	for i := 0; i < len(te.ResultTypes); i++ {
+		var typ @types.Type = resolveTypeExpr(c, te.ResultTypes[i])
+		results = slices.Append[@types.Type](results, typ)
+	}
+	if managed {
+		return types.MakeManagedFuncValueType(params, results)
+	}
+	return types.MakeFuncValueType(params, results)
+}
+
+// resolveNamedTypeExpr resolves a named type reference, including
+// qualified (pkg.Type) names. Accepts SYM_TYPE and SYM_INTERFACE
+// symbols — for SYM_INTERFACE, returns the TYP_INTERFACE Type. The
+// caller is responsible for either (a) wrapping in `*` / `@` to
+// produce an interface-value type, or (b) reporting that bare
+// interface names aren't usable as type expressions. resolveTypeExpr
+// does (b); resolveTypeExprAllowInterface does (a).
+func resolveNamedTypeExpr(c @Checker, te @ast.TypeExpr) @types.Type {
+	if len(te.Pkg) > 0 {
+		// Qualified type: pkg.Type
+		var sym @Symbol = c.Scope.Lookup(te.Pkg)
+		if sym == nil || sym.Kind != types.SYM_PKG {
+			errUndefined(c, te.Pos, te.Pkg)
+			return types.TypVoid()
+		}
+		var pkgScope @Scope = lookupPackage(c, sym.PkgPath)
+		if pkgScope == nil {
+			errUndefined(c, te.Pos, te.Pkg)
+			return types.TypVoid()
+		}
+		var member @Symbol = pkgScope.Lookup(te.Name)
+		if member == nil {
+			errUndefined(c, te.Pos, te.Name)
+			return types.TypVoid()
+		}
+		if member.IsGeneric {
+			// A bare reference to an exposed generic marker (`fwd.Box` with no
+			// type arguments) is not a usable type, exactly as a bare `glib.Box`
+			// is rejected — the marker exists only to carry the home package.
+			addCheckError(c, te.Pos, "generic type used without type arguments")
+			return types.TypVoid()
+		}
+		return member.Type
+	}
+	var sym @Symbol = c.Scope.Lookup(te.Name)
+	if sym == nil {
+		errUndefined(c, te.Pos, te.Name)
+		return types.TypVoid()
+	}
+	if sym.IsGeneric {
+		// A bare reference to an exposed generic marker (no type arguments) is not
+		// a usable type — reject rather than returning its nil placeholder Type.
+		addCheckError(c, te.Pos, "generic type used without type arguments")
+		return types.TypVoid()
+	}
+	if sym.Kind != types.SYM_TYPE && sym.Kind != types.SYM_INTERFACE {
+		errNotAType(c, te.Pos, te.Name)
+		return types.TypVoid()
+	}
+	return sym.Type
+}
+
+// resolveTypeExprAllowInterface resolves a type expression in the
+// "base of `*X` / `@X`" position, where a bare interface name is a
+// valid base (it lowers to TYP_INTERFACE_VALUE / TYP_
+// INTERFACE_VALUE_MANAGED at the caller). For non-interface
+// bases this is identical to resolveTypeExpr.
+func resolveTypeExprAllowInterface(c @Checker, te @ast.TypeExpr) @types.Type {
+	if te != nil && te.Kind == ast.TEXPR_NAMED {
+		return resolveNamedTypeExpr(c, te)
+	}
+	return resolveTypeExpr(c, te)
+}
+
+// resolveStructType resolves a struct type expression, building the field list.
+// Struct fields are sized-use sites — capturePendingIfSized fires
+// on each field whose resolved type is a pending TYP_NAMED, so the
+// surrounding decl parks waiting on the pending dependency.
+func resolveStructType(c @Checker, te @ast.TypeExpr) @types.Type {
+	var fields @[]@types.Field
+	for i := 0; i < len(te.Fields); i++ {
+		var fd @ast.FieldDecl = te.Fields[i]
+		var typ @types.Type = resolveTypeExpr(c, fd.Type)
+		capturePendingIfSized(c, typ)
+		var f @types.Field = make(types.Field)
+		f.Name = fd.Name
+		f.Type = typ
+		fields = slices.Append[@types.Field](fields, f)
+	}
+	return types.MakeStructType("", fields)
+}
+
+// resolveFuncDeclType resolves a function declaration's parameter and
+// return types into a func type.  When d carries a generic
+// type-parameter list, installs a per-decl scope with the type-params
+// as SYM_TYPE entries before resolving signatures, so references to
+// `T` in param / result type expressions resolve correctly; the
+// resulting FUNC type's TypeParams field carries the @[]@types.Type for
+// the body-check pass to re-install.
+func resolveFuncDeclType(c @Checker, d @ast.Decl) @types.Type {
+	var pushedTpScope bool = false
+	var tpTypes @[]@types.Type
+	if len(d.TypeParams) > 0 {
+		pushScope(c)
+		pushedTpScope = true
+		tpTypes = installTypeParamScope(c, d)
+	}
+	// Check for duplicate parameter names
+	for i := 0; i < len(d.Params); i++ {
+		for j := 0; j < i; j++ {
+			if types.CharEq(d.Params[i].Name, d.Params[j].Name) {
+				var cb @strings.Builder = strings.NewBuilder()
+				cb.Write("duplicate parameter name: ")
+				cb.Write(d.Params[i].Name)
+				addCheckError(c, d.Pos, buf.CopyStr(cb.String()))
+			}
+		}
+	}
+	var params @[]@types.Param
+	for i := 0; i < len(d.Params); i++ {
+		var pd @ast.ParamDecl = d.Params[i]
+		var typ @types.Type = resolveTypeExpr(c, pd.Type)
+		var p @types.Param = make(types.Param)
+		p.Name = pd.Name
+		if pd.Variadic {
+			// A variadic parameter's in-body type is the raw slice *[]T
+			// (func.variadic.decl); pd.Type is the element type T.  Any
+			// element-`readonly` is already in the resolved element type — do
+			// not re-wrap.
+			p.Type = types.MakeSliceType(typ)
+			p.IsVariadic = true
+		} else {
+			p.Type = typ
+		}
+		capturePendingIfSized(c, p.Type)
+		params = slices.Append[@types.Param](params, p)
+	}
+	var results @[]@types.Type
+	for i := 0; i < len(d.Results); i++ {
+		var rt @types.Type = resolveTypeExpr(c, d.Results[i])
+		capturePendingIfSized(c, rt)
+		results = slices.Append[@types.Type](results, rt)
+	}
+	var ft @types.Type = types.MakeFuncType(params, results)
+	if pushedTpScope {
+		ft.TypeParams = tpTypes
+		popScope(c)
+	}
+	return ft
+}
+
+// installTypeParamScope defines each of d's type-parameters as a
+// SYM_TYPE entry in the current scope (which should be a fresh
+// scope pushed by the caller).  Returns the @[]@types.Type of the
+// constructed TYP_TYPE_PARAM types for the caller to attach to
+// the resulting FUNC type — these same @types.Type instances are
+// re-installed during body checking so identity comparison
+// (Q3) is stable.
+//
+// Constraint resolution: `any` (the bare unconstrained marker)
+// stores nil in TpConstraint; any other shape must resolve to a
+// declared interface (TYP_INTERFACE) and is stored on
+// TpConstraint for the satisfaction check and constraint-
+// method dispatch.
+func installTypeParamScope(c @Checker, d @ast.Decl) @[]@types.Type {
+	var tpTypes @[]@types.Type
+	for i := 0; i < len(d.TypeParams); i++ {
+		var tp @ast.TypeParam = d.TypeParams[i]
+		var constraint @types.Type = resolveTypeParamConstraint(c, tp)
+		var tparam @types.Type = MakeTypeParamType(tp.Name, bit_cast(*uint8, d), i, constraint)
+		defineType(c.Scope, tp.Name, tparam)
+		tpTypes = slices.Append[@types.Type](tpTypes, tparam)
+	}
+	return tpTypes
+}
+
+// resolveTypeParamConstraint resolves a parsed constraint
+// TypeExpr to nil (for `any`) or to a TYP_INTERFACE @types.Type.
+// Anything else surfaces a clean error and returns nil so the
+// rest of the decl still type-checks.
+func resolveTypeParamConstraint(c @Checker, tp @ast.TypeParam) @types.Type {
+	if tp.Constraint == nil {
+		addCheckError(c, tp.Pos, "type parameter must have a constraint (use `any` for none)")
+		return nil
+	}
+	if tp.Constraint.Kind == ast.TEXPR_NAMED && len(tp.Constraint.Pkg) == 0 &&
+			types.CharEq(tp.Constraint.Name, "any") {
+		return nil
+	}
+	var t @types.Type = resolveTypeExprAllowInterface(c, tp.Constraint)
+	if t == nil || t.Kind == types.TYP_VOID {
+		return nil
+	}
+	if t.Kind != types.TYP_INTERFACE {
+		addCheckError(c, tp.Pos, "constraint must be `any` or an interface name")
+		return nil
+	}
+	return t
+}

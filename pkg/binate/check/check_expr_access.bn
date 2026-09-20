@@ -1,0 +1,434 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+
+// Type checking for access-shape expressions: index / instantiate-or-
+// index, slice, and selector.  Extracted from check_expr.bn to keep
+// that file under the hygiene soft-length cap.  Binary / unary / call
+// dispatch stays in check_expr.bn alongside the top-level checkExpr
+// entry point.
+
+// checkInstantiateOrIndex dispatches an EXPR_INSTANTIATE_OR_INDEX
+// node.  When the head resolves to a generic function, treats the
+// brackets as generic instantiation; otherwise falls back to value
+// indexing.
+//
+// Cross-package generic instantiation (Slice 7) — e.X may also be
+// EXPR_SELECTOR `pkg.Name`; look up Name in the imported package's
+// scope.
+func checkInstantiateOrIndex(c @Checker, e @ast.Expr) @types.Type {
+	// Generic-instantiation interpretation, available only when the
+	// head is a bare identifier or a package-qualified selector
+	// resolving to a generic FUNC symbol.
+	if e.X != nil && e.X.Kind == ast.EXPR_IDENT {
+		var sym @Symbol = c.Scope.Lookup(e.X.Name)
+		if sym != nil && sym.Kind == types.SYM_FUNC && sym.Type != nil && len(sym.Type.TypeParams) > 0 {
+			return instantiateGenericFunc(c, e, sym.Type)
+		}
+	}
+	if e.X != nil && e.X.Kind == ast.EXPR_SELECTOR && e.X.X != nil && e.X.X.Kind == ast.EXPR_IDENT {
+		var pkgSym @Symbol = c.Scope.Lookup(e.X.X.Name)
+		if pkgSym != nil && pkgSym.Kind == types.SYM_PKG {
+			var pkgScope @Scope = lookupPackage(c, pkgSym.PkgPath)
+			if pkgScope != nil {
+				var sym @Symbol = pkgScope.Lookup(e.X.Name)
+				if sym != nil && sym.Kind == types.SYM_FUNC && sym.Type != nil && len(sym.Type.TypeParams) > 0 {
+					return instantiateGenericFunc(c, e, sym.Type)
+				}
+			}
+		}
+	}
+	if len(e.Args) != 1 {
+		addCheckError(c, e.Pos, "generic instantiation requires a generic function head")
+		return types.TypVoid()
+	}
+	return checkIndexExpr(c, e)
+}
+
+// checkIndexExpr type-checks an index expression (slice, array, pointer, or string indexing).
+// e.X is the collection; e.Args[0] is the index.
+func checkIndexExpr(c @Checker, e @ast.Expr) @types.Type {
+	var xt @types.Type = checkExpr(c, e.X)
+	// A string literal is untyped; indexing it (`"abc"[i]`) reads a byte, so adopt
+	// its natural [N]readonly char array — the array arm below then yields a readonly
+	// char element, matching how a string literal indexed as an array behaved before
+	// it was made untyped.
+	if isUntypedString(xt) {
+		xt = types.UntypedStringNaturalArray(xt)
+	}
+	var idx @ast.Expr = e.Args[0]
+	var idxType @types.Type = checkExpr(c, idx)
+	if !idxType.IsInteger() {
+		addCheckError(c, idx.Pos, "index must be integer")
+	}
+
+	// Whether any `readonly` wrapper is crossed reaching the collection.  For an
+	// ARRAY this is object-const (the array is a read-only VALUE, so its elements
+	// are read-only too — like a readonly struct's fields); for a slice/pointer the
+	// outer readonly is HANDLE-const and does NOT ride to the elements (element
+	// readonly-ness is carried by the element type itself, `*[]readonly T`).
+	var baseConst bool
+	_, baseConst = peelFieldAccessBase(xt)
+	// peelNamedBounded sees through alias / readonly / named-distinct wrappers
+	// to the concrete underlying, so indexing works on a named slice/array/
+	// pointer type (`type Buf @[]int; b[0]`) as well as the bare composite.
+	xt = types.PeelNamedBounded(xt)
+	if xt == nil {
+		return types.TypVoid()
+	}
+	if xt.Kind == types.TYP_SLICE || xt.Kind == types.TYP_MANAGED_SLICE ||
+			xt.Kind == types.TYP_ARRAY || xt.Kind == types.TYP_POINTER {
+		// Indexing MATERIALIZES the element as a value, so an opaque (or
+		// cross-package opaque-export) element is rejected here (bug 211).  Such
+		// a collection can rarely be formed in the first place, but a provider
+		// could hand one back, so gate the read.  requireSizedType no-ops on a
+		// sized element.
+		requireSizedType(c, xt.Elem, e.Pos)
+		// A readonly ARRAY's element is read-only: `var r readonly [3]int; r[i] =
+		// v` is rejected (the IsReadonly assignment-target guard fires on the
+		// element type).  Slices/pointers keep the bare element type (handle-const).
+		if xt.Kind == types.TYP_ARRAY && baseConst {
+			return types.MakeReadonlyType(xt.Elem)
+		}
+		return xt.Elem
+	}
+	addCheckError(c, e.X.Pos, "cannot index this type")
+	return types.TypVoid()
+}
+
+// checkSliceExpr type-checks a slice expression (x[lo:hi]).
+func checkSliceExpr(c @Checker, e @ast.Expr) @types.Type {
+	var xt @types.Type = checkExpr(c, e.X)
+	// A string literal is untyped; slicing it (`"abc"[:]`) yields a *[]readonly char
+	// subslice, so adopt its natural [N]readonly char array — the TYP_ARRAY arm below
+	// then produces the raw slice, matching pre-untyped behavior.
+	if isUntypedString(xt) {
+		xt = types.UntypedStringNaturalArray(xt)
+	}
+	// Z = lo, Y = hi in the AST
+	if e.Z != nil {
+		var lt @types.Type = checkExpr(c, e.Z)
+		if !lt.IsInteger() {
+			addCheckError(c, e.Z.Pos, "slice index must be integer")
+		}
+	}
+	if e.Y != nil {
+		var ht @types.Type = checkExpr(c, e.Y)
+		if !ht.IsInteger() {
+			addCheckError(c, e.Y.Pos, "slice index must be integer")
+		}
+	}
+
+	// peelNamedBounded sees through alias / readonly / named-distinct wrappers
+	// to the concrete underlying.  The outer readonly-ness (a property of the
+	// storage handle) does not ride along to the fresh subslice value — only
+	// element readonly-ness does, and that is carried by the underlying slice's
+	// Elem.  Mirrors checkIndexExpr's peel.
+	xt = types.PeelNamedBounded(xt)
+	if xt == nil {
+		return types.TypVoid()
+	}
+	if xt.Kind == types.TYP_SLICE || xt.Kind == types.TYP_MANAGED_SLICE {
+		return xt
+	}
+	if xt.Kind == types.TYP_ARRAY {
+		return types.MakeSliceType(xt.Elem)
+	}
+	addCheckError(c, e.X.Pos, "cannot slice this type")
+	return types.TypVoid()
+}
+
+// packageAccessorType returns the type of the compiler-synthesized
+// `__Package()` accessor — `func() @reflect.Package` — or nil if
+// pkg/builtins/reflect is not loaded (so the caller falls through to the
+// normal undefined-member error).  Every package has a generated
+// `__Package()` (codegen's emit_pkg_descriptor.bn); it is not declared
+// in any .bni, so selector
+// resolution synthesizes its type here.  reflect is force-loaded by the
+// driver (ensureReflectLoaded), so the lookup normally succeeds.
+func packageAccessorType(c @Checker) @types.Type {
+	var reflectScope @Scope = lookupPackage(c, "pkg/builtins/reflect")
+	if reflectScope == nil { return nil }
+	var pkgSym @Symbol = reflectScope.Lookup("Package")
+	if pkgSym == nil || pkgSym.Type == nil { return nil }
+	var noParams @[]@types.Param
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = types.MakeManagedPtrType(pkgSym.Type)
+	return types.MakeFuncType(noParams, results)
+}
+
+// resolveQualifiedSym resolves a package-qualified selector `pkg.Name`
+// to the package member's symbol (any kind), or nil if e is not such a
+// selector — a struct-field access, or `pkg` not an imported package.
+// Shared by the const-write rejections (`&pkg.C` in check_expr.bn,
+// `pkg.C = v` in check_stmt.bn), which both gate on member.Kind ==
+// SYM_CONST.
+func resolveQualifiedSym(c @Checker, e @ast.Expr) @Symbol {
+	if e == nil || e.Kind != ast.EXPR_SELECTOR { return nil }
+	if e.X == nil || e.X.Kind != ast.EXPR_IDENT { return nil }
+	var psym @Symbol = c.Scope.Lookup(e.X.Name)
+	if psym == nil || psym.Kind != types.SYM_PKG { return nil }
+	var pkgScope @Scope = lookupPackage(c, psym.PkgPath)
+	if pkgScope == nil { return nil }
+	return pkgScope.Lookup(e.Name)
+}
+
+// peelFieldAccessBase peels alias / readonly / named-distinct wrappers from t
+// to the concrete base for field access, returning that base (nil if opaque
+// nil-underlying or cyclic) and whether any `readonly` wrapper was crossed
+// (object-const: a readonly path makes the reached fields read-only).
+//
+// A named-distinct type is transparent to its underlying for field access
+// (`type H @Box; h.field` reaches Box's field — claude-notes.md "Type
+// declarations"), so TYP_NAMED with a concrete Underlying is peeled.  An
+// OPAQUE named type (TYP_NAMED with nil Underlying — e.g. a `.bni` forward
+// `type Foo`) stays unpeeled: the bare TYP_NAMED is returned, and the caller
+// rejects field access on it (encapsulation across the package boundary).
+func peelFieldAccessBase(t @types.Type) (@types.Type, bool) {
+	var konst bool = false
+	var depth int = 0
+	for t != nil && depth < 1024 {
+		if t.Kind == types.TYP_ALIAS {
+			t = t.Target
+		} else if t.Kind == types.TYP_READONLY {
+			konst = true
+			t = t.Elem
+		} else if t.Kind == types.TYP_NAMED && t.Underlying != nil {
+			t = t.Underlying
+		} else {
+			return t, konst
+		}
+		depth = depth + 1
+	}
+	return nil, konst
+}
+
+// fieldBaseOpaqueToConsumer reports whether a FIELD access on a value of type t
+// must be rejected because t bottoms out at (or is reached through) an
+// opaque-export type viewed from a DIFFERENT package than the one that owns it.
+// An opaque export (`type Box` forward-declared in a .bni, layout filled by its
+// own .bn — OpaqueExportPkg set) presents only its opaque surface to importers,
+// even when the defining .bn is co-compiled (which fills the SHARED Type's
+// Underlying so the provider can build it).  Peels pointer / alias / readonly /
+// transparent-named wrappers like the field-access peel, stopping at the first
+// opaque-export type.  Same-package access (OpaqueExportPkg == curPkgPath) is
+// NOT opaque — the provider sees its own full layout.  Methods are unaffected:
+// only the struct-field lookup is gated on this, so .bni-exported methods on an
+// opaque type still resolve.
+func fieldBaseOpaqueToConsumer(c @Checker, t @types.Type) bool {
+	var depth int = 0
+	for t != nil && depth < 1024 {
+		depth = depth + 1
+		if t.Kind == types.TYP_NAMED && len(t.OpaqueExportPkg) > 0 &&
+				!types.CharEq(t.OpaqueExportPkg, c.curPkgPath) {
+			return true
+		}
+		var elem @types.Type = t.PointerElem()
+		if elem != nil {
+			t = elem
+		} else if t.Kind == types.TYP_ALIAS {
+			t = t.Target
+		} else if t.Kind == types.TYP_READONLY {
+			t = t.Elem
+		} else if t.Kind == types.TYP_NAMED && t.Underlying != nil {
+			t = t.Underlying
+		} else {
+			return false
+		}
+	}
+	return false
+}
+
+// isGenericStructInstHead reports whether ie — an EXPR_INSTANTIATE_OR_INDEX —
+// is a generic STRUCT type instantiation (`Box[..]` / `pkg.Box[..]`), the base
+// of a method expression `Box[int].M`, as opposed to a value being indexed
+// (`arr[i]`).  It consults only the generic-type-decl table (no error side
+// effects) and requires the head name not to be shadowed by a value symbol in
+// scope.  Interfaces are excluded — `Iface[int].M` is not a valid method
+// expression (and IR-gen has no path for it).
+func isGenericStructInstHead(c @Checker, ie @ast.Expr) bool {
+	if ie == nil || ie.Kind != ast.EXPR_INSTANTIATE_OR_INDEX || ie.X == nil {
+		return false
+	}
+	var headName @[]char
+	var declPkg @[]char
+	if ie.X.Kind == ast.EXPR_IDENT {
+		// A value symbol of the same name shadows the type — then `name[i]` is
+		// value indexing, not a type instantiation.
+		var vs @Symbol = c.Scope.Lookup(ie.X.Name)
+		if vs != nil && vs.Kind != types.SYM_TYPE {
+			return false
+		}
+		headName = ie.X.Name
+	} else if ie.X.Kind == ast.EXPR_SELECTOR && ie.X.X != nil && ie.X.X.Kind == ast.EXPR_IDENT {
+		// Same expose home-remap as resolveTypeInstantiation, so a method-expression
+		// head `fwd.Gen[X].M` recognizes the exposed home generic.
+		declPkg = resolveQualifiedGenericDeclPkg(c, ie.X.X.Name, ie.X.Name)
+		headName = ie.X.Name
+	} else {
+		return false
+	}
+	return lookupGenericTypeDeclPkg(c, declPkg, headName) != nil
+}
+
+// checkSelectorExpr type-checks a selector (x.Name), handling package access and struct fields.
+func checkSelectorExpr(c @Checker, e @ast.Expr) @types.Type {
+	// Method expression on a generic type instantiation: Box[int].M.  The base
+	// is a generic-struct instantiation (not a value index); resolve it (the
+	// cached instance `Box[int]`, the same one a `var bx Box[int]` uses) and take
+	// the method as a function value, exactly like the T.M case below — the
+	// receiver rides as Params[0].  A value-index base (`arr[i].field`) has a
+	// non-generic head, so isGenericStructInstHead returns false and it falls
+	// through to the field path.
+	if e.X != nil && e.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX && isGenericStructInstHead(c, e.X) {
+		var it @types.Type = typeArgFromExpr(c, e.X)
+		if it != nil && it.Kind != types.TYP_VOID {
+			var im @types.Method = it.LookupMethod(e.Name)
+			if im == nil {
+				errUndefined(c, e.Pos, e.Name)
+				return types.TypVoid()
+			}
+			return types.MakeFuncValueType(im.FuncType.Params, im.FuncType.Results)
+		}
+	}
+	// Check for package-qualified access: pkg.Name
+	if e.X != nil && e.X.Kind == ast.EXPR_IDENT {
+		var sym @Symbol = c.Scope.Lookup(e.X.Name)
+		if sym != nil && sym.Kind == types.SYM_PKG {
+			var pkgScope @Scope = lookupPackage(c, sym.PkgPath)
+			if pkgScope == nil {
+				errUndefined(c, e.X.Pos, e.X.Name)
+				return types.TypVoid()
+			}
+			var member @Symbol = pkgScope.Lookup(e.Name)
+			if member == nil {
+				// Every package has a compiler-synthesized
+				// `__Package() @reflect.Package` accessor.  It is not declared
+				// in any .bni, so resolve it here rather than via the scope.
+				if types.CharEq(e.Name, "__Package") {
+					var accTyp @types.Type = packageAccessorType(c)
+					if accTyp != nil { return accTyp }
+				}
+				errUndefined(c, e.Pos, e.Name)
+				return types.TypVoid()
+			}
+			if member.IsGeneric {
+				// An exposed generic type name used as a VALUE (`x := fwd.Box`) is
+				// not a value — reject rather than yielding its nil placeholder Type.
+				addCheckError(c, e.Pos, "generic type used without type arguments")
+				return types.TypVoid()
+			}
+			return member.Type
+		}
+		// Method expression: T.M where T is a named type. The result
+		// is a function value whose signature includes the method's
+		// receiver as the first parameter (per the method's declared
+		// receiver kind — value, *T, or @T).
+		if sym != nil && sym.Kind == types.SYM_TYPE {
+			var t @types.Type = sym.Type
+			var m @types.Method = t.LookupMethod(e.Name)
+			if m == nil {
+				errUndefined(c, e.Pos, e.Name)
+				return types.TypVoid()
+			}
+			// m.FuncType already has the receiver baked in as Params[0].
+			return types.MakeFuncValueType(m.FuncType.Params, m.FuncType.Results)
+		}
+	}
+
+	var xt @types.Type = checkExpr(c, e.X)
+	// Preserve the ORIGINAL receiver type before any auto-deref —
+	// the method-value path below needs it to decide what shape
+	// the capture takes (T, *T, @T).  Method lookup off origXt finds
+	// the NAMED type's OWN method set — a named-distinct type does NOT
+	// inherit its underlying's methods — so origXt must stay as-written.
+	var origXt @types.Type = xt
+
+	// Cross-package encapsulation (bug 211): if the base bottoms out at an
+	// opaque-export type owned by another package, its FIELDS are not visible
+	// here even though a co-compiled .bn filled the shared Type's layout.  The
+	// struct-field lookups below are gated on this; method lookup is not (a .bni
+	// may export methods on an opaque type), so `b.exportedMethod` still works
+	// while `b.privateField` is rejected.
+	var opaqueToConsumer bool = fieldBaseOpaqueToConsumer(c, origXt)
+
+	// Peel alias / readonly / named-distinct wrappers to the concrete
+	// base, tracking whether any readonly was crossed (object-const).
+	// A named-distinct type is field-transparent (`type H @Box; h.f`),
+	// so the named wrapper is peeled BEFORE the auto-deref below.
+	//
+	// pathConst signals that the access path was const.  Writing
+	// through a const access path is rejected at the assign site; we
+	// signal it by propagating const onto the returned field type so
+	// that `checkAssignStmt` observes outer-const on the LHS and rejects.
+	var pathConst bool
+	xt, pathConst = peelFieldAccessBase(xt)
+	if xt == nil {
+		return types.TypVoid()
+	}
+
+	// Auto-dereference a pointer base, peeling the pointee's own
+	// wrappers too — the pointee may itself be a named struct (and the
+	// pointee may be readonly, which makes the reached fields const).
+	var elem @types.Type = xt.PointerElem()
+	if elem != nil {
+		var ec bool
+		xt, ec = peelFieldAccessBase(elem)
+		if ec {
+			pathConst = true
+		}
+		if xt == nil {
+			return types.TypVoid()
+		}
+	}
+
+	// Struct field access — fields take precedence over methods of
+	// the same name (Go convention; pins the existing behavior).  Skipped when
+	// the base is opaque to this package (bug 211): the layout is visible only
+	// to the owning package, so an importer's field access falls through to
+	// method lookup and, failing that, the cross-package "cannot access field"
+	// rejection below.
+	if xt.Kind == types.TYP_STRUCT && !opaqueToConsumer {
+		var f @types.Field = xt.FieldByName(e.Name)
+		if f != nil {
+			if pathConst { return types.MakeReadonlyType(f.Type) }
+			return f.Type
+		}
+	}
+
+	// Method value:
+	// `x.M` where x is a value and M is a method on x's base type
+	// is a function value whose signature is the method's
+	// signature MINUS the receiver — the receiver is captured at
+	// the selector site.  origXt is the receiver type as written
+	// (T, *T, @T); IR-gen uses it to lay out the closure struct.
+	var recvNamed @types.Type = origXt.ReceiverBaseNamed()
+	if recvNamed != nil {
+		var m @types.Method = recvNamed.LookupMethod(e.Name)
+		if m != nil && m.FuncType != nil && len(m.FuncType.Params) >= 1 {
+			// Drop the receiver (Params[0]) to produce the user-
+			// visible function-value type.
+			var paramsNoRecv @[]@types.Param = make_slice(@types.Param, len(m.FuncType.Params) - 1)
+			for i := 1; i < len(m.FuncType.Params); i++ {
+				paramsNoRecv[i - 1] = m.FuncType.Params[i]
+			}
+			return types.MakeFuncValueType(paramsNoRecv, m.FuncType.Results)
+		}
+	}
+
+	// Neither field nor method matched.  Distinguish "struct without
+	// that field" (preserves the existing `undefined: <name>` message
+	// that conformance tests pin) from "not a field-bearing type."
+	// xt is the peeled base here, so a named-over-struct has already
+	// been reduced to TYP_STRUCT; an opaque named type (nil Underlying)
+	// reaches this point as the bare TYP_NAMED and falls to the generic
+	// rejection, preserving cross-package encapsulation.
+	if xt.Kind == types.TYP_STRUCT && !opaqueToConsumer {
+		errUndefined(c, e.Pos, e.Name)
+		return types.TypVoid()
+	}
+	addCheckError(c, e.Pos, "cannot access field on this type")
+	return types.TypVoid()
+}

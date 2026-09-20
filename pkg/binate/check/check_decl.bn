@@ -1,0 +1,482 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/mangle"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// Top-level declaration checking — driver pipeline (collect + check
+// passes) plus the simple decl kinds (var, const, type, group).
+// Function- and method-decl-specific machinery — `.bni` signature
+// matching, method-receiver collection, function-body checking, and
+// control-flow termination analysis — lives in check_decl_func.bn.
+
+// ============================================================
+// Declaration Collection (Pass 1)
+// ============================================================
+
+// checkDuplicateDecls reports errors for names declared more than once
+// in the same declaration list. This catches user errors like defining
+// two functions with the same name, but does NOT flag .bni→.bn matches
+// (those are in the scope from LoadPackageInterface, not in decls).
+//
+// Methods (DECL_FUNC with Recv != nil) are skipped here — they live in
+// per-type method sets and method-name duplicates are detected by
+// AddMethod when the method is registered.
+func checkDuplicateDecls(c @Checker, decls *[]@ast.Decl) {
+	for i := 0; i < len(decls); i++ {
+		var name @[]char = decls[i].Name
+		if len(name) == 0 { continue }
+		// The blank identifier binds no name, so multiple `var _ = ...` (or
+		// `func _`) are never a redeclaration.
+		if isBlank(name) { continue }
+		// Skip type decls (handled by preRegisterTypeNames)
+		if decls[i].Kind == ast.DECL_TYPE { continue }
+		// Skip groups (checked recursively)
+		if decls[i].Kind == ast.DECL_GROUP { continue }
+		// Skip methods (per-type method-set duplicate check is in AddMethod)
+		if decls[i].Kind == ast.DECL_FUNC && decls[i].Recv != nil { continue }
+		for j := 0; j < i; j++ {
+			if len(decls[j].Name) > 0 && types.CharEq(decls[j].Name, name) {
+				if decls[j].Kind == ast.DECL_TYPE { continue }
+				if decls[j].Kind == ast.DECL_GROUP { continue }
+				if decls[j].Kind == ast.DECL_FUNC && decls[j].Recv != nil { continue }
+				var cb @strings.Builder = strings.NewBuilder()
+				cb.Write(name)
+				cb.Write(" redeclared in this block")
+				addCheckError(c, decls[i].Pos, buf.CopyStr(cb.String()))
+				break
+			}
+		}
+	}
+}
+
+// checkReservedDeclNames rejects user declarations whose name is reserved
+// for compiler-synthesized symbols (see mangle.IsReservedIdentifier): a
+// `__`-prefixed name, or one carrying the `__bn_inst__` instantiation
+// marker.  Without this, such a name would mangle to the same linker
+// symbol as a compiler helper (`__entry`, a closure thunk, a generic
+// instantiation), a silent duplicate-symbol miscompilation.  Iterates one
+// decl level only (groups are reached via collectDeclsBody's recursion,
+// like checkDuplicateDecls).  Groups carry no name; impls have an empty
+// name — both are skipped by the length guard / kind skip.
+func checkReservedDeclNames(c @Checker, decls *[]@ast.Decl) {
+	for i := 0; i < len(decls); i++ {
+		var name @[]char = decls[i].Name
+		if len(name) == 0 { continue }
+		if decls[i].Kind == ast.DECL_GROUP { continue }
+		if mangle.IsReservedIdentifier(name) {
+			var cb @strings.Builder = strings.NewBuilder()
+			cb.Write(name)
+			cb.Write(": reserved identifier (names beginning with \"__\" or ")
+			cb.Write("containing \"__bn_inst__\" are reserved for the compiler)")
+			addCheckError(c, decls[i].Pos, buf.CopyStr(cb.String()))
+		}
+	}
+}
+
+// collectDecls runs pass 1: registers type names, resolves top-level
+// consts in dependency order, then collects func/var/const symbols.
+//
+// preRegisterTypeNames runs once here (it already recurses into groups, and
+// re-running it would double-append generic type decls).  Top-level consts
+// are then resolved in dependency order (batch path) so a forward reference
+// sees a const's real type and a struct field array dimension sees its
+// folded value regardless of source order — see resolveTopLevelConsts.  The
+// REPL path (TentativeMode) skips that sweep and keeps its park/retry
+// resolution; collectDeclsBody registers const placeholders for it instead.
+func collectDecls(c @Checker, decls *[]@ast.Decl) {
+	// Enforce the no-full-redeclaration rule on the source decl list before
+	// resolution (see check_type_redecl.bn).
+	checkTypeRedeclaration(c, decls)
+	preRegisterTypeNames(c, decls)
+	if !c.ReplDeclMode {
+		// A top-level const's declared type may be a named distinct
+		// scalar (`const C Rate = 0.5` over `type Rate float64`).
+		// resolveTopLevelConsts (next) needs that type's underlying to
+		// validate the const is scalar and the value assignable, but
+		// collectDeclsBody — which sets underlyings — runs after.  Fill
+		// in the underlyings that can't depend on a const (named types
+		// over a builtin scalar) here first.
+		resolveBuiltinScalarTypeDecls(c, decls)
+		resolveTopLevelConsts(c, decls)
+	}
+	// Defer generic-instantiation constraint checks across the batch collection so
+	// they see the package's COMPLETE impl set regardless of source order — a
+	// `func F() @Box[Item]` may precede `impl Item : Sizer` (see
+	// Checker.CollectingDecls).  The REPL keeps its inline/park behavior.
+	var savedCollecting bool = c.CollectingDecls
+	if !c.ReplDeclMode {
+		c.CollectingDecls = true
+	}
+	collectDeclsBody(c, decls)
+	c.CollectingDecls = savedCollecting
+	// Now that every generic-receiver method is attached to its placeholder,
+	// re-sync any generic-struct instantiation that was cached method-less
+	// because it was forced (by a var/field/param/receiver type) earlier in this
+	// pass, before its method decls were reached.  Runs before pass 2 (body
+	// check) so an intra-body `.Method()` call resolves.
+	backfillInstantiationMethods(c)
+	// Fire the constraint checks deferred above, now that collectDeclsBody has
+	// recorded every impl (order-independent — see recheckDeferredConstraints).
+	if !c.ReplDeclMode {
+		recheckDeferredConstraints(c)
+	}
+	if !c.ReplDeclMode {
+		// Record the dependency order of top-level var initializers so IR-gen
+		// emits them in an order where each initializer's package-var
+		// dependencies run first (rather than filename-then-source order).
+		// The REPL initializes one var at a time — no batch to order.
+		resolveTopLevelVarOrder(c, decls)
+	}
+}
+
+// checkValueEmbedding rejects an opaque type embedded BY VALUE in a struct
+// value field or a by-value function parameter / return.  It runs AFTER
+// collectDecls, when forward references are filled in place — so a TYP_NAMED
+// placeholder is now either concrete or a genuine opaque type.  Checking
+// these sites inline during collection would race forward-reference
+// resolution: a `type Whence int` used before its decl is a not-yet-resolved
+// placeholder (nil-Underlying TYP_NAMED), byte-identical to an opaque type.
+// Var decls are checked in pass 2 by checkVarDecl (also post-collection).
+//
+// Generic decls are skipped — a type-parameter field/param isn't opaque, and
+// re-resolving a generic signature here (its type-param scope is no longer
+// installed) would spuriously fail.  A concrete-opaque field in a generic decl
+// (`type Box[T any] struct { v Opaque }`) is still caught: it is reached when
+// the generic is INSTANTIATED and used by value (requireSizedType recurses the
+// instantiated struct via embedsOpaqueByValue), and a pointer to such an
+// instantiation is rejected too (pointeeEmbedsOpaque) — an unused generic is
+// benign.  Re-resolving each type expression is side-effect-free
+// (resolveTypeExpr reads the scope / builds throwaway Type values) and there
+// are no methods on generic types in the tree, so receiver/param resolution
+// needs no type-param scope.
+func checkValueEmbedding(c @Checker, decls *[]@ast.Decl) {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		// File-scoped imports: field/param/result types may be qualified, so
+		// resolve under this decl's file scope (see checkPackageImpl).
+		if fileScopedActive(c) {
+			c.Scope = scopeForFile(c, d.Pos.File)
+		}
+		if d.Kind == ast.DECL_GROUP {
+			checkValueEmbedding(c, d.Decls)
+			continue
+		}
+		if len(d.TypeParams) > 0 {
+			continue
+		}
+		// A method on a generic type binds the type's parameters; its param /
+		// result types reference those binders, which are not in scope here, so
+		// resolving them for the sizing check would spuriously report `undefined:
+		// T`. Its sizing is enforced per concrete instantiation, exactly as a
+		// generic function's is — skip it here.
+		if d.Kind == ast.DECL_FUNC && d.Recv != nil && receiverBaseInstantiation(d.Recv.Type) != nil {
+			continue
+		}
+		// Reject a type whose underlying STRUCT or ARRAY contains itself BY VALUE
+		// (`type C struct { self C }`, `type C [2]C`, or through a named-distinct
+		// wrapper `type C struct { d D }; type D C`).  Runs here (post-collection)
+		// rather than in collectTypeDecl so EVERY named type's underlying is filled —
+		// a wrapper cycle is then visible regardless of decl order.  Must precede the
+		// requireSizedType walk below (and IR-gen's size/destruction/ABI walks), which
+		// recurse through by-value fields/elements and would otherwise stack-overflow;
+		// checkTypeByValueCycle poisons the offending field/element so those walks
+		// terminate.  Runs for every type decl (an array/struct underlying may be
+		// reached only through a named-distinct wrapper decl).
+		if d.Kind == ast.DECL_TYPE {
+			var tsym @Symbol = c.Scope.Lookup(d.Name)
+			if tsym != nil {
+				checkTypeByValueCycle(c, tsym.Type, d)
+			}
+		}
+		if d.Kind == ast.DECL_TYPE && d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+			for j := 0; j < len(d.TypeRef.Fields); j++ {
+				requireSizedType(c, resolveTypeExpr(c, d.TypeRef.Fields[j].Type), d.Pos)
+			}
+		}
+		if d.Kind == ast.DECL_FUNC {
+			for j := 0; j < len(d.Params); j++ {
+				requireSizedType(c, resolveTypeExpr(c, d.Params[j].Type), d.Pos)
+			}
+			for j := 0; j < len(d.Results); j++ {
+				requireSizedType(c, resolveTypeExpr(c, d.Results[j]), d.Pos)
+			}
+		}
+	}
+}
+
+// isConcreteScalar reports whether t is a builtin scalar Type object
+// (a real, stable int / float / bool — not a named wrapper, alias, or
+// placeholder).  Used by resolveBuiltinScalarTypeDecls to restrict its
+// eager underlying-fill to targets that are already fully resolved and
+// will never be replaced by a later collection pass.
+func isConcreteScalar(t @types.Type) bool {
+	if t == nil {
+		return false
+	}
+	return t.Kind == types.TYP_INT || t.Kind == types.TYP_FLOAT || t.Kind == types.TYP_BOOL
+}
+
+// resolveBuiltinScalarTypeDecls fills the underlying of each distinct
+// named type whose body is a bare builtin scalar name (`type Celsius
+// int`, `type Rate float64`), BEFORE top-level consts are resolved, so
+// a const of such a type sees its underlying.  Restricted to builtin
+// scalar targets: those resolve to a stable concrete type (never a
+// not-yet-collected placeholder that a later pass would replace, which
+// would leave a stale reference), and they never embed a const-dependent
+// array dimension.  Mutates the placeholder created by preRegisterType-
+// Names in place, so collectDeclsBody's later collectTypeDecl sees the
+// underlying already set and treats it as a benign re-declaration.
+// Aliases, structs, arrays, generics, forward decls, and named-over-
+// named/-alias/-qualified types are left for collectDeclsBody.
+func resolveBuiltinScalarTypeDecls(c @Checker, decls *[]@ast.Decl) {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d.Kind == ast.DECL_TYPE && len(d.TypeParams) == 0 && !d.IsForward && !d.IsAlias &&
+				d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_NAMED && len(d.TypeRef.Pkg) == 0 {
+			var sym @Symbol = c.Scope.Lookup(d.Name)
+			if sym != nil && sym.Type != nil && sym.Type.Kind == types.TYP_NAMED &&
+					sym.Type.Underlying == nil {
+				var u @Symbol = c.Scope.Lookup(d.TypeRef.Name)
+				if u != nil && u.Kind == types.SYM_TYPE && isConcreteScalar(u.Type) {
+					sym.Type.Underlying = u.Type
+				}
+			}
+		}
+		if d.Kind == ast.DECL_GROUP {
+			resolveBuiltinScalarTypeDecls(c, d.Decls)
+		}
+	}
+}
+
+// collectDeclsBody is the per-level collection loop (also the target of the
+// grouped-decl recursion).  Const names are forward-registered here only on
+// the REPL path; on the batch path resolveTopLevelConsts (run once in
+// collectDecls) already recorded their real types.
+func collectDeclsBody(c @Checker, decls *[]@ast.Decl) {
+	// Check for duplicate declarations.  In the multi-file CheckPackage path
+	// `decls` is the whole merged list, so this catches cross-file
+	// duplicates (it ran package-wide before file-scoping too).
+	checkDuplicateDecls(c, decls)
+	checkReservedDeclNames(c, decls)
+
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		// File-scoped imports: resolve this decl's qualifiers against only
+		// its own file's imports.  Package symbols still land in
+		// c.PackageScope (the file scope delegates defines upward).
+		if fileScopedActive(c) {
+			c.Scope = scopeForFile(c, d.Pos.File)
+		}
+		if d.Kind == ast.DECL_FUNC {
+			if d.Recv != nil {
+				collectMethodDecl(c, d)
+			} else {
+				var ft @types.Type = resolveFuncDeclType(c, d)
+				// Check .bni → .bn signature match: if the function was already
+				// declared (from .bni), verify the .bn definition matches.
+				checkBniSignatureMatch(c, d, ft)
+				defineFunc(c.Scope, d.Name, ft)
+			}
+		}
+		if d.Kind == ast.DECL_TYPE {
+			collectTypeDecl(c, d)
+		}
+		if d.Kind == ast.DECL_VAR {
+			// A blank var binds no name; don't enter `_` into scope (its
+			// initializer is still checked/run for side effects — see
+			// checkVarDecl / buildInitBody).
+			if d.TypeRef != nil && !isBlank(d.Name) {
+				var typ @types.Type = resolveTypeExpr(c, d.TypeRef)
+				capturePendingIfSized(c, typ)
+				// If a `.bni` declared this var (extern), verify the `.bn`
+				// definition's type agrees — an importer reads the type
+				// from the `.bni`, so a mismatch would misread the storage.
+				checkBniVarMatch(c, d, typ)
+				defineVar(c.Scope, d.Name, typ)
+			}
+		}
+		if d.Kind == ast.DECL_CONST && d.Value != nil {
+			if c.ReplDeclMode {
+				registerOneConstPlaceholder(c, d)
+			}
+		}
+		if d.Kind == ast.DECL_GROUP {
+			if c.ReplDeclMode {
+				for j := 0; j < len(d.Decls); j++ {
+					if d.Decls[j].Kind == ast.DECL_CONST {
+						registerGroupConstPlaceholder(c, d.Decls[j])
+					}
+				}
+			}
+			collectDeclsBody(c, d.Decls)
+		}
+		if d.Kind == ast.DECL_INTERFACE {
+			collectInterfaceDecl(c, d)
+		}
+		if d.Kind == ast.DECL_IMPL {
+			collectImplDecl(c, d)
+		}
+	}
+}
+
+// preRegisterTypeNames creates placeholder named types for all type
+// declarations (enables forward refs).  Generic struct decls
+// (DECL_TYPE with non-empty TypeParams) register a placeholder
+// alongside their AST entry in c.GenericTypeDecls so use sites
+// can find the source decl when instantiating.
+func preRegisterTypeNames(c @Checker, decls *[]@ast.Decl) {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d.Kind == ast.DECL_TYPE {
+			if c.Scope.Lookup(d.Name) == nil {
+				var placeholder @types.Type = types.MakeNamedType(d.Name)
+				defineType(c.Scope, d.Name, placeholder)
+			}
+			if len(d.TypeParams) > 0 {
+				c.GenericTypeDecls = slices.Append[@ast.Decl](
+						c.GenericTypeDecls, d)
+				// Key on the FULL package path (matching bni_scope's stash),
+				// so same-final-segment packages' generic structs stay
+				// distinct; same-package unqualified lookups go through
+				// lookupGenericTypeDeclPkg's curPkgPath fallback.
+				c.GenericTypeDeclPkgs = slices.Append[@[]char](
+						c.GenericTypeDeclPkgs, buf.CopyStr(c.curPkgPath))
+				// Record this generic's defining-file import scope so its
+				// body's qualified field types resolve against THIS file's
+				// imports at the instantiation site (see populateInstantiated*).
+				c.GenericTypeDeclScopes = slices.Append[@Scope](
+						c.GenericTypeDeclScopes, scopeForFile(c, d.Pos.File))
+			}
+		}
+		if d.Kind == ast.DECL_GROUP {
+			preRegisterTypeNames(c, d.Decls)
+		}
+	}
+}
+
+// ============================================================
+// Declaration Checking (Pass 2)
+// ============================================================
+
+// checkDecls runs pass 2: type-checks function bodies, variable initializers, and const values.
+func checkDecls(c @Checker, decls *[]@ast.Decl) {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		// File-scoped imports (see collectDeclsBody): check each decl's body
+		// under its own file's import scope.
+		if fileScopedActive(c) {
+			c.Scope = scopeForFile(c, d.Pos.File)
+		}
+		if d.Kind == ast.DECL_FUNC {
+			checkFuncDecl(c, d)
+		}
+		if d.Kind == ast.DECL_VAR {
+			checkVarDecl(c, d)
+		}
+		if d.Kind == ast.DECL_CONST {
+			// Batch path: top-level consts with a value were already
+			// resolved in dependency order during pass 1
+			// (resolveTopLevelConsts); re-checking here would double any
+			// error.  A value-less const (`const X` with no initializer,
+			// not an iota member) is NOT swept, so it must still be checked
+			// here to report the missing value.  The REPL path
+			// (TentativeMode) resolves all consts here.
+			if c.TentativeMode || d.Value == nil {
+				checkConstDecl(c, d)
+			}
+		}
+		if d.Kind == ast.DECL_GROUP {
+			checkGroupDecl(c, d)
+		}
+	}
+}
+
+// checkVarDecl type-checks a variable declaration, validating initializer assignability.
+// Blank-identifier declarations (`var _ T = expr` / `var _ = expr`) check the
+// initializer for side effects but do NOT enter any name into scope.
+func checkVarDecl(c @Checker, d @ast.Decl) {
+	if isBlank(d.Name) {
+		if d.TypeRef != nil && d.Value != nil {
+			var declType @types.Type = resolveTypeExpr(c, d.TypeRef)
+			capturePendingIfSized(c, declType)
+			var valType @types.Type
+			var okInit bool
+			valType, okInit = checkBorrowingArg(c, d.Value, declType)
+			if !okInit {
+				errCannotAssign(c, d.Value.Pos, valType, declType)
+			}
+		} else if d.Value != nil {
+			checkExpr(c, d.Value)
+		}
+		return
+	}
+	if d.TypeRef != nil && d.Value != nil {
+		var declType @types.Type = resolveTypeExpr(c, d.TypeRef)
+		capturePendingIfSized(c, declType)
+		requireSizedType(c, declType, d.Pos)
+		// B.3b: when the destination is a function-value type,
+		// pass it down as a hint so checkFuncLit can resolve a
+		// matching literal as @func / *func per the destination
+		// rather than always returning the raw form.
+		var valType @types.Type
+		var okInit bool
+		valType, okInit = checkBorrowingArg(c, d.Value, declType)
+		if !okInit && !stringLitInitFitsArray(d.Value, valType, declType) {
+			errCannotAssign(c, d.Value.Pos, valType, declType)
+		}
+		defineVar(c.Scope, d.Name, declType)
+	} else if d.TypeRef != nil {
+		var declType @types.Type = resolveTypeExpr(c, d.TypeRef)
+		capturePendingIfSized(c, declType)
+		// A value-typed variable needs the type's layout; reject opaque.
+		// checkVarDecl runs in pass 2 (post-collection), so a forward ref
+		// is resolved here — no race (`var p *Opaque` / `@Opaque` are fine).
+		requireSizedType(c, declType, d.Pos)
+		defineVar(c.Scope, d.Name, declType)
+	} else if d.Value != nil {
+		var rawType @types.Type = checkExpr(c, d.Value)
+		var valType @types.Type = defaultType(rawType)
+		// Fit-check an untyped-int literal against its default type, mirroring
+		// the explicit `var x T = e` path — `var x = 0xFFFFFFFFFFFFFFFF` must be
+		// rejected, not silently wrapped to int -1 (const.default.int-width).
+		checkDefaultIntFits(c, d.Value.Pos, rawType, valType)
+		// An inferred var binds a value of valType; reject inferring an opaque
+		// (or opaque-embedding) value the composite-literal gate doesn't see —
+		// e.g. `var x = *opaquePtr` (deref load) or `var x = genRetOpaque()`.
+		// Pass 2, so no forward-ref race.
+		requireSizedType(c, valType, d.Pos)
+		defineVar(c.Scope, d.Name, valType)
+	}
+}
+
+// checkBniVarMatch verifies a `.bn` `var X T` definition agrees with a
+// `.bni` `var X T2` extern declaration: the types must be identical, or
+// an importer — which reads X's type from the `.bni` — would misread the
+// `.bn`-defined storage.  Mirrors checkBniSignatureMatch for funcs; the
+// `.bni` symbol was pre-loaded into the package scope (CheckPackage),
+// so a SYM_VAR already in scope under this name came from the `.bni`.
+func checkBniVarMatch(c @Checker, d @ast.Decl, bnType @types.Type) {
+	if c.AllowRedef { return }
+	// The `.bni` symbol lives in the package scope; under file-scoped imports
+	// c.Scope is the current decl's file scope, so look in the package scope
+	// (pkgScopeLookupLocal falls back to c.Scope on the single-file/REPL path).
+	var existing @Symbol = pkgScopeLookupLocal(c, d.Name)
+	if existing == nil { return }
+	if existing.Kind != types.SYM_VAR { return }
+	var bniType @types.Type = existing.Type
+	if bniType == nil || bnType == nil { return }
+	if !bniType.Identical(bnType) {
+		var cb @strings.Builder = strings.NewBuilder()
+		cb.Write(d.Name)
+		cb.Write(": .bn defines var of type ")
+		cb.Write(bnType.TypeName())
+		cb.Write(" but .bni declares ")
+		cb.Write(bniType.TypeName())
+		addCheckError(c, d.Pos, buf.CopyStr(cb.String()))
+	}
+}

@@ -1,0 +1,315 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// Enforcement of the no-full-redeclaration rule: a
+// type may be declared full at most once per package.  Kept separate from
+// the resolution machinery in check_decl.bn precisely because it must NOT
+// participate in that machinery's multi-pass re-processing of the same
+// decl — it counts source declarations instead.  Invoked from collectDecls
+// (check_decl.bn) before pass-1 collection.
+
+// checkTypeRedeclaration enforces that a type is declared FULL at most
+// once per package.  The legal shapes for a type name are: full in the
+// .bni only (transparent), a forward decl (`type T`) in the .bni plus a
+// full decl in one .bn (opaque), or a full decl in one .bn with no .bni
+// (package-private).  A full decl in both the .bni and a .bn, or two full
+// decls across the .bn files, is rejected.
+//
+// It counts source DECL_TYPE objects (one per `type T` in the source), so
+// — unlike collectTypeDecl — it is not fooled by the resolution machinery
+// re-processing the same decl (the loader's .bni merge-prepend re-seen by
+// collectTypeDecl, or resolveBuiltinScalarTypeDecls pre-filling a distinct-
+// scalar placeholder).  Forward decls are not "full" and never count.
+// Generic type decls ARE covered — counting decl objects works the same
+// for them (a transparent generic appears once in the merged list; a
+// full-in-both appears twice), so a generic redeclaration is rejected just
+// like a non-generic one (conformance/794).  FromBNI (set by the loader)
+// is used only to phrase the diagnostic and point at the .bn decl, which
+// is the one to remove.
+func checkTypeRedeclaration(c @Checker, decls *[]@ast.Decl) {
+	checkTypeRedeclFrom(c, decls, false)
+}
+
+// checkTypeRedeclFrom is the recursive worker for checkTypeRedeclaration.
+// groupFromBni carries the FromBNI origin of an enclosing `type (...)`
+// group down to its members, which the loader tags only at the top level.
+func checkTypeRedeclFrom(c @Checker, decls *[]@ast.Decl, groupFromBni bool) {
+	for i := 0; i < len(decls); i++ {
+		var di @ast.Decl = decls[i]
+		if di.Kind == ast.DECL_GROUP {
+			checkTypeRedeclFrom(c, di.Decls, groupFromBni || di.FromBNI)
+			continue
+		}
+		if !isFullTypeDecl(di) {
+			continue
+		}
+		var iBni bool = di.FromBNI || groupFromBni
+		for j := 0; j < i; j++ {
+			var dj @ast.Decl = decls[j]
+			if !isFullTypeDecl(dj) {
+				continue
+			}
+			if !types.CharEq(dj.Name, di.Name) {
+				continue
+			}
+			// di and dj are both full decls of the same name: a redecl.
+			// Point at the .bn decl (the one to remove); at most one of a
+			// .bni/.bn pair carries FromBNI.
+			var jBni bool = dj.FromBNI || groupFromBni
+			var at @ast.Decl = di
+			if iBni && !jBni {
+				at = dj
+			}
+			addCheckError(c, at.Pos, redeclTypeMsg(di.Name, iBni != jBni))
+			break
+		}
+	}
+}
+
+// isFullTypeDecl reports whether d fully defines a type (struct, alias,
+// distinct, or generic) — as opposed to a forward decl (`type T`), which
+// declares only a name and does not count as a "full" declaration for the
+// no-redeclaration rule.
+func isFullTypeDecl(d @ast.Decl) bool {
+	return d.Kind == ast.DECL_TYPE && !d.IsForward
+}
+
+// redeclTypeMsg phrases the redeclaration error.  bniAndBn distinguishes
+// the full-in-both case (one decl from the .bni, one from a .bn) from a
+// plain .bn-side duplicate, pointing the user at the right fix.
+func redeclTypeMsg(name @[]char, bniAndBn bool) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("duplicate type definition: ")
+	cb.Write(name)
+	if bniAndBn {
+		cb.Write(
+				" (declared in full in both the .bni and a .bn; define in"
+						" .bni OR .bn, not both; use `type ")
+		cb.Write(name)
+		cb.Write("` forward-decl in the .bni for opaque export)")
+	} else {
+		cb.Write(" (a type may be declared in full only once per package)")
+	}
+	return buf.CopyStr(cb.String())
+}
+
+// Type-declaration collection: resolving a `type` decl (alias / struct /
+// named-distinct) into a Type and defining it, plus the cyclic-underlying
+// guard.  Split out of check_decl.bn to keep it under the file-length limit.
+
+// collectTypeDecl resolves a type declaration (alias, struct, or named) and defines it in scope.
+// Generic decls are skipped — their struct bodies stay AST-form
+// in c.GenericTypeDecls until an instantiation site resolves them
+// with the type-param scope installed (Slice 5b).
+// namedTypeDefIsCyclic reports whether following `start`'s named-distinct
+// Underlying chain loops back to `start` (`type A B; type B A`) or to itself
+// (`type A A`).  Such a type has no well-defined underlying; the definition is
+// rejected and the cycle broken at the call site, so the operand-comparability
+// walks (comparabilityKind / IsInteger / …) can't hang `==` / stack-overflow
+// `<` on a parseable-but-malformed input.  The depth bound is a backstop for
+// any cycle not passing through `start`.
+func namedTypeDefIsCyclic(start @types.Type) bool {
+	if start == nil || start.Underlying == nil {
+		return false
+	}
+	var t @types.Type = types.ResolveAliasAndConst(start.Underlying)
+	var depth int = 0
+	for t != nil && t.Kind == types.TYP_NAMED && t.Underlying != nil {
+		if charSliceEq(t.Name, start.Name) {
+			return true
+		}
+		if depth >= 1024 {
+			return true
+		}
+		t = types.ResolveAliasAndConst(t.Underlying)
+		depth = depth + 1
+	}
+	return false
+}
+
+// collectTypeDecl registers a top-level type declaration in the current
+// scope during pass-1 collection, so later declarations and forward
+// references resolve by name.  Generic decls (with type params) are
+// skipped here — they're instantiated on demand; a forward decl registers
+// a bodyless TYP_NAMED placeholder; an alias registers a TYP_ALIAS; a
+// struct / named-distinct decl registers its underlying (or fills a
+// previously-registered forward placeholder's).
+func collectTypeDecl(c @Checker, d @ast.Decl) {
+	if len(d.TypeParams) > 0 {
+		return
+	}
+	if d.IsForward {
+		// Forward declaration: register as TYP_NAMED with no
+		// Underlying.  The .bn impl's `type S struct { ... }` (if
+		// present) fills in the body via the same path used for
+		// generic-decl placeholders (the TYP_NAMED-with-nil-
+		// Underlying branch below).  Idempotent — a second forward
+		// decl of the same name is a no-op.
+		var sym @Symbol = c.Scope.Lookup(d.Name)
+		if sym != nil {
+			return
+		}
+		var named @types.Type = types.MakeNamedType(d.Name)
+		defineType(c.Scope, d.Name, named)
+		return
+	}
+	if d.IsAlias {
+		var target @types.Type = resolveTypeExpr(c, d.TypeRef)
+		capturePendingIfSized(c, target)
+		var alias @types.Type = types.MakeAliasType(d.Name, target)
+		defineType(c.Scope, d.Name, alias)
+	} else if d.TypeRef != nil && d.TypeRef.Kind == ast.TEXPR_STRUCT {
+		var st @types.Type = resolveStructType(c, d.TypeRef)
+		st.Name = types.QualifyName(c.curPkgPath, d.Name)
+		var sym @Symbol = c.Scope.Lookup(d.Name)
+		// An existing same-name type means this decl either fills a
+		// forward placeholder (Underlying == nil — the legal opaque
+		// path) or re-declares an already-defined type.  A genuine
+		// redeclaration is diagnosed by the dedicated checkTypeRedeclar-
+		// ation pass (which counts source decls, so it isn't fooled by
+		// the loader's .bni merge-prepend or resolveBuiltinScalarType-
+		// Decls re-seeing the same decl); collectTypeDecl stays silent
+		// here rather than emit a second diagnostic.
+		if sym != nil && sym.Type.Kind == types.TYP_NAMED {
+			if sym.Type.Underlying == nil {
+				sym.Type.Underlying = st
+			}
+			return
+		}
+		if sym != nil && sym.Type.Kind == types.TYP_STRUCT {
+			return
+		}
+		defineType(c.Scope, d.Name, st)
+	} else {
+		var underlying @types.Type = resolveTypeExpr(c, d.TypeRef)
+		capturePendingIfSized(c, underlying)
+		var sym @Symbol = c.Scope.Lookup(d.Name)
+		// As in the struct branch: fill a forward placeholder if present,
+		// otherwise stay silent and let checkTypeRedeclaration diagnose a
+		// genuine redeclaration.
+		if sym != nil && sym.Type.Kind == types.TYP_NAMED {
+			// Stamp the defining package for cross-package identity (a struct
+			// carries this in its qualified underlying Name; a non-struct
+			// scalar/etc. wrapper carries it here — see namedIdentityName).
+			sym.Type.Pkg = buf.CopyStr(c.curPkgPath)
+			if sym.Type.Underlying == nil {
+				sym.Type.Underlying = underlying
+				if namedTypeDefIsCyclic(sym.Type) {
+					errCyclicType(c, d.Pos, d.Name)
+					sym.Type.Underlying = nil
+				}
+			}
+			return
+		}
+		var named @types.Type = types.MakeNamedType(d.Name)
+		named.Pkg = buf.CopyStr(c.curPkgPath)
+		named.Underlying = underlying
+		if namedTypeDefIsCyclic(named) {
+			errCyclicType(c, d.Pos, d.Name)
+			named.Underlying = nil
+		}
+		defineType(c.Scope, d.Name, named)
+	}
+}
+
+// charSliceEq compares two @[]char by length + byte content.  Local
+// because the obvious helpers live in other packages; used by
+// namedTypeDefIsCyclic to walk a named-distinct underlying chain.
+func charSliceEq(a *[]readonly char, b *[]readonly char) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] { return false }
+	}
+	return true
+}
+
+// typeReachesNamedByValue reports whether t transitively reaches the named type
+// `target` BY VALUE — through struct fields, array elements, and named→underlying
+// links, STOPPING at a pointer / slice / managed wrapper.  A reference to `target`
+// behind `@target` / `*target` is legal (a recursive type such as a linked-list
+// node) and is NOT a by-value reach.  `visited` prevents an unbounded walk if the
+// type graph holds another by-value cycle not through `target`.
+func typeReachesNamedByValue(t @types.Type, target @types.Type, visited @[]@types.Type) bool {
+	if t == nil {
+		return false
+	}
+	if t.Kind == types.TYP_ALIAS {
+		return typeReachesNamedByValue(t.Target, target, visited)
+	}
+	if t.Kind == types.TYP_READONLY {
+		return typeReachesNamedByValue(t.Elem, target, visited)
+	}
+	if t.Kind == types.TYP_NAMED {
+		if same(t, target) {
+			return true
+		}
+		for k := 0; k < len(visited); k++ {
+			if same(visited[k], t) {
+				return false
+			}
+		}
+		if t.Underlying == nil {
+			return false
+		}
+		return typeReachesNamedByValue(t.Underlying, target, slices.Append[@types.Type](visited, t))
+	}
+	if t.Kind == types.TYP_STRUCT {
+		for i := 0; i < len(t.Fields); i++ {
+			if typeReachesNamedByValue(t.Fields[i].Type, target, visited) {
+				return true
+			}
+		}
+		return false
+	}
+	if t.Kind == types.TYP_ARRAY {
+		return typeReachesNamedByValue(t.Elem, target, visited)
+	}
+	return false
+}
+
+// checkTypeByValueCycle rejects a named type whose underlying STRUCT or ARRAY
+// contains ITSELF by value — a cycle with no finite layout (`type C struct { self C }`,
+// `type C struct { items [2]C }`, `type C [2]C`, or through a named-distinct wrapper
+// `type C struct { d D }; type D C`) — which would otherwise infinite-loop the size /
+// destruction / ABI walks that recurse through by-value fields/elements (a SIGSEGV
+// at compile time, or a bogus finite `sizeof`).  Reports a clean error and POISONS
+// the offending field / element to void, breaking the cycle so those walks
+// terminate.  A cycle through a pointer (`@C` / `*C`) is a valid recursive type and
+// is left untouched.  Runs post-collection (checkValueEmbedding), so every named
+// underlying is filled and the check is decl-order-independent.
+func checkTypeByValueCycle(c @Checker, named @types.Type, d @ast.Decl) {
+	if named == nil {
+		return
+	}
+	var st @types.Type = named.Underlying
+	if st == nil {
+		return
+	}
+	if st.Kind == types.TYP_STRUCT {
+		for i := 0; i < len(st.Fields); i++ {
+			var visited @[]@types.Type
+			if typeReachesNamedByValue(st.Fields[i].Type, named, visited) {
+				addCheckError(c, d.Pos,
+						"recursive type: a type cannot contain itself by value "
+								"(hold the recursive field via a pointer -- *T or @T)")
+				st.Fields[i].Type = types.TypVoid()
+			}
+		}
+		return
+	}
+	if st.Kind == types.TYP_ARRAY {
+		var visited @[]@types.Type
+		if typeReachesNamedByValue(st.Elem, named, visited) {
+			addCheckError(c, d.Pos,
+					"recursive type: a type cannot contain itself by value "
+							"(hold the recursive element via a pointer -- *T or @T)")
+			st.Elem = types.TypVoid()
+		}
+	}
+}

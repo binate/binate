@@ -3,7 +3,7 @@
 #
 # Checks non-test source files for excessive length.
 #   .bn  (implementation): 500 lines.
-#   .bni (interface):      1231 lines.  A package's whole API lives in one
+#   .bni (interface):      1214 lines.  A package's whole API lives in one
 #        interface file — the loader loads a single <pkg>.bni, so unlike an
 #        impl's .bn files a .bni cannot be split within its package.  The cap is
 #        therefore set to the current largest .bni (pkg/binate/ir.bni) as a
@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 BN_LIMIT=500
-BNI_LIMIT=1231
+BNI_LIMIT=1214
 
 errors=0
 

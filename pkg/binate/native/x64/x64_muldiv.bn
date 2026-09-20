@@ -1,0 +1,248 @@
+package "pkg/binate/native/x64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Constant multiply/divide/modulo strength reduction for the x64 backend.  When
+// the second operand of an OP_MUL / OP_DIV / OP_REM is a compile-time constant,
+// emit a Granlund-Montgomery magic-number multiply (one-operand IMUL/MUL →
+// RDX:RAX, RDX = the multiply-high) plus shifts, a power-of-two shift, or a bare
+// move/neg — instead of a hardware IDIV/DIV.  Mirrors native/aarch64; the
+// magic-constant math is the shared common.ComputeMagic* helper.
+//
+// x64 works at 64 bits: operands are kept sign/zero-extended to the host word,
+// so a 64-bit magic divide of the extended value equals the true (possibly
+// sub-word) divide, and the caller re-narrows the result.
+//
+// Register discipline: the one-operand IMUL/MUL clobber RDX:RAX.  scratchReg
+// never returns RAX (not in the pool).  The ONLY value that must survive the
+// multiply is `mreg` (the multiplier the multiply reads); it is the 1st or 2nd
+// scratch allocated (after at most one preceding `lhs` reload) so it is always
+// R10/R11 — never RAX/RDX.  `treg`, `qres`, and `dreg` may land on RDX (the REM
+// path allocates four scratches, reaching pool slot 3), but that is benign:
+// every one of them is written only AFTER the multiply (treg/qres) or is read by
+// Imul2, which does not touch RDX:RAX (dreg) — none is live ACROSS the RDX:RAX
+// clobber.  `lhs` is a home reg or an R10 reload, never RAX/RDX, so it is
+// readable after the multiply for the AddN/SubN correction and the REM
+// `n - q*c`.
+
+const xWordW int = 64
+
+// constDivisorX64 returns (value, true) when ins's second operand is a
+// compile-time integer constant.
+func constDivisorX64(ins @ir.Instr) (int64, bool) {
+	if len(ins.Args) != 2 {
+		return cast(int64, 0), false
+	}
+	var b @ir.Instr = ins.Args[1]
+	if b == nil || b.Op != iropcode.OP_CONST_INT {
+		return cast(int64, 0), false
+	}
+	return b.IntVal, true
+}
+
+// pow2LogX64 returns k when v == 2^k for k in [1, 63], else -1.
+func pow2LogX64(v uint64) int {
+	if v == cast(uint64, 0) || (v & (v - cast(uint64, 1))) != cast(uint64, 0) {
+		return -1
+	}
+	var k int = 0
+	var x uint64 = v
+	for x > cast(uint64, 1) {
+		x = x >> cast(uint64, 1)
+		k = k + 1
+	}
+	return k
+}
+
+// absU64X64 returns |c| as a uint64.
+func absU64X64(c int64) uint64 {
+	if c < cast(int64, 0) {
+		return cast(uint64, 0) - cast(uint64, c)
+	}
+	return cast(uint64, c)
+}
+
+// r64 is shorthand for a 64-bit register operand.
+func r64(reg int) x64.Operand {
+	return x64.Reg(reg, x64.SZ64)
+}
+
+// emitConstMulX64 strength-reduces `rd * c` in place (rd already holds the
+// multiplicand): 0 -> zero, 1 -> unchanged, -1 -> neg, ±2^k -> shift (+ neg).
+// Returns true when handled; false to fall through to the register IMUL.
+func emitConstMulX64(a @asm.Assembler, rd int, c int64) bool {
+	if c == cast(int64, 0) {
+		x64.Mov(a, r64(rd), x64.Imm(0))
+		return true
+	}
+	if c == cast(int64, 1) {
+		return true
+	}
+	if c == cast(int64, -1) {
+		x64.Neg(a, r64(rd))
+		return true
+	}
+	var k int = pow2LogX64(absU64X64(c))
+	if k >= 1 {
+		x64.Shl(a, r64(rd), x64.Imm(k))
+		if c < cast(int64, 0) {
+			x64.Neg(a, r64(rd))
+		}
+		return true
+	}
+	return false
+}
+
+// emitConstDivRemX64 lowers OP_DIV / OP_REM by the nonzero constant `c`.
+// Handles operand fetch, result allocation, and sub-word narrowing.
+func emitConstDivRemX64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, c int64) bool {
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	if lhs < 0 {
+		return false
+	}
+	var uTyp @types.Type = types.StripWrappers(ins.Typ)
+	var isUnsigned bool = uTyp != nil && uTyp.IsInteger() && !uTyp.Signed
+	var isRem bool = ins.Op == iropcode.OP_REM
+
+	// n / (±1) and n % (±1).
+	if c == cast(int64, 1) || (!isUnsigned && c == cast(int64, -1)) {
+		var rd int = nextReg(rm, ins.ID)
+		if isRem {
+			x64.Mov(a, r64(rd), x64.Imm(0))
+		} else if c == cast(int64, 1) {
+			x64.Mov(a, r64(rd), r64(lhs))
+		} else {
+			x64.Mov(a, r64(rd), r64(lhs))
+			x64.Neg(a, r64(rd))
+		}
+		emitSubWordNarrow(a, rd, ins.Typ)
+		return true
+	}
+
+	// Unsigned n % 2^k is a low-bit mask (cheaper than quotient + n-q*d).
+	if isRem && isUnsigned {
+		var k int = pow2LogX64(cast(uint64, c))
+		if k >= 1 {
+			var rd int = nextReg(rm, ins.ID)
+			x64.Mov(a, r64(rd), r64(lhs))
+			x64.Shl(a, r64(rd), x64.Imm(xWordW - k))
+			x64.Shr(a, r64(rd), x64.Imm(xWordW - k))
+			emitSubWordNarrow(a, rd, ins.Typ)
+			return true
+		}
+	}
+
+	// Compute the quotient into a scratch, then finalize.
+	var qres int = computeConstQuotientX64(a, rm, lhs, c, isUnsigned)
+	if !isRem {
+		var rd int = nextReg(rm, ins.ID)
+		if rd != qres {
+			x64.Mov(a, r64(rd), r64(qres))
+		}
+		emitSubWordNarrow(a, rd, ins.Typ)
+		return true
+	}
+	// r = lhs - qres*c
+	var dreg int = scratchReg(rm)
+	emitConstInt64(a, dreg, c)
+	x64.Imul2(a, r64(qres), r64(dreg)) // qres = q*c (low 64)
+	var rd int = nextReg(rm, ins.ID)
+	x64.Mov(a, r64(rd), r64(lhs))
+	x64.Sub(a, r64(rd), r64(qres))
+	emitSubWordNarrow(a, rd, ins.Typ)
+	return true
+}
+
+// computeConstQuotientX64 emits `lhs / c` (c not 0, not ±1) into a fresh scratch
+// register and returns it.  Power-of-two divisors use shifts; others use the
+// magic-number multiply through RDX:RAX.
+func computeConstQuotientX64(a @asm.Assembler, rm @common.RegMap, lhs int, c int64,
+		isUnsigned bool) int {
+	var ad uint64 = absU64X64(c)
+	var k int = pow2LogX64(ad)
+	if k >= 1 {
+		return computeConstPow2QuotientX64(a, rm, lhs, c, k, isUnsigned)
+	}
+	return computeConstMagicQuotientX64(a, rm, lhs, c, isUnsigned)
+}
+
+// computeConstPow2QuotientX64 handles ±2^k.
+func computeConstPow2QuotientX64(a @asm.Assembler, rm @common.RegMap, lhs int, c int64, k int,
+		isUnsigned bool) int {
+	var qres int = scratchReg(rm)
+	if isUnsigned {
+		x64.Mov(a, r64(qres), r64(lhs))
+		x64.Shr(a, r64(qres), x64.Imm(k))
+		return qres
+	}
+	// Signed: bias by (2^k - 1) when the dividend is negative, then arithmetic
+	// shift; negate for a negative divisor.
+	x64.Mov(a, r64(qres), r64(lhs))
+	if k == 1 {
+		x64.Shr(a, r64(qres), x64.Imm(xWordW - 1)) // sign bit
+	} else {
+		x64.Sar(a, r64(qres), x64.Imm(k - 1))
+		x64.Shr(a, r64(qres), x64.Imm(xWordW - k))
+	}
+	x64.Add(a, r64(qres), r64(lhs))
+	x64.Sar(a, r64(qres), x64.Imm(k))
+	if c < cast(int64, 0) {
+		x64.Neg(a, r64(qres))
+	}
+	return qres
+}
+
+// computeConstMagicQuotientX64 emits the magic-number multiply for a non-power-
+// of-two |c| >= 2, returning the scratch holding the quotient.
+func computeConstMagicQuotientX64(a @asm.Assembler, rm @common.RegMap, lhs int, c int64,
+		isUnsigned bool) int {
+	var mreg int = scratchReg(rm)
+	var treg int = scratchReg(rm)
+	var qres int = scratchReg(rm)
+	x64.Mov(a, r64(x64.RAX), r64(lhs))
+	if isUnsigned {
+		var mg common.MagicUnsigned = common.ComputeMagicUnsigned(cast(uint64, c), xWordW)
+		emitConstInt64(a, mreg, cast(int64, mg.M))
+		x64.Mul1(a, r64(mreg)) // RDX = high(unsigned RAX * M)
+		if !mg.Add {
+			if mg.Shift > 0 {
+				x64.Shr(a, r64(x64.RDX), x64.Imm(mg.Shift))
+			}
+			x64.Mov(a, r64(qres), r64(x64.RDX))
+		} else {
+			// t = (n - q) >> 1 ; q = (t + q) >> (shift-1)
+			x64.Mov(a, r64(treg), r64(lhs))
+			x64.Sub(a, r64(treg), r64(x64.RDX))
+			x64.Shr(a, r64(treg), x64.Imm(1))
+			x64.Add(a, r64(treg), r64(x64.RDX))
+			if mg.Shift - 1 > 0 {
+				x64.Shr(a, r64(treg), x64.Imm(mg.Shift - 1))
+			}
+			x64.Mov(a, r64(qres), r64(treg))
+		}
+		return qres
+	}
+	var mg common.MagicSigned = common.ComputeMagicSigned(c, xWordW)
+	emitConstInt64(a, mreg, mg.M)
+	x64.Imul1(a, r64(mreg)) // RDX = high(signed RAX * M)
+	if mg.AddN {
+		x64.Add(a, r64(x64.RDX), r64(lhs))
+	}
+	if mg.SubN {
+		x64.Sub(a, r64(x64.RDX), r64(lhs))
+	}
+	if mg.Shift > 0 {
+		x64.Sar(a, r64(x64.RDX), x64.Imm(mg.Shift))
+	}
+	// Round toward zero: add the sign bit (logical-shift-right by W-1 → 0/1).
+	x64.Mov(a, r64(treg), r64(x64.RDX))
+	x64.Shr(a, r64(treg), x64.Imm(xWordW - 1))
+	x64.Add(a, r64(x64.RDX), r64(treg))
+	x64.Mov(a, r64(qres), r64(x64.RDX))
+	return qres
+}

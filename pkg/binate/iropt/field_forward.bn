@@ -1,0 +1,442 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/iropcode"
+import "pkg/stdx/slices"
+
+// Redundant field-load elimination for managed-pointer PARAMETERS.
+//
+// After load-forwarding store-forwards a single-store managed-pointer slot, a
+// param `s @T` reaches its field accesses directly as an OP_PARAM value, so
+// `s.f` is LOAD(GET_FIELD_PTR(OP_PARAM_s, idx)).  Gen emits a fresh such load per
+// use; this pass coalesces the redundant ones onto one dominating load via an
+// available-loads dataflow, so a hot param field is loaded once per barrier-free
+// region instead of on every use (the richards `s.current` reload storm).
+//
+// SOUNDNESS.
+//  * Value: forwarding a later load to an earlier one reuses an SSA value; a plain
+//    OP_LOAD carries no implicit RefInc/RefDec (refcounting is explicit +
+//    operand-based), so this is refcount-neutral.  It is value-correct iff the
+//    field's value is unchanged between the two loads — enforced by the barrier
+//    (kill) model below.
+//  * Lifetime: the base is restricted to a managed-pointer PARAMETER.  The callee
+//    holds a reference to each @T param for the whole body, so *param is live
+//    throughout and its field address is never freed under the callee — a RefDec
+//    can neither change the field's value (Binate has no user destructors; dtors
+//    only decrement child refcounts + free) nor free the object.  So OP_REFDEC is
+//    NOT a barrier, which is what makes this pay off in refcount-dense code.
+//
+// BARRIERS (kill an available field value):
+//  * any call (arbitrary heap mutation): OP_CALL / OP_CALL_INDIRECT /
+//    OP_CALL_IFACE_METHOD / OP_CALL_FUNC_VALUE / OP_CALL_HANDLE / OP_C_CALL —
+//    kills ALL available fields;
+//  * an OP_STORE that may-alias the field — conservatively every store EXCEPT one
+//    provably disjoint: a store to a different field (same param base, different
+//    index) or a store rooted at a local OP_ALLOC.  (A store to another heap object
+//    — a different base, or a loaded value like `s.current.input = …` — is NOT
+//    proven disjoint here and conservatively kills; a type-based refinement is a
+//    possible follow-up.)
+//
+// Runs at -O1+ after forwardLoads (which exposes the OP_PARAM field bases).
+
+func forwardFieldLoads(m @ir.Module) {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @ir.Func = m.Funcs[fi]
+		if f.IsExtern {
+			continue
+		}
+		forwardFieldLoadsFunc(f)
+	}
+}
+
+// ffKey is one (managed-pointer-param base id, field index) coordinate — the
+// granularity at which a field value is tracked as available.
+type ffKey struct {
+	baseID int
+	idx    int
+}
+
+// ffCoord is loadFieldCoord's result: whether instr is a tracked param-field load
+// and, if so, its coordinate.
+type ffCoord struct {
+	ok     bool
+	baseID int
+	idx    int
+}
+
+// forwardFieldLoadsFunc runs the available-loads dataflow over one function and
+// forwards every redundant managed-ptr-param field load to its dominating repr.
+func forwardFieldLoadsFunc(f @ir.Func) {
+	if len(f.Blocks) == 0 {
+		return
+	}
+	var keys @[]ffKey = collectFieldKeys(f)
+	if len(keys) == 0 {
+		return
+	}
+	var d @DomInfo = ComputeDom(f)
+	var nb int = len(f.Blocks)
+	var nk int = len(keys)
+
+	// Dataflow to a fixpoint: availOut[b][k] = the reprLoadID available at b's exit
+	// for key k, or -1.  availIn is the meet (same-repr intersection) over preds.
+	var availOut @[]@[]int
+	for b := 0; b < nb; b++ {
+		availOut = slices.Append[@[]int](availOut, newMinusOne(nk))
+	}
+	var changed bool = true
+	for changed {
+		changed = false
+		for b := 0; b < nb; b++ {
+			var inb @[]int = meetPreds(f, d, availOut, b, nk)
+			var outb @[]int = ffTransfer(f, f.Blocks[b], keys, inb)
+			if !intSliceEq(outb, availOut[b]) {
+				availOut[b] = outb
+				changed = true
+			}
+		}
+	}
+
+	// Final pass: recompute avail at each load with the fixpoint availIn, recording
+	// which loads forward to which repr.
+	var replByID @[]@ir.Instr = newNilInstrs(f.NextID)
+	var anyFwd bool = false
+	for b := 0; b < nb; b++ {
+		var avail @[]int = meetPreds(f, d, availOut, b, nk)
+		var blk @ir.Block = f.Blocks[b]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			var ki int = loadKeyIndex(instr, keys)
+			if ki >= 0 {
+				if avail[ki] >= 0 && avail[ki] != instr.ID {
+					replByID[instr.ID] = instrByID(f, avail[ki])
+					anyFwd = true
+				} else if avail[ki] < 0 {
+					avail[ki] = instr.ID
+				}
+				continue
+			}
+			ffKillInstr(instr, keys, avail)
+		}
+	}
+	if !anyFwd {
+		return
+	}
+	applyFieldForward(f, replByID)
+}
+
+// collectFieldKeys returns the distinct (managed-ptr-param base id, field index)
+// coordinates that appear as a LOAD(GET_FIELD_PTR(OP_PARAM, idx)) somewhere in f.
+func collectFieldKeys(f @ir.Func) @[]ffKey {
+	var keys @[]ffKey
+	for b := 0; b < len(f.Blocks); b++ {
+		var blk @ir.Block = f.Blocks[b]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var c ffCoord = loadFieldCoord(blk.Instrs[ii])
+			if c.ok {
+				var k ffKey
+				k.baseID = c.baseID
+				k.idx = c.idx
+				if !keysContain(keys, k) {
+					keys = slices.Append[ffKey](keys, k)
+				}
+			}
+		}
+	}
+	return keys
+}
+
+// loadFieldCoord reports whether instr is LOAD(GET_FIELD_PTR(OP_PARAM@managedptr,
+// idx)) and, if so, its param base id and field index.
+func loadFieldCoord(instr @ir.Instr) ffCoord {
+	var c ffCoord
+	c.ok = false
+	if instr.Op != iropcode.OP_LOAD || len(instr.Args) < 1 {
+		return c
+	}
+	var gfp @ir.Instr = instr.Args[0]
+	if gfp == nil || gfp.Op != iropcode.OP_GET_FIELD_PTR || len(gfp.Args) < 1 {
+		return c
+	}
+	var b @ir.Instr = gfp.Args[0]
+	if b == nil || b.Op != iropcode.OP_PARAM {
+		return c
+	}
+	if !irutil.IsManagedPtrType(b.Typ) {
+		return c
+	}
+	c.ok = true
+	c.baseID = b.ID
+	c.idx = gfp.Index
+	return c
+}
+
+// loadKeyIndex returns the key index if instr is a tracked field load, else -1.
+func loadKeyIndex(instr @ir.Instr, keys @[]ffKey) int {
+	var c ffCoord = loadFieldCoord(instr)
+	if !c.ok {
+		return -1
+	}
+	for k := 0; k < len(keys); k++ {
+		if keys[k].baseID == c.baseID && keys[k].idx == c.idx {
+			return k
+		}
+	}
+	return -1
+}
+
+// ffTransfer computes a block's availOut from its availIn: forward pass over the
+// block's instrs, generating a repr at each first load of a key and killing at
+// barriers.  (Forward decisions are recorded only in the final pass.)
+func ffTransfer(f @ir.Func, blk @ir.Block, keys @[]ffKey, inb @[]int) @[]int {
+	var avail @[]int = copyInts(inb)
+	for ii := 0; ii < len(blk.Instrs); ii++ {
+		var instr @ir.Instr = blk.Instrs[ii]
+		var ki int = loadKeyIndex(instr, keys)
+		if ki >= 0 {
+			if avail[ki] < 0 {
+				avail[ki] = instr.ID
+			}
+			continue
+		}
+		ffKillInstr(instr, keys, avail)
+	}
+	return avail
+}
+
+// ffKillInstr applies instr's barrier effect to avail (in place): a call clears
+// everything; a store clears the keys it is not provably disjoint from.
+func ffKillInstr(instr @ir.Instr, keys @[]ffKey, avail @[]int) {
+	if isCallBarrier(instr.Op) {
+		for k := 0; k < len(avail); k++ {
+			avail[k] = -1
+		}
+		return
+	}
+	if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 1 {
+		for k := 0; k < len(keys); k++ {
+			if avail[k] >= 0 && storeKillsField(instr.Args[0], keys[k]) {
+				avail[k] = -1
+			}
+		}
+	}
+}
+
+// isCallBarrier reports whether op is a call form (arbitrary heap mutation).
+func isCallBarrier(op int) bool {
+	return op == iropcode.OP_CALL || op == iropcode.OP_CALL_INDIRECT ||
+			op == iropcode.OP_CALL_IFACE_METHOD || op == iropcode.OP_CALL_FUNC_VALUE ||
+			op == iropcode.OP_CALL_HANDLE || op == iropcode.OP_C_CALL
+}
+
+// storeKillsField reports whether a store to address `addr` may change the field
+// keyed by k — conservatively yes unless provably disjoint: a store to a different
+// field of the same param object, or a store rooted at a local OP_ALLOC.
+func storeKillsField(addr @ir.Instr, k ffKey) bool {
+	if addr == nil {
+		return true
+	}
+	if addrRootIsAlloca(addr) {
+		return false
+	}
+	if addr.Op == iropcode.OP_GET_FIELD_PTR && len(addr.Args) >= 1 && addr.Args[0] != nil &&
+			addr.Args[0].Op == iropcode.OP_PARAM && addr.Args[0].ID == k.baseID {
+		return addr.Index == k.idx
+	}
+	return true
+}
+
+// addrRootIsAlloca walks a pointer-arith chain (GET_FIELD_PTR / GET_ELEM_PTR) to
+// its root and reports whether that root is a local OP_ALLOC.
+func addrRootIsAlloca(addr @ir.Instr) bool {
+	var cur @ir.Instr = addr
+	for cur != nil {
+		if cur.Op == iropcode.OP_ALLOC {
+			return true
+		}
+		if (cur.Op == iropcode.OP_GET_FIELD_PTR || cur.Op == iropcode.OP_GET_ELEM_PTR) &&
+				len(cur.Args) >= 1 {
+			cur = cur.Args[0]
+		} else {
+			return false
+		}
+	}
+	return false
+}
+
+// meetPreds computes availIn for block b: the same-repr intersection over its CFG
+// predecessors' availOut.
+//
+// Block 0 is the function entry.  Its availIn is ALWAYS all-⊥ (nothing loaded on
+// entry): the implicit function-entry edge carries ⊥, and intersection with ⊥ is
+// ⊥, so a back-edge into block 0 could not make anything available there.  Pinning
+// entry to ⊥ unconditionally (not merely when it has no CFG predecessor) is what
+// makes the dominance guarantee hold for ANY CFG: a repr is "available" at a block
+// only if it is available along every path from entry, and entry contributes
+// nothing — so an available repr's defining block always dominates the use.  (Gen
+// never gives block 0 a predecessor today — no goto, loops build fresh headers —
+// but this must not silently rest on that external invariant.)
+func meetPreds(f @ir.Func, d @DomInfo, availOut @[]@[]int, b int, nk int) @[]int {
+	var preds @[]int = d.Preds[b]
+	if b == 0 || len(preds) == 0 {
+		return newMinusOne(nk)
+	}
+	var res @[]int = copyInts(availOut[preds[0]])
+	for pi := 1; pi < len(preds); pi++ {
+		var po @[]int = availOut[preds[pi]]
+		for k := 0; k < nk; k++ {
+			if res[k] != po[k] {
+				res[k] = -1
+			}
+		}
+	}
+	return res
+}
+
+// applyFieldForward rewrites every use of a forwarded load to its repr, deletes the
+// forwarded loads, and deletes any GET_FIELD_PTR left with no remaining use.
+func applyFieldForward(f @ir.Func, replByID @[]@ir.Instr) {
+	var cap int = f.NextID
+	rewriteUsesInBlocks(f.Blocks, replByID, cap)
+	rewriteUsesInBlocks(f.FaultPads, replByID, cap)
+	// Drop the forwarded loads.
+	for b := 0; b < len(f.Blocks); b++ {
+		var blk @ir.Block = f.Blocks[b]
+		var kept @[]@ir.Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.ID >= 0 && instr.ID < cap && replByID[instr.ID] != nil {
+				continue
+			}
+			kept = slices.Append[@ir.Instr](kept, instr)
+		}
+		blk.Instrs = kept
+	}
+	// Drop now-dead GET_FIELD_PTRs (whose only use was a forwarded load).
+	dropDeadFieldPtrs(f)
+	var noDel @[]bool = newFalse(cap)
+	assertNoSurvivingUses(f.Blocks, replByID, noDel, cap)
+	assertNoSurvivingUses(f.FaultPads, replByID, noDel, cap)
+}
+
+// dropDeadFieldPtrs removes OP_GET_FIELD_PTR instructions that no instruction
+// references any longer (their sole load consumer was forwarded away).
+func dropDeadFieldPtrs(f @ir.Func) {
+	var used @[]bool = newFalse(f.NextID)
+	markUses(f.Blocks, used, f.NextID)
+	markUses(f.FaultPads, used, f.NextID)
+	for b := 0; b < len(f.Blocks); b++ {
+		var blk @ir.Block = f.Blocks[b]
+		var kept @[]@ir.Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.Op == iropcode.OP_GET_FIELD_PTR && instr.ID >= 0 && instr.ID < f.NextID &&
+					!used[instr.ID] {
+				continue
+			}
+			kept = slices.Append[@ir.Instr](kept, instr)
+		}
+		blk.Instrs = kept
+	}
+}
+
+// markUses sets used[id] for every instruction id referenced as an operand or phi
+// entry across blocks.
+func markUses(blocks @[]@ir.Block, used @[]bool, cap int) {
+	for b := 0; b < len(blocks); b++ {
+		var blk @ir.Block = blocks[b]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			for a := 0; a < len(instr.Args); a++ {
+				var v @ir.Instr = instr.Args[a]
+				if v != nil && v.ID >= 0 && v.ID < cap {
+					used[v.ID] = true
+				}
+			}
+			for p := 0; p < len(instr.Phis); p++ {
+				var pv @ir.Instr = instr.Phis[p].Val
+				if pv != nil && pv.ID >= 0 && pv.ID < cap {
+					used[pv.ID] = true
+				}
+			}
+		}
+	}
+}
+
+// newMinusOne returns a length-n int slice filled with -1 (an empty avail map).
+func newMinusOne(n int) @[]int {
+	var out @[]int
+	for i := 0; i < n; i++ {
+		out = slices.Append[int](out, -1)
+	}
+	return out
+}
+
+// newFalse returns a length-n bool slice of false.
+func newFalse(n int) @[]bool {
+	var out @[]bool
+	for i := 0; i < n; i++ {
+		out = slices.Append[bool](out, false)
+	}
+	return out
+}
+
+// newNilInstrs returns a length-n slice of nil @ir.Instr (an id-indexed repl map).
+func newNilInstrs(n int) @[]@ir.Instr {
+	var out @[]@ir.Instr
+	for i := 0; i < n; i++ {
+		var none @ir.Instr
+		out = slices.Append[@ir.Instr](out, none)
+	}
+	return out
+}
+
+// copyInts returns a fresh copy of int slice s.
+func copyInts(s @[]int) @[]int {
+	var out @[]int
+	for i := 0; i < len(s); i++ {
+		out = slices.Append[int](out, s[i])
+	}
+	return out
+}
+
+// intSliceEq reports whether two int slices are element-wise equal.
+func intSliceEq(a @[]int, b @[]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// keysContain reports whether k is already in the key list.
+func keysContain(keys @[]ffKey, k ffKey) bool {
+	for i := 0; i < len(keys); i++ {
+		if keys[i].baseID == k.baseID && keys[i].idx == k.idx {
+			return true
+		}
+	}
+	return false
+}
+
+// instrByID returns the instruction with the given id (scans f) — used to resolve a
+// repr load id back to its Instr for the rewrite map.  Repr counts are tiny.
+func instrByID(f @ir.Func, id int) @ir.Instr {
+	for b := 0; b < len(f.Blocks); b++ {
+		var blk @ir.Block = f.Blocks[b]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			if blk.Instrs[ii].ID == id {
+				return blk.Instrs[ii]
+			}
+		}
+	}
+	var none @ir.Instr
+	return none
+}

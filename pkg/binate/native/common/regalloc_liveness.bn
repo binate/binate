@@ -63,6 +63,16 @@ type LivenessInfo struct {
 	// at block b's entry / exit, id-indexed bool sets.
 	LiveIn  @[]@[]bool
 	LiveOut @[]@[]bool
+
+	// Fusable[id] flags an OP_GET_ELEM_PTR that folds into its consuming
+	// load/store's scaled addressing mode (aa64; see common.FusableElemGeps).
+	// A folded GEP is NOT a def (defIdOf returns -1) and its result is never
+	// used — its consumer instead uses the GEP's base+index (fusedGepBaseIdx),
+	// so those operands stay live to the load/store, not to the (elided) GEP.
+	// Empty on backends without the fold, making every fusion hook a no-op.
+	// The fusion-awareness hooks (fusedGepBaseIdx / isFusedGepDef / the mark*
+	// helpers) live in regalloc_fuse_liveness.bn.
+	Fusable @[]bool
 }
 
 // isAllocatableType reports whether a scalar of type t can live in a GP
@@ -115,7 +125,15 @@ func IsAllocatableDef(ins @ir.Instr, wordBytes int) bool {
 // cache-drop point, which dirty values are still live (must be spilled to their
 // slot) versus dead (their store is elided).
 func ComputeLiveBeforeAll(f @ir.Func, wordBytes int) @[]@[]@[]bool {
-	var lv @LivenessInfo = ComputeLiveness(f, wordBytes)
+	var none @[]bool
+	return ComputeLiveBeforeAllFused(f, wordBytes, none)
+}
+
+// ComputeLiveBeforeAllFused is ComputeLiveBeforeAll with the fusable-GEP set
+// (aa64), so lazy spill sees a folded GEP's base+index live to the consuming
+// load/store, not to the elided GEP.  Pass an empty set for the no-fold path.
+func ComputeLiveBeforeAllFused(f @ir.Func, wordBytes int, fusable @[]bool) @[]@[]@[]bool {
+	var lv @LivenessInfo = ComputeLivenessFused(f, wordBytes, fusable)
 	var res @[]@[]@[]bool = make_slice(@[]@[]bool, len(f.Blocks))
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		res[bi] = blockLiveBefore(lv, f, bi)
@@ -141,12 +159,18 @@ func blockLiveBefore(lv @LivenessInfo, f @ir.Func, bi int) @[]@[]bool {
 		for id := 0; id < nid; id++ {
 			s[id] = lb[ii + 1][id]
 		}
-		if isAllocatableDef(ins, lv.WordBytes) && ins.ID >= 0 && ins.ID < nid {
-			s[ins.ID] = false
+		var d int = defIdOf(lv, ins, lv.WordBytes)
+		if d >= 0 {
+			s[d] = false
 		}
 		for ai := 0; ai < len(ins.Args); ai++ {
-			var u int = useIdOf(lv, ins.Args[ai])
-			if u >= 0 { s[u] = true }
+			base, idx := fusedGepBaseIdx(lv, ins, ai, ins.Args[ai])
+			if base != nil {
+				markLiveUse(lv, s, base)
+				markLiveUse(lv, s, idx)
+			} else {
+				markLiveUse(lv, s, ins.Args[ai])
+			}
 		}
 		lb[ii] = s
 	}
@@ -157,11 +181,20 @@ func blockLiveBefore(lv @LivenessInfo, f @ir.Func, bi int) @[]@[]bool {
 // f must be phi-free (post iropt.EliminatePhis).  Requires the types target
 // to be set (SizeOf is consulted); backends set it before emission.
 func ComputeLiveness(f @ir.Func, wordBytes int) @LivenessInfo {
+	var none @[]bool
+	return ComputeLivenessFused(f, wordBytes, none)
+}
+
+// ComputeLivenessFused is ComputeLiveness with the fusable-GEP set (aa64), so
+// every liveness hook redirects a folded GEP's operand liveness to its consuming
+// load/store.  Pass an empty set for the no-fold path (ComputeLiveness).
+func ComputeLivenessFused(f @ir.Func, wordBytes int, fusable @[]bool) @LivenessInfo {
 	var lv @LivenessInfo = make(LivenessInfo)
 	var n int = len(f.Blocks)
 	lv.NumBlocks = n
 	lv.NextID = f.NextID
 	lv.WordBytes = wordBytes
+	lv.Fusable = fusable
 	if n == 0 {
 		// A bodyless func (extern) still has parameters that bump NextID, so
 		// honor the documented per-id array invariant: Allocatable is length
@@ -381,8 +414,13 @@ func computeBlockDefUse(lv @LivenessInfo, b @ir.Block, def @[]bool, upwardUse @[
 							"iropt.EliminatePhis must run before native emission")
 		}
 		for ai := 0; ai < len(ins.Args); ai++ {
-			var u int = useIdOf(lv, ins.Args[ai])
-			if u >= 0 && !definedSoFar[u] { upwardUse[u] = true }
+			base, idx := fusedGepBaseIdx(lv, ins, ai, ins.Args[ai])
+			if base != nil {
+				markUpwardUse(lv, definedSoFar, upwardUse, base)
+				markUpwardUse(lv, definedSoFar, upwardUse, idx)
+			} else {
+				markUpwardUse(lv, definedSoFar, upwardUse, ins.Args[ai])
+			}
 		}
 		var d int = defIdOf(lv, ins, wordBytes)
 		if d >= 0 {
@@ -394,6 +432,7 @@ func computeBlockDefUse(lv @LivenessInfo, b @ir.Block, def @[]bool, upwardUse @[
 
 // defIdOf returns the allocatable id ins defines, or -1.
 func defIdOf(lv @LivenessInfo, ins @ir.Instr, wordBytes int) int {
+	if isFusedGepDef(lv, ins) { return -1 } // folded into a load/store; defines nothing
 	if !isAllocatableDef(ins, wordBytes) { return -1 }
 	if ins.ID >= lv.NextID { return -1 }
 	if !lv.Allocatable[ins.ID] { return -1 }

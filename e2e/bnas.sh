@@ -4,7 +4,7 @@
 # (7902d5de7) left uncovered — --version banner, no-input usage, unknown flag,
 # and the "multiple input files" rejection.  The generic flag-parsing behavior
 # (unknown-flag/missing-value errors, positional handling) is unit-tested in
-# pkg/stdx/flags; the actual assemble pipeline in pkg/binate/asm/assemble — this
+# pkg/std/flags; the actual assemble pipeline in pkg/binate/asm/assemble — this
 # locks how cmd/bnas wires the two together end to end.
 #
 # Exit 0 on full pass; non-zero with per-case diagnostics on failure.

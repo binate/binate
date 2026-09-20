@@ -1,0 +1,309 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Constant-fold of casts + algebraic-identity simplification + dead-constant
+// elimination.
+//
+// mem2reg grounds a promoted var load whose stored value has a looser type
+// (e.g. an untyped-int literal into a declared `int`/`int32` slot) by rewriting
+// the load into an identity OP_CAST of the stored constant.  So
+// `var d = 139968; x % d` reaches the backend as `srem x, cast(int, 139968)` —
+// the divisor is an OP_CAST, not the OP_CONST_INT the backends' constant-divisor
+// magic-multiply keys on.  foldCastConst folds an OP_CAST-of-constant to the
+// equivalent OP_CONST_INT (exposing the constant, so magic fires on NAMED
+// constants like fasta's `% im`, and removing the cast).
+//
+// simplifyIdentities additionally folds genuine algebraic identities
+// (`add X,0`, `sub X,0`, `or X,0`, `xor X,0`, `shl/shr X,0`, `mul X,1`, and the
+// commuted forms — user-written or exposed by another pass): it rewrites every
+// use of the identity result to the surviving operand, chasing chains
+// transitively via the shared rewriteUsesInBlocks/chaseRepl, then deletes the
+// now-dead identity instrs.  Finally any leaf constant left with no remaining use
+// is removed.  Backend-neutral — it drops instructions the native backends would
+// otherwise emit literally (LLVM already folds them), a native↔LLVM gap-closer.
+
+// isConstIntVal reports whether v is an OP_CONST_INT with the given value.
+func isConstIntVal(v @ir.Instr, val int64) bool {
+	return v != nil && v.Op == iropcode.OP_CONST_INT && v.IntVal == val
+}
+
+// identityReplacement returns the operand that r is equal to when r is an
+// algebraic identity (X+0, X-0, X|0, X^0, X<<0, X>>0, X*1 and the commuted
+// forms), else nil.  Both operands share r's type, so substituting is
+// type-preserving.
+func identityReplacement(r @ir.Instr) @ir.Instr {
+	if len(r.Args) != 2 {
+		return nil
+	}
+	var a @ir.Instr = r.Args[0]
+	var b @ir.Instr = r.Args[1]
+	if r.Op == iropcode.OP_ADD || r.Op == iropcode.OP_OR || r.Op == iropcode.OP_XOR {
+		if isConstIntVal(b, cast(int64, 0)) {
+			return a
+		}
+		if isConstIntVal(a, cast(int64, 0)) {
+			return b
+		}
+		return nil
+	}
+	if r.Op == iropcode.OP_SUB || r.Op == iropcode.OP_SHL || r.Op == iropcode.OP_SHR {
+		if isConstIntVal(b, cast(int64, 0)) {
+			return a
+		}
+		return nil
+	}
+	if r.Op == iropcode.OP_MUL {
+		if isConstIntVal(b, cast(int64, 1)) {
+			return a
+		}
+		if isConstIntVal(a, cast(int64, 1)) {
+			return b
+		}
+		return nil
+	}
+	return nil
+}
+
+// foldIntCastValue returns the value of casting `c` to integer type `rt` — the
+// low rt.Width bits, sign-extended (signed) or zero-extended (unsigned).  A
+// width >= 64 target is unchanged; the width <= 0 guard is dead-defensive (a
+// concrete integer type is always target-assigned a real bit width, e.g. `int`
+// gets 32 or 64), never a live no-truncation hole on a 32-bit target.
+func foldIntCastValue(c int64, rt @types.Type) int64 {
+	var w int = rt.Width
+	if w <= 0 || w >= 64 {
+		return c
+	}
+	var mask uint64 = (cast(uint64, 1) << cast(uint64, w)) - cast(uint64, 1)
+	var v uint64 = cast(uint64, c) & mask
+	if rt.Signed {
+		var signbit uint64 = cast(uint64, 1) << cast(uint64, w - 1)
+		if (v & signbit) != cast(uint64, 0) {
+			v = v | ((cast(uint64, 0) - cast(uint64, 1)) ^ mask)
+		}
+	}
+	return cast(int64, v)
+}
+
+// foldCastConst mutates an `OP_CAST(OP_CONST_INT)` to an integer type into the
+// equivalent OP_CONST_INT in place (keeping its id and result type), so the
+// folded constant reaches consumers directly — notably the constant-divisor
+// magic-multiply, which mem2reg otherwise hides behind an identity cast of the
+// promoted var value.  Returns true if it folded.
+func foldCastConst(r @ir.Instr) bool {
+	if r.Op != iropcode.OP_CAST || len(r.Args) != 1 {
+		return false
+	}
+	var src @ir.Instr = r.Args[0]
+	if src == nil || src.Op != iropcode.OP_CONST_INT {
+		return false
+	}
+	var rt @types.Type = types.StripWrappers(r.Typ)
+	if rt == nil || !rt.IsInteger() {
+		return false
+	}
+	r.Op = iropcode.OP_CONST_INT
+	r.IntVal = foldIntCastValue(src.IntVal, rt)
+	var noArgs @[]@ir.Instr
+	r.Args = noArgs
+	return true
+}
+
+// foldCastConsts folds every OP_CAST-of-constant in the given blocks in place.
+func foldCastConsts(blocks @[]@ir.Block) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			foldCastConst(blk.Instrs[ii])
+		}
+	}
+}
+
+// simplifyIdentities runs the identity simplification + dead-constant elimination
+// over every non-extern func.  Invoked by RunOptPasses at -O1+, after
+// forwardLoads (so mem2reg's load-replacement copies are present to fold).
+func simplifyIdentities(m @ir.Module) {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @ir.Func = m.Funcs[fi]
+		if f.IsExtern {
+			continue
+		}
+		simplifyIdentitiesFunc(f)
+	}
+}
+
+// simplifyIdentitiesFunc runs the fold + DCE over one function: cast-const
+// folding, then identity folding (rewrite uses, assert, drop), then dead leaf
+// constant removal.
+func simplifyIdentitiesFunc(f @ir.Func) {
+	var cap int = f.NextID
+	if cap <= 0 {
+		return
+	}
+	// Fold OP_CAST-of-constant → OP_CONST_INT first: mem2reg rewrites a promoted
+	// var load into an identity cast of the stored constant, which would
+	// otherwise hide the constant from the identity fold and the backends.
+	foldCastConsts(f.Blocks)
+	foldCastConsts(f.FaultPads)
+	// id -> surviving operand (nil = not an identity).
+	var replByID @[]@ir.Instr
+	var i int = 0
+	for i < cap {
+		var none @ir.Instr
+		replByID = slices.Append[@ir.Instr](replByID, none)
+		i = i + 1
+	}
+	var any bool = false
+	any = collectIdentities(f.Blocks, replByID, cap) || any
+	any = collectIdentities(f.FaultPads, replByID, cap) || any
+	if any {
+		rewriteUsesInBlocks(f.Blocks, replByID, cap)
+		rewriteUsesInBlocks(f.FaultPads, replByID, cap)
+		assertNoDroppedUses(f.Blocks, replByID, cap)
+		assertNoDroppedUses(f.FaultPads, replByID, cap)
+		dropInstrsWhere(f.Blocks, replByID, cap)
+		dropInstrsWhere(f.FaultPads, replByID, cap)
+	}
+	deadLeafConstElim(f)
+}
+
+// collectIdentities records each identity instr's surviving operand into
+// replByID, returning true if it found any.
+func collectIdentities(blocks @[]@ir.Block, replByID @[]@ir.Instr, cap int) bool {
+	var found bool = false
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.ID < 0 || instr.ID >= cap {
+				continue
+			}
+			var v @ir.Instr = identityReplacement(instr)
+			if v != nil {
+				replByID[instr.ID] = v
+				found = true
+			}
+		}
+	}
+	return found
+}
+
+// assertNoDroppedUses fails loud if any surviving instr still references an instr
+// marked for deletion (an identity in replByID) — the rewrite must have missed a
+// use, which would leave a dangling reference after dropInstrsWhere.  Coverage is
+// complete today; this makes a future operand-model or block-list change fail
+// loud instead of miscompiling silently (mirrors mem2reg's assertNoSurvivingUses).
+func assertNoDroppedUses(blocks @[]@ir.Block, replByID @[]@ir.Instr, cap int) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.ID >= 0 && instr.ID < cap && replByID[instr.ID] != nil {
+				continue
+			}
+			for k := 0; k < len(instr.Args); k++ {
+				var a @ir.Instr = instr.Args[k]
+				if a != nil && a.ID >= 0 && a.ID < cap && replByID[a.ID] != nil {
+					panic("iropt/simplify: a use of a folded identity survived the rewrite")
+				}
+			}
+			for k := 0; k < len(instr.Phis); k++ {
+				var pv @ir.Instr = instr.Phis[k].Val
+				if pv != nil && pv.ID >= 0 && pv.ID < cap && replByID[pv.ID] != nil {
+					panic("iropt/simplify: a phi use of a folded identity survived the rewrite")
+				}
+			}
+		}
+	}
+}
+
+// dropInstrsWhere rebuilds each block's instruction list without the instrs whose
+// id is marked in replByID (the now-dead identities — all their uses were already
+// redirected to the surviving operand).
+func dropInstrsWhere(blocks @[]@ir.Block, replByID @[]@ir.Instr, cap int) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		var kept @[]@ir.Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.ID >= 0 && instr.ID < cap && replByID[instr.ID] != nil {
+				continue
+			}
+			kept = slices.Append[@ir.Instr](kept, instr)
+		}
+		blk.Instrs = kept
+	}
+}
+
+// deadLeafConstElim deletes leaf constant instrs (OP_CONST_INT / BOOL / FLOAT /
+// NIL) with no remaining use — the dead `0`/`1` operands the identity fold leaves
+// behind.  Leaf constants have no operands, so a single use-count pass suffices
+// (removing one can never make another leaf dead).  Conservative on purpose:
+// only side-effect-free, operand-free leaves are touched.
+func deadLeafConstElim(f @ir.Func) {
+	var cap int = f.NextID
+	if cap <= 0 {
+		return
+	}
+	var used @[]bool
+	var i int = 0
+	for i < cap {
+		used = slices.Append[bool](used, false)
+		i = i + 1
+	}
+	markUsed(f.Blocks, used, cap)
+	markUsed(f.FaultPads, used, cap)
+	dropDeadLeafConsts(f.Blocks, used, cap)
+	dropDeadLeafConsts(f.FaultPads, used, cap)
+}
+
+// markUsed sets used[id] for every instr id referenced as an Arg or a phi value
+// anywhere in the given blocks.
+func markUsed(blocks @[]@ir.Block, used @[]bool, cap int) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			for k := 0; k < len(instr.Args); k++ {
+				var a @ir.Instr = instr.Args[k]
+				if a != nil && a.ID >= 0 && a.ID < cap {
+					used[a.ID] = true
+				}
+			}
+			for k := 0; k < len(instr.Phis); k++ {
+				var pv @ir.Instr = instr.Phis[k].Val
+				if pv != nil && pv.ID >= 0 && pv.ID < cap {
+					used[pv.ID] = true
+				}
+			}
+		}
+	}
+}
+
+// isLeafConst reports whether op is an operand-free, side-effect-free constant
+// (safe to delete when unused).
+func isLeafConst(op int) bool {
+	return op == iropcode.OP_CONST_INT || op == iropcode.OP_CONST_BOOL ||
+			op == iropcode.OP_CONST_FLOAT || op == iropcode.OP_CONST_NIL
+}
+
+// dropDeadLeafConsts rebuilds each block's instruction list without the leaf
+// constants whose id is unused.
+func dropDeadLeafConsts(blocks @[]@ir.Block, used @[]bool, cap int) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		var kept @[]@ir.Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.ID >= 0 && instr.ID < cap && isLeafConst(instr.Op) && !used[instr.ID] {
+				continue
+			}
+			kept = slices.Append[@ir.Instr](kept, instr)
+		}
+		blk.Instrs = kept
+	}
+}

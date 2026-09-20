@@ -1,0 +1,212 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/iropcode"
+
+// Access-path + barrier analysis for field-load elimination (field_forward.bn):
+// computing a load's access path from a managed-pointer-param root (valuePath /
+// loadPath), the per-block transfer that generates reprs and applies barriers
+// (ffTransfer / ffKillInstr), and the store-aliasing / call-barrier predicates
+// (storeKillsPath / isPrefixOrEqual / addrRootIsAlloca / isCallBarrier).  Split
+// from field_forward.bn (file length); the dataflow driver + apply live there.
+
+// valuePath computes the access path of a VALUE used as a dereferenceable base: a
+// managed-pointer PARAM (path []), or a managed-pointer field load reached through
+// such a base (its base's path ++ [field index]).  Each level must be a managed
+// pointer so it can be dereferenced further.  Returns ok=false for anything else.
+func valuePath(v @ir.Instr) ffCoord {
+	var c ffCoord
+	c.ok = false
+	if v == nil {
+		return c
+	}
+	if v.Op == iropcode.OP_PARAM {
+		if !irutil.IsManagedPtrType(v.Typ) {
+			return c
+		}
+		c.ok = true
+		c.paramID = v.ID
+		return c
+	}
+	if v.Op == iropcode.OP_LOAD && irutil.IsManagedPtrType(v.Typ) && len(v.Args) >= 1 {
+		var gfp @ir.Instr = v.Args[0]
+		if gfp != nil && gfp.Op == iropcode.OP_GET_FIELD_PTR && len(gfp.Args) >= 1 {
+			var base ffCoord = valuePath(gfp.Args[0])
+			if base.ok {
+				c.ok = true
+				c.paramID = base.paramID
+				c.indices = appendIdx(base.indices, gfp.Index)
+				return c
+			}
+		}
+	}
+	return c
+}
+
+// loadPath computes the access path of a field LOAD: base object's path ++ [field
+// index].  Unlike valuePath, the load's own type is unconstrained (the final field
+// may be a leaf scalar like an int state), only its base must be a valuePath.
+func loadPath(instr @ir.Instr) ffCoord {
+	var c ffCoord
+	c.ok = false
+	if instr.Op != iropcode.OP_LOAD || len(instr.Args) < 1 {
+		return c
+	}
+	var gfp @ir.Instr = instr.Args[0]
+	if gfp == nil || gfp.Op != iropcode.OP_GET_FIELD_PTR || len(gfp.Args) < 1 {
+		return c
+	}
+	var base ffCoord = valuePath(gfp.Args[0])
+	if !base.ok {
+		return c
+	}
+	c.ok = true
+	c.paramID = base.paramID
+	c.indices = appendIdx(base.indices, gfp.Index)
+	return c
+}
+
+// loadKeyIndex returns the key index if instr is a tracked field load, else -1.
+func loadKeyIndex(instr @ir.Instr, keys @[]ffKey) int {
+	var c ffCoord = loadPath(instr)
+	if !c.ok {
+		return -1
+	}
+	for k := 0; k < len(keys); k++ {
+		if keys[k].paramID == c.paramID && intSliceEq(keys[k].indices, c.indices) {
+			return k
+		}
+	}
+	return -1
+}
+
+// ffTransfer computes a block's availOut from its availIn: forward pass over the
+// block's instrs, generating a repr at each first load of a key and killing at
+// barriers.  (Forward decisions are recorded only in the final pass.)
+func ffTransfer(f @ir.Func, blk @ir.Block, keys @[]ffKey, inb @[]int) @[]int {
+	var avail @[]int = copyInts(inb)
+	for ii := 0; ii < len(blk.Instrs); ii++ {
+		var instr @ir.Instr = blk.Instrs[ii]
+		var ki int = loadKeyIndex(instr, keys)
+		if ki >= 0 {
+			if avail[ki] < 0 {
+				avail[ki] = instr.ID
+			}
+			continue
+		}
+		ffKillInstr(instr, keys, avail)
+	}
+	return avail
+}
+
+// ffKillInstr applies instr's barrier effect to avail (in place): a call clears
+// everything; a store clears the keys it is not provably disjoint from.
+func ffKillInstr(instr @ir.Instr, keys @[]ffKey, avail @[]int) {
+	if isCallBarrier(instr.Op) {
+		for k := 0; k < len(avail); k++ {
+			avail[k] = -1
+		}
+		return
+	}
+	if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 1 {
+		for k := 0; k < len(keys); k++ {
+			if avail[k] >= 0 && storeKillsPath(instr.Args[0], keys[k]) {
+				avail[k] = -1
+			}
+		}
+	}
+}
+
+// isCallBarrier reports whether op is a call form (arbitrary heap mutation).
+func isCallBarrier(op int) bool {
+	return op == iropcode.OP_CALL || op == iropcode.OP_CALL_INDIRECT ||
+			op == iropcode.OP_CALL_IFACE_METHOD || op == iropcode.OP_CALL_FUNC_VALUE ||
+			op == iropcode.OP_CALL_HANDLE || op == iropcode.OP_C_CALL
+}
+
+// storeKillsPath reports whether a store to address `addr` may change (or free an
+// object on) the access path k — conservatively yes unless provably disjoint.  A
+// store rooted at a local OP_ALLOC is disjoint from any heap param path; a
+// different param root, or a target whose path can't be computed (an opaque /
+// GET_ELEM_PTR / raw-pointer store), can't be proven disjoint → conservative kill.
+// Same-param aliasing is decided by pathsMayAlias on the store's target path.
+func storeKillsPath(addr @ir.Instr, k ffKey) bool {
+	if addr == nil {
+		return true
+	}
+	if addrRootIsAlloca(addr) {
+		return false
+	}
+	if addr.Op != iropcode.OP_GET_FIELD_PTR || len(addr.Args) < 1 {
+		return true
+	}
+	var base ffCoord = valuePath(addr.Args[0])
+	if !base.ok || base.paramID != k.paramID {
+		return true
+	}
+	var target @[]int = appendIdx(base.indices, addr.Index)
+	return pathsMayAlias(target, k.indices)
+}
+
+// pathsMayAlias reports whether a store at same-param access path `target` may
+// touch the memory a load at path `k` reads.  Cases:
+//   * target ⊑ k (prefix-or-equal): the store overwrites k's own field (value
+//     change) or an INTERMEDIATE pointer on k's path (which may free the object k
+//     reads through) — MAY alias.
+//   * k ⊏ target (k a strict prefix of target): the store is strictly deeper than
+//     k's own pointer slot — it writes a field of an object k merely POINTS TO, not
+//     k's value — disjoint.
+//   * divergent (first differ at index i, neither a prefix): disjoint ONLY when the
+//     divergence is TERMINAL on both sides (i is the last index of both) — then the
+//     two are distinct fields of the SAME object (no unions in Binate).  If either
+//     side dereferences PAST i (an interior divergence, e.g. `s.f0.state` vs
+//     `s.f1.state`), the two managed-pointer fields f0/f1 may hold the SAME pointer
+//     at runtime, so the post-divergence objects may alias — MAY alias.
+func pathsMayAlias(target @[]int, k @[]int) bool {
+	if isPrefixOrEqual(target, k) {
+		return true
+	}
+	if isPrefixOrEqual(k, target) {
+		return false // k is a strict prefix of target: store is deeper than k's slot
+	}
+	// Neither is a prefix — they diverge at some index i < min(len).
+	var i int = 0
+	for i < len(target) && i < len(k) && target[i] == k[i] {
+		i = i + 1
+	}
+	return !(i == len(target) - 1 && i == len(k) - 1)
+}
+
+// isPrefixOrEqual reports whether `pre` is a prefix of (or equal to) `full`.
+func isPrefixOrEqual(pre @[]int, full @[]int) bool {
+	if len(pre) > len(full) {
+		return false
+	}
+	for i := 0; i < len(pre); i++ {
+		if pre[i] != full[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// addrRootIsAlloca walks a pointer-arith chain (GET_FIELD_PTR / GET_ELEM_PTR) to
+// its root and reports whether that root is a local OP_ALLOC.
+func addrRootIsAlloca(addr @ir.Instr) bool {
+	var cur @ir.Instr = addr
+	for cur != nil {
+		if cur.Op == iropcode.OP_ALLOC {
+			return true
+		}
+		if (cur.Op == iropcode.OP_GET_FIELD_PTR || cur.Op == iropcode.OP_GET_ELEM_PTR) &&
+				len(cur.Args) >= 1 {
+			cur = cur.Args[0]
+		} else {
+			return false
+		}
+	}
+	return false
+}

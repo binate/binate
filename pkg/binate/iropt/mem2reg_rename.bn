@@ -1,0 +1,210 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// The per-alloca SSA-construction core of scalar promotion (mem2reg.bn):
+// phi placement via the iterated dominance frontier and the dominator-tree
+// rename walk that computes reaching definitions.  See mem2reg.bn for the
+// orchestration and the one IR mutation phase.
+
+// m2rResult is one alloca's analysis: the phis to place (per block, nil where
+// none), the load-id -> reaching-value rewrites for loads that forward directly,
+// and the loads that instead need a grounding cast (their reaching value's type
+// differs observably from the load's), or ok=false if the alloca cannot be
+// cleanly promoted (a load / phi-operand with no reaching def).
+type m2rResult struct {
+	ok         bool
+	phiOfBlock @[]@ir.Instr
+	replIDs    @[]int
+	replVals   @[]@ir.Instr
+	// Parallel: a load whose reaching value must be grounded to the load's type
+	// (groundVals[i] is that reaching value).  A load reinterprets memory AS its
+	// type, so forwarding a reaching value of a LOOSER type (e.g. an untyped-int
+	// const/expr with Signed=false into a signed int slot) would change the
+	// signedness a downstream compare/div/shift/int->float reads off the operand
+	// type.  Such a load is rewritten in place into an OP_CAST to its own type.
+	groundLoads @[]@ir.Instr
+	groundVals  @[]@ir.Instr
+	// zeroVal is the alloca's materialized zero constant, used wherever the
+	// reaching value would otherwise be undef (a dead outer-header phi operand
+	// for an inner-loop induction var, or a genuine uninitialized read — zero
+	// matches gen's zero-init for no-init scalars).  nil if never needed; the
+	// apply phase prepends it to the entry block.
+	zeroVal @ir.Instr
+}
+
+// makeZeroConst builds the zero constant of a non-managed scalar type (int 0 /
+// float 0 / bool false / raw-pointer nil), typed as `typ` so it matches the
+// promoted slot's phis and loads.  mem2reg uses it for int/bool/ptr; SROA's field
+// zero-init also uses it for a broadened float / oversized-int field slot.  Not
+// inserted into a block (the apply phase / caller does that).
+func makeZeroConst(f @ir.Func, typ @types.Type) @ir.Instr {
+	var t @types.Type = ir.PeelToRepr(typ)
+	if t != nil && t.Kind == types.TYP_BOOL {
+		var c @ir.Instr = ir.NewInstr(f, iropcode.OP_CONST_BOOL, typ)
+		c.BoolVal = false
+		return c
+	}
+	if t != nil && t.Kind == types.TYP_POINTER {
+		return ir.NewInstr(f, iropcode.OP_CONST_NIL, typ)
+	}
+	if t != nil && t.Kind == types.TYP_FLOAT {
+		// A float's zero is all-zero bits, but its op / representation is
+		// OP_CONST_FLOAT (StrVal), not an int — mem2reg never reaches here (float
+		// is non-promotable), but SROA's field zero-init does for a broadened
+		// float field.
+		var cf @ir.Instr = ir.NewInstr(f, iropcode.OP_CONST_FLOAT, typ)
+		cf.StrVal = "0"
+		return cf
+	}
+	var c @ir.Instr = ir.NewInstr(f, iropcode.OP_CONST_INT, typ)
+	c.IntVal = 0
+	return c
+}
+
+// analyzeAlloca creates the phis for alloca a (via IteratedDF over defBlocks)
+// and renames — computing each load's reaching value and each phi's operands —
+// without mutating the IR.  Returns ok=false (and leaves the IR untouched) if
+// any load or phi-operand has no reaching def (a store-less path); the not-yet-
+// inserted phis are simply discarded.
+func analyzeAlloca(f @ir.Func, d @DomInfo, domChildren @[]@[]int, n int, a @ir.Instr,
+		defBlocks @[]int) @m2rResult {
+	var res @m2rResult = make(m2rResult)
+	res.ok = false
+	// Create one phi per iterated-dominance-frontier block (not inserted yet).
+	var phiOfBlock @[]@ir.Instr
+	for b := 0; b < n; b++ {
+		var none @ir.Instr
+		phiOfBlock = slices.Append[@ir.Instr](phiOfBlock, none)
+	}
+	var phiBlocks @[]int = d.IteratedDF(defBlocks)
+	for k := 0; k < len(phiBlocks); k++ {
+		var b int = phiBlocks[k]
+		phiOfBlock[b] = ir.NewInstr(f, iropcode.OP_PHI, a.TypeArg)
+	}
+
+	var replIDs @[]int
+	var replVals @[]@ir.Instr
+	var groundLoads @[]@ir.Instr
+	var groundVals @[]@ir.Instr
+	var zeroVal @ir.Instr // lazily materialized undef-value zero (see makeZeroConst)
+
+	// Dominator-tree preorder walk, carrying the current reaching def.  Each
+	// block is pushed once, with its immediate dominator's exit value, so no
+	// save/restore is needed.
+	var stackB @[]int
+	var stackV @[]@ir.Instr
+	stackB = slices.Append[int](stackB, 0)
+	var entryNil @ir.Instr
+	stackV = slices.Append[@ir.Instr](stackV, entryNil)
+	for len(stackB) > 0 {
+		var b int = stackB[len(stackB) - 1]
+		var curVal @ir.Instr = stackV[len(stackV) - 1]
+		stackB = popInt(stackB)
+		stackV = stackV[0:len(stackV) - 1]
+
+		if phiOfBlock[b] != nil {
+			curVal = phiOfBlock[b]
+		}
+		var blk @ir.Block = f.Blocks[b]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 2 && instr.Args[0] == a {
+				curVal = instr.Args[1]
+			} else if instr.Op == iropcode.OP_LOAD && len(instr.Args) >= 1 && instr.Args[0] == a {
+				if curVal == nil {
+					// Undef read: materialize the slot's zero (gen zero-inits
+					// no-init scalars, so this is the value the load reads today).
+					if zeroVal == nil {
+						zeroVal = makeZeroConst(f, a.TypeArg)
+					}
+					curVal = zeroVal
+				}
+				if needsGrounding(curVal, instr.Typ) {
+					groundLoads = slices.Append[@ir.Instr](groundLoads, instr)
+					groundVals = slices.Append[@ir.Instr](groundVals, curVal)
+				} else {
+					replIDs = slices.Append[int](replIDs, instr.ID)
+					replVals = slices.Append[@ir.Instr](replVals, curVal)
+				}
+			}
+		}
+		// Fill each successor phi's operand for the edge b -> s.
+		for si := 0; si < len(d.Succs[b]); si++ {
+			var s int = d.Succs[b][si]
+			if phiOfBlock[s] == nil {
+				continue
+			}
+			if curVal == nil {
+				// A phi operand from a path with no reaching def — e.g. the dead
+				// outer-header phi of an inner-loop induction var.  Zero is safe
+				// (dead operands are never read; a live one matches zero-init).
+				if zeroVal == nil {
+					zeroVal = makeZeroConst(f, a.TypeArg)
+				}
+				curVal = zeroVal
+			}
+			var pe ir.PhiEntry
+			pe.Block = f.Blocks[b]
+			pe.Val = curVal
+			phiOfBlock[s].Phis = slices.Append[ir.PhiEntry](phiOfBlock[s].Phis, pe)
+		}
+		// Descend into dominator-tree children with this block's exit value.
+		for ci := 0; ci < len(domChildren[b]); ci++ {
+			stackB = slices.Append[int](stackB, domChildren[b][ci])
+			stackV = slices.Append[@ir.Instr](stackV, curVal)
+		}
+	}
+
+	res.ok = true
+	res.phiOfBlock = phiOfBlock
+	res.replIDs = replIDs
+	res.replVals = replVals
+	res.groundLoads = groundLoads
+	res.groundVals = groundVals
+	res.zeroVal = zeroVal
+	return res
+}
+
+// needsGrounding reports whether forwarding v in place of a load of type
+// targetTyp would change an observable scalar property (kind / signedness /
+// width) that a backend reads off the operand type.  A load re-establishes the
+// slot type, so a reaching value of a looser type (the untyped-int Signed=false
+// case) must be grounded to targetTyp rather than forwarded raw.  Grounding is
+// always correct; this predicate only avoids an unnecessary cast when the types
+// already agree (e.g. a phi, whose type is already the slot type).
+func needsGrounding(v @ir.Instr, targetTyp @types.Type) bool {
+	if v == nil {
+		return false
+	}
+	var vt @types.Type = ir.PeelToRepr(v.Typ)
+	var tt @types.Type = ir.PeelToRepr(targetTyp)
+	if vt == nil || tt == nil {
+		return false
+	}
+	return vt.Kind != tt.Kind || vt.Signed != tt.Signed || vt.Width != tt.Width
+}
+
+// buildDomChildren returns the dominator-tree children of each block (blocks
+// whose immediate dominator is that block), for the rename descent.
+func buildDomChildren(d @DomInfo) @[]@[]int {
+	var out @[]@[]int
+	for i := 0; i < d.NumBlocks; i++ {
+		var empty @[]int
+		out = slices.Append[@[]int](out, empty)
+	}
+	for c := 1; c < d.NumBlocks; c++ {
+		if d.PostNum[c] < 0 {
+			continue // unreachable (pruned before this in promoteFuncScalars)
+		}
+		var p int = d.Idom[c]
+		if p >= 0 && p != c {
+			out[p] = slices.Append[int](out[p], c)
+		}
+	}
+	return out
+}

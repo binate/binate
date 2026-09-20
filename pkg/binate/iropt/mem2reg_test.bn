@@ -1,0 +1,330 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Tests for scalar SSA promotion (mem2reg.bn): the pass driver, escape /
+// type-gate rejection, and the mutation phase.  The rename/phi/grounding core
+// is tested in mem2reg_rename_test.bn.  The package-shared countOp (ir_test.bn)
+// counts instrs of an op across a func.
+
+// firstPhi returns the first OP_PHI in block b, or nil.
+func firstPhi(b @ir.Block) @ir.Instr {
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		if b.Instrs[ii].Op == iropcode.OP_PHI {
+			return b.Instrs[ii]
+		}
+	}
+	var none @ir.Instr
+	return none
+}
+
+// lastInstr returns b's last instruction (its terminator in well-formed IR).
+func lastInstr(b @ir.Block) @ir.Instr {
+	return b.Instrs[len(b.Instrs) - 1]
+}
+
+// A straight-line `store; load` promotes to the stored value with NO phi, and
+// the load/store/alloca vanish.
+func TestMem2regStraightLine() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var x @ir.Instr = entry.EmitAlloc(types.TypInt())
+	var five @ir.Instr = entry.EmitConstInt(5, types.TypInt())
+	entry.EmitStore(x, five)
+	var v @ir.Instr = entry.EmitLoad(x, types.TypInt())
+	entry.EmitReturn(oneRet(v))
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 0 || countOp(f, iropcode.OP_LOAD) != 0 ||
+			countOp(f, iropcode.OP_STORE) != 0 {
+		return fail("straight-line: alloca/load/store should be gone")
+	}
+	if countOp(f, iropcode.OP_PHI) != 0 {
+		return fail("straight-line: no phi for a single-block var")
+	}
+	if lastInstr(entry).Args[0] != five {
+		return fail("straight-line: return should use the stored const directly")
+	}
+	return ""
+}
+
+// An alloca whose address escapes (returned as a pointer) is left untouched.
+func TestMem2regEscapeNotPromoted() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var x @ir.Instr = entry.EmitAlloc(types.TypInt())
+	entry.EmitStore(x, entry.EmitConstInt(5, types.TypInt()))
+	// Return the ADDRESS of the local — x appears in OP_RETURN's args, which is
+	// not a load/store pointer operand, so the slot escapes.
+	entry.EmitReturn(oneRet(x))
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 1 || countOp(f, iropcode.OP_STORE) != 1 {
+		return fail("escape: an escaping slot must be left untouched")
+	}
+	if countOp(f, iropcode.OP_PHI) != 0 {
+		return fail("escape: no phi for an unpromoted slot")
+	}
+	return ""
+}
+
+// A GET_ELEM_PTR use of the alloca (address arithmetic) also counts as escape.
+func TestMem2regGepEscapeNotPromoted() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var x @ir.Instr = entry.EmitAlloc(types.TypInt())
+	entry.EmitStore(x, entry.EmitConstInt(5, types.TypInt()))
+	var idx @ir.Instr = entry.EmitConstInt(0, types.TypInt())
+	var gep @ir.Instr = entry.EmitGetElemPtr(x, idx, types.TypInt())
+	entry.EmitReturn(oneRet(gep))
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 1 {
+		return fail("gep-escape: address-arithmetic use must pin the slot")
+	}
+	return ""
+}
+
+// A float slot is not promotable (EliminatePhis has no float lowering).
+func TestMem2regFloatNotPromoted() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var x @ir.Instr = entry.EmitAlloc(types.TypFloat64())
+	entry.EmitStore(x, entry.EmitConstFloat("0", types.TypFloat64()))
+	var v @ir.Instr = entry.EmitLoad(x, types.TypFloat64())
+	entry.EmitReturn(oneRet(v))
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 1 || countOp(f, iropcode.OP_LOAD) != 1 {
+		return fail("float: a float slot must not be promoted")
+	}
+	return ""
+}
+
+// A slot loaded with no reaching store promotes by forwarding a materialized
+// zero (gen zero-inits no-init scalars, so zero is the value the load reads) —
+// rather than aborting.  This is what unlocks inner-loop induction vars.
+func TestMem2regUndefLoadPromotesToZero() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var x @ir.Instr = entry.EmitAlloc(types.TypInt())
+	var v @ir.Instr = entry.EmitLoad(x, types.TypInt()) // load with no prior store
+	entry.EmitReturn(oneRet(v))
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 0 || countOp(f, iropcode.OP_LOAD) != 0 {
+		return fail("undef load: the slot should now promote (forward zero)")
+	}
+	var rv @ir.Instr = lastInstr(entry).Args[0]
+	if rv.Op != iropcode.OP_CONST_INT || rv.IntVal != 0 {
+		return fail("undef load: should forward the materialized zero (0)")
+	}
+	return ""
+}
+
+// A diamond that stores x on only ONE arm, then loads at the merge: the merge
+// phi's un-storing-arm operand has no reaching def.  Previously this aborted
+// promotion; now it is filled with a materialized zero, so x promotes.
+func TestMem2regPartialStorePromotesWithZero() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var thenB @ir.Block = ir.AddBlock(f, "then")
+	var elseB @ir.Block = ir.AddBlock(f, "else")
+	var merge @ir.Block = ir.AddBlock(f, "merge")
+	var x @ir.Instr = entry.EmitAlloc(types.TypInt())
+	entry.EmitBranch(entry.EmitConstBool(true), thenB, elseB)
+	var five @ir.Instr = thenB.EmitConstInt(5, types.TypInt())
+	thenB.EmitStore(x, five) // stored only on the then-arm
+	thenB.EmitJump(merge)
+	elseB.EmitJump(merge) // else-arm: no store to x
+	var v @ir.Instr = merge.EmitLoad(x, types.TypInt())
+	merge.EmitReturn(oneRet(v))
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 0 || countOp(f, iropcode.OP_LOAD) != 0 {
+		return fail("partial-store: the slot should promote (else operand zeroed)")
+	}
+	var phi @ir.Instr = firstPhi(merge)
+	if phi == nil || len(phi.Phis) != 2 {
+		return fail("partial-store: a 2-entry merge phi expected")
+	}
+	// One entry is the stored 5, the other is the materialized zero.
+	var sawFive bool = false
+	var sawZero bool = false
+	for i := 0; i < len(phi.Phis); i++ {
+		if phi.Phis[i].Val == five {
+			sawFive = true
+		}
+		if phi.Phis[i].Val.Op == iropcode.OP_CONST_INT && phi.Phis[i].Val.IntVal == 0 {
+			sawZero = true
+		}
+	}
+	if !sawFive || !sawZero {
+		return fail("partial-store: phi entries should be {5, materialized 0}")
+	}
+	return ""
+}
+
+// A benign orphan block (unreachable, but branching into a phi-merge) is pruned
+// so the phi's entry count matches the merge's real predecessors — otherwise the
+// LLVM backend would see a predecessor the phi lacks an entry for.
+func TestMem2regOrphanPruned() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var thenB @ir.Block = ir.AddBlock(f, "then")
+	var elseB @ir.Block = ir.AddBlock(f, "else")
+	var merge @ir.Block = ir.AddBlock(f, "merge")
+	var orphan @ir.Block = ir.AddBlock(f, "orphan") // unreachable: nothing branches here
+	var x @ir.Instr = entry.EmitAlloc(types.TypInt())
+	entry.EmitStore(x, entry.EmitConstInt(0, types.TypInt()))
+	entry.EmitBranch(entry.EmitConstBool(true), thenB, elseB)
+	thenB.EmitStore(x, thenB.EmitConstInt(1, types.TypInt()))
+	thenB.EmitJump(merge)
+	elseB.EmitStore(x, elseB.EmitConstInt(2, types.TypInt()))
+	elseB.EmitJump(merge)
+	orphan.EmitJump(merge) // unreachable edge into the merge
+	var v @ir.Instr = merge.EmitLoad(x, types.TypInt())
+	merge.EmitReturn(oneRet(v))
+
+	promoteFuncScalars(f)
+
+	if len(f.Blocks) != 4 {
+		return fail("orphan: the unreachable block should be pruned")
+	}
+	if countOp(f, iropcode.OP_PHI) != 1 {
+		return fail("orphan: exactly one phi expected")
+	}
+	var phi @ir.Instr = firstPhi(merge)
+	if phi == nil || len(phi.Phis) != 2 {
+		return fail("orphan: phi must have 2 entries (then + else), not the orphan")
+	}
+	return ""
+}
+
+// Two independent scalars both promote in one function.
+func TestMem2regMultipleAllocas() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var x @ir.Instr = entry.EmitAlloc(types.TypInt())
+	var one @ir.Instr = entry.EmitConstInt(1, types.TypInt())
+	entry.EmitStore(x, one)
+	var y @ir.Instr = entry.EmitAlloc(types.TypInt())
+	var two @ir.Instr = entry.EmitConstInt(2, types.TypInt())
+	entry.EmitStore(y, two)
+	var xv @ir.Instr = entry.EmitLoad(x, types.TypInt())
+	var yv @ir.Instr = entry.EmitLoad(y, types.TypInt())
+	var sum @ir.Instr = entry.EmitBinop(iropcode.OP_ADD, xv, yv, types.TypInt())
+	entry.EmitReturn(oneRet(sum))
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 0 || countOp(f, iropcode.OP_LOAD) != 0 {
+		return fail("multi: both slots should promote away")
+	}
+	if sum.Args[0] != one || sum.Args[1] != two {
+		return fail("multi: the add should read the two stored consts directly")
+	}
+	return ""
+}
+
+// A store-only slot (no loads) is a dead store: the alloca and its store are
+// deleted with no phi and no cast.
+func TestMem2regStoreOnlyDeadSlot() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var x @ir.Instr = entry.EmitAlloc(types.TypInt())
+	entry.EmitStore(x, entry.EmitConstInt(5, types.TypInt()))
+	var noVals @[]@ir.Instr
+	entry.EmitReturn(noVals)
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 0 || countOp(f, iropcode.OP_STORE) != 0 {
+		return fail("dead-store: the store-only slot should be removed")
+	}
+	if countOp(f, iropcode.OP_PHI) != 0 || countOp(f, iropcode.OP_CAST) != 0 {
+		return fail("dead-store: no phi or cast expected")
+	}
+	return ""
+}
+
+// Storing a slot's ADDRESS as a value (Args[1] of a store) escapes it.
+func TestMem2regAddrStoredEscape() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var x @ir.Instr = entry.EmitAlloc(types.TypInt())
+	entry.EmitStore(x, entry.EmitConstInt(5, types.TypInt()))
+	var p @ir.Instr = entry.EmitAlloc(types.MakePointerType(types.TypInt()))
+	entry.EmitStore(p, x) // x's ADDRESS stored as a value -> x escapes
+	entry.EmitReturn(oneRet(p)) // p's address returned -> p escapes too
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 2 {
+		return fail("addr-escape: both slots must be left unpromoted")
+	}
+	return ""
+}
+
+// A managed-pointer slot is not a promotable scalar (refcount-bearing).
+func TestMem2regManagedRejected() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var x @ir.Instr = entry.EmitAlloc(types.MakeManagedPtrType(types.TypInt()))
+	var v @ir.Instr = entry.EmitLoad(x, types.MakeManagedPtrType(types.TypInt()))
+	entry.EmitReturn(oneRet(v))
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 1 {
+		return fail("managed: a managed-pointer slot must not be promoted")
+	}
+	return ""
+}
+
+// A raw-pointer slot that stores an untyped `nil` (TYP_NIL) then loads it must
+// promote so the grounded load becomes a properly-typed OP_CONST_NIL, NOT an
+// OP_CAST.  The reaching nil's kind (TYP_NIL) differs from the pointer load's
+// kind, so it is classified as a ground load; grounding it with a cast would
+// lower to `inttoptr i64 <v>` where <v> is already a `ptr` (invalid LLVM; the
+// native backend SIGSEGVs).  Re-materializing a typed nil is refcount-neutral
+// (raw pointer) and every backend lowers it correctly.
+func TestMem2regNilPointerGroundsToConstNil() testing.TestResult {
+	var ptrTyp @types.Type = types.MakePointerType(types.TypInt())
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var p @ir.Instr = entry.EmitAlloc(ptrTyp)
+	var nilv @ir.Instr = entry.EmitConstNil(types.TypNil()) // untyped nil literal
+	entry.EmitStore(p, nilv)
+	var ld @ir.Instr = entry.EmitLoad(p, ptrTyp) // load's own type is *int
+	entry.EmitReturn(oneRet(ld))
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 0 || countOp(f, iropcode.OP_STORE) != 0 {
+		return fail("nil-ptr: the promoted alloca/store must be gone")
+	}
+	if countOp(f, iropcode.OP_CAST) != 0 {
+		return fail("a promoted nil-pointer load must NOT ground to an OP_CAST (bogus inttoptr)")
+	}
+	// The grounded load keeps its id, so the return still references it; it must
+	// now be an OP_CONST_NIL carrying the load's pointer type, not TYP_NIL.
+	var used @ir.Instr = lastInstr(entry).Args[0]
+	if used.Op != iropcode.OP_CONST_NIL {
+		return fail("promoted nil load must be re-materialized as OP_CONST_NIL")
+	}
+	if used.Typ == nil || used.Typ.Kind != types.TYP_POINTER {
+		return fail("re-materialized nil must carry the load's pointer type, not TYP_NIL")
+	}
+	return ""
+}

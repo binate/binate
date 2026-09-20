@@ -1,0 +1,422 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Tests for the SROA rewrite mechanics (sroa_rewrite.bn), exercised end to end
+// via sroaFunc: scalar replacement of field-accessed structs, extractable
+// whole-store copies, whole-load extract-forwarding, unstored-field zero-init,
+// and raw-slice {data,len} splitting (then mem2reg promotion).  Reuses
+// twoIntStruct (sroa_test.bn) and instrInBlocks (sroa_transform_test.bn).
+
+// A field-accessed POD struct is scalar-replaced: the struct alloca and every
+// field-ptr vanish, replaced by one scalar alloca per field, which mem2reg then
+// promotes away entirely.
+func TestSroaStructScalarReplaced() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var s @ir.Instr = entry.EmitAlloc(twoIntStruct())
+	var fp0 @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitStore(fp0, entry.EmitConstInt(7, types.TypInt()))
+	var fp1 @ir.Instr = entry.EmitGetFieldPtr(s, 1, types.TypInt())
+	entry.EmitStore(fp1, entry.EmitConstInt(9, types.TypInt()))
+	var fp0b @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	var v @ir.Instr = entry.EmitLoad(fp0b, types.TypInt())
+	entry.EmitReturn(oneRet(v))
+
+	sroaFunc(f)
+
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 0 {
+		return fail("SROA: every field-ptr of the struct should be gone")
+	}
+	if countOp(f, iropcode.OP_ALLOC) != 2 {
+		return fail("SROA: the struct alloca should become two scalar field allocas")
+	}
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 0 || countOp(f, iropcode.OP_LOAD) != 0 ||
+			countOp(f, iropcode.OP_STORE) != 0 {
+		return fail("SROA+mem2reg: field slots should be fully promoted away")
+	}
+	if lastInstr(entry).Args[0].Op != iropcode.OP_CONST_INT || lastInstr(entry).Args[0].IntVal != 7 {
+		return fail("SROA+mem2reg: return should forward the stored field-0 constant 7")
+	}
+	return ""
+}
+
+// A field never explicitly stored reads back as zero after SROA + mem2reg
+// (mem2reg's undef-load-to-zero), matching struct zero-init semantics.
+func TestSroaStructUnstoredFieldIsZero() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var s @ir.Instr = entry.EmitAlloc(twoIntStruct())
+	var fp0 @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitStore(fp0, entry.EmitConstInt(5, types.TypInt()))
+	// field 1 is never stored; reading it must yield zero.
+	var fp1 @ir.Instr = entry.EmitGetFieldPtr(s, 1, types.TypInt())
+	var v @ir.Instr = entry.EmitLoad(fp1, types.TypInt())
+	entry.EmitReturn(oneRet(v))
+
+	sroaFunc(f)
+	promoteFuncScalars(f)
+
+	if lastInstr(entry).Args[0].Op != iropcode.OP_CONST_INT || lastInstr(entry).Args[0].IntVal != 0 {
+		return fail("SROA+mem2reg: an unstored field must read back as zero")
+	}
+	return ""
+}
+
+// A whole OP_STORE whose value is a load result (a struct copy `t = s`) is
+// scalarized into per-field OP_EXTRACT + OP_STORE; the copied-to alloca is split.
+func TestSroaStructWholeStoreFromLoadScalarized() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var other @ir.Instr = entry.EmitAlloc(st)
+	var s @ir.Instr = entry.EmitAlloc(st)
+	var v @ir.Instr = entry.EmitLoad(other, st) // struct value (copy source)
+	entry.EmitStore(s, v) // whole store `s = other` — extractable value
+	var fp0 @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	var r @ir.Instr = entry.EmitLoad(fp0, types.TypInt())
+	entry.EmitReturn(oneRet(r))
+
+	sroaFunc(f)
+
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 0 {
+		return fail("SROA: field-ptr should be gone after whole-store scalarization")
+	}
+	if countOp(f, iropcode.OP_EXTRACT) != 2 {
+		return fail("SROA: a whole store should scalarize into one extract per field")
+	}
+	return ""
+}
+
+// The whole-LOAD scalarization path: a candidate whose whole value is loaded and
+// consumed only by OP_EXTRACT gets per-field loads at the load site, the extracts
+// rewritten to them; the whole load and extracts vanish.  (Gen doesn't produce
+// this shape for plain structs — field reads use GET_FIELD_PTR — so it is
+// exercised here by hand; it is the machinery the raw-slice phase reuses.)
+func TestSroaStructWholeLoadForwarded() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var s @ir.Instr = entry.EmitAlloc(st)
+	var fp0 @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitStore(fp0, entry.EmitConstInt(7, types.TypInt()))
+	var fp1 @ir.Instr = entry.EmitGetFieldPtr(s, 1, types.TypInt())
+	entry.EmitStore(fp1, entry.EmitConstInt(9, types.TypInt()))
+	var v @ir.Instr = entry.EmitLoad(s, st) // whole load; value used only by extract
+	var e0 @ir.Instr = entry.EmitExtract(v, 0, types.TypInt())
+	entry.EmitReturn(oneRet(e0))
+
+	sroaFunc(f)
+
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 0 || countOp(f, iropcode.OP_EXTRACT) != 0 {
+		return fail("SROA: whole load + extract should be replaced by per-field loads")
+	}
+
+	promoteFuncScalars(f)
+
+	if lastInstr(entry).Args[0].Op != iropcode.OP_CONST_INT || lastInstr(entry).Args[0].IntVal != 7 {
+		return fail("SROA+mem2reg: the forwarded field-0 load should carry the stored 7")
+	}
+	return ""
+}
+
+// A raw slice initialized from the managed->raw decay (OP_MANAGED_TO_RAW — the
+// `var s *[]T = make_slice(...)` shape) is scalar-replaced: OP_MANAGED_TO_RAW is
+// a whitelisted extractable store value, and the managed source slice is left
+// alone (managed).
+func TestSroaRawSliceFromManagedToRawScalarReplaced() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var mst @types.Type = types.MakeManagedSliceType(types.TypInt())
+	var slt @types.Type = types.MakeSliceType(types.TypInt())
+	var msAlloc @ir.Instr = entry.EmitAlloc(mst)
+	var mv @ir.Instr = entry.EmitLoad(msAlloc, mst)
+	var raw @ir.Instr = entry.EmitManagedToRaw(mv) // OP_MANAGED_TO_RAW value
+	var s @ir.Instr = entry.EmitAlloc(slt)
+	entry.EmitStore(s, raw) // whole store of a managed->raw value
+	var sv @ir.Instr = entry.EmitLoad(s, slt)
+	var lenv @ir.Instr = entry.EmitSliceLen(sv)
+	entry.EmitReturn(oneRet(lenv))
+
+	sroaFunc(f)
+
+	if instrInBlocks(f, s) {
+		return fail("SROA: a raw slice from OP_MANAGED_TO_RAW should be scalar-replaced")
+	}
+	if !instrInBlocks(f, msAlloc) {
+		return fail("SROA: the managed source slice must be left untouched")
+	}
+	return ""
+}
+
+// A raw-slice local (`*[]int`) accessed via whole-load + OP_EXTRACT (len) and
+// whole-stored from an extractable value is scalar-replaced into its {data,len}
+// field slots.
+func TestSroaRawSliceScalarReplaced() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var slt @types.Type = types.MakeSliceType(types.TypInt())
+	var other @ir.Instr = entry.EmitAlloc(slt)
+	var s @ir.Instr = entry.EmitAlloc(slt)
+	var v @ir.Instr = entry.EmitLoad(other, slt) // slice value (extractable)
+	entry.EmitStore(s, v) // whole store `s = other`
+	var sv @ir.Instr = entry.EmitLoad(s, slt) // whole load
+	var lenv @ir.Instr = entry.EmitSliceLen(sv) // OP_EXTRACT(sv, 1)
+	entry.EmitReturn(oneRet(lenv))
+
+	sroaFunc(f)
+
+	if instrInBlocks(f, s) {
+		return fail("SROA: a raw-slice local should be scalar-replaced")
+	}
+	if !instrInBlocks(f, other) {
+		return fail("SROA: the pinned source slice should remain")
+	}
+	return ""
+}
+
+// A managed slice of non-managed elements (`@[]int`) is scalar-replaced (Phase 2):
+// data/len/backinglen promote, and the refptr goes to a managed field slot with
+// an explicit nil zero-init.  The refcount spine (whole-load + extract-2) is
+// forwarded to that slot.  The pinned copy source (its load feeds the store)
+// remains.
+func TestSroaManagedSliceScalarReplaced() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var mst @types.Type = types.MakeManagedSliceType(types.TypInt())
+	var other @ir.Instr = entry.EmitAlloc(mst)
+	var v @ir.Instr = entry.EmitLoad(other, mst) // extractable managed-slice value
+	var s @ir.Instr = entry.EmitAlloc(mst)
+	entry.EmitStore(s, v) // whole store `s = other`
+	var sv @ir.Instr = entry.EmitLoad(s, mst)
+	var lenv @ir.Instr = entry.EmitSliceLen(sv)
+	entry.EmitReturn(oneRet(lenv))
+
+	sroaFunc(f)
+
+	if instrInBlocks(f, s) {
+		return fail("SROA: a managed @[]int should be scalar-replaced (Phase 2)")
+	}
+	if !instrInBlocks(f, other) {
+		return fail("SROA: the pinned copy source should remain")
+	}
+	if countOp(f, iropcode.OP_CONST_NIL) < 1 {
+		return fail("SROA: the refptr field slot needs an explicit nil zero-init")
+	}
+	return ""
+}
+
+// SROA to a fixpoint collapses BOTH sides of a copy.  `b = a` lowers to a whole
+// store of `load(a)`; that value is a non-extract use of `load(a)`, so the source
+// a is L2-pinned on the first pass while b is scalar-replaced.  Replacing b turns
+// the whole store into per-field OP_EXTRACTs of `load(a)`, after which a is
+// eligible — sroaFuncToFixpoint iterates until both allocas are gone and mem2reg
+// forwards the copied field constant.
+func TestSroaFixpointCollapsesCopySource() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var a @ir.Instr = entry.EmitAlloc(st)
+	var fpa @ir.Instr = entry.EmitGetFieldPtr(a, 0, types.TypInt())
+	entry.EmitStore(fpa, entry.EmitConstInt(7, types.TypInt())) // a.x = 7
+	var av @ir.Instr = entry.EmitLoad(a, st) // whole-load a
+	var b @ir.Instr = entry.EmitAlloc(st)
+	entry.EmitStore(b, av) // b = a (source av = load(a))
+	var fpb @ir.Instr = entry.EmitGetFieldPtr(b, 0, types.TypInt())
+	var v @ir.Instr = entry.EmitLoad(fpb, types.TypInt()) // read b.x
+	entry.EmitReturn(oneRet(v))
+
+	// One pass: b is scalar-replaced; the source a stays pinned (its whole-load
+	// still feeds the whole store of b as a non-extract value).
+	if !sroaFunc(f) {
+		return fail("SROA: first pass should scalar-replace b")
+	}
+	if !instrInBlocks(f, a) {
+		return fail("SROA: after one pass the copy source a should still be pinned")
+	}
+
+	// Fixpoint: a becomes eligible and is scalar-replaced too.
+	sroaFuncToFixpoint(f)
+	if instrInBlocks(f, a) {
+		return fail("SROA fixpoint: the copy source a should be scalar-replaced")
+	}
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 0 {
+		return fail("SROA fixpoint: every field-ptr of both structs should be gone")
+	}
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 0 {
+		return fail("SROA fixpoint + mem2reg: both struct allocas should be fully promoted away")
+	}
+	if lastInstr(entry).Args[0].Op != iropcode.OP_CONST_INT || lastInstr(entry).Args[0].IntVal != 7 {
+		return fail("SROA fixpoint + mem2reg: return should forward the copied field-0 constant 7")
+	}
+	return ""
+}
+
+// A copy CHAIN deeper than the old fixed 16-pass cap fully collapses under the
+// count-based bound: 20 structs `s1=s0; …; s19=s18`, each link peeling one alloca
+// per pass, need 20 passes (cap = alloca-count+1 = 21).  All 20 promote away and
+// the tail read forwards the seed constant through the whole chain.
+func TestSroaFixpointDeepCopyChain() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var chainLen int = 20
+	var prev @ir.Instr = entry.EmitAlloc(st)
+	var seed @ir.Instr = entry.EmitGetFieldPtr(prev, 0, types.TypInt())
+	entry.EmitStore(seed, entry.EmitConstInt(5, types.TypInt())) // s0.a = 5
+	for i := 1; i < chainLen; i++ {
+		var cur @ir.Instr = entry.EmitAlloc(st)
+		entry.EmitStore(cur, entry.EmitLoad(prev, st)) // s_i = s_{i-1}
+		prev = cur
+	}
+	var tailFp @ir.Instr = entry.EmitGetFieldPtr(prev, 0, types.TypInt())
+	entry.EmitReturn(oneRet(entry.EmitLoad(tailFp, types.TypInt()))) // read tail.a
+
+	sroaFuncToFixpoint(f)
+
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 0 {
+		return fail("SROA fixpoint: every field-ptr in the 20-deep chain should be gone")
+	}
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 0 {
+		return fail("SROA fixpoint + mem2reg: the whole 20-deep copy chain should promote away")
+	}
+	if lastInstr(entry).Args[0].Op != iropcode.OP_CONST_INT || lastInstr(entry).Args[0].IntVal != 5 {
+		return fail("SROA fixpoint: the tail read should forward the seed constant 5 through the chain")
+	}
+	return ""
+}
+
+// A whole load whose value is NEVER extracted (dead) is L2-vacuously splittable:
+// expandWholeLoad marks no field used, so it contributes zero per-field loads and
+// simply vanishes — only the genuine field-0 access load survives.
+func TestSroaDeadWholeLoadDropped() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var s @ir.Instr = entry.EmitAlloc(st)
+	var fp0 @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitStore(fp0, entry.EmitConstInt(7, types.TypInt()))
+	entry.EmitLoad(s, st) // whole load, value UNUSED — must expand to nothing
+	var fp0b @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitReturn(oneRet(entry.EmitLoad(fp0b, types.TypInt())))
+
+	if !sroaFunc(f) {
+		return fail("SROA: a struct with a dead whole-load should still be scalar-replaced")
+	}
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 0 {
+		return fail("SROA: field-ptrs should be gone")
+	}
+	if countOp(f, iropcode.OP_LOAD) != 1 {
+		return fail("SROA: the dead whole-load should drop to nothing; only the field-0 load remains")
+	}
+	promoteFuncScalars(f)
+	if lastInstr(entry).Args[0].Op != iropcode.OP_CONST_INT || lastInstr(entry).Args[0].IntVal != 7 {
+		return fail("SROA+mem2reg: the surviving field-0 load should forward the stored 7")
+	}
+	return ""
+}
+
+// A field extracted ONLY inside a FaultPad must still get a per-field load —
+// expandWholeLoad's used-field scan covers fault pads, not just Func.Blocks.  The
+// pad's OP_EXTRACT is then dropped (extract of the deleted whole-load) and its
+// field-1 per-field load is materialized at the whole-load site in the block.
+func TestSroaWholeLoadExtractedInFaultPad() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var s @ir.Instr = entry.EmitAlloc(st)
+	entry.EmitStore(entry.EmitGetFieldPtr(s, 0, types.TypInt()), entry.EmitConstInt(3, types.TypInt()))
+	entry.EmitStore(entry.EmitGetFieldPtr(s, 1, types.TypInt()), entry.EmitConstInt(4, types.TypInt()))
+	var v @ir.Instr = entry.EmitLoad(s, st) // whole load
+	entry.EmitReturn(oneRet(entry.EmitExtract(v, 0, types.TypInt()))) // field 0 read in the block
+	// A fault pad reads field 1 of the SAME whole-load value.
+	var pad @ir.Block = ir.AddFaultPad(f, "pad")
+	pad.EmitExtract(v, 1, types.TypInt())
+	pad.EmitUnwindReturn()
+
+	if !sroaFunc(f) {
+		return fail("SROA: a whole-load feeding a pad extract should be scalar-replaced")
+	}
+	if countOpInBlock(f.FaultPads[0], iropcode.OP_EXTRACT) != 0 {
+		return fail("SROA: the pad's extract (of the deleted whole-load) should be dropped")
+	}
+	// Both field-0 (block) and field-1 (pad) are marked used, so BOTH per-field
+	// loads are materialized in the block — field-1's only because the pad scan saw it.
+	if countOp(f, iropcode.OP_LOAD) != 2 {
+		return fail("SROA: the pad-only field-1 extract must still produce a per-field load")
+	}
+	return ""
+}
+
+// Two whole loads of the SAME alloca extracting DISJOINT fields: the used-field
+// tally is per-load, so each whole-load materializes only its own extracted
+// field's load (2 total, not 4).  Verifies the tally keys on the specific load.
+func TestSroaTwoWholeLoadsDisjointFields() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var s @ir.Instr = entry.EmitAlloc(st)
+	entry.EmitStore(entry.EmitGetFieldPtr(s, 0, types.TypInt()), entry.EmitConstInt(3, types.TypInt()))
+	entry.EmitStore(entry.EmitGetFieldPtr(s, 1, types.TypInt()), entry.EmitConstInt(4, types.TypInt()))
+	var v1 @ir.Instr = entry.EmitLoad(s, st) // whole load 1 -> field 0 only
+	var e1 @ir.Instr = entry.EmitExtract(v1, 0, types.TypInt())
+	var v2 @ir.Instr = entry.EmitLoad(s, st) // whole load 2 -> field 1 only
+	var e2 @ir.Instr = entry.EmitExtract(v2, 1, types.TypInt())
+	entry.EmitReturn(oneRet(entry.EmitBinop(iropcode.OP_ADD, e1, e2, types.TypInt())))
+
+	if !sroaFunc(f) {
+		return fail("SROA: two disjoint-field whole loads should be scalar-replaced")
+	}
+	if countOp(f, iropcode.OP_EXTRACT) != 0 {
+		return fail("SROA: both extracts should be rewritten to per-field loads")
+	}
+	if countOp(f, iropcode.OP_LOAD) != 2 {
+		return fail("SROA: each whole load should materialize only its own field's load (2 total)")
+	}
+	promoteFuncScalars(f)
+	var sum @ir.Instr = lastInstr(entry).Args[0]
+	if sum.Op != iropcode.OP_ADD || sum.Args[0].IntVal != 3 || sum.Args[1].IntVal != 4 {
+		return fail("SROA+mem2reg: the loads should forward 3 (field 0) and 4 (field 1)")
+	}
+	return ""
+}
+
+// A struct initialized from a by-value aggregate call result (`var s S = f()`)
+// scalar-replaces: the whole-store of the OP_CALL expands to per-field
+// store(slot_i, OP_EXTRACT(call, i)), so s's field-ptrs vanish and the call is
+// read field-wise.  (The backends lower OP_EXTRACT of a call result — sret buffer
+// load or coerced-register reconstitution.)
+func TestSroaCallResultWholeStoreScalarized() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var s @ir.Instr = entry.EmitAlloc(st)
+	var call @ir.Instr = entry.EmitCall("mk", noArgs, st) // returns the struct by value
+	entry.EmitStore(s, call) // whole-store of the call result
+	var fp0 @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitReturn(oneRet(entry.EmitLoad(fp0, types.TypInt())))
+
+	if !sroaFunc(f) {
+		return fail("SROA: a struct initialized from a by-value call result should scalar-replace")
+	}
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 0 {
+		return fail("SROA: s's field-ptrs should be gone")
+	}
+	if countOp(f, iropcode.OP_EXTRACT) != 2 {
+		return fail("SROA: the whole-store should expand to per-field extracts of the call")
+	}
+	return ""
+}

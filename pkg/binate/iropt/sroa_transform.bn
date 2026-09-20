@@ -1,0 +1,381 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// SROA rewrite — Phase 1: NON-MANAGED, ALL-PROMOTABLE-FIELD AGGREGATES
+// (structs and raw slices).
+//
+// Consumes the Phase-0 eligibility analysis (sroa.bn).  For a splittable
+// non-managed aggregate alloca — a struct whose every field is a
+// mem2reg-promotable scalar, or a raw slice `*[]T` ({data: *uint8, len: int}) —
+// this creates one scalar alloca per field, rewrites the aggregate's accesses
+// onto those field slots, and deletes the aggregate alloca.  mem2reg
+// (promoteScalars, run right after this in RunOptPasses) then promotes the field
+// slots to SSA, collapsing the field-by-field stack traffic the native backends
+// emit for a local aggregate.  A struct is field-accessed via OP_GET_FIELD_PTR; a
+// raw slice is whole-loaded then read via OP_EXTRACT (len / data) — both handled.
+//
+// The four access kinds a candidate alloca `a` can have (L1 admits only these),
+// and how each is rewritten:
+//   - OP_GET_FIELD_PTR(a, i)  -> replaced by the field alloca fa[i] (its load /
+//     store consumers then load/store the scalar slot directly).
+//   - whole OP_STORE(a, val)  -> per-field OP_STORE(fa[i], OP_EXTRACT(val, i)).
+//     Sound ONLY when val is a coercion-free first-class aggregate value
+//     (isExtractableAggregateValue) — a copy's load result.  An ABI-coerced call
+//     result and a byval-param-ref (a `ptr`) are NOT extractvalue-able, so such a
+//     candidate is pinned (see collectSroaAggregateCandidates).
+//   - whole OP_LOAD(a)        -> per-field OP_LOAD(fa[i]) at the load's position;
+//     each OP_EXTRACT(load, i) consumer is rewritten to fl[i].  L2 guarantees a
+//     whole load's value is used only by OP_EXTRACT.
+//   - the OP_ALLOC(a) itself   -> replaced by the fa[i] allocas.
+//
+// SCOPE gates (soundness):
+//   - Non-managed structs only — a managed field needs refcount / fault-pad
+//     handling and never reaches here (sroaAggregateContainsManaged excludes it,
+//     and a non-managed struct never appears in a FaultPad).
+//   - All fields mem2reg-promotable — deleting the struct alloca drops the
+//     backend's implicit whole-struct zero-fill, so a field never explicitly
+//     stored is recovered as zero ONLY by mem2reg zero-forwarding its undef load,
+//     which needs the field slot to be promotable.
+//   - Non-managed structs and raw slices; managed aggregates are a later phase.
+
+// sroaStoreExp pairs each whole-store instruction (void, so not id-keyable) with
+// the per-field extract+store instructions that replace it in the rebuild.
+type sroaStoreExp struct {
+	stores @[]@ir.Instr
+	exps   @[]@[]@ir.Instr
+}
+
+// runSroa applies scalar replacement to every non-extern func in the module,
+// each to a fixpoint.  Invoked by RunOptPasses at -O1+, BEFORE promoteScalars.
+func runSroa(m @ir.Module) {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @ir.Func = m.Funcs[fi]
+		if f.IsExtern {
+			continue
+		}
+		sroaFuncToFixpoint(f)
+	}
+}
+
+// sroaFuncToFixpoint runs sroaFunc repeatedly until a pass scalar-replaces
+// nothing new.  One pass alone leaves a copy's SOURCE pinned: `b = a` lowers to a
+// whole-store of `load(a)`, whose value is a non-extract use of `load(a)`, so a
+// is L2-pinned on the first pass; scalar-replacing b rewrites that whole-store to
+// per-field OP_EXTRACTs of `load(a)`, after which every use of `load(a)` IS an
+// extract and a becomes eligible next pass.  A copy CHAIN `s1=s0; s2=s1; …` peels
+// one link per pass, so a fixed small cap would silently leave a deep chain's
+// outer allocas un-split.
+//
+// The bound is the total count of by-value aggregate NODES across f's aggregate
+// allocas (each contributes aggregateNodeCount — itself plus its transitively-
+// nested aggregate fields), +1 to observe the terminating false pass.  A nested-
+// aggregate field splits into a field slot that is ITSELF an aggregate (a struct
+// with a nested struct / raw-slice field), so a progress pass CAN add aggregate
+// allocas — but only strictly shallower ones (a by-value type cannot contain
+// itself; recursion goes through managed pointers, which are leaves).  Counting
+// only top-level allocas would under-count: a depth-D nest is one alloca yet
+// needs D passes.  The node count covers both axes — a depth-D nest is D nodes,
+// and a copy CHAIN of k links (peeled one per pass, see above) is k allocas = k
+// nodes.  The cap never truncates legitimate work, yet still stops a hypothetical
+// analysis bug that reported progress without shrinking the IR.
+func sroaFuncToFixpoint(f @ir.Func) {
+	var maxPasses int = sroaFixpointPassBound(f) + 1
+	for i := 0; i < maxPasses; i++ {
+		if !sroaFunc(f) {
+			return
+		}
+	}
+}
+
+// sroaFixpointPassBound sums aggregateNodeCount over f's aggregate allocas — an
+// upper bound on how many progress passes sroaFuncToFixpoint can make, since each
+// splits at least one aggregate node and never regenerates one.
+func sroaFixpointPassBound(f @ir.Func) int {
+	var n int = 0
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if isSroaAggregateAlloca(instr) {
+				n = n + aggregateNodeCount(instr.TypeArg)
+			}
+		}
+	}
+	return n
+}
+
+// aggregateNodeCount returns the number of by-value aggregate nodes in t: 0 for a
+// non-splittable leaf (scalar / managed pointer / array / func-value /
+// iface-value), else 1 (t itself) plus the count over its field types.  By-value
+// aggregates cannot recurse (that would be infinite size — recursion goes through
+// managed pointers, which are leaves), so this terminates.
+func aggregateNodeCount(t @types.Type) int {
+	if !isSroaAggregateType(t) {
+		return 0
+	}
+	var fts @[]@types.Type = aggregateFieldTypes(t)
+	var n int = 1
+	for i := 0; i < len(fts); i++ {
+		n = n + aggregateNodeCount(fts[i])
+	}
+	return n
+}
+
+// sroaFunc scalar-replaces every splittable aggregate alloca in f in ONE pass,
+// returning whether it replaced any (so sroaFuncToFixpoint can iterate).  A copy
+// source stays pinned until a later pass — see sroaFuncToFixpoint.
+func sroaFunc(f @ir.Func) bool {
+	if len(f.Blocks) == 0 {
+		return false
+	}
+	var cands @[]@ir.Instr = collectSroaAggregateCandidates(f)
+	if len(cands) == 0 {
+		return false
+	}
+	validateSroaCandidates(f, cands) // fail-loud precondition guard (L1 + L2)
+
+	// Per-alloca field slots, keyed by the ORIGINAL alloca id.  New instrs get
+	// ids >= the original NextID; the id-keyed tables are sized to that original
+	// NextID, so new ids fall outside them (guarded lookups).
+	var origCap int = f.NextID
+	var isCand @[]bool = boolTable(origCap)
+	var fieldsOf @[]@[]@ir.Instr = instrListTable(origCap)
+	var zeroInitsOf @[]@[]@ir.Instr = instrListTable(origCap)
+	for ci := 0; ci < len(cands); ci++ {
+		var a @ir.Instr = cands[ci]
+		isCand[a.ID] = true
+		fieldsOf[a.ID] = makeFieldAllocas(f, a)
+		zeroInitsOf[a.ID] = makeFieldZeroInits(f, fieldsOf[a.ID])
+	}
+
+	// Plan the rewrite: mark dropped instrs, build per-field loads for whole
+	// loads, and collect the void whole-store expansions.  This creates all new
+	// instrs, so f.NextID is final afterward.
+	var deleted @[]bool = boolTable(origCap)
+	var loadExp @[]@[]@ir.Instr = instrListTable(origCap)
+	var se @sroaStoreExp = planStructRewrite(f, isCand, fieldsOf, deleted, loadExp, origCap)
+
+	// repl (field-ptr -> field alloca; extract -> per-field load) is keyed by
+	// original id but sized to the final NextID so rewriteUsesInBlocks' bounds
+	// check covers every id, including the new instrs it walks.
+	var repl @[]@ir.Instr = instrTable(f.NextID)
+	fillReplacements(f, isCand, fieldsOf, deleted, loadExp, repl, origCap)
+
+	rebuildSroaBlocks(f, isCand, fieldsOf, zeroInitsOf, deleted, loadExp, se, origCap)
+	rewriteUsesInBlocks(f.Blocks, repl, f.NextID)
+	rewriteUsesInBlocks(f.FaultPads, repl, f.NextID)
+	assertNoSurvivingSroaUses(f, deleted, origCap)
+	return true
+}
+
+// collectSroaAggregateCandidates filters the Phase-0 candidate set to this
+// phase's scope: a NON-MANAGED aggregate alloca — a struct or a raw slice
+// (`*[]T`) — with all fields promotable, and every whole store into it carrying
+// an extractable aggregate value.  A raw slice is a 2-field aggregate
+// {data: *uint8, len: int}; both fields are promotable and its access is
+// whole-load + OP_EXTRACT (len / data), which the same machinery scalarizes.
+func collectSroaAggregateCandidates(f @ir.Func) @[]@ir.Instr {
+	var out @[]@ir.Instr
+	var all @[]@ir.Instr = collectSroaCandidates(f)
+	for i := 0; i < len(all); i++ {
+		var a @ir.Instr = all[i]
+		var t @types.Type = irutil.PeelTransparent(a.TypeArg)
+		if t == nil {
+			continue
+		}
+		if t.Kind != types.TYP_STRUCT && t.Kind != types.TYP_SLICE {
+			continue
+		}
+		if sroaAggregateContainsManaged(a.TypeArg) {
+			continue // excludes managed slices and structs with a managed field
+		}
+		if !aggregateFieldsScalarReplaceable(t) {
+			continue
+		}
+		if !aggregateWholeStoresExtractable(f, a) {
+			continue
+		}
+		out = slices.Append[@ir.Instr](out, a)
+	}
+	// Phase 2: managed slices `@[]T` whose element needs no destruction.  These
+	// are excluded from collectSroaCandidates' non-managed set (and its
+	// pad-pinning L1), so collect them here with a pad-AWARE L1/L2 that admits the
+	// refcount spine's whole-load+extract in FaultPads.
+	out = appendAll(out, collectManagedSliceCandidates(f))
+	// Phase 2: leaf-managed structs.  At -O1+ their cleanup is inline per-field
+	// RefDecs on the alloca's field-ptrs (emitDecForManagedLocals /
+	// managedStructLeafEligible), so a candidate's uses are all field-ptr
+	// load/store in blocks AND pads — collected with the same pad-aware L1/L2.
+	out = appendAll(out, collectManagedStructCandidates(f))
+	return out
+}
+
+// isScalarPromotableType reports whether an OP_ALLOC of type t is one mem2reg
+// can promote a phi of: int (<= target word), bool, or a raw pointer.  Float /
+// managed / aggregate are excluded.  The shared promotable-type predicate for
+// mem2reg's isPromotableAlloca AND SROA's field gate: a promotable field slot is
+// mem2reg-promoted and zero-forwarded (recovering the deleted struct alloca's
+// implicit backend zero-fill), while a non-promotable field slot would read stack
+// garbage unless SROA gives it an explicit zero-const init
+// (aggregateFieldsScalarReplaceable + makeFieldZeroInits handle float / oversized
+// int that way; a managed slot gets a nil).
+func isScalarPromotableType(t @types.Type) bool {
+	t = ir.PeelToRepr(t)
+	if t == nil {
+		return false
+	}
+	if t.Kind == types.TYP_INT {
+		return t.Width <= types.TypInt().Width
+	}
+	if t.Kind == types.TYP_BOOL {
+		return true
+	}
+	if t.Kind == types.TYP_POINTER {
+		return true
+	}
+	return false
+}
+
+// fieldNeedsZeroConstInit reports whether a split-out field of type t is a
+// non-managed SCALAR that mem2reg cannot promote (so it would read stack garbage
+// after the parent's whole-struct backend zero-fill is dropped) and the backend
+// does not zero-fill (it is not an aggregate) — namely a float or an oversized
+// int (wider than the target word).  makeFieldZeroInits gives such a field an
+// explicit zero-const store.  (A promotable scalar is mem2reg-zero-forwarded; a
+// managed scalar is nil-init'd separately; an aggregate is backend-zero-filled.)
+func fieldNeedsZeroConstInit(t @types.Type) bool {
+	var tr @types.Type = ir.PeelToRepr(t)
+	if tr == nil {
+		return false
+	}
+	if tr.Kind == types.TYP_FLOAT {
+		return true
+	}
+	return tr.Kind == types.TYP_INT && tr.Width > types.TypInt().Width
+}
+
+// fieldIsBackendZeroFilledAggregate reports whether a split-out field of type t is
+// an AGGREGATE the backend zero-fills at its own alloca — so after the split the
+// field slot is zero-initialized with no explicit init (unlike a non-promotable
+// scalar).  MUST MIRROR pkg/binate/native/common.IsAggregateTyp, which is also the
+// LLVM (emit_helpers.bn) + native emitAlloc zero-fill set: struct / array / raw +
+// managed slice / func-value / iface-value.  (In the non-managed SROA path only the
+// non-managed variants occur — a managed field is excluded upstream by
+// sroaAggregateContainsManaged — but mirroring the full set keeps this in lockstep
+// with the backend predicate.)  ir must not import native/common; keep in sync.
+func fieldIsBackendZeroFilledAggregate(t @types.Type) bool {
+	var tr @types.Type = irutil.PeelTransparent(t)
+	if tr == nil {
+		return false
+	}
+	return tr.Kind == types.TYP_STRUCT || tr.Kind == types.TYP_ARRAY || tr.Kind == types.TYP_SLICE ||
+			tr.Kind == types.TYP_MANAGED_SLICE || tr.Kind == types.TYP_FUNC_VALUE ||
+			tr.Kind == types.TYP_MANAGED_FUNC_VALUE || tr.Kind == types.TYP_INTERFACE_VALUE ||
+			tr.Kind == types.TYP_INTERFACE_VALUE_MANAGED
+}
+
+// aggregateFieldsScalarReplaceable reports whether EVERY field of NON-MANAGED
+// aggregate type t can be safely split into its own alloca: a mem2reg-promotable
+// scalar (zero-forwarded), a float / oversized-int scalar given an explicit
+// zero-const init (fieldNeedsZeroConstInit / makeFieldZeroInits), or a nested
+// AGGREGATE the backend zero-fills at its own alloca (fieldIsBackendZeroFilled-
+// Aggregate — no init needed; the SROA fixpoint then recurses into a nested
+// struct / raw-slice slot to flatten it further).  A raw slice's fields are
+// {*uint8, int} — always promotable.
+func aggregateFieldsScalarReplaceable(t @types.Type) bool {
+	t = irutil.PeelTransparent(t)
+	if t == nil {
+		return false
+	}
+	if t.Kind == types.TYP_SLICE {
+		return true
+	}
+	for i := 0; i < len(t.Fields); i++ {
+		var ft @types.Type = t.Fields[i].Type
+		if !isScalarPromotableType(ft) && !fieldNeedsZeroConstInit(ft) &&
+				!fieldIsBackendZeroFilledAggregate(ft) {
+			return false
+		}
+	}
+	return true
+}
+
+// aggregateWholeStoresExtractable reports whether every whole OP_STORE into
+// alloca a carries an extractable aggregate value.  a has already passed L1, so
+// its only alloca uses are whole load/store + field-ptr; a whole load's value is
+// extract-only by L2.  A whole store whose value is NOT extractable (e.g. a
+// byval-param-ref `ptr`) cannot be scalarized via OP_EXTRACT, so it pins a.
+func aggregateWholeStoresExtractable(f @ir.Func, a @ir.Instr) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.Op != iropcode.OP_STORE || len(instr.Args) < 2 || instr.Args[0] != a {
+				continue
+			}
+			// A whole-store of OP_CONST_NIL is a zero-init (`var h S` for a managed
+			// struct lowers to `store(h, nil)`); it is DROPPED in the rewrite —
+			// the split field slots get their per-field zeros from makeFieldZeroInits
+			// (managed / float / oversized) and mem2reg zero-forwarding (promotable),
+			// so the whole-nil-store is redundant, not something to scalarize.
+			if instr.Args[1].Op == iropcode.OP_CONST_NIL {
+				continue
+			}
+			if !isExtractableAggregateValue(instr.Args[1]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isExtractableAggregateValue reports whether val is a first-class aggregate SSA
+// value that OP_EXTRACT can read a field from WITHOUT ABI-coercion trouble: a
+// memory load result, or a nested extract.  Both are the aggregate's plain
+// in-representation value.  A CALL result is deliberately EXCLUDED: the backends
+// coerce a by-value aggregate return to the call ABI shape (e.g. a 2-word struct
+// to `[2 x i64]`), so OP_EXTRACT on it emits a type-mismatched extractvalue
+// (`extractvalue [2 x i64] %call, 0` where %call is typed as the struct).  A
+// byval-param-ref (OP_PARAM, physically a `ptr`) and an alloca pointer
+// (OP_ALLOC) are likewise excluded.  Coerced-value producers (calls) are a
+// follow-up (scalarize via the un-coercion path, not extractvalue).
+func isExtractableAggregateValue(val @ir.Instr) bool {
+	if val == nil {
+		return false
+	}
+	if val.Op == iropcode.OP_LOAD || val.Op == iropcode.OP_EXTRACT {
+		return true
+	}
+	// A by-value aggregate call result (`var s S = f()`): OP_EXTRACT reads field i
+	// of the returned struct — every backend already materializes the result (in
+	// the sret buffer, or by reconstituting the coerced registers as the struct)
+	// and extracts field-wise from it, so `store(s, call)` scalar-replaces into
+	// per-field `store(slot_i, extract(call, i))` instead of a whole-struct
+	// copy-then-field-load.  The three call ops a user aggregate-returning call
+	// lowers to are all admitted: a direct call, a `*func`/`@func`-value call, and
+	// an interface-method call.  (OP_CALL_INDIRECT / OP_CALL_HANDLE are NOT here —
+	// they are the compiler-internal shim/dtor magics, whose result is asserted
+	// scalar-or-void, so they never carry an aggregate to extract.)
+	// A struct with a MANAGED field never reaches here —
+	// collectSroaAggregateCandidates excludes it (sroaAggregateContainsManaged).
+	// A managed-SLICE return (`@[]T = f()`) IS admitted, through the phase-2
+	// managed-slice path (collectManagedSliceCandidates, which shares this gate):
+	// its +1-owned refptr is extracted source-agnostically into a managed slot
+	// that is RefDec'd exactly once — no leak, no double-free.
+	if val.Op == iropcode.OP_CALL || val.Op == iropcode.OP_CALL_FUNC_VALUE ||
+			val.Op == iropcode.OP_CALL_IFACE_METHOD {
+		return true
+	}
+	// OP_MANAGED_TO_RAW decays an @[]T / @T to a first-class raw {data,len} (or
+	// pointer) value built in-register (extractvalue of the managed header), not
+	// ABI-coerced — so a `var s *[]T = make_slice(...)` init store is extractable
+	// and its raw-slice local can be scalar-replaced.
+	return val.Op == iropcode.OP_MANAGED_TO_RAW
+}

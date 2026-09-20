@@ -1,0 +1,485 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Tests for the SROA Phase-1 candidate ANALYSIS (sroa_transform.bn): the
+// extractable-value whitelist and the leave-alone cases (byval-param store,
+// non-promotable field, nested-aggregate field, address-escape, managed struct,
+// managed slice, whole-value-returned).  The rewrite/scalarization tests live in
+// sroa_rewrite_test.bn.  Reuses twoIntStruct (sroa_test.bn), oneRet, countOp,
+// fail; managedFieldStruct and instrInBlocks are shared helpers defined here.
+
+// managedFieldStruct builds `struct { Ref @Inner }` — a managed aggregate.
+func managedFieldStruct() @types.Type {
+	var fields @[]@types.Field = make_slice(@types.Field, 1)
+	var f0 @types.Field = make(types.Field)
+	f0.Name = "Ref"
+	f0.Type = types.MakeManagedPtrType(types.MakeStructType("Inner", noFields))
+	fields[0] = f0
+	return types.MakeStructType("Boxed", fields)
+}
+
+// isExtractableAggregateValue whitelists first-class aggregate producers whose
+// per-field OP_EXTRACT the backends can lower — a load, an extract, and a
+// by-value aggregate call result — and rejects an alloca pointer and a const
+// (not struct values), the gate that keeps whole-store scalarization from
+// emitting an OP_EXTRACT on a value that isn't a plain struct value.
+func TestSroaExtractableValuePredicate() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var ld @ir.Instr = entry.EmitLoad(entry.EmitAlloc(st), st)
+	var call @ir.Instr = entry.EmitCall("mk", noArgs, st)
+	var alloc @ir.Instr = entry.EmitAlloc(st)
+	var cnst @ir.Instr = entry.EmitConstInt(0, types.TypInt())
+	// A func-value call and an interface-method call returning the struct by value
+	// are also extractable — a user aggregate-returning call lowers to one of these
+	// three ops, all admitted.
+	var noTypeParams @[]@types.Param
+	var noTypeResults @[]@types.Type
+	var fvTyp @types.Type = types.MakeManagedFuncValueType(noTypeParams, noTypeResults)
+	var fvCall @ir.Instr = entry.EmitCallFuncValue(entry.EmitConstNil(fvTyp), noArgs, st)
+	var ivTyp @types.Type = types.MakeManagedInterfaceValueType(nil)
+	var ivCall @ir.Instr = entry.EmitCallIfaceMethod(entry.EmitConstNil(ivTyp), noArgs, 0, st)
+
+	if !isExtractableAggregateValue(ld) {
+		return fail("SROA: a load result must be extractable")
+	}
+	if !isExtractableAggregateValue(call) {
+		return fail("SROA: a by-value aggregate call result must be extractable")
+	}
+	if !isExtractableAggregateValue(fvCall) || !isExtractableAggregateValue(ivCall) {
+		return fail("SROA: a func-value / iface-method aggregate call result must be extractable")
+	}
+	if isExtractableAggregateValue(alloc) || isExtractableAggregateValue(cnst) {
+		return fail("SROA: an alloca pointer / const must NOT be extractable")
+	}
+	return ""
+}
+
+// A struct with a float field IS scalar-replaced (field-broadening): mem2reg
+// can't promote the float slot, so splitting would drop the whole-struct zero-fill
+// — SROA instead gives the float slot an explicit zero-const init, so an unwritten
+// float field reads 0, not stack garbage.  The int field then promotes away; the
+// float slot (non-promotable) stays with its zero-init.
+func TestSroaStructWithFloatFieldScalarReplaced() testing.TestResult {
+	var fields @[]@types.Field = make_slice(@types.Field, 2)
+	var f0 @types.Field = make(types.Field)
+	f0.Name = "a"
+	f0.Type = types.TypInt()
+	fields[0] = f0
+	var f1 @types.Field = make(types.Field)
+	f1.Name = "f"
+	f1.Type = types.TypFloat64()
+	fields[1] = f1
+	var st @types.Type = types.MakeStructType("Mixed", fields)
+
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var s @ir.Instr = entry.EmitAlloc(st)
+	var fp0 @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitStore(fp0, entry.EmitConstInt(5, types.TypInt())) // s.a = 5 (s.f unwritten)
+	var fp0b @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitReturn(oneRet(entry.EmitLoad(fp0b, types.TypInt())))
+
+	sroaFunc(f)
+
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 0 {
+		return fail("SROA: a float-field struct should be scalar-replaced (field-ptrs gone)")
+	}
+	if countOp(f, iropcode.OP_ALLOC) != 2 {
+		return fail("SROA: the struct should become an int slot + a float slot")
+	}
+	if countOp(f, iropcode.OP_CONST_FLOAT) < 1 {
+		return fail("SROA: the non-promotable float slot needs an explicit zero-const init")
+	}
+
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 1 {
+		return fail("SROA+mem2reg: the int slot promotes; only the float slot survives")
+	}
+	return ""
+}
+
+// A whole store whose value is a byval-param-ref (OP_PARAM — physically a `ptr`,
+// not extractvalue-able) pins the candidate: the param-slot init pattern.
+func TestSroaStructWholeStoreByvalParamPinned() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var p @ir.Param = ir.NewParam(f, "p", st)
+	var pref @ir.Instr = ir.NewParamRef(p) // OP_PARAM byval-ref value
+	var s @ir.Instr = entry.EmitAlloc(st)
+	entry.EmitStore(s, pref) // whole store of a non-extractable value
+	var fp0 @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	var r @ir.Instr = entry.EmitLoad(fp0, types.TypInt())
+	entry.EmitReturn(oneRet(r))
+
+	sroaFunc(f)
+
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 1 || countOp(f, iropcode.OP_ALLOC) != 1 {
+		return fail("SROA: a struct whole-stored from a byval-param-ref must be pinned")
+	}
+	return ""
+}
+
+// A struct with a nested-AGGREGATE field is scalar-replaced (field-broadening): the
+// nested struct slot is backend-zero-filled (no explicit init), and the SROA
+// fixpoint then RECURSES into it — one pass splits Outer (leaving the inner struct
+// as its own aggregate slot), the next splits the inner struct — so mem2reg
+// promotes the whole nest away and the return forwards the written outer field.
+func TestSroaStructWithNestedAggregateFieldScalarReplaced() testing.TestResult {
+	var fields @[]@types.Field = make_slice(@types.Field, 2)
+	var f0 @types.Field = make(types.Field)
+	f0.Name = "a"
+	f0.Type = types.TypInt()
+	fields[0] = f0
+	var f1 @types.Field = make(types.Field)
+	f1.Name = "inner"
+	f1.Type = twoIntStruct()
+	fields[1] = f1
+	var st @types.Type = types.MakeStructType("Outer", fields)
+
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var s @ir.Instr = entry.EmitAlloc(st)
+	var fp0 @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitStore(fp0, entry.EmitConstInt(5, types.TypInt())) // s.a = 5
+	var fp0b @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitReturn(oneRet(entry.EmitLoad(fp0b, types.TypInt())))
+
+	// One pass: Outer's field-ptrs are gone; it becomes an int slot + a nested
+	// twoIntStruct slot (the fixpoint splits the inner one on the NEXT pass).
+	if !sroaFunc(f) {
+		return fail("SROA: a nested-aggregate-field struct should be scalar-replaced")
+	}
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 0 {
+		return fail("SROA: Outer's field-ptrs should be gone after one pass")
+	}
+	if countOp(f, iropcode.OP_ALLOC) != 2 {
+		return fail("SROA: Outer should become an int slot + a nested-struct slot")
+	}
+
+	// Fixpoint splits the nested struct too; mem2reg then promotes everything.
+	sroaFuncToFixpoint(f)
+	promoteFuncScalars(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 0 {
+		return fail("SROA fixpoint + mem2reg: the whole nest should promote away")
+	}
+	if lastInstr(entry).Args[0].Op != iropcode.OP_CONST_INT || lastInstr(entry).Args[0].IntVal != 5 {
+		return fail("SROA fixpoint + mem2reg: return should forward s.a = 5")
+	}
+	return ""
+}
+
+// A struct field accessed field-by-field THROUGH a nested struct (s.inner.b) is
+// the case the L1-recursion admits: the inner OP_GET_FIELD_PTR's base is the
+// outer field-ptr, so fieldPtrChainScalarReplaceable must recurse through the
+// chain rather than pin the outer slot on that non-load/store use.  After one
+// pass Outer's own field-ptrs are gone (the inner field-ptrs rebase onto the new
+// nested slot); the fixpoint + mem2reg then flatten the whole nest, forwarding
+// s.a + s.inner.b = 5 + 9.
+func TestSroaNestedFieldAccessRecursesL1() testing.TestResult {
+	var fields @[]@types.Field = make_slice(@types.Field, 2)
+	var f0 @types.Field = make(types.Field)
+	f0.Name = "a"
+	f0.Type = types.TypInt()
+	fields[0] = f0
+	var f1 @types.Field = make(types.Field)
+	f1.Name = "inner"
+	f1.Type = twoIntStruct()
+	fields[1] = f1
+	var st @types.Type = types.MakeStructType("Outer", fields)
+
+	var pair @types.Type = twoIntStruct()
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var s @ir.Instr = entry.EmitAlloc(st)
+
+	// s.a = 5
+	entry.EmitStore(entry.EmitGetFieldPtr(s, 0, types.TypInt()), entry.EmitConstInt(5, types.TypInt()))
+	// s.inner.b = 9 — nested: GET_FIELD_PTR(s, 1) is the base of GET_FIELD_PTR(inner, 1).
+	var wInner @ir.Instr = entry.EmitGetFieldPtr(s, 1, pair)
+	entry.EmitStore(entry.EmitGetFieldPtr(wInner, 1, types.TypInt()),
+			entry.EmitConstInt(9, types.TypInt()))
+	// return s.a + s.inner.b
+	var ra @ir.Instr = entry.EmitLoad(entry.EmitGetFieldPtr(s, 0, types.TypInt()), types.TypInt())
+	var rInner @ir.Instr = entry.EmitGetFieldPtr(s, 1, pair)
+	var rb @ir.Instr = entry.EmitLoad(entry.EmitGetFieldPtr(rInner, 1, types.TypInt()), types.TypInt())
+	entry.EmitReturn(oneRet(entry.EmitBinop(iropcode.OP_ADD, ra, rb, types.TypInt())))
+
+	// One pass: Outer splits (the L1-recursion admits the nested field-by-field
+	// chain) into an int slot + a nested-struct slot; the inner slot is split on
+	// the NEXT pass.
+	if !sroaFunc(f) {
+		return fail("SROA: a nested field-by-field-accessed struct should scalar-replace")
+	}
+	if countOp(f, iropcode.OP_ALLOC) != 2 {
+		return fail("SROA: Outer should split into an int slot + a nested-struct slot")
+	}
+
+	// Fixpoint splits the nested slot; mem2reg promotes the whole nest away.
+	sroaFuncToFixpoint(f)
+	promoteFuncScalars(f)
+	if countOp(f, iropcode.OP_ALLOC) != 0 {
+		return fail("SROA fixpoint + mem2reg: the whole nest should promote away")
+	}
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 0 {
+		return fail("SROA fixpoint + mem2reg: no field-ptrs should survive")
+	}
+	var sum @ir.Instr = lastInstr(entry).Args[0]
+	if sum.Op != iropcode.OP_ADD {
+		return fail("SROA: return operand should be the s.a + s.inner.b add")
+	}
+	if sum.Args[0].Op != iropcode.OP_CONST_INT || sum.Args[0].IntVal != 5 {
+		return fail("SROA: add lhs should forward s.a = 5")
+	}
+	if sum.Args[1].Op != iropcode.OP_CONST_INT || sum.Args[1].IntVal != 9 {
+		return fail("SROA: add rhs should forward s.inner.b = 9")
+	}
+	return ""
+}
+
+// nestOnce builds `struct { pad int; f inner }` — one nesting level for the
+// deep-nest fixpoint-bound test below.
+func nestOnce(name @[]char, inner @types.Type) @types.Type {
+	var fields @[]@types.Field = make_slice(@types.Field, 2)
+	var f0 @types.Field = make(types.Field)
+	f0.Name = "pad"
+	f0.Type = types.TypInt()
+	fields[0] = f0
+	var f1 @types.Field = make(types.Field)
+	f1.Name = "f"
+	f1.Type = inner
+	fields[1] = f1
+	return types.MakeStructType(name, fields)
+}
+
+// A THREE-level nest guards the fixpoint pass BOUND: it must count transitively-
+// nested aggregate NODES (a depth-D local needs D passes, one level peeled per
+// pass), not just top-level allocas — otherwise the deepest level is left
+// un-split.  d.f.f.v (three GET_FIELD_PTRs deep) is written and read; the whole
+// nest must flatten to zero allocas and the return forward the written 42.
+func TestSroaDeeplyNestedAggregateFlattensToFixpoint() testing.TestResult {
+	// Lv1{v int}
+	var lv1Fields @[]@types.Field = make_slice(@types.Field, 1)
+	var fv @types.Field = make(types.Field)
+	fv.Name = "v"
+	fv.Type = types.TypInt()
+	lv1Fields[0] = fv
+	var lv1 @types.Type = types.MakeStructType("Lv1", lv1Fields)
+	var lv2 @types.Type = nestOnce("Lv2", lv1) // { pad int; f Lv1 }
+	var lv3 @types.Type = nestOnce("Lv3", lv2) // { pad int; f Lv2 }
+
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var d @ir.Instr = entry.EmitAlloc(lv3)
+
+	// d.f.f.v = 42 — three field-ptrs deep.
+	var w1 @ir.Instr = entry.EmitGetFieldPtr(d, 1, lv2)
+	var w2 @ir.Instr = entry.EmitGetFieldPtr(w1, 1, lv1)
+	entry.EmitStore(entry.EmitGetFieldPtr(w2, 0, types.TypInt()),
+			entry.EmitConstInt(42, types.TypInt()))
+	// return d.f.f.v
+	var r1 @ir.Instr = entry.EmitGetFieldPtr(d, 1, lv2)
+	var r2 @ir.Instr = entry.EmitGetFieldPtr(r1, 1, lv1)
+	entry.EmitReturn(
+			oneRet(entry.EmitLoad(entry.EmitGetFieldPtr(r2, 0, types.TypInt()), types.TypInt())))
+
+	sroaFuncToFixpoint(f)
+	promoteFuncScalars(f)
+	if countOp(f, iropcode.OP_ALLOC) != 0 {
+		return fail("SROA fixpoint + mem2reg: a 3-deep nest should flatten to zero allocas")
+	}
+	if lastInstr(entry).Args[0].Op != iropcode.OP_CONST_INT || lastInstr(entry).Args[0].IntVal != 42 {
+		return fail("SROA fixpoint + mem2reg: return should forward d.f.f.v = 42")
+	}
+	return ""
+}
+
+// A struct with an ARRAY field is scalar-replaced (the gate admits `[N]T` as a
+// backend-zero-filled aggregate): the scalar field promotes, while the array
+// field slot stays an OP_ALLOC (arrays are not split element-wise — dynamic
+// OP_GET_ELEM_PTR access — but ARE backend-zero-filled).  Only the int field is
+// accessed here, so the outer struct splits and the return forwards s.a = 5; the
+// array slot persists (mem2reg promotes scalars only).
+func TestSroaStructWithArrayFieldScalarReplaced() testing.TestResult {
+	var fields @[]@types.Field = make_slice(@types.Field, 2)
+	var f0 @types.Field = make(types.Field)
+	f0.Name = "a"
+	f0.Type = types.TypInt()
+	fields[0] = f0
+	var f1 @types.Field = make(types.Field)
+	f1.Name = "arr"
+	f1.Type = types.MakeArrayType(types.TypInt(), 3)
+	fields[1] = f1
+	var st @types.Type = types.MakeStructType("Grid", fields)
+
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var s @ir.Instr = entry.EmitAlloc(st)
+	var fp0 @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitStore(fp0, entry.EmitConstInt(5, types.TypInt())) // s.a = 5 (arr untouched)
+	var fp0b @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitReturn(oneRet(entry.EmitLoad(fp0b, types.TypInt())))
+
+	if !sroaFunc(f) {
+		return fail("SROA: a struct with an array field should be scalar-replaced")
+	}
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 0 {
+		return fail("SROA: Grid's field-ptrs should be gone after one pass")
+	}
+	if countOp(f, iropcode.OP_ALLOC) != 2 {
+		return fail("SROA: Grid should become an int slot + an array slot")
+	}
+
+	sroaFuncToFixpoint(f)
+	promoteFuncScalars(f)
+
+	// The int slot promotes; the array slot survives (not split, not promotable).
+	if countOp(f, iropcode.OP_ALLOC) != 1 {
+		return fail("SROA + mem2reg: only the array slot should survive")
+	}
+	if lastInstr(entry).Args[0].Op != iropcode.OP_CONST_INT || lastInstr(entry).Args[0].IntVal != 5 {
+		return fail("SROA + mem2reg: return should forward s.a = 5")
+	}
+	return ""
+}
+
+// A field-ptr-accessed POD struct whose ADDRESS also escapes (stored as a value,
+// as a method value capturing &c does) is pinned by L1 — the whole reason the
+// SSA-id-aliasing gen fix (so the escape is visible on the alloca) is needed.
+func TestSroaFieldAccessedStructWhoseAddressEscapesPinned() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var s @ir.Instr = entry.EmitAlloc(st)
+	var fp0 @ir.Instr = entry.EmitGetFieldPtr(s, 0, types.TypInt())
+	entry.EmitStore(fp0, entry.EmitConstInt(7, types.TypInt()))
+	// Capture &s: store the struct alloca (its address) as a value elsewhere.
+	var dst @ir.Instr = entry.EmitAlloc(types.MakePointerType(st))
+	entry.EmitStore(dst, s)
+	entry.EmitReturn(noArgs)
+
+	sroaFunc(f)
+
+	if countOp(f, iropcode.OP_GET_FIELD_PTR) != 1 {
+		return fail("SROA: a struct whose address escapes must be pinned (L1), field-ptr kept")
+	}
+	return ""
+}
+
+// instrInBlocks reports whether instr x is still present in any of f's blocks.
+func instrInBlocks(f @ir.Func, x @ir.Instr) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			if blk.Instrs[ii] == x {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// A managed-slice local (`@[]int`) is left untouched — managed aggregates are a
+// later phase (they carry a refcount and appear in fault pads).
+// A managed slice of a MANAGED element (`@[]@Inner`, element needs destruction)
+// is left untouched: its RefDec passes the whole value's ADDRESS to an elem dtor
+// (a whole-value use), so it stays out of Phase 2 (which is non-managed-element
+// managed slices only).
+// A managed slice of managed elements is now scalar-replaceable
+// (managedSliceElemScalarReplaceable admits any element): with only extract-only
+// uses (here a len read), it splits.
+func TestSroaManagedSliceOfManagedElemSplits() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var elemTyp @types.Type = types.MakeManagedPtrType(types.MakeStructType("Inner", noFields))
+	var mst @types.Type = types.MakeManagedSliceType(elemTyp)
+	var s @ir.Instr = entry.EmitAlloc(mst)
+	var sv @ir.Instr = entry.EmitLoad(s, mst)
+	var lenv @ir.Instr = entry.EmitSliceLen(sv)
+	entry.EmitReturn(oneRet(lenv))
+
+	sroaFunc(f)
+
+	if instrInBlocks(f, s) {
+		return fail("SROA: a managed slice of managed elements should now split (extract-only uses)")
+	}
+	return ""
+}
+
+// End-to-end: a @[]@Inner local whose scope-exit cleanup is the -O1+ forwardable
+// reshape (emitManagedSliceRefDec at OptLevel>=1: extract refptr/backinglen + call
+// __dtor_ms_elems_<T>, NO whole-value store) scalar-replaces.  This is the reshape
+// 2b adds — the pre-2b whole-value-store cleanup pinned the slice.
+func TestSroaManagedSliceOfManagedElemReshapedSplit() testing.TestResult {
+	var m @ir.Module = ir.NewModule("\"main\"")
+	m.OptLevel = 1
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	f.Mod = m
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var elemTyp @types.Type = types.MakeManagedPtrType(types.MakeStructType("Inner", noFields))
+	var mst @types.Type = types.MakeManagedSliceType(elemTyp)
+	var s @ir.Instr = entry.EmitAlloc(mst)
+	entry.EmitReturn(oneRet(entry.EmitSliceLen(entry.EmitLoad(s, mst))))
+	// scope-exit cleanup via the shared emitter (its -O1+ forwardable path fires).
+	ir.EmitManagedSliceRefDec(f, entry, entry.EmitLoad(s, mst))
+
+	sroaFunc(f)
+
+	if instrInBlocks(f, s) {
+		return fail("SROA: a @[]@Inner with the -O1+ forwardable cleanup should split")
+	}
+	return ""
+}
+
+// A managed struct (holds a @Inner field) is left untouched — Phase 1 is
+// non-managed only.
+// A leaf-managed struct (a `@T` field) IS scalar-replaced (Phase 2 managed
+// structs): the managed field-ptr access forwards onto an unpromoted managed slot
+// with a nil zero-init.  (WIP: works on this synthetic field-ptr shape; some real
+// gen shapes — the whole-store zero-init of `var h S`, a managed-field deref — are
+// not yet collected. See plan-sroa-managed-structs.md.)
+func TestSroaManagedStructScalarReplaced() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var s @ir.Instr = entry.EmitAlloc(managedFieldStruct())
+	var mtyp @types.Type = types.MakeManagedPtrType(types.MakeStructType("Inner", noFields))
+	var fp @ir.Instr = entry.EmitGetFieldPtr(s, 0, mtyp)
+	entry.EmitStore(fp, entry.EmitConstNil(mtyp))
+	entry.EmitReturn(noArgs)
+
+	sroaFunc(f)
+
+	if instrInBlocks(f, s) {
+		return fail("SROA: a leaf-managed struct should be scalar-replaced")
+	}
+	if countOp(f, iropcode.OP_CONST_NIL) < 1 {
+		return fail("SROA: the managed field slot needs an explicit nil zero-init")
+	}
+	return ""
+}
+
+// A struct whose whole value is returned (pinned by L2) is left untouched.
+func TestSroaPinnedStructNotTransformed() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = twoIntStruct()
+	var s @ir.Instr = entry.EmitAlloc(st)
+	var v @ir.Instr = entry.EmitLoad(s, st) // whole load
+	entry.EmitReturn(oneRet(v)) // returned by value → pinned
+
+	sroaFunc(f)
+
+	if countOp(f, iropcode.OP_ALLOC) != 1 {
+		return fail("SROA: a by-value-returned struct must be left untouched")
+	}
+	return ""
+}

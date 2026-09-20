@@ -1,0 +1,269 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/stdx/slices"
+
+// Loop-invariant code motion.  Hoists pure, non-trapping instructions whose
+// operands are all loop-invariant out of a loop body into the loop's preheader,
+// so they execute once instead of once per iteration.  The native backends
+// otherwise re-materialize a loop-invariant constant (e.g. a magic-division
+// multiplier, or `7` in `s += i*7`) and recompute invariant arithmetic every
+// iteration; LLVM already does LICM, so this is a native↔LLVM gap-closer.
+//
+// Safety: only pure, side-effect-free, non-trapping instrs are hoisted, so
+// executing one speculatively in the preheader (even when the loop runs zero
+// iterations) is harmless.  A hoisted instr keeps its SSA id and value, so no use
+// is rewritten — the preheader dominates the whole loop, hence every use, and an
+// invariant operand is either defined outside the loop (which provably dominates
+// the preheader) or is itself hoisted earlier in dependency order.  Loops without
+// a clean preheader (a single outside predecessor of the header whose only
+// successor is the header) are skipped — no CFG surgery is performed.
+
+// isHoistable reports whether an op is pure, non-trapping, and free of memory or
+// control effects — safe to execute speculatively in a preheader.  Notably
+// EXCLUDES OP_DIV / OP_REM (trap on divide-by-zero), loads/stores/calls, guards,
+// allocation, refcount ops, phis, and terminators.
+func isHoistable(op int) bool {
+	if op == iropcode.OP_CONST_INT || op == iropcode.OP_CONST_FLOAT || op == iropcode.OP_CONST_BOOL ||
+			op == iropcode.OP_CONST_STRING || op == iropcode.OP_CONST_NIL {
+		return true
+	}
+	if op == iropcode.OP_ADD || op == iropcode.OP_SUB || op == iropcode.OP_MUL ||
+			op == iropcode.OP_AND || op == iropcode.OP_OR || op == iropcode.OP_XOR ||
+			op == iropcode.OP_SHL || op == iropcode.OP_SHR || op == iropcode.OP_LAND ||
+			op == iropcode.OP_LOR {
+		return true
+	}
+	if op == iropcode.OP_EQ || op == iropcode.OP_NE || op == iropcode.OP_LT || op == iropcode.OP_LE ||
+			op == iropcode.OP_GT || op == iropcode.OP_GE {
+		return true
+	}
+	if op == iropcode.OP_NEG || op == iropcode.OP_NOT || op == iropcode.OP_CAST ||
+			op == iropcode.OP_BIT_CAST {
+		return true
+	}
+	return false
+}
+
+// hoistLoopInvariants runs LICM over every non-extern func.  Invoked by
+// RunOptPasses at -O1+, after simplifyIdentities (so folded constants are
+// hoistable) and the BCE passes.
+func hoistLoopInvariants(m @ir.Module) {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @ir.Func = m.Funcs[fi]
+		if f.IsExtern {
+			continue
+		}
+		licmFunc(f)
+	}
+}
+
+// licmFunc runs LICM over one function: for each natural loop with a clean
+// preheader, hoist its loop-invariant instrs into the preheader.
+func licmFunc(f @ir.Func) {
+	var d @DomInfo = ComputeDom(f)
+	var n int = d.NumBlocks
+	var cap int = f.NextID
+	if n == 0 || cap <= 0 {
+		return
+	}
+	// defBlock[id] = index of the block defining instr id (-1 if none).
+	var defBlock @[]int = make_slice(int, cap)
+	var i int = 0
+	for i < cap {
+		defBlock[i] = -1
+		i = i + 1
+	}
+	for bi := 0; bi < n; bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var id int = blk.Instrs[ii].ID
+			if id >= 0 && id < cap {
+				defBlock[id] = bi
+			}
+		}
+	}
+	// A block h is a loop header if some CFG edge b->h has h dominating b.
+	for h := 0; h < n; h++ {
+		if d.PostNum[h] < 0 {
+			continue
+		}
+		if !isLoopHeader(d, h) {
+			continue
+		}
+		var inBody @[]bool = naturalLoopBody(d, h, n)
+		var pre int = findPreheader(d, h, inBody)
+		if pre < 0 {
+			continue
+		}
+		hoistFromLoop(f, inBody, pre, defBlock, cap)
+	}
+}
+
+// isLoopHeader reports whether any CFG edge b->h is a back-edge (h dominates b).
+func isLoopHeader(d @DomInfo, h int) bool {
+	for b := 0; b < d.NumBlocks; b++ {
+		if d.PostNum[b] < 0 {
+			continue
+		}
+		for k := 0; k < len(d.Succs[b]); k++ {
+			if d.Succs[b][k] == h && d.Dominates(h, b) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// naturalLoopBody returns the natural loop of header h: h plus every block that
+// reaches a latch (a b with a b->h back-edge) without leaving h's dominance
+// region.  Mirrors loops.bn's inLoop computation.
+func naturalLoopBody(d @DomInfo, h int, n int) @[]bool {
+	var inLoop @[]bool = make_slice(bool, n)
+	inLoop[h] = true
+	var stack @[]int
+	for b := 0; b < n; b++ {
+		if d.PostNum[b] < 0 || !d.Dominates(h, b) {
+			continue
+		}
+		var latch bool = false
+		for k := 0; k < len(d.Succs[b]); k++ {
+			if d.Succs[b][k] == h {
+				latch = true
+			}
+		}
+		if latch && !inLoop[b] {
+			inLoop[b] = true
+			stack = slices.Append[int](stack, b)
+		}
+	}
+	for len(stack) > 0 {
+		var m int = stack[len(stack) - 1]
+		stack = stack[0:len(stack) - 1]
+		for k := 0; k < len(d.Preds[m]); k++ {
+			var p int = d.Preds[m][k]
+			if !inLoop[p] && d.Dominates(h, p) {
+				inLoop[p] = true
+				stack = slices.Append[int](stack, p)
+			}
+		}
+	}
+	return inLoop
+}
+
+// findPreheader returns the header's unique out-of-loop predecessor when that
+// predecessor's only successor is the header (a clean preheader), else -1.
+func findPreheader(d @DomInfo, h int, inBody @[]bool) int {
+	var pre int = -1
+	for k := 0; k < len(d.Preds[h]); k++ {
+		var p int = d.Preds[h][k]
+		if inBody[p] {
+			continue
+		}
+		if pre >= 0 {
+			return -1 // more than one out-of-loop predecessor
+		}
+		pre = p
+	}
+	if pre < 0 {
+		return -1
+	}
+	if len(d.Succs[pre]) != 1 {
+		return -1 // preheader must branch only to the header
+	}
+	return pre
+}
+
+// operandAvailable reports whether operand a is loop-invariant-available: defined
+// outside the loop body (which dominates the preheader) or already marked
+// invariant (hoisted earlier in dependency order).
+func operandAvailable(a @ir.Instr, inBody @[]bool, defBlock @[]int, invariant @[]bool,
+		cap int) bool {
+	if a == nil {
+		return true
+	}
+	if a.ID < 0 || a.ID >= cap {
+		return false
+	}
+	var db int = defBlock[a.ID]
+	if db < 0 {
+		return true // no tracked definition (treated as available)
+	}
+	if !inBody[db] {
+		return true // defined outside the loop
+	}
+	return invariant[a.ID]
+}
+
+// hoistFromLoop marks the loop-invariant instrs of the body (to a fixpoint, in
+// dependency order) and moves them into the preheader before its terminator.
+func hoistFromLoop(f @ir.Func, inBody @[]bool, pre int, defBlock @[]int, cap int) {
+	var invariant @[]bool = make_slice(bool, cap)
+	var ordered @[]@ir.Instr
+	var changed bool = true
+	for changed {
+		changed = false
+		for bi := 0; bi < len(inBody); bi++ {
+			if !inBody[bi] || bi == pre {
+				continue
+			}
+			var blk @ir.Block = f.Blocks[bi]
+			for ii := 0; ii < len(blk.Instrs); ii++ {
+				var instr @ir.Instr = blk.Instrs[ii]
+				if instr.ID < 0 || instr.ID >= cap || invariant[instr.ID] {
+					continue
+				}
+				if !isHoistable(instr.Op) {
+					continue
+				}
+				var ok bool = true
+				for k := 0; k < len(instr.Args); k++ {
+					if !operandAvailable(instr.Args[k], inBody, defBlock, invariant, cap) {
+						ok = false
+					}
+				}
+				if ok {
+					invariant[instr.ID] = true
+					ordered = slices.Append[@ir.Instr](ordered, instr)
+					changed = true
+				}
+			}
+		}
+	}
+	if len(ordered) == 0 {
+		return
+	}
+	// Remove the hoisted instrs from their body blocks.
+	for bi := 0; bi < len(inBody); bi++ {
+		if !inBody[bi] {
+			continue
+		}
+		var blk @ir.Block = f.Blocks[bi]
+		var kept @[]@ir.Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.ID >= 0 && instr.ID < cap && invariant[instr.ID] {
+				continue
+			}
+			kept = slices.Append[@ir.Instr](kept, instr)
+		}
+		blk.Instrs = kept
+	}
+	// Insert them into the preheader, in dependency order, before its terminator.
+	var pblk @ir.Block = f.Blocks[pre]
+	var np int = len(pblk.Instrs)
+	var rebuilt @[]@ir.Instr
+	var j int = 0
+	for j < np - 1 {
+		rebuilt = slices.Append[@ir.Instr](rebuilt, pblk.Instrs[j])
+		j = j + 1
+	}
+	for j = 0; j < len(ordered); j++ {
+		rebuilt = slices.Append[@ir.Instr](rebuilt, ordered[j])
+	}
+	if np > 0 {
+		rebuilt = slices.Append[@ir.Instr](rebuilt, pblk.Instrs[np - 1])
+	}
+	pblk.Instrs = rebuilt
+}

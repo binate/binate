@@ -13,8 +13,13 @@
 #      L and N are the SAME program built two ways; their only difference is the
 #      quality of the machine code they are made of.
 #   2. Time EACH binary performing the identical work: compile <path> with a
-#      fixed, in-process (no clang subprocess) backend+linker.
+#      fixed, in-process (no clang subprocess) backend+linker.  The metric is
+#      USER CPU time (/usr/bin/time -p), not wall clock — far more robust to a
+#      loaded box (see explorations/perf-optimization-guide.md §4).
 #   3. Report both times and the ratio time(N)/time(L).
+#
+# Rounds are interleaved AND alternate the A/B order (L,N then N,L then …) so
+# neither concurrent load nor monotonic thermal drift becomes a consistent bias.
 #
 # Because L and N do byte-identical work, the ratio isolates code quality.  The
 # timed work defaults to `--backend native --linker bnld` (fully in-process, so
@@ -36,7 +41,8 @@
 #   --target PATH     what the timed bnc run compiles (default: cmd/bnc = self-compile)
 #   --arch KEY        cross-build L/N for a bnc --target key (e.g. x86_64-darwin);
 #                     reports STATIC code-quality metrics, no wall-clock
-#   --rounds N        interleaved timed rounds; best + median reported (default 5)
+#   --rounds N        interleaved, order-alternating timed rounds; best + median
+#                     reported, on USER CPU time (default 5)
 #   --work-backend B  backend the TIMED run uses: native (default) | llvm
 #   --work-linker L   linker the TIMED run uses: bnld (default) | clang
 #   --keep            keep the built L/N binaries and print their paths
@@ -66,7 +72,7 @@ while [ $# -gt 0 ]; do
         --work-backend) WORK_BACKEND="$2"; shift 2 ;;
         --work-linker) WORK_LINKER="$2"; shift 2 ;;
         --keep) KEEP=1; shift ;;
-        -h|--help) sed -n '2,49p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,54p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -80,9 +86,6 @@ TARGET_OPT=""
 IP="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $TARGET_OPT)"
 LP="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $TARGET_OPT)"
 
-# Millisecond-resolution wall time (perl Time::HiRes is core), matching perf/*.sh.
-now()   { perl -MTime::HiRes=time -e 'printf "%.3f", time()'; }
-delta() { perl -e "printf '%.3f', $2 - $1"; }
 # min / median of the whitespace-separated numbers in $1 (empties filtered).
 minof()    { echo "$1" | tr ' ' '\n' | awk 'NF' | sort -n | head -1; }
 medianof() { echo "$1" | tr ' ' '\n' | awk 'NF' | sort -n | awk '{a[NR]=$0} END{print a[int((NR+1)/2)]}'; }
@@ -94,7 +97,8 @@ if [ -n "$ARCH" ]; then
     echo "arch:        $ARCH (cross-build; STATIC code-quality metrics, no wall-clock)"
 else
     echo "timed work:  bnc --backend $WORK_BACKEND --linker $WORK_LINKER <tgt>"
-    echo "rounds:      $ROUNDS (interleaved, best + median reported)"
+    echo "metric:      user CPU time (/usr/bin/time -p)"
+    echo "rounds:      $ROUNDS (interleaved, order-alternating; best + median reported)"
 fi
 echo
 
@@ -181,14 +185,20 @@ fi
 
 BD="$WORK/out"
 mkdir -p "$BD"
-# One timed compile of TARGET by binary $1 -> prints seconds.
+TIMEOUT="$WORK/time.out"
+# One timed compile of TARGET by binary $1 -> prints USER CPU seconds.
+# User CPU time (not wall clock) is the metric: it is far more robust to a
+# loaded box, where wall clock absorbs everything else running concurrently
+# (see explorations/perf-optimization-guide.md §4).  /usr/bin/time -p writes a
+# three-line `real`/`user`/`sys` block (POSIX portable format) to stderr AFTER
+# the command finishes, so it is always the last three lines; tail -3 isolates
+# it from any stderr the compiler itself emitted before extracting `user`.
 timed() {
-    t0="$(now)"
-    "$1" --backend "$WORK_BACKEND" --linker "$WORK_LINKER" -I "$IP" -L "$LP" \
-        --build-dir "$BD" -o "$BD/out.bin" "$TARGET" >/dev/null 2>&1
+    ( /usr/bin/time -p "$1" --backend "$WORK_BACKEND" --linker "$WORK_LINKER" -I "$IP" -L "$LP" \
+        --build-dir "$BD" -o "$BD/out.bin" "$TARGET" >/dev/null ) 2>"$TIMEOUT"
     rc=$?
-    t1="$(now)"
-    if [ "$rc" -ne 0 ]; then echo "ERR"; else delta "$t0" "$t1"; fi
+    if [ "$rc" -ne 0 ]; then echo "ERR"; return; fi
+    tail -3 "$TIMEOUT" | awk '/^user/{print $2}'
 }
 
 # Warmup (fills caches; discarded).
@@ -196,12 +206,19 @@ timed "$L" >/dev/null; timed "$N" >/dev/null
 
 LT=""
 NT=""
-echo "round    L(llvm)   N(native)"
+echo "round    L(llvm)   N(native)  order"
+# Alternate the A/B order each round (L,N then N,L then L,N …): interleaving
+# equalizes concurrent load between the arms, but a FIXED order lets monotonic
+# thermal drift systematically penalize whichever arm always runs second,
+# turning drift into a consistent bias.  Alternating cancels it in the average.
 r=1
 while [ "$r" -le "$ROUNDS" ]; do
-    l="$(timed "$L")"
-    n="$(timed "$N")"
-    printf "  %-4s   %-8s  %-8s\n" "$r" "$l" "$n"
+    if [ $((r % 2)) -eq 1 ]; then
+        l="$(timed "$L")"; n="$(timed "$N")"; order="L,N"
+    else
+        n="$(timed "$N")"; l="$(timed "$L")"; order="N,L"
+    fi
+    printf "  %-4s   %-8s  %-8s  %s\n" "$r" "$l" "$n" "$order"
     LT="$LT $l"
     NT="$NT $n"
     r=$((r + 1))

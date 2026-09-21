@@ -1,0 +1,139 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// FusableFieldGeps returns a dense ID-indexed flag set (sized to f.NextID):
+// element [id] is true iff the OP_GET_FIELD_PTR value with that SSA id can be
+// folded into a CONSTANT-offset load/store — so its field address
+// (base + FieldByteOffset) rides in the memory operand (`[base, #off]` on aa64 /
+// arm32, `[base+disp]` on x64) instead of being materialized by a separate ADD.
+//
+// A backend that supports the fold skips the flagged GEP's standalone emission
+// and rederives the address inside the consuming load/store from the GEP's own
+// base operand + its field offset; AllocateRegisters then leaves the GEP result
+// unhomed (nothing reads it as a register) — the fold flag is unioned into the
+// liveness fusable set so the base stays live to the consumer, not to the
+// elided GEP.
+//
+// The conditions are exactly what makes that fold correct AND a net win:
+//   - the result is used EXACTLY ONCE, as the ADDRESS (Args[0]) of an OP_LOAD or
+//     OP_STORE — a second use would need the pointer in a register, so the GEP
+//     cannot be elided; a use in any other position (incl. a phi, or the stored
+//     VALUE at Args[1]) disqualifies.
+//   - that access is a plain GP scalar (see fieldAccessFusable): not FP (an FP
+//     field rides the D-register path, not this GP load/store), not an aggregate
+//     (handled by-address / memcpy), and — on a 32-bit target — not a 64-bit
+//     register-PAIR value (int64/uint64), which loads/stores through a separate
+//     two-register path, not the single-register constant-offset form.
+//   - the base is a register value, NOT an alloca or a global: those reach their
+//     address via SP-relative / ADRP+ADD sequences that the plain register-base
+//     memory form cannot express, so they keep the standalone GEP.
+//   - the field's byte offset is resolvable (FieldByteOffset) — a struct
+//     FieldOffset, or wordBytes*Index for a slice-descriptor field.
+//   - on a 32-bit target the offset additionally fits arm32's smallest
+//     load/store immediate (255): arm32's assembler REJECTS an over-range
+//     LDR/STR offset (unlike aa64, which materializes a scratch), so a larger
+//     offset keeps the standalone GEP.  wordBytes==8 targets (aa64/x64) need no
+//     bound — aa64 materializes a scratch, x64's displacement is 32-bit.
+//
+// wordBytes is the target pointer/int size (8 on aa64/x64, 4 on arm32), matching
+// the value passed to AllocateRegisters.
+func FusableFieldGeps(f @ir.Func, wordBytes int) @[]bool {
+	var n int = f.NextID
+	var useCount @[]int = make_slice(int, n)
+	var addrUse @[]bool = make_slice(bool, n)
+
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var ins @ir.Instr = blk.Instrs[j]
+			var isMemAddr bool = (ins.Op == iropcode.OP_LOAD || ins.Op == iropcode.OP_STORE) &&
+					fieldAccessFusable(ins, wordBytes)
+			for ai := 0; ai < len(ins.Args); ai++ {
+				markGepUse(useCount, addrUse, ins.Args[ai], isMemAddr && ai == 0)
+			}
+			for pi := 0; pi < len(ins.Phis); pi++ {
+				markGepUse(useCount, addrUse, ins.Phis[pi].Val, false)
+			}
+		}
+	}
+
+	var fusable @[]bool = make_slice(bool, n)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var ins @ir.Instr = blk.Instrs[j]
+			if ins.Op != iropcode.OP_GET_FIELD_PTR || ins.ID < 0 || ins.ID >= n {
+				continue
+			}
+			if useCount[ins.ID] != 1 || !addrUse[ins.ID] {
+				continue
+			}
+			if !gepBaseIsRegister(ins) {
+				continue
+			}
+			var off int
+			var ok bool
+			off, ok = FieldByteOffset(ins, wordBytes)
+			if !ok {
+				continue
+			}
+			if wordBytes == 4 && (off < 0 || off > 255) {
+				continue
+			}
+			fusable[ins.ID] = true
+		}
+	}
+	return fusable
+}
+
+// fieldAccessFusable reports whether load/store `ins` accesses a plain GP scalar
+// the constant-offset fold handles: not FP (rides the D-register path), not an
+// aggregate (handled by-address), and — on a 32-bit target — not a 64-bit
+// register-pair value (loads/stores through a two-register path).  Any narrower
+// scalar size is fine — a constant-offset load/store size-dispatches to
+// LDRB/LDRH/LDR (aa64) / MOVZX/MOV (x64) etc.
+func fieldAccessFusable(ins @ir.Instr, wordBytes int) bool {
+	var t @types.Type
+	if ins.Op == iropcode.OP_LOAD {
+		t = ins.Typ
+	} else {
+		if len(ins.Args) < 2 || ins.Args[1] == nil {
+			return false
+		}
+		t = ins.Args[1].Typ
+	}
+	if t == nil {
+		return false
+	}
+	if IsFloatScalarTyp(t) || IsAggregateTyp(t) {
+		return false
+	}
+	if wordBytes == 4 && t.SizeOf() > wordBytes {
+		return false
+	}
+	return true
+}
+
+// FieldByteOffset returns the byte offset of the field an OP_GET_FIELD_PTR
+// addresses, matching each backend's emitGetFieldPtr: a struct base gives
+// FieldOffset(Index); a slice-descriptor base gives wordBytes*Index (data / len /
+// [refptr, backingLen] in word-sized slots).  ok=false when the base is neither
+// a struct nor a slice descriptor (the GEP keeps its standalone emission).  The
+// fused consumers and the arm32 offset-range gate both call this, so the offset
+// they emit and the offset the analysis bounds are one computation.
+func FieldByteOffset(gep @ir.Instr, wordBytes int) (int, bool) {
+	if len(gep.Args) < 1 || gep.Args[0] == nil {
+		return 0, false
+	}
+	var st @types.Type = StructTypeOf(gep.Args[0])
+	if st != nil {
+		return st.FieldOffset(gep.Index), true
+	}
+	if IsSliceFieldBase(gep.Args[0]) {
+		return wordBytes * gep.Index, true
+	}
+	return 0, false
+}

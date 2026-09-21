@@ -1,0 +1,137 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/stdx/slices"
+
+// coalesceSliceExtracts hoists a materialized slice value's field extracts to one
+// canonical OP_EXTRACT per field, placed right after that value's definition.
+//
+// After RLE (applyRLE) forwards every load of a slice slot to a single
+// materializing OP_LOAD `l0` — a >16 B raw/managed slice value that SPILLS on the
+// native backends — each `a[i]` access still re-extracts the slice's base (field 0)
+// and length (field 1).  On native those extracts lower to a field load off l0's
+// spill slot EVERY iteration (the reload storm the scaled-addressing fold rides on:
+// `ldr base,[hdr]; ldr len,[hdr+8]` per access).  Because l0 dominates every use
+// and, when it materializes a param/loop-invariant slice before a loop, is itself
+// loop-invariant, one extract per field placed right after l0 is a homed scalar
+// reused across the loop — so the per-access reload becomes a register read.  LLVM's
+// GVN/LICM already does this on the clang path; the native backends do not, so this
+// is a native<->LLVM gap closer done at the IR level (it also shrinks the clang IR
+// harmlessly — clang re-runs its own GVN).
+//
+// Correctness: an OP_EXTRACT is a pure value read (no refcount effect), so
+// redirecting its uses and dropping the duplicate leaves the refcount trajectory
+// byte-identical.  Only extracts whose aggregate operand IS l0 are touched, and SSA
+// dominance holds by transitivity: every gathered extract E reads l0, so l0
+// dominates E, so l0 — and the canonical placed right after it — dominates every use
+// of E (a normal-block use, a phi operand measured at its predecessor edge, or a
+// fault-pad use alike).  This needs no assumption about WHERE l0 sits.
+func coalesceSliceExtracts(f @ir.Func, l0s @[]@ir.Instr) {
+	for i := 0; i < len(l0s); i++ {
+		if l0s[i] == nil {
+			continue
+		}
+		coalesceOneSliceExtracts(f, l0s[i])
+	}
+}
+
+// coalesceOneSliceExtracts coalesces the normal-block OP_EXTRACT uses of a single
+// materialized slice value l0: it creates one canonical extract per distinct field
+// index right after l0, redirects every use (in normal blocks AND fault pads) to the
+// canonical, and drops the originals.  Fault-pad extracts of l0 keep their own
+// (cold) instructions; only their uses of a now-dropped normal extract are redirected
+// — the canonical at entry dominates the pads.
+func coalesceOneSliceExtracts(f @ir.Func, l0 @ir.Instr) {
+	var oldCap int = f.NextID
+	var replByID @[]@ir.Instr
+	var deleted @[]bool
+	for i := 0; i < oldCap; i++ {
+		var none @ir.Instr
+		replByID = slices.Append[@ir.Instr](replByID, none)
+		deleted = slices.Append[bool](deleted, false)
+	}
+
+	// One canonical extract per distinct field index, in first-seen order.  Scan
+	// normal blocks only: that is where l0 and the hot per-access extracts live.
+	var idxSeen @[]int
+	var canon @[]@ir.Instr
+	var any bool = false
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var ins @ir.Instr = blk.Instrs[ii]
+			if ins.Op != iropcode.OP_EXTRACT {
+				continue
+			}
+			if len(ins.Args) < 1 || ins.Args[0] != l0 {
+				continue
+			}
+			any = true
+			var c @ir.Instr = findCanonExtract(idxSeen, canon, ins.Index)
+			if c == nil {
+				c = ir.NewInstr(f, iropcode.OP_EXTRACT, ins.Typ)
+				c.Args = ir.MakeArgs1(l0)
+				c.Index = ins.Index
+				idxSeen = slices.Append[int](idxSeen, ins.Index)
+				canon = slices.Append[@ir.Instr](canon, c)
+			}
+			if ins.ID >= 0 && ins.ID < oldCap {
+				replByID[ins.ID] = c
+				deleted[ins.ID] = true
+			}
+		}
+	}
+	if !any {
+		return
+	}
+
+	// Rebuild normal blocks: drop the coalesced extracts, and emit the canonicals
+	// right after l0's own instruction (l0 lives in a normal block).
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		var kept @[]@ir.Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var ins @ir.Instr = blk.Instrs[ii]
+			if ins.ID >= 0 && ins.ID < oldCap && deleted[ins.ID] {
+				continue
+			}
+			kept = slices.Append[@ir.Instr](kept, ins)
+			if ins == l0 {
+				for k := 0; k < len(canon); k++ {
+					kept = slices.Append[@ir.Instr](kept, canon[k])
+				}
+			}
+		}
+		blk.Instrs = kept
+	}
+
+	// Redirect every remaining use of a coalesced extract to its canonical (normal
+	// blocks AND fault pads).  Pass oldCap: the canonicals have IDs >= oldCap, so
+	// chaseRepl leaves them (and their l0 operand) untouched, mapping only the
+	// dropped originals.
+	rewriteUsesInBlocks(f.Blocks, replByID, oldCap)
+	rewriteUsesInBlocks(f.FaultPads, replByID, oldCap)
+
+	// Tripwire (matches applyRLE / applyPromotion / field-forward): no reference to a
+	// dropped extract may survive the rewrite.  No alloca is deleted here, so the
+	// alloca-deletion flags are all-false.
+	var noAllocaDeleted @[]bool
+	for i := 0; i < oldCap; i++ {
+		noAllocaDeleted = slices.Append[bool](noAllocaDeleted, false)
+	}
+	assertNoSurvivingUses(f.Blocks, replByID, noAllocaDeleted, oldCap)
+	assertNoSurvivingUses(f.FaultPads, replByID, noAllocaDeleted, oldCap)
+}
+
+// findCanonExtract returns the canonical extract already created for field index
+// `index` (parallel arrays idxSeen/canon), or nil if none yet.
+func findCanonExtract(idxSeen @[]int, canon @[]@ir.Instr, index int) @ir.Instr {
+	for k := 0; k < len(idxSeen); k++ {
+		if idxSeen[k] == index {
+			return canon[k]
+		}
+	}
+	var none @ir.Instr
+	return none
+}

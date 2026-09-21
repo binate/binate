@@ -1,0 +1,171 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+import "pkg/binate/irbuild"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Tests for coalesceSliceExtracts (slice_extract_coalesce.bn): a materialized slice
+// value's per-field OP_EXTRACTs are coalesced to one canonical extract per field,
+// placed right after the slice value, so the native backends stop re-extracting
+// base/len off the spilled slice header every loop iteration.
+
+// buildSliceExtractFixture makes `entry -> loop`, with l0 a managed-slice-typed load
+// of an alloca in entry, and `nBase` extracts of field 0 plus `nLen` extracts of
+// field 1 in the loop block.  Returns (f, entry, loop, l0).
+func buildSliceExtractFixture(nBase int, nLen int) @ir.Func {
+	var elemTyp @types.Type = types.TypInt()
+	var sliceTyp @types.Type = types.MakeManagedSliceType(elemTyp)
+	var baseTyp @types.Type = types.MakePointerType(elemTyp)
+
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var loop @ir.Block = ir.AddBlock(f, "loop")
+
+	var a @ir.Instr = irbuild.EmitAlloc(entry, sliceTyp)
+	var l0 @ir.Instr = irbuild.EmitLoad(entry, a, sliceTyp)
+	irbuild.EmitJump(entry, loop)
+
+	for i := 0; i < nBase; i++ {
+		_ = irbuild.EmitExtract(loop, l0, 0, baseTyp)
+	}
+	for i := 0; i < nLen; i++ {
+		_ = irbuild.EmitExtract(loop, l0, 1, types.TypInt())
+	}
+	irbuild.EmitReturn(loop, noArgs)
+	return f
+}
+
+// findL0 returns the OP_LOAD in f's entry block (the materialized slice value the
+// fixture builds), or nil.
+func findL0(f @ir.Func) @ir.Instr {
+	var entry @ir.Block = f.Blocks[0]
+	for ii := 0; ii < len(entry.Instrs); ii++ {
+		if entry.Instrs[ii].Op == iropcode.OP_LOAD {
+			return entry.Instrs[ii]
+		}
+	}
+	var none @ir.Instr
+	return none
+}
+
+// extractsInBlock counts OP_EXTRACTs in a block whose aggregate operand is l0.
+func extractsInBlock(blk @ir.Block, l0 @ir.Instr) int {
+	var n int = 0
+	for ii := 0; ii < len(blk.Instrs); ii++ {
+		var ins @ir.Instr = blk.Instrs[ii]
+		if ins.Op == iropcode.OP_EXTRACT && len(ins.Args) >= 1 && ins.Args[0] == l0 {
+			n = n + 1
+		}
+	}
+	return n
+}
+
+// Many base+len extracts across the loop collapse to exactly one per field, and all
+// land in the entry block (right after l0) — none remain in the loop.
+func TestCoalesceSliceExtractsCollapsesPerField() testing.TestResult {
+	var f @ir.Func = buildSliceExtractFixture(3, 2)
+	var l0 @ir.Instr = findL0(f)
+	if l0 == nil { return "fixture has no l0 load" }
+	var l0s @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	l0s[0] = l0
+	coalesceSliceExtracts(f, l0s)
+
+	if countOp(f, iropcode.OP_EXTRACT) != 2 {
+		return "expected exactly 2 extracts after coalescing (one base, one len)"
+	}
+	var entry @ir.Block = f.Blocks[0]
+	var loop @ir.Block = f.Blocks[1]
+	if extractsInBlock(entry, l0) != 2 {
+		return "both canonical extracts must be in the entry block (with l0)"
+	}
+	if extractsInBlock(loop, l0) != 0 {
+		return "no extract of l0 may remain in the loop block"
+	}
+	return ""
+}
+
+// Each canonical extract is placed IMMEDIATELY after l0 (the hoist point), and keeps
+// its field index — so the backend homes base/len as scalars before the loop.
+func TestCoalesceSliceExtractsPlacedAfterL0() testing.TestResult {
+	var f @ir.Func = buildSliceExtractFixture(1, 1)
+	var l0 @ir.Instr = findL0(f)
+	if l0 == nil { return "fixture has no l0 load" }
+	var l0s @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	l0s[0] = l0
+	coalesceSliceExtracts(f, l0s)
+
+	var entry @ir.Block = f.Blocks[0]
+	var l0pos int = -1
+	for ii := 0; ii < len(entry.Instrs); ii++ {
+		if entry.Instrs[ii] == l0 { l0pos = ii }
+	}
+	if l0pos < 0 { return "l0 not found in entry after coalescing" }
+	if l0pos + 2 >= len(entry.Instrs) { return "expected two canonical extracts right after l0" }
+	var e1 @ir.Instr = entry.Instrs[l0pos + 1]
+	var e2 @ir.Instr = entry.Instrs[l0pos + 2]
+	if e1.Op != iropcode.OP_EXTRACT || e2.Op != iropcode.OP_EXTRACT {
+		return "the two instrs right after l0 must be the canonical extracts"
+	}
+	// The two fields (0 and 1) are both present, in first-seen order (base then len).
+	if e1.Index != 0 || e2.Index != 1 {
+		return "canonical extracts must keep their field indices (0=base, 1=len)"
+	}
+	if e1.Args[0] != l0 || e2.Args[0] != l0 {
+		return "canonical extracts must read from l0"
+	}
+	return ""
+}
+
+// A downstream use of a coalesced extract is redirected to the canonical (never left
+// pointing at a dropped instruction).
+func TestCoalesceSliceExtractsRedirectsUses() testing.TestResult {
+	var elemTyp @types.Type = types.TypInt()
+	var sliceTyp @types.Type = types.MakeManagedSliceType(elemTyp)
+
+	var f @ir.Func = ir.NewFunc("", "test", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var loop @ir.Block = ir.AddBlock(f, "loop")
+	var a @ir.Instr = irbuild.EmitAlloc(entry, sliceTyp)
+	var l0 @ir.Instr = irbuild.EmitLoad(entry, a, sliceTyp)
+	irbuild.EmitJump(entry, loop)
+	// Two separate len extracts, each consumed by an add — after coalescing both adds
+	// must reference the single canonical len extract.
+	var len1 @ir.Instr = irbuild.EmitExtract(loop, l0, 1, types.TypInt())
+	var use1 @ir.Instr = irbuild.EmitBinop(loop, iropcode.OP_ADD, len1, len1, types.TypInt())
+	var len2 @ir.Instr = irbuild.EmitExtract(loop, l0, 1, types.TypInt())
+	var use2 @ir.Instr = irbuild.EmitBinop(loop, iropcode.OP_ADD, len2, len2, types.TypInt())
+	irbuild.EmitReturn(loop, noArgs)
+
+	var l0s @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	l0s[0] = l0
+	coalesceSliceExtracts(f, l0s)
+
+	if use1.Args[0].Op != iropcode.OP_EXTRACT || use1.Args[1].Op != iropcode.OP_EXTRACT {
+		return "use1 operands must still be an extract"
+	}
+	if use1.Args[0] != use2.Args[0] {
+		return "both uses must reference the SAME canonical len extract after coalescing"
+	}
+	if use1.Args[0].Args[0] != l0 || use1.Args[0].Index != 1 {
+		return "the canonical extract must be l0's field-1 (len)"
+	}
+	return ""
+}
+
+// A nil entry in l0s is skipped (no crash) and a slice with no extracts is left
+// untouched.
+func TestCoalesceSliceExtractsNilAndEmpty() testing.TestResult {
+	var f @ir.Func = buildSliceExtractFixture(0, 0)
+	var l0 @ir.Instr = findL0(f)
+	var l0s @[]@ir.Instr = make_slice(@ir.Instr, 2)
+	var none @ir.Instr
+	l0s[0] = none
+	l0s[1] = l0
+	coalesceSliceExtracts(f, l0s)
+	if countOp(f, iropcode.OP_EXTRACT) != 0 {
+		return "a slice with no extracts must be left untouched"
+	}
+	return ""
+}

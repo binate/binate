@@ -1,0 +1,160 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/ir"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// Element- and field-pointer lowering, and the fused scaled register-offset
+// element load/store the FusableElemGeps fold selects (see common_elem_gep_fuse.bn).
+// Extracted from aarch64_emit.bn to keep it under the file-length cap.
+
+// emitFusedElemLoad emits a scaled register-offset load for an 8-byte GP element
+// whose address GEP was folded (FusableElemGeps): `ldr rd, [base, idx, lsl #3]`,
+// reading base+index from the GEP's own operands.  The index scales by the
+// 64-bit access size, so it holds the element index — no separate shift+add.
+// Operands are resolved before the result register (allocReg marks each used, so
+// nothing collides) — the standard operands-first ordering.
+func emitFusedElemLoad(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, gep @ir.Instr) {
+	var base int = getOperand(a, rm, gep.Args[0].ID)
+	if base < 0 { return }
+	var idx int = getOperand(a, rm, gep.Args[1].ID)
+	if idx < 0 { return }
+	var rd int = nextReg(rm, ins.ID)
+	var sz int = 8
+	if ins.Typ != nil { sz = ins.Typ.SizeOf() }
+	if sz == 4 {
+		// A 4-byte element: LDRSW (sign-extend to 64) for a signed value, LDR-W
+		// (zero-extend to the 32-bit W register) otherwise — matching the
+		// non-fused emitScalarLoad convention so the value's representation is
+		// identical whether or not the address folded.
+		var sgnTyp @types.Type = types.StripWrappers(ins.Typ)
+		if sgnTyp != nil && sgnTyp.Signed {
+			aarch64.LdrswRegScaled(a, rd, base, idx)
+		} else {
+			aarch64.Ldr(a, false, rd, aarch64.MemRegScaled(base, idx))
+		}
+		return
+	}
+	aarch64.Ldr(a, true, rd, aarch64.MemRegScaled(base, idx))
+}
+
+// emitFusedElemStore is the store analogue: `str val, [base, idx, lsl #n]` (a
+// 64-bit STR for an 8-byte element, a 32-bit STR-W for a 4-byte one).  The value
+// is resolved first (matching the plain store path), then the GEP's base+index.
+func emitFusedElemStore(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
+		ins @ir.Instr, gep @ir.Instr) {
+	var valReg int = emitValOperand(a, pkgName, rm, ins.Args[1])
+	if valReg < 0 { return }
+	var base int = getOperand(a, rm, gep.Args[0].ID)
+	if base < 0 { return }
+	var idx int = getOperand(a, rm, gep.Args[1].ID)
+	if idx < 0 { return }
+	var sz int = 8
+	if ins.Args[1].Typ != nil { sz = ins.Args[1].Typ.SizeOf() }
+	aarch64.Str(a, sz == 8, valReg, aarch64.MemRegScaled(base, idx))
+}
+
+// log2IfPow2 returns log2(n) when n is a positive power of two, else -1. Used to
+// scale an array index with a shift instead of a multiply.
+func log2IfPow2(n int) int {
+	if n <= 0 {
+		return -1
+	}
+	var v int = n
+	var shift int = 0
+	for v > 1 {
+		if (v & 1) != 0 {
+			return -1
+		}
+		v = v >> 1
+		shift = shift + 1
+	}
+	return shift
+}
+
+// emitGetElemPtr: OP_GET_ELEM_PTR — compute base + idx*elemSize. The
+// GEP's Typ is *elemTyp regardless of whether the base came from array
+// indexing or from a slice whose data pointer was already extracted.
+// A package-level global base is reached via ADRP+ADD.
+func emitGetElemPtr(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 2 { return }
+	// A fusable GEP folds into its sole consuming load/store's scaled addressing
+	// mode (emitFusedElemLoad / emitFusedElemStore rederive the address from this
+	// GEP's base+index), so emit nothing here.
+	if rm.IsFusableElemGep(ins.ID) { return }
+	var elemSize int = common.ElemSizeOf(ins)
+	if elemSize <= 0 { return }
+	var idx int = getOperand(a, rm, ins.Args[1].ID)
+	if idx < 0 { return }
+
+	// byteOff = idx * elemSize.  For a power-of-two element size, scale with a
+	// single shift (idx << log2(elemSize)) rather than materialising the size
+	// into a register and doing a hardware multiply; for elemSize 1 the index
+	// is already the byte offset.  Only a non-power-of-two size (rare) needs the
+	// movz+mul.
+	var byteOff int
+	var shift int = log2IfPow2(elemSize)
+	if elemSize == 1 {
+		byteOff = idx
+	} else if shift >= 1 {
+		byteOff = scratchReg(rm)
+		aarch64.Lsl(a, true, byteOff, idx, aarch64.Imm(shift))
+	} else {
+		var sizeTmp int = scratchReg(rm)
+		aarch64.Movz(a, true, sizeTmp, elemSize, 0)
+		byteOff = scratchReg(rm)
+		aarch64.Mul(a, true, byteOff, idx, sizeTmp)
+	}
+
+	var rd int = nextReg(rm, ins.ID)
+	var allocOff int = rm.LookupAlloc(ins.Args[0].ID)
+	if allocOff >= 0 {
+		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(allocOff))
+		aarch64.Add(a, true, rd, rd, aarch64.Reg(byteOff))
+		return
+	}
+	if isGlobalRef(ins.Args[0]) {
+		emitGlobalAddr(a, pkgName, rd, ins.Args[0])
+		aarch64.Add(a, true, rd, rd, aarch64.Reg(byteOff))
+		return
+	}
+	var base int = getOperand(a, rm, ins.Args[0].ID)
+	if base < 0 { return }
+	aarch64.Add(a, true, rd, base, aarch64.Reg(byteOff))
+}
+
+// emitGetFieldPtr: OP_GET_FIELD_PTR — compute base + FieldOffset.
+// A package-level global base is reached via ADRP+ADD. Slice bases
+// (raw or managed) get a flat 8*Index offset — fields are
+// data, len, [refptr, backingLen] in word-sized slots, matching
+// types.SliceDataOffset / MSliceDataOffset etc.
+func emitGetFieldPtr(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var fieldOff int
+	var baseTyp @types.Type = common.StructTypeOf(ins.Args[0])
+	if baseTyp != nil {
+		fieldOff = baseTyp.FieldOffset(ins.Index)
+	} else if common.IsSliceFieldBase(ins.Args[0]) {
+		fieldOff = 8 * ins.Index
+	} else {
+		return
+	}
+	var rd int = nextReg(rm, ins.ID)
+	var allocOff int = rm.LookupAlloc(ins.Args[0].ID)
+	if allocOff >= 0 {
+		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(allocOff + fieldOff))
+		return
+	}
+	if isGlobalRef(ins.Args[0]) {
+		emitGlobalAddr(a, pkgName, rd, ins.Args[0])
+		if fieldOff != 0 {
+			aarch64.Add(a, true, rd, rd, aarch64.Imm(fieldOff))
+		}
+		return
+	}
+	var ptr int = getOperand(a, rm, ins.Args[0].ID)
+	if ptr < 0 { return }
+	aarch64.Add(a, true, rd, ptr, aarch64.Imm(fieldOff))
+}

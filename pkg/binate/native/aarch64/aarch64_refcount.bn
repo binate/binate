@@ -29,26 +29,28 @@ func refincSkipLabel(seq int) @[]char {
 }
 
 // emitRefIncInline lowers OP_REFINC to an inline RefInc fast path:
-// nil-check, compute the header address into a scratch register, read the
-// refcount, then add+store.
+// nil-check, read the refcount header at a negative unscaled offset, then
+// add+store.
 //
 // A negative refcount marks immortal static-managed data
 // (rt.STATIC_REFCOUNT): TBNZ on the sign bit skips the count mutation.
 //
 //   CBZ  ptrReg, .Lri_skip_<seq>
-//   SUB  hdrReg, ptrReg, #16          ; hdrReg = ptr-16 (ptrReg untouched)
-//   LDR  refcount, [hdrReg, #0]
-//   TBNZ refcount, #63, .Lri_skip_<seq> ; negative → immortal, skip
+//   LDUR refcount, [ptrReg, #-16]        ; header word; ptrReg untouched
+//   TBNZ refcount, #63, .Lri_skip_<seq>  ; negative → immortal, skip
 //   ADD  refcount, refcount, #1
-//   STR  refcount, [hdrReg, #0]
+//   STUR refcount, [ptrReg, #-16]
 // .Lri_skip_<seq>:
 //
-// ptrReg is NOT mutated (mirroring emitRefDecInline's SUB-into-scratch): the
-// register allocator may keep the managed pointer live in ptrReg across this
-// op, so a pre-index writeback (`LDR ..., [ptrReg, #-16]!`) that rewrites
-// ptrReg to the header address would corrupt the value — a home-allocated
-// pointer would silently become ptr-16 (surfaced as a make(T) returning a
-// pointer 16 bytes low).
+// ptrReg is NOT mutated: LDUR/STUR are the UNSCALED, NON-writeback forms, so
+// `[ptrReg, #-16]` reads/writes the header while leaving ptrReg holding the
+// object pointer.  This matters because the register allocator may keep the
+// managed pointer live in ptrReg across this op — a pre-index writeback
+// (`LDR ..., [ptrReg, #-16]!`) would instead rewrite ptrReg to the header
+// address and corrupt the value (a home-allocated pointer silently becoming
+// ptr-16, surfaced as a make(T) returning a pointer 16 bytes low).  The
+// earlier form computed the header into a scratch via `SUB`; LDUR/STUR fold
+// the -16 into the access, dropping both the SUB and the scratch register.
 func emitRefIncInline(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
 	if len(ins.Args) < 1 { return }
 	var ptrReg int = getOperand(a, rm, ins.Args[0].ID)
@@ -69,16 +71,14 @@ func emitRefIncInline(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
 	var wordBytes int = hdrBytes / 2
 	var rcW bool = wordBytes == 8
 	var signBit int = wordBytes * 8 - 1
-	var hdrReg int = scratchReg(rm)
 	var refcountReg int = scratchReg(rm)
 	var skipLabel @[]char = refincSkipLabel(refincSeq)
 	refincSeq = refincSeq + 1
 	aarch64.Cbz(a, true, ptrReg, skipLabel)
-	aarch64.Sub(a, true, hdrReg, ptrReg, aarch64.Imm(hdrBytes))
-	aarch64.Ldr(a, rcW, refcountReg, aarch64.MemImm(hdrReg, 0))
+	aarch64.Ldr(a, rcW, refcountReg, aarch64.MemUnscaled(ptrReg, -hdrBytes))
 	aarch64.Tbnz(a, refcountReg, signBit, skipLabel) // negative → immortal static-managed
 	aarch64.Add(a, rcW, refcountReg, refcountReg, aarch64.Imm(1))
-	aarch64.Str(a, rcW, refcountReg, aarch64.MemImm(hdrReg, 0))
+	aarch64.Str(a, rcW, refcountReg, aarch64.MemUnscaled(ptrReg, -hdrBytes))
 	a.DefineLabel(skipLabel)
 }
 
@@ -111,11 +111,10 @@ func refdecSkipLabel(seq int) @[]char {
 // when the decrement leaves the refcount at zero.
 //
 //   CBZ  ptrReg, .Lrd_skip_<seq>            ; nil → skip
-//   SUB  hdrReg, ptrReg, #16                ; hdrReg = ptr-16
-//   LDR  refcount, [hdrReg, #0]
+//   LDUR refcount, [ptrReg, #-16]           ; header word; ptrReg untouched
 //   TBNZ refcount, #63, .Lrd_skip_<seq>     ; negative → immortal, skip
 //   SUB  refcount, refcount, #1
-//   STR  refcount, [hdrReg, #0]
+//   STUR refcount, [ptrReg, #-16]
 //   CBNZ refcount, .Lrd_skip_<seq>          ; refcount > 0 → skip
 //   ; slow path: refcount hit zero
 //   MOV  X0, ptrReg
@@ -126,30 +125,31 @@ func refdecSkipLabel(seq int) @[]char {
 // Args[1] is the optional destructor; passed via X1 to the runtime
 // helper. The BL clobbers caller-saved registers (X0–X18) but the
 // branch target is the skip label, so no further uses follow within
-// this emission. Computing hdrReg via SUB rather than reusing a pre-
-// indexed addressing trick keeps ptrReg alive for the X0 mov.
+// this emission. LDUR/STUR access the header at `[ptrReg, #-16]` without a
+// writeback, so ptrReg still holds the object pointer for the X0 mov on the
+// zero path (see emitRefIncInline for why the non-writeback unscaled form is
+// required, and why it lets the SUB + scratch header register go).
 func emitRefDecInline(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
 		ins @ir.Instr) {
 	if len(ins.Args) < 1 { return }
 	var ptrReg int = getOperand(a, rm, ins.Args[0].ID)
 	if ptrReg < 0 { return }
 	// See emitRefIncInline: header size, refcount width, and sentinel bit are
-	// target-derived so the fast-path is ILP32-on-aarch64 correct; pointer ops
-	// (CBZ, the address SUB) stay 64-bit, only the refcount VALUE ops track it.
+	// target-derived so the fast-path is ILP32-on-aarch64 correct; the pointer
+	// op (CBZ) and the LDUR/STUR base stay 64-bit, only the refcount VALUE ops
+	// track the word width.
 	var hdrBytes int = types.ManagedHeaderSize()
 	var wordBytes int = hdrBytes / 2
 	var rcW bool = wordBytes == 8
 	var signBit int = wordBytes * 8 - 1
-	var hdrReg int = scratchReg(rm)
 	var refcountReg int = scratchReg(rm)
 	var skipLabel @[]char = refdecSkipLabel(refdecSeq)
 	refdecSeq = refdecSeq + 1
 	aarch64.Cbz(a, true, ptrReg, skipLabel)
-	aarch64.Sub(a, true, hdrReg, ptrReg, aarch64.Imm(hdrBytes))
-	aarch64.Ldr(a, rcW, refcountReg, aarch64.MemImm(hdrReg, 0))
+	aarch64.Ldr(a, rcW, refcountReg, aarch64.MemUnscaled(ptrReg, -hdrBytes))
 	aarch64.Tbnz(a, refcountReg, signBit, skipLabel) // negative → immortal static-managed
 	aarch64.Sub(a, rcW, refcountReg, refcountReg, aarch64.Imm(1))
-	aarch64.Str(a, rcW, refcountReg, aarch64.MemImm(hdrReg, 0))
+	aarch64.Str(a, rcW, refcountReg, aarch64.MemUnscaled(ptrReg, -hdrBytes))
 	aarch64.Cbnz(a, rcW, refcountReg, skipLabel)
 	// Slow path: refcount hit zero. Set up X0=ptr, X1=dtor, call
 	// `rt.ZeroRefDestroy`.

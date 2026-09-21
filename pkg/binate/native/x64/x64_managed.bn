@@ -2,10 +2,14 @@ package "pkg/binate/native/x64"
 
 import "pkg/binate/asm"
 import "pkg/binate/asm/x64"
+import "pkg/binate/buf"
 import "pkg/binate/ir"
 import "pkg/binate/iropcode"
 import "pkg/binate/mangle"
 import "pkg/binate/native/common"
+import "pkg/binate/stringutils"
+import "pkg/binate/types"
+import "pkg/std/strings"
 
 // ============================================================
 // Managed memory + struct copy (Phase 3g)
@@ -42,53 +46,136 @@ func emitConstNil(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
 	x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Imm(0))
 }
 
-// emitRefInc: OP_REFINC — slow-path runtime call.  SysV-AMD64
-// first arg in RDI.  aarch64 has an inline fast path (CBZ + LDR-
-// pre-index + ADD + STR); the x86-64 equivalent is a follow-on
-// perf optimisation, deferred.  The runtime function handles nil
-// and the refcount-zero edge cases.
+// refIncSeqX64 is a module-scoped counter for the unique inline RefInc skip
+// labels (parallel to aarch64's refincSeq).
+var refIncSeqX64 int
+
+// refDecSeqX64 is a module-scoped counter for the unique inline RefDec skip
+// labels (parallel to aarch64's refdecSeq).
+var refDecSeqX64 int
+
+// refcountSkipLabelX64 formats a per-emission unique local skip label with the
+// given prefix (a leading `L` keeps it out of the symbol table on Mach-O/ELF).
+func refcountSkipLabelX64(prefix *[]readonly char, seq int) @[]char {
+	var out @strings.Builder = strings.NewBuilder()
+	out.Write(prefix)
+	stringutils.WriteInt(out, seq)
+	return buf.CopyStr(out.String())
+}
+
+// refcountMemSizeX64 maps the managed header size to the x64 operand size of its
+// refcount WORD (the first of the 2-word header): SZ64 on LP64, SZ32 on an
+// ILP32-with-32-bit-pointer ABI.  Derived from ManagedHeaderSize() (= 2 *
+// ptrSize) so the fast path is not LP64-hardcoded.
+func refcountMemSizeX64(hdrBytes int) int {
+	if hdrBytes / 2 == 8 { return x64.SZ64 }
+	return x64.SZ32
+}
+
+// emitFuncHandleAddr materializes the address of a function's static handle
+// (`__handle.<mangled>`) into rd via a RIP-relative LEA.  Shared by the
+// OP_FUNC_HANDLE dispatch and the inline RefDec slow path, which sinks a folded
+// dtor handle here so the LEA runs only on the branch that frees.
+func emitFuncHandleAddr(a @asm.Assembler, pkgName *[]readonly char, rd int,
+		funcName *[]readonly char) {
+	var label @[]char = handleSymFor_x64(pkgName, funcName)
+	a.SetGlobal(label)
+	x64.LeaRipLabel(a, x64.Reg(rd, x64.SZ64), label)
+}
+
+// emitRefInc: OP_REFINC — inline fast path mirroring aarch64_refcount.bn's
+// emitRefIncInline: nil-check, immortal-check, in-place header increment, no
+// runtime call.  The refcount word is the first of the 2-word managed header at
+// [ptr - hdrBytes]; its immortal-static sentinel (rt.STATIC_REFCOUNT) is its
+// high (sign) bit, so a negative value skips the mutation.  Header size / word
+// width come from ManagedHeaderSize() so the fast path is ILP32-correct, not
+// LP64-hardcoded.  x64 addresses the header word directly ([ptr - hdrBytes]) and
+// mutates it in place, so no scratch register is needed.
+//
+//   test ptr, ptr
+//   jz   .Lx64ri_<seq>
+//   cmp  <word> [ptr - hdrBytes], 0
+//   js   .Lx64ri_<seq>              ; negative → immortal, skip
+//   add  <word> [ptr - hdrBytes], 1
+// .Lx64ri_<seq>:
 func emitRefInc(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
 	if len(ins.Args) < 1 { return }
 	var ptr int = getOperand(a, rm, ins.Args[0].ID)
 	if ptr < 0 { return }
-	if ptr != x64.RDI {
-		x64.Mov(a, x64.Reg(x64.RDI, x64.SZ64), x64.Reg(ptr, x64.SZ64))
-	}
-	var sym @[]char = symPrefixed(mangle.FuncName("pkg/builtins/rt", "RefInc"))
-	a.SetGlobal(sym)
-	x64.Call(a, sym)
-	rm.ResetRegs()
+	var hdrBytes int = types.ManagedHeaderSize()
+	var negHdr int = 0 - hdrBytes
+	var memSz int = refcountMemSizeX64(hdrBytes)
+	var skip @[]char = refcountSkipLabelX64("Lx64ri_", refIncSeqX64)
+	refIncSeqX64 = refIncSeqX64 + 1
+	x64.Test(a, x64.Reg(ptr, x64.SZ64), x64.Reg(ptr, x64.SZ64))
+	x64.Jcc(a, x64.CC_Z, skip)
+	x64.Cmp(a, x64.Mem(ptr, negHdr, memSz), x64.Imm(0))
+	x64.Jcc(a, x64.CC_S, skip)
+	x64.Add(a, x64.Mem(ptr, negHdr, memSz), x64.Imm(1))
+	a.DefineLabel(skip)
 }
 
-// emitRefDec: OP_REFDEC — slow-path runtime call.  The runtime
-// decrements, and if the count hits zero, invokes the destructor
-// (Args[1], if present) and frees.  SysV-AMD64 first arg = RDI
-// (ptr), second arg = RSI (dtor or nil).
-func emitRefDec(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+// emitRefDec: OP_REFDEC — inline fast path mirroring aarch64_refcount.bn's
+// emitRefDecInline: nil-check, immortal-check, in-place decrement, and a
+// slow-path `rt.ZeroRefDestroy(ptr, dtor)` call only when the count hits zero.
+// The decrement is a single memory read-modify-write (`sub <word>[ptr-hdr], 1`)
+// that sets ZF from the stored result, so `jnz` reads it directly — no separate
+// load/store or compare.  SysV-AMD64: RDI = ptr, RSI = dtor (or 0).
+//
+//   test ptr, ptr
+//   jz   .Lx64rd_<seq>
+//   cmp  <word> [ptr - hdrBytes], 0
+//   js   .Lx64rd_<seq>              ; negative → immortal, skip
+//   sub  <word> [ptr - hdrBytes], 1
+//   jnz  .Lx64rd_<seq>              ; refcount > 0 → skip
+//   mov  rdi, ptr
+//   <dtor → rsi>                    ; static handle materialized HERE (past the
+//   call rt.ZeroRefDestroy          ;  zero-test), or reloaded, or 0
+// .Lx64rd_<seq>:
+func emitRefDec(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins @ir.Instr) {
 	if len(ins.Args) < 1 { return }
 	var ptr int = getOperand(a, rm, ins.Args[0].ID)
 	if ptr < 0 { return }
+	var hdrBytes int = types.ManagedHeaderSize()
+	var negHdr int = 0 - hdrBytes
+	var memSz int = refcountMemSizeX64(hdrBytes)
+	var skip @[]char = refcountSkipLabelX64("Lx64rd_", refDecSeqX64)
+	refDecSeqX64 = refDecSeqX64 + 1
+	x64.Test(a, x64.Reg(ptr, x64.SZ64), x64.Reg(ptr, x64.SZ64))
+	x64.Jcc(a, x64.CC_Z, skip)
+	x64.Cmp(a, x64.Mem(ptr, negHdr, memSz), x64.Imm(0))
+	x64.Jcc(a, x64.CC_S, skip)
+	x64.Sub(a, x64.Mem(ptr, negHdr, memSz), x64.Imm(1))
+	x64.Jcc(a, x64.CC_NZ, skip)
+	// Slow path: refcount hit zero. Set up RDI=ptr, RSI=dtor, call
+	// rt.ZeroRefDestroy.  For the runtime-loaded dtor (OP_FUNC_VALUE_DTOR)
+	// resolve its register FIRST — before RDI is overwritten — since neither ptr
+	// nor dtor is ever homed in RSI (RSI is not allocatable), so only the
+	// RDI-first ordering can collide.
+	var isFuncHandle bool = len(ins.Args) > 1 && ins.Args[1].Op == iropcode.OP_FUNC_HANDLE
 	var dtor int = -1
-	if len(ins.Args) > 1 {
+	if len(ins.Args) > 1 && !isFuncHandle {
 		dtor = getOperand(a, rm, ins.Args[1].ID)
+		if dtor < 0 { return }
 	}
-	// Move ptr to RDI first so the dtor reload (if any) doesn't
-	// clobber RDI before we set it.  The arg might already be in
-	// RDI — Mov from RDI to RDI is a no-op, skip.
 	if ptr != x64.RDI {
 		x64.Mov(a, x64.Reg(x64.RDI, x64.SZ64), x64.Reg(ptr, x64.SZ64))
 	}
-	if dtor >= 0 {
+	if isFuncHandle {
+		// Static dtor handle: materialize `&__handle.<dtor>` into RSI HERE, past
+		// the zero-test, rather than before it.
+		emitFuncHandleAddr(a, pkgName, x64.RSI, ins.Args[1].StrVal)
+	} else if dtor >= 0 {
 		if dtor != x64.RSI {
 			x64.Mov(a, x64.Reg(x64.RSI, x64.SZ64), x64.Reg(dtor, x64.SZ64))
 		}
 	} else {
 		x64.Mov(a, x64.Reg(x64.RSI, x64.SZ64), x64.Imm(0))
 	}
-	var sym @[]char = symPrefixed(mangle.FuncName("pkg/builtins/rt", "RefDec"))
+	var sym @[]char = symPrefixed(mangle.FuncName("pkg/builtins/rt", "ZeroRefDestroy"))
 	a.SetGlobal(sym)
 	x64.Call(a, sym)
-	rm.ResetRegs()
+	a.DefineLabel(skip)
 }
 
 // emitMake: OP_MAKE — call `rt.Alloc`(SizeOf(T)) for a fresh

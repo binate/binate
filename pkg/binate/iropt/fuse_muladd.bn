@@ -1,0 +1,180 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Fuse a single-use multiply feeding an add/subtract into one fused
+// multiply-add.  `(a*b) + c` becomes OP_MADD(a, b, c) and `c - (a*b)` becomes
+// OP_MSUB(a, b, c), so a target with a fused multiply-add (aa64 madd/msub, arm32
+// mla/mls) emits one instruction instead of a separate multiply then add/sub;
+// targets without one (x64, the VM, LLVM) lower OP_MADD/OP_MSUB back to a plain
+// multiply then add/sub, so they are unaffected.
+//
+// The multiply is fused only when it is single-use (its result feeds ONLY this
+// add/sub) and defined in the SAME block as the consumer.  Same-block keeps the
+// product's evaluation where it already was: fusing a block-crossing multiply
+// would move the product to the consumer's block, and if that block is a loop
+// body while the multiply is loop-invariant, the product would be recomputed
+// every iteration.  LICM runs earlier and hoists an invariant multiply into the
+// preheader, leaving it in a different block from a variant consumer, so this
+// pass then correctly declines to fuse it.
+//
+// The consumer keeps its SSA id and result type, so no use is rewritten and the
+// value's type is unchanged; only the dead multiply is removed afterward.  This
+// pass must run late (it leaves each block's Instrs rebuilt, like LICM).
+
+// fuseMulAdds runs the fusion over every non-extern func.  Invoked by
+// RunOptPasses at -O1+, after LICM.
+func fuseMulAdds(m @ir.Module) {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @ir.Func = m.Funcs[fi]
+		if f.IsExtern {
+			continue
+		}
+		fuseMulAddFunc(f)
+	}
+}
+
+// countUses accumulates a per-id use count over the Args and phi values of the
+// given blocks.
+func countUses(blocks @[]@ir.Block, uses @[]int, cap int) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			for k := 0; k < len(instr.Args); k++ {
+				var a @ir.Instr = instr.Args[k]
+				if a != nil && a.ID >= 0 && a.ID < cap {
+					uses[a.ID] = uses[a.ID] + 1
+				}
+			}
+			for k := 0; k < len(instr.Phis); k++ {
+				var pv @ir.Instr = instr.Phis[k].Val
+				if pv != nil && pv.ID >= 0 && pv.ID < cap {
+					uses[pv.ID] = uses[pv.ID] + 1
+				}
+			}
+		}
+	}
+}
+
+// fusibleResultType reports whether an add/sub result type is a fusion target: a
+// FULL-GP-WIDTH integer (size exactly the target's IntSize), so the fused
+// multiply-add is a single hardware instruction (aa64/x64 madd at 64 bits, arm32
+// mla/mls at 32 bits) whose result needs no sub-word re-narrowing.  Restricting to
+// full width has two payoffs: a wider integer (int64 on 32-bit arm32, a register
+// pair with no single-instruction madd) is excluded, and the VM's fused bytecode
+// can carry the third operand in its one spare field (`Aux`) because no narrow
+// width/sign fields are needed.  Sub-word integers (e.g. int32 on a 64-bit target)
+// are therefore left unfused — a deliberate, minor gap; the common `int` / `int64`
+// arithmetic is full width and does fuse.  A float `a*b+c` is excluded (it must
+// not become an integer madd).  A malformed target with no int width (IntSize
+// <= 0) also fuses nothing; the normal flows always carry a host-default or an
+// explicit width (types.GetTarget defaults an unconfigured target to the host).
+func fusibleResultType(t @types.Type) bool {
+	var iw int = types.GetTarget().IntSize
+	if iw <= 0 {
+		return false
+	}
+	var rt @types.Type = types.StripWrappers(t)
+	if rt == nil || !rt.IsInteger() {
+		return false
+	}
+	return rt.SizeOf() == iw
+}
+
+// isFusibleMul reports whether m is a two-operand OP_MUL, defined in block bi,
+// whose result is used exactly once (by the consumer being rewritten).
+func isFusibleMul(m @ir.Instr, uses @[]int, defBlock @[]int, bi int, cap int) bool {
+	if m == nil || m.Op != iropcode.OP_MUL || len(m.Args) != 2 {
+		return false
+	}
+	if m.ID < 0 || m.ID >= cap {
+		return false
+	}
+	return uses[m.ID] == 1 && defBlock[m.ID] == bi
+}
+
+// makeMadd mutates the consumer instr in place into a ternary fused op with
+// args [a, b, c], reusing its id and result type.
+func makeMadd(instr @ir.Instr, op int, a @ir.Instr, b @ir.Instr, c @ir.Instr) {
+	instr.Op = op
+	var args @[]@ir.Instr
+	args = slices.Append[@ir.Instr](args, a)
+	args = slices.Append[@ir.Instr](args, b)
+	args = slices.Append[@ir.Instr](args, c)
+	instr.Args = args
+}
+
+// fuseMulAddFunc fuses within one function's normal blocks.
+func fuseMulAddFunc(f @ir.Func) {
+	var cap int = f.NextID
+	if cap <= 0 {
+		return
+	}
+	var uses @[]int = make_slice(int, cap)
+	countUses(f.Blocks, uses, cap)
+	countUses(f.FaultPads, uses, cap)
+	// defBlock[id] = index of the normal block defining id (-1 if none / fault pad).
+	var defBlock @[]int = make_slice(int, cap)
+	var i int = 0
+	for i < cap {
+		defBlock[i] = -1
+		i = i + 1
+	}
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var id int = blk.Instrs[ii].ID
+			if id >= 0 && id < cap {
+				defBlock[id] = bi
+			}
+		}
+	}
+	var fused @[]bool = make_slice(bool, cap)
+	var any bool = false
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.Op == iropcode.OP_ADD && len(instr.Args) == 2 && fusibleResultType(instr.Typ) {
+				var x @ir.Instr = instr.Args[0]
+				var y @ir.Instr = instr.Args[1]
+				if isFusibleMul(x, uses, defBlock, bi, cap) {
+					makeMadd(instr, iropcode.OP_MADD, x.Args[0], x.Args[1], y)
+					fused[x.ID] = true
+					any = true
+				} else if isFusibleMul(y, uses, defBlock, bi, cap) {
+					makeMadd(instr, iropcode.OP_MADD, y.Args[0], y.Args[1], x)
+					fused[y.ID] = true
+					any = true
+				}
+			} else if instr.Op == iropcode.OP_SUB && len(instr.Args) == 2 && fusibleResultType(instr.Typ) {
+				// Only `c - (a*b)` fuses: the multiply must be the subtrahend.
+				var y @ir.Instr = instr.Args[1]
+				if isFusibleMul(y, uses, defBlock, bi, cap) {
+					makeMadd(instr, iropcode.OP_MSUB, y.Args[0], y.Args[1], instr.Args[0])
+					fused[y.ID] = true
+					any = true
+				}
+			}
+		}
+	}
+	if !any {
+		return
+	}
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		var kept @[]@ir.Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr.ID >= 0 && instr.ID < cap && fused[instr.ID] {
+				continue
+			}
+			kept = slices.Append[@ir.Instr](kept, instr)
+		}
+		blk.Instrs = kept
+	}
+}

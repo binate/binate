@@ -145,39 +145,14 @@ run_sepc() {
         return
     fi
 
-    # --- 3b. rt.MemZero object (aarch64 only) ---------------------------
-    # aarch64's rt.MemZero is a #[build]-gated-off hand-asm .s seam that only
-    # cmd/bnc's own link paths assemble + include (assembleRtMemObj); the raw
-    # clang link below has no definition for it, so provide it here.  A
-    # `--linker bnld --keep-objs` link preserves that object (the clang link path
-    # deletes it unconditionally), and the object is target-independent, so a
-    # trivial program suffices.  On x86-64 rt.MemZero is ordinary compiled code
-    # (already in the objects), so this stays empty and the link is unchanged.
-    # (Stopgap; the proper fix is self-contained `bnc -c` output — see the
-    # "#[build]-gated assembly file as part of a package" todo.)
-    rtmem_obj=""
-    rtdir="$work/rtmem"
-    mkdir -p "$rtdir"
-    printf 'package "main"\nfunc main() {}\n' > "$rtdir/probe.bn"
-    if "$bnc" -I "$iface" -L "$impl" --linker bnld --keep-objs \
-            --build-dir "$rtdir" -o "$rtdir/probe" "$rtdir/probe.bn" >"$rtdir/log" 2>&1; then
-        rtmem_obj=$(find "$rtdir" -name 'bnrt_mem_*.o' 2>/dev/null | head -1)
-    else
-        # A probe failure leaves rtmem_obj empty; on aarch64 the link below then
-        # fails with a (misleading) undefined-MemZero error. Surface the probe log
-        # so the real cause is diagnosable rather than silent. Benign on x86-64,
-        # which needs no rt-mem object.
-        echo "note: rt.MemZero probe link failed — see log (only fatal on aarch64):" >&2
-        cat "$rtdir/log" >&2
-    fi
-
     # --- 4. link the independently-built objects into a binary ----------
+    # Each dependency's separate compile is self-contained: a package that ships
+    # hand-written asm (e.g. aarch64's #[build]-gated rt.MemZero, whose Binate body
+    # is gated off) emits that .s as its own object in the --pkg output, collected
+    # into sep_objs below — so no extra runtime object is supplied here.
     sep_objs=$(find "$work/sep" -name '*.o' | tr '\n' ' ')
     bnas_sep="$work/bnas_sep"
-    # The runtime is pure Binate (no C runtime linked), so the separately-built
-    # objects link with no extra runtime object — EXCEPT aarch64's rt.MemZero,
-    # a hand-asm .s seam (see step 3b); $rtmem_obj supplies it there, empty on x86-64.
-    if ! "$CLANG" -w -o "$bnas_sep" "$work/wp/main.o" $sep_objs $rtmem_obj 2>"$work/link.err" \
+    if ! "$CLANG" -w -o "$bnas_sep" "$work/wp/main.o" $sep_objs 2>"$work/link.err" \
             || [ ! -x "$bnas_sep" ]; then
         fail "$label: link of separately-compiled objects failed" "$(head -4 "$work/link.err")"
         return

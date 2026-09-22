@@ -2,13 +2,10 @@ package "pkg/binate/native/x64"
 
 import "pkg/binate/asm"
 import "pkg/binate/asm/x64"
-import "pkg/binate/buf"
 import "pkg/binate/ir"
 import "pkg/binate/iropcode"
 import "pkg/binate/native/common"
-import "pkg/binate/stringutils"
 import "pkg/binate/types"
-import "pkg/std/strings"
 
 // Floating-point lowering for the SysV-AMD64 backend.
 //
@@ -63,17 +60,44 @@ func floatBitWidth(t @types.Type) int {
 // bits and materialize via MOV reg64, imm64 (the same encoder
 // emitConstInt64 uses).  Bits live in the GP scratch / spill slot
 // like any other 64-bit value.
-func emitConstFloat(a @asm.Assembler, rd int, ins @ir.Instr) {
+func emitConstFloat(a @asm.Assembler, rm @common.RegMap, rd int, ins @ir.Instr) {
 	var bits uint64 = common.ParseFloatLitToBits(ins.StrVal)
 	// A float32-typed constant materializes its narrowed 32-bit value
 	// (round-to-nearest-even), not the low half of the float64 pattern;
 	// otherwise bit_cast(int32, C) would read the wrong bits.
-	if floatBitWidth(ins.Typ) == 32 {
+	var is32 bool = floatBitWidth(ins.Typ) == 32
+	if is32 {
 		bits = cast(uint64, common.F64BitsToF32Bits(bits))
 	}
 	// cast(int64, …) reinterprets the full 64-bit IEEE pattern;
 	// cast(int, …) would drop the high 32 bits on a 32-bit host.
+	if isFpReg(rd) {
+		// FP-homed const: build the IEEE bits in a GP scratch, then MOV them into
+		// the XMM home (Movd zero-extends the f32 high 32).
+		var gp int = scratchReg(rm)
+		emitConstInt64(a, gp, cast(int64, bits))
+		if is32 {
+			x64.Movd_gp_to_xmm(a, rd, gp)
+		} else {
+			x64.Movq_gp_to_xmm(a, rd, gp)
+		}
+		return
+	}
 	emitConstInt64(a, rd, cast(int64, bits))
+}
+
+// storeFloatResult moves the float result sitting in FP_SCRATCH_A into rd: an
+// XMM home takes a whole-register Movapd (keeping the clean f32 upper bits
+// FP_SCRATCH_A carries); otherwise the bits go to the GP result slot via Movd
+// (f32, zero-extending the high 32) / Movq (f64).
+func storeFloatResult(a @asm.Assembler, rd int, is32 bool) {
+	if isFpReg(rd) {
+		x64.Movapd(a, rd, FP_SCRATCH_A)
+	} else if is32 {
+		x64.Movd_xmm_to_gp(a, rd, FP_SCRATCH_A)
+	} else {
+		x64.Movq_xmm_to_gp(a, rd, FP_SCRATCH_A)
+	}
 }
 
 // emitFloatBinop: OP_ADD/SUB/MUL/DIV when the result is float.
@@ -84,48 +108,56 @@ func emitConstFloat(a @asm.Assembler, rd int, ins @ir.Instr) {
 func emitFloatBinop(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
 	if !isFloatTyp(ins.Typ) { return false }
 	if len(ins.Args) < 2 { return false }
-	var ra int = getOperand(a, rm, ins.Args[0].ID)
-	var rb int = getOperand(a, rm, ins.Args[1].ID)
-	if ra < 0 || rb < 0 { return false }
-	if floatBitWidth(ins.Typ) == 32 {
-		// float32: round at single precision.  Move the f32 bit patterns
-		// (low 32 bits of the GP slots) into XMM via the 32-bit MOVD and
-		// use the single-precision (SS) ops; MOVD back zero-extends the
-		// result's high 32 bits.  Computing in double on the raw f32 bits
-		// would reinterpret them as a garbage double.
-		x64.Movd_gp_to_xmm(a, FP_SCRATCH_A, ra)
-		x64.Movd_gp_to_xmm(a, FP_SCRATCH_B, rb)
-		if ins.Op == iropcode.OP_ADD {
-			x64.Addss(a, FP_SCRATCH_A, FP_SCRATCH_B)
-		} else if ins.Op == iropcode.OP_SUB {
-			x64.Subss(a, FP_SCRATCH_A, FP_SCRATCH_B)
-		} else if ins.Op == iropcode.OP_MUL {
-			x64.Mulss(a, FP_SCRATCH_A, FP_SCRATCH_B)
-		} else if ins.Op == iropcode.OP_DIV {
-			x64.Divss(a, FP_SCRATCH_A, FP_SCRATCH_B)
-		} else {
-			return false
-		}
-		var rd32 int = nextReg(rm, ins.ID)
-		x64.Movd_xmm_to_gp(a, rd32, FP_SCRATCH_A)
-		return true
-	}
-	x64.Movq_gp_to_xmm(a, FP_SCRATCH_A, ra)
-	x64.Movq_gp_to_xmm(a, FP_SCRATCH_B, rb)
-	switch ins.Op {
-	case iropcode.OP_ADD:
-		x64.Addsd(a, FP_SCRATCH_A, FP_SCRATCH_B)
-	case iropcode.OP_SUB:
-		x64.Subsd(a, FP_SCRATCH_A, FP_SCRATCH_B)
-	case iropcode.OP_MUL:
-		x64.Mulsd(a, FP_SCRATCH_A, FP_SCRATCH_B)
-	case iropcode.OP_DIV:
-		x64.Divsd(a, FP_SCRATCH_A, FP_SCRATCH_B)
-	default:
+	if ins.Op != iropcode.OP_ADD && ins.Op != iropcode.OP_SUB && ins.Op != iropcode.OP_MUL &&
+			ins.Op != iropcode.OP_DIV {
 		return false
 	}
+	var is32 bool = floatBitWidth(ins.Typ) == 32
+	// Operands arrive as XMM registers: an FP-homed operand IS its home (no MOV),
+	// otherwise its bits reload into the fixed FP scratch (XMM14/XMM15) via the
+	// upper-zeroing Movd (f32) / Movq (f64) — computing in double on raw f32 bits
+	// would reinterpret them as a garbage double.
+	var da int = getFloatOperand(a, rm, ins.Args[0].ID, FP_SCRATCH_A, is32)
+	var db int = getFloatOperand(a, rm, ins.Args[1].ID, FP_SCRATCH_B, is32)
+	if da < 0 || db < 0 { return false }
+	// SSE is two-address (dst OP= src), so compute into FP_SCRATCH_A = da OP db,
+	// then move to the result.  db is never FP_SCRATCH_A (a reloaded op1 goes to
+	// FP_SCRATCH_B; homes are XMM8..13), so the Movapd below can't clobber it.
+	if da != FP_SCRATCH_A {
+		x64.Movapd(a, FP_SCRATCH_A, da)
+	}
+	if is32 {
+		if ins.Op == iropcode.OP_ADD {
+			x64.Addss(a, FP_SCRATCH_A, db)
+		} else if ins.Op == iropcode.OP_SUB {
+			x64.Subss(a, FP_SCRATCH_A, db)
+		} else if ins.Op == iropcode.OP_MUL {
+			x64.Mulss(a, FP_SCRATCH_A, db)
+		} else {
+			x64.Divss(a, FP_SCRATCH_A, db)
+		}
+	} else {
+		if ins.Op == iropcode.OP_ADD {
+			x64.Addsd(a, FP_SCRATCH_A, db)
+		} else if ins.Op == iropcode.OP_SUB {
+			x64.Subsd(a, FP_SCRATCH_A, db)
+		} else if ins.Op == iropcode.OP_MUL {
+			x64.Mulsd(a, FP_SCRATCH_A, db)
+		} else {
+			x64.Divsd(a, FP_SCRATCH_A, db)
+		}
+	}
+	// The result computes into its XMM home when homed (Movapd copies the whole
+	// register, so the f32 upper bits FP_SCRATCH_A carried stay clean); otherwise
+	// MOV back to the GP result slot (Movd zero-extends the f32 high 32).
 	var rd int = nextReg(rm, ins.ID)
-	x64.Movq_xmm_to_gp(a, rd, FP_SCRATCH_A)
+	if isFpReg(rd) {
+		x64.Movapd(a, rd, FP_SCRATCH_A)
+	} else if is32 {
+		x64.Movd_xmm_to_gp(a, rd, FP_SCRATCH_A)
+	} else {
+		x64.Movq_xmm_to_gp(a, rd, FP_SCRATCH_A)
+	}
 	return true
 }
 
@@ -163,22 +195,19 @@ func emitFloatCompare(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
 	if ins.Args[0].Typ == nil || !isFloatTyp(ins.Args[0].Typ) {
 		return false
 	}
-	var lhs int = getOperand(a, rm, ins.Args[0].ID)
-	var rhs int = getOperand(a, rm, ins.Args[1].ID)
-	if lhs < 0 || rhs < 0 { return false }
-	if floatBitWidth(ins.Args[0].Typ) == 32 {
-		// float32: compare at single precision.  A double UCOMISD on the
-		// raw f32 bits reinterprets them as garbage doubles (a negative
-		// f32 reads as a large positive double), flipping the order.
-		// UCOMISS sets the same EFLAGS, so the condition logic below is
-		// shared.
-		x64.Movd_gp_to_xmm(a, FP_SCRATCH_A, lhs)
-		x64.Movd_gp_to_xmm(a, FP_SCRATCH_B, rhs)
-		x64.Ucomiss(a, FP_SCRATCH_A, FP_SCRATCH_B)
+	var is32 bool = floatBitWidth(ins.Args[0].Typ) == 32
+	// Operands as XMM registers (home or reloaded into the FP scratch).  float32:
+	// compare at single precision — a double UCOMISD on the raw f32 bits
+	// reinterprets them as garbage doubles (a negative f32 reads as a large
+	// positive double), flipping the order.  UCOMISS sets the same EFLAGS, so the
+	// condition logic below is shared.
+	var da int = getFloatOperand(a, rm, ins.Args[0].ID, FP_SCRATCH_A, is32)
+	var db int = getFloatOperand(a, rm, ins.Args[1].ID, FP_SCRATCH_B, is32)
+	if da < 0 || db < 0 { return false }
+	if is32 {
+		x64.Ucomiss(a, da, db)
 	} else {
-		x64.Movq_gp_to_xmm(a, FP_SCRATCH_A, lhs)
-		x64.Movq_gp_to_xmm(a, FP_SCRATCH_B, rhs)
-		x64.Ucomisd(a, FP_SCRATCH_A, FP_SCRATCH_B)
+		x64.Ucomisd(a, da, db)
 	}
 	var rd int = nextReg(rm, ins.ID)
 	switch ins.Op {
@@ -230,12 +259,29 @@ func emitFloatNeg(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
 	if len(ins.Args) < 1 { return false }
 	var src int = getOperand(a, rm, ins.Args[0].ID)
 	if src < 0 { return false }
+	var is32 bool = floatBitWidth(ins.Typ) == 32
 	var rd int = nextReg(rm, ins.ID)
+	if isFpReg(rd) {
+		// FP-homed result: flip the sign bit in a GP scratch, then move the bits
+		// into the XMM home (Movd zero-extends the f32 high 32, keeping it clean).
+		var gp int = scratchReg(rm)
+		x64.Mov(a, x64.Reg(gp, x64.SZ64), x64.Reg(src, x64.SZ64))
+		if is32 {
+			x64.Xor(a, x64.Reg(gp, x64.SZ32), x64.Imm(-2147483647 - 1))
+			x64.Movd_gp_to_xmm(a, rd, gp)
+		} else {
+			var mask int = scratchReg(rm)
+			emitConstInt64(a, mask, cast(int64, 1) << 63)
+			x64.Xor(a, x64.Reg(gp, x64.SZ64), x64.Reg(mask, x64.SZ64))
+			x64.Movq_gp_to_xmm(a, rd, gp)
+		}
+		return true
+	}
 	var rdOp x64.Operand = x64.Reg(rd, x64.SZ64)
 	if rd != src {
 		x64.Mov(a, rdOp, x64.Reg(src, x64.SZ64))
 	}
-	if floatBitWidth(ins.Typ) == 32 {
+	if is32 {
 		// XOR low 32 bits with 0x80000000.  x86 32-bit ops zero
 		// the upper 32 of the GP, which is fine — float32 only
 		// occupies the low dword.  Imm(-2147483648) → imm32
@@ -253,116 +299,13 @@ func emitFloatNeg(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
 	return true
 }
 
-// uitofpLabel mints a unique local label for the uint64→double add-back
-// branch, keyed on the current code offset so two conversions in one
-// function don't collide.  The 'L' prefix keeps it out of the exported
-// symbol list (same-section Jcc/Jmp fixups resolve before link).
-func uitofpLabel(prefix *[]readonly char, off int) @[]char {
-	var b @strings.Builder = strings.NewBuilder()
-	b.Write(prefix)
-	stringutils.WriteInt(b, off)
-	return buf.CopyStr(b.String())
-}
-
-// pickScratchGP returns a GP reg from {RAX, RDX, R11} that is neither avoid1
-// nor avoid2, evicting any within-block retained value cached in the chosen
-// register so the caller may clobber it without leaving a stale cache entry
-// (eviction is loss-free — the value stays in its spill slot and reloads on
-// next use).  The candidates are caller-saved and outside the callee-saved
-// home pool (RBX/R12..R15), so none can hold a live homed value; the only live
-// GP regs a lowering must protect are its own operand/result (passed as
-// avoid1/avoid2).  Three candidates always leave one free of the two to avoid.
-func pickScratchGP(m @common.RegMap, avoid1 int, avoid2 int) int {
-	var r int = x64.R11
-	if x64.RAX != avoid1 && x64.RAX != avoid2 {
-		r = x64.RAX
-	} else if x64.RDX != avoid1 && x64.RDX != avoid2 {
-		r = x64.RDX
-	}
-	if m.RegHeldBy(r) >= 0 { storeDirtyOnEvict(m, r); m.EvictReg(r) }
-	return r
-}
-
-// pickTwoScratchGP returns two DISTINCT GP regs, each neither avoid1 nor
-// avoid2, from a fixed caller-saved, non-home candidate set (RAX/RDX/R8/R9/
-// R10/R11 — none is a home register, so none can hold a live homed value).
-// Used where a lowering needs two throwaway GP scratches without clobbering
-// its operand/result (avoid1/avoid2) or any home.  Six candidates always
-// leave at least two free of the two to avoid.  Any within-block retained
-// value cached in a chosen register is evicted (loss-free) so the caller may
-// clobber it without leaving a stale cache entry.
-func pickTwoScratchGP(m @common.RegMap, avoid1 int, avoid2 int) (int, int) {
-	var cands @[]int = make_slice(int, 6)
-	cands[0] = x64.RAX
-	cands[1] = x64.RDX
-	cands[2] = x64.R8
-	cands[3] = x64.R9
-	cands[4] = x64.R10
-	cands[5] = x64.R11
-	var first int = -1
-	var second int = -1
-	for i := 0; i < len(cands); i++ {
-		var c int = cands[i]
-		if c == avoid1 || c == avoid2 { continue }
-		if first < 0 {
-			first = c
-		} else {
-			second = c
-			break
-		}
-	}
-	if first >= 0 && m.RegHeldBy(first) >= 0 { storeDirtyOnEvict(m, first); m.EvictReg(first) }
-	if second >= 0 && m.RegHeldBy(second) >= 0 { storeDirtyOnEvict(m, second); m.EvictReg(second) }
-	return first, second
-}
-
-// emitUint64ToDouble converts the UNSIGNED 64-bit value in `src` to a
-// double in FP_SCRATCH_A.  x86-64 has no unsigned-int64→double
-// instruction, so use the sign-bit add-back: for values < 2^63 a signed
-// CVTSI2SD is exact; for values >= 2^63 (bit 63 set), convert
-// (src>>1)|(src&1) — round-to-odd, which keeps the final doubling exact
-// (avoids the double-rounding a plain >>1 would suffer) — then ADDSD it
-// to itself.  `scratch` and `scratch2` are GP regs distinct from src (and
-// each other) that may be clobbered; src is only READ — it may be a live
-// register-allocated (homed) value, so the round-to-odd is built entirely in
-// the two scratch registers, never in src itself.
-func emitUint64ToDouble(a @asm.Assembler, src int, scratch int, scratch2 int) {
-	var off int = cast(int, a.CurrentOffset())
-	var plainLbl @[]char = uitofpLabel("Lu2d_p", off)
-	var doneLbl @[]char = uitofpLabel("Lu2d_d", off)
-	// if (int64)src >= 0 → bit 63 clear → the signed convert is exact.
-	x64.Test(a, x64.Reg(src, x64.SZ64), x64.Reg(src, x64.SZ64))
-	x64.Jcc(a, x64.CC_NS, plainLbl)
-	// Big path: scratch = (src >> 1) | (src & 1); convert; double.  src stays
-	// intact — (src & 1) is computed into scratch2, not by mutating src.
-	x64.Mov(a, x64.Reg(scratch, x64.SZ64), x64.Reg(src, x64.SZ64))
-	x64.Shr(a, x64.Reg(scratch, x64.SZ64), x64.Imm(1))
-	x64.Mov(a, x64.Reg(scratch2, x64.SZ64), x64.Reg(src, x64.SZ64))
-	x64.And(a, x64.Reg(scratch2, x64.SZ64), x64.Imm(1))
-	x64.Or(a, x64.Reg(scratch, x64.SZ64), x64.Reg(scratch2, x64.SZ64))
-	x64.Cvtsi2sd(a, FP_SCRATCH_A, scratch)
-	x64.Addsd(a, FP_SCRATCH_A, FP_SCRATCH_A)
-	x64.Jmp(a, doneLbl)
-	a.DefineLabel(plainLbl)
-	x64.Cvtsi2sd(a, FP_SCRATCH_A, src)
-	a.DefineLabel(doneLbl)
-}
-
-// emitFloatCast: OP_CAST when source or target is a float.  Returns
-// true if handled.  Cases (all variants present here, with float32
-// rare in conformance — test 283 is the only mover):
-//   int → float64    : CVTSI2SD xmm,gp ; MOVQ rd,xmm
-//   int → float32    : CVTSI2SD xmm,gp ; CVTSD2SS xmm,xmm ; MOVD rd,xmm
-//   float64 → int    : MOVQ xmm,gp ; CVTTSD2SI rd,xmm  (round-toward-zero)
-//   float32 → int    : MOVD xmm,gp ; CVTSS2SD xmm,xmm ; CVTTSD2SI rd,xmm
-//   float32 → float64: MOVD xmm,gp ; CVTSS2SD xmm,xmm ; MOVQ rd,xmm
-//   float64 → float32: MOVQ xmm,gp ; CVTSD2SS xmm,xmm ; MOVD rd,xmm
-//   same-width float→float: plain MOV (no bit change needed).
-//
-// Spill slots are uniformly 8 bytes; float32 occupies the low half,
-// float64 the full 8.  The integer-bit-pattern interpretation lets
-// us treat MOV / MOVQ / MOVD uniformly without reasoning about the
-// upper-bits-zero state in the spill.
+// emitFloatCast: OP_CAST when source or target is a float.  Returns true if
+// handled.  Result-producing cases (int→float, float→float) land the float
+// result in its XMM home when the result is FP-homed (storeFloatResult /
+// Movd/Movq_gp_to_xmm), else in the GP result slot; float→int keeps the GP
+// path.  The unsigned int64↔double directions use the add-back / subtract-2^63
+// idioms in x64_float_convert.bn.  Spill slots are uniformly 8 bytes (float32 in
+// the low half), so MOV / MOVQ / MOVD treat the bit pattern uniformly.
 func emitFloatCast(a @asm.Assembler, m @common.RegMap, rd int, src int, srcTyp @types.Type,
 		dstTyp @types.Type) bool {
 	var srcF bool = isFloatTyp(srcTyp)
@@ -375,19 +318,29 @@ func emitFloatCast(a @asm.Assembler, m @common.RegMap, rd int, src int, srcTyp @
 
 	if srcF && dstF {
 		if srcW == dstW {
-			x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(src, x64.SZ64))
+			// Same-width float->float is a bit copy: into an XMM home, MOV the
+			// GP-materialized source bits (Movd for f32); else a plain GP move.
+			if isFpReg(rd) {
+				if srcW == 32 {
+					x64.Movd_gp_to_xmm(a, rd, src)
+				} else {
+					x64.Movq_gp_to_xmm(a, rd, src)
+				}
+			} else {
+				x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(src, x64.SZ64))
+			}
 			return true
 		}
 		if srcW == 32 && dstW == 64 {
 			x64.Movd_gp_to_xmm(a, FP_SCRATCH_A, src)
 			x64.Cvtss2sd(a, FP_SCRATCH_A, FP_SCRATCH_A)
-			x64.Movq_xmm_to_gp(a, rd, FP_SCRATCH_A)
+			storeFloatResult(a, rd, false)
 			return true
 		}
 		// f64 → f32.
 		x64.Movq_gp_to_xmm(a, FP_SCRATCH_A, src)
 		x64.Cvtsd2ss(a, FP_SCRATCH_A, FP_SCRATCH_A)
-		x64.Movd_xmm_to_gp(a, rd, FP_SCRATCH_A)
+		storeFloatResult(a, rd, true)
 		return true
 	}
 	if !srcF && dstF {
@@ -410,9 +363,9 @@ func emitFloatCast(a @asm.Assembler, m @common.RegMap, rd int, src int, srcTyp @
 		}
 		if dstW == 32 {
 			x64.Cvtsd2ss(a, FP_SCRATCH_A, FP_SCRATCH_A)
-			x64.Movd_xmm_to_gp(a, rd, FP_SCRATCH_A)
+			storeFloatResult(a, rd, true)
 		} else {
-			x64.Movq_xmm_to_gp(a, rd, FP_SCRATCH_A)
+			storeFloatResult(a, rd, false)
 		}
 		return true
 	}
@@ -435,28 +388,29 @@ func emitFloatCast(a @asm.Assembler, m @common.RegMap, rd int, src int, srcTyp @
 	return true
 }
 
-// emitDoubleToUint64 truncates the double in FP_SCRATCH_A to a uint64 in
-// rd.  x86-64's CVTTSD2SI is signed-only — it saturates a value >= 2^63
-// to INT64_MIN — so for f >= 2^63 convert f - 2^63 (which lands in
-// [0, 2^63) and fits a signed int64) and set bit 63 back; f < 2^63 uses
-// the plain signed CVTTSD2SI.  FP_SCRATCH_B holds the 2^63 constant;
-// `scratch` is a GP reg != rd that may be clobbered.
-func emitDoubleToUint64(a @asm.Assembler, rd int, scratch int) {
-	var off int = cast(int, a.CurrentOffset())
-	var smallLbl @[]char = uitofpLabel("Ld2u_s", off)
-	var doneLbl @[]char = uitofpLabel("Ld2u_d", off)
-	// FP_SCRATCH_B = 2^63 as a double (0x43E0000000000000).
-	emitConstInt64(a, scratch, cast(int64, 0x43E0000000000000))
-	x64.Movq_gp_to_xmm(a, FP_SCRATCH_B, scratch)
-	x64.Ucomisd(a, FP_SCRATCH_A, FP_SCRATCH_B)
-	x64.Jcc(a, x64.CC_B, smallLbl) // f < 2^63 → plain
-	// Big path: rd = (int64)(f - 2^63) | 2^63.
-	x64.Subsd(a, FP_SCRATCH_A, FP_SCRATCH_B)
-	x64.Cvttsd2si(a, rd, FP_SCRATCH_A)
-	emitConstInt64(a, scratch, cast(int64, 1) << 63)
-	x64.Or(a, x64.Reg(rd, x64.SZ64), x64.Reg(scratch, x64.SZ64))
-	x64.Jmp(a, doneLbl)
-	a.DefineLabel(smallLbl)
-	x64.Cvttsd2si(a, rd, FP_SCRATCH_A)
-	a.DefineLabel(doneLbl)
+// emitBitCastX64: OP_BIT_CAST — reinterpret same-size bits.  Into an FP-homed
+// float result the source int bits MOV into the XMM home (Movd for f32,
+// zero-extending; Movq for f64), no sub-word narrow.  Otherwise a plain 64-bit
+// GP MOV then re-narrow to the TARGET type's width — a sub-word target used
+// DIRECTLY (e.g. `bit_cast(uint32, <int32 -1>)` read in a compare) must hold its
+// own value range, not the source's leaked sign-extended high bits.
+// emitValOperand (not getOperand) so `bit_cast(int, &G)` materializes the global
+// address — bare getOperand would miss the IsGlobalRef pseudo.
+func emitBitCastX64(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins @ir.Instr) {
+	if len(ins.Args) < 1 { return }
+	var src int = emitValOperand(a, pkgName, rm, ins.Args[0])
+	if src < 0 { return }
+	var rd int = nextReg(rm, ins.ID)
+	if isFloatTyp(ins.TypeArg) && isFpReg(rd) {
+		if floatBitWidth(ins.TypeArg) == 32 {
+			x64.Movd_gp_to_xmm(a, rd, src)
+		} else {
+			x64.Movq_gp_to_xmm(a, rd, src)
+		}
+		return
+	}
+	if rd != src {
+		x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(src, x64.SZ64))
+	}
+	emitSubWordNarrow(a, rd, ins.TypeArg)
 }

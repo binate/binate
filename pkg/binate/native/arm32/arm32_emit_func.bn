@@ -116,6 +116,24 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 			}
 		}
 	}
+	// Second linear-scan pass over the FP register class (hard-float only): home
+	// float values in callee-saved VFP D8..D15 instead of round-tripping them
+	// through GP spill slots.  Soft-float passes an empty descriptor, so
+	// AllocateFpRegisters homes nothing and the AEABI-libcall float path is
+	// unchanged.  No FP un-homing is needed (unlike the GP R0..R3 loop above): the
+	// D8..D15 home pool is disjoint from the D0..D7 arg/return CPRC bank, so FP
+	// call-arg/return marshalling never collides with a home.
+	var fpdesc common.RegClassDesc
+	if types.Arm32HardFloat() {
+		fpdesc.CalleeSaved = arm32FpAllocatablePool()
+	}
+	rm.AllocateFpRegisters(f, 4, fpdesc)
+	// f64-only homes for now: un-home any f32 value the FP pass homed.  An f32
+	// homes in a D-register's low S-view, but its producer sites (const / load /
+	// extract / bit_cast / phi / param / return, all single-word) are not yet
+	// FP-home-aware — only the f64 register-pair path (load64/store64) is.  So
+	// leave f32 values GP-slotted (unchanged); f32 homing is a follow-up.
+	unhomeF32Values(rm, f)
 	var frameSize int = rm.PlanFrame(f)
 	// Lazy spill (dead-store elimination): stamp the assembler back-channel so
 	// allocReg can spill a dirty value it must evict, and precompute the
@@ -198,6 +216,13 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 	if frameSize > 0 {
 		emitSpAdjust(a, false, frameSize)
 	}
+	// Save the callee-saved VFP homes (hard-float) the FP pass used, into the FP
+	// save area (at SavedFpRegsOff, inside the frame).  Empty until the FP pass
+	// runs.  IP is a safe large-offset scratch here (already pushed, not yet
+	// holding a param).  emitEpilogueAndRet restores.
+	for fi := 0; fi < len(rm.SavedFpRegs); fi++ {
+		vfpStoreBaseHard(a, true, rm.SavedFpRegs[fi], arm32.SP, rm.SavedFpRegsOff + 8 * fi, arm32.IP)
+	}
 
 	// AAPCS32 sret: a function returning an aggregate (or multi-return tuple)
 	// above the sret threshold receives the hidden buffer pointer in R0 (the
@@ -225,17 +250,22 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 		emitSpillParam(a, rm, f.Params[pi], paramTypes, dispatchIdx, stackArgsBase)
 	}
 
-	// Register-allocated (homed) scalar params: spillIncomingParams above wrote
+	// Register-allocated (homed) GP scalar params: spillIncomingParams above wrote
 	// EVERY param to its stack slot (reading the incoming arg registers, never
 	// writing R0..R3), so the incoming values are now safely in memory.  Load
 	// each homed param from its slot into its home register.  This spill-then-
 	// reload avoids the register shuffle a direct arg-reg -> home-reg landing
 	// would hit (homes overlap the arg registers R0..R3): the spill phase above
 	// touches no R0..R3, so no incoming arg value is clobbered before it is
-	// saved; this phase reads only memory and writes homes.
+	// saved; this phase reads only memory and writes homes.  An FP-homed float
+	// param is EXCLUDED here: it was already moved into its D-register home by
+	// emitSpillParamFloatHard (a VFP register move, safe because the FP home pool
+	// D8..D15 is disjoint from the D0..D7 arg bank — no shuffle hazard), and its
+	// GP-addressed emitFrameLoad here would mis-encode the D-home number as a GP
+	// register (the low 4 bits of D15's number are r15/PC).
 	for pi := 0; pi < len(f.Params); pi++ {
 		var phome int = rm.LookupHome(f.Params[pi].ID)
-		if phome >= 0 {
+		if phome >= 0 && !isFpReg(phome) {
 			var poff int = rm.LookupSpill(f.Params[pi].ID)
 			if poff >= 0 {
 				emitFrameLoad(a, phome, poff)
@@ -293,7 +323,7 @@ func emitFunc(a @asm.Assembler, pkgName *[]readonly char, f @ir.Func, strings @[
 	}
 
 	// Safety net: emit an epilogue if the IR didn't end with OP_RETURN.
-	emitEpilogueAndRet(a, frameSize)
+	emitEpilogueAndRet(a, rm, frameSize)
 }
 
 // arm32AllocatablePool returns the registers the linear-scan allocator homes
@@ -312,167 +342,4 @@ func arm32AllocatablePool() @[]int {
 	p[2] = arm32.R2
 	p[3] = arm32.R3
 	return p
-}
-
-// emitSpillParam stores one incoming parameter to its frame slot so later uses
-// (which reload via getOperand) see it.  dispatchIdx is the param's position in
-// paramTypes, which — for an sret-returning function — carries a synthesised
-// leading sret-pointer slot, so a user param's dispatchIdx is one past its
-// positional index.  A scalar param spills its register (or reloads its incoming
-// stack slot); an aggregate param (raw / managed slice) is reconstructed into
-// its data region and a pointer to that region is written to the spill slot.  A
-// emitFrameLoadSized loads a sub-word stack arg from [SP + off] into rd, sized AND
-// sign-/zero-extended to the arg's packed footprint.  AAPCS32 uses 4-byte word stack-arg
-// slots and never packs sub-word args (NaturalSizeStackArgs is Darwin-aarch64 only), so
-// StackArgNaturalSize returns 0 and this is the plain word emitFrameLoad for most functions
-// — int32 is already the full 4-byte word, so only int8 / int16 could be sub-word.
-//
-// An int8 / int16 arg is loaded at its natural size and sign-/zero-extended (LDRSB/LDRSH
-// signed, LDRB/LDRH bool/unsigned) rather than as a full word — UNCONDITIONALLY.  This
-// normalizes the entry against a C caller (a #[c_export] entry, or a function reached through
-// a `__c_entry` callback pointer) that stores only the arg's low 1 / 2 bytes into the 4-byte
-// slot and leaves the rest junk — else that junk lands in the 32-bit canonical home and
-// corrupts a promoted use.  A native caller stores the full extended word (arm32_call.bn's
-// 4-byte stack-arg store), so the narrow-size load reproduces the same value — idempotent.
-// Doing it here at the mangled entry (which every caller reaches) also covers a non-#[c_export]
-// `__c_entry` target whose callback thunk normalizes only the argument registers.  Floats /
-// aggregates never reach here as sub-word.  Addresses via IP (LDR[S]H's 8-bit immediate can't
-// reach a large frame offset).
-func emitFrameLoadSized(a @asm.Assembler, rd int, off int, cc common.CallConv, t @types.Type) {
-	var natSize int = cc.StackArgNaturalSize(t, false)
-	if natSize == 0 && !common.IsAggregateTyp(t) && !common.IsFloatScalarTyp(t) {
-		var sz int = t.SizeOf()
-		if sz > 0 && sz < 4 {
-			natSize = sz
-		}
-	}
-	if natSize != 1 && natSize != 2 {
-		emitFrameLoad(a, rd, off)
-		return
-	}
-	var signed bool
-	_, signed = common.SubWordNarrow(t, 32)
-	emitConstInt32(a, arm32.IP, off)
-	if natSize == 1 {
-		if signed {
-			arm32.Ldrsb(a, arm32.COND_AL, rd, arm32.MemReg(arm32.SP, arm32.IP))
-		} else {
-			arm32.Ldrb(a, arm32.COND_AL, rd, arm32.MemReg(arm32.SP, arm32.IP))
-		}
-	} else {
-		if signed {
-			arm32.Ldrsh(a, arm32.COND_AL, rd, arm32.MemReg(arm32.SP, arm32.IP))
-		} else {
-			arm32.Ldrh(a, arm32.COND_AL, rd, arm32.MemReg(arm32.SP, arm32.IP))
-		}
-	}
-}
-
-// normalizeNarrowRegParamArm32 sign-/zero-extends an incoming narrow GP register param
-// (int8/int16 — int32 is word-sized on AAPCS32) to its type width before spill.  Applied
-// ONLY to #[c_export] functions: a non-native (C) caller may leave a narrow reg arg's high
-// bits UNSPECIFIED, and a native callee spills the whole 4-byte register, so a promoted
-// -O1+ use would read garbage.  Idempotent for a native caller; no-op for word params.
-func normalizeNarrowRegParamArm32(a @asm.Assembler, reg int, t @types.Type) {
-	var sz int = t.SizeOf()
-	if sz != 1 && sz != 2 {
-		return
-	}
-	var signed bool
-	_, signed = common.SubWordNarrow(t, 32)
-	if sz == 1 {
-		if signed {
-			arm32.Sxtb(a, arm32.COND_AL, reg, reg)
-		} else {
-			arm32.Uxtb(a, arm32.COND_AL, reg, reg)
-		}
-	} else {
-		if signed {
-			arm32.Sxth(a, arm32.COND_AL, reg, reg)
-		} else {
-			arm32.Uxth(a, arm32.COND_AL, reg, reg)
-		}
-	}
-}
-
-// emitCExportRegNormArm32 emits the #[c_export] C-entry prefix: for each narrow GP scalar
-// parameter passed in an argument register, sign-/zero-extend it in place.  The register set
-// comes from common.CEntryRegNormWalk — the same classification the __c_entry thunk-emission
-// decision uses (float scalars, 64-bit pairs, and aggregates are excluded as non-narrow-GP;
-// AAPCS32 puts sret in R0, a GP arg reg, so CEntryRegNormWalk applies the R1.. shift when f
-// sret-returns) — so the argReg mapping matches the mangled entry's spill.  Emitted BEFORE the
-// mangled `sym` label so a C caller (entering at the alias) runs it and falls through, while a
-// native caller (at `sym`) skips it.
-func emitCExportRegNormArm32(a @asm.Assembler, rm @common.RegMap, f @ir.Func) {
-	var regStarts @[]int
-	var regTypes @[]@types.Type
-	regStarts, regTypes = common.CEntryRegNormWalk(f, rm.CC)
-	for i := 0; i < len(regStarts); i++ {
-		normalizeNarrowRegParamArm32(a, argReg(regStarts[i]), regTypes[i])
-	}
-}
-
-// float32 param rides the scalar single-word path like an int32; a float64 param
-// arrives as a register pair like an int64 (soft-float — no FP register file).
-func emitSpillParam(a @asm.Assembler, rm @common.RegMap, p @ir.Param, paramTypes @[]@types.Type,
-		dispatchIdx int, stackArgsBase int) {
-	var regStart int = rm.CC.CallArgRegStart(paramTypes, dispatchIdx)
-	var stackOff int = rm.CC.CallArgStackOff(paramTypes, dispatchIdx)
-	// Hard-float (AAPCS-VFP): a float scalar param arrives in a VFP register (S/D,
-	// allocated by CallArgFpReg's CPRC back-fill), so VSTR it directly to its frame
-	// slot — PEELED off the GP paths BEFORE isPair64Typ (a float64 that stayed there
-	// would emitSpillParam64 from the unwritten incoming r-pair).  Returns false for
-	// an FP-file OVERFLOW param, whose bits arrived on the incoming stack and are
-	// handled by the GP paths below exactly as a GP stack param.  Inert unless
-	// types.Arm32HardFloat().
-	if types.Arm32HardFloat() && common.IsFloatScalarTyp(p.Typ) {
-		if emitSpillParamFloatHard(a, rm, p, paramTypes, dispatchIdx) {
-			return
-		}
-	}
-	// A 64-bit-pair scalar param (int64 / uint64 / float64) arrives as an
-	// even-aligned register pair (argReg(regStart):argReg(regStart+1)) or an
-	// 8-byte incoming stack slot; spill both words to its frame slot so later uses
-	// reload the pair.
-	if isPair64Typ(p.Typ) {
-		emitSpillParam64(a, rm, p, regStart, stackOff, stackArgsBase)
-		return
-	}
-	if common.IsAggregateTyp(p.Typ) {
-		emitSpillAggregateParam(a, rm, p, regStart, stackOff, stackArgsBase)
-		return
-	}
-	var off int = rm.LookupSpill(p.ID)
-	if off < 0 { return }
-	if regStart >= 0 {
-		emitFrameStore(a, argReg(regStart), off)
-	} else if stackOff >= 0 {
-		var tmp int = scratchReg(rm)
-		emitFrameLoadSized(a, tmp, stackArgsBase + stackOff, rm.CC, p.Typ)
-		emitFrameStore(a, tmp, off)
-		rm.ResetRegs()
-	}
-}
-
-// emitSpillParam64 spills an incoming 64-bit (int64 / uint64) parameter to its
-// frame slot.  A register-pair param copies argReg(regStart) → [slot+0] and
-// argReg(regStart+1) → [slot+4]; a stack param (past r0-r3) copies the two words
-// from the caller's outgoing-args area.  Later uses reload the pair via load64.
-func emitSpillParam64(a @asm.Assembler, rm @common.RegMap, p @ir.Param, regStart int, stackOff int,
-		stackArgsBase int) {
-	var off int = rm.LookupSpill(p.ID)
-	if off < 0 { return }
-	if regStart >= 0 {
-		emitFrameStore(a, argReg(regStart), off)
-		emitFrameStore(a, argReg(regStart + 1), off + 4)
-		return
-	}
-	if stackOff >= 0 {
-		var tmp int = scratchReg(rm)
-		emitFrameLoad(a, tmp, stackArgsBase + stackOff)
-		emitFrameStore(a, tmp, off)
-		emitFrameLoad(a, tmp, stackArgsBase + stackOff + 4)
-		emitFrameStore(a, tmp, off + 4)
-		rm.ResetRegs()
-	}
 }

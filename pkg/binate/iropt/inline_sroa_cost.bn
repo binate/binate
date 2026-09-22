@@ -1,0 +1,214 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+
+// SROA-aware inline cost: estimate a callee's instruction count AFTER the SROA +
+// mem2reg passes (which run right after inlining — see opt.bn) would collapse its
+// non-managed aggregate plumbing.
+//
+// The inliner scores a callee BEFORE SROA runs, on its raw op count.  A shape
+// like record-churn's `mix` — a handful of field arithmetic wrapped in by-value
+// struct plumbing (param slot loads, result slot stores, field-ptrs) — scores far
+// over the threshold on raw ops yet shrinks to that handful once inlined and
+// SROA'd.  Gating on this adjusted size lets such SROA-thin shapes inline WITHOUT
+// a blanket threshold raise (which also inlines genuinely-large bodies and
+// regressed the tree — the refuted lever this deliberately avoids): a large
+// function keeps a large NON-plumbing remainder, so the discount can never pull
+// it under the threshold.
+//
+// The estimate is more optimistic than the standalone SROA eligibility
+// (collectSroaCandidates) in exactly ONE controlled way: it RELAXES the L2
+// "whole-loaded value's uses are all OP_EXTRACT" pin to also accept an OP_RETURN
+// use.  That single case — a by-value RESULT slot returned whole (`return m`) —
+// is the boundary that dissolves on inlining (the return becomes an assignment
+// into the caller's own slot, which the caller SROA then collapses); a by-value
+// PARAM slot is likewise fine because it is field-READ, not whole-loaded (mix's
+// `a.f1` is GET_FIELD_PTR + scalar-load, so it has no whole-load to pin).  Every
+// OTHER whole-load use is STILL pinned: a whole-loaded value that escapes to a
+// by-value call arg, `box`, a store-elsewhere, or a phi does NOT collapse if the
+// enclosing callee is inlined but that use's own callee is not, so its plumbing
+// must be counted (sroaCostLoadedValuesOK).  It keeps the L1 field-addressability
+// check (uses are only whole load/store + const-index field-ptr chains, never
+// escaping as a value operand, never in a fault pad) and the non-managed
+// restriction (a managed aggregate keeps refcount ops that do not collapse).
+
+// sroaAdjustedSize returns the callee's post-SROA instruction-count estimate:
+// funcInstrCount minus the eliminable plumbing of every non-managed
+// field-addressable aggregate alloca.  Falls back to funcInstrCount when the
+// function has no such alloca (nothing to discount).
+func sroaAdjustedSize(f @ir.Func) int {
+	var n int = f.NextID
+	if n <= 0 {
+		return funcInstrCount(f)
+	}
+	var isCand @[]bool = make_slice(bool, n)
+	var any bool = false
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var a @ir.Instr = blk.Instrs[ii]
+			if !sroaCostCandidate(f, a) {
+				continue
+			}
+			if a.ID >= 0 && a.ID < n {
+				isCand[a.ID] = true
+				any = true
+			}
+		}
+	}
+	if !any {
+		return funcInstrCount(f)
+	}
+	// elim[id] marks an instruction SROA + mem2reg would delete: a candidate
+	// alloca, a const-index field-ptr chain rooted at one, a whole/field load or
+	// store through one, or an OP_EXTRACT on a marked whole-load value.  Marked to
+	// a fixpoint so nested field-ptrs and their consumers are reached.
+	var elim @[]bool = make_slice(bool, n)
+	var id int = 0
+	for id = 0; id < n; id++ {
+		if isCand[id] {
+			elim[id] = true
+		}
+	}
+	var changed bool = true
+	for changed {
+		changed = false
+		for bi := 0; bi < len(f.Blocks); bi++ {
+			var blk @ir.Block = f.Blocks[bi]
+			for ii := 0; ii < len(blk.Instrs); ii++ {
+				var ins @ir.Instr = blk.Instrs[ii]
+				if ins.ID < 0 || ins.ID >= n || elim[ins.ID] {
+					continue
+				}
+				if sroaPlumbingInstr(ins, elim, n) {
+					elim[ins.ID] = true
+					changed = true
+				}
+			}
+		}
+	}
+	var count int = 0
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var ins @ir.Instr = blk.Instrs[ii]
+			if ins.Op == iropcode.OP_STACK_CHECK {
+				continue
+			}
+			if ins.ID >= 0 && ins.ID < n && elim[ins.ID] {
+				continue
+			}
+			// An OP_STORE is a VOID instruction (ID < 0), so it can never sit in the
+			// id-indexed elim set — but a store into a candidate slot / marked field-
+			// ptr is eliminable plumbing too (SROA + mem2reg turn it into an SSA def
+			// of the field, deleting the store).  Catch it by its address operand.
+			if sroaPlumbingInstr(ins, elim, n) {
+				continue
+			}
+			count = count + 1
+		}
+	}
+	return count
+}
+
+// sroaCostCandidate reports whether alloca `a` is a non-managed, field-
+// addressable aggregate whose plumbing the post-inline SROA collapses: an
+// OP_ALLOC of a non-managed struct / slice whose every use is L1-splittable
+// (sroaAllocaL1OK — whole load/store Args[0] or a const-index field-ptr chain,
+// never escaping and never in a fault pad) AND whose whole-loaded values are used
+// only by OP_EXTRACT or OP_RETURN (sroaCostLoadedValuesOK — the relaxed L2 that
+// admits the returned-by-value slot without admitting a value that escapes to a
+// non-collapsing use; see the file header).
+func sroaCostCandidate(f @ir.Func, a @ir.Instr) bool {
+	if !isSroaAggregateAlloca(a) {
+		return false
+	}
+	if sroaAggregateContainsManaged(a.TypeArg) {
+		return false
+	}
+	if !sroaAllocaL1OK(f, a) {
+		return false
+	}
+	return sroaCostLoadedValuesOK(f, a)
+}
+
+// sroaCostLoadedValuesOK is the cost-model's relaxed L2: every whole-load of
+// alloca `a` has its loaded value consumed only by OP_EXTRACT (Args[0]) or
+// OP_RETURN.  The OP_RETURN case is the returned-by-value slot that dissolves on
+// inlining — the one place the discount justifiably drops the real SROA's stricter
+// all-extract pin (sroaLoadedValuesAllExtract).  A whole-loaded value reaching any
+// OTHER use (a by-value call arg, box, a store-elsewhere, a phi entry, or any
+// fault-pad reference) does NOT collapse post-inline, so `a`'s plumbing must be
+// counted — return false to reject the discount.
+func sroaCostLoadedValuesOK(f @ir.Func, a @ir.Instr) bool {
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var ld @ir.Instr = blk.Instrs[ii]
+			if ld.Op != iropcode.OP_LOAD {
+				continue
+			}
+			if len(ld.Args) < 1 || ld.Args[0] != a {
+				continue
+			}
+			if !costLoadValueUsesOK(f.Blocks, ld) || !costLoadValueUsesOK(f.FaultPads, ld) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// costLoadValueUsesOK reports whether every use of whole-load value `v` within
+// `blocks` is an OP_EXTRACT reading v as Args[0] or an OP_RETURN — the two uses
+// that collapse (extract) or dissolve on inlining (return).  A phi entry or any
+// other operand position rejects.
+func costLoadValueUsesOK(blocks @[]@ir.Block, v @ir.Instr) bool {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if instr == v {
+				continue
+			}
+			for k := 0; k < len(instr.Phis); k++ {
+				if instr.Phis[k].Val == v {
+					return false
+				}
+			}
+			for k := 0; k < len(instr.Args); k++ {
+				if instr.Args[k] != v {
+					continue
+				}
+				var okExtract bool = instr.Op == iropcode.OP_EXTRACT && k == 0
+				var okReturn bool = instr.Op == iropcode.OP_RETURN
+				if !okExtract && !okReturn {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// sroaPlumbingInstr reports whether ins is eliminable plumbing of a candidate
+// alloca: a const-index field-ptr, a load, a store, or an OP_EXTRACT whose
+// address / source operand (Args[0]) is a candidate alloca or an already-marked
+// field-ptr / whole-load (elim).  The value operand of a store (Args[1]) is left
+// unmarked, so the arithmetic feeding it is still counted.
+func sroaPlumbingInstr(ins @ir.Instr, elim @[]bool, n int) bool {
+	if ins.Op != iropcode.OP_GET_FIELD_PTR && ins.Op != iropcode.OP_LOAD &&
+			ins.Op != iropcode.OP_STORE && ins.Op != iropcode.OP_EXTRACT {
+		return false
+	}
+	if len(ins.Args) < 1 {
+		return false
+	}
+	var base @ir.Instr = ins.Args[0]
+	if base == nil || base.ID < 0 || base.ID >= n {
+		return false
+	}
+	return elim[base.ID]
+}

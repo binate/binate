@@ -1,0 +1,128 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/irbuild"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Tests for the SROA-aware inline cost (inline_sroa_cost.bn): sroaAdjustedSize
+// discounts the plumbing of a non-managed field-addressable aggregate alloca —
+// including a by-value RESULT alloca that collectSroaCandidates pins at L2 (its
+// whole-load feeds OP_RETURN) — so a SROA-thin shape scores by what it collapses
+// to after inlining + SROA.  Hand-built IR; reuses noParams / noResults / oneRet
+// / fail / candContains from the package-shared test helpers.
+
+// eightIntStruct builds `struct { f0..f7 int }` — a POD aggregate whose per-field
+// plumbing (alloca + 8 field-ptrs + 8 stores + a whole load) dominates its raw op
+// count, the record-churn `mix` shape.
+func eightIntStruct() @types.Type {
+	var fields @[]@types.Field = make_slice(@types.Field, 8)
+	for i := 0; i < 8; i++ {
+		var fld @types.Field = make(types.Field)
+		fld.Name = "f"
+		fld.Type = types.TypInt()
+		fields[i] = fld
+	}
+	return types.MakeStructType("Rec8", fields)
+}
+
+// A struct built field-by-field and returned by value: raw op count is over the
+// inline threshold, but SROA + mem2reg collapse every field-ptr / store / the
+// whole-load, so the adjusted size (the const values + the return) is far under.
+// This is the shape the discount exists to inline WITHOUT a blanket raise.
+func TestSroaAdjustedSizeDiscountsReturnedAggregate() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "build", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = eightIntStruct()
+	var s @ir.Instr = irbuild.EmitAlloc(entry, st)
+	for i := 0; i < 8; i++ {
+		var fp @ir.Instr = irbuild.EmitGetFieldPtr(entry, s, i, types.TypInt())
+		irbuild.EmitStore(entry, fp, irbuild.EmitConstInt(entry, i, types.TypInt()))
+	}
+	var v @ir.Instr = irbuild.EmitLoad(entry, s, st) // whole load -> OP_RETURN (L2-pinned)
+	irbuild.EmitReturn(entry, oneRet(v))
+
+	// collectSroaCandidates pins s (returned by value), but the cost model does not.
+	if candContains(collectSroaCandidates(f), s) {
+		return fail("returned-by-value struct should be L2-pinned for real SROA")
+	}
+	var raw int = funcInstrCount(f)
+	var adj int = sroaAdjustedSize(f)
+	// raw = 1 alloca + 8 const + 8 field-ptr + 8 store + 1 load + 1 return = 27.
+	// adjusted eliminates the alloca + 8 field-ptrs + 8 stores + the whole-load,
+	// leaving the 8 consts + the return = 9.
+	if raw != 27 {
+		return fail("expected raw funcInstrCount 27")
+	}
+	if adj != 9 {
+		return fail("expected sroaAdjustedSize 9 (plumbing discounted, consts+return kept)")
+	}
+	if adj >= raw {
+		return fail("adjusted size must be strictly below raw for an aggregate shape")
+	}
+	return ""
+}
+
+// An aggregate whose whole-loaded value ESCAPES to a by-value call arg does NOT
+// collapse when only this function is inlined (the callee holding the arg is not),
+// so its plumbing must be counted — the relaxed L2 (sroaCostLoadedValuesOK) admits
+// only OP_EXTRACT / OP_RETURN uses, not a call arg.  Adjusted size == raw here.
+func TestSroaAdjustedSizeEscapingWholeLoadNotDiscounted() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "escape", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = eightIntStruct()
+	var s @ir.Instr = irbuild.EmitAlloc(entry, st)
+	for i := 0; i < 8; i++ {
+		var fp @ir.Instr = irbuild.EmitGetFieldPtr(entry, s, i, types.TypInt())
+		irbuild.EmitStore(entry, fp, irbuild.EmitConstInt(entry, i, types.TypInt()))
+	}
+	var v @ir.Instr = irbuild.EmitLoad(entry, s, st) // whole load
+	_ = irbuild.EmitCall(entry, "sink", oneRet(v), types.TypVoid()) // v escapes by-value
+	irbuild.EmitReturn(entry, oneRet(irbuild.EmitConstInt(entry, 0, types.TypInt())))
+
+	if sroaAdjustedSize(f) != funcInstrCount(f) {
+		return fail("an aggregate whose whole-load escapes to a call arg must NOT be discounted")
+	}
+	return ""
+}
+
+// A scalar-only function has no aggregate alloca, so the adjusted size equals the
+// raw count — the discount is inert for non-aggregate callees (they inline
+// exactly as before this change).
+func TestSroaAdjustedSizeScalarUnchanged() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "scalar", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var a @ir.Instr = irbuild.EmitConstInt(entry, 3, types.TypInt())
+	var b @ir.Instr = irbuild.EmitConstInt(entry, 4, types.TypInt())
+	var sum @ir.Instr = irbuild.EmitBinop(entry, iropcode.OP_ADD, a, b, types.TypInt())
+	irbuild.EmitReturn(entry, oneRet(sum))
+
+	if sroaAdjustedSize(f) != funcInstrCount(f) {
+		return fail("a scalar-only function's adjusted size must equal its raw count")
+	}
+	return ""
+}
+
+// A managed aggregate (a managed-slice) keeps refcount ops that do NOT collapse
+// under mem2reg, so the discount must NOT apply — sroaAdjustedSize equals the raw
+// count.
+func TestSroaAdjustedSizeManagedNotDiscounted() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "managed", noParams, noResults)
+	var entry @ir.Block = ir.AddBlock(f, "entry")
+	var mst @types.Type = types.MakeManagedSliceType(types.TypInt())
+	var s @ir.Instr = irbuild.EmitAlloc(entry, mst)
+	var fp @ir.Instr = irbuild.EmitGetFieldPtr(entry, s, 0, types.MakePointerType(types.TypInt()))
+	var v @ir.Instr = irbuild.EmitLoad(entry, fp, types.MakePointerType(types.TypInt()))
+	irbuild.EmitReturn(entry, oneRet(v))
+
+	if !sroaAggregateContainsManaged(s.TypeArg) {
+		return fail("a managed-slice alloca must classify as managed")
+	}
+	if sroaAdjustedSize(f) != funcInstrCount(f) {
+		return fail("a managed aggregate must NOT be discounted")
+	}
+	return ""
+}

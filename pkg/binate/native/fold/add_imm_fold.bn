@@ -1,0 +1,125 @@
+package "pkg/binate/native/fold"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+
+// AddImmFoldableConsts returns a dense ID-indexed flag set (sized to f.NextID):
+// element [id] is true iff the OP_CONST_INT value id is used ONLY as an ADD/SUB
+// operand that can ride the target's add/sub immediate — so a backend folds it
+// into `add rd, rn, #v` / `sub rd, rn, #v` (sign-swapping the operation for a
+// small negative: x + (-k) ≡ x - k, x - (-k) ≡ x + k) and neither materializes
+// it into a register nor homes it.
+//
+// A backend with an immediate add/sub form assigns this to m.FoldedAddImmConst
+// BEFORE AllocateRegisters (so the allocator leaves the constant unhomed) and
+// skips the constant's standalone emission; emitBinop then rides the value in the
+// ADD/SUB immediate operand.  This removes the constant materialization — and,
+// under register pressure, the spill/reload of a loop-carried increment folded
+// every iteration (`c = c + 1` reloading `1` from a slot, the counter-increment
+// pathology).
+//
+// The foldable positions, exactly matching what the emitter can lower:
+//   - ADD is commutative, so a constant in EITHER operand folds, PROVIDED the
+//     other operand is a register (a non-const): the immediate carries the
+//     constant, the register carries the addend.  (iropt already folds a
+//     const+const add; here neither const is marked, so the fallback path
+//     materializes them.)
+//   - SUB folds only its SUBTRAHEND (Args[1]): `x - #v`.  A const MINUEND
+//     (`#v - x`) would need a reverse-subtract the emitter does not form, so a
+//     const in Args[0] of a SUB is a disqualifying use.
+//   - the result is no WIDER than the target word (`wordBytes`): a wider add
+//     (arm32's int64 pair ADD/SUB, a multi-word sequence) does not take a single
+//     register immediate, so it keeps the register path.  On a 64-bit target
+//     int64 is one word wide and folds.
+//   - the value fits the immediate: 0 <= v <= posMax (add/sub #v), or
+//     negMin <= v < 0 (the sign-swapped sub/add #-v).  add/sub immediates are
+//     signedness-agnostic (two's-complement add is identical for a signed and an
+//     unsigned interpretation), so unlike a compare there is no signed/unsigned
+//     split.
+// A constant used anywhere else — by a non-add/sub op, as a SUB minuend, in a
+// phi, or out of immediate range — is not foldable.
+func AddImmFoldableConsts(f @ir.Func, wordBytes int, posMax int64, negMin int64) @[]bool {
+	var n int = f.NextID
+	var isConst @[]bool = make_slice(bool, n)
+	var used @[]bool = make_slice(bool, n)
+	var disq @[]bool = make_slice(bool, n)
+
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var ins @ir.Instr = blk.Instrs[j]
+			if ins.Op == iropcode.OP_CONST_INT && ins.ID >= 0 && ins.ID < n {
+				isConst[ins.ID] = true
+			}
+			// A wider-than-word add/sub can't ride a single register immediate;
+			// treat its operands as non-foldable uses.  A nil type is likewise not
+			// foldable (its width is unknown).
+			var widthOk bool = ins.Typ != nil && ins.Typ.SizeOf() <= wordBytes
+			if ins.Op == iropcode.OP_ADD && len(ins.Args) == 2 && widthOk {
+				noteAddArg(used, disq, ins.Args[0], ins.Args[1], posMax, negMin)
+				noteAddArg(used, disq, ins.Args[1], ins.Args[0], posMax, negMin)
+				continue
+			}
+			if ins.Op == iropcode.OP_SUB && len(ins.Args) == 2 && widthOk {
+				// Only the subtrahend folds; the minuend is the register operand, so
+				// a const there is a disqualifying use.
+				noteDisqArg(used, disq, ins.Args[0])
+				noteAddArg(used, disq, ins.Args[1], ins.Args[0], posMax, negMin)
+				continue
+			}
+			// Any other reference (non-add/sub arg, wide add/sub, or a phi input)
+			// is a use that cannot ride an add/sub immediate, so it disqualifies.
+			for ai := 0; ai < len(ins.Args); ai++ {
+				noteDisqArg(used, disq, ins.Args[ai])
+			}
+			for pi := 0; pi < len(ins.Phis); pi++ {
+				noteDisqArg(used, disq, ins.Phis[pi].Val)
+			}
+		}
+	}
+
+	var foldable @[]bool = make_slice(bool, n)
+	for id := 0; id < n; id++ {
+		foldable[id] = isConst[id] && used[id] && !disq[id]
+	}
+	return foldable
+}
+
+// noteAddArg records one add/sub operand reference `arg` whose sibling operand is
+// `other`.  For an OP_CONST_INT arg it marks the constant used, and disqualifies
+// it unless it can ride the immediate: the sibling is NOT itself a constant (a
+// register must supply the addend) AND the value fits addImmFits.
+func noteAddArg(used @[]bool, disq @[]bool, arg @ir.Instr, other @ir.Instr, posMax int64,
+		negMin int64) {
+	if arg == nil || arg.Op != iropcode.OP_CONST_INT || arg.ID < 0 || arg.ID >= len(used) {
+		return
+	}
+	used[arg.ID] = true
+	var siblingIsConst bool = other != nil && other.Op == iropcode.OP_CONST_INT
+	if siblingIsConst || !addImmFits(arg.IntVal, posMax, negMin) {
+		disq[arg.ID] = true
+	}
+}
+
+// noteDisqArg records a non-foldable reference to `arg`: for an OP_CONST_INT it
+// marks it used and disqualified (it cannot ride an add/sub immediate here).
+func noteDisqArg(used @[]bool, disq @[]bool, arg @ir.Instr) {
+	if arg == nil || arg.Op != iropcode.OP_CONST_INT || arg.ID < 0 || arg.ID >= len(used) {
+		return
+	}
+	used[arg.ID] = true
+	disq[arg.ID] = true
+}
+
+// addImmFits reports whether constant v fits the add/sub immediate: a small non-
+// negative value (0..posMax) rides `add`/`sub #v`; a small negative value
+// (negMin..-1) rides the sign-swapped `sub`/`add #-v`.
+func addImmFits(v int64, posMax int64, negMin int64) bool {
+	if v >= cast(int64, 0) && v <= posMax {
+		return true
+	}
+	if v < cast(int64, 0) && v >= negMin {
+		return true
+	}
+	return false
+}

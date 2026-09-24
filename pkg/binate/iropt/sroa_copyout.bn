@@ -1,0 +1,240 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// SROA copy-out splitting.
+//
+// L2 pins an aggregate alloca `a` when a whole OP_LOAD(a) value has any
+// non-OP_EXTRACT use.  A common such use is a whole OP_STORE(p, load(a)) that
+// copies the value somewhere else.  When `p` is itself a splittable alloca the
+// fixpoint already copes (splitting `p` turns the store into per-field extracts,
+// so `a` qualifies on the next pass), but when `p` is a heap element pointer
+// (`out[i] = m`), a global, or any other non-splittable destination, `a` stays
+// pinned — and so does every alloca copied into `a`.
+//
+// splitSroaCopyOuts rewrites each such copy-out
+//
+//	v = OP_LOAD(a); OP_STORE(p, v)
+//
+// into, at the store's position, per field i:
+//
+//	OP_STORE(OP_GET_FIELD_PTR(p, i), OP_EXTRACT(v, i))
+//
+// after which every use of `v` is an OP_EXTRACT and `a` passes L2.  No aggregate
+// value is rebuilt, so this keeps SROA's pin-don't-rebuild design.  `p` can
+// alias `a` only by being `a` itself (L1: a's address never escapes), in which
+// case the rewrite is per-field stores into `a`; either way the extracts read
+// the SSA snapshot `v` (SROA materializes a split load's fields at the load's
+// position), exactly as the whole store did.
+//
+// It is applied ONLY to an alloca that is otherwise a non-managed struct SROA
+// candidate (copyOutsUnpin), so a slot that would stay pinned anyway never has
+// its whole copy turned into per-field stores for nothing.
+
+// splitSroaCopyOuts rewrites the copy-outs of every alloca in f that copyOutsUnpin
+// admits, returning whether it rewrote any store.
+func splitSroaCopyOuts(f @ir.Func) bool {
+	var origCap int = f.NextID
+	var marked @[]bool = boolTable(origCap)
+	var found bool = false
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if copyOutsUnpin(f, instr) {
+				marked[instr.ID] = true
+				found = true
+			}
+		}
+	}
+	if !found {
+		return false
+	}
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		var kept @[]@ir.Instr
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			if isCopyOutOfMarked(instr, marked, origCap) {
+				kept = appendAll(kept, expandCopyOut(f, instr))
+				continue
+			}
+			kept = slices.Append[@ir.Instr](kept, instr)
+		}
+		blk.Instrs = kept
+	}
+	return true
+}
+
+// copyOutsUnpin reports whether instr is an aggregate alloca that fails SROA only
+// because some whole loads of it are copied out by whole stores — i.e. it is a
+// non-managed struct candidate in every other respect (L1, promotable fields,
+// extractable whole stores into it), every use of every whole load of it is an
+// OP_EXTRACT or the value operand of a whole store to an identically-typed
+// pointer, and at least one such store exists.
+func copyOutsUnpin(f @ir.Func, instr @ir.Instr) bool {
+	if !isSroaAggregateAlloca(instr) {
+		return false
+	}
+	var t @types.Type = irutil.PeelTransparent(instr.TypeArg)
+	if t == nil || t.Kind != types.TYP_STRUCT {
+		return false
+	}
+	if sroaAggregateContainsManaged(instr.TypeArg) || !aggregateFieldsScalarReplaceable(t) {
+		return false
+	}
+	if !sroaAllocaL1OK(f, instr) || !aggregateWholeStoresExtractable(f, instr) {
+		return false
+	}
+	var sawCopyOut bool = false
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var ld @ir.Instr = blk.Instrs[ii]
+			if ld.Op != iropcode.OP_LOAD || len(ld.Args) < 1 || ld.Args[0] != instr {
+				continue
+			}
+			var n int = loadCopyOutCount(f, ld, t)
+			if n < 0 {
+				return false
+			}
+			if n > 0 {
+				sawCopyOut = true
+			}
+		}
+	}
+	return sawCopyOut
+}
+
+// loadCopyOutCount checks every use of whole-load value ld (of struct type t):
+// each must be an OP_EXTRACT reading it as Args[0], or the value operand of a
+// whole OP_STORE whose destination points to a type identical to t.  Returns the
+// number of such stores, or -1 if any other use exists (including a phi entry or
+// any FaultPad appearance).
+func loadCopyOutCount(f @ir.Func, ld @ir.Instr, t @types.Type) int {
+	if !blocksNeverReference(f.FaultPads, ld) {
+		return -1
+	}
+	var n int = 0
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var use @ir.Instr = blk.Instrs[ii]
+			if use == ld {
+				continue
+			}
+			for k := 0; k < len(use.Phis); k++ {
+				if use.Phis[k].Val == ld {
+					return -1
+				}
+			}
+			for k := 0; k < len(use.Args); k++ {
+				if use.Args[k] != ld {
+					continue
+				}
+				if use.Op == iropcode.OP_EXTRACT && k == 0 {
+					continue
+				}
+				if use.Op == iropcode.OP_STORE && k == 1 && len(use.Args) == 2 && use.Args[0] != ld &&
+						pointsToIdentical(use.Args[0], t) {
+					n++
+					continue
+				}
+				return -1
+			}
+		}
+	}
+	return n
+}
+
+// blocksNeverReference reports whether no instruction (argument or phi entry) in
+// blocks refers to v.
+func blocksNeverReference(blocks @[]@ir.Block, v @ir.Instr) bool {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var instr @ir.Instr = blk.Instrs[ii]
+			for k := 0; k < len(instr.Args); k++ {
+				if instr.Args[k] == v {
+					return false
+				}
+			}
+			for k := 0; k < len(instr.Phis); k++ {
+				if instr.Phis[k].Val == v {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// pointsToIdentical reports whether p is a plain raw pointer whose pointee is
+// identical to struct type t, so field index i addresses the same field at p as
+// in t.  p's type must be an UNWRAPPED TYP_POINTER, and its TypeArg (if any) the
+// same struct: the backends resolve an OP_GET_FIELD_PTR base's struct from
+// TypeArg, then from the unpeeled Typ.Elem, so a named / alias pointer type
+// (`type PS *S`, which has no Elem) would lower the field-ptr with no struct type.
+// A destination reached through a reinterpreting cast (a pointee of another
+// type) fails too.  Either way the copy stays whole and the source stays pinned.
+func pointsToIdentical(p @ir.Instr, t @types.Type) bool {
+	if p.Typ == nil || p.Typ.Kind != types.TYP_POINTER {
+		return false
+	}
+	var elem @types.Type = irutil.PeelTransparent(p.Typ.Elem)
+	if elem == nil || elem.Kind != types.TYP_STRUCT || !elem.Identical(t) {
+		return false
+	}
+	if p.TypeArg != nil {
+		var ta @types.Type = irutil.PeelTransparent(p.TypeArg)
+		return ta != nil && ta.Kind == types.TYP_STRUCT && ta.Identical(t)
+	}
+	return true
+}
+
+// isCopyOutOfMarked reports whether instr is a whole OP_STORE whose value is a
+// whole load of an alloca marked for copy-out splitting.
+func isCopyOutOfMarked(instr @ir.Instr, marked @[]bool, origCap int) bool {
+	if instr.Op != iropcode.OP_STORE || len(instr.Args) != 2 {
+		return false
+	}
+	var v @ir.Instr = instr.Args[1]
+	if v.Op != iropcode.OP_LOAD || len(v.Args) < 1 {
+		return false
+	}
+	var a @ir.Instr = v.Args[0]
+	return a.ID >= 0 && a.ID < origCap && marked[a.ID] && a.Op == iropcode.OP_ALLOC
+}
+
+// expandCopyOut lowers the whole store OP_STORE(p, v) into per-field
+// OP_STORE(OP_GET_FIELD_PTR(p, i), OP_EXTRACT(v, i)).
+func expandCopyOut(f @ir.Func, store @ir.Instr) @[]@ir.Instr {
+	var p @ir.Instr = store.Args[0]
+	var v @ir.Instr = store.Args[1]
+	var fieldTyps @[]@types.Type = aggregateFieldTypes(irutil.PeelTransparent(v.Args[0].TypeArg))
+	var out @[]@ir.Instr
+	for i := 0; i < len(fieldTyps); i++ {
+		var ft @types.Type = ir.StripConstForIR(fieldTyps[i])
+		var fp @ir.Instr = ir.NewInstr(f, iropcode.OP_GET_FIELD_PTR, types.MakePointerType(ft))
+		fp.Args = ir.MakeArgs1(p)
+		fp.Index = i
+		fp.Line = store.Line
+		var ex @ir.Instr = ir.NewInstr(f, iropcode.OP_EXTRACT, ft)
+		ex.Args = ir.MakeArgs1(v)
+		ex.Index = i
+		ex.Line = store.Line
+		var st @ir.Instr = ir.NewVoidInstr(iropcode.OP_STORE)
+		st.Args = ir.MakeArgs2(fp, ex)
+		st.Line = store.Line
+		out = slices.Append[@ir.Instr](out, fp)
+		out = slices.Append[@ir.Instr](out, ex)
+		out = slices.Append[@ir.Instr](out, st)
+	}
+	return out
+}

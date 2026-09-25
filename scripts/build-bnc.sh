@@ -75,11 +75,12 @@ BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/binate_build_XXXXXX")"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
 if [ "$DEBUG" = 1 ]; then
-    CFLAGS="-O0"
+    OPT_FLAGS="--cflag -O0"
     DBG_FLAG="-g"
     MODE_DESC="debug (-O0 -g)"
 else
-    CFLAGS="-O2"
+    # -O2 runs the IR optimization passes and implies clang -O2.
+    OPT_FLAGS="-O2"
     DBG_FLAG=""
     MODE_DESC="release (-O2)"
 fi
@@ -113,10 +114,15 @@ GEN1_DIR="$BUILD_DIR/gen1"
 GEN1_BNC="$GEN1_DIR/bnc"
 mkdir -p "$GEN1_DIR/build"
 
+# gen1 is built --cflag -O2 whatever the final build's mode: it runs this tree's
+# IR passes over all of cmd/bnc in Stage 2, several times slower at clang's -O0
+# default.  clang only, not bnc -O2, which would run the BUILDER's own frozen IR
+# passes (see scripts/lib/build-compilers.sh build_gen1).
 echo "  Stage 1: BUILDER → gen1 ..."
 "$BUILDER" \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB" --prepend "$BINATE_DIR" --prepend "$BINATE_DIR/ifaces/toolchain")" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB" --prepend "$BINATE_DIR")" \
+    --cflag -O2 \
     --build-dir "$GEN1_DIR/build" \
     -o "$GEN1_BNC" \
     "$BINATE_DIR/cmd/bnc"
@@ -137,7 +143,7 @@ if [ -n "$DBG_FLAG" ]; then
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $TARGET_OPT)" \
         -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $TARGET_OPT)" \
         --build-dir "$BUILD_DIR" \
-        --cflag "$CFLAGS" \
+        $OPT_FLAGS \
         $TARGET_OPT \
         "$DBG_FLAG" \
         -o "$OUT" \
@@ -147,7 +153,7 @@ else
         -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $TARGET_OPT)" \
         -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $TARGET_OPT)" \
         --build-dir "$BUILD_DIR" \
-        --cflag "$CFLAGS" \
+        $OPT_FLAGS \
         $TARGET_OPT \
         -o "$OUT" \
         "$BINATE_DIR/cmd/bnc"

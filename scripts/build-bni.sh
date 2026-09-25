@@ -75,11 +75,12 @@ BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/binate_build_XXXXXX")"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
 if [ "$DEBUG" = 1 ]; then
-    CFLAGS="-O0"
+    OPT_FLAGS="--cflag -O0"
     DBG_FLAG="-g"
     MODE_DESC="debug (-O0 -g)"
 else
-    CFLAGS="-O2"
+    # -O2 runs the IR optimization passes and implies clang -O2.
+    OPT_FLAGS="-O2"
     DBG_FLAG=""
     MODE_DESC="release (-O2)"
 fi
@@ -112,7 +113,7 @@ TARGET_OPT=""
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $TARGET_OPT)" \
     -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $TARGET_OPT)" \
     --build-dir "$BUILD_DIR" \
-    --cflag "$CFLAGS" \
+    $OPT_FLAGS \
     $TARGET_OPT \
     ${DBG_FLAG:+$DBG_FLAG} \
     -o "$OUT" \

@@ -107,11 +107,15 @@ build_gen1() {
     # checkout runtime.
     # e2e/{repl,os-args}.sh + scripts/build-*.sh use the same invocation form.
     #
-    # --cflag -O2 (the release opt level — scripts/build-bnc.sh): gen1 is the
-    # compiler that compiles every test in the comp-based lanes (unit,
-    # conformance, perf), so leaving it at clang's -O0 default makes the whole
-    # suite several × slower.  The one-time -O2 build cost (once per runner_setup)
-    # is dwarfed by the faster per-test compiles across the lane.
+    # --cflag -O2: gen1 is the compiler that compiles every test in the
+    # comp-based lanes (unit, conformance, perf), so leaving it at clang's -O0
+    # default makes the whole suite several × slower.  The one-time -O2 build cost
+    # (once per runner_setup) is dwarfed by the faster per-test compiles across the
+    # lane.  clang only, NOT bnc's -O2: that would run the BUILDER's own (frozen)
+    # IR optimization passes, which tests nothing in this tree and carries every
+    # optimizer bug fixed since the BUILDER was cut.  The toolchain binaries built
+    # from gen1 / gen2 (gen2, gen3, bni, the native bnc) are built at bnc -O2, so
+    # this tree's passes are what those binaries run through.
     build_out=$("$builder" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$blib" --prepend "$BINATE_DIR" --prepend "$BINATE_DIR/ifaces/toolchain")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$blib" --prepend "$BINATE_DIR")" --cflag -O2 --build-dir "$GEN1_BUILD_DIR" -o "$GEN1_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN1_COMPILER" ]; then
         echo "ERROR: Failed to build gen1 compiler:"
@@ -124,14 +128,16 @@ build_gen1() {
 # Build gen2 compiler (gen1 compiles cmd/bnc → gen2 binary)
 # Requires GEN1_COMPILER to be set (call build_gen1 first).
 # Sets GEN2_COMPILER to the path.
-# Built --cflag -O2 for the same reason as gen1 (it drives the comp-comp lanes'
-# per-test compiles).
+# Built -O2 (the release opt level — scripts/build-bnc.sh: this tree's IR
+# optimization passes, plus clang -O2) — it drives the comp-comp lanes' per-test
+# compiles, and being built through this tree's optimizer makes every lane that
+# uses it an integration test of -O2 on a large program.
 build_gen2() {
     _ensure_compilers_dir
     GEN2_COMPILER="$_COMPILERS_DIR/gen2_compiler"
     GEN2_BUILD_DIR="$(_new_build_dir)"
     echo "Building gen2 compiler (-O2)..."
-    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --cflag -O2 --build-dir "$GEN2_BUILD_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" -O2 --build-dir "$GEN2_BUILD_DIR" -o "$GEN2_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN2_COMPILER" ]; then
         echo "ERROR: Failed to build gen2 compiler:"
         echo "$build_out"
@@ -143,14 +149,14 @@ build_gen2() {
 # Build gen3 compiler (gen2 compiles cmd/bnc → gen3 binary).  gen3 verifies the
 # gen2→gen3 self-host fixpoint: it should behave identically to gen2.
 # Requires GEN2_COMPILER to be set (call build_gen2 first).  Sets GEN3_COMPILER.
-# Built --cflag -O2 for the same reason as gen1/gen2 (drives the comp-comp-comp
-# lane's per-test compiles).
+# Built -O2 for the same reasons as gen2 (drives the comp-comp-comp lane's
+# per-test compiles).
 build_gen3() {
     _ensure_compilers_dir
     GEN3_COMPILER="$_COMPILERS_DIR/gen3_compiler"
     GEN3_BUILD_DIR="$(_new_build_dir)"
     echo "Building gen3 compiler (-O2)..."
-    build_out=$("$GEN2_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --cflag -O2 --build-dir "$GEN3_BUILD_DIR" -o "$GEN3_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$GEN2_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" -O2 --build-dir "$GEN3_BUILD_DIR" -o "$GEN3_COMPILER" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$GEN3_COMPILER" ]; then
         echo "ERROR: Failed to build gen3 compiler:"
         echo "$build_out"
@@ -171,6 +177,8 @@ build_gen3() {
 # is always current-tree cmd/bnc rather than the BUILDER directly
 # (under bnc-* BUILDER, bnc-X.Y.Z's native backend may lag behind
 # current-tree features otherwise).
+# Built -O2 (this tree's IR optimization passes; on the native backend clang
+# only links) like the other toolchain builds.
 # Sets BNC_NATIVE to the path.
 build_bnc_native_aa64() {
     if [ -z "$GEN1_COMPILER" ]; then build_gen1; fi
@@ -178,7 +186,7 @@ build_bnc_native_aa64() {
     BNC_NATIVE="$_COMPILERS_DIR/bnc_native_aa64"
     BNC_NATIVE_BUILD_DIR="$(_new_build_dir)"
     echo "Building bnc with native aarch64 backend..."
-    build_out=$("$GEN1_COMPILER" --backend native -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
+    build_out=$("$GEN1_COMPILER" --backend native -O2 -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --build-dir "$BNC_NATIVE_BUILD_DIR" -o "$BNC_NATIVE" "$BINATE_DIR/cmd/bnc" 2>&1)
     if [ ! -x "$BNC_NATIVE" ]; then
         echo "ERROR: Failed to build bnc (native aarch64):"
         echo "$build_out"
@@ -201,20 +209,22 @@ build_interp_boot_comp() {
 # $1 = compiler binary path
 # Sets COMPILED_INTERP to the path.
 #
-# Built --cflag -O2 (the release opt level — see scripts/build-bni.sh): this is
-# the VM lanes' execution vehicle, and on the double-VM lane (-int-int) it runs
-# cmd/bni's whole load pipeline (parse→typecheck→IR→bytecode) plus the interpreter
-# dispatch loop, all compute-bound.  clang defaults to -O0 when bnc passes no -O,
-# and -O0 native here is several times slower — enough to blow the per-shard
-# timeout.  The one-time -O2 build cost (once per shard in runner_setup) is dwarfed
-# by the faster execution across the shard.
+# Built -O2 (the release opt level — see scripts/build-bni.sh: this tree's IR
+# optimization passes, plus clang -O2): this is the VM lanes' execution vehicle,
+# and on the double-VM lane (-int-int) it runs cmd/bni's whole load pipeline
+# (parse→typecheck→IR→bytecode) plus the interpreter dispatch loop, all
+# compute-bound.  clang defaults to -O0 when bnc passes no -O, and -O0 native here
+# is several times slower — enough to blow the per-shard timeout.  The one-time
+# -O2 build cost (once per shard in runner_setup) is dwarfed by the faster
+# execution across the shard, and running bni built through this tree's optimizer
+# makes every VM lane an integration test of -O2 on a large program.
 build_interp() {
     local compiler="$1"
     _ensure_compilers_dir
     COMPILED_INTERP="$_COMPILERS_DIR/compiled_interp"
     INTERP_BUILD_DIR="$(_new_build_dir)"
     echo "Building compiled interpreter (-O2)..."
-    build_out=$("$compiler" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --cflag -O2 --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    build_out=$("$compiler" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" -O2 --build-dir "$INTERP_BUILD_DIR" -o "$COMPILED_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$COMPILED_INTERP" ]; then
         echo "ERROR: Failed to build compiled interpreter:"
         echo "$build_out"
@@ -227,9 +237,10 @@ build_interp() {
 # current-tree cmd/bnc (GEN1_COMPILER) with --target arm32-linux.  The result is
 # a 32-bit-HOST bytecode VM (host int == 4 bytes); because cmd/bni bakes in
 # ConfigForTarget("") it interprets 32-bit-target bytecode — so running it (under
-# qemu-arm) exercises the VM's 32-bit-host paths.  Requires the arm32 cross-
-# toolchain (clang -target arm-linux-gnueabihf); NOT buildable on macOS.  Run it
-# via conformance/runners/builder-comp_arm32_linux_int.sh.
+# qemu-arm) exercises the VM's 32-bit-host paths.  Built -O2 like the host
+# bni (this tree's IR passes, plus clang -O2 for the cross target).  Requires the
+# arm32 cross-toolchain (clang -target arm-linux-gnueabihf); NOT buildable on
+# macOS.  Run it via conformance/runners/builder-comp_arm32_linux_int.sh.
 # Sets ARM32_INTERP to the path.
 build_interp_arm32() {
     if [ -z "$GEN1_COMPILER" ]; then build_gen1; fi
@@ -237,7 +248,7 @@ build_interp_arm32() {
     ARM32_INTERP="$_COMPILERS_DIR/arm32_interp"
     ARM32_INTERP_BUILD_DIR="$(_new_build_dir)"
     echo "Cross-building compiled interpreter (bni) for arm32-linux..."
-    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target arm32-linux)" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --target arm32-linux --build-dir "$ARM32_INTERP_BUILD_DIR" -o "$ARM32_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
+    build_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target arm32-linux)" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" --target arm32-linux -O2 --build-dir "$ARM32_INTERP_BUILD_DIR" -o "$ARM32_INTERP" "$BINATE_DIR/cmd/bni" 2>&1)
     if [ ! -x "$ARM32_INTERP" ]; then
         echo "ERROR: Failed to cross-build arm32 compiled interpreter:"
         echo "$build_out"

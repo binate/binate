@@ -1,0 +1,160 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/iropcode"
+
+// Call-site-independent inlining facts, cached per callee.
+//
+// Most of inlinableCallee's work depends only on the callee: its result types,
+// block shapes, the ops it contains, their pads, and its size.  Phase 2's
+// re-scan (findMultiBlockSite) asks again for every call site after every
+// multi-block inline, so recomputing those facts per query made the inliner
+// cost O(sites * callee size) per inlined site.  They are computed once per
+// callee and reused until the callee changes.
+//
+// The only IR the inline pass mutates is a function it inlines INTO, and
+// inlineCallsInFunc drops that function's cached facts when it finishes with
+// it (invalidateFacts).  A function is never a callee while it is being
+// inlined into (inlinableCallee rejects self-calls), so no cached entry is read
+// while its function is mid-mutation.
+
+// calleeFacts is one function's cached eligibility as an inline callee.
+type calleeFacts struct {
+	valid bool // the fields below are computed
+	// eligible: every call-site-independent inlinability check passes.
+	eligible bool
+	// needsSitePad: some op in the body carries a cleanup pad that the inlined
+	// copy chains into (or reuses as) the call site's pad, so only a call site
+	// that has a pad can inline this callee.
+	needsSitePad bool
+	// rawSize is funcInstrCount(callee): the growth-budget charge.
+	rawSize int
+}
+
+// factsOf returns callee's facts, computing and caching them on first use.  A
+// function not in the analysis' snapshot of m.Funcs (added later, or sharing
+// another's name) is computed afresh each time rather than cached.
+func (ia @inlineAnalysis) factsOf(callee @ir.Func) calleeFacts {
+	var i int = ia.factsSlot(callee)
+	if i < 0 {
+		return computeCalleeFacts(ia, callee)
+	}
+	if !ia.facts[i].valid {
+		ia.facts[i] = computeCalleeFacts(ia, callee)
+	}
+	return ia.facts[i]
+}
+
+// invalidateFacts drops f's cached facts (f was just inlined into).
+func (ia @inlineAnalysis) invalidateFacts(f @ir.Func) {
+	var i int = ia.factsSlot(f)
+	if i >= 0 {
+		var none calleeFacts
+		ia.facts[i] = none
+	}
+}
+
+// factsSlot returns f's index in ia.facts, or -1 if f has no cache slot.
+func (ia @inlineAnalysis) factsSlot(f @ir.Func) int {
+	var i int
+	var ok bool
+	i, ok = ia.funcIdx.Get(f.Name)
+	if !ok || i >= len(ia.funcs) || ia.funcs[i] != f {
+		return -1
+	}
+	return i
+}
+
+// computeCalleeFacts runs the call-site-independent checks of inlinableCallee
+// (see its doc for the rules) on callee.
+func computeCalleeFacts(ia @inlineAnalysis, callee @ir.Func) calleeFacts {
+	var cf calleeFacts
+	cf.valid = true
+	cf.rawSize = funcInstrCount(callee)
+	if len(callee.Blocks) == 0 {
+		return cf
+	}
+	// Every result must be an inlinable type — a scalar or a by-value data
+	// aggregate; func-value / iface-value results (cross-mode vtable) are
+	// excluded.  Multiple results are packed into a tuple value at each
+	// return by buildTupleInstrs, so the call's OP_EXTRACT uses read a real tuple.
+	for ri := 0; ri < len(callee.Results); ri++ {
+		if !isInlinableResultType(callee.Results[ri]) {
+			return cf
+		}
+	}
+	var returnCount int = 0
+	for cbj := 0; cbj < len(callee.Blocks); cbj++ {
+		var cblk @ir.Block = callee.Blocks[cbj]
+		var n int = len(cblk.Instrs)
+		if n == 0 {
+			return cf // malformed (empty block)
+		}
+		var term int = cblk.Instrs[n - 1].Op
+		if term != iropcode.OP_JUMP && term != iropcode.OP_BRANCH && term != iropcode.OP_RETURN {
+			return cf // UNREACHABLE / UNWIND / non-terminator-last not handled
+		}
+		for k := 0; k < n; k++ {
+			var bi @ir.Instr = cblk.Instrs[k]
+			if bi.Op == iropcode.OP_RETURN {
+				returnCount = returnCount + 1
+			}
+			if isCallFamilyOp(bi.Op) && bi.Op != iropcode.OP_CALL {
+				// A NON-leaf callee is permitted, but only via DIRECT OP_CALLs:
+				// those are cloned verbatim (their arg-passing + result refcount
+				// ops come along faithfully) and the fixpoint re-scan can inline
+				// them transitively.  The dynamic-dispatch call kinds
+				// (OP_CALL_INDIRECT / _IFACE_METHOD / _FUNC_VALUE / _HANDLE /
+				// _C_CALL / OP_SAT_LOOKUP) still disqualify: they can't be
+				// transitively inlined, and cloning them raises cross-mode-vtable /
+				// c-ABI questions not yet validated.
+				return cf
+			}
+			if bi.PadBlock != nil {
+				// A faulting op OR an internal direct call is inlinable when the
+				// call site has a pad (to chain/reuse) AND the op's pad is either
+				// EMPTY (the cloned op reuses the caller's call-site pad directly)
+				// or padInlinable — a single straight-line block OR a branching
+				// multi-block cleanup (an iface / func-value refdec, or the
+				// stack-check pad) whose whole sub-CFG cloneInlinablePad copies into
+				// the caller and chains into the call-site pad.  A call carries a
+				// call-site cleanup pad of the same shape as a fault pad, so this
+				// handles both.
+				cf.needsSitePad = true
+				if !isEmptyPad(bi.PadBlock) && !padInlinable(bi.PadBlock, callee) {
+					return cf
+				}
+			}
+			if len(bi.Phis) != 0 {
+				return cf // no phis expected before mem2reg; bail if present
+			}
+			for a := 0; a < len(bi.Args); a++ {
+				var av @ir.Instr = bi.Args[a]
+				if av == nil || av.IsGlobalRef || av.ID < 0 || av.ID >= callee.NextID {
+					return cf // operand not a param/in-callee value -> not remappable
+				}
+			}
+		}
+	}
+	// Gate on the POST-SROA size estimate, not the raw op count: inlining runs
+	// before SROA (opt.bn), so a SROA-thin aggregate shape (e.g. record-churn's
+	// `mix` — field arithmetic wrapped in by-value struct plumbing) must be scored
+	// by what it shrinks to once inlined and SROA'd, else it never inlines.  A
+	// non-aggregate callee is unaffected (sroaAdjustedSize == funcInstrCount); a
+	// genuinely-large body keeps a large non-plumbing remainder, so the discount
+	// can never pull it under the threshold (unlike a blanket threshold raise).
+	// Without SROA + mem2reg the plumbing stays, so the raw count is the size.
+	var size int = cf.rawSize
+	if ia.sroaDiscount {
+		size = sroaAdjustedSize(callee)
+	}
+	if size > ia.threshold {
+		return cf
+	}
+	if returnCount < 1 {
+		return cf // no return site (all blocks loop) -> nothing to splice
+	}
+	cf.eligible = true
+	return cf
+}

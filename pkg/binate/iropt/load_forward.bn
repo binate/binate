@@ -73,6 +73,10 @@ func forwardLoadsFunc(f @ir.Func) {
 		return
 	}
 	var d @DomInfo = ComputeDom(f)
+	// The analysis below reads f without mutating it (the rewrites run after it),
+	// so one use index and one pad-site table serve every alloca.
+	var ui @useIndex = buildUseIndex(f)
+	var ps @padFaultSites = buildPadFaultSites(f)
 
 	// Store-forwarding accumulators (load-id -> stored value; deleted allocas).
 	var gReplID @vec.Vec[int] = vec.New[int]()
@@ -94,10 +98,10 @@ func forwardLoadsFunc(f @ir.Func) {
 			if instr.Op != iropcode.OP_ALLOC {
 				continue
 			}
-			if forwardEscapes(f, instr) {
+			if forwardEscapes(ui, instr) {
 				continue
 			}
-			var res @fwdResult = analyzeForwardAlloca(f, d, instr)
+			var res @fwdResult = analyzeForwardAlloca(ui, ps, d, instr)
 			if !res.ok {
 				continue
 			}
@@ -153,7 +157,7 @@ type fwdResult struct {
 // fault-pad loads and requires the store to dominate each pad's fault point.
 // useRLE is set for any slice (managed pointers store-forward like scalars); a
 // >16B non-slice aggregate (large struct) is declined outright.
-func analyzeForwardAlloca(f @ir.Func, d @DomInfo, a @ir.Instr) @fwdResult {
+func analyzeForwardAlloca(ui @useIndex, ps @padFaultSites, d @DomInfo, a @ir.Instr) @fwdResult {
 	var res @fwdResult = make(fwdResult)
 	res.ok = false
 
@@ -195,20 +199,21 @@ func analyzeForwardAlloca(f @ir.Func, d @DomInfo, a @ir.Instr) @fwdResult {
 	var loadBlks @[]int
 	var loadPoss @[]int
 
-	for bi := 0; bi < len(f.Blocks); bi++ {
-		var blk @ir.Block = f.Blocks[bi]
-		for ii := 0; ii < len(blk.Instrs); ii++ {
-			var instr @ir.Instr = blk.Instrs[ii]
-			if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 2 && instr.Args[0] == a {
-				storeCount = storeCount + 1
-				storeBlk = bi
-				storePos = ii
-				val = instr.Args[1]
-			} else if instr.Op == iropcode.OP_LOAD && len(instr.Args) >= 1 && instr.Args[0] == a {
-				loadIDs = slices.Append[int](loadIDs, instr.ID)
-				loadBlks = slices.Append[int](loadBlks, bi)
-				loadPoss = slices.Append[int](loadPoss, ii)
-			}
+	var us @[]valueUse = ui.usesOf(a)
+	for i := 0; i < len(us); i++ {
+		var instr @ir.Instr = us[i].user
+		if us[i].inPad || us[i].argIdx != 0 {
+			continue
+		}
+		if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 2 {
+			storeCount = storeCount + 1
+			storeBlk = us[i].blockIdx
+			storePos = us[i].pos
+			val = instr.Args[1]
+		} else if instr.Op == iropcode.OP_LOAD {
+			loadIDs = slices.Append[int](loadIDs, instr.ID)
+			loadBlks = slices.Append[int](loadBlks, us[i].blockIdx)
+			loadPoss = slices.Append[int](loadPoss, us[i].pos)
 		}
 	}
 
@@ -237,18 +242,20 @@ func analyzeForwardAlloca(f @ir.Func, d @DomInfo, a @ir.Instr) @fwdResult {
 	// V, not the zero-filled slot.  (forwardEscapes already barred any non-load pad
 	// use.)
 	if isMS || isMP {
-		for pi := 0; pi < len(f.FaultPads); pi++ {
-			var pad @ir.Block = f.FaultPads[pi]
-			var padLoadCount int = 0
-			for ii := 0; ii < len(pad.Instrs); ii++ {
-				var instr @ir.Instr = pad.Instrs[ii]
-				if instr.Op == iropcode.OP_LOAD && len(instr.Args) >= 1 && instr.Args[0] == a {
-					loadIDs = slices.Append[int](loadIDs, instr.ID)
-					padLoadCount = padLoadCount + 1
-				}
+		// The index lists pad reads in pad order, so each pad holding a load of
+		// `a` is checked once, when its first load is reached.
+		var lastPad int = -1
+		for i := 0; i < len(us); i++ {
+			var instr @ir.Instr = us[i].user
+			if !us[i].inPad || us[i].argIdx != 0 || instr.Op != iropcode.OP_LOAD {
+				continue
 			}
-			if padLoadCount > 0 && !storeDominatesPad(f, d, storeBlk, storePos, pad) {
-				return res
+			loadIDs = slices.Append[int](loadIDs, instr.ID)
+			if us[i].blockIdx != lastPad {
+				lastPad = us[i].blockIdx
+				if !storeDominatesPad(ps, d, storeBlk, storePos, lastPad) {
+					return res
+				}
 			}
 		}
 	}
@@ -283,79 +290,21 @@ func isManagedSlice(t @types.Type) bool {
 // pad load while leaving the pad's RefDec dangling.  Every non-pad escape (a
 // store's value operand, GET_FIELD/ELEM_PTR, a phi entry) is barred exactly as
 // allocaEscapes.
-func forwardEscapes(f @ir.Func, a @ir.Instr) bool {
+func forwardEscapes(ui @useIndex, a @ir.Instr) bool {
 	var relaxPad bool = isManagedSlice(a.TypeArg) || irutil.IsManagedPtrType(a.TypeArg)
-	for bi := 0; bi < len(f.Blocks); bi++ {
-		if blockUsesAllocaNonLoadStore(f.Blocks[bi], a) {
-			return true
-		}
-	}
-	for pi := 0; pi < len(f.FaultPads); pi++ {
-		var pad @ir.Block = f.FaultPads[pi]
-		if relaxPad {
-			if padUsesAllocaNonLoad(pad, a) {
-				return true
+	var us @[]valueUse = ui.usesOf(a)
+	for i := 0; i < len(us); i++ {
+		var k int = us[i].argIdx
+		var op int = us[i].user.Op
+		if !us[i].inPad {
+			if k != 0 || (op != iropcode.OP_LOAD && op != iropcode.OP_STORE) {
+				return true // a phi entry, or any use but a load/store address
 			}
-		} else if blockReferencesAlloca(pad, a) {
-			return true
+		} else if !relaxPad || k != 0 || op != iropcode.OP_LOAD {
+			return true // any pad appearance, or (relaxed) any but a pad load
 		}
 	}
 	return false
-}
-
-// padUsesAllocaNonLoad reports whether pad b references A as anything other than
-// the Args[0] pointer of a plain OP_LOAD (a store, any other operand position, or a
-// phi entry) — which would be a real escape even in a cleanup pad.
-func padUsesAllocaNonLoad(b @ir.Block, a @ir.Instr) bool {
-	for ii := 0; ii < len(b.Instrs); ii++ {
-		var instr @ir.Instr = b.Instrs[ii]
-		for k := 0; k < len(instr.Args); k++ {
-			if instr.Args[k] != a {
-				continue
-			}
-			if !(instr.Op == iropcode.OP_LOAD && k == 0) {
-				return true
-			}
-		}
-		for k := 0; k < len(instr.Phis); k++ {
-			if instr.Phis[k].Val == a {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// storeDominatesPad reports whether the store at (storeBlk, storePos) dominates
-// every fault point that lands in pad P — each faulting op in f.Blocks whose
-// PadBlock is P (pointer identity: a `@Block` and the faulting op's `*Block`
-// back-ref bit_cast to the same payload address).  Required so the pad's forwarded
-// load provably reads the stored value, not the zero-filled slot.  Returns false
-// (bail) if P has no locatable fault point, or any is not dominated.
-func storeDominatesPad(f @ir.Func, d @DomInfo, storeBlk int, storePos int, pad @ir.Block) bool {
-	var padKey int = bit_cast(int, pad)
-	var found bool = false
-	for bi := 0; bi < len(f.Blocks); bi++ {
-		var blk @ir.Block = f.Blocks[bi]
-		for ii := 0; ii < len(blk.Instrs); ii++ {
-			var instr @ir.Instr = blk.Instrs[ii]
-			if instr.PadBlock == nil {
-				continue
-			}
-			if bit_cast(int, instr.PadBlock) != padKey {
-				continue
-			}
-			found = true
-			if bi == storeBlk {
-				if ii <= storePos {
-					return false // fault point at/before the store
-				}
-			} else if !d.Dominates(storeBlk, bi) {
-				return false
-			}
-		}
-	}
-	return found
 }
 
 // applyRLE materializes each RLE slot's value with one OP_LOAD inserted right after

@@ -1,0 +1,310 @@
+package "main"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/buildcfg"
+import "pkg/binate/check"
+import "pkg/binate/interp"
+import "pkg/binate/ir"
+import "pkg/binate/irgen"
+import "pkg/binate/iropt"
+import "pkg/binate/loader"
+import "pkg/binate/mangle"
+import "pkg/binate/vm"
+import "pkg/std/fmt"
+import "pkg/std/os"
+import "pkg/std/vec"
+
+// runTests discovers and runs Test* functions in the specified
+// packages via the bytecode VM.
+func runTests(cli CLIArgs) {
+	if len(cli.TestPkgs) == 0 {
+		fmt.Println("error: --test requires package paths (e.g. pkg/foo)")
+		os.Exit(1)
+	}
+
+	var root @[]char = primaryRoot(cli)
+	if len(root) == 0 {
+		root = "."
+	}
+
+	// Set up loader with test packages enabled
+	var ldr @loader.Loader = loader.NewLoader()
+	ldr.AddBniPath(root)
+	ldr.AddImplPath(root)
+	applyPathFlags(ldr, cli)
+	// The interpreter runs on (and for) the host, so gate #[build(...)] by the
+	// host config baked into this bni — no build.bni read.
+	ldr.BuildConfig = buildcfg.ConfigForTarget("")
+	for i := 0; i < len(cli.TestPkgs); i++ {
+		ldr.TestPackages = appendCharSlice(
+				ldr.TestPackages, cli.TestPkgs[i])
+	}
+
+	// Load native-only DEPENDENCIES (rt + pkg/std, minus any that are
+	// themselves --test targets) interface-only: they run as injected native
+	// instances, so the runner needs their `.bni` but not their `.bn` — and
+	// keeping their impls unparsed keeps their native-only `__c_call` out of the
+	// interpreted-mode type check (TypecheckPackages sets Checker.Interpreted).
+	// Mirrors interp.New's run-path interface-only load.
+	ldr.InterfaceOnly = interp.NativeOnlyInterfacePaths(cli.TestPkgs)
+
+	// Synthetic imports to load test packages and their deps
+	var syntheticImps @[]@ast.ImportSpec
+	for i := 0; i < len(cli.TestPkgs); i++ {
+		var imp @ast.ImportSpec = make(ast.ImportSpec)
+		imp.Path = quotePath(cli.TestPkgs[i])
+		syntheticImps = appendImportSpec(syntheticImps, imp)
+	}
+	ldr.LoadImports(syntheticImps)
+	interp.EnsureLangLoaded(ldr)
+	interp.EnsureReflectLoaded(ldr)
+	if len(ldr.Errors) > 0 {
+		for i := 0; i < len(ldr.Errors); i++ {
+			fmt.Println(ldr.Errors[i])
+		}
+		os.Exit(1)
+	}
+
+	var checker @check.Checker
+	var tcErrs @[]@[]char
+	checker, tcErrs = interp.TypecheckPackages(ldr)
+	if len(tcErrs) > 0 {
+		for i := 0; i < len(tcErrs); i++ { fmt.Println(tcErrs[i]) }
+		os.Exit(1)
+	}
+
+	// Build VM and lower all packages.  Track which packages emit a
+	// `<pkg>.__init` (top-level var initializers) so they can be run in
+	// dep order before the tests — same shape as the run path's init
+	// dispatcher.
+	var vmInst @vm.VM = vm.NewVM(8 * 1024 * 1024)
+	interp.RegisterStandardExterns(vmInst)
+	// Exempt the --test target packages from injection: a native-only package
+	// under test is lowered to bytecode (the symmetric exemption in the loop
+	// below), not injected, so its Test* run as bytecode.
+	interp.InjectStdlibExterns(vmInst, cli.TestPkgs)
+	var initPkgNames @vec.Vec[@[]char] = vec.New[@[]char]()
+	for i := 0; i < len(ldr.Order); i++ {
+		var pkg @loader.Package = ldr.GetPackage(
+				ldr.Order[i])
+		if pkg == nil { continue }
+		if pkg.Merged == nil { continue }
+		// rt and every pkg/std package run as their injected compiled
+		// instance, not lowered — UNLESS the package is itself a test target, in
+		// which case it must be lowered so its own Test* run as bytecode (it's
+		// injected only as a DEPENDENCY, never when it IS the program under test).
+		// A __c_call package under test (pkg/std/os) therefore can't run its tests
+		// here — its methods need the native impl — so the stdlib unit tests are
+		// not run under the interpreter modes (scripts/unittest/run.sh); their
+		// cross-mode coverage is the conformance/stdlib suite (stdlib injected).
+		if interp.IsNativeOnlyInVM(ldr.Order[i]) && !interp.PkgIsTestTarget(ldr.Order[i], cli.TestPkgs) {
+			continue
+		}
+		var mod @ir.Module = irgen.InitModule(
+				quotePath(ldr.Order[i]))
+		mod.Checker = checker
+		var gc @irgen.GenCtx = irgen.NewGenCtx(mod)
+		// A test suite wants host survival: nil-pointer-deref checking is ON so a
+		// nil deref in test code becomes a recoverable fault (reported as a failed
+		// test below) rather than a SEGV that kills the whole runner.  Always on
+		// under --test — the opt-in `--check-nil` governs only a plain run.
+		gc.EmitNilChecks = true
+		gc.SroaCleanupShape = iropt.OptPassEnabled(vmInst.Opt, iropt.PASS_SROA)
+		interp.RegisterPkgImports(ldr, pkg, gc)
+		if pkg.BNI != nil {
+			irgen.RegisterSelfTypes(checker, pkg.BNI, gc)
+		}
+		irgen.GeneratePackage(checker, pkg.Merged, gc, pkg.Files)
+		if mod.HasPackageInit() {
+			initPkgNames.Push(
+					ir.PackageInitName(mangle.PkgPathFromQuoted(
+							quotePath(ldr.Order[i]))))
+		}
+		vmInst.LowerModule(mod)
+	}
+
+	// Give the interpreted tests their own (empty) argv before any package init
+	// or test runs.  os is shared (injected native), so without this a test's
+	// os.Args() would read bni's OWN command line -- the --test flag plus the
+	// -I/-L compiler search paths -- rather than an empty argument list.  A
+	// program run under --test has no command line of its own, so os.Args() must
+	// return just the program-name slot (element 0) with no arguments; e.g. a
+	// test that scans os.Args() for a developer-supplied -I would otherwise pick
+	// up bni's compiler -I.  Element 0 is the first test package; --run/--skip
+	// stay bni's concern (filtered above), not the test program's argv.
+	var noProgArgs @[]@[]char
+	setProgramArgs(cli.TestPkgs[0], noProgArgs)
+
+	// Run package var-initializers in dep order before any test.  Unlike
+	// the run path, a test program has no `main.__entry` to drive the
+	// init dispatcher, so a top-level `var` initialized by `<pkg>.__init`
+	// would otherwise read its zero value (e.g. a string-literal slice
+	// global reading as len 0).
+	var initNoArgs @[]int
+	for ii := 0; ii < initPkgNames.Len(); ii++ {
+		vmInst.CallFunc(initPkgNames.Get(ii), initNoArgs)
+	}
+
+	// Discover and run Test* functions
+	var passed int = 0
+	var failed int = 0
+	var skipped int = 0
+
+	for pi := 0; pi < len(cli.TestPkgs); pi++ {
+		var pkgPath @[]char = cli.TestPkgs[pi]
+		var pkg @loader.Package = ldr.GetPackage(
+				pkgPath)
+		if pkg == nil || pkg.Merged == nil {
+			fmt.Print("warning: no implementation for ", pkgPath, "\n")
+			continue
+		}
+
+		// Find Test* functions.  When --run is non-empty, only
+		// include names that contain it as a substring; when --skip
+		// is non-empty, exclude names that contain it (skip wins
+		// over run when both match).  Mirrors `go test -run`/`-skip`
+		// but plain substring.
+		var testNamesV @vec.Vec[@[]char] = vec.New[@[]char]()
+		for di := 0; di < len(pkg.Merged.Decls); di++ {
+			var d @ast.Decl = pkg.Merged.Decls[di]
+			if d.Kind != ast.DECL_FUNC { continue }
+			if d.Body == nil { continue }
+			if !hasPrefix(d.Name, "Test") { continue }
+			if len(d.Params) != 0 { continue }
+			if !isTestResultReturn(d, pkg.Merged.Decls) { continue }
+			if !containsStr(d.Name, cli.RunFilter) { continue }
+			if len(cli.SkipFilter) > 0 && skipMatchesAny(pkgPath, d.Name, cli.SkipFilter) {
+				skipped = skipped + 1
+				continue
+			}
+			testNamesV.Push(d.Name)
+		}
+
+		var testNames @[]@[]char = testNamesV.Items()
+		if len(testNames) == 0 {
+			fmt.Print("?   \t", pkgPath, "\t[no test functions]\n")
+			continue
+		}
+
+		var pkgFailed int = 0
+		for ti := 0; ti < len(testNames); ti++ {
+			// Shard selection: run only this shard's slice of the package's tests
+			// (pos % count == index-1), so a heavy package can be split across
+			// parallel CI shards.  Default 1/1 runs every test.
+			if ti % cli.ShardCount != cli.ShardIdx - 1 { continue }
+			fmt.Print("=== RUN   ", testNames[ti], "\n")
+
+			var noArgs @[]int
+			// CallFunc looks up via the full pkgPath-qualified name
+			// (matches mangle.QualifyName since 7f989ad's full-path
+			// flip — short-segment forms no longer match the stored
+			// keys, so every -int unit test would otherwise miss with
+			// "function not found").
+			var qualName @[]char = buf.Concat(
+					buf.Concat(pkgPath, "."), testNames[ti])
+			var rc int = vmInst.CallFunc(qualName, noArgs)
+			// A recoverable VM fault (Plan 2) — bad test code, e.g. an
+			// out-of-bounds index — unwinds and leaves Status = FAULTED
+			// instead of killing the runner.  Report it as a failed test
+			// (carrying the fault message) and keep going: the test runner is
+			// an embedder that treats a fault as a failure, not a crash.  The
+			// next CallFunc resets Status.  Without this the test would read as
+			// an empty (passing) result — a silent pass.
+			if vmInst.Status == vm.VM_STATUS_FAULTED {
+				fmt.Print("--- FAIL: ", testNames[ti], "\n")
+				fmt.Print("    ", vmInst.FaultMsg, "\n")
+				failed = failed + 1
+				pkgFailed = pkgFailed + 1
+				continue
+			}
+			// Test returns @[]char (testing.TestResult).
+			// Empty string = pass, non-empty = fail.
+			// rc is the pointer to the @[]char header.
+			var failMsg @[]char = readResultStr(rc)
+			if len(failMsg) > 0 {
+				fmt.Print("--- FAIL: ", testNames[ti], "\n")
+				fmt.Print("    ", failMsg, "\n")
+				failed = failed + 1
+				pkgFailed = pkgFailed + 1
+			} else {
+				fmt.Print("--- PASS: ", testNames[ti], "\n")
+				passed = passed + 1
+			}
+		}
+
+		if pkgFailed > 0 {
+			fmt.Print("FAIL\t", pkgPath, "\n")
+		} else {
+			fmt.Print("ok  \t", pkgPath, "\t", len(testNames), " tests\n")
+		}
+	}
+
+	// Summary
+	fmt.Println()
+	if failed > 0 {
+		fmt.Print("FAIL\t", passed, " passed, ", failed, " failed")
+		if skipped > 0 {
+			fmt.Print(", ", skipped, " skipped")
+		}
+		fmt.Print("\n")
+		os.Exit(1)
+	} else {
+		fmt.Print("ok\t", passed, " passed")
+		if skipped > 0 {
+			fmt.Print(", ", skipped, " skipped")
+		}
+		fmt.Print("\n")
+	}
+}
+
+// readResultStr reads a @[]char value from a VM stack address.
+// VM functions returning @[]char put a pointer to a 4-word
+// managed-slice header on the VM stack. Empty → "".
+func readResultStr(addr int) @[]char {
+	if addr == 0 { return "" }
+	var hdr *int = bit_cast(*int, addr)
+	var slen int = hdr[1]
+	if slen == 0 { return "" }
+	var data *uint8 = bit_cast(*uint8, hdr[0])
+	var s @[]char = make_slice(char, slen)
+	for i := 0; i < slen; i++ {
+		s[i] = cast(char, data[i])
+	}
+	return s
+}
+
+// isTestResultReturn checks if a func decl has a single return type that marks a
+// Test* function as a test: qualified `testing.TestResult` / `sys.TestResult`, a
+// bare `TestResult` inside a package that declares the type locally (testing's own
+// _test files — matched via hasLocalTestResultType, mirroring cmd/bnc/test.bn), or
+// `@[]char`.
+func isTestResultReturn(d @ast.Decl, decls @[]@ast.Decl) bool {
+	if len(d.Results) != 1 { return false }
+	var r @ast.TypeExpr = d.Results[0]
+	if r.Kind == ast.TEXPR_NAMED && streq(r.Name, "TestResult") {
+		if len(r.Pkg) > 0 {
+			return streq(r.Pkg, "testing") || streq(r.Pkg, "sys")
+		}
+		// Bare `TestResult`: a test only inside pkg/builtins/testing itself, where the
+		// type is declared locally and in scope unqualified (its own _test files).
+		return hasLocalTestResultType(decls)
+	}
+	if r.Kind == ast.TEXPR_MANAGED_SLICE && r.Base != nil {
+		if r.Base.Kind == ast.TEXPR_NAMED && streq(r.Base.Name, "char") {
+			return true
+		}
+	}
+	return false
+}
+
+// hasLocalTestResultType reports whether decls declares `type TestResult` — gates a
+// bare `TestResult` return so it is a test only inside pkg/builtins/testing.
+func hasLocalTestResultType(decls @[]@ast.Decl) bool {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d.Kind != ast.DECL_TYPE { continue }
+		if streq(d.Name, "TestResult") { return true }
+	}
+	return false
+}

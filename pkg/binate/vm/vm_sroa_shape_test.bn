@@ -1,0 +1,134 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/ast"
+import "pkg/binate/check"
+import "pkg/binate/ir"
+import "pkg/binate/irgen"
+import "pkg/binate/iropt"
+import "pkg/binate/parser"
+import "pkg/builtins/rt"
+import "pkg/builtins/testing"
+
+// The VM running SROA on the cleanup shape IR-gen emits when SROA will run
+// (GenCtx.SroaCleanupShape): managed struct and managed-slice locals with inline
+// per-field cleanup, split by SROA, with nil checks and recoverable-fault pads on.
+// This is what bni builds whenever its config enables SROA; the other VM opt
+// tests build through irgen.GenModule, which never sets the shape.
+
+// genModuleShaped is genModule with IR-gen told SROA will run (sroaShape) and
+// nil checks on (as bni --test and the REPL emit them).
+func genModuleShaped(src *[]readonly char, sroaShape bool) @ir.Module {
+	var p @parser.Parser = parser.New(toBytes(src), "test.bn")
+	var file @ast.File = p.ParseFile()
+	var c @check.Checker = check.NewChecker()
+	c.Check(file)
+	var m @ir.Module = irgen.InitModule(file.PkgName)
+	m.Checker = c
+	var gc @irgen.GenCtx = irgen.NewGenCtx(m)
+	gc.EmitNilChecks = true
+	gc.SroaCleanupShape = sroaShape
+	irgen.GeneratePackage(c, file, gc, make_slice(@ast.File, 0))
+	return m
+}
+
+// shapedRun lowers src under config c (with the matching cleanup shape), calls
+// fn `iters` + 1 times, and returns fn's result on the first call, whether that
+// call faulted, and the rt.LiveBlocks() delta across the other `iters` calls.
+func shapedRun(src *[]readonly char, fn *[]readonly char, c iropt.OptConfig,
+		iters int) (int, bool, int) {
+	var m @ir.Module = genModuleShaped(src, iropt.OptPassEnabled(c, iropt.PASS_SROA))
+	var vm @VM = newTestVM(testVMStackSize)
+	registerTestExterns(vm)
+	vm.Opt = c
+	vm.LowerModule(m)
+	var idx int = vm.LookupFunc(fn)
+	if idx < 0 {
+		vm.Shutdown()
+		return -1, false, -1000000
+	}
+	var noArgs @[]int
+	var result int = cast(int, execFunc(vm, idx, noArgs))
+	var faulted bool = vm.Status == VM_STATUS_FAULTED
+	var base int = rt.LiveBlocks()
+	for i := 0; i < iters; i++ {
+		execFunc(vm, idx, noArgs)
+	}
+	var delta int = rt.LiveBlocks() - base
+	vm.Shutdown()
+	return result, faulted, delta
+}
+
+// shapedSrc returns a program with a managed struct local (managed-pointer and managed-slice
+// fields) and a managed-slice-of-managed local, live across a loop.  In
+// `fault` the loop's array index runs out of bounds on its third iteration,
+// unwinding through the cleanup pads; `ok` stops before that.
+func shapedSrc() *[]readonly char {
+	return "package \"test\"\n"
+			"type Node struct { v int }\n"
+			"type Pair struct {\n\ta @Node\n\tb @[]int\n\tn int\n}\n"
+			"func run(limit int) int {\n"
+			"\tvar p Pair\n"
+			"\tp.a = make(Node)\n"
+			"\tp.a.v = 7\n"
+			"\tp.b = make_slice(int, 3)\n"
+			"\tp.n = 2\n"
+			"\tvar xs @[]@Node = make_slice(@Node, 2)\n"
+			"\txs[1] = p.a\n"
+			"\tvar arr [2]int\n"
+			"\tarr[1] = 5\n"
+			"\tvar s int = 0\n"
+			"\tfor i := 0; i < limit; i++ {\n"
+			"\t\ts = s + arr[i] + xs[1].v + len(p.b) + p.n\n"
+			"\t}\n"
+			"\treturn s\n"
+			"}\n"
+			"func ok() int { return run(2) }\n"
+			"func fault() int { return run(4) }\n"
+}
+
+func TestVMSroaShapeRunMatchesO0() testing.TestResult {
+	var r0 int
+	var f0 bool
+	var d0 int
+	r0, f0, d0 = shapedRun(shapedSrc(), "test.ok", iropt.LevelOptConfig(0), 20)
+	var r1 int
+	var f1 bool
+	var d1 int
+	r1, f1, d1 = shapedRun(shapedSrc(), "test.ok", iropt.LevelOptConfig(2), 20)
+	if f0 || f1 { return "ok() must not fault" }
+	if r0 != 29 { return "-O0 baseline: expected 29" }
+	if r1 != r0 { return "-O2 with the SROA cleanup shape must match -O0" }
+	if d0 != 0 || d1 != 0 { return "ok() must not leak" }
+	return ""
+}
+
+func TestVMSroaShapeFaultUnwindNoLeak() testing.TestResult {
+	var r int
+	var f0 bool
+	var d0 int
+	r, f0, d0 = shapedRun(shapedSrc(), "test.fault", iropt.LevelOptConfig(0), 20)
+	var f1 bool
+	var d1 int
+	r, f1, d1 = shapedRun(shapedSrc(), "test.fault", iropt.LevelOptConfig(2), 20)
+	if !f0 || !f1 { return "fault() must fault (index 2 of a [2]int)" }
+	if d0 != 0 { return "-O0: the fault unwind must not leak" }
+	if d1 != 0 { return "-O2 with the SROA cleanup shape: the fault unwind must not leak" }
+	if r == -1 { return "setup: test.fault not found" }
+	return ""
+}
+
+// Each pass off in turn (the rest of -O2 on) must still run correctly and
+// leak-free through both the normal and the faulting path.
+func TestVMSroaShapeEachPassOff() testing.TestResult {
+	for p := 0; p < iropt.NUM_OPT_PASSES; p++ {
+		var c iropt.OptConfig = iropt.WithOptPass(iropt.LevelOptConfig(2), p, false)
+		var r int
+		var f bool
+		var d int
+		r, f, d = shapedRun(shapedSrc(), "test.ok", c, 5)
+		if f || r != 29 || d != 0 { return "ok() wrong or leaking with one pass off" }
+		r, f, d = shapedRun(shapedSrc(), "test.fault", c, 5)
+		if !f || d != 0 { return "fault() not faulting or leaking with one pass off" }
+	}
+	return ""
+}

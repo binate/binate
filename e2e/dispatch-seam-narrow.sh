@@ -212,36 +212,6 @@ fi
 CKI="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 CKL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
 
-# synth_memzero <objdir> <out.o>: if any object under <objdir> has an UNDEFINED
-# rt.MemZero (the arches — currently aarch64 — whose Binate rt.MemZero body is
-# #[build]-gated off in favor of a hand-written asm one that bnc's OWN linker
-# injects, which a raw cross-backend clang link bypasses), synthesize a trivial
-# byte-loop rt.MemZero with the EXACT undefined symbol name extracted from the
-# object, assemble it with clang, and echo the object path.  Echoes "" when no
-# MemZero is missing (e.g. x64, whose portable Binate body is compiled in).
-synth_memzero() {
-    _od="$1"; _out="$2"
-    _sym="$(find "$_od" -name '*.o' -exec nm {} \; 2>/dev/null \
-            | awk '/ U / && /MemZero/ { print $2; exit }')"
-    [ -z "$_sym" ] && { echo ""; return; }
-    case "$(uname -m)" in
-        arm64|aarch64) : ;;
-        *) echo ""; return ;;   # only the aarch64 memzero body is provided here
-    esac
-    cat > "$TMP/memzero.s" <<EOF2
-.text
-.globl $_sym
-$_sym:
-1: cbz x1, 2f
-   strb wzr, [x0], #1
-   sub x1, x1, #1
-   b 1b
-2: ret
-EOF2
-    "$CLANG" -c -o "$_out" "$TMP/memzero.s" 2>/dev/null || { echo ""; return; }
-    echo "$_out"
-}
-
 # build_mixed <label> <nat-backend-flag>: separate-compile the program with
 # seam/nat built under <nat-backend-flag> (either `--backend native` for the real
 # cross-backend test, or "" for the all-LLVM control), link, run, and check.
@@ -280,9 +250,11 @@ build_mixed() {
         fail "$_label: C dirt source compile failed" "$(head -3 "$_w/cc.err")"
         return
     fi
-    _memobj="$(synth_memzero "$_w/sep" "$_w/memzero.o")"
+    # Each --pkg compile is self-contained: a package's #[build]-gated `.s`
+    # (e.g. aarch64's rt.MemZero) lands as its own object in that package's
+    # build dir, so the collected objects link with no extra runtime object.
     _sep="$(find "$_w/sep" -name '*.o' | tr '\n' ' ')"
-    if ! "$CLANG" -w -o "$_w/run" "$_w/main/main.o" $_sep "$_w/dirt.o" $_memobj \
+    if ! "$CLANG" -w -o "$_w/run" "$_w/main/main.o" $_sep "$_w/dirt.o" \
             2>"$_w/link.err" || [ ! -x "$_w/run" ]; then
         fail "$_label: link failed" "$(head -6 "$_w/link.err")"
         return

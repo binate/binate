@@ -12,8 +12,10 @@ load time it adds.  This driver measures both, per pass, with bni's
     VM-sized inputs.  These times include bni loading the benchmark (small
     programs, so a small share), so a pass's load cost is not fully excluded.
 
-Pass configurations:
+Pass configurations (each spelled out as a full set of -f / -fno flags, so
+bni's own default does not matter):
   O0        no pass
+  VM        bni's default pass set (no flags)
   O2        every pass
   cum:<p>   the passes up to and including <p>, in pipeline order
   loo:<p>   every pass except <p>
@@ -48,7 +50,7 @@ PASSES = ["inline", "sroa", "mem2reg", "dead-phi", "load-fwd", "field-load-fwd",
           "simplify", "div-check-elim", "bce-const", "bce-loop", "bce-redundant",
           "licm", "fuse-madd"]
 
-# name -> (argument, VM-sized input).  Sized to run ~1-4 s under bni -O 0.
+# name -> (argument, VM-sized input).  Sized to run ~1-4 s with no pass.
 BENCHMARKS = [
     ("binary-trees", "11"),
     ("fannkuch-redux", "8"),
@@ -82,18 +84,25 @@ def workloads(bench_dir, only):
     return out
 
 
+def passes_flags(on):
+    """The flags that run exactly the passes in `on`."""
+    return [("-f" if p in on else "-fno-") + p for p in PASSES]
+
+
 def configs(kinds):
     out = []
     if "O0" in kinds:
-        out.append(("O0", []))
+        out.append(("O0", passes_flags(set())))
+    if "VM" in kinds:
+        out.append(("VM", []))
     if "O2" in kinds:
-        out.append(("O2", ["-O", "2"]))
+        out.append(("O2", passes_flags(set(PASSES))))
     if "cum" in kinds:
         for i, p in enumerate(PASSES):
-            out.append(("cum:" + p, ["-f" + q for q in PASSES[:i + 1]]))
+            out.append(("cum:" + p, passes_flags(set(PASSES[:i + 1]))))
     if "loo" in kinds:
         for p in PASSES:
-            out.append(("loo:" + p, ["-O", "2", "-fno-" + p]))
+            out.append(("loo:" + p, passes_flags(set(PASSES) - {p})))
     return out
 
 
@@ -126,7 +135,7 @@ def main():
     ap.add_argument("--bni", required=True)
     ap.add_argument("--bench", required=True, help="the benchmarks repo's bench/ dir")
     ap.add_argument("--rounds", type=int, default=4, help="an even number")
-    ap.add_argument("--configs", default="O0,O2,cum,loo")
+    ap.add_argument("--configs", default="O0,VM,O2,cum,loo")
     ap.add_argument("--only", default="", help="comma-separated workload names")
     ap.add_argument("--log", default="")
     a = ap.parse_args()
@@ -136,7 +145,7 @@ def main():
     ws = workloads(a.bench, set(filter(None, a.only.split(","))))
     cs = configs(set(a.configs.split(",")))
     if not any(c[0] == "O0" for c in cs):
-        cs.insert(0, ("O0", []))  # the reference for outputs and ratios
+        cs.insert(0, ("O0", passes_flags(set())))  # the reference for outputs and ratios
     log = open(a.log, "w") if a.log else None
 
     times = {}      # (workload, config) -> [seconds]

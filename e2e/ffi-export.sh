@@ -320,6 +320,24 @@ func Mretfi() (float64, int64) { return cast(float64, 8), cast(int64, 9) }
 #[c_export("mretpad")]
 func Mretpad() (int32, int64) { return cast(int32, 11), cast(int64, 22) }
 
+// A tuple return that needs adapting (the 24-byte sret above) from a function with
+// 64 stack-passed argument words: the C-entry trampoline copies them into its own
+// outgoing-argument area and saves FP/LR above it, 512+ bytes up — past the reach of
+// an STP/LDP immediate, so the save and restore must not address it that way.
+#[c_export("mret_many")]
+func MretMany(p0 int64, p1 int64, p2 int64, p3 int64, p4 int64, p5 int64, p6 int64, p7 int64,
+		p8 int64, p9 int64, p10 int64, p11 int64, p12 int64, p13 int64, p14 int64, p15 int64,
+		p16 int64, p17 int64, p18 int64, p19 int64, p20 int64, p21 int64, p22 int64, p23 int64,
+		p24 int64, p25 int64, p26 int64, p27 int64, p28 int64, p29 int64, p30 int64, p31 int64,
+		p32 int64, p33 int64, p34 int64, p35 int64, p36 int64, p37 int64, p38 int64, p39 int64,
+		p40 int64, p41 int64, p42 int64, p43 int64, p44 int64, p45 int64, p46 int64, p47 int64,
+		p48 int64, p49 int64, p50 int64, p51 int64, p52 int64, p53 int64, p54 int64, p55 int64,
+		p56 int64, p57 int64, p58 int64, p59 int64, p60 int64, p61 int64, p62 int64, p63 int64,
+		p64 int64, p65 int64, p66 int64, p67 int64, p68 int64, p69 int64, p70 int64,
+		p71 int64) (int64, int64, int64) {
+	return p0 + p7, p8 + p39, p71
+}
+
 // __c_entry POINTERS to multi-return functions: each getter hands C the address
 // of a callback that returns a divergent tuple, so C invokes it THROUGH the
 // pointer.  This must present the same platform struct-return ABI the #[c_export]
@@ -521,6 +539,12 @@ extern struct M3f mret3f(void);
 extern struct Mif mretif(void);
 extern struct Mfi mretfi(void);
 extern struct Mpad mretpad(void);
+extern struct M3i mret_many(long, long, long, long, long, long, long, long, long, long, long,
+    long, long, long, long, long, long, long, long, long, long, long, long, long, long, long,
+    long, long, long, long, long, long, long, long, long, long, long, long, long, long, long,
+    long, long, long, long, long, long, long, long, long, long, long, long, long, long, long,
+    long, long, long, long, long, long, long, long, long, long, long, long, long, long, long,
+    long);
 int main(void) {
     struct M3i a = mret3i(); printf("%ld %ld %ld\n", a.a, a.b, a.c);
     struct M2i b = mret2i(); printf("%d %d\n", b.a, b.b);
@@ -529,6 +553,11 @@ int main(void) {
     struct Mif e = mretif(); printf("%ld %.0f\n", e.a, e.b);
     struct Mfi f = mretfi(); printf("%.0f %ld\n", f.a, f.b);
     struct Mpad g = mretpad(); printf("%d %ld\n", g.a, g.b);
+    struct M3i h = mret_many(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+        20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41,
+        42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+        64, 65, 66, 67, 68, 69, 70, 71, 72);
+    printf("%ld %ld %ld\n", h.a, h.b, h.c);
     return 0;
 }
 EOF
@@ -538,7 +567,8 @@ WANT_MULTIRET="10 20 30
 1 2 3
 5 6
 8 9
-11 22"
+11 22
+9 49 72"
 
 # --- a C driver that invokes multi-return callbacks THROUGH __c_entry pointers ---
 # Each get_cb_* returns a void* naming the callback's C entry; C casts it to the

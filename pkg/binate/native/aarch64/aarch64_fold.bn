@@ -1,0 +1,147 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/common"
+import "pkg/binate/native/fold"
+
+// Immediate-operand folding for the aarch64 backend: the fold predicate
+// (aa64ImmFits) that fold.ImmOperandConsts uses to pick the constants that ride
+// an instruction immediate, the per-position checks it shares with the consuming
+// emitters (aa64CmpImm for emitCmpAgainst, aa64AddSubImm for emitAddSubImmFold),
+// and the add/sub-immediate emitter itself.  Because the predicate and the
+// emitters call the same checks, a constant the analysis marked is exactly a
+// constant the emitters can encode; an emitter that meets a marked constant the
+// checks reject reports an error instead of encoding it.
+
+// aa64ImmWordBytes is the operand width the immediate folds are judged against:
+// every aa64 general-purpose register is 64 bits wide, so a compare or add/sub of
+// any integer up to int64 is one instruction that can take an immediate.
+const aa64ImmWordBytes int = 8
+
+// aa64ImmPosMax is the largest constant an aa64 compare or add/sub immediate
+// carries.  The ADD/SUB immediate — and CMP/CMN, the flag-setting SUBS/ADDS
+// aliases — is an unshifted 12-bit unsigned field.
+const aa64ImmPosMax int64 = 4095
+
+// aa64ImmNegMin is the most negative constant that folds.  A small negative -k
+// rides the sign-swapped operation with k in the same 12-bit field: `cmn #k` for
+// a signed compare, `sub #k` for an add, `add #k` for a subtract.
+const aa64ImmNegMin int64 = -4095
+
+// aa64CmpImm returns (value, true) iff operand argIdx of `user` is a constant in
+// a compare-immediate position (fold.CmpImmOperand) whose value fits aa64's
+// CMP/CMN immediate for the compare's signedness (fold.CmpImmFits).
+func aa64CmpImm(user @ir.Instr, argIdx int) (int64, bool) {
+	var v int64
+	var isUns bool
+	var ok bool
+	v, isUns, ok = fold.CmpImmOperand(user, argIdx, aa64ImmWordBytes)
+	if !ok || !fold.CmpImmFits(v, isUns, aa64ImmPosMax, aa64ImmNegMin) {
+		return cast(int64, 0), false
+	}
+	return v, true
+}
+
+// aa64AddSubImm returns (value, true) iff operand argIdx of `user` is a constant
+// in an add/sub-immediate position (fold.AddSubImmOperand) whose value fits
+// aa64's ADD/SUB immediate, directly or sign-swapped (fold.AddSubImmFits).
+func aa64AddSubImm(user @ir.Instr, argIdx int) (int64, bool) {
+	var v int64
+	var ok bool
+	v, ok = fold.AddSubImmOperand(user, argIdx, aa64ImmWordBytes)
+	if !ok || !fold.AddSubImmFits(v, aa64ImmPosMax, aa64ImmNegMin) {
+		return cast(int64, 0), false
+	}
+	return v, true
+}
+
+// aa64ImmFits is the aarch64 predicate for fold.ImmOperandConsts: operand argIdx
+// of `user` rides an immediate iff it is a compare RHS that fits CMP/CMN
+// (aa64CmpImm) or an add/sub operand that fits ADD/SUB (aa64AddSubImm).
+func aa64ImmFits(user @ir.Instr, argIdx int) bool {
+	var ok bool
+	_, ok = aa64CmpImm(user, argIdx)
+	if ok { return true }
+	_, ok = aa64AddSubImm(user, argIdx)
+	return ok
+}
+
+// isFoldedImmConst reports whether operand `arg` is an OP_CONST_INT the fold
+// marked (m.FoldedImm) to ride an instruction immediate — so it was left unhomed
+// and skip-emitted, and must be consumed as an immediate, never via getOperand
+// (which rejects a folded-away value).
+func isFoldedImmConst(rm @common.RegMap, arg @ir.Instr) bool {
+	return arg != nil && arg.Op == iropcode.OP_CONST_INT && rm.IsFoldedImm(arg.ID)
+}
+
+// emitAddSubImmFold lowers an OP_ADD / OP_SUB with a FoldedImm constant operand:
+// the constant rides the 12-bit unsigned add/sub immediate (`add`/`sub rd, rn,
+// #v`), sign-swapping the operation for a small negative (x + (-k) ≡ x - k,
+// x - (-k) ≡ x + k).  ADD is commutative so the constant may be either operand
+// (the other supplies the register addend); SUB folds only its subtrahend
+// (Args[1]).  Width and sub-word re-narrow mirror the register path exactly, so
+// the result is bit-identical.
+//
+// Returns false when neither operand is a folded constant, leaving emitBinop's
+// register path to run.  Returns true when it handled ins: either it emitted the
+// immediate form, or a folded constant fails aa64AddSubImm at its position (a
+// constant minuend, a constant sibling, a too-wide result, or an out-of-range
+// value) and it recorded an a.SetError — the constant was never materialized,
+// so no register path can read it either — or the register operand could not
+// be resolved, which also records an a.SetError.
+func emitAddSubImmFold(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != iropcode.OP_ADD && ins.Op != iropcode.OP_SUB { return false }
+	if len(ins.Args) != 2 { return false }
+	var c0 bool = isFoldedImmConst(rm, ins.Args[0])
+	var c1 bool = isFoldedImmConst(rm, ins.Args[1])
+	if !c0 && !c1 { return false }
+
+	// The constant is Args[1] when that is folded, else Args[0]; the register
+	// operand is the other one.  aa64AddSubImm rejects a constant sibling, so two
+	// folded operands fail here too.
+	var ci int = 1
+	if !c1 { ci = 0 }
+	var cval int64
+	var fits bool
+	cval, fits = aa64AddSubImm(ins, ci)
+	if !fits {
+		a.SetError("native arm64: folded immediate does not fit the add/sub")
+		return true
+	}
+	var reg int = getOperand(a, rm, ins.Args[1 - ci].ID)
+	if reg < 0 {
+		a.SetError("native arm64: add/sub with a folded immediate has no register operand")
+		return true
+	}
+	var rd int = nextReg(rm, ins.ID)
+
+	// Width: a 32-bit unsigned result uses the w-form op (self-clears bits [32,64))
+	// and skips the re-narrow; everything else runs 64-bit and re-narrows a
+	// sub-word result — identical to emitBinop's register path.
+	var nw int
+	var nsigned bool
+	nw, nsigned = common.SubWordNarrow(ins.Typ, 64)
+	var use32 bool = nw == 32 && !nsigned
+	var sf bool = !use32
+
+	// x + (-k) ≡ x - k and x - (-k) ≡ x + k: fold a small negative by swapping the
+	// operation and using its magnitude, which aa64AddSubImm checked fits.
+	var doAdd bool = ins.Op == iropcode.OP_ADD
+	var mag int64 = cval
+	if cval < cast(int64, 0) {
+		doAdd = !doAdd
+		mag = cast(int64, 0) - cval
+	}
+	if doAdd {
+		aarch64.Add(a, sf, rd, reg, aarch64.Imm(cast(int, mag)))
+	} else {
+		aarch64.Sub(a, sf, rd, reg, aarch64.Imm(cast(int, mag)))
+	}
+	if !use32 {
+		emitSubWordNarrow(a, rd, ins.Typ)
+	}
+	return true
+}

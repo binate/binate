@@ -4,12 +4,15 @@
 
 runner_setup() { build_interp_boot_comp; }
 
+# BNI_PASS_FLAGS (set by build_interp; see _set_bni_pass_flags) is word-split on
+# purpose: it holds the -fno-<pass> flags when BNI_NO_PASSES=1, else nothing.
+# shellcheck disable=SC2086
 runner_exec() {
     bn="$1"; root="$2"
     if [ -n "$root" ]; then
-        "$COMPILED_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$root")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$root")" -main-file "$bn" 2>&1 || true
+        "$COMPILED_INTERP" ${CONF_CHECK_NIL:+--check-nil} $BNI_PASS_FLAGS -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$root")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$root")" -main-file "$bn" 2>&1 || true
     else
-        "$COMPILED_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" -main-file "$bn" 2>&1 || true
+        "$COMPILED_INTERP" ${CONF_CHECK_NIL:+--check-nil} $BNI_PASS_FLAGS -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" -main-file "$bn" 2>&1 || true
     fi
 }
 

@@ -11,12 +11,18 @@ import "pkg/binate/types"
 // (FusableFieldGeps) and its consuming access rederives the address in the
 // memory operand's immediate offset (`[base, #FieldByteOffset]`, or
 // `[sp, #allocaOffset+FieldByteOffset]` for an alloca base) instead of a
-// separate ADD.  The analysis gates arm32 to non-pair64 scalars; for a REGISTER
-// base it also bounds the field offset to arm32's load/store immediate (≤255),
-// so those never hit emitScalarLoad's range error.  An alloca base's combined
+// separate ADD.  For a REGISTER base the analysis bounds the field offset to
+// arm32's smallest load/store immediate (≤255), so those never hit
+// emitScalarLoad's range error.  An alloca base's combined
 // allocaOffset+fieldOffset isn't bounded by the analysis (unknown until frame
 // layout), so the emitters below materialize the address in a scratch when it
 // overruns the immediate — the load/store then addresses `[scratch]`.
+//
+// Float fields: an FP-homed float moves straight between its D-register home and
+// memory with VLDR/VSTR (float32 through the home's low S-view).  A float64 field
+// is a 64-bit value, so it never reaches the single-word emitters here — emitLoad
+// / emitStore route every 64-bit pair to emitLoad64 / emitStore64 first, which
+// hand a fused field GEP to emitFusedFieldLoad64 / emitFusedFieldStore64 below.
 
 // smallImm is the conservative immediate bound the fused alloca path emits a
 // direct `[sp, #off]` access within: 255 fits EVERY arm32 load/store form
@@ -26,16 +32,34 @@ import "pkg/binate/types"
 // same cost as the standalone GEP it replaces, so never a regression.
 func smallImm() int { return 255 }
 
-// emitFusedFieldLoad emits `ldr rd, [base, #FieldByteOffset]` for a GP scalar
-// field whose address GEP was folded — reading the base from the GEP's own
+// emitFusedFieldLoad emits `ldr rd, [base, #FieldByteOffset]` for a single-word
+// scalar field whose address GEP was folded — reading the base from the GEP's own
 // operand.  An alloca base folds allocaOffset+fieldOffset into an SP-relative
 // access.  emitScalarLoad size-dispatches (LDRB/LDRH/LDR); wordBytes() (4) is
 // the ILP32 word size, matching the FusableFieldGeps(f, 4, ...) offset computation.
+// An FP-homed float32 instead loads with `vldr s, [base, #off]` into its home.
 func emitFusedFieldLoad(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, gep @ir.Instr) {
 	var off int
 	var ok bool
 	off, ok = common.FieldByteOffset(gep, wordBytes())
 	if !ok { return }
+	var home int = rm.LookupHome(ins.ID)
+	if isFpReg(home) {
+		// An FP-homed float32 (a float64 never reaches this single-word path) loads
+		// straight into the low S-view of its D-register home.  nextReg is NOT
+		// called: it would hand out a GP scratch that handleResult then VMOVs over
+		// the home.
+		if isFloat64Typ(ins.Typ) {
+			a.SetError("native arm32: float64 reached the single-word fused field load")
+			return
+		}
+		var fbase int
+		var foff int
+		fbase, foff = fusedFieldAddr(a, rm, gep, off)
+		if fbase < 0 { return }
+		vfpLoadBaseHard(a, false, lowSingleOf(home), fbase, foff, arm32.IP)
+		return
+	}
 	var sz int = wordBytes()
 	if ins.Typ != nil { sz = ins.Typ.SizeOf() }
 	if sz <= 0 { sz = wordBytes() }
@@ -61,13 +85,25 @@ func emitFusedFieldLoad(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, gep 
 
 // emitFusedFieldStore is the store analogue: `str val, [base, #FieldByteOffset]`
 // (`str val, [sp, #allocaOffset+FieldByteOffset]` for an alloca base).  The
-// value is resolved first (matching the plain store path), then the base.
+// value is resolved first (matching the plain store path), then the base.  An
+// FP-homed float32 value instead stores with `vstr s, [base, #off]` from its home.
 func emitFusedFieldStore(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
 		ins @ir.Instr, gep @ir.Instr) {
 	var off int
 	var ok bool
 	off, ok = common.FieldByteOffset(gep, wordBytes())
 	if !ok { return }
+	var vhome int = rm.LookupHome(ins.Args[1].ID)
+	if isFloatTyp(ins.Args[1].Typ) && isFpReg(vhome) {
+		// An FP-homed float32 value stores straight from the low S-view of its
+		// D-register home (emitValOperand would bridge it through a GP scratch).
+		var fbase int
+		var foff int
+		fbase, foff = fusedFieldAddr(a, rm, gep, off)
+		if fbase < 0 { return }
+		vfpStoreBaseHard(a, false, lowSingleOf(vhome), fbase, foff, arm32.IP)
+		return
+	}
 	var valReg int = emitValOperand(a, pkgName, rm, ins.Args[1])
 	if valReg < 0 { return }
 	var sz int = wordBytes()
@@ -89,4 +125,78 @@ func emitFusedFieldStore(a @asm.Assembler, pkgName *[]readonly char, rm @common.
 	var base int = getOperand(a, rm, gep.Args[0].ID)
 	if base < 0 { return }
 	emitScalarStore(a, valReg, base, off, sz)
+}
+
+// fusedFieldAddr resolves a fused field access to (base register, offset): the
+// alloca base folds to (SP, allocaOffset+fieldOffset), a register base to (its
+// register, fieldOffset).  base is -1 when the base operand is not materializable.
+// Only for the VFP and 64-bit paths, which address through helpers that
+// materialize an out-of-range offset in IP themselves (vfpLoadBaseHard /
+// emitBaseLoad and their store twins).
+func fusedFieldAddr(a @asm.Assembler, rm @common.RegMap, gep @ir.Instr, off int) (int, int) {
+	var allocOff int = rm.LookupAlloc(gep.Args[0].ID)
+	if allocOff >= 0 {
+		return arm32.SP, allocOff + off
+	}
+	return getOperand(a, rm, gep.Args[0].ID), off
+}
+
+// emitFusedFieldLoad64 is the 64-bit fused field load (a float64 field — the only
+// 64-bit field the analysis folds on arm32): an FP-homed value loads straight into
+// its D-register home (VLDR.64); an unhomed one loads its two words (lo at +0, hi
+// at +4) and stores the pair to its slot (store64).
+func emitFusedFieldLoad64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, gep @ir.Instr) {
+	var off int
+	var ok bool
+	off, ok = common.FieldByteOffset(gep, wordBytes())
+	if !ok { return }
+	var base int
+	base, off = fusedFieldAddr(a, rm, gep, off)
+	if base < 0 {
+		a.SetError("native arm32: fused 64-bit field load base not materializable")
+		return
+	}
+	var home int = rm.LookupHome(ins.ID)
+	if isFpReg(home) {
+		vfpLoadBaseHard(a, true, home, base, off, arm32.IP)
+		return
+	}
+	var lo int = scratchReg(rm)
+	var hi int = scratchReg(rm)
+	emitBaseLoad(a, lo, base, off, arm32.IP)
+	emitBaseLoad(a, hi, base, off + 4, arm32.IP)
+	store64(a, rm, ins, lo, hi)
+}
+
+// emitFusedFieldStore64 is the store analogue: an FP-homed float64 value stores
+// straight from its D-register home (VSTR.64); an unhomed one stores its two words
+// (load64) at +0 / +4.  The value is resolved first (matching the plain store
+// path), then the base.
+func emitFusedFieldStore64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr, gep @ir.Instr) {
+	var off int
+	var ok bool
+	off, ok = common.FieldByteOffset(gep, wordBytes())
+	if !ok { return }
+	var vhome int = rm.LookupHome(ins.Args[1].ID)
+	var lo int = -1
+	var hi int = -1
+	if !isFpReg(vhome) {
+		lo, hi = load64(a, rm, ins.Args[1])
+		if lo < 0 {
+			a.SetError("native arm32: fused 64-bit field store value not materializable")
+			return
+		}
+	}
+	var base int
+	base, off = fusedFieldAddr(a, rm, gep, off)
+	if base < 0 {
+		a.SetError("native arm32: fused 64-bit field store base not materializable")
+		return
+	}
+	if isFpReg(vhome) {
+		vfpStoreBaseHard(a, true, vhome, base, off, arm32.IP)
+		return
+	}
+	emitBaseStore(a, lo, base, off, arm32.IP)
+	emitBaseStore(a, hi, base, off + 4, arm32.IP)
 }

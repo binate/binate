@@ -1,23 +1,49 @@
 package "pkg/binate/asm/parse"
 
-// Expression parser for assembly constant expressions.
-// Supports: integer literals, character literals, $, label names,
-// arithmetic (+, -, *, /, %), bitwise (&, |, ^, ~, <<, >>),
-// unary (-, ~), parentheses.
-//
-// Precedence (lowest to highest):
-// 1. | (bitwise OR)
-// 2. ^ (bitwise XOR)
-// 3. & (bitwise AND)
-// 4. <<, >> (shifts)
-// 5. +, - (additive)
-// 6. *, /, % (multiplicative)
-// 7. unary -, ~ (unary)
-// 8. atoms: integers, chars, $, idents, (expr)
+import "pkg/binate/buf"
 
-// exprFail returns an ExprResult with Ok=false.
-func exprFail() ExprResult {
+// Constant-expression evaluator for assembly operands and directives: integer and
+// character literals, parentheses, unary - + ~, and the binary operators
+// * / % << >> + - | & ^, over 64-bit values.
+//
+// clang evaluates binary operators with one of three precedence tables — a Darwin
+// table for Mach-O (| & ^  <  << >>  <  + -  <  * / %), a GNU table for ELF and for
+// directives (+ -  <  | & ^  <  * / % << >>), and C's for x86 Intel-syntax operands
+// (|  <  ^  <  &  <  << >>  <  + -  <  * / %) — so the same unparenthesized
+// expression can mean different things.  The evaluator uses the precedences all
+// three share and rejects a mix they disagree on, so an expression never silently
+// means something other than what clang reads in any of those contexts:
+//   - accepted: * / % over + -; * / % over | & ^; << >> over | & ^; each group on
+//     its own (left-associative);
+//   - rejected at one parenthesization level: + - with << >>, + - with | & ^,
+//     * / % with << >>, and two different bitwise operators (| with & or ^, & with
+//     ^) — add parentheses to say which is meant.
+// >> shifts a non-negative value (logically, as in clang's Mach-O and ELF tables);
+// shifting a negative value right is an error, since x86 Intel syntax shifts
+// arithmetically where the others shift logically.  Shift counts must lie in
+// [0, 63], and / or % by zero and the overflowing minimum-value / -1 are errors,
+// as is nesting past maxExprDepth.
+
+// Operator groups, as bits of the set parseBinary reports for one level.
+const (
+	EG_MUL int = 1   // * / %
+	EG_SHIFT int = 2 // << >>
+	EG_ADD int = 4   // + -
+	EG_OR int = 8    // |
+	EG_XOR int = 16  // ^
+	EG_AND int = 32  // &
+)
+
+// EG_BIT is every bitwise group; a level may use at most one of them.
+const EG_BIT int = EG_OR | EG_XOR | EG_AND
+
+// maxExprDepth bounds the nesting of parentheses and unary operators.
+const maxExprDepth int = 256
+
+// exprFail returns a failed ExprResult carrying (a copy of) msg.
+func exprFail(msg *[]readonly char) ExprResult {
 	var r ExprResult
+	r.Err = buf.CopyStr(msg)
 	return r
 }
 
@@ -29,180 +55,157 @@ func exprOk(val int64) ExprResult {
 	return r
 }
 
+// exprErr returns r's diagnostic, or fallback when it carries none.
+func exprErr(r ExprResult, fallback *[]readonly char) @[]char {
+	if len(r.Err) > 0 { return r.Err }
+	return buf.CopyStr(fallback)
+}
+
 // ParseExpr parses and evaluates a constant expression from the token stream.
 // Returns the updated lexer and the result.
 // cur is the current (already lexed) token; the function consumes tokens as needed.
 func ParseExpr(l Lexer, cur Token) (Lexer, Token, ExprResult) {
-	var result ExprResult
-	l, cur, result = parseOr(l, cur)
-	return l, cur, result
+	return parseLevel(l, cur, 0)
 }
 
-// Precedence-climbing expression parsers. Each function handles one level
-// and calls the next-higher-precedence function for its operands.
-// All return (updated lexer, next token, result).
-
-func parseOr(l Lexer, cur Token) (Lexer, Token, ExprResult) {
-	var left ExprResult
-	l, cur, left = parseXor(l, cur)
-	if !left.Ok { return l, cur, left }
-	for cur.Kind == TOK_PIPE {
-		l, cur = LexNext(l)
-		var right ExprResult
-		l, cur, right = parseXor(l, cur)
-		if !right.Ok { return l, cur, right }
-		left = exprOk(left.Val | right.Val)
+// parseLevel parses one parenthesization level at nesting depth and rejects a mix
+// of operator groups whose relative precedence clang's two tables disagree on.
+func parseLevel(l Lexer, cur Token, depth int) (Lexer, Token, ExprResult) {
+	var r ExprResult
+	var groups int = 0
+	l, cur, r, groups = parseBinary(l, cur, 1, depth)
+	if !r.Ok { return l, cur, r }
+	if (groups & (EG_ADD | EG_SHIFT)) == (EG_ADD | EG_SHIFT) ||
+			((groups & EG_ADD) != 0 && (groups & EG_BIT) != 0) ||
+			(groups & (EG_MUL | EG_SHIFT)) == (EG_MUL | EG_SHIFT) || bitGroupCount(groups & EG_BIT) > 1 {
+		return l, cur,
+			exprFail(
+					"ambiguous operator precedence (Mach-O and ELF differ); add parentheses")
 	}
-	return l, cur, left
+	return l, cur, r
 }
 
-// parseXor handles bitwise-XOR `^` (precedence between OR and AND).
-func parseXor(l Lexer, cur Token) (Lexer, Token, ExprResult) {
-	var left ExprResult
-	l, cur, left = parseAnd(l, cur)
-	if !left.Ok { return l, cur, left }
-	for cur.Kind == TOK_CARET {
-		l, cur = LexNext(l)
-		var right ExprResult
-		l, cur, right = parseAnd(l, cur)
-		if !right.Ok { return l, cur, right }
-		left = exprOk(left.Val ^ right.Val)
+// binPrec returns the binary precedence of token kind k (the GNU table's, which
+// agrees with the Darwin and Intel tables on every mix parseLevel accepts), or 0 when
+// k is not a binary operator.
+func binPrec(k int) int {
+	if k == TOK_STAR || k == TOK_SLASH || k == TOK_PERCENT || k == TOK_SHL || k == TOK_SHR {
+		return 3
 	}
-	return l, cur, left
+	if k == TOK_PIPE || k == TOK_AMP || k == TOK_CARET { return 2 }
+	if k == TOK_PLUS || k == TOK_MINUS { return 1 }
+	return 0
 }
 
-// parseAnd handles bitwise-AND `&` (precedence above XOR, below shifts).
-func parseAnd(l Lexer, cur Token) (Lexer, Token, ExprResult) {
-	var left ExprResult
-	l, cur, left = parseShift(l, cur)
-	if !left.Ok { return l, cur, left }
-	for cur.Kind == TOK_AMP {
-		l, cur = LexNext(l)
-		var right ExprResult
-		l, cur, right = parseShift(l, cur)
-		if !right.Ok { return l, cur, right }
-		left = exprOk(left.Val & right.Val)
-	}
-	return l, cur, left
+// binGroup returns the EG_* group of binary operator token kind k.
+func binGroup(k int) int {
+	if k == TOK_STAR || k == TOK_SLASH || k == TOK_PERCENT { return EG_MUL }
+	if k == TOK_SHL || k == TOK_SHR { return EG_SHIFT }
+	if k == TOK_PLUS || k == TOK_MINUS { return EG_ADD }
+	if k == TOK_PIPE { return EG_OR }
+	if k == TOK_CARET { return EG_XOR }
+	return EG_AND
 }
 
-// parseShift handles `<<` and `>>` (precedence above AND, below additive).
-func parseShift(l Lexer, cur Token) (Lexer, Token, ExprResult) {
+// bitGroupCount returns how many of the bitwise groups EG_OR, EG_XOR, EG_AND are in g.
+func bitGroupCount(g int) int {
+	var n int = 0
+	if (g & EG_OR) != 0 { n = n + 1 }
+	if (g & EG_XOR) != 0 { n = n + 1 }
+	if (g & EG_AND) != 0 { n = n + 1 }
+	return n
+}
+
+// parseBinary parses operands joined by binary operators of precedence >= minPrec
+// (precedence climbing, left-associative), returning the value and the set of
+// operator groups used at this level.
+func parseBinary(l Lexer, cur Token, minPrec int, depth int) (Lexer, Token, ExprResult, int) {
 	var left ExprResult
-	l, cur, left = parseAdd(l, cur)
-	if !left.Ok { return l, cur, left }
-	for cur.Kind == TOK_SHL || cur.Kind == TOK_SHR {
+	l, cur, left = parseUnary(l, cur, depth)
+	if !left.Ok { return l, cur, left, 0 }
+	var groups int = 0
+	for binPrec(cur.Kind) >= minPrec {
 		var op int = cur.Kind
+		var prec int = binPrec(op)
+		groups = groups | binGroup(op)
 		l, cur = LexNext(l)
 		var right ExprResult
-		l, cur, right = parseAdd(l, cur)
-		if !right.Ok { return l, cur, right }
-		if op == TOK_SHL {
-			left = exprOk(left.Val << right.Val)
-		} else {
-			left = exprOk(left.Val >> right.Val)
-		}
+		var rg int = 0
+		l, cur, right, rg = parseBinary(l, cur, prec + 1, depth)
+		groups = groups | rg
+		if !right.Ok { return l, cur, right, groups }
+		left = applyBinary(op, left.Val, right.Val)
+		if !left.Ok { return l, cur, left, groups }
 	}
-	return l, cur, left
+	return l, cur, left, groups
 }
 
-// parseAdd handles `+` and `-` (precedence above shifts, below multiplicative).
-func parseAdd(l Lexer, cur Token) (Lexer, Token, ExprResult) {
-	var left ExprResult
-	l, cur, left = parseMul(l, cur)
-	if !left.Ok { return l, cur, left }
-	for cur.Kind == TOK_PLUS || cur.Kind == TOK_MINUS {
+// minInt64 is the most negative 64-bit value.
+const minInt64 int64 = -9223372036854775807 - 1
+
+// applyBinary evaluates `x op y` for binary operator token kind op.
+func applyBinary(op int, x int64, y int64) ExprResult {
+	if op == TOK_PLUS { return exprOk(x + y) }
+	if op == TOK_MINUS { return exprOk(x - y) }
+	if op == TOK_STAR { return exprOk(x * y) }
+	if op == TOK_PIPE { return exprOk(x | y) }
+	if op == TOK_AMP { return exprOk(x & y) }
+	if op == TOK_CARET { return exprOk(x ^ y) }
+	if op == TOK_SLASH || op == TOK_PERCENT {
+		if y == 0 { return exprFail("division by zero in expression") }
+		if x == minInt64 && y == -1 {
+			// The quotient overflows 64 bits; the remainder is exactly 0.
+			if op == TOK_SLASH { return exprFail("division overflow in expression") }
+			return exprOk(0)
+		}
+		if op == TOK_SLASH { return exprOk(x / y) }
+		return exprOk(x % y)
+	}
+	// << and >>: the count is 0..63; >> takes a non-negative value (so shifting in
+	// zeros and shifting in sign bits agree).
+	if y < 0 || y > 63 { return exprFail("shift count out of range [0, 63]") }
+	if op == TOK_SHR && x < 0 {
+		return exprFail("right shift of a negative value (arithmetic in x86 syntax, logical elsewhere)")
+	}
+	var ux uint64 = bit_cast(uint64, x)
+	var n uint = cast(uint, y)
+	if op == TOK_SHL { return exprOk(bit_cast(int64, ux << n)) }
+	return exprOk(bit_cast(int64, ux >> n))
+}
+
+// parseUnary handles unary `-` (negation), `+` and `~` (bitwise NOT), then an atom.
+func parseUnary(l Lexer, cur Token, depth int) (Lexer, Token, ExprResult) {
+	if depth >= maxExprDepth { return l, cur, exprFail("expression nested too deeply") }
+	if cur.Kind == TOK_MINUS || cur.Kind == TOK_PLUS || cur.Kind == TOK_TILDE {
 		var op int = cur.Kind
-		l, cur = LexNext(l)
-		var right ExprResult
-		l, cur, right = parseMul(l, cur)
-		if !right.Ok { return l, cur, right }
-		if op == TOK_PLUS {
-			left = exprOk(left.Val + right.Val)
-		} else {
-			left = exprOk(left.Val - right.Val)
-		}
-	}
-	return l, cur, left
-}
-
-// parseMul handles `*`, `/`, `%` (precedence above additive, below unary).
-// Division/modulo by zero return exprFail().
-func parseMul(l Lexer, cur Token) (Lexer, Token, ExprResult) {
-	var left ExprResult
-	l, cur, left = parseUnary(l, cur)
-	if !left.Ok { return l, cur, left }
-	for cur.Kind == TOK_STAR || cur.Kind == TOK_SLASH || cur.Kind == TOK_PERCENT {
-		var op int = cur.Kind
-		l, cur = LexNext(l)
-		var right ExprResult
-		l, cur, right = parseUnary(l, cur)
-		if !right.Ok { return l, cur, right }
-		if op == TOK_STAR {
-			left = exprOk(left.Val * right.Val)
-		} else if op == TOK_SLASH {
-			if right.Val == 0 { return l, cur, exprFail() }
-			left = exprOk(left.Val / right.Val)
-		} else {
-			if right.Val == 0 { return l, cur, exprFail() }
-			left = exprOk(left.Val % right.Val)
-		}
-	}
-	return l, cur, left
-}
-
-// parseUnary handles unary `-` (negation) and `~` (bitwise NOT).
-// Falls through to parseAtom when neither prefix is present.
-func parseUnary(l Lexer, cur Token) (Lexer, Token, ExprResult) {
-	if cur.Kind == TOK_MINUS {
 		l, cur = LexNext(l)
 		var inner ExprResult
-		l, cur, inner = parseUnary(l, cur)
+		l, cur, inner = parseUnary(l, cur, depth + 1)
 		if !inner.Ok { return l, cur, inner }
-		return l, cur, exprOk(0 - inner.Val)
+		if op == TOK_MINUS { return l, cur, exprOk(0 - inner.Val) }
+		if op == TOK_TILDE { return l, cur, exprOk(inner.Val ^ -1) } // ~x = x ^ -1
+		return l, cur, inner
 	}
-	if cur.Kind == TOK_TILDE {
-		l, cur = LexNext(l)
-		var inner ExprResult
-		l, cur, inner = parseUnary(l, cur)
-		if !inner.Ok { return l, cur, inner }
-		return l, cur, exprOk(inner.Val ^ -1) // ~x = x ^ -1
-	}
-	var result ExprResult
-	l, cur, result = parseAtom(l, cur)
-	return l, cur, result
+	return parseAtom(l, cur, depth)
 }
 
-// parseAtom matches one terminal: integer literal, character literal,
-// `$` (current offset placeholder, returned as -1 for the caller to
-// substitute), parenthesized sub-expression. Unknown tokens fail.
-func parseAtom(l Lexer, cur Token) (Lexer, Token, ExprResult) {
-	if cur.Kind == TOK_INT {
+// parseAtom matches one terminal: an integer or character literal, or a
+// parenthesized sub-expression (its own precedence level).  Anything else fails.
+func parseAtom(l Lexer, cur Token, depth int) (Lexer, Token, ExprResult) {
+	if cur.Kind == TOK_INT || cur.Kind == TOK_CHAR {
 		var val int64 = cur.Ival
 		l, cur = LexNext(l)
 		return l, cur, exprOk(val)
-	}
-	if cur.Kind == TOK_CHAR {
-		var val int64 = cur.Ival
-		l, cur = LexNext(l)
-		return l, cur, exprOk(val)
-	}
-	if cur.Kind == TOK_DOLLAR {
-		// $ = current offset — caller must substitute
-		// For now, return a special marker. The caller handles this.
-		l, cur = LexNext(l)
-		return l, cur, exprOk(-1) // placeholder — TODO: proper $ handling
 	}
 	if cur.Kind == TOK_LPAREN {
 		l, cur = LexNext(l)
 		var inner ExprResult
-		l, cur, inner = parseOr(l, cur)
+		l, cur, inner = parseLevel(l, cur, depth + 1)
 		if !inner.Ok { return l, cur, inner }
-		if cur.Kind == TOK_RPAREN {
-			l, cur = LexNext(l)
-		}
+		if cur.Kind != TOK_RPAREN { return l, cur, exprFail("expected ')' in expression") }
+		l, cur = LexNext(l)
 		return l, cur, inner
 	}
-	// Unknown token in expression
-	return l, cur, exprFail()
+	if cur.Kind == TOK_ERROR { return l, cur, exprFail(cur.Text) }
+	return l, cur, exprFail("")
 }

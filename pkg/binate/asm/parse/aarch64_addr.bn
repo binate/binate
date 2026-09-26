@@ -1,0 +1,341 @@
+package "pkg/binate/asm/parse"
+
+import "pkg/binate/asm/aarch64/isa"
+
+// Register classes of an AArch64 register name (parseA64Reg).  The zero registers
+// and SP share encoding 31 with each other, so an operand's class — not its number
+// — decides whether it is legal where it appears (a base register may be SP but not
+// XZR; a transfer register may be XZR but not SP).
+const (
+	RC_NONE int = iota
+	RC_X               // x0-x30 (and the fp / lr aliases)
+	RC_W               // w0-w30
+	RC_XZR             // xzr
+	RC_WZR             // wzr
+	RC_SP              // sp
+	RC_WSP             // wsp
+	RC_B               // b0-b31 (SIMD&FP 8-bit scalar)
+	RC_H               // h0-h31 (16-bit)
+	RC_S               // s0-s31 (32-bit)
+	RC_D               // d0-d31 (64-bit)
+	RC_Q               // q0-q31 (128-bit)
+	RC_V               // v0-v31 (a whole SIMD&FP vector register; no text form takes one yet)
+)
+
+// lowerChar returns c lowercased if it is an ASCII capital letter.
+func lowerChar(c char) char {
+	if c >= 'A' && c <= 'Z' { return c + 32 }
+	return c
+}
+
+// nameIs reports whether name equals lit case-insensitively (lit is lowercase).
+func nameIs(name *[]readonly char, lit *[]readonly char) bool {
+	if len(name) != len(lit) { return false }
+	for i := 0; i < len(name); i++ {
+		if lowerChar(name[i]) != lit[i] { return false }
+	}
+	return true
+}
+
+// regIndexSuffix parses the decimal register index after name's one-letter prefix,
+// returning -1 unless it is all digits (no sign, no leading zero other than "0")
+// with a value <= max.
+func regIndexSuffix(name *[]readonly char, max int) int {
+	if len(name) < 2 || len(name) > 3 { return -1 }
+	if len(name) == 3 && name[1] == '0' { return -1 }
+	var num int = 0
+	for i := 1; i < len(name); i++ {
+		var c char = name[i]
+		if c < '0' || c > '9' { return -1 }
+		num = num * 10 + cast(int, c) - cast(int, '0')
+	}
+	if num > max { return -1 }
+	return num
+}
+
+// parseA64Reg classifies an AArch64 register name, case-insensitively, returning its
+// encoding number (0-31) and RC_* class, or (-1, RC_NONE) when name is not a
+// register.  General-purpose: x0-x30 / w0-w30, fp (x29), lr (x30), xzr / wzr (also
+// x31 / w31), sp / wsp.  SIMD&FP scalar: b / h / s / d / q followed by 0-31; vector:
+// v0-v31 (classified so that a vector register is never taken for a symbol name).
+func parseA64Reg(name *[]readonly char) (int, int) {
+	if nameIs(name, "sp") { return 31, RC_SP }
+	if nameIs(name, "wsp") { return 31, RC_WSP }
+	if nameIs(name, "xzr") { return 31, RC_XZR }
+	if nameIs(name, "wzr") { return 31, RC_WZR }
+	if nameIs(name, "fp") { return 29, RC_X }
+	if nameIs(name, "lr") { return 30, RC_X }
+	if len(name) < 2 { return -1, RC_NONE }
+	var prefix char = lowerChar(name[0])
+	if prefix == 'x' || prefix == 'w' {
+		// x31 / w31 name the zero register (as xzr / wzr), never SP.
+		var n int = regIndexSuffix(name, 31)
+		if n < 0 { return -1, RC_NONE }
+		if n == 31 {
+			if prefix == 'x' { return 31, RC_XZR }
+			return 31, RC_WZR
+		}
+		if prefix == 'x' { return n, RC_X }
+		return n, RC_W
+	}
+	var cls int = RC_NONE
+	if prefix == 'b' { cls = RC_B }
+	if prefix == 'h' { cls = RC_H }
+	if prefix == 's' { cls = RC_S }
+	if prefix == 'd' { cls = RC_D }
+	if prefix == 'q' { cls = RC_Q }
+	if prefix == 'v' { cls = RC_V }
+	if cls == RC_NONE { return -1, RC_NONE }
+	var fn int = regIndexSuffix(name, 31)
+	if fn < 0 { return -1, RC_NONE }
+	return fn, cls
+}
+
+// rcIsX reports whether a class is a 64-bit general-purpose data register (x0-x30
+// or xzr) — legal as a 64-bit transfer or index register, not as a base.
+func rcIsX(cls int) bool { return cls == RC_X || cls == RC_XZR }
+
+// rcIsW reports whether a class is a 32-bit general-purpose data register (w0-w30
+// or wzr).
+func rcIsW(cls int) bool { return cls == RC_W || cls == RC_WZR }
+
+// Addressing modes of a parsed load/store address (a64Addr.Mode).
+const (
+	ADDR_BASE int = iota // [Xn|SP]
+	ADDR_IMM             // [Xn|SP, #imm]
+	ADDR_PRE             // [Xn|SP, #imm]!
+	ADDR_POST            // [Xn|SP], #imm
+	ADDR_REG             // [Xn|SP, Rm{, <extend> {#amount}}]
+	ADDR_LO12            // [Xn|SP, #:lo12:label]
+	ADDR_GOT_LO12        // [Xn|SP, #:got_lo12:label]
+)
+
+// a64Addr is a parsed load/store address operand.  Base is the base register (an X
+// register or SP); Imm the byte offset of IMM/PRE/POST; for REG, Index / IndexCls
+// the index register and its class, Ext the extend written (an isa.EXT_*; LSL
+// when none), and AmtGiven / Amt the optional `#amount`; Label the symbol of a
+// LO12 / GOT_LO12 page offset.
+type a64Addr struct {
+	Mode     int
+	Base     int
+	Imm      int
+	Index    int
+	IndexCls int
+	Ext      int
+	AmtGiven bool
+	Amt      int
+	Label    @[]char
+}
+
+// parseA64Addr parses a load/store address starting at tok == '[': the base
+// register must be an X register or SP.  Every token of the operand is consumed or
+// rejected — a missing ']', a post-index offset without '#', or anything after the
+// index register other than an extend keyword is an error — so no operand text is
+// silently dropped.  Returns the lexer and token just past the operand and ok=false
+// (with p's error set) on a malformed address.
+func parseA64Addr(p @Parser, l Lexer, tok Token) (Lexer, Token, a64Addr, bool) {
+	var ad a64Addr
+	ad.Ext = isa.EXT_LSL // an X index with no extend keyword
+	if tok.Kind != TOK_LBRACKET {
+		setErr(p, "expected '[' to start a memory address")
+		return l, tok, ad, false
+	}
+	l, tok = LexNext(l)
+	var bcls int = RC_NONE
+	if tok.Kind == TOK_IDENT { ad.Base, bcls = parseA64Reg(tok.Text) }
+	if bcls != RC_X && bcls != RC_SP {
+		setErr(p, "memory base must be an X register or SP")
+		return l, tok, ad, false
+	}
+	l, tok = LexNext(l)
+	if tok.Kind == TOK_RBRACKET {
+		l, tok = LexNext(l)
+		if tok.Kind != TOK_COMMA {
+			ad.Mode = ADDR_BASE
+			return l, tok, ad, true
+		}
+		l, tok = LexNext(l)
+		var ok bool = false
+		if tok.Kind == TOK_HASH {
+			l, tok, ad.Imm, ok = parseHashImmValue(p, l)
+		} else if startsNumericExpr(tok) {
+			l, tok, ad.Imm, ok = parseImmValueAt(p, l, tok)
+		} else {
+			setErr(p, "expected an immediate post-index offset after ']'")
+			return l, tok, ad, false
+		}
+		ad.Mode = ADDR_POST
+		return l, tok, ad, ok
+	}
+	if tok.Kind != TOK_COMMA {
+		setErr(p, "expected ']' or ',' after the memory base register")
+		return l, tok, ad, false
+	}
+	l, tok = LexNext(l)
+	if tok.Kind == TOK_HASH {
+		var peek Lexer = l
+		var pt Token
+		peek, pt = LexNext(peek)
+		if pt.Kind == TOK_COLON {
+			var qit a64Item
+			var okQ bool = false
+			l, tok, qit, okQ = parseQualifiedItem(p, peek)
+			return finishA64AddrSym(p, l, tok, ad, qit, okQ)
+		}
+		return parseA64AddrImm(p, l, ad)
+	}
+	if tok.Kind == TOK_COLON {
+		var cit a64Item
+		var okC bool = false
+		l, tok, cit, okC = parseQualifiedItem(p, l)
+		return finishA64AddrSym(p, l, tok, ad, cit, okC)
+	}
+	if tok.Kind == TOK_IDENT {
+		_, icls := parseA64Reg(tok.Text)
+		if icls == RC_NONE {
+			var sit a64Item
+			var okS bool = false
+			l, tok, sit, okS = parseA64Item(p, l, tok)
+			return finishA64AddrSym(p, l, tok, ad, sit, okS)
+		}
+		return parseA64AddrIndex(p, l, tok, ad)
+	}
+	setErr(p, "expected '#imm' or an index register in the memory address")
+	return l, tok, ad, false
+}
+
+// parseHashImmValue parses the expression after a consumed '#' (l is positioned
+// just past it), returning the lexer / next token and the value; ok=false with p's
+// error set on an invalid expression.
+func parseHashImmValue(p @Parser, l Lexer) (Lexer, Token, int, bool) {
+	var tok Token
+	l, tok = LexNext(l)
+	return parseImmValueAt(p, l, tok)
+}
+
+// parseImmValueAt parses an immediate expression starting at tok (no '#'), returning
+// it as an int; ok=false with p's error set on an invalid expression or a value too
+// large for the host's int.
+func parseImmValueAt(p @Parser, l Lexer, tok Token) (Lexer, Token, int, bool) {
+	var r ExprResult
+	l, tok, r = ParseExpr(l, tok)
+	if !r.Ok {
+		setErr(p, exprErr(r, "invalid immediate expression"))
+		return l, tok, 0, false
+	}
+	if !intFits(r.Val) {
+		setErr(p, "immediate out of range")
+		return l, tok, 0, false
+	}
+	return l, tok, cast(int, r.Val), true
+}
+
+// parseA64AddrImm finishes `[base, #imm` with l just past the '#': an immediate offset
+// closed by ']' with an optional pre-index '!'.
+func parseA64AddrImm(p @Parser, l Lexer, ad a64Addr) (Lexer, Token, a64Addr, bool) {
+	var tok Token
+	var ok bool = false
+	l, tok, ad.Imm, ok = parseHashImmValue(p, l)
+	if !ok { return l, tok, ad, false }
+	if tok.Kind != TOK_RBRACKET {
+		setErr(p, "expected ']' after the memory offset")
+		return l, tok, ad, false
+	}
+	l, tok = LexNext(l)
+	ad.Mode = ADDR_IMM
+	if tok.Kind == TOK_BANG {
+		ad.Mode = ADDR_PRE
+		l, tok = LexNext(l)
+	}
+	return l, tok, ad, true
+}
+
+// finishA64AddrSym finishes `[base, <symbol operand>` given the scanned operand it: a
+// page offset — `#:lo12:sym{+n}` / `sym{+n}@PAGEOFF` (ADDR_LO12) or `#:got_lo12:sym` /
+// `sym@GOTPAGEOFF` (ADDR_GOT_LO12) — closed by ']'.  The addend rides in ad.Imm.
+func finishA64AddrSym(p @Parser, l Lexer, tok Token, ad a64Addr, it a64Item,
+		ok bool) (Lexer, Token, a64Addr, bool) {
+	if !ok { return l, tok, ad, false }
+	if it.Kind != IT_LO12 {
+		setErr(p, "expected a page offset (:lo12:sym or sym@PAGEOFF) in the memory address")
+		return l, tok, ad, false
+	}
+	ad.Mode = ADDR_LO12
+	if it.Spec == SPEC_GOTPAGEOFF { ad.Mode = ADDR_GOT_LO12 }
+	ad.Label = it.Label
+	if !intFits(it.Imm) {
+		setErr(p, "symbol addend out of range")
+		return l, tok, ad, false
+	}
+	ad.Imm = cast(int, it.Imm)
+	if tok.Kind != TOK_RBRACKET {
+		setErr(p, "expected ']' after the page offset")
+		return l, tok, ad, false
+	}
+	l, tok = LexNext(l)
+	return l, tok, ad, true
+}
+
+// parseA64AddrIndex finishes `[base, Rm{, <extend> {#amount}}]` with tok the index
+// register: an X index takes no extend, `lsl #amount`, or `sxtx {#amount}`; a W
+// index requires `uxtw` or `sxtw {#amount}`.  The amount's legality depends on the
+// access size and is checked by the caller.
+func parseA64AddrIndex(p @Parser, l Lexer, tok Token, ad a64Addr) (Lexer, Token, a64Addr, bool) {
+	ad.Index, ad.IndexCls = parseA64Reg(tok.Text)
+	if !rcIsX(ad.IndexCls) && !rcIsW(ad.IndexCls) {
+		setErr(p, "memory index must be an X or W register")
+		return l, tok, ad, false
+	}
+	ad.Mode = ADDR_REG
+	l, tok = LexNext(l)
+	var extGiven bool = false
+	if tok.Kind == TOK_COMMA {
+		l, tok = LexNext(l)
+		if tok.Kind != TOK_IDENT {
+			setErr(p, "expected an extend or shift after the index register")
+			return l, tok, ad, false
+		}
+		extGiven = true
+		if nameIs(tok.Text, "lsl") {
+			ad.Ext = isa.EXT_LSL
+		} else if nameIs(tok.Text, "sxtx") {
+			ad.Ext = isa.EXT_SXTX
+		} else if nameIs(tok.Text, "uxtw") {
+			ad.Ext = isa.EXT_UXTW
+		} else if nameIs(tok.Text, "sxtw") {
+			ad.Ext = isa.EXT_SXTW
+		} else {
+			setErr(p, "expected lsl, sxtx, uxtw or sxtw after the index register")
+			return l, tok, ad, false
+		}
+		var isLsl bool = ad.Ext == isa.EXT_LSL
+		l, tok = LexNext(l)
+		if tok.Kind == TOK_HASH || startsNumericExpr(tok) {
+			var ok bool = false
+			if tok.Kind == TOK_HASH {
+				l, tok, ad.Amt, ok = parseHashImmValue(p, l)
+			} else {
+				l, tok, ad.Amt, ok = parseImmValueAt(p, l, tok)
+			}
+			if !ok { return l, tok, ad, false }
+			ad.AmtGiven = true
+		} else if isLsl {
+			setErr(p, "expected '#amount' after lsl")
+			return l, tok, ad, false
+		}
+	}
+	if rcIsX(ad.IndexCls) && (ad.Ext == isa.EXT_UXTW || ad.Ext == isa.EXT_SXTW) {
+		setErr(p, "an X index takes lsl or sxtx, not uxtw/sxtw")
+		return l, tok, ad, false
+	}
+	if rcIsW(ad.IndexCls) && (!extGiven || ad.Ext == isa.EXT_LSL || ad.Ext == isa.EXT_SXTX) {
+		setErr(p, "a W index requires uxtw or sxtw")
+		return l, tok, ad, false
+	}
+	if tok.Kind != TOK_RBRACKET {
+		setErr(p, "expected ']' after the memory index")
+		return l, tok, ad, false
+	}
+	l, tok = LexNext(l)
+	return l, tok, ad, true
+}

@@ -1,0 +1,460 @@
+package "pkg/binate/asm/parse"
+
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/asm/aarch64/isa"
+
+// AArch64 data-processing instructions, part 1: add/sub (with their cmp / cmn / neg
+// aliases), logical (with tst / mvn), and the register / immediate moves.  Each
+// handler matches the scanned operand list (a64Items), checks every register's class
+// and width, picks the encoding clang's alias rules pick, and emits it through the
+// exact encoders (isa.AddSubImm, …) — or rejects the line.
+
+// rcIsSP reports whether a class is SP or WSP.
+func rcIsSP(cls int) bool { return cls == RC_SP || cls == RC_WSP }
+
+// rcIs64GP reports whether a class is a 64-bit general-purpose register (X, XZR, SP).
+func rcIs64GP(cls int) bool { return cls == RC_X || cls == RC_XZR || cls == RC_SP }
+
+// rcIsGP reports whether a class is any general-purpose register.
+func rcIsGP(cls int) bool { return rcIsX(cls) || rcIsW(cls) || rcIsSP(cls) }
+
+// dpRegAt checks that item i of its is a general-purpose register usable where SP
+// (allowSP) and/or the zero register (allowZR) may or may not appear, and of the
+// width sf; it returns the register number, or -1 with p's error set.
+func dpRegAt(p @Parser, its a64Items, i int, sf bool, allowSP bool, allowZR bool) int {
+	if i >= its.N || its.It[i].Kind != IT_REG || !rcIsGP(its.It[i].Cls) {
+		setErr(p, "expected a general-purpose register operand")
+		return -1
+	}
+	var cls int = its.It[i].Cls
+	if rcIs64GP(cls) != sf {
+		setErr(p, "register operands must all be the same width (all X or all W)")
+		return -1
+	}
+	if rcIsSP(cls) && !allowSP {
+		setErr(p, "SP is not valid in this operand")
+		return -1
+	}
+	if (cls == RC_XZR || cls == RC_WZR) && !allowZR {
+		setErr(p, "the zero register is not valid in this operand")
+		return -1
+	}
+	return its.It[i].Reg
+}
+
+// dpFirstWidth returns the width (sf) of item i if it is a general-purpose register,
+// or false with ok=false (p's error set) otherwise.
+func dpFirstWidth(p @Parser, its a64Items, i int) (bool, bool) {
+	if i >= its.N || its.It[i].Kind != IT_REG || !rcIsGP(its.It[i].Cls) {
+		setErr(p, "expected a general-purpose register operand")
+		return false, false
+	}
+	return rcIs64GP(its.It[i].Cls), true
+}
+
+// dpExpectCount reports an error unless the operand list has exactly n items.
+func dpExpectCount(p @Parser, its a64Items, n int) bool {
+	if its.N != n {
+		setErr(p, "wrong number of operands")
+		return false
+	}
+	return true
+}
+
+// dpShiftAt parses an optional shift modifier at item i (i == its.N: none), returning
+// (shift, amount, ok): kinds allowed by allowROR, the amount required and below the
+// width.  No modifier gives LSL #0.
+func dpShiftAt(p @Parser, its a64Items, i int, sf bool, allowROR bool) (int, int, bool) {
+	if i >= its.N { return aarch64.LSL, 0, true }
+	var m a64Item = its.It[i]
+	if m.Kind != IT_MOD || m.Mod > MOD_ROR || (m.Mod == MOD_ROR && !allowROR) {
+		setErr(p, "expected a shift (lsl, lsr, asr) here")
+		return 0, 0, false
+	}
+	if !m.AmtGiven {
+		setErr(p, "expected a shift amount")
+		return 0, 0, false
+	}
+	var w int = 32
+	if sf { w = 64 }
+	if m.Amt >= w {
+		setErr(p, "shift amount out of range for the register width")
+		return 0, 0, false
+	}
+	return m.Mod, m.Amt, true
+}
+
+// dpAddSubOp maps an add/sub-family mnemonic to its OPS_* operation and whether Rd
+// (cmp, cmn) or Rn (neg, negs) is the implicit zero register; ok=false otherwise.
+func dpAddSubOp(mnem *[]readonly char) (uint32, bool, bool, bool) {
+	if mnemIs(mnem, "add") { return isa.OPS_ADD, false, false, true }
+	if mnemIs(mnem, "adds") { return isa.OPS_ADDS, false, false, true }
+	if mnemIs(mnem, "sub") { return isa.OPS_SUB, false, false, true }
+	if mnemIs(mnem, "subs") { return isa.OPS_SUBS, false, false, true }
+	if mnemIs(mnem, "cmp") { return isa.OPS_SUBS, true, false, true }
+	if mnemIs(mnem, "cmn") { return isa.OPS_ADDS, true, false, true }
+	if mnemIs(mnem, "neg") { return isa.OPS_SUB, false, true, true }
+	if mnemIs(mnem, "negs") { return isa.OPS_SUBS, false, true, true }
+	return 0, false, false, false
+}
+
+// dpAddSub emits the add/sub family: immediate (a negative immediate flips add<->sub,
+// a multiple of 4096 above 4095 takes `lsl #12`), `#:lo12:sym` page offset (ADD),
+// shifted register, and extended register (chosen for an extend modifier, or when Rd
+// or Rn is SP, where the shifted form cannot name SP).
+func dpAddSub(p @Parser, mnem *[]readonly char, its a64Items) {
+	op, rdZero, rnZero, _ := dpAddSubOp(mnem)
+	var setsFlags bool = op == isa.OPS_ADDS || op == isa.OPS_SUBS
+	var sf bool = false
+	var ok bool = false
+	sf, ok = dpFirstWidth(p, its, 0)
+	if !ok { return }
+	var i int = 0
+	var rd int = 31
+	var rdSP bool = false
+	if !rdZero {
+		rdSP = rcIsSP(its.It[0].Cls)
+		i = 1
+	}
+	var rn int = 31
+	var rnSP bool = false
+	if !rnZero {
+		if i >= its.N || its.It[i].Kind != IT_REG {
+			setErr(p, "expected a register operand")
+			return
+		}
+		rnSP = rcIsSP(its.It[i].Cls)
+		i = i + 1
+	}
+	if i >= its.N {
+		setErr(p, "missing the last operand")
+		return
+	}
+	var last a64Item = its.It[i]
+	if last.Kind == IT_IMM && !rnZero {
+		if !rdZero { rd = dpRegAt(p, its, 0, sf, !setsFlags, setsFlags) }
+		rn = dpRegAt(p, its, i - 1, sf, true, false)
+		if p.HasError { return }
+		dpAddSubImm(p, op, sf, rd, rn, last.Imm, its, i + 1)
+		return
+	}
+	if last.Kind == IT_LO12 && last.Spec == SPEC_NONE && op == isa.OPS_ADD && !rdZero && !rnZero &&
+			its.N == i + 1 {
+		rd = dpRegAt(p, its, 0, sf, true, false)
+		rn = dpRegAt(p, its, i - 1, sf, true, false)
+		if p.HasError { return }
+		if !intFits(last.Imm) {
+			setErr(p, "symbol addend out of range")
+			return
+		}
+		isa.AddSubLo12(p.Asm, sf, rd, rn, last.Label, cast(int, last.Imm))
+		return
+	}
+	if last.Kind != IT_REG {
+		setErr(p, "expected a register or an immediate as the last add/sub operand")
+		return
+	}
+	var hasMod bool = its.N > i + 1
+	var isExt bool = hasMod && its.It[i + 1].Kind == IT_MOD && its.It[i + 1].Mod >= MOD_UXTB
+	if isExt || rdSP || rnSP {
+		dpAddSubExt(p, op, sf, setsFlags, its, rdZero, rnZero, i)
+		return
+	}
+	if !rdZero { rd = dpRegAt(p, its, 0, sf, false, true) }
+	if !rnZero { rn = dpRegAt(p, its, i - 1, sf, false, true) }
+	var rm int = dpRegAt(p, its, i, sf, false, true)
+	if p.HasError { return }
+	shift, amt, okS := dpShiftAt(p, its, i + 1, sf, false)
+	if !okS { return }
+	if its.N > i + 2 {
+		setErr(p, "too many operands")
+		return
+	}
+	isa.AddSubShifted(p.Asm, op, sf, rd, rn, rm, shift, amt)
+}
+
+// dpAddSubImm emits the immediate form for value v, with an optional `lsl #0|#12`
+// modifier at item m.
+func dpAddSubImm(p @Parser, op uint32, sf bool, rd int, rn int, v int64, its a64Items, m int) {
+	var shift12 bool = false
+	var explicit bool = false
+	if m < its.N {
+		var mi a64Item = its.It[m]
+		if its.N > m + 1 || mi.Kind != IT_MOD || mi.Mod != MOD_LSL || !mi.AmtGiven ||
+				(mi.Amt != 0 && mi.Amt != 12) {
+			setErr(p, "an add/sub immediate takes only `lsl #0` or `lsl #12`")
+			return
+		}
+		shift12 = mi.Amt == 12
+		explicit = true
+	}
+	if v < 0 {
+		if v < -0xFFFFFF {
+			setErr(p, "add/sub immediate out of range")
+			return
+		}
+		v = 0 - v
+		if op == isa.OPS_ADD {
+			op = isa.OPS_SUB
+		} else if op == isa.OPS_SUB {
+			op = isa.OPS_ADD
+		} else if op == isa.OPS_ADDS {
+			op = isa.OPS_SUBS
+		} else {
+			op = isa.OPS_ADDS
+		}
+	}
+	if !explicit && v > 4095 && v % 4096 == 0 && v / 4096 <= 4095 {
+		v = v / 4096
+		shift12 = true
+	}
+	if v > 4095 {
+		setErr(p, "add/sub immediate out of range [0, 4095] (optionally lsl #12)")
+		return
+	}
+	isa.AddSubImm(p.Asm, op, sf, rd, rn, cast(int, v), shift12)
+}
+
+// dpAddSubExt emits the extended-register form; items: [Rd,] [Rn,] Rm (at i) and an
+// optional extend (or `lsl #n`, meaning UXTX / UXTW) at i+1.
+func dpAddSubExt(p @Parser, op uint32, sf bool, setsFlags bool, its a64Items, rdZero bool,
+		rnZero bool, i int) {
+	if rnZero {
+		setErr(p, "SP is not valid in this operand")
+		return
+	}
+	var rd int = 31
+	if !rdZero { rd = dpRegAt(p, its, 0, sf, !setsFlags, setsFlags) }
+	var rn int = dpRegAt(p, its, i - 1, sf, true, false)
+	if p.HasError { return }
+	var ext int = isa.XT_UXTW
+	if sf { ext = isa.XT_UXTX }
+	var amt int = 0
+	if its.N > i + 1 {
+		var mi a64Item = its.It[i + 1]
+		if its.N > i + 2 || mi.Kind != IT_MOD || (mi.Mod != MOD_LSL && mi.Mod < MOD_UXTB) {
+			setErr(p, "expected an extend (uxtb..sxtx) or lsl after the index register")
+			return
+		}
+		if mi.Mod == MOD_LSL && !mi.AmtGiven {
+			setErr(p, "expected a shift amount")
+			return
+		}
+		if mi.Mod >= MOD_UXTB { ext = mi.Mod - MOD_UXTB }
+		amt = mi.Amt
+		if amt > 4 {
+			setErr(p, "extend shift amount out of range [0, 4]")
+			return
+		}
+	}
+	// The 64-bit form takes an X Rm for uxtx / sxtx and a W Rm for the narrower
+	// extends; the 32-bit form always takes a W Rm, whichever of the eight extends.
+	var xRm bool = sf && (ext == isa.XT_UXTX || ext == isa.XT_SXTX)
+	var m a64Item = its.It[i]
+	if m.Kind != IT_REG || !((rcIsX(m.Cls) && xRm) || (rcIsW(m.Cls) && !xRm)) {
+		setErr(p, "the extended register must be X for a 64-bit uxtx/sxtx, W otherwise")
+		return
+	}
+	isa.AddSubExtended(p.Asm, op, sf, rd, rn, m.Reg, ext, amt)
+}
+
+// dpLogicalOp maps a logical mnemonic to its LG_* operation (with LG_NOT for the
+// inverted forms) and whether Rd (tst) or Rn (mvn) is the implicit zero register.
+func dpLogicalOp(mnem *[]readonly char) (uint32, bool, bool, bool) {
+	if mnemIs(mnem, "and") { return isa.LG_AND, false, false, true }
+	if mnemIs(mnem, "orr") { return isa.LG_ORR, false, false, true }
+	if mnemIs(mnem, "eor") { return isa.LG_EOR, false, false, true }
+	if mnemIs(mnem, "ands") { return isa.LG_ANDS, false, false, true }
+	if mnemIs(mnem, "bic") { return isa.LG_AND | isa.LG_NOT, false, false, true }
+	if mnemIs(mnem, "orn") { return isa.LG_ORR | isa.LG_NOT, false, false, true }
+	if mnemIs(mnem, "eon") { return isa.LG_EOR | isa.LG_NOT, false, false, true }
+	if mnemIs(mnem, "bics") { return isa.LG_ANDS | isa.LG_NOT, false, false, true }
+	if mnemIs(mnem, "tst") { return isa.LG_ANDS, true, false, true }
+	if mnemIs(mnem, "mvn") { return isa.LG_ORR | isa.LG_NOT, false, true, true }
+	return 0, false, false, false
+}
+
+// dpLogical emits the logical family: a bitmask immediate (an inverted mnemonic —
+// bic, orn, eon, bics — takes the complement of its immediate through the plain op),
+// or a shifted register (ROR allowed).
+func dpLogical(p @Parser, mnem *[]readonly char, its a64Items) {
+	op, rdZero, rnZero, _ := dpLogicalOp(mnem)
+	var base uint32 = op & (0xFFFFFFFF ^ isa.LG_NOT)
+	var inverted bool = op != base
+	var setsFlags bool = base == isa.LG_ANDS
+	var sf bool = false
+	var ok bool = false
+	sf, ok = dpFirstWidth(p, its, 0)
+	if !ok { return }
+	var i int = 0
+	var rd int = 31
+	if !rdZero { i = 1 }
+	var rn int = 31
+	var rnIdx int = -1
+	if !rnZero {
+		rnIdx = i
+		i = i + 1
+	}
+	if i >= its.N {
+		setErr(p, "missing the last operand")
+		return
+	}
+	if its.It[i].Kind == IT_IMM {
+		if rnZero || its.N != i + 1 {
+			setErr(p, "wrong operands for a logical immediate")
+			return
+		}
+		// The immediate form's Rd 31 is SP for AND/ORR/EOR and XZR for ANDS.
+		if !rdZero { rd = dpRegAt(p, its, 0, sf, !setsFlags, setsFlags) }
+		rn = dpRegAt(p, its, rnIdx, sf, false, true)
+		if p.HasError { return }
+		var v uint64 = cast(uint64, its.It[i].Imm)
+		if inverted {
+			v = invertLogicalImm(p, v, sf)
+			if p.HasError { return }
+		}
+		isa.LogicalImm(p.Asm, base, sf, rd, rn, v)
+		return
+	}
+	if !rdZero { rd = dpRegAt(p, its, 0, sf, false, true) }
+	if !rnZero { rn = dpRegAt(p, its, rnIdx, sf, false, true) }
+	var rm int = dpRegAt(p, its, i, sf, false, true)
+	if p.HasError { return }
+	shift, amt, okS := dpShiftAt(p, its, i + 1, sf, true)
+	if !okS { return }
+	if its.N > i + 2 {
+		setErr(p, "too many operands")
+		return
+	}
+	isa.LogicalShifted(p.Asm, op, sf, rd, rn, rm, shift, amt)
+}
+
+// invertLogicalImm returns the complement, within the register width, of the
+// immediate v of an inverted-immediate alias (bic / bics / orn / eon #imm).  For a W
+// register v's upper half must first be all zero or all one — the rule the direct
+// forms apply (clang's) — so any other value is rejected rather than having its
+// upper half dropped.
+func invertLogicalImm(p @Parser, v uint64, sf bool) uint64 {
+	if sf { return v ^ 0xFFFFFFFFFFFFFFFF }
+	var hi uint64 = v >> 32
+	if hi != 0 && hi != 0xFFFFFFFF {
+		setErr(p, "immediate does not fit a 32-bit register")
+		return 0
+	}
+	return (v ^ 0xFFFFFFFF) & 0xFFFFFFFF
+}
+
+// dpMov emits `mov`: register-to-register (ADD #0 when either side is SP, else ORR
+// from the zero register), or an immediate — MOVZ, else MOVN, else an ORR bitmask,
+// the order clang uses — rejecting a value none of them encodes.
+func dpMov(p @Parser, its a64Items) {
+	if !dpExpectCount(p, its, 2) { return }
+	var sf bool = false
+	var ok bool = false
+	sf, ok = dpFirstWidth(p, its, 0)
+	if !ok { return }
+	if its.It[1].Kind == IT_REG {
+		var sp bool = rcIsSP(its.It[0].Cls) || rcIsSP(its.It[1].Cls)
+		var rd int = dpRegAt(p, its, 0, sf, sp, !sp)
+		var rm int = dpRegAt(p, its, 1, sf, sp, !sp)
+		if p.HasError { return }
+		if sp {
+			isa.AddSubImm(p.Asm, isa.OPS_ADD, sf, rd, rm, 0, false)
+		} else {
+			isa.LogicalShifted(p.Asm, isa.LG_ORR, sf, rd, 31, rm, aarch64.LSL, 0)
+		}
+		return
+	}
+	if its.It[1].Kind != IT_IMM {
+		setErr(p, "mov takes a register or an immediate")
+		return
+	}
+	var toSP bool = rcIsSP(its.It[0].Cls)
+	var rd int = dpRegAt(p, its, 0, sf, true, true)
+	if p.HasError { return }
+	var v uint64 = cast(uint64, its.It[1].Imm)
+	if !sf {
+		var hi uint64 = v >> 32
+		if hi != 0 && !(hi == 0xFFFFFFFF && (v & 0x80000000) != 0) {
+			setErr(p, "mov immediate does not fit a 32-bit register")
+			return
+		}
+		v = v & 0xFFFFFFFF
+	}
+	if !toSP {
+		var chunk int = 0
+		var shift int = 0
+		chunk, shift, ok = movWideChunk(v, sf)
+		if ok {
+			isa.MoveWide(p.Asm, isa.MW_MOVZ, sf, rd, chunk, shift)
+			return
+		}
+		var inv uint64 = v ^ 0xFFFFFFFFFFFFFFFF
+		if !sf { inv = inv & 0xFFFFFFFF }
+		chunk, shift, ok = movWideChunk(inv, sf)
+		if ok {
+			isa.MoveWide(p.Asm, isa.MW_MOVN, sf, rd, chunk, shift)
+			return
+		}
+	}
+	if !isa.IsLogicalImm(v, sf) {
+		setErr(p, "mov immediate is not encodable as MOVZ, MOVN or a bitmask immediate")
+		return
+	}
+	// ORR (immediate)'s Rd 31 is SP, so the zero register cannot take this form.
+	if its.It[0].Cls == RC_XZR || its.It[0].Cls == RC_WZR {
+		setErr(p, "a bitmask-immediate mov cannot target the zero register")
+		return
+	}
+	isa.LogicalImm(p.Asm, isa.LG_ORR, sf, rd, 31, v)
+}
+
+// movWideChunk reports whether v is a single 16-bit chunk at a 16-bit-aligned
+// position within the register width (zero is chunk 0 at shift 0), returning the
+// chunk and its shift.
+func movWideChunk(v uint64, sf bool) (int, int, bool) {
+	var w int = 32
+	if sf { w = 64 }
+	if v == 0 { return 0, 0, true }
+	for s := 0; s < w; s = s + 16 {
+		var chunk uint64 = (v >> cast(uint64, s)) & 0xFFFF
+		if (chunk << cast(uint64, s)) == v { return cast(int, chunk), s, true }
+	}
+	return 0, 0, false
+}
+
+// dpMoveWide emits movz / movn / movk `Rd, #imm16{, lsl #shift}`.
+func dpMoveWide(p @Parser, mnem *[]readonly char, its a64Items) {
+	var op uint32 = isa.MW_MOVZ
+	if mnemIs(mnem, "movn") { op = isa.MW_MOVN }
+	if mnemIs(mnem, "movk") { op = isa.MW_MOVK }
+	if its.N < 2 || its.N > 3 {
+		setErr(p, "wrong number of operands")
+		return
+	}
+	var sf bool = false
+	var ok bool = false
+	sf, ok = dpFirstWidth(p, its, 0)
+	if !ok { return }
+	var rd int = dpRegAt(p, its, 0, sf, false, true)
+	if p.HasError { return }
+	if its.It[1].Kind != IT_IMM {
+		setErr(p, "expected a 16-bit immediate")
+		return
+	}
+	var shift int = 0
+	if its.N == 3 {
+		var m a64Item = its.It[2]
+		if m.Kind != IT_MOD || m.Mod != MOD_LSL || !m.AmtGiven {
+			setErr(p, "expected `lsl #shift`")
+			return
+		}
+		shift = m.Amt
+	}
+	var imm int64 = its.It[1].Imm
+	if imm < 0 || imm > 0xFFFF {
+		setErr(p, "move-wide immediate out of range [0, 65535]")
+		return
+	}
+	isa.MoveWide(p.Asm, op, sf, rd, cast(int, imm), shift)
+}

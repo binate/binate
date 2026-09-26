@@ -1,0 +1,395 @@
+package "pkg/binate/asm/parse"
+
+// Operand lists of the AArch64 data-processing instructions are scanned into a flat
+// list of typed items (register, immediate, shift/extend modifier, condition, label,
+// page offset) before any instruction looks at them.  The scan consumes every token
+// of the line or fails, so an instruction handler sees exactly what was written —
+// nothing trailing is silently ignored — and matches the item shape it accepts.
+
+// Item kinds (a64Item.Kind).
+const (
+	IT_REG int = iota // a register (Reg, Cls)
+	IT_IMM            // an immediate, `#expr` or a bare numeric expression (Imm)
+	IT_MOD            // a shift or extend modifier with optional amount (Mod, Amt, AmtGiven)
+	IT_COND           // a condition code (Cond)
+	IT_LABEL          // a symbol with optional addend and page specifier (Label, Imm, Spec)
+	IT_LO12           // a page offset: `#:lo12:sym{+n}` or `sym{+n}@PAGEOFF` (Label, Imm, Spec)
+	IT_DOT            // `.`, the current location, plus an optional offset (Imm)
+)
+
+// Symbol specifiers (a64Item.Spec) of IT_LABEL / IT_LO12 items: the plain symbol, its
+// 4KB page (`sym@PAGE` — the same as the plain symbol for ADRP), its GOT slot's page
+// (`:got:sym` / `sym@GOTPAGE`), the GOT slot's page offset (`sym@GOTPAGEOFF`, an
+// IT_LO12), or a call through the PLT (`sym@PLT`, a plain branch target).
+const (
+	SPEC_NONE int = iota
+	SPEC_PAGE
+	SPEC_GOTPAGE
+	SPEC_GOTPAGEOFF
+	SPEC_PLT
+)
+
+// Modifier kinds (a64Item.Mod): the four shifts, then the eight extends in option-
+// field order (MOD_UXTB + n is extend option n).
+const (
+	MOD_LSL int = iota
+	MOD_LSR
+	MOD_ASR
+	MOD_ROR
+	MOD_UXTB
+	MOD_UXTH
+	MOD_UXTW
+	MOD_UXTX
+	MOD_SXTB
+	MOD_SXTH
+	MOD_SXTW
+	MOD_SXTX
+)
+
+// a64Item is one scanned operand; see the IT_* kinds for which fields are set.  A
+// label's addend (`sym+8`) is carried in Imm.
+type a64Item struct {
+	Kind     int
+	Reg      int
+	Cls      int
+	Imm      int64
+	Mod      int
+	Amt      int
+	AmtGiven bool
+	Cond     int
+	Spec     int
+	Label    @[]char
+}
+
+// maxA64Items bounds an operand list (the longest, e.g. `ccmp Rn, #imm, #nzcv, cond`
+// or `madd Rd, Rn, Rm, Ra`, has four; a modifier makes five).
+const maxA64Items int = 6
+
+// a64Items is a scanned operand list: N items in It.
+type a64Items struct {
+	N  int
+	It [6]a64Item
+}
+
+// parseModName returns the MOD_* kind of a shift/extend keyword, or -1.
+func parseModName(name *[]readonly char) int {
+	if nameIs(name, "lsl") { return MOD_LSL }
+	if nameIs(name, "lsr") { return MOD_LSR }
+	if nameIs(name, "asr") { return MOD_ASR }
+	if nameIs(name, "ror") { return MOD_ROR }
+	if nameIs(name, "uxtb") { return MOD_UXTB }
+	if nameIs(name, "uxth") { return MOD_UXTH }
+	if nameIs(name, "uxtw") { return MOD_UXTW }
+	if nameIs(name, "uxtx") { return MOD_UXTX }
+	if nameIs(name, "sxtb") { return MOD_SXTB }
+	if nameIs(name, "sxth") { return MOD_SXTH }
+	if nameIs(name, "sxtw") { return MOD_SXTW }
+	if nameIs(name, "sxtx") { return MOD_SXTX }
+	return -1
+}
+
+// parseCondName returns the 4-bit condition of a condition-code name
+// (case-insensitive, including the hs / lo aliases and nv), or -1.
+func parseCondName(name *[]readonly char) int {
+	if nameIs(name, "eq") { return 0 }
+	if nameIs(name, "ne") { return 1 }
+	if nameIs(name, "cs") || nameIs(name, "hs") { return 2 }
+	if nameIs(name, "cc") || nameIs(name, "lo") { return 3 }
+	if nameIs(name, "mi") { return 4 }
+	if nameIs(name, "pl") { return 5 }
+	if nameIs(name, "vs") { return 6 }
+	if nameIs(name, "vc") { return 7 }
+	if nameIs(name, "hi") { return 8 }
+	if nameIs(name, "ls") { return 9 }
+	if nameIs(name, "ge") { return 10 }
+	if nameIs(name, "lt") { return 11 }
+	if nameIs(name, "gt") { return 12 }
+	if nameIs(name, "le") { return 13 }
+	if nameIs(name, "al") { return 14 }
+	if nameIs(name, "nv") { return 15 }
+	return -1
+}
+
+// intFits reports whether v survives narrowing to this host's int (a no-op check on
+// a 64-bit host; on a 32-bit one it stops a large value silently wrapping into a
+// small offset or addend).
+func intFits(v int64) bool {
+	return cast(int64, cast(int, v)) == v
+}
+
+// startsNumericExpr reports whether tok can begin a bare numeric expression (an
+// immediate written without '#').
+func startsNumericExpr(tok Token) bool {
+	return tok.Kind == TOK_INT || tok.Kind == TOK_MINUS || tok.Kind == TOK_LPAREN ||
+			tok.Kind == TOK_TILDE || tok.Kind == TOK_PLUS
+}
+
+// parseExprValue parses an expression starting at tok, returning the lexer / next
+// token and its value; ok=false with p's error set on an invalid expression.
+func parseExprValue(p @Parser, l Lexer, tok Token) (Lexer, Token, int64, bool) {
+	var r ExprResult
+	l, tok, r = ParseExpr(l, tok)
+	if !r.Ok {
+		setErr(p, exprErr(r, "invalid immediate expression"))
+		return l, tok, 0, false
+	}
+	return l, tok, r.Val, true
+}
+
+// parseA64Items scans the rest of the line (tok is the first operand token, or EOF
+// for none) into an operand list.  Returns ok=false with p's error set on a malformed
+// operand, more than maxA64Items operands, or anything left after the last one.
+func parseA64Items(p @Parser, l Lexer, tok Token) (a64Items, bool) {
+	var its a64Items
+	if tok.Kind == TOK_EOF { return its, true }
+	for {
+		if its.N >= maxA64Items {
+			setErr(p, "too many operands")
+			return its, false
+		}
+		var it a64Item
+		var ok bool = false
+		l, tok, it, ok = parseA64Item(p, l, tok)
+		if !ok { return its, false }
+		its.It[its.N] = it
+		its.N = its.N + 1
+		if tok.Kind == TOK_EOF { return its, true }
+		if tok.Kind != TOK_COMMA {
+			setErr(p, "unexpected token after an operand (expected ',' or end of line)")
+			return its, false
+		}
+		l, tok = LexNext(l)
+	}
+	return its, false
+}
+
+// parseA64Item scans one operand starting at tok.
+func parseA64Item(p @Parser, l Lexer, tok Token) (Lexer, Token, a64Item, bool) {
+	var it a64Item
+	var ok bool = false
+	if tok.Kind == TOK_HASH {
+		var peek Lexer = l
+		var pt Token
+		peek, pt = LexNext(peek)
+		if pt.Kind == TOK_COLON { return parseQualifiedItem(p, peek) }
+		l, tok = LexNext(l)
+		it.Kind = IT_IMM
+		l, tok, it.Imm, ok = parseExprValue(p, l, tok)
+		return l, tok, it, ok
+	}
+	if startsNumericExpr(tok) {
+		it.Kind = IT_IMM
+		l, tok, it.Imm, ok = parseExprValue(p, l, tok)
+		return l, tok, it, ok
+	}
+	if tok.Kind == TOK_COLON { return parseQualifiedItem(p, l) }
+	if tok.Kind == TOK_DOT {
+		it.Kind = IT_DOT
+		l, tok, it.Imm, ok = parseDotTarget(p, l, tok)
+		return l, tok, it, ok
+	}
+	if tok.Kind != TOK_IDENT {
+		setErr(p, "expected an operand")
+		return l, tok, it, false
+	}
+	var reg int = -1
+	var cls int = RC_NONE
+	reg, cls = parseA64Reg(tok.Text)
+	if cls != RC_NONE {
+		it.Kind = IT_REG
+		it.Reg = reg
+		it.Cls = cls
+		l, tok = LexNext(l)
+		return l, tok, it, true
+	}
+	var mod int = parseModName(tok.Text)
+	if mod >= 0 {
+		it.Kind = IT_MOD
+		it.Mod = mod
+		l, tok = LexNext(l)
+		// The amount follows `#`, or starts with an integer literal (`lsl 3`,
+		// `lsl 1+1`); anything else (`lsl (3)`, `lsl -1`) is not an amount.
+		if tok.Kind == TOK_HASH {
+			l, tok = LexNext(l)
+		} else if tok.Kind != TOK_INT {
+			return l, tok, it, true
+		}
+		var amt int64 = 0
+		l, tok, amt, ok = parseExprValue(p, l, tok)
+		if !ok { return l, tok, it, false }
+		if amt < 0 || amt > 64 {
+			setErr(p, "shift/extend amount out of range")
+			return l, tok, it, false
+		}
+		it.Amt = cast(int, amt)
+		it.AmtGiven = true
+		return l, tok, it, true
+	}
+	var cond int = parseCondName(tok.Text)
+	if cond >= 0 {
+		it.Kind = IT_COND
+		it.Cond = cond
+		l, tok = LexNext(l)
+		return l, tok, it, true
+	}
+	it.Kind = IT_LABEL
+	it.Label = resolveLabel(p, tok.Text)
+	l, tok = LexNext(l)
+	return parseLabelTail(p, l, tok, it)
+}
+
+// parseLabelTail finishes a symbol operand after its name: an optional `+expr` /
+// `-expr` addend (into Imm), then an optional `@PAGE` / `@PAGEOFF` / `@GOTPAGE` /
+// `@GOTPAGEOFF` / `@PLT` specifier, which may itself be followed by the addend.  it is
+// IT_LABEL (or IT_LO12 for a `#:lo12:` operand, which takes no specifier).
+func parseLabelTail(p @Parser, l Lexer, tok Token, it a64Item) (Lexer, Token, a64Item, bool) {
+	if tok.Kind == TOK_PLUS || tok.Kind == TOK_MINUS {
+		var neg bool = tok.Kind == TOK_MINUS
+		l, tok = LexNext(l)
+		var v int64 = 0
+		var ok bool = false
+		l, tok, v, ok = parseAddendTerm(p, l, tok)
+		if !ok { return l, tok, it, false }
+		if neg { v = 0 - v }
+		it.Imm = v
+	}
+	if tok.Kind != TOK_AT { return l, tok, it, true }
+	if it.Kind == IT_LO12 {
+		setErr(p, "a :lo12: operand takes no @ specifier")
+		return l, tok, it, false
+	}
+	l, tok = LexNext(l)
+	if tok.Kind != TOK_IDENT {
+		setErr(p, "expected a symbol specifier after '@'")
+		return l, tok, it, false
+	}
+	if nameIs(tok.Text, "page") {
+		it.Spec = SPEC_PAGE
+	} else if nameIs(tok.Text, "pageoff") {
+		it.Kind = IT_LO12
+	} else if nameIs(tok.Text, "gotpage") {
+		it.Spec = SPEC_GOTPAGE
+	} else if nameIs(tok.Text, "gotpageoff") {
+		it.Kind = IT_LO12
+		it.Spec = SPEC_GOTPAGEOFF
+	} else if nameIs(tok.Text, "plt") {
+		it.Spec = SPEC_PLT
+	} else {
+		setErr(p, "unsupported symbol specifier (@PAGE, @PAGEOFF, @GOTPAGE, @GOTPAGEOFF, @PLT)")
+		return l, tok, it, false
+	}
+	l, tok = LexNext(l)
+	// An addend may also follow the specifier (`sym@PAGE+8`), unless one preceded it.
+	if (tok.Kind == TOK_PLUS || tok.Kind == TOK_MINUS) && it.Imm == 0 {
+		var neg2 bool = tok.Kind == TOK_MINUS
+		l, tok = LexNext(l)
+		var v2 int64 = 0
+		var ok2 bool = false
+		l, tok, v2, ok2 = parseAddendTerm(p, l, tok)
+		if !ok2 { return l, tok, it, false }
+		if neg2 { v2 = 0 - v2 }
+		it.Imm = v2
+	}
+	return l, tok, it, true
+}
+
+// parseDotTarget parses a `.` operand (tok is the TOK_DOT) — the current location —
+// with an optional `+n` / `-n` offset, returning the offset from the instruction.
+func parseDotTarget(p @Parser, l Lexer, tok Token) (Lexer, Token, int64, bool) {
+	var dotEnd int = tok.Col + 1
+	l, tok = LexNext(l)
+	if tok.Kind == TOK_IDENT && tok.Col == dotEnd {
+		setErr(p, "'.'-prefixed labels are not supported")
+		return l, tok, 0, false
+	}
+	var v int64 = 0
+	if tok.Kind == TOK_PLUS || tok.Kind == TOK_MINUS {
+		var neg bool = tok.Kind == TOK_MINUS
+		l, tok = LexNext(l)
+		var ok bool = false
+		l, tok, v, ok = parseAddendTerm(p, l, tok)
+		if !ok { return l, tok, 0, false }
+		if neg { v = 0 - v }
+	}
+	return l, tok, v, true
+}
+
+// parseAddendTerm parses a symbol addend after its '+' / '-': a number, or a
+// parenthesized expression (so `sym+4*2` is not silently read as `sym+4`, and an
+// addend that is itself a sum needs parentheses, as in `sym+(8+4)`).
+func parseAddendTerm(p @Parser, l Lexer, tok Token) (Lexer, Token, int64, bool) {
+	if tok.Kind != TOK_INT && tok.Kind != TOK_LPAREN {
+		setErr(p, "expected a number or a parenthesized expression as the symbol addend")
+		return l, tok, 0, false
+	}
+	var v int64 = 0
+	if tok.Kind == TOK_INT {
+		v = tok.Ival
+		l, tok = LexNext(l)
+	} else {
+		// Only the parenthesized term: `(` expr `)`, so a following `+2` is not folded
+		// into the value the caller then negates (`sym-(4)+2` must not become -6).
+		l, tok = LexNext(l)
+		var r ExprResult
+		l, tok, r = ParseExpr(l, tok)
+		if !r.Ok {
+			setErr(p, exprErr(r, "invalid parenthesized symbol addend"))
+			return l, tok, 0, false
+		}
+		if tok.Kind != TOK_RPAREN {
+			setErr(p, "invalid parenthesized symbol addend")
+			return l, tok, 0, false
+		}
+		v = r.Val
+		l, tok = LexNext(l)
+	}
+	if tok.Kind != TOK_EOF && tok.Kind != TOK_COMMA && tok.Kind != TOK_AT && tok.Kind != TOK_RBRACKET {
+		setErr(p, "a symbol addend must be a single number or a parenthesized expression")
+		return l, tok, 0, false
+	}
+	return l, tok, v, true
+}
+
+// parseQualifiedItem finishes a `:qual:sym{+n}` operand with l positioned so the next
+// token is the qualifier (just past the opening ':'): `:lo12:` (a page offset, IT_LO12),
+// `:got_lo12:` (the GOT slot's page offset, IT_LO12 / SPEC_GOTPAGEOFF), or `:got:`
+// (the GOT slot's page, IT_LABEL / SPEC_GOTPAGE).
+func parseQualifiedItem(p @Parser, l Lexer) (Lexer, Token, a64Item, bool) {
+	var it a64Item
+	var tok Token
+	l, tok = LexNext(l) // the qualifier
+	if tok.Kind != TOK_IDENT {
+		setErr(p, "expected a relocation qualifier (:lo12:, :got:, :got_lo12:)")
+		return l, tok, it, false
+	}
+	if nameIs(tok.Text, "lo12") {
+		it.Kind = IT_LO12
+	} else if nameIs(tok.Text, "got_lo12") {
+		it.Kind = IT_LO12
+		it.Spec = SPEC_GOTPAGEOFF
+	} else if nameIs(tok.Text, "got") {
+		it.Kind = IT_LABEL
+		it.Spec = SPEC_GOTPAGE
+	} else {
+		setErr(p, "unsupported relocation qualifier (:lo12:, :got:, :got_lo12:)")
+		return l, tok, it, false
+	}
+	l, tok = LexNext(l)
+	if tok.Kind != TOK_COLON {
+		setErr(p, "expected ':' after the relocation qualifier")
+		return l, tok, it, false
+	}
+	l, tok = LexNext(l)
+	if tok.Kind != TOK_IDENT {
+		setErr(p, "expected a symbol after the relocation qualifier")
+		return l, tok, it, false
+	}
+	it.Label = resolveLabel(p, tok.Text)
+	var qualKind int = it.Kind
+	l, tok = LexNext(l)
+	// The specifier is already fixed by the qualifier: parse the addend only.
+	it.Kind = IT_LO12
+	l, tok, it, _ = parseLabelTail(p, l, tok, it)
+	it.Kind = qualKind
+	return l, tok, it, !p.HasError
+}

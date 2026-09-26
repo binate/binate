@@ -1,0 +1,314 @@
+package "pkg/binate/asm/parse"
+
+import "pkg/binate/asm/aarch64/isa"
+
+// AArch64 branch and system instructions: branches (with label addends or explicit
+// offsets), branch-to-register and the pointer-authenticated forms, ADR / ADRP,
+// exception generation, hints, barriers, MRS / MSR, SYS / SYSL and the DC / IC cache
+// operations.  Like the other families, each line is scanned into operand items
+// (every token consumed or rejected), each register's class checked, and exactly one
+// instruction emitted through the exact encoders — or the line rejected.
+
+// ctrlXReg returns item i as an X register (x0-x30, or xzr when allowZR), or -1 with
+// p's error set; SP and W registers are rejected.
+func ctrlXReg(p @Parser, its a64Items, i int, allowZR bool) int {
+	if i >= its.N || its.It[i].Kind != IT_REG {
+		setErr(p, "expected an X register")
+		return -1
+	}
+	var cls int = its.It[i].Cls
+	if cls == RC_X || (cls == RC_XZR && allowZR) { return its.It[i].Reg }
+	setErr(p, "expected an X register")
+	return -1
+}
+
+// ctrlTarget reads item i as a branch / ADR target: a label (plain symbol or
+// `sym@PLT`, addend allowed), an explicit immediate offset, or `.` (the current
+// location) plus an optional offset.  Returns (isLabel, label, addend-or-
+// offset, ok).
+func ctrlTarget(p @Parser, its a64Items, i int) (bool, @[]char, int, bool) {
+	var none @[]char
+	if i >= its.N {
+		setErr(p, "missing the branch target")
+		return false, none, 0, false
+	}
+	var it a64Item = its.It[i]
+	if !intFits(it.Imm) {
+		setErr(p, "branch offset or addend out of range")
+		return false, none, 0, false
+	}
+	if it.Kind == IT_IMM || it.Kind == IT_DOT { return false, none, cast(int, it.Imm), true }
+	if it.Kind == IT_LABEL && (it.Spec == SPEC_NONE || it.Spec == SPEC_PLT) {
+		return true, it.Label, cast(int, it.Imm), true
+	}
+	setErr(p, "expected a label or an immediate offset")
+	return false, none, 0, false
+}
+
+// condAliasOf returns the condition of a `b<cond>` alias mnemonic (beq, bne, blo, …),
+// or -1.
+func condAliasOf(mnem *[]readonly char) int {
+	if len(mnem) != 3 || lowerChar(mnem[0]) != 'b' { return -1 }
+	return parseCondName(mnem[1:3])
+}
+
+// parseA64Ctrl parses and emits a branch / system instruction; mnemTok is the
+// mnemonic and l is positioned just after it.  Returns false (consuming nothing) when
+// the mnemonic is not in this family.
+func parseA64Ctrl(p @Parser, l Lexer, mnemTok Token) bool {
+	// bnlint:allow managed-to-raw-assign - mnemTok is a live token; Text outlives the read
+	var mnem *[]readonly char = mnemTok.Text
+	var cond int = condAliasOf(mnem)
+	var tok Token
+	if len(mnem) > 2 && lowerChar(mnem[0]) == 'b' && mnem[1] == '.' {
+		// `b.cond` (one symbol-like token).
+		cond = parseCondName(mnem[2:len(mnem)])
+		if cond < 0 {
+			setErr(p, "unknown condition code in b.<cond>")
+			return true
+		}
+	}
+	var kind int = ctrlKind(mnem)
+	if kind == CK_NONE && cond < 0 { return false }
+	l, tok = LexNext(l)
+	its, ok := parseA64Items(p, l, tok)
+	if !ok { return true }
+	if cond >= 0 {
+		ctrlCondBranch(p, cond, its)
+		return true
+	}
+	if kind == CK_BRANCH { ctrlBranch(p, mnem, its) }
+	if kind == CK_CMPBR { ctrlCompareBranch(p, mnem, its) }
+	if kind == CK_TSTBR { ctrlTestBranch(p, mnem, its) }
+	if kind == CK_BRREG { ctrlBranchReg(p, mnem, its) }
+	if kind == CK_FIXED { ctrlFixedBranch(p, mnem, its) }
+	if kind == CK_ADR { ctrlAdr(p, mnem, its) }
+	if kind == CK_EXC { ctrlException(p, mnem, its) }
+	if kind == CK_HINT { ctrlHint(p, mnem, its) }
+	if kind == CK_BARRIER { ctrlBarrier(p, mnem, its) }
+	if kind == CK_SYSREG { ctrlSysReg(p, mnem, its) }
+	if kind == CK_SYS { ctrlSys(p, mnem, its) }
+	return true
+}
+
+// Branch / system mnemonic families (ctrlKind).
+const (
+	CK_NONE int = iota
+	CK_BRANCH          // b, bl
+	CK_CMPBR           // cbz, cbnz
+	CK_TSTBR           // tbz, tbnz
+	CK_BRREG           // br, blr, ret
+	CK_FIXED           // eret, drps and the pointer-authenticated branches / returns
+	CK_ADR             // adr, adrp
+	CK_EXC             // svc, hvc, smc, brk, hlt, udf, dcps1-3
+	CK_HINT            // nop and the named hints, hint, bti, psb, tsb
+	CK_BARRIER         // clrex, dsb, dmb, isb, sb, ssbb, pssbb
+	CK_SYSREG          // mrs, msr
+	CK_SYS             // sys, sysl, dc, ic
+)
+
+// ctrlKind classifies a branch / system mnemonic, or CK_NONE.
+func ctrlKind(m *[]readonly char) int {
+	if mnemIs(m, "b") || mnemIs(m, "bl") { return CK_BRANCH }
+	if mnemIs(m, "cbz") || mnemIs(m, "cbnz") { return CK_CMPBR }
+	if mnemIs(m, "tbz") || mnemIs(m, "tbnz") { return CK_TSTBR }
+	if mnemIs(m, "br") || mnemIs(m, "blr") || mnemIs(m, "ret") { return CK_BRREG }
+	if fixedBranchOp(m) != 0 { return CK_FIXED }
+	if mnemIs(m, "adr") || mnemIs(m, "adrp") { return CK_ADR }
+	_, isExc := excOp(m)
+	if isExc { return CK_EXC }
+	if hintValue(m) >= 0 || mnemIs(m, "hint") || mnemIs(m, "bti") || mnemIs(m, "psb") ||
+			mnemIs(m, "tsb") {
+		return CK_HINT
+	}
+	if mnemIs(m, "clrex") || mnemIs(m, "dsb") || mnemIs(m, "dmb") || mnemIs(m, "isb") ||
+			mnemIs(m, "sb") || mnemIs(m, "ssbb") || mnemIs(m, "pssbb") {
+		return CK_BARRIER
+	}
+	if mnemIs(m, "mrs") || mnemIs(m, "msr") { return CK_SYSREG }
+	if mnemIs(m, "sys") || mnemIs(m, "sysl") || mnemIs(m, "dc") || mnemIs(m, "ic") { return CK_SYS }
+	return CK_NONE
+}
+
+// ctrlCondBranch emits `b.cond target` / `b<cond> target`.
+func ctrlCondBranch(p @Parser, cond int, its a64Items) {
+	if !dpExpectCount(p, its, 1) { return }
+	isLabel, label, v, ok := ctrlTarget(p, its, 0)
+	if !ok { return }
+	if isLabel {
+		isa.CondBranchLabel(p.Asm, cond, label, v)
+	} else {
+		isa.CondBranchOffset(p.Asm, cond, v)
+	}
+}
+
+// ctrlBranch emits `b target` / `bl target`.
+func ctrlBranch(p @Parser, mnem *[]readonly char, its a64Items) {
+	if !dpExpectCount(p, its, 1) { return }
+	isLabel, label, v, ok := ctrlTarget(p, its, 0)
+	if !ok { return }
+	var link bool = mnemIs(mnem, "bl")
+	if isLabel {
+		isa.BranchLabel(p.Asm, link, label, v)
+	} else {
+		isa.BranchOffset(p.Asm, link, v)
+	}
+}
+
+// ctrlCompareBranch emits `cbz / cbnz Rt, target` (Rt an X or W register, or the zero
+// register).
+func ctrlCompareBranch(p @Parser, mnem *[]readonly char, its a64Items) {
+	if !dpExpectCount(p, its, 2) { return }
+	sf, okW := dpFirstWidth(p, its, 0)
+	if !okW { return }
+	var rt int = dpRegAt(p, its, 0, sf, false, true)
+	if p.HasError { return }
+	isLabel, label, v, ok := ctrlTarget(p, its, 1)
+	if !ok { return }
+	var nz bool = mnemIs(mnem, "cbnz")
+	if isLabel {
+		isa.CompareBranchLabel(p.Asm, nz, sf, rt, label, v)
+	} else {
+		isa.CompareBranchOffset(p.Asm, nz, sf, rt, v)
+	}
+}
+
+// ctrlTestBranch emits `tbz / tbnz Rt, #bit, target`; the bit is 0-31 for a W register
+// and 0-63 for an X register.
+func ctrlTestBranch(p @Parser, mnem *[]readonly char, its a64Items) {
+	if !dpExpectCount(p, its, 3) { return }
+	sf, okW := dpFirstWidth(p, its, 0)
+	if !okW { return }
+	var rt int = dpRegAt(p, its, 0, sf, false, true)
+	if p.HasError { return }
+	var maxBit int = 31
+	if sf { maxBit = 63 }
+	bit, okB := dpImmAt(p, its, 1, 0, maxBit, "test-bit number out of range for the register width")
+	if !okB { return }
+	isLabel, label, v, ok := ctrlTarget(p, its, 2)
+	if !ok { return }
+	var nz bool = mnemIs(mnem, "tbnz")
+	if isLabel {
+		isa.TestBranchLabel(p.Asm, nz, rt, bit, label, v)
+	} else {
+		isa.TestBranchOffset(p.Asm, nz, rt, bit, v)
+	}
+}
+
+// ctrlBranchReg emits `br Xn`, `blr Xn`, or `ret {Xn}` (x30 by default).
+func ctrlBranchReg(p @Parser, mnem *[]readonly char, its a64Items) {
+	var op int = isa.BR_BR
+	if mnemIs(mnem, "blr") { op = isa.BR_BLR }
+	if mnemIs(mnem, "ret") {
+		op = isa.BR_RET
+		if its.N == 0 {
+			isa.BranchReg(p.Asm, op, 30)
+			return
+		}
+	}
+	if !dpExpectCount(p, its, 1) { return }
+	var rn int = ctrlXReg(p, its, 0, true)
+	if p.HasError { return }
+	isa.BranchReg(p.Asm, op, rn)
+}
+
+// fixedBranchOp returns the SB_* word of a fixed-form branch mnemonic, or 0.
+func fixedBranchOp(m *[]readonly char) uint32 {
+	if mnemIs(m, "eret") { return isa.SB_ERET }
+	if mnemIs(m, "drps") { return isa.SB_DRPS }
+	if mnemIs(m, "retaa") { return isa.SB_RETAA }
+	if mnemIs(m, "retab") { return isa.SB_RETAB }
+	if mnemIs(m, "eretaa") { return isa.SB_ERETAA }
+	if mnemIs(m, "eretab") { return isa.SB_ERETAB }
+	if mnemIs(m, "braaz") { return isa.SB_BRAAZ }
+	if mnemIs(m, "brabz") { return isa.SB_BRABZ }
+	if mnemIs(m, "blraaz") { return isa.SB_BLRAAZ }
+	if mnemIs(m, "blrabz") { return isa.SB_BLRABZ }
+	if mnemIs(m, "braa") { return isa.SB_BRAA }
+	if mnemIs(m, "brab") { return isa.SB_BRAB }
+	if mnemIs(m, "blraa") { return isa.SB_BLRAA }
+	if mnemIs(m, "blrab") { return isa.SB_BLRAB }
+	return 0
+}
+
+// ctrlFixedBranch emits a fixed-form branch: no operands (eret, drps, retaa, retab,
+// eretaa, eretab), `Xn` (braaz, brabz, blraaz, blrabz), or `Xn, Xm|SP` (braa, brab,
+// blraa, blrab).
+func ctrlFixedBranch(p @Parser, mnem *[]readonly char, its a64Items) {
+	var op uint32 = fixedBranchOp(mnem)
+	var n int = 0
+	if op == isa.SB_BRAAZ || op == isa.SB_BRABZ || op == isa.SB_BLRAAZ || op == isa.SB_BLRABZ {
+		n = 1
+	}
+	if op == isa.SB_BRAA || op == isa.SB_BRAB || op == isa.SB_BLRAA || op == isa.SB_BLRAB {
+		n = 2
+	}
+	if !dpExpectCount(p, its, n) { return }
+	var rn int = 0
+	var rm int = 0
+	if n >= 1 { rn = ctrlXReg(p, its, 0, true) }
+	if n == 2 {
+		if its.It[1].Kind == IT_REG && its.It[1].Cls == RC_SP {
+			rm = 31
+		} else {
+			rm = ctrlXReg(p, its, 1, false)
+		}
+	}
+	if p.HasError { return }
+	isa.SysBranch(p.Asm, op, rn, rm)
+}
+
+// ctrlAdr emits `adr Xd, target` or `adrp Xd, target`; ADRP also takes `sym@PAGE`,
+// and `:got:sym` / `sym@GOTPAGE` (the page of sym's GOT slot).
+func ctrlAdr(p @Parser, mnem *[]readonly char, its a64Items) {
+	if !dpExpectCount(p, its, 2) { return }
+	var rd int = ctrlXReg(p, its, 0, true)
+	if p.HasError { return }
+	var page bool = mnemIs(mnem, "adrp")
+	var t a64Item = its.It[1]
+	if !intFits(t.Imm) {
+		setErr(p, "adr/adrp offset or addend out of range")
+		return
+	}
+	if t.Kind == IT_IMM || t.Kind == IT_DOT {
+		isa.PCRelOffset(p.Asm, page, rd, cast(int, t.Imm))
+		return
+	}
+	// ADR takes a plain label; ADRP also its page (@PAGE) or its GOT slot's page
+	// (@GOTPAGE / :got:) — never @PLT, which names no page.
+	var specOk bool = t.Spec == SPEC_NONE || (page && (t.Spec == SPEC_PAGE || t.Spec == SPEC_GOTPAGE))
+	if t.Kind != IT_LABEL || !specOk {
+		setErr(p, "expected a label or an immediate offset")
+		return
+	}
+	isa.PCRelLabel(p.Asm, page, t.Spec == SPEC_GOTPAGE, rd, t.Label, cast(int, t.Imm))
+}
+
+// excOp returns the EXC_* word of an exception-generating mnemonic, with ok=false
+// for any other mnemonic.
+func excOp(m *[]readonly char) (uint32, bool) {
+	if mnemIs(m, "svc") { return isa.EXC_SVC, true }
+	if mnemIs(m, "hvc") { return isa.EXC_HVC, true }
+	if mnemIs(m, "smc") { return isa.EXC_SMC, true }
+	if mnemIs(m, "brk") { return isa.EXC_BRK, true }
+	if mnemIs(m, "hlt") { return isa.EXC_HLT, true }
+	if mnemIs(m, "udf") { return isa.EXC_UDF, true }
+	if mnemIs(m, "dcps1") { return isa.EXC_DCPS1, true }
+	if mnemIs(m, "dcps2") { return isa.EXC_DCPS2, true }
+	if mnemIs(m, "dcps3") { return isa.EXC_DCPS3, true }
+	return 0, false
+}
+
+// ctrlException emits `op #imm16`; dcps1-3 may omit the immediate (0).
+func ctrlException(p @Parser, mnem *[]readonly char, its a64Items) {
+	op, _ := excOp(mnem)
+	var dcps bool = op == isa.EXC_DCPS1 || op == isa.EXC_DCPS2 || op == isa.EXC_DCPS3
+	if dcps && its.N == 0 {
+		isa.ExceptionGen(p.Asm, op, 0)
+		return
+	}
+	if !dpExpectCount(p, its, 1) { return }
+	imm, ok := dpImmAt(p, its, 0, 0, 0xFFFF, "exception immediate out of range [0, 65535]")
+	if !ok { return }
+	isa.ExceptionGen(p.Asm, op, imm)
+}

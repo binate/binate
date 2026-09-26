@@ -155,6 +155,7 @@ if [ -z "$MODE" ]; then
     echo ""
     echo "Environment:"
     echo "  BINATE_FLAGS              Extra flags for the compiler (e.g. \"-g\")"
+    echo "  BNI_NO_PASSES=1           builder-comp-int: run bni with every IR pass off"
     exit 1
 fi
 shift

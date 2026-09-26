@@ -231,6 +231,27 @@ build_interp() {
         exit 1
     fi
     echo "Compiled interpreter ready: $COMPILED_INTERP"
+    _set_bni_pass_flags "$compiler"
+}
+
+# _set_bni_pass_flags sets BNI_PASS_FLAGS, the extra bni flags the VM runners
+# pass: empty (bni's own pass set) unless BNI_NO_PASSES=1, which switches every
+# IR optimization pass off (-fno-<pass> for each name `$1 --list-opt-passes`
+# prints — the current tree's compiler, so a newly added pass is covered).  That
+# is the reference VM a miscompiling pass is bisected against, run by one CI lane
+# so it doesn't rot.
+_set_bni_pass_flags() {
+    BNI_PASS_FLAGS=""
+    if [ "${BNI_NO_PASSES:-}" = 1 ]; then
+        for p in $("$1" --list-opt-passes); do
+            BNI_PASS_FLAGS="$BNI_PASS_FLAGS -fno-$p"
+        done
+        if [ -z "$BNI_PASS_FLAGS" ]; then
+            echo "ERROR: BNI_NO_PASSES=1 but $1 --list-opt-passes printed no pass"
+            exit 1
+        fi
+        echo "bni runs with every IR pass off:$BNI_PASS_FLAGS"
+    fi
 }
 
 # Build the compiled interpreter (bni) CROSS-COMPILED for arm32-linux, using

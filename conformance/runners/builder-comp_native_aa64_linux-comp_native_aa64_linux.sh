@@ -64,6 +64,7 @@ runner_setup() {
 }
 
 runner_exec() {
+    _rc=0
     bn="$1"
     root="$2"
     name="$(basename "$bn" .bn)"
@@ -81,11 +82,11 @@ runner_exec() {
         # routes through qemu-aarch64 user-mode emulation.
         if host_is_aarch64; then
             if command -v timeout >/dev/null 2>&1; then
-                timeout 10 "$tmpbin" 2>&1 || true
+                timeout 10 "$tmpbin" 2>&1; _rc=$?
             elif command -v gtimeout >/dev/null 2>&1; then
-                gtimeout 10 "$tmpbin" 2>&1 || true
+                gtimeout 10 "$tmpbin" 2>&1; _rc=$?
             else
-                "$tmpbin" 2>&1 || true
+                "$tmpbin" 2>&1; _rc=$?
             fi
         elif [ -n "$QEMU_AARCH64" ]; then
             # qemu-user shares the host filesystem, but the produced binaries are
@@ -96,20 +97,22 @@ runner_exec() {
             QEMU_LD_PREFIX="${QEMU_LD_PREFIX:-/usr/aarch64-linux-gnu}"
             export QEMU_LD_PREFIX
             if command -v timeout >/dev/null 2>&1; then
-                timeout 10 "$QEMU_AARCH64" "$tmpbin" 2>&1 || true
+                timeout 10 "$QEMU_AARCH64" "$tmpbin" 2>&1; _rc=$?
             elif command -v gtimeout >/dev/null 2>&1; then
-                gtimeout 10 "$QEMU_AARCH64" "$tmpbin" 2>&1 || true
+                gtimeout 10 "$QEMU_AARCH64" "$tmpbin" 2>&1; _rc=$?
             else
-                "$QEMU_AARCH64" "$tmpbin" 2>&1 || true
+                "$QEMU_AARCH64" "$tmpbin" 2>&1; _rc=$?
             fi
         else
             echo "RUN_SKIPPED: no qemu-aarch64 and host is not aarch64"
         fi
     else
         echo "COMPILE_ERROR: $compile_out"
+        _rc=1
     fi
     rm -f "$tmpbin"
     rm -rf "$bdir"
+    return $_rc
 }
 
 runner_cleanup() { cleanup_compilers; }

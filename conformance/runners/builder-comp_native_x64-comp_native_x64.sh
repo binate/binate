@@ -55,6 +55,7 @@ runner_setup() {
 }
 
 runner_exec() {
+    _rc=0
     bn="$1"
     root="$2"
     name="$(basename "$bn" .bn)"
@@ -72,28 +73,30 @@ runner_exec() {
         # routes through qemu-x86_64 user-mode emulation.
         if host_is_x86_64; then
             if command -v timeout >/dev/null 2>&1; then
-                timeout 10 "$tmpbin" 2>&1 || true
+                timeout 10 "$tmpbin" 2>&1; _rc=$?
             elif command -v gtimeout >/dev/null 2>&1; then
-                gtimeout 10 "$tmpbin" 2>&1 || true
+                gtimeout 10 "$tmpbin" 2>&1; _rc=$?
             else
-                "$tmpbin" 2>&1 || true
+                "$tmpbin" 2>&1; _rc=$?
             fi
         elif [ -n "$QEMU_X86_64" ]; then
             if command -v timeout >/dev/null 2>&1; then
-                timeout 10 "$QEMU_X86_64" "$tmpbin" 2>&1 || true
+                timeout 10 "$QEMU_X86_64" "$tmpbin" 2>&1; _rc=$?
             elif command -v gtimeout >/dev/null 2>&1; then
-                gtimeout 10 "$QEMU_X86_64" "$tmpbin" 2>&1 || true
+                gtimeout 10 "$QEMU_X86_64" "$tmpbin" 2>&1; _rc=$?
             else
-                "$QEMU_X86_64" "$tmpbin" 2>&1 || true
+                "$QEMU_X86_64" "$tmpbin" 2>&1; _rc=$?
             fi
         else
             echo "RUN_SKIPPED: no qemu-x86_64 and host is not x86_64"
         fi
     else
         echo "COMPILE_ERROR: $compile_out"
+        _rc=1
     fi
     rm -f "$tmpbin"
     rm -rf "$bdir"
+    return $_rc
 }
 
 runner_cleanup() { cleanup_compilers; }

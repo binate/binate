@@ -57,6 +57,7 @@ runner_setup() {
 }
 
 runner_exec() {
+    _rc=0
     bn="$1"
     root="$2"
     # qemu-user shares the host filesystem, so the arm32 bni resolves the -I/-L
@@ -72,12 +73,13 @@ runner_exec() {
         impls="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
     fi
     if command -v timeout >/dev/null 2>&1; then
-        timeout 20 "$QEMU_ARM" "$ARM32_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$ifaces" -L "$impls" -main-file "$bn" 2>&1 || true
+        timeout 20 "$QEMU_ARM" "$ARM32_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$ifaces" -L "$impls" -main-file "$bn" 2>&1; _rc=$?
     elif command -v gtimeout >/dev/null 2>&1; then
-        gtimeout 20 "$QEMU_ARM" "$ARM32_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$ifaces" -L "$impls" -main-file "$bn" 2>&1 || true
+        gtimeout 20 "$QEMU_ARM" "$ARM32_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$ifaces" -L "$impls" -main-file "$bn" 2>&1; _rc=$?
     else
-        "$QEMU_ARM" "$ARM32_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$ifaces" -L "$impls" -main-file "$bn" 2>&1 || true
+        "$QEMU_ARM" "$ARM32_INTERP" ${CONF_CHECK_NIL:+--check-nil} -I "$ifaces" -L "$impls" -main-file "$bn" 2>&1; _rc=$?
     fi
+    return $_rc
 }
 
 runner_cleanup() { cleanup_compilers; }

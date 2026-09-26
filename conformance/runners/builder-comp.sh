@@ -8,6 +8,7 @@
 runner_setup() { build_gen1; }
 
 runner_exec() {
+    _rc=0
     bn="$1"
     root="$2"
     name="$(basename "$bn" .bn)"
@@ -20,12 +21,14 @@ runner_exec() {
     compile_out=$("$GEN1_COMPILER" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$compile_root")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$compile_root")" \
         --build-dir "$bdir" $BINATE_FLAGS -o "$tmpbin" "$bn" 2>&1) || true
     if [ -x "$tmpbin" ]; then
-        "$tmpbin" 2>&1 || true
+        "$tmpbin" 2>&1; _rc=$?
     else
         echo "COMPILE_ERROR: $compile_out"
+        _rc=1
     fi
     rm -f "$tmpbin"
     rm -rf "$bdir"
+    return $_rc
 }
 
 runner_cleanup() { cleanup_compilers; }

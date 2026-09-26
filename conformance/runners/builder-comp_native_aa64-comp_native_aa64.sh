@@ -14,6 +14,7 @@
 runner_setup() { build_bnc_native_aa64; }
 
 runner_exec() {
+    _rc=0
     bn="$1"
     root="$2"
     name="$(basename "$bn" .bn)"
@@ -32,17 +33,19 @@ runner_exec() {
         # correct binary (empty output) when the full parallel sweep
         # saturated the host — the intermittent native-aa64 flakiness.
         if command -v timeout >/dev/null 2>&1; then
-            timeout 10 "$tmpbin" 2>&1 || true
+            timeout 10 "$tmpbin" 2>&1; _rc=$?
         elif command -v gtimeout >/dev/null 2>&1; then
-            gtimeout 10 "$tmpbin" 2>&1 || true
+            gtimeout 10 "$tmpbin" 2>&1; _rc=$?
         else
-            "$tmpbin" 2>&1 || true
+            "$tmpbin" 2>&1; _rc=$?
         fi
     else
         echo "COMPILE_ERROR: $compile_out"
+        _rc=1
     fi
     rm -f "$tmpbin"
     rm -rf "$bdir"
+    return $_rc
 }
 
 runner_cleanup() { cleanup_compilers; }

@@ -248,7 +248,10 @@ case "$MODE" in
     *_native_arm32_*) OVERRIDE_MODE=$(printf '%s' "$MODE" | sed 's/_native_arm32_/_arm32_/') ;;
 esac
 
-# Load the runner
+# Load the runner.  A runner defines runner_setup, runner_cleanup and
+# runner_exec BN ROOT, which prints the test program's combined stdout+stderr
+# (or a COMPILE_ERROR line) and returns the program's exit status — non-zero
+# when compilation failed.  run_error_test relies on that status.
 RUNNER="$SCRIPT_DIR/runners/${MODE}.sh"
 if [ ! -f "$RUNNER" ]; then
     echo "Unknown mode: $MODE"
@@ -365,7 +368,7 @@ run_test() {
 run_error_test() {
     name="$1"
     bn="$2"         # path to .bn file
-    errorfile="$3"  # path to .error file (each line is a required substring)
+    errorfile="$3"  # path to .error file (each line is a required grep -E regex)
     root="$4"       # root dir for multi-pkg (empty for single-file)
 
     known_fail="$SCRIPT_DIR/${name}.xfail.${MODE}"
@@ -393,12 +396,23 @@ run_error_test() {
     t_end=$(date +%s)
     elapsed=$((t_end - t_start))
 
-    # The program should have failed (non-zero exit or error output)
-    # Check that each line in the .error file matches as a regex in output
+    # The program must have failed (a compile error or a non-zero exit), and
+    # each line in the .error file must match, as a regex, somewhere in the
+    # output.  Matching the message alone is not enough: a program that prints
+    # it and then exits 0 did not fail, and one killed by the runner's timeout
+    # (status 124) hung instead of terminating.
     all_found=true
     missing=""
+    if [ "$rc" -eq 0 ]; then
+        all_found=false
+        missing="(exited 0; an .error test must fail)"
+    elif [ "$rc" -eq 124 ]; then
+        all_found=false
+        missing="(timed out; an .error test must terminate)"
+    fi
     while IFS= read -r pattern || [ -n "$pattern" ]; do
         [ -z "$pattern" ] && continue
+        $all_found || break
         if ! echo "$actual" | grep -qE "$pattern"; then
             all_found=false
             missing="$pattern"

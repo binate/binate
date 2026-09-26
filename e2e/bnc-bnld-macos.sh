@@ -104,4 +104,72 @@ build_run() {
 build_run "--backend native --target aarch64-darwin" native
 build_run "--target aarch64-darwin" llvm
 
+# ----- LLVM -O2: PAGEOFF12 on every load/store access size -----
+# clang -O2 addresses byte/halfword/word globals with `adrp` + LDRB/LDRH/32-bit LDR
+# `:lo12:` and vectorizes the fill loop with a 128-bit constant-pool `ldr q` — so the
+# object carries ARM64_RELOC_PAGEOFF12 on 8/16/32/128-bit accesses, each of whose imm12
+# is scaled by its own access size.  Each global is WRITTEN through its address (an
+# `adrp` + ADD `:lo12:`, whose page offset is unscaled) by the out-of-package rt.MemCopy
+# the optimizer cannot see through, then READ back by sumGlobals — called through a
+# function pointer so it is not inlined into main — with its own `adrp` + sized `:lo12:`
+# loads.  A wrongly-scaled load/store PAGEOFF12 reads a different address than the ADD
+# computed, so the sum comes out wrong (exit 1, not 42); the fill-and-sum likewise
+# catches a wrongly-scaled 128-bit constant-pool load.  (Writing the globals with plain
+# stores would not do: a store and a load mis-scaled alike round-trip through the same
+# wrong address.)
+cat > "$TMP/lo12.bn" <<'BN'
+package "main"
+
+import "pkg/builtins/rt"
+import "pkg/std/os"
+
+var g8 uint8
+var g16 uint16
+var g32 uint32
+
+// reader holds sumGlobals; main calls it through this package variable, reloaded
+// after the opaque rt.MemCopy calls, so the optimizer cannot inline the reads into
+// main and reuse main's computed addresses — sumGlobals materializes each global's
+// address itself, with a direct sized :lo12: load.
+var reader *func() int
+
+func sumGlobals() int {
+	return cast(int, g8) + cast(int, g16) + cast(int, g32)
+}
+
+func fillSum() int {
+	var s @[]uint8 = make_slice(uint8, 256)
+	for k := 0; k < 256; k++ { s[k] = cast(uint8, k) }
+	var sum int = 0
+	for k := 0; k < 256; k++ { sum = sum + cast(int, s[k]) }
+	return sum // 32640
+}
+
+func main() {
+	reader = sumGlobals
+	var v8 uint8 = 7
+	var v16 uint16 = 300
+	var v32 uint32 = 70000
+	rt.MemCopy(bit_cast(*uint8, &g8), bit_cast(*uint8, &v8), 1)
+	rt.MemCopy(bit_cast(*uint8, &g16), bit_cast(*uint8, &v16), 2)
+	rt.MemCopy(bit_cast(*uint8, &g32), bit_cast(*uint8, &v32), 4)
+	var t int = fillSum() + reader()
+	if t == 32640 + 7 + 300 + 70000 { os.Exit(42) }
+	os.Exit(1)
+}
+BN
+if ! "$BNC" -O2 --target aarch64-darwin --linker bnld -I "$IFACE" -L "$IMPL" \
+        --build-dir "$TMP" -o "$TMP/lo12" "$TMP/lo12.bn" > "$TMP/link_lo12.log" 2>&1; then
+    echo "FAIL: bnc (llvm -O2) --linker bnld failed on the lo12 program" >&2
+    cat "$TMP/link_lo12.log" >&2
+    exit 1
+fi
+_code=0
+"$TMP/lo12" || _code=$?
+if [ "$_code" != 42 ]; then
+    echo "FAIL: llvm -O2 lo12 program expected exit 42, got $_code (mis-scaled PAGEOFF12?)" >&2
+    exit 1
+fi
+echo "PASS: llvm -O2 — PAGEOFF12 on 8/16/32/128-bit loads/stores linked by bnld, exited 42"
+
 echo "ALL PASS: bnc --linker bnld on macOS, native + LLVM backends (self-hosted final link, no ld)"

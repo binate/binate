@@ -14,20 +14,24 @@
 // emits it as a scalar word loop) is #[build(!is(arch, "aarch64"))]-gated off,
 // and this defines the same rt.MemZero symbol instead.
 //
-// A leaf using only x0-x5 — no stack frame, no callee-saved registers.  size<=0
-// is a no-op (the portable body aborts on size<0; that path is never hit — Alloc
-// only passes a non-negative payload size).  DC ZVA never overruns: x0 is first
-// brought to 64-byte alignment, and a block is zeroed only while >= 64 bytes
-// remain, so every zeroed block lies within [ptr, ptr+size).  Local labels are
-// `L`-prefixed so their branches resolve in-section (Mach-O treats a non-`L`
-// defined symbol as an atom boundary).  `.global_c` gives the symbol the
-// platform C-prefix (`_` on Mach-O, none on ELF).
+// A leaf using only x0-x2 — no stack frame, no callee-saved registers.  size == 0
+// is a no-op (ptr may be nil).  size < 0 aborts, per the rt.bni contract: it
+// tail-branches to rt.Panic with the message "rt.MemZero: size must be >= 0"
+// (rt.Panic takes a raw `*[]readonly char`, passed as data pointer x0 + length
+// x1).  DC ZVA never overruns: x0 is first brought to 64-byte alignment, and a
+// block is zeroed only while >= 64 bytes remain, so every zeroed block lies
+// within [ptr, ptr+size).  Local labels are `L`-prefixed so their branches
+// resolve in-section (Mach-O treats a non-`L` defined symbol as an atom
+// boundary).  `.global_c` gives both the defined MemZero symbol and the
+// referenced Panic symbol the platform C-prefix (`_` on Mach-O, none on ELF),
+// matching the compiler's names for Binate functions.
 .arch aarch64
 .section text
 .global_c bn_F3_3_pkg8_builtins2_rt1_7_MemZero
+.global_c bn_F3_3_pkg8_builtins2_rt1_5_Panic
 bn_F3_3_pkg8_builtins2_rt1_7_MemZero:
  cmp x1, #0
- b.le Lmz_done
+ b.le Lmz_le0
  // Only bother with DC ZVA for large fills — below this the head/tail and the
  // DCZID read outweigh the per-line saving.
  cmp x1, #256
@@ -83,3 +87,13 @@ Lmz_byte:
  cbnz x1, Lmz_byte
 Lmz_done:
  ret
+ // Flags are still those of `cmp x1, #0`: size == 0 returns, size < 0 aborts.
+Lmz_le0:
+ b.lt Lmz_neg
+ ret
+Lmz_neg:
+ adr x0, Lmz_msg
+ mov x1, #29
+ b bn_F3_3_pkg8_builtins2_rt1_5_Panic
+Lmz_msg:
+ .ascii "rt.MemZero: size must be >= 0"

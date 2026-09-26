@@ -9,7 +9,8 @@ load time it adds.  This driver measures both, per pass, with bni's
   - LOAD cost: bni loading a large program (cmd/bnc, run as `--version`, so
     the time is almost all parse + check + IR + passes + lowering).
   - RUN benefit: the benchmarks repo's programs (binary-trees, n-body, ...) at
-    VM-sized inputs.
+    VM-sized inputs.  These times include bni loading the benchmark (small
+    programs, so a small share), so a pass's load cost is not fully excluded.
 
 Pass configurations:
   O0        no pass
@@ -20,8 +21,11 @@ Pass configurations:
 Timing follows explorations/perf-optimization-guide.md: user CPU of the child
 (wait4 rusage, not wall clock), every configuration of a round interleaved with
 the others, the order reversed on alternate rounds so drift cancels, the median
-over rounds reported.  Each run's output is checked against the O0 run of the
-same workload, so a miscompiling configuration is flagged, not timed.
+over rounds reported with the min-max range beside it (the spread of the O0 row
+is the noise floor).  Use an even number of rounds so the reversals balance.
+Each run's output is checked against the O0 run of the same workload; a
+configuration whose output differs, or that exits nonzero, is still timed but
+marked BAD, and the script exits 1.
 
 Usage:
   perf/vm-pass-costs.py --bni <bni> --bench <benchmarks-repo>/bench [--rounds N]
@@ -101,7 +105,10 @@ def run(argv):
         os.close(r)
         os.dup2(w, 1)
         os.dup2(w, 2)
-        os.execv(argv[0], argv)
+        try:
+            os.execv(argv[0], argv)
+        finally:
+            os._exit(127)
     os.close(w)
     chunks = []
     while True:
@@ -118,11 +125,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--bni", required=True)
     ap.add_argument("--bench", required=True, help="the benchmarks repo's bench/ dir")
-    ap.add_argument("--rounds", type=int, default=3)
+    ap.add_argument("--rounds", type=int, default=4, help="an even number")
     ap.add_argument("--configs", default="O0,O2,cum,loo")
     ap.add_argument("--only", default="", help="comma-separated workload names")
     ap.add_argument("--log", default="")
     a = ap.parse_args()
+    if a.rounds < 1 or a.rounds % 2 != 0:
+        ap.error("--rounds must be a positive even number (forward and reversed rounds balance)")
 
     ws = workloads(a.bench, set(filter(None, a.only.split(","))))
     cs = configs(set(a.configs.split(",")))
@@ -150,7 +159,8 @@ def main():
                 print(line, file=log)
                 log.flush()
 
-    # Report: median user seconds, and each config's ratio to O0 per workload.
+    # Report: median user seconds [min-max], and each config's ratio of medians
+    # to O0 per workload.
     cnames = [c[0] for c in cs]
     wnames = [w[0] for w in ws]
     print("| config | " + " | ".join(wnames) + " |")
@@ -158,10 +168,12 @@ def main():
     for c in cnames:
         cells = []
         for w in wnames:
-            med = statistics.median(times[(w, c)])
+            ts = times[(w, c)]
+            med = statistics.median(ts)
             base = statistics.median(times[(w, "O0")])
+            ratio = "%.2f" % (med / base) if base > 0 else "n/a"
             mark = " BAD" if (w, c) in bad else ""
-            cells.append("%.2fs (%.2f)%s" % (med, med / base if base else 0.0, mark))
+            cells.append("%.2fs [%.2f-%.2f] (%s)%s" % (med, min(ts), max(ts), ratio, mark))
         print("| %s | %s |" % (c, " | ".join(cells)))
     return 1 if bad else 0
 

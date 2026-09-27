@@ -118,6 +118,57 @@ func Double(x int) int {
 }
 EOF
 
+# ----- Two packages whose names share the last segment `lib`: the local
+# single-segment package "lib" and pkg/other/lib.  A prompt import of one must
+# rebind `lib` away from the other, and an explicit alias must be honored. ---
+mkdir -p "$TMP/lib" "$TMP/pkg/other/lib"
+cat > "$TMP/lib.bni" <<'EOF'
+package "lib"
+
+type T struct { X int }
+
+const K int = 1000
+EOF
+cat > "$TMP/lib/lib.bn" <<'EOF'
+package "lib"
+EOF
+cat > "$TMP/pkg/other/lib.bni" <<'EOF'
+package "pkg/other/lib"
+
+type T struct {
+    A int
+    B int
+    C int
+}
+
+const K int = 7
+EOF
+cat > "$TMP/pkg/other/lib/lib.bn" <<'EOF'
+package "pkg/other/lib"
+EOF
+OTHERLIB_FIXTURE="$TMP/otherlib_fixture.bn"
+cat > "$OTHERLIB_FIXTURE" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+import "pkg/other/lib"
+
+func main() {
+    testing.Println(lib.K)
+}
+EOF
+ALIASLIB_FIXTURE="$TMP/aliaslib_fixture.bn"
+cat > "$ALIASLIB_FIXTURE" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+import L "lib"
+
+func main() {
+    testing.Println(L.K)
+}
+EOF
+
 # ----- Bad fixture: a module with a setup-time type error (a
 # top-level var whose initializer references an undefined name).
 # NewReplSession surfaces this as a ReplError VALUE that the CLI
@@ -1023,6 +1074,31 @@ pending cycle: B -> A -> B
 # `import "pkg/repldemo"` at the prompt and the loader pulls
 # it in.  After the load + type-check + lower, subsequent
 # prompt entries can call repldemo.Double. ---
+# --- A prompt import REBINDS its name: after `import "lib"`, `lib` is the local
+# package "lib", not the fixture's pkg/other/lib — its T and K. ---
+run_repl "tier5-prompt-import-rebinds-alias" \
+"testing.Println(lib.K)
+import \"lib\"
+var t lib.T = lib.T{X: 8}
+testing.Println(t.X)
+testing.Println(lib.K)
+" \
+"$BANNER
+> 7
+> package lib loaded
+> > 8
+> 1000
+> " "$OTHERLIB_FIXTURE"
+
+# --- A fixture's explicit import alias (`import L "lib"`) resolves at the
+# prompt. ---
+run_repl "tier1-fixture-explicit-alias" \
+"testing.Println(L.K)
+" \
+"$BANNER
+> 1000
+> " "$ALIASLIB_FIXTURE"
+
 run_repl "tier5-mid-session-import-call" \
 'import "pkg/repldemo"
 testing.Println(repldemo.Double(21))

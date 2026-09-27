@@ -142,7 +142,8 @@ if [ -z "$MODE" ]; then
     done
     echo ""
     echo "Test formats:"
-    echo "  NNN_name.bn + .expected   Positive: run and compare stdout"
+    echo "  NNN_name.bn + .expected   Positive: run, compare stdout, require exit 0"
+    echo "    (+ NNN_name.aborts: require a non-zero exit instead — a defined abort)"
     echo "  NNN_name.bn + .error      Negative: must fail with matching error"
     echo "  NNN_name/ directory        Multi-package test (main.bn + pkg/)"
     echo ""
@@ -251,7 +252,7 @@ esac
 # Load the runner.  A runner defines runner_setup, runner_cleanup and
 # runner_exec BN ROOT, which prints the test program's combined stdout+stderr
 # (or a COMPILE_ERROR line) and returns the program's exit status — non-zero
-# when compilation failed.  run_error_test relies on that status.
+# when compilation failed.  run_test and run_error_test check that status.
 RUNNER="$SCRIPT_DIR/runners/${MODE}.sh"
 if [ ! -f "$RUNNER" ]; then
     echo "Unknown mode: $MODE"
@@ -324,12 +325,28 @@ run_test() {
     set_check_nil_env "$name"
     t_start=$(date +%s)
     actual=$(runner_exec "$bn" "$root")
+    rc=$?
     actual=$(strip_signal_msgs "$actual")
     t_end=$(date +%s)
     elapsed=$((t_end - t_start))
 
+    # The program must exit 0, unless a ${name}.aborts marker says the test
+    # pins a defined abort: then it must exit non-zero (and not by the runner's
+    # timeout, 124), after printing exactly the expected output.
+    status_ok=true
+    status_msg=""
+    if [ -f "$SCRIPT_DIR/${name}.aborts" ]; then
+        if [ "$rc" -eq 0 ] || [ "$rc" -eq 124 ]; then
+            status_ok=false
+            status_msg="exit status $rc; a .aborts test must abort"
+        fi
+    elif [ "$rc" -ne 0 ]; then
+        status_ok=false
+        status_msg="exit status $rc; expected 0"
+    fi
+
     expected_content="$(cat "$expected")"
-    if [ "$actual" = "$expected_content" ]; then
+    if [ "$actual" = "$expected_content" ] && $status_ok; then
         if [ -f "$known_fail" ]; then
             # XPASS: xfail marker exists but the test passes — stale xfail.
             if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
@@ -357,6 +374,7 @@ run_test() {
         if [ "$QUIET" -eq 0 ] || [ "$VERBOSE" -eq 1 ]; then
             echo ""
             echo "FAIL: $name [${elapsed}s]"
+            [ -n "$status_msg" ] && echo "  status:   $status_msg"
             echo "  expected: $(head -3 "$expected")"
             echo "  actual:   $(echo "$actual" | head -3)"
         fi

@@ -49,7 +49,14 @@ Optional arguments filter tests by substring match against the test name. Multip
 
 ### Positive tests
 
-`NNN_name.bn` + `NNN_name.expected`: run the program, compare stdout to expected output.
+`NNN_name.bn` + `NNN_name.expected`: run the program, compare stdout to expected output. The
+program must also exit 0.
+
+A positive test that pins a defined non-recoverable abort (the program prints some output, then
+aborts) adds `NNN_name.aborts` (beside the `.bn`, or beside the directory of a multi-package test,
+like `.xfail` markers), whose contents describe the abort: the output must still match
+`.expected` exactly, and the program must exit non-zero (a runner timeout does not count). Unlike
+an `.error` test, this pins that nothing is printed after the abort.
 
 ### Negative tests (error tests)
 

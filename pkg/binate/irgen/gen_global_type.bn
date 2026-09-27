@@ -1,0 +1,151 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/ast"
+import "pkg/binate/irutil"
+import "pkg/binate/types"
+
+// Global-var type inference: the IR type of a top-level `var`.
+
+// resolveGlobalVarType returns the type for a top-level
+// `var` declaration.  When `d.TypeRef` is set, it's the
+// resolved declared type.  When it's nil (untyped — `var x =
+// expr`), the type is inferred from the initializer literal:
+//
+//   var x = 42        → int
+//   var x = 1.5       → float64
+//   var x = true      → bool
+//   var x = 'a'       → char
+//   var x = "hello"   → @[]readonly char
+//
+// For a FUNCTION-VALUE initializer — a bare function reference
+// (`var G = add1`), a generic-function instantiation (`var G =
+// glib.Ident[int]`), or another func-value variable including one of a
+// NAMED func-value type (`type Fn @func(int)int; var base Fn = add1;
+// var G = base`) — the type is the underlying func-value, derived from
+// the checker's resolved initializer type and stripped of any named
+// wrapper (see below).  Returns nil for other non-literal initializers.
+func resolveGlobalVarType(gc @GenCtx, d @ast.Decl) @types.Type {
+	if d.TypeRef != nil {
+		return resolveTypeExpr(gc, d.TypeRef)
+	}
+	if d.Value == nil { return nil }
+	var e @ast.Expr = d.Value
+	if e.Kind == ast.EXPR_INT_LIT { return types.TypInt() }
+	if e.Kind == ast.EXPR_BOOL_LIT { return types.TypBool() }
+	if e.Kind == ast.EXPR_CHAR_LIT { return types.TypChar() }
+	if e.Kind == ast.EXPR_FLOAT_LIT { return types.TypFloat64() }
+	if e.Kind == ast.EXPR_STRING_LIT {
+		return types.MakeManagedSliceType(
+				types.MakeReadonlyType(types.TypUint8()))
+	}
+	// A composite literal's type is its written type (`P{...}`, `Box[int]{...}`,
+	// `[2]int{...}`): resolve it exactly as for an explicitly typed `var g P`.
+	if e.Kind == ast.EXPR_COMPOSITE && e.TypeRef != nil {
+		return resolveTypeExpr(gc, e.TypeRef)
+	}
+	// Function-value initializer: a bare func reference (`var G = add1`) or a
+	// generic-function instantiation (`var G = glib.Ident[int]`) decays to
+	// `@func`, exactly as for a LOCAL `var f = add` (checker defaultType).
+	// IR-gen can't re-derive it here — the same-package func-signature registry
+	// isn't populated until a later pass than this one — but the checker already
+	// resolved the initializer, stamping its type on `Expr.ResolvedTypeID`, so
+	// read that and apply the same TYP_FUNC → @func decay.  (ResolvedTypeID holds
+	// the RAW `func(...)` type, not the decayed one; the package-symbol type IS
+	// decayed but the `main` package is checked single-file and never registered,
+	// so that scope isn't queryable — the expr type is.)  Without this the global
+	// registers as an opaque scalar and its `__init` assignment lowers the
+	// reference to a zero placeholder (no OP_FUNC_VALUE) — a silent miscompile
+	// clang then rejects.  Guarded so the no-checker paths (single-file test gen)
+	// fall back unchanged (nil).
+	if gc.Mod != nil && gc.Mod.Checker != nil && e.ResolvedTypeID != 0 {
+		var t @types.Type = gc.Mod.Checker.ExprType(e.ResolvedTypeID)
+		if t != nil {
+			// Strip NAMED / alias / readonly wrappers to the underlying, exactly as
+			// resolveTypeExpr does for an EXPLICIT declared type: IR-gen represents a
+			// named non-struct type by its underlying, so `var base Fn = add1` (Fn:
+			// `type Fn @func(int)int`) registers a stripped @func slot.  An inferred
+			// `var G = base` reads the checker's view of `base`, which is the NAMED
+			// `Fn` (TYP_NAMED-over-@func); without stripping it here the kind-check
+			// misses, the slot registers as an opaque 8-byte scalar, and __init's
+			// 16-byte func-value store overruns it WHILE the call `G(x)` mis-lowers
+			// to a direct symbol call on a nonexistent `@bn_F..._G`.  Stripping makes
+			// the inferred form register the same @func slot the explicit form does.
+			var u @types.Type = irutil.PeelTransparent(t)
+			if u != nil {
+				if u.Kind == types.TYP_FUNC {
+					return types.MakeManagedFuncValueType(u.Params, u.Results)
+				}
+				// Every other initializer (a composite literal, a call result, a
+				// copy of another var, an untyped constant expression, …) gives
+				// the global the checker's inferred type — the untyped kinds at
+				// their default, as the checker's defaultType does — so it is laid
+				// out exactly like the explicitly typed form.  Left nil, the slot
+				// was a pointer-sized scalar: an aggregate initializer's
+				// temp-storage ADDRESS was stored into it (dangling once __init
+				// returned) and reads saw the wrong type.
+				if u.Kind == types.TYP_UNTYPED_INT { return types.TypInt() }
+				if u.Kind == types.TYP_UNTYPED_FLOAT { return types.TypFloat64() }
+				if u.Kind == types.TYP_UNTYPED_BOOL { return types.TypBool() }
+				if u.Kind == types.TYP_UNTYPED_STRING {
+					return types.MakeManagedSliceType(
+							types.MakeReadonlyType(types.TypUint8()))
+				}
+				// TODO: some checker types differ from IR-gen's representation
+				// (see checkerTypeUnmappable); such a global stays untyped (still
+				// broken) until the checker type is mapped to IR-gen's — see
+				// claude-todo "Package-level var inferred from a
+				// generic-instantiated non-literal initializer".  Tested on the
+				// UNPEELED type: peeling drops an instantiation's named wrapper,
+				// which is what carries its InstDecl.
+				if checkerTypeUnmappable(t, gc.Mod.PkgPath) { return nil }
+				return u
+			}
+		}
+	}
+	return nil
+}
+
+// checkerTypeUnmappable reports whether the checker's type t differs from how
+// IR-gen represents that type, so it cannot serve as a global's IR type as is:
+// it reaches a generic instantiation (named by its source spelling, `Box[int]`,
+// not IR-gen's instantiated name), an interface (spelled with the checker's
+// package form), or — through a pointer, managed pointer or slice — a named type
+// of another package (whose methods IR-gen would then look up in this package).
+// curPkg is this module's package path.
+func checkerTypeUnmappable(t @types.Type, curPkg *[]readonly char) bool {
+	var indirect bool = false
+	for t != nil {
+		if t.InstDecl != nil { return true }
+		if t.Kind == types.TYP_INTERFACE || t.Kind == types.TYP_INTERFACE_VALUE ||
+				t.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+			return true
+		}
+		if indirect && len(t.Pkg) > 0 && !samePkgPath(t.Pkg, curPkg) { return true }
+		if t.Kind == types.TYP_NAMED && t.Underlying != nil {
+			t = t.Underlying
+		} else if t.Kind == types.TYP_ALIAS && t.Target != nil {
+			t = t.Target
+		} else if t.Kind == types.TYP_READONLY || t.Kind == types.TYP_ARRAY {
+			t = t.Elem
+		} else if t.Kind == types.TYP_POINTER || t.Kind == types.TYP_MANAGED_PTR ||
+				t.Kind == types.TYP_SLICE || t.Kind == types.TYP_MANAGED_SLICE {
+			indirect = true
+			t = t.Elem
+		} else {
+			return false
+		}
+	}
+	return false
+}
+
+// samePkgPath compares two package paths, ignoring the surrounding quotes the
+// checker's spelling may carry (`"main"` vs `main`).
+func samePkgPath(a *[]readonly char, b *[]readonly char) bool {
+	return irutil.Streq(unquotePkg(a), unquotePkg(b))
+}
+
+// unquotePkg strips one pair of surrounding double quotes, if present.
+func unquotePkg(p *[]readonly char) *[]readonly char {
+	if len(p) >= 2 && p[0] == '"' && p[len(p) - 1] == '"' { return p[1:len(p) - 1] }
+	return p
+}

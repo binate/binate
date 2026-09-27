@@ -9,16 +9,22 @@ import "pkg/binate/native/fold"
 
 // x64WordBytes is the x64 word size in bytes: the widest integer an immediate
 // operand can stand in for.  The fold predicate and the immediate emitters pass
-// it to the shared position helpers (fold.CmpImmOperand, fold.AddSubImmOperand).
+// it to the shared position helpers (fold.CmpImmOperand, fold.AddSubImmOperand,
+// fold.LogicImmOperand).
 const x64WordBytes int = 8
 
-// x64ImmMax is the largest constant an x64 CMP / ADD / SUB immediate carries:
-// the immediate is a sign-extended imm32, so 2^31-1.
+// x64ImmMax is the largest constant an x64 CMP / ADD / SUB immediate, or a
+// 64-bit AND / OR / XOR immediate, carries: the immediate is a sign-extended
+// imm32, so 2^31-1.
 const x64ImmMax int64 = 2147483647
 
-// x64ImmMin is the smallest constant an x64 CMP / ADD / SUB immediate carries:
-// the sign-extended imm32's -2^31.
+// x64ImmMin is the smallest constant an x64 CMP / ADD / SUB immediate, or a
+// 64-bit AND / OR / XOR immediate, carries: the sign-extended imm32's -2^31.
 const x64ImmMin int64 = -2147483648
+
+// x64Low32Mask selects the low 32 bits of a constant: the only bits a 32-bit
+// (SZ32) AND / OR / XOR reads from its immediate.
+const x64Low32Mask int64 = 0xFFFFFFFF
 
 // x64CmpImm returns (value, true) iff operand argIdx of `user` is a constant in a
 // compare-immediate position (fold.CmpImmOperand) that fits the sign-extended
@@ -46,15 +52,48 @@ func x64AddSubImm(user @ir.Instr, argIdx int) (int64, bool) {
 	return v, true
 }
 
+// x64LogicImm returns (imm, opSz, notForm, true) iff operand argIdx of `user` is a
+// constant in a bitwise-logic-immediate position (fold.LogicImmOperand) that the
+// AND / OR / XOR immediate carries at the op's width.  opSz is the width
+// emitBinop's register path runs the op at (intOpSizeX64): SZ32 for a 32-bit
+// unsigned result, SZ64 for every other one.  A 32-bit op reads only the low 32
+// bits of its immediate, so at SZ32 imm is the constant's low 32 bits, which
+// always fit.  A 64-bit op sign-extends its imm32, so at SZ64 only a value in
+// x64ImmMin..x64ImmMax denotes the constant; a wider one (such as the mask
+// 0xFFFFFFFF, whose imm32 would sign-extend to all ones) does not fit.  A
+// sub-word result runs at SZ64 and is re-narrowed, so its constant must fit the
+// same range.  notForm is true for an XOR with all-ones at the op width (-1 at
+// SZ64, 0xFFFFFFFF at SZ32): x ^ ~0 is ~x, which the emitter lowers as `not`,
+// the same complement form the aa64 and arm32 folds pick (MVN).  Both
+// x64ImmFits and emitLogicImmFoldX64 decide the fit here.
+func x64LogicImm(user @ir.Instr, argIdx int) (int64, int, bool, bool) {
+	var v int64
+	var ok bool
+	v, ok = fold.LogicImmOperand(user, argIdx, x64WordBytes)
+	if !ok { return v, x64.SZ64, false, false }
+	var opSz int = intOpSizeX64(user.Typ)
+	var allOnes int64 = cast(int64, -1)
+	if opSz == x64.SZ32 {
+		v = v & x64Low32Mask
+		allOnes = x64Low32Mask
+	} else if v < x64ImmMin || v > x64ImmMax {
+		return v, opSz, false, false
+	}
+	return v, opSz, user.Op == iropcode.OP_XOR && v == allOnes, true
+}
+
 // x64ImmFits is the x64 predicate for fold.ImmOperandConsts: operand argIdx of
 // `user` can ride an immediate iff it is a compare RHS (x64CmpImm) or an add/sub
-// operand (x64AddSubImm) that fits the sign-extended imm32.  Every other operand
-// position needs its value in a register.
+// operand (x64AddSubImm) that fits the sign-extended imm32, or an and/or/xor
+// operand that fits that op's immediate at its width (x64LogicImm).  Every other
+// operand position needs its value in a register.
 func x64ImmFits(user @ir.Instr, argIdx int) bool {
 	var ok bool
 	_, ok = x64CmpImm(user, argIdx)
 	if ok { return true }
 	_, ok = x64AddSubImm(user, argIdx)
+	if ok { return true }
+	_, _, _, ok = x64LogicImm(user, argIdx)
 	return ok
 }
 
@@ -107,13 +146,7 @@ func emitAddSubImmFoldX64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bo
 		return true
 	}
 
-	var nw int
-	var nsigned bool
-	nw, nsigned = common.SubWordNarrow(ins.Typ, 64)
-	var use32 bool = nw == 32 && !nsigned
-	var opSz int = x64.SZ64
-	if use32 { opSz = x64.SZ32 }
-
+	var opSz int = intOpSizeX64(ins.Typ)
 	var rd int = nextReg(rm, ins.ID)
 	var rdOp x64.Operand = x64.Reg(rd, opSz)
 	x64.Mov(a, rdOp, x64.Reg(reg, opSz))
@@ -122,8 +155,99 @@ func emitAddSubImmFoldX64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bo
 	} else {
 		x64.Sub(a, rdOp, x64.Imm(cast(int, cval)))
 	}
-	if !use32 {
+	if opSz != x64.SZ32 {
 		emitSubWordNarrow(a, rd, ins.Typ)
 	}
 	return true
+}
+
+// emitLogicImmFoldX64 lowers an OP_AND / OP_OR / OP_XOR with a FoldedImm
+// constant operand: the constant rides the ALU immediate (`and`/`or`/`xor rd,
+// #imm`), which emitALU encodes in the short sign-extended imm8 form when the
+// value at the op width allows and as an imm32 otherwise.  All three ops are
+// commutative, so the constant may be either operand; the other supplies the
+// register.  An XOR with all-ones at the op width is a complement and becomes
+// `not rd` (x64LogicImm's notForm).  x64LogicImm gives the op width — the one
+// emitBinop's register path uses — and the immediate at that width, and the
+// sub-word re-narrow matches the register path too (skipped at SZ32, whose op
+// self-clears the top half), so the folded result is bit-identical.
+//
+// The fit is re-verified with x64LogicImm, the check x64ImmFits applied: a
+// folded constant that does not fit its position (outside the sign-extended
+// imm32 of a 64-bit op, an op wider than the word, or both operands folded)
+// records an error and emits nothing, since the constant was never materialized
+// and there is no correct encoding.  Returns false when neither operand is a
+// folded constant, leaving emitBinop's register path to run; true once the
+// instruction is handled, including when an error was recorded, so emitBinop
+// never reads a folded constant as a register.
+func emitLogicImmFoldX64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != iropcode.OP_AND && ins.Op != iropcode.OP_OR && ins.Op != iropcode.OP_XOR {
+		return false
+	}
+	if len(ins.Args) != 2 { return false }
+	var c0 bool = isFoldedImmX64(rm, ins.Args[0])
+	var c1 bool = isFoldedImmX64(rm, ins.Args[1])
+	if !c0 && !c1 { return false }
+
+	// The folded constant is the immediate; the other operand is the register.
+	var ci int = 1
+	if !c1 { ci = 0 }
+	var imm int64
+	var opSz int
+	var notForm bool
+	var ok bool
+	imm, opSz, notForm, ok = x64LogicImm(ins, ci)
+	if !ok {
+		a.SetError("native amd64: folded immediate does not fit its and/or/xor operand")
+		return true
+	}
+	var regArg @ir.Instr = ins.Args[1 - ci]
+	var reg int = getOperand(a, rm, regArg.ID)
+	if reg < 0 {
+		a.SetError("native amd64: and/or/xor with a folded immediate has no register operand")
+		return true
+	}
+
+	var rd int = nextReg(rm, ins.ID)
+	var rdOp x64.Operand = x64.Reg(rd, opSz)
+	// Imm64 carries a SZ32 immediate's full low-32-bit value (up to 2^32-1)
+	// unchanged even on a 32-bit host, where Imm's `int` would not hold it.
+	var immOp x64.Operand = x64.Imm64(imm)
+	x64.Mov(a, rdOp, x64.Reg(reg, opSz))
+	if notForm {
+		x64.Not(a, rdOp)
+	} else if ins.Op == iropcode.OP_AND {
+		x64.And(a, rdOp, immOp)
+	} else if ins.Op == iropcode.OP_OR {
+		x64.Or(a, rdOp, immOp)
+	} else {
+		x64.Xor(a, rdOp, immOp)
+	}
+	if opSz != x64.SZ32 {
+		emitSubWordNarrow(a, rd, ins.Typ)
+	}
+	return true
+}
+
+// ============================================================
+// Fold-candidate marking
+// ============================================================
+
+// markFoldCandidates sets rm's fold flag sets for f.  emitFunc calls it BEFORE
+// register allocation, so the allocator leaves every flagged value — one whose
+// result is never read as a register — unhomed, and the dispatch skips its
+// standalone emission.
+func markFoldCandidates(f @ir.Func, rm @common.RegMap) {
+	// A field GEP folds into a load/store's constant displacement
+	// (emitGetFieldPtr skips it; the access rederives the address inline), and an
+	// integer compare folds into its consuming conditional branch (a flag-setting
+	// CMP + Jcc, no 0/1 boolean materialized via SETcc+MOVZX).
+	rm.FusableFieldGep = fieldFoldSet(f)
+	rm.FusedCmp = fold.BranchFusedCmps(f, 8)
+	// Flag integer constants every use of which rides its user's immediate
+	// operand — a compare RHS (CMP's sign-extended imm32), an ADD/SUB operand (the
+	// ALU's sign-extended imm8/imm32) or an AND/OR/XOR operand (the ALU immediate
+	// at the op's width), per x64ImmFits.  A negative compare RHS folds only into
+	// a signed compare (the imm32 sign-extends).
+	rm.FoldedImm = fold.ImmOperandConsts(f, x64ImmFits)
 }

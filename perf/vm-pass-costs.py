@@ -29,16 +29,32 @@ Each run's output is checked against the O0 run of the same workload; a
 configuration whose output differs, or that exits nonzero, is still timed but
 marked BAD, and the script exits 1.
 
+With --instructions, each configuration's workloads are instead run once under
+callgrind and the table reports instructions executed (deterministic, so it
+resolves load costs far below the timing noise; outputs are not checked).
+Meant for the load workload (--only load:cmd/bnc); --jobs runs that many
+callgrind processes at once, which does not perturb instruction counts.
+
+With --log F, every finished run is appended to F as it completes (round,
+workload, config, result, a hash of its output); --resume reads F back and runs
+only what is missing, so an interrupted measurement continues where it stopped.
+
 Usage:
   perf/vm-pass-costs.py --bni <bni> --bench <benchmarks-repo>/bench [--rounds N]
-                        [--configs O0,O2,cum,loo] [--only <workload>,...] [--log F]
+                        [--configs O0,O2,cum,loo] [--only <workload>,...]
+                        [--log F [--resume]]
+  perf/vm-pass-costs.py --bni <bni> --bench <benchmarks-repo>/bench --instructions
+                        [--jobs N] [--configs ...] [--only ...] [--log F [--resume]]
 
 Requires python3.  The bni is whatever you pass (build it the way the
 measurement should reflect, e.g. at bnc -O2 like the release scripts).
 """
 
 import argparse
+import concurrent.futures
+import hashlib
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -130,6 +146,70 @@ def run(argv):
     return ru.ru_utime, status, b"".join(chunks)
 
 
+def instructions(argv):
+    """Instructions argv executes, counted by callgrind."""
+    _, status, out = run(["/usr/bin/env", "valgrind", "--tool=callgrind",
+                          "--callgrind-out-file=/dev/null"] + argv)
+    m = re.search(rb"Collected : (\d+)", out)
+    if not m:
+        raise RuntimeError("no callgrind count (status %d): %s" % (status, out[-2000:]))
+    return int(m.group(1)), status
+
+
+def read_log(a):
+    """The lines of a previous --log, split on tabs, when resuming."""
+    if not (a.resume and os.path.exists(a.log)):
+        return []
+    with open(a.log) as f:
+        return [l.rstrip("\n").split("\t") for l in f if l.strip()]
+
+
+def open_log(a):
+    return open(a.log, "a" if a.resume else "w") if a.log else None
+
+
+def emit(log, fields):
+    line = "\t".join(str(x) for x in fields)
+    print(line, file=sys.stderr)
+    if log:
+        print(line, file=log)
+        log.flush()
+
+
+def report_instructions(a, ws, cs):
+    counts = {}     # (workload, config) -> (instructions, exit status)
+    for f in read_log(a):
+        counts[(f[0], f[1])] = (int(f[2]), int(f[3]))
+    log = open_log(a)
+    jobs = [(w, c) for w in ws for c in cs if (w[0], c[0]) not in counts]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
+        futs = {ex.submit(instructions, [a.bni] + c[1] + w[1]): (w[0], c[0]) for w, c in jobs}
+        for f in concurrent.futures.as_completed(futs):
+            n, status = f.result()
+            counts[futs[f]] = (n, status)
+            emit(log, [futs[f][0], futs[f][1], n, status])
+    # Report: instructions (billions), ratio to O0, and the step from the
+    # previous row (for the cum: rows, the cost of that pass given the ones
+    # before it).
+    wnames = [w[0] for w in ws]
+    print("| config | " + " | ".join(wnames) + " |")
+    print("|---|" + "---|" * len(wnames))
+    prev = None
+    for cname, _ in cs:
+        cells = []
+        for w in wnames:
+            n, status = counts[(w, cname)]
+            base = counts[(w, "O0")][0]
+            step = ""
+            if prev is not None and cname.startswith("cum:"):
+                step = " %+.2f" % ((n - counts[(w, prev)][0]) / 1e9)
+            mark = " exit=%d" % status if status != 0 else ""
+            cells.append("%.2fG (%.3f)%s%s" % (n / 1e9, n / base, step, mark))
+        print("| %s | %s |" % (cname, " | ".join(cells)))
+        prev = cname if cname.startswith("cum:") or cname == "O0" else prev
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--bni", required=True)
@@ -138,7 +218,14 @@ def main():
     ap.add_argument("--configs", default="O0,VM,O2,cum,loo")
     ap.add_argument("--only", default="", help="comma-separated workload names")
     ap.add_argument("--log", default="")
+    ap.add_argument("--instructions", action="store_true",
+                    help="count instructions under callgrind instead of timing")
+    ap.add_argument("--jobs", type=int, default=1, help="parallel callgrind runs")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue the measurement recorded in --log")
     a = ap.parse_args()
+    if a.resume and not a.log:
+        ap.error("--resume needs --log")
     if a.rounds < 1 or a.rounds % 2 != 0:
         ap.error("--rounds must be a positive even number (forward and reversed rounds balance)")
 
@@ -146,27 +233,33 @@ def main():
     cs = configs(set(a.configs.split(",")))
     if not any(c[0] == "O0" for c in cs):
         cs.insert(0, ("O0", passes_flags(set())))  # the reference for outputs and ratios
-    log = open(a.log, "w") if a.log else None
-
+    if a.instructions:
+        return report_instructions(a, ws, cs)
     times = {}      # (workload, config) -> [seconds]
-    bad = set()     # (workload, config) whose output differs from O0
-    ref = {}        # workload -> O0 output
+    runs = []       # (workload, config, exit status, output hash)
+    done = set()    # (round, workload, config) already measured
+    for f in read_log(a):
+        rnd, wname, cname, t, status, digest = f
+        done.add((int(rnd), wname, cname))
+        times.setdefault((wname, cname), []).append(float(t))
+        runs.append((wname, cname, int(status), digest))
+    log = open_log(a)
     order = [(w, c) for w in ws for c in cs]
     for rnd in range(a.rounds):
         seq = order if rnd % 2 == 0 else list(reversed(order))
         for (wname, wargs), (cname, cargs) in seq:
+            if (rnd, wname, cname) in done:
+                continue
             t, status, out = run([a.bni] + cargs + wargs)
-            key = (wname, cname)
-            if cname == "O0" and wname not in ref:
-                ref[wname] = out
-            if status != 0 or (wname in ref and out != ref[wname]):
-                bad.add(key)
-            times.setdefault(key, []).append(t)
-            line = "%d\t%s\t%s\t%.3f\t%s" % (rnd, wname, cname, t, "BAD" if key in bad else "ok")
-            print(line, file=sys.stderr)
-            if log:
-                print(line, file=log)
-                log.flush()
+            digest = hashlib.sha1(out).hexdigest()
+            times.setdefault((wname, cname), []).append(t)
+            runs.append((wname, cname, status, digest))
+            emit(log, [rnd, wname, cname, "%.3f" % t, status, digest])
+
+    # A run is BAD if it exited nonzero or its output differs from the O0 run
+    # of the same workload.
+    ref = {w: d for w, c, _, d in runs if c == "O0"}
+    bad = {(w, c) for w, c, status, d in runs if status != 0 or d != ref.get(w)}
 
     # Report: median user seconds [min-max], and each config's ratio of medians
     # to O0 per workload.

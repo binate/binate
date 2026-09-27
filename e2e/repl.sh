@@ -169,6 +169,43 @@ func main() {
 }
 EOF
 
+# ----- An impl whose receiver is spelled through the package's own alias of
+# another package's type: pkg/aliaslib's `type LS = aliashome.S; impl *LS : Loc`
+# is aliashome.S's impl. ---
+mkdir -p "$TMP/pkg/aliashome" "$TMP/pkg/aliaslib"
+cat > "$TMP/pkg/aliashome.bni" <<'EOF'
+package "pkg/aliashome"
+
+type S struct { N int }
+
+func (s *S) Label() int
+
+func MkS(n int) S
+EOF
+cat > "$TMP/pkg/aliashome/aliashome.bn" <<'EOF'
+package "pkg/aliashome"
+
+func (s *S) Label() int { return s.N * 10 }
+
+func MkS(n int) S { return S{N: n} }
+EOF
+cat > "$TMP/pkg/aliaslib.bni" <<'EOF'
+package "pkg/aliaslib"
+
+import "pkg/aliashome"
+
+type LS = aliashome.S
+
+interface Loc {
+    Label() int
+}
+
+impl *LS : Loc
+EOF
+cat > "$TMP/pkg/aliaslib/aliaslib.bn" <<'EOF'
+package "pkg/aliaslib"
+EOF
+
 # ----- Bad fixture: a module with a setup-time type error (a
 # top-level var whose initializer references an undefined name).
 # NewReplSession surfaces this as a ReplError VALUE that the CLI
@@ -1098,6 +1135,23 @@ run_repl "tier1-fixture-explicit-alias" \
 "$BANNER
 > 1000
 > " "$ALIASLIB_FIXTURE"
+
+# --- A mid-session import's impl whose receiver is the package's own alias
+# (`impl *LS : Loc`, LS = aliashome.S) keys on aliashome.S — even with a
+# same-named `LS` already declared at the prompt. ---
+run_repl "tier5-mid-session-alias-receiver-impl" \
+"type LS struct { Q int }
+import \"pkg/aliashome\"
+import \"pkg/aliaslib\"
+var s aliashome.S = aliashome.MkS(4)
+var l *aliaslib.Loc = &s
+testing.Println(l.Label())
+" \
+"$BANNER
+> > package pkg/aliashome loaded
+> package pkg/aliaslib loaded
+> > > 40
+> "
 
 run_repl "tier5-mid-session-import-call" \
 'import "pkg/repldemo"

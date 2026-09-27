@@ -26,6 +26,12 @@
 # named skip, not papered over. Every OTHER pkg/std package must still be
 # injected; a future exemption is likewise a deliberate decision to add here.
 #
+# A PURE FORWARDER (scripts/lib/stdlib-forwarders.sh — a .bni of only `expose`
+# declarations, left at a moved package's old path) is not a package to inject:
+# it has no compiled instance and no descriptor entries of its own (spec
+# pkg.expose.dep / pkg.expose.reflect), and every member reached through it is
+# its home's, which this same loop requires to be injected. So it is skipped.
+#
 # Packages are enumerated from the iface tree (one .bni per package — the
 # canonical importable list). The injection set is read from externs.bn so the
 # check stays in sync with that one source of truth (assumes one stdPkg entry
@@ -37,6 +43,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 EXTERNS="$BINATE_DIR/pkg/binate/interp/externs.bn"
 IFACE_STD="$BINATE_DIR/ifaces/stdlib/pkg/std"
+. "$BINATE_DIR/scripts/lib/stdlib-forwarders.sh"
 
 missing=0
 
@@ -49,6 +56,11 @@ for bni in $(find "$IFACE_STD" -name '*.bni' | sort); do
     # pkg/std/debug is the one deliberate carve-out (see the header comment): it
     # walks the VM's own bytecode stack, so it must be lowered, never injected.
     if [ "$pkg" = "pkg/std/debug" ]; then
+        continue
+    fi
+
+    # A pure forwarder has nothing of its own to inject (see the header comment).
+    if is_pure_forwarder "$BINATE_DIR" "$bni" "$pkg"; then
         continue
     fi
 

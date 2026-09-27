@@ -1,5 +1,8 @@
 package "pkg/binate/asm/macho"
 
+import "pkg/binate/asm"
+import "pkg/binate/buf"
+
 // Mach-O relocation encoding helpers: mapping assembler fixup kinds to the
 // relocation_info fields (type, length, pc-relative flag) and baking an
 // inline addend (Mach-O has no addend field).
@@ -11,18 +14,20 @@ package "pkg/binate/asm/macho"
 //
 // Mach-O ARM64 has reloc kinds for ADRP (PAGE21) and ADD/LDR (PAGEOFF12)
 // pairs, plus 26-bit branches. There is no reloc kind for the 19-bit/14-bit
-// conditional branches (FIX_BRANCH19, FIX_BRANCH14) or for ADR
-// (FIX_ADR_LO21) — those are short-range, expected to be resolved within the
-// source section by aarch64.ResolveFixups. Letting them fall through to a
-// reloc would mismap to a wrong instruction encoding (e.g. the old
-// FIX_ADR_LO21 → PAGE21 path used to silently produce a PAGE21 reloc on an
-// ADR instruction, which ld rejected).
+// conditional branches (FIX_BRANCH19, FIX_BRANCH14), the literal load
+// (FIX_LD_PREL_LO19) or ADR (FIX_ADR_LO21) — those are short-range, expected to
+// be resolved within the source atom by aarch64.ResolveFixups; one that is not
+// has no relocation to become and is an error (mapping it to some other kind,
+// e.g. PAGE21 for an ADR, would describe a different instruction).
 func machoRelocType(fixKind int, cpuType int) int {
 	if cpuType == CPU_TYPE_ARM64 {
 		if fixKind == 100 { return ARM64_RELOC_BRANCH26 }
 		if fixKind == 103 { return ARM64_RELOC_PAGE21 } // FIX_ADRP_HI21
 		if fixKind == 105 { return ARM64_RELOC_PAGEOFF12 } // FIX_ADD_LO12
+		// Every lo12 load/store size is a PAGEOFF12: Mach-O has one kind for all,
+		// and the linker reads the access size from the patched instruction.
 		if fixKind == 106 { return ARM64_RELOC_PAGEOFF12 } // FIX_LDR_LO12
+		if fixKind >= 109 && fixKind <= 112 { return ARM64_RELOC_PAGEOFF12 } // FIX_LDST{8,16,32,128}_LO12
 		if fixKind == 107 { return ARM64_RELOC_GOT_LOAD_PAGE21 } // FIX_ADRP_GOT_HI21
 		if fixKind == 108 { return ARM64_RELOC_GOT_LOAD_PAGEOFF12 } // FIX_LD_GOT_LO12
 		if fixKind == 0 { return ARM64_RELOC_UNSIGNED }
@@ -65,7 +70,7 @@ func machoRelocPCRel(fixKind int, cpuType int) int {
 	if fixKind == 103 { return 1 } // ADRP
 	if fixKind == 107 { return 1 } // GOT_LOAD_PAGE21 (ADRP-side)
 	// FIX_LD_GOT_LO12 (108) patches a within-instruction imm12, like
-	// PAGEOFF12 (105/106) — NOT pc-relative; it falls through to 0.
+	// PAGEOFF12 (105/106/109-112) — NOT pc-relative; it falls through to 0.
 	return 0
 }
 
@@ -78,4 +83,127 @@ func bakeAddend(data *[]uint8, offset int, value int, nbytes int) {
 		data[offset + i] = cast(uint8, v & 0xFF)
 		v = v >> 8
 	}
+}
+
+// Count relocations for a given section index
+func countRelocsForSection(a @asm.Assembler, si int, cpuType int) int {
+	var count int = 0
+	for i := 0; i < a.NumRelocs; i++ {
+		if a.Relocs[i].Section == si {
+			count = count + 1
+			if machoNeedsAddendPair(a.Relocs[i], cpuType) { count = count + 1 }
+		}
+	}
+	return count
+}
+
+// machoNeedsAddendPair reports whether rel is an arm64 instruction relocation with a
+// non-zero addend.  relocation_info has no addend field, and arm64 instruction
+// relocations (unlike UNSIGNED data, whose addend is baked inline) carry theirs in an
+// ARM64_RELOC_ADDEND entry immediately before the relocation it applies to.
+func machoNeedsAddendPair(rel asm.Relocation, cpuType int) bool {
+	return cpuType == CPU_TYPE_ARM64 && rel.Kind != 0 && rel.Addend != 0
+}
+
+// machoAddendInline reports whether a relocation of fixKind carries its addend in the
+// relocated field itself: UNSIGNED data (FIX_ABS64 included), and x86-64's BRANCH
+// and SIGNED (the rel32 field holds the addend; the linker adds the target and
+// subtracts the field's end).
+func machoAddendInline(fixKind int, cpuType int) bool {
+	if fixKind == 0 { return true }
+	return cpuType == CPU_TYPE_X86_64 && (fixKind == 300 || fixKind == 301 || fixKind == 302)
+}
+
+// machoAddendOk reports whether a relocation's addend can be represented: zero
+// always; otherwise an inline one (machoAddendInline; an x86-64 rel32 addend must fit
+// 32 bits, an 8-byte UNSIGNED field takes any), or, on arm64, a BRANCH26 / PAGE21 /
+// PAGEOFF12 relocation with an addend that fits ARM64_RELOC_ADDEND's signed 24 bits.
+// A GOT-load relocation has no addend form.
+func machoAddendOk(rel asm.Relocation, cpuType int) bool {
+	if rel.Addend == 0 || rel.Kind == 0 { return true }
+	// An x86-64 FIX_ABS64 is an 8-byte UNSIGNED field: any addend fits.
+	if cpuType == CPU_TYPE_X86_64 && rel.Kind == 301 { return true }
+	if machoAddendInline(rel.Kind, cpuType) {
+		return rel.Addend >= -2147483648 && rel.Addend <= 2147483647
+	}
+	if cpuType != CPU_TYPE_ARM64 { return false }
+	var rtype int = machoRelocType(rel.Kind, cpuType)
+	if rtype != ARM64_RELOC_BRANCH26 && rtype != ARM64_RELOC_PAGE21 && rtype != ARM64_RELOC_PAGEOFF12 {
+		return false
+	}
+	return rel.Addend >= -8388608 && rel.Addend <= 8388607
+}
+
+// writeMachoRelocs appends each section's relocation_info entries (sectRelocCounts[si]
+// of them, as countRelocsForSection counted: an arm64 relocation with an addend is
+// preceded by its ARM64_RELOC_ADDEND entry), remapping symbols through symNewIndex.
+// Returns (bb, false) with a's error set for a fixup Mach-O cannot represent.
+func writeMachoRelocs(bb BinBuf, a @asm.Assembler, sectRelocCounts @[]int, symNewIndex @[]int,
+		cpu_type int) (BinBuf, bool) {
+	for si := 0; si < a.NumSections; si++ {
+		if sectRelocCounts[si] == 0 {
+			continue
+		}
+		for ri := 0; ri < a.NumRelocs; ri++ {
+			var rel asm.Relocation = a.Relocs[ri]
+			if rel.Section != si {
+				continue
+			}
+			var rtype int = machoRelocType(rel.Kind, cpu_type)
+			if rtype < 0 {
+				// The short-range branch / literal / ADR kinds have no Mach-O relocation:
+				// they resolve only within the target's own atom.
+				a.SetError(
+						"macho: no Mach-O relocation for this fixup (a b.cond / cbz / tbz / "
+								"ldr-literal / adr target must be in the same atom: an L-prefixed "
+								"local label, or the symbol this code follows)")
+				return bb, false
+			}
+			if !machoAddendOk(rel, cpu_type) {
+				a.SetError("macho: this relocation cannot carry an addend")
+				return bb, false
+			}
+			if machoNeedsAddendPair(rel, cpu_type) {
+				// ARM64_RELOC_ADDEND: r_address as the paired relocation's, the addend in
+				// r_symbolnum (signed 24 bits), r_pcrel=0, r_length=2, r_extern=0.
+				bb = bb.WriteU32(cast(uint32, rel.Offset))
+				var ainfo uint32 = cast(uint32, rel.Addend & 0x00FFFFFF)
+				ainfo = ainfo | (cast(uint32, 2) << 25)
+				ainfo = ainfo | (cast(uint32, ARM64_RELOC_ADDEND) << 28)
+				bb = bb.WriteU32(ainfo)
+			}
+			// relocation_info: r_address (4 bytes), then r_symbolnum:24, r_pcrel:1,
+			// r_length:2, r_extern:1, r_type:4 — after any ADDEND entry, which precedes
+			// the relocation it applies to.
+			bb = bb.WriteU32(cast(uint32, rel.Offset))
+			var rlength int = machoRelocLength(rel.Kind, cpu_type)
+			var rpcrel int = machoRelocPCRel(rel.Kind, cpu_type)
+			// r_extern=1 selects "by symbol index"; r_extern=0 selects
+			// "by section index". All our relocations are against
+			// named symbols (every fixup goes through a.Symbols), and
+			// Apple's ld rejects address-based relocs (PAGE21,
+			// PAGEOFF12, BRANCH26 on ARM64; SIGNED, BRANCH on x86_64)
+			// with r_extern=0 even for locally-defined targets. We
+			// always have a symtab entry to point to, so use it.
+			var rextern int = 1
+			// Remap through symNewIndex: the symbol table is emitted in
+			// partitioned order, so r_symbolnum must reference the new
+			// position, not the original a.Symbols index.
+			if symNewIndex[rel.Symbol] < 0 {
+				// Every relocation against an unlisted temporary was retargeted
+				// (retargetTemporaryRelocs); one left would name no symbol.
+				a.SetError(
+						buf.Concat(buf.Concat("macho: a relocation targets '", a.Symbols[rel.Symbol].Name),
+								"', which is not in the symbol table"))
+				return bb, false
+			}
+			var info uint32 = cast(uint32, symNewIndex[rel.Symbol] & 0x00FFFFFF)
+			info = info | (cast(uint32, rpcrel & 1) << 24)
+			info = info | (cast(uint32, rlength & 3) << 25)
+			info = info | (cast(uint32, rextern & 1) << 27)
+			info = info | (cast(uint32, rtype & 0xF) << 28)
+			bb = bb.WriteU32(info)
+		}
+	}
+	return bb, true
 }

@@ -115,31 +115,24 @@ EOF
 
 PASSES=0
 FAILS=0
-SKIPS=0
 FAIL_NAMES=""
 
-# check_backend <label> <extra-bnc-flags> <required>
+# check_backend <label> <extra-bnc-flags>
 #   Compile the program to objects with the given backend, archive them, link
-#   the C driver, run, and check the "42 1" result.  required=1 -> a compile
-#   failure is a hard FAIL; required=0 (native) -> producing no objects SKIPs
-#   (the host native backend may not cover this program), but a produced-but-
-#   wrong result FAILs.
+#   the C driver, run, and check the "42 1" result.
+#   A build failure is a FAIL on either backend: bnc has a native backend for
+#   every host architecture it runs on, so a native build failure is a defect.
 check_backend() {
-    label="$1"; extra="$2"; required="$3"
+    label="$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
     echo "[$label] compiling program to objects..."
     if ! "$GEN1" -I "$IFACE" -L "$IMPL" $extra \
             --build-dir "$work" -c "$TMP/prog/main.bn" >"$work/objs.txt" 2>"$work/c.err" \
             || [ ! -s "$work/objs.txt" ]; then
-        if [ "$required" -eq 1 ]; then
-            echo "FAIL: $label: -c produced no objects"
-            tail -8 "$work/c.err" | sed 's/^/    /'
-            FAILS=$((FAILS + 1)); FAIL_NAMES="$FAIL_NAMES $label"
-        else
-            echo "SKIP: $label: native -c unavailable for this host (no objects)"
-            SKIPS=$((SKIPS + 1))
-        fi
+        echo "FAIL: $label: -c produced no objects"
+        tail -8 "$work/c.err" | sed 's/^/    /'
+        FAILS=$((FAILS + 1)); FAIL_NAMES="$FAIL_NAMES $label"
         return
     fi
     # The program artifact must DEFINE bn_init (external) — the property this
@@ -169,14 +162,12 @@ check_backend() {
     fi
 }
 
-# LLVM is required (the fix lives in backend-neutral IR-gen, but LLVM is the
-# always-available backend); native self-skips when the host backend can't emit
-# the program's objects, but must pass when it runs.
-check_backend "llvm"   ""                 1
-check_backend "native" "--backend native" 0
+# The fix lives in backend-neutral IR-gen, so both backends must pass.
+check_backend "llvm"   ""
+check_backend "native" "--backend native"
 
 echo ""
-echo "=== Summary: $PASSES passed, $FAILS failed, $SKIPS skipped ==="
+echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then
     echo "Failed:$FAIL_NAMES"
     exit 1

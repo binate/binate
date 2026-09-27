@@ -21,8 +21,7 @@
 # misplaced counter store either hangs (counter never advances) or prints a wrong
 # sum.  Checked on native -O1 and -O2 (the regression) with an LLVM -O1 control
 # (the two backends must agree) and a native -O0 control.  Each run is bounded by
-# a timeout so a hang is a FAIL, not a stuck test.  The native variants self-skip
-# if the host's native backend can't build this program.
+# a timeout so a hang is a FAIL, not a stuck test.
 #
 # Uses a gen1 bnc built from current source.  Auto-discovered by the e2e runner;
 # no C compiler required.
@@ -44,10 +43,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 PASSES=0
 FAILS=0
-SKIPS=0
 FAIL_NAMES=""
 pass() { echo "PASS: $1"; PASSES=$((PASSES + 1)); }
-skip() { echo "SKIP: $1"; SKIPS=$((SKIPS + 1)); }
 fail() {
     echo "FAIL: $1"
     FAIL_NAMES="$FAIL_NAMES ${1%% *}"
@@ -58,7 +55,7 @@ fail() {
 
 summary() {
     echo ""
-    echo "=== Summary: $PASSES passed, $FAILS failed, $SKIPS skipped ==="
+    echo "=== Summary: $PASSES passed, $FAILS failed ==="
     if [ "$FAILS" -ne 0 ]; then
         echo "Failed:$FAIL_NAMES"
         exit 1
@@ -104,23 +101,19 @@ fi
 IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
 
-# check_variant <label> <extra-bnc-flags> <required>
+# check_variant <label> <extra-bnc-flags>
 #   Build the program with the given flags, run it (bounded by a timeout), and
-#   check the printed sum.  required=1 -> a build failure is a hard FAIL (LLVM);
-#   required=0 -> a native backend that can't build this program on this host
-#   SKIPs (matches the other native e2e tests' self-skip convention).
+#   check the printed sum.
+#   A build failure is a FAIL on either backend: bnc has a native backend for
+#   every host architecture it runs on, so a native build failure is a defect.
 check_variant() {
-    label="$1"; extra="$2"; required="$3"
+    label="$1"; extra="$2"
     work="$TMP/$(echo "$label" | tr ' /' '__')"
     mkdir -p "$work"
     if ! "$GEN1" -I "$IFACE" -L "$IMPL" $extra --build-dir "$work" \
             -o "$work/run" "$TMP/main.bn" >"$work/comp.log" 2>&1 \
             || [ ! -x "$work/run" ]; then
-        if [ "$required" -eq 1 ]; then
-            fail "$label: compile failed" "$(tail -5 "$work/comp.log")"
-        else
-            skip "$label: native backend cannot build this program on this host"
-        fi
+        fail "$label: compile failed" "$(tail -5 "$work/comp.log")"
         return
     fi
     got="$(run_timed 10 "$work/run" 2>&1)"; rc=$?
@@ -135,9 +128,9 @@ check_variant() {
     fi
 }
 
-check_variant "llvm -O1"        "-O1"                    1
-check_variant "native -O0"      "--backend native -O0"  0
-check_variant "native -O1"      "--backend native -O1"  0
-check_variant "native -O2"      "--backend native -O2"  0
+check_variant "llvm -O1"        "-O1"
+check_variant "native -O0"      "--backend native -O0"
+check_variant "native -O1"      "--backend native -O1"
+check_variant "native -O2"      "--backend native -O2"
 
 summary

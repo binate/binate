@@ -29,9 +29,8 @@
 # deliberately omitted: its variadic-HFA rule (AAPCS-VFP base-standard, floats
 # via GP/stack) is a separate mechanism, not the DarwinPCS stack-only rule.
 #
-# Both backends are checked: LLVM (always) and native (--backend native, which
-# on the aa64/x64 CI hosts emits + links this program; self-skips if the host's
-# native backend can't build it).  Built at -O2.
+# Both backends are checked — LLVM and native (--backend native) — and a build
+# failure on either is a FAIL.  Built at -O2.
 #
 # Uses a gen1 bnc built from current source.  Auto-discovered by
 # .github/workflows/e2e-tests.yml on Linux + macOS; skips if no C compiler.
@@ -214,9 +213,13 @@ fi
 IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
 
-# check_backend <label> <extra-bnc-flags> <required>
+# check_backend <label> <extra-bnc-flags>
+#   Compile the C callee, compile+link the Binate program with the given backend,
+#   run, and check the output.
+#   A build failure is a FAIL on either backend: bnc has a native backend for
+#   every host architecture it runs on, so a native build failure is a defect.
 check_backend() {
-    label="$1"; extra="$2"; required="$3"
+    label="$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
     if ! "$CLANG" -c -O2 -o "$work/vhfa.o" "$TMP/vhfa.c" 2>"$work/cc.err"; then
@@ -227,12 +230,8 @@ check_backend() {
             --link-after-objs "$work/vhfa.o" --build-dir "$work" \
             -o "$work/run" "$TMP/main.bn" >"$work/comp.log" 2>&1 \
             || [ ! -x "$work/run" ]; then
-        if [ "$required" -eq 1 ]; then
-            fail "$label: compile/link of the Binate program failed" \
-                 "$(tail -5 "$work/comp.log")"
-        else
-            skip "$label: native backend cannot build this program on this host"
-        fi
+        fail "$label: compile/link of the Binate program failed" \
+             "$(tail -5 "$work/comp.log")"
         return
     fi
     got="$("$work/run" 2>&1)"
@@ -245,7 +244,7 @@ check_backend() {
     fi
 }
 
-check_backend "llvm" "-O2" 1
-check_backend "native" "--backend native -O2" 0
+check_backend "llvm" "-O2"
+check_backend "native" "--backend native -O2"
 
 summary

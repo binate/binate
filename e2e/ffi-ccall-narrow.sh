@@ -18,10 +18,9 @@
 # wide value; the -O2 callee returns the narrow param straight back as `int`,
 # trusting the caller's extension.
 #
-# Both backends are checked: LLVM (default, required) and NATIVE (--backend
-# native, self-skips if the host backend can't emit the facade).  Native passes
-# narrow args as canonical full-width values, so it over-satisfies the C ABI and
-# must pass when it runs.
+# Both backends are checked, and a build failure on either is a FAIL: LLVM (the
+# default) and NATIVE (--backend native).  Native passes narrow args as canonical
+# full-width values, so it over-satisfies the C ABI and must pass too.
 #
 # Uses a gen1 bnc built from current source (the shipped BUILDER predates
 # #[c_export] / __c_call and would reject the facade).  Auto-discovered by
@@ -49,10 +48,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 PASSES=0
 FAILS=0
-SKIPS=0
 FAIL_NAMES=""
 pass() { echo "PASS: $1"; PASSES=$((PASSES + 1)); }
-skip() { echo "SKIP: $1"; SKIPS=$((SKIPS + 1)); }
 fail() {
     echo "FAIL: $1"
     FAIL_NAMES="$FAIL_NAMES ${1%% *}"
@@ -62,7 +59,7 @@ fail() {
 }
 summary() {
     echo ""
-    echo "=== Summary: $PASSES passed, $FAILS failed, $SKIPS skipped ==="
+    echo "=== Summary: $PASSES passed, $FAILS failed ==="
     if [ "$FAILS" -ne 0 ]; then
         echo "Failed:$FAIL_NAMES"
         exit 1
@@ -138,25 +135,21 @@ int main(void) {
 EOF
 WANT="-5 -300 200 1"
 
-# check_ccall_narrow <label> <extra-bnc-flags> <required>
+# check_ccall_narrow <label> <extra-bnc-flags>
 #   Compile the facade with the given backend flags, link the -O2 C driver
 #   (which supplies both `main` and the callees) against the object, run, and
-#   check.  required=1 -> a compile failure is a hard FAIL; required=0 -> a
-#   compile producing no object SKIPs (host native backend may not cover the
-#   facade), but a produced-but-broken object still FAILs at link/run.
+#   check.
+#   A build failure is a FAIL on either backend: bnc has a native backend for
+#   every host architecture it runs on, so a native build failure is a defect.
 check_ccall_narrow() {
-    label="$1"; extra="$2"; required="$3"
+    label="$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
     if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
             $extra --build-dir "$work" --pkg ccnarrow >"$work/pkg.log" 2>&1 \
             || [ ! -f "$work/ccnarrow.o" ]; then
-        if [ "$required" -eq 1 ]; then
-            fail "$label: compile of facade (--pkg ccnarrow) produced no object" \
-                 "$(tail -5 "$work/pkg.log")"
-        else
-            skip "$label: native --pkg unavailable for this host (no object emitted)"
-        fi
+        fail "$label: compile of facade (--pkg ccnarrow) produced no object" \
+             "$(tail -5 "$work/pkg.log")"
         return
     fi
     if ! "$CLANG" -w -O2 "$TMP/driver.c" "$work/ccnarrow.o" -o "$work/run" 2>"$work/link.err" \
@@ -172,10 +165,9 @@ check_ccall_narrow() {
     fi
 }
 
-# LLVM is required (the bug lived on the LLVM __c_call path); native self-skips
-# when the host backend can't emit the facade, but must pass when it runs (its
-# canonical full-width args over-satisfy the C ABI).
-check_ccall_narrow "llvm"   ""                 1
-check_ccall_narrow "native" "--backend native" 0
+# The bug lived on the LLVM __c_call path; native must pass too (its canonical
+# full-width args over-satisfy the C ABI).
+check_ccall_narrow "llvm"   ""
+check_ccall_narrow "native" "--backend native"
 
 summary

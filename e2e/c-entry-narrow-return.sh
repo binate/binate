@@ -26,10 +26,10 @@
 # bits, not 64).  Binate just hands the three __c_entry pointers to `run_narrow` via
 # a void `__c_call`.
 #
-# Both backends are checked: LLVM (always — the meaningful one, since the bug is
-# LLVM-only) and native (--backend native; self-skips if the host's native backend
-# can't build this program).  Native is unaffected by construction (full-width
-# canonical returns), so its variant just pins that the backends agree.
+# Both backends are checked, and a build failure on either is a FAIL: LLVM (the
+# meaningful one, since the bug is LLVM-only) and native (--backend native).  Native
+# is unaffected by construction (full-width canonical returns), so its variant just
+# pins that the backends agree.
 #
 # Uses a gen1 bnc built from current source.  Auto-discovered by
 # .github/workflows/e2e-tests.yml on Linux + macOS; skips if no C compiler.
@@ -128,13 +128,13 @@ fi
 IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
 
-# check_backend <label> <extra-bnc-flags> <required>
+# check_backend <label> <extra-bnc-flags>
 #   Compile the C caller (-O2) for the host, compile+link the Binate program with
-#   the given backend, run, and check the output.  required=1 -> a compile failure
-#   is a hard FAIL (LLVM); required=0 -> a native backend that can't build this
-#   program on this host SKIPs.
+#   the given backend, run, and check the output.
+#   A build failure is a FAIL on either backend: bnc has a native backend for
+#   every host architecture it runs on, so a native build failure is a defect.
 check_backend() {
-    label="$1"; extra="$2"; required="$3"
+    label="$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
     if ! "$CLANG" -c -O2 -o "$work/ccall.o" "$TMP/ccall.c" 2>"$work/cc.err"; then
@@ -145,12 +145,8 @@ check_backend() {
             --link-after-objs "$work/ccall.o" --build-dir "$work" \
             -o "$work/run" "$TMP/main.bn" >"$work/comp.log" 2>&1 \
             || [ ! -x "$work/run" ]; then
-        if [ "$required" -eq 1 ]; then
-            fail "$label: compile/link of the Binate program failed" \
-                 "$(tail -5 "$work/comp.log")"
-        else
-            skip "$label: native backend cannot build this program on this host"
-        fi
+        fail "$label: compile/link of the Binate program failed" \
+             "$(tail -5 "$work/comp.log")"
         return
     fi
     got="$("$work/run" 2>&1)"
@@ -163,7 +159,7 @@ check_backend() {
     fi
 }
 
-check_backend "llvm" "-O2" 1
-check_backend "native" "--backend native -O2" 0
+check_backend "llvm" "-O2"
+check_backend "native" "--backend native -O2"
 
 summary

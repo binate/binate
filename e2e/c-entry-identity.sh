@@ -29,9 +29,8 @@
 # exactly what `pkg.centry.identity` promises works.  The weak `__centry.` copies
 # the two producers emit coalesce to one address at link time.
 #
-# Runs only where the host's native backend can build centryb (the aa64/x64 CI
-# hosts); self-skips otherwise, and skips if no C compiler is present.  int32 is
-# the narrow parameter — narrow on both 64-bit backends.
+# Skips if no C compiler is present.  int32 is the narrow parameter — narrow on
+# both 64-bit backends.
 #
 # Uses a gen1 bnc built from current source.  Auto-discovered by
 # .github/workflows/e2e-tests.yml on Linux + macOS.
@@ -127,10 +126,8 @@ IMPL="$TMP/im:$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR
 
 PASSES=0
 FAILS=0
-SKIPS=0
 FAIL_NAMES=""
 pass() { echo "PASS: $1"; PASSES=$((PASSES + 1)); }
-skip() { echo "SKIP: $1"; SKIPS=$((SKIPS + 1)); }
 fail() {
     echo "FAIL: $1"
     FAIL_NAMES="$FAIL_NAMES ${1%% *}"
@@ -140,7 +137,7 @@ fail() {
 }
 summary() {
     echo ""
-    echo "=== Summary: $PASSES passed, $FAILS failed, $SKIPS skipped ==="
+    echo "=== Summary: $PASSES passed, $FAILS failed ==="
     if [ "$FAILS" -ne 0 ]; then
         echo "Failed:$FAIL_NAMES"
         exit 1
@@ -186,12 +183,11 @@ else
 fi
 
 # 2. Mixed producers: the LLVM getter and the NATIVE getter of the same F must
-#    agree — the #[c_export]/native harmonization this test guards.  Native --pkg
-#    that the host backend can't emit is a SKIP.
+#    agree — the #[c_export]/native harmonization this test guards.
 mkdir -p "$TMP/wb"
 if ! "$GEN1" -I "$IFACE" -L "$IMPL" --backend native --build-dir "$TMP/wb" --pkg centryb >"$TMP/wb.log" 2>&1 \
         || [ ! -f "$TMP/wb/centryb.o" ]; then
-    skip "llvm+native: native backend cannot build centryb on this host"
+    fail "llvm+native: native compile of centryb (--pkg) produced no object" "$(tail -5 "$TMP/wb.log")"
 else
     check_identity "llvm+native" "$TMP/wb/centryb.o"
 fi

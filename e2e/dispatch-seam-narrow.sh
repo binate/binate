@@ -32,7 +32,6 @@
 # Correct output is "111" then "1"; a shim that does not re-extend prints "222", and
 # an x64 seam caller that does not re-canonicalize the result prints "0".
 #
-# The native part self-skips if the host's native backend can't build this program.
 # Uses a gen1 bnc built from current source.  Auto-discovered by the e2e runner;
 # skips if no C compiler.
 #
@@ -216,7 +215,7 @@ CKL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
 # seam/nat built under <nat-backend-flag> (either `--backend native` for the real
 # cross-backend test, or "" for the all-LLVM control), link, run, and check.
 build_mixed() {
-    _label="$1"; _natflag="$2"; _required="$3"
+    _label="$1"; _natflag="$2"
     _w="$TMP/$_label"; mkdir -p "$_w/sep" "$_w/main"
     _I="$TMP/iface:$CKI"
     _L="$TMP/impl_nat:$TMP/impl_lv:$CKL"
@@ -233,11 +232,7 @@ build_mixed() {
         if [ "$_p" = "seam/nat" ]; then _be="$_natflag"; fi
         if ! "$GEN1" -I "$_I" -L "$_L" $_be -O2 --build-dir "$_d" --pkg "$_p" >"$_d/log" 2>&1 \
                 || [ -z "$(ls "$_d"/*.o 2>/dev/null)" ]; then
-            if [ "$_p" = "seam/nat" ] && [ "$_required" -eq 0 ]; then
-                skip "$_label: native backend cannot build seam/nat on this host"
-            else
-                fail "$_label: separate compile of '$_p' failed" "$(tail -3 "$_d/log")"
-            fi
+            fail "$_label: separate compile of '$_p' failed" "$(tail -3 "$_d/log")"
             return
         fi
     done
@@ -269,9 +264,9 @@ build_mixed() {
     fi
 }
 
-# The mixed-backend case is the meaningful one (self-skips if native can't build);
-# the all-LLVM control pins that the program is correct when both sides agree.
-build_mixed "mixed" "--backend native" 0
-build_mixed "llvm-control" "" 1
+# The mixed-backend case is the meaningful one; the all-LLVM control pins that the
+# program is correct when both sides agree.
+build_mixed "mixed" "--backend native"
+build_mixed "llvm-control" ""
 
 summary

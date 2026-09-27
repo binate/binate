@@ -35,9 +35,8 @@
 # at -O2 with the thunk suppressed, cb reads the dirty argument and prints 222;
 # with the thunk it prints 111 — so this test genuinely guards the thunk.
 #
-# Both backends are checked: LLVM (always) and native (--backend native, which on
-# the aa64/x64 CI hosts emits + links this program; self-skips if the host's
-# native backend can't build it).  The thunk is native-only, so the native
+# Both backends are checked — LLVM and native (--backend native) — and a build
+# failure on either is a FAIL.  The thunk is native-only, so the native
 # variant is the meaningful one; the LLVM variant pins that the two backends
 # agree (clang's mangled entry handles the narrow argument directly).
 #
@@ -175,13 +174,13 @@ fi
 IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
 IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
 
-# check_backend <label> <extra-bnc-flags> <required>
+# check_backend <label> <extra-bnc-flags>
 #   Compile the C caller for the HOST arch, compile+link the Binate program
-#   against it with the given backend, run, and check the output.  required=1 -> a
-#   compile failure is a hard FAIL (LLVM); required=0 -> a native backend that
-#   can't build this program on this host SKIPs.
+#   against it with the given backend, run, and check the output.
+#   A build failure is a FAIL on either backend: bnc has a native backend for
+#   every host architecture it runs on, so a native build failure is a defect.
 check_backend() {
-    label="$1"; extra="$2"; required="$3"
+    label="$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
     if ! "$CLANG" -c -O2 -o "$work/ccall.o" "$TMP/ccall.c" 2>"$work/cc.err"; then
@@ -192,12 +191,8 @@ check_backend() {
             --link-after-objs "$work/ccall.o" --build-dir "$work" \
             -o "$work/run" "$TMP/main.bn" >"$work/comp.log" 2>&1 \
             || [ ! -x "$work/run" ]; then
-        if [ "$required" -eq 1 ]; then
-            fail "$label: compile/link of the Binate program failed" \
-                 "$(tail -5 "$work/comp.log")"
-        else
-            skip "$label: native backend cannot build this program on this host"
-        fi
+        fail "$label: compile/link of the Binate program failed" \
+             "$(tail -5 "$work/comp.log")"
         return
     fi
     got="$("$work/run" 2>&1)"
@@ -210,7 +205,7 @@ check_backend() {
     fi
 }
 
-check_backend "llvm" "-O2" 1
-check_backend "native" "--backend native -O2" 0
+check_backend "llvm" "-O2"
+check_backend "native" "--backend native -O2"
 
 summary

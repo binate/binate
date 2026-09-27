@@ -81,29 +81,24 @@ EOF
 
 PASSES=0
 FAILS=0
-SKIPS=0
 FAIL_NAMES=""
 
-# check_backend <label> <extra-bnc-flags> <required>
+# check_backend <label> <extra-bnc-flags>
 #   Build the --library archive, link the C driver against it, run, and check the
-#   facade `.s` symbol was archived + linkable.  required=1 -> a build failure is a
-#   hard FAIL; required=0 (native) -> no archive SKIPs, but a wrong result FAILs.
+#   facade `.s` symbol was archived + linkable.
+#   A build failure is a FAIL on either backend: bnc has a native backend for
+#   every host architecture it runs on, so a native build failure is a defect.
 check_backend() {
-    label="$1"; extra="$2"; required="$3"
+    label="$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
     echo "[$label] building --library archive..."
     if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" $extra \
             --build-dir "$work" -o "$work/lib.a" --library libasm >"$work/lib.log" 2>&1 \
             || [ ! -f "$work/lib.a" ]; then
-        if [ "$required" -eq 1 ]; then
-            echo "FAIL: $label: --library libasm produced no archive"
-            tail -8 "$work/lib.log" | sed 's/^/    /'
-            FAILS=$((FAILS + 1)); FAIL_NAMES="$FAIL_NAMES $label"
-        else
-            echo "SKIP: $label: native --library unavailable for this host (no archive)"
-            SKIPS=$((SKIPS + 1))
-        fi
+        echo "FAIL: $label: --library libasm produced no archive"
+        tail -8 "$work/lib.log" | sed 's/^/    /'
+        FAILS=$((FAILS + 1)); FAIL_NAMES="$FAIL_NAMES $label"
         return
     fi
     if ! "$CLANG" -w "$TMP/driver.c" "$work/lib.a" -o "$work/run" 2>"$work/link.err" \
@@ -125,13 +120,12 @@ check_backend() {
 }
 
 # The archiving fix is backend-neutral (library.bn adds the facade's asm object to
-# oFiles regardless of --backend), so LLVM (always available) is the required check;
-# native self-skips when the host backend can't emit the archive.
-check_backend "llvm"   ""                 1
-check_backend "native" "--backend native" 0
+# oFiles regardless of --backend), so both backends must archive it.
+check_backend "llvm"   ""
+check_backend "native" "--backend native"
 
 echo ""
-echo "=== Summary: $PASSES passed, $FAILS failed, $SKIPS skipped ==="
+echo "=== Summary: $PASSES passed, $FAILS failed ==="
 if [ "$FAILS" -ne 0 ]; then
     echo "Failed:$FAIL_NAMES"
     exit 1

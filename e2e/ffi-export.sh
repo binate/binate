@@ -11,10 +11,10 @@
 #     NOT required to c_export — a package can expose a private callback);
 #   - one function exported under SEVERAL C names.
 #
-# Both backends are checked: the LLVM path (default, always) and the NATIVE path
-# (--backend native, when the host's native backend can emit the facade — else
-# that variant self-skips).  So the native second-symbol emission gets real
-# link-and-run coverage, not just an in-memory symbol-table assertion.
+# Both backends are checked, and a build failure on either is a FAIL: the LLVM path
+# (the default) and the NATIVE path (--backend native).  So the native second-symbol
+# emission gets real link-and-run coverage, not just an in-memory symbol-table
+# assertion.
 #
 # Beyond the #[c_export] names, the facade also covers MULTI-VALUE returns crossing
 # the C boundary two ways: called directly by C name (check_multiret) and reached
@@ -412,22 +412,18 @@ int main(void) {
 EOF
 WANT_NARROW="-5 -128 200 1"
 
-# check_narrow_returns <label> <extra-bnc-flags> <required>
+# check_narrow_returns <label> <extra-bnc-flags>
 #   Like check_backend, but links the -O2 narrow-returns driver and checks the
-#   sub-`int` return extension.  Same required/skip semantics.
+#   sub-`int` return extension.
 check_narrow_returns() {
-    label="narrow-$1"; extra="$2"; required="$3"
+    label="narrow-$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
     if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
             $extra --build-dir "$work" --pkg ffiexp >"$work/pkg.log" 2>&1 \
             || [ ! -f "$work/ffiexp.o" ]; then
-        if [ "$required" -eq 1 ]; then
-            fail "$label: compile of facade (--pkg ffiexp) produced no object" \
-                 "$(tail -40 "$work/pkg.log")"
-        else
-            skip "$label: native --pkg unavailable for this host (no object emitted)"
-        fi
+        fail "$label: compile of facade (--pkg ffiexp) produced no object" \
+             "$(tail -40 "$work/pkg.log")"
         return
     fi
     if ! "$CLANG" -w -O2 "$TMP/driver_narrow.c" "$work/ffiexp.o" -o "$work/run" 2>"$work/link.err" \
@@ -487,22 +483,18 @@ WANT_BIGAGG="123
 39
 54"
 
-# check_bigagg <label> <extra-bnc-flags> <required>
-#   Links the >16-byte by-value-struct driver and checks the callee read the
-#   fields correctly.  Same required/skip semantics as check_narrow_returns.
+# check_bigagg <label> <extra-bnc-flags>
+#   Like check_backend, but links the >16-byte by-value-struct driver and checks the
+#   callee read the fields correctly.
 check_bigagg() {
-    label="bigagg-$1"; extra="$2"; required="$3"
+    label="bigagg-$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
     if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
             $extra --build-dir "$work" --pkg ffiexp >"$work/pkg.log" 2>&1 \
             || [ ! -f "$work/ffiexp.o" ]; then
-        if [ "$required" -eq 1 ]; then
-            fail "$label: compile of facade (--pkg ffiexp) produced no object" \
-                 "$(tail -40 "$work/pkg.log")"
-        else
-            skip "$label: native --pkg unavailable for this host (no object emitted)"
-        fi
+        fail "$label: compile of facade (--pkg ffiexp) produced no object" \
+             "$(tail -40 "$work/pkg.log")"
         return
     fi
     if ! "$CLANG" -w "$TMP/driver_bigagg.c" "$work/ffiexp.o" -o "$work/run" 2>"$work/link.err" \
@@ -608,22 +600,18 @@ WANT_CENTRY="10 20 30
 5 6
 11 22"
 
-# check_multiret <label> <extra-bnc-flags> <required>
-#   Links the multi-value-return driver and checks the C caller reads each tuple
-#   correctly.  Same required/skip semantics as check_bigagg.
+# check_multiret <label> <extra-bnc-flags>
+#   Like check_backend, but links the multi-value-return driver and checks the C
+#   caller reads each tuple correctly.
 check_multiret() {
-    label="multiret-$1"; extra="$2"; required="$3"
+    label="multiret-$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
     if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
             $extra --build-dir "$work" --pkg ffiexp >"$work/pkg.log" 2>&1 \
             || [ ! -f "$work/ffiexp.o" ]; then
-        if [ "$required" -eq 1 ]; then
-            fail "$label: compile of facade (--pkg ffiexp) produced no object" \
-                 "$(tail -40 "$work/pkg.log")"
-        else
-            skip "$label: native --pkg unavailable for this host (no object emitted)"
-        fi
+        fail "$label: compile of facade (--pkg ffiexp) produced no object" \
+             "$(tail -40 "$work/pkg.log")"
         return
     fi
     if ! "$CLANG" -w "$TMP/driver_multiret.c" "$work/ffiexp.o" -o "$work/run" 2>"$work/link.err" \
@@ -640,24 +628,20 @@ check_multiret() {
     fi
 }
 
-# check_centry <label> <extra-bnc-flags> <required>
-#   Links the __c_entry-pointer driver and checks C reads each tuple correctly when
-#   the multi-return callback is invoked THROUGH the __c_entry pointer (the entry is
-#   the weak __centry.<mangled> return-adaptation thunk).  Same required/skip
-#   semantics as check_multiret.
+# check_centry <label> <extra-bnc-flags>
+#   Like check_backend, but links the __c_entry-pointer driver and checks C reads
+#   each tuple correctly when the multi-return callback is invoked THROUGH the
+#   __c_entry pointer (the entry is the weak __centry.<mangled> return-adaptation
+#   thunk).
 check_centry() {
-    label="centry-$1"; extra="$2"; required="$3"
+    label="centry-$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
     if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
             $extra --build-dir "$work" --pkg ffiexp >"$work/pkg.log" 2>&1 \
             || [ ! -f "$work/ffiexp.o" ]; then
-        if [ "$required" -eq 1 ]; then
-            fail "$label: compile of facade (--pkg ffiexp) produced no object" \
-                 "$(tail -40 "$work/pkg.log")"
-        else
-            skip "$label: native --pkg unavailable for this host (no object emitted)"
-        fi
+        fail "$label: compile of facade (--pkg ffiexp) produced no object" \
+             "$(tail -40 "$work/pkg.log")"
         return
     fi
     if ! "$CLANG" -w "$TMP/driver_centry.c" "$work/ffiexp.o" -o "$work/run" 2>"$work/link.err" \
@@ -674,25 +658,20 @@ check_centry() {
     fi
 }
 
-# check_backend <label> <extra-bnc-flags> <required>
+# check_backend <label> <extra-bnc-flags>
 #   Compile the facade with the given backend flags, link the C driver against
-#   the object, run, and check output.  `required=1` -> a compile failure is a
-#   hard FAIL; `required=0` (the native variant) -> a compile that produces no
-#   object SKIPs (the host's native backend may not cover this facade yet), but a
-#   produced-but-broken object still FAILs at link/run.
+#   the object, run, and check output.  A compile that produces no object is a
+#   FAIL on either backend: bnc has a native backend for every host architecture
+#   it runs on, so a native build failure is a defect.
 check_backend() {
-    label="$1"; extra="$2"; required="$3"
+    label="$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
     if ! "$GEN1" -I "$TMP/if:$IFACE" -L "$TMP/im:$IMPL" \
             $extra --build-dir "$work" --pkg ffiexp >"$work/pkg.log" 2>&1 \
             || [ ! -f "$work/ffiexp.o" ]; then
-        if [ "$required" -eq 1 ]; then
-            fail "$label: compile of facade (--pkg ffiexp) produced no object" \
-                 "$(tail -40 "$work/pkg.log")"
-        else
-            skip "$label: native --pkg unavailable for this host (no object emitted)"
-        fi
+        fail "$label: compile of facade (--pkg ffiexp) produced no object" \
+             "$(tail -40 "$work/pkg.log")"
         return
     fi
     if ! "$CLANG" -w "$TMP/driver.c" "$work/ffiexp.o" -o "$work/run" 2>"$work/link.err" \
@@ -820,42 +799,37 @@ EOF
     fi
 }
 
-# LLVM backend (default) — always required.
-check_backend "llvm" "" 1
-# Native backend — real link+run coverage of the second-symbol emission when the
-# host's native backend can emit the facade; self-skips otherwise.
-check_backend "native" "--backend native" 0
+# LLVM backend (the default).
+check_backend "llvm" ""
+# Native backend — real link+run coverage of the second-symbol emission.
+check_backend "native" "--backend native"
 # Native at -O2 — exercises the #[c_export] narrow register-param sign-extension: at -O1+
 # mem2reg promotes the param, so ffi_sgn(-5) must still be 1 (a plain 64-bit reload of an
-# un-extended negative int32 reads positive).  Self-skips if the host native backend cannot
-# emit the facade.
-check_backend "native-O2" "--backend native -O2" 0
+# un-extended negative int32 reads positive).
+check_backend "native-O2" "--backend native -O2"
 # Narrow sub-`int` returns read by an -O2 clang caller — the LLVM callee must
 # carry signext/zeroext on the c_export define (a plain -O2 caller trusts it and
-# skips re-extension).  LLVM is required; native self-skips when the host backend
-# can't emit the facade (native returns over-satisfy, so it must pass when it runs).
-check_narrow_returns "llvm" "" 1
-check_narrow_returns "native" "--backend native" 0
+# skips re-extension).  Native returns over-satisfy, so native must pass too.
+check_narrow_returns "llvm" ""
+check_narrow_returns "native" "--backend native"
 
 # >16-byte struct passed BY VALUE — both backends adapt.  LLVM: an entry thunk on
 # x86-64 / arm32, a plain alias on aarch64 (conventions coincide).  Native: an
 # adapter trampoline on x86-64, a plain entry on aarch64.  On an aarch64 host these
-# exercise the alias/direct path; on an x86-64 host, the thunk / trampoline.  (The
-# native check self-skips where the host native backend can't emit the facade.)
-check_bigagg "llvm" "" 1
-check_bigagg "native" "--backend native" 0
+# exercise the alias/direct path; on an x86-64 host, the thunk / trampoline.
+check_bigagg "llvm" ""
+check_bigagg "native" "--backend native"
 
 # MULTI-VALUE returns read by struct — both backends adapt the tuple to the C
-# struct-return ABI (sret / eightbyte-packing / HFA, per the host arch).  LLVM is
-# required; native self-skips when the host backend can't emit the facade.
-check_multiret "llvm" "" 1
-check_multiret "native" "--backend native" 0
+# struct-return ABI (sret / eightbyte-packing / HFA, per the host arch).
+check_multiret "llvm" ""
+check_multiret "native" "--backend native"
 
 # MULTI-VALUE returns reached THROUGH a __c_entry callback pointer — the entry the
 # pointer names must adapt the tuple to the C struct-return ABI too (the weak
 # __centry.<mangled> thunk), the case #[c_export]-only return wiring used to miss.
-check_centry "llvm" "" 1
-check_centry "native" "--backend native" 0
+check_centry "llvm" ""
+check_centry "native" "--backend native"
 
 # The --library archive: init-once-via-bn_init + call the exports from a real .a.
 check_library

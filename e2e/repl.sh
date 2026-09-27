@@ -514,23 +514,25 @@ testing.Println(counter)
 > > > > 3
 > "
 
-# --- Case 17 (Tier 2 var-untyped): `var x = expr` with a literal
-# initializer infers the type (int / bool / char-slice / etc.).
-# Non-literal initializers like `var x = i + 100` still need an
-# explicit type; rejected with a clear diagnostic. ---
+# --- Case 17 (Tier 2 var-untyped): `var x = expr` infers the type
+# from the initializer — a literal (int / bool / char-slice / etc.)
+# or any other expression (`var x = i + 100` is an int), and a
+# composite literal gives the struct type itself. ---
 run_repl "tier2-var-untyped" \
 "var i = 7
 var s = \"hi\"
 testing.Println(i)
 testing.Println(s)
 var x = i + 100
-testing.Println(helper(7))
+testing.Println(x)
+var b = Box{V: 5}
+testing.Println(b.V + helper(7))
 " \
 "$BANNER
 > > > 7
 > hi
-> var decl at the prompt requires an explicit type or a literal initializer
-> 14
+> > 107
+> > 19
 > "
 
 # --- Case 18 (Tier 4 redef): redefining a func with the same

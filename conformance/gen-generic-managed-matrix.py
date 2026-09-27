@@ -21,7 +21,7 @@ Two invariants, two cell shapes:
 
 Cross-package cells put the body-included generic Holder in a per-cell
 pkg/gh.bni (mirroring conformance/995's gholder.bni — self-contained, so
-conformance-imports stays green; NEVER import pkg/stdx/containers/*).  In-package
+conformance-imports stays green; NEVER import pkg/std/containers/*).  In-package
 cells define Holder in the single .bn.  Coordinate-addressed:
 matrix/generic-managed/<site>/<kind>/<op>{.bn | /main.bn}.
 

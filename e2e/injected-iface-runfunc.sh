@@ -26,7 +26,8 @@
 # which fires only on dispatchCompiledIfaceMethod).  That errors IS native-injected
 # is a structural invariant, not an observation: one table (stdPkgs) feeds both the
 # lowering-skip and the injection, and scripts/hygiene/stdlib-injected.sh enforces
-# every pkg/std .bni appears there — so a "lower errors instead" regression cannot
+# every pkg/std package appears there (bar its named exemptions, which errors is not
+# one of) — so a "lower errors instead" regression cannot
 # arise without failing hygiene.  A broken lookupShimVtable, by contrast, DOES fail
 # this test loudly: dispatchCompiledIfaceMethod vmPanics on a 0 shim, aborting the
 # run so the captured output no longer equals the expected strings.

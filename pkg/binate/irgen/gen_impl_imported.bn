@@ -1,0 +1,185 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/irdata"
+import "pkg/binate/irutil"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Cross-package impl collection: the impls declared in IMPORTED packages,
+// recorded on m.ImportedImpls so this TU can name the (R, I) vtables those
+// packages' TUs emit.
+
+// collectImportedImplsFromDecl is the cross-package counterpart of
+// collectImplsFromDecl: it appends to m.ImportedImpls (not m.Impls)
+// so codegen doesn't try to re-emit the vtable in this TU. The
+// vtable global lives in the imported package's TU with weak_odr
+// linkage; this entry exists only so findImplVtableName at use
+// sites here in the importing TU can produce the canonical symbol
+// name that the linker resolves to it.
+//
+// pkgShort is the import alias's pkg-short (e.g., "hello" for an
+// `import "pkg/hello"`) — equals the impl declaration's package.
+// MethodFuncs and DtorFuncName are deliberately left empty: those
+// drive vtable emission, which is the imported TU's job.
+//
+// TEXPR_INSTANTIATE interface refs (`impl R : Container[int]` declared
+// in the imported package) are handled too, mirroring
+// collectImplsFromDecl's instantiate branch: the instantiated iface is
+// keyed on the generic's DEFINING package so the symbol the consumer
+// references here matches the one the library TU emitted.  gc is needed
+// for the generic-iface decl lookup and type-arg / instantiation
+// resolution.
+func collectImportedImplsFromDecl(gc @GenCtx, d @ast.Decl, pkgShort *[]readonly char,
+		m @ir.Module) {
+	if d == nil || d.Kind != ast.DECL_IMPL {
+		return
+	}
+	// A parameterized-receiver impl (`impl @Table[K,V,H,E] : ...`) is a template whose
+	// concrete rows are synthesized on demand at each boxing site (ensureGenericImplInfo),
+	// so it registers no ImportedImpls row.  recvBaseNameAndPkg already returns an empty
+	// name for a generic-instantiation receiver (recvTypeName does not peel TEXPR_INSTANTIATE),
+	// so the len(recvName)==0 guard below skips it either way; this makes the skip explicit
+	// rather than implicit, matching collectImplsFromDecl and the checker's collectImplDecl.
+	if receiverGenericInstBase(d.TypeRef) != nil {
+		return
+	}
+	var recvName @[]char
+	var aliasBasePkg @[]char
+	recvName, aliasBasePkg = recvBaseNameAndPkg(gc, d.TypeRef)
+	if len(recvName) == 0 {
+		return
+	}
+	// RecvPkg must key on the RECEIVER's defining package, not the package
+	// the `impl` was written in.  A local alias receiver resolved above carries
+	// its target's package (aliasBasePkg).  Otherwise, for a qualified receiver
+	// (`impl *widget.Widget : shape.Talker` declared in pkg/glue) recvTypePkg
+	// yields the receiver alias (`widget`), resolved here to its full path; an
+	// unqualified receiver (`impl *Widget : ...` in the receiver's own package)
+	// defaults to the impl's package.  Mirrors collectImplsFromDecl's local-TU
+	// derivation — without it a third-package impl keys RecvPkg on pkg/glue
+	// while the construction site looks up pkg/widget, so the (R, I) vtable is
+	// never found -> null-vtable crash at dispatch.
+	var recvPkg @[]char = aliasBasePkg
+	if len(recvPkg) == 0 {
+		recvPkg = ir.ResolveImportPkg(m, recvTypePkg(d.TypeRef))
+	}
+	if len(recvPkg) == 0 {
+		recvPkg = ir.ResolveImportPkg(m, pkgShort)
+	}
+	for i := 0; i < len(d.Interfaces); i++ {
+		var ref @ast.TypeExpr = d.Interfaces[i]
+		if ref == nil {
+			continue
+		}
+		var refIfacePkg @[]char
+		var refIfaceName @[]char
+		if ref.Kind == ast.TEXPR_NAMED {
+			if len(ref.Pkg) > 0 {
+				refIfacePkg = ir.ResolveImportPkg(m, ref.Pkg)
+			} else {
+				refIfacePkg = ir.ResolveImportPkg(m, pkgShort)
+			}
+			refIfaceName = ref.Name
+		} else if ref.Kind == ast.TEXPR_INSTANTIATE {
+			// `impl R : Container[int]` in the imported package: look up
+			// the generic iface decl under its defining package and
+			// instantiate so the (R, I) entry keys on the same iface
+			// package the library TU emitted under.
+			if ref.Base == nil { continue }
+			if ref.Base.Kind != ast.TEXPR_NAMED { continue }
+			var lookupPkg @[]char
+			if len(ref.Base.Pkg) > 0 {
+				lookupPkg = ir.ResolveImportPkg(m, ref.Base.Pkg)
+			} else {
+				lookupPkg = ir.ResolveImportPkg(m, pkgShort)
+			}
+			var gd @ast.Decl = lookupGenericIfaceDeclPkg(gc, lookupPkg, ref.Base.Name)
+			if gd == nil { continue }
+			var argTypes @[]@types.Type
+			for ai := 0; ai < len(ref.TypeArgs); ai++ {
+				argTypes = slices.Append[@types.Type](argTypes, resolveTypeExpr(gc, ref.TypeArgs[ai]))
+			}
+			refIfacePkg = buf.CopyStr(lookupPkg)
+			refIfaceName = ensureInstantiatedInterface(gc, gd, argTypes, lookupPkg)
+		} else {
+			continue
+		}
+		var info @irdata.ImplInfo = make(irdata.ImplInfo)
+		info.RecvPkg = buf.CopyStr(recvPkg)
+		info.RecvTypeName = buf.CopyStr(recvName)
+		info.IfacePkg = ir.CanonicalIfacePkg(m, refIfacePkg, refIfaceName)
+		info.IfaceName = ir.CanonicalIfaceName(m, refIfacePkg, refIfaceName)
+		// Dedup: the same (R, I) pair may be reached via the consumer's
+		// direct imports AND the transitive closure (RegisterImportedImpls);
+		// codegen emits one `external constant` decl per m.ImportedImpls entry
+		// with no symbol-level dedup, so a duplicate would be a redefinition.
+		if !moduleHasImportedImpl(m, info.RecvPkg, info.RecvTypeName, info.IfacePkg, info.IfaceName) {
+			m.ImportedImpls = slices.Append[@irdata.ImplInfo](m.ImportedImpls, info)
+		}
+		// Wire the ANCESTOR closure of the listed interface, mirroring the
+		// local collectImplsFromDecl walk: an imported `impl R : Sub`
+		// (Sub : Base) also satisfies Base, so the consumer must reference the
+		// (R, Base) vtable too -- the impl's home package emits it (its own
+		// ancestor walk) -- or a cross-package `*Base = &r` upcast nil-vtables
+		// at dispatch (the imported counterpart of the iface.extend.upcast
+		// construction case 048).
+		var aPkgs @[]@[]char = IfaceAncestorClosurePkgs(m, info.IfacePkg, info.IfaceName)
+		var aNames @[]@[]char = IfaceAncestorClosure(m, info.IfacePkg, info.IfaceName)
+		for j := 0; j < len(aPkgs); j++ {
+			if moduleHasImportedImpl(m, info.RecvPkg, info.RecvTypeName, aPkgs[j], aNames[j]) {
+				continue
+			}
+			var anc @irdata.ImplInfo = make(irdata.ImplInfo)
+			anc.RecvPkg = buf.CopyStr(info.RecvPkg)
+			anc.RecvTypeName = buf.CopyStr(info.RecvTypeName)
+			anc.IfacePkg = buf.CopyStr(aPkgs[j])
+			anc.IfaceName = buf.CopyStr(aNames[j])
+			m.ImportedImpls = slices.Append[@irdata.ImplInfo](m.ImportedImpls, anc)
+		}
+	}
+}
+
+// moduleHasImportedImpl reports whether m.ImportedImpls already has an entry for
+// the (recvPkg, recvName) x (ifacePkg, ifaceName) pair — the ImportedImpls
+// counterpart of moduleHasImpl, used to dedup the direct-import and transitive-
+// closure collection paths.
+func moduleHasImportedImpl(m @ir.Module, recvPkg *[]readonly char, recvName *[]readonly char,
+		ifacePkg *[]readonly char, ifaceName *[]readonly char) bool {
+	if m == nil { return false }
+	for i := 0; i < len(m.ImportedImpls); i++ {
+		var info @irdata.ImplInfo = m.ImportedImpls[i]
+		if info == nil { continue }
+		if !irutil.CharEq(info.RecvPkg, recvPkg) { continue }
+		if !irutil.CharEq(info.RecvTypeName, recvName) { continue }
+		if !irutil.CharEq(info.IfacePkg, ifacePkg) { continue }
+		if !irutil.CharEq(info.IfaceName, ifaceName) { continue }
+		return true
+	}
+	return false
+}
+
+// RegisterImportedImpls collects the impls of the given packages into
+// m.ImportedImpls so a generic body monomorphized at the consumer can upcast a
+// receiver to an interface defined in a TRANSITIVELY-imported package: the
+// upcast needs the imported impl's vtable symbol wired (findImplVtableName), and
+// codegen emits the matching `external constant` decl that links to the impl's
+// owning TU.  collectImportedImplsFromDecl normally runs only over the
+// consumer's DIRECT imports (registerImportFieldsAndFuncs); without this a
+// transitive-package upcast inside a monomorphized generic body produced a nil
+// vtable (SIGSEGV).  Deduped (collectImportedImplsFromDecl skips a pair already
+// present) and locally-covered entries are skipped at codegen.
+func RegisterImportedImpls(aliases @[]@[]char, paths @[]@[]char, files *[]@ast.File, gc @GenCtx) {
+	for k := 0; k < len(aliases); k++ {
+		var file @ast.File = files[k]
+		if file == nil || len(file.Decls) == 0 { continue }
+		for i := 0; i < len(file.Decls); i++ {
+			var d @ast.Decl = file.Decls[i]
+			if d.Kind == ast.DECL_IMPL {
+				collectImportedImplsFromDecl(gc, d, paths[k], gc.Mod)
+			}
+		}
+	}
+}

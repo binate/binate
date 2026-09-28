@@ -43,6 +43,8 @@ for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" -name
             s = line; sub(/^[\t ]+/, "", s); sub(/[^A-Za-z0-9_].*$/, "", s); return s
         }
         function flag(kind, name) {
+            # A blank `_` declares no name, so it exports nothing.
+            if (name == "_") return
             printf("%s:%d: lowercase %s name in .bni: %s\n", rel, FNR, kind, name)
             e++
         }

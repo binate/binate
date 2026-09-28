@@ -551,6 +551,22 @@ testing.Println(b.items[0] + b.items[1] + b.items[2])
 > > > > > 60
 > "
 
+# --- Case 8a2 (Tier 2): a top-level var initialized with a raw-slice
+# literal keeps its elements: the literal's backing is a hidden module
+# global (materialized before the var-init synthetic runs), not a slot on
+# that one-shot function's stack — plain and managed elements alike, read
+# after a later prompt entry has reused the stack. ---
+run_repl "tier2-var-raw-slice-literal" \
+"type Cell struct { b @int }
+var gb *[]readonly Cell = *[]readonly Cell{Cell{b: box(5)}, Cell{b: box(6)}}
+var g *[]readonly int = *[]readonly int{1, 2, 3}
+var a [64]int = [64]int{9, 9, 9, 9}
+testing.Println(g[0], g[1], g[2], *gb[0].b, *gb[1].b)
+" \
+"$BANNER
+> > > > > 1 2 3 5 6
+> "
+
 # --- Case 8b (Tier 2): methods on a prompt-defined type
 # work end-to-end.  Pointer receiver mutates; value receiver
 # reads.  Both invoked via the obj.M() selector path. ---

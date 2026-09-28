@@ -1,0 +1,324 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/ast"
+import "pkg/binate/bignum"
+import "pkg/binate/check"
+import "pkg/binate/constval"
+import "pkg/binate/ir"
+import "pkg/binate/irbuild"
+import "pkg/binate/irsym"
+import "pkg/binate/irutil"
+import "pkg/binate/types"
+
+// Constant evaluation in IR generation.  IR-gen reads the value the type
+// checker recorded — for a constant declaration (Checker.DeclConst, a bare
+// const-group member included) and for a checked expression
+// (Checker.ConstValue) — and evaluates only what the checker could not: a
+// value that depends on a type parameter (DEPENDENT), for each instantiation,
+// or one the checker recorded nothing for.  It evaluates through
+// pkg/binate/constval, the evaluator the checker uses, with irgenEnv, which
+// resolves names through Module.Consts (the last registered match, so a
+// function-local constant shadows a package one), types through the current
+// instantiation, and `len` through the checker's expression types.
+
+// irgenEnv is the constval.Env of IR generation.
+type irgenEnv struct {
+	gc      @GenCtx
+	iotaVal int
+	inGroup bool
+}
+
+// Const resolves a constant name through Module.Consts.
+func (env *irgenEnv) Const(e @ast.Expr) (constval.Value, int) {
+	var v constval.Value
+	var idx int = -1
+	if e.Kind == ast.EXPR_IDENT {
+		idx = findBareModuleConst(env.gc, e.Name)
+	} else if e.X != nil && e.X.Kind == ast.EXPR_IDENT {
+		idx = findModuleConst(env.gc, buildQualNameHomed(env.gc.Mod, e.X.Name, e.Name))
+	}
+	if idx < 0 {
+		return v, constval.NOT_CONST
+	}
+	return moduleConstValue(env.gc.Mod.Consts[idx])
+}
+
+// Type resolves a type expression at the current instantiation.
+func (env *irgenEnv) Type(te @ast.TypeExpr) (@types.Type, int) {
+	var t @types.Type = resolveTypeExpr(env.gc, te)
+	if t == nil {
+		return nil, constval.NOT_CONST
+	}
+	return t, constval.OK
+}
+
+// Len is `len(e)` of an array or a string literal, from the checker's type of
+// e.  An array whose length depends on a type parameter has no length there.
+func (env *irgenEnv) Len(e @ast.Expr) (constval.Value, int) {
+	var v constval.Value
+	if env.gc.Mod.Checker == nil {
+		return v, constval.NOT_CONST
+	}
+	var t @types.Type = env.gc.Mod.Checker.ExprType(e.ResolvedTypeID)
+	if t != nil && t.Kind == types.TYP_UNTYPED_STRING {
+		t = types.UntypedStringNaturalArray(t)
+	}
+	var p @types.Type = irutil.PeelTransparent(t)
+	if p == nil || p.Kind != types.TYP_ARRAY || p.ArrayLenDependent {
+		return v, constval.NOT_CONST
+	}
+	v.N = bignum.FromInt(p.ArrayLen)
+	v.Typ = types.TypInt()
+	return v, constval.OK
+}
+
+// Iota returns the iota being evaluated at; false outside a const group.
+func (env *irgenEnv) Iota() (int, bool) {
+	return env.iotaVal, env.inGroup
+}
+
+impl *irgenEnv : constval.Env
+
+// evalConstIR evaluates the constant expression e, at iota iotaVal when inGroup.
+func evalConstIR(gc @GenCtx, e @ast.Expr, iotaVal int,
+		inGroup bool) (constval.Value, int, @ast.Expr) {
+	var env irgenEnv
+	env.gc = gc
+	env.iotaVal = iotaVal
+	env.inGroup = inGroup
+	var ep *constval.Env = &env
+	return constval.Eval(ep, e)
+}
+
+// exprConstIR returns the constant value of expression e: the value checker c
+// recorded for it, or IR-gen's own evaluation when c recorded none (no
+// checker, or an expression it did not check) or the value depends on a type
+// parameter.
+func exprConstIR(gc @GenCtx, c @check.Checker, e @ast.Expr) (constval.Value, int) {
+	var v constval.Value
+	var st int
+	if c != nil && e != nil && e.ResolvedTypeID > 0 {
+		v, st = c.ConstValue(e)
+		if st != constval.DEPENDENT {
+			return v, st
+		}
+	}
+	var at @ast.Expr
+	v, st, at = evalConstIR(gc, e, 0, false)
+	_ = at
+	return v, st
+}
+
+// findModuleConst returns the index in Module.Consts of the constant named
+// name, or -1: the last registered, so a function-local constant (registered
+// after the package's) shadows a package one.
+func findModuleConst(gc @GenCtx, name *[]readonly char) int {
+	for i := len(gc.Mod.Consts) - 1; i >= 0; i-- {
+		if irutil.Streq(gc.Mod.Consts[i].Name, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// findBareModuleConst is findModuleConst for an unqualified name, which
+// resolves in CurrentImportPkg first (as lookupBareConst does).
+func findBareModuleConst(gc @GenCtx, name *[]readonly char) int {
+	if len(gc.Mod.CurrentImportPkg) > 0 {
+		var i int = findModuleConst(gc, qualNameInPkg(gc.Mod.CurrentImportPkg, name))
+		if i >= 0 {
+			return i
+		}
+	}
+	return findModuleConst(gc, name)
+}
+
+// moduleConstValue returns a registered constant's value.
+func moduleConstValue(mc irsym.ModuleConst) (constval.Value, int) {
+	var v constval.Value
+	if mc.HasCVal {
+		return mc.CVal, constval.OK
+	}
+	if mc.Kind == CONST_BOOL {
+		v.IsBool = true
+		v.B = mc.BoolVal
+		return v, constval.OK
+	}
+	if mc.Kind != CONST_INT {
+		return v, constval.NOT_CONST
+	}
+	var w int
+	var s bool
+	var ok bool
+	w, s, ok = constval.IntKind(mc.Typ)
+	if ok {
+		v.N = bignum.FromBits(cast(uint64, mc.Val), w, s)
+		v.Typ = mc.Typ
+		return v, constval.OK
+	}
+	v.N = bignum.FromInt64(mc.Val)
+	return v, constval.OK
+}
+
+// setModuleConstValue records the constant value v on mc, whose Typ is its
+// declared type or nil: the exact value (CVal, for evaluation), the 64-bit
+// pattern a reference emits (Val), and the kind.  An untyped value of a
+// declared integer type takes that type (the checker has checked it fits).
+// An untyped integer with no declared type gets a Typ that holds it, since a
+// reference materializes Val at Typ and a nil Typ reads as an unsigned untyped
+// int: signed int (int64 beyond int32) for a negative value — else an
+// int->float conversion reads it as a huge positive — and uint64 for one of
+// 2^63 or more, which the VM and native backends would otherwise sign-convert.
+func setModuleConstValue(mc *irsym.ModuleConst, v constval.Value) {
+	if v.IsBool {
+		mc.Kind = CONST_BOOL
+		mc.BoolVal = v.B
+		mc.CVal = v
+		mc.HasCVal = true
+		return
+	}
+	if v.Typ == nil && mc.Typ != nil && mc.Typ.IsInteger() {
+		v.Typ = mc.Typ
+	}
+	mc.Kind = CONST_INT
+	mc.CVal = v
+	mc.HasCVal = true
+	mc.Val = cast(int64, v.N.Bits())
+	if mc.Typ != nil {
+		return
+	}
+	if v.Typ != nil {
+		mc.Typ = v.Typ
+	} else {
+		mc.Typ = untypedIntIRType(v.N)
+	}
+}
+
+// untypedIntIRType returns the type an untyped integer constant n is
+// materialized at: signed int (int64 beyond int32) for a negative value,
+// uint64 for one of 2^63 or more, and nil (the untyped int, converted at its
+// use) otherwise — see setModuleConstValue.
+func untypedIntIRType(n bignum.Num) @types.Type {
+	if n.IsNegative() {
+		if n.FitsSigned(32) {
+			return types.TypInt()
+		}
+		return types.TypInt64()
+	}
+	if !n.FitsSigned(64) {
+		return types.TypUint64()
+	}
+	return nil
+}
+
+// emitConstValue emits the constant v, at its type, or for an untyped integer
+// at untypedIntIRType's (the untyped int when that is nil), as a reference to
+// a registered constant is.
+func emitConstValue(b @ir.Block, v constval.Value) @ir.Instr {
+	if v.IsBool {
+		return irbuild.EmitConstBool(b, v.B)
+	}
+	var t @types.Type = v.Typ
+	if t == nil {
+		t = untypedIntIRType(v.N)
+	}
+	if t == nil {
+		t = types.TypUntypedInt()
+	}
+	return irbuild.EmitConstInt64(b, cast(int64, v.N.Bits()), t)
+}
+
+// stampedConstValue returns the value the checker recorded on constant
+// initializer e (attachConstLitVal / attachConstBoolVal), if it did.
+func stampedConstValue(gc @GenCtx, e @ast.Expr) (constval.Value, bool) {
+	var v constval.Value
+	if gc.Mod.Checker == nil || e == nil || e.ResolvedTypeID == 0 {
+		return v, false
+	}
+	var st @types.Type = gc.Mod.Checker.ExprType(e.ResolvedTypeID)
+	if st == nil || !st.IsConstStamp {
+		return v, false
+	}
+	if st.HasBoolVal {
+		v.IsBool = true
+		v.B = st.BoolVal
+		return v, true
+	}
+	if !st.HasLitVal {
+		return v, false
+	}
+	v.N.Magnitude = st.LitMag
+	v.N.Sign = st.LitSign
+	v.Typ = st.ConstType
+	return v, true
+}
+
+// constFromInitializer fills mc (Name and Typ — the declared type, or nil —
+// already set) for the constant declaration d, whose initializer (its own, or
+// for a bare group member the one it repeats) is e, at iotaVal when inGroup:
+// the value the checker recorded for d; else a boolean or floating-point
+// literal, the checker's stamp on e when d owns it (useStamp), a
+// floating-point expression, or IR-gen's own evaluation.  A nil e (a group's
+// first member, bare) is iota itself.  Returns false for an initializer that is
+// not an integer, boolean or floating-point constant, which is not registered.
+func constFromInitializer(gc @GenCtx, mc *irsym.ModuleConst, d @ast.Decl, e @ast.Expr, iotaVal int,
+		inGroup bool, useStamp bool) bool {
+	var v constval.Value
+	if gc.Mod.Checker != nil && d != nil {
+		var cst int
+		var have bool
+		v, cst, have = gc.Mod.Checker.DeclConst(d)
+		if have && cst == constval.OK {
+			setModuleConstValue(mc, v)
+			return true
+		}
+		if have && (cst == constval.POISONED || cst == constval.NOT_KNOWN) {
+			constEvalFailure(e, cst)
+		}
+	}
+	if e == nil {
+		v.N = bignum.FromInt(iotaVal)
+		setModuleConstValue(mc, v)
+		return true
+	}
+	if classifyConstLit(mc, e) {
+		return true
+	}
+	if useStamp {
+		var ok bool
+		v, ok = stampedConstValue(gc, e)
+		if ok {
+			setModuleConstValue(mc, v)
+			return true
+		}
+	}
+	if classifyConstFloatExpr(gc, mc, e, iotaVal) {
+		return true
+	}
+	var st int
+	var at @ast.Expr
+	v, st, at = evalConstIR(gc, e, iotaVal, inGroup)
+	if st == constval.OK {
+		setModuleConstValue(mc, v)
+		return true
+	}
+	if st == constval.NOT_CONST {
+		return false
+	}
+	constEvalFailure(at, st)
+	return false
+}
+
+// constEvalFailure panics for a constant IR-gen cannot evaluate.  The checker
+// has accepted the program, so this is a compiler bug — or an error that only
+// one instantiation of a generic body has (a constant depending on a type
+// parameter, e.g. `cast(uint8, sizeof(T) * 100)`), which has no diagnostic at
+// IR generation yet.
+func constEvalFailure(at @ast.Expr, st int) {
+	if st >= constval.ERR_OVERFLOW {
+		panic(
+				"error: a constant expression is invalid in an instantiation of a generic body "
+						"(or the type checker missed it: compiler bug)")
+	}
+	panic("internal error: IR generation cannot evaluate a constant the type checker accepted")
+}

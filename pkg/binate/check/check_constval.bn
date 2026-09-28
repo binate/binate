@@ -1,0 +1,272 @@
+package "pkg/binate/check"
+
+import "pkg/binate/ast"
+import "pkg/binate/bignum"
+import "pkg/binate/constval"
+import "pkg/binate/token"
+import "pkg/binate/types"
+
+// Constant values (spec Ch.6), evaluated by pkg/binate/constval so that the
+// checker and IR-gen agree.  checkExpr records each checked expression's value
+// (recordConst): constval.Step applied to the values already recorded for its
+// operands, so evaluation is linear in the expression and shares constval's
+// dispatch.  An expression the checker does not checkExpr — an array
+// dimension, a `.bni` constant's initializer, a bare const-group member's
+// repeated initializer — is evaluated whole with constval.Eval (evalConst).
+// Both resolve names, types, `len` and iota through checkerEnv.
+
+// checkerEnv is the constval.Env of the checker's current scope.
+type checkerEnv struct {
+	c @Checker
+}
+
+// Const resolves a constant name through the current scope.
+func (env *checkerEnv) Const(e @ast.Expr) (constval.Value, int) {
+	var v constval.Value
+	var sym @Symbol = nil
+	if e.Kind == ast.EXPR_IDENT {
+		sym = env.c.Scope.Lookup(e.Name)
+	} else {
+		sym = resolveQualifiedSym(env.c, e)
+	}
+	if sym == nil || sym.Kind != types.SYM_CONST {
+		return v, constval.NOT_CONST
+	}
+	if !sym.HasCVal {
+		return v, constval.NOT_KNOWN
+	}
+	return sym.CVal, sym.CStat
+}
+
+// Type resolves a type expression; a type whose layout involves a type
+// parameter is DEPENDENT.
+func (env *checkerEnv) Type(te @ast.TypeExpr) (@types.Type, int) {
+	if te == nil {
+		return nil, constval.NOT_CONST
+	}
+	var t @types.Type = resolveTypeExpr(env.c, te)
+	if t == nil || t.Kind == types.TYP_ERROR {
+		return nil, constval.NOT_CONST
+	}
+	if containsByValueTypeParam(t) || arrayLenDependent(t) {
+		return nil, constval.DEPENDENT
+	}
+	if embedsOpaqueByValue(env.c, t) {
+		// Its layout is unavailable; the sizeof / alignof check (or, in an
+		// array dimension, validateDimExpr) reports it.
+		return nil, constval.POISONED
+	}
+	return t, constval.OK
+}
+
+// arrayLenDependent reports whether t is an array (possibly named) whose
+// length, or an element array's length, depends on a type parameter.
+func arrayLenDependent(t @types.Type) bool {
+	var p @types.Type = types.PeelNamedBounded(t)
+	for p != nil && p.Kind == types.TYP_ARRAY {
+		if p.ArrayLenDependent {
+			return true
+		}
+		p = types.PeelNamedBounded(p.Elem)
+	}
+	return false
+}
+
+// Len is `len(e)` of an array or a string literal: its length, a typed int.
+// An array whose length depends on a type parameter has no length here, and
+// `len` of it is not treated as a constant (NOT_CONST).
+func (env *checkerEnv) Len(e @ast.Expr) (constval.Value, int) {
+	var v constval.Value
+	var t @types.Type = env.c.ExprType(e.ResolvedTypeID)
+	if t == nil {
+		if e.Kind == ast.EXPR_STRING_LIT {
+			t = checkExpr(env.c, e)
+		} else if e.Kind == ast.EXPR_IDENT {
+			var sym @Symbol = env.c.Scope.Lookup(e.Name)
+			if sym != nil && sym.Kind == types.SYM_VAR {
+				t = sym.Type
+			}
+		}
+	}
+	if t != nil && isUntypedString(t) {
+		t = types.UntypedStringNaturalArray(t)
+	}
+	var p @types.Type = types.PeelNamedBounded(t)
+	if p == nil || p.Kind != types.TYP_ARRAY {
+		return v, constval.NOT_CONST
+	}
+	if p.ArrayLenDependent {
+		return v, constval.NOT_CONST
+	}
+	v.N = bignum.FromInt(p.ArrayLen)
+	v.Typ = types.TypInt()
+	return v, constval.OK
+}
+
+// Iota returns the current iota; false outside a const group.
+func (env *checkerEnv) Iota() (int, bool) {
+	return env.c.Iota, env.c.Iota >= 0
+}
+
+impl *checkerEnv : constval.Env
+
+// evalConst evaluates e, which has not been checked, in the current scope.
+func evalConst(c @Checker, e @ast.Expr) (constval.Value, int, @ast.Expr) {
+	var env checkerEnv
+	env.c = c
+	var ep *constval.Env = &env
+	return constval.Eval(ep, e)
+}
+
+// evalConstNoPos is evalConst without the failing sub-expression.
+func evalConstNoPos(c @Checker, e @ast.Expr) (constval.Value, int) {
+	var v constval.Value
+	var st int
+	var at @ast.Expr
+	v, st, at = evalConst(c, e)
+	_ = at
+	return v, st
+}
+
+// constHostInt returns the integer constant v (status st) as a host int; false
+// when st is not OK, v is not an integer, or it does not fit.
+func constHostInt(v constval.Value, st int) (int, bool) {
+	if st != constval.OK || v.IsBool || !v.N.FitsSigned(hostIntBits()) {
+		return 0, false
+	}
+	return v.N.ToInt(), true
+}
+
+// constOf returns the value and status recorded for the checked expression e.
+func constOf(c @Checker, e @ast.Expr) (constval.Value, int) {
+	var v constval.Value
+	if e == nil || e.ResolvedTypeID <= 0 || e.ResolvedTypeID >= c.NumExprTypes {
+		return v, constval.NOT_CONST
+	}
+	return c.ConstVals[e.ResolvedTypeID], c.ConstStats[e.ResolvedTypeID]
+}
+
+// declConst is a constant declaration's recorded value and status, with the
+// declaration itself, so a ConstID another checker assigned over a shared AST
+// is never mistaken for this checker's.
+type declConst struct {
+	d  @ast.Decl
+	v  constval.Value
+	st int
+}
+
+// recordDeclConst records value v (status st) for the constant declaration d.
+func recordDeclConst(c @Checker, d @ast.Decl, v constval.Value, st int) {
+	var dc declConst
+	dc.d = d
+	dc.v = v
+	dc.st = st
+	if d.ConstID > 0 && d.ConstID <= c.DeclConsts.Len() && c.DeclConsts.Get(d.ConstID - 1).d == d {
+		c.DeclConsts.Set(d.ConstID - 1, dc)
+		return
+	}
+	c.DeclConsts.Push(dc)
+	d.ConstID = c.DeclConsts.Len()
+}
+
+// DeclConst returns the value recorded for the constant declaration d.
+func (c @Checker) DeclConst(d @ast.Decl) (constval.Value, int, bool) {
+	var v constval.Value
+	if d == nil || d.ConstID <= 0 || d.ConstID > c.DeclConsts.Len() {
+		return v, constval.NOT_CONST, false
+	}
+	var dc declConst = c.DeclConsts.Get(d.ConstID - 1)
+	if dc.d != d {
+		return v, constval.NOT_CONST, false
+	}
+	return dc.v, dc.st, true
+}
+
+// ConstValue returns the value recorded for the checked expression e.
+func (c @Checker) ConstValue(e @ast.Expr) (constval.Value, int) {
+	return constOf(c, e)
+}
+
+// setConst records v and status st for the checked expression e.
+func setConst(c @Checker, e @ast.Expr, v constval.Value, st int) {
+	if e == nil || e.ResolvedTypeID <= 0 || e.ResolvedTypeID >= c.NumExprTypes {
+		return
+	}
+	c.ConstVals[e.ResolvedTypeID] = v
+	c.ConstStats[e.ResolvedTypeID] = st
+}
+
+// recordConst records the constant value of e, just checked, from its
+// operands' recorded values.  An error in e's own operation is reported here
+// (constErrReportedElsewhere names the ones the typing reports) and e is
+// recorded POISONED, so the expressions around it report nothing more.
+func recordConst(c @Checker, e @ast.Expr) {
+	var ops @[]@ast.Expr = constval.Operands(e)
+	var vals @[]constval.Value = make_slice(constval.Value, len(ops))
+	var stats @[]int = make_slice(int, len(ops))
+	for i := 0; i < len(ops); i++ {
+		var ov constval.Value
+		var ost int
+		ov, ost = constOf(c, ops[i])
+		vals[i] = ov
+		stats[i] = ost
+	}
+	var env checkerEnv
+	env.c = c
+	var ep *constval.Env = &env
+	var v constval.Value
+	var st int
+	v, st = constval.Step(ep, e, vals, stats)
+	if isConstErr(st) {
+		if st == constval.ERR_OPERAND_FIT && e.Kind == ast.EXPR_BUILTIN &&
+				e.Op == cast(int, token.BIT_CAST) {
+			addCheckError(c, e.Pos, "untyped constant bit_cast operand does not fit int")
+		} else if !constErrReportedElsewhere(e, st) {
+			reportConstErr(c, e.Pos, st)
+		}
+		st = constval.POISONED
+	}
+	setConst(c, e, v, st)
+}
+
+// isConstErr reports whether st is one of constval's ERR_* statuses.
+func isConstErr(st int) bool {
+	return st >= constval.ERR_OVERFLOW
+}
+
+// constErrReportedElsewhere reports whether the typing already diagnoses
+// error st at e: an out-of-range integer literal (checkExpr), an untyped
+// operand that does not fit its typed peer of a binary operator or
+// unsafe_div / unsafe_rem (checkUntypedLitFits), and a negative count of
+// `<<` / `>>` (checkShiftCountNonNegative).  A bit_cast operand that does not
+// fit `int` is reported here.
+func constErrReportedElsewhere(e @ast.Expr, st int) bool {
+	if st == constval.ERR_OVERFLOW && e.Kind == ast.EXPR_INT_LIT {
+		return true
+	}
+	if st == constval.ERR_OPERAND_FIT {
+		return e.Kind == ast.EXPR_BINARY ||
+				(e.Kind == ast.EXPR_BUILTIN &&
+						(e.Op == cast(int, token.UNSAFE_DIV) || e.Op == cast(int, token.UNSAFE_REM)))
+	}
+	return st == constval.ERR_NEG_SHIFT && e.Kind == ast.EXPR_BINARY
+}
+
+// reportConstErr reports the constant-evaluation error st at pos.
+func reportConstErr(c @Checker, pos token.Pos, st int) {
+	if st == constval.ERR_OVERFLOW {
+		addCheckError(c, pos, "constant expression overflows representable range")
+	} else if st == constval.ERR_DIV_ZERO {
+		addCheckError(c, pos, "division by zero in constant expression")
+	} else if st == constval.ERR_MIN_DIV {
+		addCheckError(c, pos, "integer overflow in constant expression (MIN / -1)")
+	} else if st == constval.ERR_NEG_SHIFT {
+		addCheckError(c, pos, "negative shift count")
+	} else if st == constval.ERR_UNSAFE_SHIFT {
+		addCheckError(c, pos, "unsafe shift count is at least the width of the constant's type")
+	} else if st == constval.ERR_CAST_FIT {
+		addCheckError(c, pos, "constant does not fit the cast target type (use bit_cast to reinterpret)")
+	} else if st == constval.ERR_OPERAND_FIT {
+		addCheckError(c, pos, "untyped constant operand does not fit the type it takes")
+	}
+}

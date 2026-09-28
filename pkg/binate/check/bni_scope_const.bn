@@ -3,94 +3,246 @@ package "pkg/binate/check"
 import "pkg/binate/types"
 
 import "pkg/binate/ast"
+import "pkg/binate/bignum"
+import "pkg/binate/constval"
+import "pkg/binate/token"
+import "pkg/stdx/slices"
 
-// .bni const definition: folding an imported const's initializer into the
-// importing package's scope.  Split out of bni_scope.bn, whose
-// buildScopeFromFile DECL_GROUP loop calls defineBniConst per const member
-// (binding iota + repeating a bare member's prior initializer at its iota).
+// .bni const definition: evaluating an imported const's initializer into the
+// importing package's scope, in dependency order (resolveBniConstByName,
+// which buildScopeFromFile's pass 2 calls for every const and const-group
+// member).
 
-// defineBniConst registers an imported `.bni` const, folding its initializer
-// to a value so importers can use it where a constant integer is required —
-// an array dimension (`[pkg.SZ]int`) or, critically, the negative-shift-count
-// gate (`x << pkg.NEG`).  Without the folded value the const is defined
-// value-less and evalConstIntValue's selector arm yields ok=false, so a
-// negative imported count slips past the gate and silently miscompiles to 0.
-// The fold mirrors IR-gen's evalConstExpr, keeping the checker's view of an
-// imported const consistent with the value codegen emits.  The const is
-// defined in BOTH the package scope `s` (read by importers via
+// defineBniConst registers an imported `.bni` const with its value, so
+// importers can use it where a constant is required — an array dimension
+// (`[pkg.SZ]int`) or a shift count (`x << pkg.NEG`).  The initializer is
+// evaluated with constval (it is not checked here: the declaring package
+// reports its errors, but an interface-only import is never checked, so they
+// are reported here too; errors dedupe).  The const
+// is defined in BOTH the package scope `s` (read by importers via
 // resolveQualifiedSym) and the temp build scope `c.Scope` (so a later sibling
-// const in the same `.bni` can reference this one while folding).  A const
-// that does not fold to an integer (a non-integer type, an initializer
-// evalConstIntValue can't reduce — e.g. iota — or one that references another
-// package's const; see the selector guard below) falls back to value-less, as
-// before.
-func defineBniConst(c @Checker, s @Scope, name @[]char, typ @types.Type, valueExpr @ast.Expr) {
+// const in the same `.bni` can reference this one).  A cross-package selector
+// initializer (`const SZ int = a.VAL`) resolves through the shared checker,
+// which has pkg/a's scope loaded.
+func defineBniConst(c @Checker, s @Scope, d @ast.Decl, typ @types.Type, valueExpr @ast.Expr) {
+	var name @[]char = d.Name
+	var v constval.Value
+	var st int = constval.OK
 	if valueExpr == nil {
-		defineConst(s, name, typ)
-		defineConst(c.Scope, name, typ)
-		return
-	}
-	// A cross-package selector initializer (`const SZ int = a.VAL`, a TRANSITIVE
-	// .bni const) folds here too: this single shared checker has pkg/a's scope
-	// loaded, so evalConstIntValue's EXPR_SELECTOR arm resolves a.VAL via
-	// resolveQualifiedSym.  IR-gen does NOT re-resolve the selector through this
-	// .bni's local alias (which the top-level importer may not import) — it reads
-	// the stamp this fold attaches below (importConstStampVal), so checker and
-	// IR-gen agree without IR-gen needing transitive-const registration.
-	//
-	// Prefer the signedness-aware bignum fold (foldConstIntValue) so an imported
-	// `const Q uint64 = U / D` (U >= 2^63) folds UNSIGNED — the host-int
-	// evalConstIntValue folds /, %, >> SIGNED and records the wrong value.  Fall
-	// back to the host-int fold for the forms foldConstNum doesn't reduce
-	// (cast-wrapped, etc.).  foldConstNum resolves the sibling idents via
-	// c.Scope, so no checkExpr is needed.
-	var iv int64
-	var ok bool
-	iv, ok = foldConstIntValue(c, valueExpr)
-	if !ok {
-		// Host-int fold fallback (widened to int64 to match; a value that
-		// overflows host int already wrapped in this path).
-		var ev int
-		ev, ok = evalConstIntValue(c, valueExpr)
-		iv = cast(int64, ev)
-	}
-	if typ != nil && typ.IsInteger() && ok {
-		defineConstVal(s, name, typ, iv)
-		defineConstVal(c.Scope, name, typ, iv)
-		// Stamp the folded value on the initializer's ExprType so IR-gen's
-		// import-registration path (which reads gc.Mod.Checker.ExprType) gets the
-		// SAME signedness-aware value, not its host-int evalConstExpr re-fold.
-		// The .bni const value isn't checkExpr'd here, so give it a fresh
-		// ResolvedTypeID first.  A bare iota-group member re-uses the previous
-		// member's shared initializer node (the explicit owner's), so skip the
-		// stamp for it — the owner owns the node, and the bare member's value
-		// rides its own symbol (defined above).  Mirrors checkConstDecl's
-		// InGroupBareMember guard.
-		if !c.InGroupBareMember {
-			valueExpr.ResolvedTypeID = registerExprType(c, typ)
-			attachConstLitVal(c, valueExpr, typ, iv)
+		if c.Iota < 0 {
+			defineConst(s, name, bniConstType(c, typ, v, constval.NOT_CONST, valueExpr))
+			defineConst(c.Scope, name, bniConstType(c, typ, v, constval.NOT_CONST, valueExpr))
+			return
 		}
+		// A group's first member without an initializer is its iota.
+		v.N = bignum.FromInt(c.Iota)
+	} else {
+		var at @ast.Expr
+		v, st, at = evalConst(c, valueExpr)
+		if isConstErr(st) && !c.InGroupBareMember {
+			reportConstErr(c, at.Pos, st)
+		} else if isConstErr(st) && bareMemberOwnError(c, valueExpr, c.BareExplicitIota, st, at) {
+			// A bare member's own error, reported at the member.
+			reportConstErr(c, d.Pos, st)
+		}
+	}
+	if isConstErr(st) {
+		st = constval.POISONED
+	}
+	if st == constval.NOT_KNOWN {
+		// A reference that never resolves in this .bni: no value.
+		st = constval.NOT_CONST
+	}
+	if st == constval.OK && typ != nil {
+		if v.IsBool {
+			v.Typ = typ
+		} else if !typ.IsInteger() {
+			// An integer value for a non-integer type: no constant value here
+			// (the declaring package's check reports the type error).
+			st = constval.NOT_CONST
+		} else if v.Typ == nil && !constval.Fits(v.N, typ) {
+			var pos token.Pos = d.Pos
+			if valueExpr != nil && !c.InGroupBareMember {
+				pos = valueExpr.Pos
+			}
+			errCannotAssign(c, pos, untypedIntOfNum(v.N), typ)
+			st = constval.POISONED
+		} else {
+			v.Typ = typ
+		}
+	}
+	var symType @types.Type = bniConstType(c, typ, v, st, valueExpr)
+	defineConstValue(s, name, symType, v, st)
+	defineConstValue(c.Scope, name, symType, v, st)
+	recordDeclConst(c, d, v, st)
+	if valueExpr == nil {
 		return
 	}
-	// A BOOLEAN imported const: fold its value so a foldConstBoolValue reference
-	// to it (`pkg.BT && (U > 5)`) resolves instead of bailing to IR-gen's
-	// host-int fold, which truncates a 64-bit operand on ILP32.  Mirrors the
-	// integer path above; the value rides SymBoolVal.
-	if typ != nil && !c.InGroupBareMember {
-		var pb @types.Type = types.PeelNamedBounded(typ)
-		if pb != nil && pb.Kind == types.TYP_BOOL {
-			var bv bool
-			var bok bool
-			bv, bok = foldConstBoolValue(c, valueExpr)
-			if bok {
-				defineConstBoolVal(s, name, typ, bv)
-				defineConstBoolVal(c.Scope, name, typ, bv)
-				valueExpr.ResolvedTypeID = registerExprType(c, typ)
-				attachConstBoolVal(c, valueExpr, bv)
-				return
+	// Record the value on the initializer for IR-gen's import-registration
+	// path (which reads Checker.ExprType).  The initializer is not checked, so
+	// give it a fresh ResolvedTypeID first.  A bare iota-group member re-uses
+	// the previous member's initializer node, which that member owns, so it is
+	// not stamped (its value rides its own symbol).
+	if st == constval.OK && !c.InGroupBareMember {
+		valueExpr.ResolvedTypeID = registerExprType(c, symType)
+		if v.IsBool {
+			attachConstBoolVal(c, valueExpr, v.B)
+		} else {
+			attachConstLitVal(c, valueExpr, v)
+		}
+	}
+}
+
+// listBniConsts returns the names of the constants the `.bni` declarations
+// decls declare — single consts and const-group members — each with its
+// declaration: the const, or for a group member the group.
+func listBniConsts(decls *[]@ast.Decl) (@[]@[]char, @[]@ast.Decl) {
+	var names @[]@[]char
+	var cdecls @[]@ast.Decl
+	for i := 0; i < len(decls); i++ {
+		if decls[i].Kind == ast.DECL_CONST {
+			names = slices.Append[@[]char](names, decls[i].Name)
+			cdecls = slices.Append[@ast.Decl](cdecls, decls[i])
+		}
+		if decls[i].Kind == ast.DECL_GROUP {
+			for j := 0; j < len(decls[i].Decls); j++ {
+				if decls[i].Decls[j].Kind == ast.DECL_CONST {
+					names = slices.Append[@[]char](names, decls[i].Decls[j].Name)
+					cdecls = slices.Append[@ast.Decl](cdecls, decls[i])
+				}
 			}
 		}
 	}
-	defineConst(s, name, typ)
-	defineConst(c.Scope, name, typ)
+	return names, cdecls
+}
+
+// resolveBniConstByName defines the `.bni` const `name` (listed in names /
+// cdecls, from listBniConsts) after the consts of the same `.bni` that its
+// initializer — for a bare group member, the initializer it repeats — names,
+// so a const may name one declared later in the file (spec
+// decl.order.forward).  c.ConstResolving guards against cycles;
+// c.ConstResolved memoizes defined names.
+func resolveBniConstByName(c @Checker, s @Scope, name @[]char, names @[]@[]char,
+		cdecls @[]@ast.Decl) {
+	if nameInList(c.ConstResolved, name) { return }
+	var d @ast.Decl = findConstDecl(names, cdecls, name)
+	if d == nil { return }
+	if nameInList(c.ConstResolving, name) {
+		errConstCycle(c, constDeclOf(d, name).Pos, name)
+		c.ConstResolved = slices.Append[@[]char](c.ConstResolved, name)
+		return
+	}
+	c.ConstResolving = slices.Append[@[]char](c.ConstResolving, name)
+	var init @ast.Expr = d.Value
+	var k int = -1
+	if d.Kind == ast.DECL_GROUP {
+		k = constGroupMemberIndex(d, name)
+		var e int = constGroupExplicit(d, k)
+		init = nil
+		if e == k {
+			init = d.Decls[k].Value
+		} else if e >= 0 {
+			// A bare member repeats member e's initializer, so its one
+			// dependency is member e.
+			resolveBniConstByName(c, s, d.Decls[e].Name, names, cdecls)
+		}
+	}
+	var deps @[]@[]char
+	deps = collectConstDeps(init, deps)
+	for i := 0; i < len(deps); i++ {
+		if nameInList(names, deps[i]) {
+			resolveBniConstByName(c, s, deps[i], names, cdecls)
+		}
+	}
+	if k >= 0 {
+		defineBniGroupMember(c, s, d, k)
+	} else {
+		var typ @types.Type = nil
+		if d.TypeRef != nil {
+			typ = resolveTypeExpr(c, d.TypeRef)
+		}
+		defineBniConst(c, s, d, typ, d.Value)
+	}
+	c.ConstResolving = c.ConstResolving[:len(c.ConstResolving) - 1]
+	c.ConstResolved = slices.Append[@[]char](c.ConstResolved, name)
+}
+
+// defineBniGroupMember defines member k of the `.bni` const group g at its
+// iota.  A bare member repeats the previous explicit member's type (none for
+// an untyped one) and initializer, evaluated at the bare member's iota — not
+// the bare iota ordinal that a value-less export gives an importer.
+func defineBniGroupMember(c @Checker, s @Scope, g @ast.Decl, k int) {
+	var inner @ast.Decl = g.Decls[k]
+	var e int = constGroupExplicit(g, k)
+	var typ @types.Type = nil
+	var effExpr @ast.Expr = nil
+	if e >= 0 {
+		if g.Decls[e].TypeRef != nil {
+			typ = resolveTypeExpr(c, g.Decls[e].TypeRef)
+		}
+		effExpr = g.Decls[e].Value
+	}
+	var savedIota int = c.Iota
+	var savedBare bool = c.InGroupBareMember
+	var savedExplicitIota int = c.BareExplicitIota
+	c.Iota = constGroupIota(g, k)
+	if e >= 0 && e != k {
+		c.InGroupBareMember = true
+		c.BareExplicitIota = constGroupIota(g, e)
+	}
+	defineBniConst(c, s, inner, typ, effExpr)
+	c.Iota = savedIota
+	c.InGroupBareMember = savedBare
+	c.BareExplicitIota = savedExplicitIota
+}
+
+// bniConstType returns the type of an imported const declared with type typ
+// (nil: untyped) and value v (status st).  An untyped const stays untyped for
+// its importers, as an in-package one does: an untyped int carrying its value,
+// an untyped bool, or — for a floating-point initializer, which constval does
+// not evaluate — an untyped float.
+func bniConstType(c @Checker, typ @types.Type, v constval.Value, st int, e @ast.Expr) @types.Type {
+	if typ != nil {
+		return typ
+	}
+	if st == constval.OK {
+		if v.Typ != nil {
+			return v.Typ
+		}
+		if v.IsBool {
+			return types.TypUntypedBool()
+		}
+		return untypedIntOfNum(v.N)
+	}
+	if bniExprIsFloat(c, e) {
+		return types.TypUntypedFloat()
+	}
+	return types.TypUntypedInt()
+}
+
+// bniExprIsFloat reports whether constant initializer e is floating-point: it
+// contains a floating-point literal, or names a floating-point constant.
+func bniExprIsFloat(c @Checker, e @ast.Expr) bool {
+	if e == nil {
+		return false
+	}
+	if e.Kind == ast.EXPR_FLOAT_LIT {
+		return true
+	}
+	if e.Kind == ast.EXPR_IDENT || e.Kind == ast.EXPR_SELECTOR {
+		var sym @Symbol = nil
+		if e.Kind == ast.EXPR_IDENT {
+			sym = c.Scope.Lookup(e.Name)
+		} else {
+			sym = resolveQualifiedSym(c, e)
+		}
+		return sym != nil && sym.Kind == types.SYM_CONST && sym.Type != nil && sym.Type.IsFloat()
+	}
+	if e.Kind == ast.EXPR_UNARY {
+		return bniExprIsFloat(c, e.X)
+	}
+	if e.Kind == ast.EXPR_BINARY {
+		return bniExprIsFloat(c, e.X) || bniExprIsFloat(c, e.Y)
+	}
+	return false
 }

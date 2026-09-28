@@ -1,0 +1,82 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/ir"
+import "pkg/binate/irbuild"
+import "pkg/binate/irutil"
+import "pkg/binate/types"
+
+// genCastValueConversion lowers the value-conversion cases shared by `cast` and
+// `unsafe_cast` (the non-interface conversions): float->int saturation, the
+// @[]T -> *[]T managed-slice decay, and the general OP_CAST (numeric width /
+// sign conversion, pointer relabel, readonly drop).  Interface-value operands
+// never reach here — cast rejects them and unsafe_cast narrows/widens them at
+// the call site.
+func genCastValueConversion(b @ir.Block, val @ir.Instr, targetTyp @types.Type) @ir.Instr {
+	// Float -> int saturates to the target's range + NaN->0; the hardware
+	// converts disagree on out-of-range/NaN, so normalize in shared IR.
+	if isFloatToIntCast(val.Typ, targetTyp) {
+		return emitGuardedFloatToInt(b, val, targetTyp)
+	}
+	// `cast(*[]T, m)` where m is @[]T: the managed->raw slice decay (spec §7.6) is
+	// a {data,len} field EXTRACTION, not a bit-reinterpret — %BnManagedSlice (4
+	// words) and %BnSlice (2 words) differ in layout.  Emit the same
+	// OP_MANAGED_TO_RAW the implicit decay uses; a plain OP_CAST mis-declares the
+	// result's LLVM type (`%BnManagedSlice` used as `%BnSlice`).
+	if isManagedToRawDecay(val, targetTyp) {
+		return irbuild.EmitManagedToRaw(b, val)
+	}
+	// Defense: OP_CAST can relabel only a SAME-KIND aggregate (struct A<->B same
+	// layout, @[]T<->@[]S same element size) or a scalar/pointer conversion.  A cast
+	// that involves an aggregate of a DIFFERENT kind (array -> managed-slice -- the
+	// MAJOR -- , aggregate <-> scalar, ...) mis-lowers to garbage.  The cast checker
+	// gates concrete casts to the safe set, so this only fires for an outlawed shape
+	// reached via a GENERIC type parameter -- fail loud rather than emit garbage.
+	var cs @types.Type = irutil.PeelTransparent(val.Typ)
+	var cd @types.Type = irutil.PeelTransparent(targetTyp)
+	if cs != nil && cd != nil {
+		if cs.Kind != cd.Kind &&
+				(irutil.IsBitCastMemoryLoweredKind(cs) || irutil.IsBitCastMemoryLoweredKind(cd)) {
+			panic(
+					"internal error: cast between mismatched aggregate/scalar shapes reached "
+							"codegen (an array/struct/managed-slice cast to a different kind); this "
+							"is not a safe cast -- use bit_cast for a same-size reinterpret or "
+							"construct the value explicitly")
+		}
+		// Same-kind slice/array with DIFFERENT-size elements: the relabel keeps `len`
+		// (the element COUNT), so a wider/narrower element reads or writes past the
+		// backing (out of bounds).  Only a same-element-size retype is a safe cast.
+		if cs.Kind == cd.Kind && isSliceOrArrayKind(cs.Kind) && cs.Elem != nil && cd.Elem != nil &&
+				cs.Elem.SizeOf() != cd.Elem.SizeOf() {
+			panic(
+					"internal error: cast between same-kind slices/arrays with different-size "
+							"elements reached codegen (via a generic type parameter); the len "
+							"invariant would be violated -- use bit_cast or construct explicitly")
+		}
+	}
+	return irbuild.EmitCast(b, val, targetTyp)
+}
+
+// emitBitCastViaMemory lowers a same-size bit_cast that involves an aggregate
+// (managed slice / struct / array / func-value / interface value) as a scratch
+// round-trip: store the source value's bytes into a stack slot, then reload them
+// at the target type.  This realizes a same-size reinterpret uniformly across
+// every backend — including an aggregate<->scalar reinterpret across the
+// by-address/by-value storage boundary — without a first-class OP_BIT_CAST that
+// the backends cannot form for an aggregate.  It is a bitwise copy with NO
+// refcount traffic: the scratch slot is a raw unmanaged OP_ALLOC (owns nothing),
+// OP_STORE is a raw store and OP_LOAD BORROWS its result (no RefInc), so managed
+// words are copied verbatim — matching bit_cast's "takes no reference" contract
+// (the programmer owns the reference-count consequences).  The slot uses the
+// stricter of the two alignments; the checker has verified the sizes are equal.
+func emitBitCastViaMemory(b @ir.Block, val @ir.Instr, srcTyp @types.Type,
+		dstTyp @types.Type) @ir.Instr {
+	var slotTyp @types.Type = srcTyp
+	if dstTyp.AlignOf() > srcTyp.AlignOf() {
+		slotTyp = dstTyp
+	}
+	var slot @ir.Instr = irbuild.EmitAlloc(b, slotTyp)
+	var srcPtr @ir.Instr = irbuild.EmitBitCast(b, slot, types.MakePointerType(srcTyp))
+	irbuild.EmitStore(b, srcPtr, val)
+	var dstPtr @ir.Instr = irbuild.EmitBitCast(b, slot, types.MakePointerType(dstTyp))
+	return irbuild.EmitLoad(b, dstPtr, dstTyp)
+}

@@ -76,7 +76,8 @@ summary() {
 WANT_BASE="42 42 42 99"
 # check_backend driver: + ffi_sgn(-5) ffi_sgn(5) ffi_ro(-3) ffi_ro(3)
 #   + ffi_stack_sgn(-5 on stack) ffi_stack_sgn(5 on stack)
-WANT="$WANT_BASE 1 0 1 0 1 0"
+#   + ffi_blank_a(41) ffi_blank_b(14) (blank `func _` exports)
+WANT="$WANT_BASE 1 0 1 0 1 0 42 42"
 
 if ! command -v "$CLANG" >/dev/null 2>&1; then
     skip "ffi-export (no C compiler '$CLANG' available)"
@@ -118,6 +119,14 @@ func mul(a int, b int) int { return a * b }
 // One function exported under SEVERAL C names.
 #[c_export("ffi_sub", "ffi_sub2")]
 func Sub(a int, b int) int { return a - b }
+
+// A BLANK function binds no Binate name but still exports its C name, and
+// several blank exports coexist.
+#[c_export("ffi_blank_a")]
+func _(a int) int { return a + 1 }
+
+#[c_export("ffi_blank_b")]
+func _(a int) int { return a * 3 }
 
 // A package-level var initializer — set to 40 ONLY when the closure's inits run.
 // The --library arm reads it (after bn_init) to prove bn_init actually ran the
@@ -377,14 +386,17 @@ extern long ffi_ro(int);
    full-8-byte reload reads a large POSITIVE value.  ffi_stack_sgn returns 1 iff its 9th
    (stack-passed) arg is a negative int32. */
 extern long ffi_stack_sgn(long, long, long, long, long, long, long, long, long);
+extern int ffi_blank_a(int);
+extern int ffi_blank_b(int);
 int main(void) {
-    printf("%d %d %d %d %ld %ld %ld %ld %ld %ld\n",
+    printf("%d %d %d %d %ld %ld %ld %ld %ld %ld %d %d\n",
            ffi_add(20, 22), ffi_mul(6, 7),
            ffi_sub(50, 8), ffi_sub2(100, 1),
            ffi_sgn(-5), ffi_sgn(5),
            ffi_ro(-3), ffi_ro(3),
            ffi_stack_sgn(0, 0, 0, 0, 0, 0, 0, 0, 0xFFFFFFFBL),
-           ffi_stack_sgn(0, 0, 0, 0, 0, 0, 0, 0, 5L));
+           ffi_stack_sgn(0, 0, 0, 0, 0, 0, 0, 0, 5L),
+           ffi_blank_a(41), ffi_blank_b(14));
     return 0;
 }
 EOF

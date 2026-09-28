@@ -1,0 +1,155 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/irbuild"
+import "pkg/binate/iropcode"
+import "pkg/binate/irutil"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Function-local variable slots: the VarSlot binding list (ctx.Vars) and its
+// define / lookup helpers, including imported-global lookups by qualified name.
+
+// VarSlot tracks a name → SSA-pointer binding for a function-local variable
+// or parameter. Ptr is the OP_ALLOC instruction whose result holds the
+// variable's address; Typ is the variable's declared type. IsParam
+// distinguishes parameters (whose slice values aren't freed by the
+// epilogue, since they came from the caller).
+type VarSlot struct {
+	Name    *[]readonly char
+	Ptr     @ir.Instr
+	Typ     @types.Type
+	IsParam bool // true for function parameters (don't free slices)
+	// ClearAfterRelease zeroes the slot after its scope-exit release, for a
+	// hidden slot allocated once in the entry block and stored to with
+	// release-the-old-value semantics (a raw-slice literal's backing): the
+	// scope may be entered again (a loop body), and its next store or release
+	// must not see the already-released values.
+	ClearAfterRelease bool
+}
+
+// lookupVar searches locals (most recent first) then globals for a variable's alloca.
+func lookupVar(ctx @GenContext, name *[]readonly char) @ir.Instr {
+	// Search backwards for most recent definition (shadowing)
+	for i := len(ctx.Vars) - 1; i >= 0; i-- {
+		if irutil.Streq(ctx.Vars[i].Name, name) {
+			return ctx.Vars[i].Ptr
+		}
+	}
+	// Fall back to global variables: a pseudo-instruction for the global's
+	// address.
+	var gi int = bareGlobalIdx(ctx.Gc, name)
+	if gi < 0 { return nil }
+	return ir.NewGlobalRef(ctx.Gc.Mod, ctx.Gc.Mod.GlobalVars[gi].Name, ctx.Gc.Mod.GlobalVars[gi].Typ)
+}
+
+// lookupImportedGlobalPtr returns an IsGlobalRef pointer to an imported
+// extern var (a `.bni`-declared `var X T` registered under its dotted
+// defining-pkg qualname during RegisterImport), or nil if qualName isn't
+// one.  Parallels lookupVar's same-package global fallback, but the
+// pointer carries the DOTTED name so codegen's GlobalName mangles it to
+// the owner's symbol (matching its definition), not the importing
+// module's package path.  Used for reads (lookupImportedGlobalRead) and
+// for write / address-of lvalues (genSelectorPtr).
+func lookupImportedGlobalPtr(gc @GenCtx, qualName *[]readonly char) @ir.Instr {
+	for i := 0; i < len(gc.Mod.GlobalVars); i++ {
+		if !irutil.Streq(gc.Mod.GlobalVars[i].Name, qualName) { continue }
+		return ir.NewGlobalRef(gc.Mod, gc.Mod.GlobalVars[i].Name, gc.Mod.GlobalVars[i].Typ)
+	}
+	return nil
+}
+
+// lookupImportedGlobalRead loads the value of an imported extern var
+// (the read form of lookupImportedGlobalPtr; nil if qualName isn't one).
+func lookupImportedGlobalRead(gc @GenCtx, b @ir.Block, qualName *[]readonly char) @ir.Instr {
+	var gp @ir.Instr = lookupImportedGlobalPtr(gc, qualName)
+	if gp == nil { return nil }
+	return irbuild.EmitLoad(b, gp, gp.TypeArg)
+}
+
+// genImportedVarLvalue returns the IsGlobalRef pointer for a package-
+// qualified imported var used as an lvalue (`&pkg.X` / `pkg.X = v`), or
+// nil if e isn't such a selector.  e.X must be a package alias (lookupVar
+// misses); the pointer carries the dotted defining-pkg name so codegen
+// mangles it to the owner's symbol.  The genSelectorPtr counterpart to
+// lookupImportedGlobalRead.
+func genImportedVarLvalue(ctx @GenContext, e @ast.Expr) @ir.Instr {
+	if e.X == nil || e.X.Kind != ast.EXPR_IDENT { return nil }
+	if lookupVar(ctx, e.X.Name) != nil { return nil }
+	return lookupImportedGlobalPtr(ctx.Gc, buildQualNameHomed(ctx.Gc.Mod, e.X.Name, e.Name))
+}
+
+// lookupVarType returns the declared type of a variable (local or global).
+func lookupVarType(ctx @GenContext, name *[]readonly char) @types.Type {
+	for i := len(ctx.Vars) - 1; i >= 0; i-- {
+		if irutil.Streq(ctx.Vars[i].Name, name) {
+			return ctx.Vars[i].Typ
+		}
+	}
+	// Fall back to global variables
+	var gi int = bareGlobalIdx(ctx.Gc, name)
+	if gi < 0 { return nil }
+	return ctx.Gc.Mod.GlobalVars[gi].Typ
+}
+
+// defineVar adds a local variable to the current scope in the GenContext.
+func defineVar(ctx @GenContext, name *[]readonly char, ptr @ir.Instr, typ @types.Type) {
+	// Tag the alloca with the variable name for debug info
+	if ptr != nil && ptr.Op == iropcode.OP_ALLOC && len(ptr.StrVal) == 0 {
+		ptr.StrVal = buf.CopyStr(name)
+	}
+	var slot VarSlot
+	slot.Name = name
+	slot.Ptr = ptr
+	slot.Typ = typ
+	slot.IsParam = false
+	ctx.Vars = slices.Append[VarSlot](ctx.Vars, slot)
+}
+
+// defineHiddenOwnedSlot registers a compiler-created slot (never visible by
+// name — `name` is not an identifier) as a scope variable that owns its
+// managed contents: every exit of the current scope releases it and then
+// zeroes it (ClearAfterRelease), so a later store into the same slot — the
+// scope entered again, or the slot's expression evaluated again — neither
+// double-releases nor leaks.  The slot must be allocated zero-filled in the
+// entry block (irbuild.EmitEntryAlloc).
+func defineHiddenOwnedSlot(ctx @GenContext, name *[]readonly char, ptr @ir.Instr, typ @types.Type) {
+	var slot VarSlot
+	slot.Name = name
+	slot.Ptr = ptr
+	slot.Typ = typ
+	slot.IsParam = false
+	slot.ClearAfterRelease = true
+	ctx.Vars = slices.Append[VarSlot](ctx.Vars, slot)
+}
+
+// defineFuncValueVar allocates a func-value slot of type `fvTyp`, constructs the
+// non-capturing func value for the top-level function `name` into it, and binds
+// `varName` to the slot.  The one home for the alloc→func-value→store→bind
+// sequence that a func-reference initializer produces, shared by `var` (genDecl)
+// and `:=` (genShortVar), for both a bare function reference (`add`) and a
+// generic-function instantiation (`glib.Ident[int]`).
+func defineFuncValueVar(ctx @GenContext, b @ir.Block, varName *[]readonly char,
+		name *[]readonly char, fvTyp @types.Type) {
+	var ptr @ir.Instr = irbuild.EmitAlloc(b, fvTyp)
+	var val @ir.Instr = irbuild.EmitFuncValue(b, name, fvTyp)
+	noteSPGrowingResult(ctx, val)
+	irbuild.EmitStore(b, ptr, val)
+	defineVar(ctx, varName, ptr, fvTyp)
+}
+
+// defineVarParam adds a function parameter variable to the scope (marked as param for cleanup).
+func defineVarParam(ctx @GenContext, name *[]readonly char, ptr @ir.Instr, typ @types.Type) {
+	// Tag the alloca with the variable name for debug info
+	if ptr != nil && ptr.Op == iropcode.OP_ALLOC && len(ptr.StrVal) == 0 {
+		ptr.StrVal = buf.CopyStr(name)
+	}
+	var slot VarSlot
+	slot.Name = name
+	slot.Ptr = ptr
+	slot.Typ = typ
+	slot.IsParam = true
+	ctx.Vars = slices.Append[VarSlot](ctx.Vars, slot)
+}

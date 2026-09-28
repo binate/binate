@@ -53,50 +53,68 @@ func (s @kernel) evalReplImport(p @parser.Parser) {
 		return
 	}
 
-	// Process any newly-loaded package: type-check, IR-gen, lower.
+	// Process any newly-loaded package: type-check, then IR-gen + lower.
 	// Walk the post-LoadImports order; skip entries already in
-	// s.ProcessedPkgs (the initial load + previous imports).  Each iteration
-	// builds its own per-package @Module (carrying its own alias map), so
-	// s.MainMod's alias map is untouched by the loop — it's only extended
-	// after the loop (below) with the freshly-imported top-level aliases.
+	// s.ProcessedPkgs (the initial load + previous imports).  Every new package
+	// is checked before any is lowered, as at the initial load (session.bn): a
+	// package's IR-gen registers the types and interfaces of every loaded
+	// package, which resolves an `expose`d member through the checker — so
+	// each must have been checked first.  Each lowering builds its own
+	// per-package @Module (carrying its own alias map), so s.MainMod's alias
+	// map is untouched by the loop — it's only extended after the loop (below)
+	// with the freshly-imported top-level aliases.
 	var preCheckErrs int = len(s.Chk.CheckerErrors())
+	var newPaths @[]@[]char
+	var cleanPaths @[]@[]char
 	for i := 0; i < len(s.Ldr.Order); i++ {
 		var path @[]char = s.Ldr.Order[i]
 		if containsPath(s.ProcessedPkgs.Items(), path) { continue }
+		newPaths = appendCharSlice(newPaths, path)
+		s.ProcessedPkgs.Push(path)
 		var pkg @loader.Package = s.Ldr.GetPackage(path)
 		if pkg == nil { continue }
+		var pkgErrsBefore int = len(s.Chk.CheckerErrors())
 		if pkg.BNI != nil {
 			s.Chk.LoadPackageInterface(path, pkg.BNI)
 		}
 		if pkg.Merged != nil {
-			var pkgErrsBefore int = len(s.Chk.CheckerErrors())
 			s.Chk.CheckPackage(path, pkg.Merged, pkg.Files, pkg.BNI)
-			// Lower a package ONLY if it type-checked cleanly.  A package that
-			// errored — e.g. an interpreted __c_call (Checker.Interpreted) —
-			// must NOT be lowered: IR-gen emits OP_C_CALL unconditionally and
-			// LowerModule would hit lower_instr's default arm and abort the whole
-			// session.  The recorded errors are surfaced after the loop; the
-			// import "partially succeeds" (clean packages stay registered).
-			// (The initial-load path in session.bn returns early on errors
-			// before any lowering; this per-package gate is the loop analog.)
-			if len(s.Chk.CheckerErrors()) == pkgErrsBefore {
-				var pkgMod @ir.Module = irgen.InitModule(quotePath(path))
-				pkgMod.Checker = s.Chk
-				var pkgGc @irgen.GenCtx = irgen.NewGenCtx(pkgMod)
-				// Nil-checking is always on for the REPL — a package imported
-				// mid-session lowers with the same guard as the initial load
-				// (session.bn's NewKernel).
-				pkgGc.EmitNilChecks = true
-				pkgGc.SroaCleanupShape = iropt.OptPassEnabled(s.Vm.Opt, iropt.PASS_SROA)
-				registerPkgImports(s.Ldr, pkg, pkgGc)
-				if pkg.BNI != nil {
-					irgen.RegisterSelfTypes(s.Chk, pkg.BNI, pkgGc)
-				}
-				irgen.GeneratePackage(s.Chk, pkg.Merged, pkgGc, pkg.Files)
-				s.Vm.LowerModule(pkgMod)
-			}
 		}
-		s.ProcessedPkgs.Push(path)
+		// IR-gen a package ONLY if it — and every package it imports (checked
+		// earlier: dependencies precede it in the order) — type-checked cleanly.
+		// A package that errored — e.g. an interpreted __c_call
+		// (Checker.Interpreted) — must NOT be lowered: IR-gen emits OP_C_CALL
+		// unconditionally and LowerModule would hit lower_instr's default arm and
+		// abort the whole session; nor may its declarations reach any IR-gen
+		// registration (s.FailedPkgs).  The recorded errors are surfaced after the
+		// loop; the import "partially succeeds" (clean packages stay registered).
+		// (The initial-load path in session.bn returns early on errors before any
+		// lowering; this per-package gate is the loop analog.)
+		if len(s.Chk.CheckerErrors()) > pkgErrsBefore || importsFailedPkg(s, pkg) {
+			s.FailedPkgs.Push(path)
+			continue
+		}
+		if pkg.Merged != nil {
+			cleanPaths = appendCharSlice(cleanPaths, path)
+		}
+	}
+	for i := 0; i < len(cleanPaths); i++ {
+		var path @[]char = cleanPaths[i]
+		var pkg @loader.Package = s.Ldr.GetPackage(path)
+		var pkgMod @ir.Module = irgen.InitModule(quotePath(path))
+		pkgMod.Checker = s.Chk
+		var pkgGc @irgen.GenCtx = irgen.NewGenCtx(pkgMod)
+		// Nil-checking is always on for the REPL — a package imported
+		// mid-session lowers with the same guard as the initial load
+		// (session.bn's NewKernel).
+		pkgGc.EmitNilChecks = true
+		pkgGc.SroaCleanupShape = iropt.OptPassEnabled(s.Vm.Opt, iropt.PASS_SROA)
+		registerPkgImports(s.Ldr, pkg, s.FailedPkgs.Items(), pkgGc)
+		if pkg.BNI != nil {
+			irgen.RegisterSelfTypes(s.Chk, pkg.BNI, pkgGc)
+		}
+		irgen.GeneratePackage(s.Chk, pkg.Merged, pkgGc, pkg.Files)
+		s.Vm.LowerModule(pkgMod)
 	}
 	// The per-package LowerModule calls above left the VM's module-lowering
 	// context pointing at the LAST lowered import; restore it to the session
@@ -128,11 +146,18 @@ func (s @kernel) evalReplImport(p @parser.Parser) {
 	// The callee resolves through the VM's native extern table instead.
 	// Each alias is rebound first (below): RegisterImportFuncSigs's own recording
 	// (Pass 0) is first-wins and would keep an earlier import's binding.
+	// First the types of EVERY package this import loaded — directly or
+	// indirectly (a dependency, an `expose` target) — on the session's gen ctx:
+	// its startup registration (registerMainImports) predates them, and a
+	// top-level import's interface may name an indirect package's generic
+	// interface as a parent or impl target.
+	registerLoadedPkgTypes(s.Ldr, pathsWithout(newPaths, s.FailedPkgs.Items()), s.MainGc)
 	var impAliases @[]@[]char
 	var impPaths @[]@[]char
 	var impFiles @[]@ast.File
 	for i := 0; i < len(specs); i++ {
 		var path @[]char = buf.CopyStr(stripImportQuotes(specs[i].Path))
+		if containsPath(s.FailedPkgs.Items(), path) { continue }
 		var f @ast.File = collectPkgFile(s.Ldr, path)
 		if f == nil { continue }
 		var alias @[]char = specs[i].Alias
@@ -165,6 +190,17 @@ func (s @kernel) evalReplImport(p @parser.Parser) {
 		if len(alias) == 0 {
 			alias = buf.CopyStr(lastSegmentOfPath(path))
 		}
+		// A package that failed type-checking — or imports one that did — is
+		// never lowered or registered for IR-gen (s.FailedPkgs), so binding it
+		// here would resolve `alias.X` to code that does not exist (and, for an
+		// alias shadowing an earlier import, the checker to the new package
+		// while IR-gen keeps the old one).  Report it and leave any earlier
+		// binding of the alias in place.
+		if containsPath(s.FailedPkgs.Items(), path) {
+			s.err("error: package not imported (it, or a package it imports, failed type-checking): ")
+			s.errln(path)
+			continue
+		}
 		if !s.Chk.RegisterReplImport(alias, path) {
 			s.err("error: package not loaded: ")
 			s.errln(path)
@@ -174,6 +210,14 @@ func (s @kernel) evalReplImport(p @parser.Parser) {
 		s.out(path)
 		s.outln(" loaded")
 	}
+}
+
+// importsFailedPkg reports whether pkg imports a package in s.FailedPkgs.
+func importsFailedPkg(s @kernel, pkg @loader.Package) bool {
+	for i := 0; i < len(pkg.Imports); i++ {
+		if containsPath(s.FailedPkgs.Items(), pkg.Imports[i]) { return true }
+	}
+	return false
 }
 
 // containsPath reports whether `paths` already contains `p`

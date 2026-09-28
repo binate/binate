@@ -206,6 +206,116 @@ cat > "$TMP/pkg/aliaslib/aliaslib.bn" <<'EOF'
 package "pkg/aliaslib"
 EOF
 
+# ----- A package whose interface names an INDIRECTLY loaded package's generic
+# interface as its parent — directly (pkg/gsub → pkg/gbase) and through an
+# `expose` forwarder (pkg/gsubf → pkg/gfwd → pkg/gbase). ---
+mkdir -p "$TMP/pkg/gbase" "$TMP/pkg/gsub" "$TMP/pkg/gfwd" "$TMP/pkg/gsubf"
+cat > "$TMP/pkg/gbase.bni" <<'EOF'
+package "pkg/gbase"
+
+interface Base[T any] {
+    Get() T
+}
+EOF
+cat > "$TMP/pkg/gbase/gbase.bn" <<'EOF'
+package "pkg/gbase"
+EOF
+cat > "$TMP/pkg/gfwd.bni" <<'EOF'
+package "pkg/gfwd"
+
+expose "pkg/gbase"
+EOF
+cat > "$TMP/pkg/gfwd/gfwd.bn" <<'EOF'
+package "pkg/gfwd"
+EOF
+for sub in gsub gsubf; do
+    if [ "$sub" = gsub ]; then dep=gbase; else dep=gfwd; fi
+    cat > "$TMP/pkg/$sub.bni" <<EOF
+package "pkg/$sub"
+
+import "pkg/$dep"
+
+interface Sub : $dep.Base[int] {
+    Extra() int
+}
+
+type S struct { v int }
+
+func (s *S) Get() int
+
+func (s *S) Extra() int
+
+impl *S : Sub
+
+func MkS(n int) S
+EOF
+    cat > "$TMP/pkg/$sub/$sub.bn" <<EOF
+package "pkg/$sub"
+
+func (s *S) Get() int { return s.v }
+
+func (s *S) Extra() int { return s.v + 1 }
+
+func MkS(n int) S { return S{v: n} }
+EOF
+done
+
+# ----- A package that fails type-checking (its interface names an undefined
+# generic parent) next to a clean dependency (pkg/gbase) that is lowered. ---
+mkdir -p "$TMP/pkg/gbad"
+cat > "$TMP/pkg/gbad.bni" <<'EOF'
+package "pkg/gbad"
+
+import "pkg/gbase"
+
+interface Bad : gbase.Nope[int] {
+    X() int
+}
+EOF
+cat > "$TMP/pkg/gbad/gbad.bn" <<'EOF'
+package "pkg/gbad"
+EOF
+
+# ----- pkg/gbaddep imports the failing pkg/gbad; pkg/xa/x and pkg/xb/x share
+# the short name `x`, and pkg/xb/x fails type-checking. ---
+mkdir -p "$TMP/pkg/gbaddep" "$TMP/pkg/xa/x" "$TMP/pkg/xb/x"
+cat > "$TMP/pkg/gbaddep.bni" <<'EOF'
+package "pkg/gbaddep"
+
+import "pkg/gbad"
+
+func G() int
+EOF
+cat > "$TMP/pkg/gbaddep/gbaddep.bn" <<'EOF'
+package "pkg/gbaddep"
+
+func G() int { return 1 }
+EOF
+cat > "$TMP/pkg/xa/x.bni" <<'EOF'
+package "pkg/xa/x"
+
+func G(n int) int
+EOF
+cat > "$TMP/pkg/xa/x/x.bn" <<'EOF'
+package "pkg/xa/x"
+
+func G(n int) int { return n + 100 }
+EOF
+cat > "$TMP/pkg/xb/x.bni" <<'EOF'
+package "pkg/xb/x"
+
+func G(a int, b int) int
+
+func F() int
+EOF
+cat > "$TMP/pkg/xb/x/x.bn" <<'EOF'
+package "pkg/xb/x"
+
+func G(a int, b int) int { return a + b }
+
+func F() int { return "not an int" }
+EOF
+
 # ----- Bad fixture: a module with a setup-time type error (a
 # top-level var whose initializer references an undefined name).
 # NewReplSession surfaces this as a ReplError VALUE that the CLI
@@ -1153,6 +1263,50 @@ testing.Println(l.Label())
 > > > 40
 > "
 
+# --- A mid-session import whose interface extends an indirectly loaded
+# package's generic interface (directly, and through an `expose` forwarder):
+# the parent's methods dispatch. ---
+run_repl "tier5-mid-session-indirect-generic-parent" \
+"import \"pkg/gsub\"
+var s gsub.S = gsub.MkS(7)
+var sub *gsub.Sub = &s
+testing.Println(sub.Get())
+testing.Println(sub.Extra())
+" \
+"$BANNER
+> package pkg/gsub loaded
+> > > 7
+> 8
+> "
+
+run_repl "tier5-mid-session-indirect-generic-parent-forwarder" \
+"import \"pkg/gsubf\"
+var s gsubf.S = gsubf.MkS(7)
+var sub *gsubf.Sub = &s
+testing.Println(sub.Get())
+testing.Println(sub.Extra())
+" \
+"$BANNER
+> package pkg/gsubf loaded
+> > > 7
+> 8
+> "
+
+# --- The alias-receiver impl again, with pkg/aliashome loaded only indirectly
+# (by pkg/aliaslib's import) before it is imported at the prompt. ---
+run_repl "tier5-mid-session-alias-receiver-indirect" \
+"import \"pkg/aliaslib\"
+import \"pkg/aliashome\"
+var s aliashome.S = aliashome.MkS(4)
+var l *aliaslib.Loc = &s
+testing.Println(l.Label())
+" \
+"$BANNER
+> package pkg/aliaslib loaded
+> package pkg/aliashome loaded
+> > > 40
+> "
+
 run_repl "tier5-mid-session-import-call" \
 'import "pkg/repldemo"
 testing.Println(repldemo.Double(21))
@@ -1237,6 +1391,36 @@ testing.Println(f)
 # frontend check records the error on the persisted checker, but the import loop
 # must skip lowering the erroring package — else IR-gen's unconditional OP_C_CALL
 # reaches lower_instr's default arm and aborts the whole session. ---
+# --- A mid-session import that loads a failing package (an undefined generic
+# parent) and a clean one: the error is reported, the failing package never
+# reaches IR-gen, and the session survives. ---
+run_repl_import_rejected "tier5-mid-session-import-bad-generic-parent" \
+'import "pkg/gbad"
+testing.Println(helper(7))
+' \
+    "Nope" \
+    "14"
+
+# --- A package importing a failed one is not imported either (and says so);
+# the session survives. ---
+run_repl_import_rejected "tier5-mid-session-import-depends-on-failed" \
+'import "pkg/gbad"
+import "pkg/gbaddep"
+testing.Println(helper(7))
+' \
+    "failed type-checking): pkg/gbaddep" \
+    "14"
+
+# --- An import that fails type-checking does not rebind its alias: `x` still
+# names pkg/xa/x, in the checker and in IR-gen alike. ---
+run_repl_import_rejected "tier5-mid-session-failed-import-keeps-alias" \
+'import "pkg/xa/x"
+import "pkg/xb/x"
+testing.Println(x.G(3))
+' \
+    "failed type-checking): pkg/xb/x" \
+    "103"
+
 run_repl_import_rejected "tier5-mid-session-import-ccall-rejected" \
 'import "pkg/std/os"
 testing.Println(helper(7))

@@ -1307,6 +1307,19 @@ testing.Println(l.Label())
 > > > 40
 > "
 
+# --- Type and var groups at the prompt: each member is declared as if typed on
+# its own (a const group stays whole). ---
+run_repl "tier2-type-and-var-groups" \
+"type ( PS struct { q int }; PA = int )
+var p PS
+p.q = 3
+var ( v1 PA = 5; v2 int = 6 )
+testing.Println(p.q + v1 + v2)
+" \
+"$BANNER
+> > > > > 14
+> "
+
 run_repl "tier5-mid-session-import-call" \
 'import "pkg/repldemo"
 testing.Println(repldemo.Double(21))

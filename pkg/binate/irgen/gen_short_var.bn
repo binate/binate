@@ -5,8 +5,10 @@ import "pkg/binate/irbuild"
 import "pkg/binate/ir"
 
 import "pkg/binate/ast"
+import "pkg/binate/buf"
 import "pkg/binate/iropcode"
 import "pkg/binate/types"
+import "pkg/std/strconv"
 
 // multiReturnFieldTypes returns the per-result types packed into a multi-
 // return result struct (the fields makeMultiReturnStructType built).  Used to
@@ -73,91 +75,122 @@ func genShortVar(ctx @GenContext, b @ir.Block, stmt @ast.Stmt) @ir.Block {
 			}
 			return b
 		}
-		// Single assign
-		var name @[]char = stmt.Exprs[0].Name
-		// Blank: evaluate RHS for side effects, don't bind.
-		if isBlank(name) {
-			genExpr(ctx, b, stmt.Exprs2[0])
+		// Parallel: `a, b := e1, e2` evaluates every right-hand side before
+		// binding any name (so `a, b := b, a` reads the old a and b, and each
+		// right-hand side sees the names as they were before the statement),
+		// then binds them in order.  Each element goes through the single-bind
+		// path under a hidden name no identifier can spell; renaming its slot
+		// afterwards makes it visible — no copy, so no extra acquire.  A blank
+		// target's right-hand side is still evaluated, for its side effects.
+		if len(stmt.Exprs) > 1 && len(stmt.Exprs2) == len(stmt.Exprs) {
+			var hidden @[]@[]char = make_slice(@[]char, len(stmt.Exprs))
+			for i := 0; i < len(stmt.Exprs); i++ {
+				ctx.CurBlock = b
+				var bindAs @[]char = stmt.Exprs[i].Name
+				if !isBlank(bindAs) {
+					bindAs = buf.Concat(".shortvar.", strconv.Itoa(i))
+					hidden[i] = bindAs
+				}
+				b = genShortVarOne(ctx, b, bindAs, stmt.Exprs2[i])
+			}
+			for i := 0; i < len(stmt.Exprs); i++ {
+				if len(hidden[i]) > 0 {
+					renameVar(ctx, hidden[i], stmt.Exprs[i].Name)
+				}
+			}
+			return b
+		}
+		return genShortVarOne(ctx, b, stmt.Exprs[0].Name, stmt.Exprs2[0])
+	}
+	return b
+}
+
+// genShortVarOne binds `name := rhs` (one element of a short variable
+// declaration): a blank name evaluates rhs for its side effects and binds
+// nothing.
+func genShortVarOne(ctx @GenContext, b @ir.Block, name *[]readonly char, rhs @ast.Expr) @ir.Block {
+	// Blank: evaluate RHS for side effects, don't bind.
+	if isBlank(name) {
+		genExpr(ctx, b, rhs)
+		return ctx.CurBlock
+	}
+	// Inferred bare func reference (`f := add`): the checker decays a
+	// TYP_FUNC reference to @func (defaultType, managed-by-default); emit
+	// the @func value directly rather than letting genExpr treat `add` as a
+	// bare ident (which mis-lowers `f(...)` to a direct `main.f` symbol).
+	// Mirrors genDecl's `var f = add` handling.
+	if isFuncRefExpr(rhs) {
+		var refName @[]char = funcRefName(ctx, rhs)
+		// A local/global VAR of the same name shadows the function (the
+		// checker resolves to the var), so only synthesize when no such var
+		// is in scope — otherwise this is an ordinary value load.
+		if !funcRefShadowed(ctx, rhs, refName) && lookupFuncExists(ctx.Gc, refName) {
+			defineFuncValueVar(ctx, b, name, refName, managedFuncValueTypeForName(ctx.Gc, refName))
 			return ctx.CurBlock
 		}
-		// Inferred bare func reference (`f := add`): the checker decays a
-		// TYP_FUNC reference to @func (defaultType, managed-by-default); emit
-		// the @func value directly rather than letting genExpr treat `add` as a
-		// bare ident (which mis-lowers `f(...)` to a direct `main.f` symbol).
-		// Mirrors genDecl's `var f = add` handling.
-		if isFuncRefExpr(stmt.Exprs2[0]) {
-			var refName @[]char = funcRefName(ctx, stmt.Exprs2[0])
-			// A local/global VAR of the same name shadows the function (the
-			// checker resolves to the var), so only synthesize when no such var
-			// is in scope — otherwise this is an ordinary value load.
-			if !funcRefShadowed(ctx, stmt.Exprs2[0], refName) && lookupFuncExists(ctx.Gc, refName) {
-				defineFuncValueVar(ctx, b, name, refName, managedFuncValueTypeForName(ctx.Gc, refName))
-				return ctx.CurBlock
+	}
+	// Inferred generic-function instantiation (`f := glib.Ident[int]`): emit
+	// the specialized instance and bind f to its func value, decayed to the
+	// managed-by-default @func.  Mirrors genDecl's `var f = glib.Ident[int]`.
+	if rhs.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		var giName @[]char = genericFuncInstanceName(ctx, rhs)
+		if len(giName) > 0 {
+			defineFuncValueVar(ctx, b, name, giName, managedFuncValueTypeForName(ctx.Gc, giName))
+			return ctx.CurBlock
+		}
+	}
+	var val @ir.Instr = genExpr(ctx, b, rhs)
+	b = ctx.CurBlock
+	// If the RHS is a struct/array VALUE (e.g. a composite literal), the
+	// result is already an alloca that IS the new variable's storage, so bind
+	// it directly.  An address (`q := &p`, `q := &aggregateGlobal`) also
+	// presents as an OP_ALLOC of a struct/array — the pointee's — but binding
+	// it directly would alias the pointee at the struct/array type instead of
+	// inferring `*T`.  initIsAggregateValue tells them apart; an address takes
+	// the else branch, which allocates a `*T` slot and stores the address.
+	if initIsAggregateValue(ctx, rhs, val) {
+		// The literal alloca becomes the variable's durable storage (dtor'd at
+		// scope end by emitDecForManagedLocals), so take it off the end-of-
+		// statement temp list genCompositeLit / genArrayLit registered it on —
+		// otherwise a managed-field literal would be both temp-dtor'd here and
+		// var-dtor'd at scope end (a double-free).  No-op for a value-only
+		// literal (never registered) or an IsGlobalRef (routed to else).
+		consumeTemp(ctx, val)
+		defineVar(ctx, name, val, val.TypeArg)
+	} else {
+		// Infer type from RHS; default untyped int to int
+		var typ @types.Type = types.TypInt()
+		if val.Typ != nil {
+			typ = val.Typ
+			if typ.Kind == types.TYP_UNTYPED_INT {
+				typ = types.TypInt()
+			}
+			if typ.Kind == types.TYP_UNTYPED_BOOL {
+				typ = types.TypBool()
 			}
 		}
-		// Inferred generic-function instantiation (`f := glib.Ident[int]`): emit
-		// the specialized instance and bind f to its func value, decayed to the
-		// managed-by-default @func.  Mirrors genDecl's `var f = glib.Ident[int]`.
-		if stmt.Exprs2[0].Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
-			var giName @[]char = genericFuncInstanceName(ctx, stmt.Exprs2[0])
-			if len(giName) > 0 {
-				defineFuncValueVar(ctx, b, name, giName, managedFuncValueTypeForName(ctx.Gc, giName))
-				return ctx.CurBlock
+		// String literal default type is @[]readonly char (matches the
+		// type-checker's defaultStringLitType). Convert the
+		// OP_CONST_STRING value to a managed-slice view of rodata.
+		if rhs.Kind == ast.EXPR_STRING_LIT {
+			typ = types.MakeManagedSliceType(
+					types.MakeReadonlyType(types.TypUint8()))
+			if val.Op == iropcode.OP_CONST_STRING {
+				val = irbuild.EmitStringToChars(b, val, typ)
+				noteSPGrowingResult(ctx, val)
 			}
 		}
-		var val @ir.Instr = genExpr(ctx, b, stmt.Exprs2[0])
-		b = ctx.CurBlock
-		// If the RHS is a struct/array VALUE (e.g. a composite literal), the
-		// result is already an alloca that IS the new variable's storage, so bind
-		// it directly.  An address (`q := &p`, `q := &aggregateGlobal`) also
-		// presents as an OP_ALLOC of a struct/array — the pointee's — but binding
-		// it directly would alias the pointee at the struct/array type instead of
-		// inferring `*T`.  initIsAggregateValue tells them apart; an address takes
-		// the else branch, which allocates a `*T` slot and stores the address.
-		if initIsAggregateValue(ctx, stmt.Exprs2[0], val) {
-			// The literal alloca becomes the variable's durable storage (dtor'd at
-			// scope end by emitDecForManagedLocals), so take it off the end-of-
-			// statement temp list genCompositeLit / genArrayLit registered it on —
-			// otherwise a managed-field literal would be both temp-dtor'd here and
-			// var-dtor'd at scope end (a double-free).  No-op for a value-only
-			// literal (never registered) or an IsGlobalRef (routed to else).
-			consumeTemp(ctx, val)
-			defineVar(ctx, name, val, val.TypeArg)
-		} else {
-			// Infer type from RHS; default untyped int to int
-			var typ @types.Type = types.TypInt()
-			if val.Typ != nil {
-				typ = val.Typ
-				if typ.Kind == types.TYP_UNTYPED_INT {
-					typ = types.TypInt()
-				}
-				if typ.Kind == types.TYP_UNTYPED_BOOL {
-					typ = types.TypBool()
-				}
-			}
-			// String literal default type is @[]readonly char (matches the
-			// type-checker's defaultStringLitType). Convert the
-			// OP_CONST_STRING value to a managed-slice view of rodata.
-			if stmt.Exprs2[0].Kind == ast.EXPR_STRING_LIT {
-				typ = types.MakeManagedSliceType(
-						types.MakeReadonlyType(types.TypUint8()))
-				if val.Op == iropcode.OP_CONST_STRING {
-					val = irbuild.EmitStringToChars(b, val, typ)
-					noteSPGrowingResult(ctx, val)
-				}
-			}
-			// Acquire-and-store through the shared dispatcher: the four
-			// managed-scalar kinds move-a-fresh-producer or RefInc-a-borrow,
-			// and a managed struct/array gets its fields RefInc'd via
-			// emitStructCopy — the arm the single-bind path previously lacked.
-			// Without it, `tgt := src` of a managed-struct-by-value stored the
-			// raw bytes without acquiring, so both src and tgt RefDec'd the
-			// shared field at scope exit (a double-free).  isInit: a fresh
-			// slot, no old value to release.
-			var ptr @ir.Instr = irbuild.EmitAlloc(b, typ)
-			b = emitStoreManagedSlot(ctx, b, ptr, val, typ, true)
-			defineVar(ctx, name, ptr, typ)
-		}
+		// Acquire-and-store through the shared dispatcher: the four
+		// managed-scalar kinds move-a-fresh-producer or RefInc-a-borrow,
+		// and a managed struct/array gets its fields RefInc'd via
+		// emitStructCopy — the arm the single-bind path previously lacked.
+		// Without it, `tgt := src` of a managed-struct-by-value stored the
+		// raw bytes without acquiring, so both src and tgt RefDec'd the
+		// shared field at scope exit (a double-free).  isInit: a fresh
+		// slot, no old value to release.
+		var ptr @ir.Instr = irbuild.EmitAlloc(b, typ)
+		b = emitStoreManagedSlot(ctx, b, ptr, val, typ, true)
+		defineVar(ctx, name, ptr, typ)
 	}
 	return b
 }

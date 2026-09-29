@@ -249,6 +249,24 @@ def form_assign_index_rawptr(t):
     return _shape(t, decl, 'p[0]')
 
 
+# Assign through pointer dereferences on both sides, `*p = *q`: the value is
+# loaded through one pointer and stored through another (a whole-value copy of
+# a struct with managed fields, for managed-struct).  The drop stores a fresh
+# value through the target pointer.
+def form_assign_deref(t):
+    b = t["baseline"]
+    lines = t["construct"]("src")
+    lines.append('testing.Println(rt.Refcount(src_po))')
+    lines += [f'var slot {t["tname"]}', f'var p *{t["tname"]} = &slot', f'var q *{t["tname"]} = &src']
+    lines.append('*p = *q')
+    lines.append('testing.Println(rt.Refcount(src_po))')
+    lines.append(f'testing.Println({t["use"]("slot")})')
+    lines += t["fresh"]("drp")
+    lines.append('*p = drp')
+    lines.append('testing.Println(rt.Refcount(src_po))')
+    return lines, [b, b + 1, t["useval"], b], ""
+
+
 # Multi-assign into a non-ident target: destructure the managed component out
 # of the tuple straight into an element/field. Same balance shape as _shape;
 # the bind is `lv, _ = pair(src)`.
@@ -404,6 +422,7 @@ FORMS = {
     ("multi-assign", "ident"): {"build": form_multi_assign, "helpers": ""},
     ("multi-short-var", "ident"): {"build": form_multi_short_var, "helpers": ""},
     ("assign", "index-rawptr"): {"build": form_assign_index_rawptr, "helpers": ""},
+    ("assign", "deref"): {"build": form_assign_deref, "helpers": ""},
     ("return", "value"): {"build": form_return, "helpers": ""},
     ("composite-lit", "elem"): {"build": form_composite_lit, "helpers": ""},
     ("array-lit", "elem"): {"build": form_array_lit, "helpers": ""},

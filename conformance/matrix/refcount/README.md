@@ -47,6 +47,7 @@ assignment forms; the other forms have a single *degenerate* shape (so the
 | `index-array` | an array element `a[i]`  | assign, multi-assign                    |
 | `index-slice` | a slice element `s[i]`   | assign, multi-assign                    |
 | `index-rawptr`| a raw-ptr element `p[i]` | assign, multi-assign                    |
+| `deref`       | `*p = *q` — stored and loaded through pointers | assign                   |
 | `blank`       | the discard target `_`   | assign, multi-assign, short-var, multi-* |
 | `elem`        | the literal element slot | composite-lit, array-lit, mslice-lit    |
 | `value`       | the delivered value      | return, for-range-value                 |

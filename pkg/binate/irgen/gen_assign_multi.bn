@@ -2,131 +2,19 @@ package "pkg/binate/irgen"
 
 import "pkg/binate/irbuild"
 
-import "pkg/binate/irutil"
-
 import "pkg/binate/ir"
 
 import "pkg/binate/ast"
 import "pkg/binate/iropcode"
-import "pkg/binate/token"
 import "pkg/binate/types"
+import "pkg/stdx/slices"
 
-// emitIndexStore stores a value into a slice or array element, RefDec'ing
-// the overwritten managed element first (Axiom 5).  Used by multi-return
-// assignment to handle LHS index expressions; the new value's copy-RefInc
-// is the caller's job (emitManagedValueCopyRefInc).  Returns the possibly-
-// updated block.
-func emitIndexStore(ctx @GenContext, b @ir.Block, lhs @ast.Expr, collection @ir.Instr,
-		index @ir.Instr, val @ir.Instr) @ir.Block {
-	emitIndexBoundsCheck(ctx, b, collection, index)
-	// Peel transparent wrappers so a named array (`type Row [3]int`) — or a
-	// readonly one — reaches the array store arm and its element type comes
-	// from the underlying array, not the wrapper (whose `.Elem` is nil).
-	var collSt @types.Type = nil
-	if collection.Typ != nil { collSt = types.StripWrappers(collection.Typ) }
-	if collSt != nil && collSt.Kind == types.TYP_ARRAY {
-		var arrPtr @ir.Instr = nil
-		// Recover the array's ADDRESS by base kind, mirroring the single-assign
-		// (genAssign) and parallel-assign (resolveParallelIndexTarget) paths.  The
-		// passed-in `collection` is a loaded COPY of the array, so storing to it drops
-		// the write; the store must target the array's real storage.  Without a
-		// matching arm arrPtr stays nil and the element store is silently DROPPED (a
-		// multi-return `t.arr[i], y = f()` / `(*p)[i], y = f()` no-ops the write).
-		if lhs.X.Kind == ast.EXPR_IDENT {
-			arrPtr = lookupVar(ctx, lhs.X.Name)
-		} else if lhs.X.Kind == ast.EXPR_SELECTOR {
-			// `t.arr[i]` / `p.arr[i]` — address the array field.  genSelectorPtr can
-			// split the block (a type-assertion base), so re-sync.  forDeref=true:
-			// the element is stored into below (a deref).
-			arrPtr = genSelectorPtr(ctx, b, lhs.X, true)
-			b = ctx.CurBlock
-		} else if lhs.X.Kind == ast.EXPR_UNARY && lhs.X.Op == cast(int, token.STAR) {
-			// `(*p)[i]` — p (a pointer-to-array) IS the array's backing address.
-			arrPtr = genExpr(ctx, b, lhs.X.X)
-			b = ctx.CurBlock
-		}
-		if arrPtr != nil {
-			var elemTyp @types.Type = collSt.Elem
-			if elemTyp == nil { elemTyp = types.TypInt() }
-			var elemPtr @ir.Instr = irbuild.EmitGetElemPtr(b, arrPtr, index, elemTyp)
-			b = emitElemPtrStore(ctx, b, elemPtr, val, elemTyp)
-		}
-	} else if collSt != nil && collSt.Kind == types.TYP_POINTER {
-		var elemTyp @types.Type = collSt.Elem
-		if elemTyp == nil { elemTyp = types.TypInt() }
-		// Raw pointer carries no length (no bounds check) — nil-check the store
-		// deref (opt-in).
-		emitNilCheckIfEnabled(ctx, b, collection)
-		var elemPtr @ir.Instr = irbuild.EmitGetElemPtr(b, collection, index, elemTyp)
-		b = emitElemPtrStore(ctx, b, elemPtr, val, elemTyp)
-	} else {
-		// Slice or managed-slice.  Element type from the PEELED collSt, not the
-		// raw collection.Typ: a named-distinct slice is TYP_NAMED with a nil
-		// `.Elem`, so the un-peeled read would default to TypInt and mis-stride a
-		// non-int named element.
-		var elemTyp @types.Type = types.TypInt()
-		if collSt != nil && collSt.Elem != nil {
-			elemTyp = collSt.Elem
-		}
-		if needsStructCopy(elemTyp) {
-			// Managed struct/array element: two-slot save-copy-destroy.  A
-			// slice element has no direct slot pointer, so copy the new
-			// value's managed fields via a fresh slot (emitStructCopy) and
-			// release the old element's via another (emitStructDtor), then
-			// write the value back.  emitStructCopy/emitStructDtor lower to
-			// the type's generated __copy_/__dtor_ helpers, so all field
-			// kinds (incl. @Iface) and nested aggregates are covered.
-			var oldElem @ir.Instr = irbuild.EmitSliceGet(b, collection, index, elemTyp)
-			var oldSlot @ir.Instr = irbuild.EmitAlloc(b, elemTyp)
-			irbuild.EmitStore(b, oldSlot, oldElem)
-			var newSlot @ir.Instr = irbuild.EmitAlloc(b, elemTyp)
-			irbuild.EmitStore(b, newSlot, val)
-			emitStructCopy(ctx.Func, b, newSlot, elemTyp)
-			emitStructDtor(ctx.Func, b, oldSlot, elemTyp)
-			irbuild.EmitSliceSet(b, collection, index, val, elemTyp)
-		} else {
-			if irutil.IsManagedScalarType(elemTyp) {
-				var oldElem @ir.Instr = irbuild.EmitSliceGet(b, collection, index, elemTyp)
-				b = emitManagedValueRefDec(ctx.Func, b, oldElem, elemTyp)
-			}
-			val = ensureWidth(ctx, b, val, elemTyp)
-			irbuild.EmitSliceSet(b, collection, index, val, elemTyp)
-		}
-	}
-	return b
-}
-
-// emitElemPtrStore stores val into an array/pointer element at elemPtr,
-// honoring Axiom 5: a managed struct element gets save-copy-destroy (copy
-// RefIncs the new aggregate's managed fields, the dtor releases the old
-// element's), a managed scalar gets old-value RefDec, plain elements a
-// bare store.  Returns the possibly-updated block.
-func emitElemPtrStore(ctx @GenContext, b @ir.Block, elemPtr @ir.Instr, val @ir.Instr,
-		elemTyp @types.Type) @ir.Block {
-	if needsStructCopy(elemTyp) {
-		var tmpSlot @ir.Instr = irbuild.EmitAlloc(b, elemTyp)
-		var oldElem @ir.Instr = irbuild.EmitLoad(b, elemPtr, elemTyp)
-		irbuild.EmitStore(b, tmpSlot, oldElem)
-		irbuild.EmitStore(b, elemPtr, val)
-		emitStructCopy(ctx.Func, b, elemPtr, elemTyp)
-		emitStructDtor(ctx.Func, b, tmpSlot, elemTyp)
-		return b
-	}
-	if irutil.IsManagedScalarType(elemTyp) {
-		var oldElem @ir.Instr = irbuild.EmitLoad(b, elemPtr, elemTyp)
-		b = emitManagedValueRefDec(ctx.Func, b, oldElem, elemTyp)
-	}
-	val = ensureWidth(ctx, b, val, elemTyp)
-	irbuild.EmitStore(b, elemPtr, val)
-	return b
-}
-
-// genMultiAssign lowers a multi-value assignment `q, r, ... = call(...)`:
-// it evaluates the call once, then for each LHS target extracts its
-// component, copy-RefIncs a managed value for the target, and stores it
-// (RefDec'ing any overwritten managed value, Axiom 5).  A blank `_` target
-// discards its component — the call-result temp's dtor frees it at end of
-// statement.
+// genMultiAssign lowers a multi-value assignment `q, r, ... = call(...)` in
+// the three steps of gen_assign_entry.bn: it evaluates the call once and
+// extracts each target's component, then evaluates every target's designator,
+// then acquires the components, stores them, and releases the replaced managed
+// values (Axiom 5).  A blank `_` target discards its component — the
+// call-result temp's dtor frees it at end of statement.
 func genMultiAssign(ctx @GenContext, b @ir.Block, stmt @ast.Stmt) @ir.Block {
 	// A 2-target comma-ok type assertion (`v, ok = x.(*T)`) yields a synthesized
 	// {recovered, ok} struct rather than a call result.
@@ -146,171 +34,29 @@ func genMultiAssign(ctx @GenContext, b @ir.Block, stmt @ast.Stmt) @ir.Block {
 	if len(retTypes) == 0 && val.Typ != nil && val.Typ.Kind == types.TYP_STRUCT {
 		retTypes = multiReturnFieldTypes(val.Typ)
 	}
+	var entries @[]AssignEntry
 	for i := 0; i < len(stmt.Exprs); i++ {
-		// A prior target may have split the block — a managed @func/@Iface
-		// IDENT target's old-value RefDec (emitManagedValueRefDec) does, and
-		// updates only the local b, not ctx.CurBlock.  Re-sync so a later
-		// SELECTOR target's `b = ctx.CurBlock` (read after genSelectorPtr,
-		// which — unlike genExpr — does not sync ctx.CurBlock) lands on the
-		// live continuation, not the stale terminated block.  Without this
-		// the field store emits into a dead block and is silently dropped.
-		ctx.CurBlock = b
 		var lhs @ast.Expr = stmt.Exprs[i]
+		var e AssignEntry
 		// A blank-identifier target (`_, n = f()`) discards its
 		// component: nothing owns it, so do NOT copy-retain it.  The
 		// call-result temp's dtor RefDec's the owned ref at end of
 		// statement, freeing it; an Axiom-3 RefInc here would have no
-		// matching RefDec and leak.  (The single-value `_ = g()` path
-		// skips the RefInc the same way, via its nil-ptr guard below.)
-		if lhs.Kind == ast.EXPR_IDENT && isBlank(lhs.Name) {
-			continue
+		// matching RefDec and leak.
+		if !isBlankTarget(lhs) {
+			var elemTyp @types.Type = types.TypInt()
+			if i < len(retTypes) { elemTyp = retTypes[i] }
+			// Axiom 3: the extracted value is a COPY borrowed from the owned
+			// call-result temp (whose dtor RefDec's it at end of statement), so
+			// acquireAssignValue RefIncs it for the target that now co-owns it
+			// (a managed struct/array is copied field-wise instead).  A RAW
+			// target (`*T` from an @T, `*[]T` from an @[]T) BORROWS the
+			// component — the temp still releases it at end of statement and the
+			// raw slot never does — so it is not acquired (a managed slice also
+			// decays to the raw {data, len}).
+			e.Val = irbuild.EmitExtract(b, val, i, elemTyp)
 		}
-		var elemTyp @types.Type = types.TypInt()
-		if len(retTypes) > 0 && i < len(retTypes) {
-			elemTyp = retTypes[i]
-		}
-		var extracted @ir.Instr = irbuild.EmitExtract(b, val, i, elemTyp)
-		// Axiom 3: the extracted value is a COPY borrowed from the
-		// owned call-result temp (whose dtor RefDec's it at end of
-		// statement), so RefInc it for the target that now co-owns it.
-		// Covers @T / @[]T / @func / @Iface; struct/array aggregates are
-		// RefInc'd by emitStructCopy at the store instead.  A RAW target
-		// (`*T` from an @T, `*[]T` from an @[]T) instead BORROWS the component
-		// — the temp still releases it at end of statement and the raw slot
-		// never does — so it is not retained (a managed slice also decays to
-		// the raw {data, len}).
-		var dstTyp @types.Type = nil
-		if ctx.Checker != nil && lhs.ResolvedTypeID != 0 {
-			dstTyp = ctx.Checker.ExprType(lhs.ResolvedTypeID)
-		}
-		if isManagedToRawDecay(extracted, dstTyp) {
-			extracted = irbuild.EmitManagedToRaw(b, extracted)
-		} else if dstTyp == nil || irutil.IsManagedScalarType(dstTyp) {
-			emitManagedValueCopyRefInc(ctx.Func, b, extracted, elemTyp)
-		}
-		if lhs.Kind == ast.EXPR_IDENT {
-			var ptr @ir.Instr = lookupVar(ctx, lhs.Name)
-			if ptr != nil {
-				var varTyp @types.Type = lookupVarType(ctx, lhs.Name)
-				if varTyp != nil && needsStructCopy(varTyp) {
-					// Axiom 5: save-copy-destroy for a managed struct.
-					var tmpSlot @ir.Instr = irbuild.EmitAlloc(b, varTyp)
-					var oldVal @ir.Instr = irbuild.EmitLoad(b, ptr, varTyp)
-					irbuild.EmitStore(b, tmpSlot, oldVal)
-					irbuild.EmitStore(b, ptr, extracted)
-					emitStructCopy(ctx.Func, b, ptr, varTyp)
-					emitStructDtor(ctx.Func, b, tmpSlot, varTyp)
-				} else {
-					// Axiom 5: RefDec the overwritten managed value
-					// before storing the new one (RefInc'd above).
-					if irutil.IsManagedScalarType(varTyp) {
-						var oldVal @ir.Instr = irbuild.EmitLoad(b, ptr, varTyp)
-						b = emitManagedValueRefDec(ctx.Func, b, oldVal, varTyp)
-					}
-					// Coerce to the destination width for symmetry with the
-					// SELECTOR arm below (and the single-assign arms).  A no-op
-					// today — a multi-return component is already typed at the
-					// declared result width — but keeps the arm robust if that
-					// extract-width == slot-width invariant ever changes.
-					if varTyp != nil {
-						extracted = ensureWidth(ctx, b, extracted, varTyp)
-					}
-					irbuild.EmitStore(b, ptr, extracted)
-				}
-			}
-		} else if lhs.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
-			// s[i] = extracted: slice/array index assignment.  extracted is already
-			// acquired above, so an element slot takes it through emitElemPtrStore
-			// (release the old occupant, store) — emitArrayElemStore would acquire
-			// it a second time and leak a reference.  A nested-ARRAY target
-			// (`a[j][i]`) has no backing pointer for the loaded inner array, so
-			// emitIndexStore's array arm would DROP the store; resolve the element
-			// pointer in-place via genIndexPtr instead (see genIndexAssign /
-			// resolveParallelIndexTarget).  Checked by TYPE first so lhs.X isn't
-			// generated twice.
-			if len(lhs.Args) == 1 && isNestedArrayBase(ctx, lhs) {
-				// Store target off a nested-array element — deref => true.
-				var elemPtr @ir.Instr = genIndexPtr(ctx, b, lhs, true)
-				b = ctx.CurBlock
-				if elemPtr != nil && elemPtr.Typ != nil && elemPtr.Typ.Elem != nil {
-					b = emitElemPtrStore(ctx, b, elemPtr, extracted, elemPtr.Typ.Elem)
-				}
-			} else {
-				// An array with storage: store in place, its base evaluated once.
-				var inPlace @ir.Instr
-				var inPlaceTyp @types.Type
-				inPlace, inPlaceTyp = genArrayElemPtrInPlace(ctx, b, lhs, true)
-				if inPlace != nil {
-					b = emitElemPtrStore(ctx, ctx.CurBlock, inPlace, extracted, inPlaceTyp)
-				} else {
-					var collection @ir.Instr = genExpr(ctx, b, lhs.X)
-					b = ctx.CurBlock
-					var index @ir.Instr = genIntOperand(ctx, b, lhs.Args[0])
-					b = ctx.CurBlock
-					b = emitIndexStore(ctx, b, lhs, collection, index, extracted)
-				}
-			}
-		} else if lhs.Kind == ast.EXPR_SELECTOR {
-			// s.field = extracted: struct field assignment (store => forDeref=true)
-			var fieldPtr @ir.Instr = genSelectorPtr(ctx, b, lhs, true)
-			b = ctx.CurBlock
-			if fieldPtr != nil {
-				var fieldTyp @types.Type = getSelectorType(ctx, lhs)
-				if fieldTyp != nil && needsStructCopy(fieldTyp) {
-					// Axiom 5: save-copy-destroy for a managed struct
-					// field — copy RefIncs the new aggregate's managed
-					// fields, the dtor releases the old field's.
-					var tmpSlot @ir.Instr = irbuild.EmitAlloc(b, fieldTyp)
-					var oldVal @ir.Instr = irbuild.EmitLoad(b, fieldPtr, fieldTyp)
-					irbuild.EmitStore(b, tmpSlot, oldVal)
-					irbuild.EmitStore(b, fieldPtr, extracted)
-					emitStructCopy(ctx.Func, b, fieldPtr, fieldTyp)
-					emitStructDtor(ctx.Func, b, tmpSlot, fieldTyp)
-				} else {
-					// Axiom 5: RefDec the overwritten managed field first.
-					if irutil.IsManagedScalarType(fieldTyp) {
-						var oldVal @ir.Instr = irbuild.EmitLoad(b, fieldPtr, fieldTyp)
-						b = emitManagedValueRefDec(ctx.Func, b, oldVal, fieldTyp)
-					}
-					if fieldTyp != nil {
-						extracted = ensureWidth(ctx, b, extracted, fieldTyp)
-					}
-					irbuild.EmitStore(b, fieldPtr, extracted)
-				}
-			}
-		} else if lhs.Kind == ast.EXPR_UNARY && lhs.Op == cast(int, token.STAR) {
-			// *p = extracted: store through a dereferenced pointer.  Without this
-			// arm the deref target was silently DROPPED (no store emitted) — a
-			// pre-existing miscompile for BOTH plain and named pointers.  ptrVal IS
-			// the slot pointer, so this mirrors the SELECTOR arm's Axiom-5
-			// save-copy-destroy / RefDec-old logic with ptrVal as the destination.
-			// Peel the pointer type (named-distinct) and accept a managed pointer.
-			var ptrVal @ir.Instr = genExpr(ctx, b, lhs.X)
-			b = ctx.CurBlock
-			var derefTyp @types.Type = nil
-			var pk @types.Type = nil
-			if ptrVal.Typ != nil { pk = types.StripWrappers(ptrVal.Typ) }
-			if pk != nil && (pk.Kind == types.TYP_POINTER || pk.Kind == types.TYP_MANAGED_PTR) {
-				derefTyp = pk.Elem
-			}
-			if derefTyp != nil && needsStructCopy(derefTyp) {
-				var tmpSlot @ir.Instr = irbuild.EmitAlloc(b, derefTyp)
-				var oldVal @ir.Instr = irbuild.EmitLoad(b, ptrVal, derefTyp)
-				irbuild.EmitStore(b, tmpSlot, oldVal)
-				irbuild.EmitStore(b, ptrVal, extracted)
-				emitStructCopy(ctx.Func, b, ptrVal, derefTyp)
-				emitStructDtor(ctx.Func, b, tmpSlot, derefTyp)
-			} else {
-				if irutil.IsManagedScalarType(derefTyp) {
-					var oldVal @ir.Instr = irbuild.EmitLoad(b, ptrVal, derefTyp)
-					b = emitManagedValueRefDec(ctx.Func, b, oldVal, derefTyp)
-				}
-				if derefTyp != nil {
-					extracted = ensureWidth(ctx, b, extracted, derefTyp)
-				}
-				irbuild.EmitStore(b, ptrVal, extracted)
-			}
-		}
+		entries = slices.Append[AssignEntry](entries, e)
 	}
-	return b
+	return resolveAndStoreAssignEntries(ctx, b, stmt.Exprs, entries)
 }

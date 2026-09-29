@@ -1,0 +1,402 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irbuild"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/ast"
+import "pkg/binate/iropcode"
+import "pkg/binate/token"
+import "pkg/binate/types"
+
+// A parallel assignment (`a, b = e1, e2`) and a multi-value assignment
+// (`a, b = f()`) evaluate in three steps: (1) every right-hand value, left to
+// right; (2) every target's designator — its pointer, base and index operands —
+// left to right; (3) the stores, left to right, and only then the releases of
+// the values the stores replaced.  Every value is read and every target fixed
+// before any slot is written, so the swap idiom `a, b = b, a` is correct and one
+// target's store cannot redirect another (`i, a[i] = f()` stores into the
+// element at the OLD i); and no old value is released before the last store, so
+// a later target inside an object the statement replaces (`p, p.v = q, 1`)
+// still has its storage when it is stored into.
+//
+// A value is converted and acquired for its target in step 3, once the target's
+// type is known from its designator — before any store, which is all the swap
+// idiom needs.  (A value borrowed in step 1 that a later operand's side effect
+// releases is undefined behavior, as for any operand.)  An AssignEntry carries
+// one target through the steps.
+
+// Assignment-target kinds: how a resolved target is stored.
+const (
+	ASSIGN_BLANK = 0 // `_`: the value is not stored
+	ASSIGN_SLOT = 1  // store through a slot pointer (ident / *p / p.f / array&ptr index)
+	ASSIGN_SLICE = 2 // store via the runtime slice set (s[i] on a slice s)
+)
+
+// AssignEntry is one target of a parallel or multi-value assignment: its value
+// (step 1), its store location and type (step 2), and the value its store
+// replaced, released after every store (step 3).
+type AssignEntry struct {
+	Kind  int // ASSIGN_BLANK / ASSIGN_SLOT / ASSIGN_SLICE
+	Slot  @ir.Instr // ASSIGN_SLOT: the slot pointer; ASSIGN_SLICE: the slice value
+	Index @ir.Instr // ASSIGN_SLICE: the element index
+	Typ   @types.Type // slot / element type
+	Val   @ir.Instr // the value; once acquired, for a struct, a pointer to an
+	// acquired temp copy (see IsStruct)
+	IsStruct bool // managed struct/array: the store MOVES Val's bits into
+	// the slot (no re-copy), and Old is a saved copy of the old occupant
+	Old @ir.Instr // the replaced managed value (or, IsStruct, its saved copy)
+}
+
+// isBlankTarget reports whether lhs is the blank identifier `_`.
+func isBlankTarget(lhs @ast.Expr) bool {
+	return lhs.Kind == ast.EXPR_IDENT && isBlank(lhs.Name)
+}
+
+// assignHintType returns the type of the location lhs designates, as far as the
+// IR-side tables know it without generating code, for genExprOrFuncRef to
+// shape the right-hand side (a function reference lifted to a function value, an
+// implicit interface borrow, an untyped constant narrowed); nil when unknown.
+func assignHintType(ctx @GenContext, lhs @ast.Expr) @types.Type {
+	if lhs.Kind == ast.EXPR_IDENT { return lookupVarType(ctx, lhs.Name) }
+	if lhs.Kind == ast.EXPR_SELECTOR { return getSelectorType(ctx, lhs) }
+	if lhs.Kind == ast.EXPR_INSTANTIATE_OR_INDEX { return getIndexElemType(ctx, lhs) }
+	if lhs.Kind == ast.EXPR_UNARY && lhs.Op == cast(int, token.STAR) { return indexExprType(ctx, lhs) }
+	return nil
+}
+
+// fieldTargetType returns the type of the field fieldPtr (genSelectorPtr's
+// address of the field lhs designates) points at: the pointer's own element
+// type, so a field reached through a generic instance — whose checker type
+// still names the type parameter, which getSelectorType cannot resolve — is
+// typed concretely; else what getSelectorType knows.
+func fieldTargetType(ctx @GenContext, lhs @ast.Expr, fieldPtr @ir.Instr) @types.Type {
+	if fieldPtr != nil && fieldPtr.Typ != nil {
+		var pt @types.Type = types.StripWrappers(fieldPtr.Typ)
+		if pt != nil && pt.Kind == types.TYP_POINTER && pt.Elem != nil { return pt.Elem }
+	}
+	return getSelectorType(ctx, lhs)
+}
+
+// resolveAndStoreAssignEntries runs steps 2 and 3 over targets lhss, whose
+// values entries already hold: every designator left to right; then every value
+// converted and acquired for its target; then every store left to right; then
+// the releases of the replaced values.  Returns the current block.
+func resolveAndStoreAssignEntries(ctx @GenContext, b @ir.Block, lhss @[]@ast.Expr,
+		entries @[]AssignEntry) @ir.Block {
+	for i := 0; i < len(entries); i++ {
+		// Re-sync after a prior target split the block: genSelectorPtr reads `b`
+		// back from ctx.CurBlock but does not itself sync it, so the current
+		// block must be live before this target is resolved.
+		ctx.CurBlock = b
+		entries[i], b = resolveAssignTarget(ctx, b, lhss[i], entries[i])
+	}
+	for i := 0; i < len(entries); i++ {
+		if entries[i].Kind != ASSIGN_BLANK {
+			entries[i] = acquireAssignValue(ctx, b, entries[i])
+		}
+	}
+	for i := 0; i < len(entries); i++ {
+		entries[i] = storeAssignEntry(ctx, b, entries[i])
+	}
+	for i := 0; i < len(entries); i++ {
+		b = releaseReplacedValue(ctx, b, entries[i])
+	}
+	ctx.CurBlock = b
+	return b
+}
+
+// acquireAssignValue converts e's value for its target type (coerceAssignValue)
+// and acquires it: a managed struct/array is snapshotted into a temp whose
+// managed fields are copied (RefInc'd), a managed scalar is RefInc'd.
+func acquireAssignValue(ctx @GenContext, b @ir.Block, e AssignEntry) AssignEntry {
+	var v @ir.Instr = coerceAssignValue(ctx, b, e.Val, e.Typ)
+	if needsStructCopy(e.Typ) {
+		// The store MOVES the temp's bits into the slot.
+		//
+		// EmitAlloc with the PEELED type (mirroring genCompositeLit) so the temp's
+		// TypeArg is the concrete TYP_STRUCT / TYP_ARRAY, not a named-distinct
+		// wrapper: the fault pad releases this temp via emitTempRefDecs'
+		// isStructOrArrayAlloc arm, which tests TypeArg.Kind WITHOUT peeling — a
+		// TYP_NAMED TypeArg (from `type NBox Box` / `type Row [N]@T`) would slip
+		// past it and leak the copied fields on the recoverable-fault path.  The
+		// underlying has identical layout (codegen peels named anyway), so the
+		// non-fault lowering is unchanged.
+		var tmp @ir.Instr = irbuild.EmitAlloc(b, types.StripWrappers(e.Typ))
+		irbuild.EmitStore(b, tmp, v)
+		emitStructCopy(ctx.Func, b, tmp, e.Typ)
+		e.Val = tmp
+		e.IsStruct = true
+	} else {
+		emitManagedValueCopyRefInc(ctx.Func, b, v, e.Typ)
+		e.Val = v
+	}
+	registerAssignAcquire(ctx, e)
+	return e
+}
+
+// registerAssignAcquire tracks a just-acquired value.  Until its store the
+// value's acquire reference — a managed-scalar slot-acquire RefInc
+// (emitManagedValueCopyRefInc), or a managed struct/array copy's field RefIncs
+// (emitStructCopy) — is owned by no slot.  Registered as a temp, it is released
+// by a recoverable-VM-fault pad raised before its store (a later entry's struct
+// copy calls a generated helper, which can overflow the VM stack) instead of
+// leaking.  storeAssignEntry consumes it once the store transfers ownership into
+// the slot, so the normal path neither double-frees (statement-end cleanup) nor
+// double-dtors (the struct move).  A value that was ALSO registered as a temp by
+// its producer (a string-literal copy in coerceAssignValue, a call result) is
+// then registered twice and RefDec'd twice by the pad — matching its two
+// orphaned references (own + acquire).  Emits nothing itself (a compile-time
+// list op), so non-fault IR — and every compiled/native backend, which has no
+// fault pads — is byte-identical.  A raw slice/pointer (borrow, not managed) is
+// never acquired, so isManagedScalarType keeps it off the list.
+func registerAssignAcquire(ctx @GenContext, e AssignEntry) {
+	if e.Val == nil { return }
+	if e.IsStruct || irutil.IsManagedScalarType(e.Typ) {
+		registerTemp(ctx, e.Val)
+	}
+}
+
+// releaseAssignAcquire deregisters an acquire once its store has transferred it
+// into the slot, so the statement-end temp cleanup does not RefDec / dtor it a
+// second time.  Pairs with registerAssignAcquire; consuming exactly one entry
+// undoes exactly one of the possibly-two registrations (the acquire), leaving a
+// producer's own temp registration to run at statement end.
+func releaseAssignAcquire(ctx @GenContext, e AssignEntry) {
+	if e.Val == nil { return }
+	if e.IsStruct || irutil.IsManagedScalarType(e.Typ) {
+		consumeTemp(ctx, e.Val)
+	}
+}
+
+// resolveAssignTarget evaluates target lhs's designator into e's store
+// location and type: a slot pointer, or a slice value and index.  A blank `_`
+// stays ASSIGN_BLANK.  A target the checker accepted always has a store
+// location and a type, so failing to resolve either is a compiler bug.
+func resolveAssignTarget(ctx @GenContext, b @ir.Block, lhs @ast.Expr,
+		e AssignEntry) (AssignEntry, @ir.Block) {
+	if isBlankTarget(lhs) { return e, b }
+	if lhs.Kind == ast.EXPR_IDENT {
+		e.Kind = ASSIGN_SLOT
+		e.Slot = lookupVar(ctx, lhs.Name)
+		e.Typ = lookupVarType(ctx, lhs.Name)
+	} else if lhs.Kind == ast.EXPR_UNARY && lhs.Op == cast(int, token.STAR) {
+		var ptrVal @ir.Instr = genExpr(ctx, b, lhs.X)
+		b = ctx.CurBlock
+		e.Kind = ASSIGN_SLOT
+		e.Slot = ptrVal
+		// Peel the pointer type (named-distinct) and accept a managed pointer; an
+		// un-peeled `== TYP_POINTER` check leaves the type nil for a named pointer,
+		// so a struct/managed target `*p1, *p2 = ...` mislowers.
+		var pk @types.Type = nil
+		if ptrVal != nil && ptrVal.Typ != nil { pk = types.StripWrappers(ptrVal.Typ) }
+		if pk != nil && (pk.Kind == types.TYP_POINTER || pk.Kind == types.TYP_MANAGED_PTR) {
+			e.Typ = pk.Elem
+		}
+	} else if lhs.Kind == ast.EXPR_SELECTOR {
+		// Assignment target (stored into) => forDeref=true.
+		e.Slot = genSelectorPtr(ctx, b, lhs, true)
+		b = ctx.CurBlock
+		e.Kind = ASSIGN_SLOT
+		e.Typ = fieldTargetType(ctx, lhs, e.Slot)
+	} else if lhs.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		e, b = resolveIndexTarget(ctx, b, lhs, e)
+	}
+	var storable bool = (e.Kind == ASSIGN_SLOT && e.Slot != nil) || e.Kind == ASSIGN_SLICE
+	if !storable {
+		panic("internal error: assignment target with no store location in IR-gen (compiler bug)")
+	}
+	// Without its type the value can be neither converted nor acquired for the
+	// slot, and a managed value would be stored without its reference.
+	if e.Typ == nil {
+		panic("internal error: assignment target with no type in IR-gen (compiler bug)")
+	}
+	return e, b
+}
+
+// resolveIndexTarget resolves a `coll[i]` target into either a slot pointer
+// (array / pointer element) or a slice value + index (runtime set), filling e
+// and returning it with the updated block.
+func resolveIndexTarget(ctx @GenContext, b @ir.Block, lhs @ast.Expr,
+		e AssignEntry) (AssignEntry, @ir.Block) {
+	// Nested-ARRAY target (`a[j][i]`): the inner array `a[j]` loaded as an r-value
+	// has no backing pointer, so the array arm below (which needs an IDENT/SELECTOR/
+	// deref base to recover arrPtr) can't address the element and silently DROPs the
+	// store.  Resolve the element pointer in-place via genIndexPtr instead.  Checked
+	// by TYPE first so lhs.X isn't generated twice.  Mirrors genIndexAssign.
+	if len(lhs.Args) == 1 && isNestedArrayBase(ctx, lhs) {
+		// Store target off a nested-array element — deref => true.
+		var elemPtr @ir.Instr = genIndexPtr(ctx, b, lhs, true)
+		b = ctx.CurBlock
+		if elemPtr != nil && elemPtr.Typ != nil && elemPtr.Typ.Elem != nil {
+			e.Kind = ASSIGN_SLOT
+			e.Slot = elemPtr
+			e.Typ = elemPtr.Typ.Elem
+		}
+		return e, b
+	}
+	// An array with storage: its element's address in place, the base
+	// evaluated once.
+	var inPlace @ir.Instr
+	var inPlaceTyp @types.Type
+	inPlace, inPlaceTyp = genArrayElemPtrInPlace(ctx, b, lhs, true)
+	if inPlace != nil {
+		e.Kind = ASSIGN_SLOT
+		e.Slot = inPlace
+		e.Typ = inPlaceTyp
+		return e, ctx.CurBlock
+	}
+	var collection @ir.Instr = genExpr(ctx, b, lhs.X)
+	b = ctx.CurBlock
+	var index @ir.Instr = genIntOperand(ctx, b, lhs.Args[0])
+	b = ctx.CurBlock
+	emitIndexBoundsCheck(ctx, b, collection, index)
+	var collSt @types.Type = nil
+	if collection.Typ != nil { collSt = types.StripWrappers(collection.Typ) }
+	if collSt != nil && collSt.Kind == types.TYP_ARRAY {
+		// Array element: GEP off the array's backing pointer.
+		var arrPtr @ir.Instr = nil
+		if lhs.X.Kind == ast.EXPR_IDENT {
+			arrPtr = lookupVar(ctx, lhs.X.Name)
+		} else if lhs.X.Kind == ast.EXPR_SELECTOR {
+			// Array/slice field indexed + stored into => forDeref=true.
+			arrPtr = genSelectorPtr(ctx, b, lhs.X, true)
+			b = ctx.CurBlock
+		} else if lhs.X.Kind == ast.EXPR_UNARY && lhs.X.Op == cast(int, token.STAR) {
+			// `(*p)[i] = v`: p is the array's backing address — GEP through it.
+			arrPtr = genExpr(ctx, b, lhs.X.X)
+			b = ctx.CurBlock
+		}
+		var elemTyp @types.Type = collSt.Elem
+		if elemTyp == nil { elemTyp = types.TypInt() }
+		if arrPtr != nil {
+			e.Kind = ASSIGN_SLOT
+			e.Slot = irbuild.EmitGetElemPtr(b, arrPtr, index, elemTyp)
+			e.Typ = elemTyp
+		}
+		return e, b
+	}
+	if collSt != nil && collSt.Kind == types.TYP_POINTER {
+		var elemTyp @types.Type = collSt.Elem
+		if elemTyp == nil { elemTyp = types.TypInt() }
+		e.Kind = ASSIGN_SLOT
+		// Raw pointer carries no length (no bounds check) — nil-check the store
+		// deref (opt-in).
+		emitNilCheckIfEnabled(ctx, b, collection)
+		e.Slot = irbuild.EmitGetElemPtr(b, collection, index, elemTyp)
+		e.Typ = elemTyp
+		return e, b
+	}
+	// Slice (or managed-slice): store via the runtime set, which has no
+	// element pointer.  Element type from the PEELED collSt (a named-distinct
+	// slice's raw `.Elem` is nil, so reading it would default to int).
+	var selemTyp @types.Type = types.TypInt()
+	if collSt != nil && collSt.Elem != nil {
+		selemTyp = collSt.Elem
+	}
+	e.Kind = ASSIGN_SLICE
+	e.Slot = collection
+	e.Index = index
+	e.Typ = selemTyp
+	return e, b
+}
+
+// coerceAssignValue applies the value coercions the single-assign path does
+// before a store: string literal → chars, nil → the slot type's nil,
+// managed-slice → raw slice, and an aggregate composite-literal alloca → its
+// loaded value.  Width adjustment for plain scalars happens at the store.
+func coerceAssignValue(ctx @GenContext, b @ir.Block, v @ir.Instr, slotTyp @types.Type) @ir.Instr {
+	if slotTyp == nil { return v }
+	if isCharSliceType(slotTyp) && v.Op == iropcode.OP_CONST_STRING {
+		v = irbuild.EmitStringToChars(b, v, slotTyp)
+		noteSPGrowingResult(ctx, v)
+		// A MANAGED @[]char copy (OP_RODATA_MSLICE_COPY) is a fresh owning value;
+		// acquireAssignValue unconditionally RefInc's it (emitManagedValueCopyRefInc)
+		// to give the destination slot its own ref, balanced only when the value is
+		// a registered cleanup temp the statement-end RefDec reclaims.  Register it
+		// (mirrors the call-arg / return sites) — otherwise the copy leaks one block
+		// per assigned target.  (The raw *[]readonly char alias — OP_RODATA_MSLICE —
+		// allocates nothing and must not be registered.)
+		if v.Op == iropcode.OP_RODATA_MSLICE_COPY {
+			registerTemp(ctx, v)
+		}
+		return v
+	}
+	// A literal `nil` takes the slot's type (nilForSlot), so a function-value
+	// slot (raw or managed, named or not) gets both words zero; left untyped,
+	// the managed acquire read the second word of a one-word nil.
+	if v.Typ != nil && v.Typ.Kind == types.TYP_NIL { return nilForSlot(b, v, slotTyp) }
+	if isManagedToRawDecay(v, slotTyp) {
+		return irbuild.EmitManagedToRaw(b, v)
+	}
+	if isAggregateAllocToLoad(v, slotTyp) {
+		return irbuild.EmitLoad(b, v, v.TypeArg)
+	}
+	return v
+}
+
+// storeAssignEntry stores an acquired value into its resolved target, saving
+// the value it replaces in e.Old (released by releaseReplacedValue once every
+// target of the statement is stored), and WITHOUT re-acquiring (the value was
+// acquired by acquireAssignValue).  A blank entry stores nothing.
+func storeAssignEntry(ctx @GenContext, b @ir.Block, e AssignEntry) AssignEntry {
+	if e.Kind == ASSIGN_BLANK { return e }
+	// Ownership now transfers to the slot, so stop tracking this acquire
+	// (registerAssignAcquire) — else statement-end cleanup would double-free it.
+	releaseAssignAcquire(ctx, e)
+	if e.Kind == ASSIGN_SLICE { return storeAssignSliceElem(ctx, b, e) }
+	if e.IsStruct {
+		// Move the acquired temp copy into the slot after saving the old
+		// occupant's bits.  No emitStructCopy here — the temp was already
+		// RefInc'd.
+		var oldSlot @ir.Instr = irbuild.EmitAlloc(b, e.Typ)
+		irbuild.EmitStore(b, oldSlot, irbuild.EmitLoad(b, e.Slot, e.Typ))
+		irbuild.EmitStore(b, e.Slot, irbuild.EmitLoad(b, e.Val, e.Typ))
+		e.Old = oldSlot
+		return e
+	}
+	if irutil.IsManagedScalarType(e.Typ) {
+		e.Old = irbuild.EmitLoad(b, e.Slot, e.Typ)
+		irbuild.EmitStore(b, e.Slot, e.Val)
+		return e
+	}
+	var v @ir.Instr = e.Val
+	if e.Typ != nil { v = ensureWidth(ctx, b, v, e.Typ) }
+	irbuild.EmitStore(b, e.Slot, v)
+	return e
+}
+
+// storeAssignSliceElem stores an acquired value into a slice element via the
+// runtime set, saving the overwritten element in e.Old.
+func storeAssignSliceElem(ctx @GenContext, b @ir.Block, e AssignEntry) AssignEntry {
+	if e.IsStruct {
+		var oldSlot @ir.Instr = irbuild.EmitAlloc(b, e.Typ)
+		irbuild.EmitStore(b, oldSlot, irbuild.EmitSliceGet(b, e.Slot, e.Index, e.Typ))
+		irbuild.EmitSliceSet(b, e.Slot, e.Index, irbuild.EmitLoad(b, e.Val, e.Typ), e.Typ)
+		e.Old = oldSlot
+		return e
+	}
+	if irutil.IsManagedScalarType(e.Typ) {
+		e.Old = irbuild.EmitSliceGet(b, e.Slot, e.Index, e.Typ)
+		irbuild.EmitSliceSet(b, e.Slot, e.Index, e.Val, e.Typ)
+		return e
+	}
+	var v @ir.Instr = e.Val
+	if e.Typ != nil { v = ensureWidth(ctx, b, v, e.Typ) }
+	irbuild.EmitSliceSet(b, e.Slot, e.Index, v, e.Typ)
+	return e
+}
+
+// releaseReplacedValue releases the value e's store replaced (Axiom 5): a saved
+// managed struct/array copy is destroyed, a managed scalar RefDec'd.  Returns
+// the (possibly split) current block.
+func releaseReplacedValue(ctx @GenContext, b @ir.Block, e AssignEntry) @ir.Block {
+	if e.Old == nil { return b }
+	if e.IsStruct {
+		emitStructDtor(ctx.Func, b, e.Old, e.Typ)
+		return b
+	}
+	return emitManagedValueRefDec(ctx.Func, b, e.Old, e.Typ)
+}

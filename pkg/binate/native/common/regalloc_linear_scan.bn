@@ -1,0 +1,277 @@
+package "pkg/binate/native/common"
+
+import "pkg/stdx/slices"
+
+// scanState is the linear scan's working state: the free pools, the active
+// intervals holding a register (parallel arrays), the per-interval result, and
+// the coalescing inputs.  An active entry is one interval currently holding a
+// register; several entries may hold the SAME register when their range lists
+// are compatible (intervalsCompatible), so a register returns to its free pool
+// only when its last active holder expires.
+type scanState struct {
+	intervals  @[]@LiveInterval
+	ties       @[]TiePoint
+	calleeSet  @[]int
+	freeCaller @[]int
+	freeCallee @[]int
+	// Active holders: End / Reg / spill cost / index in intervals and result.
+	actEnd    @[]int
+	actReg    @[]int
+	actCost   @[]int
+	actResIdx @[]int
+	result    @[]RegAssignment
+	// regOfID[id]: the register id was assigned (-1 if spilled, evicted, or not
+	// yet reached) — read through the tie-partner hints.
+	regOfID  @[]int
+	partners @[]@[]int
+}
+
+// LinearScan assigns each interval a register or marks it spilled.  Intervals
+// must be sorted by Start (BuildIntervals returns them so).  clobbers is the
+// ascending clobber-position list (ClobberPositions).  An interval that spans
+// a clobber takes a callee-saved register (or spills if none is available); one
+// that does not prefers a caller-saved register (leaving callee-saved for
+// spanning intervals), falling back to callee-saved.
+//
+// Registers are chosen, in order: (1) a tie partner's register (ties,
+// CollectTiePoints; copy partners first) when sharing it is legal — the move
+// between them then disappears; (2) a free register; (3) a register every
+// active holder of which is compatible with this interval (this interval fits
+// in their holes); (4) eviction.  Sharing is decided by intervalsCompatible, so
+// two values share a register only where they are never live together except
+// at a tie between them.
+//
+// spillCosts is the id-indexed spill cost (computeSpillCosts): each def/use
+// point weighted by its block's loop depth, so a higher cost means more dynamic
+// reloads if spilled.  When nothing else is available, the scan EVICTS the
+// eligible register whose holders cost least in total, IF that is cheaper than
+// the current interval — spilling them and handing the current the register —
+// else spills the current.  Equal costs never evict, so a uniform (or empty)
+// spillCosts reduces to spill-the-newcomer.
+func LinearScan(intervals @[]@LiveInterval, clobbers @[]int, desc RegClassDesc, spillCosts @[]int,
+		ties @[]TiePoint) @[]RegAssignment {
+	var s @scanState = newScanState(intervals, desc, ties)
+	for i := 0; i < len(intervals); i++ {
+		var iv @LiveInterval = intervals[i]
+		s.expire(iv.Start())
+		var spans bool = spansClobber(iv, clobbers)
+		var costC int = spillCostOf(spillCosts, iv.ID)
+
+		var reg int = s.pickPartner(iv, spans)
+		if reg < 0 { reg = s.pickFree(spans) }
+		if reg < 0 { reg = s.pickHole(iv, spans) }
+		if reg < 0 {
+			reg = s.pickEvict(spans, costC)
+			if reg >= 0 { s.evict(reg, iv) }
+		}
+		if reg >= 0 {
+			s.actEnd = slices.Append[int](s.actEnd, iv.End())
+			s.actReg = slices.Append[int](s.actReg, reg)
+			s.actCost = slices.Append[int](s.actCost, costC)
+			s.actResIdx = slices.Append[int](s.actResIdx, i)
+		}
+		if reg >= 0 { s.regOfID[iv.ID] = reg }
+		var ra RegAssignment
+		ra.ID = iv.ID
+		ra.Reg = reg
+		s.result[i] = ra
+	}
+	return s.result
+}
+
+// newScanState builds the scan's initial state: full free pools, no actives,
+// and the id-indexed partner/assignment tables sized to the largest id seen.
+func newScanState(intervals @[]@LiveInterval, desc RegClassDesc, ties @[]TiePoint) @scanState {
+	var s @scanState = make(scanState)
+	s.intervals = intervals
+	s.ties = ties
+	s.calleeSet = desc.CalleeSaved
+	s.freeCaller = copyInts(desc.CallerSaved)
+	s.freeCallee = copyInts(desc.CalleeSaved)
+	// One RegAssignment per interval; size up front and fill by index rather
+	// than reallocating the growing @[]RegAssignment on every interval.
+	s.result = make_slice(RegAssignment, len(intervals))
+	var nIDs int = 0
+	for i := 0; i < len(intervals); i++ {
+		if intervals[i].ID >= nIDs { nIDs = intervals[i].ID + 1 }
+	}
+	s.regOfID = make_slice(int, nIDs)
+	for id := 0; id < nIDs; id++ { s.regOfID[id] = -1 }
+	s.partners = buildTiePartners(ties, nIDs)
+	return s
+}
+
+// expire drops the actives that end at or before start, compacting the
+// survivors in place, and returns each dropped register to its pool once no
+// surviving active holds it.
+func (s @scanState) expire(start int) {
+	var dropped @[]int
+	var w int = 0
+	for a := 0; a < len(s.actEnd); a++ {
+		if s.actEnd[a] <= start {
+			dropped = AppendInt(dropped, s.actReg[a])
+		} else {
+			s.actEnd[w] = s.actEnd[a]
+			s.actReg[w] = s.actReg[a]
+			s.actCost[w] = s.actCost[a]
+			s.actResIdx[w] = s.actResIdx[a]
+			w = w + 1
+		}
+	}
+	s.actEnd = s.actEnd[0:w]
+	s.actReg = s.actReg[0:w]
+	s.actCost = s.actCost[0:w]
+	s.actResIdx = s.actResIdx[0:w]
+	for k := 0; k < len(dropped); k++ {
+		var r int = dropped[k]
+		if s.holderCount(r) > 0 { continue }
+		if regInSet(r, s.freeCallee) || regInSet(r, s.freeCaller) { continue }
+		if regInSet(r, s.calleeSet) {
+			s.freeCallee = slices.Append[int](s.freeCallee, r)
+		} else {
+			s.freeCaller = slices.Append[int](s.freeCaller, r)
+		}
+	}
+}
+
+// holderCount returns how many actives hold register r.
+func (s @scanState) holderCount(r int) int {
+	var n int = 0
+	for a := 0; a < len(s.actReg); a++ {
+		if s.actReg[a] == r { n = n + 1 }
+	}
+	return n
+}
+
+// eligible reports whether register r may hold an interval that does (spans)
+// or does not span a clobber: a spanning interval needs a callee-saved register.
+func (s @scanState) eligible(r int, spans bool) bool {
+	return !spans || regInSet(r, s.calleeSet)
+}
+
+// canShare reports whether iv may take register r now: r is free, or every
+// active holder of r is compatible with iv.
+func (s @scanState) canShare(r int, iv @LiveInterval) bool {
+	for a := 0; a < len(s.actReg); a++ {
+		if s.actReg[a] != r { continue }
+		if !intervalsCompatible(s.intervals[s.actResIdx[a]], iv, s.ties) { return false }
+	}
+	return true
+}
+
+// claim takes register r for a new holder: if r is in a free pool (no active
+// holder), remove it from there.
+func (s @scanState) claim(r int) {
+	s.freeCaller = removeInt(s.freeCaller, r)
+	s.freeCallee = removeInt(s.freeCallee, r)
+}
+
+// pickPartner returns (and claims) the register of one of iv's tie partners
+// (copy partners first) if iv may legally share it, else -1.
+func (s @scanState) pickPartner(iv @LiveInterval, spans bool) int {
+	if iv.ID < 0 || iv.ID >= len(s.partners) { return -1 }
+	var ps @[]int = s.partners[iv.ID]
+	for k := 0; k < len(ps); k++ {
+		if ps[k] >= len(s.regOfID) { continue }
+		var r int = s.regOfID[ps[k]]
+		if r < 0 || !s.eligible(r, spans) { continue }
+		if s.canShare(r, iv) {
+			s.claim(r)
+			return r
+		}
+	}
+	return -1
+}
+
+// pickFree pops a free register: callee-saved only for a spanning interval,
+// else caller-saved first, falling back to callee-saved.
+func (s @scanState) pickFree(spans bool) int {
+	var r int = -1
+	if !spans && len(s.freeCaller) > 0 {
+		r = s.freeCaller[len(s.freeCaller) - 1]
+		s.freeCaller = dropLast(s.freeCaller)
+	} else if len(s.freeCallee) > 0 {
+		r = s.freeCallee[len(s.freeCallee) - 1]
+		s.freeCallee = dropLast(s.freeCallee)
+	}
+	return r
+}
+
+// pickHole returns an eligible register all of whose active holders are
+// compatible with iv (iv fits in their holes), else -1.
+func (s @scanState) pickHole(iv @LiveInterval, spans bool) int {
+	for a := 0; a < len(s.actReg); a++ {
+		var r int = s.actReg[a]
+		if !s.eligible(r, spans) { continue }
+		if s.canShare(r, iv) { return r }
+	}
+	return -1
+}
+
+// pickEvict returns the register to evict for a new interval of cost costC, or
+// -1: the eligible register whose holders' summed cost is least, and only if
+// strictly cheaper than costC.  Evicting a register spills every holder, since
+// leaving one there would occupy it; counting all their costs keeps a shared
+// register (a phi and its tied latch value, say) from looking as cheap as one
+// of them.
+func (s @scanState) pickEvict(spans bool, costC int) int {
+	var best int = -1
+	var bestCost int = 0
+	for a := 0; a < len(s.actEnd); a++ {
+		var r int = s.actReg[a]
+		if !s.eligible(r, spans) || s.firstHolder(r) != a { continue }
+		var c int = 0
+		for h := a; h < len(s.actReg); h++ {
+			if s.actReg[h] == r { c = c + s.actCost[h] }
+		}
+		if best < 0 || c < bestCost {
+			best = r
+			bestCost = c
+		}
+	}
+	if best >= 0 && bestCost < costC { return best }
+	return -1
+}
+
+// firstHolder returns the index of the first active holding register r, or -1.
+func (s @scanState) firstHolder(r int) int {
+	for a := 0; a < len(s.actReg); a++ {
+		if s.actReg[a] == r { return a }
+	}
+	return -1
+}
+
+// evict spills every active holder of register r (for newcomer iv) and drops
+// them from the active set; r is then iv's alone.
+func (s @scanState) evict(r int, iv @LiveInterval) {
+	var w int = 0
+	for a := 0; a < len(s.actEnd); a++ {
+		if s.actReg[a] == r {
+			var ev int = s.actResIdx[a]
+			s.result[ev].Reg = -1
+			s.regOfID[s.intervals[ev].ID] = -1
+		} else {
+			s.actEnd[w] = s.actEnd[a]
+			s.actReg[w] = s.actReg[a]
+			s.actCost[w] = s.actCost[a]
+			s.actResIdx[w] = s.actResIdx[a]
+			w = w + 1
+		}
+	}
+	s.actEnd = s.actEnd[0:w]
+	s.actReg = s.actReg[0:w]
+	s.actCost = s.actCost[0:w]
+	s.actResIdx = s.actResIdx[0:w]
+}
+
+// removeInt returns s without its (first) element equal to v, or s unchanged.
+func removeInt(s @[]int, v int) @[]int {
+	for i := 0; i < len(s); i++ {
+		if s[i] != v { continue }
+		var out @[]int = make_slice(int, len(s) - 1)
+		for j := 0; j < i; j++ { out[j] = s[j] }
+		for j := i + 1; j < len(s); j++ { out[j - 1] = s[j] }
+		return out
+	}
+	return s
+}

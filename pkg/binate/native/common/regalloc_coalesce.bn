@@ -1,0 +1,203 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Range-aware interference and coalescing for the linear scan.  A value's
+// interval is a list of live ranges with dead holes between them (a
+// loop-carried phi id is live from the header to its last use in the body, dead
+// until the latch OP_COPY redefines it, then live again across the back edge),
+// and a register is only occupied across those ranges.  Two intervals whose
+// range lists are disjoint may therefore share one register.
+//
+// They may also both cover a position P that is a TIE between them: the
+// instruction at P defines one of them and reads the other, whose value dies at
+// P.  A use's range ends one past the use and a def's range starts at the def,
+// so the dying operand and the result nominally overlap at P; they may still
+// share a register when the instruction's emitter reads every operand before
+// it writes the result.  Which opcodes' emitters guarantee that is per backend
+// and per register class (RegClassDesc.TieOps).  This is how the latch copy
+// disappears: in `iNext = i + 1; copy i <- iNext` the increment writes into
+// i's register (i dies there) and the copy becomes `mov r, r`, which the
+// backends elide.
+
+// TiePoint is one tie at linear position Pos: the instruction there defines
+// Def and reads Use (both allocatable ids of the liveness universe the
+// intervals were built from).  Copy marks an OP_COPY, whose partners are the
+// preferred coalescing hints.
+type TiePoint struct {
+	Pos  int
+	Def  int
+	Use  int
+	Copy bool
+}
+
+// CollectTiePoints returns a tie point for every operand of every instruction
+// in f's reachable blocks whose opcode is in tieOps, whose result and operand
+// are allocatable in lv (and distinct), and — except for OP_COPY — whose result
+// is an integer.  Ascending by position (blocks are walked in RPO, the order
+// positions are assigned).  lv's own def/use extraction means the GP and FP
+// passes each see only their own class's ties.
+func CollectTiePoints(f @ir.Func, lv @LivenessInfo, tieOps @[]int) @[]TiePoint {
+	var out @[]TiePoint
+	if len(tieOps) == 0 { return out }
+	for k := 0; k < len(lv.RPO); k++ {
+		var b int = lv.RPO[k]
+		var blk @ir.Block = f.Blocks[b]
+		var from int = lv.BlockFrom[b]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var ins @ir.Instr = blk.Instrs[j]
+			if !regInSet(ins.Op, tieOps) || !tieResultOK(ins) { continue }
+			var d int = defIdOf(lv, ins, lv.WordBytes)
+			if d < 0 || readsID(ins, d) { continue }
+			for ai := 0; ai < len(ins.Args); ai++ {
+				var u int = useIdOf(lv, ins.Args[ai])
+				if u < 0 { continue }
+				var tp TiePoint
+				tp.Pos = from + j
+				tp.Def = d
+				tp.Use = u
+				tp.Copy = ins.Op == iropcode.OP_COPY
+				out = slices.Append[TiePoint](out, tp)
+			}
+		}
+	}
+	return out
+}
+
+// dropFoldedTies returns ties without those whose result or operand is folded
+// away (RegMap.IsFoldedAway: a constant riding an immediate, a fused compare or
+// GEP, a tst-folded AND, a folded dtor handle).  Such a value still takes part
+// in the scan but is never materialized, so tying to its register saves no move
+// — a result tied to a folded constant instead of its real operand would keep
+// the move the tie was meant to remove.
+func (m @RegMap) dropFoldedTies(ties @[]TiePoint) @[]TiePoint {
+	var out @[]TiePoint
+	for k := 0; k < len(ties); k++ {
+		if m.IsFoldedAway(ties[k].Def) || m.IsFoldedAway(ties[k].Use) { continue }
+		out = slices.Append[TiePoint](out, ties[k])
+	}
+	return out
+}
+
+// tieResultOK reports whether ins's result type admits a tie: any OP_COPY, else
+// an integer or bool result only (a float operation may lower to a libcall or
+// an SSE/VFP sequence the tie audit does not cover).
+func tieResultOK(ins @ir.Instr) bool {
+	if ins.Op == iropcode.OP_COPY { return true }
+	var t @types.Type = types.StripWrappers(ins.Typ)
+	return t != nil && (t.IsInteger() || t.IsBool())
+}
+
+// readsID reports whether ins has id as an operand.
+func readsID(ins @ir.Instr, id int) bool {
+	for ai := 0; ai < len(ins.Args); ai++ {
+		if ins.Args[ai] != nil && ins.Args[ai].ID == id { return true }
+	}
+	return false
+}
+
+// firstTieAt returns the index in ties (ascending by Pos) of the first tie at
+// position pos, or len(ties) if none is there.
+func firstTieAt(ties @[]TiePoint, pos int) int {
+	var lo int = 0
+	var hi int = len(ties)
+	for lo < hi {
+		var mid int = lo + (hi - lo) / 2
+		if ties[mid].Pos < pos {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+// definesAt reports whether a tie at position pos defines id.
+func definesAt(ties @[]TiePoint, pos int, id int) bool {
+	for k := firstTieAt(ties, pos); k < len(ties) && ties[k].Pos == pos; k++ {
+		if ties[k].Def == id { return true }
+	}
+	return false
+}
+
+// tiedAt reports whether position pos, covered by both a and b, is a tie
+// between them: the instruction there defines one and reads the other, and the
+// operand's value dies there — its interval does not cover pos+1, or pos+1
+// redefines it (a phi copy right after its last use: the adjacent ranges merge,
+// so the death is read off the redefinition).  pos+1 is in the same block: no
+// tie opcode is a terminator, and a block with successors ends in one.
+func tiedAt(ties @[]TiePoint, pos int, a @LiveInterval, b @LiveInterval) bool {
+	for k := firstTieAt(ties, pos); k < len(ties) && ties[k].Pos == pos; k++ {
+		var t TiePoint = ties[k]
+		var use @LiveInterval = nil
+		if t.Def == a.ID && t.Use == b.ID { use = b }
+		if t.Def == b.ID && t.Use == a.ID { use = a }
+		if use == nil { continue }
+		if !use.Covers(pos + 1) || definesAt(ties, pos + 1, use.ID) { return true }
+	}
+	return false
+}
+
+// intervalsCompatible reports whether a and b may share one register: every
+// position both cover is a tie between them (tiedAt).  Ranges within one
+// interval are sorted and never overlap, so a two-pointer walk visits each
+// overlap of a pair of ranges once.  The walk starts at the first ranges that
+// can overlap at all (a long-lived active value can have hundreds of ranges
+// before the newcomer's start), found by binary search.
+func intervalsCompatible(a @LiveInterval, b @LiveInterval, ties @[]TiePoint) bool {
+	var i int = firstRangeEndingAfter(a, b.Start())
+	var j int = firstRangeEndingAfter(b, a.Start())
+	for i < len(a.Ranges) && j < len(b.Ranges) {
+		var ra LiveRange = a.Ranges[i]
+		var rb LiveRange = b.Ranges[j]
+		var lo int = ra.Start
+		if rb.Start > lo { lo = rb.Start }
+		var hi int = ra.End
+		if rb.End < hi { hi = rb.End }
+		for p := lo; p < hi; p++ {
+			if !tiedAt(ties, p, a, b) { return false }
+		}
+		if ra.End < rb.End {
+			i = i + 1
+		} else {
+			j = j + 1
+		}
+	}
+	return true
+}
+
+// firstRangeEndingAfter returns the index of iv's first range whose End is past
+// pos (the first that can cover pos or anything later), or len(iv.Ranges).
+func firstRangeEndingAfter(iv @LiveInterval, pos int) int {
+	var lo int = 0
+	var hi int = len(iv.Ranges)
+	for lo < hi {
+		var mid int = lo + (hi - lo) / 2
+		if iv.Ranges[mid].End <= pos {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+// buildTiePartners returns, indexed by id (0..nIDs-1), the ids each id is tied
+// to — the coalescing hints, since taking a partner's register makes the move
+// between them unnecessary.  Copy partners come first: a copy costs a whole
+// move, while the other ties only save x64's two-address `mov rd, lhs`.
+func buildTiePartners(ties @[]TiePoint, nIDs int) @[]@[]int {
+	var partners @[]@[]int = make_slice(@[]int, nIDs)
+	for pass := 0; pass < 2; pass++ {
+		for k := 0; k < len(ties); k++ {
+			var t TiePoint = ties[k]
+			if t.Copy != (pass == 0) { continue }
+			if t.Def < nIDs { partners[t.Def] = AppendInt(partners[t.Def], t.Use) }
+			if t.Use < nIDs { partners[t.Use] = AppendInt(partners[t.Use], t.Def) }
+		}
+	}
+	return partners
+}

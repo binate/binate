@@ -1,0 +1,366 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/std/strings"
+import "pkg/std/vec"
+import "pkg/stdx/slices"
+
+// Package-level declarations resolved on demand (spec decl.order.forward).
+// collectDecls collects a package's type, function and variable declarations;
+// its top-level constants are resolved afterwards (finishDeclBatch, once
+// checkValueEmbedding has broken any type that holds itself by value), so a
+// constant may take the layout of any of the package's types (`sizeof`,
+// `alignof`) or the type of any of its variables (`len`).  A declaration needed
+// before its turn is resolved when it is first read: a constant that an array
+// length reads during collection (batchConstOnDemand); the types whose layout a
+// `sizeof` / `alignof` takes during collection (prepareLayout,
+// check_decl_layout.bn); and a variable whose type is inferred from its
+// initializer, which pass 2 would otherwise define only when it reaches it
+// (batchVarOnDemand).
+
+// DeclBatch is the package-level declaration batch collectDecls is checking.
+type DeclBatch struct {
+	// ConstNames / ConstDecls list the top-level constants — a group member
+	// with its group — and Blanks the blank `const _ = …` declarations.
+	ConstNames @[]@[]char
+	ConstDecls @[]@ast.Decl
+	Blanks     @[]@ast.Decl
+	// ConstCycleMembers lists the constants on a definition cycle already
+	// reported.
+	ConstCycleMembers @[]@[]char
+	// ConstsOpen is true while a constant may be unresolved: from the start
+	// of collection to the end of finishDeclBatch.
+	ConstsOpen bool
+	// Types lists the non-generic named type declarations (not forward
+	// ones); Collecting is true while collectDeclsBody runs, when a type may
+	// not be collected yet.  TypesCollecting are the ones being collected,
+	// TypesCollected the ones collected on demand (before their turn),
+	// TypesWalking the ones whose by-value types are being prepared, and
+	// TypesPrepared the ones collected with every type they hold by value.
+	Types           @vec.Vec[@ast.Decl]
+	Collecting      bool
+	TypesCollecting @[]@ast.Decl
+	TypesCollected  @vec.Vec[@ast.Decl]
+	TypesWalking    @[]@ast.Decl
+	TypesPrepared   @vec.Vec[@ast.Decl]
+	// GenericsPrepared lists the generic struct declarations whose field
+	// types were prepared.
+	GenericsPrepared @[]@ast.Decl
+	// Vars lists the non-blank variable declarations; VarsChecking the ones
+	// with an inferred type whose declaration is being checked, VarsChecked
+	// the ones checked, and VarsDefined the ones with a declared type defined
+	// on demand, before collection reached them.  VarsOpen is true from the
+	// start of collection: a variable may be defined on demand.
+	Vars         @vec.Vec[@ast.Decl]
+	VarsOpen     bool
+	VarsChecking @[]@ast.Decl
+	VarsChecked  @vec.Vec[@ast.Decl]
+	VarsDefined  @[]@ast.Decl
+	// VarsDeferred lists the variables with an inferred type whose check
+	// while types were collected had errors, checked again after collection.
+	VarsDeferred @[]@ast.Decl
+}
+
+// newDeclBatch returns the batch of the package-level declarations decls.
+func newDeclBatch(decls *[]@ast.Decl) @DeclBatch {
+	var b @DeclBatch = make(DeclBatch)
+	b.Types = vec.New[@ast.Decl]()
+	b.TypesPrepared = vec.New[@ast.Decl]()
+	b.TypesCollected = vec.New[@ast.Decl]()
+	b.Vars = vec.New[@ast.Decl]()
+	b.VarsChecked = vec.New[@ast.Decl]()
+	listBatchDecls(b, decls)
+	return b
+}
+
+// listBatchDecls records decls' type and variable declarations in b, groups
+// included.
+func listBatchDecls(b @DeclBatch, decls *[]@ast.Decl) {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d.Kind == ast.DECL_GROUP {
+			listBatchDecls(b, d.Decls)
+			continue
+		}
+		if isBlank(d.Name) {
+			continue
+		}
+		if d.Kind == ast.DECL_TYPE && len(d.TypeParams) == 0 && !d.IsForward {
+			b.Types.Push(d)
+		}
+		if d.Kind == ast.DECL_VAR {
+			b.Vars.Push(d)
+		}
+	}
+}
+
+// finishDeclBatch checks again the variables deferred during collection
+// (recheckDeferredVars), then resolves the batch's top-level constants that
+// nothing has read yet — now that every type, function and variable
+// declaration is collected and no type holds itself by value — and closes
+// constant resolution.
+func finishDeclBatch(c @Checker) {
+	if c.Batch == nil {
+		return
+	}
+	recheckDeferredVars(c)
+	finishTopLevelConsts(c)
+	c.Batch.ConstsOpen = false
+}
+
+// lookupDeclOnDemand looks name up in the current scope, first resolving the
+// batch's constant or variable name if it is not resolved yet.
+func lookupDeclOnDemand(c @Checker, name *[]readonly char) @Symbol {
+	var sym @Symbol = c.Scope.Lookup(name)
+	if sym == nil {
+		return batchVarOnDemand(c, name)
+	}
+	if sym.Kind == types.SYM_CONST && !sym.HasCVal && batchConstOnDemand(c, name) {
+		return c.Scope.Lookup(name)
+	}
+	return sym
+}
+
+// batchConstOnDemand resolves the batch's top-level constant name if it is not
+// resolved yet: a constant read before finishDeclBatch reaches it, by an array
+// length during collection or by a declaration checked on demand.  Reports
+// whether it resolved it now.  A constant read while it is being resolved is a
+// cycle, which resolveConstByName reports.
+func batchConstOnDemand(c @Checker, name *[]readonly char) bool {
+	var b @DeclBatch = c.Batch
+	if b == nil || !b.ConstsOpen || nameInList(c.ConstResolved, name) ||
+			!nameInList(b.ConstNames, name) {
+		return false
+	}
+	var saved declContext = enterPackageDecl(c, findConstDecl(b.ConstNames, b.ConstDecls, name))
+	resolveConstByName(c, buf.CopyStr(name), b.ConstNames, b.ConstDecls)
+	leavePackageDecl(c, saved)
+	return true
+}
+
+// batchVarOnDemand defines the batch's package variable name, which is not
+// defined yet, and returns its symbol (nil when name is no such variable): one
+// with a declared type that collection has not reached, or one whose type is
+// inferred from its initializer, checked now rather than when pass 2 reaches
+// it.  A variable read while its own declaration is being checked is an
+// initialization cycle, which resolveTopLevelVarOrder reports
+// (prog.init.var-cycle); it is defined with the error type, so the read reports
+// nothing more.
+func batchVarOnDemand(c @Checker, name *[]readonly char) @Symbol {
+	var b @DeclBatch = c.Batch
+	if b == nil || !b.VarsOpen {
+		return nil
+	}
+	var d @ast.Decl = findDeclIn(b.Vars, name)
+	if d == nil {
+		return nil
+	}
+	var saved declContext = enterPackageDecl(c, d)
+	if d.TypeRef != nil {
+		if prepareLayout(c, d.TypeRef, d.Pos) {
+			defineVar(c.Scope, d.Name, resolveTypeExpr(c, d.TypeRef))
+		} else {
+			defineVar(c.Scope, d.Name, types.TypError())
+		}
+		b.VarsDefined = slices.Append[@ast.Decl](b.VarsDefined, d)
+	} else if declInList(b.VarsChecking, d) {
+		// Named from its own initializer.  A function literal's type is its
+		// signature, known before its body (which names the variable) is
+		// checked; anything else is a cycle.
+		defineVar(c.Scope, d.Name, funcLitDefaultType(c, d.Value))
+	} else {
+		var before int = len(c.Errors)
+		checkBatchVarDecl(c, d)
+		finalizeUntypedNonConst(c)
+		if b.Collecting && len(c.Errors) > before {
+			// Checked while types are collected (an array length reads it), the
+			// initializer sees only the declarations collected so far, and its
+			// errors may just name the others as undefined or opaque: it is
+			// checked again once collection is done (recheckDeferredVars).
+			c.Errors = c.Errors[:before]
+			defineVar(c.Scope, d.Name, types.TypError())
+			b.VarsDeferred = slices.Append[@ast.Decl](b.VarsDeferred, d)
+		}
+	}
+	leavePackageDecl(c, saved)
+	return c.Scope.Lookup(name)
+}
+
+// recheckDeferredVars checks again, now that collection is done, each variable
+// whose check while types were collected had errors.  If it now checks
+// cleanly, those errors came from declarations not collected yet: the one error
+// is that its type was needed too early (errVarNeededDuringCollection).
+// Otherwise its own errors stand.
+func recheckDeferredVars(c @Checker) {
+	var b @DeclBatch = c.Batch
+	for i := 0; i < len(b.VarsDeferred); i++ {
+		var d @ast.Decl = b.VarsDeferred[i]
+		var saved declContext = enterPackageDecl(c, d)
+		var before int = len(c.Errors)
+		checkVarDecl(c, d)
+		finalizeUntypedNonConst(c)
+		if len(c.Errors) == before {
+			errVarNeededDuringCollection(c, d)
+		}
+		leavePackageDecl(c, saved)
+	}
+}
+
+// errVarNeededDuringCollection reports that the type of the variable d, which
+// is inferred from its initializer, is needed while the package's types are
+// collected, before the declarations its initializer uses are.
+func errVarNeededDuringCollection(c @Checker, d @ast.Decl) {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("the type of `")
+	cb.Write(d.Name)
+	cb.Write("` is needed while the package's types are collected (an array length reads it), but ")
+	cb.Write("its initializer uses declarations not collected yet: declare its type")
+	addCheckError(c, d.Pos, buf.CopyStr(cb.String()))
+}
+
+// funcLitDefaultType returns the type a variable initialized with the function
+// literal e has when nothing hints its form — a managed function value of the
+// literal's signature (checkFuncLit) — or the error type when e is not a
+// function literal.
+func funcLitDefaultType(c @Checker, e @ast.Expr) @types.Type {
+	if e == nil || e.Kind != ast.EXPR_FUNC_LIT || e.DeclRef == nil {
+		return types.TypError()
+	}
+	var ft @types.Type = resolveFuncDeclType(c, e.DeclRef)
+	if ft == nil {
+		return types.TypError()
+	}
+	return types.MakeManagedFuncValueType(ft.Params, ft.Results)
+}
+
+// varDefinedOnDemand reports whether the declared-type variable d was defined
+// on demand, before collection reached it.
+func varDefinedOnDemand(c @Checker, d @ast.Decl) bool {
+	return c.Batch != nil && declInList(c.Batch.VarsDefined, d)
+}
+
+// checkBatchVarDecl checks the package variable declaration d; one whose type
+// is inferred from its initializer is checked once — on demand, or when pass 2
+// reaches it.
+func checkBatchVarDecl(c @Checker, d @ast.Decl) {
+	var b @DeclBatch = c.Batch
+	if b == nil || d.TypeRef != nil || isBlank(d.Name) {
+		checkVarDecl(c, d)
+		return
+	}
+	if declInVec(b.VarsChecked, d) || declInList(b.VarsChecking, d) {
+		return
+	}
+	b.VarsChecking = slices.Append[@ast.Decl](b.VarsChecking, d)
+	checkVarDecl(c, d)
+	b.VarsChecking = b.VarsChecking[:len(b.VarsChecking) - 1]
+	b.VarsChecked.Push(d)
+}
+
+// declContext is the checker state that belongs to the declaration or
+// function body being checked; checking another package-level declaration on
+// demand saves it (enterPackageDecl) and restores it (leavePackageDecl).
+type declContext struct {
+	scope      @Scope
+	funcRet    @[]@types.Type
+	iota       int
+	inLoop     bool
+	inSwitch   bool
+	inLoopBody bool
+	inFunc     bool
+	captures   @[]@CaptureFrame
+	untyped    @vec.Vec[@ast.Expr]
+	expectedFV @types.Type
+	borrowPos  int
+	bareMember bool
+	bareIota   int
+}
+
+// enterPackageDecl saves the checker's declaration state and sets it up for
+// checking the package-level declaration d: d's file scope, outside any
+// function, loop, constant group or function literal.
+func enterPackageDecl(c @Checker, d @ast.Decl) declContext {
+	var s declContext
+	s.scope = c.Scope
+	s.funcRet = c.FuncRet
+	s.iota = c.Iota
+	s.inLoop = c.InLoop
+	s.inSwitch = c.InSwitch
+	s.inLoopBody = c.InLoopBody
+	s.inFunc = c.InFunc
+	s.captures = c.CaptureStack
+	s.untyped = c.UntypedNonConst
+	s.expectedFV = c.ExpectedFVType
+	s.borrowPos = c.BorrowPosKind
+	s.bareMember = c.InGroupBareMember
+	s.bareIota = c.BareExplicitIota
+	c.Scope = c.PackageScope
+	if fileScopedActive(c) {
+		c.Scope = scopeForFile(c, d.Pos.File)
+	}
+	var noRet @[]@types.Type
+	c.FuncRet = noRet
+	c.Iota = -1
+	c.InLoop = false
+	c.InSwitch = false
+	c.InLoopBody = false
+	c.InFunc = false
+	var noCaptures @[]@CaptureFrame
+	c.CaptureStack = noCaptures
+	c.UntypedNonConst = nil
+	c.ExpectedFVType = nil
+	c.BorrowPosKind = POS_STORING
+	c.InGroupBareMember = false
+	c.BareExplicitIota = 0
+	return s
+}
+
+// leavePackageDecl restores the declaration state enterPackageDecl saved.
+func leavePackageDecl(c @Checker, s declContext) {
+	c.Scope = s.scope
+	c.FuncRet = s.funcRet
+	c.Iota = s.iota
+	c.InLoop = s.inLoop
+	c.InSwitch = s.inSwitch
+	c.InLoopBody = s.inLoopBody
+	c.InFunc = s.inFunc
+	c.CaptureStack = s.captures
+	c.UntypedNonConst = s.untyped
+	c.ExpectedFVType = s.expectedFV
+	c.BorrowPosKind = s.borrowPos
+	c.InGroupBareMember = s.bareMember
+	c.BareExplicitIota = s.bareIota
+}
+
+// findDeclIn returns the declaration named name in ds, or nil.
+func findDeclIn(ds @vec.Vec[@ast.Decl], name *[]readonly char) @ast.Decl {
+	for i := 0; i < ds.Len(); i++ {
+		if types.CharEq(ds.Get(i).Name, name) {
+			return ds.Get(i)
+		}
+	}
+	return nil
+}
+
+// declInVec reports whether d is in ds.
+func declInVec(ds @vec.Vec[@ast.Decl], d @ast.Decl) bool {
+	for i := 0; i < ds.Len(); i++ {
+		if same(ds.Get(i), d) {
+			return true
+		}
+	}
+	return false
+}
+
+// declInList reports whether d is in ds.
+func declInList(ds *[]@ast.Decl, d @ast.Decl) bool {
+	for i := 0; i < len(ds); i++ {
+		if same(ds[i], d) {
+			return true
+		}
+	}
+	return false
+}

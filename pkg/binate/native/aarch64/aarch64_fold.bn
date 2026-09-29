@@ -6,13 +6,15 @@ import "pkg/binate/ir"
 import "pkg/binate/iropcode"
 import "pkg/binate/native/common"
 import "pkg/binate/native/fold"
+import "pkg/binate/types"
 
 // Immediate-operand folding for the aarch64 backend: the fold predicate
 // (aa64ImmFits) that fold.ImmOperandConsts uses to pick the constants that ride
 // an instruction immediate, the per-position checks it shares with the consuming
 // emitters (aa64CmpImm for emitCmpAgainst, aa64AddSubImm for emitAddSubImmFold,
-// aa64LogicImm for emitLogicImmFold and emitTstImmFold), and the add/sub, logical
-// and tst immediate emitters themselves.  Because the predicate and the emitters
+// aa64LogicImm for emitLogicImmFold and emitTstImmFold, fold.ShiftImmOperand for
+// emitShiftImmFold), and the add/sub, logical, shift and tst immediate emitters
+// themselves.  Because the predicate and the emitters
 // call the same checks, a constant the analysis marked is exactly a constant the
 // emitters can encode; an emitter that meets a marked constant the checks reject
 // reports an error instead of encoding it.  markFoldCandidates, at the end, sets
@@ -101,9 +103,10 @@ func aa64LogicImm(user @ir.Instr, argIdx int) (int64, bool, bool, bool) {
 
 // aa64ImmFits is the aarch64 predicate for fold.ImmOperandConsts: operand argIdx
 // of `user` rides an immediate iff it is a compare RHS that fits CMP/CMN
-// (aa64CmpImm), an add/sub operand that fits ADD/SUB (aa64AddSubImm), or an
+// (aa64CmpImm), an add/sub operand that fits ADD/SUB (aa64AddSubImm), an
 // AND/OR/XOR operand that fits the bitmask immediate or is XOR's all-ones MVN
-// form (aa64LogicImm).
+// form (aa64LogicImm), or a shift count in [0, width) (fold.ShiftImmOperand),
+// which LSL/LSR/ASR-immediate always encode at the op width.
 func aa64ImmFits(user @ir.Instr, argIdx int) bool {
 	var ok bool
 	_, ok = aa64CmpImm(user, argIdx)
@@ -111,6 +114,8 @@ func aa64ImmFits(user @ir.Instr, argIdx int) bool {
 	_, ok = aa64AddSubImm(user, argIdx)
 	if ok { return true }
 	_, _, _, ok = aa64LogicImm(user, argIdx)
+	if ok { return true }
+	_, ok = fold.ShiftImmOperand(user, argIdx, aa64ImmWordBytes)
 	return ok
 }
 
@@ -251,6 +256,53 @@ func emitLogicImmFold(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
 	return true
 }
 
+// emitShiftImmFold lowers an OP_SHL / OP_SHR whose count is a FoldedImm
+// constant: the count rides the LSL / LSR / ASR immediate (the UBFM / SBFM
+// aliases), so it is never materialized into a register.  The count is in
+// [0, width) (fold.ShiftImmOperand), where the hardware shift and the spec'd
+// shift agree, and the W form is used only for a 32-bit unsigned result, so the
+// count is always below the register width.  The W-vs-X choice, the LSR-vs-ASR
+// choice and the sub-word re-narrow mirror emitBinop's register path exactly,
+// so the folded result is bit-identical.
+//
+// The fit is re-verified with fold.ShiftImmOperand, the check aa64ImmFits
+// applied: a folded count that does not fit records an error and emits nothing,
+// since the constant was never materialized.  Returns false when the count is
+// not a folded constant, leaving emitBinop's register path to run; true once the
+// instruction is handled, including when an error was recorded.
+func emitShiftImmFold(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != iropcode.OP_SHL && ins.Op != iropcode.OP_SHR { return false }
+	if len(ins.Args) != 2 || !isFoldedImmConst(rm, ins.Args[1]) { return false }
+	var cnt int64
+	var ok bool
+	cnt, ok = fold.ShiftImmOperand(ins, 1, aa64ImmWordBytes)
+	if !ok {
+		a.SetError("native arm64: folded immediate does not fit the shift count")
+		return true
+	}
+	var lhs int = getOperand(a, rm, ins.Args[0].ID)
+	if lhs < 0 {
+		a.SetError("native arm64: shift with a folded count has no register operand")
+		return true
+	}
+	var rd int = nextReg(rm, ins.ID)
+	var use32 bool = aa64UseWForm(ins.Typ)
+	var sf bool = !use32
+	var cntOp aarch64.Operand = aarch64.Imm(cast(int, cnt))
+	var uTyp @types.Type = types.StripWrappers(ins.Typ)
+	if ins.Op == iropcode.OP_SHL {
+		aarch64.Lsl(a, sf, rd, lhs, cntOp)
+	} else if uTyp != nil && uTyp.IsInteger() && !uTyp.Signed {
+		aarch64.Lsr(a, sf, rd, lhs, cntOp)
+	} else {
+		aarch64.Asr(a, sf, rd, lhs, cntOp)
+	}
+	if sf {
+		emitSubWordNarrow(a, rd, ins.Typ)
+	}
+	return true
+}
+
 // emitTstImmFold lowers a tst-folded OP_AND (rm.IsTstFoldedAnd — its only use is
 // an adjacent `== 0` / `!= 0` compare that reads Z) whose constant operand is
 // FoldedImm: the constant rides the TST bitmask immediate, `tst rn, #imm`, at
@@ -306,11 +358,12 @@ func markFoldCandidates(f @ir.Func, rm @common.RegMap) {
 	rm.FusableFieldGep = fieldFoldSet(f)
 	rm.FusedCmp = fold.BranchFusedCmps(f, 8)
 	// Flag integer constants every use of which rides an instruction immediate —
-	// a compare RHS (CMP/CMN), an add/sub operand (ADD/SUB) or an AND/OR/XOR operand
-	// (AND/ORR/EOR/TST, or MVN).  aa64ImmFits holds the aa64 position and range
-	// rules: an unshifted 12-bit immediate, 0..4095, and -4095..-1 via the
-	// sign-swapped operation (CMN, or SUB/ADD) where the position allows; a
-	// bitmask immediate at the op width.
+	// a compare RHS (CMP/CMN), an add/sub operand (ADD/SUB), an AND/OR/XOR operand
+	// (AND/ORR/EOR/TST, or MVN) or a shift count (LSL/LSR/ASR).  aa64ImmFits holds
+	// the aa64 position and range rules: an unshifted 12-bit immediate, 0..4095,
+	// and -4095..-1 via the sign-swapped operation (CMN, or SUB/ADD) where the
+	// position allows; a bitmask immediate at the op width; any count in
+	// [0, width) for a shift.
 	rm.FoldedImm = fold.ImmOperandConsts(f, aa64ImmFits)
 	// Flag `(a & b) == 0` / `!= 0` bitwise-ANDs: the AND + compare fold into a
 	// single flag-setting `tst a, b`, so emitBinop

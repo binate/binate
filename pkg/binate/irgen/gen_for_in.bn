@@ -1,0 +1,315 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/irbuild"
+import "pkg/binate/iropcode"
+import "pkg/binate/irutil"
+import "pkg/binate/token"
+import "pkg/binate/types"
+
+// IR generation for the range loop `for [k,] v in coll`.
+
+// genForIn generates IR for a for-in loop over a collection (array or slice).
+func genForIn(ctx @GenContext, b @ir.Block, stmt @ast.Stmt) @ir.Block {
+	// Evaluate the range operand once.  An operand rooted in a variable (the
+	// variable itself, or a field / element / `*p` chain from one;
+	// forInOperandIsStable) has storage that outlives the loop and is ranged
+	// directly: an array in place through its address, so the loop reads each
+	// element at its iteration as indexing does, and a slice through its loaded
+	// value.  Any other operand (a call result, a composite literal, a slice
+	// expression, `*f()`, …) is a statement temporary the loop would outlive,
+	// so it is first bound to a hidden local, as `tmp := operand`
+	// (genShortVarOne: it moves a fresh value and acquires a borrowed one),
+	// which the loop ranges over and releases when it exits (a `return` in the
+	// body releases it with the other locals).  Reading an array as a slice
+	// value instead is invalid IR on LLVM and loops zero times on native.
+	//
+	// Types are peeled of transparent wrappers: a named array (`type Row
+	// [3]int`) or named slice (`type Buf @[]int`) is TYP_NAMED with a nil
+	// `.Elem`, so reading the kind / ArrayLen / element type off the raw type
+	// would mis-route a named array to the slice path and default a named
+	// slice's element to TypInt (mis-striding a non-int element).
+	var operandVarLen int = len(ctx.Vars)
+	var x @ast.Expr = stmt.X
+	if !forInOperandIsStable(x) {
+		ctx.CurBlock = b
+		b = genShortVarOne(ctx, b, forInOperandName(), x)
+		x = forInOperandIdent(x)
+	}
+	var collection @ir.Instr = nil
+	var arrPtr @ir.Instr = nil
+	var collSt @types.Type = nil
+	// ctx.CurBlock is set before each evaluation: the resync after it would
+	// otherwise pick up a stale block (a previous statement's) when the
+	// evaluation emits nothing, as a global's address does.
+	ctx.CurBlock = b
+	if forInOperandIsArray(ctx, stmt.X, x) {
+		arrPtr = forInArrayAddr(ctx, b, x)
+		b = ctx.CurBlock
+		collSt = addrPointeeType(arrPtr)
+		if collSt == nil || collSt.Kind != types.TYP_ARRAY {
+			panic("internal error: the address of an array range operand is not a pointer to an array")
+		}
+	} else {
+		collection = genExpr(ctx, b, x)
+		b = ctx.CurBlock
+		if collection.Typ != nil { collSt = irutil.PeelTransparent(collection.Typ) }
+	}
+
+	// Get the collection length
+	var length @ir.Instr
+	var isArray bool = false
+	if collSt != nil && collSt.Kind == types.TYP_ARRAY {
+		isArray = true
+		length = irbuild.EmitConstInt(b, collSt.ArrayLen, types.TypInt())
+	} else {
+		length = irbuild.EmitSliceLen(b, collection)
+	}
+
+	// Determine element type
+	var elemTyp @types.Type = types.TypInt()
+	if collSt != nil && collSt.Elem != nil {
+		elemTyp = collSt.Elem
+	}
+
+	// The header's remaining statement temporaries (those the operand was
+	// computed from — a raw view's backing, a struct a field came from) live
+	// until the end of the statement, which for a loop is after it; left on the
+	// temp list they would be released by the first body statement's cleanup —
+	// code inside the loop, run every iteration.  Move them into hidden locals
+	// released with the operand local as the loop exits.
+	forInHoldHeaderTemps(ctx, b)
+
+	// Create index variable: alloca i64, init to 0
+	var idxPtr @ir.Instr = irbuild.EmitAlloc(b, types.TypInt())
+	var zero @ir.Instr = irbuild.EmitConstInt(b, 0, types.TypInt())
+	irbuild.EmitStore(b, idxPtr, zero)
+
+	var condBlk @ir.Block = ir.AddBlock(ctx.Func, "forin.cond")
+	var bodyBlk @ir.Block = ir.AddBlock(ctx.Func, "forin.body")
+	var postBlk @ir.Block = ir.AddBlock(ctx.Func, "forin.post")
+	var exitBlk @ir.Block = ir.AddBlock(ctx.Func, "forin.exit")
+	irbuild.EmitJump(b, condBlk)
+
+	// Condition: idx < length
+	var idx @ir.Instr = irbuild.EmitLoad(condBlk, idxPtr, types.TypInt())
+	var cond @ir.Instr = irbuild.EmitBinop(condBlk, iropcode.OP_LT, idx, length, types.TypBool())
+	irbuild.EmitBranch(condBlk, cond, bodyBlk, exitBlk)
+
+	// Body: load element at index
+	var bodyIdx @ir.Instr = irbuild.EmitLoad(bodyBlk, idxPtr, types.TypInt())
+	var elem @ir.Instr
+	if isArray && arrPtr != nil {
+		var elemPtr @ir.Instr = irbuild.EmitGetElemPtr(bodyBlk, arrPtr, bodyIdx, elemTyp)
+		elem = irbuild.EmitLoad(bodyBlk, elemPtr, elemTyp)
+	} else {
+		elem = irbuild.EmitSliceGet(bodyBlk, collection, bodyIdx, elemTyp)
+	}
+
+	// The value (and key) variable is a fresh per-iteration binding.  Record
+	// the scope depth so the value var's per-iteration acquire is matched by
+	// a per-iteration RELEASE below: the value var copy-OWNS its element
+	// (`for v in s` is `var v = s[i]` each trip — emitStoreManagedSlot RefIncs
+	// the borrowed element), so a release per iteration is required.  Without
+	// it an N-element loop RefIncs N times but RefDecs once: a leak of N-1.
+	var savedVarLen int = len(ctx.Vars)
+	// `break` routes through breakBlk so the current iteration's value var is
+	// released before the loop exits (continue / normal fall-through release
+	// it at postBlk).
+	var breakBlk @ir.Block = ir.AddBlock(ctx.Func, "forin.break")
+
+	// Bind the value variable.  The element was loaded as a BORROW
+	// (EmitLoad / EmitSliceGet, no RefInc); emitStoreManagedSlot acquires it
+	// (RefInc a managed scalar, emitStructCopy a managed struct).  isInit: a
+	// fresh slot each iteration, no old value.  A blank `_` value is never
+	// read, so skip the bind rather than register a phantom managed scope var.
+	if !isBlank(stmt.ForVal.Name) {
+		var valPtr @ir.Instr = irbuild.EmitAlloc(bodyBlk, elemTyp)
+		bodyBlk = emitStoreManagedSlot(ctx, bodyBlk, valPtr, elem, elemTyp, true)
+		defineVar(ctx, stmt.ForVal.Name, valPtr, elemTyp)
+	}
+
+	// Define key variable if present (always int — non-managed).
+	if stmt.ForKey != nil {
+		var keyPtr @ir.Instr = irbuild.EmitAlloc(bodyBlk, types.TypInt())
+		irbuild.EmitStore(bodyBlk, keyPtr, bodyIdx)
+		defineVar(ctx, stmt.ForKey.Name, keyPtr, types.TypInt())
+	}
+
+	// Generate body.  BreakVarLen/ContinueVarLen are taken HERE — after the
+	// value/key vars are bound — so a break/continue in the body RefDec's only
+	// the body's managed locals; the loop's per-iteration value var is released
+	// by breakBlk/postBlk (at the lower savedVarLen), so the two are disjoint
+	// (no double-release).
+	var savedBreak @ir.Block = ctx.BreakTo
+	var savedContinue @ir.Block = ctx.ContinueTo
+	var savedBreakVL int = ctx.BreakVarLen
+	var savedContinueVL int = ctx.ContinueVarLen
+	ctx.BreakTo = breakBlk
+	ctx.ContinueTo = postBlk
+	ctx.BreakVarLen = len(ctx.Vars)
+	ctx.ContinueVarLen = len(ctx.Vars)
+	var bodyEnd @ir.Block = genBlock(ctx, bodyBlk, stmt.Body)
+	ctx.BreakTo = savedBreak
+	ctx.ContinueTo = savedContinue
+	ctx.BreakVarLen = savedBreakVL
+	ctx.ContinueVarLen = savedContinueVL
+	if len(bodyEnd.Instrs) == 0 || !bodyEnd.Instrs[len(bodyEnd.Instrs) - 1].IsTerminator() {
+		irbuild.EmitJump(bodyEnd, postBlk)
+	}
+
+	// Post: release the per-iteration loop var(s) — RefDec the managed value
+	// var (the int key is a no-op) — then increment the index and loop back.
+	// Both normal fall-through and `continue` land here; the value released is
+	// whatever v currently holds (the bound element, or a body reassignment).
+	postBlk = emitDecForScopeVars(ctx, postBlk, savedVarLen)
+	var postIdx @ir.Instr = irbuild.EmitLoad(postBlk, idxPtr, types.TypInt())
+	var one @ir.Instr = irbuild.EmitConstInt(postBlk, 1, types.TypInt())
+	var nextIdx @ir.Instr = irbuild.EmitBinop(postBlk, iropcode.OP_ADD, postIdx, one, types.TypInt())
+	irbuild.EmitStore(postBlk, idxPtr, nextIdx)
+	irbuild.EmitJump(postBlk, condBlk)
+
+	// Break: release the current iteration's loop var(s), then exit.  The
+	// cond-fail path reaches exitBlk directly — the last completed iteration
+	// released its value at postBlk, so nothing is live to release there.
+	var breakEnd @ir.Block = emitDecForScopeVars(ctx, breakBlk, savedVarLen)
+	irbuild.EmitJump(breakEnd, exitBlk)
+
+	// The loop var(s) are released per-iteration above, not at the enclosing
+	// block's exit — drop them from the enclosing scope.  The hidden operand
+	// local (if any) is released as the loop exits, and dropped too.
+	ctx.Vars = ctx.Vars[:savedVarLen]
+	exitBlk = emitDecForScopeVars(ctx, exitBlk, operandVarLen)
+	ctx.Vars = ctx.Vars[:operandVarLen]
+
+	return exitBlk
+}
+
+// forInOperandIsArray reports whether the range operand is an array: x is the
+// expression the loop ranges (orig itself, or the hidden local it was bound
+// to).  A variable's type comes from IR-gen's own binding; otherwise the
+// checker's type of orig is used (only its kind, which instantiation cannot
+// change).
+func forInOperandIsArray(ctx @GenContext, orig @ast.Expr, x @ast.Expr) bool {
+	var t @types.Type = nil
+	if x.Kind == ast.EXPR_IDENT {
+		t = lookupVarType(ctx, x.Name)
+	}
+	if t == nil && ctx.Checker != nil && orig.ResolvedTypeID != 0 {
+		t = ctx.Checker.ExprType(orig.ResolvedTypeID)
+	}
+	if t == nil {
+		return false
+	}
+	t = irutil.PeelTransparent(t)
+	return t != nil && t.Kind == types.TYP_ARRAY
+}
+
+// addrPointeeType returns the (wrapper-peeled) type addr points to — addr being
+// an address: an alloca, a field / element pointer, a global reference, or a
+// raw / managed pointer value — or nil.
+func addrPointeeType(addr @ir.Instr) @types.Type {
+	if addr == nil || addr.Typ == nil {
+		return nil
+	}
+	var pt @types.Type = irutil.PeelTransparent(addr.Typ)
+	if pt == nil || pt.Elem == nil ||
+			(pt.Kind != types.TYP_POINTER && pt.Kind != types.TYP_MANAGED_PTR) {
+		return nil
+	}
+	return irutil.PeelTransparent(pt.Elem)
+}
+
+// forInOperandName returns the name of the hidden local a range loop binds a
+// temporary operand to; `.` keeps it from colliding with (or being named by)
+// any identifier.
+func forInOperandName() *[]readonly char {
+	return ".forin.operand"
+}
+
+// forInOperandIdent returns an identifier expression naming the hidden operand
+// local, positioned at x.
+func forInOperandIdent(x @ast.Expr) @ast.Expr {
+	var id @ast.Expr = make(ast.Expr)
+	id.Kind = ast.EXPR_IDENT
+	id.Pos = x.Pos
+	id.Name = buf.CopyStr(forInOperandName())
+	return id
+}
+
+// forInOperandIsStable reports whether the range operand x is rooted in a
+// variable — the variable itself, or a field, element or dereference reached
+// from one — so its storage outlives the loop without a hidden local.
+func forInOperandIsStable(x @ast.Expr) bool {
+	if x == nil {
+		return false
+	}
+	if x.Kind == ast.EXPR_IDENT {
+		return true
+	}
+	if x.Kind == ast.EXPR_SELECTOR || x.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		return forInOperandIsStable(x.X)
+	}
+	if x.Kind == ast.EXPR_UNARY && x.Op == cast(int, token.STAR) {
+		return forInOperandIsStable(x.X)
+	}
+	return false
+}
+
+// forInArrayAddr returns the address of the array operand x (variable-rooted,
+// or the hidden operand local) for the loop to read its elements through: the
+// dereferencing address forms indexing uses, so a nil pointer on the way is
+// caught by the opt-in nil check, as `x[i]` would be.
+func forInArrayAddr(ctx @GenContext, b @ir.Block, x @ast.Expr) @ir.Instr {
+	if x.Kind == ast.EXPR_SELECTOR {
+		var sp @ir.Instr = genSelectorPtr(ctx, b, x, true)
+		if sp != nil { return sp }
+	}
+	if x.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
+		var ip @ir.Instr = genIndexPtr(ctx, b, x, true)
+		if ip != nil { return ip }
+	}
+	if x.Kind == ast.EXPR_UNARY && x.Op == cast(int, token.STAR) {
+		var p @ir.Instr = genExpr(ctx, b, x.X)
+		emitDerefNilCheck(ctx, ctx.CurBlock, p, true)
+		return p
+	}
+	return genLValueAddr(ctx, b, x)
+}
+
+// forInHoldHeaderTemps moves the statement's remaining temporaries into hidden
+// locals (released at scope exit like any local) and clears the temp list.
+// Mirrors emitTempRefDecs: a managed scalar or managed aggregate value is
+// stored into a slot of its type; a managed-field composite-literal alloca is
+// its own storage.  Every held value now lives in a frame slot, so the
+// header's vm.SP growth is reclaimed here, as emitTempCleanup would.
+func forInHoldHeaderTemps(ctx @GenContext, b @ir.Block) {
+	for i := 0; i < len(ctx.Temps); i++ {
+		var tmp @ir.Instr = ctx.Temps[i]
+		if tmp.Typ == nil { continue }
+		if isStructOrArrayAlloc(tmp) && needsStructCopy(tmp.TypeArg) {
+			defineVar(ctx, forInTempName(), tmp, tmp.TypeArg)
+			continue
+		}
+		if irutil.IsManagedPtrType(tmp.Typ) || irutil.IsManagedSliceType(tmp.Typ) ||
+				irutil.IsManagedIfaceValueType(tmp.Typ) || irutil.IsManagedFuncValueType(tmp.Typ) ||
+				needsStructCopy(tmp.Typ) {
+			var slot @ir.Instr = irbuild.EmitAlloc(b, tmp.Typ)
+			irbuild.EmitStore(b, slot, tmp)
+			defineVar(ctx, forInTempName(), slot, tmp.Typ)
+		}
+	}
+	ctx.Temps = ctx.Temps[:0]
+	if ctx.StmtGrewSP {
+		irbuild.EmitSPRestore(b)
+		ctx.StmtGrewSP = false
+	}
+}
+
+// forInTempName returns the name of the hidden locals holding a range loop's
+// header temporaries (never looked up; `.` keeps it from any identifier).
+func forInTempName() *[]readonly char {
+	return ".forin.temp"
+}

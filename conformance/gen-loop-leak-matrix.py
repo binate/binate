@@ -80,6 +80,13 @@ CONSTRUCTS = [
     ("rodata-array", "",
      ['var a [64]char = "%s"' % ("0123456789abcdef" * 4),
       "sink(cast(int, a[0]))"], 210000),                  # 64 B/iter
+    # The same copy from a plain assignment and into a by-value argument.
+    ("rodata-array-assign", "",
+     ["var a [64]char", 'a = "%s"' % ("0123456789abcdef" * 4),
+      "sink(cast(int, a[0]))"], 210000),                  # 64 B/iter
+    ("rodata-array-arg",
+     "func first(a [64]char) int { return cast(int, a[0]) }",
+     ['sink(first("%s"))' % ("0123456789abcdef" * 4)], 210000),  # 64 B/iter
     # (OP_BOX's `.tmp` leak is covered by the static checker — boxing
     # needs a per-iteration heap alloc and a tiny `.tmp`, so a runtime
     # stress cell would be heavy and slow; conformance/check-alloca-hoist

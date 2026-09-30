@@ -29,7 +29,9 @@ never sees it — the leak only manifests at scale. Three lowerings bit this way
 - **`<construct>`** — what sits in the loop body:
   - `const-nil-mslice` / `const-nil-nested-mslice` / `const-nil-funcval` /
     `const-nil-iface` — default-init managed aggregates (`OP_CONST_NIL`).
-  - `rodata-array` — `var a [64]char = "..."` (`OP_RODATA_ARRAY`).
+  - `rodata-array` — `var a [64]char = "..."` (`OP_RODATA_ARRAY`);
+    `rodata-array-assign` / `rodata-array-arg` — the same copy from a plain
+    assignment and into a by-value argument.
   - `alloc-bigstruct` / `alloc-bigarray` — default-init plain struct / array
     (`OP_ALLOC`, always hoisted; **controls** guarding against a regression).
   - `control-make-slice` / `control-string-mslice` — hoisted heap-allocating

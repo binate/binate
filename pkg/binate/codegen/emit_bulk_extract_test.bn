@@ -1,0 +1,150 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/irbuild"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+import "pkg/std/strings"
+
+// bulkExtractDecls declares a two-result function returning bulk arrays, and a
+// function returning a struct with a bulk member.
+func bulkExtractDecls() @[]char {
+	return buf.CopyStr(
+			"package \"main\"\n"
+					"var ga [100]uint8\n"
+					"type Big struct {\n\tdata [100]uint8\n\tn int\n}\n"
+					"var gb Big\n"
+					"func two() ([100]uint8, [100]uint8) { return ga, ga }\n"
+					"func mkBig() Big { return gb }\n")
+}
+
+// The results of a multi-return call through sret stay in its `.sret` buffer:
+// each extracted result is a GEP into it (memory-backed), stored from there by
+// rt.MemCopy — no whole-tuple load, no extractvalue.
+func TestBulkMultiReturnExtracts() testing.TestResult {
+	setTarget64()
+	var src @[]char = buf.Concat(bulkExtractDecls(),
+			"func multi() int {\n\ta, b := two()\n"
+					"\treturn cast(int, a[1]) + cast(int, b[2])\n}\n"
+					"func main() { _ = multi() }\n")
+	var fn @[]char = llvmFuncBody(compileToLLVM(src), "multi")
+	if contains(fn, "extractvalue") || contains(fn, "insertvalue") {
+		return fail(buf.Concat("multi: no per-leaf or whole-tuple SSA: ", fn))
+	}
+	if countSubstr(fn, ".ep = getelementptr inbounds <{ [100 x i8], [100 x i8] }>, ptr %v") != 2 {
+		return fail(buf.Concat("multi: each result is a GEP into the .sret buffer: ", fn))
+	}
+	if countSubstr(fn, rtSym("MemCopy")) != 2 || !contains(fn, ".ep, i64 100)") {
+		return fail("multi: each result is stored from its GEP by one rt.MemCopy")
+	}
+	return ""
+}
+
+// At -O2 `mkBig().n` becomes an extract of the call's result, which reads the
+// field in place — a GEP into the `.sret` buffer and a scalar load — and a bulk
+// member of a call result is stored from its GEP.
+func TestBulkExtractInPlaceAtO2() testing.TestResult {
+	setTarget64()
+	var src @[]char = buf.Concat(bulkExtractDecls(),
+			"func nOf() int { return mkBig().n }\n"
+					"func dataOf() int {\n\tvar d [100]uint8 = mkBig().data\n"
+					"\treturn cast(int, d[4])\n}\n"
+					"func main() { _ = nOf() + dataOf() }\n")
+	var out @[]char = compileToLLVMOpt(src, 2)
+	var n @[]char = llvmFuncBody(out, "nOf")
+	// The field load is the one line ending in `.ep` (the GEP line ends in its index).
+	if !contains(n, ".ep = getelementptr inbounds ") || !contains(n, " = load i64, ptr %v") ||
+			!contains(n, ".ep\n") {
+		return fail(buf.Concat("nOf: the field is read in place: ", n))
+	}
+	if contains(n, "extractvalue") { return fail(buf.Concat("nOf: no whole-value extract: ", n)) }
+	var d @[]char = llvmFuncBody(out, "dataOf")
+	if contains(d, "extractvalue") || contains(d, "insertvalue") {
+		return fail(buf.Concat("dataOf: no per-leaf SSA: ", d))
+	}
+	return ""
+}
+
+// bulkStructType returns struct { data [100]uint8; pair [2]int }.
+func bulkStructType() @types.Type {
+	var flds @[]@types.Field = make_slice(@types.Field, 2)
+	flds[0] = make(types.Field)
+	flds[0].Name = buf.CopyStr("data")
+	flds[0].Type = types.MakeArrayType(types.TypUint8(), 100)
+	flds[1] = make(types.Field)
+	flds[1].Name = buf.CopyStr("pair")
+	flds[1].Type = types.MakeArrayType(types.TypInt(), 2)
+	return types.MakeStructType("", flds)
+}
+
+// A small aggregate member of a memory-backed aggregate is loaded per leaf from
+// its GEP; a bulk member is memory-backed at its GEP and never passed to a
+// callee as its own copy.
+func TestEmitBulkMemExtract() testing.TestResult {
+	setTarget64()
+	var noP @[]@ir.Param
+	var noR @[]@types.Type
+	var f @ir.Func = ir.NewFunc("", "t", noP, noR)
+	var e @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = bulkStructType()
+	var v @ir.Instr = irbuild.EmitLoad(e, irbuild.EmitAlloc(e, st), st)
+	var data @ir.Instr = irbuild.EmitExtract(e, v, 0, types.MakeArrayType(types.TypUint8(), 100))
+	var pair @ir.Instr = irbuild.EmitExtract(e, v, 1, types.MakeArrayType(types.TypInt(), 2))
+	irbuild.EmitStore(e, irbuild.EmitAlloc(e, pair.Typ), pair)
+	var args @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	args[0] = data
+	var c @ir.Instr = irbuild.EmitCall(e, "g", args, types.TypInt())
+	irbuild.EmitReturn(e, make_slice(@ir.Instr, 0))
+	computeBulkMemValues(f, noFuncRetTypes())
+	var memV bool = isBulkMem(v)
+	var memData bool = isBulkMem(data)
+	var direct bool = bulkArgDirect(c, data)
+	var dataRef @[]char = bulkMemRef(data)
+	var sb @strings.Builder = strings.NewBuilder()
+	emitBulkMemExtract(sb, pair, noFuncRetTypes())
+	var pairOut @[]char = buf.CopyStr(sb.String())
+	var sb2 @strings.Builder = strings.NewBuilder()
+	emitBulkMemExtract(sb2, data, noFuncRetTypes())
+	var dataOut @[]char = buf.CopyStr(sb2.String())
+	clearBulkMemValues()
+	if !memV || !memData { return fail("the struct and its bulk member should be memory-backed") }
+	if direct { return fail("an extracted member is never passed as its own copy") }
+	if !contains(dataRef, ".ep") { return fail("a bulk member's memory is its GEP") }
+	if !contains(pairOut, ".ep = getelementptr inbounds ") ||
+			!contains(pairOut, "insertvalue [2 x i64]") {
+		return fail(buf.Concat("a small member loads per leaf from its GEP: ", pairOut))
+	}
+	if !contains(dataOut, ".ep = getelementptr inbounds ") || contains(dataOut, " = load ") {
+		return fail(buf.Concat("a bulk member is only its GEP: ", dataOut))
+	}
+	return ""
+}
+
+// A bulk member of an aggregate that keeps the SSA form (here: returned other
+// than through sret) keeps the SSA form too — its memory would be its parent's.
+func TestBulkExtractOfSSAParent() testing.TestResult {
+	setTarget64()
+	var noP @[]@ir.Param
+	var noR @[]@types.Type
+	var f @ir.Func = ir.NewFunc("", "t", noP, noR)
+	var e @ir.Block = ir.AddBlock(f, "entry")
+	var st @types.Type = bulkStructType()
+	var v @ir.Instr = irbuild.EmitLoad(e, irbuild.EmitAlloc(e, st), st)
+	var data @ir.Instr = irbuild.EmitExtract(e, v, 0, types.MakeArrayType(types.TypUint8(), 100))
+	irbuild.EmitStore(e, irbuild.EmitAlloc(e, data.Typ), data)
+	var rets @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	rets[0] = v
+	irbuild.EmitReturn(e, rets)
+	var was bool = currentFuncUsesSret
+	currentFuncUsesSret = false
+	computeBulkMemValues(f, noFuncRetTypes())
+	var memV bool = isBulkMem(v)
+	var memData bool = isBulkMem(data)
+	currentFuncUsesSret = was
+	clearBulkMemValues()
+	if memV { return fail("a value returned other than through sret keeps the SSA form") }
+	if memData { return fail("a member of an SSA aggregate keeps the SSA form") }
+	return ""
+}

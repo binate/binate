@@ -4,6 +4,7 @@ import "pkg/binate/asm"
 import "pkg/binate/asm/x64"
 import "pkg/binate/ir"
 import "pkg/binate/iropcode"
+import "pkg/binate/native/aggcopy"
 import "pkg/binate/native/common"
 import "pkg/binate/types"
 
@@ -216,23 +217,44 @@ func emitAggMemcpyX64(a @asm.Assembler, dstPtr int, srcPtr int, sz int, tmpGP in
 		x64.Mov(a, x64.Mem(dstPtr, off, x64.SZ64), x64.Reg(tmpGP, x64.SZ64))
 		off = off + 8
 	}
-	// A final sub-word tail (sz not a multiple of 8) is copied as one full-word
-	// access, matching the prior word-at-a-time loop's over-read of the padding.
-	if off < sz {
-		x64.Mov(a, x64.Reg(tmpGP, x64.SZ64), x64.Mem(srcPtr, off, x64.SZ64))
-		x64.Mov(a, x64.Mem(dstPtr, off, x64.SZ64), x64.Reg(tmpGP, x64.SZ64))
+	// A sub-word tail (sz not a multiple of 8) is copied exactly, in 4-, 2- and
+	// 1-byte pieces: the bytes after sz belong to whatever follows the
+	// destination (the next field, element or global) whenever the aggregate's
+	// alignment is below 8, so a full-word store there would overwrite it.
+	var tail @[]aggcopy.Piece = aggcopy.TailPieces(off, sz, false)
+	for i := 0; i < len(tail); i++ {
+		emitAggPieceX64(a, true, tmpGP, srcPtr, tail[i])
+		emitAggPieceX64(a, false, tmpGP, dstPtr, tail[i])
+	}
+}
+
+// emitAggPieceX64 loads (isLoad) or stores one piece of an aggregate copy:
+// p.Width bytes at [base + p.Off] through the GP register rt.
+func emitAggPieceX64(a @asm.Assembler, isLoad bool, rt int, base int, p aggcopy.Piece) {
+	var size int = x64.SZ8
+	if p.Width == 8 {
+		size = x64.SZ64
+	} else if p.Width == 4 {
+		size = x64.SZ32
+	} else if p.Width == 2 {
+		size = x64.SZ16
+	}
+	if isLoad {
+		x64.Mov(a, x64.Reg(rt, size), x64.Mem(base, p.Off, size))
+	} else {
+		x64.Mov(a, x64.Mem(base, p.Off, size), x64.Reg(rt, size))
 	}
 }
 
 // emitAggMemcpySafeX64 is an OVERLAP-SAFE aggregate copy: it loads the WHOLE source
 // into registers first (up to two 16-byte MOVUPS chunks in the XMM scratches plus a
-// remainder word or two in GP), THEN stores — so a copy whose dst aliases (overlaps)
-// its src (an elided raw-pointer `*dst = *src`) reads all of the source before
-// writing any of the destination.  Used by emitStructCopy, whose source may be an
-// aliased (elided) load.  A copy larger than 32 bytes delegates to the interleaved
-// emitAggMemcpyX64 — reached only by NON-aliasing copies, since the S-adjacent
-// elision that can alias is size-capped (<= 16 bytes) well within it.  Same op count
-// as the interleaved form, just reordered.
+// remainder of up to two GP pieces, the last ending exactly at sz), THEN stores — so
+// a copy whose dst aliases (overlaps) its src (an elided raw-pointer `*dst = *src`)
+// reads all of the source before writing any of the destination.  Used by
+// emitStructCopy, whose source may be an aliased (elided) load.  A copy larger than
+// 32 bytes delegates to the interleaved emitAggMemcpyX64 — reached only by
+// NON-aliasing copies, since the S-adjacent elision that can alias is size-capped
+// (<= 16 bytes) well within it.
 func emitAggMemcpySafeX64(a @asm.Assembler, rm @common.RegMap, dstPtr int, srcPtr int, sz int,
 		tmpGP int) {
 	if sz <= 0 || sz > 32 {
@@ -240,23 +262,32 @@ func emitAggMemcpySafeX64(a @asm.Assembler, rm @common.RegMap, dstPtr int, srcPt
 		return
 	}
 	var nchunks int = sz / 16
-	var remStart int = nchunks * 16
-	var remWords int = (sz - remStart + 7) / 8
-	var g0 int = tmpGP
-	var g1 int = tmpGP
-	if remWords >= 2 { g1 = scratchReg(rm) }
+	var words int = (sz - nchunks * 16) / 8
+	var wordsEnd int = nchunks * 16 + words * 8
+	var tail @[]aggcopy.Piece = aggcopy.TailPieces(wordsEnd, sz, true)
+	// At most two GP pieces — an 8-byte word plus the tail, which TailPieces
+	// caps at one overlapping word from 8 bytes up and two pieces below — so the
+	// copy takes tmpGP and at most one scratch register.
+	var pieces @[]aggcopy.Piece = make_slice(aggcopy.Piece, words + len(tail))
+	for i := 0; i < words; i++ {
+		pieces[i].Off = nchunks * 16 + i * 8
+		pieces[i].Width = 8
+	}
+	for i := 0; i < len(tail); i++ { pieces[words + i] = tail[i] }
+	var regs @[]int = make_slice(int, len(pieces))
+	for i := 0; i < len(regs); i++ {
+		if i == 0 {
+			regs[i] = tmpGP
+		} else {
+			regs[i] = scratchReg(rm)
+		}
+	}
 	if nchunks >= 1 { x64.Movups_load(a, FP_SCRATCH_A, x64.Mem(srcPtr, 0, x64.SZ64)) }
 	if nchunks >= 2 { x64.Movups_load(a, FP_SCRATCH_B, x64.Mem(srcPtr, 16, x64.SZ64)) }
-	if remWords >= 1 { x64.Mov(a, x64.Reg(g0, x64.SZ64), x64.Mem(srcPtr, remStart, x64.SZ64)) }
-	if remWords >= 2 {
-		x64.Mov(a, x64.Reg(g1, x64.SZ64), x64.Mem(srcPtr, remStart + 8, x64.SZ64))
-	}
+	for i := 0; i < len(pieces); i++ { emitAggPieceX64(a, true, regs[i], srcPtr, pieces[i]) }
 	if nchunks >= 1 { x64.Movups_store(a, x64.Mem(dstPtr, 0, x64.SZ64), FP_SCRATCH_A) }
 	if nchunks >= 2 { x64.Movups_store(a, x64.Mem(dstPtr, 16, x64.SZ64), FP_SCRATCH_B) }
-	if remWords >= 1 { x64.Mov(a, x64.Mem(dstPtr, remStart, x64.SZ64), x64.Reg(g0, x64.SZ64)) }
-	if remWords >= 2 {
-		x64.Mov(a, x64.Mem(dstPtr, remStart + 8, x64.SZ64), x64.Reg(g1, x64.SZ64))
-	}
+	for i := 0; i < len(pieces); i++ { emitAggPieceX64(a, false, regs[i], dstPtr, pieces[i]) }
 }
 
 // emitAggLoad materializes an aggregate OP_LOAD: it copies the loaded

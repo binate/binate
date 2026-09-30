@@ -45,7 +45,10 @@ import "pkg/binate/iropt"
 // Additionally every use of `ld`'s value must be a read-only consumer in the SAME
 // block, after `ld`: a cross-block use, a fault-pad use, a use that writes through the
 // value (as an `OP_STORE` destination) or takes its address, or a `__c_call` argument
-// use is conservatively rejected.
+// use is conservatively rejected.  The same holds for every alias of the value (an
+// instruction that passes its pointer on — an aggregate field, a raw view, a cast;
+// see lastAliasUseIndex), whose consumers read the source too and so extend the
+// range every shape checks.
 func AggLoadElidable(f @ir.Func, ld @ir.Instr) bool {
 	if ld.Op != iropcode.OP_LOAD { return false }
 	if !IsAggregateTyp(ld.Typ) { return false }
@@ -69,8 +72,9 @@ func AggLoadElidable(f @ir.Func, ld @ir.Instr) bool {
 	// same-block use-range analysis below cannot reason about those.
 	if valueUsedInOtherBlockOrPad(f, blk, ld) { return false }
 
-	// Every same-block use must be a read-only consumer at/after li; get the last.
-	var lastUse int = lastReadOnlyUseIndex(blk, li, ld)
+	// Every same-block read of ld's bytes — through ld or an alias of it — must be a
+	// read-only consumer after li; get the last.
+	var lastUse int = lastAliasUseIndex(f, blk, li, ld)
 	if lastUse < 0 { return false }
 
 	var src @ir.Instr = ld.Args[0]
@@ -191,10 +195,77 @@ func lastReadOnlyUseIndex(blk @ir.Block, li int, ld @ir.Instr) int {
 			// Aliasing the source would let the callee corrupt it.  Refuse elision for
 			// any `__c_call` value use (conservative across targets/sizes).
 			if ins.Op == iropcode.OP_C_CALL { return -1 }
+			// An OP_COPY hands the value to a phi, whose own uses (named by the phi,
+			// not by this copy) lie outside this block's range analysis.
+			if ins.Op == iropcode.OP_COPY { return -1 }
 		}
 		if uses { last = ii }
 	}
 	return last
+}
+
+// lastAliasUseIndex returns the index in blk of the last instruction that reads ld
+// or an alias of it, or -1 if ld has no use or any read is disqualified (each alias
+// is held to lastReadOnlyUseIndex's read-only rules and to a same-block use range).
+// On every native backend an aggregate SSA value is a pointer to its bytes, and a
+// pass-through instruction (isAggregateAlias) hands that pointer on instead of
+// copying: its consumers read ld's bytes later, at their own position.  Those reads
+// belong to ld's use range, or a write between the pass-through and its consumer
+// would go unchecked and the consumer would read the overwritten source.
+func lastAliasUseIndex(f @ir.Func, blk @ir.Block, li int, ld @ir.Instr) int {
+	// A use earlier in the block than the definition (a phi reached around a
+	// back edge) is outside the forward range analysis: reject it.
+	if valueReadInBlockRange(blk, 0, li, ld) { return -1 }
+	var last int = lastReadOnlyUseIndex(blk, li, ld)
+	if last < 0 { return -1 }
+	// Worklist of alias positions in blk, starting with ld's own.
+	var work @[]int = AppendInt(make_slice(int, 0), li)
+	for len(work) > 0 {
+		var ai int = work[len(work) - 1]
+		work = work[0:len(work) - 1]
+		var a @ir.Instr = blk.Instrs[ai]
+		for ii := ai + 1; ii < len(blk.Instrs); ii++ {
+			var ins @ir.Instr = blk.Instrs[ii]
+			if !isAggregateAlias(ins) || ins.Args[0] != a { continue }
+			if valueUsedInOtherBlockOrPad(f, blk, ins) { return -1 }
+			if valueReadInBlockRange(blk, 0, ii, ins) { return -1 }
+			var al int = lastReadOnlyUseIndex(blk, ii, ins)
+			if al < 0 {
+				// No use at all is fine for an alias (nothing reads through it);
+				// a disqualifying use is not.
+				if valueReadInBlockRange(blk, ii + 1, len(blk.Instrs), ins) { return -1 }
+				al = ii
+			}
+			if al > last { last = al }
+			work = AppendInt(work, ii)
+		}
+	}
+	return last
+}
+
+// isAggregateAlias reports whether ins passes its first operand's aggregate pointer
+// on as its own aggregate result rather than copying the bytes: an aggregate-typed
+// OP_EXTRACT (an address inside the operand), and an OP_MANAGED_TO_RAW, OP_CAST or
+// OP_BIT_CAST with an aggregate result (the same pointer).
+func isAggregateAlias(ins @ir.Instr) bool {
+	if len(ins.Args) < 1 || !IsAggregateTyp(ins.Typ) { return false }
+	return ins.Op == iropcode.OP_EXTRACT || ins.Op == iropcode.OP_MANAGED_TO_RAW ||
+			ins.Op == iropcode.OP_CAST || ins.Op == iropcode.OP_BIT_CAST
+}
+
+// valueReadInBlockRange reports whether any instruction of blk at an index in
+// [from, to) names v as an argument or phi entry.
+func valueReadInBlockRange(blk @ir.Block, from int, to int, v @ir.Instr) bool {
+	for ii := from; ii < to; ii++ {
+		var ins @ir.Instr = blk.Instrs[ii]
+		for k := 0; k < len(ins.Args); k++ {
+			if ins.Args[k] == v { return true }
+		}
+		for k := 0; k < len(ins.Phis); k++ {
+			if ins.Phis[k].Val == v { return true }
+		}
+	}
+	return false
 }
 
 // allSameBlockUsesAreExtracts reports whether `ld` has at least one use in blk over
@@ -214,13 +285,12 @@ func allSameBlockUsesAreExtracts(blk @ir.Block, li int, lastUse int, ld @ir.Inst
 		if usesLd {
 			sawUse = true
 			if ins.Op != iropcode.OP_EXTRACT { return false }
-			// The extract must be a SCALAR field read — the read happens AT the
-			// extract (within the guarded interval), so the source is provably
-			// byte-stable for it.  An AGGREGATE-typed extract instead emits a bare
-			// address-of-sub-object (a pointer aliasing the source); the actual
-			// read is deferred to whatever consumes that pointer, which uses the
-			// extract — not `ld` — and so lies OUTSIDE (li, lastUse] and unchecked.
-			// Reject it: the source could be freed before that deferred read.
+			// The extract must be a SCALAR field read, which happens AT the extract.
+			// An AGGREGATE-typed extract instead emits a bare address-of-sub-object (a
+			// pointer aliasing the source) whose read is deferred to its consumers;
+			// lastAliasUseIndex puts those in the checked range, but this shape is
+			// the field-read-only one, so it takes scalar extracts only and leaves
+			// aggregate ones to the other shapes.
 			if IsAggregateTyp(ins.Typ) { return false }
 		}
 	}

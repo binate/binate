@@ -1489,6 +1489,54 @@ testing.Println(c.v, d.v, c.Get(), d.Get())
 > 5 6 5 6
 > "
 
+# --- A named type that names itself (`type Tree @[]Tree`) and two that name
+# each other (parked until both are declared, then resolved together) have those
+# types at the prompt. ---
+run_repl "tier3-named-type-self-reference" \
+'type Tree @[]Tree
+func depth(t Tree) int { var d int = 0; for i := 0; i < len(t); i++ { var c int = depth(t[i]); if c > d { d = c } }; return d + 1 }
+var leaf Tree = make_slice(Tree, 0)
+var top Tree = make_slice(Tree, 1)
+top[0] = leaf
+testing.Println(depth(top))
+type SA @[]SB
+type SB @[]SA
+var sa SA = make_slice(SB, 2)
+sa[1] = make_slice(SA, 3)
+testing.Println(len(sa), len(sa[1]))
+' \
+"$BANNER
+> > > > > > 2
+> type SA parked (pending: SB)
+> type SB parked (pending: SA)
+type SA resolved
+type SB resolved
+> > > 2 3
+> "
+
+# --- A named type that names an alias declared after it, parked as a group with
+# it (the alias is built first), and a function whose recursive local is
+# destroyed at the prompt. ---
+run_repl "tier3-named-type-alias-cycle-and-local" \
+'type TN2 @[]TA2
+type TA2 = @[]TN2
+var tn TN2 = make_slice(TA2, 1)
+tn[0] = make_slice(TN2, 2)
+tn[0][1] = make_slice(TA2, 3)
+testing.Println(len(tn), len(tn[0]), len(tn[0][1]))
+type Tree @[]Tree
+func f() int { var t Tree = make_slice(Tree, 2); t[0] = make_slice(Tree, 1); t[0][0] = make_slice(Tree, 3); return len(t) + len(t[0]) + len(t[0][0]) }
+testing.Println(f(), f())
+' \
+"$BANNER
+> type TN2 parked (pending: TA2)
+> type TA2 parked (pending: TN2)
+type TN2 resolved
+type TA2 resolved
+> > > > 1 2 3
+> > > 6 6
+> "
+
 # --- Case 46 (Tier 5 import alias): `import alt "pkg/repldemo"`
 # binds the package to `alt` rather than the default last-segment
 # name.  Calls through the alias work; the default name `repldemo`

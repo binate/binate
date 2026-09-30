@@ -118,6 +118,31 @@ func Double(x int) int {
 }
 EOF
 
+# ----- A package with a generic struct and a function returning one of its
+# instantiations: a prompt variable inferred from it is typed as that
+# instantiation. ---
+mkdir -p "$TMP/pkg/replgen"
+cat > "$TMP/pkg/replgen.bni" <<'EOF'
+package "pkg/replgen"
+
+type Cell[T any] struct {
+    v T
+}
+
+func (c *Cell[T]) Get() T { return c.v }
+
+func MkCell(v int) Cell[int]
+EOF
+cat > "$TMP/pkg/replgen/replgen.bn" <<'EOF'
+package "pkg/replgen"
+
+func MkCell(v int) Cell[int] {
+    var c Cell[int]
+    c.v = v
+    return c
+}
+EOF
+
 # ----- Two packages whose names share the last segment `lib`: the local
 # single-segment package "lib" and pkg/other/lib.  A prompt import of one must
 # rebind `lib` away from the other, and an explicit alias must be honored. ---
@@ -1445,6 +1470,23 @@ testing.Println(repldemo.Double(21))
 "$BANNER
 > package pkg/repldemo loaded
 > 42
+> "
+
+# --- A variable inferred from a call returning an imported generic
+# instantiation — typed at the prompt, and parked on its initializer's function
+# then resolved — has that type: its fields and methods work. ---
+run_repl "tier5-inferred-var-imported-generic" \
+'import "pkg/replgen"
+var c = replgen.MkCell(5)
+var d = e()
+func e() replgen.Cell[int] { return replgen.MkCell(6) }
+testing.Println(c.v, d.v, c.Get(), d.Get())
+' \
+"$BANNER
+> package pkg/replgen loaded
+> > variable d parked (pending: e)
+> variable d resolved
+> 5 6 5 6
 > "
 
 # --- Case 46 (Tier 5 import alias): `import alt "pkg/repldemo"`

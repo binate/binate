@@ -1,0 +1,183 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/types"
+
+// ============================================================
+// Checker type → IR-gen type
+// ============================================================
+//
+// IR-gen types a value from the syntax that produces it (resolveTypeExpr, or the
+// type of the generated instruction).  Where it must type a value WITHOUT
+// generating it first — an inferred package-level variable, a deferred method
+// call's receiver (built by a pre-pass at function entry, before any local is
+// declared) — it has only the checker's type, which names types differently:
+//   - an instantiation of a generic struct / interface is the checker's
+//     `pkg.Box[int]` (carrying InstDecl / InstArgs), where IR-gen registers the
+//     instantiated struct under a mangled name (ensureInstantiatedStruct);
+//   - a named type is the checker's (Pkg, Name), where IR-gen's registered
+//     struct / type-declaration entry is keyed on the qualified name;
+//   - inside a generic body a type parameter is abstract to the checker, where
+//     IR-gen substitutes the instantiation's argument (bound by owner and
+//     position, CurrentTypeParamOwner / CurrentTypeParamArgs).
+
+// irTypeFromChecker returns IR-gen's representation of the checker's type t —
+// the type resolveTypeExpr gives the same type written in source — or nil when
+// t reaches a type IR-gen has no representation for.  An untyped constant type
+// maps to its default type, as the checker's defaultType does.
+func irTypeFromChecker(gc @GenCtx, t @types.Type) @types.Type {
+	if t == nil { return nil }
+	var k int = t.Kind
+	if k == types.TYP_INT || k == types.TYP_FLOAT || k == types.TYP_BOOL || k == types.TYP_VOID {
+		return t
+	}
+	if k == types.TYP_UNTYPED_INT { return types.TypInt() }
+	if k == types.TYP_UNTYPED_FLOAT { return types.TypFloat64() }
+	if k == types.TYP_UNTYPED_BOOL { return types.TypBool() }
+	if k == types.TYP_UNTYPED_STRING {
+		return types.MakeManagedSliceType(types.MakeReadonlyType(types.TypUint8()))
+	}
+	if k == types.TYP_TYPE_PARAM {
+		// Bound by the checker's identity for a type parameter — its owning
+		// declaration and position — not by name: the checker's types in a
+		// generic body carry the binder names of whichever declaration was
+		// checked first (`Pair[V, K]` beside `Pair[K, V]`, a blank `_`), as
+		// bindTypeParams notes.
+		if gc.CurrentTypeParamOwner != nil && t.TpOwner == gc.CurrentTypeParamOwner && t.TpIndex >= 0 &&
+				t.TpIndex < len(gc.CurrentTypeParamArgs) {
+			return gc.CurrentTypeParamArgs[t.TpIndex]
+		}
+		return nil
+	}
+	if t.InstDecl != nil && (k == types.TYP_NAMED || k == types.TYP_INTERFACE) {
+		return irInstantiationFromChecker(gc, t)
+	}
+	if k == types.TYP_NAMED {
+		return irNamedFromChecker(gc, t)
+	}
+	if k == types.TYP_ALIAS { return irTypeFromChecker(gc, t.Target) }
+	if k == types.TYP_INTERFACE {
+		return types.MakeInterfaceType(buf.CopyStr(unquotePkg(t.Pkg)), buf.CopyStr(t.Name))
+	}
+	if k == types.TYP_STRUCT {
+		return irStructFromChecker(gc, t)
+	}
+	if k == types.TYP_FUNC || k == types.TYP_FUNC_VALUE || k == types.TYP_MANAGED_FUNC_VALUE {
+		return irFuncFromChecker(gc, t)
+	}
+	if k == types.TYP_TUPLE {
+		var rs @[]@types.Type
+		var ok bool
+		rs, ok = irTypesFromChecker(gc, t.Results)
+		if !ok { return nil }
+		return types.MakeTupleType(rs)
+	}
+	if k == types.TYP_ARRAY && t.ArrayLenDependent { return nil }
+	var elem @types.Type = irTypeFromChecker(gc, t.Elem)
+	if elem == nil { return nil }
+	if k == types.TYP_READONLY { return types.MakeReadonlyType(elem) }
+	if k == types.TYP_POINTER { return types.MakePointerType(elem) }
+	if k == types.TYP_MANAGED_PTR { return types.MakeManagedPtrType(elem) }
+	if k == types.TYP_SLICE { return types.MakeSliceType(elem) }
+	if k == types.TYP_MANAGED_SLICE { return types.MakeManagedSliceType(elem) }
+	if k == types.TYP_ARRAY { return types.MakeArrayType(elem, t.ArrayLen) }
+	if k == types.TYP_INTERFACE_VALUE { return types.MakeInterfaceValueType(elem) }
+	if k == types.TYP_INTERFACE_VALUE_MANAGED {
+		return types.MakeManagedInterfaceValueType(elem)
+	}
+	return nil
+}
+
+// irTypesFromChecker maps each of ts (irTypeFromChecker); false when any maps
+// to nil.
+func irTypesFromChecker(gc @GenCtx, ts @[]@types.Type) (@[]@types.Type, bool) {
+	var out @[]@types.Type = make_slice(@types.Type, len(ts))
+	for i := 0; i < len(ts); i++ {
+		out[i] = irTypeFromChecker(gc, ts[i])
+		if out[i] == nil { return out, false }
+	}
+	return out, true
+}
+
+// irInstantiationFromChecker instantiates, in IR-gen, the generic struct or
+// interface a checker instantiation t names: the generic declaration IR-gen
+// registered under the declaring package, with t's type arguments mapped.
+func irInstantiationFromChecker(gc @GenCtx, t @types.Type) @types.Type {
+	if gc.Mod == nil || gc.Mod.Checker == nil { return nil }
+	var d @ast.Decl = bit_cast(@ast.Decl, t.InstDecl)
+	var defPkg @[]char = buf.CopyStr(unquotePkg(gc.Mod.Checker.GenericDeclPkg(d)))
+	var args @[]@types.Type
+	var ok bool
+	args, ok = irTypesFromChecker(gc, t.InstArgs)
+	if !ok { return nil }
+	if t.Kind == types.TYP_INTERFACE {
+		var gi @ast.Decl = lookupGenericIfaceDeclPkg(gc, defPkg, d.Name)
+		if gi == nil { return nil }
+		var instName @[]char = ensureInstantiatedInterface(gc, gi, args, defPkg)
+		return types.MakeInterfaceType(defPkg, instName)
+	}
+	var gd @ast.Decl = lookupGenericTypeDeclPkg(gc, defPkg, d.Name)
+	if gd == nil { return nil }
+	return ensureInstantiatedStruct(gc, gd, defPkg, args)
+}
+
+// irNamedFromChecker returns IR-gen's registered type for the checker's named
+// type t: the struct, or the type-declaration entry (typeDeclEntryType — a named
+// non-struct type, or a func-value type's underlying), under t's qualified name.
+func irNamedFromChecker(gc @GenCtx, t @types.Type) @types.Type {
+	if gc.Mod == nil { return nil }
+	var qual @[]char = types.QualifyName(buf.CopyStr(unquotePkg(t.Pkg)), t.Name)
+	var si int = lookupStructIdx(gc, qual)
+	if si >= 0 { return gc.Mod.Structs[si].Typ }
+	return lookupTypeAlias(gc, qual)
+}
+
+// irStructFromChecker maps a checker struct type: a named struct's (its Name is
+// qualified) is the registered struct; an anonymous one's fields are mapped and
+// the struct interned as resolveTypeExpr interns a written `struct { … }`.
+func irStructFromChecker(gc @GenCtx, t @types.Type) @types.Type {
+	if len(t.Name) > 0 {
+		if gc.Mod == nil { return nil }
+		var si int = lookupStructIdx(gc, t.Name)
+		if si < 0 { return nil }
+		return gc.Mod.Structs[si].Typ
+	}
+	var fields @[]@types.Field = make_slice(@types.Field, len(t.Fields))
+	for i := 0; i < len(t.Fields); i++ {
+		var f @types.Field = make(types.Field)
+		f.Name = t.Fields[i].Name
+		f.Type = irTypeFromChecker(gc, t.Fields[i].Type)
+		if f.Type == nil { return nil }
+		fields[i] = f
+	}
+	return internAnonStruct(gc, fields)
+}
+
+// irFuncFromChecker maps a function or function-value type's parameter and
+// result types, keeping each parameter's name and variadic-ness.
+func irFuncFromChecker(gc @GenCtx, t @types.Type) @types.Type {
+	var params @[]@types.Param = make_slice(@types.Param, len(t.Params))
+	for i := 0; i < len(t.Params); i++ {
+		var p @types.Param = make(types.Param)
+		p.Name = t.Params[i].Name
+		p.IsVariadic = t.Params[i].IsVariadic
+		p.Type = irTypeFromChecker(gc, t.Params[i].Type)
+		if p.Type == nil { return nil }
+		params[i] = p
+	}
+	var results @[]@types.Type
+	var ok bool
+	results, ok = irTypesFromChecker(gc, t.Results)
+	if !ok { return nil }
+	if t.Kind == types.TYP_FUNC { return types.MakeFuncType(params, results) }
+	if t.Kind == types.TYP_FUNC_VALUE { return types.MakeFuncValueType(params, results) }
+	return types.MakeManagedFuncValueType(params, results)
+}
+
+// unquotePkg strips one pair of surrounding double quotes, if present: the
+// checker spells some package paths quoted (`"main"`), IR-gen never does.
+func unquotePkg(p *[]readonly char) *[]readonly char {
+	if len(p) >= 2 && p[0] == '"' && p[len(p) - 1] == '"' { return p[1:len(p) - 1] }
+	return p
+}

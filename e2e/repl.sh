@@ -1893,7 +1893,57 @@ function asB resolved
 > > > 2
 > "
 
-# --- Case 61: an impl at the prompt on value receivers of a named scalar,
+# --- Case 61: a cast to an interface waits on an impl written through an
+# alias of a pointer to the type; at the prompt the function and the impl
+# report themselves unresolved; the method resolves both. ---
+run_repl "tier3-cast-waits-on-alias-receiver-impl" \
+"interface Sizer { Size() int }
+type Crate struct { n int }
+type PC = *Crate
+impl PC : Sizer
+func sz(c *Crate) int { return cast(*Sizer, c).Size() }
+var cr Crate
+cr.n = 7
+testing.Println(sz(&cr))
+_ = cast(*Sizer, &cr)
+func (c *Crate) Size() int { return c.n * 2 }
+testing.Println(sz(&cr))
+var t *Sizer = &cr
+testing.Println(t.Size())
+" \
+"$BANNER
+> > > > impl PC : Sizer parked (pending: Crate.Size)
+> function sz parked (pending: Crate:Sizer)
+> > > <repl>:1:17: function sz is unresolved (pending: Crate:Sizer)
+> <repl>:1:5: impl PC : Sizer is unresolved (pending: Crate.Size)
+> impl PC : Sizer resolved
+function sz resolved
+> 14
+> > 14
+> "
+
+# --- Case 62: an impl of a generic interface's instance parks on its
+# method, and resolves together with a method converting its receiver to
+# that instance. ---
+run_repl "tier3-impl-of-generic-interface-instance-parks" \
+"interface Getter[T any] { Get() T }
+type Cell struct { v int }
+impl *Cell : Getter[int]
+func (c *Cell) Get() int { var g *Getter[int] = c; _ = g; return c.v + 1 }
+var ce Cell
+ce.v = 8
+var g *Getter[int] = &ce
+testing.Println(g.Get())
+" \
+"$BANNER
+> > > impl *Cell : Getter[int] parked (pending: Cell.Get)
+> method Cell.Get parked (pending: Cell:Getter)
+impl *Cell : Getter[int] resolved
+method Cell.Get resolved
+> > > > 9
+> "
+
+# --- Case 63: an impl at the prompt on value receivers of a named scalar,
 # a struct and a named bool: dispatch goes through the receiver thunk
 # (the interface value holds the data by pointer). ---
 run_repl "tier2-impl-scalar-value-receivers" \
@@ -1925,7 +1975,7 @@ testing.Println(sf.Size())
 > > > > > > 1
 > "
 
-# --- Case 62: a value receiver with a managed field: dispatch through the
+# --- Case 64: a value receiver with a managed field: dispatch through the
 # thunk copies the value properly, so the field's refcount holds. ---
 run_repl "tier2-impl-value-receiver-managed-fields" \
 "import \"pkg/builtins/rt\"
@@ -1950,7 +2000,7 @@ testing.Println(s.Size(), rt.Refcount(ptr))
 > 3 2
 > "
 
-# --- Case 63: a method shadowed after its impl, before any value is boxed:
+# --- Case 65: a method shadowed after its impl, before any value is boxed:
 # the impl's vtable was built when the impl was declared, so it keeps the
 # method it was declared with. ---
 run_repl "tier4-shadow-before-first-box" \
@@ -1969,7 +2019,7 @@ testing.Println(s.Size())
 > > > > 4
 > "
 
-# --- Case 64: an impl at the prompt of an interface alias whose target
+# --- Case 66: an impl at the prompt of an interface alias whose target
 # extends a parent, and of an imported interface: dispatch through the
 # child, the parent, and the imported interface. ---
 run_repl "tier2-impl-parent-alias-imported-interfaces" \

@@ -33,8 +33,7 @@ func checkCastSafeSet(c @Checker, pos token.Pos, argExpr @ast.Expr, src @types.T
 	}
 	// A CONSTANT operand to an integer target must fit, and is not laundered
 	// (conv.cast.const-not-laundered): recordConst reports it on the cast.
-	// (1) Everything assignable is a safe cast.
-	if AssignableTo(src, c, dst) {
+	if castSafeSetAllows(c, src, dst) {
 		return
 	}
 	var ps @types.Type = types.StripWrappers(src)
@@ -42,17 +41,31 @@ func checkCastSafeSet(c @Checker, pos token.Pos, argExpr @ast.Expr, src @types.T
 	if ps == nil || pd == nil {
 		return
 	}
-	// (2) Numeric scalar conversions.
 	if ps.IsScalar() && pd.IsScalar() {
-		if pd.IsBool() && !ps.IsBool() {
-			addCheckError(c, pos,
-					"cast cannot convert a numeric value to bool (a value outside"
-							" {0, 1} is not a valid bool); use unsafe_cast(bool, x)")
-			return
-		}
-		// int<->int, int<->float, float<->float, float->int, bool->numeric: defined
-		// (the constant fit-check above already covered a constant operand).
+		addCheckError(c, pos,
+				"cast cannot convert a numeric value to bool (a value outside"
+						" {0, 1} is not a valid bool); use unsafe_cast(bool, x)")
 		return
+	}
+	addCastRejectError(c, pos, src, dst, ps, pd)
+}
+
+// castSafeSetAllows reports whether `cast` accepts src -> dst (see
+// checkCastSafeSet for the set).
+func castSafeSetAllows(c @Checker, src @types.Type, dst @types.Type) bool {
+	// (1) Everything assignable is a safe cast.
+	if AssignableTo(src, c, dst) {
+		return true
+	}
+	var ps @types.Type = types.StripWrappers(src)
+	var pd @types.Type = types.StripWrappers(dst)
+	if ps == nil || pd == nil {
+		return false
+	}
+	// (2) Numeric scalar conversions: int<->int, int<->float, float<->float,
+	// float->int, bool->numeric (defined), but not numeric->bool.
+	if ps.IsScalar() && pd.IsScalar() {
+		return !(pd.IsBool() && !ps.IsBool())
 	}
 	// (3) Named <-> underlying: a named type and its underlying, or two named types
 	// sharing one underlying (§8.5, any type — a same-layout retype).  Both peel to
@@ -62,17 +75,157 @@ func checkCastSafeSet(c @Checker, pos token.Pos, argExpr @ast.Expr, src @types.T
 	// DROP (`*readonly int` -> `*int`) is "identical modulo const" but is the
 	// unverifiable unsafe_cast case, NOT a same-layout retype.
 	if ps.Identical(pd) && !dropsConst(src, dst) {
-		return
+		return true
 	}
 	if ps.Kind == types.TYP_STRUCT && pd.Kind == types.TYP_STRUCT && sameStructFields(ps, pd) {
-		return
+		return true
 	}
 	// (4) Aggregate leaf-wise retype.
-	if isAggregateLeafRetype(ps, pd) {
+	return isAggregateLeafRetype(ps, pd)
+}
+
+// checkUnsafeCastSet gates a non-interface `unsafe_cast` to its set (spec §8.7
+// conv.unsafe-cast): everything `cast` accepts, plus the unverifiable
+// conversions the programmer asserts — dropping element-level readonly
+// (`*readonly T -> *T`, `@[]readonly T -> @[]T`; a string literal adopted as a
+// char slice or array and its readonly dropped), a raw pointer to a managed
+// pointer (`*T -> @T`), the invariant-breaking scalar directions (`int8 ->
+// bool`), and a container retyped over such an element conversion (`@[]int8 ->
+// @[]bool`, `@[]readonly int8 -> @[]uint8`).  (Interface narrowing and widening
+// are checked by the caller.)
+// Anything else is a compile error: IR-gen has no lowering for it — the raw
+// slice and function-value forms `*[]T -> @[]T` / `*func -> @func` in
+// particular are under-determined constructions, not reinterpretations (§8.4).
+func checkUnsafeCastSet(c @Checker, pos token.Pos, src @types.Type, dst @types.Type) {
+	if src == nil || dst == nil {
+		return // a prior error produced the nil; don't pile on
+	}
+	// As for cast: a conversion through an abstract type parameter is deferred
+	// to instantiation.
+	if isTypeParamType(src) || isTypeParamType(dst) {
 		return
 	}
-	// Otherwise: not in the safe set.
-	addCastRejectError(c, pos, src, dst, ps, pd)
+	if castSafeSetAllows(c, src, dst) {
+		return
+	}
+	var ps @types.Type = types.StripWrappers(src)
+	var pd @types.Type = types.StripWrappers(dst)
+	if ps == nil || pd == nil {
+		return
+	}
+	// A readonly drop: the same type modulo readonly (Identical is
+	// const-transparent).
+	if ps.Identical(pd) {
+		return
+	}
+	// The invariant-breaking scalar directions (numeric -> bool).
+	if ps.IsScalar() && pd.IsScalar() {
+		return
+	}
+	// Raw pointer -> managed pointer to the same pointee (modulo readonly).
+	if ps.Kind == types.TYP_POINTER && pd.Kind == types.TYP_MANAGED_PTR && ps.Elem != nil &&
+			pd.Elem != nil && ps.Elem.Identical(pd.Elem) {
+		return
+	}
+	// A container retype whose element conversion cast refuses only for being
+	// unverifiable (§8.5 conv.cast.aggregate-retype sends it here).
+	if isUnsafeAggregateLeafRetype(ps, pd) {
+		return
+	}
+	// A string literal adopted as a char slice or array with element-level
+	// readonly (a cast), its readonly then dropped.
+	if isUntypedString(src) {
+		var ro @types.Type = readonlyElemForm(pd)
+		if ro != nil && AssignableTo(src, c, ro) {
+			return
+		}
+	}
+	addUnsafeCastRejectError(c, pos, ps, pd)
+}
+
+// isUnsafeAggregateLeafRetype reports whether ps -> pd (both peeled) retypes a
+// container — a raw slice, managed-slice or array of one length — over an
+// element conversion unsafe_cast accepts in place: same-size elements whose
+// conversion is bit-preserving once element-level readonly is ignored (a
+// readonly drop, an integer of the same size, named <-> underlying, bool ->
+// integer), or the partial integer / bool -> bool direction (§8.5's `int8 ->
+// bool`) — or whose elements are containers retyped so in turn.  A
+// value-changing element conversion (`int32 -> float32`) is not one: that is
+// bit_cast's.
+func isUnsafeAggregateLeafRetype(ps @types.Type, pd @types.Type) bool {
+	if ps.Kind != pd.Kind {
+		return false
+	}
+	if ps.Kind != types.TYP_SLICE && ps.Kind != types.TYP_MANAGED_SLICE && ps.Kind != types.TYP_ARRAY {
+		return false
+	}
+	if ps.Kind == types.TYP_ARRAY && ps.ArrayLen != pd.ArrayLen {
+		return false
+	}
+	var se @types.Type = types.StripWrappers(ps.Elem)
+	var de @types.Type = types.StripWrappers(pd.Elem)
+	if se == nil || de == nil || se.SizeOf() != de.SizeOf() {
+		return false
+	}
+	if se.Identical(de) {
+		return true
+	}
+	// A nested container (`[2][4]int8 -> [2][4]bool`): its elements are retyped
+	// in place the same way.
+	if isUnsafeAggregateLeafRetype(se, de) {
+		return true
+	}
+	if se.Kind == types.TYP_STRUCT && de.Kind == types.TYP_STRUCT {
+		return sameStructFields(se, de)
+	}
+	if de.IsBool() {
+		return se.IsInteger() || se.IsBool()
+	}
+	return de.IsInteger() && (se.IsInteger() || se.IsBool())
+}
+
+// readonlyElemForm returns the char-slice or char-array type t with its element
+// made readonly (`*[]char` -> `*[]readonly char`), or nil for any other type.
+func readonlyElemForm(t @types.Type) @types.Type {
+	if t == nil || t.Elem == nil { return nil }
+	// Peel only readonly: a distinct named element (`type MyC char`) keeps its
+	// identity, so `*[]MyC` gets `*[]readonly MyC` — which a string literal is not
+	// assignable to — rather than `*[]readonly uint8`.
+	var e @types.Type = t.Elem
+	for e != nil && e.Kind == types.TYP_READONLY { e = e.Elem }
+	if e == nil { return nil }
+	var ro @types.Type = types.MakeReadonlyType(e)
+	if t.Kind == types.TYP_SLICE { return types.MakeSliceType(ro) }
+	if t.Kind == types.TYP_MANAGED_SLICE { return types.MakeManagedSliceType(ro) }
+	if t.Kind == types.TYP_ARRAY { return types.MakeArrayType(ro, t.ArrayLen) }
+	return nil
+}
+
+// addUnsafeCastRejectError reports an unsafe_cast outside its set, naming the
+// right alternative for the (peeled) shape.
+func addUnsafeCastRejectError(c @Checker, pos token.Pos, ps @types.Type, pd @types.Type) {
+	if ps.Kind == types.TYP_SLICE && pd.Kind == types.TYP_MANAGED_SLICE {
+		addCheckError(c, pos,
+				"unsafe_cast cannot convert a raw slice to a managed-slice: a managed-slice"
+						" carries words the raw slice lacks (§8.4); construct one (allocate + copy)")
+		return
+	}
+	if ps.Kind == types.TYP_FUNC_VALUE && pd.Kind == types.TYP_MANAGED_FUNC_VALUE {
+		addCheckError(c, pos,
+				"unsafe_cast cannot convert a raw function value to a managed one: a managed"
+						" function value owns what the raw one only borrows (§8.4); construct it"
+						" from the function")
+		return
+	}
+	if (isPointerKind(ps) && pd.IsInteger()) || (ps.IsInteger() && isPointerKind(pd)) {
+		addCheckError(c, pos,
+				"unsafe_cast cannot convert between a pointer and an integer; use bit_cast"
+						" (a same-size reinterpret, §8.6)")
+		return
+	}
+	addCheckError(c, pos,
+			"unsafe_cast does not support this conversion; use bit_cast for a same-size"
+					" reinterpret (§8.6) or construct the value explicitly")
 }
 
 // isAggregateLeafRetype reports whether ps -> pd (both peeled) is a slice/array

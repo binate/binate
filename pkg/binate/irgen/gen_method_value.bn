@@ -227,80 +227,55 @@ func genMethodValue(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr {
 	}
 	var fnValTyp @types.Type = types.MakeFuncValueType(userParams, m.FuncType.Results)
 
-	// At the selector site: allocate a closure struct {receiver},
-	// store the evaluated receiver (possibly converted by
-	// smoothing) into it, emit OP_FUNC_VALUE-with-data pointing
-	// at the wrapper.  A managed captured form (@T, @[]T) is RefInc'd
-	// before the store (emitCaptureRefInc, mirroring gen_func_lit's B.3a
-	// flow); a by-value struct with MANAGED fields is stored then RefInc'd
-	// in place (emitStructCopy); either way the closure owns its own
-	// reference, and the closure struct + closure-local are registered for
-	// cleanup so the synthesized struct-dtor RefDec's it at frame end.
+	// At the selector site: store the evaluated receiver (possibly converted by
+	// smoothing) into this site's frame closure record {receiver}
+	// (allocFrameClosureRecord — allocated once per call, released at every
+	// function exit), then emit OP_FUNC_VALUE-with-data pointing at the wrapper.
+	// The store (emitStoreManagedSlot) gives the record its own reference to a
+	// managed receiver — a fresh @T / @[]T call result is moved in, any other
+	// @T / @[]T is RefInc'd, and a by-value struct's managed fields are copied
+	// in (its call-result temp keeps its own end-of-statement release) — and
+	// releases the previous evaluation's receiver, so a selector evaluated again
+	// in the same call (a loop, a `for` condition) neither leaks nor frees early.
 	var closureStruct @types.Type = buildMethodValueClosureStruct(ctx.Gc.PkgPath, wrapperName,
 			capturedTyp)
-	var closurePtr @ir.Instr = irbuild.EmitAlloc(b, closureStruct)
+	var closurePtr @ir.Instr = allocFrameClosureRecord(ctx, closureStruct, "")
 	var recvVal @ir.Instr = genCapturedRecv(ctx, b, e.X, bridge, capturedTyp)
 	// Re-sync: a type-assertion receiver (`a.(*T).Method`) splits the block inside
-	// genCapturedRecv; the closure-struct stores below must land in the HIT
-	// continuation (closurePtr, alloc'd in the pre-split block, still dominates it).
-	// A no-op for non-splitting receivers.
+	// genCapturedRecv; the record stores below must land in the HIT continuation
+	// (the record is allocated in the entry block, so it dominates it).  A no-op
+	// for non-splitting receivers.
 	b = ctx.CurBlock
 	var fieldPtr @ir.Instr = irbuild.EmitGetFieldPtr(b, closurePtr, 0, capturedTyp)
-	if needsStructCopy(capturedTyp) {
-		// By-value capture of a struct with managed fields (949): copy the
-		// bytes, then RefInc the copy's managed fields so the closure owns its
-		// own reference (the closure dtor RefDec's them at frame end).  The
-		// mkX() call-result temp is itself registered for end-of-statement
-		// RefDec (registerManagedCallResult's needsStructCopy branch), so the
-		// net effect is +1 ref for the closure — the same acquire discipline
-		// emitStoreManagedSlot's isInit aggregate path uses for var-init.
-		irbuild.EmitStore(b, fieldPtr, recvVal)
-		emitStructCopy(ctx.Func, b, fieldPtr, capturedTyp)
-	} else {
-		// A plain struct that arrived as an aggregate alloca (a
-		// composite-literal temp, `Pt{...}.M`) must be LOADED to a value before
-		// the store — EmitStore of the alloca POINTER would mistype the field
-		// (`store %S %ptr`).  (A call-result / field value receiver arrives as a
-		// struct-typed value (register or sret), so this is a no-op there.)  Mirrors gen_call's
-		// isAggregateAllocToLoad arg path.
-		if isAggregateAllocToLoad(recvVal, capturedTyp) {
-			recvVal = irbuild.EmitLoad(b, recvVal, capturedTyp)
-		}
-		emitCaptureRefInc(ctx, b, recvVal, capturedTyp)
-		irbuild.EmitStore(b, fieldPtr, recvVal)
+	// A plain struct that arrived as an aggregate alloca (a composite-literal
+	// temp, `Pt{...}.M`) must be LOADED to a value before the store — EmitStore of
+	// the alloca POINTER would mistype the field (`store %S %ptr`).  (A call-result
+	// / field value receiver arrives as a struct-typed value (register or sret), so
+	// this is a no-op there.)  Mirrors gen_call's isAggregateAllocToLoad arg path.
+	if !needsStructCopy(capturedTyp) && isAggregateAllocToLoad(recvVal, capturedTyp) {
+		recvVal = irbuild.EmitLoad(b, recvVal, capturedTyp)
 	}
+	b = emitStoreManagedSlot(ctx, b, fieldPtr, recvVal, capturedTyp, false)
+	ctx.CurBlock = b
 	if closureStruct.NeedsDestruction() {
-		registerClosureStructForCleanup(ctx.Gc, closureStruct)
-		// method-value wrappers are dedup'd by wrapper name,
-		// so reuse the per-(method, recv-shape) wrapper name as
-		// the local registration key — buffer reuse across the
-		// same closure shape is fine because each call site has
-		// its own alloca; only the dtor + ctx.Vars entry need to
-		// be unique per call site, which the synthetic name
-		// `__mv_local_<wrapperName>_<litCounter>` guarantees.
+		// Name the record `__mv_local_<n>` for debug info; the counter is shared
+		// with genFuncLit's `__funclit_<n>` names.
 		var n int = ctx.Gc.FuncLitCounter
 		ctx.Gc.FuncLitCounter = ctx.Gc.FuncLitCounter + 1
-		registerMethodValueLocalForCleanup(ctx, closurePtr, closureStruct, n)
+		closurePtr.StrVal = methodValueRecordName(n)
 	}
 	var fv @ir.Instr = irbuild.EmitFuncValueWithData(b, wrapperName, closurePtr, fnValTyp)
 	noteSPGrowingResult(ctx, fv)
 	return fv
 }
 
-// registerMethodValueLocalForCleanup is the method-value-site
-// equivalent of `registerClosureLocalForCleanup` in gen_func_lit.bn:
-// it registers the alloca'd method-value closure struct in the
-// enclosing function's ctx.Vars so the standard frame-end
-// emitDecForManagedLocals pass invokes the struct dtor on it.  The
-// synthetic name `__mv_local_<n>` is per-gc.FuncLitCounter id so it's
-// unique within the enclosing function (we share the counter with
-// genFuncLit; values are namespaced by the `__mv_local_` prefix).
-func registerMethodValueLocalForCleanup(ctx @GenContext, closurePtr @ir.Instr,
-		closureStruct @types.Type, n int) {
+// methodValueRecordName builds the debug name `__mv_local_<n>` of a method
+// value's frame closure record (n is a gc.FuncLitCounter value).
+func methodValueRecordName(n int) @[]char {
 	var nameBuf @strings.Builder = strings.NewBuilder()
 	nameBuf.Write("__mv_local_")
 	nameBuf.Write(strconv.Itoa(n))
-	defineVar(ctx, buf.CopyStr(nameBuf.String()), closurePtr, closureStruct)
+	return buf.CopyStr(nameBuf.String())
 }
 
 // methodValueWrapperName builds a stable name for the per-(method,

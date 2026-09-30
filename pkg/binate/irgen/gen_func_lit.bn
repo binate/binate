@@ -30,23 +30,21 @@ import "pkg/stdx/slices"
 //      body's references to capture names resolve through the
 //      normal local-name mechanism (defineVarParam) — no special
 //      capture-load IR ops needed.
-//   3. At the literal expression site: alloca the closure struct
-//      in the enclosing frame, store each capture's current value
-//      into a field, emit OP_FUNC_VALUE with the struct pointer
-//      as the data arg.
+//   3. At the literal expression site: store each capture's current
+//      value into a field of the closure struct — the literal's frame
+//      closure record for a *func (allocFrameClosureRecord), a fresh
+//      heap struct for an @func — and emit OP_FUNC_VALUE with the
+//      struct pointer as the data arg.
 //   4. Func.IsClosure + Func.ClosureStruct + Func.NumCaptureParams
 //      tell backends to emit a shim that reads the captures out of
 //      the data pointer before tail-calling the lifted body.
 //
-// B.3a status: CAP_MANAGED captures now supported for *func.
-// Closure struct is registered in Module.Structs so generateDtors
-// synthesizes a struct-dtor that RefDec's each managed field, and
-// the closure alloca is registered in ctx.Vars so the frame-end
-// emitDecForManagedLocals pass runs that dtor on it.  At the
-// capture site we RefInc each managed-captured value before
-// storing it into the field, balancing the dtor's later RefDec.
-// All literals still use the *func (stack-alloc) form; @func heap-
-// allocation lands in B.3b.
+// The closure struct is registered in Module.Structs so generateDtors
+// synthesizes a struct-dtor that RefDec's each managed field; the
+// capture store acquires each managed capture's own reference, which
+// that dtor releases — at every exit of the enclosing function for a
+// *func record (releaseFrameClosureRecords), when the last reference
+// to an @func goes for a heap struct.
 
 // resetFuncLitState resets the per-package function-literal state at
 // the start of a GeneratePackage / GenModule call. The counter is
@@ -132,56 +130,42 @@ func genFuncLit(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr {
 	}
 
 	// Capturing path.  Two flavours:
-	//   *func: stack-alloc closure struct in the enclosing frame;
-	//          frame-end emitDecForManagedLocals on the closure-
-	//          local runs the struct dtor.
+	//   *func: the closure record lives in the enclosing frame
+	//          (allocFrameClosureRecord): allocated once per call, and
+	//          released — its struct dtor run — at every function exit.
+	//          Each evaluation of the literal re-fills that one record.
 	//   @func: heap-alloc closure struct (EmitMake) — refcount-
 	//          managed; the @func value's data slot owns the
 	//          reference, and the standard managed-ptr RefDec on
 	//          the @func variable at frame end runs the closure-
 	//          struct dtor via the vtable's dtor slot.
-	// For B.3a, each CAP_MANAGED capture also RefInc's the value
-	// before the store so the closure struct owns its own
-	// reference; the matching RefDec runs from the struct dtor.
+	// Each capture is stored with emitStoreManagedSlot, so the record owns its
+	// own reference to a managed capture — @T, @[]T, @func or @Iface through any
+	// named / alias / readonly wrapper, classified with the same full peel as the
+	// struct dtor's release, or a by-value struct / array capture's managed
+	// fields, copied in.  A fresh heap record is initialized; the frame record may still hold
+	// the previous evaluation's captures (a loop, a `for` condition), which the
+	// store releases as it replaces them.
 	var closurePtr @ir.Instr
 	if isManagedFV {
 		closurePtr = irbuild.EmitMake(b, closureStruct)
 	} else {
-		closurePtr = irbuild.EmitAlloc(b, closureStruct)
+		closurePtr = allocFrameClosureRecord(ctx, closureStruct, closureRecordName(n))
 	}
 	for i := 0; i < len(captures); i++ {
 		var capValue @ir.Instr = genCaptureRead(ctx, b, captures[i], captureTypes[i])
-		emitCaptureRefInc(ctx, b, capValue, captureTypes[i])
 		var fieldPtr @ir.Instr = irbuild.EmitGetFieldPtr(b, closurePtr, i, captureTypes[i])
-		irbuild.EmitStore(b, fieldPtr, capValue)
-		// A by-value struct / array capture with managed fields: copy it in
-		// (RefInc its managed fields in the closure's field) to balance the
-		// closure dtor, which destroys the field.
-		if needsStructCopy(captureTypes[i]) {
-			emitStructCopy(ctx.Func, b, fieldPtr, captureTypes[i])
-		}
+		b = emitStoreManagedSlot(ctx, b, fieldPtr, capValue, captureTypes[i], isManagedFV)
 	}
-	// Register the closure struct so generateDtors synthesizes the
-	// dtor; needed for both flavours when the struct has any
-	// managed field (otherwise the dtor would be a no-op and we
-	// can skip).  For *func, also register the closure-local in
-	// ctx.Vars so emitDecForManagedLocals's frame-end pass invokes
-	// that dtor on the stack-alloc'd struct.  For @func, skip the
-	// ctx.Vars registration — the @func variable's own RefDec at
-	// frame end drives the cleanup (via the data slot's managed-
-	// ptr machinery + the vtable's dtor slot).
-	if closureStruct.NeedsDestruction() {
+	ctx.CurBlock = b
+	// @func: register the closure struct so generateDtors synthesizes its dtor
+	// (allocFrameClosureRecord does this for *func).  The heap closure struct's
+	// only owner is the func value's data slot.  Under the VM that data slot is
+	// a COMPILED_CLOSURE record (not the struct itself), so the VM needs the
+	// dtor name to release the struct on rec free.
+	if isManagedFV && closureStruct.NeedsDestruction() {
 		registerClosureStructForCleanup(ctx.Gc, closureStruct)
-		if !isManagedFV {
-			registerClosureLocalForCleanup(ctx, closurePtr, closureStruct, n)
-		} else {
-			// @func: the heap closure struct's only owner is the
-			// func value's data slot.  Under the VM that data slot
-			// is a COMPILED_CLOSURE record (not the struct itself),
-			// so the VM needs the dtor name to release the struct on
-			// rec free.  Same dtor generateDtors synthesizes above.
-			f.ClosureStructDtorName = qualifiedDtorNameForType(closureStruct)
-		}
+		f.ClosureStructDtorName = qualifiedDtorNameForType(closureStruct)
 	}
 	if isManagedFV {
 		f.IsManagedFuncValue = true
@@ -190,8 +174,9 @@ func genFuncLit(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr {
 	noteSPGrowingResult(ctx, fv)
 	if isManagedFV {
 		// A fresh @func value OWNS its heap closure struct (EmitMake, rc 1) — and
-		// unlike the *func flavour it is NOT registered in ctx.Vars (the cleanup is
-		// normally driven by the @func VARIABLE's own frame-end RefDec).  Register
+		// unlike the *func flavour's frame record it gets no function-exit release
+		// (the cleanup is normally driven by the @func VARIABLE's own frame-end
+		// RefDec).  Register
 		// the value as a cleanup temp so a fresh literal that is NOT bound to a
 		// variable — a directly-returned `return func(){...}`, a discarded literal —
 		// still gets released: a consumer (return delivery / assignment / arg) moves
@@ -309,21 +294,6 @@ func genCaptureRead(ctx @GenContext, b @ir.Block, cap @ast.Capture, typ @types.T
 	return irbuild.EmitLoad(b, slot, typ)
 }
 
-// emitCaptureRefInc emits the refcount-acquire side of a managed
-// capture — @T, @[]T, @func, or @Iface, through any named / alias /
-// readonly wrapper — and is a no-op for a non-managed capture, so the
-// caller can call it unconditionally.  The matching RefDec runs from the
-// closure-struct dtor at frame-end cleanup, which classifies a managed
-// scalar field with the same full peel; acquiring with a narrower test
-// (e.g. missing a `readonly @Box` param, a `type MB @Box`, or an @Iface)
-// would leave the capture under-retained and the dtor's RefDec would free
-// it early.
-// A by-value struct / array capture with managed fields is copied in by
-// the caller (genFuncLit) after the field store instead.
-func emitCaptureRefInc(ctx @GenContext, b @ir.Block, val @ir.Instr, t @types.Type) {
-	emitManagedValueCopyRefInc(ctx.Func, b, val, t)
-}
-
 // registerClosureStructForCleanup adds the closure struct type to
 // gc.Mod.Structs so generateDtors synthesizes its struct-dtor (which
 // walks the managed fields and emits RefDec for each).  Duplicate
@@ -342,19 +312,14 @@ func registerClosureStructForCleanup(gc @GenCtx, closureStruct @types.Type) {
 	gc.Mod.Structs = slices.Append[irsym.ModuleStruct](gc.Mod.Structs, ms)
 }
 
-// registerClosureLocalForCleanup registers the alloca'd closure
-// struct in the enclosing function's ctx.Vars so the standard
-// frame-end emitDecForManagedLocals pass invokes the struct dtor
-// on it.  The synthetic name `__closure_local_<n>` is per-literal-
-// id (n is the gc.FuncLitCounter value from genFuncLit), guaranteed
-// unique within the enclosing function.  defineVar's IsParam=false
-// is what emitStructDtor needs to actually run.
-func registerClosureLocalForCleanup(ctx @GenContext, closurePtr @ir.Instr,
-		closureStruct @types.Type, n int) {
+// closureRecordName builds the debug name of the n-th function literal's
+// frame closure record: `__closure_local_<n>` (n is the gc.FuncLitCounter value
+// from genFuncLit).
+func closureRecordName(n int) @[]char {
 	var nameBuf @strings.Builder = strings.NewBuilder()
 	nameBuf.Write("__closure_local_")
 	nameBuf.Write(strconv.Itoa(n))
-	defineVar(ctx, buf.CopyStr(nameBuf.String()), closurePtr, closureStruct)
+	return buf.CopyStr(nameBuf.String())
 }
 
 // synthFuncLitName builds the bare synthetic name for the n-th

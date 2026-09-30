@@ -1,0 +1,145 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/std/vec"
+
+// Sink each OP_EXTRACT down its block to just before its first use.  Scalar
+// replacement and inlining leave a struct's field reads together where the
+// struct was bound (`mix(arr[i], carry)` reads all eight fields of `arr[i]` up
+// front); a backend that reads a field at its extract then holds every field in
+// a register at once, and spills them under pressure.  Placing each extract at
+// its first use keeps only the fields in flight live.
+//
+// An extract reads an SSA aggregate value, so moving it later is always correct.
+// It is moved only when every use is later in the same block (a phi, other-block
+// or fault-pad use keeps it in place), and never past an instruction that may
+// write or free memory (OpWritesNothing): a backend may read an extract's field
+// straight from the memory an aggregate load came from, which is valid only while
+// nothing between the load and its last extract writes memory, and sinking must
+// not break that.  Extracts of extracts sink in dependency order.  Like
+// fuse-madd, this pass rebuilds each changed block's Instrs directly and leaves
+// its InstrsVec stale.
+
+// sinkExtractsFunc sinks the extracts of every normal block of f.
+func sinkExtractsFunc(f @ir.Func) {
+	var cap int = f.NextID
+	if cap <= 0 {
+		return
+	}
+	// A use anywhere but the extract's own block (another block, a fault pad, a
+	// phi) pins it: count every use, then the in-block ones, and sink only when
+	// they agree.
+	var uses @[]int = make_slice(int, cap)
+	countUses(f.Blocks, uses, cap)
+	countUses(f.FaultPads, uses, cap)
+	// Per-id scratch shared by every block; each block initializes only the
+	// entries of the ids it defines, so the cost stays linear in the function.
+	var s sinkScratch
+	s.defBlock = make_slice(int, cap)
+	for id := 0; id < cap; id++ { s.defBlock[id] = -1 }
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for i := 0; i < len(blk.Instrs); i++ {
+			var id int = blk.Instrs[i].ID
+			if id >= 0 && id < cap { s.defBlock[id] = bi }
+		}
+	}
+	s.inBlock = make_slice(int, cap)
+	s.userAnchor = make_slice(int, cap)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		sinkExtractsBlock(f.Blocks[bi], bi, uses, s)
+	}
+}
+
+// sinkScratch is sinkExtractsFunc's per-id working state.  defBlock[id] is the
+// index of the block defining id (-1 if none); inBlock[id] and userAnchor[id]
+// are valid only for ids defined in the block being processed: the number of
+// uses of id in that block, and the least anchor among those users.
+type sinkScratch struct {
+	defBlock   @[]int
+	inBlock    @[]int
+	userAnchor @[]int
+}
+
+// localID returns a's id if a is defined in block bi, else -1.
+func (s sinkScratch) localID(a @ir.Instr, bi int) int {
+	if a == nil || a.ID < 0 || a.ID >= len(s.defBlock) || s.defBlock[a.ID] != bi { return -1 }
+	return a.ID
+}
+
+// sinkExtractsBlock sinks blk's extracts.  anchor[i] is the original index
+// instruction i will be emitted just before (i itself for an instruction that
+// stays).  Walking bottom-up, every user of instruction i is later and already
+// has its final anchor, so userAnchor (the least anchor among a value's in-block
+// users, kept up to date as the walk passes each user) gives i's first use; the
+// anchor is capped at the first memory-writing instruction after i.  The block
+// is then re-emitted in anchor order, moved extracts ahead of their anchor in
+// original order (which is dependency order).
+func sinkExtractsBlock(blk @ir.Block, bi int, uses @[]int, s sinkScratch) {
+	var n int = len(blk.Instrs)
+	if n < 2 {
+		return
+	}
+	for i := 0; i < n; i++ {
+		var id int = s.localID(blk.Instrs[i], bi)
+		if id < 0 { continue }
+		s.inBlock[id] = 0
+		s.userAnchor[id] = n
+	}
+	for i := 0; i < n; i++ {
+		var ins @ir.Instr = blk.Instrs[i]
+		for k := 0; k < len(ins.Args); k++ {
+			var id int = s.localID(ins.Args[k], bi)
+			if id >= 0 { s.inBlock[id] = s.inBlock[id] + 1 }
+		}
+	}
+	var anchor @[]int = make_slice(int, n)
+	var moved bool = false
+	// barrier = index of the first memory-writing instruction after i.
+	var barrier int = n
+	for i := n - 1; i >= 0; i-- {
+		var ins @ir.Instr = blk.Instrs[i]
+		anchor[i] = i
+		var self int = s.localID(ins, bi)
+		if ins.Op == iropcode.OP_EXTRACT && self >= 0 && uses[self] > 0 && uses[self] == s.inBlock[self] {
+			var a int = s.userAnchor[self]
+			if a > barrier { a = barrier }
+			if a > i + 1 {
+				anchor[i] = a
+				moved = true
+			}
+		}
+		for k := 0; k < len(ins.Args); k++ {
+			var id int = s.localID(ins.Args[k], bi)
+			if id >= 0 && anchor[i] < s.userAnchor[id] { s.userAnchor[id] = anchor[i] }
+		}
+		if !OpWritesNothing(ins.Op) { barrier = i }
+	}
+	if !moved {
+		return
+	}
+	// Bucket the moved extracts by anchor, in original order.
+	var at @[]@vec.Vec[int] = make_slice(@vec.Vec[int], n)
+	for i := 0; i < n; i++ {
+		if anchor[i] == i { continue }
+		if at[anchor[i]] == nil { at[anchor[i]] = vec.New[int]() }
+		at[anchor[i]].Push(i)
+	}
+	var out @[]@ir.Instr = make_slice(@ir.Instr, n)
+	var w int = 0
+	for i := 0; i < n; i++ {
+		if at[i] != nil {
+			var ks @[]int = at[i].Items()
+			for k := 0; k < len(ks); k++ {
+				out[w] = blk.Instrs[ks[k]]
+				w = w + 1
+			}
+		}
+		if anchor[i] == i {
+			out[w] = blk.Instrs[i]
+			w = w + 1
+		}
+	}
+	blk.Instrs = out
+}

@@ -813,7 +813,7 @@ testing.Println(f())
 > "
 
 # --- Case 22 (Tier 3): chain forward refs (a → b → c), all
-# parked, all resolve when c arrives. ---
+# parked, all resolve when c arrives — dependencies first. ---
 run_repl "tier3-forward-ref-chain" \
 "func a() int { return b() + 1 }
 func b() int { return c() + 10 }
@@ -823,8 +823,8 @@ testing.Println(a())
 "$BANNER
 > function a parked (pending: b)
 > function b parked (pending: c)
-> function a resolved
-function b resolved
+> function b resolved
+function a resolved
 > 111
 > "
 
@@ -1142,12 +1142,10 @@ testing.Println(t)
 > > 0
 > "
 
-# --- Case 40 (Stage 2 (d): reference use doesn't propagate):
-# `var p *T` (raw pointer to a pending struct) does NOT park
-# — the pointer wrapper is size-stable regardless of T's
-# layout.  Only the pending type's parked message appears;
-# `var p *T` lands quietly. ---
-run_repl "tier3-pending-type-reference-use-no-park" \
+# --- Case 40: a pointer to a parked type parks too — a parked
+# declaration binds nothing, so `var p *T` waits for T — and
+# resolves after it. ---
+run_repl "tier3-pending-type-pointer-use-parks" \
 "type T struct { F Bag }
 var p *T
 type Bag struct { N int }
@@ -1155,15 +1153,15 @@ testing.Println(\"reached\")
 " \
 "$BANNER
 > type T parked (pending: Bag)
-> > type T resolved
+> variable p parked (pending: T)
+> type T resolved
+variable p resolved
 > reached
 > "
 
-# --- Case 41 (Stage 2 (d): mutual recursion via managed
-# pointers).  `type A struct { Next @B }`, `type B struct
-# { Next @A }`.  A parks waiting on B; defining B (which
-# references @A — reference use, doesn't propagate) lets
-# B land cleanly and A retry. ---
+# --- Case 41: mutual recursion via managed pointers.  `type A
+# struct { Next @B }` parks waiting on B; `type B struct { Next @A }`
+# parks waiting on A; the two resolve together at that prompt. ---
 run_repl "tier3-pending-mutual-recursion-resolves" \
 "type A struct { Next @B }
 type B struct { Next @A }
@@ -1171,16 +1169,15 @@ testing.Println(\"resolved\")
 " \
 "$BANNER
 > type A parked (pending: B)
-> type A resolved
+> type B parked (pending: A)
+type A resolved
+type B resolved
 > resolved
 > "
 
-# --- Case 42 (Stage 2 (d): func sig parks func).  T is
-# initially parked (waiting on Bag); `func f(x T) int`
-# references T in its sig — captureFuncSigPendingDeps in
-# CheckDeclInScope's DECL_FUNC tentative pass captures T,
-# parking f.  When Bag arrives → T resolves → f resolves
-# (via the sig-audit branch in RetryPendingDecls). ---
+# --- Case 42: a function whose signature names a parked type
+# parks on it.  T parks (waiting on Bag); `func f(x T) int`
+# parks waiting on T.  When Bag arrives, T resolves, then f. ---
 run_repl "tier3-pending-func-sig-parks-func" \
 "type T struct { F Bag }
 func f(x T) int { return 0 }
@@ -1195,11 +1192,10 @@ function f resolved
 > done
 > "
 
-# --- Case 43 (Stage 2 (e): methods on pending receivers).
-# T parks (waiting on Bag); a method on *T parks too
-# (captureFuncSigPendingDeps peels the pointer wrapper to
-# T's IsPending).  When Bag arrives: T resolves, then
-# the method resolves.  After that the method is callable. ---
+# --- Case 43: a method on a parked type parks.  T parks
+# (waiting on Bag); a method on *T parks waiting on T.  When
+# Bag arrives: T resolves, then the method.  After that the
+# method is callable. ---
 run_repl "tier3-pending-method-on-pending-receiver" \
 "type T struct { F Bag }
 func (t *T) M() int { return 7 }
@@ -1215,13 +1211,12 @@ method T.M resolved
 > > 7
 > "
 
-# --- Case 44 (Stage 4: cycle detection).  `type A struct { B B }`
+# --- Case 44: a by-value type cycle.  `type A struct { B B }`
 # parks A waiting on B; `type B struct { A A }` parks B waiting
-# on A.  Both fields are sized uses, so the references propagate
-# through capturePendingIfSized.  The cycle detector at park-
-# close time reports `pending cycle: B -> A -> B` so the user
-# knows the chain won't resolve via retry alone — they need to
-# break it (e.g., use a pointer). ---
+# on A.  The two are checked together, as a file's types are, so
+# the by-value cycle is reported, and both stay parked (a
+# redefinition that breaks the cycle — e.g. a pointer field —
+# replaces the parked one). ---
 run_repl "tier3-pending-cycle-detected" \
 "type A struct { B B }
 type B struct { A A }
@@ -1229,7 +1224,9 @@ type B struct { A A }
 "$BANNER
 > type A parked (pending: B)
 > type B parked (pending: A)
-pending cycle: B -> A -> B
+type A still parked (it does not check)
+type B still parked (it does not check)
+<repl>:1:1: recursive type: a type cannot contain itself by value (hold the recursive field via a pointer -- *T or @T)
 > "
 
 # --- Case 45 (Tier 5: mid-session imports).  pkg/repldemo
@@ -1473,6 +1470,34 @@ constant B1 parked (pending: M)
 > constant B0 resolved
 constant B1 resolved
 > 4
+> "
+
+# --- Case 49: a parked declaration whose missing name arrives with a
+# type that does not fit stays parked: its error is shown once, and
+# a later declaration that fits resolves it. ---
+run_repl "tier3-failed-retry-stays-parked" \
+"var x int = y
+var y bool = true
+var y int = 2
+testing.Println(x)
+" \
+"$BANNER
+> variable x parked (pending: y)
+> variable x still parked (it does not check)
+<repl>:1:13: cannot assign bool to int
+> variable x resolved
+> 2
+> "
+
+# --- Case 50: redefining a type at the prompt is rejected (a type
+# is identified by its name, so the old type's values could not
+# keep their layout). ---
+run_repl "tier4-type-redefinition-rejected" \
+"type T struct { a int }
+type T struct { b int }
+" \
+"$BANNER
+> > <repl>:1:1: cannot redefine type T
 > "
 
 # --- Setup-error case: a type error in the loaded module surfaces

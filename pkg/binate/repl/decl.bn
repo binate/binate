@@ -81,13 +81,10 @@ func (s @kernel) evalReplOneDecl(d @ast.Decl) {
 		c.RollbackDecl(rollback)
 		return
 	}
-	// Tier 3: if the body referenced names not yet bound, the
-	// decl is parked on c.Pending (sig was registered already so
-	// other code can refer to it).  Announce each freshly-parked
-	// decl and (in the single-decl case) skip IR-gen — the body
-	// can't be emitted with unresolved names.  A subsequent decl
-	// that binds the missing names triggers RetryPendingDecls
-	// below.
+	// Forward references: a declaration that used names not yet declared
+	// is parked (it binds nothing) and not emitted.  Announce each one, then
+	// retry the parked declarations — this one may complete a group that
+	// waits on it (`func f` using g, then `func g` using f).
 	//
 	// DECL_GROUP is special: group parking is split per-member, so a
 	// group can have some members parked and others resolved.
@@ -99,19 +96,8 @@ func (s @kernel) evalReplOneDecl(d @ast.Decl) {
 		for i := c.PendingMark(); i < len(c.Pending()); i++ {
 			s.announceParked(c.Pending()[i])
 		}
-		// Tier 3 Stage 4: cycle detection.  A fresh park may
-		// close a cycle in the pending missing-names graph
-		// (e.g., `type A struct { B B }; type B struct { A A }`
-		// where both decls park waiting on each other).  Such a
-		// cycle won't resolve via retry — the user has to break
-		// it by redefining one of the decls (e.g., switch to a
-		// pointer-typed field).  Surface the cycle once at
-		// park-close time so they know.
-		var cycles @[]@[]@[]char = c.FindFreshCycles(c.PendingMark())
-		for i := 0; i < len(cycles); i++ {
-			s.announcePendingCycle(cycles[i])
-		}
 		if d.Kind != ast.DECL_GROUP {
+			s.retryPending()
 			return
 		}
 	}
@@ -131,11 +117,8 @@ func (s @kernel) evalReplOneDecl(d @ast.Decl) {
 		for i := preFuncCount; i < len(m.Funcs); i++ {
 			vmInst.LowerOneFunc(m, m.Funcs[i])
 		}
-		// Fall through to retryPending — a freshly-resolved
-		// type may have unblocked decls parked on its name.  Other
-		// decl kinds reach retryPending via their own per-kind
-		// dispatch tail; DECL_TYPE used to short-circuit here
-		// before type-decl parking landed.
+		// A freshly-resolved type may have unblocked decls parked on its
+		// name.
 		s.retryPending()
 		return
 	}
@@ -145,48 +128,8 @@ func (s @kernel) evalReplOneDecl(d @ast.Decl) {
 		return
 	}
 	if d.Kind == ast.DECL_FUNC {
-		// Capture the body's index in m.Funcs BEFORE draining
-		// pending dtor / copy registrations, since the drain
-		// appends helpers AFTER the body.  GenDecl added exactly
-		// one entry (the body) at preFuncCount.
-		var f @ir.Func = m.Funcs[preFuncCount]
-		// Drain pending managed-aggregate dtor / copy needs the
-		// body registered.  Lower the resulting helpers BEFORE the
-		// body so its eager CallCache fill resolves their names.
-		var helpersStart int = len(m.Funcs)
-		irgen.EnsureReplBodyHelpers(m)
-		for i := helpersStart; i < len(m.Funcs); i++ {
-			vmInst.LowerOneFunc(m, m.Funcs[i])
-		}
-		if oldFuncType == nil {
-			// First-time definition.
-			vmInst.LowerOneFunc(m, f)
-		} else {
-			// Redefinition.  Compare new sig to old to choose path.
-			// Method new-type lookup goes through the receiver type's
-			// method set; free-func lookup goes through c.Scope.
-			var newType @types.Type = nil
-			if d.Recv != nil {
-				var newM @types.Method = c.LookupMethodForDecl(d)
-				if newM != nil { newType = newM.FuncType }
-			} else {
-				var newSym @check.Symbol = c.Scope().Lookup(d.Name)
-				if newSym != nil { newType = newSym.Type() }
-			}
-			if newType != nil && oldFuncType.Identical(newType) {
-				// Same signature: replace in place.
-				vmInst.LowerOneFunc(m, f)
-			} else {
-				// Different signature: shadow.  Old VMFunc is
-				// kept in vm.Funcs at its existing idx so any
-				// caller whose CallCache already resolved it
-				// continues to invoke the old shape.
-				s.out("warning: ")
-				s.printRedefName(d)
-				s.outln(" shadowed (incompatible signature); existing callers retain old definition")
-				vmInst.LowerOneFuncShadow(m, f)
-			}
-		}
+		// GenDecl added exactly one entry, the body, at preFuncCount.
+		s.lowerReplFunc(d, m.Funcs[preFuncCount], oldFuncType)
 	}
 	if d.Kind == ast.DECL_VAR && isBlankReplName(d.Name) {
 		// A blank var has no global (GenDecl added none); its initializer
@@ -214,6 +157,46 @@ func (s @kernel) evalReplOneDecl(d @ast.Decl) {
 	// for typical sessions) and safe (a still-unresolved decl
 	// stays parked).
 	s.retryPending()
+}
+
+// lowerReplFunc lowers f, the IR of function or method d just generated,
+// with the helpers its generation needed lowered first (so its eager
+// CallCache fill resolves their names).  oldFuncType is the signature of the
+// definition d replaces (nil for a first definition): the same signature
+// replaces that definition in place, so its callers run the new body; a
+// different one shadows it — the old VMFunc keeps its index, so callers
+// whose CallCache already resolved it keep calling the old shape.
+func (s @kernel) lowerReplFunc(d @ast.Decl, f @ir.Func, oldFuncType @types.Type) {
+	var vmInst @vm.VM = s.Vm
+	var m @ir.Module = s.MainMod
+	var c @check.Checker = s.Chk
+	var helpersStart int = len(m.Funcs)
+	irgen.EnsureReplBodyHelpers(m)
+	for i := helpersStart; i < len(m.Funcs); i++ {
+		vmInst.LowerOneFunc(m, m.Funcs[i])
+	}
+	if oldFuncType == nil {
+		vmInst.LowerOneFunc(m, f)
+		return
+	}
+	// Method new-type lookup goes through the receiver type's method set;
+	// free-func lookup goes through c.Scope.
+	var newType @types.Type = nil
+	if d.Recv != nil {
+		var newM @types.Method = c.LookupMethodForDecl(d)
+		if newM != nil { newType = newM.FuncType }
+	} else {
+		var newSym @check.Symbol = c.Scope().Lookup(d.Name)
+		if newSym != nil { newType = newSym.Type() }
+	}
+	if newType != nil && oldFuncType.Identical(newType) {
+		vmInst.LowerOneFunc(m, f)
+		return
+	}
+	s.out("warning: ")
+	s.printRedefName(d)
+	s.outln(" shadowed (incompatible signature); existing callers retain old definition")
+	vmInst.LowerOneFuncShadow(m, f)
 }
 
 // printRedefName prints the user-facing name for a redefinition
@@ -246,20 +229,6 @@ func (s @kernel) announceParked(pd @types.PendingDecl) {
 		s.out(pd.MissingNames[i])
 	}
 	s.outln(")")
-}
-
-// announcePendingCycle prints a one-line "pending cycle:
-// A -> B -> A" message for a cycle returned by
-// FindFreshCycles.  The cycle list is the path through the
-// pending missing-names graph, starting and ending at the
-// same name.
-func (s @kernel) announcePendingCycle(path @[]@[]char) {
-	s.out("pending cycle: ")
-	for i := 0; i < len(path); i++ {
-		if i > 0 { s.out(" -> ") }
-		s.out(path[i])
-	}
-	s.outln("")
 }
 
 // parkedDeclLabel returns the "X Y" prefix used in parked /
@@ -306,105 +275,14 @@ func methodReceiverName(d @ast.Decl) @[]char {
 			break
 		}
 	}
+	// A generic type's method: `func (b *Box[T]) M()`.
+	if rb != nil && rb.Kind == ast.TEXPR_INSTANTIATE {
+		rb = rb.Base
+	}
 	if rb != nil && rb.Kind == ast.TEXPR_NAMED {
 		return rb.Name
 	}
 	return ""
-}
-
-// retryPending walks RetryPendingDecls's output (newly-resolved
-// pending decls) and runs the IR-gen + lower path on each.
-// Resolved decls are first-time-defined from IR-gen's view (the
-// sig was in c.Scope all along, but no IR Func / VMFunc existed
-// yet), so we use the simple "first-time" path: irgen.GenDecl
-// followed by per-kind lowering.  No redef bookkeeping needed.
-func (s @kernel) retryPending() {
-	var vmInst @vm.VM = s.Vm
-	var m @ir.Module = s.MainMod
-	var c @check.Checker = s.Chk
-	// Snapshot len(c.Pending) before retry so the loop can
-	// recover each resolved decl's IotaIdx — RetryPendingDecls
-	// removes resolved entries from c.Pending, so we walk the
-	// pre-retry list ourselves.
-	var preretry @[]@types.PendingDecl = c.Pending()
-	var resolved @[]@ast.Decl = c.RetryPendingDecls()
-	for i := 0; i < len(resolved); i++ {
-		var rd @ast.Decl = resolved[i]
-		s.out(parkedDeclLabel(rd))
-		s.outln(" resolved")
-		// Recover the resolved decl's IotaIdx so a group-member
-		// const lands with the right positional value.  Free
-		// top-level decls have IotaIdx == -1.
-		var iotaIdx int = -1
-		for j := 0; j < len(preretry); j++ {
-			if preretry[j].Decl == rd {
-				iotaIdx = preretry[j].IotaIdx
-				break
-			}
-		}
-		var preFuncCount int = len(m.Funcs)
-		var preGlobalCount int = len(m.Globals)
-		var msg @[]char
-		if iotaIdx >= 0 && rd.Kind == ast.DECL_CONST {
-			// Group-member const: GenConstMember handles iota
-			// positioning.  GenDecl on a bare DECL_CONST would
-			// route through genConst with iotaVal=0 — wrong
-			// for a member parked at position N.
-			irgen.GenConstMember(rd, s.MainGc, iotaIdx)
-		} else {
-			msg = irgen.GenDecl(rd, s.MainGc)
-		}
-		if len(msg) > 0 {
-			s.errln(msg)
-			continue
-		}
-		// A blank `func _` lowers nothing (see evalReplOneDecl).
-		if rd.Kind == ast.DECL_FUNC && !(rd.Recv == nil && isBlankReplName(rd.Name)) {
-			// Same body-then-helpers shape as evalReplDecl's
-			// first-time-define path: capture the body before the
-			// drain, lower helpers first, then the body.  Strictly,
-			// this drain is an optimization — a later prompt
-			// entry's drain plus backfillExternCachesForName would
-			// upgrade f's CallCache from -1 to the helper idx — but
-			// running it now keeps the per-decl invariant ("pending
-			// lists are empty after IR-gen + lower of this decl")
-			// consistent across the four prompt-body paths.
-			var f @ir.Func = m.Funcs[preFuncCount]
-			var helpersStart int = len(m.Funcs)
-			irgen.EnsureReplBodyHelpers(m)
-			for j := helpersStart; j < len(m.Funcs); j++ {
-				vmInst.LowerOneFunc(m, m.Funcs[j])
-			}
-			vmInst.LowerOneFunc(m, f)
-		}
-		if rd.Kind == ast.DECL_VAR {
-			// Same shape as evalReplOneDecl's DECL_VAR first-define
-			// path: materialize the slot and run the initializer
-			// synthetic.  A blank var (`var _ T = expr`) has no slot
-			// but still runs its initializer for its side effects.
-			if len(m.Globals) > preGlobalCount {
-				var g @ir.Global = m.Globals[len(m.Globals) - 1]
-				vmInst.MaterializeOneGlobal(g)
-			}
-			if rd.Value != nil {
-				s.runReplVarInit(rd)
-			}
-		}
-		if rd.Kind == ast.DECL_TYPE {
-			// Same as evalReplDecl's DECL_TYPE first-define
-			// path: a managed-field struct adds dtor / copy
-			// helpers to m.Funcs via ensureReplStructHelpers
-			// — lower each one.  Plain types add zero funcs.
-			for k := preFuncCount; k < len(m.Funcs); k++ {
-				vmInst.LowerOneFunc(m, m.Funcs[k])
-			}
-		}
-		// DECL_CONST and DECL_GROUP (const-only groups): GenDecl
-		// registers the symbol in moduleConsts; no slot
-		// materialization or initializer evaluation is needed
-		// since consts are folded at IR-gen time at each use
-		// site.  Nothing more to do here.
-	}
 }
 
 // runReplVarInit generates a one-shot synthetic function whose

@@ -1,0 +1,240 @@
+package "pkg/binate/check"
+
+import "pkg/binate/ast"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// The retry sweep over the REPL's parked declarations (check_pending.bn).
+// Declarations that wait on one another — mutually recursive functions,
+// types that point at each other — can only resolve together, so the sweep
+// checks them as groups: the strongly connected groups of the graph with an
+// edge from each parked declaration to the parked declarations providing
+// the names it misses, visited dependencies first.
+
+// Outcomes of checking a group of parked declarations again.
+const (
+	RETRY_PARKED int = 0   // still missing names: stays parked, undone
+	RETRY_FAILED int = 1   // all names declared, but it does not check: stays parked, undone
+	RETRY_RESOLVED int = 2 // checks: stays bound, to be emitted
+)
+
+// RetryPendingDecls checks again every group of parked declarations whose
+// missing names are all declared (or provided by the group itself), and
+// returns what it checked, in the order checked: dependencies first, each
+// group's members together.  A group that checks resolves — it stays bound
+// and leaves c.Pending.  One that still misses names stays parked with them.
+// One that does not check stays parked too (a later declaration may give it
+// what it expects); its errors are returned, not reported, and only when
+// new.  The sweep repeats while groups resolve, so one call reaches every
+// group the resolutions unblock; a failed group is checked again only after
+// another group resolved.
+func (c @Checker) RetryPendingDecls() @[]@types.RetriedDecl {
+	var out @[]@types.RetriedDecl
+	var groupNo int = 0
+	var resolvedCount int = 0
+	var failed @[]@types.PendingDecl
+	var failedAt @[]int
+	for {
+		var groups @[]@[]int = pendingGroups(c)
+		var resolved @[]@types.PendingDecl
+		for gi := 0; gi < len(groups); gi++ {
+			var g @[]int = groups[gi]
+			if !groupReady(c, g) { continue }
+			var fi int = pendingIndexOf(failed, c.Pending[g[0]])
+			if fi >= 0 && failedAt[fi] == resolvedCount { continue }
+			var outcome int
+			var entries @[]@types.RetriedDecl
+			outcome, entries = retryGroup(c, g, groupNo)
+			for i := 0; i < len(entries); i++ {
+				out = slices.Append[@types.RetriedDecl](out, entries[i])
+			}
+			if len(entries) > 0 { groupNo = groupNo + 1 }
+			if outcome == RETRY_RESOLVED {
+				resolvedCount = resolvedCount + 1
+				for i := 0; i < len(g); i++ {
+					resolved = slices.Append[@types.PendingDecl](resolved, c.Pending[g[i]])
+				}
+			} else if outcome == RETRY_FAILED {
+				for i := 0; i < len(g); i++ {
+					var fj int = pendingIndexOf(failed, c.Pending[g[i]])
+					if fj >= 0 {
+						failedAt[fj] = resolvedCount
+					} else {
+						failed = slices.Append[@types.PendingDecl](failed, c.Pending[g[i]])
+						failedAt = slices.Append[int](failedAt, resolvedCount)
+					}
+				}
+			}
+		}
+		if len(resolved) == 0 { break }
+		var kept @[]@types.PendingDecl
+		for i := 0; i < len(c.Pending); i++ {
+			if pendingIndexOf(resolved, c.Pending[i]) < 0 {
+				kept = slices.Append[@types.PendingDecl](kept, c.Pending[i])
+			}
+		}
+		c.Pending = kept
+	}
+	var emptyMissing @[]@[]char
+	c.TentativeMissing = emptyMissing
+	return out
+}
+
+// retryGroup checks the parked declarations c.Pending[g[...]] together
+// (checkDeclsTentative) and returns the outcome, with a RetriedDecl for each
+// member when it resolved or failed.  A group that parks or fails is undone.
+func retryGroup(c @Checker, g @[]int, groupNo int) (int, @[]@types.RetriedDecl) {
+	var entries @[]@types.RetriedDecl
+	var members @[]@ast.Decl = make_slice(@ast.Decl, len(g))
+	var iotas @[]int = make_slice(int, len(g))
+	var snaps @[]@DeclRollback = make_slice(@DeclRollback, len(g))
+	for i := 0; i < len(g); i++ {
+		members[i] = c.Pending[g[i]].Decl
+		iotas[i] = c.Pending[g[i]].IotaIdx
+		snaps[i] = c.SnapshotDecl(members[i])
+	}
+	var savedAllow bool = c.AllowRedef
+	c.AllowRedef = true
+	var savedRepl bool = c.ReplDeclMode
+	c.ReplDeclMode = true
+	var noOrder @[]@[]char
+	c.VarOrdered = noOrder
+	checkDeclsTentative(c, members, iotas)
+	c.AllowRedef = savedAllow
+	c.ReplDeclMode = savedRepl
+	if len(c.TentativeMissing) > 0 || len(c.TentativeErrors) > 0 {
+		for i := len(g) - 1; i >= 0; i-- {
+			undoDecl(c, snaps[i])
+		}
+	}
+	if len(c.TentativeMissing) > 0 {
+		for i := 0; i < len(g); i++ {
+			var pd @types.PendingDecl = c.Pending[g[i]]
+			pd.MissingNames = c.TentativeMissing
+			pd.Failed = false
+			var noErrs @[]types.CheckError
+			pd.Errs = noErrs
+		}
+		return RETRY_PARKED, entries
+	}
+	if len(c.TentativeErrors) > 0 {
+		// Errors are captured without the deduplication c.Errors gets
+		// (appendUniqueCheckError); deduplicate them here.
+		var errs @[]types.CheckError
+		for i := 0; i < len(c.TentativeErrors); i++ {
+			errs = appendUniqueCheckError(errs, 0, c.TentativeErrors[i])
+		}
+		var emptyTentErrs @[]types.CheckError
+		c.TentativeErrors = emptyTentErrs
+		var first @types.PendingDecl = c.Pending[g[0]]
+		var fresh bool = !first.Failed || !checkErrorListsEqual(first.Errs, errs)
+		for i := 0; i < len(g); i++ {
+			var pd @types.PendingDecl = c.Pending[g[i]]
+			pd.Failed = true
+			pd.Errs = errs
+			var rd @types.RetriedDecl = make(types.RetriedDecl)
+			rd.Decl = pd.Decl
+			rd.IotaIdx = pd.IotaIdx
+			rd.Group = groupNo
+			if i == 0 && fresh {
+				rd.Errs = errs
+			}
+			entries = slices.Append[@types.RetriedDecl](entries, rd)
+		}
+		return RETRY_FAILED, entries
+	}
+	for i := 0; i < len(g); i++ {
+		var rd @types.RetriedDecl = make(types.RetriedDecl)
+		rd.Decl = members[i]
+		rd.IotaIdx = iotas[i]
+		rd.Group = groupNo
+		rd.Resolved = true
+		rd.PrevFunc = prevFuncType(snaps[i])
+		entries = slices.Append[@types.RetriedDecl](entries, rd)
+	}
+	return RETRY_RESOLVED, orderVarsForInit(c, entries)
+}
+
+// orderVarsForInit moves a resolved group's variables after its other
+// members, in the order their initializers must run (c.VarOrdered, which the
+// group's check recorded when it has variables with initializers).
+func orderVarsForInit(c @Checker, entries @[]@types.RetriedDecl) @[]@types.RetriedDecl {
+	var out @[]@types.RetriedDecl
+	var vars @[]@types.RetriedDecl
+	for i := 0; i < len(entries); i++ {
+		if entries[i].Decl.Kind == ast.DECL_VAR {
+			vars = slices.Append[@types.RetriedDecl](vars, entries[i])
+		} else {
+			out = slices.Append[@types.RetriedDecl](out, entries[i])
+		}
+	}
+	for i := 0; i < len(c.VarOrdered); i++ {
+		for j := 0; j < len(vars); j++ {
+			if vars[j] != nil && types.CharEq(vars[j].Decl.Name, c.VarOrdered[i]) {
+				out = slices.Append[@types.RetriedDecl](out, vars[j])
+				vars[j] = nil
+			}
+		}
+	}
+	for j := 0; j < len(vars); j++ {
+		if vars[j] != nil {
+			out = slices.Append[@types.RetriedDecl](out, vars[j])
+		}
+	}
+	return out
+}
+
+// checkErrorListsEqual reports whether two error lists are the same
+// diagnostics in the same order.
+func checkErrorListsEqual(a *[]types.CheckError, b *[]types.CheckError) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if !checkErrorsEqual(a[i], b[i]) { return false }
+	}
+	return true
+}
+
+// pendingIndexOf returns the index of pd in list (by identity), or -1.
+func pendingIndexOf(list *[]@types.PendingDecl, pd @types.PendingDecl) int {
+	for i := 0; i < len(list); i++ {
+		if same(list[i], pd) { return i }
+	}
+	return -1
+}
+
+// groupReady reports whether every name the members of group g miss is
+// declared or provided by a member of g.
+func groupReady(c @Checker, g @[]int) bool {
+	for i := 0; i < len(g); i++ {
+		var missing @[]@[]char = c.Pending[g[i]].MissingNames
+		for j := 0; j < len(missing); j++ {
+			if keyBound(c, missing[j]) || groupProvides(c, g, missing[j]) { continue }
+			return false
+		}
+	}
+	return true
+}
+
+// groupProvides reports whether a member of group g provides key.
+func groupProvides(c @Checker, g @[]int, key *[]readonly char) bool {
+	for i := 0; i < len(g); i++ {
+		if types.CharEq(pendingKey(c.Pending[g[i]].Decl), key) { return true }
+	}
+	return false
+}
+
+// keyBound reports whether a missing-name key is now declared: a name bound
+// in scope, or `T.M` naming a method of the session's named type T.
+func keyBound(c @Checker, key *[]readonly char) bool {
+	var dot int = -1
+	for i := 0; i < len(key); i++ {
+		if key[i] == '.' { dot = i }
+	}
+	if dot < 0 {
+		return c.Scope.Lookup(key) != nil
+	}
+	if c.PackageScope == nil { return false }
+	var sym @Symbol = c.PackageScope.LookupLocal(key[:dot])
+	if sym == nil || sym.Kind != types.SYM_TYPE || sym.Type == nil { return false }
+	return sym.Type.LookupMethod(key[dot + 1:]) != nil
+}

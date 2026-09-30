@@ -1,0 +1,156 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/irbuild"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+import "pkg/std/strings"
+
+// bulkResultDecls declares functions returning a bulk array ([100]uint8) — a
+// plain one, `mk`, and an interface method — and `take`, which takes one (and
+// recurses, never at run time, so the optimizer keeps its calls).
+func bulkResultDecls() @[]char {
+	return buf.CopyStr(
+			"package \"main\"\n"
+					"var g [100]uint8\n"
+					"interface Maker {\n\tMake() [100]uint8\n}\n"
+					"type T struct {\n\tk int\n}\n"
+					"func (t *T) Make() [100]uint8 { return g }\n"
+					"impl *T : Maker\n"
+					"func mk() [100]uint8 { return g }\n"
+					"func take(a [100]uint8) int {\n"
+					"\tif a[0] == 9 { return take(a) }\n"
+					"\treturn cast(int, a[3])\n}\n")
+}
+
+// A bulk return copies the value into the caller's sret buffer with one
+// rt.MemCopy; a bulk call result stays in the call's `.sret` slot — stored from
+// there, passed from there, returned from there — with no whole-value load.
+func TestBulkReturnAndSretResult() testing.TestResult {
+	setTarget64()
+	var src @[]char = buf.Concat(bulkResultDecls(),
+			"func keep() int {\n\tvar h [100]uint8 = mk()\n\treturn cast(int, h[0])\n}\n"
+					"func pass() int { return take(mk()) }\n"
+					"func wrap() [100]uint8 { return mk() }\n"
+					"func main() {\n\tvar w [100]uint8 = wrap()\n"
+					"\t_ = keep() + pass() + cast(int, w[0])\n}\n")
+	var out @[]char = compileToLLVM(src)
+	var mk @[]char = llvmFuncBody(out, "mk")
+	if countSubstr(mk, rtSym("MemCopy")) != 2 || !contains(mk, "(i8* %v.retbuf, i8* %v") {
+		return fail(buf.Concat("mk: load and return are one rt.MemCopy each: ", mk))
+	}
+	if contains(mk, "store [100 x i8]") || contains(mk, "insertvalue") {
+		return fail("mk: no whole-value store, no per-leaf SSA aggregate")
+	}
+	var keep @[]char = llvmFuncBody(out, "keep")
+	if contains(keep, "load [100 x i8]") { return fail("keep: no whole-value load of the result") }
+	if countSubstr(keep, rtSym("MemCopy")) != 1 || !contains(keep, ".sret, i64 100)") {
+		return fail(buf.Concat("keep: the result is stored from its .sret slot: ", keep))
+	}
+	var pass @[]char = llvmFuncBody(out, "pass")
+	if contains(pass, rtSym("MemCopy")) || !contains(pass, "_take(ptr %v") ||
+			!contains(pass, ".sret)") {
+		return fail(buf.Concat("pass: the result's .sret slot is the argument: ", pass))
+	}
+	var wrap @[]char = llvmFuncBody(out, "wrap")
+	if countSubstr(wrap, rtSym("MemCopy")) != 1 || !contains(wrap, "(i8* %v.retbuf, i8* %v") ||
+			!contains(wrap, ".sret, i64 100)") {
+		return fail(buf.Concat("wrap: the result is returned from its .sret slot: ", wrap))
+	}
+	return ""
+}
+
+// A bulk result of a function-value or interface-method call stays in the
+// call's `.rb` result buffer, and is stored from there.
+func TestBulkShimCallResult() testing.TestResult {
+	setTarget64()
+	var src @[]char = buf.Concat(bulkResultDecls(),
+			"func viaValue() int {\n\tvar fv *func() [100]uint8 = mk\n"
+					"\tvar h [100]uint8 = fv()\n\treturn cast(int, h[1])\n}\n"
+					"func viaIface() int {\n\tvar t T\n\tvar m *Maker = &t\n"
+					"\tvar h [100]uint8 = m.Make()\n\treturn cast(int, h[1])\n}\n"
+					"func main() { _ = viaValue() + viaIface() }\n")
+	var out @[]char = compileToLLVM(src)
+	var names @[]@[]char = make_slice(@[]char, 2)
+	names[0] = buf.CopyStr("viaValue")
+	names[1] = buf.CopyStr("viaIface")
+	for k := 0; k < len(names); k++ {
+		var body @[]char = llvmFuncBody(out, names[k])
+		if len(body) == 0 { return fail(buf.Concat(names[k], " was not emitted")) }
+		if contains(body, "load [100 x i8]") {
+			return fail(buf.Concat(names[k], ": no whole-value load of the result"))
+		}
+		if countSubstr(body, rtSym("MemCopy")) != 1 || !contains(body, ".rb, i64 100)") {
+			return fail(buf.Concat(buf.Concat(names[k], ": stored from the .rb buffer: "), body))
+		}
+	}
+	return ""
+}
+
+// A __c_call returning a bulk value through sret leaves it in the `.sret` slot:
+// the call emits no load, and the value's memory is that slot.
+func TestBulkCCallResult() testing.TestResult {
+	setTarget64()
+	var noP @[]@ir.Param
+	var noR @[]@types.Type
+	var f @ir.Func = ir.NewFunc("", "t", noP, noR)
+	var e @ir.Block = ir.AddBlock(f, "entry")
+	var arr @types.Type = types.MakeArrayType(types.TypUint8(), 100)
+	var dst @ir.Instr = irbuild.EmitAlloc(e, arr)
+	var noArgs @[]@ir.Instr = make_slice(@ir.Instr, 0)
+	var cc @ir.Instr = irbuild.EmitCCall(e, buf.CopyStr("cf"), noArgs, arr, 0, false)
+	irbuild.EmitStore(e, dst, cc)
+	irbuild.EmitReturn(e, make_slice(@ir.Instr, 0))
+	computeBulkMemValues(f, noFuncRetTypes())
+	var mem bool = isBulkMem(cc)
+	var sb @strings.Builder = strings.NewBuilder()
+	emitCCall(sb, cc)
+	var call @[]char = buf.CopyStr(sb.String())
+	var ref @[]char = bulkMemRef(cc)
+	clearBulkMemValues()
+	if !mem { return fail("a stored sret __c_call result should be memory-backed") }
+	if contains(call, " = load ") { return fail(buf.Concat("no load of the result: ", call)) }
+	if !contains(ref, ".sret") {
+		return fail(buf.Concat("the value's memory is the .sret slot: ", ref))
+	}
+	return ""
+}
+
+// bulkCallResult follows the callee table for a direct call; a return accepts
+// a memory-backed value only through sret.
+func TestBulkCallResultAndReturn() testing.TestResult {
+	setTarget64()
+	var noP @[]@ir.Param
+	var noR @[]@types.Type
+	var f @ir.Func = ir.NewFunc("", "t", noP, noR)
+	var e @ir.Block = ir.AddBlock(f, "entry")
+	var arr @types.Type = types.MakeArrayType(types.TypUint8(), 100)
+	var noArgs @[]@ir.Instr = make_slice(@ir.Instr, 0)
+	var c @ir.Instr = irbuild.EmitCall(e, "g", noArgs, arr)
+	var rets @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	rets[0] = c
+	irbuild.EmitReturn(e, rets)
+	var table @[]FuncRetType = make_slice(FuncRetType, 1)
+	table[0].Name = mangle.FuncName(modulePkgName, "g")
+	table[0].IsSret = true
+	var was bool = currentFuncUsesSret
+	currentFuncUsesSret = true
+	computeBulkMemValues(f, table)
+	var viaSret bool = isBulkMem(c)
+	var ref @[]char = bulkMemRef(c)
+	computeBulkMemValues(f, noFuncRetTypes())
+	var unknownCallee bool = isBulkMem(c)
+	currentFuncUsesSret = false
+	computeBulkMemValues(f, table)
+	var noSretReturn bool = isBulkMem(c)
+	currentFuncUsesSret = was
+	clearBulkMemValues()
+	if !viaSret { return fail("a returned sret call result should be memory-backed") }
+	if !contains(ref, ".sret") { return fail("its memory is the call's .sret slot") }
+	if unknownCallee { return fail("a callee not known to return through sret gives no memory form") }
+	if noSretReturn { return fail("a return not through sret does not accept the memory form") }
+	return ""
+}

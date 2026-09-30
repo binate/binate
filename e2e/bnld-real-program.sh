@@ -4,9 +4,11 @@
 #
 # A trivial Binate program is compiled to ELF objects (the main module plus the
 # auto-pulled runtime packages), a small hermetic shim supplies `_start` and the
-# handful of libc symbols the runtime references (malloc/calloc/free/write/abort)
-# with a bump allocator + syscalls, and bnld links the whole object graph into one
-# static ELF64 executable.  The program's exit code is what its bnc-compiled
+# handful of libc symbols the runtime references (malloc/calloc/free/write/abort,
+# and — for the LLVM backend, whose bulk copies / zero-fills on a hosted target are
+# llvm.memcpy / llvm.memset — memcpy/memset) with a bump allocator, byte loops and
+# syscalls, and bnld links the whole object graph into one static ELF64
+# executable.  The program's exit code is what its bnc-compiled
 # `compute()` returns — the sum of a managed slice it allocates and fills at run
 # time (42) — so a correct run proves real compiled Binate code, INCLUDING the
 # runtime memory path (MakeManagedSlice -> malloc, bounds checks, refcount), was
@@ -138,7 +140,8 @@ fi
 
 # ----- hermetic shim: _start + the libc symbols the runtime references.
 # malloc is a bump allocator over a .bss arena; calloc reuses it (the arena is
-# zero-initialized and never freed); free is a no-op; write/abort are syscalls.
+# zero-initialized and never freed); free is a no-op; memcpy/memset are byte
+# loops; write/abort are syscalls.
 # _start runs the program's init+main (bn_entry, which returns) then exits with
 # compute()'s value. -----
 cat > "$TMP/shim.s" <<EOF
@@ -189,6 +192,35 @@ free:
 write:
 	mov eax, 1
 	syscall
+	ret
+
+.global memcpy
+memcpy:
+	mov rax, rdi
+	test rdx, rdx
+	jz memcpy_done
+memcpy_loop:
+	mov cl, byte ptr [rsi]
+	mov byte ptr [rdi], cl
+	inc rsi
+	inc rdi
+	dec rdx
+	jnz memcpy_loop
+memcpy_done:
+	ret
+
+.global memset
+memset:
+	mov rax, rdi
+	mov ecx, esi
+	test rdx, rdx
+	jz memset_done
+memset_loop:
+	mov byte ptr [rdi], cl
+	inc rdi
+	dec rdx
+	jnz memset_loop
+memset_done:
 	ret
 
 .global abort
@@ -307,6 +339,12 @@ free:
 	ret
 .global write
 write:
+	ret
+.global memcpy
+memcpy:
+	ret
+.global memset
+memset:
 	ret
 .global abort
 abort:

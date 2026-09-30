@@ -1605,6 +1605,195 @@ type T struct { b int }
 > > <repl>:1:1: cannot redefine type T
 > "
 
+# --- Case 51: an interface and an impl declared at the prompt: a boxed
+# value dispatches, in a statement and in a function; a same-signature
+# method redefinition is dispatched to, a shadowing one is not (the impl
+# keeps the method it was built with). ---
+run_repl "tier2-interface-impl-at-prompt" \
+"interface Sizer { Size() int }
+type Crate struct { n int }
+func (b *Crate) Size() int { return b.n }
+impl *Crate : Sizer
+var b Crate
+b.n = 4
+var s *Sizer = &b
+testing.Println(s.Size())
+func total(x *Sizer) int { return x.Size() + 1 }
+testing.Println(total(&b))
+func (b *Crate) Size() int { return b.n * 10 }
+testing.Println(s.Size())
+func (b *Crate) Size(k int) int { return k }
+testing.Println(s.Size())
+" \
+"$BANNER
+> > > > > > > > 4
+> > 5
+> > 40
+> warning: Crate.Size shadowed (incompatible signature); existing callers retain old definition
+> 40
+> "
+
+# --- Case 52: impls at the prompt on a value receiver, on a named
+# managed slice, and of a generic interface. ---
+run_repl "tier2-impl-receivers-and-generic-interface" \
+"interface Sizer { Size() int }
+type V struct { n int }
+func (v V) Size() int { return v.n + 100 }
+impl V : Sizer
+var v V
+v.n = 2
+var s *Sizer = &v
+testing.Println(s.Size())
+type MS @[]int
+func (m MS) Size() int { return len(m) }
+impl MS : Sizer
+var ms MS = make_slice(int, 3)
+var sm *Sizer = &ms
+testing.Println(sm.Size())
+interface Getter[T any] { Get() T }
+type IntBox struct { v int }
+func (b *IntBox) Get() int { return b.v }
+impl *IntBox : Getter[int]
+var ib IntBox
+ib.v = 9
+var g *Getter[int] = &ib
+testing.Println(g.Get())
+" \
+"$BANNER
+> > > > > > > > 102
+> > > > > > 3
+> > > > > > > > 9
+> "
+
+# --- Case 53: an impl missing a method is rejected; a type or an
+# interface is not redefined, and no declaration of another kind takes its
+# name (the checker's and IR-gen's registries identify them by name). ---
+run_repl "tier4-interface-rejections" \
+"interface Sizer { Size() int }
+type Crate struct { n int }
+impl *Crate : Sizer
+interface Sizer { Other() int }
+type Sizer int
+interface Crate { M() }
+const Sizer = 1
+var Crate int
+func Sizer() {}
+" \
+"$BANNER
+> > > <repl>:1:1: type Crate does not implement Sizer (missing method \`Size\`)
+> <repl>:1:1: cannot redefine interface Sizer
+> <repl>:1:1: cannot redefine interface Sizer as a type
+> <repl>:1:1: cannot redefine type Crate as an interface
+> <repl>:1:1: cannot redefine interface Sizer as a constant
+> <repl>:1:1: cannot redefine type Crate as a variable
+> <repl>:1:1: cannot redefine interface Sizer as a function
+> "
+
+# --- Case 54: an impl at the prompt on value receivers of a named scalar,
+# a struct and a named bool: dispatch goes through the receiver thunk
+# (the interface value holds the data by pointer). ---
+run_repl "tier2-impl-scalar-value-receivers" \
+"interface Sizer { Size() int }
+type N int
+func (n N) Size() int { return cast(int, n) + 1000 }
+impl N : Sizer
+var x N = 5
+var s *Sizer = &x
+testing.Println(s.Size())
+type Pair struct { a int; b int }
+func (p Pair) Size() int { return p.a * 10 + p.b }
+impl Pair : Sizer
+var pr Pair
+pr.a = 3
+pr.b = 4
+var sp *Sizer = &pr
+testing.Println(sp.Size())
+type Flag bool
+func (f Flag) Size() int { if f { return 1 }; return 0 }
+impl Flag : Sizer
+var fl Flag = true
+var sf *Sizer = &fl
+testing.Println(sf.Size())
+" \
+"$BANNER
+> > > > > > > 1005
+> > > > > > > > 34
+> > > > > > 1
+> "
+
+# --- Case 55: a value receiver with a managed field: dispatch through the
+# thunk copies the value properly, so the field's refcount holds. ---
+run_repl "tier2-impl-value-receiver-managed-fields" \
+"import \"pkg/builtins/rt\"
+type Inner struct { v int }
+var inner @Inner = make(Inner)
+var ptr *uint8 = bit_cast(*uint8, inner)
+interface Sizer { Size() int }
+type V struct { p @Inner }
+func (v V) Size() int { return 3 }
+impl V : Sizer
+var v V
+v.p = inner
+testing.Println(rt.Refcount(ptr))
+var s *Sizer = &v
+testing.Println(s.Size(), rt.Refcount(ptr))
+testing.Println(s.Size(), rt.Refcount(ptr))
+" \
+"$BANNER
+> package pkg/builtins/rt loaded
+> > > > > > > > > > 2
+> > 3 2
+> 3 2
+> "
+
+# --- Case 56: a method shadowed after its impl, before any value is boxed:
+# the impl's vtable was built when the impl was declared, so it keeps the
+# method it was declared with. ---
+run_repl "tier4-shadow-before-first-box" \
+"interface Sizer { Size() int }
+type C struct { n int }
+func (c *C) Size() int { return c.n }
+impl *C : Sizer
+func (c *C) Size(k int) int { return k * 1000 + 7 }
+var c C
+c.n = 4
+var s *Sizer = &c
+testing.Println(s.Size())
+" \
+"$BANNER
+> > > > > warning: C.Size shadowed (incompatible signature); existing callers retain old definition
+> > > > 4
+> "
+
+# --- Case 57: an impl at the prompt of an interface alias whose target
+# extends a parent, and of an imported interface: dispatch through the
+# child, the parent, and the imported interface. ---
+run_repl "tier2-impl-parent-alias-imported-interfaces" \
+"import \"pkg/builtins/lang\"
+interface Named { Name() int }
+interface Full : Named { Extra() int }
+interface FullA = Full
+type Q struct { n int }
+func (q *Q) Name() int { return q.n }
+func (q *Q) Extra() int { return q.n + 1 }
+func (q *Q) String() @[]char { return \"q\" }
+impl *Q : FullA, lang.Stringer
+var q Q
+q.n = 7
+var f *Full = &q
+testing.Println(f.Name(), f.Extra())
+var nm *Named = &q
+testing.Println(nm.Name())
+var st *lang.Stringer = &q
+testing.Println(st.String())
+" \
+"$BANNER
+> package pkg/builtins/lang loaded
+> > > > > > > > > > > > 7 8
+> > 7
+> > q
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # (Stage 2) as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

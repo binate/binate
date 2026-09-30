@@ -1,0 +1,340 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/irbuild"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+import "pkg/std/strings"
+
+// bulkArgDecls declares a function, an interface and a method that each take a
+// bulk array ([100]uint8) by value; `take` recurses (never, at run time) so the
+// optimizer does not inline its calls.
+func bulkArgDecls() @[]char {
+	return buf.CopyStr(
+			"package \"main\"\n"
+					"interface Taker {\n\tTake(a [100]uint8) int\n}\n"
+					"type T struct {\n\tk int\n}\n"
+					"func (t *T) Take(a [100]uint8) int { return t.k + cast(int, a[1]) }\n"
+					"impl *T : Taker\n"
+					"type S struct {\n\tarr [100]uint8\n}\n"
+					"func take(a [100]uint8) int {\n"
+					"\tif a[0] == 9 { return take(a) }\n"
+					"\treturn cast(int, a[3])\n}\n")
+}
+
+// A bulk argument whose only use is the call is passed as the address of the
+// loaded value's private copy: one rt.MemCopy (the load), no argument slot, no
+// per-leaf SSA aggregate — for a direct call, a function-value call and an
+// interface-method call.
+func TestBulkCallArgPassesPrivateCopy() testing.TestResult {
+	setTarget64()
+	var src @[]char = buf.Concat(bulkArgDecls(),
+			"func direct() int {\n\tvar x [100]uint8\n\treturn take(x)\n}\n"
+					"func viaValue() int {\n\tvar x [100]uint8\n"
+					"\tvar fv *func([100]uint8) int = take\n\treturn fv(x)\n}\n"
+					"func viaIface() int {\n\tvar x [100]uint8\n\tvar t T\n"
+					"\tvar tk *Taker = &t\n\treturn tk.Take(x)\n}\n"
+					"func main() { _ = direct() + viaValue() + viaIface() }\n")
+	var out @[]char = compileToLLVM(src)
+	var fn @[]char = llvmFuncBody(out, "direct")
+	if countSubstr(fn, rtSym("MemCopy")) != 1 {
+		return fail(buf.Concat("direct: one rt.MemCopy: ", fn))
+	}
+	if !contains(fn, "_take(ptr %v") || !contains(fn, ".m)") {
+		return fail(buf.Concat("direct: the private copy should be the argument: ", fn))
+	}
+	if contains(fn, ".bv0") { return fail("direct: no .bv slot for a private-copy argument") }
+	if contains(fn, "insertvalue") { return fail("direct: no per-leaf SSA aggregate") }
+	var names @[]@[]char = make_slice(@[]char, 2)
+	names[0] = buf.CopyStr("viaValue")
+	names[1] = buf.CopyStr("viaIface")
+	for k := 0; k < len(names); k++ {
+		var body @[]char = llvmFuncBody(out, names[k])
+		if len(body) == 0 { return fail(buf.Concat(names[k], " was not emitted")) }
+		if countSubstr(body, rtSym("MemCopy")) != 1 {
+			return fail(buf.Concat(names[k], ": one rt.MemCopy"))
+		}
+		if !contains(body, ".ap8.0 = bitcast ptr %v") || !contains(body, ".m to i8*") {
+			return fail(buf.Concat(names[k], ": the private copy should be the argument"))
+		}
+		if contains(body, ".ap0") {
+			return fail(buf.Concat(names[k], ": no .ap slot for a private-copy argument"))
+		}
+		if contains(body, "insertvalue [100 x i8]") {
+			return fail(buf.Concat(names[k], ": no per-leaf SSA aggregate"))
+		}
+	}
+	return ""
+}
+
+// At -O2 two reads of one field become one value with two uses — the store to x
+// and the call — so the call's argument slot is kept and filled from the private
+// copy by rt.MemCopy, for each kind of call.
+func TestBulkCallArgWithTwoUsesIsCopied() testing.TestResult {
+	setTarget64()
+	var src @[]char = buf.Concat(bulkArgDecls(),
+			"func direct(s @S) int {\n\tvar x [100]uint8 = s.arr\n"
+					"\treturn take(s.arr) + cast(int, x[3])\n}\n"
+					"func viaValue(s @S, fv *func([100]uint8) int) int {\n"
+					"\tvar x [100]uint8 = s.arr\n\treturn fv(s.arr) + cast(int, x[3])\n}\n"
+					"func viaIface(s @S, tk *Taker) int {\n\tvar x [100]uint8 = s.arr\n"
+					"\treturn tk.Take(s.arr) + cast(int, x[3])\n}\n"
+					"func main() {\n\tvar s @S = make(S)\n\tvar t T\n"
+					"\t_ = direct(s) + viaValue(s, take) + viaIface(s, &t)\n}\n")
+	var out @[]char = compileToLLVMOpt(src, 2)
+	var names @[]@[]char = make_slice(@[]char, 3)
+	names[0] = buf.CopyStr("direct")
+	names[1] = buf.CopyStr("viaValue")
+	names[2] = buf.CopyStr("viaIface")
+	for k := 0; k < len(names); k++ {
+		var body @[]char = llvmFuncBody(out, names[k])
+		var slot *[]readonly char = ".ap0"
+		if k == 0 { slot = ".bv0" }
+		if !contains(body, buf.Concat(slot, " = alloca [100 x i8]")) {
+			return fail(buf.Concat(buf.Concat(names[k], ": the argument slot should stay: "), body))
+		}
+		if countSubstr(body, rtSym("MemCopy")) != 3 || !contains(body, buf.Concat(slot, ", i8* %v")) {
+			return fail(buf.Concat(names[k], ": the load, x and the slot are each one rt.MemCopy"))
+		}
+	}
+	return ""
+}
+
+// bulkArgFunc builds a function that loads a bulk array twice from one alloca:
+// the first load is passed to two calls of `g` (two uses), the second to one.
+func bulkArgFunc() (@ir.Func, @ir.Instr, @ir.Instr, @ir.Instr, @ir.Instr) {
+	var noP @[]@ir.Param
+	var noR @[]@types.Type
+	var f @ir.Func = ir.NewFunc("", "t", noP, noR)
+	var e @ir.Block = ir.AddBlock(f, "entry")
+	var arr @types.Type = types.MakeArrayType(types.TypUint8(), 100)
+	var src @ir.Instr = irbuild.EmitAlloc(e, arr)
+	var twice @ir.Instr = irbuild.EmitLoad(e, src, arr)
+	var args @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	args[0] = twice
+	var c1 @ir.Instr = irbuild.EmitCall(e, "g", args, types.TypInt())
+	irbuild.EmitCall(e, "g", args, types.TypInt())
+	var once @ir.Instr = irbuild.EmitLoad(e, src, arr)
+	var args2 @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	args2[0] = once
+	var c3 @ir.Instr = irbuild.EmitCall(e, "g", args2, types.TypInt())
+	irbuild.EmitReturn(e, make_slice(@ir.Instr, 0))
+	return f, twice, c1, once, c3
+}
+
+// A memory-backed argument with another use fills the call's `.bv<i>` slot by
+// rt.MemCopy from its private copy; one whose only use is the call is passed as
+// that copy and fills nothing.
+func TestEmitByvalArgFillBulk() testing.TestResult {
+	setTarget64()
+	var f @ir.Func
+	var twice @ir.Instr
+	var c1 @ir.Instr
+	var once @ir.Instr
+	var c3 @ir.Instr
+	f, twice, c1, once, c3 = bulkArgFunc()
+	computeBulkMemValues(f)
+	var sb @strings.Builder = strings.NewBuilder()
+	emitByvalArgFill(sb, c1, 0)
+	var fill @[]char = buf.CopyStr(sb.String())
+	var sb2 @strings.Builder = strings.NewBuilder()
+	emitByvalArgFill(sb2, c3, 0)
+	var ref @[]char = byvalArgSlotRef(c3, 0)
+	var want @[]char = bulkMemRef(once)
+	var directTwice bool = bulkArgDirect(c1, twice)
+	var directOnce bool = bulkArgDirect(c3, once)
+	var bothMem bool = isBulkMem(twice) && isBulkMem(once)
+	clearBulkMemValues()
+	if !bothMem { return fail("both loads should be memory-backed") }
+	if directTwice { return fail("a value with two uses must not be passed as its private copy") }
+	if !directOnce { return fail("a value used only by the call is passed as its private copy") }
+	if !contains(fill, rtSym("MemCopy")) || !contains(fill, ".bv0") {
+		return fail(buf.Concat("expected an rt.MemCopy into .bv0: ", fill))
+	}
+	if !contains(fill, bulkMemRef(twice)) {
+		return fail("the copy into .bv0 is from the private copy")
+	}
+	if sb2.Len() != 0 { return fail("an argument passed as its private copy fills no slot") }
+	if !contains(ref, want) || len(ref) != len(want) {
+		return fail(buf.Concat("expected the private copy, got ", ref))
+	}
+	return ""
+}
+
+// A value used only by a call in another block is not passed as its private
+// copy — the call could run again without the value being reloaded — so the
+// call keeps its `.bv<i>` slot.
+func TestBulkArgDirectNeedsSameBlock() testing.TestResult {
+	setTarget64()
+	var noP @[]@ir.Param
+	var noR @[]@types.Type
+	var f @ir.Func = ir.NewFunc("", "t", noP, noR)
+	var e @ir.Block = ir.AddBlock(f, "entry")
+	var next @ir.Block = ir.AddBlock(f, "next")
+	var arr @types.Type = types.MakeArrayType(types.TypUint8(), 100)
+	var v @ir.Instr = irbuild.EmitLoad(e, irbuild.EmitAlloc(e, arr), arr)
+	irbuild.EmitJump(e, next)
+	var args @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	args[0] = v
+	var c @ir.Instr = irbuild.EmitCall(next, "g", args, types.TypInt())
+	irbuild.EmitReturn(next, make_slice(@ir.Instr, 0))
+	computeBulkMemValues(f)
+	var mem bool = isBulkMem(v)
+	var direct bool = bulkArgDirect(c, v)
+	var sb @strings.Builder = strings.NewBuilder()
+	emitByvalAllocDecls(sb, c)
+	var decls @[]char = buf.CopyStr(sb.String())
+	clearBulkMemValues()
+	if !mem { return fail("the load should be memory-backed") }
+	if direct { return fail("a call in another block must not get the private copy") }
+	if !contains(decls, ".bv0 = alloca") {
+		return fail(buf.Concat("the call keeps its slot: ", decls))
+	}
+	return ""
+}
+
+// A memory-backed load nothing uses copies nothing.
+func TestBulkMemUnusedLoad() testing.TestResult {
+	setTarget64()
+	var noP @[]@ir.Param
+	var noR @[]@types.Type
+	var f @ir.Func = ir.NewFunc("", "t", noP, noR)
+	var e @ir.Block = ir.AddBlock(f, "entry")
+	var arr @types.Type = types.MakeArrayType(types.TypUint8(), 100)
+	var v @ir.Instr = irbuild.EmitLoad(e, irbuild.EmitAlloc(e, arr), arr)
+	irbuild.EmitReturn(e, make_slice(@ir.Instr, 0))
+	computeBulkMemValues(f)
+	var unused bool = bulkMemUnused(v)
+	var sb @strings.Builder = strings.NewBuilder()
+	emitLoadInstr(sb, v)
+	var n int = sb.Len()
+	clearBulkMemValues()
+	if !unused { return fail("a load with no uses is an unused memory-backed value") }
+	if n != 0 { return fail("an unused load emits no copy") }
+	return ""
+}
+
+// A non-bulk by-value argument (three leaves, 24 bytes) is stored whole into its
+// `.bv<i>` slot.
+func TestEmitByvalArgFillSSA() testing.TestResult {
+	setTarget64()
+	var noP @[]@ir.Param
+	var noR @[]@types.Type
+	var f @ir.Func = ir.NewFunc("", "t", noP, noR)
+	var e @ir.Block = ir.AddBlock(f, "entry")
+	var arr @types.Type = types.MakeArrayType(types.TypInt(), 3)
+	var v @ir.Instr = irbuild.EmitLoad(e, irbuild.EmitAlloc(e, arr), arr)
+	var args @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	args[0] = v
+	var c @ir.Instr = irbuild.EmitCall(e, "g", args, types.TypInt())
+	irbuild.EmitReturn(e, make_slice(@ir.Instr, 0))
+	computeBulkMemValues(f)
+	var sb @strings.Builder = strings.NewBuilder()
+	emitByvalArgFill(sb, c, 0)
+	var fill @[]char = buf.CopyStr(sb.String())
+	clearBulkMemValues()
+	if !contains(fill, "store [3 x i64] ") || !contains(fill, ".bv0") {
+		return fail(buf.Concat("expected a whole store into .bv0: ", fill))
+	}
+	return ""
+}
+
+// isBulkCallArg accepts an IsByvalParam argument of a direct call, and an
+// aggregate a function-value or interface-method call passes by address — with
+// operand k of a function-value call being its parameter k-1 — and rejects the
+// callee operand, scalars and register-coerced aggregates.
+func TestIsBulkCallArg() testing.TestResult {
+	setTarget64()
+	var noP @[]@ir.Param
+	var noR @[]@types.Type
+	var e @ir.Block = ir.AddBlock(ir.NewFunc("", "u", noP, noR), "entry")
+	var arr @types.Type = types.MakeArrayType(types.TypUint8(), 100)
+	var bulk @ir.Instr = irbuild.EmitLoad(e, irbuild.EmitAlloc(e, arr), arr)
+	var args @[]@ir.Instr = make_slice(@ir.Instr, 2)
+	args[0] = irbuild.EmitConstInt(e, 1, types.TypInt())
+	args[1] = bulk
+	var dc @ir.Instr = irbuild.EmitCall(e, "h", args, types.TypInt())
+	if isBulkCallArg(dc, 0) { return fail("direct: an int argument is not passed by address") }
+	if !isBulkCallArg(dc, 1) { return fail("direct: a bulk argument is passed by address") }
+	var params @[]@types.Param = make_slice(@types.Param, 2)
+	params[0] = make(types.Param)
+	params[0].Type = types.TypInt()
+	params[1] = make(types.Param)
+	params[1].Type = arr
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = types.TypInt()
+	var fnTyp @types.Type = types.MakeFuncValueType(params, results)
+	var fv @ir.Instr = irbuild.EmitLoad(e, irbuild.EmitAlloc(e, fnTyp), fnTyp)
+	var vc @ir.Instr = irbuild.EmitCallFuncValue(e, fv, args, types.TypInt())
+	if isBulkCallArg(vc, 0) { return fail("func value: the callee operand is not an argument") }
+	if isBulkCallArg(vc, 1) { return fail("func value: operand 1 is the int parameter") }
+	if !isBulkCallArg(vc, 2) { return fail("func value: operand 2 is the bulk parameter") }
+	var ivTyp @types.Type = types.MakeInterfaceValueType(types.MakeInterfaceType("", "I"))
+	var iv @ir.Instr = irbuild.EmitLoad(e, irbuild.EmitAlloc(e, ivTyp), ivTyp)
+	var ic @ir.Instr = irbuild.EmitCallIfaceMethod(e, iv, args, 0, types.TypInt())
+	if isBulkCallArg(ic, 0) { return fail("iface: the interface operand is not an argument") }
+	if isBulkCallArg(ic, 1) || !isBulkCallArg(ic, 2) {
+		return fail("iface: operand 2 is the bulk argument")
+	}
+	if !shimArgByAddress(arr) { return fail("a bulk array is a by-address shim argument") }
+	if shimArgByAddress(types.TypInt()) { return fail("an int is not a by-address shim argument") }
+	if shimArgByAddress(types.MakeArrayType(types.TypInt(), 2)) {
+		return fail("a 16-byte array is register-coerced, not a by-address shim argument")
+	}
+	return ""
+}
+
+// bulkCCall builds a function passing one bulk array, loaded once, to a
+// __c_call; returns the call and the loaded value.
+func bulkCCall() (@ir.Func, @ir.Instr, @ir.Instr) {
+	var noP @[]@ir.Param
+	var noR @[]@types.Type
+	var f @ir.Func = ir.NewFunc("", "t", noP, noR)
+	var e @ir.Block = ir.AddBlock(f, "entry")
+	var arr @types.Type = types.MakeArrayType(types.TypUint8(), 100)
+	var v @ir.Instr = irbuild.EmitLoad(e, irbuild.EmitAlloc(e, arr), arr)
+	var args @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	args[0] = v
+	var cc @ir.Instr = irbuild.EmitCCall(e, buf.CopyStr("cf"), args, types.TypInt(), 1, false)
+	irbuild.EmitReturn(e, make_slice(@ir.Instr, 0))
+	return f, cc, v
+}
+
+// A bulk __c_call argument is read straight from the value's private copy: on
+// arm32 the AAPCS32 coerced words are loaded from it, and on x64 it is the
+// `byval` pointer LLVM copies onto the outgoing stack.
+func TestBulkCCallArg() testing.TestResult {
+	setTargetArm32()
+	var f @ir.Func
+	var cc @ir.Instr
+	var v @ir.Instr
+	f, cc, v = bulkCCall()
+	computeBulkMemValues(f)
+	var sb @strings.Builder = strings.NewBuilder()
+	writeByvalArgPreamble(sb, cc)
+	var pre @[]char = buf.CopyStr(sb.String())
+	var armRef @[]char = bulkMemRef(v)
+	setTarget64()
+	if !contains(pre, ".cagL0 = load [") || !contains(pre, buf.Concat(", ptr ", armRef)) {
+		clearBulkMemValues()
+		return fail(buf.Concat("arm32: the coerced words should load from the private copy: ", pre))
+	}
+	if contains(pre, "store ") || contains(pre, "MemCopy") {
+		clearBulkMemValues()
+		return fail("arm32: nothing to fill")
+	}
+	types.SetArch(types.ARCH_X64)
+	f, cc, v = bulkCCall()
+	computeBulkMemValues(f)
+	var sb2 @strings.Builder = strings.NewBuilder()
+	writeByvalArgLLVM(sb2, cc, 0, false)
+	var arg @[]char = buf.CopyStr(sb2.String())
+	setTarget64()
+	clearBulkMemValues()
+	if !contains(arg, "ptr byval([100 x i8]) align 8 ") || !contains(arg, bulkMemRef(v)) {
+		return fail(buf.Concat("x64: the private copy should be the byval pointer: ", arg))
+	}
+	return ""
+}

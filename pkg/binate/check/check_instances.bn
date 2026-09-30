@@ -4,6 +4,7 @@ import "pkg/binate/types"
 
 import "pkg/binate/ast"
 import "pkg/binate/buf"
+import "pkg/binate/token"
 import "pkg/std/vec"
 
 // Instances of generic functions (spec gen.mono, gen.mono.check).  A generic
@@ -18,25 +19,47 @@ import "pkg/std/vec"
 
 // GenericHome records where the generic function Decl is declared: the scope
 // its signature and body resolve in (its file's imports and its package's
-// declarations) and its package path.
+// declarations) and its package path.  Checked is set once its body has been
+// checked with its type parameters abstract, BodyErrs if that check reported
+// an error (its instances are then not checked).
 type GenericHome struct {
-	Decl  @ast.Decl
-	Scope @Scope
-	Pkg   @[]char
+	Decl     @ast.Decl
+	Scope    @Scope
+	Pkg      @[]char
+	Checked  bool
+	BodyErrs bool
 }
 
 // FuncInstance is the generic function Decl instantiated with the concrete type
-// arguments Args; Sig is its signature for them.
+// arguments Args; Sig is its signature for them, State its body's check.
 type FuncInstance struct {
-	Decl @ast.Decl
-	Args @[]@types.Type
-	Sig  @types.Type
+	Decl  @ast.Decl
+	Args  @[]@types.Type
+	Sig   @types.Type
+	State @InstCheckState
 }
 
-// InstanceState holds the generic functions' homes and their instances.
+// InstanceState holds the generic functions' homes and their instances, and
+// the instances whose bodies are still to be checked: a stack (Queue[:Top]),
+// so the instances one body names are checked before its siblings and a chain
+// that grows without bound reaches MAX_INSTANCE_DEPTH before its fan-out
+// multiplies (Overflowed then stops the check).  Current is the instance being
+// checked; Epoch counts the drains of the stack (drainInstancesAbove).  At the
+// REPL (TrackNamed), Named[:NamedTop] records the instances the input being
+// checked names (commitNamed), and Snapshot is the driver's snapshot of the
+// declaration being checked (SnapshotDecl).
 type InstanceState struct {
-	Homes @vec.Vec[@GenericHome]
-	Funcs @vec.Vec[@FuncInstance]
+	Homes      @vec.Vec[@GenericHome]
+	Funcs      @vec.Vec[@FuncInstance]
+	Queue      @vec.Vec[@InstWork]
+	Top        int
+	Overflowed bool
+	Current    @InstWork
+	Epoch      int
+	Named      @vec.Vec[@InstCheckState]
+	NamedTop   int
+	TrackNamed bool
+	Snapshot   @DeclRollback
 }
 
 // instanceState returns c's instance state, creating it on first use.
@@ -45,6 +68,8 @@ func instanceState(c @Checker) @InstanceState {
 		var st @InstanceState = make(InstanceState)
 		st.Homes = vec.New[@GenericHome]()
 		st.Funcs = vec.New[@FuncInstance]()
+		st.Queue = vec.New[@InstWork]()
+		st.Named = vec.New[@InstCheckState]()
 		c.Instances = st
 	}
 	return c.Instances
@@ -61,6 +86,8 @@ func recordGenericHome(c @Checker, d @ast.Decl) {
 	h.Pkg = buf.CopyStr(c.curPkgPath)
 	for i := 0; i < st.Homes.Len(); i++ {
 		if same(st.Homes.Get(i).Decl, d) {
+			h.Checked = st.Homes.Get(i).Checked
+			h.BodyErrs = st.Homes.Get(i).BodyErrs
 			st.Homes.Set(i, h)
 			return
 		}
@@ -92,9 +119,11 @@ func genericFuncDecl(ft @types.Type) @ast.Decl {
 }
 
 // funcInstance returns the instance of the generic function declaration d for
-// the concrete type arguments args, creating it — and resolving its signature
-// in d's home — on first use; nil when d has no recorded home.
-func funcInstance(c @Checker, d @ast.Decl, args *[]@types.Type) @FuncInstance {
+// the concrete type arguments args, creating it on first use — resolving its
+// signature in d's home and queuing its body check, named at site — and queuing
+// the check again when it needs it (needsInstanceCheck); nil when d has no
+// recorded home.
+func funcInstance(c @Checker, d @ast.Decl, args *[]@types.Type, site token.Pos) @FuncInstance {
 	var home @GenericHome = genericHomeOf(c, d)
 	if home == nil {
 		return nil
@@ -103,6 +132,10 @@ func funcInstance(c @Checker, d @ast.Decl, args *[]@types.Type) @FuncInstance {
 	for i := 0; i < st.Funcs.Len(); i++ {
 		var fi @FuncInstance = st.Funcs.Get(i)
 		if same(fi.Decl, d) && typeListsIdentical(fi.Args, args) {
+			if needsInstanceCheck(c, fi.State) {
+				enqueueFuncWork(c, d, args, site, fi.State)
+			}
+			noteInstanceNamed(c, fi.State)
 			return fi
 		}
 	}
@@ -110,7 +143,10 @@ func funcInstance(c @Checker, d @ast.Decl, args *[]@types.Type) @FuncInstance {
 	inst.Decl = d
 	inst.Args = copyTypeList(args)
 	inst.Sig = resolveInstanceSignature(c, home, d, args)
+	inst.State = newInstCheckState(c, site)
 	st.Funcs.Push(inst)
+	enqueueFuncWork(c, d, args, site, inst.State)
+	noteInstanceNamed(c, inst.State)
 	return inst
 }
 
@@ -138,6 +174,34 @@ func resolveInstanceSignature(c @Checker, home @GenericHome, d @ast.Decl,
 	c.Scope = savedScope
 	c.curPkgPath = savedPkgPath
 	return ft
+}
+
+// checkErrorCount counts what the check has found wrong so far: the errors
+// reported, and under TentativeMode those captured and the names used that
+// nothing binds (a REPL declaration's body that parks on one is not clean).
+func checkErrorCount(c @Checker) int {
+	return len(c.Errors) + len(c.TentativeErrors) + len(c.TentativeMissing)
+}
+
+// noteGenericBodyChecked records that the body of d — a generic function, or a
+// method of a generic type — was checked with its type parameters abstract, and
+// whether that check reported an error.
+func noteGenericBodyChecked(c @Checker, d @ast.Decl, hadErrs bool) {
+	if d.Recv == nil {
+		var home @GenericHome = genericHomeOf(c, d)
+		if home != nil {
+			home.Checked = true
+			home.BodyErrs = hadErrs
+		}
+		return
+	}
+	for i := 0; i < len(c.GenericMethods); i++ {
+		if same(c.GenericMethods[i].Decl, d) {
+			c.GenericMethods[i].Checked = true
+			c.GenericMethods[i].BodyErrs = hadErrs
+			return
+		}
+	}
 }
 
 // typeListsIdentical reports whether a and b hold strictly identical types,

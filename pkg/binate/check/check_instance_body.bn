@@ -1,0 +1,380 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/std/strconv"
+import "pkg/std/strings"
+
+// Each instantiation's body checked (spec gen.mono.check): a generic function
+// instance, and each method of a generic struct instance, has its body checked
+// with its type parameters bound to the concrete type arguments — on its own
+// copy of the declaration, so what the check records on the AST belongs to that
+// instance — which decides what depends on a type parameter (a length or size
+// computed from it, and the array identity, literal counts and sizes that
+// depend on those).  Instances are queued as they are named (enqueueFuncWork,
+// enqueueTypeWork) and checked when the package's own checking is done
+// (drainInstances); an instance named inside another's body is queued in turn,
+// so the chain from an instantiation the program writes is followed to its end,
+// or to MAX_INSTANCE_DEPTH (gen.mono.instances).  A generic whose abstract body
+// check reported an error, or whose body this compilation did not check (an
+// interface-only import), is not checked per instance.
+
+// MAX_INSTANCE_DEPTH bounds a chain of instances, each named from the previous
+// one's body (spec §21.4: at least 128).
+const MAX_INSTANCE_DEPTH int = 128
+
+// InstWork is one instance to check: a generic function Decl with its type
+// arguments, or the methods of the generic struct TypeDecl instantiated with
+// them.  Site is where it was named, Label its name for messages (`F[int64]`),
+// Parent the instance whose body named it (nil for one the program writes),
+// Depth the length of that chain, State the instance's check, and DepFailed
+// set when its check named an instance whose check failed.
+type InstWork struct {
+	Decl      @ast.Decl
+	TypeDecl  @ast.Decl
+	Args      @[]@types.Type
+	Site      token.Pos
+	Label     @[]char
+	Parent    @InstWork
+	Depth     int
+	State     @InstCheckState
+	DepFailed bool
+}
+
+// enqueueFuncWork queues the body check of the generic function d's instance
+// for the concrete type arguments args, named at site, whose check state is s.
+func enqueueFuncWork(c @Checker, d @ast.Decl, args *[]@types.Type, site token.Pos,
+		s @InstCheckState) {
+	var w @InstWork = newInstWork(c, d.Name, args, site)
+	w.Decl = d
+	w.State = s
+	s.Queued = true
+	pushInstWork(instanceState(c), w)
+}
+
+// enqueueTypeWork queues the method body and impl checks of the generic struct
+// d's instance for the concrete type arguments args, named at site, whose check
+// state is s.
+func enqueueTypeWork(c @Checker, d @ast.Decl, args *[]@types.Type, site token.Pos,
+		s @InstCheckState) {
+	var w @InstWork = newInstWork(c, d.Name, args, site)
+	w.TypeDecl = d
+	w.State = s
+	s.Queued = true
+	pushInstWork(instanceState(c), w)
+}
+
+// pushInstWork pushes w on st's stack of instances to check.
+func pushInstWork(st @InstanceState, w @InstWork) {
+	// TODO: the increment comes first, not after the `if`, because the pinned
+	// BUILDER drops a field `++` that follows an `if` (claude-todo: "Until
+	// BUILDER_VERSION includes binate 1f29d31e9"); it may follow the store once
+	// BUILDER_VERSION includes that fix.
+	st.Top++
+	if st.Top <= st.Queue.Len() {
+		st.Queue.Set(st.Top - 1, w)
+	} else {
+		st.Queue.Push(w)
+	}
+}
+
+// popInstWork pops the instance on top of st's stack of instances to check.
+func popInstWork(st @InstanceState) @InstWork {
+	st.Top--
+	return st.Queue.Get(st.Top)
+}
+
+// newInstWork returns an instance record named name[args] at site, chained to
+// the instance whose body is being checked, if any.
+func newInstWork(c @Checker, name *[]readonly char, args *[]@types.Type, site token.Pos) @InstWork {
+	var w @InstWork = make(InstWork)
+	w.Args = copyTypeList(args)
+	w.Site = site
+	w.Label = instanceLabel(name, args)
+	w.Parent = instanceState(c).Current
+	w.Depth = 1
+	if w.Parent != nil {
+		w.Depth = w.Parent.Depth + 1
+	}
+	return w
+}
+
+// drainInstances checks every queued instance (drainInstancesAbove), unless
+// declarations are being checked tentatively (checkDeclsTentative drains
+// their instances itself).
+func drainInstances(c @Checker) {
+	if c.Instances == nil || c.TentativeMode {
+		return
+	}
+	drainInstancesAbove(c, 0)
+}
+
+// drainInstancesAbove checks the instances queued above floor on the stack,
+// and those queued while checking them: depth-first, each body's instances in
+// the order it names them, stopping at the first chain that grows beyond
+// MAX_INSTANCE_DEPTH.
+func drainInstancesAbove(c @Checker, floor int) {
+	var st @InstanceState = instanceState(c)
+	reverseInstWork(st, floor)
+	for st.Top > floor && !st.Overflowed {
+		// TODO: keep the pop in popInstWork — the pinned BUILDER skips a loop
+		// body opening with `st.Top--` (claude-todo: "Until BUILDER_VERSION
+		// includes binate 1f29d31e9").
+		var w @InstWork = popInstWork(st)
+		var mark int = st.Top
+		checkInstanceWork(c, w)
+		reverseInstWork(st, mark)
+	}
+	finishInstanceDrain(st, floor)
+}
+
+// checkInstanceWork checks the instance w — a function's body, or each method
+// body and parameterized impl of a struct instance — and records the outcome
+// in its state.  A failure is also recorded for each instance whose check named
+// w (failInstanceChain): naming one of them again checks it again.
+func checkInstanceWork(c @Checker, w @InstWork) {
+	var st @InstanceState = instanceState(c)
+	var failed bool = true
+	if w.Depth > MAX_INSTANCE_DEPTH {
+		errInstanceTooDeep(c, w)
+		st.Overflowed = true
+	} else if w.Decl != nil {
+		failed = checkFuncInstance(c, w)
+	} else {
+		failed = checkTypeInstance(c, w)
+	}
+	if w.DepFailed {
+		failed = true
+	}
+	noteInstanceChecked(st, w.State, !failed)
+	if failed {
+		failInstanceChain(st, w)
+	}
+}
+
+// checkFuncInstance checks the body of the generic function instance w, unless
+// the generic's abstract body check failed or did not run; reports whether it
+// found an error.
+func checkFuncInstance(c @Checker, w @InstWork) bool {
+	var home @GenericHome = genericHomeOf(c, w.Decl)
+	if home == nil || !home.Checked || home.BodyErrs {
+		return false
+	}
+	return checkInstanceBody(c, w, w.Decl, home.Scope, home.Pkg, w.Label)
+}
+
+// checkTypeInstance checks each method body of the generic struct instance w
+// whose abstract check passed, and its parameterized impls; reports whether it
+// found an error.
+func checkTypeInstance(c @Checker, w @InstWork) bool {
+	var failed bool = false
+	var pkg @[]char = genericTypeDeclPkg(c, w.TypeDecl)
+	for i := 0; i < len(c.GenericMethods); i++ {
+		var entry @GenericMethodEntry = c.GenericMethods[i]
+		var base @ast.TypeExpr = receiverBaseInstantiation(entry.Decl.Recv.Type)
+		if !types.CharEq(entry.Pkg, pkg) || base == nil || base.Base == nil ||
+				!types.CharEq(base.Base.Name, w.TypeDecl.Name) {
+			continue
+		}
+		if entry.Checked && !entry.BodyErrs {
+			var cb @strings.Builder = strings.NewBuilder()
+			cb.Write(w.Label)
+			cb.Write(".")
+			cb.Write(entry.Decl.Name)
+			if checkInstanceBody(c, w, entry.Decl, entry.Scope, entry.Pkg, buf.CopyStr(cb.String())) {
+				failed = true
+			}
+		}
+	}
+	if checkInstanceImpls(c, w) {
+		failed = true
+	}
+	return failed
+}
+
+// checkInstanceBody checks the body of the generic function or method d for the
+// instance w, on a copy of d, in d's home scope with d's type parameters (a
+// method's receiver binders) bound to w's type arguments.  Errors it reports
+// name the instance as label (contextualizeInstanceErrors).  Reports whether
+// the check found an error.
+func checkInstanceBody(c @Checker, w @InstWork, d @ast.Decl, home @Scope, pkg @[]char,
+		label *[]readonly char) bool {
+	if d.Body == nil {
+		return false
+	}
+	var clone @ast.Decl = ast.CloneDecl(d)
+	var noParams @[]@ast.TypeParam
+	clone.TypeParams = noParams
+	var saved declContext = enterPackageDecl(c, d)
+	var savedPkgPath @[]char = c.curPkgPath
+	var st @InstanceState = instanceState(c)
+	var savedCur @InstWork = st.Current
+	st.Current = w
+	c.curPkgPath = pkg
+	c.Scope = NewScope(home)
+	var before int = len(c.Errors)
+	bindInstanceArgs(c, d, w.Args)
+	var savedDeriving bool = c.DerivingInstanceSig
+	c.DerivingInstanceSig = true
+	var ft @types.Type = instanceFuncType(c, clone)
+	c.DerivingInstanceSig = savedDeriving
+	if ft != nil {
+		checkFuncBody(c, clone, ft)
+		finalizeUntypedNonConst(c)
+	}
+	var failed bool = contextualizeInstanceErrors(c, before, w, label)
+	st.Current = savedCur
+	c.curPkgPath = savedPkgPath
+	leavePackageDecl(c, saved)
+	return failed
+}
+
+// bindInstanceArgs defines, in the current scope, the names d binds to its type
+// arguments — a generic function's type parameters, or a method's receiver
+// binders — as the concrete types args.
+func bindInstanceArgs(c @Checker, d @ast.Decl, args *[]@types.Type) {
+	if d.Recv == nil {
+		for i := 0; i < len(d.TypeParams) && i < len(args); i++ {
+			if !isBlank(d.TypeParams[i].Name) {
+				defineType(c.Scope, d.TypeParams[i].Name, args[i])
+			}
+		}
+		return
+	}
+	var inst @ast.TypeExpr = receiverBaseInstantiation(d.Recv.Type)
+	if inst == nil {
+		return
+	}
+	for j := 0; j < len(inst.TypeArgs) && j < len(args); j++ {
+		var binder @ast.TypeExpr = inst.TypeArgs[j]
+		if binder != nil && binder.Kind == ast.TEXPR_NAMED {
+			defineType(c.Scope, ast.ReceiverBinderName(binder, j), args[j])
+		}
+	}
+}
+
+// instanceFuncType resolves the function type of the copy d of a generic
+// function or method, its type arguments bound (a method's receiver first).
+func instanceFuncType(c @Checker, d @ast.Decl) @types.Type {
+	var ft @types.Type = resolveFuncDeclType(c, d)
+	if ft == nil || d.Recv == nil {
+		return ft
+	}
+	var recvType @types.Type = resolveTypeExpr(c, ast.WithNamedBlankBinders(d.Recv.Type))
+	var combined @[]@types.Param = prependRecvParam(d.Recv.Name, recvType, ft.Params)
+	return types.MakeFuncType(combined, ft.Results)
+}
+
+// contextualizeInstanceErrors names the instance w, as label, in each error
+// reported since before (`… (in F[int64], instantiated at main.bn:12:5)`), and
+// drops one that another instance already reported at the same position.
+// Reports whether any error was reported since before, dropped or not.
+func contextualizeInstanceErrors(c @Checker, before int, w @InstWork, label *[]readonly char) bool {
+	if len(c.Errors) <= before {
+		return false
+	}
+	var fresh @[]types.CheckError = make_slice(types.CheckError, len(c.Errors) - before)
+	for i := before; i < len(c.Errors); i++ {
+		fresh[i - before] = c.Errors[i]
+	}
+	c.Errors = c.Errors[:before]
+	var context @[]char = instanceContext(w, label)
+	for i := 0; i < len(fresh); i++ {
+		if instanceErrorReported(c, fresh[i]) {
+			continue
+		}
+		var cb @strings.Builder = strings.NewBuilder()
+		cb.Write(fresh[i].Msg)
+		cb.Write(context)
+		var e types.CheckError
+		e.Pos = fresh[i].Pos
+		e.Msg = buf.CopyStr(cb.String())
+		c.Errors = appendUniqueCheckError(c.Errors, c.DedupFrom, e)
+	}
+	return true
+}
+
+// instanceErrorReported reports whether an error with e's position and message,
+// named for some instance, is already reported — since c.DedupFrom, so a REPL
+// prompt repeating an earlier prompt's mistake still reports it.
+func instanceErrorReported(c @Checker, e types.CheckError) bool {
+	for i := c.DedupFrom; i < len(c.Errors); i++ {
+		var o types.CheckError = c.Errors[i]
+		if types.CharEq(o.Pos.File, e.Pos.File) && o.Pos.Line == e.Pos.Line && o.Pos.Col == e.Pos.Col &&
+				len(o.Msg) > len(e.Msg) && types.CharEq(o.Msg[:len(e.Msg)], e.Msg) {
+			return true
+		}
+	}
+	return false
+}
+
+// instanceContext returns ` (in F[int64], instantiated at file:line:col)` for
+// the instance w, named label — the site of the chain's first instance, which
+// the program writes, and that instance when it is not w.
+func instanceContext(w @InstWork, label *[]readonly char) @[]char {
+	var root @InstWork = w
+	for root.Parent != nil {
+		root = root.Parent
+	}
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(" (in ")
+	cb.Write(label)
+	cb.Write(", instantiated at ")
+	cb.Write(posString(root.Site))
+	if !same(root, w) {
+		cb.Write(" via ")
+		cb.Write(root.Label)
+	}
+	cb.Write(")")
+	return buf.CopyStr(cb.String())
+}
+
+// errInstanceTooDeep reports, at the site of the chain's first instance, that
+// the chain of instances from it grew beyond MAX_INSTANCE_DEPTH: `F[int]` names
+// `F[@int]`, which names …
+func errInstanceTooDeep(c @Checker, w @InstWork) {
+	var root @InstWork = w
+	var next @InstWork = w
+	for root.Parent != nil {
+		next = root
+		root = root.Parent
+	}
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("generic instantiation nested too deeply (polymorphic recursion?): ")
+	cb.Write(root.Label)
+	cb.Write(" names ")
+	cb.Write(next.Label)
+	cb.Write(", and so on through ")
+	cb.Write(strconv.Itoa(MAX_INSTANCE_DEPTH))
+	cb.Write(" levels")
+	addCheckError(c, root.Site, buf.CopyStr(cb.String()))
+}
+
+// instanceLabel returns `name[A, B]` for type arguments args.
+func instanceLabel(name *[]readonly char, args *[]@types.Type) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(name)
+	cb.Write("[")
+	for i := 0; i < len(args); i++ {
+		if i > 0 {
+			cb.Write(", ")
+		}
+		cb.Write(args[i].TypeName())
+	}
+	cb.Write("]")
+	return buf.CopyStr(cb.String())
+}
+
+// posString returns `file:line:col` for pos.
+func posString(pos token.Pos) @[]char {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(pos.File)
+	cb.Write(":")
+	cb.Write(strconv.Itoa(pos.Line))
+	cb.Write(":")
+	cb.Write(strconv.Itoa(pos.Col))
+	return buf.CopyStr(cb.String())
+}

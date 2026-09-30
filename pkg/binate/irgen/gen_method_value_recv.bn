@@ -72,83 +72,88 @@ func methodValueRecvIRType(ctx @GenContext, xExpr @ast.Expr) @types.Type {
 	return nil
 }
 
-// genCapturedRecv evaluates the receiver expression `xExpr` and
-// converts the result to the captured form expected by the
-// closure struct's `recv` field.  Smoothing per plan-function-
-// values-phase-2.md §"Method values x.M":
-//
-//   * recvTyp.Identical(capturedTyp) — no conversion, plain
-//     genExpr.  Covers same-shape paths (T+T, *T+*T, @T+@T).
-//   * recvTyp is T, capturedTyp is *T — take address-of x.  For
-//     EXPR_IDENT this is `lookupVar(ctx, x.Name)`, the alloca'd
-//     stack slot itself (Binate's address-of-local pattern;
-//     mirrors genUnary's `&x` path).  Other addressable shapes
-//     (struct field, indexed slot) aren't yet wired here.
-//   * recvTyp is *T or @T, capturedTyp is T — load through the
-//     pointer to materialise the T copy.
-//   * recvTyp is @T, capturedTyp is *T — bitcast managed-ptr to
-//     raw pointer; the @T's refcount is unaffected (raw doesn't
-//     refcount), so the captured raw pointer's lifetime piggy-
-//     backs on the @T variable that produced it.
-//
-// When the smoothing case isn't recognised, fall back to plain
-// genExpr — IR-gen / backend will catch any remaining mismatch
-// downstream.  Type-checker is the gate on which shapes are
-// valid at the source level.
-func genCapturedRecv(ctx @GenContext, b @ir.Block, xExpr @ast.Expr, recvTyp @types.Type,
-		capturedTyp @types.Type) @ir.Instr {
-	if recvTyp.Identical(capturedTyp) {
-		return genExpr(ctx, b, xExpr)
-	}
-	// T → *T: take address.  EXPR_IDENT case — the alloca'd
-	// stack slot for the local IS its *T address.
-	if capturedTyp != nil && capturedTyp.Kind == types.TYP_POINTER &&
+// How a method value's receiver expression bridges to the form the method
+// declares for its receiver (the closure's captured form).
+const (
+	MVBRIDGE_SAME int = iota // the same shape: T and T, *T and *T, @T and @T
+	MVBRIDGE_ADDR            // a T value captured as *T: its address
+	MVBRIDGE_LOAD            // a *T or @T captured as T: a copy loaded through it
+	MVBRIDGE_BITCAST         // an @T captured as *T: the same address, raw
+	MVBRIDGE_OTHER           // anything else: the value as evaluated
+)
+
+// methodValueBridge classifies how a receiver of type recvTyp bridges to the
+// captured form capturedTyp — both the CHECKER's types, compared before
+// remapCapturedBaseToIR renames a generic receiver's base to IR-gen's
+// instantiated struct (after which the checker's `Box[int]` no longer matches
+// the captured `*Box__bn_inst__int`, and every bridge would miss).
+func methodValueBridge(recvTyp @types.Type, capturedTyp @types.Type) int {
+	if recvTyp == nil || capturedTyp == nil { return MVBRIDGE_OTHER }
+	if recvTyp.Identical(capturedTyp) { return MVBRIDGE_SAME }
+	if capturedTyp.Kind == types.TYP_POINTER && capturedTyp.Elem != nil &&
 			recvTyp.Identical(capturedTyp.Elem) {
+		return MVBRIDGE_ADDR
+	}
+	// The pointer arms classify the receiver expression's type through every
+	// wrapper: a `readonly *F` / `readonly @F` handle or an alias `type PF = *F`
+	// is still a pointer, so a value-receiver method value loads through it.
+	var prt @types.Type = types.StripWrappers(recvTyp)
+	if prt == nil || prt.Elem == nil { return MVBRIDGE_OTHER }
+	if (prt.Kind == types.TYP_POINTER || prt.Kind == types.TYP_MANAGED_PTR) &&
+			prt.Elem.Identical(capturedTyp) {
+		return MVBRIDGE_LOAD
+	}
+	if capturedTyp.Kind == types.TYP_POINTER && prt.Kind == types.TYP_MANAGED_PTR &&
+			capturedTyp.Elem != nil && prt.Elem.Identical(capturedTyp.Elem) {
+		return MVBRIDGE_BITCAST
+	}
+	return MVBRIDGE_OTHER
+}
+
+// genCapturedRecv evaluates the receiver expression `xExpr` and converts it to
+// capturedTyp, the captured form the closure struct's `recv` field holds (IR
+// types), as `bridge` (methodValueBridge) directs:
+//   - MVBRIDGE_SAME / MVBRIDGE_OTHER: the value as evaluated;
+//   - MVBRIDGE_ADDR: the receiver's address — an EXPR_IDENT's alloca'd slot IS
+//     its *T address, and any other receiver reaching here is addressable
+//     (genMethodValue captures a non-addressable one by value), its address
+//     taken as a method call's receiver's is (genReceiverAddr);
+//   - MVBRIDGE_LOAD: a copy loaded through the pointer;
+//   - MVBRIDGE_BITCAST: the managed pointer reinterpreted as a raw one; the @T's
+//     refcount is unaffected (raw doesn't refcount), so the captured raw
+//     pointer's lifetime piggy-backs on the @T variable that produced it.
+func genCapturedRecv(ctx @GenContext, b @ir.Block, xExpr @ast.Expr, bridge int,
+		capturedTyp @types.Type) @ir.Instr {
+	if bridge == MVBRIDGE_ADDR {
 		if xExpr.Kind == ast.EXPR_IDENT {
 			var slot @ir.Instr = lookupVar(ctx, xExpr.Name)
 			if slot != nil {
-				// The alloca's runtime value IS the *T pointer, and the
-				// alloca's own Typ is already MakePointerType(T) == *T ==
-				// capturedTyp, so the slot instr already carries the right
-				// type for the EmitStore into the closure struct.  Return it
-				// directly: cloning it into a second @Instr that ALIASES its
-				// SSA id (`ptr.ID = slot.ID`) would put two distinct instrs on
-				// one id, which breaks any identity/id-keyed SSA analysis (e.g.
-				// SROA's escape check would miss that the slot escapes into the
-				// closure).
+				// The alloca's runtime value IS the *T pointer.  Return it directly:
+				// cloning it into a second @Instr that ALIASES its SSA id would put
+				// two distinct instrs on one id, which breaks any identity/id-keyed
+				// SSA analysis (e.g. SROA's escape check would miss that the slot
+				// escapes into the closure).
 				return slot
 			}
 		}
+		var addr @ir.Instr = genReceiverAddr(ctx, b, xExpr)
+		if addr == nil {
+			panic("internal error: method-value receiver with no address in IR-gen (compiler bug)")
+		}
+		return addr
 	}
-	// The two pointer arms classify the receiver expression's type through
-	// every wrapper: a `readonly *F` / `readonly @F` handle or an alias `type
-	// PF = *F` is still a pointer, so a value-receiver method value must load
-	// through it (unpeeled, the pointer itself was captured as the value).
-	var prt @types.Type = types.StripWrappers(recvTyp)
-	// *T → T / @T → T: load through the pointer.  e.X is
-	// pointer-typed; deref produces the value.
-	if capturedTyp != nil && prt != nil &&
-			(prt.Kind == types.TYP_POINTER || prt.Kind == types.TYP_MANAGED_PTR) && prt.Elem != nil &&
-			prt.Elem.Identical(capturedTyp) {
+	if bridge == MVBRIDGE_LOAD {
 		var ptrVal @ir.Instr = genExpr(ctx, b, xExpr)
 		// Re-sync: an assert receiver (`a.(*T).Method`) splits the block in genExpr.
 		b = ctx.CurBlock
 		return irbuild.EmitLoad(b, ptrVal, capturedTyp)
 	}
-	// @T → *T: bitcast managed-ptr to raw pointer.  Same
-	// underlying address; the captured raw pointer doesn't
-	// participate in refcounting.
-	if capturedTyp != nil && capturedTyp.Kind == types.TYP_POINTER && prt != nil &&
-			prt.Kind == types.TYP_MANAGED_PTR && prt.Elem != nil && capturedTyp.Elem != nil &&
-			prt.Elem.Identical(capturedTyp.Elem) {
+	if bridge == MVBRIDGE_BITCAST {
 		var mptr @ir.Instr = genExpr(ctx, b, xExpr)
 		// Re-sync: an assert receiver (`a.(@T).Method`) splits the block in genExpr.
 		b = ctx.CurBlock
 		return irbuild.EmitBitCast(b, mptr, capturedTyp)
 	}
-	// Unrecognised: fall back to plain genExpr.  Downstream type
-	// mismatch is the user's signal that the shape isn't yet
-	// supported.
 	return genExpr(ctx, b, xExpr)
 }
 

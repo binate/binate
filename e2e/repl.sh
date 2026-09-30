@@ -260,6 +260,40 @@ func MkS(n int) S { return S{v: n} }
 EOF
 done
 
+# ----- A generic type with a generic-receiver impl of pkg/gbase's generic
+# interface: boxing an instantiation at the prompt mints its impl row on the
+# session module. ---
+mkdir -p "$TMP/pkg/gcur"
+cat > "$TMP/pkg/gcur.bni" <<'EOF'
+package "pkg/gcur"
+
+import "pkg/gbase"
+
+type Cursor[T any] struct { v T }
+
+func (c *Cursor[T]) Get() T { return c.v }
+
+impl *Cursor[T] : gbase.Base[T]
+
+func MkInt(n int) Cursor[int]
+EOF
+cat > "$TMP/pkg/gcur/gcur.bn" <<'EOF'
+package "pkg/gcur"
+
+func MkInt(n int) Cursor[int] { return Cursor[int]{v: n} }
+EOF
+
+# ----- A package exporting a generic function (its body in the .bni). ---
+mkdir -p "$TMP/pkg/gfn"
+cat > "$TMP/pkg/gfn.bni" <<'EOF'
+package "pkg/gfn"
+
+func Pick[T any](x T) T { return x }
+EOF
+cat > "$TMP/pkg/gfn/gfn.bn" <<'EOF'
+package "pkg/gfn"
+EOF
+
 # ----- A package that fails type-checking (its interface names an undefined
 # generic parent) next to a clean dependency (pkg/gbase) that is lowered. ---
 mkdir -p "$TMP/pkg/gbad"
@@ -847,6 +881,30 @@ testing.Println(helper(7))
 # the free-func replace path, keyed on the qualified
 # <pkg>.<TypeName>.<Method> name.  Subsequent calls hit the new
 # body. ---
+# --- A function literal in a prompt function: the function's body is
+# the last function generating it appends (after the literal), and both
+# are lowered. ---
+run_repl "tier2-func-literal-in-prompt-func" \
+"func k() int { var f @func(int) int = func(x int) int { return x + 1 }; return f(5) }
+testing.Println(k())
+" \
+"$BANNER
+> > 6
+> "
+
+# --- A redefinition with a different signature shadows the old one; a
+# function literal in it that calls the function calls the NEW one (it is
+# lowered after the shadow re-points the name). ---
+run_repl "tier4-shadow-literal-calls-new" \
+"func k() int { return 7 }
+func k(n int) int { var f @func(int) int = func(x int) int { if x <= 0 { return 100 }; return k(x - 1) }; return f(n) }
+testing.Println(k(3))
+" \
+"$BANNER
+> > warning: k shadowed (incompatible signature); existing callers retain old definition
+> 100
+> "
+
 run_repl "tier4-method-redef-replace" \
 "type Counter struct { n int }
 func (c *Counter) Inc() { c.n = c.n + 1 }
@@ -1290,6 +1348,53 @@ testing.Println(sub.Extra())
 > package pkg/gsub loaded
 > > > 7
 > 8
+> "
+
+# --- Boxing an imported generic type's instantiation into the generic
+# interface its generic-receiver impl satisfies: the impl row IR-gen mints
+# at the box, and the instantiated method, reach the VM before the prompt
+# runs (not "interface vtable not found" / "interface method slot is
+# empty"). ---
+run_repl "tier5-box-generic-receiver-impl-instantiation" \
+"import \"pkg/gcur\"
+import \"pkg/gbase\"
+var c gcur.Cursor[int] = gcur.MkInt(5)
+var bb *gbase.Base[int] = &c
+testing.Println(bb.Get())
+" \
+"$BANNER
+> package pkg/gcur loaded
+> package pkg/gbase loaded
+> > > 5
+> "
+
+# --- Functions IR-gen appends while generating a prompt entry are lowered
+# with it: a generic type's instantiated method used in a prompt function,
+# and an imported generic function called from a statement, a function
+# and a variable initializer (each panicked "extern not found"). ---
+run_repl "tier5-generic-instantiation-in-prompt-func" \
+"import \"pkg/gcur\"
+func f() int { var c gcur.Cursor[int] = gcur.MkInt(3); return c.Get() }
+testing.Println(f())
+" \
+"$BANNER
+> package pkg/gcur loaded
+> > 3
+> "
+
+run_repl "tier5-imported-generic-func-at-prompt" \
+"import \"pkg/gfn\"
+testing.Println(gfn.Pick[int](6))
+func q() int { return gfn.Pick[int](7) }
+testing.Println(q())
+var z int = gfn.Pick[int](8)
+testing.Println(z)
+" \
+"$BANNER
+> package pkg/gfn loaded
+> 6
+> > 7
+> > 8
 > "
 
 run_repl "tier5-mid-session-indirect-generic-parent-forwarder" \

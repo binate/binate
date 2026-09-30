@@ -1707,7 +1707,7 @@ testing.Println(g.Get())
 > > > > > > > > 9
 > "
 
-# --- Case 53: an impl missing a method is rejected; a type or an
+# --- Case 53: an impl missing a method parks on it; a type or an
 # interface is not redefined, and no declaration of another kind takes its
 # name (the checker's and IR-gen's registries identify them by name). ---
 run_repl "tier4-interface-rejections" \
@@ -1722,7 +1722,7 @@ var Crate int
 func Sizer() {}
 " \
 "$BANNER
-> > > <repl>:1:1: type Crate does not implement Sizer (missing method \`Size\`)
+> > > impl *Crate : Sizer parked (pending: Crate.Size)
 > <repl>:1:1: cannot redefine interface Sizer
 > <repl>:1:1: cannot redefine interface Sizer as a type
 > <repl>:1:1: cannot redefine type Crate as an interface
@@ -1731,7 +1731,169 @@ func Sizer() {}
 > <repl>:1:1: cannot redefine interface Sizer as a function
 > "
 
-# --- Case 54: an impl at the prompt on value receivers of a named scalar,
+# --- Case 54: an impl whose type lacks a method parks on it (`C.Size`); a
+# conversion needing the impl parks on the impl (`C:Sizer`); declaring the
+# method resolves both. ---
+run_repl "tier3-impl-parks-on-method" \
+"interface Sizer { Size() int }
+type C struct { n int }
+impl *C : Sizer
+var c C
+c.n = 4
+var s *Sizer = &c
+func (c *C) Size() int { return c.n }
+var s2 *Sizer = &c
+testing.Println(s2.Size())
+" \
+"$BANNER
+> > > impl *C : Sizer parked (pending: C.Size)
+> > > variable s parked (pending: C:Sizer)
+> impl *C : Sizer resolved
+variable s resolved
+> > 4
+> "
+
+# --- Case 55: functions converting to an interface and to its parent
+# wait on an impl; an impl of the child interface resolves both. ---
+run_repl "tier3-conversion-waits-on-impl-of-child" \
+"interface P { A() int }
+interface Q : P { B() int }
+type D struct { n int }
+func asP(d *D) *P { return d }
+func asQ(d *D) *Q { return d }
+func (d *D) A() int { return d.n }
+func (d *D) B() int { return d.n + 1 }
+impl *D : Q
+var dd D
+dd.n = 10
+testing.Println(asP(&dd).A(), asQ(&dd).B())
+" \
+"$BANNER
+> > > > function asP parked (pending: D:P)
+> function asQ parked (pending: D:Q)
+> > > function asP resolved
+function asQ resolved
+> > > 10 11
+> "
+
+# --- Case 56: an impl waiting on a method, and the method converting its
+# receiver to the impl's interface, resolve together. ---
+run_repl "tier3-impl-and-method-resolve-together" \
+"interface Sizer { Size() int }
+type E struct { n int }
+impl *E : Sizer
+func (e *E) Size() int { var s *Sizer = e; _ = s; return e.n }
+var ee E
+ee.n = 3
+var se *Sizer = &ee
+testing.Println(se.Size())
+" \
+"$BANNER
+> > > impl *E : Sizer parked (pending: E.Size)
+> method E.Size parked (pending: E:Sizer)
+impl *E : Sizer resolved
+method E.Size resolved
+> > > > 3
+> "
+
+# --- Case 57: an impl and a method that boxes its receiver into the
+# impl's interface and dispatches through it resolve together: the impl's
+# row is registered before the method is generated. ---
+run_repl "tier3-impl-group-boxes-in-method" \
+"interface I { M() int; N() int }
+type K struct { n int }
+func (k *K) N() int { return k.n }
+impl *K : I
+func (k *K) M() int { var i *I = k; return i.N() + 100 }
+var k K
+k.n = 5
+testing.Println(k.M())
+var j *I = &k
+testing.Println(j.M())
+" \
+"$BANNER
+> > > > impl *K : I parked (pending: K.M)
+> method K.M parked (pending: K:I)
+impl *K : I resolved
+method K.M resolved
+> > > 105
+> > 105
+> "
+
+# --- Case 58: an interface whose method returns an alias of a struct that
+# points back at the interface: the three resolve together, the alias
+# registered before the interface's method set. ---
+run_repl "tier3-interface-alias-struct-group" \
+"interface I { M() SV }
+type SV = S
+type S struct { i *I; a int; b int; c int }
+type K struct { n int }
+func (k *K) M() SV { var s S; s.a = k.n; s.b = 2; s.c = 3; return s }
+impl *K : I
+var k K
+k.n = 12
+var ii *I = &k
+var r SV = ii.M()
+testing.Println(r.a, r.b, r.c)
+" \
+"$BANNER
+> interface I parked (pending: SV)
+> type SV parked (pending: S)
+> type S parked (pending: I)
+interface I resolved
+type SV resolved
+type S resolved
+> > > > > > > > 12 2 3
+> "
+
+# --- Case 59: an impl of an imported interface does not stand for an
+# impl of the session's interface of the same name. ---
+run_repl "tier3-impl-keys-by-package" \
+"import \"pkg/builtins/lang\"
+interface Stringer { String() @[]char }
+type Q struct { n int }
+func asMine(q *Q) *Stringer { return q }
+impl *Q : lang.Stringer
+func (q *Q) String() @[]char { return \"q\" }
+impl *Q : Stringer
+var q Q
+testing.Println(asMine(&q).String())
+" \
+"$BANNER
+> package pkg/builtins/lang loaded
+> > > function asMine parked (pending: Q:Stringer)
+> impl *Q : lang.Stringer parked (pending: Q.String)
+> impl *Q : lang.Stringer resolved
+> function asMine resolved
+> > q
+> "
+
+# --- Case 60: an impl of a parent interface does not replace a parked
+# impl of a child interface; both resolve. ---
+run_repl "tier3-impl-of-parent-keeps-child-impl" \
+"interface A { M() int }
+interface B : A { N() int }
+type Crate struct { n int }
+impl *Crate : B
+func asB(b *Crate) *B { return b }
+impl *Crate : A
+func (b *Crate) M() int { return b.n }
+func (b *Crate) N() int { return b.n + 1 }
+var bb Crate
+bb.n = 1
+testing.Println(asB(&bb).N())
+" \
+"$BANNER
+> > > > impl *Crate : B parked (pending: Crate.M, Crate.N)
+> function asB parked (pending: Crate:B)
+> impl *Crate : A parked (pending: Crate.M)
+> impl *Crate : A resolved
+> impl *Crate : B resolved
+function asB resolved
+> > > 2
+> "
+
+# --- Case 61: an impl at the prompt on value receivers of a named scalar,
 # a struct and a named bool: dispatch goes through the receiver thunk
 # (the interface value holds the data by pointer). ---
 run_repl "tier2-impl-scalar-value-receivers" \
@@ -1763,7 +1925,7 @@ testing.Println(sf.Size())
 > > > > > > 1
 > "
 
-# --- Case 55: a value receiver with a managed field: dispatch through the
+# --- Case 62: a value receiver with a managed field: dispatch through the
 # thunk copies the value properly, so the field's refcount holds. ---
 run_repl "tier2-impl-value-receiver-managed-fields" \
 "import \"pkg/builtins/rt\"
@@ -1788,7 +1950,7 @@ testing.Println(s.Size(), rt.Refcount(ptr))
 > 3 2
 > "
 
-# --- Case 56: a method shadowed after its impl, before any value is boxed:
+# --- Case 63: a method shadowed after its impl, before any value is boxed:
 # the impl's vtable was built when the impl was declared, so it keeps the
 # method it was declared with. ---
 run_repl "tier4-shadow-before-first-box" \
@@ -1807,7 +1969,7 @@ testing.Println(s.Size())
 > > > > 4
 > "
 
-# --- Case 57: an impl at the prompt of an interface alias whose target
+# --- Case 64: an impl at the prompt of an interface alias whose target
 # extends a parent, and of an imported interface: dispatch through the
 # child, the parent, and the imported interface. ---
 run_repl "tier2-impl-parent-alias-imported-interfaces" \

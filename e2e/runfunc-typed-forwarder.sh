@@ -112,7 +112,7 @@ func main() {
 	var f @ast.File = p.ParseFile()
 	var perrs @[]parser.ParseError = p.Errors()
 	if len(perrs) > 0 {
-		for i := 0; i < len(perrs); i++ { testing.Println(perrs[i].Msg) }
+		for i := 0; i < len(perrs); i++ { testing.Println(parser.FormatParseError(perrs[i])) }
 		os.Exit(1)
 	}
 	var files @[]@ast.File = make_slice(@ast.File, 1)

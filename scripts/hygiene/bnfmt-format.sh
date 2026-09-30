@@ -132,9 +132,10 @@ if [ "$status" -eq 0 ]; then
 fi
 
 # Non-zero exit: at least one file is unformatted or unparseable.  Every stderr
-# line is `<path>: <reason>`; the path is the text before the first `: ` (in-tree
-# paths contain no colon).  Dedup -- a parse error can emit several lines per file.
-unformatted="$(sed 's/: .*//' "$errfile" | LC_ALL=C sort -u | sed '/^$/d')"
+# line is `<path>: <reason>`, or `<path>:<line>:<col>: <reason>` for a parse error;
+# the path is the text before the first `: ` (in-tree paths contain no colon) less
+# any `:<line>:<col>`.  Dedup -- a parse error can emit several lines per file.
+unformatted="$(sed -e 's/: .*//' -e 's/:[0-9][0-9]*:[0-9][0-9]*$//' "$errfile" | LC_ALL=C sort -u | sed '/^$/d')"
 
 if [ -z "$unformatted" ]; then
 	# Non-zero exit but no `<path>:` lines to parse: an unexpected bnfmt failure.

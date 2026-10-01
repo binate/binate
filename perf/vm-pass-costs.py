@@ -63,7 +63,7 @@ BINATE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Pipeline order (iropt PASS_*); `bnc --list-opt-passes` prints the same list.
 PASSES = ["inline", "sroa", "mem2reg", "dead-phi", "load-fwd", "field-load-fwd",
-          "simplify", "div-check-elim", "bce-const", "bce-loop", "bce-redundant",
+          "dead-slot", "simplify", "div-check-elim", "bce-const", "bce-loop", "bce-redundant",
           "licm", "fuse-madd", "sink-extract"]
 
 # name -> (argument, VM-sized input).  Sized to run ~1-4 s with no pass.

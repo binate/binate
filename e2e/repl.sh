@@ -2048,6 +2048,28 @@ testing.Println(st.String())
 > > q
 > "
 
+# --- Case 67: a named type over a struct, declared at the prompt and boxed
+# into a user interface and into @any: dropping the box releases the
+# struct's managed field (its slot-0 destructor is the struct's). ---
+run_repl "tier3-named-struct-box-releases-fields" \
+"import \"pkg/builtins/rt\"
+interface Sizer { Size() int }
+type Inner struct { v int }
+type S struct { p @Inner }
+type S2 S
+func (s *S2) Size() int { return s.p.v }
+impl *S2 : Sizer
+var inr @Inner = make(Inner)
+var before int = rt.Refcount(bit_cast(*uint8, inr))
+func boxIt() { var b @S2 = make(S2); b.p = inr; var s @Sizer = b; _ = s; var a @any = b; _ = a }
+boxIt()
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
+" \
+"$BANNER
+> package pkg/builtins/rt loaded
+> > > > > > > > > > > 0
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # (Stage 2) as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

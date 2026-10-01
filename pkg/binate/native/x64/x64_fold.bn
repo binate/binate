@@ -83,12 +83,42 @@ func x64LogicImm(user @ir.Instr, argIdx int) (int64, int, bool, bool) {
 	return v, opSz, user.Op == iropcode.OP_XOR && v == allOnes, true
 }
 
+// x64MulImm returns (imm, opSz, shiftForm, true) iff operand argIdx of `user` is
+// a constant in a multiply-immediate position (fold.MulImmOperand) that the x64
+// multiply carries.  opSz is the width emitBinop's register path runs the
+// multiply at (intOpSizeX64).  shiftForm is true for a multiplier
+// emitConstMulX64 strength-reduces (0, ±1, ±2^k), which needs no immediate, so
+// any such value fits and imm is the constant itself.  Every other multiplier
+// rides `imul r, r/m, imm`: a 32-bit op reads only the low 32 bits of the
+// multiplier, so at SZ32 any constant fits and imm is its low 32 bits as a signed
+// imm32 (the product mod 2^32 is the same); a 64-bit op sign-extends its imm32,
+// so at SZ64 only a value in x64ImmMin..x64ImmMax fits.  A sub-word result runs
+// at SZ64 and is re-narrowed, so its constant must fit that range.  Both
+// x64ImmFits and emitMulImmFoldX64 decide the fit here.
+func x64MulImm(user @ir.Instr, argIdx int) (int64, int, bool, bool) {
+	var v int64
+	var ok bool
+	v, ok = fold.MulImmOperand(user, argIdx, x64WordBytes)
+	var opSz int = intOpSizeX64(user.Typ)
+	if !ok { return v, opSz, false, false }
+	if constMulReducibleX64(v) { return v, opSz, true, true }
+	if opSz == x64.SZ32 {
+		var lo int64 = v & x64Low32Mask
+		if lo > x64ImmMax { lo = lo - x64Low32Mask - 1 }
+		return lo, opSz, false, true
+	}
+	if v < x64ImmMin || v > x64ImmMax { return v, opSz, false, false }
+	return v, opSz, false, true
+}
+
 // x64ImmFits is the x64 predicate for fold.ImmOperandConsts: operand argIdx of
 // `user` can ride an immediate iff it is a compare RHS (x64CmpImm) or an add/sub
 // operand (x64AddSubImm) that fits the sign-extended imm32, an and/or/xor
-// operand that fits that op's immediate at its width (x64LogicImm), or a shift
-// count in [0, width) (fold.ShiftImmOperand), which the imm8 of `shl`/`shr`/`sar`
-// always carries.  Every other operand position needs its value in a register.
+// operand that fits that op's immediate at its width (x64LogicImm), a multiplier
+// that `imul`'s immediate carries or that strength-reduces to a shift
+// (x64MulImm), or a shift count in [0, width) (fold.ShiftImmOperand), which the
+// imm8 of `shl`/`shr`/`sar` always carries.  Every other operand position needs
+// its value in a register.
 func x64ImmFits(user @ir.Instr, argIdx int) bool {
 	var ok bool
 	_, ok = x64CmpImm(user, argIdx)
@@ -96,6 +126,8 @@ func x64ImmFits(user @ir.Instr, argIdx int) bool {
 	_, ok = x64AddSubImm(user, argIdx)
 	if ok { return true }
 	_, _, _, ok = x64LogicImm(user, argIdx)
+	if ok { return true }
+	_, _, _, ok = x64MulImm(user, argIdx)
 	if ok { return true }
 	_, ok = fold.ShiftImmOperand(user, argIdx, x64WordBytes)
 	return ok
@@ -281,6 +313,59 @@ func emitShiftImmFoldX64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) boo
 	return true
 }
 
+// emitMulImmFoldX64 lowers an OP_MUL with a FoldedImm constant operand.  A
+// multiplier emitConstMulX64 strength-reduces (0, ±1, ±2^k) becomes that move /
+// negate / shift of the other operand; any other rides the three-operand
+// `imul rd, reg, imm`, which needs no copy of the register operand first.  The
+// constant may be either operand (multiplication is commutative).  Width and the
+// sub-word re-narrow mirror emitBinop's register path: the multiply runs at
+// x64MulImm's opSz (SZ32 self-clears the top half, so its narrow is skipped),
+// while the strength-reduced form works in the 64-bit register and keeps the
+// narrow, as the register path's constant multiply does.
+//
+// The fit is re-verified with x64MulImm, the check x64ImmFits applied: a folded
+// constant that does not fit records an error and emits nothing, since the
+// constant was never materialized.  Returns false when neither operand is a
+// folded constant, leaving emitBinop's register path to run; true once the
+// instruction is handled, including when an error was recorded.
+func emitMulImmFoldX64(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) bool {
+	if ins.Op != iropcode.OP_MUL || len(ins.Args) != 2 { return false }
+	var c0 bool = isFoldedImmX64(rm, ins.Args[0])
+	var c1 bool = isFoldedImmX64(rm, ins.Args[1])
+	if !c0 && !c1 { return false }
+
+	var ci int = 1
+	if !c1 { ci = 0 }
+	var imm int64
+	var opSz int
+	var shiftForm bool
+	var ok bool
+	imm, opSz, shiftForm, ok = x64MulImm(ins, ci)
+	if !ok {
+		a.SetError("native amd64: folded immediate does not fit its multiply operand")
+		return true
+	}
+	var reg int = getOperand(a, rm, ins.Args[1 - ci].ID)
+	if reg < 0 {
+		a.SetError("native amd64: multiply with a folded immediate has no register operand")
+		return true
+	}
+
+	var rd int = nextReg(rm, ins.ID)
+	var rdOp x64.Operand = x64.Reg(rd, opSz)
+	if shiftForm {
+		if rd != reg { x64.Mov(a, rdOp, x64.Reg(reg, opSz)) }
+		emitConstMulX64(a, rd, imm)
+		emitSubWordNarrow(a, rd, ins.Typ)
+		return true
+	}
+	x64.Imul3(a, rdOp, x64.Reg(reg, opSz), cast(int, imm))
+	if opSz != x64.SZ32 {
+		emitSubWordNarrow(a, rd, ins.Typ)
+	}
+	return true
+}
+
 // ============================================================
 // Fold-candidate marking
 // ============================================================
@@ -299,7 +384,8 @@ func markFoldCandidates(f @ir.Func, rm @common.RegMap) {
 	// Flag integer constants every use of which rides its user's immediate
 	// operand — a compare RHS (CMP's sign-extended imm32), an ADD/SUB operand (the
 	// ALU's sign-extended imm8/imm32) or an AND/OR/XOR operand (the ALU immediate
-	// at the op's width) or a shift count (the shift's imm8), per x64ImmFits.  A
+	// at the op's width), a multiplier (`imul`'s immediate, or a shift for a power
+	// of two) or a shift count (the shift's imm8), per x64ImmFits.  A
 	// negative compare RHS folds only into a signed compare (the imm32
 	// sign-extends).
 	rm.FoldedImm = fold.ImmOperandConsts(f, x64ImmFits)

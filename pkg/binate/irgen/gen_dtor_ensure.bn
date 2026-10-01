@@ -1,0 +1,183 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irbuild"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Destructor helpers the module's struct destructors and drops call: the managed-slice,
+// managed-pointer, func-value, interface-value and array destructors (each generated
+// once, recorded in `generated`), and extern declarations of another package's.
+
+// ensureMsDtor ensures a managed-slice dtor exists for the given type,
+// recursively generating dtors for nested managed-slice element types.
+func ensureMsDtor(m @ir.Module, msTyp @types.Type, generated @[]@[]char) @[]@[]char {
+	var name @[]char = irutil.DtorNameForType(msTyp)
+	if irutil.HasName(generated, name) { return generated }
+	// Recorded before the element's helpers are ensured: a type that reaches
+	// itself (`type Tree @[]Tree`) needs this helper as its own element's, and
+	// would otherwise recurse here forever; its body then calls itself by name.
+	generated = slices.Append[@[]char](generated, name)
+	// Ensure the element's dtor exists first — genManagedSliceDtor's body calls
+	// it (by its LOCAL name, via elemDtorName).  A managed-slice element recurses
+	// here; an ARRAY element needs ensureArrayDtor (mirrors ensureArrayDtor's own
+	// element recursion).  Without the array arm, `@[]([N]@T)` named a local
+	// __dtor_arrN_... it never emitted — clang "use of undefined value".  A
+	// struct element's dtor comes from the module-structs / pending-dtor pass,
+	// not from here.
+	// StripWrappers (not the raw .Elem): a NAMED-distinct transparent wrapper
+	// element (`type Buf @[]@T`) must be classified by its UNDERLYING kind, else
+	// the TYP_MANAGED_SLICE / TYP_ARRAY recursion below is skipped and the inner
+	// element helper is never emitted -- the outer body still calls it (by the
+	// wrapper's underlying name, since dtorNameForType peels NAMED), so the call
+	// references a symbol no pass produces (undefined value / VM extern not found).
+	// Mirrors the StripWrappers the struct field-walk already applies.
+	var elemTyp @types.Type = types.StripWrappers(msTyp.Elem)
+	if elemTyp != nil && elemTyp.Kind == types.TYP_MANAGED_SLICE {
+		generated = ensureMsDtor(m, elemTyp, generated)
+	}
+	// A `@(@[]T)` / `@(@T)` element (managed pointer to a managed value): ensure the
+	// pointee ms-/mp-dtor.
+	generated = ensureNestedMptrPointeeDtor(m, elemTyp, generated)
+	if elemTyp != nil && elemTyp.Kind == types.TYP_ARRAY && elemTyp.Elem != nil &&
+			elemTyp.Elem.NeedsDestruction() {
+		generated = ensureArrayDtor(m, elemTyp, generated)
+	}
+	var dtorFunc @ir.Func = genManagedSliceDtor(m.PkgPath, name, msTyp)
+	m.AddFunc(dtorFunc)
+	// A destruction-needing element needs the scalar-arg __dtor_ms_elems_<T> helper
+	// the by-address dtor above delegates to (and the SROA-shape inline cleanup calls);
+	// emit it alongside.  Distinct name (msElemsDtorName), so its own generated-set
+	// guard.
+	if elemTyp != nil && elemTyp.NeedsDestruction() {
+		var elemsName @[]char = irutil.MsElemsDtorName(msTyp)
+		if !irutil.HasName(generated, elemsName) {
+			m.AddFunc(genManagedSliceElemsDtor(m.PkgPath, elemsName, msTyp))
+			generated = slices.Append[@[]char](generated, elemsName)
+		}
+	}
+	return generated
+}
+
+// ensureMpDtor ensures a managed-POINTER dtor (`__dtor_mp_<T>`) exists for a `@T`
+// type, recursively ensuring the pointee's dtor first (a managed-slice pointee → its
+// ms-dtor, a managed-ptr pointee → recurse).  A struct pointee's dtor comes from the
+// module-structs pass.  Mirrors ensureMsDtor.
+func ensureMpDtor(m @ir.Module, mpTyp @types.Type, generated @[]@[]char) @[]@[]char {
+	var name @[]char = irutil.DtorNameForType(mpTyp)
+	if irutil.HasName(generated, name) { return generated }
+	// Recorded before the pointee's helpers are ensured (see ensureMsDtor).
+	generated = slices.Append[@[]char](generated, name)
+	var elemTyp @types.Type = types.StripWrappers(mpTyp.Elem)
+	if elemTyp != nil && elemTyp.Kind == types.TYP_MANAGED_SLICE {
+		generated = ensureMsDtor(m, elemTyp, generated)
+	}
+	if elemTyp != nil && elemTyp.Kind == types.TYP_MANAGED_PTR {
+		generated = ensureMpDtor(m, elemTyp, generated)
+	}
+	var dtorFunc @ir.Func = genManagedPtrDtor(m.PkgPath, name, mpTyp)
+	m.AddFunc(dtorFunc)
+	return generated
+}
+
+// ensureNestedMptrPointeeDtor ensures the pointee dtor for a managed-pointer-to-
+// managed-value type — `@(@[]T)` (→ the pointee ms-dtor), `@(@T)` (→ the pointee
+// mp-dtor), or `@([N]@Node)` (→ the pointee array-dtor).  The drop of such a
+// field/element goes through emitManagedPtrRefDec, whose dtor reference a synthesized
+// (module-less) dtor body can't register at emit time, so the emission passes ensure
+// it here.  No-op for any other type.
+func ensureNestedMptrPointeeDtor(m @ir.Module, t @types.Type, generated @[]@[]char) @[]@[]char {
+	if t == nil || t.Kind != types.TYP_MANAGED_PTR || t.Elem == nil { return generated }
+	var pointee @types.Type = types.StripWrappers(t.Elem)
+	if pointee == nil { return generated }
+	if pointee.Kind == types.TYP_MANAGED_SLICE {
+		return ensureMsDtor(m, pointee, generated)
+	}
+	if pointee.Kind == types.TYP_MANAGED_PTR {
+		return ensureMpDtor(m, pointee, generated)
+	}
+	if pointee.Kind == types.TYP_ARRAY && pointee.Elem != nil && pointee.Elem.NeedsDestruction() {
+		return ensureArrayDtor(m, pointee, generated)
+	}
+	if pointee.Kind == types.TYP_MANAGED_FUNC_VALUE {
+		return ensureFuncValueDtor(m, generated)
+	}
+	if pointee.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		return ensureIfaceValueDtor(m, generated)
+	}
+	return generated
+}
+
+// ensureFuncValueDtor emits the single signature-independent `__dtor_func` managed-
+// func-value dtor if the module needs it and it isn't already generated.  Called for
+// a `@(@func())` pointee (ensureNestedMptrPointeeDtor) and drained from the
+// NeedsFuncValueDtor flag.  One canonical `@func()` load type serves every signature.
+func ensureFuncValueDtor(m @ir.Module, generated @[]@[]char) @[]@[]char {
+	var noParams @[]@types.Param
+	var noResults @[]@types.Type
+	var fvTyp @types.Type = types.MakeManagedFuncValueType(noParams, noResults)
+	var name @[]char = irutil.DtorNameForType(fvTyp)
+	if irutil.HasName(generated, name) { return generated }
+	var dtorFunc @ir.Func = genManagedFuncValueDtor(m.PkgPath, name, fvTyp)
+	m.AddFunc(dtorFunc)
+	generated = slices.Append[@[]char](generated, name)
+	return generated
+}
+
+// ensureIfaceValueDtor emits the single interface-independent `__dtor_interface`
+// managed-iface-value dtor if the module needs it and it isn't already generated.
+// Called for a `@(@I)` pointee (ensureNestedMptrPointeeDtor) and drained from the
+// NeedsIfaceValueDtor flag.  A canonical iface-value load type serves every interface
+// (the receiver dtor is fetched from the value's own vtable at runtime).
+func ensureIfaceValueDtor(m @ir.Module, generated @[]@[]char) @[]@[]char {
+	var ivTyp @types.Type = types.MakeManagedInterfaceValueType(
+			types.MakeInterfaceType("", "any"))
+	var name @[]char = irutil.DtorNameForType(ivTyp)
+	if irutil.HasName(generated, name) { return generated }
+	var dtorFunc @ir.Func = genManagedIfaceValueDtor(m.PkgPath, name, ivTyp)
+	m.AddFunc(dtorFunc)
+	generated = slices.Append[@[]char](generated, name)
+	return generated
+}
+
+// ensureArrayDtor ensures an array dtor exists for the given type.
+func ensureArrayDtor(m @ir.Module, arrTyp @types.Type, generated @[]@[]char) @[]@[]char {
+	var name @[]char = irutil.DtorNameForType(arrTyp)
+	if irutil.HasName(generated, name) { return generated }
+	// Recorded before the element's helpers are ensured (see ensureMsDtor).
+	generated = slices.Append[@[]char](generated, name)
+	// If element type needs a dtor too (nested array, managed-slice, etc.), ensure
+	// it.  StripWrappers (not the raw .Elem) so a NAMED-distinct wrapper element
+	// is classified by its underlying kind and the recursion is not skipped -- see
+	// ensureMsDtor's element-peel note.
+	var elemTyp @types.Type = types.StripWrappers(arrTyp.Elem)
+	if elemTyp != nil {
+		if elemTyp.Kind == types.TYP_MANAGED_SLICE {
+			generated = ensureMsDtor(m, elemTyp, generated)
+		}
+		// A `@(@[]T)` / `@(@T)` element (see ensureMsDtor's note): ensure the pointee.
+		generated = ensureNestedMptrPointeeDtor(m, elemTyp, generated)
+		if elemTyp.Kind == types.TYP_ARRAY && elemTyp.Elem.NeedsDestruction() {
+			generated = ensureArrayDtor(m, elemTyp, generated)
+		}
+	}
+	var dtorFunc @ir.Func = genArrayDtor(m.PkgPath, name, arrTyp)
+	m.AddFunc(dtorFunc)
+	return generated
+}
+
+// declareExternDtor adds an extern function declaration for a cross-package dtor.
+func declareExternDtor(m @ir.Module, name @[]char) {
+	var ptrParam @ir.Param = make(ir.Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@ir.Param = make_slice(@ir.Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+	var ef @ir.Func = irbuild.NewExternFunc(m.PkgPath, name, params, noResults)
+	m.AddFunc(ef)
+}

@@ -96,7 +96,7 @@ func Wrapped() @[]readonly char {
 }
 EOF
 
-# ---- custom host: load a whole program, then RunFuncTyped the fixture funcs ----
+# ---- custom host: load a whole program, Init, then RunFuncTyped the fixture funcs ----
 # The inject-set is the default StandardPackages() (the pkg/std packages), so
 # pkg/std/errors runs as its native compiled instance.  The embedded program
 # imports pkg/errtest (which imports errors); the host then RunFuncTyped's the
@@ -148,6 +148,11 @@ func main() {
 	var loadErrs @[]@[]char = it.LoadProgram(files)
 	if len(loadErrs) > 0 {
 		for i := 0; i < len(loadErrs); i++ { testing.Println(loadErrs[i]) }
+		os.Exit(1)
+	}
+	var initErrs @[]@[]char = it.Init()
+	if len(initErrs) > 0 {
+		for i := 0; i < len(initErrs); i++ { testing.Println(initErrs[i]) }
 		os.Exit(1)
 	}
 

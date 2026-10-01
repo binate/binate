@@ -18,7 +18,8 @@ import "pkg/std/containers/vec"
 
 // Interp is an embeddable whole-program interpreter: a VM plus a loader, set up
 // once via New, configured with search paths, then driven with LoadProgram +
-// RunMain / RunFunc.  All state lives on the struct (no process-globals), so
+// RunMain, or with LoadProgram / LoadCallable + Init + RunFunc / RunFuncTyped.
+// All state lives on the struct (no process-globals), so
 // multiple @Interp instances run independently in one process (the inc-5 / 5d-4
 // reentrancy work makes this sound at the loader / types / ir / vm layers).
 // Errors are returned as values; nothing here calls os.Exit — the host decides.
@@ -48,6 +49,16 @@ type Interp struct {
 	// (IR byte-identical to pre-feature).  LoadProgram copies it onto every gen
 	// context it creates.
 	EmitNilChecks bool
+	// Initialized records that the loaded packages' initializers have run (Init,
+	// or the Init RunMain does), so Init runs them at most once — the interpreted
+	// counterpart of compiled bn_init's run-once guard.  Reinit runs them again.
+	Initialized bool
+	// InitFault is the message of a recoverable fault the last run of the
+	// initializers stopped on (empty if it completed).  While it is set the
+	// packages are only partly initialized, so Init keeps reporting it and
+	// RunMain / RunFunc / RunFuncTyped refuse to call into them; a Reinit that
+	// completes clears it.
+	InitFault @[]char
 }
 
 // New creates an interpreter with a stackSize-byte VM and a loader gated by the
@@ -241,7 +252,6 @@ func (it @Interp) LoadProgram(files @[]@ast.File) @[]@[]char {
 				"error: no main function (a program must define func main in package main)")
 	}
 	irbuild.EmitInitDispatcher(mainMod, initPkgNames.Items())
-	irbuild.EmitMainEntry(mainMod)
 	it.Vm.LowerModule(mainMod)
 
 	var noErrs @[]@[]char
@@ -255,9 +265,9 @@ func (it @Interp) LoadProgram(files @[]@ast.File) @[]@[]char {
 // lookup-able scope (TypecheckDriver → CheckPackage) rather than as a main program, and
 // requires no `main` package/func and emits no entry — the package is a library the host
 // drives.  Returns load / type-check errors (empty = ok); on a non-empty result the VM is
-// left partially populated and the caller should not call it.  (Spike limitation: the
-// driver package's own top-level `var` initializers are not run, so a driver must not rely
-// on package-level state.)
+// left partially populated and the caller should not call it.  Call Init before calling
+// into the package: it runs the top-level `var` initializers of the driver and of every
+// dependency lowered here.
 func (it @Interp) LoadCallable(files @[]@ast.File, pkgPath @[]char) @[]@[]char {
 	var merged @ast.File
 	var built @[]@ast.File
@@ -283,8 +293,8 @@ func (it @Interp) LoadCallable(files @[]@ast.File, pkgPath @[]char) @[]@[]char {
 	// Lower every loaded dependency except those hosted in the compiled system (the
 	// substrate + this interpreter's inject-set), which run as injected instances.
 	// Collect each lowered package's init (its top-level `var` initializers) in dependency
-	// order for the dispatcher below — RunFuncTyped runs `main.__init_all` before a call,
-	// and a driver (or a dependency it calls) may read a package global.  (Injected
+	// order for the dispatcher below — Init runs `main.__init_all`, and a driver (or a
+	// dependency it calls) may read a package global.  (Injected
 	// packages are host-initialized, so they neither lower nor init here.)
 	var initPkgNames @vec.Vec[@[]char] = vec.New[@[]char]()
 	for i := 0; i < len(it.Ldr.Order); i++ {
@@ -324,10 +334,9 @@ func (it @Interp) LoadCallable(files @[]@ast.File, pkgPath @[]char) @[]@[]char {
 
 	// Emit a `main.__init_all` dispatcher that runs every lowered package's init (deps,
 	// then the driver) in order — the callable analogue of LoadProgram's dispatcher.
-	// RunFuncTyped looks it up by that fixed name before calling into the driver, so
-	// without this a driver whose deps have top-level var initializers would see them
-	// zero-valued.  Named "main" only because that is the name RunFuncTyped keys on; there
-	// is no actual main package on this path.
+	// Init runs it by that fixed name, so without this a driver whose deps have top-level
+	// var initializers would see them zero-valued.  Named "main" only because that is the
+	// name Init keys on; there is no actual main package on this path.
 	var initMod @ir.Module = irgen.InitModule("\"main\"")
 	initMod.PkgPath = "main"
 	initMod.Checker = checker
@@ -338,19 +347,22 @@ func (it @Interp) LoadCallable(files @[]@ast.File, pkgPath @[]char) @[]@[]char {
 	return noErrs
 }
 
-// RunMain runs the loaded program's entry sequence — `main.__entry`, which
-// runs the package-init dispatcher and then calls main.main — returning its
-// result code.  Errors are returned as values (empty = ok); a missing
-// main.__entry (LoadProgram not run, or no main) is reported rather than
-// crashing.
+// RunMain runs the loaded program: Init (a no-op if the host already ran it),
+// then main.main, returning its result code.  Errors are returned as values
+// (empty = ok); a missing main.main (LoadProgram not run, or no main) is
+// reported rather than crashing, and so is a fault in an initializer.
 func (it @Interp) RunMain() (int, @[]@[]char) {
-	if it.Vm.LookupFunc("main.__entry") < 0 {
+	if it.Vm.LookupFunc("main.main") < 0 {
 		var e @[]@[]char
-		e = appendCharSlice(e, "interp: main.__entry not found (LoadProgram not run, or no main package)")
+		e = appendCharSlice(e, "interp: main.main not found (LoadProgram not run, or no main package)")
 		return 0, e
 	}
+	var initErrs @[]@[]char = it.Init()
+	if len(initErrs) > 0 {
+		return 0, initErrs
+	}
 	var noArgs @[]int
-	var rc int = it.Vm.CallFunc("main.__entry", noArgs)
+	var rc int = it.Vm.CallFunc("main.main", noArgs)
 	if it.Vm.Status == vm.VM_STATUS_FAULTED {
 		// A recoverable user-code fault (Plan 2) unwound to the host.  For the run
 		// path a program fault is fatal: surface the fault message as a run error so
@@ -365,20 +377,26 @@ func (it @Interp) RunMain() (int, @[]@[]char) {
 	return rc, noErrs
 }
 
-// RunFunc runs the package-init dispatcher once, then calls the named function
-// (a fully-qualified `pkg.Func` name) with the given int args, returning its
-// result code.  Alternative to RunMain — call one, not both (RunMain already
-// runs init).  A missing function is reported as an error.
+// RunFunc calls the named function (a fully-qualified `pkg.Func` name) with the
+// given int args, returning its result code.  It only calls: the host runs Init
+// first, and a call before Init is reported as an error.  A missing function and
+// a recoverable run fault are reported as errors too.
 func (it @Interp) RunFunc(qualName @[]char, args @[]int) (int, @[]@[]char) {
 	if it.Vm.LookupFunc(qualName) < 0 {
 		var e @[]@[]char
 		e = appendCharSlice(e, "interp: function not found")
 		return 0, e
 	}
-	if it.Vm.LookupFunc("main.__init_all") >= 0 {
-		var noInitArgs @[]int
-		it.Vm.CallFunc("main.__init_all", noInitArgs)
+	var notReady @[]@[]char = it.callReadiness()
+	if len(notReady) > 0 {
+		return 0, notReady
+	}
+	var rc int = it.Vm.CallFunc(qualName, args)
+	if it.Vm.Status == vm.VM_STATUS_FAULTED {
+		var e @[]@[]char
+		e = appendCharSlice(e, it.Vm.FaultMsg)
+		return rc, e
 	}
 	var noErrs @[]@[]char
-	return it.Vm.CallFunc(qualName, args), noErrs
+	return rc, noErrs
 }

@@ -81,7 +81,7 @@ package "pkg/fwd"
 expose "pkg/home"
 EOF
 
-# ---- custom host: load the program, then RunFuncTyped via fwd and via home ----
+# ---- custom host: load the program, Init, then RunFuncTyped via fwd and via home ----
 # Every call prints one line, "<label> <result>" on success or
 # "<label> ERROR <msg>" on failure, and the host carries on to the next call, so
 # the harness can check each path independently.
@@ -127,6 +127,11 @@ func main() {
 	var loadErrs @[]@[]char = it.LoadProgram(files)
 	if len(loadErrs) > 0 {
 		for i := 0; i < len(loadErrs); i++ { testing.Println(loadErrs[i]) }
+		os.Exit(1)
+	}
+	var initErrs @[]@[]char = it.Init()
+	if len(initErrs) > 0 {
+		for i := 0; i < len(initErrs); i++ { testing.Println(initErrs[i]) }
 		os.Exit(1)
 	}
 

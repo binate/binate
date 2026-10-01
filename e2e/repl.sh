@@ -2215,12 +2215,14 @@ testing.Println(t())
 > > > > 2
 > "
 
-# --- Case 71: forward-declared types defined as an alias of a struct, as a
-# func value, and as a managed slice of itself. ---
-run_repl "tier3-forward-type-defined-as-alias-func-value-or-itself" \
+# --- Case 71: an alias cannot define a forward-declared type, a named type
+# over the struct can; forward-declared types defined as a func value and as a
+# managed slice of themselves. ---
+run_repl "tier3-forward-type-alias-rejected-func-value-or-itself" \
 "type Inner struct { v int }
 type F
 type F = Inner
+type F Inner
 func g() int { var c @F = make(F); c.v = 3; return c.v }
 testing.Println(g())
 type FV
@@ -2240,7 +2242,8 @@ func f() int { var t Tr = make_slice(Tr, 2); return len(t) }
 testing.Println(f())
 " \
 "$BANNER
-> > > > > 3
+> > > <repl>:1:1: type F is forward-declared; its definition cannot be an alias
+> > > 3
 > > > > > > > 42
 > > 10
 > > 7

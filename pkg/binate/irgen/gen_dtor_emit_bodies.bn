@@ -60,6 +60,44 @@ func genStructDtorWithName(pkgPath @[]char, name @[]char, structTyp @types.Type)
 	return f
 }
 
+// genNamedDtorWithName generates the destructor of a named type defined over
+// something other than a struct literal (`type X @[]char`, `type X [4]@T`,
+// `type X S`): it destroys the `underlying` value its argument points at, and
+// does nothing for one that needs no destruction.  An opaque type has one
+// whatever its definition, because code that cannot see the definition (an
+// importer of the opaque type, a REPL body lowered before a forward-declared
+// type is defined) releases an `@X` through `__dtor_X` by name.  The helpers
+// the body calls are ensured by the caller (ensureValueDtorHelpers).
+func genNamedDtorWithName(pkgPath @[]char, name @[]char, underlying @types.Type) @ir.Func {
+	var ptrParam @ir.Param = make(ir.Param)
+	ptrParam.Name = "ptr"
+	ptrParam.Typ = types.MakePointerType(types.TypUint8())
+	var params @[]@ir.Param = make_slice(@ir.Param, 1)
+	params[0] = ptrParam
+	var noResults @[]@types.Type
+
+	var f @ir.Func = ir.NewFunc(pkgPath, name, params, noResults)
+	f.IsLinkOnce = true
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	var u @types.Type = types.StripWrappers(underlying)
+	if u != nil && u.Kind == types.TYP_NAMED && u.Underlying == nil && len(u.OpaqueExportPkg) > 0 {
+		// Defined over an opaque type G not defined yet (`type F G` with G only
+		// forward-declared at the prompt): an F is a G, so release it through G's
+		// own dtor, by name — G's definition supplies (or replaces) that one, which
+		// this body could not see.
+		var args @[]@ir.Instr = make_slice(@ir.Instr, 1)
+		args[0] = irbuild.NewParamRef(f, f.Params[0])
+		irbuild.EmitCall(b, irutil.QualifiedDtorName(u.Name), args, types.TypVoid())
+	} else if u != nil && u.NeedsDestruction() {
+		var rawPtr @ir.Instr = irbuild.NewParamRef(f, f.Params[0])
+		var valPtr @ir.Instr = irbuild.EmitBitCast(b, rawPtr, types.MakePointerType(u))
+		b = emitValueRefDecsAt(f, b, valPtr, u, false)
+	}
+	var noRetVals @[]@ir.Instr
+	irbuild.EmitReturn(b, noRetVals)
+	return f
+}
+
 // emitStructFieldRefDecs emits the per-field RefDec cleanup for a managed struct:
 // for each field that needs destruction, GET_FIELD_PTR(structPtr, i) then RefDec
 // per the field's managed kind (managed pointer / slice / func-value / iface-value
@@ -87,80 +125,84 @@ func emitStructFieldRefDecs(f @ir.Func, b @ir.Block, structPtr @ir.Instr, struct
 		// when the managed-slice arm is taken (see gen_dtor_emit.bn) — an
 		// undefined-symbol link failure on the compiled backends.
 		fieldTyp = types.StripWrappers(fieldTyp)
+		var fieldPtr @ir.Instr = irbuild.EmitGetFieldPtr(b, structPtr, i, fieldTyp)
+		b = emitValueRefDecsAt(f, b, fieldPtr, fieldTyp, inlineNested)
+	}
+	return b
+}
 
-		switch fieldTyp.Kind {
-		case types.TYP_MANAGED_PTR:
-			// @T field: load the managed pointer, RefDec with pointee dtor
-			var fieldPtr @ir.Instr = irbuild.EmitGetFieldPtr(b, structPtr, i, fieldTyp)
-			var fieldVal @ir.Instr = irbuild.EmitLoad(b, fieldPtr, fieldTyp)
-			irbuild.EmitManagedPtrRefDec(f, b, fieldVal)
-		case types.TYP_MANAGED_SLICE:
-			// @[]T field: run the element cleanup (destruction-needing element) or
-			// just RefDec the backing (non-destruction element).
-			var fieldPtr @ir.Instr = irbuild.EmitGetFieldPtr(b, structPtr, i, fieldTyp)
-			var fieldVal @ir.Instr = irbuild.EmitLoad(b, fieldPtr, fieldTyp)
-			if fieldTyp.Elem != nil && fieldTyp.Elem.NeedsDestruction() {
-				if inlineNested {
-					// SROA-shape forwardable @[]@T cleanup: extract refptr (slot 2) /
-					// backingLen (slot 3) from the LOADED field value and call the
-					// scalar-arg elems helper — the field-ptr is NOT bitcast (no escape),
-					// so the struct and this @[]@T field slot scalar-replace.
-					// registerPendingMsDtor ensures the elems helper is generated (the
-					// shared __dtor_T, which would otherwise ensure it, may be elided).
-					irbuild.RegisterPendingMsDtor(f, fieldTyp)
-					var refptr @ir.Instr = irbuild.EmitExtract(b, fieldVal, 2, types.MakeManagedPtrType(nil))
-					var backingLen @ir.Instr = irbuild.EmitExtract(b, fieldVal, 3, types.TypInt())
-					var backingPtrRaw @ir.Instr = irbuild.EmitBitCast(b, refptr,
-							types.MakePointerType(types.TypUint8()))
-					var elemsArgs @[]@ir.Instr = make_slice(@ir.Instr, 2)
-					elemsArgs[0] = backingPtrRaw
-					elemsArgs[1] = backingLen
-					irbuild.EmitCallLocal(b, irutil.MsElemsDtorName(fieldTyp), elemsArgs, types.TypVoid())
-				} else {
-					// Shared __dtor_T (by-address value — not a SROA candidate): keep the
-					// by-address ms-dtor call.
-					var fieldRawPtr @ir.Instr = irbuild.EmitBitCast(b, fieldPtr,
-							types.MakePointerType(types.TypUint8()))
-					var msArgs @[]@ir.Instr = make_slice(@ir.Instr, 1)
-					msArgs[0] = fieldRawPtr
-					irbuild.EmitCallLocal(b, irutil.DtorNameForType(fieldTyp), msArgs, types.TypVoid())
-				}
-			} else {
-				// No element destruction needed — just RefDec the backing
-				var refptr @ir.Instr = irbuild.EmitExtract(b, fieldVal, 2, types.MakeManagedPtrType(nil))
-				irbuild.EmitRefDec(b, refptr)
-			}
-		case types.TYP_MANAGED_FUNC_VALUE:
-			// @func field: RefDec the data slot (slot 1) with its dtor —
-			// when the capture record's refcount hits zero the closure
-			// dtor RefDec's each managed capture, then frees the record.
-			var fieldPtr @ir.Instr = irbuild.EmitGetFieldPtr(b, structPtr, i, fieldTyp)
-			var fieldVal @ir.Instr = irbuild.EmitLoad(b, fieldPtr, fieldTyp)
-			b = emitManagedFuncValueRefDec(f, b, fieldVal)
-		case types.TYP_INTERFACE_VALUE_MANAGED:
-			// @Iface field: RefDec the data slot (field 0); the dtor is
-			// fetched from the value's vtable, so when the receiver's
-			// refcount hits zero its struct dtor runs.
-			var fieldPtr @ir.Instr = irbuild.EmitGetFieldPtr(b, structPtr, i, fieldTyp)
-			var fieldVal @ir.Instr = irbuild.EmitLoad(b, fieldPtr, fieldTyp)
-			b = emitManagedIfaceValueRefDec(f, b, fieldVal)
-		default:
-			var fieldPtr @ir.Instr = irbuild.EmitGetFieldPtr(b, structPtr, i, fieldTyp)
-			if inlineNested && fieldTyp.Kind == types.TYP_STRUCT && ir.ManagedStructLeafEligible(fieldTyp) {
-				// Nested leaf-managed struct field: recurse to inline its per-field
-				// RefDecs on the field-ptr (== inlining the nested __dtor body, an
-				// identical RefDec set) instead of the by-address elem-dtor call — the
-				// bitcast in that call would pin the field slot out of SROA.  The nested
-				// field then becomes its own field-ptr-only slot the fixpoint splits.
-				b = emitStructFieldRefDecs(f, b, fieldPtr, fieldTyp, inlineNested)
-			} else {
-				// struct with non-leaf content, or [N]T stored inline: by-address dtor
-				// call (pins the slot — but SROA never splits arrays, and a non-leaf
-				// nested struct stays ineligible, so no optimization is lost).
-				var fieldRawPtr @ir.Instr = irbuild.EmitBitCast(b, fieldPtr,
+// emitValueRefDecsAt emits the cleanup of the value of type typ (wrappers
+// stripped, needing destruction) stored at valPtr, a pointer to it: a managed
+// pointer / slice / func-value / iface-value is loaded and released, and a
+// struct or array is destroyed in place (see emitStructFieldRefDecs for
+// inlineNested).  Returns the final block.
+func emitValueRefDecsAt(f @ir.Func, b @ir.Block, valPtr @ir.Instr, typ @types.Type,
+		inlineNested bool) @ir.Block {
+	switch typ.Kind {
+	case types.TYP_MANAGED_PTR:
+		// @T: load the managed pointer, RefDec with pointee dtor
+		var val @ir.Instr = irbuild.EmitLoad(b, valPtr, typ)
+		irbuild.EmitManagedPtrRefDec(f, b, val)
+	case types.TYP_MANAGED_SLICE:
+		// @[]T: run the element cleanup (destruction-needing element) or
+		// just RefDec the backing (non-destruction element).
+		var val @ir.Instr = irbuild.EmitLoad(b, valPtr, typ)
+		if typ.Elem != nil && typ.Elem.NeedsDestruction() {
+			if inlineNested {
+				// SROA-shape forwardable @[]@T cleanup: extract refptr (slot 2) /
+				// backingLen (slot 3) from the LOADED field value and call the
+				// scalar-arg elems helper — the field-ptr is NOT bitcast (no escape),
+				// so the struct and this @[]@T field slot scalar-replace.
+				// registerPendingMsDtor ensures the elems helper is generated (the
+				// shared __dtor_T, which would otherwise ensure it, may be elided).
+				irbuild.RegisterPendingMsDtor(f, typ)
+				var refptr @ir.Instr = irbuild.EmitExtract(b, val, 2, types.MakeManagedPtrType(nil))
+				var backingLen @ir.Instr = irbuild.EmitExtract(b, val, 3, types.TypInt())
+				var backingPtrRaw @ir.Instr = irbuild.EmitBitCast(b, refptr,
 						types.MakePointerType(types.TypUint8()))
-				emitDtorOrCopyCall(f, b, elemDtorName(fieldTyp), fieldRawPtr, isElemDtorModuleLocal(fieldTyp))
+				var elemsArgs @[]@ir.Instr = make_slice(@ir.Instr, 2)
+				elemsArgs[0] = backingPtrRaw
+				elemsArgs[1] = backingLen
+				irbuild.EmitCallLocal(b, irutil.MsElemsDtorName(typ), elemsArgs, types.TypVoid())
+			} else {
+				// Shared __dtor_T (by-address value — not a SROA candidate): keep the
+				// by-address ms-dtor call.
+				var rawPtr @ir.Instr = irbuild.EmitBitCast(b, valPtr, types.MakePointerType(types.TypUint8()))
+				var msArgs @[]@ir.Instr = make_slice(@ir.Instr, 1)
+				msArgs[0] = rawPtr
+				irbuild.EmitCallLocal(b, irutil.DtorNameForType(typ), msArgs, types.TypVoid())
 			}
+		} else {
+			// No element destruction needed — just RefDec the backing
+			var refptr @ir.Instr = irbuild.EmitExtract(b, val, 2, types.MakeManagedPtrType(nil))
+			irbuild.EmitRefDec(b, refptr)
+		}
+	case types.TYP_MANAGED_FUNC_VALUE:
+		// @func: RefDec the data slot (slot 1) with its dtor —
+		// when the capture record's refcount hits zero the closure
+		// dtor RefDec's each managed capture, then frees the record.
+		var val @ir.Instr = irbuild.EmitLoad(b, valPtr, typ)
+		b = emitManagedFuncValueRefDec(f, b, val)
+	case types.TYP_INTERFACE_VALUE_MANAGED:
+		// @Iface: RefDec the data slot (field 0); the dtor is
+		// fetched from the value's vtable, so when the receiver's
+		// refcount hits zero its struct dtor runs.
+		var val @ir.Instr = irbuild.EmitLoad(b, valPtr, typ)
+		b = emitManagedIfaceValueRefDec(f, b, val)
+	default:
+		if inlineNested && typ.Kind == types.TYP_STRUCT && ir.ManagedStructLeafEligible(typ) {
+			// Nested leaf-managed struct field: recurse to inline its per-field
+			// RefDecs on the field-ptr (== inlining the nested __dtor body, an
+			// identical RefDec set) instead of the by-address elem-dtor call — the
+			// bitcast in that call would pin the field slot out of SROA.  The nested
+			// field then becomes its own field-ptr-only slot the fixpoint splits.
+			b = emitStructFieldRefDecs(f, b, valPtr, typ, inlineNested)
+		} else {
+			// struct with non-leaf content, or [N]T stored inline: by-address dtor
+			// call (pins the slot — but SROA never splits arrays, and a non-leaf
+			// nested struct stays ineligible, so no optimization is lost).
+			var rawPtr @ir.Instr = irbuild.EmitBitCast(b, valPtr, types.MakePointerType(types.TypUint8()))
+			emitDtorOrCopyCall(f, b, elemDtorName(typ), rawPtr, isElemDtorModuleLocal(typ))
 		}
 	}
 	return b

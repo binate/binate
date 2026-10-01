@@ -2118,6 +2118,159 @@ testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 > > > > > > > > > > > 0
 > "
 
+# --- Case 68: a type and a function that use a forward-declared type before
+# its struct definition: dropping a value through either releases the
+# struct's managed field. ---
+run_repl "tier3-forward-type-defined-as-struct" \
+"import \"pkg/builtins/rt\"
+type Inner struct { v int }
+type S5
+type MPP @@S5
+func clearIt(pp @@S5) { var e @S5; *pp = e }
+type S5 struct { p @Inner }
+var inr @Inner = make(Inner)
+var before int = rt.Refcount(bit_cast(*uint8, inr))
+func dropM() { var s @S5 = make(S5); s.p = inr; var m MPP = make(@S5); *m = s }
+dropM()
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
+func mk() @@S5 { var s @S5 = make(S5); s.p = inr; var pp @@S5 = make(@S5); *pp = s; return pp }
+func run() { var pp @@S5 = mk(); clearIt(pp) }
+run()
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
+" \
+"$BANNER
+> package pkg/builtins/rt loaded
+> > > > > > > > > > 0
+> > > > 0
+> "
+
+# --- Case 69: forward-declared types defined as a managed pointer, an array,
+# a managed slice, a named type over a struct and a scalar: functions lowered
+# before the definitions release what the values hold. ---
+run_repl "tier3-forward-type-defined-as-other-types" \
+"import \"pkg/builtins/rt\"
+type Inner struct { v int }
+type Wr struct { n int; p @Inner }
+type FL
+type FA
+type FS
+type FW
+type FN
+func clrL(pp @@FL) { var e @FL; *pp = e }
+func clrA(pp @@FA) { var e @FA; *pp = e }
+func clrS(pp @@FS) { var e @FS; *pp = e }
+func clrW(pp @@FW) { var e @FW; *pp = e }
+func clrN(pp @@FN) { var e @FN; *pp = e }
+type FL @Inner
+type FA [2]@Inner
+type FS @[]@Inner
+type FW Wr
+type FN int
+var inr @Inner = make(Inner)
+var before int = rt.Refcount(bit_cast(*uint8, inr))
+func mkL() @@FL { var c @FL = make(FL); *c = inr; var pp @@FL = make(@FL); *pp = c; return pp }
+func mkA() @@FA { var c @FA = make(FA); (*c)[0] = inr; (*c)[1] = inr; var pp @@FA = make(@FA); *pp = c; return pp }
+func mkS() @@FS { var c @FS = make(FS); var es @[]@Inner = make_slice(@Inner, 2); es[0] = inr; es[1] = inr; *c = es; var pp @@FS = make(@FS); *pp = c; return pp }
+func mkW() @@FW { var c @FW = make(FW); c.p = inr; var pp @@FW = make(@FW); *pp = c; return pp }
+func mkN() @@FN { var c @FN = make(FN); *c = 4; var pp @@FN = make(@FN); *pp = c; return pp }
+func run() { clrL(mkL()); clrA(mkA()); clrS(mkS()); clrW(mkW()); var n @@FN = mkN(); testing.Println(cast(int, **n)); clrN(n) }
+run()
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
+" \
+"$BANNER
+> package pkg/builtins/rt loaded
+> > > > > > > > > > > > > > > > > > > > > > > > > > 4
+> 0
+> "
+
+# --- Case 70: functions using forward-declared types run before the types
+# are defined (dropping only nil values) and after: once defined, the same
+# function releases what the value holds; a type never defined stays
+# usable. ---
+run_repl "tier3-forward-type-used-before-definition" \
+"import \"pkg/builtins/rt\"
+type Inner struct { v int }
+type N
+func clr(pp @@N) { var e @N; *pp = e }
+func pre() int { var pp @@N = make(@N); clr(pp); return 1 }
+testing.Println(pre())
+type N struct { p @Inner }
+var inr @Inner = make(Inner)
+var before int = rt.Refcount(bit_cast(*uint8, inr))
+func mk() @@N { var s @N = make(N); s.p = inr; var pp @@N = make(@N); *pp = s; return pp }
+func run() { var pp @@N = mk(); clr(pp) }
+run()
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
+testing.Println(pre())
+type X
+func clrX(pp @@X) { var e @X; *pp = e }
+func t() int { var pp @@X = make(@X); clrX(pp); return 2 }
+testing.Println(t())
+" \
+"$BANNER
+> package pkg/builtins/rt loaded
+> > > > > 1
+> > > > > > > 0
+> 1
+> > > > 2
+> "
+
+# --- Case 71: forward-declared types defined as an alias of a struct, as a
+# func value, and as a managed slice of itself. ---
+run_repl "tier3-forward-type-defined-as-alias-func-value-or-itself" \
+"type Inner struct { v int }
+type F
+type F = Inner
+func g() int { var c @F = make(F); c.v = 3; return c.v }
+testing.Println(g())
+type FV
+func clrF(pp @@FV) int { var e @FV; *pp = e; return 7 }
+type FV @func(int) int
+func dbl(x int) int { return x * 2 }
+func mkc() @FV { var c @FV = make(FV); *c = dbl; return c }
+func callIt(c @FV, x int) int { return (*c)(x) }
+testing.Println(callIt(mkc(), 21))
+func sl() int { var fs @[]FV = make_slice(FV, 1); fs[0] = dbl; return fs[0](5) }
+testing.Println(sl())
+func run() int { var pp @@FV = make(@FV); *pp = mkc(); return clrF(pp) }
+testing.Println(run())
+type Tr
+type Tr @[]Tr
+func f() int { var t Tr = make_slice(Tr, 2); return len(t) }
+testing.Println(f())
+" \
+"$BANNER
+> > > > > 3
+> > > > > > > 42
+> > 10
+> > 7
+> > > > 2
+> "
+
+# --- Case 72: a forward-declared type defined over another one not defined
+# yet releases what its values hold once that one is defined. ---
+run_repl "tier3-forward-type-defined-over-undefined-forward-type" \
+"import \"pkg/builtins/rt\"
+type Inner struct { v int }
+type G
+type F
+type F G
+type G struct { p @Inner }
+var inr @Inner = make(Inner)
+var before int = rt.Refcount(bit_cast(*uint8, inr))
+func run2() { var f @F = make(F); f.p = inr }
+run2()
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
+func run3() { var g @G = make(G); g.p = inr }
+run3()
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
+" \
+"$BANNER
+> package pkg/builtins/rt loaded
+> > > > > > > > > > 0
+> > > 0
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # (Stage 2) as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

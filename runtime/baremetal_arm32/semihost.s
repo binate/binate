@@ -93,6 +93,57 @@ memset_done:
 	pop     {r0, r4}
 	bx      lr
 
+// ============================================================
+// The ARM run-time ABI's memory helpers (AEABI, IHI0043 §4.3.4).  On an
+// ARM EABI target LLVM lowers its memory intrinsics to these rather than
+// to memcpy / memset — notably at -O1 and above, where its optimizer turns
+// a zeroing loop or a run of zero stores into llvm.memset, and so into
+// __aeabi_memclr, even in rt.MemZero's own loop.  Each forwards to the
+// byte loops above; the 4 / 8 forms (whose arguments are 4- / 8-byte
+// aligned) are the same routines.  Arguments:
+//   __aeabi_memcpy*(dest=r0, src=r1, n=r2)       like memcpy
+//   __aeabi_memmove*(dest=r0, src=r1, n=r2)      like memmove
+//   __aeabi_memset*(dest=r0, n=r1, c=r2)         memset's n and c swapped
+//   __aeabi_memclr*(dest=r0, n=r1)               memset to zero
+// None returns a value.
+// ============================================================
+	.global __aeabi_memcpy
+	.global __aeabi_memcpy4
+	.global __aeabi_memcpy8
+__aeabi_memcpy:
+__aeabi_memcpy4:
+__aeabi_memcpy8:
+	b       memcpy
+
+	.global __aeabi_memmove
+	.global __aeabi_memmove4
+	.global __aeabi_memmove8
+__aeabi_memmove:
+__aeabi_memmove4:
+__aeabi_memmove8:
+	b       memmove
+
+	.global __aeabi_memset
+	.global __aeabi_memset4
+	.global __aeabi_memset8
+__aeabi_memset:
+__aeabi_memset4:
+__aeabi_memset8:
+	mov     r3, r1          // n
+	mov     r1, r2          // c
+	mov     r2, r3
+	b       memset
+
+	.global __aeabi_memclr
+	.global __aeabi_memclr4
+	.global __aeabi_memclr8
+__aeabi_memclr:
+__aeabi_memclr4:
+__aeabi_memclr8:
+	mov     r2, r1          // n
+	mov     r1, #0
+	b       memset
+
 	.global memcmp
 memcmp:
 	// r0 = a, r1 = b, r2 = len; returns r0 = signed-cmp result

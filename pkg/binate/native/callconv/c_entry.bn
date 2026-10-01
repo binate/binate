@@ -1,0 +1,150 @@
+package "pkg/binate/native/callconv"
+
+import "pkg/binate/ir"
+import "pkg/binate/types"
+
+// CEntryNeedsThunk reports whether __c_entry(f) needs a `__centry.<mangled>`
+// adaptation thunk under cc — the SINGLE decision every backend makes, so the set
+// of __c_entry targets that get a weak `__centry.` thunk (and therefore the pointer
+// value `__c_entry(f)` yields) is identical across producers (pkg.centry.identity
+// in a mixed-producer link, ABI review #10).  True on any of:
+//   - a narrow GP integer/bool parameter passed in a REGISTER
+//     (funcHasNarrowGPRegParam) — the native backends re-extend it in the thunk;
+//     the LLVM calling convention self-extends via the mangled definition, so its
+//     thunk is a pure FORWARDER, emitted only for the cross-producer identity;
+//   - a >16-byte by-value aggregate PARAMETER whose C form diverges from the
+//     internal single-pointer form (funcNeedsCEntryByvalParamThunk — SysV-AMD64 /
+//     AAPCS32, not AAPCS64);
+//   - a divergent multi-value RETURN (cc.CExportMultiReturnRetAdaptKind != NONE).
+func (cc CallConv) CEntryNeedsThunk(f @ir.Func) bool {
+	return funcHasNarrowGPRegParam(f, cc) || cc.CExportMultiReturnRetAdaptKind(f) != CRET_ADAPT_NONE ||
+			funcNeedsCEntryByvalParamThunk(f, cc)
+}
+
+// CEntryRegNormWalk classifies f's parameters for #[c_export] / __c_entry argument-REGISTER
+// normalization.  It returns two parallel lists — for each parameter that is a narrow GP
+// integer/bool scalar PASSED IN A GP ARGUMENT REGISTER (not on the stack), the GP
+// argument-register index (as CallArgRegStart yields; the backend maps it to a physical
+// register via argReg) and the parameter's type (for the extend width / signedness).  It is
+// the SINGLE source of truth shared by the thunk-emission DECISION (funcHasNarrowGPRegParam
+// -> collectCEntryThunkTargets) and the actual register normalization
+// (emitCExportRegNorm{,X64,Arm32}), so the two can never disagree about which registers a
+// target's thunk touches — a disagreement that dropped a needed thunk would re-expose the
+// narrow-register-arg dirty-bits bug.  A narrow STACK-passed arg is deliberately NOT returned:
+// the mangled entry's own sub-word stack-arg spill canonicalizes it unconditionally, so it
+// needs no thunk.  cEntryParamNeedsThunk already excludes floats (a separate register file),
+// aggregates, and word-size scalars.  The sret shift — a hidden return-buffer pointer
+// occupying the FIRST GP ARGUMENT register, shifting every user param by one — applies only
+// where the target puts sret in a GP arg reg (SysV RDI, AAPCS32 R0: cc.SretInGpArgReg), NOT
+// on AAPCS64 (sret is the dedicated X8, no arg shift), and only when f actually sret-returns;
+// it is derived here from cc so every caller agrees.
+func CEntryRegNormWalk(f @ir.Func, cc CallConv) (@[]int, @[]@types.Type) {
+	var sretShift bool = cc.SretInGpArgReg &&
+			(cc.FuncReturnsBigAggregate(f) || cc.FuncReturnsBigMultiReturn(f))
+	var nDispatch int = len(f.Params)
+	if sretShift {
+		nDispatch = nDispatch + 1
+	}
+	var paramTypes @[]@types.Type = make_slice(@types.Type, nDispatch)
+	if sretShift {
+		paramTypes[0] = types.MakePointerType(types.TypUint8())
+		for pi := 0; pi < len(f.Params); pi++ {
+			paramTypes[pi + 1] = f.Params[pi].Typ
+		}
+	} else {
+		for pi := 0; pi < len(f.Params); pi++ {
+			paramTypes[pi] = f.Params[pi].Typ
+		}
+	}
+	var regStarts @[]int
+	var regTypes @[]@types.Type
+	for pi := 0; pi < len(f.Params); pi++ {
+		if !cEntryParamNeedsThunk(f.Params[pi].Typ, cc.WordBytes) {
+			continue
+		}
+		var dispatchIdx int = pi
+		if sretShift {
+			dispatchIdx = pi + 1
+		}
+		var regStart int = cc.CallArgRegStart(paramTypes, dispatchIdx)
+		if regStart >= 0 {
+			regStarts = appendInt(regStarts, regStart)
+			regTypes = appendType(regTypes, f.Params[pi].Typ)
+		}
+	}
+	return regStarts, regTypes
+}
+
+// funcHasNarrowGPRegParam reports whether f has a narrow GP integer/bool parameter passed in
+// a GP argument REGISTER (see CEntryRegNormWalk) — i.e. whether a __c_entry to f needs an
+// adaptation thunk.  A target whose only narrow params are stack-passed returns false: those
+// args are canonicalized by f's own mangled-entry spill, so it is referenced degenerate (no
+// thunk).
+func funcHasNarrowGPRegParam(f @ir.Func, cc CallConv) bool {
+	var regStarts @[]int
+	regStarts, _ = CEntryRegNormWalk(f, cc)
+	return len(regStarts) > 0
+}
+
+// funcNeedsCEntryByvalParamThunk reports whether f has a >16-byte by-value
+// aggregate parameter whose C-ABI passing form differs from Binate's internal
+// single-pointer form on this target — the case whose adaptation the __c_entry
+// thunk must perform (re-marshal the by-value struct into a pointer before calling
+// the mangled entry), exactly as the #[c_export] entry does.  The divergence is the
+// internal-vs-C large-aggregate convention split: SysV-AMD64 (C MEMORY-class, bytes
+// on the stack) and AAPCS32 (C by-value split r0-r3 + stack) pass a >16-byte
+// aggregate by value while the internal convention passes a pointer, so the thunk is
+// required; AAPCS64 passes it indirectly BOTH ways (IndirectLargeAggregates ==
+// CAbiIndirectLargeAggregates), so the mangled entry is already C-callable and no
+// thunk is needed.  Mirrors the LLVM cExportNeedsThunk byval trigger and the native
+// per-target cExportNeedsTrampoline{X64,Arm32} the __c_entry emitters route through.
+func funcNeedsCEntryByvalParamThunk(f @ir.Func, cc CallConv) bool {
+	if cc.IndirectLargeAggregates == cc.CAbiIndirectLargeAggregates {
+		return false
+	}
+	for i := 0; i < len(f.Params); i++ {
+		if f.Params[i].Typ.IsByvalParam() {
+			return true
+		}
+	}
+	return false
+}
+
+// appendInt grows an @[]int by one — the vec/slices helpers are not in this package's import
+// set, and the CEntryRegNormWalk lists hold one entry per register-passed narrow-arg param (a
+// short list).
+func appendInt(dst @[]int, v int) @[]int {
+	var out @[]int = make_slice(int, len(dst) + 1)
+	for i := 0; i < len(dst); i++ { out[i] = dst[i] }
+	out[len(dst)] = v
+	return out
+}
+
+// appendType grows an @[]@types.Type by one — the @[]int twin for CEntryRegNormWalk's parallel
+// param-type list.
+func appendType(dst @[]@types.Type, v @types.Type) @[]@types.Type {
+	var out @[]@types.Type = make_slice(@types.Type, len(dst) + 1)
+	for i := 0; i < len(dst); i++ { out[i] = dst[i] }
+	out[len(dst)] = v
+	return out
+}
+
+// cEntryParamNeedsThunk reports whether a parameter of type t is a narrow GP
+// integer/bool scalar under a target whose word size is wordBytes bytes — a
+// parameter a C caller may leave with dirty high bits.  This is the TYPE-level half
+// of the classification; CEntryRegNormWalk adds the argument-LOCATION check (only a
+// REGISTER-passed such param needs the thunk — a stack-passed one is canonicalized by
+// the mangled-entry spill).  Floats (a separate register file) and aggregates (passed
+// by reference / in multiple registers) are excluded, matching the float/aggregate
+// skips in normalizeNarrowRegParam{,X64,Arm32}; pointers are word-size, so the
+// `< wordBytes` bound already excludes them.  The bool trap:
+// SubWordNarrow reports bool non-narrow (it is not IsInteger), but a bool param IS a
+// 1-byte GP arg the C-entry path still zero-extends, so keying off SizeOf (which is
+// 1 for bool) — not SubWordNarrow — correctly flags it.
+func cEntryParamNeedsThunk(t @types.Type, wordBytes int) bool {
+	if t == nil { return false }
+	if IsFloatScalarTyp(t) { return false }
+	if IsAggregateTyp(t) { return false }
+	var sz int = t.SizeOf()
+	return sz > 0 && sz < wordBytes
+}

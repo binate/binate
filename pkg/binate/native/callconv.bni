@@ -1,0 +1,397 @@
+// Package callconv is the native backends' calling-convention model: the
+// CallConv descriptor each target constructs (AAPCS64, SysV-AMD64, AAPCS32),
+// the argument-placement and return-classification queries every call site,
+// prologue and C-ABI boundary asks of it, and the value-kind predicates those
+// queries are phrased in.  It depends only on the IR and type layers, so the
+// LLVM backend and the VM can ask the same ABI questions the native backends do.
+package "pkg/binate/native/callconv"
+
+import "pkg/binate/ir"
+import "pkg/binate/types"
+
+// CallConv parameterises the arg-passing / return-classification
+// helpers below so the same algorithms serve multiple backends.
+// Each backend constructs its CallConv once (via AAPCS64() /
+// AAPCS64_Darwin() / SysV_AMD64()) and stamps it onto the per-
+// function RegMap, so call-site code reads it via rm.CC.X(...).
+//
+// The numeric thresholds and register-count fields match the values
+// historically hardcoded for AAPCS64; the AAPCS64() constructor
+// reproduces them so the arm64 backend's behaviour is unchanged.
+type CallConv struct {
+	// NumGpArgRegs is the count of general-purpose argument registers
+	// (X0..X7 on AAPCS64 → 8; RDI/RSI/RDX/RCX/R8/R9 on SysV-AMD64 → 6).
+	// Aggregates and scalars compete for the same pool except where
+	// IsFloatScalarTyp pulls a value into the FP register file.
+	NumGpArgRegs int
+
+	// NumFpArgRegs is the count of FP/SIMD argument registers
+	// (D0..D7 on AAPCS64; XMM0..XMM7 on SysV-AMD64). Currently both
+	// targets cap at 8.
+	NumFpArgRegs int
+
+	// NumGpRetRegs / NumFpRetRegs are the counts of return registers a
+	// multi-return tuple's fields fill, by class, before the whole tuple
+	// is sret-returned (see MultiReturnTupleNeedsSret).  They mirror how
+	// LLVM lowers a first-class IR aggregate return — each non-float
+	// field's words fill the GP return regs, each float-scalar field
+	// fills the FP return regs, the two counters independent.
+	//
+	// AAPCS64: 8 GP (X0..X7) + 8 FP (D0..D7) — a 24-byte (int,@Iface)
+	// tuple comes back in X0,X1,X2, NOT sret, even though it exceeds the
+	// 16-byte single-aggregate threshold.  SysV-AMD64: 3 GP (RAX,RDX,RCX)
+	// + 2 FP (XMM0,XMM1).  These are RETURN-register counts, distinct from
+	// the arg-register counts above.
+	NumGpRetRegs int
+	NumFpRetRegs int
+
+	// NumX87RetRegs is the count of x87 stack slots (ST0, ST1) that float
+	// return fields overflow into AFTER the NumFpRetRegs XMM registers are
+	// full, before the whole tuple is sret-returned.  LLVM returns a
+	// first-class-aggregate's 3rd/4th float in x87 ST0/ST1 on SysV-AMD64,
+	// so the FP-class capacity before sret is NumFpRetRegs + NumX87RetRegs.
+	// SysV-AMD64: 2 (ST0, ST1).  AAPCS64: 0 (aarch64 has no x87 — its 8 D
+	// registers already cover every in-register float tuple).  Only the x64
+	// backend emits the x87 pack/collect (see x64_return.bn / x64_call.bn).
+	NumX87RetRegs int
+
+	// InternalSretBytes is the size threshold above which a Binate-
+	// internal aggregate or multi-return tuple is returned via the
+	// AAPCS-style sret indirection (X8 on AAPCS64, hidden first arg on
+	// SysV) rather than packed into return registers. > N → sret.
+	InternalSretBytes int
+
+	// AggregateInRegMax is the largest aggregate (in bytes) that may
+	// be passed in registers. AAPCS64 spreads any aggregate across
+	// NumGpArgRegs*8 bytes; SysV-AMD64 caps at 16 bytes per aggregate
+	// (above that → memory). Used by the aggregate-arg classifier.
+	AggregateInRegMax int
+
+	// StackAlign is the required alignment of the stack pointer at a
+	// call boundary. 16 for both AAPCS64 and SysV-AMD64.
+	StackAlign int
+
+	// SplitAggregates is true when the ABI allows an aggregate that
+	// doesn't fit entirely in the remaining GP arg registers to be
+	// *split* across registers and stack (AAPCS64 / LLVM byval).
+	// False under SysV-AMD64, where any aggregate that won't fit
+	// wholly in registers — or that exceeds AggregateInRegMax —
+	// is MEMORY-classified and passed *entirely* on the stack
+	// (never split, NGRN unchanged so later args can still take
+	// remaining GP regs).
+	SplitAggregates bool
+
+	// IndirectLargeAggregates is true when aggregates exceeding
+	// AggregateInRegMax bytes are passed by reference: the caller
+	// allocates the struct in its own frame and passes a single
+	// pointer in the next available GP arg register (or as a
+	// 1-word stack slot if the GP arg regs are exhausted).  Matches
+	// the plain-`ptr` LLVM IR shape pkg/codegen emits for >16-byte
+	// aggregate params (see writeParamTypeLLVM); LLVM lowers that
+	// to "pointer in next free GP arg reg" on both targets.  Set
+	// true for AAPCS64 / AAPCS64_Darwin / SysV-AMD64.
+
+	IndirectLargeAggregates bool
+
+	// CAbiIndirectLargeAggregates is the value IndirectLargeAggregates takes at
+	// the C boundary (an OP_C_CALL argument), which can differ from Binate's
+	// INTERNAL convention above.  The platform C ABI decides how a >16-byte
+	// aggregate crosses to C: SysV-AMD64 passes it MEMORY class (bytes on the
+	// outgoing stack — NOT indirect), AAPCS32 passes it BY VALUE split across
+	// r0-r3 + stack (NOT indirect), while AAPCS64 genuinely passes it INDIRECT
+	// (a pointer to a caller-allocated copy, matching Binate's internal form).
+	// So this is false for SysV-AMD64 / AAPCS32 and true for AAPCS64 /
+	// AAPCS64_Darwin.  ForCBoundary() applies it; PlanFrame's outgoing-args
+	// sizing and each backend's OP_C_CALL dispatch BOTH consult the resulting
+	// conv, so the frame reservation and the arg emission agree (a mismatch
+	// under-reserves the outgoing-args area and a live spill overlaps it).
+	CAbiIndirectLargeAggregates bool
+
+	// HfaAggregates is true when the ABI passes a Homogeneous Floating-point
+	// Aggregate — a struct/array folding to 1-4 members ALL of the same float
+	// type (float32 xor float64) — in consecutive SIMD/FP argument registers
+	// (v0..v7 / xmm0..xmm7) rather than as a GP aggregate, with an
+	// all-or-nothing stack fallback on FP-register overflow.  This models the
+	// AAPCS64 HFA rule; set true for AAPCS64 / AAPCS64_Darwin.  (SysV x64 uses
+	// a different per-eightbyte SSE classification — left false until the x64
+	// classifier implements it.)
+	HfaAggregates bool
+
+	// VfpBackfill is true when float scalar arguments are allocated by the
+	// AAPCS-VFP co-processor-register-candidate rule: the 8 double / 16 single
+	// FP arg registers are ONE physical bank (d0..d7 === s0..s15), a float32
+	// takes the lowest free S-slot (which may BACK-FILL a hole an earlier
+	// float64's even-alignment left), a float64 takes the lowest even-aligned
+	// free S-pair, and the FIRST FP arg that spills to the stack latches the
+	// bank exhausted — every later FP arg then stacks too (back-fill disabled).
+	// This cannot be expressed by the monotonic NSRN cursor the LP64 conventions
+	// use, so it drives a separate 16-bit S-occupancy-mask allocator (see
+	// callconv/callconv_vfp.bn) that the arg walkers and CallArgFpReg all consult.
+	// Set only in AAPCS32() under the shared types.Arm32HardFloat() gate; false
+	// for AAPCS64 / SysV-AMD64 / soft-float AAPCS32, which keep the unchanged
+	// monotonic-NSRN path (aa64's D0+NSRN must not regress).  INERT today — no
+	// target is stamped FLOAT_ABI_HARD, so Arm32HardFloat() is false everywhere.
+	VfpBackfill bool
+
+	// SseAggregates is the SysV-AMD64 x64 analogue of HfaAggregates: true when
+	// the ABI passes/returns a <=16-byte float aggregate by SSE EIGHTBYTE — each
+	// 8-byte chunk independently SSE (-> an XMM reg) or INTEGER (-> a GP reg),
+	// so one aggregate can consume BOTH register files (unlike an HFA, which is
+	// homogeneous and FP-only).  Set from types.SysVSseInRegs() in SysV_AMD64();
+	// the per-eightbyte placement/pack lives in pkg/binate/native/x64 (the
+	// (regStart,regWords,stackWords) triple can't express dual-file placement).
+	// Dormant until the cross-backend SSE gate flips.
+	SseAggregates bool
+
+	// VariadicStackOnly forces every variadic argument (those at
+	// index >= fixedCount in the V-variant helpers below) to the
+	// stack regardless of remaining GP-register budget.  Set on
+	// darwin-arm64 to match Apple's ARM64 calling convention,
+	// which deviates from AAPCS-64 on this point.
+	VariadicStackOnly bool
+
+	// VariadicFloatInGp forces a FLOAT scalar in the variadic portion
+	// (index >= fixedCount) to be passed like its same-width integer —
+	// in the GP core registers / on the stack, NEVER a VFP register.
+	// Set on arm32 hard-float (AAPCS-VFP), whose variadic rule is that
+	// variadic args are passed by the base standard (as if the callee
+	// had no prototype), so a variadic double rides an even GP register
+	// pair (or the stack), not d0..d7.  The V-variant walkers implement
+	// this by classifying such an arg as a uint of the same width, so
+	// the existing GP placement + NGRN/NSRN advance handle it (a uint is
+	// not a float scalar → it consumes GP, not the VFP file).  Distinct
+	// from VariadicStackOnly (darwin: variadic floats to the STACK, not
+	// GP regs); the two are mutually exclusive.  aa64/x64/soft-float
+	// leave this false (x64-SysV correctly keeps variadic floats in XMM).
+	VariadicFloatInGp bool
+
+	// SretInGpArgReg is true when the sret return-buffer pointer
+	// consumes the first GP arg register (SysV-AMD64 uses RDI),
+	// false when it lives in a dedicated register outside the GP
+	// arg-reg pool (AAPCS64 uses X8).  PlanFrame consults this so
+	// the outgoing-args reservation for a call returning a big
+	// aggregate accounts for the sret-induced register shift —
+	// otherwise the call's stack-spilled tail would overlap the
+	// caller's own sret-stash slot at SP+SretSlotOff.
+	SretInGpArgReg bool
+
+	// NaturalSizeStackArgs is true when a FIXED narrow scalar stack
+	// argument occupies its natural size + alignment (a 4-byte int32 /
+	// float32 takes 4 bytes, 4-aligned) rather than a rounded 8-byte
+	// slot.  Apple's ARM64 ABI packs fixed stack args this way (variadic
+	// args still take 8-byte slots — that stays governed by
+	// VariadicStackOnly).  SysV-AMD64 and Linux AAPCS64 round stack args
+	// up to 8 bytes, so this is false for them; only AAPCS64_Darwin sets
+	// it.  The convention walkers and the backend caller/callee/shim
+	// stack stores+reads consult it so a narrow stack arg matches the
+	// LLVM-compiled side at the native↔LLVM boundary.
+	NaturalSizeStackArgs bool
+
+	// WordBytes is the target's GP register / pointer word size in bytes:
+	// 8 for the LP64 conventions (AAPCS64 / SysV-AMD64), 4 for ILP32
+	// AAPCS32.  cc.ArgWords and the arg/return classifiers below round and
+	// multiply in these units so one set of algorithms serves both 32- and
+	// 64-bit targets.  The AAPCS64 / SysV_AMD64 / AAPCS32 constructors set
+	// it; a zero value (uninitialised CallConv) would divide-by-zero in
+	// cc.ArgWords, so always build a CallConv via a constructor.
+	WordBytes int
+}
+
+// AAPCS64 returns the AArch64 Procedure Call Standard CallConv
+// (Linux variant — varargs follow the normal register/stack rule).
+func AAPCS64() CallConv
+
+// AAPCS64_Darwin returns AAPCS64 with VariadicStackOnly = true: on
+// Apple's ARM64 ABI, every variadic argument is passed on the stack.
+func AAPCS64_Darwin() CallConv
+
+// SysV_AMD64 returns the System V x86-64 CallConv (Linux / macOS / BSD).
+func SysV_AMD64() CallConv
+
+// AAPCS32 returns the 32-bit ARM AAPCS/EABI CallConv, base (soft-float)
+// variant used by arm32-baremetal: 4 GP arg registers (r0-r3), a 64-bit
+// (8-byte-aligned) argument occupies an EVEN-aligned register pair
+// (r0:r1 / r2:r3) or an 8-byte-aligned stack slot, floats ride GP
+// registers (NumFpArgRegs = 0), and a composite larger than 4 bytes is
+// returned via an sret pointer.  WordBytes = 4.  A hard-float VFP variant
+// (arm32-linux) is a later addition.
+func AAPCS32() CallConv
+
+func IsAggregateTyp(t @types.Type) bool
+
+func IsFloatScalarTyp(t @types.Type) bool
+
+// FloatScalarIsI32 reports whether a float scalar occupies a 32-bit integer
+// slot (a float32) rather than a 64-bit one (float64 / untyped-float), in the
+// all-int func-value shim ABI.  Mirrors the LLVM backend's floatSlotIsI32
+// (pkg/binate/codegen/emit_funcvals.bn) so the two pick the same slot width.
+// Result is meaningless unless IsFloatScalarTyp(t) is true.
+func FloatScalarIsI32(t @types.Type) bool
+
+func IsMultiReturnCall(ins @ir.Instr) bool
+
+// ArgWords is the word count of an argument of type t, in 8-byte words —
+// the LP64 form, retained for the aarch64 / x64 backend call sites (both
+// LP64).  The general, target-parameterised form is the CallConv method
+// cc.ArgWords below, which rounds in cc.WordBytes-sized words (4 on
+// AAPCS32, where a 64-bit scalar is 2 words).  Both share one
+// implementation; free ArgWords == cc.ArgWords for any WordBytes == 8 CC.
+func ArgWords(t @types.Type) int
+
+// ArgWords is the target-parameterised word count of an argument of type
+// t, rounded up in cc.WordBytes-sized words (at least 1).  On LP64
+// (WordBytes 8) every scalar is one word; on ILP32 AAPCS32 (WordBytes 4)
+// a 64-bit scalar is 2 words and a 16-byte managed-slice is 4.
+func (cc CallConv) ArgWords(t @types.Type) int
+
+// AggCoercedInReg reports whether t is a NAMED struct/array passed coerced into
+// registers by the real ABI (SizeOf in [1, AggregateInRegMax]).  This is the
+// case that rides the func-value DISPATCH convention BY-ADDRESS (one pointer
+// word; the per-function shim loads its ArgWords value-words and re-coerces
+// them).  Slices / managed-slices / iface-values / func-values / anonymous
+// structs are NOT this — they keep their existing dispatch representation.
+func AggCoercedInReg(t @types.Type) bool
+
+// Per-CallConv call-arg dispatch + return classification. See
+// callconv/callconv.bn for the AAPCS-style algorithm; SysV-AMD64
+// aggregate dispatch will diverge and lives in pkg/binate/native/x64.
+func (cc CallConv) CallArgRegStart(argTypes @[]@types.Type, i int) int
+
+func (cc CallConv) CallArgStackOff(argTypes @[]@types.Type, i int) int
+
+func (cc CallConv) CallStackBytes(argTypes @[]@types.Type) int
+
+// CallArgFpReg returns the concrete VFP argument register that float arg i lands
+// in under AAPCS-VFP back-fill (cc.VfpBackfill): (hwSlot, isDouble) where hwSlot
+// is the S-index for a float32 or the D-index for a float64, or (-1, false) if
+// arg i is not an in-register float (it is a non-float, or an FP arg that spilled
+// to the stack, or cc.VfpBackfill is false — the monotonic-NSRN conventions do
+// not place FP regs through this method).  Runs the same S-occupancy-mask walk as
+// the arg walkers so the register the emitter reads and the in-reg-vs-stack
+// decision the walkers make cannot diverge (the "one predicate" discipline).  The
+// arm32 hard-float emitter uses this instead of a D0+NSRN recomputation, which is
+// wrong under back-fill.
+func (cc CallConv) CallArgFpReg(argTypes @[]@types.Type, i int) (int, bool)
+
+// EffectiveArgWords returns the positional GP/stack word count for an arg of
+// type t in the func-value DISPATCH convention: 1 for any aggregate passed
+// by-address (an indirect-large aggregate OR a coerced in-register struct/array
+// — AggCoercedInReg), else ArgWords(t).  Func-value / closure shims use it
+// instead of raw ArgWords so their word count + per-arg shift agree with the
+// dispatch caller (which passes the by-address aggregate as one pointer).
+func (cc CallConv) EffectiveArgWords(t @types.Type) int
+
+// NeedsEvenReg reports whether arg t obeys the AAPCS §6.5 stage C.3 even-
+// register-pair rule under this convention (an 8-byte-aligned arg on an ILP32
+// convention must start on an even core register).  Always false on LP64.  The
+// single source of truth for the even-pair condition, applied both by the
+// dispatch classifier and by a func-value shim's outgoing-register marshal.
+func (cc CallConv) NeedsEvenReg(t @types.Type) bool
+
+// V-variants take a fixedCount marking the variadic boundary.  With
+// VariadicStackOnly set (AAPCS64_Darwin), args at index >= fixedCount
+// are forced to the stack regardless of remaining GP-register budget.
+// Non-variadic callers pass fixedCount = len(argTypes) for identical
+// behavior to the non-V originals.
+func (cc CallConv) CallArgRegStartV(argTypes @[]@types.Type, i int, fixedCount int) int
+
+func (cc CallConv) CallArgStackOffV(argTypes @[]@types.Type, i int, fixedCount int) int
+
+func (cc CallConv) CallStackBytesV(argTypes @[]@types.Type, fixedCount int) int
+
+func (cc CallConv) ReturnsHfaInRegs(t @types.Type) bool
+
+// ReturnsSseInRegs reports whether result t is a SysV-AMD64 SSE aggregate
+// returned with SSE eightbytes in XMM0/XMM1 + INTEGER eightbytes in RAX/RDX (the
+// x64 analogue of ReturnsHfaInRegs; gated on cc.SseAggregates).  Dormant while
+// cc.SseAggregates is false.
+func (cc CallConv) ReturnsSseInRegs(t @types.Type) bool
+
+func (cc CallConv) FuncReturnsBigAggregate(f @ir.Func) bool
+
+func (cc CallConv) CallReturnsBigAggregate(ins @ir.Instr) bool
+
+func (cc CallConv) FuncReturnsBigMultiReturn(f @ir.Func) bool
+
+func (cc CallConv) CallReturnsBigMultiReturn(ins @ir.Instr) bool
+
+// FuncReturnsViaInternalSret reports whether f's mangled body returns its result
+// through a hidden sret buffer (a big single aggregate or a big multi-return
+// tuple) rather than in registers — the same condition PlanFrame uses to allocate
+// SretSlotOff.  Lets a C-ABI adapter trampoline derive the internal return shape
+// from f alone (no planned frame).
+func (cc CallConv) FuncReturnsViaInternalSret(f @ir.Func) bool
+
+// CExportMultiReturnRetAdaptKind classifies whether f's return needs C-ABI
+// multi-value-return adaptation (and which CRET_ADAPT_* kind): NONE for a single
+// result / non-multi return, else CExportMultiReturnAdaptKind(f.MultiReturnType).
+// Shared by the #[c_export] return trampolines and the __c_entry thunk emission.
+func (cc CallConv) CExportMultiReturnRetAdaptKind(f @ir.Func) int
+
+// CEntryNeedsThunk reports whether __c_entry(f) needs a `__centry.<mangled>`
+// adaptation thunk under cc — a narrow GP register parameter, a >16-byte by-value
+// aggregate parameter whose C form diverges, or a divergent multi-value return.
+// The single cross-backend decision: the set of __c_entry targets that get a weak
+// `__centry.` thunk (hence the pointer `__c_entry(f)` yields) is identical across
+// producers, so pkg.centry.identity holds in a mixed-producer link.
+func (cc CallConv) CEntryNeedsThunk(f @ir.Func) bool
+
+// MultiReturnTupleNeedsSret applies the target's register-vs-sret rule to a
+// multi-return tuple struct type: a register-count rule on BOTH targets (SysV
+// > 3 GP-words / > 2 FP-fields; AAPCS64 > 8 GP-words / > 8 FP-fields), matching
+// how LLVM lowers a first-class IR aggregate return field-per-register-by-class
+// rather than by the 16-byte single-aggregate rule.  Exposed so the x64
+// func-value path classifies a func value's result tuple by the SAME rule the
+// callee's FuncReturnsBigMultiReturn uses, keeping call site and callee in
+// agreement.
+func (cc CallConv) MultiReturnTupleNeedsSret(t @types.Type) bool
+
+// CMultiReturnTupleReturnsHfaInFpRegs reports whether the current target returns
+// the multi-return tuple `t` (as a C struct) in FP registers because it is a
+// Homogeneous Floating-point Aggregate: aarch64 always, arm32 hard-float only.
+// Such a tuple is never sret and the internal convention already matches clang,
+// so its #[c_export] entry stays a plain alias.
+func CMultiReturnTupleReturnsHfaInFpRegs(t @types.Type) bool
+
+// CMultiReturnTupleNeedsSret reports whether a C caller of a #[c_export] returning
+// tuple `t` receives it via a hidden sret buffer — `t` treated as a C struct is
+// memory-class (> 16 bytes LP64 / > 4 ILP32, and not an FP-HFA).  Distinct from
+// CallConv.MultiReturnTupleNeedsSret, the wider INTERNAL register-count rule.
+func CMultiReturnTupleNeedsSret(t @types.Type) bool
+
+// CMultiReturnTupleInRegCoerced reports whether tuple `t` is register-returned by
+// both the C ABI and the internal convention but the C ABI packs its sub-word
+// fields per eightbyte where the internal aggregate spreads them, so the
+// #[c_export] entry must present clang's coerced form.  Triggered by a field
+// narrower than a register word.
+func CMultiReturnTupleInRegCoerced(t @types.Type) bool
+
+// Return-adaptation kinds for a #[c_export] multi-value return (see
+// CExportMultiReturnAdaptKind).  NONE: alias.  SRET: C sret's a tuple the internal
+// convention register-returns → store the register result into the caller's
+// buffer.  COERCE: both register-return but C packs sub-word fields → store the
+// register result to a slot and reload clang's coerced form.  COERCE_FROM_SRET:
+// the C ABI register-returns a tuple the internal convention sret's (x86-64: its
+// 3-GP-word internal budget is narrower than C's 2-eightbyte packing of >3 narrow
+// fields) → pass the body a local buffer and reload clang's coerced form from it.
+const CRET_ADAPT_NONE int = 0
+
+const CRET_ADAPT_SRET int = 1
+
+const CRET_ADAPT_COERCE int = 2
+
+const CRET_ADAPT_COERCE_FROM_SRET int = 3
+
+// CExportMultiReturnAdaptKind classifies how a #[c_export] entry must adapt the
+// multi-value return tuple `t` (this cc's internal convention) to the C
+// struct-return ABI: CRET_ADAPT_NONE / _SRET / _COERCE.  Callers pass
+// f.MultiReturnType having already checked len(f.Results) > 1.
+func (cc CallConv) CExportMultiReturnAdaptKind(t @types.Type) int
+
+// CEntryRegNormWalk returns, for each of f's narrow GP integer/bool parameters passed in a GP
+// argument register (per cc, accounting for a target's sret arg-register shift), the
+// argument-register index and the parameter type — the shared classification behind both the
+// __c_entry thunk-emission decision and the #[c_export] / __c_entry register normalization
+// (emitCExportRegNorm*).  Stack-passed narrow args are excluded (the mangled-entry spill
+// canonicalizes them).
+func CEntryRegNormWalk(f @ir.Func, cc CallConv) (@[]int, @[]@types.Type)

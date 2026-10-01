@@ -1,0 +1,224 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/types"
+
+// Constant-branch folding: a compare of two constants becomes a constant, a
+// branch on a constant becomes a jump to the target it always takes, and the
+// blocks no longer reachable from the entry are removed (with their entries in
+// the phis of the blocks they reached).  LLVM does all of this itself; the
+// native backends emitted the dead compare, branch and block literally.
+//
+// With OptConfig.NullFuncValueData — set for a backend whose non-capturing
+// function value carries a null data word (every compiled backend; not the VM,
+// whose data word is the callee's shared closure record) — it first folds the
+// data-word extract of an argument-less OP_FUNC_VALUE to nil.  The release of
+// such a value (`extract data; eq nil; branch; dtor`, IR-gen's
+// emitManagedFuncValueRefDec) then folds away entirely.
+//
+// Fault pads (Func.FaultPads) are not part of the CFG (see dom.bn) and are left
+// alone.  A pad whose fault site was in a removed block is orphaned, which is
+// harmless.  The compiled backends emit no pads; native's aggregate-load
+// elision does scan them for uses of a value, and an orphaned pad can only make
+// that check more conservative.  The VM lowers every pad but branches to one only
+// from a faulting op still in Func.Blocks (see bceBlock's notes), and it indexes
+// registers by value id, so an orphaned pad that reads a removed block's values
+// lowers to dead bytecode.
+
+// foldNullFuncValueData folds, in place, every OP_EXTRACT of a non-capturing
+// OP_FUNC_VALUE's data word to OP_CONST_NIL (keeping the extract's id and type).
+// Reports whether it folded any.
+func foldNullFuncValueData(blocks @[]@ir.Block) bool {
+	var changed bool = false
+	var dataIdx int = types.FuncValueDataIndex()
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var r @ir.Instr = blk.Instrs[ii]
+			if r.Op != iropcode.OP_EXTRACT || len(r.Args) != 1 || r.Index != dataIdx {
+				continue
+			}
+			var fv @ir.Instr = r.Args[0]
+			if fv == nil || fv.Op != iropcode.OP_FUNC_VALUE || len(fv.Args) != 0 {
+				continue
+			}
+			r.Op = iropcode.OP_CONST_NIL
+			var noArgs @[]@ir.Instr
+			r.Args = noArgs
+			changed = true
+		}
+	}
+	return changed
+}
+
+// constsEqual reports whether a and b are constants whose equality is known —
+// two integers of one integer width, two bools, or two nils — and, if so,
+// whether they are equal.  Integer constants are compared after truncating to
+// the operand type's width: IR-gen does not always store a constant's IntVal
+// normalized to its type (a uint8 255 may be stored as -1).
+func constsEqual(a @ir.Instr, b @ir.Instr) (bool, bool) {
+	if a == nil || b == nil || a.Op != b.Op {
+		return false, false
+	}
+	if a.Op == iropcode.OP_CONST_INT {
+		var at @types.Type = types.StripWrappers(a.Typ)
+		var bt @types.Type = types.StripWrappers(b.Typ)
+		if at == nil || bt == nil || !at.IsInteger() || !bt.IsInteger() || at.Width != bt.Width {
+			return false, false
+		}
+		return true, foldIntCastValue(a.IntVal, at) == foldIntCastValue(b.IntVal, at)
+	}
+	if a.Op == iropcode.OP_CONST_BOOL {
+		return true, a.BoolVal == b.BoolVal
+	}
+	if a.Op == iropcode.OP_CONST_NIL {
+		return true, true
+	}
+	return false, false
+}
+
+// foldConstCompare folds, in place, an OP_EQ / OP_NE of two constants whose
+// equality is known to OP_CONST_BOOL (keeping its id and bool type).  Reports
+// whether it folded.
+func foldConstCompare(r @ir.Instr) bool {
+	if (r.Op != iropcode.OP_EQ && r.Op != iropcode.OP_NE) || len(r.Args) != 2 {
+		return false
+	}
+	var known bool
+	var eq bool
+	known, eq = constsEqual(r.Args[0], r.Args[1])
+	if !known {
+		return false
+	}
+	r.BoolVal = eq == (r.Op == iropcode.OP_EQ)
+	r.Op = iropcode.OP_CONST_BOOL
+	var noArgs @[]@ir.Instr
+	r.Args = noArgs
+	return true
+}
+
+// dropPhiEntriesFrom removes, from every phi of blk, the entries for
+// predecessor pred.
+func dropPhiEntriesFrom(blk *ir.Block, pred *ir.Block) {
+	for ii := 0; ii < len(blk.Instrs); ii++ {
+		var r @ir.Instr = blk.Instrs[ii]
+		if r.Op != iropcode.OP_PHI {
+			continue
+		}
+		var kept int = 0
+		for k := 0; k < len(r.Phis); k++ {
+			if r.Phis[k].Block != pred {
+				kept = kept + 1
+			}
+		}
+		if kept == len(r.Phis) {
+			continue
+		}
+		var entries @[]ir.PhiEntry = make_slice(ir.PhiEntry, kept)
+		var n int = 0
+		for k := 0; k < len(r.Phis); k++ {
+			if r.Phis[k].Block != pred {
+				entries[n] = r.Phis[k]
+				n = n + 1
+			}
+		}
+		r.Phis = entries
+	}
+}
+
+// foldConstBranches turns each OP_BRANCH on an OP_CONST_BOOL into an OP_JUMP to
+// the target it always takes, dropping the block from the other target's phis.
+// Reports whether any branch was folded.
+func foldConstBranches(blocks @[]@ir.Block) bool {
+	var changed bool = false
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		var n int = len(blk.Instrs)
+		if n == 0 {
+			continue
+		}
+		var term @ir.Instr = blk.Instrs[n - 1]
+		if term.Op != iropcode.OP_BRANCH || len(term.Args) != 1 ||
+				term.Args[0].Op != iropcode.OP_CONST_BOOL {
+			continue
+		}
+		var taken *ir.Block = term.Block2
+		var dropped *ir.Block = term.Block1
+		if term.Args[0].BoolVal {
+			taken = term.Block1
+			dropped = term.Block2
+		}
+		term.Op = iropcode.OP_JUMP
+		var noArgs @[]@ir.Instr
+		term.Args = noArgs
+		term.Block1 = taken
+		term.Block2 = nil
+		if dropped != taken {
+			dropPhiEntriesFrom(dropped, blk)
+		}
+		changed = true
+	}
+	return changed
+}
+
+// removeUnreachableBlocks drops the blocks of f not reachable from its entry
+// block, first removing their entries from the phis of the reachable blocks
+// they branched to.
+func removeUnreachableBlocks(f @ir.Func) {
+	var nb int = len(f.Blocks)
+	if nb == 0 {
+		return
+	}
+	var d @DomInfo = make(DomInfo)
+	d.NumBlocks = nb
+	buildSuccsPreds(d, f)
+	dfsPostorder(d)
+	if len(d.Postorder) == nb {
+		return
+	}
+	for i := 0; i < nb; i++ {
+		if d.PostNum[i] >= 0 {
+			continue
+		}
+		for k := 0; k < len(d.Succs[i]); k++ {
+			var s int = d.Succs[i][k]
+			if d.PostNum[s] >= 0 {
+				dropPhiEntriesFrom(f.Blocks[s], f.Blocks[i])
+			}
+		}
+	}
+	var kept @[]@ir.Block = make_slice(@ir.Block, len(d.Postorder))
+	var k int = 0
+	for i := 0; i < nb; i++ {
+		if d.PostNum[i] >= 0 {
+			kept[k] = f.Blocks[i]
+			k = k + 1
+		}
+	}
+	f.Blocks = kept
+}
+
+// foldBranchesFunc runs the pass on f: the null-data fold (when the backend
+// represents a non-capturing function value's data word as null), constant
+// compares, constant branches, then unreachable-block removal and the leaf
+// constants left unused.
+func foldBranchesFunc(f @ir.Func, nullFuncValueData bool) {
+	var changed bool = false
+	if nullFuncValueData {
+		changed = foldNullFuncValueData(f.Blocks)
+	}
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var blk @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			changed = foldConstCompare(blk.Instrs[ii]) || changed
+		}
+	}
+	if foldConstBranches(f.Blocks) {
+		removeUnreachableBlocks(f)
+		changed = true
+	}
+	if changed {
+		deadLeafConstElim(f)
+	}
+}

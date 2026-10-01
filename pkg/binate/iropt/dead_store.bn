@@ -1,0 +1,177 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+import "pkg/std/vec"
+
+import "pkg/binate/iropcode"
+
+// Overwritten-store elimination.
+//
+// A stack slot is often written twice before anything reads it: `var x T`
+// then `x = v`, or a managed struct's nil store followed by its initializer.
+// The first write is dead, and so is the zero-fill an aggregate OP_ALLOC
+// otherwise gets when the slot's first use is a whole store.  Two rewrites,
+// both within one block (a later block may read what an earlier one left):
+//   - an OP_STORE to a slot is removed when a later whole store to the same
+//     slot follows with no load of it in between.  Only a slot whose address
+//     is confined to whole loads and stores qualifies — any other use (an
+//     address computation, a call argument, a value operand) could read it
+//     unseen;
+//   - an OP_ALLOC whose first use in its block is a whole store of the slot's
+//     full size is marked NoZeroInit, so the backends skip its zero-fill.
+// Struct padding is left unwritten by a field-wise store; its contents are
+// unspecified (spec §21), so nothing may rely on the zero-fill there.
+//
+// A slot named in a fault pad is left alone by both rewrites: a fault between
+// the two writes (or between the OP_ALLOC and its first store) would run the
+// pad's cleanup on bytes the removed write or zero-fill would have set (the VM
+// runs fault pads; the compiled backends do not, and the VM's pass set leaves
+// this pass out regardless).  Package globals' references and parameter slots
+// are left alone too.
+//
+// Like dead-slot, the pass keeps blk.InstrsVec in step with a rebuilt block.
+
+// eliminateFuncDeadStores removes f's overwritten stores and marks its
+// fully-written slots NoZeroInit, returning whether it changed anything.
+func eliminateFuncDeadStores(f @ir.Func) bool {
+	var n int = f.NextID
+	if n <= 0 { return false }
+	// slotOK[id]: a stack slot not named in a fault pad.  confined[id]: also
+	// used only as the address of a whole load or store.
+	var slotOK @[]bool = make_slice(bool, n)
+	var confined @[]bool = make_slice(bool, n)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			if ins.Op == iropcode.OP_ALLOC && !ins.IsGlobalRef && ins.ParamIndex == 0 && ins.ID >= 0 &&
+					ins.ID < n {
+				slotOK[ins.ID] = true
+				confined[ins.ID] = true
+			}
+		}
+	}
+	unconfineSlots(f.Blocks, slotOK, confined, n, false)
+	unconfineSlots(f.FaultPads, slotOK, confined, n, true)
+	// pending[id]: index in the current block of the last store to slot id not
+	// yet read, or -1; dropOverwrittenStores leaves it all -1 again.
+	var pending @[]int = make_slice(int, n)
+	for i := 0; i < n; i++ { pending[i] = -1 }
+	var changed bool = false
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		if markFullyWrittenSlots(b, slotOK, n) { changed = true }
+		if dropOverwrittenStores(b, confined, pending, n) { changed = true }
+	}
+	return changed
+}
+
+// unconfineSlots clears confined for every slot an instruction of blocks uses
+// other than as the address (Args[0]) of an OP_LOAD or OP_STORE, and — in a
+// fault pad (isPad) — clears both slotOK and confined for every slot it uses.
+func unconfineSlots(blocks @[]@ir.Block, slotOK @[]bool, confined @[]bool, n int, isPad bool) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var b @ir.Block = blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			for k := 0; k < len(ins.Args); k++ {
+				var a @ir.Instr = ins.Args[k]
+				if a == nil || a.ID < 0 || a.ID >= n || !slotOK[a.ID] { continue }
+				if isPad {
+					slotOK[a.ID] = false
+					confined[a.ID] = false
+					continue
+				}
+				var access bool = (ins.Op == iropcode.OP_LOAD || ins.Op == iropcode.OP_STORE) && k == 0
+				if !access { confined[a.ID] = false }
+			}
+			for k := 0; k < len(ins.Phis); k++ {
+				var v *ir.Instr = ins.Phis[k].Val
+				if v != nil && v.ID >= 0 && v.ID < n {
+					confined[v.ID] = false
+					if isPad { slotOK[v.ID] = false }
+				}
+			}
+		}
+	}
+}
+
+// isWholeStoreTo reports whether ins stores a value of slot's full size into
+// slot (and does not store slot's own address).
+func isWholeStoreTo(ins @ir.Instr, slot @ir.Instr) bool {
+	if ins.Op != iropcode.OP_STORE || len(ins.Args) < 2 || ins.Args[0] != slot || ins.Args[1] == slot {
+		return false
+	}
+	var v @ir.Instr = ins.Args[1]
+	if v.Typ == nil || slot.TypeArg == nil { return false }
+	return v.Typ.SizeOf() == slot.TypeArg.SizeOf()
+}
+
+// usesValue reports whether ins reads v as an operand or phi entry.
+func usesValue(ins @ir.Instr, v @ir.Instr) bool {
+	for k := 0; k < len(ins.Args); k++ {
+		if ins.Args[k] == v { return true }
+	}
+	for k := 0; k < len(ins.Phis); k++ {
+		if ins.Phis[k].Val == v { return true }
+	}
+	return false
+}
+
+// markFullyWrittenSlots marks NoZeroInit every OP_ALLOC of b whose first use in
+// b is a whole store of the slot, returning whether it marked any.
+func markFullyWrittenSlots(b @ir.Block, slotOK @[]bool, n int) bool {
+	var marked bool = false
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var a @ir.Instr = b.Instrs[ii]
+		if a.Op != iropcode.OP_ALLOC || a.NoZeroInit || a.ID < 0 || a.ID >= n { continue }
+		if !slotOK[a.ID] { continue }
+		for jj := ii + 1; jj < len(b.Instrs); jj++ {
+			var ins @ir.Instr = b.Instrs[jj]
+			if !usesValue(ins, a) { continue }
+			if isWholeStoreTo(ins, a) {
+				a.NoZeroInit = true
+				marked = true
+			}
+			break
+		}
+	}
+	return marked
+}
+
+// dropOverwrittenStores removes every store to a confined slot of b that a
+// later whole store to the slot overwrites before a load of it, returning
+// whether it removed any.  pending is all -1 on entry and on return.
+func dropOverwrittenStores(b @ir.Block, confined @[]bool, pending @[]int, n int) bool {
+	var dead @[]bool = make_slice(bool, len(b.Instrs))
+	var any bool = false
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var ins @ir.Instr = b.Instrs[ii]
+		if len(ins.Args) < 1 { continue }
+		var s @ir.Instr = ins.Args[0]
+		if s == nil || s.ID < 0 || s.ID >= n || !confined[s.ID] { continue }
+		if ins.Op == iropcode.OP_LOAD {
+			pending[s.ID] = -1
+		} else if ins.Op == iropcode.OP_STORE {
+			if pending[s.ID] >= 0 && isWholeStoreTo(ins, s) {
+				dead[pending[s.ID]] = true
+				any = true
+			}
+			pending[s.ID] = ii
+		}
+	}
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var ins @ir.Instr = b.Instrs[ii]
+		if len(ins.Args) > 0 && ins.Args[0] != nil && ins.Args[0].ID >= 0 && ins.Args[0].ID < n {
+			pending[ins.Args[0].ID] = -1
+		}
+	}
+	if !any { return false }
+	var kept @vec.Vec[@ir.Instr] = vec.New[@ir.Instr]()
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		if !dead[ii] { kept.Push(b.Instrs[ii]) }
+	}
+	b.InstrsVec = kept
+	b.Instrs = kept.Items()
+	return true
+}

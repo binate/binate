@@ -7,7 +7,7 @@
 # (patchArm32), and ELF32 executable emit — through the scripted-driver front end.  Two
 # hand-assembled arm32 objects are linked by `bnld -driver drivers/baremetal-arm.bn ...
 # -target arm32-baremetal`: _start (object A) does a CROSS-OBJECT `bl emit_msg` (an
-# R_ARM_JUMP24 relocation the linker must resolve and patch) into emit_msg (object B), which
+# R_ARM_CALL relocation the linker must resolve and patch) into emit_msg (object B), which
 # writes "OK\n" to the PL011 UART data register at 0x09000000 (the `virt` machine's console,
 # routed to stdout by `-nographic`).
 #
@@ -46,7 +46,7 @@ u16_at() { od -An -tu2 -j"$2" -N2 "$1" | tr -d ' \n'; }
 u32_at() { od -An -tu4 -j"$2" -N4 "$1" | tr -d ' \n'; }
 
 # Object A: _start sets up sp, then a CROSS-OBJECT bl to emit_msg (undefined here ->
-# an R_ARM_JUMP24 relocation), then spins.
+# an R_ARM_CALL relocation), then spins.
 cat > "$TMP/start.s" <<'EOF'
 .arch arm32
 .section text
@@ -123,7 +123,7 @@ fi
 # captured regardless.
 OUT="$($TO "$QEMU" -M virt -cpu cortex-a15 -m 16M -nographic -no-reboot -kernel "$E" 2>&1 || true)"
 if printf '%s' "$OUT" | grep -qF "OK"; then
-    echo "PASS: qemu-system-arm booted the image and it printed OK (cross-object R_ARM_JUMP24 resolved)"
+    echo "PASS: qemu-system-arm booted the image and it printed OK (cross-object R_ARM_CALL resolved)"
     exit 0
 fi
 echo "FAIL: booted image did not print OK" >&2

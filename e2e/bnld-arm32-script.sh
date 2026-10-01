@@ -7,7 +7,7 @@
 # it builds a LayoutScript (start dot at the RAM base, ordered sections with `*(GLOB)`
 # placements + boundary symbols, an entry) and calls LinkWithScript.  Two hand-assembled
 # arm32 objects are linked: _start (object A) does a CROSS-OBJECT `bl emit_msg` (an
-# R_ARM_JUMP24 the linker resolves + patches) into emit_msg (object B), which writes "OK\n"
+# R_ARM_CALL the linker resolves + patches) into emit_msg (object B), which writes "OK\n"
 # to the PL011 UART at 0x09000000 (routed to stdout by `-nographic`).
 #
 # The emitted ELF32 is structure-checked, then — when qemu-system-arm is available — BOOTED

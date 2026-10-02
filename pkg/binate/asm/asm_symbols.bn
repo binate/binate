@@ -1,0 +1,186 @@
+package "pkg/binate/asm"
+
+import "pkg/binate/buf"
+
+// The symbol table: finding and adding symbols, defining labels, absolute symbols and
+// aliases, and declaring bindings.
+
+// DefineLocalAt defines the local symbol name at offset in section; see asm.bni.
+func (a @Assembler) DefineLocalAt(name *[]readonly char, section int, offset uint) int {
+	if a.findSymbol(name) >= 0 {
+		a.setError(buf.Concat(buf.Concat("symbol '", name), "' already exists"))
+		return -1
+	}
+	return a.addSymbol(name, section, offset, BIND_LOCAL)
+}
+
+// undefinedSymbolFor returns the index of an undefined symbol name to define — the one a
+// `.global` / `.weak` declared, or a new local one — or -1, with the error set, when name
+// is already defined.
+func (a @Assembler) undefinedSymbolFor(name *[]readonly char) int {
+	var idx int = a.findSymbol(name)
+	if idx < 0 { return a.addSymbol(name, -1, 0, BIND_LOCAL) }
+	if a.Symbols[idx].Section >= 0 || a.Symbols[idx].Abs {
+		a.setError(buf.Concat(buf.Concat("symbol '", name), "' is already defined"))
+		return -1
+	}
+	return idx
+}
+
+// DefineAbsolute defines name as an absolute symbol; see asm.bni.
+func (a @Assembler) DefineAbsolute(name *[]readonly char, value int64) {
+	var idx int = a.undefinedSymbolFor(name)
+	if idx < 0 { return }
+	a.Symbols[idx].Abs = true
+	a.Symbols[idx].AbsValue = value
+}
+
+// DefineAlias defines name at offset in section; see asm.bni.
+func (a @Assembler) DefineAlias(name *[]readonly char, section int, offset uint, altEntry bool) {
+	var idx int = a.undefinedSymbolFor(name)
+	if idx < 0 { return }
+	a.Symbols[idx].Section = section
+	a.Symbols[idx].Offset = offset
+	a.Symbols[idx].AltEntry = altEntry
+}
+
+// symHash is the djb2 hash of `name` — SymIndex's injected key hasher, paired
+// with charsEqual as its injected equality.  The arithmetic wraps (two's
+// complement), which is fine for a hash; Put and Get use the same function, so it
+// stays consistent.
+func symHash(name *[]readonly char) uint {
+	var h uint = 5381
+	for i := 0; i < len(name); i++ {
+		h = h * 33 + cast(uint, name[i])
+	}
+	return h
+}
+
+// findSymbol returns the index of a symbol in a.Symbols by name,
+// or -1 if not found.  Backed by a.SymIndex (name→index) for O(1)
+// lookup; addSymbol keeps the index in lockstep as the sole append site.
+func (a @Assembler) findSymbol(name *[]readonly char) int {
+	var idx int
+	var ok bool
+	idx, ok = a.SymIndex.Get(name)
+	if ok {
+		return idx
+	}
+	return -1
+}
+
+// addSymbol appends a new symbol to a.Symbols and returns its index.
+// The name is copied. Does not check for duplicates — caller must
+// check via findSymbol first if needed.
+func (a @Assembler) addSymbol(name *[]readonly char, section int, offset uint, binding int) int {
+	if a.NumSymbols >= len(a.Symbols) {
+		var newCap int = len(a.Symbols) * 2
+		var newArr @[]Symbol = make_slice(Symbol, newCap)
+		for i := 0; i < a.NumSymbols; i++ {
+			newArr[i] = a.Symbols[i]
+		}
+		a.Symbols = newArr
+	}
+	var idx int = a.NumSymbols
+	a.Symbols[idx].Name = buf.CopyStr(name)
+	a.Symbols[idx].Section = section
+	a.Symbols[idx].Offset = offset
+	a.Symbols[idx].Binding = binding
+	a.NumSymbols = a.NumSymbols + 1
+	// Record name→index for findSymbol.  Key off the stored Name (the CopyStr
+	// buffer the Symbols array keeps alive), not the caller's `name`.  Keep the
+	// FIRST index per name — matching the old first-match linear scan — though
+	// callers already check findSymbol before adding, so names never repeat here.
+	if !a.SymIndex.Has(a.Symbols[idx].Name) {
+		a.SymIndex.Put(a.Symbols[idx].Name, idx)
+	}
+	return idx
+}
+
+// DefineLabel records a symbol whose value is the current offset in
+// the active section. If `name` was previously referenced as a forward
+// reference (Section == -1), that entry is filled in; if it was already
+// defined, the assembler records a "duplicate label" error. New labels
+// default to BIND_LOCAL — promote with SetGlobal/SetWeak as needed.
+// Sets an error and is a no-op if no section is active.
+func (a @Assembler) DefineLabel(name *[]readonly char) {
+	if a.Current < 0 {
+		a.setError("no current section")
+		return
+	}
+	var existing int = a.findSymbol(name)
+	if existing >= 0 {
+		// Check for redefinition
+		if a.Symbols[existing].Section >= 0 {
+			a.setError(buf.Concat(buf.Concat("duplicate label '", name), "'"))
+			return
+		}
+		// Was undefined (forward reference) — now define it
+		a.Symbols[existing].Section = a.Current
+		a.Symbols[existing].Offset = cast(uint, a.Sections[a.Current].Len)
+		return
+	}
+	a.addSymbol(name, a.Current, cast(uint, a.Sections[a.Current].Len), BIND_LOCAL)
+}
+
+// SetGlobal marks a symbol with global linkage. Creates an undefined
+// global entry if the symbol hasn't been seen yet, so a forward
+// reference to an external symbol can also be marked global before
+// any definition exists.
+//
+// A symbol that's already BIND_WEAK is left WEAK: weak symbols are
+// already externally visible to the linker, and emitFuncValueVtables
+// (in particular) calls SetGlobal on a shim that emitFuncValueShims
+// already marked WEAK — the intent there is "let me reference this
+// symbol from this section", not "promote it to strong global".
+// Without this guard the SetGlobal call demoted the shim to strong
+// global, so two .o files both defining the same shim collided at
+// link time ("duplicate symbol <mangled-fn>__shim") rather than
+// deduping the way weak_odr-style symbols should.
+func (a @Assembler) SetGlobal(name *[]readonly char) {
+	var idx int = a.findSymbol(name)
+	if idx < 0 {
+		// Create as undefined global — will be defined later or remain external
+		idx = a.addSymbol(name, -1, 0, BIND_GLOBAL)
+		return
+	}
+	if a.Symbols[idx].Binding == BIND_WEAK { return }
+	a.Symbols[idx].Binding = BIND_GLOBAL
+}
+
+// SetGlobalC marks a symbol global AND flags it to carry the platform
+// C-symbol prefix (`_` on Mach-O, none on ELF — see Symbol.CPrefix).  Backs the
+// `.global_c` directive, letting one hand-written `.s` define a Binate function
+// symbol that resolves under both object formats.  Like SetGlobal it creates an
+// undefined entry if the symbol is not yet known and preserves an existing WEAK
+// binding (weak symbols are already externally visible); the CPrefix flag is set
+// regardless of binding.
+func (a @Assembler) SetGlobalC(name *[]readonly char) {
+	var idx int = a.findSymbol(name)
+	if idx < 0 {
+		idx = a.addSymbol(name, -1, 0, BIND_GLOBAL)
+		a.Symbols[idx].CPrefix = true
+		return
+	}
+	if a.Symbols[idx].Binding != BIND_WEAK {
+		a.Symbols[idx].Binding = BIND_GLOBAL
+	}
+	a.Symbols[idx].CPrefix = true
+}
+
+// SetWeak marks a symbol with weak linkage. Like SetGlobal, this also
+// creates an undefined entry if the symbol is not yet known.
+func (a @Assembler) SetWeak(name *[]readonly char) {
+	var idx int = a.findSymbol(name)
+	if idx < 0 {
+		idx = a.addSymbol(name, -1, 0, BIND_WEAK)
+		return
+	}
+	a.Symbols[idx].Binding = BIND_WEAK
+}
+
+// LookupSymbol returns the index of a symbol by name, or -1 if not found.
+// Exported for use by per-architecture fixup resolvers.
+func (a @Assembler) LookupSymbol(name *[]readonly char) int {
+	return a.findSymbol(name)
+}

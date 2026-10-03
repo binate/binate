@@ -1694,7 +1694,8 @@ testing.Println(x)
 > variable x parked (pending: y)
 > variable x still parked (it does not check)
 <repl>:1:13: cannot assign bool to int
-> variable x resolved
+> warning: variable y shadowed (incompatible type); existing references retain the old variable
+variable x resolved
 > 2
 > "
 
@@ -2321,6 +2322,112 @@ testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
 > 0
 > > > 5
 > 0
+> "
+
+# --- Case 74: a variable redeclared at the prompt — with its own type it is
+# replaced (same storage: earlier functions see the new value; without an
+# initializer it is reset, releasing what it held), with another type it is
+# shadowed (earlier functions keep the old variable), as it is when a constant
+# or function takes its name; also when the redeclaration parks and resolves
+# later. ---
+run_repl "tier3-variable-redeclared-replaced-or-shadowed" \
+"import \"pkg/builtins/rt\"
+var x int = 1
+var x bool = true
+testing.Println(x)
+var q int = 1
+var q int = 2
+testing.Println(q)
+var s @[]char = \"ab\"
+var s int = 7
+testing.Println(s)
+var y bool = false
+var y int = 9
+testing.Println(y)
+func useX() bool { return x }
+testing.Println(useX())
+var n int = 1
+func getN() int { return n }
+var n int = 5
+testing.Println(getN())
+var m int = 1
+func getM() int { return m }
+var m bool = true
+testing.Println(getM(), m)
+var z int = 5
+var z int
+testing.Println(z)
+var inr @Box = make(Box)
+var before int = rt.Refcount(bit_cast(*uint8, inr))
+var h @Box = inr
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
+var h @Box = make(Box)
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
+var h @Box = inr
+var h @Box
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before, h == nil)
+var h2 @Box = inr
+var h2 int = 3
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before, h2)
+var p int = 1
+var p bool = later()
+func later() bool { return true }
+testing.Println(p)
+var r int = 1
+var r int = val()
+func val() int { return 9 }
+testing.Println(r)
+var q int = 1
+func readQ() int { return q }
+const q = 2
+testing.Println(q, readQ())
+var q [4]int = [4]int{5, 6, 7, 8}
+testing.Println(q[0], q[3], readQ())
+var u int = 1
+func u() int { return 2 }
+testing.Println(u())
+var u @[]char = make_slice(char, 9)
+testing.Println(len(u))
+const (
+	k1 = 1
+	cx = 2
+)
+var cx @[]char = make_slice(char, 4)
+testing.Println(len(cx))
+" \
+"$BANNER
+> package pkg/builtins/rt loaded
+> > warning: variable x shadowed (incompatible type); existing references retain the old variable
+> true
+> > > 2
+> > warning: variable s shadowed (incompatible type); existing references retain the old variable
+> 7
+> > warning: variable y shadowed (incompatible type); existing references retain the old variable
+> 9
+> > true
+> > > > 5
+> > > warning: variable m shadowed (incompatible type); existing references retain the old variable
+> 1 true
+> > > 0
+> > > > 1
+> > 0
+> > > 0 true
+> > warning: variable h2 shadowed (incompatible type); existing references retain the old variable
+> 1 3
+> > variable p parked (pending: later)
+> variable p resolved
+warning: variable p shadowed (incompatible type); existing references retain the old variable
+> true
+> > variable r parked (pending: val)
+> variable r resolved
+> 9
+> > > warning: variable q shadowed (redeclared as a constant); existing references retain the old variable
+> 2 1
+> > 5 8 1
+> > warning: variable u shadowed (redeclared as a function); existing references retain the old variable
+> 2
+> > 9
+> ... ... ... > > 4
 > "
 
 # --- Setup-error case: a type error in the loaded module surfaces

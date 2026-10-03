@@ -91,6 +91,15 @@ CONSTRUCTS = [
     # needs a per-iteration heap alloc and a tiny `.tmp`, so a runtime
     # stress cell would be heavy and slow; conformance/check-alloca-hoist
     # over the corpus catches it cleanly, e.g. cells 445 / 450.)
+    # --- leak-prone: OP_CAST's `.crs` reinterpret slot — a struct cast to a
+    #     distinct struct of one layout, an array retype whose element LLVM
+    #     types differ (`[N x i8]` -> `[N x i1]`). ---
+    ("cast-struct-retype",
+     "type BigQ struct {\n\tdata [256]int\n}",
+     ["var b Big", "var q BigQ = cast(BigQ, b)", "sink(q.data[0])"], 6500),  # 2 KB/iter
+    ("unsafe-cast-array-retype", "",
+     ["var a [2048]int8", "var b [2048]bool = unsafe_cast([2048]bool, a)",
+      "sink(len(b))"], 6500),                             # 2 KB/iter
     # --- controls: hoisted ops + per-iteration heap that must stay bounded ---
     ("control-make-slice", "",
      ["var m @[]char = make_slice(char, 4)", "sink(len(m))"], 200000),

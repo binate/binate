@@ -1,0 +1,157 @@
+package "pkg/binate/link"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/asm/elf"
+import "pkg/binate/asm/macho"
+import "pkg/binate/buf"
+import "pkg/builtins/testing"
+import "pkg/std/os"
+
+// An AArch64 32-bit absolute data word (aarch64.FIX_ABS32: ELF R_AARCH64_ABS32, Mach-O a
+// 4-byte ARM64_RELOC_UNSIGNED with the addend in the word) links to its target's address
+// plus the addend — a negative one too — and is an error when that does not fit 32 bits.
+// (fail is in parse_elf_test.bn, testTmpDir in link_test.bn, fieldWord in
+// relocate_arm32_test.bn.)
+
+// abs32Link assembles an object whose text defines g (after a nop) and whose data holds
+// the 32-bit absolute word g + addend, writes it in format, reads it back and links it at
+// base, returning the object, the layout, g's address and the link error.
+func abs32Link(dir *[]readonly char, format int, addend int,
+		base uint64) (@InputObject, @LayoutResult, uint64, @[]readonly char) {
+	var none @InputObject
+	var noLr @LayoutResult
+	var a @asm.Assembler = asm.New(8)
+	a.ObjFormat = format
+	a.SetSection("text", -1)
+	a.EmitUint32(0xD503201F) // nop
+	a.DefineLabel("g")
+	a.SetGlobal("g")
+	a.EmitUint32(0xD65F03C0) // ret
+	a.SetSection("data", -1)
+	a.AddFixup("g", aarch64.FIX_ABS32, addend, 4)
+	a.Fill(4, cast(uint8, 0))
+	aarch64.ResolveFixups(a)
+	a.Finalize()
+	if a.HasError { return none, noLr, 0, "assembler error" }
+	var path @[]char = buf.Concat(dir, "/abs32.o")
+	var obj @InputObject
+	if format == asm.OBJ_ELF {
+		if !elf.WriteAArch64(a, path) { return none, noLr, 0, "cannot write the ELF object" }
+		o, err := ReadObject(path)
+		if len(err) != 0 { return none, noLr, 0, "cannot read the ELF object" }
+		obj = o
+	} else {
+		if !macho.WriteARM64(a, path) { return none, noLr, 0, "cannot write the Mach-O object" }
+		data, ok := readFile(path)
+		if !ok { return none, noLr, 0, "cannot read the Mach-O object" }
+		o, err := parseMachoBytes(data, path)
+		if len(err) != 0 { return none, noLr, 0, "cannot parse the Mach-O object" }
+		obj = o
+	}
+	var objs @[]@InputObject = make_slice(@InputObject, 1)
+	objs[0] = obj
+	t, rerr := Resolve(objs)
+	if len(rerr) != 0 { return none, noLr, 0, rerr }
+	var lr @LayoutResult = Layout(objs, base)
+	var lerr @[]readonly char = Relocate(t, lr)
+	oo, ss, found := t.Lookup("g")
+	if !found { return obj, lr, 0, "g not defined" }
+	g, gok := definedAddr(t, lr, oo, ss)
+	if !gok { return obj, lr, 0, "g not placed" }
+	return obj, lr, g, lerr
+}
+
+// The word holds g's address plus the addend (4, and -4 through Mach-O's sign-extended
+// implicit addend), from an ELF and from a Mach-O object.
+func TestAbs32Links() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	for f := 0; f < 2; f++ {
+		var format int = asm.OBJ_ELF
+		if f == 1 { format = asm.OBJ_MACHO }
+		for k := 0; k < 2; k++ {
+			var addend int = 4
+			if k == 1 { addend = -4 }
+			obj, lr, g, err := abs32Link(dir, format, addend, cast(uint64, 0x400000))
+			if len(err) != 0 { return fail(buf.Concat("link failed: ", err)) }
+			word, _, ok := fieldWord(obj, lr, "g", R_AARCH64_ABS32)
+			if !ok || cast(uint64, word) != g + cast(uint64, addend) {
+				return fail("the word does not hold g plus its addend")
+			}
+		}
+	}
+	return ""
+}
+
+// The word's value must lie in [-2^31, 2^32): g linked past 4 GiB (from an ELF and a
+// Mach-O object) and g plus an addend below -2^31 do not fit, and the link fails.
+func TestAbs32OutOfRange() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	var want *[]readonly char = "ABS32 out of range for g"
+	_, _, _, err := abs32Link(dir, asm.OBJ_ELF, 0, cast(uint64, 0x100000000))
+	if !charsEqual(err, want) { return fail(buf.Concat("ELF past 4 GiB not out of range: ", err)) }
+	_, _, _, merr := abs32Link(dir, asm.OBJ_MACHO, 0, cast(uint64, 0x100000000))
+	if !charsEqual(merr, want) {
+		return fail(buf.Concat("Mach-O past 4 GiB not out of range: ", merr))
+	}
+	_, _, _, nerr := abs32Link(dir, asm.OBJ_ELF, -0x80000000 - 0x500000, cast(uint64, 0x400000))
+	if !charsEqual(nerr, want) { return fail(buf.Concat("below -2^31 not out of range: ", nerr)) }
+	return ""
+}
+
+// machoRelocInfo returns the file offset of the first relocation_info of the second
+// section_64 (data) in the Mach-O object b — the first load command's sections start at
+// 32 + 72, 80 bytes each — and its count.
+func machoRelocInfo(b @[]uint8) (int, int) {
+	var sec int = 32 + 72 + 80
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var rd *[]readonly uint8 = b
+	return cast(int, u32(rd, sec + 56)), cast(int, u32(rd, sec + 60))
+}
+
+// A Mach-O UNSIGNED marked PC-relative, or preceded by an ARM64_RELOC_ADDEND entry, is
+// malformed (an absolute word whose addend is the word itself) and is rejected, as ld64
+// rejects it.
+func TestReadMachoMalformedUnsigned() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	var a @asm.Assembler = asm.New(8)
+	a.ObjFormat = asm.OBJ_MACHO
+	a.SetSection("text", -1)
+	a.DefineLabel("g")
+	a.SetGlobal("g")
+	a.EmitUint32(0xD65F03C0) // ret
+	a.SetSection("data", -1)
+	a.AddFixup("g", 0, 0, 8)
+	a.Fill(8, cast(uint8, 0))
+	a.AddFixup("g", 0, 0, 8)
+	a.Fill(8, cast(uint8, 0))
+	aarch64.ResolveFixups(a)
+	a.Finalize()
+	var path @[]char = buf.Concat(dir, "/unsigned.o")
+	if a.HasError || !macho.WriteARM64(a, path) { return fail("cannot write the object") }
+	for k := 0; k < 2; k++ {
+		data, ok := readFile(path)
+		if !ok { return fail("cannot read the object back") }
+		roff, n := machoRelocInfo(data)
+		if n != 2 { return fail("not two relocations in data") }
+		if k == 0 {
+			data[roff + 7] = data[roff + 7] | 0x01 // r_pcrel (bit 24 of the info word)
+		} else {
+			data[roff + 4] = 4 // r_symbolnum: an addend of 4
+			data[roff + 5] = 0
+			data[roff + 6] = 0
+			data[roff + 7] = cast(uint8, 0xA0 | 0x04) // type ARM64_RELOC_ADDEND, length 2
+		}
+		_, err := parseMachoBytes(data, path)
+		if !charsEqual(err, buf.Concat("malformed ARM64_RELOC_UNSIGNED in ", path)) {
+			return fail(buf.Concat("malformed UNSIGNED accepted: ", err))
+		}
+	}
+	return ""
+}

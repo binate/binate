@@ -610,6 +610,20 @@ testing.Println(b.items[0] + b.items[1] + b.items[2])
 > > > > > 60
 > "
 
+# --- Case 8a1 (Tier 2): an alias of a struct literal at the prompt is the
+# anonymous struct itself: a value of the alias passes where the literal type is
+# expected, and its fields read back. ---
+run_repl "tier2-type-struct-alias" \
+"type Anon = struct { a int8; b int8 }
+func getB(s struct { a int8; b int8 }) int8 { return s.b }
+var x Anon
+x.b = 7
+testing.Println(getB(x), x.b)
+" \
+"$BANNER
+> > > > > 7 7
+> "
+
 # --- Case 8a2 (Tier 2): a top-level var initialized with a raw-slice
 # literal keeps its elements: the literal's backing is a hidden module
 # global (materialized before the var-init synthetic runs), not a slot on

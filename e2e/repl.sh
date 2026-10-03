@@ -2288,6 +2288,41 @@ testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 > > > 0
 > "
 
+# --- Case 73: closures created at the prompt — in a variable initializer, a
+# function body, a block, a raw func value and a method value — release
+# what they capture when dropped (their closure structs' dtors exist). ---
+run_repl "tier3-closure-captures-released-at-prompt" \
+"import \"pkg/builtins/rt\"
+type F @func() int
+var bx @Box = make(Box)
+var before int = rt.Refcount(bit_cast(*uint8, bx))
+var g F = func() int { return bx.V + 1 }
+testing.Println(g())
+g = func() int { return 2 }
+testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
+func mk() F { var b @Box = bx; return func() int { return b.V + 3 } }
+{ var h F = mk(); testing.Println(h()) }
+testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
+func raw() int { var b @Box = bx; var r *func() int = func() int { return b.V + 4 }; return r() }
+testing.Println(raw())
+testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
+func (b @Box) Get() int { return b.V + 5 }
+func mv() int { var b @Box = bx; var m *func() int = b.Get; return m() }
+testing.Println(mv())
+testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
+" \
+"$BANNER
+> package pkg/builtins/rt loaded
+> > > > > 1
+> > 0
+> > 3
+> 0
+> > 4
+> 0
+> > > 5
+> 0
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # (Stage 2) as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

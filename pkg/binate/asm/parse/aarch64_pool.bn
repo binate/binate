@@ -1,0 +1,236 @@
+package "pkg/binate/asm/parse"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64/isa"
+import "pkg/binate/buf"
+
+// Literal pools: `ldr Wt|Xt, =expr`, as clang assembles it.  A number one MOVZ builds —
+// its set bits within one 16-bit chunk at a shift the register allows (0 or 16 for W, up
+// to 48 for X) — is that MOVZ; any other value is an entry of the register's size in
+// its section's pool, which an LDR (literal) loads.  A section's pending entries are
+// emitted at `.ltorg` / `.pool` and at the end of the input, each aligned to its size.
+// An entry is shared by later loads of the same size and value in the section — a number
+// by its value, a plain name (`f`, `1b`, an alias, also parenthesized) by the name — even
+// once emitted, while it is within a load's reach behind it; a symbol with arithmetic
+// (`f+4`) gets an entry of its own each time, as clang's do.  No sharing crosses a label
+// that starts a Mach-O atom (any but an `L` temporary; with the object format not yet
+// known, too), since a linker may move each atom: a load and its entry stay in one atom,
+// where clang shares across them and resolves the load in place.
+
+// poolKeyNumber is the sharing key of a number entry (shared by value).
+var poolKeyNumber *[]readonly char = "#"
+
+// parseA64PoolLoad parses the `=expr` operand of `ldr Rt, =expr` (tok the '=', l just
+// after it) for transfer spec and register rt, and emits the MOVZ or the literal load.
+func parseA64PoolLoad(p @Parser, l Lexer, tok Token, spec uint32, rt int,
+		unscaledOnly bool) (Lexer, Token) {
+	if unscaledOnly || (spec != isa.LS_LDR_W && spec != isa.LS_LDR_X) {
+		setErr(p, "a literal-pool load (`=`) is an LDR of a W or X register")
+		return l, tok
+	}
+	var isX bool = spec == isa.LS_LDR_X
+	l, tok = LexNext(l)
+	var key @[]char = poolNameKey(l, tok)
+	var r ExprResult
+	l, tok, r = parseSymExpr(p, l, tok)
+	if !r.Ok {
+		setErr(p, exprErr(r, "invalid literal-pool value"))
+		return l, tok
+	}
+	if !a64AtEOL(p, tok) { return l, tok }
+	if r.Dot {
+		r.Sym = dotLabel(p)
+		if p.Asm.HasError { return l, tok }
+	}
+	if len(r.Sym) == 0 {
+		var shift int = movzShift(r.Val, isX)
+		if shift >= 0 {
+			var chunk int = cast(int, (bit_cast(uint64, r.Val) >> cast(uint64, shift)) & 0xFFFF)
+			isa.MoveWide(p.Asm, isa.MW_MOVZ, isX, rt, chunk, shift)
+			return l, tok
+		}
+		if !isX && (r.Val < -2147483648 || r.Val > 4294967295) {
+			setErr(p, "the literal-pool value does not fit a W register")
+			return l, tok
+		}
+		key = buf.CopyStr(poolKeyNumber)
+	} else {
+		if !intFits(r.Val) {
+			setErr(p, "literal-pool addend out of range")
+			return l, tok
+		}
+		if len(key) > 0 && isDigit(key[0]) { key = buf.CopyStr(r.Sym) } // a numeric label's instance
+	}
+	var label @[]char = poolEntry(p, isX, r.Sym, r.Val, key)
+	isa.LdStLiteral(p.Asm, spec, rt, label, 0)
+	return l, tok
+}
+
+// poolNameKey returns the name the operand (tok its first token, l just after it) is — a
+// lone name, in any number of parentheses — the key a plain name shares its entry by, or
+// "".
+func poolNameKey(l Lexer, tok Token) @[]char {
+	var depth int = 0
+	for tok.Kind == TOK_LPAREN {
+		depth = depth + 1
+		l, tok = LexNext(l)
+	}
+	if tok.Kind != TOK_IDENT { return "" }
+	var name @[]char = buf.CopyStr(tok.Text)
+	var next Token
+	l, next = LexNext(l)
+	for depth > 0 && next.Kind == TOK_RPAREN {
+		depth = depth - 1
+		l, next = LexNext(l)
+	}
+	if depth != 0 || next.Kind != TOK_EOF { return "" }
+	return name
+}
+
+// poolSecGen returns section si's count of atom-starting labels (PoolSecGens).
+func poolSecGen(p @Parser, si int) int {
+	if si < 0 || si >= len(p.PoolSecGens) { return 0 }
+	return p.PoolSecGens[si]
+}
+
+// notePoolAtom counts the label name, just defined in the current section, when it starts
+// a Mach-O atom: on Mach-O, or with the object format not yet known (none starts one on
+// ELF).
+func notePoolAtom(p @Parser, name *[]readonly char) {
+	if p.Asm.ObjFormat == asm.OBJ_ELF || asm.IsTemporaryLabel(name, asm.OBJ_MACHO) { return }
+	var si int = p.Asm.Current
+	if si < 0 { return }
+	if si >= len(p.PoolSecGens) {
+		var gens @[]int = make_slice(int, si + 8)
+		for i := 0; i < len(p.PoolSecGens); i++ { gens[i] = p.PoolSecGens[i] }
+		p.PoolSecGens = gens
+	}
+	p.PoolSecGens[si] = p.PoolSecGens[si] + 1
+}
+
+// movzShift returns the shift of the MOVZ that builds v in a W (isX false) or X register
+// — v's set bits within one 16-bit chunk at that shift (0 for v = 0) — or -1 if there is
+// none, as clang reads `ldr Rt, =v` (it does not try MOVN or ORR).
+func movzShift(v int64, isX bool) int {
+	var u uint64 = bit_cast(uint64, v)
+	var shift int = 0
+	for u > 0xFFFF && (u & 0xFFFF) == 0 {
+		u = u >> 16
+		shift = shift + 16
+	}
+	var maxShift int = 16
+	if isX { maxShift = 48 }
+	if u > 0xFFFF || shift > maxShift { return -1 }
+	return shift
+}
+
+// poolEntry returns the label of the entry holding sym + val (a number when sym is
+// empty) in 8 (isX) or 4 bytes in the current section's pool, sharing one with key (see
+// the file comment; "" shares none), or adding a pending one.
+func poolEntry(p @Parser, isX bool, sym *[]readonly char, val int64, key *[]readonly char) @[]char {
+	var size int = 4
+	if isX { size = 8 }
+	var si int = p.Asm.Current
+	var here int = p.Asm.Sections[si].Len
+	var gen int = poolSecGen(p, si)
+	for i := p.NumPool - 1; i >= 0 && len(key) > 0; i-- {
+		if p.PoolSecs[i] != si || p.PoolSizes[i] != size || !charsEqual(p.PoolKeys[i], key) { continue }
+		if p.PoolVals[i] != val || !charsEqual(p.PoolSyms[i], sym) { continue }
+		if p.PoolGens[i] != gen { break } // the newest such entry is in an earlier atom
+		// The newest matching entry: pending, or emitted within the load's reach behind it
+		// (an LDR (literal) reaches 1 MB back); otherwise a new entry, nearer.
+		if p.PoolOffs[i] < 0 || here - p.PoolOffs[i] <= 1048576 { return p.PoolLabels[i] }
+		break
+	}
+	if p.NumPool >= len(p.PoolSecs) { growPool(p) }
+	var n int = p.NumPool
+	p.PoolSecs[n] = si
+	p.PoolLabels[n] = asm.GeneratedLabelName("=", n)
+	p.PoolSizes[n] = size
+	p.PoolVals[n] = val
+	p.PoolSyms[n] = buf.CopyStr(sym)
+	p.PoolKeys[n] = buf.CopyStr(key)
+	p.PoolOffs[n] = -1
+	p.PoolGens[n] = gen
+	p.NumPool = n + 1
+	return p.PoolLabels[n]
+}
+
+// growPool doubles the capacity of p's literal-pool table.
+func growPool(p @Parser) {
+	var n int = 2 * len(p.PoolSecs)
+	if n == 0 { n = 8 }
+	var secs @[]int = make_slice(int, n)
+	var labels @[]@[]char = make_slice(@[]char, n)
+	var sizes @[]int = make_slice(int, n)
+	var vals @[]int64 = make_slice(int64, n)
+	var syms @[]@[]char = make_slice(@[]char, n)
+	var keys @[]@[]char = make_slice(@[]char, n)
+	var offs @[]int = make_slice(int, n)
+	var gens @[]int = make_slice(int, n)
+	for i := 0; i < p.NumPool; i++ {
+		secs[i] = p.PoolSecs[i]
+		labels[i] = p.PoolLabels[i]
+		sizes[i] = p.PoolSizes[i]
+		vals[i] = p.PoolVals[i]
+		syms[i] = p.PoolSyms[i]
+		keys[i] = p.PoolKeys[i]
+		offs[i] = p.PoolOffs[i]
+		gens[i] = p.PoolGens[i]
+	}
+	p.PoolSecs = secs
+	p.PoolLabels = labels
+	p.PoolSizes = sizes
+	p.PoolVals = vals
+	p.PoolSyms = syms
+	p.PoolKeys = keys
+	p.PoolOffs = offs
+	p.PoolGens = gens
+}
+
+// flushPool emits section si's pending literal-pool entries at its end, in the order they
+// were added, each aligned to its size with zero bytes: a number's bytes, or a zero word
+// with an absolute fixup to its symbol plus the number (the pointer-sized generic kind, or
+// aarch64's FIX_ABS32 for a 4-byte entry there).  The current section is kept.
+func flushPool(p @Parser, si int) {
+	var a @asm.Assembler = p.Asm
+	var cur int = a.Current
+	var switched bool = false
+	for i := 0; i < p.NumPool; i++ {
+		if p.PoolSecs[i] != si || p.PoolOffs[i] >= 0 { continue }
+		if !switched && cur != si {
+			a.SetSection(a.Sections[si].Name, -1)
+			switched = true
+		}
+		var size int = p.PoolSizes[i]
+		a.Align(size)
+		a.DefineLabel(p.PoolLabels[i])
+		p.PoolOffs[i] = a.Sections[si].Len
+		p.PoolGens[i] = poolSecGen(p, si)
+		if len(p.PoolSyms[i]) > 0 {
+			var kind int = 0
+			if size != a.WordSize && p.Arch == ARCH_AARCH64 { kind = isa.FIX_ABS32 }
+			a.AddFixup(p.PoolSyms[i], kind, cast(int, p.PoolVals[i]), size)
+			a.Fill(size, cast(uint8, 0))
+		} else if size == 8 {
+			a.EmitUint64(bit_cast(uint64, p.PoolVals[i]))
+		} else {
+			a.EmitUint32(cast(uint32, p.PoolVals[i]))
+		}
+	}
+	if switched && cur >= 0 { a.SetSection(a.Sections[cur].Name, -1) }
+}
+
+// flushAllPools emits every section's pending literal-pool entries at its end.
+func flushAllPools(p @Parser) {
+	for si := 0; si < p.Asm.NumSections; si++ { flushPool(p, si) }
+}
+
+// poolNamesSymbol reports whether a pending literal-pool entry refers to symbol name (an
+// emitted one is a fixup, which usedAsSymbol sees).
+func poolNamesSymbol(p @Parser, name *[]readonly char) bool {
+	for i := 0; i < p.NumPool; i++ {
+		if p.PoolOffs[i] < 0 && charsEqual(p.PoolSyms[i], name) { return true }
+	}
+	return false
+}

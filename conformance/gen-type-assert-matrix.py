@@ -196,7 +196,7 @@ def ancestor_ok(src, rec):
 
 def ancestor_abort(src, rec):
     # Res (behind *RC / @RC) does not implement the unrelated Writer → the abort
-    # form panics.  An interface TARGET names the target by its bare interface.
+    # form panics.  An interface TARGET is named qualified, like every type.
     if src == "raw":
         setup = ["var t Res", "t.x = 10", "var rc *RC = &t"]
         p = "*"
@@ -609,22 +609,22 @@ for src in ("raw", "mgd"):
                       exp=[105, 105, 0, 1]))
     CELLS.append(dict(rel=f"iface/{src}-concrete/abort", inv=INV["abort"], decls=IFACE_DECLS,
                       body=iface_abort(src, rec, "Dog"),
-                      err="type assertion failed: main.Cat is not main.Dog"))
+                      err="type assertion failed: main\\.Cat is not main\\.Dog"))
     # interface *J / @J (direct satisfaction; MISS via unsatisfied Flyer)
     CELLS.append(dict(rel=f"iface/{src}-iface/ok", inv=INV["iface"], decls=IFACE_DECLS,
                       body=iface_ok(src, rec, "Named", "Named", ".name()", 0),
                       exp=[105, 105, 0, 1]))
-    # An interface-TARGET miss names the target by its bare interface name
-    # (`is not Named`), not a package-qualified concrete name (`is not main.Dog`).
+    # An interface-TARGET miss names the target qualified (`is not main.Named`),
+    # as a concrete target is (`is not main.Dog`).
     CELLS.append(dict(rel=f"iface/{src}-iface/abort", inv=INV["abort"], decls=IFACE_DECLS,
                       body=iface_abort(src, rec, "Named"),
-                      err="type assertion failed: main.Cat is not Named"))
+                      err="type assertion failed: main\\.Cat is not main\\.Named"))
     # transitive-ancestor *J / @J (HITs + wrong-type / unset MISS + abort)
     CELLS.append(dict(rel=f"iface/{src}-ancestor/ok", inv=INV["iface"], decls=ANCESTOR_DECLS,
                       body=ancestor_ok(src, rec), exp=[10, 11, 10, 0, 1]))
     CELLS.append(dict(rel=f"iface/{src}-ancestor/abort", inv=INV["abort"], decls=ANCESTOR_DECLS,
                       body=ancestor_abort(src, rec),
-                      err="type assertion failed: main.Res is not Writer"))
+                      err="type assertion failed: main\\.Res is not main\\.Writer"))
 
 # any-source value recovery.
 CELLS.append(dict(rel="any/raw-scalar/recover", inv=INV["any"], decls="",

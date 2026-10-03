@@ -1,0 +1,200 @@
+package "pkg/binate/link"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/asm/aarch64/isa"
+import "pkg/binate/asm/macho"
+import "pkg/binate/buf"
+import "pkg/builtins/build"
+import "pkg/builtins/testing"
+import "pkg/std/errors"
+import "pkg/std/os"
+import "pkg/std/os/process"
+
+// An absolute symbol in the dynamic Mach-O link, whose image dyld slides: an ABS64 word
+// holding it is not rebased, a GOT-indirect load of it reads a __got slot holding its
+// value (neither bound nor rebased), and a PC-relative reference to it is an error.
+// (findRelocByKind / relocPatchedInsn are in macho_link_test.bn, testTmpDir in
+// link_test.bn, fail in parse_elf_test.bn.)
+
+// absProgAsm returns `_main`, which returns 7 when a GOT load of K, an ABS64 word holding
+// K and an ABS64 word holding _main read 0x1234, 0x1234 and _main's address, else 0.  With
+// imports, unreached code after it GOT-loads ___stdoutp and calls _exit, so the dynamic
+// link puts two imports' __got slots before K's.
+func absProgAsm(imports bool) @asm.Assembler {
+	var a @asm.Assembler = asm.New(8)
+	a.ObjFormat = asm.OBJ_MACHO
+	a.SetSection("text", -1)
+	a.DefineLabel("_main")
+	a.SetGlobal("_main")
+	a.SetGlobal("K")
+	aarch64.AdrpGot(a, aarch64.X1, "K") // x1 = K, through its GOT slot
+	aarch64.LdrGotLo12(a, aarch64.X1, aarch64.X1, "K")
+	aarch64.Adrp(a, aarch64.X2, "ptrK") // x2 = ptrK's word
+	isa.AddSubLo12(a, true, aarch64.X2, aarch64.X2, "ptrK", 0, false)
+	a.EmitUint32(0xF9400042) // ldr x2, [x2]
+	aarch64.Adrp(a, aarch64.X3, "ptrMain") // x3 = ptrMain's word
+	isa.AddSubLo12(a, true, aarch64.X3, aarch64.X3, "ptrMain", 0, false)
+	a.EmitUint32(0xF9400063) // ldr x3, [x3]
+	aarch64.Adr(a, aarch64.X4, "_main")
+	a.EmitUint32(0xD2800000) // mov x0, #0
+	a.EmitUint32(0xD2824685) // mov x5, #0x1234
+	a.EmitUint32(0xEB05003F) // cmp x1, x5
+	a.EmitUint32(0x540000E1) // b.ne fail (+28)
+	a.EmitUint32(0xEB05005F) // cmp x2, x5
+	a.EmitUint32(0x540000A1) // b.ne fail (+20)
+	a.EmitUint32(0xEB04007F) // cmp x3, x4
+	a.EmitUint32(0x54000061) // b.ne fail (+12)
+	a.EmitUint32(0xD28000E0) // mov x0, #7
+	a.EmitUint32(0xD65F03C0) // ret
+	a.EmitUint32(0xD65F03C0) // fail: ret
+	if imports {
+		a.SetGlobal("___stdoutp")
+		a.SetGlobal("_exit")
+		aarch64.AdrpGot(a, aarch64.X6, "___stdoutp")
+		aarch64.LdrGotLo12(a, aarch64.X6, aarch64.X6, "___stdoutp")
+		aarch64.Bl(a, "_exit")
+	}
+	a.SetSection("data", -1)
+	a.DefineLabel("ptrK")
+	a.AddFixup("K", 0, 0, 8)
+	a.Fill(8, cast(uint8, 0))
+	a.DefineLabel("ptrMain")
+	a.AddFixup("_main", 0, 0, 8)
+	a.Fill(8, cast(uint8, 0))
+	return a
+}
+
+// absDefAsm returns an object defining K as a global absolute symbol of value 0x1234.
+func absDefAsm() @asm.Assembler {
+	var a @asm.Assembler = asm.New(8)
+	a.ObjFormat = asm.OBJ_MACHO
+	a.SetSection("text", -1)
+	a.EmitUint32(0xD503201F) // nop
+	a.SetGlobal("K")
+	a.DefineAbsolute("K", 0x1234)
+	return a
+}
+
+// writeMachoAsm resolves, finalizes and writes a as an arm64 Mach-O object at
+// dir/name, returning the path or "" on failure.
+func writeMachoAsm(a @asm.Assembler, dir *[]readonly char, name *[]readonly char) @[]char {
+	aarch64.ResolveFixups(a)
+	a.Finalize()
+	if a.HasError { return "" }
+	var path @[]char = buf.Concat(buf.Concat(dir, "/"), name)
+	if !macho.WriteARM64(a, path) { return "" }
+	return path
+}
+
+// absPaths writes prog and absDefAsm under dir, returning both paths or an empty slice on
+// failure.
+func absPaths(dir *[]readonly char, prog @asm.Assembler) @[]@[]char {
+	var paths @[]@[]char = make_slice(@[]char, 2)
+	paths[0] = writeMachoAsm(prog, dir, "abs_prog.o")
+	paths[1] = writeMachoAsm(absDefAsm(), dir, "abs_def.o")
+	if len(paths[0]) == 0 || len(paths[1]) == 0 { return make_slice(@[]char, 0) }
+	return paths
+}
+
+// Resolved as the dynamic Mach-O link resolves it, the program's ABS64 word holding _main
+// is a rebase site and the one holding K is not; its GOT load of K gets one slot, and
+// Relocate points the load (ADRP page and LDR offset) at that slot.
+func TestMachoPieAbsoluteSymbol() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	var paths @[]@[]char = absPaths(dir, absProgAsm(false))
+	if len(paths) == 0 { return fail("cannot build the objects") }
+	var objs @[]@InputObject = make_slice(@InputObject, 2)
+	for i := 0; i < 2; i++ {
+		data, ok := readFile(paths[i])
+		if !ok { return fail("cannot read an object back") }
+		obj, perr := parseMachoBytes(data, paths[i])
+		if len(perr) != 0 { return fail(buf.Concat("rejected: ", perr)) }
+		objs[i] = obj
+	}
+	t, rerr := Resolve(objs)
+	if len(rerr) != 0 { return fail(buf.Concat("resolve failed: ", rerr)) }
+	t.PIE = true
+	var lr @LayoutResult = LayoutPaged(objs, cast(uint64, 0x100004000), machoDynPage)
+	var sites @[]uint64 = collectMachoRebaseSites(t, lr)
+	var mainWord uint64 = 0
+	for r := 0; r < len(objs[0].Relocs); r++ {
+		var rel InputReloc = objs[0].Relocs[r]
+		if rel.Kind == R_AARCH64_ABS64 && charsEqual(objs[0].Symbols[rel.SymIndex].Name, "_main") {
+			mainWord = relocFieldAddr(objs[0], lr, rel)
+		}
+	}
+	if len(sites) != 1 || mainWord == 0 || sites[0] != mainWord {
+		return fail("not exactly the _main word rebased")
+	}
+	var absGot @[]AbsGotSlot = collectAbsGotTargets(t)
+	if len(absGot) != 1 || absGot[0].ObjIdx != 1 {
+		return fail("not one GOT slot, for the K in abs_def.o")
+	}
+	absGot[0].Addr = sites[0] + 0x2000 // any 8-aligned address in range
+	t.AbsGot = absGot
+	if len(Relocate(t, lr)) != 0 { return fail("relocate failed") }
+	var ri int = findRelocByKind(objs[0], R_AARCH64_LD64_GOT_LO12_NC)
+	var pi int = findRelocByKind(objs[0], R_AARCH64_ADR_GOT_PAGE)
+	if ri < 0 || pi < 0 { return fail("no GOT-load relocations") }
+	var ldr int = relocPatchedInsn(objs[0], lr, objs[0].Relocs[ri])
+	var slotLo int = cast(int, (absGot[0].Addr & 0xfff) >> 3)
+	if (ldr & 0xffc00000) != 0xf9400000 || ((ldr >> 10) & 0xfff) != slotLo {
+		return fail("the GOT load does not read K's slot")
+	}
+	var adrp int = relocPatchedInsn(objs[0], lr, objs[0].Relocs[pi])
+	var pages int64 = cast(int64, ((adrp >> 29) & 3) | (((adrp >> 5) & 0x7ffff) << 2))
+	var pAddr uint64 = relocFieldAddr(objs[0], lr, objs[0].Relocs[pi])
+	if (cast(int64, pAddr >> 12) + pages) != cast(int64, absGot[0].Addr >> 12) {
+		return fail("the GOT page does not hold K's slot")
+	}
+	return ""
+}
+
+// A branch to an absolute symbol cannot be encoded in an image dyld slides: the link fails.
+func TestLinkDynMachoRejectsPcRelativeToAbsolute() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	var a @asm.Assembler = asm.New(8)
+	a.ObjFormat = asm.OBJ_MACHO
+	a.SetSection("text", -1)
+	a.DefineLabel("_main")
+	a.SetGlobal("_main")
+	a.SetGlobal("K")
+	aarch64.Bl(a, "K")
+	a.EmitUint32(0xD65F03C0) // ret
+	var paths @[]@[]char = absPaths(dir, a)
+	if len(paths) == 0 { return fail("cannot build the objects") }
+	var err @[]readonly char = LinkDynMacho(paths, "_main", EM_AARCH64, cast(uint64, 0x100004000),
+			buf.Concat(dir, "/abs_bl"))
+	var want *[]readonly char = "PC-relative reference to absolute symbol K "
+	if len(err) < len(want) || !charsEqual(err[0:len(want)], want) {
+		return fail(buf.Concat("not rejected as a PC-relative reference: ", err))
+	}
+	return ""
+}
+
+// The program, with imports, links into a dynamic executable; on a macOS arm64 host it
+// runs (dyld slides it) and returns 7: K reads 0x1234 through its own __got slot (after
+// the imports', which dyld binds) and through its ABS64 word, and the rebased word holding
+// _main reads _main's address.
+func TestLinkDynMachoAbsoluteRuns() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	var paths @[]@[]char = absPaths(dir, absProgAsm(true))
+	if len(paths) == 0 { return fail("cannot build the objects") }
+	var exe @[]char = buf.Concat(dir, "/abs_run")
+	var err @[]readonly char = LinkDynMacho(paths, "_main", EM_AARCH64, cast(uint64, 0x100004000), exe)
+	if len(err) != 0 { return fail(buf.Concat("LinkDynMacho failed: ", err)) }
+	if build.OS != build.OS_DARWIN || build.Arch != build.ARCH_AARCH64 { return "" }
+	var st process.ExitStatus
+	var perr @errors.Error
+	st, perr = process.Run(exe, &process.Options{Args: make_slice(@[]char, 0)})
+	if present(perr) || !st.Exited() { return fail("the executable did not run to exit") }
+	if st.Code() != 7 { return fail("the executable read a wrong value (exit not 7)") }
+	return ""
+}

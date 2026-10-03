@@ -33,10 +33,9 @@ import "pkg/stdx/slices"
 //     the final load.
 //
 //     The "shift user args" step is 1:1 (one incoming dispatch word ->
-//     one outgoing word) for scalars / pointers / indirect-large
-//     aggregates, but a by-address aggregate — a coerced in-register
-//     struct/array (callconv.AggCoercedInReg), OR (option B) a raw slice /
-//     iface-value (isByAddressAggX64) — DIVERGES: it arrives as ONE
+//     one outgoing word) for scalars / pointers, but a by-address aggregate
+//     (isByAddressAggX64: a coerced in-register struct/array, a raw slice /
+//     iface-value, a >16-byte aggregate) — DIVERGES: it arrives as ONE
 //     by-address dispatch pointer word yet the underlying's real ABI reads
 //     callconv.ArgWords value-words, so the shim copies the pointer to a
 //     scratch (R11) and LOADS those words into the consecutive outgoing
@@ -51,22 +50,23 @@ import "pkg/stdx/slices"
 //     rather than JMP (since the stack frame must be undone
 //     before RET):
 //         shim:
-//           SUB RSP, stkBytes + 8        ; +8 compensates for the
+//           SUB RSP, stkBytes + stageBytes + 8  ; +8 compensates for the
 //                                        ; return-address push so
 //                                        ; the outgoing CALL sees
 //                                        ; a 16-byte-aligned RSP.
 //           <spill stack-bound captures: [RDI+ofs] → RAX → [RSP+sof]>
-//           <move user-args incoming → outgoing positions>
+//           <stage the incoming user words, then move each user arg
+//            from the stage to its outgoing position>
 //           <load reg-bound captures: [RDI+ofs] → argReg(rs)>
 //           CALL underlying_fn
-//           ADD RSP, stkBytes + 8
+//           ADD RSP, stkBytes + stageBytes + 8
 //           RET
 //     Ordering rationale: step 1 (stack-spill) uses RDI as the
 //     read base, so it must finish before step 2 / 3 can touch
-//     RDI; step 2 (user-arg moves) uses RSI..R9 as sources, so it
-//     must finish before step 3 (which might overwrite those regs
-//     with reg-captures); step 3 (reg-captures) goes right-to-
-//     left so the final iteration's write into RDI happens last.
+//     RDI; step 2 stages RSI..R9 before writing any outgoing
+//     register, so no move order clobbers a source; step 3
+//     (reg-captures) goes right-to-left so the final iteration's
+//     write into RDI happens last.
 
 // lookupClosureFunc_x64 returns the Func with the given name iff
 // it is a capturing-literal closure (IsClosure=true).  Returns nil
@@ -215,31 +215,12 @@ func shimNeedsStackSpill_x64(cc callconv.CallConv, argTypes @[]@types.Type) bool
 	return false
 }
 
-// isIndirectLargeCap_x64 reports whether a capture-type is passed
-// via the IndirectLargeAggregates convention (a single pointer in
-// 1 reg / 1 stack word) at the underlying body's call boundary.
-// Mirrors the classifier path in
-// pkg/binate/native/callconv/callconv.bn's
-// argRegWordsStackWords for the indirect-large branch.
-func isIndirectLargeCap_x64(cc callconv.CallConv, t @types.Type) bool {
-	return cc.IndirectLargeAggregates && callconv.IsAggregateTyp(t) &&
-			t.SizeOf() > cc.AggregateInRegMax
-}
-
-// effectiveCapWords_x64 returns the number of GP arg-reg slots a
-// capture consumes at the underlying body's call boundary — 1 for
-// indirect-large aggregates (pointer-pass), ArgWords for the rest.
-func effectiveCapWords_x64(cc callconv.CallConv, t @types.Type) int {
-	if isIndirectLargeCap_x64(cc, t) { return 1 }
-	return callconv.ArgWords(t)
-}
-
 // userWords_x64 sums the INCOMING GP dispatch-word footprint of a closure's
 // user params — the count the shims use to locate incoming-arg positions
 // (argReg(1 + inIdx) / the caller stack).  shimInWordsForTypeX64 (not ArgWords /
-// EffectiveArgWords): a by-address user arg — an indirect-large aggregate, a
-// coerced in-register named struct/array (AggCoercedInReg), OR (option B) a raw
-// slice / iface-value — travels as a SINGLE pointer word in the dispatch
+// EffectiveArgWords): a by-address user arg — every aggregate (isByAddressAggX64:
+// a coerced in-register named struct/array, a raw slice / iface-value, a >16-byte
+// aggregate) — travels as a SINGLE pointer word in the dispatch
 // convention (a slice's EffectiveArgWords is 2, but by-address it rides one
 // incoming word).  For a by-address agg the OUTGOING (real-ABI) register footprint
 // is larger (ArgWords value-words loaded from the pointer); the register/spill
@@ -259,8 +240,7 @@ func userWords_x64(cc callconv.CallConv, fvTyp @types.Type) int {
 // (shimInWordsForTypeX64 == 1) but the shim expands it into ArgWords value
 // registers, so counting it via the incoming word count would undercount the
 // outgoing register pressure and wrongly keep a wide call on the register-only
-// path.  Every other arg (including an indirect-large aggregate, a pointer in and
-// out) matches its EffectiveArgWords.
+// path.  Every other arg (a scalar) matches its EffectiveArgWords.
 func outUserWords_x64(cc callconv.CallConv, fvTyp @types.Type) int {
 	var n int = 0
 	for pi := 0; pi < len(fvTyp.Params); pi = pi + 1 {
@@ -275,16 +255,15 @@ func outUserWords_x64(cc callconv.CallConv, fvTyp @types.Type) int {
 }
 
 // emitClosureShimFast_x64 is the register-only path: every outgoing
-// arg lands in a GP arg register (no MEMORY classification).
-// Indirect-large captures contribute 1 reg slot (a pointer to the
-// closure-struct field, materialised via LEA); scalar / small-
-// aggregate captures contribute their ArgWords reg slots.
+// arg lands in a GP arg register (no MEMORY classification — a >16-byte
+// capture or user arg is MEMORY class, so its closure takes the stack-spill
+// path).  Each capture contributes its ArgWords reg slots.
 func emitClosureShimFast_x64(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Type, f @ir.Func,
 		nUserWords int) {
 	var cc callconv.CallConv = callconv.SysV_AMD64()
 	var captureWords int = 0
 	for i := 0; i < f.NumCaptureParams; i++ {
-		captureWords = captureWords + effectiveCapWords_x64(cc, f.ClosureStruct.Fields[i].Type)
+		captureWords = captureWords + callconv.ArgWords(f.ClosureStruct.Fields[i].Type)
 	}
 	// Budget the JMP-fallback guard on the OUTGOING (real-ABI) word count:
 	// a coerced in-register struct/array arrives as one dispatch pointer word
@@ -328,9 +307,8 @@ func emitClosureShimFast_x64(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Typ
 			}
 			continue
 		}
-		// Generic lockstep path: an indirect-large aggregate is 1 pointer word
-		// (the dispatch caller placed it as one), NOT its ArgWords expansion; for
-		// it and every scalar, incoming and outgoing word counts agree.
+		// Generic lockstep path: a scalar's incoming and outgoing word counts
+		// agree.
 		var w int = shimInWordsForTypeX64(cc, pt)
 		srcWord = srcWord - w
 		outWord = outWord - w
@@ -344,7 +322,7 @@ func emitClosureShimFast_x64(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Typ
 		// A narrow USER-arg scalar rides one dispatch slot with only its low bits
 		// guaranteed (abi/03 §3.3); a foreign dispatch caller may leave the high
 		// bits dirty, so re-extend it before the closure body reads the full
-		// register.  A no-op for word-size / indirect-large-aggregate-pointer words;
+		// register.  A no-op for word-size words;
 		// captures are native-canonical and handled below, not here.
 		canonicalizeSubWordSeamX64(a, argReg(captureWords + outWord), pt)
 	}
@@ -356,12 +334,6 @@ func emitClosureShimFast_x64(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Typ
 	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
 		var ft @types.Type = f.ClosureStruct.Fields[i].Type
 		var baseOfs int = f.ClosureStruct.FieldOffset(i)
-		if isIndirectLargeCap_x64(cc, ft) {
-			w = w - 1
-			// LEA argReg(w), [RDI + baseOfs] — pointer-pass.
-			x64.Lea(a, x64.Reg(argReg(w), x64.SZ64), x64.Mem(x64.RDI, baseOfs, x64.SZ64))
-			continue
-		}
 		var wordCount int = callconv.ArgWords(ft)
 		for k := wordCount - 1; k >= 0; k = k - 1 {
 			w = w - 1
@@ -370,60 +342,4 @@ func emitClosureShimFast_x64(a @asm.Assembler, fnLabel @[]char, fvTyp @types.Typ
 	}
 	a.SetGlobal(fnLabel)
 	x64.Jmp(a, fnLabel)
-}
-
-// emitUserArgWordMove_x64 emits the single-word transfer for a
-// user-arg word at slot k of the current user-arg, given the user-
-// arg's incoming register base (inRegBase, accumulated by step 2's
-// loop), the post-SUB stkBytes adjustment, and the outgoing reg /
-// stack slot (one of outRegStart >= 0 OR outStkOff >= 0, never
-// both — SPLIT user-args aren't reachable here).
-//
-// prefixRegs is how many GP regs precede the incoming user args (1 for
-// the scalar/void shim where data rides RDI, so args start at RSI; 2 for
-// the aggregate shim where retbuf+data ride RDI/RSI and args start at
-// RDX).  The incoming source is the global word index
-// `inIdx = inRegBase + k - 1` (0-based across all user-arg words):
-// reg argReg(prefixRegs + inIdx) while it fits the (6 - prefixRegs)
-// incoming arg regs, else the caller stack at
-// [RSP + stkBytes + 16 + (inIdx - (6 - prefixRegs)) * 8].
-// (RSP+stkBytes+8 is the return address; RSP+stkBytes+16 the first stack
-// arg — both shims use rspDelta = stkBytes + 8.)
-func emitUserArgWordMove_x64(a @asm.Assembler, inRegBase int, k int, prefixRegs int, stkBytes int,
-		outRegStart int, outStkOff int, pt @types.Type) {
-	var inIdx int = inRegBase + k - 1
-	var nArgRegs int = 6 - prefixRegs
-	var srcIsReg bool = inIdx < nArgRegs
-	var srcReg int
-	var srcStkOff int = 0
-	if srcIsReg {
-		srcReg = argReg(prefixRegs + inIdx)
-	} else {
-		srcStkOff = stkBytes + 16 + (inIdx - nArgRegs) * 8
-	}
-	if outRegStart >= 0 {
-		var dstReg int = argReg(outRegStart + k)
-		if srcIsReg {
-			if srcReg != dstReg {
-				x64.Mov(a, x64.Reg(dstReg, x64.SZ64), x64.Reg(srcReg, x64.SZ64))
-			}
-		} else {
-			x64.Mov(a, x64.Reg(dstReg, x64.SZ64), x64.Mem(x64.RSP, srcStkOff, x64.SZ64))
-		}
-		// Re-extend a narrow reg-destined user-arg word (abi/03 §3.3; see the fast-
-		// path note).  Every ≤16-byte aggregate is isByAddressAggX64 and routed to the
-		// by-address path by the callers before this helper, so pt here is only a
-		// scalar or an indirect-large pointer: the extend fires for a narrow scalar
-		// and is a no-op for word-size / indirect-large words.
-		canonicalizeSubWordSeamX64(a, dstReg, pt)
-		return
-	}
-	if outStkOff >= 0 {
-		if srcIsReg {
-			x64.Mov(a, x64.Mem(x64.RSP, outStkOff + k * 8, x64.SZ64), x64.Reg(srcReg, x64.SZ64))
-		} else {
-			x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.RSP, srcStkOff, x64.SZ64))
-			x64.Mov(a, x64.Mem(x64.RSP, outStkOff + k * 8, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
-		}
-	}
 }

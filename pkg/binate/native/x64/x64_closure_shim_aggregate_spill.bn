@@ -50,24 +50,16 @@ func emitClosureShimAggregateStackSpill_x64(a @asm.Assembler, fnLabel @[]char, f
 	var stkBytes int = cc.CallStackBytes(marshalArgTypes)
 	var userArgBase int = capBaseSlot + f.NumCaptureParams
 	var nUserWords int = userWords_x64(cc, fvTyp)
-	var captureWords int = 0
-	for i := 0; i < f.NumCaptureParams; i = i + 1 {
-		captureWords = captureWords + effectiveCapWords_x64(cc, f.ClosureStruct.Fields[i].Type)
-	}
-	// When the outgoing user slot sits BELOW its incoming slot (pack-return + a
-	// single capture word, capBaseSlot + captureWords < 2) a divergent by-address
-	// aggregate (1 incoming pointer word -> ArgWords outgoing value words) writes
-	// value words that drift UP onto a LATER param's live incoming register before
-	// it is read — a silent clobber (the CRITICAL closure-aggregate-return bug).
-	// That case STAGES every incoming user word to a scratch region just above the
-	// retbuf slot and marshals from memory (source-order-free).  stageBytes reserves
-	// the region; being 16-aligned it preserves the CALL's rsp alignment.
-	var staged bool = capBaseSlot + captureWords < 2 && hasByAddressUserArg_x64(cc, fvTyp)
-	var stageBytes int = 0
-	if staged {
-		stageBytes = nUserWords * 8
-		if stageBytes % 16 != 0 { stageBytes = stageBytes + 8 }
-	}
+	// Every incoming user word is STAGED to a scratch region just above the retbuf
+	// slot and marshalled from memory (source-order-free): a by-address aggregate
+	// (1 incoming pointer word -> ArgWords outgoing value words) moves later args
+	// UP a register, while a capture or user arg that takes no outgoing register (a
+	// >16-byte aggregate, MEMORY class) moves them DOWN, so no fixed register move
+	// order avoids writing a later param's live incoming register before it is
+	// read.  stageBytes reserves the region; being 16-aligned it preserves the
+	// CALL's rsp alignment.
+	var stageBytes int = nUserWords * 8
+	if stageBytes % 16 != 0 { stageBytes = stageBytes + 8 }
 	var stageBase int = stkBytes + 8
 	// +8 compensates for the return-address push at shim entry (RSP is
 	// 8-aligned there; the outgoing CALL needs 16).  For the pack shape
@@ -80,19 +72,14 @@ func emitClosureShimAggregateStackSpill_x64(a @asm.Assembler, fnLabel @[]char, f
 	}
 	x64.Mov(a, x64.Reg(x64.R11, x64.SZ64), x64.Reg(x64.RSI, x64.SZ64))
 
-	// Step 1: spill stack-bound captures from [R11].  Indirect-large
-	// captures pointer-pass (LEA); per-word captures shuttle via RAX.
+	// Step 1: spill stack-bound captures from [R11], each word shuttled via
+	// RAX.
 	for i := 0; i < f.NumCaptureParams; i = i + 1 {
 		var ft @types.Type = f.ClosureStruct.Fields[i].Type
 		var regStart int = cc.CallArgRegStart(marshalArgTypes, capBaseSlot + i)
 		var stkOff int = cc.CallArgStackOff(marshalArgTypes, capBaseSlot + i)
 		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
 		if regStart >= 0 || stkOff < 0 { continue }
-		if isIndirectLargeCap_x64(cc, ft) {
-			x64.Lea(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.R11, fieldOfs, x64.SZ64))
-			x64.Mov(a, x64.Mem(x64.RSP, stkOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
-			continue
-		}
 		var nWords int = callconv.ArgWords(ft)
 		for k := 0; k < nWords; k = k + 1 {
 			x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64), x64.Mem(x64.R11, fieldOfs + k * 8, x64.SZ64))
@@ -101,58 +88,28 @@ func emitClosureShimAggregateStackSpill_x64(a @asm.Assembler, fnLabel @[]char, f
 	}
 
 	// Step 2: move user args from their incoming slots (prefix 2: retbuf
-	// RDI, data RSI, args RDX..) to the classifier's outgoing slots.  The
-	// incoming cursor advances by shimInWordsForTypeX64 (the dispatch-word count: a
-	// by-address aggregate — a coerced in-register struct/array, OR (option B) a raw
-	// slice / iface-value — is ONE by-address pointer word there); the outgoing
-	// slots come from the classifier over marshalArgTypes (the REAL types), so a
-	// by-address aggregate's ArgWords value-words land in their proper reg/stack
-	// slots — see emitSpillAggUserArg_x64, which dereferences the pointer for that
-	// case.  When the first outgoing user slot sits at/above the incoming base
-	// (capBaseSlot + captureWords >= 2) the params/words move HIGH-first / right-to-
-	// left so each source is read before its slot is overwritten.  When it sits
-	// below (pack + a single capture word) a plain list moves LOW-first / left-to-
-	// right — but a divergent by-address aggregate would then drift an outgoing
-	// value word up onto a later param's not-yet-read incoming register, so that
-	// case instead STAGES every incoming word to a scratch region and marshals from
-	// memory (see the `staged` branch / emitSpillAggUserArgStaged_x64).
-	if staged {
-		// Stage every incoming user word to [rsp + stageBase + w*8]: register-
-		// resident words (w < NumGpArgRegs-2) from argReg(2+w); overflow words from
-		// the caller's stack (whose offset shifted up by stageBytes when the frame
-		// grew).  Then marshal from memory — no live incoming register is read after
-		// an outgoing write, so the divergent down-shift can't clobber it.
-		for w := 0; w < nUserWords; w = w + 1 {
-			if w < cc.NumGpArgRegs - 2 {
-				x64.Mov(a, x64.Mem(x64.RSP, stageBase + w * 8, x64.SZ64), x64.Reg(argReg(2 + w), x64.SZ64))
-			} else {
-				x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
-						x64.Mem(x64.RSP, stkBytes + 16 + stageBytes + (w - (cc.NumGpArgRegs - 2)) * 8, x64.SZ64))
-				x64.Mov(a, x64.Mem(x64.RSP, stageBase + w * 8, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
-			}
+	// RDI, data RSI, args RDX..) to the classifier's outgoing slots.
+	// Stage every incoming user word to [rsp + stageBase + w*8]: register-resident
+	// words (w < NumGpArgRegs-2) from argReg(2+w); overflow words from the caller's
+	// stack (whose offset shifted up by stageBytes when the frame grew).  Then
+	// marshal from memory: the incoming cursor advances by shimInWordsForTypeX64 (a
+	// by-address aggregate is ONE pointer word there), the outgoing slots come from
+	// the classifier over marshalArgTypes (the REAL types), so a by-address
+	// aggregate's ArgWords value-words land in their proper reg/stack slots.
+	for w := 0; w < nUserWords; w = w + 1 {
+		if w < cc.NumGpArgRegs - 2 {
+			x64.Mov(a, x64.Mem(x64.RSP, stageBase + w * 8, x64.SZ64), x64.Reg(argReg(2 + w), x64.SZ64))
+		} else {
+			x64.Mov(a, x64.Reg(x64.RAX, x64.SZ64),
+					x64.Mem(x64.RSP, stkBytes + 16 + stageBytes + (w - (cc.NumGpArgRegs - 2)) * 8, x64.SZ64))
+			x64.Mov(a, x64.Mem(x64.RSP, stageBase + w * 8, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
 		}
-		var inWordBase int = 0
-		for ui := 0; ui < len(fvTyp.Params); ui = ui + 1 {
-			emitSpillAggUserArgStaged_x64(a, cc, fvTyp, marshalArgTypes, userArgBase, ui, inWordBase,
-					stageBase)
-			inWordBase = inWordBase + shimInWordsForTypeX64(cc, fvTyp.Params[ui].Type)
-		}
-	} else if capBaseSlot + captureWords >= 2 {
-		var inRegBase int = 1 + nUserWords
-		for ui := len(fvTyp.Params) - 1; ui >= 0; ui = ui - 1 {
-			var nUw int = shimInWordsForTypeX64(cc, fvTyp.Params[ui].Type)
-			inRegBase = inRegBase - nUw
-			emitSpillAggUserArg_x64(a, cc, fvTyp, marshalArgTypes, userArgBase, ui, inRegBase, stkBytes,
-					true)
-		}
-	} else {
-		var inRegBase int = 1
-		for ui := 0; ui < len(fvTyp.Params); ui = ui + 1 {
-			var nUw int = shimInWordsForTypeX64(cc, fvTyp.Params[ui].Type)
-			emitSpillAggUserArg_x64(a, cc, fvTyp, marshalArgTypes, userArgBase, ui, inRegBase, stkBytes,
-					false)
-			inRegBase = inRegBase + nUw
-		}
+	}
+	var inWordBase int = 0
+	for ui := 0; ui < len(fvTyp.Params); ui = ui + 1 {
+		emitSpillAggUserArgStaged_x64(a, cc, fvTyp, marshalArgTypes, userArgBase, ui, inWordBase,
+				stageBase)
+		inWordBase = inWordBase + shimInWordsForTypeX64(cc, fvTyp.Params[ui].Type)
 	}
 
 	// Step 3: load register-passed captures from [R11], after the user
@@ -162,10 +119,6 @@ func emitClosureShimAggregateStackSpill_x64(a @asm.Assembler, fnLabel @[]char, f
 		var regStart int = cc.CallArgRegStart(marshalArgTypes, capBaseSlot + i)
 		var fieldOfs int = f.ClosureStruct.FieldOffset(i)
 		if regStart < 0 { continue }
-		if isIndirectLargeCap_x64(cc, ft) {
-			x64.Lea(a, x64.Reg(argReg(regStart), x64.SZ64), x64.Mem(x64.R11, fieldOfs, x64.SZ64))
-			continue
-		}
 		var nWords int = callconv.ArgWords(ft)
 		for k := nWords - 1; k >= 0; k = k - 1 {
 			x64.Mov(a, x64.Reg(argReg(regStart + k), x64.SZ64), x64.Mem(x64.R11, fieldOfs + k * 8, x64.SZ64))
@@ -196,73 +149,13 @@ func emitClosureShimAggregateStackSpill_x64(a @asm.Assembler, fnLabel @[]char, f
 	x64.Ret(a)
 }
 
-// emitSpillAggUserArg_x64 marshals one user param (index ui) of the stack-spill
-// aggregate shim from its incoming dispatch slots to the classifier's outgoing
-// reg/stack slots.  inRegBase is the param's incoming dispatch-word cursor (the
-// running 1-based count the caller maintains, matching emitUserArgWordMove_x64);
-// outgoing positions come from CallArgRegStart/CallArgStackOff over the REAL
-// marshalArgTypes.
-//
-// Most params shift word-for-word via emitUserArgWordMove_x64.  A by-address
-// aggregate — a coerced in-register struct/array, OR (option B) a raw slice /
-// iface-value — DIVERGES: it arrives as ONE by-address pointer word
-// (shimInWordsForTypeX64 == 1, so the caller's incoming cursor advanced by 1) but
-// the underlying's real ABI reads its ArgWords value-words; so the shim loads the
-// incoming pointer into R10 (a scratch — not a SysV arg reg, not the return reg,
-// and NOT R11, which holds the live closure-struct pointer) and copies
-// [R10 + 8k] into each outgoing slot.  SysV does not split a <=16 B aggregate, so
-// the outgoing slots are EITHER all registers (outRegStart >= 0) OR all stack
-// (outStkOff >= 0); the stack case shuttles each word through RAX.  hiToLo orders
-// the value-word writes high-first / low-first to match the caller's param
-// direction (so a write can't clobber an unread source).
-func emitSpillAggUserArg_x64(a @asm.Assembler, cc callconv.CallConv, fvTyp @types.Type,
-		marshalArgTypes @[]@types.Type, userArgBase int, ui int, inRegBase int, stkBytes int,
-		hiToLo bool) {
-	var ut @types.Type = fvTyp.Params[ui].Type
-	var outRegStart int = cc.CallArgRegStart(marshalArgTypes, userArgBase + ui)
-	var outStkOff int = cc.CallArgStackOff(marshalArgTypes, userArgBase + ui)
-	if !isByAddressAggX64(cc, ut) {
-		var nUw int = shimInWordsForTypeX64(cc, ut)
-		if hiToLo {
-			for k := nUw - 1; k >= 0; k = k - 1 {
-				emitUserArgWordMove_x64(a, inRegBase, k, 2, stkBytes, outRegStart, outStkOff, ut)
-			}
-		} else {
-			for k := 0; k < nUw; k = k + 1 {
-				emitUserArgWordMove_x64(a, inRegBase, k, 2, stkBytes, outRegStart, outStkOff, ut)
-			}
-		}
-		return
-	}
-	// Load the incoming by-address pointer (one word at incoming index
-	// inRegBase - 1; prefix 2 = retbuf + data) into R10.
-	var inIdx int = inRegBase - 1
-	if inIdx < 4 {
-		x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Reg(argReg(2 + inIdx), x64.SZ64))
-	} else {
-		x64.Mov(a, x64.Reg(x64.R10, x64.SZ64),
-				x64.Mem(x64.RSP, stkBytes + 16 + (inIdx - 4) * 8, x64.SZ64))
-	}
-	var n int = callconv.ArgWords(ut)
-	if hiToLo {
-		for k := n - 1; k >= 0; k = k - 1 {
-			emitCoercedValueWord_x64(a, k, outRegStart, outStkOff)
-		}
-	} else {
-		for k := 0; k < n; k = k + 1 {
-			emitCoercedValueWord_x64(a, k, outRegStart, outStkOff)
-		}
-	}
-}
-
 // emitSpillAggUserArgStaged_x64 marshals one user param (index ui) of the stack-
 // spill aggregate shim from the STAGING region (every incoming word pre-saved to
 // [rsp + stageBase + w*8]) to its outgoing real-ABI reg/stack slot.  Because the
-// source is memory there is no register-permutation hazard — the divergent
-// by-address down-shift that clobbers a register in the direct-marshal path is
-// harmless here — so param/word order is free.  A by-address aggregate loads its
+// source is memory there is no register-permutation hazard, so param/word order
+// is free.  A by-address aggregate loads its
 // pointer from the staging slot into R10 and fans its ArgWords value-words out via
-// emitCoercedValueWord_x64; a scalar / indirect-large arg copies its shimInWords
+// emitCoercedValueWord_x64; a scalar arg copies its shimInWords
 // words straight to the outgoing slot (RAX shuttles a stack destination).  inWordBase
 // is the param's first global incoming word index in the staging region.
 func emitSpillAggUserArgStaged_x64(a @asm.Assembler, cc callconv.CallConv, fvTyp @types.Type,

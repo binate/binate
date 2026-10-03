@@ -1,0 +1,146 @@
+package "pkg/binate/native/x64"
+
+import "pkg/binate/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/callconv"
+import "pkg/binate/native/common"
+
+// RCX and RDX are both caller-saved homes and the 3rd and 4th registers of the
+// per-instruction scratch pool (regPool).  Each instruction declares which of
+// them its lowering may use for itself (x64RegClobbers, the allocator's
+// RegClassDesc.RegClobbers hook): the allocator then keeps every value live at
+// that instruction out of the declared registers, and the emitter lets the
+// instruction's scratch allocation reach only R10, R11 and the declared ones.
+// The bar applies only in a function that has a home in the register (the
+// allocator fills RCX/RDX last), so a function without one emits exactly as if
+// RCX and RDX were scratch-only.
+
+// x64RegClobbers returns the registers among RCX and RDX that ins's lowering may
+// use for itself:
+//   - nothing for an instruction emitted as part of its consumer (m.IsFoldedAway:
+//     its consumer's declaration covers that work), a jump or branch (a fused
+//     compare's CMP is emitted at the compare; a plain branch reads one operand),
+//     a bounds check (two operands; its failure path never returns), an int,
+//     bool or string constant (one result register), or a shift by a folded
+//     constant (one operand, one result);
+//   - RDX for an op the retention cache flows through (retentionSafe): its
+//     lowering takes registers only from the scratch allocators, needs at most a
+//     third, and (a cast's float conversion) may take RDX in pickScratchGP /
+//     pickTwoScratchGP — except the shapes x64NeedsFourScratch picks out;
+//   - both for every other op: calls, returns, divides, register-count shifts and
+//     the rest name RCX/RDX directly or take a fourth scratch.
+// The scratch allocator fails loud if an instruction needs a register outside
+// R10, R11 and its declaration while a home holds the other (allocReg).
+func x64RegClobbers(m @common.RegMap, ins @ir.Instr) @[]int {
+	if ins.ID >= 0 && m.IsFoldedAway(ins.ID) { return x64NoRegs() }
+	var op int = ins.Op
+	if op == iropcode.OP_JUMP || op == iropcode.OP_BRANCH || op == iropcode.OP_BOUNDS_CHECK ||
+			op == iropcode.OP_CONST_INT || op == iropcode.OP_CONST_BOOL || op == iropcode.OP_CONST_STRING {
+		return x64NoRegs()
+	}
+	if (op == iropcode.OP_SHL || op == iropcode.OP_SHR) && len(ins.Args) == 2 &&
+			isFoldedImmX64(m, ins.Args[1]) {
+		return x64NoRegs()
+	}
+	var r @[]int
+	if retentionSafe(op) && !x64NeedsFourScratch(ins) {
+		r = make_slice(int, 1)
+		r[0] = x64.RDX
+		return r
+	}
+	r = make_slice(int, 2)
+	r[0] = x64.RCX
+	r[1] = x64.RDX
+	return r
+}
+
+// x64NeedsFourScratch reports whether ins is one of the retention-safe shapes
+// whose lowering can take a fourth scratch register:
+//   - an aggregate store (emitStructCopy): source and destination pointers, a
+//     copy temp, and a second temp when the copy has two partial-word pieces;
+//   - an element GEP whose element size is not a SIB scale: index, the scaled
+//     offset, the result, and the base (a global's address or a reload);
+//   - a float compare: each operand not in an XMM register passes through a GP
+//     reload, then the result and the NaN-gate temp.
+func x64NeedsFourScratch(ins @ir.Instr) bool {
+	var op int = ins.Op
+	if op == iropcode.OP_STORE {
+		return len(ins.Args) >= 2 && ins.Args[1] != nil && callconv.IsAggregateTyp(ins.Args[1].Typ)
+	}
+	if op == iropcode.OP_GET_ELEM_PTR { return !isSibScale(common.ElemSizeOf(ins)) }
+	if op == iropcode.OP_EQ || op == iropcode.OP_NE || op == iropcode.OP_LT || op == iropcode.OP_LE ||
+			op == iropcode.OP_GT || op == iropcode.OP_GE {
+		return len(ins.Args) >= 1 && ins.Args[0] != nil && ins.Args[0].Typ != nil &&
+				isFloatTyp(ins.Args[0].Typ)
+	}
+	return false
+}
+
+// x64NoRegs is the empty register list.
+func x64NoRegs() @[]int {
+	var none @[]int
+	return none
+}
+
+// scratchBarRCX is set while an instruction is emitted whose function has a
+// home in RCX and whose x64RegClobbers declaration does not name RCX: allocReg
+// must not hand RCX out, since a home may be live in it.  False outside the
+// instruction loop (setScratchBars / clearScratchBars).
+var scratchBarRCX bool
+
+// scratchBarRDX is scratchBarRCX for RDX: set while an instruction is emitted
+// whose function has a home in RDX and whose declaration does not name RDX.
+var scratchBarRDX bool
+
+// x64HomesIn reports whether any value of m's function is homed in register r.
+func x64HomesIn(m @common.RegMap, r int) bool {
+	for k := 0; k < len(m.HomeRegs); k++ {
+		if m.HomeRegs[k] == r { return true }
+	}
+	return false
+}
+
+// setScratchBars sets the scratch bars for instruction ins (homeRCX / homeRDX:
+// whether the function has a home there) and drops any value retained in a
+// barred register by an earlier instruction — storing it first if it is dirty
+// and live, as an eviction would — so a home written there cannot leave a stale
+// cache entry behind.
+func setScratchBars(m @common.RegMap, ins @ir.Instr, homeRCX bool, homeRDX bool) {
+	scratchBarRCX = false
+	scratchBarRDX = false
+	if !homeRCX && !homeRDX { return }
+	var decl @[]int = x64RegClobbers(m, ins)
+	scratchBarRCX = homeRCX && !intIn(decl, x64.RCX)
+	scratchBarRDX = homeRDX && !intIn(decl, x64.RDX)
+	if scratchBarRCX { dropRetained(m, x64.RCX) }
+	if scratchBarRDX { dropRetained(m, x64.RDX) }
+}
+
+// clearScratchBars lifts both bars (end of a function's instruction loop).
+func clearScratchBars() {
+	scratchBarRCX = false
+	scratchBarRDX = false
+}
+
+// scratchBarred reports whether allocReg must skip pool register r for the
+// instruction being emitted.
+func scratchBarred(r int) bool {
+	return (r == x64.RCX && scratchBarRCX) || (r == x64.RDX && scratchBarRDX)
+}
+
+// dropRetained evicts the value retained in pool register r, if any, storing it
+// first when it is dirty and live.
+func dropRetained(m @common.RegMap, r int) {
+	if m.RegHeldBy(r) < 0 { return }
+	storeDirtyOnEvict(m, r)
+	m.EvictReg(r)
+}
+
+// intIn reports whether v is an element of s.
+func intIn(s @[]int, v int) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == v { return true }
+	}
+	return false
+}

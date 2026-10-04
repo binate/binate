@@ -1,0 +1,311 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/constval"
+import "pkg/binate/token"
+import "pkg/stdx/slices"
+
+// Addressed composite literals (expr.composite.lifetime).  A composite literal
+// is addressable (expr.addressable), so its storage can be addressed — by `&`,
+// the implicit `&` of a pointer-receiver method call or method value, slicing an
+// array literal, or an implicit value-borrow into a raw interface — directly or
+// through its fields and elements.  Such a literal in a `var` / `:=` initializer
+// lives as long as the new binding (the checker marks it, ast.Expr.LitAddressed,
+// for IR-gen); its address stored by an assignment or a `return` would dangle
+// at the statement's end, and is an error (expr.composite.addr-store).
+
+// literalRoot returns the composite literal whose storage e designates, or nil
+// when e designates other storage (a variable, a heap object) or none: e itself;
+// a field of a struct value or an element of an array value whose storage is a
+// literal's; or a dereference `*p`, or a field or element reached through a
+// pointer or slice p, where p holds an address into a literal (heldLiteral).
+func literalRoot(c @Checker, e @ast.Expr) @ast.Expr {
+	for e != nil {
+		if e.Kind == ast.EXPR_COMPOSITE { return e }
+		if e.Kind == ast.EXPR_UNARY && e.Op == cast(int, token.STAR) {
+			return heldLiteral(c, e.X)
+		}
+		var bt @types.Type = accessBase(c, e)
+		if bt == nil { return nil }
+		if bt.Kind == types.TYP_POINTER || bt.Kind == types.TYP_MANAGED_PTR ||
+				bt.Kind == types.TYP_SLICE || bt.Kind == types.TYP_MANAGED_SLICE {
+			return heldLiteral(c, e.X)
+		}
+		e = e.X
+	}
+	return nil
+}
+
+// accessBase returns the type e's base is accessed through when e is a field
+// selector or a single index, its wrappers peeled — a struct, or a pointer to
+// one, for a field; an array, a slice or a pointer for an index — or nil when e
+// is neither (or its base is of no such type).
+func accessBase(c @Checker, e @ast.Expr) @types.Type {
+	if e.X == nil { return nil }
+	var isField bool = e.Kind == ast.EXPR_SELECTOR
+	var isIndex bool = e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX && len(e.Args) == 1
+	if !isField && !isIndex { return nil }
+	var bt @types.Type
+	bt, _ = peelFieldAccessBase(c.ExprType(e.X.ResolvedTypeID))
+	if bt == nil { return nil }
+	if bt.Kind == types.TYP_POINTER || bt.Kind == types.TYP_MANAGED_PTR { return bt }
+	if isField && bt.Kind == types.TYP_STRUCT { return bt }
+	if isIndex &&
+			(bt.Kind == types.TYP_ARRAY || bt.Kind == types.TYP_SLICE ||
+					bt.Kind == types.TYP_MANAGED_SLICE) {
+		return bt
+	}
+	return nil
+}
+
+// heldLiteral returns the composite literal whose storage the value v holds an
+// address into, or nil: `&X` where X designates a literal's storage; a sub-slice
+// of such an array or of such a slice; a `cast`, `unsafe_cast` or `bit_cast` of
+// such a value; a pointer-receiver method value whose receiver is such storage
+// or such an address; a value-borrow of such storage into a raw interface; or a
+// field or element read out of a literal whose initializer for it is one.
+func heldLiteral(c @Checker, v @ast.Expr) @ast.Expr {
+	if v == nil { return nil }
+	if v.Kind == ast.EXPR_UNARY && v.Op == cast(int, token.AMP) {
+		return literalRoot(c, v.X)
+	}
+	if v.Kind == ast.EXPR_SLICE && v.X != nil {
+		var bt @types.Type = types.StripWrappers(c.ExprType(v.X.ResolvedTypeID))
+		if bt == nil { return nil }
+		if bt.Kind == types.TYP_ARRAY { return literalRoot(c, v.X) }
+		if bt.Kind == types.TYP_SLICE || bt.Kind == types.TYP_MANAGED_SLICE {
+			return heldLiteral(c, v.X)
+		}
+		return nil
+	}
+	if isConversion(v) { return heldLiteral(c, v.Args[0]) }
+	if isBorrowedLiteral(c, v) { return literalRoot(c, v) }
+	if v.Kind == ast.EXPR_SELECTOR && selectorIsMethodValue(c, v) {
+		if methodValueRecvKind(c, v) != 1 { return nil }
+		if v.ImplicitAddr { return literalRoot(c, v.X) }
+		return heldLiteral(c, v.X)
+	}
+	// A literal itself is a value, not an address; a field or element read out of
+	// one holds what its initializer does.
+	if v.Kind == ast.EXPR_COMPOSITE { return nil }
+	var inits @[]@ast.Expr = literalInits(c, v)
+	for i := 0; i < len(inits); i++ {
+		var lit @ast.Expr = heldLiteral(c, inits[i])
+		if lit != nil { return lit }
+	}
+	return nil
+}
+
+// literalInits returns, when e designates (part of) a composite literal's
+// storage, the initializers of that storage written in the literal: e itself for
+// a literal; for a field or element of one — reached directly, through a
+// pointer into the literal (`(&S{…}).p`, `*&S{…}`), or through a slice literal
+// or a sub-slice of an array literal — its initializer (none when omitted — it
+// is zero), or every element's for an index that is not constant (or is into a
+// sub-slice).  Otherwise it returns none.
+func literalInits(c @Checker, e @ast.Expr) @[]@ast.Expr {
+	var out @[]@ast.Expr
+	if e == nil { return out }
+	if e.Kind == ast.EXPR_COMPOSITE {
+		out = slices.Append[@ast.Expr](out, e)
+		return out
+	}
+	if e.Kind == ast.EXPR_UNARY && e.Op == cast(int, token.STAR) { return pointeeInits(c, e.X) }
+	var bt @types.Type = accessBase(c, e)
+	if bt == nil { return out }
+	var outer @[]@ast.Expr
+	var anyIndex bool = false
+	if bt.Kind == types.TYP_POINTER || bt.Kind == types.TYP_MANAGED_PTR {
+		if e.Kind != ast.EXPR_SELECTOR {
+			// Pointer indexing: `p[0]` is `*p` (expr.index); a constant index
+			// other than 0 reaches past the one object a literal is.
+			if !indexMayBeZero(c, e.Args[0]) { return out }
+			return pointeeInits(c, e.X)
+		}
+		outer = pointeeInits(c, e.X)
+	} else if bt.Kind == types.TYP_SLICE || bt.Kind == types.TYP_MANAGED_SLICE {
+		outer, anyIndex = sliceInits(c, e.X)
+	} else {
+		outer = literalInits(c, e.X)
+	}
+	for i := 0; i < len(outer); i++ {
+		var lit @ast.Expr = outer[i]
+		if lit.Kind != ast.EXPR_COMPOSITE { continue }
+		for j := 0; j < len(lit.Elems); j++ {
+			if lit.Elems[j] != nil && elemInitializes(c, bt, e, lit.Elems[j], j, anyIndex) {
+				out = slices.Append[@ast.Expr](out, lit.Elems[j].Value)
+			}
+		}
+	}
+	return out
+}
+
+// pointeeInits returns literalInits of the storage a pointer-valued p holds the
+// address of, when that is a composite literal's: `&Y`; a conversion of such a
+// pointer; `box(Y)` (a copy of Y's initializers); or a pointer read out of a
+// literal whose initializer is such a pointer.
+func pointeeInits(c @Checker, p @ast.Expr) @[]@ast.Expr {
+	var out @[]@ast.Expr
+	if p == nil { return out }
+	if p.Kind == ast.EXPR_UNARY && p.Op == cast(int, token.AMP) { return literalInits(c, p.X) }
+	if isConversion(p) { return pointeeInits(c, p.Args[0]) }
+	if isBox(p) { return literalInits(c, p.Args[0]) }
+	if p.Kind == ast.EXPR_COMPOSITE { return out }
+	var inits @[]@ast.Expr = literalInits(c, p)
+	for i := 0; i < len(inits); i++ {
+		var more @[]@ast.Expr = pointeeInits(c, inits[i])
+		for j := 0; j < len(more); j++ { out = slices.Append[@ast.Expr](out, more[j]) }
+	}
+	return out
+}
+
+// sliceInits returns the composite literals whose elements the slice-valued s
+// views, and whether its indexes are shifted relative to theirs: a slice literal
+// (or a slice read out of a literal whose initializer is one), or a sub-slice of
+// such a slice or of an array literal's storage — shifted.
+func sliceInits(c @Checker, s @ast.Expr) (@[]@ast.Expr, bool) {
+	if s != nil && s.Kind == ast.EXPR_SLICE && s.X != nil {
+		var bt @types.Type = types.StripWrappers(c.ExprType(s.X.ResolvedTypeID))
+		if bt != nil && bt.Kind == types.TYP_ARRAY { return literalInits(c, s.X), true }
+		var inits @[]@ast.Expr
+		inits, _ = sliceInits(c, s.X)
+		return inits, true
+	}
+	return literalInits(c, s), false
+}
+
+// indexMayBeZero reports whether the index i is 0 or not a constant.
+func indexMayBeZero(c @Checker, i @ast.Expr) bool {
+	var kv constval.Value
+	var kst int
+	kv, kst = constOf(c, i)
+	var idx int
+	var ok bool
+	idx, ok = constHostInt(kv, kst)
+	return !ok || idx == 0
+}
+
+// isBox reports whether e is `box(x)`.
+func isBox(e @ast.Expr) bool {
+	return e.Kind == ast.EXPR_BUILTIN && len(e.Args) == 1 && e.Op == cast(int, token.BOX)
+}
+
+// elemInitializes reports whether el, the j-th element of a composite literal
+// whose storage the access e reaches (bt being what e accesses through: the
+// struct, or the array or slice it indexes), may initialize what e designates:
+// the named field, keyed or in position; the indexed element, keyed or in
+// position — any element when the index is not constant, or anyIndex.
+func elemInitializes(c @Checker, bt @types.Type, e @ast.Expr, el @ast.Element, j int,
+		anyIndex bool) bool {
+	if e.Kind == ast.EXPR_SELECTOR {
+		var st @types.Type = bt
+		if st.Kind == types.TYP_POINTER || st.Kind == types.TYP_MANAGED_PTR {
+			st, _ = peelFieldAccessBase(st.Elem)
+		}
+		if st == nil || st.Kind != types.TYP_STRUCT { return false }
+		if el.Key != nil { return types.CharEq(el.Key.Name, e.Name) }
+		return j < len(st.Fields) && types.CharEq(st.Fields[j].Name, e.Name)
+	}
+	if anyIndex { return true }
+	var kv constval.Value
+	var kst int
+	kv, kst = constOf(c, e.Args[0])
+	var idx int
+	var ok bool
+	idx, ok = constHostInt(kv, kst)
+	if !ok { return true }
+	if el.Key != nil { return el.KeyKnown && el.KeyVal == idx }
+	return j == idx
+}
+
+// methodValueRecvKind returns the receiver kind (receiverShape's: 0 a value,
+// 1 a raw pointer, 2 a managed pointer) of the method the selector e names when
+// e is a method value, or -1.
+func methodValueRecvKind(c @Checker, e @ast.Expr) int {
+	if !selectorIsMethodValue(c, e) { return -1 }
+	var recvNamed @types.Type = methodRecvBase(c.ExprType(e.X.ResolvedTypeID))
+	if recvNamed == nil { return -1 }
+	var m @types.Method = recvNamed.LookupMethod(e.Name)
+	if m == nil { return -1 }
+	var mKind int
+	_, mKind, _ = receiverShape(m.RecvType)
+	return mKind
+}
+
+// isConversion reports whether e is a `cast`, `unsafe_cast` or `bit_cast` of one
+// operand.
+func isConversion(e @ast.Expr) bool {
+	return e.Kind == ast.EXPR_BUILTIN && len(e.Args) == 1 &&
+			(e.Op == cast(int, token.CAST) || e.Op == cast(int, token.UNSAFE_CAST) ||
+					e.Op == cast(int, token.BIT_CAST))
+}
+
+// noteAddressedLiteral marks the composite literal whose storage e designates,
+// if any, as addressed (ast.Expr.LitAddressed).
+func noteAddressedLiteral(c @Checker, e @ast.Expr) {
+	var lit @ast.Expr = literalRoot(c, e)
+	if lit != nil { lit.LitAddressed = true }
+}
+
+// noteBorrowedLiteral records e, a source the implicit value-borrow
+// (canBorrowValueIntoRawIface) borrows by address, when it designates a
+// composite literal's storage: the literal is addressed, and e must not be
+// stored (checkStoredLiteralAddr).
+func noteBorrowedLiteral(c @Checker, e @ast.Expr) {
+	var lit @ast.Expr = literalRoot(c, e)
+	if lit == nil { return }
+	lit.LitAddressed = true
+	c.LitBorrows = slices.Append[@ast.Expr](c.LitBorrows, e)
+}
+
+// isBorrowedLiteral reports whether e is a source noteBorrowedLiteral recorded.
+func isBorrowedLiteral(c @Checker, e @ast.Expr) bool {
+	for i := 0; i < len(c.LitBorrows); i++ {
+		if same(c.LitBorrows[i], e) { return true }
+	}
+	return false
+}
+
+// checkStoredLiteralAddr reports an error where e, a value an assignment or a
+// `return` stores past the end of its statement, holds the address of a
+// composite literal (heldLiteral) — directly, as an element of a composite
+// literal, under a conversion, or in an initializer a field or element read out
+// of a literal comes from.  The literal is released when the statement ends.
+func checkStoredLiteralAddr(c @Checker, e @ast.Expr) {
+	if e == nil { return }
+	if heldLiteral(c, e) != nil {
+		addCheckError(c, e.Pos,
+				"cannot store the address of a composite literal: it is released at the end of the statement")
+		return
+	}
+	if e.Kind == ast.EXPR_COMPOSITE {
+		for i := 0; i < len(e.Elems); i++ {
+			if e.Elems[i] != nil { checkStoredLiteralAddr(c, e.Elems[i].Value) }
+		}
+		return
+	}
+	// A conversion stores its operand's value; `box` a copy of it.
+	if isConversion(e) || isBox(e) {
+		checkStoredLiteralAddr(c, e.Args[0])
+		return
+	}
+	// A value-receiver method value stores a copy of its receiver — through a
+	// pointer receiver expression, of the object it points to.
+	if e.Kind == ast.EXPR_SELECTOR && methodValueRecvKind(c, e) == 0 {
+		var rt @types.Type
+		rt, _ = peelFieldAccessBase(c.ExprType(e.X.ResolvedTypeID))
+		if rt != nil && (rt.Kind == types.TYP_POINTER || rt.Kind == types.TYP_MANAGED_PTR) {
+			var pointee @[]@ast.Expr = pointeeInits(c, e.X)
+			for i := 0; i < len(pointee); i++ { checkStoredLiteralAddr(c, pointee[i]) }
+			return
+		}
+		checkStoredLiteralAddr(c, e.X)
+		return
+	}
+	var inits @[]@ast.Expr = literalInits(c, e)
+	for i := 0; i < len(inits); i++ {
+		checkStoredLiteralAddr(c, inits[i])
+	}
+}

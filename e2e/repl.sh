@@ -2430,6 +2430,65 @@ warning: variable p shadowed (incompatible type); existing references retain the
 > ... ... ... > > 4
 > "
 
+# --- Case 75: generic struct types declared at the prompt are instantiated
+# where used — the right size and fields, also over a type declared after,
+# through an alias, in a global — and an instance's destructor and copy exist,
+# also for an imported generic's instance.  A method of a generic type is
+# emitted per instance, and a redefinition replaces the instances emitted
+# before it. ---
+run_repl "tier3-generic-struct-types-at-prompt" \
+"import \"pkg/builtins/rt\"
+import \"pkg/std/containers/vec\"
+type G[T any] struct { v T; w Missing }
+type Missing struct { a int; b int }
+testing.Println(sizeof(G[int]))
+var g G[int]
+g.w.b = 7
+testing.Println(g.w.b)
+type Cur[T any] struct { v T }
+type CI = Cur[int]
+var cc CI
+cc.v = 4
+cc.v++
+testing.Println(cc.v)
+func (c *Cur[T]) Get() T { return c.v }
+func old() int { return cc.Get() }
+testing.Println(old())
+func (c *Cur[T]) Get() T { var z T; return z }
+testing.Println(old())
+type GB[T any] struct { v T; p @Box }
+var bx @Box = make(Box)
+var before int = rt.Refcount(bit_cast(*uint8, bx))
+func useGB() int { var x GB[int]; x.p = bx; return x.p.V }
+func useP() int { var x @GB[int] = make(GB[int]); x.p = bx; return x.v }
+testing.Println(useGB(), useP())
+var gp @GB[bool] = make(GB[bool])
+gp.p = bx
+testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
+gp = nil
+func useV() int { var v @vec.Vec[@Box] = vec.New[@Box](); v.Push(bx); v.Push(bx); return v.Len() }
+testing.Println(useV())
+testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
+func copyV() int { var p @vec.Vec[@Box] = vec.New[@Box](); p.Push(bx); var c vec.Vec[@Box] = *p; return rt.Refcount(bit_cast(*uint8, bx)) - before }
+testing.Println(copyV(), rt.Refcount(bit_cast(*uint8, bx)) - before)
+" \
+"$BANNER
+> package pkg/builtins/rt loaded
+> package pkg/std/containers/vec loaded
+> type G parked (pending: Missing)
+> type G resolved
+> 24
+> > > 7
+> > > > > > 5
+> > > 5
+> > 0
+> > > > > > 0 0
+> > > 1
+> > > 2
+> 0
+> > 1 0
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # (Stage 2) as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

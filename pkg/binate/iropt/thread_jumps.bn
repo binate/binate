@@ -1,0 +1,310 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+import "pkg/binate/irbuild"
+import "pkg/binate/iropcode"
+import "pkg/std/vec"
+
+// Jump threading and block merging.
+//
+// A jump or branch arm whose target is a jump-only block (a block holding just
+// an OP_JUMP) is retargeted to where that block's jumps lead, and a block whose
+// one predecessor reaches it by an unconditional jump is merged into that
+// predecessor.  IR-gen leaves both shapes in abundance (empty `else` / merge /
+// continuation blocks), and the constant-branch fold leaves more; LLVM removes
+// them, and the native backends emitted every block and jump as written — each
+// a taken branch, and each block boundary a point where the native register
+// allocator drops its cached registers.
+//
+// An edge is not threaded into a loop header, nor past one: the loop passes that
+// follow want the header's single out-of-loop predecessor to branch only to it
+// (licm's clean preheader) and one back edge per loop (bce-loop), and threading a
+// jump-only preheader or latch away could give the header a predecessor that
+// branches elsewhere too, or a second back edge; threading past a jump-only
+// header would enter the loop below it.  Merging keeps a loop's header and the
+// header's out-of-loop predecessor jumping only to it: a header has at least two
+// predecessors, so it is never the merged block, and a block merged into its
+// predecessor leaves that predecessor ending in the merged block's own
+// terminator.  It can change which block is the latch (a latch merged into its
+// predecessor), and a body merged into a jump-only header replaces the header's
+// terminator with the body's.
+
+// isJumpOnly reports whether b holds nothing but a jump to some other block.
+func isJumpOnly(b *ir.Block) bool {
+	return len(b.Instrs) == 1 && b.Instrs[0].Op == iropcode.OP_JUMP && b.Instrs[0].Block1 != nil &&
+			b.Instrs[0].Block1 != b
+}
+
+// threadTarget follows a chain of jump-only blocks from c to the first block
+// that is not one, returning it and the last jump-only block on the way (whose
+// entries the target's phis hold).  It returns nil for a chain that never leaves
+// jump-only blocks (an empty infinite loop), detected by a step bound.
+func threadTarget(f @ir.Func, c *ir.Block) (*ir.Block, *ir.Block) {
+	var last *ir.Block = c
+	var t *ir.Block = c.Instrs[0].Block1
+	for steps := 0; steps <= len(f.Blocks); steps++ {
+		if !isJumpOnly(t) {
+			return t, last
+		}
+		last = t
+		t = t.Instrs[0].Block1
+	}
+	var none *ir.Block
+	return none, none
+}
+
+// chainCrossesHeader reports whether the jump-only chain from c up to (not
+// including) t passes through a loop header: threading around it would enter the
+// loop past its header.
+func chainCrossesHeader(f @ir.Func, c *ir.Block, t *ir.Block, headers @[]bool) bool {
+	var cur *ir.Block = c
+	for cur != t {
+		var ci int = irbuild.BlockIndexIn(f, cur)
+		if ci < 0 || headers[ci] {
+			return true
+		}
+		cur = cur.Instrs[0].Block1
+	}
+	return false
+}
+
+// hasPhis reports whether b begins with an OP_PHI.
+func hasPhis(b *ir.Block) bool {
+	return len(b.Instrs) > 0 && b.Instrs[0].Op == iropcode.OP_PHI
+}
+
+// addPhiEntriesFor gives every phi of t an entry for new predecessor p carrying
+// the value its entry for `from` carries.
+func addPhiEntriesFor(t *ir.Block, from *ir.Block, p *ir.Block) {
+	for ii := 0; ii < len(t.Instrs); ii++ {
+		var r @ir.Instr = t.Instrs[ii]
+		if r.Op != iropcode.OP_PHI {
+			break
+		}
+		for k := 0; k < len(r.Phis); k++ {
+			if r.Phis[k].Block == from {
+				var e ir.PhiEntry = r.Phis[k]
+				e.Block = p
+				var grown @[]ir.PhiEntry = make_slice(ir.PhiEntry, len(r.Phis) + 1)
+				for j := 0; j < len(r.Phis); j++ {
+					grown[j] = r.Phis[j]
+				}
+				grown[len(r.Phis)] = e
+				r.Phis = grown
+				break
+			}
+		}
+	}
+}
+
+// threadJumpOnlyBlocks retargets each jump / branch arm aimed at a jump-only
+// block to the end of its chain, except into a loop header, or where it would
+// give a branch both arms into one block that has phis (two edges from one
+// block, which phis cannot tell apart).  A branch left with both arms on one
+// block becomes a jump.  Reports whether any arm was retargeted.
+func threadJumpOnlyBlocks(f @ir.Func) bool {
+	var any bool = false
+	for bi := 1; bi < len(f.Blocks); bi++ {
+		if isJumpOnly(f.Blocks[bi]) {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return false
+	}
+	var headers @[]bool = ComputeLoopHeaders(f)
+	var changed bool = false
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var p @ir.Block = f.Blocks[bi]
+		var n int = len(p.Instrs)
+		if n == 0 {
+			continue
+		}
+		var term @ir.Instr = p.Instrs[n - 1]
+		if term.Op != iropcode.OP_JUMP && term.Op != iropcode.OP_BRANCH {
+			continue
+		}
+		for arm := 0; arm < 2; arm++ {
+			var c *ir.Block = term.Block1
+			var other *ir.Block = term.Block2
+			if arm == 1 {
+				c = term.Block2
+				other = term.Block1
+			}
+			if c == nil || c == p || !isJumpOnly(c) {
+				continue
+			}
+			var t *ir.Block
+			var last *ir.Block
+			t, last = threadTarget(f, c)
+			if t == nil || t == p {
+				continue
+			}
+			var ti int = irbuild.BlockIndexIn(f, t)
+			if ti < 0 || headers[ti] || chainCrossesHeader(f, c, t, headers) {
+				continue
+			}
+			if hasPhis(t) && other == t {
+				continue
+			}
+			addPhiEntriesFor(t, last, p)
+			if arm == 0 {
+				term.Block1 = t
+			} else {
+				term.Block2 = t
+			}
+			changed = true
+		}
+		if term.Op == iropcode.OP_BRANCH && term.Block1 == term.Block2 {
+			term.Op = iropcode.OP_JUMP
+			var noArgs @[]@ir.Instr
+			term.Args = noArgs
+			term.Block2 = nil
+		}
+	}
+	return changed
+}
+
+// setInstrs replaces b's instruction list with v's items, keeping the builder
+// (InstrsVec) and the view (Instrs) in step so a later append through the
+// builder cannot bring back what was removed.
+func setInstrs(b @ir.Block, v @vec.Vec[@ir.Instr]) {
+	b.InstrsVec = v
+	b.Instrs = v.Items()
+}
+
+// mergeSinglePredBlocks merges each block whose one incoming edge is an
+// unconditional jump into the block that jumps to it: the jumping block's
+// terminator is replaced by the merged block's instructions, the merged block's
+// (single-entry) phis are replaced by their values, and its successors' phis
+// name the jumping block in its place.  Repeats along chains.  Reports whether
+// any block was merged.
+func mergeSinglePredBlocks(f @ir.Func) bool {
+	var nb int = len(f.Blocks)
+	var edges @[]int = make_slice(int, nb)
+	for bi := 0; bi < nb; bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		var n int = len(b.Instrs)
+		if n == 0 {
+			continue
+		}
+		var term @ir.Instr = b.Instrs[n - 1]
+		if term.Block1 != nil {
+			var s int = irbuild.BlockIndexIn(f, term.Block1)
+			if s >= 0 { edges[s] = edges[s] + 1 }
+		}
+		if term.Block2 != nil {
+			var s int = irbuild.BlockIndexIn(f, term.Block2)
+			if s >= 0 { edges[s] = edges[s] + 1 }
+		}
+	}
+	var removed @[]bool = make_slice(bool, nb)
+	var cap int = f.NextID
+	var replByID @[]@ir.Instr = make_slice(@ir.Instr, cap)
+	var merged bool = false
+	for pi := 0; pi < nb; pi++ {
+		if removed[pi] {
+			continue
+		}
+		var p @ir.Block = f.Blocks[pi]
+		for {
+			var n int = len(p.Instrs)
+			if n == 0 || p.Instrs[n - 1].Op != iropcode.OP_JUMP {
+				break
+			}
+			var bIdx int = irbuild.BlockIndexIn(f, p.Instrs[n - 1].Block1)
+			if bIdx <= 0 || bIdx == pi || removed[bIdx] || edges[bIdx] != 1 {
+				break
+			}
+			var b @ir.Block = f.Blocks[bIdx]
+			if !mergeInto(p, b, replByID, cap) {
+				break
+			}
+			removed[bIdx] = true
+			merged = true
+		}
+	}
+	if !merged {
+		return false
+	}
+	// Rewrite the uses of the dropped phis BEFORE dropping the merged blocks: a
+	// phi elsewhere refers to a dropped phi only through its raw PhiEntry.Val, so
+	// the merged block's instruction list is what keeps the dropped phi alive
+	// while the rewrite reads it.
+	rewriteUsesInBlocks(f.Blocks, replByID, cap)
+	rewriteUsesInBlocks(f.FaultPads, replByID, cap)
+	var kept @[]@ir.Block = make_slice(@ir.Block, nb)
+	var k int = 0
+	for i := 0; i < nb; i++ {
+		if !removed[i] {
+			kept[k] = f.Blocks[i]
+			k = k + 1
+		}
+	}
+	f.Blocks = kept[:k]
+	return true
+}
+
+// mergeInto appends b — whose one incoming edge is p's closing jump — onto p in
+// place of that jump, recording each of b's phis in replByID as replaced by its
+// one incoming value.  It declines (returning false, changing nothing) when a
+// phi of b does not have exactly one entry, for p.
+func mergeInto(p @ir.Block, b @ir.Block, replByID @[]@ir.Instr, cap int) bool {
+	var firstNonPhi int = 0
+	for firstNonPhi < len(b.Instrs) && b.Instrs[firstNonPhi].Op == iropcode.OP_PHI {
+		var phi @ir.Instr = b.Instrs[firstNonPhi]
+		if len(phi.Phis) != 1 || phi.Phis[0].Block != p || phi.ID < 0 || phi.ID >= cap {
+			return false
+		}
+		firstNonPhi = firstNonPhi + 1
+	}
+	for ii := 0; ii < firstNonPhi; ii++ {
+		var phi @ir.Instr = b.Instrs[ii]
+		replByID[phi.ID] = ir.PhiVal(phi.Phis[0])
+	}
+	var out @vec.Vec[@ir.Instr] = vec.New[@ir.Instr]()
+	for ii := 0; ii < len(p.Instrs) - 1; ii++ {
+		out.Push(p.Instrs[ii])
+	}
+	for ii := firstNonPhi; ii < len(b.Instrs); ii++ {
+		out.Push(b.Instrs[ii])
+	}
+	setInstrs(p, out)
+	var term @ir.Instr = p.Instrs[len(p.Instrs) - 1]
+	if term.Block1 != nil {
+		renamePhiPred(term.Block1, b, p)
+	}
+	if term.Block2 != nil && term.Block2 != term.Block1 {
+		renamePhiPred(term.Block2, b, p)
+	}
+	return true
+}
+
+// renamePhiPred makes every phi entry of blk for predecessor from name to
+// instead.
+func renamePhiPred(blk *ir.Block, from *ir.Block, to *ir.Block) {
+	for ii := 0; ii < len(blk.Instrs); ii++ {
+		var r @ir.Instr = blk.Instrs[ii]
+		if r.Op != iropcode.OP_PHI {
+			break
+		}
+		for k := 0; k < len(r.Phis); k++ {
+			if r.Phis[k].Block == from {
+				r.Phis[k].Block = to
+			}
+		}
+	}
+}
+
+// threadJumpsFunc runs the pass on f: thread jumps through jump-only blocks,
+// drop the blocks that leaves unreachable, then merge single-predecessor blocks.
+func threadJumpsFunc(f @ir.Func) {
+	if len(f.Blocks) < 2 {
+		return
+	}
+	if threadJumpOnlyBlocks(f) {
+		removeUnreachableBlocks(f)
+	}
+	mergeSinglePredBlocks(f)
+}

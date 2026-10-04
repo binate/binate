@@ -91,6 +91,14 @@ Because a package is linted as its merged AST and imports are deduplicated by
 (alias, path) at merge time, a path imported-and-unused in one file but
 imported-and-used in another is not flagged — a rare, safe under-warning.
 
+### doubled-expose
+
+Flags an `expose "P"` in a package's `.bni` that repeats an earlier expose of the
+same package.  A repeated expose is accepted (it is idempotent) but re-exports
+nothing new, so it is almost always a merge leftover or a typo for another
+package.  This rule reads the `.bni` itself; a `// bnlint:allow doubled-expose`
+there suppresses it.
+
 ## Suppressing diagnostics
 
 A `// bnlint:allow <rulespec>` comment suppresses a rule's finding. `<rulespec>`

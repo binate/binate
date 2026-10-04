@@ -1,0 +1,250 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+import "pkg/binate/irbuild"
+import "pkg/binate/iropcode"
+
+// Threading through a branch on a phi that is constant along an edge.
+//
+// A block B holding only phis and a branch on one of them, r, decides its
+// successor from r alone; where r's value on the edge from a predecessor P is a
+// constant bool, P's arm into B is retargeted to the successor that constant
+// selects.  This is the shape of a short-circuit `&&` / `||` result: the left
+// operand's early exit stores a constant, so `for i < n && a[i] != 0` reaches
+// its merge block with r = false on the header's false edge, and threading that
+// edge sends the header straight out of the loop — a guard that is the loop's
+// exit test again (which bce-loop needs) and one branch fewer on the way out.
+//
+// The same header rules as the jump-only threading apply: not into a loop
+// header, and not past one (B itself a header).  B's phis may be used only by
+// B's branch and as phi entries on B's own outgoing edges: P no longer passes
+// through B, so a use anywhere else could lose its dominating definition.
+
+// constPhiBranch reports whether b holds only phis followed by a branch whose
+// condition is one of them, with two distinct targets, and returns that phi.
+func constPhiBranch(b *ir.Block) (bool, @ir.Instr) {
+	var none @ir.Instr
+	var n int = len(b.Instrs)
+	if n < 2 {
+		return false, none
+	}
+	var term @ir.Instr = b.Instrs[n - 1]
+	if term.Op != iropcode.OP_BRANCH || len(term.Args) != 1 || term.Block1 == nil ||
+			term.Block2 == nil || term.Block1 == term.Block2 {
+		return false, none
+	}
+	var cond @ir.Instr = term.Args[0]
+	var found bool = false
+	for ii := 0; ii < n - 1; ii++ {
+		if b.Instrs[ii].Op != iropcode.OP_PHI {
+			return false, none
+		}
+		if b.Instrs[ii] == cond {
+			found = true
+		}
+	}
+	if !found {
+		return false, none
+	}
+	return true, cond
+}
+
+// phiEntryFor returns the value phi takes on the edge from pred, or nil when it
+// has no entry, or more than one, for pred.
+func phiEntryFor(phi @ir.Instr, pred *ir.Block) @ir.Instr {
+	var none @ir.Instr
+	var found @ir.Instr
+	var count int = 0
+	for k := 0; k < len(phi.Phis); k++ {
+		if phi.Phis[k].Block == pred {
+			found = ir.PhiVal(phi.Phis[k])
+			count = count + 1
+		}
+	}
+	if count != 1 {
+		return none
+	}
+	return found
+}
+
+// phisOnlyUsedLocally reports whether b's phis are used only by b's own
+// terminator and as phi entries on edges out of b.
+func phisOnlyUsedLocally(f @ir.Func, b *ir.Block) bool {
+	var term @ir.Instr = b.Instrs[len(b.Instrs) - 1]
+	if !phisUsedOnlyIn(f.Blocks, b, term) {
+		return false
+	}
+	return phisUsedOnlyIn(f.FaultPads, b, term)
+}
+
+// phisUsedOnlyIn is phisOnlyUsedLocally over one block list.
+func phisUsedOnlyIn(blocks @[]@ir.Block, b *ir.Block, term @ir.Instr) bool {
+	for bi := 0; bi < len(blocks); bi++ {
+		var blk @ir.Block = blocks[bi]
+		for ii := 0; ii < len(blk.Instrs); ii++ {
+			var r @ir.Instr = blk.Instrs[ii]
+			if r != term {
+				for k := 0; k < len(r.Args); k++ {
+					if isPhiOf(b, r.Args[k]) {
+						return false
+					}
+				}
+			}
+			for k := 0; k < len(r.Phis); k++ {
+				if r.Phis[k].Block != b && isPhiOf(b, ir.PhiVal(r.Phis[k])) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// isPhiOf reports whether v is one of b's phis.
+func isPhiOf(b *ir.Block, v @ir.Instr) bool {
+	if v == nil || v.Op != iropcode.OP_PHI {
+		return false
+	}
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		if b.Instrs[ii].Op != iropcode.OP_PHI {
+			return false
+		}
+		if b.Instrs[ii] == v {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveThroughPhis returns w's value on the edge from p into b: the entry for
+// p when w is one of b's phis, otherwise w itself (defined outside b, so it
+// dominates b and therefore p).  Returns nil when w is a phi of b with no single
+// entry for p.
+func resolveThroughPhis(b *ir.Block, w @ir.Instr, p *ir.Block) @ir.Instr {
+	if isPhiOf(b, w) {
+		return phiEntryFor(w, p)
+	}
+	return w
+}
+
+// threadIntoConstPhiTarget gives each phi of x an entry for new predecessor p,
+// carrying what its entry for b carries resolved through b's phis for p.  It
+// changes nothing and returns false if any value cannot be resolved.
+func threadIntoConstPhiTarget(x *ir.Block, b *ir.Block, p *ir.Block) bool {
+	var nPhi int = 0
+	for nPhi < len(x.Instrs) && x.Instrs[nPhi].Op == iropcode.OP_PHI {
+		nPhi = nPhi + 1
+	}
+	var vals @[]@ir.Instr = make_slice(@ir.Instr, nPhi)
+	for ii := 0; ii < nPhi; ii++ {
+		var w @ir.Instr = phiEntryFor(x.Instrs[ii], b)
+		if w == nil {
+			return false
+		}
+		vals[ii] = resolveThroughPhis(b, w, p)
+		if vals[ii] == nil {
+			return false
+		}
+	}
+	for ii := 0; ii < nPhi; ii++ {
+		var phi @ir.Instr = x.Instrs[ii]
+		var e ir.PhiEntry
+		e.Block = p
+		e.Val = vals[ii]
+		var grown @[]ir.PhiEntry = make_slice(ir.PhiEntry, len(phi.Phis) + 1)
+		for j := 0; j < len(phi.Phis); j++ {
+			grown[j] = phi.Phis[j]
+		}
+		grown[len(phi.Phis)] = e
+		phi.Phis = grown
+	}
+	return true
+}
+
+// threadConstPhiBranches retargets each jump / branch arm into a constPhiBranch
+// block whose condition phi is a constant bool on that edge to the successor
+// the constant selects.  Reports whether any arm was retargeted.
+func threadConstPhiBranches(f @ir.Func) bool {
+	var any bool = false
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var ok bool
+		ok, _ = constPhiBranch(f.Blocks[bi])
+		if ok {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return false
+	}
+	var headers @[]bool = ComputeLoopHeaders(f)
+	var changed bool = false
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var p @ir.Block = f.Blocks[bi]
+		var n int = len(p.Instrs)
+		if n == 0 {
+			continue
+		}
+		var term @ir.Instr = p.Instrs[n - 1]
+		if term.Op != iropcode.OP_JUMP && term.Op != iropcode.OP_BRANCH {
+			continue
+		}
+		if term.Op == iropcode.OP_BRANCH && term.Block1 == term.Block2 {
+			continue
+		}
+		for arm := 0; arm < 2; arm++ {
+			var b *ir.Block = term.Block1
+			var other *ir.Block = term.Block2
+			if arm == 1 {
+				b = term.Block2
+				other = term.Block1
+			}
+			if b == nil || b == p {
+				continue
+			}
+			var ok bool
+			var r @ir.Instr
+			ok, r = constPhiBranch(b)
+			if !ok {
+				continue
+			}
+			var v @ir.Instr = phiEntryFor(r, p)
+			if v == nil || v.Op != iropcode.OP_CONST_BOOL {
+				continue
+			}
+			var bTerm @ir.Instr = b.Instrs[len(b.Instrs) - 1]
+			var x *ir.Block = bTerm.Block2
+			if v.BoolVal {
+				x = bTerm.Block1
+			}
+			if x == b || x == p {
+				continue
+			}
+			var bi2 int = irbuild.BlockIndexIn(f, b)
+			var xi int = irbuild.BlockIndexIn(f, x)
+			if bi2 < 0 || xi < 0 || headers[bi2] || headers[xi] {
+				continue
+			}
+			if hasPhis(x) && other == x {
+				continue
+			}
+			if !phisOnlyUsedLocally(f, b) || !threadIntoConstPhiTarget(x, b, p) {
+				continue
+			}
+			dropPhiEntriesFrom(b, p)
+			if arm == 0 {
+				term.Block1 = x
+			} else {
+				term.Block2 = x
+			}
+			changed = true
+		}
+		if term.Op == iropcode.OP_BRANCH && term.Block1 == term.Block2 {
+			term.Op = iropcode.OP_JUMP
+			var noArgs @[]@ir.Instr
+			term.Args = noArgs
+			term.Block2 = nil
+		}
+	}
+	return changed
+}

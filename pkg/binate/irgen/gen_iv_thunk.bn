@@ -141,6 +141,20 @@ func genIvRecvThunk(m @ir.Module, name @[]char, f @ir.Func) @ir.Func {
 
 	// Reference to the pointer-typed receiver param (param[0]).
 	var ptrRef @ir.Instr = irbuild.NewParamRef(thunk, thunk.Params[0])
+	// The forwarded params the thunk OWNS (positions 1..: a caller-delivered @Iface
+	// or managed-field struct) live in slots, as a method-value wrapper's do, so the
+	// forward's overflow pad can release them; a byval-aggregate param's store
+	// memcpy's from its `ptr byval(<T>)` pointer (newParamRef's flag).  The rest are
+	// forwarded straight from their param refs (paramSlots[i] stays nil).
+	var paramSlots @[]@ir.Instr = make_slice(@ir.Instr, len(thunk.Params))
+	for i := 1; i < len(thunk.Params); i++ {
+		var pt @types.Type = types.StripWrappers(thunk.Params[i].Typ)
+		if !irutil.IsManagedIfaceValueType(pt) && !needsStructCopy(pt) { continue }
+		var slot @ir.Instr = irbuild.EmitAlloc(b, thunk.Params[i].Typ)
+		slot.ParamIndex = i + 1
+		irbuild.EmitStore(b, slot, irbuild.NewParamRef(thunk, thunk.Params[i]))
+		paramSlots[i] = slot
+	}
 	// RefInc the receiver's managed fields before forwarding.  The value-receiver
 	// method owns its parameter copy (owning-copy convention) and RefDec's those
 	// fields on scope cleanup, so without this entry RefInc the callee drops the
@@ -148,9 +162,14 @@ func genIvRecvThunk(m @ir.Module, name @[]char, f @ir.Func) @ir.Func {
 	// while other refs keep the object alive, a use-after-free / double-free once the
 	// count reaches 0).  Mirrors coerceArg's by-value struct-copy RefInc on the regular
 	// call path (gen_call.bn); gated on needsStructCopy, so a scalar / no-managed-field
-	// receiver adds nothing.
+	// receiver adds nothing.  The copy calls `__copy`, whose own frame push can
+	// overflow before it RefIncs anything, so that call's pad releases only the moved
+	// params.
+	var recvOwned @ir.Instr = nil
 	if needsStructCopy(origRecvTyp) {
 		emitStructCopy(thunk, b, ptrRef, origRecvTyp)
+		attachMethodValueForwardPad(thunk, b, thunk.Params, paramSlots, nil, origRecvTyp)
+		recvOwned = ptrRef
 	}
 	// Load T from *readonly T.
 	var recvVal @ir.Instr = irbuild.EmitLoad(b, ptrRef, origRecvTyp)
@@ -159,28 +178,41 @@ func genIvRecvThunk(m @ir.Module, name @[]char, f @ir.Func) @ir.Func {
 	// the callee releases it at exit, where for `@T` / `@[]T` / `@func` the callee
 	// acquires its own on entry).  Deliver it here as a regular call's argument does:
 	// without it every dispatch releases a reference the box owns, freeing the boxed
-	// interface's object while the box still holds it.
+	// interface's object while the box still holds it.  The thunk owns it until the
+	// forward, so it sits in a slot the overflow pad can release.
 	if irutil.IsManagedIfaceValueType(origRecvTyp) {
 		emitManagedIfaceValueRefInc(thunk, b, recvVal)
+		recvOwned = irbuild.EmitAlloc(b, origRecvTyp)
+		irbuild.EmitStore(b, recvOwned, recvVal)
 	}
 
-	// Build call args: the loaded receiver, then forwarded
-	// pass-through params.  Byval-eligible aggregate params arrive
-	// at the thunk as `ptr byval(<T>) align 8 %v<paramID>` — the
-	// LLVM-level param is a pointer to the struct, not the struct
-	// value.  Load through it before forwarding so the inner call's
-	// arg has the struct type its byval-preamble alloca expects.
+	// Build call args: the loaded receiver, then the forwarded params — an owned one
+	// from its slot, any other straight from its param ref.  Byval-eligible aggregate
+	// params arrive at the thunk as `ptr byval(<T>) align 8 %v<paramID>` — the
+	// LLVM-level param is a pointer to the struct, not the struct value — so a direct
+	// one is loaded through it, giving the inner call's arg the struct type its
+	// byval-preamble alloca expects.
 	var args @[]@ir.Instr
 	args = slices.Append[@ir.Instr](args, recvVal)
 	for i := 1; i < len(thunk.Params); i++ {
-		var paramRef @ir.Instr = irbuild.NewParamRef(thunk, thunk.Params[i])
-		if thunk.Params[i].Typ.IsByvalParam() {
-			var loaded @ir.Instr = irbuild.EmitLoad(b, paramRef, thunk.Params[i].Typ)
-			args = slices.Append[@ir.Instr](args, loaded)
+		if paramSlots[i] != nil {
+			args = slices.Append[@ir.Instr](args, irbuild.EmitLoad(b, paramSlots[i], thunk.Params[i].Typ))
+		} else if thunk.Params[i].Typ.IsByvalParam() {
+			var paramRef @ir.Instr = irbuild.NewParamRef(thunk, thunk.Params[i])
+			args = slices.Append[@ir.Instr](args, irbuild.EmitLoad(b, paramRef, thunk.Params[i].Typ))
 		} else {
-			args = slices.Append[@ir.Instr](args, paramRef)
+			args = slices.Append[@ir.Instr](args, irbuild.NewParamRef(thunk, thunk.Params[i]))
 		}
 	}
+	// Recoverable-stack-overflow pre-check for the forward: the thunk forwards its
+	// owned values — the acquired receiver (or its field-RefInc'd copy) and the
+	// caller-delivered @Iface / managed-field struct params — to the method BY MOVE,
+	// so if the method's frame push overflows it never starts to release them.
+	// Fault BEFORE the forward, where the pad releases them instead.  VM-only: the
+	// compiled backends no-op OP_STACK_CHECK.  The call itself gets an empty pad: a
+	// fault inside the method is unwound by the method's own pads.
+	irbuild.EmitStackCheck(b, f.Name)
+	attachMethodValueForwardPad(thunk, b, thunk.Params, paramSlots, recvOwned, origRecvTyp)
 
 	// Determine the call's result type.  Multi-return uses the
 	// MultiReturnType struct; single-result is just that result;
@@ -196,10 +228,12 @@ func genIvRecvThunk(m @ir.Module, name @[]char, f @ir.Func) @ir.Func {
 
 	if len(f.Results) == 0 {
 		irbuild.EmitCall(b, f.Name, args, resultTyp)
+		attachEmptyFaultPad(thunk, b)
 		var noVals @[]@ir.Instr
 		irbuild.EmitReturn(b, noVals)
 	} else if len(f.Results) == 1 {
 		var callResult @ir.Instr = irbuild.EmitCall(b, f.Name, args, resultTyp)
+		attachEmptyFaultPad(thunk, b)
 		var vals @[]@ir.Instr = make_slice(@ir.Instr, 1)
 		vals[0] = callResult
 		irbuild.EmitReturn(b, vals)
@@ -213,6 +247,7 @@ func genIvRecvThunk(m @ir.Module, name @[]char, f @ir.Func) @ir.Func {
 		// owned values and the thunk hands them to its caller with no extra RefInc
 		// and no temp-cleanup dec, exactly as the single-return path does.
 		var callResult @ir.Instr = irbuild.EmitCall(b, f.Name, args, resultTyp)
+		attachEmptyFaultPad(thunk, b)
 		var vals @[]@ir.Instr
 		for i := 0; i < len(f.Results); i++ {
 			var srcTyp @types.Type = f.Results[i]

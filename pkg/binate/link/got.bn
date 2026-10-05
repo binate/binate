@@ -1,0 +1,326 @@
+package "pkg/binate/link"
+
+import "pkg/binate/buf"
+
+// The linker-made GOT slots of an AArch64 link.  A GOT reference to a defined symbol is
+// relaxed to the symbol's own address (ADRP of its page; the slot load an ADD of its low
+// 12 bits) — except when one of the symbol's GOT references cannot be: a literal load of
+// the slot (GOT_LD_PREL19), the slot's offset from the GOT's page (LD64_GOTPAGE_LO15), or a
+// transfer through the slot's page offset other than a 64-bit load (a store, a D register,
+// a prefetch: LD64_GOT_LO12_NC).  Such a symbol gets a real slot, and every one of its GOT
+// references reaches the slot (relaxing some would split the ADRP of a pair from its
+// store).  A dynamic import has its own slot, which the loader fills; a GOT reference to
+// one with an addend gets a further slot the loader fills with the import plus the addend
+// (G(GDAT(S+A)) in the ELF for the Arm 64-bit Architecture).  `_GLOBAL_OFFSET_TABLE_`, when
+// referenced, is the GOT's start.
+
+// gotSymbolName is the symbol a program names the GOT's start by.
+var gotSymbolName *[]readonly char = "_GLOBAL_OFFSET_TABLE_"
+
+// GotSlot is a linker-made GOT slot holding the address of a symbol plus Addend.  It is
+// keyed by the symbol — a global or weak one by Name (every reference to a name binds to
+// one definition), a local one by its object and index (ObjIdx, SymIdx; Name empty) — and
+// the addend, so it can be found before symbols are resolved.  RefObj / RefSym name one
+// reference to the symbol, through which the slot's value is computed.  Import marks the
+// slot of a dynamic import reached with an addend, which the loader fills (a GLOB_DAT
+// carrying the addend); the linker fills the others.  Dead marks a slot only references in
+// sections a scripted layout discarded reach, which is left unfilled.  Addr is its address
+// once laid out.
+type GotSlot struct {
+	Name   @[]char
+	ObjIdx int
+	SymIdx int
+	Addend int
+	RefObj int
+	RefSym int
+	Import bool
+	Dead   bool
+	Addr   uint64
+}
+
+// isAArch64GotKind reports whether an AArch64 relocation kind references its target's GOT
+// slot: ADR_GOT_PAGE, LD64_GOT_LO12_NC, GOT_LD_PREL19 or LD64_GOTPAGE_LO15.
+func isAArch64GotKind(kind int) bool {
+	return kind == R_AARCH64_ADR_GOT_PAGE || kind == R_AARCH64_LD64_GOT_LO12_NC ||
+			kind == R_AARCH64_GOT_LD_PREL19 || kind == R_AARCH64_LD64_GOTPAGE_LO15
+}
+
+// isLd64GotWord reports whether insn is a 64-bit unsigned-offset LDR (of an X register) —
+// the one GOT-slot transfer a relaxation can rewrite into an ADD.
+func isLd64GotWord(insn int64) bool { return (insn & 0xffc00000) == 0xf9400000 }
+
+// isGotSlotTransferWord reports whether insn is an unsigned-offset transfer of 8 bytes — a
+// GOT slot's size: LDR / STR of an X or D register, or PRFM.
+func isGotSlotTransferWord(insn int64) bool {
+	var op int64 = insn & 0xffc00000
+	return op == 0xf9400000 || op == 0xf9000000 || op == 0xfd400000 || op == 0xfd000000 ||
+			op == 0xf9800000
+}
+
+// gotRefRelaxable reports whether GOT relocation rel of obj can be relaxed: an
+// ADR_GOT_PAGE, or a LD64_GOT_LO12_NC on a 64-bit LDR (read from the input section).
+func gotRefRelaxable(obj @InputObject, rel InputReloc) bool {
+	if rel.Kind == R_AARCH64_ADR_GOT_PAGE { return true }
+	if rel.Kind != R_AARCH64_LD64_GOT_LO12_NC { return false }
+	if rel.SecIndex < 0 || rel.SecIndex >= len(obj.Sections) { return false }
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var d *[]readonly uint8 = obj.Sections[rel.SecIndex].Data
+	var off int = cast(int, rel.Offset)
+	if off < 0 || off + 4 > len(d) { return false }
+	return isLd64GotWord(u32(d, off))
+}
+
+// isLocalSymbol reports whether sym is local to its object (neither global nor weak).
+func isLocalSymbol(sym InputSymbol) bool {
+	return sym.Binding != BIND_GLOBAL && sym.Binding != BIND_WEAK
+}
+
+// gotKeyOf returns the slot key of relocation rel of object o: the symbol's name (a view
+// of objs' own) for a global or weak one, else "" with (o, its index).
+func gotKeyOf(objs @[]@InputObject, o int, rel InputReloc) (*[]readonly char, int, int) {
+	if isLocalSymbol(objs[o].Symbols[rel.SymIndex]) { return "", o, rel.SymIndex }
+	// bnlint:allow managed-to-raw-assign - a view of the symbol's name, which objs keeps
+	var name *[]readonly char = objs[o].Symbols[rel.SymIndex].Name
+	return name, -1, -1
+}
+
+// gotKeyIs reports whether slot s has the key (name, o, si).
+func gotKeyIs(s GotSlot, name *[]readonly char, o int, si int) bool {
+	if len(name) > 0 { return charsEqual(s.Name, name) }
+	return len(s.Name) == 0 && s.ObjIdx == o && s.SymIdx == si
+}
+
+// nameListHas reports whether names holds name.
+func nameListHas(names @[]@[]char, name *[]readonly char) bool {
+	for i := 0; i < len(names); i++ {
+		if charsEqual(names[i], name) { return true }
+	}
+	return false
+}
+
+// collectGotSlots returns the linker-made GOT slots objs' AArch64 GOT references need (see
+// the file comment), in first-reference order: a slot per (symbol, addend) for each symbol
+// one of whose GOT references cannot be relaxed, and per (import, addend) for each nonzero
+// addend a GOT reference to one of imports (the dynamic imports reached through the GOT)
+// carries.  A GOT reference to an import with no addend uses the import's own slot.
+func collectGotSlots(objs @[]@InputObject, imports @[]@[]char) @[]GotSlot {
+	// The keys of the symbols that need a slot: one of their references is unrelaxable.
+	var keys @[]GotSlot = make_slice(GotSlot, 0)
+	var nKeys int = 0
+	for o := 0; o < len(objs); o++ {
+		var obj @InputObject = objs[o]
+		if obj.Machine != EM_AARCH64 { continue }
+		for r := 0; r < len(obj.Relocs); r++ {
+			var rel InputReloc = obj.Relocs[r]
+			if !isAArch64GotKind(rel.Kind) || gotRefRelaxable(obj, rel) { continue }
+			if rel.SymIndex < 0 || rel.SymIndex >= len(obj.Symbols) { continue }
+			name, ko, ks := gotKeyOf(objs, o, rel)
+			if len(name) > 0 && nameListHas(imports, name) { continue }
+			if gotSlotIndex(keys[0:nKeys], name, ko, ks, 0, false) >= 0 { continue }
+			var k GotSlot
+			k.Name = buf.CopyStr(name)
+			k.ObjIdx = ko
+			k.SymIdx = ks
+			keys = gotSlotsGrown(keys, nKeys)
+			keys[nKeys] = k
+			nKeys = nKeys + 1
+		}
+	}
+	if nKeys == 0 && len(imports) == 0 { return make_slice(GotSlot, 0) }
+	var slots @[]GotSlot = make_slice(GotSlot, 0)
+	var nSlots int = 0
+	for o := 0; o < len(objs); o++ {
+		var obj @InputObject = objs[o]
+		if obj.Machine != EM_AARCH64 { continue }
+		for r := 0; r < len(obj.Relocs); r++ {
+			var rel InputReloc = obj.Relocs[r]
+			if !isAArch64GotKind(rel.Kind) { continue }
+			if rel.SymIndex < 0 || rel.SymIndex >= len(obj.Symbols) { continue }
+			name, ko, ks := gotKeyOf(objs, o, rel)
+			var imp bool = len(name) > 0 && nameListHas(imports, name)
+			if imp && rel.Addend == 0 { continue }
+			if !imp && gotSlotIndex(keys[0:nKeys], name, ko, ks, 0, false) < 0 { continue }
+			if gotSlotIndex(slots[0:nSlots], name, ko, ks, rel.Addend, true) >= 0 { continue }
+			var s GotSlot
+			s.Name = buf.CopyStr(name)
+			s.ObjIdx = ko
+			s.SymIdx = ks
+			s.Addend = rel.Addend
+			s.RefObj = o
+			s.RefSym = rel.SymIndex
+			s.Import = imp
+			slots = gotSlotsGrown(slots, nSlots)
+			slots[nSlots] = s
+			nSlots = nSlots + 1
+		}
+	}
+	return slots[0:nSlots]
+}
+
+// gotSlotIndex returns the index in slots of the slot keyed (name, o, si) — and, when
+// withAddend, addend — or -1.
+func gotSlotIndex(slots @[]GotSlot, name *[]readonly char, o int, si int, addend int,
+		withAddend bool) int {
+	for i := 0; i < len(slots); i++ {
+		if gotKeyIs(slots[i], name, o, si) && (!withAddend || slots[i].Addend == addend) { return i }
+	}
+	return -1
+}
+
+// gotSlotsGrown returns slots, its first n entries in use, with room for one more —
+// doubled when full, so a list built entry by entry is amortized linear.
+func gotSlotsGrown(slots @[]GotSlot, n int) @[]GotSlot {
+	if n < len(slots) { return slots }
+	var c int = 2 * len(slots)
+	if c < 8 { c = 8 }
+	var out @[]GotSlot = make_slice(GotSlot, c)
+	for i := 0; i < n; i++ { out[i] = slots[i] }
+	return out
+}
+
+// gotSlotsWith returns slots with s appended.
+func gotSlotsWith(slots @[]GotSlot, s GotSlot) @[]GotSlot {
+	var out @[]GotSlot = make_slice(GotSlot, len(slots) + 1)
+	for i := 0; i < len(slots); i++ { out[i] = slots[i] }
+	out[len(slots)] = s
+	return out
+}
+
+// gotSymbolReferenced reports whether some object references `_GLOBAL_OFFSET_TABLE_` and
+// none defines it (so the linker defines it at the GOT's start).
+func gotSymbolReferenced(objs @[]@InputObject) bool {
+	var used bool = false
+	for o := 0; o < len(objs); o++ {
+		for i := 0; i < len(objs[o].Symbols); i++ {
+			var sym InputSymbol = objs[o].Symbols[i]
+			if !charsEqual(sym.Name, gotSymbolName) || isLocalSymbol(sym) { continue }
+			if sym.SecIndex >= 0 || sym.Abs { return false }
+			used = true
+		}
+	}
+	return used
+}
+
+// newGotObject returns a linker-made object holding a `.got` section of n zero 8-byte
+// slots (a writable section, 8-aligned) and nothing else.
+func newGotObject(n int, machine int) @InputObject {
+	var obj @InputObject = make(InputObject)
+	obj.Path = buf.CopyStr("<linker-made GOT>")
+	obj.Machine = machine
+	obj.Sections = make_slice(InputSection, 1)
+	obj.Sections[0] = mkDynSection(".got", SF_READ | SF_WRITE, 8, make_slice(uint8, n * 8))
+	obj.Symbols = make_slice(InputSymbol, 0)
+	obj.Relocs = make_slice(InputReloc, 0)
+	return obj
+}
+
+// gotObjectsWith returns objs with gotObj appended.
+func gotObjectsWith(objs @[]@InputObject, gotObj @InputObject) @[]@InputObject {
+	var out @[]@InputObject = make_slice(@InputObject, len(objs) + 1)
+	for i := 0; i < len(objs); i++ { out[i] = objs[i] }
+	out[len(objs)] = gotObj
+	return out
+}
+
+// gotSlotAddr returns the address of the linker-made slot GOT relocation rel of object o
+// reaches (t.GotSlots), if it has one.
+func (t @SymbolTable) gotSlotAddr(o int, rel InputReloc) (uint64, bool) {
+	if len(t.GotSlots) == 0 { return cast(uint64, 0), false }
+	name, ko, ks := gotKeyOf(t.Objs, o, rel)
+	var i int = gotSlotIndex(t.GotSlots, name, ko, ks, rel.Addend, true)
+	if i < 0 { return cast(uint64, 0), false }
+	return t.GotSlots[i].Addr, true
+}
+
+// placeGotSlots sets the address of each of slots, the GOT's linker-made slots in order
+// from gotVa + 8 * first.
+func placeGotSlots(slots @[]GotSlot, gotVa uint64, first int) {
+	for i := 0; i < len(slots); i++ { slots[i].Addr = gotVa + cast(uint64, (first + i) * 8) }
+}
+
+// gotBaseFor returns the GOT's start that LD64_GOTPAGE_LO15 offsets are from: where
+// `_GLOBAL_OFFSET_TABLE_` resolves — an object's or a layout script's definition, or the
+// linker's (gotVa) — so an ADRP of the symbol and the offsets agree.
+func gotBaseFor(t @SymbolTable, lr @LayoutResult, gotVa uint64) uint64 {
+	oo, ss, found := t.Lookup(gotSymbolName)
+	if found {
+		addr, ok := definedAddr(t, lr, oo, ss)
+		if ok { return addr }
+	}
+	av, aok := t.lookupAbs(gotSymbolName)
+	if aok { return av }
+	return gotVa
+}
+
+// withoutName returns names and binds (one per name) without the entry named name.
+func withoutName(names @[]@[]char, binds @[]int, name *[]readonly char) (@[]@[]char, @[]int) {
+	if !nameListHas(names, name) { return names, binds }
+	var n @[]@[]char = make_slice(@[]char, len(names) - 1)
+	var b @[]int = make_slice(int, len(names) - 1)
+	var k int = 0
+	for i := 0; i < len(names); i++ {
+		if charsEqual(names[i], name) { continue }
+		n[k] = names[i]
+		b[k] = binds[i]
+		k = k + 1
+	}
+	return n, b
+}
+
+// fillGotSlots writes, at byte off + 8 * (first + i) of data (the output bytes holding the
+// GOT), each linker-filled slot's value: its symbol's address plus its addend (not a Dead
+// one's).  Returns "" or an error for a symbol with no address.
+func fillGotSlots(t @SymbolTable, lr @LayoutResult, data @[]uint8, off int,
+		first int) @[]readonly char {
+	for i := 0; i < len(t.GotSlots); i++ {
+		var s GotSlot = t.GotSlots[i]
+		if s.Import || s.Dead { continue }
+		addr, ok := symbolAddr(t, lr, s.RefObj, s.RefSym)
+		if !ok { return buf.Concat("unresolved symbol ", t.Objs[s.RefObj].Symbols[s.RefSym].Name) }
+		writeU64(data, off + (first + i) * 8, cast(uint64, cast(int64, addr) + cast(int64, s.Addend)))
+	}
+	return ""
+}
+
+// inImageGotSlots returns slots without those of absolute symbols, which a position-
+// independent output keeps in its own unrebased slots (t.AbsGot), for a Mach-O link: every
+// slot left holds an in-image address (or 0, a weak undefined symbol's).  A slot for an
+// import with an addend is an internal error: a Mach-O object has no GOT addend.
+func inImageGotSlots(t @SymbolTable, slots @[]GotSlot) (@[]GotSlot, @[]readonly char) {
+	var out @[]GotSlot = make_slice(GotSlot, 0)
+	for i := 0; i < len(slots); i++ {
+		if slots[i].Import {
+			return out,
+				buf.Concat("internal error: a Mach-O GOT reference to an import with an addend: ",
+						slots[i].Name)
+		}
+		oo, ss, found := chosenDef(t, slots[i].RefObj, slots[i].RefSym)
+		if found && t.Objs[oo].Symbols[ss].Abs { continue }
+		out = gotSlotsWith(out, slots[i])
+	}
+	return out, ""
+}
+
+// gotSlotRebaseSites returns the addresses of t's linker-made slots that hold an in-image
+// address (a defined, non-absolute symbol's), which a sliding image must rebase.
+func gotSlotRebaseSites(t @SymbolTable) @[]uint64 {
+	var sites @[]uint64 = make_slice(uint64, len(t.GotSlots))
+	var k int = 0
+	for i := 0; i < len(t.GotSlots); i++ {
+		var s GotSlot = t.GotSlots[i]
+		if s.Import { continue }
+		oo, ss, found := chosenDef(t, s.RefObj, s.RefSym)
+		if !found || t.Objs[oo].Symbols[ss].Abs { continue }
+		sites[k] = s.Addr
+		k = k + 1
+	}
+	return sites[0:k]
+}
+
+// concatSites returns a followed by b.
+func concatSites(a @[]uint64, b @[]uint64) @[]uint64 {
+	var out @[]uint64 = make_slice(uint64, len(a) + len(b))
+	for i := 0; i < len(a); i++ { out[i] = a[i] }
+	for i := 0; i < len(b); i++ { out[len(a) + i] = b[i] }
+	return out
+}

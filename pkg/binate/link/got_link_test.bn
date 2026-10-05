@@ -1,0 +1,364 @@
+package "pkg/binate/link"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/asm/aarch64/isa"
+import "pkg/binate/asm/elf"
+import "pkg/binate/buf"
+import "pkg/builtins/build"
+import "pkg/builtins/testing"
+import "pkg/std/errors"
+import "pkg/std/os"
+import "pkg/std/os/process"
+
+// The linker-made GOT end to end: an ELF object's GOT forms in a static link, an import
+// with an addend in a dynamic ELF link, and a Mach-O program whose slot dyld must rebase;
+// a malformed Mach-O GOT load with an addend.  (fail is in parse_elf_test.bn, testTmpDir
+// in link_test.bn, fieldWord in relocate_arm32_test.bn, writeMachoAsm in
+// dynmacho_abs_test.bn.)
+
+// gotProgAsm returns the program: a literal load of g's slot, ADRP of
+// `_GLOBAL_OFFSET_TABLE_` and g's slot at its offset from it, h's relaxable ADRP / LDR
+// pair, and k's ADRP with a store through its slot's page offset; g, h and k are 8-byte
+// words in data.
+func gotProgAsm() @asm.Assembler {
+	var a @asm.Assembler = asm.New(8)
+	a.ObjFormat = asm.OBJ_ELF
+	a.SetSection("text", -1)
+	a.DefineLabel("_start")
+	a.SetGlobal("_start")
+	a.SetGlobal("_GLOBAL_OFFSET_TABLE_")
+	isa.LdStLiteralGot(a, isa.LS_LDR_X, 0, "g")
+	aarch64.Adrp(a, aarch64.X1, "_GLOBAL_OFFSET_TABLE_")
+	isa.LdStGotPageLo15(a, isa.LS_LDR_X, 2, 1, "g")
+	aarch64.AdrpGot(a, aarch64.X3, "h")
+	aarch64.LdrGotLo12(a, aarch64.X3, aarch64.X3, "h")
+	aarch64.AdrpGot(a, aarch64.X4, "k")
+	isa.LdStGotLo12(a, isa.LS_STR_X, 5, 4, "k")
+	a.EmitUint32(0xD65F03C0) // ret
+	a.SetSection("data", -1)
+	var names @[]*[]readonly char = make_slice(*[]readonly char, 3)
+	names[0] = "g"
+	names[1] = "h"
+	names[2] = "k"
+	for i := 0; i < 3; i++ {
+		a.DefineLabel(names[i])
+		a.SetGlobal(names[i])
+		a.EmitUint64(cast(uint64, 0))
+	}
+	return a
+}
+
+// gotProgObjects writes gotProgAsm as an ELF object under dir and reads it back as the
+// one-object list.
+func gotProgObjects(dir *[]readonly char) (@[]@InputObject, @[]readonly char) {
+	var none @[]@InputObject
+	var a @asm.Assembler = gotProgAsm()
+	aarch64.ResolveFixups(a)
+	a.Finalize()
+	if a.HasError { return none, a.ErrorMsg }
+	var path @[]char = buf.Concat(dir, "/got_prog.o")
+	if !elf.WriteAArch64(a, path) { return none, "cannot write the object" }
+	obj, err := ReadObject(path)
+	if len(err) != 0 { return none, err }
+	var objs @[]@InputObject = make_slice(@InputObject, 1)
+	objs[0] = obj
+	return objs, ""
+}
+
+// gotSlotOf returns the address of the slot of t's linker-made GOT for the global name.
+func gotSlotOf(t @SymbolTable, name *[]readonly char) uint64 {
+	for i := 0; i < len(t.GotSlots); i++ {
+		if charsEqual(t.GotSlots[i].Name, name) { return t.GotSlots[i].Addr }
+	}
+	return cast(uint64, 0)
+}
+
+// gotCheckProg checks the relocated program obj (laid out in lr, its GOT in t, whose
+// contents start at byte off of data): g and k each have a slot holding their address, h
+// none; every patched instruction reaches what it names.  Returns "" or what is wrong.
+func gotCheckProg(t @SymbolTable, lr @LayoutResult, obj @InputObject, data @[]uint8,
+		off int) @[]readonly char {
+	if len(t.GotSlots) != 2 { return "not exactly two slots (g, k)" }
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var d *[]readonly uint8 = data
+	for i := 0; i < 2; i++ {
+		var s GotSlot = t.GotSlots[i]
+		addr, _ := symbolAddr(t, lr, s.RefObj, s.RefSym)
+		if cast(uint64, u64(d, off + 8 * i)) != addr { return "a slot does not hold its symbol" }
+	}
+	var gSlot uint64 = gotSlotOf(t, "g")
+	var kSlot uint64 = gotSlotOf(t, "k")
+	lit, litAt, ok1 := fieldWord(obj, lr, "g", R_AARCH64_GOT_LD_PREL19)
+	var disp int64 = ((lit >> 5) & 0x7ffff) << 2
+	if !ok1 || cast(int64, litAt) + disp != cast(int64, gSlot) {
+		return "the literal load misses g's slot"
+	}
+	adrp, adrpAt, ok2 := fieldWord(obj, lr, "_GLOBAL_OFFSET_TABLE_", R_AARCH64_ADR_PREL_PG_HI21)
+	var pages int64 = ((adrp >> 29) & 3) | (((adrp >> 5) & 0x7ffff) << 2)
+	if !ok2 || (cast(int64, adrpAt >> 12) + pages) != cast(int64, t.GotBase >> 12) {
+		return "the ADRP misses the GOT's page"
+	}
+	lo15, _, ok3 := fieldWord(obj, lr, "g", R_AARCH64_LD64_GOTPAGE_LO15)
+	if !ok3 || ((lo15 >> 10) & 0xfff) * 8 != cast(int64, gSlot - (t.GotBase & 0xfffffffffffff000)) {
+		return "the GOT-page offset misses g's slot"
+	}
+	hLd, _, ok4 := fieldWord(obj, lr, "h", R_AARCH64_LD64_GOT_LO12_NC)
+	if !ok4 || (hLd & 0xff800000) != 0x91000000 { return "h's GOT load not relaxed to an ADD" }
+	kAdrp, kAt, ok5 := fieldWord(obj, lr, "k", R_AARCH64_ADR_GOT_PAGE)
+	var kPages int64 = ((kAdrp >> 29) & 3) | (((kAdrp >> 5) & 0x7ffff) << 2)
+	if !ok5 || (cast(int64, kAt >> 12) + kPages) != cast(int64, kSlot >> 12) {
+		return "k's ADRP misses its slot's page"
+	}
+	kStr, _, ok6 := fieldWord(obj, lr, "k", R_AARCH64_LD64_GOT_LO12_NC)
+	if !ok6 || (kStr & 0xffc00000) != 0xf9000000 ||
+			((kStr >> 10) & 0xfff) != cast(int64, (kSlot & 0xfff) >> 3) {
+		return "k's store misses its slot"
+	}
+	return ""
+}
+
+// A static link gives g and k slots in a linker-made GOT — `_GLOBAL_OFFSET_TABLE_` its
+// start — and relaxes h.
+func TestLinkStaticGot() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	objs, err := gotProgObjects(dir)
+	if len(err) != 0 { return fail(buf.Concat("cannot build the object: ", err)) }
+	t, lr, gotObj, lerr := layoutStatic(objs, EM_AARCH64, cast(uint64, 0x400000))
+	if len(lerr) != 0 { return fail(buf.Concat("layout failed: ", lerr)) }
+	if !present(gotObj) || !t.HasGotBase { return fail("no linker-made GOT") }
+	var rerr @[]readonly char = relocateStatic(t, lr, gotObj)
+	if len(rerr) != 0 { return fail(buf.Concat("relocate failed: ", rerr)) }
+	gotData, gotOff := outData(gotObj, lr, 0)
+	var cerr @[]readonly char = gotCheckProg(t, lr, objs[0], gotData, gotOff)
+	if len(cerr) != 0 { return fail(buf.CopyStr(cerr)) }
+	av, aok := t.lookupAbs("_GLOBAL_OFFSET_TABLE_")
+	if !aok || av != t.GotBase { return fail("_GLOBAL_OFFSET_TABLE_ is not the GOT's start") }
+	return ""
+}
+
+// A dynamic ELF link of `adrp x0, :got:environ+8` / `ldr x0, [x0, :got_lo12:environ+8]`
+// (as clang assembles it) and a plain GOT load of environ has two GLOB_DATs: environ's own
+// slot, and one more carrying the addend 8.
+func TestLinkDynElfImportAddendSlot() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	var a @asm.Assembler = asm.New(8)
+	a.SetSection("text", -1)
+	a.DefineLabel("_start")
+	a.SetGlobal("_start")
+	a.SetGlobal("environ")
+	a.AddFixup("environ", isa.FIX_ADRP_GOT_HI21, 8, 4)
+	a.EmitUint32(0x90000000) // adrp x0, :got:environ+8
+	a.AddFixup("environ", isa.FIX_LD_GOT_LO12, 8, 4)
+	a.EmitUint32(0xf9400000) // ldr x0, [x0, :got_lo12:environ+8]
+	aarch64.AdrpGot(a, aarch64.X1, "environ")
+	aarch64.LdrGotLo12(a, aarch64.X1, aarch64.X1, "environ")
+	a.Finalize()
+	if a.HasError { return fail("assembler error") }
+	if !elf.WriteAArch64(a, buf.Concat(dir, "/got_dyn.o")) { return fail("write object failed") }
+	var paths @[]@[]char = make_slice(@[]char, 1)
+	paths[0] = buf.Concat(dir, "/got_dyn.o")
+	var err @[]readonly char = LinkDynElf(paths, "_start", EM_AARCH64, cast(uint64, 0x400000),
+			buf.Concat(dir, "/got_dyn"), make_slice(@[]char, 0))
+	if len(err) != 0 { return fail(buf.Concat("LinkDynElf failed: ", err)) }
+	data, ok := readFile(buf.Concat(dir, "/got_dyn"))
+	if !ok { return fail("cannot read the linked executable") }
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var rd *[]readonly uint8 = data
+	var phoff int = cast(int, u64(rd, 32))
+	var dynOff int = -1
+	for i := 0; i < u16(rd, 56); i++ {
+		var ph int = phoff + i * u16(rd, 54)
+		if cast(int, u32(rd, ph)) == PT_DYNAMIC { dynOff = cast(int, u64(rd, ph + 8)) }
+	}
+	if dynOff < 0 { return fail("no PT_DYNAMIC") }
+	var relaVa int64 = -1
+	var relaSz int = -1
+	for e := dynOff; cast(int, u64(rd, e)) != DT_NULL; e = e + 16 {
+		if cast(int, u64(rd, e)) == DT_RELA { relaVa = u64(rd, e + 8) }
+		if cast(int, u64(rd, e)) == DT_RELASZ { relaSz = cast(int, u64(rd, e + 8)) }
+	}
+	if relaSz != 2 * relaEntSize || relaVa < 0 { return fail("not two GLOB_DATs") }
+	var rela int = fileOff(rd, cast(int, relaVa))
+	if u64(rd, rela + 24 + 16) != 8 || (u64(rd, rela + 24 + 8) >> 32) != 1 {
+		return fail("the second GLOB_DAT is not environ + 8")
+	}
+	if u64(rd, rela + 24) != u64(rd, rela) + 8 {
+		return fail("environ + 8's slot not after environ's")
+	}
+	return ""
+}
+
+// On Mach-O, a prefetch through _v's slot's page offset keeps _v's GOT references off the
+// relaxation, so `_main` loads _v's address from a linker-made __got slot, which dyld
+// rebases: on a macOS arm64 host the program returns _v's 7.
+func TestLinkDynMachoGotSlotRuns() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	var a @asm.Assembler = asm.New(8)
+	a.ObjFormat = asm.OBJ_MACHO
+	a.SetSection("text", -1)
+	a.DefineLabel("_main")
+	a.SetGlobal("_main")
+	aarch64.AdrpGot(a, aarch64.X8, "_v")
+	isa.LdStGotLo12(a, isa.LS_PRFM, 0, 8, "_v")
+	aarch64.LdrGotLo12(a, aarch64.X9, aarch64.X8, "_v")
+	a.EmitUint32(0xF9400120) // ldr x0, [x9]
+	a.EmitUint32(0xD65F03C0) // ret
+	a.SetSection("data", -1)
+	a.DefineLabel("_v")
+	a.SetGlobal("_v")
+	a.EmitUint64(cast(uint64, 7))
+	var path @[]char = writeMachoAsm(a, dir, "got_slot.o")
+	if len(path) == 0 { return fail("cannot build the object") }
+	var paths @[]@[]char = make_slice(@[]char, 1)
+	paths[0] = path
+	var exe @[]char = buf.Concat(dir, "/got_slot")
+	var err @[]readonly char = LinkDynMacho(paths, "_main", EM_AARCH64, cast(uint64, 0x100004000), exe)
+	if len(err) != 0 { return fail(buf.Concat("LinkDynMacho failed: ", err)) }
+	if build.OS != build.OS_DARWIN || build.Arch != build.ARCH_AARCH64 { return "" }
+	var st process.ExitStatus
+	var perr @errors.Error
+	st, perr = process.Run(exe, &process.Options{Args: make_slice(@[]char, 0)})
+	if present(perr) || !st.Exited() { return fail("the executable did not run to exit") }
+	if st.Code() != 7 { return fail("the executable read a wrong value (exit not 7)") }
+	return ""
+}
+
+// gotMachoTextRelocs returns the file offset of the first relocation_info of the first
+// section_64 (text) in the Mach-O object b — its header at 32 + 72 — and their count.
+func gotMachoTextRelocs(b @[]uint8) (int, int) {
+	var sec int = 32 + 72
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var rd *[]readonly uint8 = b
+	return cast(int, u32(rd, sec + 56)), cast(int, u32(rd, sec + 60))
+}
+
+// A Mach-O GOT load preceded by an ARM64_RELOC_ADDEND entry is malformed (a GOT slot holds
+// no addend) and is rejected, not read with the addend dropped.
+func TestReadMachoGotLoadAddendRejected() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	var a @asm.Assembler = asm.New(8)
+	a.ObjFormat = asm.OBJ_MACHO
+	a.SetSection("text", -1)
+	a.DefineLabel("_main")
+	a.SetGlobal("_main")
+	a.SetGlobal("_g")
+	aarch64.LdrGotLo12(a, aarch64.X0, aarch64.X0, "_g")
+	aarch64.LdrGotLo12(a, aarch64.X1, aarch64.X1, "_g")
+	var path @[]char = writeMachoAsm(a, dir, "got_addend.o")
+	if len(path) == 0 { return fail("cannot build the object") }
+	data, ok := readFile(path)
+	if !ok { return fail("cannot read the object back") }
+	roff, n := gotMachoTextRelocs(data)
+	if n != 2 { return fail("not two relocations in text") }
+	// The first entry becomes an ADDEND of 8 (type 10, length 2) for the second.
+	data[roff + 4] = 8
+	data[roff + 5] = 0
+	data[roff + 6] = 0
+	data[roff + 7] = cast(uint8, 0xA0 | 0x04)
+	_, err := parseMachoBytes(data, path)
+	if !charsEqual(err, buf.Concat("malformed ARM64_RELOC_GOT_LOAD (with an addend) in ", path)) {
+		return fail(buf.Concat("a GOT load with an addend accepted: ", err))
+	}
+	return ""
+}
+
+// loadFileOff returns the file offset of virtual address vaddr in the ELF executable rd —
+// through the PT_LOAD segment whose file bytes hold it — or -1.
+func loadFileOff(rd *[]readonly uint8, vaddr uint64) int {
+	var phoff int = cast(int, u64(rd, 32))
+	for i := 0; i < u16(rd, 56); i++ {
+		var ph int = phoff + i * u16(rd, 54)
+		if cast(int, u32(rd, ph)) != 1 { continue } // PT_LOAD
+		var off uint64 = cast(uint64, u64(rd, ph + 8))
+		var va uint64 = cast(uint64, u64(rd, ph + 16))
+		var filesz uint64 = cast(uint64, u64(rd, ph + 32))
+		if vaddr >= va && vaddr < va + filesz { return cast(int, off + (vaddr - va)) }
+	}
+	return -1
+}
+
+// A dynamic ELF link of `adrp x0, _GLOBAL_OFFSET_TABLE_` / `ldr x1, [x0,
+// :gotpage_lo15:val]` (beside a call to the import exit): `_GLOBAL_OFFSET_TABLE_` is the
+// linker's — the .got's start, not an import — and the load reaches val's slot, which
+// holds val's address.
+func TestLinkDynElfGotPageLo15() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	var a @asm.Assembler = asm.New(8)
+	a.SetSection("text", -1)
+	a.DefineLabel("_start")
+	a.SetGlobal("_start")
+	a.SetGlobal("_GLOBAL_OFFSET_TABLE_")
+	a.SetGlobal("exit")
+	aarch64.Adrp(a, aarch64.X0, "_GLOBAL_OFFSET_TABLE_")
+	isa.LdStGotPageLo15(a, isa.LS_LDR_X, 1, 0, "val")
+	aarch64.Bl(a, "exit")
+	a.SetSection("data", -1)
+	a.DefineLabel("val")
+	a.SetGlobal("val")
+	a.EmitUint64(cast(uint64, 0x1122334455667788))
+	aarch64.ResolveFixups(a)
+	a.Finalize()
+	if a.HasError { return fail("assembler error") }
+	if !elf.WriteAArch64(a, buf.Concat(dir, "/got_lo15.o")) { return fail("write object failed") }
+	var paths @[]@[]char = make_slice(@[]char, 1)
+	paths[0] = buf.Concat(dir, "/got_lo15.o")
+	var err @[]readonly char = LinkDynElf(paths, "_start", EM_AARCH64, cast(uint64, 0x400000),
+			buf.Concat(dir, "/got_lo15"), make_slice(@[]char, 0))
+	if len(err) != 0 { return fail(buf.Concat("LinkDynElf failed: ", err)) }
+	data, ok := readFile(buf.Concat(dir, "/got_lo15"))
+	if !ok { return fail("cannot read the linked executable") }
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var rd *[]readonly uint8 = data
+	var entry uint64 = cast(uint64, u64(rd, 24))
+	var at int = loadFileOff(rd, entry)
+	if at < 0 { return fail("the entry is not in a loaded segment") }
+	var adrp int64 = u32(rd, at)
+	var ldr int64 = u32(rd, at + 4)
+	var pages int64 = ((adrp >> 29) & 3) | (((adrp >> 5) & 0x7ffff) << 2)
+	var gotPage uint64 = cast(uint64, (cast(int64, entry >> 12) + pages) << 12)
+	var slot uint64 = gotPage + cast(uint64, ((ldr >> 10) & 0xfff) * 8)
+	var slotAt int = loadFileOff(rd, slot)
+	if slotAt < 0 { return fail("the slot is not in a loaded segment") }
+	var valAt int = loadFileOff(rd, cast(uint64, u64(rd, slotAt)))
+	if valAt < 0 || u64(rd, valAt) != 0x1122334455667788 {
+		return fail("the slot does not hold val's address")
+	}
+	return ""
+}
+
+// An object's own `_GLOBAL_OFFSET_TABLE_` is the GOT's start the `:gotpage_lo15:` offsets
+// are from, as an ADRP of it reaches: here the text's start, so g's slot offset is from
+// that page.
+func TestLinkStaticGotBaseFollowsDefinition() testing.TestResult {
+	var insns @[]int64 = make_slice(int64, 1)
+	insns[0] = 0xf9400020 // ldr x0, [x1]
+	var syms @[]InputSymbol = make_slice(InputSymbol, 2)
+	syms[0] = gotTestSym("g", false, true)
+	syms[1] = gotTestSym("_GLOBAL_OFFSET_TABLE_", false, true)
+	var rels @[]InputReloc = make_slice(InputReloc, 1)
+	rels[0] = gotTestRel(0, 0, R_AARCH64_LD64_GOTPAGE_LO15, 0)
+	var prog @InputObject = gotTestObj(insns, syms, rels)
+	t, lr, gotObj, lerr := layoutStatic(gotTestObjs(prog), EM_AARCH64, cast(uint64, 0x400000))
+	if len(lerr) != 0 || !present(gotObj) { return fail("no GOT laid out") }
+	var rerr @[]readonly char = relocateStatic(t, lr, gotObj)
+	if len(rerr) != 0 { return fail(buf.Concat("relocate failed: ", rerr)) }
+	defAt, _ := definedAddr(t, lr, 0, 1)
+	if t.GotBase != defAt { return fail("the GOT's start is not the object's _GLOBAL_OFFSET_TABLE_") }
+	word, _, ok := fieldWord(prog, lr, "g", R_AARCH64_LD64_GOTPAGE_LO15)
+	if !ok ||
+			((word >> 10) & 0xfff) * 8 != cast(int64, t.GotSlots[0].Addr - (defAt & 0xfffffffffffff000)) {
+		return fail("g's offset is not from the definition's page")
+	}
+	return ""
+}

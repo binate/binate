@@ -1,0 +1,220 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/irbuild"
+
+import "pkg/binate/irutil"
+
+import "pkg/binate/ast"
+
+import "pkg/binate/ir"
+
+import "pkg/binate/irdata"
+import "pkg/binate/iropcode"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// Readonly variants of named dynamic types (iface.assert.readonly).  A box of a
+// READONLY object of a named type T — `&c` with `c readonly T`, an `@readonly T`,
+// the implicit borrow of a readonly variable — records the object's readonly: its
+// dynamic type is T's readonly variant, a receiver identity of its own in T's
+// package (irutil.ReadonlyVariantName) with T's layout, methods and destructor.
+// So a mutable recovery `.(*T)` / `.(@T)` (which compares against T's record
+// only) misses it, while `.(*readonly T)`, `.(@readonly T)` and the value copy
+// `.(T)` match either record (emitTypeInfoMismatch).  The variant has its own
+// ImplInfo rows — the vtables, and the satisfaction entries an interface-target
+// assertion `.(*J)` finds — only for an impl a readonly object may reach
+// (implAdmitsReadonlyObject), so `.(*J)` on a readonly box misses a J whose
+// methods would write the object.  A name-less dynamic type (a slice, array or
+// function value) has no variant: it is recovered by value (a copy), and keeps
+// element readonly in its structural identity.
+
+// implAdmitsReadonlyObject reports whether an impl with receiver type rt (the
+// impl's receiver type expression, resolved) is reachable from a READONLY object,
+// so its rows get a readonly variant: the receiver binds a read-only object —
+// `*readonly T` / `@readonly T`, or a `readonly T` value — exactly the
+// object-constness the checker's receiverAssignable keeps (a readonly object may
+// not drop to a receiver that is not readonly).  An outer `readonly` on a POINTER
+// receiver makes the handle read-only, not the object, so it does not count.
+func implAdmitsReadonlyObject(rt @types.Type) bool {
+	var t @types.Type = rt
+	for t != nil && t.Kind == types.TYP_ALIAS {
+		t = t.Target
+	}
+	var outer bool = false
+	if t != nil && t.Kind == types.TYP_READONLY {
+		outer = true
+		t = t.Elem
+		for t != nil && t.Kind == types.TYP_ALIAS {
+			t = t.Target
+		}
+	}
+	if t == nil { return false }
+	if t.Kind == types.TYP_POINTER || t.Kind == types.TYP_MANAGED_PTR { return pointeeIsReadonly(t) }
+	return outer
+}
+
+// genericImplAdmitsReadonlyObject is implAdmitsReadonlyObject for a parameterized
+// impl's receiver (`*readonly Box[T]`), read off its syntax: resolving the whole
+// receiver would instantiate the generic type with a blank binder's position
+// (`Box[_, V]`) unbound.  A generic receiver is an instantiation under at most
+// `readonly` and one `*` / `@`, never an alias, so its shape is in the syntax.
+func genericImplAdmitsReadonlyObject(te @ast.TypeExpr) bool {
+	var t @ast.TypeExpr = peelTypeExprParens(te)
+	var outer bool = false
+	if t != nil && t.Kind == ast.TEXPR_CONST {
+		outer = true
+		t = peelTypeExprParens(t.Base)
+	}
+	if t == nil { return false }
+	if t.Kind == ast.TEXPR_POINTER || t.Kind == ast.TEXPR_MANAGED {
+		var e @ast.TypeExpr = peelTypeExprParens(t.Base)
+		return e != nil && e.Kind == ast.TEXPR_CONST
+	}
+	return outer
+}
+
+// peelTypeExprParens strips parentheses around a type expression.
+func peelTypeExprParens(te @ast.TypeExpr) @ast.TypeExpr {
+	var t @ast.TypeExpr = te
+	for t != nil && t.Kind == ast.TEXPR_PAREN {
+		t = t.Base
+	}
+	return t
+}
+
+// pointeeIsReadonly reports whether pointer type p's pointee is outer-`readonly`
+// (through aliases).  Not types.Type.IsReadonly: a named type over readonly
+// (`type RI readonly int8`) is readonly at its own level (type.readonly.named), so
+// its objects need no variant, and treating it as one would make `.(*RI)` miss.
+func pointeeIsReadonly(p @types.Type) bool {
+	if p == nil { return false }
+	var e @types.Type = p.Elem
+	for e != nil && e.Kind == types.TYP_ALIAS {
+		e = e.Target
+	}
+	return e != nil && e.Kind == types.TYP_READONLY
+}
+
+// appendReadonlyVariantRow appends the readonly variant of impl row `info` — the
+// same methods, destructor and interface under the receiver's variant name — and
+// registers the variant's TypeInfo record (recvTyp, the receiver's base value
+// type).  A no-op when the module already has the row.
+func appendReadonlyVariantRow(m @ir.Module, info @irdata.ImplInfo, recvTyp @types.Type) {
+	var roName @[]char = irutil.ReadonlyVariantName(info.RecvTypeName)
+	if moduleHasImpl(m, info.RecvPkg, roName, info.IfacePkg, info.IfaceName) { return }
+	var ro @irdata.ImplInfo = make(irdata.ImplInfo)
+	ro.RecvPkg = info.RecvPkg
+	ro.RecvTypeName = roName
+	ro.IfacePkg = info.IfacePkg
+	ro.IfaceName = info.IfaceName
+	ro.MethodFuncs = info.MethodFuncs
+	ro.DtorFuncName = info.DtorFuncName
+	ir.RegisterTypeInfo(m, info.RecvPkg, roName, recvTyp, info.DtorFuncName)
+	m.Impls = slices.Append[@irdata.ImplInfo](m.Impls, ro)
+}
+
+// ensureReadonlyVariantRows gives the module's (recvName, iface) row and its
+// ancestors' rows their readonly variants — the on-demand counterpart of
+// collectImplsFromDecl's, for a monomorphized generic receiver whose rows are
+// themselves minted on demand (ensureGenericImplInfo).  The checker admitted the
+// readonly object's widening, so the impl admits it.
+func ensureReadonlyVariantRows(m @ir.Module, recvPkg *[]readonly char, recvName *[]readonly char,
+		ifacePkg *[]readonly char, ifaceName *[]readonly char, recvTyp @types.Type) {
+	var canonPkg @[]char = ir.CanonicalIfacePkg(m, ifacePkg, ifaceName)
+	var canonName @[]char = ir.CanonicalIfaceName(m, ifacePkg, ifaceName)
+	var pkgs @[]@[]char = IfaceAncestorClosurePkgs(m, canonPkg, canonName)
+	var names @[]@[]char = IfaceAncestorClosure(m, canonPkg, canonName)
+	pkgs = slices.Append[@[]char](pkgs, canonPkg)
+	names = slices.Append[@[]char](names, canonName)
+	for i := 0; i < len(m.Impls); i++ {
+		var info @irdata.ImplInfo = m.Impls[i]
+		if info == nil { continue }
+		if !irutil.CharEq(info.RecvPkg, recvPkg) || !irutil.CharEq(info.RecvTypeName, recvName) {
+			continue
+		}
+		for j := 0; j < len(names); j++ {
+			if irutil.CharEq(info.IfacePkg, pkgs[j]) && irutil.CharEq(info.IfaceName, names[j]) {
+				appendReadonlyVariantRow(m, info, recvTyp)
+				break
+			}
+		}
+	}
+}
+
+// boxReadonlyVariantName is the receiver name a box keys its dynamic type on: the
+// readonly variant of the named type recvName when the boxed object is readonly —
+// the boxed pointer's pointee is outer-`readonly` in srcExprTyp, the source's
+// checker type (the IR type has readonly stripped) — else recvName itself.  A
+// name-less identity (`__nameless_…`) has no variant.  With no checker (IR-gen
+// unit tests) there is no readonly to record; with one, a missing srcExprTyp
+// would box a readonly object as mutable, so it is an internal error.
+func boxReadonlyVariantName(ctx @GenContext, recvName @[]char, srcExprTyp @types.Type) @[]char {
+	if irutil.IsNamelessRecvName(recvName) { return recvName }
+	if srcExprTyp == nil {
+		if ctx.Checker != nil {
+			panic("boxing a named type into an interface: no checker type for the source")
+		}
+		return recvName
+	}
+	var t @types.Type = types.ResolveAliasAndConst(bindTypeParams(ctx.Gc, srcExprTyp))
+	if t == nil || (t.Kind != types.TYP_POINTER && t.Kind != types.TYP_MANAGED_PTR) {
+		return recvName
+	}
+	if !pointeeIsReadonly(t) { return recvName }
+	return irutil.ReadonlyVariantName(recvName)
+}
+
+// readonlyVariantTypeInfoSymFor is the readonly variant's `__typeinfo` symbol that
+// an assertion target ALSO matches — for a readonly-pointee target (`*readonly T`,
+// `@readonly T`) or a value target (`T`, a copy) of a named T — emitting the
+// variant's record here as typeInfoSymFor does the base's; empty for any other
+// target (a mutable `*T` / `@T`, a name-less slice).
+func readonlyVariantTypeInfoSymFor(ctx @GenContext, recoveredTyp @types.Type) @[]char {
+	var empty @[]char
+	if recoveredTyp == nil { return empty }
+	var k int = recoveredTyp.Kind
+	if k == types.TYP_SLICE || k == types.TYP_MANAGED_SLICE { return empty }
+	if (k == types.TYP_POINTER || k == types.TYP_MANAGED_PTR) && !pointeeIsReadonly(recoveredTyp) {
+		return empty
+	}
+	var recvPkg @[]char
+	var recvName @[]char
+	recvPkg, recvName = irutil.SplitQualName(irutil.ReceiverBaseTypeName(recoveredTyp))
+	if len(recvName) == 0 || irutil.IsNamelessRecvName(recvName) { return empty }
+	if len(recvPkg) == 0 {
+		recvPkg = ctx.Gc.PkgPath
+	}
+	var roName @[]char = irutil.ReadonlyVariantName(recvName)
+	if ctx.Gc.Mod != nil {
+		ensureAnyImplInfo(ctx.Gc.Mod, recvPkg, roName, assertBaseType(recoveredTyp))
+	}
+	return mangle.TypeInfoName(recvPkg, roName)
+}
+
+// emitTypeInfoMismatch emits, into b, the test that the dynamic `*TypeInfo` slot1
+// is NOT the asserted target's: it differs from the target's record and — for a
+// target that also matches the readonly variant (readonlyVariantTypeInfoSymFor) —
+// from the variant's.  Shared by the expression and comma-ok (and so type-switch)
+// assertion forms.
+func emitTypeInfoMismatch(ctx @GenContext, b @ir.Block, slot1 @ir.Instr,
+		recoveredTyp @types.Type) @ir.Instr {
+	var wrong @ir.Instr = emitTypeInfoNe(b, slot1, typeInfoSymFor(ctx, recoveredTyp))
+	var roSym @[]char = readonlyVariantTypeInfoSymFor(ctx, recoveredTyp)
+	if len(roSym) == 0 { return wrong }
+	var wrongRo @ir.Instr = emitTypeInfoNe(b, slot1, roSym)
+	// Mismatch iff it matches neither record: the two bools AND-ed as ints (an i1
+	// AND is not a uniformly lowered op), then tested non-zero.
+	var intTyp @types.Type = types.TypInt()
+	var both @ir.Instr = irbuild.EmitBinop(b, iropcode.OP_AND, irbuild.EmitCast(b, wrong, intTyp),
+			irbuild.EmitCast(b, wrongRo, intTyp), intTyp)
+	var zero @ir.Instr = irbuild.EmitConstInt(b, 0, intTyp)
+	return irbuild.EmitBinop(b, iropcode.OP_NE, both, zero, types.TypBool())
+}
+
+// emitTypeInfoNe emits, into b, the test that the `*TypeInfo` slot1 is not the
+// record sym.
+func emitTypeInfoNe(b @ir.Block, slot1 @ir.Instr, sym @[]char) @ir.Instr {
+	var want @ir.Instr = irbuild.EmitDataSymAddr(b, sym, types.TypUint8())
+	return irbuild.EmitBinop(b, iropcode.OP_NE, slot1, want, types.TypBool())
+}

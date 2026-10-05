@@ -1,0 +1,158 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/native/common"
+
+// A large aggregate copy or zero-fill is a loop rather than straight-line code, so its
+// code size stays constant whatever the aggregate's size — straight-line, a [5000]uint8
+// is ten thousand instructions, at every copy.  Up to aggCopyUnrollMaxBytes (or, byte by
+// byte, aggCopyUnrollMaxBytewise) it stays straight-line: the code is still small there,
+// and pays no loop overhead.  Each loop branches back with its displacement already
+// resolved (arm32.BOffset), so it records no fixup: the function emitter takes a fixup for
+// a branch out of the op and drops its register cache, which a loop running wholly within
+// the op does not need.
+
+// aggCopyUnrollMaxBytes is the largest word-aligned copy or zero-fill emitted
+// straight-line (16 words).
+const aggCopyUnrollMaxBytes int = 64
+
+// aggCopyUnrollMaxBytewise is the largest byte-by-byte copy emitted straight-line.
+const aggCopyUnrollMaxBytewise int = 16
+
+// aggCopyIsLoop reports whether an sz-byte copy (byteWise: byte by byte) is a loop.
+func aggCopyIsLoop(sz int, byteWise bool) bool {
+	if byteWise { return sz > aggCopyUnrollMaxBytewise }
+	return sz > aggCopyUnrollMaxBytes
+}
+
+// branchBackArm32 emits B{cond} back to the instruction at byte offset top of the
+// current section (a loop's first instruction).
+func branchBackArm32(a @asm.Assembler, cond int, top int) {
+	arm32.BOffset(a, cond, false, top - a.Sections[a.Current].Len)
+}
+
+// emitAggCopyLoopArm32 copies sz bytes from [srcBase + srcOff] to [dstBase + dstOff] with
+// a loop.  It claims two pool registers as cursors (scratchReg, which evicts a cached
+// value loss-free; both bases are marked claimed first so neither is evicted) and points
+// them at the two ends.  Word-aligned, with at least two more pool registers free, it moves
+// an LDM/STM chunk of up to four words per iteration through them (emitLdmCopyLoopArm32,
+// one or two instructions a word); otherwise it moves one unit per iteration — a word, or
+// a byte when byteWise (a sub-word-aligned aggregate, which may sit at an odd address) —
+// through a third claimed register (emitIndexedCopyLoopArm32).  scratch (IP) materializes
+// a large offset, then counts or indexes the loop; it must not be a pool register.
+func emitAggCopyLoopArm32(a @asm.Assembler, rm @common.RegMap, dstBase int, dstOff int, srcBase int,
+		srcOff int, sz int, byteWise bool, scratch int) {
+	rm.MarkUsed(dstBase)
+	rm.MarkUsed(srcBase)
+	var src int = scratchReg(rm)
+	var dst int = scratchReg(rm)
+	emitAddImm(a, src, srcBase, srcOff, scratch)
+	emitAddImm(a, dst, dstBase, dstOff, scratch)
+	if !byteWise {
+		var mask int = 0
+		var nData int = 0
+		var first int = -1
+		for i := 0; i <= 6 && nData < 4; i = i + 1 {
+			var r int = regPool(i)
+			if rm.IsUsed(r) || rm.RegHeldBy(r) >= 0 { continue }
+			if first < 0 { first = r }
+			mask = mask | (1 << r)
+			nData = nData + 1
+		}
+		if nData >= 2 {
+			emitLdmCopyLoopArm32(a, dst, src, sz, mask, nData, first, scratch)
+			return
+		}
+	}
+	emitIndexedCopyLoopArm32(a, dst, src, sz, byteWise, scratchReg(rm), scratch)
+}
+
+// emitLdmCopyLoopArm32 copies sz word-aligned bytes from [src] to [dst] with an LDM/STM
+// loop over the nData registers in mask (the lowest of them `first`), advancing the two
+// cursors by write-back and counting iterations in count; the words left over (fewer than
+// a chunk) follow through first, off the advanced cursors.  The cursors must not be in
+// mask; count must be neither.
+func emitLdmCopyLoopArm32(a @asm.Assembler, dst int, src int, sz int, mask int, nData int,
+		first int, count int) {
+	var w int = wordBytes()
+	if sz % w != 0 {
+		a.SetError("native arm32: an LDM copy loop needs a whole number of words")
+		return
+	}
+	var chunk int = nData * w
+	if sz >= chunk {
+		emitConstInt32(a, count, sz / chunk)
+		var top int = a.Sections[a.Current].Len
+		arm32.Ldm(a, arm32.COND_AL, src, true, mask)
+		arm32.Stm(a, arm32.COND_AL, dst, true, mask)
+		arm32.Sub(a, arm32.COND_AL, true, count, count, arm32.Imm(1))
+		branchBackArm32(a, arm32.COND_NE, top)
+	}
+	for off := 0; off < sz % chunk; off = off + w {
+		arm32.Ldr(a, arm32.COND_AL, first, arm32.MemImm(src, off))
+		arm32.Str(a, arm32.COND_AL, first, arm32.MemImm(dst, off))
+	}
+}
+
+// emitIndexedCopyLoopArm32 copies sz bytes from [src] to [dst] one unit per iteration — a
+// word, or a byte when byteWise — indexed by idx counting down from the last unit, so the
+// loop ends on the sign flag; tmp carries each unit.  sz must be at least one unit, and a
+// whole number of words when word-wise; src and dst stay intact.  It needs no register
+// map: the four registers are the caller's, all distinct.
+func emitIndexedCopyLoopArm32(a @asm.Assembler, dst int, src int, sz int, byteWise bool, tmp int,
+		idx int) {
+	var unit int = wordBytes()
+	if byteWise { unit = 1 }
+	if sz < unit || sz % unit != 0 {
+		a.SetError("native arm32: an indexed copy loop needs a whole number of units, at least one")
+		return
+	}
+	emitConstInt32(a, idx, sz - unit)
+	var top int = a.Sections[a.Current].Len
+	if byteWise {
+		arm32.Ldrb(a, arm32.COND_AL, tmp, arm32.MemReg(src, idx))
+		arm32.Strb(a, arm32.COND_AL, tmp, arm32.MemReg(dst, idx))
+	} else {
+		arm32.Ldr(a, arm32.COND_AL, tmp, arm32.MemReg(src, idx))
+		arm32.Str(a, arm32.COND_AL, tmp, arm32.MemReg(dst, idx))
+	}
+	arm32.Sub(a, arm32.COND_AL, true, idx, idx, arm32.Imm(unit))
+	branchBackArm32(a, arm32.COND_PL, top)
+}
+
+// emitShimCopyLoopArm32 copies sz bytes from [src] to [dst] in a func-value / closure
+// spill shim, where R4 (frame-saved) and LR (saved, free until the BL) are free besides
+// the two cursors: word-wise an LDM/STM loop of two words per iteration through {R4, LR},
+// counted in IP (it advances the cursors); byte-wise the indexed byte loop through R4,
+// indexed by IP.
+func emitShimCopyLoopArm32(a @asm.Assembler, dst int, src int, sz int, byteWise bool) {
+	if byteWise {
+		emitIndexedCopyLoopArm32(a, dst, src, sz, true, arm32.R4, arm32.IP)
+		return
+	}
+	emitLdmCopyLoopArm32(a, dst, src, sz, (1 << arm32.R4) | (1 << arm32.LR), 2, arm32.R4, arm32.IP)
+}
+
+// emitFrameZeroArm32 zero-fills the sz-byte frame region at [SP + off] (sz a multiple of
+// the word size, as PlanFrame rounds a data region up): word by word up to
+// aggCopyUnrollMaxBytes, else with a loop storing one zero word per iteration off a
+// claimed base register, indexed by IP counting down from the last word.  zero is a
+// scratch register it clears.
+func emitFrameZeroArm32(a @asm.Assembler, rm @common.RegMap, off int, sz int, zero int) {
+	var w int = wordBytes()
+	arm32.Mov(a, arm32.COND_AL, false, zero, arm32.Imm(0))
+	if !aggCopyIsLoop(sz, false) {
+		for bo := 0; bo < sz; bo = bo + w {
+			emitFrameStore(a, zero, off + bo)
+		}
+		return
+	}
+	var base int = scratchReg(rm)
+	emitFrameAddr(a, base, off)
+	emitConstInt32(a, arm32.IP, sz - w)
+	var top int = a.Sections[a.Current].Len
+	arm32.Str(a, arm32.COND_AL, zero, arm32.MemReg(base, arm32.IP))
+	arm32.Sub(a, arm32.COND_AL, true, arm32.IP, arm32.IP, arm32.Imm(w))
+	branchBackArm32(a, arm32.COND_PL, top)
+}

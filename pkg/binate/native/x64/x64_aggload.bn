@@ -1,0 +1,137 @@
+package "pkg/binate/native/x64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/x64"
+import "pkg/binate/ir"
+import "pkg/binate/native/aggcopy"
+import "pkg/binate/native/common"
+
+// emitAggLoad materializes an aggregate OP_LOAD: it copies the loaded
+// bytes into the load's OWN data region (reserved by PlanFrame) and
+// leaves rd pointing at that region.  A bare pointer pass-through aliases
+// the source object, which dangles when the source is a local the
+// function's cleanup RefDecs before the loaded value is consumed — e.g.
+// `return container[i]`, whose element header lives in `container`'s
+// backing and is read into the sret buffer only after `container`'s dtor
+// has freed that backing.  Materializing at the load point (before any
+// cleanup) gives the value its own storage, matching the LLVM backend.
+func emitAggLoad(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap, ins @ir.Instr,
+		arg @ir.Instr) {
+	var rd int = nextReg(rm, ins.ID)
+	var srcAlloc int = rm.LookupAlloc(arg.ID)
+	// Destination: the load's own region.  PlanFrame reserves one for
+	// every aggregate load; should that ever not hold, the load aliases its
+	// source (myAlloc < 0).
+	var myAlloc int = rm.LookupAlloc(ins.ID)
+	if myAlloc < 0 {
+		// No region: alias the source.
+		if srcAlloc >= 0 {
+			x64.Lea(a, x64.Reg(rd, x64.SZ64), x64.Mem(x64.RSP, srcAlloc, x64.SZ64))
+			return
+		}
+		var aliasPtr int
+		if isGlobalRef(arg) {
+			aliasPtr = scratchReg(rm)
+			emitGlobalAddr(a, pkgName, aliasPtr, arg)
+		} else {
+			aliasPtr = getOperand(a, rm, arg.ID)
+		}
+		if aliasPtr < 0 { return }
+		x64.Mov(a, x64.Reg(rd, x64.SZ64), x64.Reg(aliasPtr, x64.SZ64))
+		return
+	}
+	// The source is a stack slot, a global's address or a pointer value, in
+	// at most one register besides rd; rd is taken first, so the source's
+	// register is never rd.  A stack slot whose address an earlier
+	// instruction left cached is read through that register (claimed by
+	// claimCachedOperands, so taking another for a LEA would make three);
+	// otherwise it is addressed off RSP, or through a LEA when
+	// x64AggLoadLeaSource.
+	var srcBase int = x64.RSP
+	var srcOff int = 0
+	var sz int = ins.Typ.SizeOf()
+	var cached int = -1
+	if srcAlloc >= 0 { cached = rm.LookupReg(arg.ID) }
+	if cached >= 0 {
+		srcBase = cached
+		rm.MarkUsed(cached)
+	} else if srcAlloc >= 0 && x64AggLoadLeaSource(srcAlloc, sz) {
+		srcBase = scratchReg(rm)
+		x64.Lea(a, x64.Reg(srcBase, x64.SZ64), x64.Mem(x64.RSP, srcAlloc, x64.SZ64))
+	} else if srcAlloc >= 0 {
+		srcOff = srcAlloc
+	} else if isGlobalRef(arg) {
+		srcBase = scratchReg(rm)
+		emitGlobalAddr(a, pkgName, srcBase, arg)
+	} else {
+		srcBase = getOperand(a, rm, arg.ID)
+	}
+	if srcBase < 0 { return }
+	emitAggLoadCopyX64(a, rd, myAlloc, srcBase, srcOff, sz)
+}
+
+// x64AggLoadLeaSource reports whether an sz-byte aggregate load from the stack
+// slot at RSP + srcOff should take the slot's address into a register first.
+// An RSP-relative access needs a SIB byte, plus a 4-byte displacement once the
+// offset passes 127, so each such source access costs about four bytes more
+// than one off a register with a 1-byte displacement; the 8-byte LEA pays for
+// itself from three accesses on.  A slot reachable with 1-byte displacements is
+// addressed off RSP directly.
+func x64AggLoadLeaSource(srcOff int, sz int) bool {
+	if srcOff + sz <= 128 { return false }
+	var n int = sz / 16
+	var rest int = sz - n * 16
+	if rest >= 8 {
+		n = n + 1
+		rest = rest - 8
+	}
+	if rest >= 4 {
+		n = n + 1
+		rest = rest - 4
+	}
+	if rest >= 2 {
+		n = n + 1
+		rest = rest - 2
+	}
+	if rest >= 1 { n = n + 1 }
+	return n >= 3
+}
+
+// emitAggLoadCopyX64 copies sz bytes from [srcBase + srcOff] into the frame
+// region at RSP + dstOff and leaves rd holding the region's address, using no
+// register besides rd and srcBase.  The bytes split into 16-byte chunks, at
+// most one 8-byte word, and a sub-word tail (aggcopy.TailPieces).  The tail's
+// 2- and 1-byte pieces go through rd first, before rd takes the address; then
+// rd is the destination base and the chunks, the word and a 4-byte tail piece
+// move through an XMM scratch (MOVUPS, MOVLPS, MOVSS: raw bit copies).
+// Addressing the destination off rd rather than RSP keeps each store's
+// displacement to one byte where an RSP-relative store into a large frame needs
+// a SIB byte and a 4-byte offset.
+func emitAggLoadCopyX64(a @asm.Assembler, rd int, dstOff int, srcBase int, srcOff int, sz int) {
+	var chunkEnd int = sz / 16 * 16
+	var wordEnd int = chunkEnd
+	if wordEnd + 8 <= sz { wordEnd = wordEnd + 8 }
+	var tail @[]aggcopy.Piece = aggcopy.TailPieces(wordEnd, sz, false)
+	for i := 0; i < len(tail); i++ {
+		if tail[i].Width <= 2 {
+			emitAggPieceOffX64(a, true, rd, srcBase, srcOff, tail[i])
+			emitAggPieceOffX64(a, false, rd, x64.RSP, dstOff, tail[i])
+		}
+	}
+	x64.Lea(a, x64.Reg(rd, x64.SZ64), x64.Mem(x64.RSP, dstOff, x64.SZ64))
+	for c := 0; c + 16 <= sz; c = c + 16 {
+		x64.Movups_load(a, FP_SCRATCH_A, x64.Mem(srcBase, srcOff + c, x64.SZ64))
+		x64.Movups_store(a, x64.Mem(rd, c, x64.SZ64), FP_SCRATCH_A)
+	}
+	if wordEnd > chunkEnd {
+		x64.Movlps_load(a, FP_SCRATCH_A, x64.Mem(srcBase, srcOff + chunkEnd, x64.SZ64))
+		x64.Movlps_store(a, x64.Mem(rd, chunkEnd, x64.SZ64), FP_SCRATCH_A)
+	}
+	for i := 0; i < len(tail); i++ {
+		var p aggcopy.Piece = tail[i]
+		if p.Width == 4 {
+			x64.Movss_load(a, FP_SCRATCH_A, x64.Mem(srcBase, srcOff + p.Off, x64.SZ32))
+			x64.Movss_store(a, x64.Mem(rd, p.Off, x64.SZ32), FP_SCRATCH_A)
+		}
+	}
+}

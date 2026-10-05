@@ -48,22 +48,25 @@ func aggMemClass(argTypes @[]@types.Type, pos int) bool {
 	return types.SysVArgInMemory(argTypes, pos)
 }
 
-// byvalOnStack reports whether a >16-byte aggregate t (IsByvalParam) is passed
-// `ptr byval(<T>) align 8` — its bytes on the outgoing stack, SysV MEMORY class —
-// rather than as a plain pointer to a copy.  True on x86-64; AAPCS64 passes it as
-// a pointer to a copy, and AAPCS32 by value in registers + stack.
-func byvalOnStack(t @types.Type) bool {
-	return targetIsX64() && t.IsByvalParam()
+// largeAggByValue reports whether a >16-byte aggregate t (IsByvalParam) is passed BY
+// VALUE, spelled `ptr byval(<T>)` — on x86-64 its bytes on the outgoing stack
+// (SysV MEMORY class), on arm32 split across r0-r3 and the stack (AAPCS32; LLVM's
+// ARM byval lowering places the words exactly as the by-value composite) — rather
+// than as a plain pointer to a copy, which is AAPCS64's form.  The callee receives
+// a pointer to its own copy either way.
+func largeAggByValue(t @types.Type) bool {
+	if !t.IsByvalParam() { return false }
+	return targetIsX64() || types.GetTarget().PointerSize == 4
 }
 
-// aggPassedOnStack reports whether the aggregate at position pos of argTypes is
-// passed `ptr byval(<T>)` on x86-64: a ≤16-byte memory-class straddle
-// (aggMemClass) or a >16-byte aggregate (byvalOnStack).  A shim or closure thunk
+// aggPassedByval reports whether the aggregate at position pos of argTypes is
+// passed `ptr byval(<T>)`: an x86-64 ≤16-byte memory-class straddle (aggMemClass)
+// or a >16-byte aggregate on x86-64 / arm32 (largeAggByValue).  A shim or closure thunk
 // forwards such an argument's incoming pointer with the byval spelling and must
 // not `tail call` the underlying (anyInMem).
-func aggPassedOnStack(argTypes @[]@types.Type, pos int) bool {
+func aggPassedByval(argTypes @[]@types.Type, pos int) bool {
 	if pos < 0 || pos >= len(argTypes) { return false }
-	return aggMemClass(argTypes, pos) || byvalOnStack(argTypes[pos])
+	return aggMemClass(argTypes, pos) || largeAggByValue(argTypes[pos])
 }
 
 // aggArgFirstClassSmall reports whether t is a ≤16-byte aggregate that codegen
@@ -127,7 +130,7 @@ func shimParamInMemory(fvTyp @types.Type, sretPrefix bool, i int) bool {
 	for k := 0; k < len(fvTyp.Params); k++ {
 		ts[k + off] = fvTyp.Params[k].Type
 	}
-	return aggPassedOnStack(ts, i + off)
+	return aggPassedByval(ts, i + off)
 }
 
 // shimInMemFlags returns, per func-value user arg, whether it is a SysV
@@ -157,7 +160,7 @@ func closureInMemFlags(f @ir.Func, fvTyp @types.Type, sretPrefix bool) @[]bool {
 	}
 	var flags @[]bool = make_slice(bool, len(fvTyp.Params))
 	for i := 0; i < len(fvTyp.Params); i++ {
-		flags[i] = aggPassedOnStack(argTypes, nCap + i + off)
+		flags[i] = aggPassedByval(argTypes, nCap + i + off)
 	}
 	return flags
 }
@@ -180,7 +183,7 @@ func closureCaptureInMemFlags(f @ir.Func, sretPrefix bool) @[]bool {
 	}
 	var flags @[]bool = make_slice(bool, nCap)
 	for i := 0; i < nCap; i++ {
-		flags[i] = aggPassedOnStack(argTypes, i + off)
+		flags[i] = aggPassedByval(argTypes, i + off)
 	}
 	return flags
 }
@@ -199,50 +202,82 @@ func anyInMem(inMemFlags @[]bool) bool {
 	return false
 }
 
-// writeByvalMemType writes the LLVM by-value memory-class parameter/argument
-// TYPE `ptr byval(<T>) align 8` for a memory-class aggregate t — LLVM lays the
-// whole aggregate on the outgoing stack (matching native + clang) rather than
-// splitting a coerced `[N x i64]` / first-class value.  This `ptr byval` form is
-// x86-64-only: arm32 passes a memory-class aggregate as a coerced `[N x iW]` and
-// aarch64 indirectly, neither through here.
+// writeByvalMemType writes the DEFINITION / declaration spelling of a by-value
+// memory parameter: `ptr byval(<T>) align <A>`.  On x86-64 A is 8 — SysV's
+// MEMORY-class stack slot alignment, which clang also uses for every type Binate
+// can express (types.AlignOf is bounded by 8), and the native x64 outgoing-args
+// word alignment, so the LLVM and native stack slots agree.  On arm32 A is
+// byvalArgAlign(t) (4 or 8): there it also decides whether the composite starts on
+// an even core register (AAPCS32 C.3), exactly as for the by-value composite.
 func writeByvalMemType(out *strings.Builder, t @types.Type) {
-	// `align 8` is clang's SysV MEMORY-class byval alignment for every type Binate
-	// can express: the widest scalar is an 8-byte int/float/pointer, so no aggregate
-	// exceeds 8-byte alignment (types.AlignOf is bounded by target.MaxAlign, which is
-	// 8 on every target), and clang emits `align 8` for every <= 8-aligned
-	// MEMORY-class struct (the class is 8-byte-aligned on the stack).  It also matches
-	// the native x64 outgoing-args word alignment (stackArgFootprint's WordBytes), so
-	// the LLVM and native stack slots agree.
-	//
-	// TODO: a >8-aligned type (a 16-aligned vector / `__int128`-like aggregate) is not
-	// representable today; if one is ever added, clang emits `align <AlignOf>` (e.g.
-	// `align 16`) here.  Bumping ONLY this annotation is both insufficient AND unsafe:
-	// the caller's `.agA<i>` spill alloca and the native stackArgFootprint (both
-	// 8-aligned) must move to the type's alignment TOGETHER, or an over-promised
-	// `align` on under-aligned storage faults.  Fix all three at once when such a type
-	// lands.
-	out.Write("ptr byval(")
-	out.Write(llvmType(t))
-	out.Write(") align 8")
-	return
-}
-
-// writeByvalArgMemType writes the CALL-SITE spelling of a memory-class aggregate
-// argument: `ptr byval(<T>) align <A>`, A = t's own alignment (at most 8).  At a
-// call site the `align` also promises the alignment of the pointer passed, which
-// is only t's alignment for a capture field, a shim's incoming pointer or a
-// private copy of a less-aligned type.  SysV still lays the copy in an 8-aligned
-// stack slot whatever A is (LLVM's x86-64 convention passes byval with at least
-// 8-byte alignment), so the callee's `align 8` view of its copy holds and the
-// stack layout matches native.
-func writeByvalArgMemType(out *strings.Builder, t @types.Type) {
-	var al int = t.AlignOf()
-	if al < 1 { al = 1 }
-	if al > 8 { al = 8 }
+	var al int = 8
+	if !targetIsX64() { al = byvalArgAlign(t) }
 	out.Write("ptr byval(")
 	out.Write(llvmType(t))
 	out.Write(") align ")
 	stringutils.WriteInt(out, al)
+	return
+}
+
+// byvalArgAlign is the `align` of a by-value memory argument at a call site (and of
+// an arm32 definition): t's alignment, at most 8, and on arm32 at least 4 — clang's
+// AAPCS byval alignment.  LLVM's ARM byval lowering loads the r0-r3 part of the
+// argument with word loads whatever the `align` says, so the pointer passed must be
+// word-aligned (byvalSlotAlign, emitByvalRealign); an `align 4` composite starts on
+// the next core register like a less-aligned one (AAPCS32 C.3).
+func byvalArgAlign(t @types.Type) int {
+	var al int = t.AlignOf()
+	if al < 1 { al = 1 }
+	if !targetIsX64() && al < 4 { al = 4 }
+	if al > 8 { al = 8 }
+	return al
+}
+
+// writeByvalSlotAlign writes `, align <A>` after the `alloca` of a slot a direct call
+// may pass as a by-value memory argument of type t, when t's own alignment does not
+// already make the slot as aligned as byvalArgAlign promises (arm32 only).
+func writeByvalSlotAlign(out *strings.Builder, t @types.Type) {
+	if !largeAggByValue(t) || targetIsX64() || t.AlignOf() >= byvalArgAlign(t) { return }
+	out.Write(", align ")
+	stringutils.WriteInt(out, byvalArgAlign(t))
+}
+
+// byvalSrcNeedsRealign reports whether a shim must copy a by-value memory argument
+// of type t to a word-aligned temporary before passing it: on arm32 a pointer it does
+// not own (a closure capture field, an incoming by-address argument) is only as
+// aligned as t, and a less-than-word-aligned one would fault on the word loads LLVM
+// makes from it (byvalArgAlign) on a strict-alignment target.
+func byvalSrcNeedsRealign(t @types.Type) bool {
+	return largeAggByValue(t) && !targetIsX64() && t.AlignOf() < byvalArgAlign(t)
+}
+
+// emitByvalRealign emits the word-aligned copy byvalSrcNeedsRealign calls for:
+// `<dst> = alloca <T>, align <A>` and a bulk copy from src into it.  The output ends
+// with the next line's indent.
+func emitByvalRealign(out *strings.Builder, t @types.Type, dst *[]readonly char,
+		src *[]readonly char) {
+	out.Write(dst)
+	out.Write(" = alloca ")
+	out.Write(llvmType(t))
+	writeByvalSlotAlign(out, t)
+	out.WriteByte('\n')
+	emitMemCopy(out, dst, src, t.SizeOf())
+	out.Write("  ")
+}
+
+// writeByvalArgMemType writes the CALL-SITE spelling of a memory-class aggregate
+// argument: `ptr byval(<T>) align <A>`, A = byvalArgAlign(t).  At a call site the
+// `align` also promises the alignment of the pointer passed, which on x86-64 is only
+// t's alignment for a capture field, a shim's incoming pointer or a private copy of a
+// less-aligned type.  On x86-64 SysV still lays the copy in an 8-aligned stack slot
+// whatever A is (LLVM's x86-64 convention passes byval with at least 8-byte
+// alignment), so the callee's `align 8` view of its copy holds and the stack layout
+// matches native; on arm32 A equals the definition's.
+func writeByvalArgMemType(out *strings.Builder, t @types.Type) {
+	out.Write("ptr byval(")
+	out.Write(llvmType(t))
+	out.Write(") align ")
+	stringutils.WriteInt(out, byvalArgAlign(t))
 	return
 }
 
@@ -310,8 +345,8 @@ func writeMemByvalArg(out *strings.Builder, callID int, t @types.Type, i int) {
 // register cursor matches).  It is the shared source of truth for how the LLVM
 // backend spells a C-boundary parameter, used by BOTH the __c_call declare
 // (emit_ccall.bn) and the #[c_export] entry thunk (emit_cexport_thunk.bn):
-//   - a >16-byte aggregate is SysV MEMORY `ptr byval(<T>)` on x86-64, but passed
-//     BY VALUE coerced to `[N x iW]` on arm32 (AAPCS32);
+//   - a >16-byte aggregate is `ptr byval(<T>)` on x86-64 (SysV MEMORY) and arm32
+//     (AAPCS32 by value), a plain `ptr` on aarch64 (a pointer to a copy);
 //   - a ≤16-byte aggregate that straddles the x86-64 register file after a
 //     preceding arg is `ptr byval`;
 //   - everything else is the coerced `[N x iW]` / plain scalar / pointer.
@@ -322,12 +357,8 @@ func writeMemByvalArg(out *strings.Builder, callID int, t @types.Type, i int) {
 // #[c_export] thunk (emit_cexport_thunk.bn) still uses this GP form and its
 // SSE-aggregate handling is a separate open item.
 func writeCAbiParamType(out *strings.Builder, at @types.Type, argTypes @[]@types.Type, pos int) {
-	if byvalOnStack(at) {
+	if largeAggByValue(at) || aggMemClass(argTypes, pos) {
 		writeByvalMemType(out, at)
-	} else if aggMemClass(argTypes, pos) {
-		writeByvalMemType(out, at)
-	} else if types.GetTarget().PointerSize == 4 && at.IsByvalParam() {
-		aggCoerceLLTy(out, at)
 	} else {
 		writeParamTypeLLVM(out, at)
 	}

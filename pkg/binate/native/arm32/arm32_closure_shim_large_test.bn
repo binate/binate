@@ -1,0 +1,293 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Tests for a closure / method-value shim whose capture is a >16-byte aggregate:
+// AAPCS32 passes it BY VALUE, as C does — its words split across the remaining core
+// registers and the outgoing stack, an 8-aligned one starting on an even register —
+// so the shim copies the capture's words out of the closure struct into those places
+// (the stack words first, then the registers right to left, keeping the closure-struct
+// base until last).  A capture less aligned than a word is assembled byte by byte (a
+// word load there faults on a strict-alignment target).
+
+// big20Arm32 is a 5 x int32 struct: 20 bytes, 4-aligned, so it takes no even-register
+// pad.
+func big20Arm32() @types.Type {
+	var fields @[]@types.Field = make_slice(@types.Field, 5)
+	for i := 0; i < 5; i++ {
+		fields[i] = make(types.Field)
+		fields[i].Name = "f"
+		fields[i].Type = types.TypInt32()
+	}
+	return types.MakeStructType("Big20", fields)
+}
+
+// big24Arm32 is a 3 x int64 struct: 24 bytes and 8-aligned, so it starts on an even
+// register (AAPCS32 C.3).
+func big24Arm32() @types.Type {
+	var fields @[]@types.Field = make_slice(@types.Field, 3)
+	for i := 0; i < 3; i++ {
+		fields[i] = make(types.Field)
+		fields[i].Name = "f"
+		fields[i].Type = types.TypInt64()
+	}
+	return types.MakeStructType("Big24", fields)
+}
+
+// mkCaptureClosureArm32 builds an IsClosure Func whose captures have the given types
+// (the ClosureStruct fields, in order).
+func mkCaptureClosureArm32(capTypes @[]@types.Type) @ir.Func {
+	var fields @[]@types.Field = make_slice(@types.Field, len(capTypes))
+	for i := 0; i < len(capTypes); i++ {
+		fields[i] = make(types.Field)
+		fields[i].Name = "c"
+		fields[i].Type = capTypes[i]
+	}
+	var f @ir.Func = make(ir.Func)
+	f.Name = "main.__funclit_big"
+	f.IsClosure = true
+	f.NumCaptureParams = len(capTypes)
+	f.ClosureStruct = types.MakeStructType("__closure_big", fields)
+	var noP @[]@ir.Param
+	f.Params = noP
+	var noR @[]@types.Type
+	f.Results = noR
+	return f
+}
+
+// shimForCapturesArm32 emits the closure shim for captures caps, no user args, and
+// the given results.
+func shimForCapturesArm32(caps @[]@types.Type, results @[]@types.Type) @asm.Assembler {
+	var noParams @[]@types.Param
+	var a @asm.Assembler = asm.New(4)
+	a.SetSection("text", -1)
+	emitClosureShimArm32(a, "bn_ul", closureFvType(noParams, results), mkCaptureClosureArm32(caps))
+	return a
+}
+
+// emitFramedShimRefArm32 emits the framed spill shim's frame — push {r4, lr}, outBytes
+// of outgoing argument words below a 16-byte area staging r0..r3 — then `body`'s
+// argument loads and the BL / teardown.
+func emitFramedShimRefArm32(ref @asm.Assembler, outBytes int, body *func(@asm.Assembler)) {
+	arm32.Push(ref, arm32.COND_AL, packShimPushMask())
+	emitSpAdjust(ref, false, outBytes + 16)
+	arm32.Str(ref, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.SP, outBytes))
+	arm32.Str(ref, arm32.COND_AL, arm32.R1, arm32.MemImm(arm32.SP, outBytes + 4))
+	arm32.Str(ref, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.SP, outBytes + 8))
+	arm32.Str(ref, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.SP, outBytes + 12))
+	body(ref)
+	ref.SetGlobal("bn_ul")
+	arm32.Bl(ref, arm32.COND_AL, "bn_ul")
+	emitSpAdjust(ref, true, outBytes + 16)
+	arm32.Pop(ref, arm32.COND_AL, packShimPopMask())
+}
+
+// refCopyWordsToStackArm32 emits `LDR R4, [base, #off + 4k] ; STR R4, [SP, #4k]` for
+// each of n words.
+func refCopyWordsToStackArm32(r @asm.Assembler, base int, off int, n int) {
+	for k := 0; k < n; k++ {
+		arm32.Ldr(r, arm32.COND_AL, arm32.R4, arm32.MemImm(base, off + 4 * k))
+		arm32.Str(r, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, 4 * k))
+	}
+}
+
+// An int capture, a Big20 capture and one int user arg: cap0 -> R0, the Big20's
+// words -> R1..R3 + stack words 0..1, user0 -> stack word 2.
+//   LDR R4, [R0, #16] ; STR R4, [SP, #0]   ; Big20 words 3..4
+//   LDR R4, [R0, #20] ; STR R4, [SP, #4]
+//   LDR R4, [SP, #20] ; STR R4, [SP, #8]   ; user0 (staged incoming R1)
+//   LDR R3, [R0, #12] ; LDR R2, [R0, #8] ; LDR R1, [R0, #4]   ; Big20 words 0..2
+//   LDR R0, [R0, #0]                       ; cap0 (last, keeps the R0 base)
+func TestClosureShimLargeCaptureSplitByteRef() testing.TestResult {
+	setArm32Target()
+	var caps @[]@types.Type = make_slice(@types.Type, 2)
+	caps[0] = types.TypInt()
+	caps[1] = big20Arm32()
+	var f @ir.Func = mkCaptureClosureArm32(caps)
+	var noResults @[]@types.Type
+	var got @asm.Assembler = asm.New(4)
+	got.SetSection("text", -1)
+	emitClosureShimArm32(got, "bn_ul", closureFvType(intParams(1), noResults), f)
+	if got.HasError { return fail("a >16-byte capture closure shim must lower") }
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	emitFramedShimRefArm32(ref, 16,
+			func(r @asm.Assembler) {
+				refCopyWordsToStackArm32(r, arm32.R0, 16, 2)
+				arm32.Ldr(r, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, 20))
+				arm32.Str(r, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, 8))
+				arm32.Ldr(r, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.R0, 12))
+				arm32.Ldr(r, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.R0, 8))
+				arm32.Ldr(r, arm32.COND_AL, arm32.R1, arm32.MemImm(arm32.R0, 4))
+				arm32.Ldr(r, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R0, 0))
+			})
+	if !asmTextEqSpill(got, ref) {
+		return fail(
+				"a Big20 capture after an int must split across R1..R3 and two stack "
+						"words, the user int following on the stack")
+	}
+	return ""
+}
+
+// Four int captures and a Big20 capture: caps 0..3 -> R0..R3, and with no core
+// register left the whole Big20 goes to stack words 0..4.
+func TestClosureShimLargeCaptureOnStackByteRef() testing.TestResult {
+	setArm32Target()
+	var caps @[]@types.Type = make_slice(@types.Type, 5)
+	for i := 0; i < 4; i++ {
+		caps[i] = types.TypInt()
+	}
+	caps[4] = big20Arm32()
+	var noResults @[]@types.Type
+	var got @asm.Assembler = shimForCapturesArm32(caps, noResults)
+	if got.HasError { return fail("a stack-bound >16-byte capture closure shim must lower") }
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	emitFramedShimRefArm32(ref, 24,
+			func(r @asm.Assembler) {
+				refCopyWordsToStackArm32(r, arm32.R0, 16, 5)
+				arm32.Ldr(r, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.R0, 12))
+				arm32.Ldr(r, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.R0, 8))
+				arm32.Ldr(r, arm32.COND_AL, arm32.R1, arm32.MemImm(arm32.R0, 4))
+				arm32.Ldr(r, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R0, 0))
+			})
+	if !asmTextEqSpill(got, ref) {
+		return fail("a Big20 capture after four int captures must go wholly to the stack")
+	}
+	return ""
+}
+
+// Every result shape lowers with a >16-byte capture: a big struct (sret), a <=4-byte
+// struct (pack), a small and a big multi-return, a scalar and none.
+func TestClosureShimLargeCaptureAllResultShapesLower() testing.TestResult {
+	setArm32Target()
+	var smallFields @[]@types.Field = make_slice(@types.Field, 1)
+	smallFields[0] = make(types.Field)
+	smallFields[0].Name = "v"
+	smallFields[0].Type = types.TypInt8()
+	var small @types.Type = types.MakeStructType("Small1", smallFields)
+	var shapes @[]@[]@types.Type = make_slice(@[]@types.Type, 6)
+	shapes[0] = make_slice(@types.Type, 1)
+	shapes[0][0] = big20Arm32()
+	shapes[1] = make_slice(@types.Type, 1)
+	shapes[1][0] = small
+	shapes[2] = make_slice(@types.Type, 2)
+	shapes[3] = make_slice(@types.Type, 5)
+	for i := 0; i < 2; i++ { shapes[2][i] = types.TypInt() }
+	for i := 0; i < 5; i++ { shapes[3][i] = types.TypInt() }
+	shapes[4] = make_slice(@types.Type, 1)
+	shapes[4][0] = types.TypInt()
+	var caps @[]@types.Type = make_slice(@types.Type, 1)
+	caps[0] = big20Arm32()
+	for i := 0; i < len(shapes); i++ {
+		var f @ir.Func = mkCaptureClosureArm32(caps)
+		var a @asm.Assembler = asm.New(4)
+		a.SetSection("text", -1)
+		emitClosureShimArm32(a, "bn_ul", closureFvType(intParams(1), shapes[i]), f)
+		if a.HasError {
+			return fail("a >16-byte capture closure shim must lower for every result shape")
+		}
+	}
+	return ""
+}
+
+// An int capture then an 8-aligned Big24 capture: the Big24 starts on the even
+// register R2 (R1 is the pad), its words 0..1 in R2..R3 and 2..5 on the stack.
+func TestClosureShimLargeCaptureEvenPadByteRef() testing.TestResult {
+	setArm32Target()
+	var caps @[]@types.Type = make_slice(@types.Type, 2)
+	caps[0] = types.TypInt()
+	caps[1] = big24Arm32()
+	var noResults @[]@types.Type
+	var got @asm.Assembler = shimForCapturesArm32(caps, noResults)
+	if got.HasError { return fail("a padded >16-byte capture closure shim must lower") }
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	emitFramedShimRefArm32(ref, 16,
+			func(r @asm.Assembler) {
+				refCopyWordsToStackArm32(r, arm32.R0, 16, 4)
+				arm32.Ldr(r, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.R0, 12))
+				arm32.Ldr(r, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.R0, 8))
+				arm32.Ldr(r, arm32.COND_AL, arm32.R0, arm32.MemImm(arm32.R0, 0))
+			})
+	if !asmTextEqSpill(got, ref) {
+		return fail("an 8-aligned >16-byte capture after an int must start at R2 (R1 padded)")
+	}
+	return ""
+}
+
+// A Big24 capture with a big-aggregate (sret) result: R0 holds the retbuf and R1 the
+// closure struct, so the Big24 pads past R1 to R2 and is read off the R1 base.
+func TestClosureShimLargeCaptureSretEvenPadByteRef() testing.TestResult {
+	setArm32Target()
+	var caps @[]@types.Type = make_slice(@types.Type, 1)
+	caps[0] = big24Arm32()
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = big20Arm32()
+	var got @asm.Assembler = shimForCapturesArm32(caps, results)
+	if got.HasError { return fail("an sret >16-byte capture closure shim must lower") }
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	emitFramedShimRefArm32(ref, 16,
+			func(r @asm.Assembler) {
+				refCopyWordsToStackArm32(r, arm32.R1, 8, 4)
+				arm32.Ldr(r, arm32.COND_AL, arm32.R3, arm32.MemImm(arm32.R1, 4))
+				arm32.Ldr(r, arm32.COND_AL, arm32.R2, arm32.MemImm(arm32.R1, 0))
+			})
+	if !asmTextEqSpill(got, ref) {
+		return fail(
+				"an 8-aligned >16-byte capture of an sret shim must take R2..R3 + stack "
+						"off the R1 base")
+	}
+	return ""
+}
+
+// refBytewiseWordArm32 spells out one byte-wise word load: `MOV tmpA, #off ; ADD tmpA,
+// base, tmpA ; LDRB dst, [tmpA]` then `LDRB tmpB, [tmpA, #i] ; ORR dst, dst, tmpB, LSL
+// #8i` for each further byte.
+func refBytewiseWordArm32(r @asm.Assembler, dst int, base int, off int, n int, tmpA int, tmpB int) {
+	arm32.Mov(r, arm32.COND_AL, false, tmpA, arm32.Imm(off))
+	arm32.Add(r, arm32.COND_AL, false, tmpA, base, arm32.Reg(tmpA))
+	arm32.Ldrb(r, arm32.COND_AL, dst, arm32.MemImm(tmpA, 0))
+	for i := 1; i < n; i++ {
+		arm32.Ldrb(r, arm32.COND_AL, tmpB, arm32.MemImm(tmpA, i))
+		arm32.Orr(r, arm32.COND_AL, false, dst, dst, arm32.RegShift(tmpB, arm32.LSL, 8 * i))
+	}
+}
+
+// A uint8 capture then a [20]uint8 capture at closure-struct offset 1: every word of
+// the array is assembled byte by byte (a word LDR at an odd address faults on
+// strict-alignment arm32) — bytes 13..20 to stack words 0..1, bytes 1..12 to R1..R3 —
+// and the uint8 is read last into R0.
+func TestClosureShimLargeSubwordCaptureBytewiseByteRef() testing.TestResult {
+	setArm32Target()
+	var caps @[]@types.Type = make_slice(@types.Type, 2)
+	caps[0] = types.TypUint8()
+	caps[1] = types.MakeArrayType(types.TypUint8(), 20)
+	var noResults @[]@types.Type
+	var got @asm.Assembler = shimForCapturesArm32(caps, noResults)
+	if got.HasError { return fail("a sub-word-aligned >16-byte capture closure shim must lower") }
+	var ref @asm.Assembler = asm.New(4)
+	ref.SetSection("text", -1)
+	emitFramedShimRefArm32(ref, 8,
+			func(r @asm.Assembler) {
+				refBytewiseWordArm32(r, arm32.R4, arm32.R0, 13, 4, arm32.IP, arm32.R2)
+				arm32.Str(r, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, 0))
+				refBytewiseWordArm32(r, arm32.R4, arm32.R0, 17, 4, arm32.IP, arm32.R2)
+				arm32.Str(r, arm32.COND_AL, arm32.R4, arm32.MemImm(arm32.SP, 4))
+				refBytewiseWordArm32(r, arm32.R3, arm32.R0, 9, 4, arm32.R4, arm32.IP)
+				refBytewiseWordArm32(r, arm32.R2, arm32.R0, 5, 4, arm32.R4, arm32.IP)
+				refBytewiseWordArm32(r, arm32.R1, arm32.R0, 1, 4, arm32.R4, arm32.IP)
+				refBytewiseWordArm32(r, arm32.R0, arm32.R0, 0, 1, arm32.R4, arm32.IP)
+			})
+	if !asmTextEqSpill(got, ref) {
+		return fail(
+				"a [20]uint8 capture at an odd offset must be loaded byte by byte into "
+						"R1..R3 and two stack words")
+	}
+	return ""
+}

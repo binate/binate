@@ -4,9 +4,12 @@
 # Binate #[c_export] functions built by the NATIVE arm32 backend, run under
 # qemu-arm.  Exercises two native-arm32 mechanisms that nothing else covers:
 #
-#   1. the >16-byte by-value aggregate param adapter TRAMPOLINE — AAPCS32 splits
-#      such an aggregate across r0-r3 + the stack, while Binate's internal
-#      convention is a single pointer, so the entry re-marshals the args; and
+#   1. >16-byte by-value aggregates at the C boundary — AAPCS32 splits such an
+#      aggregate across r0-r3 + the stack, and so does Binate, so the export name is
+#      the mangled entry itself; a narrow scalar after the aggregate still gets the
+#      re-extending entry; once a float has overflowed the VFP bank to the stack, an
+#      aggregate that does not fit the remaining core registers goes wholly to the
+#      stack (AAPCS32 C.5) rather than splitting; and
 #   2. ARM/Thumb INTERWORKING — the native functions are A32 (ARM) code, so a
 #      Thumb caller's BL must be routed through an interworking veneer, which bfd
 #      sets up only from the callee's STT_FUNC type (+ the .text "$a" mapping
@@ -85,12 +88,12 @@ type Big struct { a int64
 	c int64 }
 
 // A lone >16-byte by-value aggregate (24B): AAPCS32 splits it across r0-r3 +
-// the stack; the trampoline gathers it into a pointer for the internal callee.
+// the stack, for C and Binate alike.
 #[c_export("a32_big")]
 func takeBig(x Big) int64 { return x.a + x.b + x.c }
 
-// A big aggregate followed by a trailing scalar — the scalar's C-ABI slot and
-// its internal slot differ (the aggregate shifts the register/stack cursor).
+// A big aggregate followed by a trailing scalar — the scalar follows the
+// aggregate's stack words.
 #[c_export("a32_bigsmall")]
 func takeBigSmall(x Big, y int32) int64 { return x.a + x.b + x.c + cast(int64, y) }
 
@@ -109,8 +112,28 @@ func takeSretBig(x Big) Big {
 	return r
 }
 
-// A plain scalar export (no trampoline) — the pure interworking control: a Thumb
-// caller reaching an ARM function needs STT_FUNC even with no aggregate param.
+// Nine float64 overflow the VFP bank, so the ninth is on the stack before the int32
+// (r0) and the struct: an aggregate may split across core registers and the stack
+// only while nothing is on the stack yet (AAPCS32 C.5), so the 24-byte struct, which
+// does not fit r1-r3, goes wholly to the stack and the trailing int32 follows it.
+#[c_export("a32_vfpover")]
+func takeVfpOver(d0 float64, d1 float64, d2 float64, d3 float64, d4 float64, d5 float64,
+		d6 float64, d7 float64, d8 float64, k int32, x Big, z int32) int64 {
+	return cast(int64, cast(int32, d8)) + cast(int64, k) * 10 + x.a + x.b + x.c + cast(int64, z) * 1000
+}
+
+type Mid struct { a int64
+	b int64 }
+
+// The same with a 16-byte struct, which would otherwise split across r2-r3 + stack.
+#[c_export("a32_vfpovermid")]
+func takeVfpOverMid(d0 float64, d1 float64, d2 float64, d3 float64, d4 float64, d5 float64,
+		d6 float64, d7 float64, d8 float64, k int32, m Mid) int64 {
+	return cast(int64, cast(int32, d8)) + cast(int64, k) * 10 + m.a + m.b
+}
+
+// A plain scalar export — the pure interworking control: a Thumb caller reaching
+// an ARM function needs STT_FUNC even with no aggregate param.
 #[c_export("a32_add")]
 func add(a int32, b int32) int32 { return a + b }
 BN
@@ -134,6 +157,11 @@ extern long long a32_bigsmall(struct Big, int);
 extern long long a32_narrowafter(struct Big, signed char);
 extern struct Big a32_sretbig(struct Big);
 extern int a32_add(int, int);
+struct Mid { long long a, b; };
+extern long long a32_vfpover(double, double, double, double, double, double, double, double,
+                             double, int, struct Big, int);
+extern long long a32_vfpovermid(double, double, double, double, double, double, double, double,
+                                double, int, struct Mid);
 
 static int fails = 0;
 static void chk(const char *n, long long got, long long want) {
@@ -149,6 +177,9 @@ int main(void) {
     struct Big r = a32_sretbig(b);
     if (r.a == 200 && r.b == 400 && r.c == 600) { printf("  a32_sretbig: PASS (%lld,%lld,%lld)\n", r.a, r.b, r.c); }
     else { printf("  a32_sretbig: FAIL got=(%lld,%lld,%lld) want=(200,400,600)\n", r.a, r.b, r.c); fails++; }
+    chk("a32_vfpover",     a32_vfpover(1, 2, 3, 4, 5, 6, 7, 8, 9, 2, b, 3), 3629);
+    struct Mid m = {40, 50};
+    chk("a32_vfpovermid",  a32_vfpovermid(1, 2, 3, 4, 5, 6, 7, 8, 9, 2, m), 119);
     if (fails) { printf("%d FAILURE(S)\n", fails); return 1; }
     printf("ALL PASS\n"); return 0;
 }

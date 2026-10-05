@@ -1,29 +1,18 @@
 #!/bin/sh
 # e2e/c-entry-byval-callback.sh — End-to-end test that a Binate callback taking a
 # >16-byte struct BY VALUE, handed to C via `__c_entry`, receives the struct
-# correctly across the ABI boundary — EXERCISING the `__centry.<mangled>` by-value
-# parameter adaptation thunk with a real C caller.
+# correctly from a real C caller.
 #
-# `__c_entry(f)` yields a C-callable pointer to a Binate function.  When f takes a
-# >16-byte aggregate BY VALUE, the platform C ABI passes it in a form that differs
-# from Binate's internal single-pointer convention: SysV-AMD64 passes it MEMORY
-# class (bytes on the outgoing stack) and AAPCS32 by value (split r0-r3 + stack),
-# whereas the mangled entry expects a POINTER to the struct.  So a C caller of the
-# raw mangled entry would hand over the struct bytes while the entry reads a pointer
-# — a silent mis-ABI.  The backend therefore hands `__c_entry(f)` a weak
-# `__centry.<mangled f>` thunk that gathers the by-value struct into a contiguous
-# slot and passes the mangled entry a pointer.  (AAPCS64 passes a >16-byte aggregate
-# indirectly BOTH ways, so no thunk is needed there — on an aarch64 host this test is
-# a parity check that confirms the two backends agree; on an x86-64 host it exercises
-# the byval adaptation thunk directly.)
+# `__c_entry(f)` yields a C-callable pointer to a Binate function.  Binate passes a
+# >16-byte aggregate exactly as the platform C ABI does — SysV-AMD64 in memory (bytes
+# on the outgoing stack), AAPCS32 by value split across r0-r3 + stack, AAPCS64 as a
+# pointer to a copy — so the pointer is f's mangled entry itself, with no adapting
+# thunk, and a C caller's by-value struct must arrive intact.
 #
 # The C caller constructs a Big{a,b,c} = {1,2,3} and calls the callback with it BY
 # VALUE.  The callback returns a*100 + b*10 + c = 123 iff all three fields survived
-# the marshaling; a mis-ABI'd struct (the entry reading a stray pointer as the
-# struct) yields some other value.  Verified while writing: with the pre-fix bnc
-# (which referenced the raw mangled entry) the arm32/x86-64 --emit-llvm output
-# carried NO __centry thunk, so a C caller mis-passed the struct; with the fix it
-# emits the thunk and the callback reads {1,2,3}.
+# the call; a mis-ABI'd struct (the entry reading the struct from the wrong place)
+# yields some other value.
 #
 # Both backends are checked — LLVM and native (--backend native) — and a build
 # failure on either is a FAIL.
@@ -81,10 +70,9 @@ fi
 
 # --- the C caller: pass a >16-byte struct BY VALUE to the Binate callback -----
 cat > "$TMP/ccall.c" <<'EOF'
-/* A 24-byte (three int64) struct — >16 bytes, so the platform C ABI passes it BY
- * VALUE (SysV MEMORY class / AAPCS32 split), a form that diverges from Binate's
- * internal single-pointer convention.  The __c_entry adaptation thunk gathers the
- * by-value struct into a pointer before calling the mangled entry. */
+/* A 24-byte (three int64) struct — >16 bytes, so the platform C ABI passes it in
+ * memory (SysV MEMORY class), split across r0-r3 + stack (AAPCS32) or as a pointer
+ * to a copy (AAPCS64) — the same way Binate passes it. */
 struct Big { long long a, b, c; };
 
 /* Construct a known struct and hand it to the Binate callback BY VALUE. */
@@ -103,10 +91,9 @@ package "main"
 
 import "pkg/builtins/testing"
 
-// A callback taking a >16-byte struct BY VALUE.  It reads all three fields — the
-// case a mis-ABI'd by-value parameter (the entry reading a stray pointer as the
-// struct) corrupts if the C entry does not re-marshal the by-value struct into the
-// pointer the mangled entry expects (the __c_entry adaptation thunk's job).
+// A callback taking a >16-byte struct BY VALUE.  It reads all three fields, which a
+// mis-ABI'd by-value parameter (the entry reading the struct from the wrong place)
+// corrupts.
 type Big struct { a int64; b int64; c int64 }
 
 func cb(s Big) int32 {

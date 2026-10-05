@@ -2489,6 +2489,37 @@ testing.Println(copyV(), rt.Refcount(bit_cast(*uint8, bx)) - before)
 > > 1 0
 > "
 
+# --- Case 76: generic functions declared at the prompt are instantiated where
+# used, also over a generic type declared at the prompt; a redefinition
+# replaces the instances emitted before it (its type parameters renamed or
+# not), or shadows them when its signature differs — as rebinding the name to
+# a non-generic function does, so a later generic function emits its own. ---
+run_repl "tier4-generic-funcs-at-prompt" \
+"func id[T any](x T) T { return x }
+testing.Println(id[int](3), id[bool](true))
+type Cur[T any] struct { v T }
+func gen[T any](x T) T { var c Cur[T]; c.v = x; return c.v }
+func old() int { return id[int](5) + cast(int, gen[uint8](9)) }
+testing.Println(old())
+func id[U any](y U) U { var z U; return z }
+testing.Println(old())
+func id[T any](x T, k int) int { return k }
+testing.Println(old(), id[int](4, 8))
+func id(x int) int { return x + 100 }
+func id[T any](x T, k int) int { return k * 2 }
+testing.Println(old(), id[int](4, 8))
+" \
+"$BANNER
+> > 3 true
+> > > > 14
+> > 9
+> warning: id shadowed (incompatible signature); existing callers retain old definition
+> 9 8
+> warning: id shadowed (incompatible signature); existing callers retain old definition
+> warning: id shadowed (incompatible signature); existing callers retain old definition
+> 9 16
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # (Stage 2) as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

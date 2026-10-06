@@ -1,0 +1,250 @@
+package "pkg/binate/asm/parse"
+
+import "pkg/binate/asm"
+import "pkg/binate/buf"
+
+// Differences of two locations in expressions (`l2 - l1`, `l2 - .`, `. - l1`, plus numbers):
+// a difference whose distance is fixed at assembly — both locations in one section on ELF,
+// in one atom on Mach-O (and with the object format unknown), where the linker may move
+// atoms apart — folds to a number, which any arithmetic then takes; one that is not fixed
+// stays a difference (ExprResult.Neg / NegDot) that only a number may be added to or
+// subtracted from.  A difference whose label a first pass has not reached is pending
+// (ExprResult.Pending): a placeholder that every operation keeps pending, until the second
+// pass (ParseSource) reads the label's first-pass location (Parser.Prev).
+
+// hasNeg reports whether r is a difference not fixed at assembly.
+func hasNeg(r ExprResult) bool { return len(r.Neg) > 0 || r.NegDot }
+
+// pendingResult returns a pending placeholder value, noting it for the line and the input.
+func pendingResult(p @Parser) ExprResult {
+	p.SawPending = true
+	p.LinePending = true
+	var r ExprResult = exprOk(0)
+	r.Pending = true
+	r.FromDiff = true
+	return r
+}
+
+// A location of a label difference: its section, offset and atom count (LabelGens), known
+// (Ok), or the error a name that is no label gives (Err).
+type diffLocation struct {
+	Sec int
+	Off int
+	Gen int
+	Ok  bool
+	Err @[]char
+}
+
+// differenceOf returns x - y for two locations (each a symbol or `.` plus a number, with
+// nothing subtracted): a number when their distance is fixed, pending when a first pass
+// has not reached one of them, else the difference.
+func differenceOf(p @Parser, x ExprResult, y ExprResult) ExprResult {
+	var pl diffLocation = locationOf(p, x.Sym, x.Dot)
+	if len(pl.Err) != 0 { return exprFail(pl.Err) }
+	var nl diffLocation = locationOf(p, y.Sym, y.Dot)
+	if len(nl.Err) != 0 { return exprFail(nl.Err) }
+	if !pl.Ok || !nl.Ok { return pendingResult(p) }
+	var r ExprResult = exprOk(x.Val - y.Val)
+	if fixedDistance(p, pl, nl) {
+		r.Val = r.Val + cast(int64, pl.Off) - cast(int64, nl.Off)
+		r.FromDiff = true
+		return r
+	}
+	r.Sym = x.Sym
+	r.Dot = x.Dot
+	r.Neg = y.Sym
+	r.NegDot = y.Dot
+	return r
+}
+
+// locationOf returns where the location name (or the current location, when dot) is: its
+// section, offset and atom count — a global or weak alias's, its target's plus its addend —
+// or not known when a first pass has not reached its label yet (the name is noted: no
+// constant may take it later).  A label a second pass has not reached reads the first
+// pass's location; one the first pass never defined is an error.
+func locationOf(p @Parser, name *[]readonly char, dot bool) diffLocation {
+	var loc diffLocation
+	if dot {
+		if p.Asm.Current < 0 {
+			loc.Err = buf.CopyStr("'.' outside any section")
+			return loc
+		}
+		loc.Sec = p.Asm.Current
+		loc.Off = cast(int, p.Asm.CurrentOffset())
+		loc.Gen = poolSecGen(p, loc.Sec) + 1
+		loc.Ok = true
+		return loc
+	}
+	var addend int = 0
+	var target @[]char = buf.CopyStr(name)
+	var ci int = constIndex(p, name)
+	if ci >= 0 && len(p.ConstSyms[ci]) > 0 {
+		// A global or weak alias, standing for itself (nameValue): its target's location.
+		addend = cast(int, p.ConstVals[ci])
+		target = p.ConstSyms[ci]
+	}
+	var si int = p.Asm.LookupSymbol(target)
+	if si >= 0 && p.Asm.Symbols[si].Section >= 0 {
+		loc.Sec = p.Asm.Symbols[si].Section
+		loc.Off = cast(int, p.Asm.Symbols[si].Offset) + addend
+		loc.Gen = genAt(p.LabelGens, si)
+		loc.Ok = true
+		return loc
+	}
+	if !present(p.Prev) {
+		noteDiffFwdName(p, target)
+		return loc
+	}
+	var pj int = p.Prev.LookupSymbol(target)
+	if pj >= 0 && p.Prev.Symbols[pj].Section >= 0 {
+		loc.Sec = p.Prev.Symbols[pj].Section
+		loc.Off = cast(int, p.Prev.Symbols[pj].Offset) + addend
+		loc.Gen = genAt(p.PrevLabelGens, pj)
+		loc.Ok = true
+		return loc
+	}
+	loc.Err = quotedName(asm.LabelForMessage(target), " is not a label defined anywhere")
+	return loc
+}
+
+// genAt returns gens[i] (Parser.LabelGens), or 0 for a symbol with none recorded.
+func genAt(gens @[]int, i int) int {
+	if i < len(gens) { return gens[i] }
+	return 0
+}
+
+// fixedDistance reports whether the distance between locations a and b is fixed at
+// assembly: one section on ELF (and on arm32, which has no Mach-O output); one atom of it on
+// Mach-O and with the object format unknown — the same atom count when each was defined.
+func fixedDistance(p @Parser, a diffLocation, b diffLocation) bool {
+	if a.Sec != b.Sec { return false }
+	if p.Asm.ObjFormat == asm.OBJ_ELF || p.Arch == ARCH_ARM32 { return true }
+	return a.Gen == b.Gen
+}
+
+// negatedDifference returns -r for a difference r not fixed at assembly: its locations
+// swapped and its number negated.
+func negatedDifference(r ExprResult) ExprResult {
+	var n ExprResult = exprOk(0 - r.Val)
+	n.Sym = r.Neg
+	n.Dot = r.NegDot
+	n.Neg = r.Sym
+	n.NegDot = r.Dot
+	return n
+}
+
+// combineDifference evaluates `x op y` where one side is a difference not fixed at
+// assembly: only a number added to it, or subtracted from it on either side.
+func combineDifference(op int, x ExprResult, y ExprResult) ExprResult {
+	var xNum bool = !isSymbolic(x) && !hasNeg(x)
+	var yNum bool = !isSymbolic(y) && !hasNeg(y)
+	if op == TOK_PLUS && yNum {
+		x.Val = x.Val + y.Val
+		return x
+	}
+	if op == TOK_PLUS && xNum {
+		y.Val = y.Val + x.Val
+		return y
+	}
+	if op == TOK_MINUS && yNum {
+		x.Val = x.Val - y.Val
+		return x
+	}
+	if op == TOK_MINUS && xNum {
+		var n ExprResult = negatedDifference(y)
+		n.Val = n.Val + x.Val
+		return n
+	}
+	return exprFail(
+			"a difference of locations in different sections or atoms takes only a number "
+					"added or subtracted")
+}
+
+// numberContextError returns the error for a location (or a difference of locations not
+// fixed at assembly) where a number is read — first the expression's first token.
+func numberContextError(p @Parser, first Token, r ExprResult) ExprResult {
+	if hasNeg(r) {
+		return exprFail("a difference of locations in different sections or atoms is not a number")
+	}
+	if r.Dot { return exprFail("'.' (the current location) is not a number here") }
+	// The first token names the location left over when it is that location: an alias (its
+	// target, or itself when global or weak) or a numeric label, as written (`1b`).
+	if first.Kind == TOK_IDENT {
+		var i int = constIndex(p, first.Text)
+		if i >= 0 && len(p.ConstSyms[i]) > 0 &&
+				(charsEqual(p.ConstSyms[i], r.Sym) || charsEqual(first.Text, r.Sym)) {
+			return exprFail(quotedName(first.Text, " is an alias of a symbol, not a number"))
+		}
+	}
+	var name @[]char = asm.LabelForMessage(r.Sym)
+	if first.Kind == TOK_IDENT && len(first.Text) > 1 && isDigit(first.Text[0]) {
+		var k int = numLabelRefInstance(p, first.Text)
+		if charsEqual(asm.GeneratedLabelName(first.Text[0:len(first.Text) - 1], k), r.Sym) {
+			name = buf.CopyStr(first.Text)
+		}
+	}
+	var si int = p.Asm.LookupSymbol(r.Sym)
+	if si >= 0 && p.Asm.Symbols[si].Section >= 0 {
+		return exprFail(quotedName(name, " is a location, not a number (a difference of two is)"))
+	}
+	return exprFail(quotedName(name, " is not a constant defined before this line"))
+}
+
+// diffTargetError sets the error for a label difference as an AArch64 PC-relative target (a
+// branch, ADR / ADRP or literal load), where a number is an offset from the instruction:
+// clang reads the difference there as an absolute address instead (a relocation against
+// it on ELF, an error on Mach-O), so neither reading is taken.
+func diffTargetError(p @Parser) {
+	setErr(p,
+			"a label difference as a branch, ADR or literal target is an absolute address, "
+					"which is not supported (`.+(b-a)` is an offset from here)")
+}
+
+// markAlias records that this line marked the alias of constant index i used (AliasMarks).
+func markAlias(p @Parser, i int) {
+	if p.NumAliasMarks >= len(p.AliasMarks) {
+		var grown @[]int = make_slice(int, 2 * len(p.AliasMarks) + 8)
+		for k := 0; k < p.NumAliasMarks; k++ { grown[k] = p.AliasMarks[k] }
+		p.AliasMarks = grown
+	}
+	p.AliasMarks[p.NumAliasMarks] = i
+	p.NumAliasMarks = p.NumAliasMarks + 1
+}
+
+// unmarkAliases unmarks the aliases marked used since mark from (AliasMarks): the operands
+// they stood in folded into a difference, whose value no binding changes.
+func unmarkAliases(p @Parser, from int) {
+	for k := from; k < p.NumAliasMarks; k++ {
+		var i int = p.AliasMarks[k]
+		if i < p.NumConsts { p.ConstUsed[i] = false }
+	}
+	if from < p.NumAliasMarks { p.NumAliasMarks = from }
+}
+
+// noteLabelGen records the atom count of the label name, just defined in the current
+// section (Parser.LabelGens).
+func noteLabelGen(p @Parser, name *[]readonly char) {
+	var idx int = p.Asm.LookupSymbol(name)
+	if idx < 0 { return }
+	if idx >= len(p.LabelGens) {
+		var grown @[]int = make_slice(int, 2 * idx + 16)
+		for k := 0; k < len(p.LabelGens); k++ { grown[k] = p.LabelGens[k] }
+		p.LabelGens = grown
+	}
+	p.LabelGens[idx] = poolSecGen(p, p.Asm.Current) + 1
+}
+
+// noteDiffFwdName records name, used by a label difference before any definition
+// (Parser.DiffFwdNames).
+func noteDiffFwdName(p @Parser, name *[]readonly char) {
+	for i := 0; i < p.NumDiffFwd; i++ {
+		if charsEqual(p.DiffFwdNames[i], name) { return }
+	}
+	if p.NumDiffFwd >= len(p.DiffFwdNames) {
+		var grown @[]@[]char = make_slice(@[]char, 2 * len(p.DiffFwdNames) + 4)
+		for k := 0; k < p.NumDiffFwd; k++ { grown[k] = p.DiffFwdNames[k] }
+		p.DiffFwdNames = grown
+	}
+	p.DiffFwdNames[p.NumDiffFwd] = buf.CopyStr(name)
+	p.NumDiffFwd = p.NumDiffFwd + 1
+}

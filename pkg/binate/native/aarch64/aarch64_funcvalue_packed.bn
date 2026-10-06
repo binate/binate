@@ -106,6 +106,8 @@ func emitOnePackedShimAA64(a @asm.Assembler, cc callconv.CallConv, shimLabel @[]
 	if aggShape { prefix = 2 }
 	var w int = funcvalPackedWordsAA64(cc, fvTyp)
 	var userBudget int = cc.NumGpArgRegs - prefix
+	var copyOffs @[]int = packedArgCopyOffsetsAA64(cc, fvTyp, w)
+	var copyBytes int = packedArgCopyBytesAA64(cc, fvTyp)
 
 	// Save argsPtr (X1) before the lead-reg shuffle / arg loads clobber X1.  X9
 	// is caller-saved and not an arg reg, so it survives until the last load
@@ -123,7 +125,7 @@ func emitOnePackedShimAA64(a @asm.Assembler, cc callconv.CallConv, shimLabel @[]
 	// may keep another TU's copy; a plain local branch could dangle.  SetGlobal
 	// leaves the weak binding weak (it only ensures the symref resolves).
 	a.SetGlobal(shimLabel)
-	if w <= userBudget {
+	if w <= userBudget && copyBytes == 0 {
 		// Register-only: load W words into argReg(prefix)..argReg(prefix+W-1),
 		// then TAIL-BRANCH — __shim's return becomes __shimP's return.
 		for u := 0; u < w; u++ {
@@ -133,27 +135,93 @@ func emitOnePackedShimAA64(a @asm.Assembler, cc callconv.CallConv, shimLabel @[]
 		return
 	}
 
-	// Spill: a frame places the > budget words on the outgoing stack (where
+	// Framed: the frame places the > budget words on the outgoing stack (where
 	// __shim's spill shim reads its incoming stack args, dispatch word g at
 	// [SP + (g-8)*8]; g = prefix+u, so u >= userBudget lands at [SP +
-	// (u-userBudget)*8]).  BL (not tail-branch): LR must survive and the frame
-	// tear down before RET.
+	// (u-userBudget)*8]), and above them the copies of the aggregates the
+	// underlying takes as a pointer to a copy of its own (packedArgCopyOffsetsAA64).
+	// BL (not tail-branch): LR must survive and the frame tear down before RET.
 	var spillWords int = w - userBudget
+	if spillWords < 0 { spillWords = 0 }
 	var spillBytes int = (spillWords * 8 + 15) / 16 * 16
+	var frameBytes int = spillBytes + copyBytes
 	aarch64.Stp(a, true, aarch64.FP, aarch64.LR, aarch64.MemPre(aarch64.SP, -16))
 	aarch64.Mov(a, true, aarch64.FP, aarch64.Reg(aarch64.SP))
-	aarch64.Sub(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(spillBytes))
-	for u := 0; u < userBudget; u++ {
-		aarch64.Ldr(a, true, argReg(prefix + u), aarch64.MemImm(aarch64.X9, 8 * u))
+	aarch64.Sub(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(frameBytes))
+	emitPackedArgCopiesAA64(a, cc, fvTyp, copyOffs, spillBytes)
+	for u := 0; u < userBudget && u < w; u++ {
+		emitPackedWordAA64(a, argReg(prefix + u), u, copyOffs, spillBytes)
 	}
 	for u := userBudget; u < w; u++ {
-		aarch64.Ldr(a, true, aarch64.X16, aarch64.MemImm(aarch64.X9, 8 * u))
+		emitPackedWordAA64(a, aarch64.X16, u, copyOffs, spillBytes)
 		aarch64.Str(a, true, aarch64.X16, aarch64.MemImm(aarch64.SP, (u - userBudget) * 8))
 	}
 	aarch64.Bl(a, shimLabel)
 	// X0 holds __shim's scalar result (a retbuf callee wrote through X0=retbuf);
 	// carry it back through the uniform i64 call_packed return.
-	aarch64.Add(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(spillBytes))
+	aarch64.Add(a, true, aarch64.SP, aarch64.SP, aarch64.Imm(frameBytes))
 	aarch64.Ldp(a, true, aarch64.FP, aarch64.LR, aarch64.MemPost(aarch64.SP, 16))
 	aarch64.Ret(a)
+}
+
+// The VM passes an aggregate argument as a pointer into its own storage.  One the
+// underlying takes as a pointer to a copy of its own (callconv.CallConv.PassesIndirect
+// — AAPCS64 lets the callee use that memory as its parameter and write to it) is
+// copied into `__shimP`'s frame first, and the copy's address passed instead.
+
+// packedArgCopyOffsetsAA64 returns, per packed word of fvTyp's w, the offset of the
+// frame copy of the aggregate that word points at (from the copies' base), or -1.
+func packedArgCopyOffsetsAA64(cc callconv.CallConv, fvTyp @types.Type, w int) @[]int {
+	var offs @[]int = make_slice(int, w)
+	for u := 0; u < w; u++ { offs[u] = -1 }
+	var u int = 0
+	var total int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		var pt @types.Type = fvTyp.Params[pi].Type
+		if cc.PassesIndirect(pt) {
+			offs[u] = total
+			total = total + (pt.SizeOf() + 15) / 16 * 16
+		}
+		u = u + shimInWordsForTypeAA64(cc, pt)
+	}
+	return offs
+}
+
+// packedArgCopyBytesAA64 returns the frame bytes packedArgCopyOffsetsAA64's copies
+// take (each rounded up to 16, keeping SP aligned).
+func packedArgCopyBytesAA64(cc callconv.CallConv, fvTyp @types.Type) int {
+	var total int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		var pt @types.Type = fvTyp.Params[pi].Type
+		if cc.PassesIndirect(pt) { total = total + (pt.SizeOf() + 15) / 16 * 16 }
+	}
+	return total
+}
+
+// emitPackedArgCopiesAA64 copies each aggregate packedArgCopyOffsetsAA64 places into
+// the frame at [SP + base + its offset], reading its pointer from the packed array
+// (X9), through X10 .. X13 (and the copy loop's V16 / V17): none is a lead register
+// already set (X0, X1) or the packed array.
+func emitPackedArgCopiesAA64(a @asm.Assembler, cc callconv.CallConv, fvTyp @types.Type,
+		copyOffs @[]int, base int) {
+	var u int = 0
+	for pi := 0; pi < len(fvTyp.Params); pi++ {
+		var pt @types.Type = fvTyp.Params[pi].Type
+		if copyOffs[u] >= 0 {
+			aarch64.Ldr(a, true, aarch64.X10, aarch64.MemImm(aarch64.X9, 8 * u))
+			aarch64.Add(a, true, aarch64.X11, aarch64.SP, aarch64.Imm(base + copyOffs[u]))
+			emitCopyAarch64(a, aarch64.X11, aarch64.X10, pt.SizeOf(), aarch64.X12, aarch64.X13)
+		}
+		u = u + shimInWordsForTypeAA64(cc, pt)
+	}
+}
+
+// emitPackedWordAA64 puts packed word u into rd: the address of its aggregate's frame
+// copy (at [SP + base + copyOffs[u]]) when it has one, else the word itself.
+func emitPackedWordAA64(a @asm.Assembler, rd int, u int, copyOffs @[]int, base int) {
+	if copyOffs[u] >= 0 {
+		aarch64.Add(a, true, rd, aarch64.SP, aarch64.Imm(base + copyOffs[u]))
+		return
+	}
+	aarch64.Ldr(a, true, rd, aarch64.MemImm(aarch64.X9, 8 * u))
 }

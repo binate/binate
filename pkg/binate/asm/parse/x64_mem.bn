@@ -1,0 +1,280 @@
+package "pkg/binate/asm/parse"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/x64"
+
+// An x86-64 memory operand (`[...]` in Intel syntax) is a sum of terms joined by `+` and `-`,
+// each sign applying to the term after it alone (`[rbx - 8 + 4]` is rbx - 4):
+//   - at most two 64-bit general registers — a base, and an index, scaled when written
+//     `reg*s` or `s*reg` (s 1, 2, 4 or 8, a number or a constant's name); an unscaled
+//     second register is the index (scale 1).  A register is never subtracted, and RSP is
+//     no index: `[rbx + rsp]` takes RSP as the base and RBX as the index, as clang does;
+//   - displacement terms, each a number (`8`, `N*2`, `(l2 - l1)`), summing to a signed
+//     32-bit value (clang silently keeps the low 32 bits of a wider one).  An operand of
+//     displacements alone is the absolute address [disp32].
+// clang reads the operand with C's precedences, under which | ^ & << >> bind more loosely
+// than + and -, while a term here ends at + and -; so a displacement term using one of them
+// outside parentheses is taken only as the operand's one displacement term, not subtracted
+// (`[rbx + 8 | 4]`, `[1 << 2 + rbx]`), and is an error otherwise (`[rbx + 3 | 4 + 1]` is
+// 7 in clang).  `[rip + expr]` is the RIP-relative form (parseX64RipMem).
+
+// parseX64MemOperand parses a memory operand after its '[' (l just after it) for an access
+// of size bits.
+func parseX64MemOperand(p @Parser, l Lexer, size int) (Lexer, Token, x64.Operand) {
+	var tok Token
+	l, tok = LexNext(l)
+	if tok.Kind == TOK_IDENT && mnemIs(tok.Text, "rip") { return parseX64RipMem(p, l) }
+	if tok.Kind == TOK_RBRACKET {
+		setErr(p, "empty memory operand")
+		return l, tok, x64.Imm(0)
+	}
+	var base int = -1
+	var index int = -1
+	var scale int = 1
+	var disp int64 = 0
+	var nDisp int = 0
+	var loose bool = false // a displacement term used | ^ & << >> outside parentheses
+	var neg bool = tok.Kind == TOK_MINUS
+	if tok.Kind == TOK_MINUS || tok.Kind == TOK_PLUS { l, tok = LexNext(l) }
+	for {
+		var reg int = -1
+		var sc int = 0
+		l, tok, reg, sc = parseX64RegTerm(p, l, tok)
+		if p.HasError { return l, tok, x64.Imm(0) }
+		if reg >= 0 {
+			if neg {
+				setErr(p, "a register cannot be subtracted in a memory operand")
+				return l, tok, x64.Imm(0)
+			}
+			if sc == 0 && base < 0 {
+				base = reg
+			} else if index < 0 {
+				index = reg
+				if sc > 0 { scale = sc }
+			} else {
+				setErr(p, "a memory operand takes at most a base and an index register")
+				return l, tok, x64.Imm(0)
+			}
+		} else {
+			var v int64 = 0
+			var groups int = 0
+			l, tok, v, groups = parseX64DispTerm(p, l, tok)
+			if p.HasError { return l, tok, x64.Imm(0) }
+			if (groups & (EG_BIT | EG_SHIFT)) != 0 {
+				if neg { return l, tok, x64LooseTermError(p) }
+				loose = true
+			}
+			if neg {
+				disp = disp - v
+			} else {
+				disp = disp + v
+			}
+			nDisp = nDisp + 1
+		}
+		if tok.Kind != TOK_PLUS && tok.Kind != TOK_MINUS { break }
+		neg = tok.Kind == TOK_MINUS
+		l, tok = LexNext(l)
+	}
+	if tok.Kind != TOK_RBRACKET {
+		setErr(p, "expected '+', '-' or ']' in the memory operand")
+		return l, tok, x64.Imm(0)
+	}
+	l, tok = LexNext(l)
+	if loose && nDisp > 1 { return l, tok, x64LooseTermError(p) }
+	if disp < -2147483648 || disp > 2147483647 {
+		setErr(p, "a memory operand's displacement is a signed 32-bit value")
+		return l, tok, x64.Imm(0)
+	}
+	if index == x64.RSP {
+		if scale != 1 || base < 0 || base == x64.RSP {
+			setErr(p, "rsp cannot be a memory operand's index")
+			return l, tok, x64.Imm(0)
+		}
+		index = base
+		base = x64.RSP
+	}
+	if index >= 0 { return l, tok, x64.MemIdx(base, index, scale, cast(int, disp), size) }
+	if base >= 0 { return l, tok, x64.Mem(base, cast(int, disp), size) }
+	return l, tok, x64.MemAbs(cast(int, disp), size)
+}
+
+// x64LooseTermError sets the error for a displacement term using | ^ & << >> outside
+// parentheses beside another displacement term or subtracted (parseX64MemOperand).
+func x64LooseTermError(p @Parser) x64.Operand {
+	setErr(p,
+			"ambiguous operator precedence in a memory operand (clang binds | ^ & << >> more "
+					"loosely than + and -); add parentheses")
+	return x64.Imm(0)
+}
+
+// parseX64RegTerm parses the memory-operand term at tok (l just after it) when it is a
+// register term — `reg`, `reg*s` or `s*reg` — returning the register and the scale written
+// (0 when none); otherwise it returns register -1, consuming nothing.  A register's name
+// other than a 64-bit general register's is an error, as is an operator other than + and -
+// after the term (`rcx*2*2`, which clang reads as rcx*2).
+func parseX64RegTerm(p @Parser, l Lexer, tok Token) (Lexer, Token, int, int) {
+	var reg int = -1
+	var sc int = 0
+	if tok.Kind == TOK_IDENT && isX64RegisterName(tok.Text) {
+		reg = x64MemReg(p, tok.Text)
+		if reg < 0 { return l, tok, -1, 0 }
+		l, tok = LexNext(l)
+		if tok.Kind == TOK_STAR {
+			l, tok = LexNext(l)
+			l, tok, sc = parseX64Scale(p, l, tok)
+			if p.HasError { return l, tok, -1, 0 }
+		}
+	} else {
+		// `s*reg`: a number or a name, '*', then a register's name.
+		if tok.Kind != TOK_INT && tok.Kind != TOK_IDENT { return l, tok, -1, 0 }
+		var peek Lexer = l
+		var star Token
+		var regTok Token
+		peek, star = LexNext(peek)
+		if star.Kind != TOK_STAR { return l, tok, -1, 0 }
+		peek, regTok = LexNext(peek)
+		if regTok.Kind != TOK_IDENT || !isX64RegisterName(regTok.Text) { return l, tok, -1, 0 }
+		l, tok, sc = parseX64Scale(p, l, tok)
+		if p.HasError { return l, tok, -1, 0 }
+		reg = x64MemReg(p, regTok.Text)
+		if reg < 0 { return l, tok, -1, 0 }
+		l, tok = LexNext(l) // the register's name
+		l, tok = LexNext(l)
+	}
+	if binPrec(tok.Kind) >= 2 {
+		setErr(p, "a memory operand's register term is reg, reg*scale or scale*reg")
+		return l, tok, -1, 0
+	}
+	return l, tok, reg, sc
+}
+
+// x64MemReg returns the register a memory operand names name (a register's name): a
+// 64-bit general register, or -1 with the error set for any other.
+func x64MemReg(p @Parser, name *[]readonly char) int {
+	reg, sz := parseX64Reg(name)
+	if reg >= 0 && sz == x64.SZ64 { return reg }
+	if reg >= 0 {
+		setErr(p,
+				quotedName(name,
+						" is not a 64-bit register; a memory operand's base and index are (32-bit "
+								"addressing is not supported)"))
+		return -1
+	}
+	if mnemIs(name, "rip") {
+		setErr(p, "rip only begins a memory operand: [rip + symbol]")
+		return -1
+	}
+	setErr(p, quotedName(name, " is not a base or index register"))
+	return -1
+}
+
+// parseX64Scale parses an index register's scale at tok (l just after it): one number or
+// constant's name, 1, 2, 4 or 8 — clang takes no other, and reads a register's name as the
+// register even where a constant has that name.
+func parseX64Scale(p @Parser, l Lexer, tok Token) (Lexer, Token, int) {
+	if tok.Kind != TOK_INT && tok.Kind != TOK_IDENT {
+		setErr(p, "a memory operand's scale is a number or a constant's name")
+		return l, tok, 0
+	}
+	if tok.Kind == TOK_IDENT && isX64RegisterName(tok.Text) {
+		setErr(p, quotedName(tok.Text, " is a register, not a scale"))
+		return l, tok, 0
+	}
+	var first Token = tok
+	var r ExprResult
+	l, tok, r = parseTerminal(p, l, tok)
+	if r.Ok && !r.Pending && (isSymbolic(r) || hasNeg(r)) { r = numberContextError(p, first, r) }
+	if !r.Ok {
+		setErr(p, exprErr(r, "invalid scale in memory operand"))
+		return l, tok, 0
+	}
+	if r.Pending { return l, tok, 1 } // an x86-64 instruction with one is an error
+	if r.Val != 1 && r.Val != 2 && r.Val != 4 && r.Val != 8 {
+		setErr(p, "a memory operand's scale is 1, 2, 4 or 8")
+		return l, tok, 0
+	}
+	return l, tok, cast(int, r.Val)
+}
+
+// parseX64DispTerm parses a displacement term at tok (l just after it) — operators binding
+// tighter than + and - over a number — returning its value and the operator groups used
+// outside parentheses.
+func parseX64DispTerm(p @Parser, l Lexer, tok Token) (Lexer, Token, int64, int) {
+	var first Token = tok
+	var r ExprResult
+	var groups int = 0
+	l, tok, r, groups = parseBinary(p, l, tok, 2, 0)
+	if r.Ok && ambiguousMix(groups) {
+		r = exprFail("ambiguous operator precedence (Mach-O and ELF differ); add parentheses")
+	}
+	if r.Ok && !r.Pending && (isSymbolic(r) || hasNeg(r)) { r = numberContextError(p, first, r) }
+	if !r.Ok {
+		setErr(p, exprErr(r, "invalid displacement in memory operand"))
+		return l, tok, 0, 0
+	}
+	return l, tok, r.Val, groups
+}
+
+// parseX64RipMem parses the rest of a RIP-relative memory operand (l just after `rip`): `+`
+// or `-` and one expression, a symbol plus numbers, optionally with `@GOTPCREL` (a
+// GOT-indirect load, with no addend), then `]`.
+func parseX64RipMem(p @Parser, l Lexer) (Lexer, Token, x64.Operand) {
+	var tok Token
+	l, tok = LexNext(l)
+	if tok.Kind == TOK_RBRACKET {
+		setErr(p, "rip-relative operand needs a symbol: [rip + label]")
+		return l, tok, x64.Imm(0)
+	}
+	if tok.Kind != TOK_PLUS && tok.Kind != TOK_MINUS {
+		setErr(p, "expected '+' or '-' after rip")
+		return l, tok, x64.Imm(0)
+	}
+	if tok.Kind == TOK_PLUS { l, tok = LexNext(l) }
+	var rr ExprResult
+	l, tok, rr = parseSymExpr(p, l, tok)
+	if !rr.Ok || rr.Dot || !intFits(rr.Val) {
+		setErr(p, exprErr(rr, "invalid rip-relative operand (a symbol plus numbers)"))
+		return l, tok, x64.Imm(0)
+	}
+	if isX64RegisterName(rr.Sym) {
+		setErr(p, "rip combines with a symbol, not a register")
+		return l, tok, x64.Imm(0)
+	}
+	if len(rr.Sym) == 0 {
+		// `[rip + disp]` with no symbol has no relocation to form.
+		setErr(p, "rip-relative operand needs a symbol: [rip + label]")
+		return l, tok, x64.Imm(0)
+	}
+	var got bool = false
+	if tok.Kind == TOK_AT {
+		l, tok = LexNext(l)
+		if tok.Kind != TOK_IDENT || !mnemIs(tok.Text, "gotpcrel") {
+			setErr(p, "expected GOTPCREL after '@'")
+			return l, tok, x64.Imm(0)
+		}
+		// (clang takes no @GOTPCREL on a numeric local label reference.)
+		if asm.IsGeneratedLabel(rr.Sym) {
+			setErr(p, "a numeric local label reference takes no @GOTPCREL")
+			return l, tok, x64.Imm(0)
+		}
+		// A GOT slot plus an addend is no symbol's address (clang emits the non-relaxable
+		// GOTPCREL with the addend; Mach-O has no form for it).
+		if rr.Val != 0 {
+			setErr(p, "a GOT-indirect operand takes no addend")
+			return l, tok, x64.Imm(0)
+		}
+		got = true
+		l, tok = LexNext(l)
+		if tok.Kind == TOK_PLUS || tok.Kind == TOK_MINUS {
+			setErr(p, "a GOT-indirect operand takes no addend")
+			return l, tok, x64.Imm(0)
+		}
+	}
+	if tok.Kind != TOK_RBRACKET {
+		setErr(p, "expected ']' after the rip-relative operand")
+		return l, tok, x64.Imm(0)
+	}
+	l, tok = LexNext(l)
+	if got { return l, tok, x64.RipGotLabel(rr.Sym) }
+	return l, tok, x64.RipLabelAddend(rr.Sym, cast(int, rr.Val))
+}

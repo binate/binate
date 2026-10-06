@@ -143,6 +143,69 @@ func MkCell(v int) Cell[int] {
 }
 EOF
 
+# ----- A package whose generic function's body calls into another package
+# that the session never imports — a struct-returning function, a constant and
+# an impl the body upcasts through: the body monomorphized at the prompt needs
+# that package's signatures, constants and impls. ---
+mkdir -p "$TMP/pkg/replgdep" "$TMP/pkg/replgbody"
+cat > "$TMP/pkg/replgdep.bni" <<'EOF'
+package "pkg/replgdep"
+
+type Pt struct {
+    X int
+    Y int
+}
+
+func Inner(n int) Pt
+
+const K int = 40
+
+interface Sizer {
+    Size() int
+}
+
+type Box struct {
+    N int
+}
+
+func (b *Box) Size() int
+
+impl *Box : Sizer
+EOF
+cat > "$TMP/pkg/replgdep/replgdep.bn" <<'EOF'
+package "pkg/replgdep"
+
+func Inner(n int) Pt { return Pt{X: n, Y: n + 1} }
+
+func (b *Box) Size() int { return b.N * 100 }
+EOF
+cat > "$TMP/pkg/replgbody.bni" <<'EOF'
+package "pkg/replgbody"
+
+import "pkg/replgdep"
+
+func Outer[T any](n int) int {
+    var p replgdep.Pt = replgdep.Inner(n)
+    var b replgdep.Box = replgdep.Box{N: n}
+    var s *replgdep.Sizer = &b
+    return p.X + p.Y + replgdep.K + s.Size()
+}
+EOF
+cat > "$TMP/pkg/replgbody/replgbody.bn" <<'EOF'
+package "pkg/replgbody"
+EOF
+GBODY_FIXTURE="$TMP/gbody_fixture.bn"
+cat > "$GBODY_FIXTURE" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+import "pkg/replgbody"
+
+func main() {
+    testing.Println(replgbody.Outer[int](1))
+}
+EOF
+
 # ----- Two packages whose names share the last segment `lib`: the local
 # single-segment package "lib" and pkg/other/lib.  A prompt import of one must
 # rebind `lib` away from the other, and an explicit alias must be honored. ---
@@ -1501,6 +1564,26 @@ testing.Println(c.v, d.v, c.Get(), d.Get())
 > > variable d parked (pending: e)
 > variable d resolved
 > 5 6 5 6
+> "
+
+# --- A generic function's body monomorphized at the prompt calls a package the
+# session never imports (pkg/replgbody's body reaches pkg/replgdep): its
+# struct-returning callee, constant and impl are registered — whether the
+# generic's package is imported by the main file or at the prompt. ---
+run_repl "generic-body-deps-startup-import" \
+'testing.Println(replgbody.Outer[int](1))
+' \
+"$BANNER
+> 143
+> " "$GBODY_FIXTURE"
+
+run_repl "generic-body-deps-prompt-import" \
+'import "pkg/replgbody"
+testing.Println(replgbody.Outer[int](2))
+' \
+"$BANNER
+> package pkg/replgbody loaded
+> 245
 > "
 
 # --- A named type that names itself (`type Tree @[]Tree`) and two that name

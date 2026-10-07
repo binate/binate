@@ -1726,7 +1726,7 @@ run_repl_import_rejected "tier5-mid-session-import-depends-on-failed" \
 import "pkg/gbaddep"
 testing.Println(helper(7))
 ' \
-    "failed type-checking): pkg/gbaddep" \
+    "failed type-checking or initialization): pkg/gbaddep" \
     "14"
 
 # --- An import that fails type-checking does not rebind its alias: `x` still
@@ -1736,7 +1736,7 @@ run_repl_import_rejected "tier5-mid-session-failed-import-keeps-alias" \
 import "pkg/xb/x"
 testing.Println(x.G(3))
 ' \
-    "failed type-checking): pkg/xb/x" \
+    "failed type-checking or initialization): pkg/xb/x" \
     "103"
 
 run_repl_import_rejected "tier5-mid-session-import-ccall-rejected" \

@@ -7,27 +7,30 @@ import "pkg/binate/native/callconv"
 import "pkg/binate/native/common"
 import "pkg/binate/types"
 
-// Indirect-call lowering: emitCallIndirect (OP_CALL_INDIRECT, dtor /
-// free_fn / cross-mode dispatch, called via CALL r11) and
+// Indirect-call lowering: emitCallIndirect (OP_CALL_INDIRECT — the
+// `_call_shim_*` intrinsics' cross-mode dispatch, called via CALL r11) and
 // emitCallFuncValue (OP_CALL_FUNC_VALUE / OP_CALL_HANDLE — call
 // through a 2-word {vtable_ptr, data_ptr} value's vtable.call slot,
-// always-shim convention).  Both share the SysV arg-passing machinery
-// emitCall in x64_call.bn uses; only the callee-target load and the
-// final CALL r11 vs CALL <symbol> differ.
-//
-// Mirrors aarch64_call_indirect.bn line for line — only the
-// instructions and the arg-register file (RDI/RSI/.../R9 vs X0..X7)
-// change.
+// always-shim convention).  Both use the SysV argument machinery emitCall
+// uses; only the callee-target load and the final CALL r11 vs CALL <symbol>
+// differ.
 
 // emitCallIndirect emits an indirect call (CALL r11).  Args[0] is the
 // fn_ptr (stashed in R11 before arg dispatch may clobber its source);
-// Args[1..] are the call args, dispatched via the same SysV machinery
-// emitCall uses.  R11 is a scratch-pool register, so the arg loop may reuse
-// it; fn_ptr is therefore stashed in a slot and reloaded into R11 just before
-// the CALL.  Same return-value handling as emitCall.
+// Args[1..] are the call args, placed as a direct call's are
+// (placeCallArgsX64).  R11 is a scratch-pool register, so the arg loop may
+// reuse it; fn_ptr is therefore stashed in a slot and reloaded into R11 just
+// before the CALL.  The result is a scalar or nothing: the shim intrinsics
+// this op lowers (_call_shim_scalar{,64} / _call_shim_aggregate) return no
+// aggregate -- one travels through an explicit retbuf argument -- so PlanFrame
+// gives the call no data region, and an aggregate result fails loud.
 func emitCallIndirect(a @asm.Assembler, pkgName *[]readonly char, rm @common.RegMap,
 		ins @ir.Instr) {
 	if len(ins.Args) < 1 { return }
+	if ins.Typ != nil && callconv.IsAggregateTyp(ins.Typ) {
+		a.SetError("native amd64: OP_CALL_INDIRECT with an aggregate result")
+		return
+	}
 
 	// Stash fn_ptr in R11 before the arg-dispatch loop.  The arg loop
 	// writes RDI..R9 (and may use RAX as a load temp for MEMORY
@@ -46,81 +49,7 @@ func emitCallIndirect(a @asm.Assembler, pkgName *[]readonly char, rm @common.Reg
 		x64.Mov(a, x64.Mem(x64.RSP, fnPtrSlot, x64.SZ64), x64.Reg(x64.R11, x64.SZ64))
 	}
 
-	// SysV arg dispatch on the call args (Args[1..]).
-	var nCallArgs int = len(ins.Args) - 1
-	var argTypes @[]@types.Type = make_slice(@types.Type, nCallArgs)
-	for i := 0; i < nCallArgs; i++ {
-		argTypes[i] = ins.Args[i + 1].Typ
-	}
-	// Place the args homed in an argument register first (x64_call_homes.bn);
-	// the loop skips them and keeps every filled argument register out of its
-	// reloads.  fn_ptr was read into R11 above, before any argument moves.
-	var callArgs @[]@ir.Instr = make_slice(@ir.Instr, nCallArgs)
-	var dstReg @[]int = make_slice(int, nCallArgs)
-	var dstStack @[]int = make_slice(int, nCallArgs)
-	for ai := 0; ai < nCallArgs; ai++ {
-		callArgs[ai] = ins.Args[ai + 1]
-		dstReg[ai] = -1
-		var rs int = rm.CC.CallArgRegStart(argTypes, ai)
-		if rs >= 0 { dstReg[ai] = argReg(rs) }
-		dstStack[ai] = rm.CC.CallArgStackOff(argTypes, ai)
-	}
-	var filled @[]int = prePlaceArgRegHomedArgsX64(a, rm, callArgs, dstReg, dstStack)
-	reserveFilledArgRegsX64(rm, filled)
-	var nsrn int = 0
-	for ai := 0; ai < nCallArgs; ai++ {
-		var arg @ir.Instr = ins.Args[ai + 1]
-		if callconv.IsFloatScalarTyp(arg.Typ) {
-			var fsrc int = getOperand(a, rm, arg.ID)
-			if fsrc >= 0 && nsrn < 8 {
-				x64.Movq_gp_to_xmm(a, x64.XMM0 + nsrn, fsrc)
-				nsrn = nsrn + 1
-			}
-			rm.ResetRegs()
-			reserveFilledArgRegsX64(rm, filled)
-			continue
-		}
-		if argHomedInArgRegX64(rm, arg) { continue }
-		var regStart int = rm.CC.CallArgRegStart(argTypes, ai)
-		var stackOff int = rm.CC.CallArgStackOff(argTypes, ai)
-		if callconv.IsAggregateTyp(arg.Typ) {
-			emitAggregateArg(a, rm, arg, regStart, stackOff)
-			filled = appendArgRegsX64(filled, regStart, callconv.ArgWords(arg.Typ))
-			rm.ResetRegs()
-			reserveFilledArgRegsX64(rm, filled)
-			continue
-		}
-		var src int = emitValOperand(a, pkgName, rm, arg)
-		if src < 0 { continue }
-		if regStart >= 0 {
-			var dst int = argReg(regStart)
-			if src != dst {
-				x64.Mov(a, x64.Reg(dst, x64.SZ64), x64.Reg(src, x64.SZ64))
-			}
-			filled = common.AppendInt(filled, dst)
-		} else {
-			x64.Mov(a, x64.Mem(x64.RSP, stackOff, x64.SZ64), x64.Reg(src, x64.SZ64))
-		}
-		rm.ResetRegs()
-		reserveFilledArgRegsX64(rm, filled)
-	}
-
-	// SysV sret: indirect calls have no callee-symbol — only the
-	// (a)/(b) cases from emitCall (big aggregate / big multi-return)
-	// apply.
-	var bigMultiRet bool = ins.ID >= 0 && rm.CC.CallReturnsBigMultiReturn(ins)
-	var bigRet bool = ins.ID >= 0 && (rm.CC.CallReturnsBigAggregate(ins) || bigMultiRet)
-	if bigRet {
-		var sretOff int = -1
-		if bigMultiRet {
-			sretOff = rm.NeedSpill(a, ins.ID, "native amd64: a call's sret buffer")
-		} else {
-			sretOff = rm.NeedAlloc(a, ins.ID, "native amd64: a call's sret buffer")
-		}
-		if sretOff >= 0 {
-			x64.Lea(a, x64.Reg(x64.RDI, x64.SZ64), x64.Mem(x64.RSP, sretOff, x64.SZ64))
-		}
-	}
+	_ = placeCallArgsX64(a, pkgName, rm, ins.Args[1:len(ins.Args)], false)
 
 	// Reload R11 from the stash slot, then CALL r11.
 	if fnPtrSlot >= 0 {
@@ -130,37 +59,7 @@ func emitCallIndirect(a @asm.Assembler, pkgName *[]readonly char, rm @common.Reg
 
 	rm.ResetRegs()
 	if ins.ID < 0 { return }
-
-	// Aggregate single-return: pack RAX (+RDX) into the alloc region,
-	// then produce its pointer (mirror of emitCall).
-	if ins.Typ != nil && callconv.IsAggregateTyp(ins.Typ) && !callconv.IsMultiReturnCall(ins) {
-		var sz int = ins.Typ.SizeOf()
-		if sz <= 0 { return }
-		var dataOff int = rm.NeedAlloc(a, ins.ID, "native amd64: an aggregate call result")
-		if dataOff < 0 { return }
-		if !bigRet {
-			x64.Mov(a, x64.Mem(x64.RSP, dataOff, x64.SZ64), x64.Reg(x64.RAX, x64.SZ64))
-			if sz > 8 {
-				x64.Mov(a, x64.Mem(x64.RSP, dataOff + 8, x64.SZ64), x64.Reg(x64.RDX, x64.SZ64))
-			}
-		}
-		var rd int = nextReg(rm, ins.ID)
-		x64.Lea(a, x64.Reg(rd, x64.SZ64), x64.Mem(x64.RSP, dataOff, x64.SZ64))
-		return
-	}
-
 	if ins.Typ != nil && ins.Typ.Kind == types.TYP_VOID { return }
-	// Multi-return tuple collect — shares collectMultiReturnTuple with the other
-	// call paths.  Currently UNREACHABLE for OP_CALL_INDIRECT: callconv.IsMultiReturnCall
-	// gates on OP_CALL / OP_CALL_FUNC_VALUE / OP_CALL_IFACE_METHOD, never a bare
-	// OP_CALL_INDIRECT (which is used for dtors / free_fn / cross-mode trampolines,
-	// never a multi-return today).  Kept
-	// on the shared helper so it stays correct if that ever changes.
-	if callconv.IsMultiReturnCall(ins) {
-		if bigMultiRet { return }
-		collectMultiReturnTuple(a, rm, ins)
-		return
-	}
 	// Scalar single-return: RAX → rd → spill.  Float scalars arrive
 	// in XMM0 — bring the bits through MOVQ instead.
 	var rd int = nextReg(rm, ins.ID)

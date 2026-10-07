@@ -2,30 +2,32 @@ package "pkg/binate/native/common"
 
 import "pkg/binate/ir"
 import "pkg/binate/iropcode"
+import "pkg/binate/native/callconv"
+import "pkg/binate/types"
 
-// A by-value aggregate parameter that arrives as a pointer to a copy the callee owns
-// (AAPCS64's aggregates over 16 bytes — callconv.CallConv.PassesIndirect natively,
-// IsByvalParam in the LLVM backend's aarch64 lowering) can use that copy as its
-// stack slot.  IR-gen stores each parameter into a slot of its own at the top of the
-// entry block; when that store is the parameter's only use, the slot may simply BE
-// the incoming memory — no copy into it and no zero-fill.  A closure's captures are
-// excluded: its shim passes them as pointers into the closure record, which the body
-// must not write.
+// A by-value aggregate parameter whose bytes arrive in memory the callee owns (see
+// paramInCallerMemory below; IsByvalParam in the LLVM backend) can use that memory as
+// its stack slot.  IR-gen stores each parameter into a slot of its own at the top of
+// the entry block; when that store is the parameter's only use, the slot may simply
+// BE the incoming memory — no copy into it and no zero-fill.  A closure's capture is
+// such a parameter too — its shim passes a copy, as any call does — except where its
+// type is passed as a pointer (PassesIndirect; a plain `ptr` in the LLVM backend's
+// aarch64 lowering): the shim then passes a pointer into the closure record, which
+// the body must not write, so the capture's slot keeps a copy of its own.
 
 // InPlaceParamSlots returns, indexed by value ID, the index of the parameter whose
 // incoming memory each OP_ALLOC of f may be (see above), or -1.  A slot qualifies
-// when its parameter is not a capture, the parameter's only use is a store of it
-// into the slot in the entry block, the slot is the parameter's size, and nothing
-// in the entry block uses the slot before that store.  Whether a qualifying slot is
-// used in place is the backend's decision: only where the parameter arrives as a
-// pointer to a copy the callee owns.
+// when the parameter's only use is a store of it into the slot in the entry block,
+// the slot is the parameter's size, and nothing in the entry block uses the slot
+// before that store.  Whether a qualifying slot is used in place is the backend's
+// decision: only where the parameter's bytes arrive in memory the callee owns —
+// never a capture passed as a pointer into the closure record (IsCaptureParam).
 func InPlaceParamSlots(f @ir.Func) @[]int {
 	var out @[]int = make_slice(int, f.NextID)
 	for i := 0; i < len(out); i++ { out[i] = -1 }
 	if len(f.Blocks) == 0 { return out }
 	var entry @ir.Block = f.Blocks[0]
 	for pi := 0; pi < len(f.Params); pi++ {
-		if f.IsClosure && pi < f.NumCaptureParams { continue }
 		var p @ir.Param = f.Params[pi]
 		if countParamUses(f.Blocks, p) + countParamUses(f.FaultPads, p) != 1 { continue }
 		for ii := 0; ii < len(entry.Instrs); ii++ {
@@ -44,6 +46,11 @@ func InPlaceParamSlots(f @ir.Func) @[]int {
 	return out
 }
 
+// IsCaptureParam reports whether f.Params[pi] is one of a closure's captures.
+func IsCaptureParam(f @ir.Func, pi int) bool {
+	return f.IsClosure && pi < f.NumCaptureParams
+}
+
 // slotUnusedBefore reports whether no instruction of b before index end has slot as
 // an operand.
 func slotUnusedBefore(b @ir.Block, end int, slot @ir.Instr) bool {
@@ -54,6 +61,52 @@ func slotUnusedBefore(b @ir.Block, end int, slot @ir.Instr) bool {
 		}
 	}
 	return true
+}
+
+// A by-value aggregate parameter whose bytes arrive in memory the callee owns needs no
+// copy of its own: its value is the address of those bytes.  That memory is the
+// caller's copy for a parameter passed as a pointer to one (PassesIndirect, AAPCS64),
+// the caller's outgoing-argument area for one passed wholly on the stack (any
+// convention), and — where an aggregate may be split between the core registers and
+// the stack (SplitAggregates, AAPCS32) — the stack part with the register part stored
+// right below it by the prologue (the split save area, SplitSaveBytes).
+
+// paramClassifyTypes returns the argument types f's parameters are classified with —
+// led by the hidden sret buffer pointer when it rides the first GP argument register
+// (SretInGpArgReg) — and the index of f.Params[0] in them.
+func (m @RegMap) paramClassifyTypes(f @ir.Func) (@[]@types.Type, int) {
+	var base int = 0
+	if m.SretSlotOff >= 0 && m.CC.SretInGpArgReg { base = 1 }
+	var ts @[]@types.Type = make_slice(@types.Type, len(f.Params) + base)
+	if base == 1 { ts[0] = types.MakePointerType(types.TypUint8()) }
+	for i := 0; i < len(f.Params); i++ { ts[base + i] = f.Params[i].Typ }
+	return ts, base
+}
+
+// paramInCallerMemory reports whether the aggregate argument at index k of the
+// classification types ts arrives in memory the callee owns (see above).
+func (m @RegMap) paramInCallerMemory(ts @[]@types.Type, k int) bool {
+	var t @types.Type = ts[k]
+	if !callconv.IsAggregateTyp(t) { return false }
+	if m.CC.PassesIndirect(t) { return true }
+	var so int = m.CC.CallArgStackOff(ts, k)
+	if so < 0 { return false }
+	return m.CC.CallArgRegStart(ts, k) < 0 || m.CC.SplitAggregates
+}
+
+// splitSaveBytes returns the size of f's split save area: the register part of the
+// aggregate parameter split between the core registers and the stack (at most one —
+// a split closes the registers), rounded up to 8 to keep SP aligned; 0 when none is.
+func (m @RegMap) splitSaveBytes(ts @[]@types.Type) int {
+	if !m.CC.SplitAggregates { return 0 }
+	for k := 0; k < len(ts); k++ {
+		if !callconv.IsAggregateTyp(ts[k]) || m.CC.PassesIndirect(ts[k]) { continue }
+		var rs int = m.CC.CallArgRegStart(ts, k)
+		if rs >= 0 && m.CC.CallArgStackOff(ts, k) >= 0 {
+			return (m.CC.WordBytes * (m.CC.NumGpArgRegs - rs) + 7) / 8 * 8
+		}
+	}
+	return 0
 }
 
 // InPlaceSlotParam returns the value ID of the parameter whose incoming copy the

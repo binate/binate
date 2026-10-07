@@ -1,0 +1,257 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/callconv"
+import "pkg/std/vec"
+
+// A call whose aggregate result is stored whole into a stack slot can write the result
+// straight into the slot.  Otherwise the result gets a buffer of its own (a native data
+// region; the LLVM backend's `.sret` / `.rb`), which the store then copies into the
+// slot.  The slot can stand in for that buffer when nothing can tell the difference:
+// the slot's bytes change when the call returns rather than at the store, and during
+// the call the callee must not be able to reach them.  So
+//   - the store is the result's only use, in the call's block;
+//   - the slot is a stack slot (not a package global, not a parameter's slot nor one
+//     that may be a parameter's incoming copy) of the result's size whose address
+//     never leaves the function: it is only ever the address of a load or a store, or
+//     the base of field and element pointers that are only ever used so in turn;
+//   - nothing between the call and the store references the slot or a value computed
+//     from it — an aggregate load of a slot may alias the slot's bytes
+//     (AggLoadElidable), on the understanding that the store is their next writer;
+//   - the slot's OP_ALLOC is not between the call and the store, unless it is
+//     NoZeroInit (it then emits nothing): its zero-fill would land on the result.
+//     Anywhere else a zero-fill runs before the call or after the store, as it does
+//     without the slot standing in, since the call and the store share a block.
+// The call's arguments are evaluated before the call, and a by-value argument is
+// passed as a copy, so an argument read from the slot is unaffected.
+
+// CallResultSlots returns, indexed by value ID, the value ID of the stack slot each
+// call of f may write its aggregate result into, in place of a buffer of its own (see
+// above), or -1.  A backend returning the result in memory passes the slot as the
+// result buffer, one returning it in registers stores them into the slot, and the
+// store then copies nothing.
+func CallResultSlots(f @ir.Func) @[]int {
+	var out @[]int = make_slice(int, f.NextID)
+	for i := 0; i < len(out); i++ { out[i] = -1 }
+	var uses @[]int = valueUseCounts(f)
+	var inPlace @[]int = InPlaceParamSlots(f)
+	var reachOf @[]@[]bool = make_slice(@[]bool, f.NextID)
+	var reachDone @[]bool = make_slice(bool, f.NextID)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var call @ir.Instr = b.Instrs[ii]
+			if !isAggregateResultCall(call) || call.ID >= len(out) || uses[call.ID] != 1 { continue }
+			var si int = nextUseIndex(b, ii, call)
+			if si < 0 { continue }
+			var st @ir.Instr = b.Instrs[si]
+			if st.Op != iropcode.OP_STORE || len(st.Args) < 2 || st.Args[1].ID != call.ID { continue }
+			var slot @ir.Instr = st.Args[0]
+			if !isPlainStackSlot(slot) || slot.ID >= len(out) || inPlace[slot.ID] >= 0 ||
+					slot.TypeArg == nil || slot.TypeArg.SizeOf() != call.Typ.SizeOf() {
+				continue
+			}
+			if !reachDone[slot.ID] {
+				reachOf[slot.ID] = slotReach(f, slot)
+				reachDone[slot.ID] = true
+			}
+			var reach @[]bool = reachOf[slot.ID]
+			if len(reach) == 0 || referencesAnyBetween(b, ii, si, reach, slot) { continue }
+			out[call.ID] = slot.ID
+		}
+	}
+	return out
+}
+
+// isAggregateResultCall reports whether ins is a call producing one aggregate value.
+func isAggregateResultCall(ins @ir.Instr) bool {
+	if ins.Op != iropcode.OP_CALL && ins.Op != iropcode.OP_C_CALL && !isIndirectCallOp(ins.Op) {
+		return false
+	}
+	if ins.ID < 0 || ins.Typ == nil || !callconv.IsAggregateTyp(ins.Typ) { return false }
+	return !callconv.IsMultiReturnCall(ins) && ins.Typ.SizeOf() > 0
+}
+
+// isPlainStackSlot reports whether v is a stack slot of f's own: an OP_ALLOC that is
+// neither a package global's reference nor a parameter's slot.
+func isPlainStackSlot(v @ir.Instr) bool {
+	return v != nil && v.Op == iropcode.OP_ALLOC && !v.IsGlobalRef && v.ParamIndex == 0 && v.ID >= 0
+}
+
+// valueUseCounts counts, indexed by value ID, the operand and phi references to each
+// value of f, in its blocks and its fault pads.
+func valueUseCounts(f @ir.Func) @[]int {
+	var n @[]int = make_slice(int, f.NextID)
+	countUsesIn(f.Blocks, n)
+	countUsesIn(f.FaultPads, n)
+	return n
+}
+
+// countUsesIn adds the references made by the instructions of blocks to n.
+func countUsesIn(blocks @[]@ir.Block, n @[]int) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var b @ir.Block = blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			for k := 0; k < len(ins.Args); k++ {
+				var v @ir.Instr = ins.Args[k]
+				if v != nil && v.ID >= 0 && v.ID < len(n) { n[v.ID] = n[v.ID] + 1 }
+			}
+			for k := 0; k < len(ins.Phis); k++ {
+				var pv *ir.Instr = ins.Phis[k].Val
+				if pv != nil && pv.ID >= 0 && pv.ID < len(n) { n[pv.ID] = n[pv.ID] + 1 }
+			}
+		}
+	}
+}
+
+// nextUseIndex returns the index of the first instruction of b after index from that
+// has v as an operand, or -1.
+func nextUseIndex(b @ir.Block, from int, v @ir.Instr) int {
+	for ii := from + 1; ii < len(b.Instrs); ii++ {
+		var ins @ir.Instr = b.Instrs[ii]
+		for k := 0; k < len(ins.Args); k++ {
+			if ins.Args[k] != nil && ins.Args[k].ID == v.ID { return ii }
+		}
+	}
+	return -1
+}
+
+// slotReach returns, indexed by value ID, the values reached from stack slot slot —
+// the slot, the field and element pointers based on it, and every value computed from
+// those — or an empty slice when the slot's address leaves the function: a pointer
+// reached is used other than as the address of a load or a store or the base of a
+// field or element pointer, flows through a phi, or is named in a fault pad.
+func slotReach(f @ir.Func, slot @ir.Instr) @[]bool {
+	var none @[]bool
+	var ptr @[]bool = make_slice(bool, f.NextID)
+	var reach @[]bool = make_slice(bool, f.NextID)
+	ptr[slot.ID] = true
+	reach[slot.ID] = true
+	var changed bool = true
+	for changed {
+		changed = false
+		var r int = extendSlotReach(f.Blocks, ptr, reach, false)
+		if r < 0 { return none }
+		var rp int = extendSlotReach(f.FaultPads, ptr, reach, true)
+		if rp < 0 { return none }
+		changed = r > 0 || rp > 0
+	}
+	return reach
+}
+
+// extendSlotReach adds to ptr and reach what the instructions of blocks derive from
+// their members (see slotReach), returning how many values it added, or -1 when a
+// pointer in ptr escapes (isPad: blocks are fault pads, where any use escapes).
+func extendSlotReach(blocks @[]@ir.Block, ptr @[]bool, reach @[]bool, isPad bool) int {
+	var added int = 0
+	for bi := 0; bi < len(blocks); bi++ {
+		var b @ir.Block = blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			var mine bool = ins.ID >= 0 && ins.ID < len(reach)
+			for k := 0; k < len(ins.Phis); k++ {
+				var pv *ir.Instr = ins.Phis[k].Val
+				if pv == nil || pv.ID < 0 || pv.ID >= len(reach) || !reach[pv.ID] { continue }
+				if ptr[pv.ID] { return -1 }
+				if mine && !reach[ins.ID] {
+					reach[ins.ID] = true
+					added++
+				}
+			}
+			for k := 0; k < len(ins.Args); k++ {
+				var v @ir.Instr = ins.Args[k]
+				if v == nil || v.ID < 0 || v.ID >= len(reach) || !reach[v.ID] { continue }
+				if ptr[v.ID] {
+					if isPad { return -1 }
+					if ins.Op == iropcode.OP_STORE && k == 0 { continue }
+					var derives bool = (ins.Op == iropcode.OP_GET_FIELD_PTR ||
+							ins.Op == iropcode.OP_GET_ELEM_PTR) && k == 0
+					if !derives && !(ins.Op == iropcode.OP_LOAD && k == 0) { return -1 }
+					if derives && mine && !ptr[ins.ID] {
+						ptr[ins.ID] = true
+						added++
+					}
+				}
+				if mine && !reach[ins.ID] {
+					reach[ins.ID] = true
+					added++
+				}
+			}
+		}
+	}
+	return added
+}
+
+// referencesAnyBetween reports whether an instruction of b strictly between indexes
+// from and to is, or has as an operand, a value in reach — the slot's own OP_ALLOC
+// excepted when it is NoZeroInit, since it then emits nothing.
+func referencesAnyBetween(b @ir.Block, from int, to int, reach @[]bool, slot @ir.Instr) bool {
+	for ii := from + 1; ii < to; ii++ {
+		var ins @ir.Instr = b.Instrs[ii]
+		if ins.ID == slot.ID {
+			if slot.NoZeroInit { continue }
+			return true
+		}
+		if ins.ID >= 0 && ins.ID < len(reach) && reach[ins.ID] { return true }
+		for k := 0; k < len(ins.Args); k++ {
+			var v @ir.Instr = ins.Args[k]
+			if v != nil && v.ID >= 0 && v.ID < len(reach) && reach[v.ID] { return true }
+		}
+		for k := 0; k < len(ins.Phis); k++ {
+			var pv *ir.Instr = ins.Phis[k].Val
+			if pv != nil && pv.ID >= 0 && pv.ID < len(reach) && reach[pv.ID] { return true }
+		}
+	}
+	return false
+}
+
+// placeCallResults gives each call PlanFrame found writing its result into a slot
+// (placedCalls, with its result's region size in placedSizes; placed from
+// CallResultSlots) the slot's region, and records the pair for CallResultSlot.  A call
+// whose slot has no region keeps a region of its own, reserved at offset, and its
+// store copies as usual.  It returns the frame offset past anything it reserved.
+func (m @RegMap) placeCallResults(placed @[]int, placedCalls @vec.Vec[int],
+		placedSizes @vec.Vec[int], allocIDs @vec.Vec[int], allocSizes @vec.Vec[int],
+		allocOffsets @vec.Vec[int], offset int) int {
+	var calls @vec.Vec[int] = vec.New[int]()
+	var slots @vec.Vec[int] = vec.New[int]()
+	var nAllocs int = allocIDs.Len()
+	for i := 0; i < placedCalls.Len(); i++ {
+		var id int = placedCalls.Get(i)
+		var k int = -1
+		for j := 0; j < nAllocs && k < 0; j++ {
+			if allocIDs.Get(j) == placed[id] { k = j }
+		}
+		allocIDs.Push(id)
+		if k >= 0 {
+			allocSizes.Push(allocSizes.Get(k))
+			allocOffsets.Push(allocOffsets.Get(k))
+			calls.Push(id)
+			slots.Push(placed[id])
+		} else {
+			allocSizes.Push(placedSizes.Get(i))
+			allocOffsets.Push(offset)
+			offset = offset + placedSizes.Get(i)
+		}
+	}
+	m.ResultSlotCalls = calls.Items()
+	m.ResultSlotSlots = slots.Items()
+	return offset
+}
+
+// CallResultSlot returns the value ID of the slot the call with value ID id writes
+// its result into (RegMap.ResultSlotCalls), or -1.
+func (m @RegMap) CallResultSlot(id int) int {
+	for i := 0; i < len(m.ResultSlotCalls); i++ {
+		if m.ResultSlotCalls[i] == id { return m.ResultSlotSlots[i] }
+	}
+	return -1
+}
+
+// roundUp8 rounds n up to a multiple of 8.
+func roundUp8(n int) int {
+	if n % 8 != 0 { return n + (8 - n % 8) }
+	return n
+}

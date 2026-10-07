@@ -1549,6 +1549,19 @@ testing.Println(repldemo.Double(21))
 > 42
 > "
 
+# --- A line of several entries — an import, declarations, statements — is
+# evaluated entry by entry, in order, as if each were entered on its own. ---
+run_repl "unit-several-entries" \
+'import "pkg/repldemo"; var a int = repldemo.Double(4); func twice(n int) int { return n + n }; testing.Println(a, twice(a))
+var b int = 1; var c int = b + 1
+testing.Println(b, c)
+' \
+"$BANNER
+> 8 16
+package pkg/repldemo loaded
+> > 1 2
+> "
+
 # --- A variable inferred from a call returning an imported generic
 # instantiation — typed at the prompt, and parked on its initializer's function
 # then resolved — has that type: its fields and methods work. ---
@@ -1738,6 +1751,25 @@ testing.Println(x.G(3))
 ' \
     "failed type-checking or initialization): pkg/xb/x" \
     "103"
+
+# --- An import that fails ends its code unit: the statement after it on the
+# same line does not run, and the next line does. ---
+actual=$(printf '%s' 'import "pkg/xb/x"; testing.Println(4242)
+testing.Println(77)
+' | "$BNI_BIN" --repl \
+    -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
+    -I "$TMP" -L "$TMP" -main-file "$FIXTURE" 2>&1)
+if printf '%s' "$actual" | grep -qF "failed type-checking or initialization): pkg/xb/x" \
+        && printf '%s' "$actual" | grep -qF "77" && ! printf '%s' "$actual" | grep -qF "4242"; then
+    echo "PASS: unit-failed-import-ends-unit"
+    PASSES=$((PASSES + 1))
+else
+    echo "FAIL: unit-failed-import-ends-unit"
+    echo "  expected: the import rejected, 77 printed, 4242 not"
+    echo "  actual:"; printf '%s\n' "$actual" | sed 's/^/    /'
+    FAILS=$((FAILS + 1))
+    FAIL_NAMES="$FAIL_NAMES unit-failed-import-ends-unit"
+fi
 
 run_repl_import_rejected "tier5-mid-session-import-ccall-rejected" \
 'import "pkg/std/os"

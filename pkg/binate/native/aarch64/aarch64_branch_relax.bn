@@ -1,0 +1,194 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/buf"
+import "pkg/binate/stringutils"
+import "pkg/std/strings"
+
+// A conditional branch -- B.cond, CBZ, CBNZ -- reaches only ±1 MiB, so in a function
+// larger than that a branch to a far block is relaxed:
+//   - backward, the target's offset is known when the branch is emitted, and a far one
+//     is the inverted branch over an unconditional B (emitCondBranchTo);
+//   - forward, the target is not known yet, so the branch is emitted short, and if its
+//     target is still undefined once the code has grown far enough past it, an island
+//     -- `stub: B target; ...` -- is emitted and the branch retargeted to its stub
+//     (branchIslands).  The function emitter checks at the end of each block, after a
+//     B, RET or BRK control never passes, so the island needs nothing around it, once
+//     the oldest waiting branch is condIslandAtEnd bytes back; and, for a block longer
+//     than that, between two IR instructions, with `B over` jumping the island, once it
+//     is condIslandMid bytes back.
+// B and BL reach ±128 MiB.  TBZ / TBNZ (±32 KiB) branch only within one instruction's
+// lowering, to a label it defines itself, so neither needs relaxing.
+
+// condBranchReach is the reach of B.cond / CBZ / CBNZ: a signed 19-bit word offset.
+const condBranchReach int = 1 << 20
+
+// condIslandMid is how far the code may grow past a waiting forward branch before an
+// island is emitted between two instructions: the rest of the reach (256 KiB) covers the
+// one IR instruction emitted after the last check, and the island itself.  (A variable
+// only so the unit tests can make islands at small distances.)
+var condIslandMid int = condBranchReach - (1 << 18)
+
+// condIslandAtEnd is how far the code may grow past a waiting forward branch before an
+// island is emitted at a block end -- lower than condIslandMid, so the island goes there,
+// with no `B over`, when a block end comes soon enough.  (A variable only so the unit
+// tests can make islands at small distances.)
+var condIslandAtEnd int = condBranchReach / 2
+
+// condBranchSeq numbers the labels branch relaxation makes, unique in the module.
+var condBranchSeq int
+
+// condBranchLabel returns a new label of the relaxation kind kind.
+func condBranchLabel(kind *[]readonly char) @[]char {
+	var out @strings.Builder = strings.NewBuilder()
+	out.Write("Lcb_")
+	out.Write(kind)
+	out.Write("_")
+	stringutils.WriteInt(out, condBranchSeq)
+	condBranchSeq = condBranchSeq + 1
+	return buf.CopyStr(out.String())
+}
+
+// labelDefined reports whether label is defined in the current section.
+func labelDefined(a @asm.Assembler, label *[]readonly char) bool {
+	var idx int = a.LookupSymbol(label)
+	return idx >= 0 && a.Symbols[idx].Section == a.Current
+}
+
+// emitCondBranchTo emits a branch to label taken when the condition holds: B.cond cond,
+// or, with condReg >= 0, CBNZ condReg (64-bit).  A label already defined further back
+// than the reach becomes the inverted branch -- B.invCond, or CBZ condReg -- over an
+// unconditional B to it.
+func emitCondBranchTo(a @asm.Assembler, cond int, invCond int, condReg int,
+		label *[]readonly char) {
+	if labelDefined(a, label) {
+		var idx int = a.LookupSymbol(label)
+		var delta int = cast(int, a.Symbols[idx].Offset) - cast(int, a.CurrentOffset())
+		if delta < -condBranchReach {
+			var skip @[]char = condBranchLabel("skip")
+			if condReg < 0 {
+				aarch64.Bcond(a, invCond, skip)
+			} else {
+				aarch64.Cbz(a, true, condReg, skip)
+			}
+			aarch64.B(a, label)
+			a.DefineLabel(skip)
+			return
+		}
+	}
+	if condReg < 0 {
+		aarch64.Bcond(a, cond, label)
+	} else {
+		aarch64.Cbnz(a, true, condReg, label)
+	}
+}
+
+// branchIslands tracks one function's forward conditional branches whose targets are not
+// yet defined, by their fixups in the function's section (check).
+type branchIslands struct {
+	sec     int // the function's section
+	scanned int // how many of the section's fixups have been looked at
+	pending @[]int // the waiting branches' fixup indices, oldest first
+	head    int // pending[head:n] are the ones still waiting
+	n       int // how many of pending are in use
+}
+
+// newBranchIslands starts tracking the function about to be emitted in a's current
+// section.
+func newBranchIslands(a @asm.Assembler) @branchIslands {
+	var b @branchIslands = make(branchIslands)
+	b.sec = a.Current
+	b.scanned = a.Sections[a.Current].NumFixups
+	b.pending = make_slice(int, 8)
+	return b
+}
+
+// add records the fixup fi as a waiting branch.
+func (b @branchIslands) add(fi int) {
+	if b.head == b.n {
+		b.head = 0
+		b.n = 0
+	}
+	if b.n == len(b.pending) {
+		var grown @[]int = make_slice(int, 2 * len(b.pending))
+		for i := 0; i < b.n; i++ { grown[i] = b.pending[i] }
+		b.pending = grown
+	}
+	b.pending[b.n] = fi
+	b.n = b.n + 1
+}
+
+// check records the conditional branches emitted since the last check whose targets are
+// not yet defined, drops the oldest ones whose targets have been defined since, and
+// emits an island for the rest once the oldest is condIslandAtEnd bytes back at a block
+// end (atBlockEnd), or condIslandMid bytes back between two instructions.  A branch
+// already out of reach -- one instruction's lowering longer than the margin -- is an
+// error naming that, not left for fixup resolution to report as out of range.
+func (b @branchIslands) check(a @asm.Assembler, atBlockEnd bool) {
+	if a.Current != b.sec {
+		a.SetError("native arm64: a function's code left its section")
+		return
+	}
+	var sec @asm.Section = a.Sections[b.sec]
+	for fi := b.scanned; fi < sec.NumFixups; fi++ {
+		if sec.Fixups[fi].Kind == aarch64.FIX_BRANCH19 && !labelDefined(a, sec.Fixups[fi].Label) {
+			b.add(fi)
+		}
+	}
+	b.scanned = sec.NumFixups
+	for b.head < b.n && labelDefined(a, sec.Fixups[b.pending[b.head]].Label) {
+		b.head = b.head + 1
+	}
+	if b.head == b.n { return }
+	var back int = cast(int, a.CurrentOffset()) - cast(int, sec.Fixups[b.pending[b.head]].Offset)
+	if back >= condBranchReach - 4 {
+		a.SetError(
+				"native arm64: a conditional branch's target block is out of its reach before an island")
+		return
+	}
+	var after int = condIslandMid
+	var jumpOver bool = true
+	if atBlockEnd && endsInTransfer(a) {
+		after = condIslandAtEnd
+		jumpOver = false
+	}
+	if back < after { return }
+	b.emitIsland(a, jumpOver)
+}
+
+// endsInTransfer reports whether the last instruction emitted is one control never
+// passes: B, BR, RET or BRK.
+func endsInTransfer(a @asm.Assembler) bool {
+	var sec @asm.Section = a.Sections[a.Current]
+	if sec.Len < 4 { return false }
+	var w uint32 = cast(uint32, sec.Data[sec.Len - 4]) | (cast(uint32, sec.Data[sec.Len - 3]) << 8) |
+			(cast(uint32, sec.Data[sec.Len - 2]) << 16) | (cast(uint32, sec.Data[sec.Len - 1]) << 24)
+	return (w & 0xFC000000) == 0x14000000 || (w & 0xFFFFFC1F) == 0xD65F0000 ||
+			(w & 0xFFFFFC1F) == 0xD61F0000 || (w & 0xFFE0001F) == 0xD4200000
+}
+
+// emitIsland emits a stub for each waiting branch whose target is still undefined -- a
+// B to the target -- and retargets the branch to it; with jumpOver, `B over` before the
+// stubs and `over:` after them.  A target defined since its branch was recorded is
+// within reach (condIslandMid), and is left.
+func (b @branchIslands) emitIsland(a @asm.Assembler, jumpOver bool) {
+	var over @[]char
+	if jumpOver {
+		over = condBranchLabel("over")
+		aarch64.B(a, over)
+	}
+	for k := b.head; k < b.n; k++ {
+		var fi int = b.pending[k]
+		var target @[]char = a.Sections[b.sec].Fixups[fi].Label
+		if labelDefined(a, target) { continue }
+		var stub @[]char = condBranchLabel("isl")
+		a.DefineLabel(stub)
+		aarch64.B(a, target)
+		a.Sections[b.sec].Fixups[fi].Label = stub
+	}
+	if jumpOver { a.DefineLabel(over) }
+	b.head = 0
+	b.n = 0
+	b.scanned = a.Sections[b.sec].NumFixups
+}

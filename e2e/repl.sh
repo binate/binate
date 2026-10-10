@@ -1264,6 +1264,25 @@ testing.Println(A); testing.Println(B); testing.Println(C)
 2
 > "
 
+# --- A const group's bare members repeat the previous initializer at their own
+# iota, typed or untyped, and after a later explicit value. ---
+run_repl "const-group-bare-members-iota" \
+"const ( A = iota * 10; B; C )
+testing.Println(A, B, C)
+const ( D int = iota * 15; E; F )
+testing.Println(D, E, F)
+const ( G = 3 * (iota + 1); H; I )
+testing.Println(G, H, I)
+const ( J = 100 + iota; K; L = 7; M )
+testing.Println(J, K, L, M)
+" \
+"$BANNER
+> > 0 10 20
+> > 0 15 30
+> > 3 6 9
+> > 100 101 7 7
+> "
+
 # --- Case 36 (Stage 2 (b) of plan-repl-tier3-pending-types.md):
 # a struct type whose field type references an undefined name
 # parks rather than erroring.  When the missing type arrives,

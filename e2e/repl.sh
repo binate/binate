@@ -118,6 +118,37 @@ func Double(x int) int {
 }
 EOF
 
+# ----- A package whose floating-point constant expression names its own import,
+# which the session does not import: read at the prompt, it has its value. ---
+mkdir -p "$TMP/pkg/rcbase" "$TMP/pkg/rcexpr"
+cat > "$TMP/pkg/rcbase.bni" <<'EOF'
+package "pkg/rcbase"
+
+const B float64 = 1.5
+EOF
+cat > "$TMP/pkg/rcbase/rcbase.bn" <<'EOF'
+package "pkg/rcbase"
+EOF
+cat > "$TMP/pkg/rcexpr.bni" <<'EOF'
+package "pkg/rcexpr"
+
+import "pkg/rcbase"
+
+const X float64 = rcbase.B * 2.0
+EOF
+cat > "$TMP/pkg/rcexpr/rcexpr.bn" <<'EOF'
+package "pkg/rcexpr"
+EOF
+mkdir -p "$TMP/pkg/rcother"
+cat > "$TMP/pkg/rcother.bni" <<'EOF'
+package "pkg/rcother"
+
+const B float64 = 100.25
+EOF
+cat > "$TMP/pkg/rcother/rcother.bn" <<'EOF'
+package "pkg/rcother"
+EOF
+
 # ----- A package with a generic struct and a function returning one of its
 # instantiations: a prompt variable inferred from it is typed as that
 # instantiation. ---
@@ -1547,6 +1578,29 @@ testing.Println(repldemo.Double(21))
 "$BANNER
 > package pkg/repldemo loaded
 > 42
+> "
+
+run_repl "tier5-imported-const-expr-own-import" \
+'import "pkg/rcexpr"
+testing.Println(cast(int, rcexpr.X * 10.0))
+' \
+"$BANNER
+> package pkg/rcexpr loaded
+> 30
+> "
+
+# --- A prompt constant expression names the package `a` meant when it was
+# declared, though a later prompt import rebinds `a`. ---
+run_repl "tier5-const-expr-keeps-its-binding" \
+'import a "pkg/rcbase"
+const X float64 = a.B * 2.0
+import a "pkg/rcother"
+testing.Println(cast(int, X * 10.0), cast(int, a.B))
+' \
+"$BANNER
+> package pkg/rcbase loaded
+> > package pkg/rcother loaded
+> 30 100
 > "
 
 # --- A line of several entries — an import, declarations, statements — is

@@ -173,6 +173,101 @@ _start:
 EOF
 echo "PASS: wdata links to a dynamically-linked aarch64 ELF (writable .data + .bss)"
 
+# ----- ctors: C constructors and a destructor run.  clang compiles two C objects: ctors.c has
+#       a default-priority constructor that prints, a destructor that prints, and a main that
+#       returns 42 only if both constructors ran in priority order; ctors101.c, linked after it,
+#       has a priority-101 constructor, which must run first (.init_array.101 sorts before
+#       .init_array whatever the input order).  _start is bnc's hosted one: it calls libc's
+#       __libc_start_main with an init that walks __init_array_start..__init_array_end, and
+#       ld.so runs .fini_array at exit.  Needs clang (SKIP without it). -----
+HAVE_CLANG=0
+if command -v clang > /dev/null 2>&1; then HAVE_CLANG=1; fi
+if [ "$HAVE_CLANG" = 1 ]; then
+    cat > "$TMP/ctors.c" <<'EOF'
+int puts(const char *);
+int order;
+__attribute__((constructor)) static void second(void) { order = order * 10 + 2; puts("ctor"); }
+__attribute__((destructor)) static void last(void) { puts("dtor"); }
+int main(void) { return order == 12 ? 42 : order; }
+EOF
+    cat > "$TMP/ctors101.c" <<'EOF'
+extern int order;
+__attribute__((constructor(101))) static void first(void) { order = order * 10 + 1; }
+EOF
+    cat > "$TMP/ctors_start.s" <<'EOF'
+.arch aarch64
+.section text
+.global _start
+.global main
+.global __libc_start_main
+.global __init_array_start
+.global __init_array_end
+_start:
+	mov x29, #0
+	mov x30, #0
+	mov x5, x0
+	ldr x1, [sp]
+	add x2, sp, #8
+	mov x6, sp
+	adrp x0, main
+	add x0, x0, #:lo12:main
+	adr x3, Linit
+	mov x4, #0
+	bl __libc_start_main
+Lhang:
+	b Lhang
+Linit:
+	stp x29, x30, [sp, #-48]!
+	mov x29, sp
+	stp x19, x20, [sp, #16]
+	stp x21, x22, [sp, #32]
+	mov x20, x0
+	mov x21, x1
+	mov x22, x2
+	adrp x19, __init_array_start
+	add x19, x19, #:lo12:__init_array_start
+Linitloop:
+	adrp x9, __init_array_end
+	add x9, x9, #:lo12:__init_array_end
+	cmp x19, x9
+	b.hs Linitdone
+	ldr x9, [x19], #8
+	mov x0, x20
+	mov x1, x21
+	mov x2, x22
+	blr x9
+	b Linitloop
+Linitdone:
+	ldp x21, x22, [sp, #32]
+	ldp x19, x20, [sp, #16]
+	ldp x29, x30, [sp], #48
+	ret
+EOF
+    for _c in ctors ctors101; do
+        if ! clang -c -O0 -fno-pic -target aarch64-linux-gnu -o "$TMP/$_c.o" "$TMP/$_c.c" \
+                > "$TMP/$_c.cc.log" 2>&1; then
+            echo "FAIL: clang could not compile $_c.c" >&2
+            cat "$TMP/$_c.cc.log" >&2
+            exit 1
+        fi
+    done
+    if ! "$BNAS" -target linux-aarch64 -o "$TMP/ctors_start.o" "$TMP/ctors_start.s" \
+            > "$TMP/ctors_start.asm.log" 2>&1; then
+        echo "FAIL: bnas could not assemble ctors_start.s" >&2
+        cat "$TMP/ctors_start.asm.log" >&2
+        exit 1
+    fi
+    if ! "$BNLD" -target linux-aarch64 -dynamic -o "$TMP/ctors" "$TMP/ctors_start.o" "$TMP/ctors.o" \
+            "$TMP/ctors101.o" > "$TMP/ctors.link.log" 2>&1; then
+        echo "FAIL: bnld could not dynamically link ctors" >&2
+        cat "$TMP/ctors.link.log" >&2
+        exit 1
+    fi
+    echo "PASS: ctors links to a dynamically-linked aarch64 ELF (C .init_array / .fini_array)"
+else
+    echo "SKIP: ctors needs clang to compile its C object"
+fi
+
 # ----- run: natively where the host can, else via Docker/qemu -----
 # CI has no native aarch64 Linux runner (the e2e matrix is x86-64 Linux + arm64
 # macOS), so the arm64 binary is run under a glibc arm64 Docker image via qemu — but
@@ -326,6 +421,24 @@ if [ "$CAN_RUN" = 1 ]; then
     fi
 else
     echo "SKIP: multi-lib -l not exercised here ($_skip_note)"
+fi
+
+if [ "$HAVE_CLANG" = 1 ]; then
+    run_dyn ctors
+    if [ "$RAN" = 1 ]; then
+        if [ "$CODE" != 42 ]; then
+            echo "FAIL: ctors expected exit 42 (both constructors, in priority order), got $CODE" >&2
+            exit 1
+        fi
+        _want="$(printf 'ctor\ndtor')"
+        if [ "$OUT" != "$_want" ]; then
+            echo "FAIL: ctors expected output 'ctor' then 'dtor', got '$OUT'" >&2
+            exit 1
+        fi
+        echo "PASS: ctors ran — the constructors ran in priority order before main, the destructor at exit"
+    else
+        echo "SKIP: ctors not run here ($_skip_note) — build+structure verified"
+    fi
 fi
 
 echo "ALL PASS: bnld dynamic ELF linking (aarch64)"

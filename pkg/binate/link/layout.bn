@@ -24,17 +24,28 @@ type OutputSection struct {
 }
 
 // LayoutResult is the set of output sections produced by Layout, in load order
-// (.text, .rodata, .data, .bss — omitting any that are empty).
+// (.text, .rodata, .preinit_array, .init_array, .fini_array, .data, .bss — omitting any that
+// are empty).  Layout fills ArrayStart / ArrayEnd with each array kind's address range
+// (indexed by kind - kindPreinitArray), start == end where the array would be when it is
+// empty — what the bracketing symbols (`__init_array_start` …) are defined as; a scripted
+// builder's result leaves them empty.
 type LayoutResult struct {
-	Sections @[]OutputSection
+	Sections   @[]OutputSection
+	ArrayStart @[]uint64
+	ArrayEnd   @[]uint64
 }
 
-// The four output-section kinds, in load order.
+// The output-section kinds, in load order: the arrays open the writable group, before .data,
+// in the order of GNU ld's default script.
 const (
 	kindText int = 0
 	kindRodata int = 1
-	kindData int = 2
-	kindBss int = 3
+	kindPreinitArray int = 2
+	kindInitArray int = 3
+	kindFiniArray int = 4
+	kindData int = 5
+	kindBss int = 6
+	kindCount int = 7
 )
 
 // linkPageSize is the load-segment page size.  The writable group's start is
@@ -44,6 +55,9 @@ const linkPageSize int = 0x1000
 
 // kindOf classifies an input section by its normalized flags and ELF type.
 func kindOf(flags int, stype int) int {
+	if stype == SHT_PREINIT_ARRAY { return kindPreinitArray }
+	if stype == SHT_INIT_ARRAY { return kindInitArray }
+	if stype == SHT_FINI_ARRAY { return kindFiniArray }
 	if stype == SHT_NOBITS { return kindBss } // NOBITS reserves memory, no file bytes
 	if (flags & SF_EXEC) != 0 { return kindText }
 	if (flags & SF_WRITE) != 0 { return kindData }
@@ -54,6 +68,9 @@ func kindOf(flags int, stype int) int {
 func kindName(k int) @[]char {
 	if k == kindText { return buf.CopyStr(".text") }
 	if k == kindRodata { return buf.CopyStr(".rodata") }
+	if k == kindPreinitArray { return buf.CopyStr(".preinit_array") }
+	if k == kindInitArray { return buf.CopyStr(".init_array") }
+	if k == kindFiniArray { return buf.CopyStr(".fini_array") }
 	if k == kindData { return buf.CopyStr(".data") }
 	return buf.CopyStr(".bss")
 }
@@ -62,7 +79,7 @@ func kindName(k int) @[]char {
 func kindFlags(k int) int {
 	if k == kindText { return SF_READ | SF_EXEC }
 	if k == kindRodata { return SF_READ }
-	return SF_READ | SF_WRITE // data and bss
+	return SF_READ | SF_WRITE // the arrays, data and bss
 }
 
 // alignUp rounds x up to a multiple of a (a >= 1).
@@ -86,8 +103,8 @@ func alignUpU64(x uint64, a int) uint64 {
 // Layout merges the objects' content sections into per-kind output sections,
 // records each input section's placement (OutIndex/OutOffset), and assigns
 // virtual addresses starting at base (each output section aligned to the maximum
-// alignment of its inputs).  Empty kinds are omitted.  The writable group
-// (.data/.bss) is page-aligned away from the read-only/exec group (.text/.rodata)
+// alignment of its inputs).  Empty kinds are omitted.  The writable group (the
+// arrays, .data, .bss) is page-aligned away from the read-only/exec group (.text/.rodata)
 // so emit can map them as separate-permission PT_LOADs — addresses are frozen
 // here (relocation runs against them), so this boundary must be decided now, not
 // at emit.  Segment *permissions* remain an emit concern.  Uses linkPageSize for the
@@ -101,31 +118,30 @@ func Layout(objs @[]@InputObject, base uint64) @LayoutResult {
 // boundary (so a backend can align the writable group to its segment page size).
 func LayoutPaged(objs @[]@InputObject, base uint64, pageSize int) @LayoutResult {
 	// Per-kind accumulated size and maximum alignment.
-	var kindSize @[]int = make_slice(int, 4)
-	var kindAlign @[]int = make_slice(int, 4)
-	for k := 0; k < 4; k++ { kindAlign[k] = 1 }
+	var kindSize @[]int = make_slice(int, kindCount)
+	var kindAlign @[]int = make_slice(int, kindCount)
+	for k := 0; k < kindCount; k++ { kindAlign[k] = 1 }
 
 	// Pass A: assign each input section a kind and an offset within that kind;
 	// accumulate per-kind sizes and alignments.  OutIndex temporarily holds the
-	// kind and is remapped to the final section index below.
+	// kind and is remapped to the final section index below.  The init / fini arrays'
+	// inputs are placed afterwards, in priority order (placeArrayByPriority).
 	for o := 0; o < len(objs); o++ {
 		var obj @InputObject = objs[o]
 		for s := 0; s < len(obj.Sections); s++ {
 			var k int = kindOf(obj.Sections[s].Flags, obj.Sections[s].Type)
-			var a int = obj.Sections[s].Align
-			if a < 1 { a = 1 }
-			if a > kindAlign[k] { kindAlign[k] = a }
-			var off int = alignUp(kindSize[k], a)
 			obj.Sections[s].OutIndex = k
-			obj.Sections[s].OutOffset = cast(uint, off)
-			kindSize[k] = off + cast(int, obj.Sections[s].Size)
+			if k == kindInitArray || k == kindFiniArray { continue }
+			placeInKind(obj, s, k, kindSize, kindAlign)
 		}
 	}
+	placeArrayByPriority(objs, kindInitArray, ".init_array", kindSize, kindAlign)
+	placeArrayByPriority(objs, kindFiniArray, ".fini_array", kindSize, kindAlign)
 
 	// Map each non-empty kind to its final output-section index (load order).
-	var kindToFinal @[]int = make_slice(int, 4)
+	var kindToFinal @[]int = make_slice(int, kindCount)
 	var nOut int = 0
-	for k := 0; k < 4; k++ {
+	for k := 0; k < kindCount; k++ {
 		if kindSize[k] > 0 {
 			kindToFinal[k] = nOut
 			nOut = nOut + 1
@@ -147,10 +163,19 @@ func LayoutPaged(objs @[]@InputObject, base uint64, pageSize int) @LayoutResult 
 	// itself runs on a 32-bit host (where uint/int are 32-bit).
 	var vaddr uint64 = base
 	var placedRO bool = false // placed any read-only/exec kind (.text/.rodata)
-	var openedRW bool = false // begun the writable group (.data/.bss)
-	for k := 0; k < 4; k++ {
-		if kindSize[k] == 0 { continue }
-		var isRW bool = (k == kindData) || (k == kindBss)
+	var openedRW bool = false // begun the writable group (the arrays, .data, .bss)
+	var arrayStart @[]uint64 = make_slice(uint64, 3)
+	var arrayEnd @[]uint64 = make_slice(uint64, 3)
+	for k := 0; k < kindCount; k++ {
+		var isArray bool = k >= kindPreinitArray && k <= kindFiniArray
+		if kindSize[k] == 0 {
+			if isArray {
+				arrayStart[k - kindPreinitArray] = vaddr
+				arrayEnd[k - kindPreinitArray] = vaddr
+			}
+			continue
+		}
+		var isRW bool = k >= kindPreinitArray
 		// Start the writable group on a fresh page so emit can map it as a separate
 		// R+W PT_LOAD, disjoint from the read-only/exec group's pages (a page can't
 		// carry two permission sets).  No gap when nothing read-only precedes it.
@@ -172,6 +197,10 @@ func LayoutPaged(objs @[]@InputObject, base uint64, pageSize int) @LayoutResult 
 		os.Addr = vaddr
 		os.Lma = vaddr // whole-link layout loads where it runs (LMA == VMA)
 		vaddr = vaddr + cast(uint64, kindSize[k])
+		if isArray {
+			arrayStart[k - kindPreinitArray] = os.Addr
+			arrayEnd[k - kindPreinitArray] = vaddr
+		}
 		if !isRW { placedRO = true }
 		if k == kindBss {
 			os.Data = make_slice(uint8, 0)
@@ -200,5 +229,18 @@ func LayoutPaged(objs @[]@InputObject, base uint64, pageSize int) @LayoutResult 
 
 	var r @LayoutResult = make(LayoutResult)
 	r.Sections = outs
+	r.ArrayStart = arrayStart
+	r.ArrayEnd = arrayEnd
 	return r
+}
+
+// placeInKind places section s of obj at the end of kind k so far (kindSize / kindAlign:
+// each kind's size and alignment), aligned to the section's alignment.
+func placeInKind(obj @InputObject, s int, k int, kindSize @[]int, kindAlign @[]int) {
+	var a int = obj.Sections[s].Align
+	if a < 1 { a = 1 }
+	if a > kindAlign[k] { kindAlign[k] = a }
+	var off int = alignUp(kindSize[k], a)
+	obj.Sections[s].OutOffset = cast(uint, off)
+	kindSize[k] = off + cast(int, obj.Sections[s].Size)
 }

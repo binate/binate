@@ -165,6 +165,103 @@ _start:
 EOF
 echo "PASS: wdata links to a dynamically-linked x86-64 ELF (writable .data + .bss)"
 
+# ----- ctors: C constructors and a destructor run.  clang compiles two C objects: ctors.c has
+#       a default-priority constructor that prints, a destructor that prints, and a main that
+#       returns 42 only if both constructors ran in priority order; ctors101.c, linked after it,
+#       has a priority-101 constructor, which must run first (.init_array.101 sorts before
+#       .init_array whatever the input order).  _start is bnc's hosted one: it calls libc's
+#       __libc_start_main with an init that walks __init_array_start..__init_array_end, and
+#       ld.so runs .fini_array at exit.  Needs clang (SKIP without it). -----
+HAVE_CLANG=0
+if command -v clang > /dev/null 2>&1; then HAVE_CLANG=1; fi
+if [ "$HAVE_CLANG" = 1 ]; then
+    cat > "$TMP/ctors.c" <<'EOF'
+int puts(const char *);
+int order;
+__attribute__((constructor)) static void second(void) { order = order * 10 + 2; puts("ctor"); }
+__attribute__((destructor)) static void last(void) { puts("dtor"); }
+int main(void) { return order == 12 ? 42 : order; }
+EOF
+    cat > "$TMP/ctors101.c" <<'EOF'
+extern int order;
+__attribute__((constructor(101))) static void first(void) { order = order * 10 + 1; }
+EOF
+    cat > "$TMP/ctors_start.s" <<'EOF'
+.arch x64
+.section text
+.global _start
+.global main
+.global __libc_start_main
+.global __init_array_start
+.global __init_array_end
+_start:
+	xor ebp, ebp
+	mov r9, rdx
+	pop rsi
+	mov rdx, rsp
+	and rsp, -16
+	push rax
+	push rsp
+	lea rdi, [rip + main]
+	lea rcx, [rip + Linit]
+	xor r8d, r8d
+	call __libc_start_main
+Lhang:
+	jmp Lhang
+Linit:
+	push rbx
+	push r12
+	push r13
+	push r14
+	push r15
+	mov r12, rdi
+	mov r13, rsi
+	mov r14, rdx
+	lea rbx, [rip + __init_array_start]
+	lea r15, [rip + __init_array_end]
+Linitloop:
+	cmp rbx, r15
+	jae Linitdone
+	mov rdi, r12
+	mov rsi, r13
+	mov rdx, r14
+	mov rax, [rbx]
+	call rax
+	add rbx, 8
+	jmp Linitloop
+Linitdone:
+	pop r15
+	pop r14
+	pop r13
+	pop r12
+	pop rbx
+	ret
+EOF
+    for _c in ctors ctors101; do
+        if ! clang -c -O0 -fno-pic -target x86_64-linux-gnu -o "$TMP/$_c.o" "$TMP/$_c.c" \
+                > "$TMP/$_c.cc.log" 2>&1; then
+            echo "FAIL: clang could not compile $_c.c" >&2
+            cat "$TMP/$_c.cc.log" >&2
+            exit 1
+        fi
+    done
+    if ! "$BNAS" -target linux-x64 -o "$TMP/ctors_start.o" "$TMP/ctors_start.s" \
+            > "$TMP/ctors_start.asm.log" 2>&1; then
+        echo "FAIL: bnas could not assemble ctors_start.s" >&2
+        cat "$TMP/ctors_start.asm.log" >&2
+        exit 1
+    fi
+    if ! "$BNLD" -target linux-x64 -dynamic -o "$TMP/ctors" "$TMP/ctors_start.o" "$TMP/ctors.o" \
+            "$TMP/ctors101.o" > "$TMP/ctors.link.log" 2>&1; then
+        echo "FAIL: bnld could not dynamically link ctors" >&2
+        cat "$TMP/ctors.link.log" >&2
+        exit 1
+    fi
+    echo "PASS: ctors links to a dynamically-linked x86-64 ELF (C .init_array / .fini_array)"
+else
+    echo "SKIP: ctors needs clang to compile its C object"
+fi
+
 # ----- run: natively on an x86-64 Linux host (the CI Linux runner — no Docker) -----
 # A default local run on a non-x86-64 host SKIPs; Docker (linux/amd64) is used only on
 # a Linux CI lane or an explicit BINATE_E2E_DOCKER=1 opt-in, never a default local run.
@@ -311,6 +408,24 @@ if [ "$CAN_RUN" = 1 ]; then
     fi
 else
     echo "SKIP: multi-lib -l not exercised here ($_skip_note)"
+fi
+
+if [ "$HAVE_CLANG" = 1 ]; then
+    run_dyn ctors
+    if [ "$RAN" = 1 ]; then
+        if [ "$CODE" != 42 ]; then
+            echo "FAIL: ctors expected exit 42 (both constructors, in priority order), got $CODE" >&2
+            exit 1
+        fi
+        _want="$(printf 'ctor\ndtor')"
+        if [ "$OUT" != "$_want" ]; then
+            echo "FAIL: ctors expected output 'ctor' then 'dtor', got '$OUT'" >&2
+            exit 1
+        fi
+        echo "PASS: ctors ran — the constructors ran in priority order before main, the destructor at exit"
+    else
+        echo "SKIP: ctors not run here ($_skip_note) — build+structure verified"
+    fi
 fi
 
 echo "ALL PASS: bnld dynamic ELF linking (x86-64)"

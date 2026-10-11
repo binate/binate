@@ -503,6 +503,22 @@ func main() {
 }
 EOF
 
+# ----- Forward-declaring fixture: its file declares `type T` and `type U` and
+# defines them nowhere, so a prompt may define them. ---
+FWD_FIXTURE="$TMP/fwd_fixture.bn"
+cat > "$FWD_FIXTURE" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+
+type T
+
+type U
+
+func main() {
+}
+EOF
+
 PASSES=0
 FAILS=0
 FAIL_NAMES=""
@@ -1282,6 +1298,22 @@ testing.Println(J, K, L, M)
 > > 3 6 9
 > > 100 101 7 7
 > "
+
+# --- A type the session's file only forward-declares is defined at a prompt —
+# as a named type or as a struct — and prompt code sees the definition. ---
+run_repl "file-forward-type-defined-at-prompt" \
+"type T int
+var x T = 3
+testing.Println(x + 4)
+type U struct { n int }
+var u @U = make(U)
+u.n = 5
+testing.Println(u.n)
+" \
+"$BANNER
+> > > 7
+> > > > 5
+> " "$FWD_FIXTURE"
 
 # --- Case 36 (Stage 2 (b) of plan-repl-tier3-pending-types.md):
 # a struct type whose field type references an undefined name

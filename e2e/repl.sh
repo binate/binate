@@ -504,16 +504,34 @@ func main() {
 EOF
 
 # ----- Forward-declaring fixture: its file declares `type T` and `type U` and
-# defines them nowhere, so a prompt may define them. ---
+# defines them nowhere, so a prompt may define them; hold drops a nil `@T`, and
+# release drops the `@U` keep held. ---
 FWD_FIXTURE="$TMP/fwd_fixture.bn"
 cat > "$FWD_FIXTURE" <<'EOF'
 package "main"
 
+import "pkg/builtins/rt"
 import "pkg/builtins/testing"
 
 type T
 
 type U
+
+var held @U
+
+func hold() int {
+    var p @T = nil
+    _ = p
+    return 1
+}
+
+func keep(p @U) {
+    held = p
+}
+
+func release() {
+    held = nil
+}
 
 func main() {
 }
@@ -1300,9 +1318,11 @@ testing.Println(J, K, L, M)
 > "
 
 # --- A type the session's file only forward-declares is defined at a prompt —
-# as a named type or as a struct — and prompt code sees the definition. ---
+# as a named type or as a struct — and prompt code sees the definition; before
+# that, the file's code drops a nil `@T` through T's placeholder destructor. ---
 run_repl "file-forward-type-defined-at-prompt" \
-"type T int
+"testing.Println(hold())
+type T int
 var x T = 3
 testing.Println(x + 4)
 type U struct { n int }
@@ -1311,8 +1331,26 @@ u.n = 5
 testing.Println(u.n)
 " \
 "$BANNER
+> 1
 > > > 7
 > > > > 5
+> " "$FWD_FIXTURE"
+
+# --- The file's code releases a value of a type the file only forward-declares,
+# defined at a prompt with a managed field, through the definition's destructor
+# (the prompt's definition replaces the placeholder the file was compiled
+# against): both blocks are freed, measured within one call (release is called
+# once first, with nothing held). ---
+run_repl "file-forward-type-dtor-replaced" \
+"type U struct { n int; s @[]int }
+func mk() @U { var x @U = make(U); x.s = make_slice(int, 4); return x }
+func measure() int { var base int = rt.LiveBlocks(); release(); return base - rt.LiveBlocks() }
+release()
+keep(mk())
+testing.Println(measure())
+" \
+"$BANNER
+> > > > > > 2
 > " "$FWD_FIXTURE"
 
 # --- Case 36 (Stage 2 (b) of plan-repl-tier3-pending-types.md):

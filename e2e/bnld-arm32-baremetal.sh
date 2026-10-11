@@ -16,7 +16,13 @@
 # is available the image is also BOOTED under `qemu-system-arm -M virt` and the run PASSES
 # only if "OK" appears on the console — the cross-object branch landed on emit_msg and the
 # emitted ELF32 is a runnable bare-metal image.  Without qemu-system-arm the boot is skipped
-# (the structure check still runs).  Exit 0 on pass/skip; non-zero on any real failure.
+# (the structure check still runs).
+#
+# A second image adds a clang-compiled C object whose constructor writes 'C' to the UART: the
+# driver places .init_array between __init_array_start and __init_array_end, and that image's
+# _start walks them before emit_msg, so the console must show "COK".  It is linked whenever
+# clang is available (clang's arm32 .init_array entry is an R_ARM_TARGET1) and booted when
+# qemu-system-arm is.  Exit 0 on pass/skip; non-zero on any real failure.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(dirname "$SCRIPT_DIR")"
@@ -102,6 +108,53 @@ PHOFF="$(u32_at "$E" 28)"
     || { echo "FAIL: load segment p_paddr is not the 0x40000000 RAM base" >&2; exit 1; }
 echo "PASS: bnld -driver baremetal-arm.bn -> ELF32 (EM_ARM, ET_EXEC, PT_LOAD @ 0x40000000)"
 
+# --- the C constructor image (see the header): linked whenever clang is available ---
+HAVE_CTOR=0
+if ! command -v clang > /dev/null 2>&1; then
+    echo "SKIP: the C constructor image needs clang"
+else
+HAVE_CTOR=1
+cat > "$TMP/ctor.c" <<'EOF'
+__attribute__((constructor)) static void ctor(void) { *(volatile unsigned int *)0x09000000 = 'C'; }
+EOF
+cat > "$TMP/start_ctor.s" <<'EOF'
+.arch arm32
+.section text
+.global _start
+.global emit_msg
+.global __init_array_start
+.global __init_array_end
+_start:
+	movw sp, #0x0000
+	movt sp, #0x4100
+	ldr r4, =__init_array_start
+	ldr r5, =__init_array_end
+ctor_loop:
+	cmp r4, r5
+	bhs ctor_done
+	ldr r3, [r4], #4
+	blx r3
+	b ctor_loop
+ctor_done:
+	bl emit_msg
+ctor_halt:
+	b ctor_halt
+EOF
+if ! clang -c -O0 -target armv7a-none-eabi -mfloat-abi=soft -ffreestanding -fno-unwind-tables \
+        -o "$TMP/ctor.o" "$TMP/ctor.c" > "$TMP/ctor.cc.log" 2>&1; then
+    echo "FAIL: clang could not compile ctor.c" >&2; cat "$TMP/ctor.cc.log" >&2; exit 1
+fi
+if ! "$BNAS" -arch arm32 -o "$TMP/start_ctor.o" "$TMP/start_ctor.s" > "$TMP/start_ctor.asm.log" 2>&1; then
+    echo "FAIL: bnas could not assemble start_ctor.s" >&2; cat "$TMP/start_ctor.asm.log" >&2; exit 1
+fi
+if ! "$BNLD" -driver "$DRIVER" -I "$IFACE_DIRS" --impl-path "$IMPL_DIRS" -target arm32-baremetal \
+        -o "$TMP/ctor.elf" "$TMP/start_ctor.o" "$TMP/emit.o" "$TMP/ctor.o" > "$TMP/ctor.link.log" 2>&1; then
+    echo "FAIL: bnld -driver (baremetal-arm) could not link the constructor image" >&2
+    cat "$TMP/ctor.link.log" >&2; exit 1
+fi
+echo "PASS: the C constructor image links (.init_array placed between its bracketing symbols)"
+fi
+
 # --- boot it under qemu-system-arm, if available ---
 QEMU="${QEMU_SYSTEM_ARM:-$(command -v qemu-system-arm || true)}"
 if [ -z "$QEMU" ]; then
@@ -122,10 +175,19 @@ fi
 # program spins after printing, so a wall-clock cap terminates QEMU; the console output is
 # captured regardless.
 OUT="$($TO "$QEMU" -M virt -cpu cortex-a15 -m 16M -nographic -no-reboot -kernel "$E" 2>&1 || true)"
-if printf '%s' "$OUT" | grep -qF "OK"; then
-    echo "PASS: qemu-system-arm booted the image and it printed OK (cross-object R_ARM_CALL resolved)"
-    exit 0
+if ! printf '%s' "$OUT" | grep -qF "OK"; then
+    echo "FAIL: booted image did not print OK" >&2
+    printf '%s\n' "$OUT" | head -8 >&2
+    exit 1
 fi
-echo "FAIL: booted image did not print OK" >&2
-printf '%s\n' "$OUT" | head -8 >&2
-exit 1
+echo "PASS: qemu-system-arm booted the image and it printed OK (cross-object R_ARM_CALL resolved)"
+
+[ "$HAVE_CTOR" = 1 ] || exit 0
+OUT="$($TO "$QEMU" -M virt -cpu cortex-a15 -m 16M -nographic -no-reboot -kernel "$TMP/ctor.elf" 2>&1 || true)"
+if ! printf '%s' "$OUT" | grep -qF "COK"; then
+    echo "FAIL: the constructor image did not print COK (the constructor before emit_msg)" >&2
+    printf '%s\n' "$OUT" | head -8 >&2
+    exit 1
+fi
+echo "PASS: the C constructor ran from .init_array before emit_msg (printed COK)"
+exit 0

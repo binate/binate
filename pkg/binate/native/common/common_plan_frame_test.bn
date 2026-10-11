@@ -1,0 +1,525 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/irbuild"
+import "pkg/binate/native/callconv"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Tests for common_plan_frame.bn: the frame PlanFrame lays out — the data regions,
+// spill slots, sret slot and outgoing-args area it reserves.
+// PlanFrame should reserve two regions for OP_MAKE_SLICE: a sized data
+// region (where the runtime writes the 32 bytes) and a pointer-sized
+// spill slot (which holds the address of that region).
+func TestPlanFrameReservesMakeSliceDataRegion() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	var n @ir.Instr = irbuild.EmitConstInt(b, 3, types.TypInt64())
+	var ms @ir.Instr = irbuild.EmitMakeSlice(b, types.TypInt64(), n)
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	if m.LookupAlloc(ms.ID) < 0 {
+		return "MAKE_SLICE should have an alloc region"
+	}
+	if m.LookupAllocSize(ms.ID) != 32 {
+		return "MAKE_SLICE alloc region should be 32 bytes"
+	}
+	if m.LookupSpill(ms.ID) < 0 {
+		return "MAKE_SLICE should have a spill slot too"
+	}
+	return ""
+}
+
+// PlanFrame for an aggregate-returning call (slice / named struct)
+// reserves a data region (AllocIDs entry) plus an 8-byte pointer
+// spill slot — the same shape as OP_MAKE_SLICE.
+func TestPlanFrameReservesAggregateCallReturnRegion() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	// Construct a CALL that returns @[]int64 (managed slice = 32 bytes
+	// on LP64 — 4 * ptrSize).  int64 (not int) so the element type's
+	// width is host-independent.
+	var noArgs @[]@ir.Instr
+	var ret @ir.Instr = irbuild.EmitCall(b, "callee", noArgs, MakeManagedSliceTypeForTest())
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	if m.LookupAlloc(ret.ID) < 0 {
+		return "aggregate call return should have a data region"
+	}
+	if m.LookupAllocSize(ret.ID) != 32 {
+		return "managed-slice return region should be 32 bytes"
+	}
+	if m.LookupSpill(ret.ID) < 0 {
+		return "aggregate call return should have a pointer spill"
+	}
+	return ""
+}
+
+// PlanFrame must give an aggregate OP_LOAD its OWN data region (plus the
+// pointer spill), the same shape as OP_MAKE_SLICE / aggregate calls — so
+// the load materializes a copy instead of aliasing the source.  Without
+// the region the spill points into the source object; when the source is
+// a local the function's cleanup RefDecs before the loaded value is
+// consumed (e.g. `return container[i]`), the value is read from freed
+// memory.  See regressions/return-aggregate-element-of-local.
+func TestPlanFrameReservesAggregateLoadDataRegion() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	// Alloc a managed-slice (32B aggregate), then LOAD it.
+	var slot @ir.Instr = irbuild.EmitAlloc(b, MakeManagedSliceTypeForTest())
+	var ld @ir.Instr = irbuild.EmitLoad(b, slot, MakeManagedSliceTypeForTest())
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	if m.LookupAlloc(ld.ID) < 0 {
+		return "aggregate OP_LOAD should have its own data region"
+	}
+	if m.LookupAllocSize(ld.ID) != 32 {
+		return "managed-slice load region should be 32 bytes"
+	}
+	if m.LookupSpill(ld.ID) < 0 {
+		return "aggregate OP_LOAD should also have a pointer spill slot"
+	}
+	return ""
+}
+
+// PlanFrame's outgoing-args reservation must include the sret-
+// induced register shift on SysV-AMD64.  Repro: a function calls
+// callee(*[]readonly char, *[]readonly char, *[]readonly char) returning
+// @[]char.  Visible args = 3 × 2 = 6 reg words; with sret in RDI
+// only 5 remain → 1 word spills.  Without the fix, PlanFrame
+// computes outgoing=0; SretSlotOff for the OUTER function
+// (which itself returns @[]char) lands at 0, and the inner call's
+// spill clobbers it.  With the fix, outgoing >= 8 → SretSlotOff
+// shifts past it.
+func TestPlanFrameAccountsForSretReturnedShiftOnSysV() testing.TestResult {
+	setTarget64()
+	var rawStr @types.Type = types.MakeSliceType(types.TypChar())
+	var params @[]@ir.Param
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = MakeManagedSliceTypeForTest()
+	var f @ir.Func = ir.NewFunc("", "outer", params, results)
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	// Three pointer-pair args plus an sret-returning callee.
+	var args @[]@ir.Instr = make_slice(@ir.Instr, 3)
+	for i := 0; i < 3; i++ {
+		args[i] = irbuild.EmitConstNil(b, rawStr)
+	}
+	irbuild.EmitCall(b, "callee", args, MakeManagedSliceTypeForTest())
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = NewRegMap(callconv.SysV_AMD64())
+	m.PlanFrame(f)
+
+	if m.OutgoingArgsSize < 8 {
+		return "SysV outgoing-args must reserve >= 8 bytes for sret-induced spill"
+	}
+	if m.SretSlotOff < m.OutgoingArgsSize {
+		return "SretSlotOff must sit above the outgoing-args area"
+	}
+	return ""
+}
+
+// AAPCS32 counterpart of TestPlanFrameAccountsForSretReturnedShiftOnSysV: an
+// sret-returning outer function whose body calls an sret-returning callee must
+// reserve outgoing-args space that COUNTS the synthetic R0 sret-pointer slot
+// (SretInGpArgReg drives callDispatchArgTypes to prepend it — the commit's
+// primary correctness fix).  Two raw-slice args (2 words each = 4 words) plus
+// the 1-word sret prepend = 5 words > the 4 GP arg regs, so at least one word
+// spills to the stack — OutgoingArgsSize must be >= 4 (WordBytes) and the
+// caller's own SretSlotOff stash must sit ABOVE it (no overlap).  Numerically
+// distinct from the SysV test (4 GP regs vs 6, WordBytes 4 vs 8), so it
+// independently pins the AAPCS32 sizing.  Restores the LP64 default on exit.
+func TestPlanFrameAccountsForSretReturnedShiftOnAapcs32() testing.TestResult {
+	setTarget32()
+	var rawStr @types.Type = types.MakeSliceType(types.TypChar())
+	var params @[]@ir.Param
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = MakeManagedSliceTypeForTest()
+	var f @ir.Func = ir.NewFunc("", "outer", params, results)
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	var args @[]@ir.Instr = make_slice(@ir.Instr, 2)
+	for i := 0; i < 2; i++ {
+		args[i] = irbuild.EmitConstNil(b, rawStr)
+	}
+	irbuild.EmitCall(b, "callee", args, MakeManagedSliceTypeForTest())
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = NewRegMap(callconv.AAPCS32())
+	m.PlanFrame(f)
+
+	var res testing.TestResult = ""
+	if m.OutgoingArgsSize < 4 {
+		res = "callconv.AAPCS32 outgoing-args must reserve >= 4 bytes for sret-induced spill"
+	} else if m.SretSlotOff < m.OutgoingArgsSize {
+		res = "SretSlotOff must sit above the outgoing-args area"
+	}
+	setTarget64()
+	return res
+}
+
+// Multi-return tuples with aggregate fields (e.g. `(StrTab, int)`
+// where StrTab is 5 words) must reserve enough bytes for the entire
+// packed tuple, not 8*field-count. Pre-fix, a `(StrTab, int)` return
+// got a 16-byte slot — the StrTab's words 2..4 and the int return
+// were silently dropped, so 141/157 read garbage from the wrong
+// offsets. The slot size must be SizeOf(tuple), 8-rounded.
+func TestPlanFrameMultiReturnTupleSlotIncludesAggregateFields() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	// Build a (StrTab, int64) tuple where StrTab = {Data @[]char,
+	// Len int64} = 40 bytes. Total 48 bytes / 6 words.  int64 (not
+	// int) so widths are host-independent.
+	var tabFields @[]@types.Field = make_slice(@types.Field, 2)
+	tabFields[0] = make(types.Field)
+	tabFields[0].Type = types.MakeManagedSliceType(types.TypChar())
+	tabFields[1] = make(types.Field)
+	tabFields[1].Type = types.TypInt64()
+	var tabTyp @types.Type = types.MakeStructType("StrTab", tabFields)
+	var tupleFields @[]@types.Field = make_slice(@types.Field, 2)
+	tupleFields[0] = make(types.Field)
+	tupleFields[0].Type = tabTyp
+	tupleFields[1] = make(types.Field)
+	tupleFields[1].Type = types.TypInt64()
+	// Anonymous (Name="") — the IR's encoding for multi-return.
+	var tupleTyp @types.Type = types.MakeStructType("", tupleFields)
+	var noArgs @[]@ir.Instr
+	var ret @ir.Instr = irbuild.EmitCall(b, "callee", noArgs, tupleTyp)
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	// Caller's spill slot must hold all 6 words.
+	var spill int = m.LookupSpill(ret.ID)
+	if spill < 0 {
+		return "multi-return spill should be allocated"
+	}
+	// We can't directly query slot size from RegMap, but we can verify
+	// the next slot (the OP_RETURN's "no result" doesn't allocate one;
+	// instead just check FrameSize includes 48 bytes for our tuple).
+	// FrameSize = OutgoingArgsSize + tuple-slot. FrameSize is rounded
+	// to 16. With no calls (we synthesized the tuple via EmitCall, so
+	// outgoing-args includes 0 — call has no args), FrameSize >= 48.
+	if m.FrameSize < 48 {
+		return "frame should include 48-byte multi-return slot"
+	}
+	return ""
+}
+
+// Data regions for aggregate-producing ops (OP_RODATA_ARRAY,
+// OP_MAKE_SLICE, etc.) must be rounded up to 8 bytes so subsequent
+// 64-bit STRs stay aligned and the per-region word-wise zero-fill
+// doesn't run past the buffer end. This was the regression that
+// produced 'H','h','h' instead of 'a','b','e' for 299_string_to_array
+// — the [5]char buffer was 5 bytes, the next 3 bytes belonged to the
+// following slot, and the zero-fill loop's first STR XZR clobbered
+// them.
+func TestPlanFrameRoundsArrayDataRegionUpToEight() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	// Construct an OP_RODATA_ARRAY producing a [5]char.
+	var ret @ir.Instr = irbuild.EmitRodataArray(b, "abcde", types.MakeArrayType(types.TypChar(), 5))
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	// The data region size should be 8 (5 rounded up), not 5.
+	if m.LookupAllocSize(ret.ID) != 8 {
+		return "[5]char data region should round up to 8 bytes"
+	}
+	return ""
+}
+
+func TestPlanFrameAllocatesSretSlotForBigReturn() testing.TestResult {
+	setTarget64()
+	// Caller's perspective: a function f() with no params/no return,
+	// containing a CALL whose return type is a big struct, should
+	// have a data region for the return value but NOT a SretSlotOff
+	// (that's the *callee*'s slot, not ours).
+	//
+	// We test the callee path by building a function whose own
+	// Results is a big struct.  int64 fields (not int) so the struct
+	// size is host-independent.
+	var fields @[]@types.Field = make_slice(@types.Field, 10)
+	for i := 0; i < 10; i++ {
+		fields[i] = make(types.Field)
+		fields[i].Type = types.TypInt64()
+	}
+	var bigStruct @types.Type = types.MakeStructType("Big", fields)
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = bigStruct
+	var f @ir.Func = ir.NewFunc("", "retBig", makeNoParams(), results)
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	if m.SretSlotOff < 0 {
+		return "big-return func should allocate SretSlotOff"
+	}
+	return ""
+}
+
+func TestPlanFrameNoSretSlotForSmallReturn() testing.TestResult {
+	// A function returning a raw slice (2 words = 16 bytes) is at-or-below
+	// the InternalSretBytes=16 threshold — packs into X0..X1, no sret slot.
+	var results @[]@types.Type = make_slice(@types.Type, 1)
+	results[0] = types.MakeSliceType(types.TypInt())
+	var f @ir.Func = ir.NewFunc("", "retSmall", makeNoParams(), results)
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	if m.SretSlotOff != -1 {
+		return "small-return func should NOT allocate SretSlotOff"
+	}
+	return ""
+}
+
+// PlanFrame must reserve OutgoingArgsSize at the bottom of the frame
+// (offset 0..N), so spills/allocas land at offsets >= N. Without this
+// shift, the caller's stack-arg writes would clobber its own spills.
+func TestPlanFrameReservesOutgoingArgsArea() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	// Construct a CALL with 9 int args so 1 word overflows to stack.
+	// CallStackBytes = 16 (one word, 16-aligned).
+	var args @[]@ir.Instr = make_slice(@ir.Instr, 9)
+	for i := 0; i < 9; i++ {
+		args[i] = irbuild.EmitConstInt(b, i, types.TypInt())
+	}
+	irbuild.EmitCall(b, "callee", args, types.TypVoid())
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	if m.OutgoingArgsSize != 16 {
+		return "OutgoingArgsSize should be 16 for 9-int call"
+	}
+	// First spill (arg 0's CONST_INT) must land at offset >= 16.
+	var firstSpill int = m.LookupSpill(args[0].ID)
+	if firstSpill < 16 {
+		return "spills must sit above the outgoing-args area"
+	}
+	return ""
+}
+
+// OP_IFACE_VALUE produces a 16-byte {data, vtable} aggregate and must
+// reserve a data region (alloc) plus a pointer-sized spill slot — the
+// same shape as OP_FUNC_VALUE and OP_MAKE_SLICE.  Without the
+// allocator's OP_IFACE_VALUE arm, OP_IFACE_VALUE's lowering would
+// produce a value with no backing storage and the codegen
+// `LookupAlloc < 0` guard would silently skip the emission.
+func TestPlanFrameReservesIfaceValueDataRegion() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	// data ptr proxy — any scalar producing instr will do.
+	var dp @ir.Instr = irbuild.EmitConstInt(b, 0, types.MakePointerType(types.TypUint8()))
+	// Build TYP_INTERFACE_VALUE for the iv (16 bytes = 2 ptr-words).
+	var ivTyp @types.Type = make(types.Type)
+	ivTyp.Kind = types.TYP_INTERFACE_VALUE
+	var iv @ir.Instr = irbuild.EmitIfaceValue(b, dp, "__ivt.bn_test__T__test__I", ivTyp)
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	if m.LookupAlloc(iv.ID) < 0 {
+		return "OP_IFACE_VALUE should have a data region"
+	}
+	if m.LookupAllocSize(iv.ID) != 16 {
+		return "iface-value alloc region should be 16 bytes (2 ptr words)"
+	}
+	if m.LookupSpill(iv.ID) < 0 {
+		return "OP_IFACE_VALUE should have a pointer spill slot"
+	}
+	return ""
+}
+
+// OP_IFACE_UPCAST rebuilds an iv with the source's data ptr and a
+// vtable adjusted by N slots.  It produces a fresh 16-byte aggregate
+// and must reserve its own data region (the source iv's region can't
+// be reused — the vtable pointer differs).  Pins the allocator's
+// OP_IFACE_UPCAST arm.
+func TestPlanFrameReservesIfaceUpcastDataRegion() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	var dp @ir.Instr = irbuild.EmitConstInt(b, 0, types.MakePointerType(types.TypUint8()))
+	var srcTyp @types.Type = make(types.Type)
+	srcTyp.Kind = types.TYP_INTERFACE_VALUE
+	var src @ir.Instr = irbuild.EmitIfaceValue(b, dp, "__ivt.bn_test__T__test__Child", srcTyp)
+	var targetTyp @types.Type = make(types.Type)
+	targetTyp.Kind = types.TYP_INTERFACE_VALUE
+	// nil module: this test exercises only RegMap data-region planning;
+	// the upcast types carry no Elem, so EmitIfaceUpcast's slot-offset
+	// precompute short-circuits and never consults the interface registry.
+	var up @ir.Instr = irbuild.EmitIfaceUpcast(b, nil, src, "__ivt.bn_test__T__test__Parent",
+			targetTyp)
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	if m.LookupAlloc(up.ID) < 0 {
+		return "OP_IFACE_UPCAST should have its own data region"
+	}
+	if m.LookupAllocSize(up.ID) != 16 {
+		return "iface-upcast alloc region should be 16 bytes"
+	}
+	if m.LookupSpill(up.ID) < 0 {
+		return "OP_IFACE_UPCAST should have a pointer spill slot"
+	}
+	// The upcast result region must NOT alias the source's region;
+	// they hold different vtable pointers and the source may still
+	// be live.
+	if m.LookupAlloc(up.ID) == m.LookupAlloc(src.ID) {
+		return "upcast result must allocate a separate region from src"
+	}
+	return ""
+}
+
+// OP_CALL_IFACE_METHOD with an aggregate return (e.g. returning a
+// managed-slice) follows the same single-return aggregate-call
+// pattern as OP_CALL / OP_CALL_FUNC_VALUE: reserve a data region for
+// the value and a pointer-sized spill.  Pins the allocator's
+// OP_CALL_IFACE_METHOD arm.
+func TestPlanFrameReservesIfaceMethodAggregateReturn() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	var dp @ir.Instr = irbuild.EmitConstInt(b, 0, types.MakePointerType(types.TypUint8()))
+	var ivTyp @types.Type = make(types.Type)
+	ivTyp.Kind = types.TYP_INTERFACE_VALUE
+	var iv @ir.Instr = irbuild.EmitIfaceValue(b, dp, "__ivt.bn_test__T__test__I", ivTyp)
+	var noCallArgs @[]@ir.Instr
+	var ret @ir.Instr = irbuild.EmitCallIfaceMethod(b, iv, noCallArgs, 1,
+			MakeManagedSliceTypeForTest())
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	if m.LookupAlloc(ret.ID) < 0 {
+		return "OP_CALL_IFACE_METHOD aggregate return should have a data region"
+	}
+	if m.LookupAllocSize(ret.ID) != 32 {
+		return "managed-slice return region should be 32 bytes"
+	}
+	if m.LookupSpill(ret.ID) < 0 {
+		return "OP_CALL_IFACE_METHOD aggregate return should have a pointer spill"
+	}
+	return ""
+}
+
+// An OP_CALL_IFACE_METHOD whose result is an anonymous tuple struct (a
+// multi-return) packs its bytes directly into the spill slot — NO data
+// region — exactly like a direct multi-return OP_CALL.  Contrast with
+// TestPlanFrameReservesIfaceMethodAggregateReturn (a managed-slice aggregate
+// return, which DOES reserve a pointer-to-data region).  Pins that
+// IsMultiReturnCall's OP_CALL_IFACE_METHOD arm flips PlanFrame's
+// tuple-vs-pointer split for the iface path: the bug it guards against is a
+// reserved data region + pointer spill, against which the per-field register
+// collect would store the tuple over the wrong layout.
+func TestPlanFrameIfaceMethodMultiReturnPacksIntoSpill() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	var dp @ir.Instr = irbuild.EmitConstInt(b, 0, types.MakePointerType(types.TypUint8()))
+	var ivTyp @types.Type = make(types.Type)
+	ivTyp.Kind = types.TYP_INTERFACE_VALUE
+	var iv @ir.Instr = irbuild.EmitIfaceValue(b, dp, "__ivt.bn_test__T__test__I", ivTyp)
+	// (uint16, uint16) — the sub-word tuple shape that exposed the aa64
+	// drop-field-1 bug (conformance abi/iface-multi-return/u16/2).
+	var tupleFields @[]@types.Field = make_slice(@types.Field, 2)
+	tupleFields[0] = make(types.Field)
+	tupleFields[0].Type = types.TypUint16()
+	tupleFields[1] = make(types.Field)
+	tupleFields[1].Type = types.TypUint16()
+	// Anonymous (Name="") — the IR's multi-return encoding.
+	var tupleTyp @types.Type = types.MakeStructType("", tupleFields)
+	var noCallArgs @[]@ir.Instr
+	var ret @ir.Instr = irbuild.EmitCallIfaceMethod(b, iv, noCallArgs, 1, tupleTyp)
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	m.PlanFrame(f)
+
+	if m.LookupAlloc(ret.ID) >= 0 {
+		return "iface multi-return must NOT reserve a data region (packs into spill)"
+	}
+	if m.LookupSpill(ret.ID) < 0 {
+		return "iface multi-return must reserve a tuple spill slot"
+	}
+	return ""
+}
+
+// PlanFrame must allocate a SpillID slot for a VOID-returning
+// OP_CALL_INDIRECT so x64's emitCallIndirect can stash + reload
+// R11 (the fn-ptr scratch) around the arg loop.  Without the
+// slot, R11 gets clobbered by the arg loads and CALL r11 fires
+// with garbage — surfaced as a SIGBUS mid-test in
+// pkg/vm.TestExternRtMakeManagedSliceViaRegistry on
+// builder-comp_native_x64_darwin (the `_call_shim_aggregate`
+// call is void).  AArch64 dodges the issue (X17 stash is outside
+// the regPool), but the fix is at the shared PlanFrame layer.
+func TestPlanFrameVoidIndirectCallGetsSpillSlot() testing.TestResult {
+	setTarget64()
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	// Build OP_CALL_INDIRECT with a void result type.  Args[0] is
+	// the fn-ptr; supply one trivial arg so the loop doesn't fold
+	// into the zero-args path.
+	var fnPtr @ir.Instr = irbuild.EmitConstInt(b, 0, types.TypInt())
+	var arg0 @ir.Instr = irbuild.EmitConstInt(b, 42, types.TypInt())
+	var args @[]@ir.Instr = make_slice(@ir.Instr, 1)
+	args[0] = arg0
+	var call @ir.Instr = irbuild.EmitCallIndirect(b, fnPtr, args, types.TypVoid())
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = NewRegMap(callconv.SysV_AMD64())
+	m.PlanFrame(f)
+
+	if m.LookupSpill(call.ID) < 0 {
+		return "void OP_CALL_INDIRECT must get a SpillID slot for fn-ptr stash"
+	}
+	return ""
+}
+
+// PlanFrame lays the FP callee-saved save area immediately above the GP save
+// area (both 16-aligned), so FP register saves get their own reserved slots.
+func TestPlanFrameReservesFpSaveArea() testing.TestResult {
+	var f @ir.Func = ir.NewFunc("", "t", makeNoParams(), makeNoResults())
+	var b @ir.Block = ir.AddBlock(f, "entry")
+	irbuild.EmitReturn(b, makeNoInstrs())
+
+	var m @RegMap = nrm()
+	// Simulate the GP and FP scans each having reserved a 16-byte save area.
+	m.SavedRegsBytes = 16
+	m.SavedFpRegsBytes = 16
+	m.PlanFrame(f)
+
+	if m.SavedFpRegsOff != m.SavedRegsOff + m.SavedRegsBytes {
+		return "the FP save area must sit immediately above the GP save area"
+	}
+	return ""
+}

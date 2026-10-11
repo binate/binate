@@ -67,29 +67,33 @@ func normFlags(shflags int) int {
 // relocation's symbol index maps directly.  A symbol's defining section is mapped
 // from the ELF section index through elfToMy; an undefined external gets -1.  The
 // symtab and its linked .strtab lie in ranges the caller (ReadObject) has already
-// validated against dlen; readCStr additionally caps every name at dlen.
+// validated against dlen; readCStr additionally caps every name at dlen.  Also returns each
+// symbol's ELF section index (0 for none: undefined, absolute, common, or a reserved or
+// out-of-range index), which tells a symbol defined in a section the reader drops (elfToMy -1)
+// from an undefined one.
 func parseSymbols(data *[]readonly uint8, dlen int, fmt elfFmt, shoff int, shentsize int, shnum int,
-		elfToMy *[]readonly int) (@[]InputSymbol, bool) {
+		elfToMy *[]readonly int) (@[]InputSymbol, @[]int, bool) {
 	var symSh int = -1
 	for i := 0; i < shnum; i++ {
 		var sh int = shoff + i * shentsize
 		if cast(int, u32(data, sh + 4)) == SHT_SYMTAB { symSh = sh; break }
 	}
-	if symSh < 0 { return make_slice(InputSymbol, 0), true }
+	if symSh < 0 { return make_slice(InputSymbol, 0), make_slice(int, 0), true }
 
 	symOff, ooOk := readOffC(data, symSh + fmt.ShOffset, fmt.Is64) // sh_offset
 	symSize, osOk := readOffC(data, symSh + fmt.ShSize, fmt.Is64) // sh_size
 	entsize, oeOk := readOffC(data, symSh + fmt.ShEntsize, fmt.Is64) // sh_entsize (Elf{32,64}_Sym)
 	var strIdx int = cast(int, u32(data, symSh + fmt.ShLink)) // sh_link -> the linked .strtab
 	if !ooOk || !osOk || !oeOk || entsize < fmt.SymEntBase || strIdx < 0 || strIdx >= shnum {
-		return make_slice(InputSymbol, 0), false
+		return make_slice(InputSymbol, 0), make_slice(int, 0), false
 	}
 	// The linked .strtab's sh_offset.
 	strOff, soOk := readOffC(data, shoff + strIdx * shentsize + fmt.ShOffset, fmt.Is64)
-	if !soOk { return make_slice(InputSymbol, 0), false }
+	if !soOk { return make_slice(InputSymbol, 0), make_slice(int, 0), false }
 
 	var count int = symSize / entsize
 	var syms @[]InputSymbol = make_slice(InputSymbol, count)
+	var defShndx @[]int = make_slice(int, count)
 	for i := 0; i < count; i++ {
 		var e int = symOff + i * entsize
 		var nameOff int = cast(int, u32(data, e + fmt.SymName))
@@ -102,9 +106,9 @@ func parseSymbols(data *[]readonly uint8, dlen int, fmt elfFmt, shoff int, shent
 			value = 0
 			vOk = true
 		}
-		if !vOk { return make_slice(InputSymbol, 0), false } // >32-bit value: unrepresentable, fail loud
+		if !vOk { return make_slice(InputSymbol, 0), make_slice(int, 0), false } // >32-bit value
 		size, szOk := readOffC(data, e + fmt.SymSize, fmt.Is64) // st_size
-		if !szOk { return make_slice(InputSymbol, 0), false } // >32-bit size: unrepresentable, fail loud
+		if !szOk { return make_slice(InputSymbol, 0), make_slice(int, 0), false } // >32-bit size
 
 		var sym InputSymbol
 		if nameOff == 0 {
@@ -134,10 +138,11 @@ func parseSymbols(data *[]readonly uint8, dlen int, fmt elfFmt, shoff int, shent
 			sym.SecIndex = -1
 		} else {
 			sym.SecIndex = elfToMy[shndx]
+			defShndx[i] = shndx
 		}
 		syms[i] = sym
 	}
-	return syms, true
+	return syms, defShndx, true
 }
 
 // relEntBase returns the smallest valid entry size for a relocation section of the
@@ -278,7 +283,8 @@ func relocSectionError(data *[]readonly uint8, fmt elfFmt, sh int, base int, sho
 }
 
 // ReadObject reads the relocatable ELF object at path into an InputObject: the
-// header, the content sections (allocatable text/rodata/data/bss), the symbol
+// header, the content sections (elfKeepsSection: allocatable text / rodata / data / bss and
+// the init / fini / preinit arrays), the symbol
 // table, and the relocations.  Both classes are handled — ELF64/RELA (x86-64,
 // aarch64) and ELF32/REL (arm32) — selected by the EI_CLASS byte.  Structural
 // offsets/sizes are validated against the file length, so a truncated or malformed
@@ -296,8 +302,24 @@ func ReadObject(path *[]readonly char) (@InputObject, @[]readonly char) {
 // for the object's Path label and error messages — it need not be a real filesystem
 // path (an archive member is labeled e.g. "libfoo.a(bar.o)").  Everything the result
 // holds (section bytes, symbol names, path) is copied, so the object does not alias
-// data and outlives it.  Validation matches ReadObject.
+// data and outlives it.  Validation matches ReadObject; an object that reads but cannot be
+// linked (readObjectBytes's Rejected) is an error.
 func parseObjectBytes(data *[]readonly uint8,
+		path *[]readonly char) (@InputObject, @[]readonly char) {
+	obj, err := readObjectBytes(data, path)
+	if len(err) != 0 { return obj, err }
+	if len(obj.Rejected) != 0 {
+		var none @InputObject
+		return none, obj.Rejected
+	}
+	return obj, ""
+}
+
+// readObjectBytes is parseObjectBytes but for an object that reads and cannot be linked —
+// a .ctors / .dtors section, or a reference into a section the reader drops
+// (droppedDefinitionError) — which it returns with the reason in Rejected rather than as an
+// error, so an archive member is rejected only if a link pulls it in.
+func readObjectBytes(data *[]readonly uint8,
 		path *[]readonly char) (@InputObject, @[]readonly char) {
 	var none @InputObject
 	var dlen int = len(data)
@@ -337,19 +359,24 @@ func parseObjectBytes(data *[]readonly uint8,
 	// The section-name string table (validated above since shstrndx < shnum).
 	strDataOff, _ := readOffC(data, shoff + shstrndx * shentsize + fmt.ShOffset, fmt.Is64)
 
-	// Map every ELF section index to a kept content-section index.  A content
-	// section is PROGBITS/NOBITS *and* SHF_ALLOC — the alloc test drops
-	// .note.GNU-stack (PROGBITS, non-alloc) and debug sections, which are not
-	// content the linker lays out.
+	// Map every ELF section index to a kept content-section index (elfKeepsSection: the
+	// allocatable program bits, zero-fill and init / fini / preinit arrays).
 	var elfToMy @[]int = make_slice(int, shnum)
 	var myCount int = 0
+	var rejected @[]readonly char = ""
 	for i := 0; i < shnum; i++ {
 		var sh int = shoff + i * shentsize
 		var stype int = cast(int, u32(data, sh + 4))
 		// sh_flags is a 4-byte field on ELF32 and 8-byte on ELF64; the SHF_* bits
 		// all fit the low 32, so read them the same way for both classes.
 		var flags int = cast(int, u32(data, sh + fmt.ShFlags))
-		if (stype == SHT_PROGBITS || stype == SHT_NOBITS) && (flags & SHF_ALLOC) != 0 {
+		if elfKeepsSection(stype, flags) {
+			var name @[]char = elfSectionName(data, dlen, shoff, shentsize, strDataOff, i)
+			if isCtorsSection(name) && len(rejected) == 0 {
+				rejected = buf.Concat(name,
+						": bnld does not run .ctors / .dtors (build with init arrays, e.g. "
+								"clang's -fuse-init-array or a GCC configured with --enable-initfini-array)")
+			}
 			elfToMy[i] = myCount
 			myCount = myCount + 1
 		} else {
@@ -392,7 +419,7 @@ func parseObjectBytes(data *[]readonly uint8,
 	obj.Path = buf.CopyStr(path)
 	obj.Machine = machine
 	obj.Sections = secs
-	syms, symOk := parseSymbols(data, dlen, fmt, shoff, shentsize, shnum, elfToMy)
+	syms, defShndx, symOk := parseSymbols(data, dlen, fmt, shoff, shentsize, shnum, elfToMy)
 	if !symOk { return none, "ELF symbol value not representable on this host" }
 	obj.Symbols = syms
 	rels, relErr := parseRelocs(data, fmt, shoff, shentsize, shnum, elfToMy)
@@ -406,5 +433,10 @@ func parseObjectBytes(data *[]readonly uint8,
 			return none, "relocation symbol index out of range"
 		}
 	}
+	if len(rejected) == 0 {
+		rejected = droppedDefinitionError(data, dlen, fmt, shoff, shentsize, strDataOff, elfToMy, obj,
+				defShndx)
+	}
+	obj.Rejected = rejected
 	return obj, ""
 }

@@ -1,0 +1,141 @@
+package "pkg/binate/link"
+
+import "pkg/binate/buf"
+import "pkg/std/table"
+
+// Common symbols in a whole-program link.  A common symbol (a C tentative definition, `int
+// x;` — ELF SHN_COMMON, a Mach-O external N_UNDF with a size) carries a size and an alignment
+// but no storage, so the whole-link drivers (Link, LinkDynElf, LinkDynMacho) add a
+// linker-made object that defines each one in a zero-filled `.bss` section, which Layout
+// places with the program's own .bss.  Its definitions are global, so Resolve binds every
+// object's common reference to them, and the dynamic drivers do not import the names.
+//
+// A strong definition of the name supersedes the common, which is then not allocated.  A
+// weak one loses to it in an ELF link (GNU ld and lld allocate the common) and supersedes it
+// in a Mach-O link (as ld64 does).  Same-named commons merge to the largest size and the
+// largest alignment.  A zero-size common still gets one byte, so it has an address (Layout
+// drops an empty section).
+
+// commonsResult is the linker-made object commonObject builds (absent when objs allocate no
+// common) and an error for a common this host cannot lay out.
+type commonsResult struct {
+	Obj @InputObject
+	Err @[]readonly char
+}
+
+// commonObject builds the linker-made object defining the commons of objs that no definition
+// supersedes (weakWins: whether a weak definition does), one per name in first-reference
+// order, each at its merged alignment within a NOBITS `.bss` section aligned for the largest.
+// Obj is absent when there is none; Err reports an alignment that is not a power of two, or
+// storage beyond this host's address range.
+func commonObject(objs @[]@InputObject, machine int, weakWins bool) commonsResult {
+	var r commonsResult
+	var n int = 0 // the commons: at most one name each
+	for o := 0; o < len(objs); o++ {
+		for s := 0; s < len(objs[o].Symbols); s++ {
+			if objs[o].Symbols[s].Common { n = n + 1 }
+		}
+	}
+	if n == 0 { return r }
+	// One entry per common name, merged, then the names some definition supersedes marked —
+	// two passes over the symbols, the table borrowing the objects' names (which outlive it).
+	var index @table.Table[*[]readonly char, int, LinkNameHasher, LinkNameEq] = table.NewTable[
+			*[]readonly char, int, LinkNameHasher, LinkNameEq](
+					LinkNameHasher{}, LinkNameEq{})
+	var names @[]@[]char = make_slice(@[]char, n)
+	var sizes @[]uint64 = make_slice(uint64, n)
+	var aligns @[]uint64 = make_slice(uint64, n)
+	var gone @[]bool = make_slice(bool, n)
+	var k int = 0
+	for o := 0; o < len(objs); o++ {
+		for s := 0; s < len(objs[o].Symbols); s++ {
+			var c InputSymbol = objs[o].Symbols[s]
+			if !c.Common || len(c.Name) == 0 { continue }
+			if c.Binding != BIND_GLOBAL && c.Binding != BIND_WEAK { continue }
+			var align uint64 = cast(uint64, c.Value) // a common's Value is its alignment
+			if align == 0 { align = 1 }
+			if (align & (align - 1)) != 0 {
+				r.Err = buf.Concat(buf.Concat("common symbol ", c.Name),
+						" has an alignment that is not a power of two")
+				return r
+			}
+			idx, found := index.Get(c.Name)
+			if !found {
+				idx = k
+				names[k] = c.Name
+				aligns[k] = 1
+				index.Put(names[k], k)
+				k = k + 1
+			}
+			if cast(uint64, c.Size) > sizes[idx] { sizes[idx] = cast(uint64, c.Size) }
+			if align > aligns[idx] { aligns[idx] = align }
+		}
+	}
+	for o := 0; o < len(objs); o++ {
+		for s := 0; s < len(objs[o].Symbols); s++ {
+			var d InputSymbol = objs[o].Symbols[s]
+			// A strong definition, in a section or absolute, supersedes a common (a weak one
+			// only when weakWins); a local of the name is a different symbol.
+			if (d.SecIndex < 0 && !d.Abs) || d.Common { continue }
+			if d.Binding != BIND_GLOBAL && !(weakWins && d.Binding == BIND_WEAK) { continue }
+			idx, found := index.Get(d.Name)
+			if found { gone[idx] = true }
+		}
+	}
+	var syms @[]InputSymbol = make_slice(InputSymbol, k)
+	var m int = 0
+	var off uint64 = 0
+	var secAlign uint64 = 1
+	for i := 0; i < k; i++ {
+		if gone[i] { continue }
+		if off + aligns[i] - 1 < off {
+			r.Err = buf.Concat(buf.Concat("common symbol ", names[i]),
+					" is beyond this host's address range")
+			return r
+		}
+		off = (off + aligns[i] - 1) & ~(aligns[i] - 1)
+		if aligns[i] > secAlign { secAlign = aligns[i] }
+		syms[m].Name = buf.CopyStr(names[i])
+		syms[m].SecIndex = 0
+		syms[m].Value = cast(uint, off)
+		syms[m].Binding = BIND_GLOBAL
+		syms[m].Size = cast(uint, sizes[i])
+		if off + sizes[i] < off || cast(uint64, syms[m].Value) != off ||
+				cast(uint64, syms[m].Size) != sizes[i] {
+			r.Err = buf.Concat(buf.Concat("common symbol ", names[i]),
+					" is beyond this host's address range")
+			return r
+		}
+		off = off + sizes[i]
+		if sizes[i] == 0 { off = off + 1 }
+		m = m + 1
+	}
+	if m == 0 { return r }
+	var bss InputSection = mkDynSection(".bss", SF_READ | SF_WRITE, cast(int, secAlign),
+			make_slice(uint8, 0))
+	bss.Type = SHT_NOBITS
+	bss.Size = cast(uint, off)
+	if cast(uint64, bss.Size) != off || bss.Align <= 0 || cast(uint64, bss.Align) != secAlign {
+		r.Err = "common symbols are beyond this host's address range"
+		return r
+	}
+	var obj @InputObject = make(InputObject)
+	obj.Path = buf.CopyStr("<linker-made commons>")
+	obj.Machine = machine
+	obj.Sections = make_slice(InputSection, 1)
+	obj.Sections[0] = bss
+	obj.Symbols = syms[0:m]
+	obj.Relocs = make_slice(InputReloc, 0)
+	r.Obj = obj
+	return r
+}
+
+// withCommons returns objs with the linker-made object commonObject builds for them appended
+// (objs itself when there is none), or an error.
+func withCommons(objs @[]@InputObject, machine int,
+		weakWins bool) (@[]@InputObject, @[]readonly char) {
+	var r commonsResult = commonObject(objs, machine, weakWins)
+	if len(r.Err) != 0 { return objs, r.Err }
+	if !present(r.Obj) { return objs, "" }
+	return objectsWith(objs, r.Obj), ""
+}

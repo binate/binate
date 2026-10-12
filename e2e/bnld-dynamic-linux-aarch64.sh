@@ -264,6 +264,66 @@ EOF
         exit 1
     fi
     echo "PASS: ctors links to a dynamically-linked aarch64 ELF (C .init_array / .fini_array)"
+
+    # ----- commons: C tentative definitions (-fcommon) are allocated in the executable, not
+    #       imported.  comm.c and comm2.c both define the commons `counter` and `table`; comm.c
+    #       also has the common `w`, which comm2.c defines weakly as 5 — the common wins, as in
+    #       GNU ld and lld, so w is 0.  main exits 42 + w after comm2.c's bump writes both. -----
+    cat > "$TMP/comm.c" <<'EOF'
+int counter;
+int table[3];
+int w;
+void bump(void);
+int main(void) { bump(); return (counter == 40 && table[2] == 2) ? 42 + w : 1; }
+EOF
+    cat > "$TMP/comm2.c" <<'EOF'
+int counter;
+int table[3];
+__attribute__((weak)) int w = 5;
+void bump(void) { counter = counter + 40; table[2] = 2; }
+EOF
+    for _c in comm comm2; do
+        if ! clang -c -O0 -fno-pic -fcommon -target aarch64-linux-gnu -o "$TMP/$_c.o" "$TMP/$_c.c" \
+                > "$TMP/$_c.cc.log" 2>&1; then
+            echo "FAIL: clang could not compile $_c.c" >&2
+            cat "$TMP/$_c.cc.log" >&2
+            exit 1
+        fi
+    done
+    if ! "$BNLD" -target linux-aarch64 -dynamic -o "$TMP/comm" "$TMP/ctors_start.o" "$TMP/comm.o" \
+            "$TMP/comm2.o" > "$TMP/comm.link.log" 2>&1; then
+        echo "FAIL: bnld could not dynamically link comm (common symbols)" >&2
+        cat "$TMP/comm.link.log" >&2
+        exit 1
+    fi
+    echo "PASS: comm links to a dynamic aarch64 ELF (common symbols allocated, not imported)"
+
+    # ----- optc: a common that libc also defines.  optc.c's common `optind` is getopt's; the
+    #       executable exports its copy, so libc's getopt, which reaches optind through its
+    #       GOT, updates the same variable main reads (as lld links it).  Exits 39 + optind:
+    #       42 after getopt scans "-a -b". -----
+    cat > "$TMP/optc.c" <<'EOF'
+int getopt(int, char *const *, const char *);
+int optind;
+int main(void) {
+	char *v[] = {"optc", "-a", "-b", 0};
+	while (getopt(3, v, "ab") != -1) {}
+	return 39 + optind;
+}
+EOF
+    if ! clang -c -O0 -fno-pic -fcommon -target aarch64-linux-gnu -o "$TMP/optc.o" "$TMP/optc.c" \
+            > "$TMP/optc.cc.log" 2>&1; then
+        echo "FAIL: clang could not compile optc.c" >&2
+        cat "$TMP/optc.cc.log" >&2
+        exit 1
+    fi
+    if ! "$BNLD" -target linux-aarch64 -dynamic -o "$TMP/optc" "$TMP/ctors_start.o" "$TMP/optc.o" \
+            > "$TMP/optc.link.log" 2>&1; then
+        echo "FAIL: bnld could not dynamically link optc" >&2
+        cat "$TMP/optc.link.log" >&2
+        exit 1
+    fi
+    echo "PASS: optc links to a dynamically-linked aarch64 ELF (its common optind exported)"
 else
     echo "SKIP: ctors needs clang to compile its C object"
 fi
@@ -438,6 +498,26 @@ if [ "$HAVE_CLANG" = 1 ]; then
         echo "PASS: ctors ran — the constructors ran in priority order before main, the destructor at exit"
     else
         echo "SKIP: ctors not run here ($_skip_note) — build+structure verified"
+    fi
+    run_dyn comm
+    if [ "$RAN" = 1 ]; then
+        if [ "$CODE" != 42 ]; then
+            echo "FAIL: comm expected exit 42 (the common w over the weak 5), got $CODE" >&2
+            exit 1
+        fi
+        echo "PASS: comm ran — the merged commons were writable, and the common beat the weak w"
+    else
+        echo "SKIP: comm not run here ($_skip_note) — build+structure verified"
+    fi
+    run_dyn optc
+    if [ "$RAN" = 1 ]; then
+        if [ "$CODE" != 42 ]; then
+            echo "FAIL: optc expected exit 42 (getopt and main share optind), got $CODE" >&2
+            exit 1
+        fi
+        echo "PASS: optc ran — libc's getopt updated the exported common optind"
+    else
+        echo "SKIP: optc not run here ($_skip_note) — build+structure verified"
     fi
 fi
 

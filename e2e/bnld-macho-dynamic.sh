@@ -23,6 +23,9 @@
 #     a destructor, exiting 42 iff the constructors ran in order: __mod_init_func kept as
 #     such in __DATA, so dyld runs it, and ___dso_handle (the destructor's __cxa_atexit
 #     argument) defined as the image's Mach-O header.
+#   * comm   — two clang C objects (SKIP without clang) sharing common symbols, plus a common
+#     that a weak definition supersedes (as in ld64): the commons allocated in __DATA, not
+#     imported from libSystem.
 #
 # Static Mach-O does not run on macOS arm64 (the kernel mandates dyld), so this is the
 # path to a bnld-linked binary that runs on this platform.  The build + link +
@@ -240,6 +243,40 @@ EOF
     fi
     chmod +x "$TMP/ctors"
     echo "PASS: ctors links to a dynamically-linked arm64 Mach-O (__mod_init_func, ___dso_handle)"
+
+    # commons: C tentative definitions — clang's default on Darwin — are allocated in the
+    # executable, not imported.  comm.c and comm2.c both define the commons `_counter` and
+    # `_table`; comm.c also has the common `_w`, which comm2.c defines weakly as 5 — the weak
+    # definition wins, as in ld64, so w is 5.  main exits 42 + w (47) after bump writes both.
+    cat > "$TMP/comm.c" <<'EOF'
+int counter;
+int table[3];
+int w;
+void bump(void);
+int main(void) { bump(); return (counter == 40 && table[2] == 2) ? 42 + w : 1; }
+EOF
+    cat > "$TMP/comm2.c" <<'EOF'
+int counter;
+int table[3];
+__attribute__((weak)) int w = 5;
+void bump(void) { counter = counter + 40; table[2] = 2; }
+EOF
+    for _c in comm comm2; do
+        if ! clang -c -O0 -fcommon -target arm64-apple-macos11 -o "$TMP/$_c.o" "$TMP/$_c.c" \
+                > "$TMP/$_c.cc.log" 2>&1; then
+            echo "FAIL: clang could not compile $_c.c" >&2
+            cat "$TMP/$_c.cc.log" >&2
+            exit 1
+        fi
+    done
+    if ! "$BNLD" -target macos-arm64 -dynamic -e _main -o "$TMP/comm" "$TMP/comm.o" \
+            "$TMP/comm2.o" > "$TMP/comm.link.log" 2>&1; then
+        echo "FAIL: bnld could not dynamically link comm (common symbols)" >&2
+        cat "$TMP/comm.link.log" >&2
+        exit 1
+    fi
+    chmod +x "$TMP/comm"
+    echo "PASS: comm links to a dynamic arm64 Mach-O (common symbols allocated, not imported)"
 else
     echo "SKIP: ctors needs clang to compile its C object"
 fi
@@ -302,6 +339,12 @@ if [ "$CAN_RUN" = 1 ]; then
             exit 1
         fi
         echo "PASS: ctors ran — dyld ran the constructors in priority order, the destructor at exit"
+        "$TMP/comm"; _code=$?
+        if [ "$_code" != 47 ]; then
+            echo "FAIL: comm expected exit 47 (the weak w = 5 over the common), got $_code" >&2
+            exit 1
+        fi
+        echo "PASS: comm ran — the merged commons were writable, and the weak w beat the common"
     fi
 else
     echo "SKIP: Mach-O binaries not run here ($_skip_note) — build+structure verified"

@@ -14,8 +14,11 @@
 # exit).  So a passing run proves our _start reached a fully-initialized libc and the
 # runtime works end to end.
 #
-# Both linux-x64 and linux-aarch64 are built + structure-checked (host-independent:
-# bnc cross-emits the ELF).  The RUN needs the target's loader: x86-64 runs natively
+# Both linux-x64 and linux-aarch64 are built + structure-checked (bnc cross-emits the ELF)
+# where the target's libc.so.6, which the link reads, is at hand
+# (scripts/lib/linux-libc-sysroot.sh: a Linux host of that arch, or Docker on a Linux CI
+# lane or with BINATE_E2E_DOCKER=1); a target without one SKIPs.  The RUN needs the
+# target's loader: x86-64 runs natively
 # on an x86-64 Linux host, otherwise via Docker on a Linux CI lane or an explicit
 # BINATE_E2E_DOCKER=1; aarch64 runs via Docker.  Exit 0 on pass (incl. run-skipped);
 # non-zero on any failure.
@@ -57,13 +60,27 @@ func main() {
 }
 BN
 
-# build_and_check <target-key> <expect-emachine> <expect-interp> -> sets $OUTBIN
+# ----- each target's libc.so.6, which the link reads (its .dynsym decides what the
+#       executable exports): the host's on a Linux host of that arch, else one copied out of
+#       the Debian image where Docker may be used.  A target with neither is SKIPped. -----
+. "$BINATE_DIR/scripts/lib/linux-libc-sysroot.sh"
+X64_SYSROOT="$(linux_libc_sysroot x86_64 "$TMP/sysroot_x64")" || X64_SYSROOT=""
+AA64_SYSROOT="$(linux_libc_sysroot aarch64 "$TMP/sysroot_aa64")" || AA64_SYSROOT=""
+_no_libc="needs its libc.so.6: a Linux host of that arch, or Docker (a Linux CI lane, or"
+_no_libc="$_no_libc BINATE_E2E_DOCKER=1)"
+if [ -z "$X64_SYSROOT" ] && [ -z "$AA64_SYSROOT" ]; then
+    echo "SKIP: bnc --linker bnld — each Linux target $_no_libc"
+    exit 0
+fi
+
+# build_and_check <target-key> <expect-emachine> <expect-interp> <sysroot> -> sets $OUTBIN
 build_and_check() {
-    _key="$1"; _emachine="$2"; _interp="$3"
+    _key="$1"; _emachine="$2"; _interp="$3"; _sysroot="$4"
     _out="$TMP/tiny_$_key"
     _iface="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target "$_key")"
     _impl="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --target "$_key")"
-    if ! "$BNC" --backend native --target "$_key" --linker bnld -I "$_iface" -L "$_impl" \
+    if ! "$BNC" --backend native --target "$_key" --linker bnld --sysroot "$_sysroot" \
+            -I "$_iface" -L "$_impl" \
             --build-dir "$TMP" -o "$_out" "$TMP/tiny.bn" > "$TMP/link_$_key.log" 2>&1; then
         echo "FAIL: bnc --linker bnld failed for $_key" >&2
         cat "$TMP/link_$_key.log" >&2
@@ -86,43 +103,56 @@ build_and_check() {
     echo "PASS: $_key — bnc --linker bnld produced a dynamic ELF (interp + libc.so.6), no clang/ld"
 }
 
-build_and_check x86_64-linux 62 "/lib64/ld-linux-x86-64.so.2"
-X64BIN="$OUTBIN"
-build_and_check aarch64-linux 183 "/lib/ld-linux-aarch64.so.1"
-AA64BIN="$OUTBIN"
+X64BIN=""
+AA64BIN=""
+if [ -n "$X64_SYSROOT" ]; then
+    build_and_check x86_64-linux 62 "/lib64/ld-linux-x86-64.so.2" "$X64_SYSROOT"
+    X64BIN="$OUTBIN"
+else
+    echo "SKIP: x86_64-linux $_no_libc"
+fi
+if [ -n "$AA64_SYSROOT" ]; then
+    build_and_check aarch64-linux 183 "/lib/ld-linux-aarch64.so.1" "$AA64_SYSROOT"
+    AA64BIN="$OUTBIN"
+else
+    echo "SKIP: aarch64-linux $_no_libc"
+fi
 
 # ----- --link-after-objs: an extra object must flow through the bnld path into the link.
 #       Build bnas, assemble a data-only object, relink tiny.bn (x86_64-linux) with
 #       --link-after-objs, and check the result is still a valid dynamic ELF — proving the
 #       extra object linked in (bnld classifies it as an object, not a shared library). -----
-BNAS="$TMP/bnas"
-if ! "$BINATE_DIR/scripts/build-bnas.sh" -o "$BNAS" > "$TMP/build_bnas.log" 2>&1; then
-    echo "FAIL: could not build bnas" >&2; cat "$TMP/build_bnas.log" >&2; exit 1
-fi
-cat > "$TMP/extra.s" <<'AS'
+if [ -n "$X64_SYSROOT" ]; then
+    BNAS="$TMP/bnas"
+    if ! "$BINATE_DIR/scripts/build-bnas.sh" -o "$BNAS" > "$TMP/build_bnas.log" 2>&1; then
+        echo "FAIL: could not build bnas" >&2; cat "$TMP/build_bnas.log" >&2; exit 1
+    fi
+    cat > "$TMP/extra.s" <<'AS'
 .arch x64
 .section data
 .global bnld_extra_datum
 bnld_extra_datum:
 	.ascii "extra\0"
 AS
-if ! "$BNAS" -arch x64 -o "$TMP/extra.o" "$TMP/extra.s" > "$TMP/extra.asm.log" 2>&1; then
-    echo "FAIL: bnas could not assemble the extra object" >&2; cat "$TMP/extra.asm.log" >&2; exit 1
+    if ! "$BNAS" -arch x64 -o "$TMP/extra.o" "$TMP/extra.s" > "$TMP/extra.asm.log" 2>&1; then
+        echo "FAIL: bnas could not assemble the extra object" >&2; cat "$TMP/extra.asm.log" >&2; exit 1
+    fi
+    _lao_iface="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target x86_64-linux)"
+    _lao_impl="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
+    if ! "$BNC" --backend native --target x86_64-linux --linker bnld --sysroot "$X64_SYSROOT" \
+            --link-after-objs "$TMP/extra.o" \
+            -I "$_lao_iface" -L "$_lao_impl" --build-dir "$TMP" -o "$TMP/tiny_lao" "$TMP/tiny.bn" \
+            > "$TMP/lao.log" 2>&1; then
+        echo "FAIL: bnc --linker bnld --link-after-objs failed" >&2; cat "$TMP/lao.log" >&2; exit 1
+    fi
+    if [ "$(od -An -tx1 -N4 "$TMP/tiny_lao" | tr -d ' \n')" != "7f454c46" ]; then
+        echo "FAIL: --link-after-objs output is not an ELF file" >&2; exit 1
+    fi
+    if ! grep -q "libc.so.6" "$TMP/tiny_lao"; then
+        echo "FAIL: --link-after-objs output does not name libc.so.6" >&2; exit 1
+    fi
+    echo "PASS: x86_64-linux — bnc --linker bnld --link-after-objs linked an extra object into the image"
 fi
-_lao_iface="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target x86_64-linux)"
-_lao_impl="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
-if ! "$BNC" --backend native --target x86_64-linux --linker bnld --link-after-objs "$TMP/extra.o" \
-        -I "$_lao_iface" -L "$_lao_impl" --build-dir "$TMP" -o "$TMP/tiny_lao" "$TMP/tiny.bn" \
-        > "$TMP/lao.log" 2>&1; then
-    echo "FAIL: bnc --linker bnld --link-after-objs failed" >&2; cat "$TMP/lao.log" >&2; exit 1
-fi
-if [ "$(od -An -tx1 -N4 "$TMP/tiny_lao" | tr -d ' \n')" != "7f454c46" ]; then
-    echo "FAIL: --link-after-objs output is not an ELF file" >&2; exit 1
-fi
-if ! grep -q "libc.so.6" "$TMP/tiny_lao"; then
-    echo "FAIL: --link-after-objs output does not name libc.so.6" >&2; exit 1
-fi
-echo "PASS: x86_64-linux — bnc --linker bnld --link-after-objs linked an extra object into the image"
 
 # ----- run gating: native x86-64 Linux, else Docker (CI Linux or BINATE_E2E_DOCKER) -----
 DOCKER_OK=0
@@ -156,7 +186,7 @@ run_expect() {
     fi
 }
 
-run_expect "$X64BIN" linux/amd64 x86_64-linux
-run_expect "$AA64BIN" linux/arm64 aarch64-linux
+if [ -n "$X64BIN" ]; then run_expect "$X64BIN" linux/amd64 x86_64-linux; fi
+if [ -n "$AA64BIN" ]; then run_expect "$AA64BIN" linux/arm64 aarch64-linux; fi
 
 echo "ALL PASS: bnc --linker bnld (self-hosted final link, no clang/ld)"

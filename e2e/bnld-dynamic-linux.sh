@@ -11,8 +11,11 @@
 #              and exits 42 iff non-null: the data-import (.got + GLOB_DAT) path — the
 #              __c_global mechanism — plus `exit` (PLT), so also the mixed PLT+GOT case.
 #
-# This is the x86-64 sibling of bnld-dynamic-linux-aarch64.sh.  The build + link +
-# structure check run everywhere; the RUN happens NATIVELY on an x86-64 Linux host —
+# This is the x86-64 sibling of bnld-dynamic-linux-aarch64.sh.  The link reads the target's
+# libc.so.6, so linking needs an x86-64 one (scripts/lib/linux-libc-sysroot.sh): an x86-64
+# Linux host's own, else one copied out of the Debian image where Docker may be used (a Linux
+# CI lane, or BINATE_E2E_DOCKER=1); without either the whole script SKIPs (as on the macOS CI
+# lane).  The RUN happens NATIVELY on an x86-64 Linux host —
 # which is the standard CI Linux runner, so CI runs it with no Docker at all.  A
 # default local run on a non-x86-64 host SKIPs (Docker is heavyweight and not imposed);
 # BINATE_E2E_DOCKER=1, or a Linux CI lane, opts into a linux/amd64 container.
@@ -44,6 +47,16 @@ if ! "$BINATE_DIR/scripts/build-bnld.sh" -o "$BNLD" > "$TMP/build_bnld.log" 2>&1
     exit 1
 fi
 
+# ----- the target's libc.so.6, which a dynamic link reads (its .dynsym decides what the
+#       executable exports): the host's on an x86-64 Linux host, else one copied out of the
+#       Debian image where Docker may be used; SKIP without either. -----
+. "$BINATE_DIR/scripts/lib/linux-libc-sysroot.sh"
+if ! SYSROOT="$(linux_libc_sysroot x86_64 "$TMP/sysroot")"; then
+    echo "SKIP: bnld dynamic ELF linking (x86-64) needs an x86-64 libc.so.6 to read: an x86-64 Linux"
+    echo "      host, or Docker (a Linux CI lane, or BINATE_E2E_DOCKER=1)"
+    exit 0
+fi
+
 # ----- helper: assemble + dynamically link + structure-check a program -----
 # asm_link_dyn <name>: read a .s from stdin, assemble with bnas (-arch x64) and link
 # with `bnld -target linux-x64 -dynamic` to $TMP/<name>, then check the output is an
@@ -57,7 +70,7 @@ asm_link_dyn() {
         cat "$TMP/$_name.asm.log" >&2
         exit 1
     fi
-    if ! "$BNLD" -target linux-x64 -dynamic -o "$TMP/$_name" "$TMP/$_name.o" \
+    if ! "$BNLD" -target linux-x64 -dynamic --sysroot "$SYSROOT" -o "$TMP/$_name" "$TMP/$_name.o" \
             > "$TMP/$_name.link.log" 2>&1; then
         echo "FAIL: bnld could not dynamically link $_name" >&2
         cat "$TMP/$_name.link.log" >&2
@@ -251,7 +264,7 @@ EOF
         cat "$TMP/ctors_start.asm.log" >&2
         exit 1
     fi
-    if ! "$BNLD" -target linux-x64 -dynamic -o "$TMP/ctors" "$TMP/ctors_start.o" "$TMP/ctors.o" \
+    if ! "$BNLD" -target linux-x64 -dynamic --sysroot "$SYSROOT" -o "$TMP/ctors" "$TMP/ctors_start.o" "$TMP/ctors.o" \
             "$TMP/ctors101.o" > "$TMP/ctors.link.log" 2>&1; then
         echo "FAIL: bnld could not dynamically link ctors" >&2
         cat "$TMP/ctors.link.log" >&2
@@ -284,7 +297,7 @@ EOF
             exit 1
         fi
     done
-    if ! "$BNLD" -target linux-x64 -dynamic -o "$TMP/comm" "$TMP/ctors_start.o" "$TMP/comm.o" \
+    if ! "$BNLD" -target linux-x64 -dynamic --sysroot "$SYSROOT" -o "$TMP/comm" "$TMP/ctors_start.o" "$TMP/comm.o" \
             "$TMP/comm2.o" > "$TMP/comm.link.log" 2>&1; then
         echo "FAIL: bnld could not dynamically link comm (common symbols)" >&2
         cat "$TMP/comm.link.log" >&2
@@ -311,7 +324,7 @@ EOF
         cat "$TMP/optc.cc.log" >&2
         exit 1
     fi
-    if ! "$BNLD" -target linux-x64 -dynamic -o "$TMP/optc" "$TMP/ctors_start.o" "$TMP/optc.o" \
+    if ! "$BNLD" -target linux-x64 -dynamic --sysroot "$SYSROOT" -o "$TMP/optc" "$TMP/ctors_start.o" "$TMP/optc.o" \
             > "$TMP/optc.link.log" 2>&1; then
         echo "FAIL: bnld could not dynamically link optc" >&2
         cat "$TMP/optc.link.log" >&2
@@ -440,7 +453,7 @@ if [ "$CAN_RUN" = 1 ]; then
         docker rm "$_cid" > /dev/null 2>&1 || true
     fi
     if [ "$_libm_ok" = 1 ]; then
-        if ! "$BNLD" -target linux-x64 -dynamic -L "$LIBM_DIR" -lm -o "$TMP/exit42lm" "$TMP/exit42.o" \
+        if ! "$BNLD" -target linux-x64 -dynamic --sysroot "$SYSROOT" -L "$LIBM_DIR" -lm -o "$TMP/exit42lm" "$TMP/exit42.o" \
                 > "$TMP/exit42lm.link.log" 2>&1; then
             echo "FAIL: bnld could not link exit42 with -lm" >&2
             cat "$TMP/exit42lm.link.log" >&2

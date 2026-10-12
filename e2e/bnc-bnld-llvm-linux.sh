@@ -13,8 +13,11 @@
 #
 # The program allocates a managed slice, fills and sums it (make_slice -> malloc, bounds
 # checks, refcount), and exits 42 via os.Exit (libc exit).  Both linux-x64 and
-# linux-aarch64 are built + structure-checked (host-independent: clang cross-emits the ELF
-# object, bnld links it).  The RUN needs the target's loader: x86-64 runs natively on an
+# linux-aarch64 are built + structure-checked (clang cross-emits the ELF object, bnld links
+# it) where the target's libc.so.6, which the link reads, is at hand
+# (scripts/lib/linux-libc-sysroot.sh: a Linux host of that arch, or Docker on a Linux CI
+# lane or with BINATE_E2E_DOCKER=1); a target without one SKIPs.  The RUN needs the
+# target's loader: x86-64 runs natively on an
 # x86-64 Linux host, else via Docker on a Linux CI lane or an explicit BINATE_E2E_DOCKER=1;
 # aarch64 runs via Docker.  Exit 0 on pass (incl. run-skipped); non-zero on any failure.
 set -u
@@ -55,14 +58,27 @@ func main() {
 }
 BN
 
-# build_and_check <target-key> <expect-interp> -> sets $OUTBIN
+# ----- each target's libc.so.6, which the link reads (its .dynsym decides what the
+#       executable exports): the host's on a Linux host of that arch, else one copied out of
+#       the Debian image where Docker may be used.  A target with neither is SKIPped. -----
+. "$BINATE_DIR/scripts/lib/linux-libc-sysroot.sh"
+X64_SYSROOT="$(linux_libc_sysroot x86_64 "$TMP/sysroot_x64")" || X64_SYSROOT=""
+AA64_SYSROOT="$(linux_libc_sysroot aarch64 "$TMP/sysroot_aa64")" || AA64_SYSROOT=""
+_no_libc="needs its libc.so.6: a Linux host of that arch, or Docker (a Linux CI lane, or"
+_no_libc="$_no_libc BINATE_E2E_DOCKER=1)"
+if [ -z "$X64_SYSROOT" ] && [ -z "$AA64_SYSROOT" ]; then
+    echo "SKIP: bnc (LLVM backend) --linker bnld — each Linux target $_no_libc"
+    exit 0
+fi
+
+# build_and_check <target-key> <expect-interp> <sysroot> -> sets $OUTBIN
 build_and_check() {
-    _key="$1"; _interp="$2"
+    _key="$1"; _interp="$2"; _sysroot="$3"
     _out="$TMP/tiny_$_key"
     _iface="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --target "$_key")"
     _impl="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
     # No --backend native: this is the DEFAULT (LLVM) backend + the bnld linker.
-    if ! "$BNC" --target "$_key" --linker bnld -I "$_iface" -L "$_impl" \
+    if ! "$BNC" --target "$_key" --linker bnld --sysroot "$_sysroot" -I "$_iface" -L "$_impl" \
             --build-dir "$TMP" -o "$_out" "$TMP/tiny.bn" > "$TMP/link_$_key.log" 2>&1; then
         echo "FAIL: bnc (LLVM backend) --linker bnld failed for $_key" >&2
         cat "$TMP/link_$_key.log" >&2
@@ -85,10 +101,20 @@ build_and_check() {
     echo "PASS: $_key — bnc (LLVM backend) --linker bnld produced a dynamic ELF (interp + libc.so.6), no ld"
 }
 
-build_and_check x86_64-linux "/lib64/ld-linux-x86-64.so.2"
-X64BIN="$OUTBIN"
-build_and_check aarch64-linux "/lib/ld-linux-aarch64.so.1"
-AA64BIN="$OUTBIN"
+X64BIN=""
+AA64BIN=""
+if [ -n "$X64_SYSROOT" ]; then
+    build_and_check x86_64-linux "/lib64/ld-linux-x86-64.so.2" "$X64_SYSROOT"
+    X64BIN="$OUTBIN"
+else
+    echo "SKIP: x86_64-linux $_no_libc"
+fi
+if [ -n "$AA64_SYSROOT" ]; then
+    build_and_check aarch64-linux "/lib/ld-linux-aarch64.so.1" "$AA64_SYSROOT"
+    AA64BIN="$OUTBIN"
+else
+    echo "SKIP: aarch64-linux $_no_libc"
+fi
 
 # ----- run gating: native x86-64 Linux, else Docker (CI Linux or BINATE_E2E_DOCKER) -----
 DOCKER_OK=0
@@ -122,7 +148,7 @@ run_expect() {
     fi
 }
 
-run_expect "$X64BIN" linux/amd64 x86_64-linux
-run_expect "$AA64BIN" linux/arm64 aarch64-linux
+if [ -n "$X64BIN" ]; then run_expect "$X64BIN" linux/amd64 x86_64-linux; fi
+if [ -n "$AA64BIN" ]; then run_expect "$AA64BIN" linux/arm64 aarch64-linux; fi
 
 echo "ALL PASS: bnc (LLVM backend) --linker bnld (self-hosted final link, no ld)"

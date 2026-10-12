@@ -2,393 +2,163 @@ package "pkg/binate/irgen"
 
 import "pkg/binate/irbuild"
 
-import "pkg/binate/irutil"
-
 import "pkg/binate/ir"
 
 import "pkg/binate/ast"
-import "pkg/binate/types"
 import "pkg/stdx/slices"
 
-// IR-gen for defer statements (§14.13) — fixed frame slots (proposal-defer §6).
-//
-// A function-entry pre-pass (registerFuncDefers) walks the body for lexical
-// defer statements — NOT descending into function literals, whose defers belong
-// to their own lifted function — and, for each, allocates in the ENTRY block an
-// armed bool (false-init) plus one typed operand slot per stored value
-// (nil-init'd; managed / managed-field-struct slots are registered in ctx.Vars
-// so the existing whole-function cleanup and the VM fault pads release them).
-// Executing the defer (genDeferStmt) evaluates its callee/receiver/arguments
-// EAGERLY, stores them call-ready into the slots (managed values acquired via
-// emitStoreManagedSlot), and sets armed.  Each function exit runs the pending
-// deferred calls LIFO, armed-gated, BEFORE the whole-function managed-local
-// release (emitPendingDefers, gen_defer_exit.bn).  A VM-isolated fault releases
-// the operand slots (the pads' emitDecForManagedLocals) but runs no deferred
-// calls — stmt.defer.no-abort.
-//
-// Operand coercion is split (see coerceArgEager / coerceArgDelivery in
-// gen_call.bn): the opcode/untyped-keyed coercions run EAGERLY at the store (a
-// value reloaded from a slot is OP_LOAD and could never re-trigger them); the
-// borrow/copy deliveries run at the call from the reloaded value — so a
-// managed→raw operand retains its pre-conversion managed value and delivers the
-// raw borrow at call time (stmt.defer).
+// Defer statements (§14.13).  A defer statement evaluates nothing: it schedules
+// its block on the innermost open scope — the block it appears in — and the
+// block is generated, as ordinary code, at every exit of that scope: its
+// fall-through end (closeScope) and each `break`, `continue` or `return` that
+// leaves it (emitLeaveScopes), after the scopes inside it have exited and before
+// its own variables are released, last scheduled first.  Which defer statements
+// have executed at an exit is known from the program text (no `goto`), so a
+// scope's list at an exit is exactly the defer statements before that exit: no
+// runtime flag or record is needed.  A deferred block is generated once per exit
+// edge of its scope; a closure site in it stays one site (gen_closure_site.bn).
 
-// Deferred-call shapes.
-const (
-	DEFER_DIRECT int = iota // free / package function: OP_CALL(sym, args)
-	DEFER_METHOD            // static method: OP_CALL(sym, recv :: args)
-	DEFER_IFACE             // interface method: OP_CALL_IFACE_METHOD(recv, args, idx)
-	DEFER_FUNCVAL           // function-value call: OP_CALL_FUNC_VALUE(fv, args)
-	DEFER_PANIC             // defer panic(msg): rt.Panic(msg) + unreachable
-)
-
-// Operand roles — how the stored value is produced at the defer site and
-// delivered at the call.
-const (
-	// OPROLE_ARG — an argument: coerceArgEager at store, coerceArgDelivery at call.
-	OPROLE_ARG int = iota
-	// OPROLE_RECEIVER — a static-method receiver: applyReceiverConversion at
-	// store, coerceArgDelivery at call; a managed receiver of a raw `*T` method
-	// (IsManagedToRaw) is stored managed and delivered as the borrow
-	// (deliverLoadedOp).
-	OPROLE_RECEIVER
-	// OPROLE_PASSTHRU — an iface receiver / func value: stored + loaded as-is.
-	OPROLE_PASSTHRU
-	// OPROLE_VARIADIC_PACK is the single trailing `*[]T` argument packed from
-	// individual trailing args (func.variadic.pack): packed EAGERLY at the defer
-	// site into a frame-lived backing array via emitVariadicTail, stored as the
-	// raw {data,len} header, loaded as-is at the call.  (A spread `xs...` operand
-	// is NOT this — it is an ordinary ARG bound to the `*[]T` param, so a managed
-	// @[]T spread rides the managed→raw retention path.)
-	OPROLE_VARIADIC_PACK
-)
-
-// DeferOperand is one eagerly-evaluated value retained for a deferred call.
-type DeferOperand struct {
-	Role     int
-	Slot     @ir.Instr // typed alloca in the entry block
-	SlotTyp  @types.Type // the stored value's type
-	ParamTyp @types.Type // the callee param type (delivery target); nil for PASSTHRU
-	// IsManagedToRaw: an @[]T / @T / @I / @func argument, or a method's @T
-	// receiver, bound to a raw *[]T / *T / *I / *func parameter, or an @T
-	// argument boxed into a raw *I (stmt.defer: the pre-conversion managed value
-	// is retained).  The managed value is stored (SlotTyp = the managed type);
-	// the raw borrow is derived when the call runs (emitDeferRun).
-	IsManagedToRaw bool
-	// ArgTyp is a managed-to-raw argument's own checker type, wrappers included.
-	// A retained @T is boxed into its raw interface parameter when the call runs,
-	// and the box reads the object's `readonly` and a name-less pointee's element
-	// types from it, which the IR type lacks (wrapAsIfaceValue).
-	ArgTyp @types.Type
-	// LoadThrough: the operand expression evaluates to a POINTER to the value
-	// stored — an interface-method call through a pointer to an interface value
-	// (`(&iv).M()`, `piv.M()`) auto-dereferences it, so the defer loads the
-	// interface value through the pointer when it executes, as it evaluates any
-	// other receiver then.
-	LoadThrough bool
-	// Managed: the slot holds a managed value (or a managed-field struct) and is
-	// registered in ctx.Vars, so emitDecForManagedLocals releases it after the
-	// deferred calls run (and the VM fault pads release it on an isolated fault).
-	Managed bool
-	// ElemTyp is the variadic element type for an OPROLE_VARIADIC_PACK operand.
-	ElemTyp @types.Type
-	// BackingSlot is the pre-allocated, entry-depth `[N]ElemTyp` backing array
-	// for an OPROLE_VARIADIC_PACK operand (nil when N == 0).  Pre-allocating it at
-	// function-entry depth (and registering it in ctx.Vars when its elements are
-	// managed) is what keeps its elements alive until the deferred call runs and
-	// releases them once afterward — packing into a defer-site temp would free
-	// them at the defer statement's end instead.
-	BackingSlot @ir.Instr
-	// PackRetainSlots holds, per trailing element of an OPROLE_VARIADIC_PACK
-	// operand, the entry-depth managed slot that retains a managed element packed
-	// into a raw element type (`@T` into `...*T` or `...*any`, `@[]T` into
-	// `...*[]T`) — the pre-conversion managed value stmt.defer retains — or nil
-	// for an element that needs none.  The backing array holds only the raw
-	// borrow.
-	PackRetainSlots @[]@ir.Instr
+// PendingDefer is a defer statement scheduled on a scope: Stmt is the statement
+// (its Body, or the shorthand's call in X), VarLen the length of ctx.Vars at the
+// statement — the variables declared after it are live at the scope's exit but
+// not in the deferred block's scope.
+type PendingDefer struct {
+	Stmt   @ast.Stmt
+	VarLen int
 }
 
-// DeferSite is the per-lexical-defer record built by the entry pre-pass.
-type DeferSite struct {
-	Stmt      @ast.Stmt // identity key (matched by `same` at gen time)
-	ArmedSlot @ir.Instr // bool alloca in the entry block, false-init
-	Shape     int
-	Sym       @[]char // DIRECT / METHOD symbol
-	MethodIdx int // IFACE vtable slot
-	ResultTyp @types.Type // deferred call's result type (for discarded-result release)
-	RecvOp    @DeferOperand // METHOD/IFACE/FUNCVAL/PANIC first operand; nil for DIRECT
-	ArgOps    @[]@DeferOperand
-	// BorrowSlots are pre-allocated, entry-depth slots for the borrows inside the
-	// operands: a snapshot slot for each managed VALUE operand boxed into an
-	// interface argument (an implicit value-borrow into an iface/`*any` param) or
-	// into an interface-typed composite element within an operand, and a retain
-	// slot for each composite element within an operand that is a managed value
-	// borrowed as a raw one (allocNestedDeferBorrowSlots).  One per such borrow,
-	// in operand-evaluation order (receiver, fixed args, then variadic-pack
-	// elements; nested borrows before the operand's own); consumed via
-	// ctx.DeferBorrowSlots/Cursor at store time.  Like DeferOperand.BackingSlot, a
-	// defer-site temp would free the managed content at block exit, before the
-	// deferred call runs.
-	BorrowSlots @[]@ir.Instr
+// scheduleDefer schedules the defer statement s on the innermost open scope.
+func scheduleDefer(ctx @GenContext, s @ast.Stmt) {
+	if len(ctx.Scopes) == 0 {
+		panic("internal error: a defer statement outside any scope reached IR-gen")
+	}
+	var pd PendingDefer
+	pd.Stmt = s
+	pd.VarLen = len(ctx.Vars)
+	var top int = len(ctx.Scopes) - 1
+	ctx.Scopes[top].Defers = slices.Append[PendingDefer](ctx.Scopes[top].Defers, pd)
 }
 
-// registerFuncDefers is the entry pre-pass: it walks `body` for lexical defer
-// statements and builds a DeferSite (with entry-block slots) for each, appended
-// to ctx.Defers in lexical order.  Call after param setup, before genBlock.
-func registerFuncDefers(ctx @GenContext, entry @ir.Block, body @ast.Stmt) {
-	walkDefersStmt(ctx, entry, body)
-}
-
-// walkDefersStmt recurses the statement tree collecting STMT_DEFER, mirroring
-// genStmt's statement recursion.  It visits only STATEMENTS (block bodies, if
-// branches, loop bodies, switch/type-switch case bodies), never expressions —
-// so a defer inside a function literal (which lives in an expression) is not
-// reached here; that literal gets its own pre-pass when it is lowered.
-func walkDefersStmt(ctx @GenContext, entry @ir.Block, s @ast.Stmt) {
-	if s == nil { return }
-	if s.Kind == ast.STMT_DEFER {
-		buildDeferSite(ctx, entry, s)
-		return
-	}
-	for i := 0; i < len(s.Stmts); i++ {
-		walkDefersStmt(ctx, entry, s.Stmts[i])
-	}
-	if s.Body != nil { walkDefersStmt(ctx, entry, s.Body) }
-	if s.Else != nil { walkDefersStmt(ctx, entry, s.Else) }
-	if s.Init != nil { walkDefersStmt(ctx, entry, s.Init) }
-	if s.Post != nil { walkDefersStmt(ctx, entry, s.Post) }
-	for i := 0; i < len(s.Cases); i++ {
-		var cc @ast.CaseClause = s.Cases[i]
-		if cc == nil { continue }
-		for j := 0; j < len(cc.Body); j++ {
-			walkDefersStmt(ctx, entry, cc.Body[j])
-		}
-	}
-}
-
-// buildDeferSite classifies the deferred call, resolves its dispatch key and
-// operand/param types, allocates the armed flag + operand slots in the entry
-// block (nil-init'd, managed slots registered in ctx.Vars), and appends the
-// DeferSite to ctx.Defers.  It aborts loudly on a not-yet-supported shape
-// (variadic callee, generic-instantiation call, unresolved method) rather than
-// miscompiling.
-func buildDeferSite(ctx @GenContext, entry @ir.Block, stmt @ast.Stmt) {
-	var e @ast.Expr = stmt.X
-	var site @DeferSite = make(DeferSite)
-	site.Stmt = stmt
-	site.ArmedSlot = irbuild.EmitAlloc(entry, types.TypBool())
-	irbuild.EmitStore(entry, site.ArmedSlot, irbuild.EmitConstBool(entry, false))
-
-	var shape int = classifyDeferShape(ctx, e)
-	site.Shape = shape
-
-	if shape == DEFER_PANIC {
-		buildDeferPanic(ctx, entry, site, e)
-	} else if shape == DEFER_DIRECT {
-		buildDeferDirect(ctx, entry, site, e)
-	} else if shape == DEFER_METHOD {
-		buildDeferMethod(ctx, entry, site, e)
-	} else if shape == DEFER_IFACE {
-		buildDeferIface(ctx, entry, site, e)
-	} else {
-		buildDeferFuncVal(ctx, entry, site, e)
-	}
-	allocDeferLitSlots(ctx, entry, e)
-	ctx.Defers = slices.Append[@DeferSite](ctx.Defers, site)
-}
-
-// classifyDeferShape picks the deferred-call shape from CHECKER-resolved types
-// only.  It must NOT use the gen-time predicates (isMethodCallSel /
-// getSelectorType / isInterfaceMethodCall) — those consult ctx.Vars, which the
-// function-entry pre-pass has not populated yet (the body is not gen'd), so an
-// IDENT receiver would misclassify.  It aborts on shapes not yet handled by the
-// defer lowering (generic-instantiation calls).
-func classifyDeferShape(ctx @GenContext, e @ast.Expr) int {
-	if e == nil { panic("internal error: defer of nil call") }
-	// panic(...) — a call of the predeclared panic.
-	if e.X != nil && e.X.Kind == ast.EXPR_IDENT && irutil.Streq(e.X.Name, "panic") {
-		return DEFER_PANIC
-	}
-	// `g[T](...)` / `pkg.G[T](...)` — a generic-FUNCTION instantiation resolves to
-	// a generic decl; it is lowered as a direct call to the monomorphized symbol
-	// (buildDeferDirect resolves the name via ensureInstantiated).  An
-	// INSTANTIATE_OR_INDEX that is instead a func-value INDEX (`fns[i]()`) has a
-	// func-value type and dispatches indirectly.
-	if e.X != nil && e.X.Kind == ast.EXPR_INSTANTIATE_OR_INDEX {
-		var gd @ast.Decl
-		gd, _ = instantiationHead(ctx, e.X)
-		if gd != nil { return DEFER_DIRECT }
-		var gt @types.Type = deferCalleeType(ctx, e.X)
-		if gt != nil && (gt.Kind == types.TYP_FUNC_VALUE || gt.Kind == types.TYP_MANAGED_FUNC_VALUE) {
-			return DEFER_FUNCVAL
-		}
-		panic("internal error: defer of an unresolved instantiate/index call")
-	}
-	if e.X != nil && e.X.Kind == ast.EXPR_SELECTOR {
-		// obj.something(...): distinguish a func-value FIELD, an interface
-		// method, and a static method — from the receiver's checker type.  A
-		// package-qualified callee (`pkg.F`) has a receiver expr with no value
-		// type (it names a package), so recvTyp is nil → a direct call.
-		var recvTyp @types.Type = deferCalleeType(ctx, e.X.X)
-		if recvTyp == nil {
-			// pkg.F / pkg.funcValueVar / a method expression T.M — a direct call
-			// unless the whole callee resolves to a func value (pkg-level @func var).
-			// A method expression has a function-value TYPE but names the method
-			// itself (funcRefName: `T.M`, an alias of T, `Box[int].M`), so it is a
-			// direct call with the receiver as its first argument — evaluated as a
-			// func value it reaches no lowering.
-			if lookupFuncExists(ctx.Gc, funcRefName(ctx, e.X)) {
-				return DEFER_DIRECT
-			}
-			var ct @types.Type = deferCalleeType(ctx, e.X)
-			if ct != nil && (ct.Kind == types.TYP_FUNC_VALUE || ct.Kind == types.TYP_MANAGED_FUNC_VALUE) {
-				return DEFER_FUNCVAL
-			}
-			return DEFER_DIRECT
-		}
-		// Interface-value receiver (or a pointer to one) → vtable dispatch.  Classified
-		// through aliases and `readonly` only, as isInterfaceMethodCall does: a named
-		// interface-value type (`type X @J`) calls its own methods, not J's.
-		if ifaceReceiverBase(types.ResolveAliasAndConst(deferCalleeOwnType(ctx, e.X.X))) {
-			return DEFER_IFACE
-		}
-		// A struct FIELD of func-value type — on the struct or through a pointer to
-		// it — is a function-value call, not a method: the checker types the
-		// selector as the field's function value, and leaves it untyped when it
-		// resolves a method instead (as it does for an importer's call of an
-		// exported method whose same-named field is hidden).
-		var ct @types.Type = deferCalleeType(ctx, e.X)
-		if ct != nil && (ct.Kind == types.TYP_FUNC_VALUE || ct.Kind == types.TYP_MANAGED_FUNC_VALUE) {
-			return DEFER_FUNCVAL
-		}
-		return DEFER_METHOD
-	}
-	// Non-selector callee: a local/parameter/expr whose resolved type is a func
-	// value (`fv()`, `(func(){...})()`, `getFn()()`), else a direct call by name.
-	var ct @types.Type = deferCalleeType(ctx, e.X)
-	if ct != nil && (ct.Kind == types.TYP_FUNC_VALUE || ct.Kind == types.TYP_MANAGED_FUNC_VALUE) {
-		return DEFER_FUNCVAL
-	}
-	return DEFER_DIRECT
-}
-
-// ifaceReceiverBase reports whether a peeled receiver type is an interface value
-// or a pointer to one (the vtable-dispatch receiver shapes).
-func ifaceReceiverBase(rb @types.Type) bool {
-	if rb == nil { return false }
-	if rb.Kind == types.TYP_INTERFACE_VALUE || rb.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
-		return true
-	}
-	if (rb.Kind == types.TYP_POINTER || rb.Kind == types.TYP_MANAGED_PTR) && rb.Elem != nil {
-		var inner @types.Type = types.ResolveAliasAndConst(rb.Elem)
-		return inner != nil &&
-				(inner.Kind == types.TYP_INTERFACE_VALUE || inner.Kind == types.TYP_INTERFACE_VALUE_MANAGED)
+// hasPendingDefers reports whether any open scope has a deferred block scheduled.
+func hasPendingDefers(ctx @GenContext) bool {
+	for d := 0; d < len(ctx.Scopes); d++ {
+		if len(ctx.Scopes[d].Defers) > 0 { return true }
 	}
 	return false
 }
 
-// deferCalleeType returns the callee expression's resolved type via the checker
-// (StripWrappers), or nil.
-func deferCalleeType(ctx @GenContext, x @ast.Expr) @types.Type {
-	return types.StripWrappers(deferCalleeOwnType(ctx, x))
+// emitScopeDefers emits, into b, the deferred blocks scheduled on scope d, last
+// scheduled first — stopping if one ends the block (a deferred `panic`).
+// Returns the block flow continues in.
+func emitScopeDefers(ctx @GenContext, b @ir.Block, d int) @ir.Block {
+	var defers @[]PendingDefer = ctx.Scopes[d].Defers
+	for j := len(defers) - 1; j >= 0; j-- {
+		if blockIsTerminated(b) { return b }
+		b = emitDeferredBlock(ctx, b, d, defers[j])
+	}
+	return b
 }
 
-// deferSlotType is IR-gen's type for the value x that a defer operand slot holds.
-// The slots are allocated at function entry, before x is generated, so x's
-// checker type is mapped to IR-gen's (an instantiated struct's mangled name, an
-// imported or opaque type's qualified name), as a receiver's is; typed with the
-// checker's type, a slot of a generic instance or opaque type would name a
-// struct and a destructor no module defines.
-func deferSlotType(ctx @GenContext, x @ast.Expr) @types.Type {
-	return irTypeFromChecker(ctx.Gc, ir.StripConstForIR(deferCalleeOwnType(ctx, x)))
-}
-
-// deferCalleeOwnType is x's checker type with no wrapper peeled, for a decision
-// that must see a named type (deferCalleeType peels it).
-func deferCalleeOwnType(ctx @GenContext, x @ast.Expr) @types.Type {
-	if x == nil || ctx.Checker == nil || x.ResolvedTypeID == 0 { return nil }
-	return ctx.Checker.ExprType(x.ResolvedTypeID)
-}
-
-// deferResultTyp collapses a callee's result-type list to the single result
-// type a call op carries (void / scalar / multi-return struct).
-func deferResultTyp(results @[]@types.Type, mrt @types.Type) @types.Type {
-	if len(results) == 0 { return types.TypVoid() }
-	if len(results) == 1 { return results[0] }
-	if mrt != nil { return mrt }
-	return irutil.MakeMultiReturnStructType(results)
-}
-
-// newDeferArgOp classifies the argument argExpr against paramTyp, allocates its
-// entry slot, registers it for cleanup if managed, and returns the operand.
-func newDeferArgOp(ctx @GenContext, entry @ir.Block, argExpr @ast.Expr,
-		paramTyp @types.Type) @DeferOperand {
-	var op @DeferOperand = make(DeferOperand)
-	op.Role = OPROLE_ARG
-	op.ParamTyp = paramTyp
-	if isManagedToRawBinding(deferCalleeOwnType(ctx, argExpr), paramTyp) {
-		// A managed argument to a raw parameter: retain the pre-conversion
-		// managed value; deliver the raw borrow at the call.
-		op.IsManagedToRaw = true
-		op.ArgTyp = deferCalleeOwnType(ctx, argExpr)
-		op.SlotTyp = deferSlotType(ctx, argExpr)
+// emitDeferredBlock generates pd, scheduled on scope d, at an exit of that scope.
+// The scopes inside d have exited — their deferred blocks ran and their variables
+// were released — so they are out of view.  The variables d declared after the
+// defer statement are live (a VM fault in the deferred code releases them) but
+// not in the deferred block's scope, so they stay in ctx.Vars under an
+// unspellable name (as `.typeswitch.scrutinee`), which no lookup finds.  A
+// `break` / `continue` cannot leave a deferred block (stmt.defer.block, enforced
+// by the checker), so the jump targets are cleared.  Returns the block flow
+// continues in.
+func emitDeferredBlock(ctx @GenContext, b @ir.Block, d int, pd PendingDefer) @ir.Block {
+	if len(ctx.Temps) != 0 {
+		panic("internal error: a deferred block generated with statement temporaries pending")
+	}
+	var savedVars @[]VarSlot = ctx.Vars
+	var savedScopes @[]ScopeRec = ctx.Scopes
+	var savedBreak @ir.Block = ctx.BreakTo
+	var savedContinue @ir.Block = ctx.ContinueTo
+	var end int = len(savedVars)
+	if d + 1 < len(savedScopes) {
+		end = savedScopes[d + 1].VarStart
+	}
+	var view @[]VarSlot = make_slice(VarSlot, end)
+	for i := 0; i < end; i++ {
+		view[i] = savedVars[i]
+		if i >= pd.VarLen {
+			view[i].Name = ".defer.later"
+		}
+	}
+	ctx.Vars = view
+	ctx.Scopes = savedScopes[:d + 1]
+	ctx.BreakTo = nil
+	ctx.ContinueTo = nil
+	ctx.CurBlock = b
+	if pd.Stmt.Body != nil {
+		b = genBlock(ctx, b, pd.Stmt.Body)
 	} else {
-		// Stored call-ready in the param's type (coerceArgEager yields a
-		// param-typed value).
-		op.SlotTyp = paramTyp
+		b = genBlock(ctx, b, deferCallBlock(pd.Stmt))
 	}
-	allocDeferOperand(ctx, entry, op)
-	return op
+	ctx.Vars = savedVars
+	ctx.Scopes = savedScopes
+	ctx.BreakTo = savedBreak
+	ctx.ContinueTo = savedContinue
+	return b
 }
 
-// isManagedToRawBinding reports whether a value of type argTyp (its own checker
-// type, wrappers included) bound to a parameter (or variadic element) of type
-// paramTyp is a managed-to-raw borrow — `@[]T` to `*[]T`, `@T` to `*T`, `@T`
-// boxed into a raw `*I` or `*any`, `@I` to `*I` (or to a raw ancestor
-// interface), `@func` to `*func` — whose managed value a deferred call must
-// retain until it runs (stmt.defer).  A named type over a managed pointer or
-// slice binds to a raw pointer or slice as its underlying; boxed into an
-// interface, a named type over a managed pointer or an interface value is a
-// value source (iface.construct.named-pointer), boxed by its address rather
-// than borrowed from, so for the interface and function cases only aliases and
-// `readonly` are read through.
-func isManagedToRawBinding(argTyp @types.Type, paramTyp @types.Type) bool {
-	var pt @types.Type = types.StripWrappers(paramTyp)
-	if pt == nil || argTyp == nil { return false }
-	if pt.Kind == types.TYP_SLICE { return irutil.IsManagedSliceType(argTyp) }
-	if pt.Kind == types.TYP_POINTER { return irutil.IsManagedPtrType(argTyp) }
-	var at @types.Type = types.ResolveAliasAndConst(argTyp)
-	if pt.Kind == types.TYP_INTERFACE_VALUE {
-		return at.Kind == types.TYP_MANAGED_PTR || at.Kind == types.TYP_INTERFACE_VALUE_MANAGED
-	}
-	return pt.Kind == types.TYP_FUNC_VALUE && at.Kind == types.TYP_MANAGED_FUNC_VALUE
+// deferCallBlock is the block the shorthand `defer <call>` (s.X) stands for:
+// one expression statement — generated as a block, so a variable its call
+// declares (a raw-slice literal's backing) is released with the block.
+func deferCallBlock(s @ast.Stmt) @ast.Stmt {
+	var es @ast.Stmt = make(ast.Stmt)
+	es.Kind = ast.STMT_EXPR
+	es.Pos = s.Pos
+	es.X = s.X
+	var blk @ast.Stmt = make(ast.Stmt)
+	blk.Kind = ast.STMT_BLOCK
+	blk.Pos = s.Pos
+	blk.Stmts = slices.Append[@ast.Stmt](blk.Stmts, es)
+	return blk
 }
 
-// allocDeferOperand allocates op's entry-block slot, nil-inits it and registers
-// it in ctx.Vars if it holds a managed value / managed-field struct.
-func allocDeferOperand(ctx @GenContext, entry @ir.Block, op @DeferOperand) {
-	op.Slot = irbuild.EmitAlloc(entry, op.SlotTyp)
-	var st @types.Type = types.StripWrappers(op.SlotTyp)
-	op.Managed = irutil.IsManagedPtrType(st) || irutil.IsManagedSliceType(st) ||
-			irutil.IsManagedIfaceValueType(st) || irutil.IsManagedFuncValueType(st) || needsStructCopy(st)
-	if op.Managed {
-		// nil/zero-init at entry so a return taken before this defer executes
-		// sweeps a nil no-op slot (backends do not zero allocas), and register
-		// for the whole-function / fault-pad release.
-		irbuild.EmitStore(entry, op.Slot, irbuild.EmitConstNil(entry, op.SlotTyp))
-		defineDeferSlotVar(ctx, op.Slot, op.SlotTyp)
+// emitReturnThroughDefers ends a `return` whose function has deferred blocks
+// pending (stmt.defer.return): the results — already evaluated, and each managed
+// one holding the reference the caller receives — are stored in frame slots, so
+// the deferred code's own statements, which reclaim the VM stack a result may
+// still sit on, cannot clobber them, and registered in ctx.LiveResults, so a VM
+// fault in that code releases them; the return statement's remaining
+// temporaries are released (no VM stack restore); every open scope exits,
+// innermost first (its deferred blocks, then its variables); the results are
+// reloaded and returned.  Emits into b; returns the final block.
+func emitReturnThroughDefers(ctx @GenContext, b @ir.Block, vals @[]@ir.Instr) @ir.Block {
+	var slots @[]@ir.Instr
+	for i := 0; i < len(vals); i++ {
+		var slot @ir.Instr = irbuild.EmitAlloc(b, vals[i].Typ)
+		irbuild.EmitStore(b, slot, vals[i])
+		slots = slices.Append[@ir.Instr](slots, slot)
+		// A result returned as a raw borrow of a managed value took no
+		// reference, so there is none for a fault to release.
+		if i < len(ctx.Func.Results) && isRawBorrowResult(vals[i], ctx.Func.Results[i]) {
+			continue
+		}
+		var vs VarSlot
+		vs.Name = ".return"
+		vs.Ptr = slot
+		vs.Typ = vals[i].Typ
+		ctx.LiveResults = slices.Append[VarSlot](ctx.LiveResults, vs)
 	}
-}
-
-// defineDeferSlotVar registers a defer operand slot as an anonymous
-// function-scope managed local, so emitDecForManagedLocals (return + fall-off +
-// VM fault pads) releases it.  Appended at entry depth — below any block's
-// savedVarLen — so block-exit truncation never drops it.
-func defineDeferSlotVar(ctx @GenContext, slot @ir.Instr, typ @types.Type) {
-	var vs VarSlot
-	vs.Name = "<defer-operand>"
-	vs.Ptr = slot
-	vs.Typ = typ
-	vs.IsParam = false
-	ctx.Vars = slices.Append[VarSlot](ctx.Vars, vs)
+	b = emitTempCleanupForReturn(ctx, b)
+	forgetAddressedLits(ctx)
+	b = emitLeaveScopes(ctx, b, 0, 0)
+	var noLive @[]VarSlot
+	ctx.LiveResults = noLive
+	if blockIsTerminated(b) { return b }
+	var out @[]@ir.Instr
+	for i := 0; i < len(vals); i++ {
+		out = slices.Append[@ir.Instr](out, irbuild.EmitLoad(b, slots[i], vals[i].Typ))
+	}
+	if ctx.Func.MultiReturnType != nil {
+		irbuild.EmitReturnTyped(b, out, ctx.Func.MultiReturnType)
+	} else {
+		irbuild.EmitReturn(b, out)
+	}
+	return b
 }

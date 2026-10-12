@@ -337,6 +337,54 @@ EOF
         exit 1
     fi
     echo "PASS: optc links to a dynamically-linked aarch64 ELF (its common optind exported)"
+
+    # ----- optd / mymalloc: program definitions (not commons) that libc also defines are
+    #       exported, so libc binds to them.  optd.c is optc.c built with -fno-common, its
+    #       `optind` an ordinary definition (exits 42 after getopt).  mymalloc.c defines malloc,
+    #       free, calloc and realloc over its own arena; libc's strdup, calling malloc, must
+    #       get memory from that arena (exits 42 if it does). -----
+    cp "$TMP/optc.c" "$TMP/optd.c"
+    cat > "$TMP/mymalloc.c" <<'EOF'
+typedef unsigned long size_t;
+static char arena[1 << 20] __attribute__((aligned(16)));
+static size_t used;
+void *malloc(size_t n) {
+	char *p = arena + used;
+	used += 16 + ((n + 15) & ~(size_t)15);
+	*(size_t *)p = n;
+	return p + 16;
+}
+void free(void *p) { (void)p; }
+void *calloc(size_t a, size_t b) { return malloc(a * b); }
+void *realloc(void *p, size_t n) {
+	char *q = malloc(n);
+	if (p) {
+		size_t o = *(size_t *)((char *)p - 16);
+		for (size_t i = 0; i < o && i < n; i++) q[i] = ((char *)p)[i];
+	}
+	return q;
+}
+char *strdup(const char *);
+int main(void) {
+	char *s = strdup("hello");
+	return (s >= arena && s < arena + sizeof arena && s[0] == 'h' && s[4] == 'o') ? 42 : 1;
+}
+EOF
+    for _c in optd mymalloc; do
+        if ! clang -c -O0 -fno-pic -fno-common -target aarch64-linux-gnu -o "$TMP/$_c.o" "$TMP/$_c.c" \
+                > "$TMP/$_c.cc.log" 2>&1; then
+            echo "FAIL: clang could not compile $_c.c" >&2
+            cat "$TMP/$_c.cc.log" >&2
+            exit 1
+        fi
+        if ! "$BNLD" -target linux-aarch64 -dynamic --sysroot "$SYSROOT" -o "$TMP/$_c" "$TMP/ctors_start.o" \
+                "$TMP/$_c.o" > "$TMP/$_c.link.log" 2>&1; then
+            echo "FAIL: bnld could not dynamically link $_c" >&2
+            cat "$TMP/$_c.link.log" >&2
+            exit 1
+        fi
+    done
+    echo "PASS: optd and mymalloc link to dynamic aarch64 ELF (their libc-named definitions exported)"
 else
     echo "SKIP: ctors needs clang to compile its C object"
 fi
@@ -531,6 +579,26 @@ if [ "$HAVE_CLANG" = 1 ]; then
         echo "PASS: optc ran — libc's getopt updated the exported common optind"
     else
         echo "SKIP: optc not run here ($_skip_note) — build+structure verified"
+    fi
+    run_dyn optd
+    if [ "$RAN" = 1 ]; then
+        if [ "$CODE" != 42 ]; then
+            echo "FAIL: optd expected exit 42 (getopt and main share the defined optind), got $CODE" >&2
+            exit 1
+        fi
+        echo "PASS: optd ran — libc's getopt updated the program's exported optind definition"
+    else
+        echo "SKIP: optd not run here ($_skip_note) — build+structure verified"
+    fi
+    run_dyn mymalloc
+    if [ "$RAN" = 1 ]; then
+        if [ "$CODE" != 42 ]; then
+            echo "FAIL: mymalloc expected exit 42 (strdup used the program's malloc), got $CODE" >&2
+            exit 1
+        fi
+        echo "PASS: mymalloc ran — libc's strdup allocated through the program's exported malloc"
+    else
+        echo "SKIP: mymalloc not run here ($_skip_note) — build+structure verified"
     fi
 fi
 

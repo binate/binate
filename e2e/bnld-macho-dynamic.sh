@@ -19,6 +19,10 @@
 #   * weakabs — GOT-loads a WEAK, genuinely-absent import and exits 42 iff it bound to 0:
 #     the weak-import path (BIND_SYMBOL_FLAGS_WEAK_IMPORT / N_WEAK_REF), which dyld binds
 #     to 0 rather than aborting the load as it would for an absent strong import.
+#   * ctors  — a clang C object (SKIP without clang) with two prioritized constructors and
+#     a destructor, exiting 42 iff the constructors ran in order: __mod_init_func kept as
+#     such in __DATA, so dyld runs it, and ___dso_handle (the destructor's __cxa_atexit
+#     argument) defined as the image's Mach-O header.
 #
 # Static Mach-O does not run on macOS arm64 (the kernel mandates dyld), so this is the
 # path to a bnld-linked binary that runs on this platform.  The build + link +
@@ -206,6 +210,40 @@ Lzero:
 EOF
 echo "PASS: weakabs links to a dynamically-linked arm64 Mach-O (weak import: _bnld_absent_weak_xyz)"
 
+# ----- ctors: C constructors and a destructor run.  clang compiles a C object with a
+#       priority-101 constructor, a default-priority one that prints, a destructor that prints,
+#       and a main returning 42 only if both constructors ran, in priority order.  clang puts
+#       the constructors (and, for the destructor, an initializer that registers it with
+#       __cxa_atexit, naming ___dso_handle) in __mod_init_func; bnld keeps it as such in
+#       __DATA, so dyld runs it, and defines ___dso_handle.  Needs clang (SKIP without it). -----
+HAVE_CLANG=0
+if command -v clang > /dev/null 2>&1; then HAVE_CLANG=1; fi
+if [ "$HAVE_CLANG" = 1 ]; then
+    cat > "$TMP/ctors.c" <<'EOF'
+int puts(const char *);
+int order = 0;
+__attribute__((constructor)) static void second(void) { order = order * 10 + 2; puts("ctor"); }
+__attribute__((constructor(101))) static void first(void) { order = order * 10 + 1; }
+__attribute__((destructor)) static void last(void) { puts("dtor"); }
+int main(void) { return order == 12 ? 42 : order; }
+EOF
+    if ! clang -c -O0 -target arm64-apple-macos11 -o "$TMP/ctors.o" "$TMP/ctors.c" > "$TMP/ctors.cc.log" 2>&1; then
+        echo "FAIL: clang could not compile ctors.c" >&2
+        cat "$TMP/ctors.cc.log" >&2
+        exit 1
+    fi
+    if ! "$BNLD" -target macos-arm64 -dynamic -e _main -o "$TMP/ctors" "$TMP/ctors.o" \
+            > "$TMP/ctors.link.log" 2>&1; then
+        echo "FAIL: bnld could not dynamically link ctors" >&2
+        cat "$TMP/ctors.link.log" >&2
+        exit 1
+    fi
+    chmod +x "$TMP/ctors"
+    echo "PASS: ctors links to a dynamically-linked arm64 Mach-O (__mod_init_func, ___dso_handle)"
+else
+    echo "SKIP: ctors needs clang to compile its C object"
+fi
+
 # ----- run: natively on macOS arm64 (the macos-latest CI lane); SKIP elsewhere. -----
 # A Mach-O cannot run in a Linux container, so there is no Docker path: the run is
 # native-or-skip.
@@ -252,6 +290,19 @@ if [ "$CAN_RUN" = 1 ]; then
         exit 1
     fi
     echo "PASS: weakabs ran — an absent weak import bound to 0 (not a load failure) and exited 42"
+
+    if [ "$HAVE_CLANG" = 1 ]; then
+        _out="$("$TMP/ctors")"; _code=$?
+        if [ "$_code" != 42 ]; then
+            echo "FAIL: ctors expected exit 42 (both constructors, in priority order), got $_code" >&2
+            exit 1
+        fi
+        if [ "$_out" != "$(printf 'ctor\ndtor')" ]; then
+            echo "FAIL: ctors expected output 'ctor' then 'dtor', got '$_out'" >&2
+            exit 1
+        fi
+        echo "PASS: ctors ran — dyld ran the constructors in priority order, the destructor at exit"
+    fi
 else
     echo "SKIP: Mach-O binaries not run here ($_skip_note) — build+structure verified"
 fi

@@ -1,0 +1,217 @@
+package "pkg/binate/link"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/buf"
+import "pkg/builtins/testing"
+import "pkg/std/os"
+
+// A dynamic Mach-O link of initializer / terminator pointers and `___dso_handle`: the arrays
+// come out as typed __mod_init_func / __mod_term_func sections of __DATA, and `___dso_handle`
+// is the image's Mach-O header — an address in the image, so a pointer to it is rebased and a
+// difference against it is image-relative.  (machoLcOffset / bytesAtEqual are in
+// dynmacho_test.bn, writeMachoAsm in dynmacho_abs_test.bn, testTmpDir in link_test.bn, fail
+// in parse_elf_test.bn.)
+
+// machoSegmentCmd returns the offset of the LC_SEGMENT_64 named seg in the Mach-O file rd, or
+// -1.
+func machoSegmentCmd(rd *[]readonly uint8, seg *[]readonly char) int {
+	var ncmds int = cast(int, u32(rd, 16))
+	var off int = 32
+	for i := 0; i < ncmds; i++ {
+		if cast(int, u32(rd, off)) == MACHO_LC_SEGMENT_64 && bytesAtEqual(rd, off + 8, seg) &&
+				rd[off + 8 + len(seg)] == 0 {
+			return off
+		}
+		off = off + cast(int, u32(rd, off + 4))
+	}
+	return -1
+}
+
+// machoSectionHeader returns the offset of the section_64 named sect in the Mach-O file rd, or
+// -1.
+func machoSectionHeader(rd *[]readonly uint8, sect *[]readonly char) int {
+	var ncmds int = cast(int, u32(rd, 16))
+	var off int = 32
+	for i := 0; i < ncmds; i++ {
+		if cast(int, u32(rd, off)) == MACHO_LC_SEGMENT_64 {
+			for k := 0; k < cast(int, u32(rd, off + 64)); k++ {
+				var s int = off + 72 + k * 80
+				if bytesAtEqual(rd, s, sect) && rd[s + len(sect)] == 0 { return s }
+			}
+		}
+		off = off + cast(int, u32(rd, off + 4))
+	}
+	return -1
+}
+
+// adrpAddTarget decodes the address the ADRP at pc (word adrp) and the ADD after it (word add)
+// compute.
+func adrpAddTarget(pc uint64, adrp int64, add int64) uint64 {
+	var imm int64 = (((adrp >> 5) & 0x7ffff) << 2) | ((adrp >> 29) & 3)
+	if (imm & 0x100000) != 0 { imm = imm - 0x200000 }
+	var page int64 = (cast(int64, pc) & (0 - 0x1000)) + (imm << 12)
+	return cast(uint64, page + ((add >> 10) & 0xfff))
+}
+
+// machoRebaseOffsets returns the offsets in segment seg that the rebase stream of the Mach-O
+// file rd rebases, decoding the opcodes buildMachoRebase writes; an opcode it does not write
+// yields no offsets.
+func machoRebaseOffsets(rd *[]readonly uint8, seg int) @[]int {
+	var dl int = machoLcOffset(rd, MACHO_LC_DYLD_INFO_ONLY)
+	if dl < 0 { return make_slice(int, 0) }
+	var p int = cast(int, u32(rd, dl + 8))
+	var end int = p + cast(int, u32(rd, dl + 12))
+	var out @[]int = make_slice(int, end - p) // at most one site per opcode byte
+	var k int = 0
+	var cur int = -1
+	var off int = 0
+	for p < end {
+		var op int = cast(int, rd[p]) & 0xf0
+		var imm int = cast(int, rd[p]) & 0x0f
+		p = p + 1
+		if op == REBASE_OPCODE_DONE { return out[0:k] }
+		if op == REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB {
+			cur = imm
+			off = 0
+			var shift int = 0
+			var more bool = true
+			for more && p < end {
+				off = off | ((cast(int, rd[p]) & 0x7f) << cast(uint, shift))
+				more = (cast(int, rd[p]) & 0x80) != 0
+				shift = shift + 7
+				p = p + 1
+			}
+		} else if op == REBASE_OPCODE_DO_REBASE_IMM_TIMES {
+			for i := 0; i < imm; i++ {
+				if cur == seg {
+					out[k] = off
+					k = k + 1
+				}
+				off = off + 8
+			}
+		} else if op != REBASE_OPCODE_SET_TYPE_IMM {
+			return make_slice(int, 0)
+		}
+	}
+	return out[0:k]
+}
+
+// initObjects writes under dir the two objects of the init / fini link: initfunc.o, whose
+// `_start` takes `___dso_handle`'s address PC-relatively, with an initializer pointer to
+// `_ctor` (its __data typed S_MOD_INIT_FUNC_POINTERS, as clang types it) and a terminator
+// pointer to `_dtor` (its __DATA_CONST __const typed S_MOD_TERM_FUNC_POINTERS); and dso.o,
+// whose __data holds `.quad ___dso_handle` then `.quad _start - ___dso_handle`.  Returns
+// their paths, or an empty slice on failure.
+func initObjects(dir *[]readonly char) @[]@[]char {
+	var a @asm.Assembler = asm.New(8)
+	a.ObjFormat = asm.OBJ_MACHO
+	a.SetSection("text", -1)
+	a.DefineLabel("_start")
+	a.SetGlobal("_start")
+	a.SetGlobal("_exit")
+	a.SetGlobal("___dso_handle")
+	aarch64.Adrp(a, aarch64.X1, "___dso_handle")
+	aarch64.AddImmLabel(a, true, aarch64.X1, aarch64.X1, "___dso_handle")
+	aarch64.Mov(a, false, aarch64.X0, aarch64.Imm(42))
+	aarch64.Bl(a, "_exit")
+	a.DefineLabel("_ctor")
+	aarch64.Ret(a)
+	a.DefineLabel("_dtor")
+	aarch64.Ret(a)
+	a.SetSection("data", -1)
+	a.AddFixup("_ctor", asm.FIX_DATA_ABS64, 0, 8)
+	a.Zero(8)
+	a.SetSection("rodata_relro", -1)
+	a.AddFixup("_dtor", asm.FIX_DATA_ABS64, 0, 8)
+	a.Zero(8)
+	var paths @[]@[]char = make_slice(@[]char, 2)
+	paths[0] = writeMachoAsm(a, dir, "initfunc.o")
+	if len(paths[0]) == 0 { return make_slice(@[]char, 0) }
+	data, ok := readFile(paths[0])
+	if !ok { return make_slice(@[]char, 0) }
+	var ds int = machoSectionHeader(data, "__data")
+	var cs int = machoSectionHeader(data, "__const")
+	if ds < 0 || cs < 0 { return make_slice(@[]char, 0) }
+	writeU32(data, ds + 64, cast(int64, MACHO_S_MOD_INIT_FUNC_POINTERS))
+	writeU32(data, cs + 64, cast(int64, MACHO_S_MOD_TERM_FUNC_POINTERS))
+	if !writeBytes(paths[0], data) { return make_slice(@[]char, 0) }
+
+	var d @asm.Assembler = asm.New(8)
+	d.ObjFormat = asm.OBJ_MACHO
+	d.SetSection("data", -1)
+	d.SetGlobal("_start")
+	d.SetGlobal("___dso_handle")
+	d.AddFixup("___dso_handle", asm.FIX_DATA_ABS64, 0, 8)
+	d.Zero(8)
+	d.AddDiffFixup("_start", "___dso_handle", asm.FIX_DATA_ABS64, 0, 8)
+	d.Zero(8)
+	paths[1] = writeMachoAsm(d, dir, "dso.o")
+	if len(paths[1]) == 0 { return make_slice(@[]char, 0) }
+	return paths
+}
+
+// machoArrayRecord checks the section_64 record named sect in rd: in __DATA, of type stype,
+// one 8-byte entry holding a relocated (non-zero) pointer.
+func machoArrayRecord(rd *[]readonly uint8, sect *[]readonly char, stype int) @[]char {
+	var s int = machoSectionHeader(rd, sect)
+	if s < 0 || !bytesAtEqual(rd, s + 16, "__DATA") { return buf.Concat("no __DATA,", sect) }
+	if cast(int, u32(rd, s + 64)) != stype || u64(rd, s + 40) != 8 {
+		return buf.Concat(sect, " is not one entry of its type")
+	}
+	if u64(rd, cast(int, u32(rd, s + 48))) == 0 {
+		return buf.Concat(sect, "'s pointer is not relocated")
+	}
+	return ""
+}
+
+// The initializer and terminator pointers come out as __mod_init_func / __mod_term_func
+// records of __DATA, of their types; `___dso_handle` is the Mach-O header (the start of
+// __TEXT), reached PC-relatively, stored by a rebased pointer, and subtracted as an address
+// in the image.
+func TestLinkDynMachoInitFuncAndDsoHandle() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer os.RemoveAll(dir)
+	var paths @[]@[]char = initObjects(dir)
+	if len(paths) != 2 { return fail("cannot build the objects") }
+	var start uint64 = 0x100004000
+	var out @[]char = buf.Concat(dir, "/initfunc")
+	var err @[]readonly char = LinkDynMacho(paths, "_start", EM_AARCH64, start, out)
+	if len(err) != 0 { return fail(buf.Concat("LinkDynMacho failed: ", err)) }
+	exe, eok := readFile(out)
+	if !eok { return fail("cannot read the executable") }
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var rd *[]readonly uint8 = exe
+	var e @[]char = machoArrayRecord(rd, "__mod_init_func", MACHO_S_MOD_INIT_FUNC_POINTERS)
+	if len(e) == 0 { e = machoArrayRecord(rd, "__mod_term_func", MACHO_S_MOD_TERM_FUNC_POINTERS) }
+	if len(e) != 0 { return fail(e) }
+	var dseg int = machoSegmentCmd(rd, "__DATA")
+	if dseg < 0 || u32(rd, dseg + 4) != 72 + 2 * 80 || u32(rd, dseg + 64) != 2 {
+		return fail("__DATA does not carry the two section records")
+	}
+
+	var tseg int = machoSegmentCmd(rd, "__TEXT")
+	if tseg < 0 { return fail("no __TEXT segment") }
+	var header uint64 = cast(uint64, u64(rd, tseg + 24))
+	var textOff int = cast(int, start - header) // _start, the first text byte
+	if adrpAddTarget(start, u32(rd, textOff), u32(rd, textOff + 4)) != header {
+		return fail("___dso_handle is not the Mach-O header")
+	}
+	// dso.o's two words: the header (rebased) and _start - header.
+	var dataFile int = cast(int, u64(rd, dseg + 40))
+	var dataSize int = cast(int, u64(rd, dseg + 48))
+	var at int = -1
+	for i := 0; i + 16 <= dataSize && at < 0; i = i + 8 {
+		if cast(uint64, u64(rd, dataFile + i)) == header { at = i }
+	}
+	if at < 0 { return fail("no pointer to ___dso_handle in __DATA") }
+	if cast(uint64, u64(rd, dataFile + at + 8)) != start - header {
+		return fail("_start - ___dso_handle is not the offset of _start in the image")
+	}
+	var offs @[]int = machoRebaseOffsets(rd, 2)
+	var rebased bool = false
+	for i := 0; i < len(offs); i++ { rebased = rebased || offs[i] == at }
+	if !rebased { return fail("the pointer to ___dso_handle is not rebased") }
+	return ""
+}

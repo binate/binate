@@ -3,7 +3,9 @@
 # (run by perf/agg-copy-table.sh).
 # Per function of the D-table probe: copies (c) and zero-fills (z) of at least 400
 # bytes (Big, or its [100]int field once SROA splits a copy).
-# native aa64: a backward-branch loop whose body has `ldp q` is a copy, `stp xzr` a zero-fill.
+# native aa64: a backward-branch loop whose body has `ldp q` is a copy, `stp xzr` a zero-fill;
+# a copy that picks its direction at run time, as memmove does, is two such loops of which
+# one runs, so its descending one (`ldp q` stepping back) is not counted.
 # LLVM arm32, in the IR bnc emits (before clang, whose own inlining blurs the shapes):
 # a call to rt.MemCopy is a copy, to rt.MemZero a zero-fill.  A by-value argument's copy
 # into r0-r3 + stack is the C ABI's, made by LLVM's lowering of `byval`: not counted.
@@ -30,6 +32,7 @@ def native(lines):
         t = int(m.group(1), 16)
         if t >= a: continue
         body = [x for (b, x) in addr if t <= b <= a]
+        if any(x.startswith('ldp\tq') and ', #-' in x for x in body): continue
         if any(x.startswith('ldp\tq') for x in body): c += 1
         elif any(x.startswith('stp\txzr') for x in body): z += 1
     return c, z

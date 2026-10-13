@@ -42,9 +42,10 @@ import "pkg/binate/native/callconv"
 //     `*dst = *src`, whose store follows the load with at most the destination-address
 //     computation between.)  At most 16 bytes, for overlap's sake (see the rule below),
 //     unless the load's one use returns it as f's result (`return *p`): the caller's
-//     result buffer it is copied into overlaps nothing the callee can reach; or its one
-//     use is a whole store (`*dst = *src`) no larger than what the backend copies by
-//     loading all of it before storing any (AggLoadElidableWithin).
+//     result buffer it is copied into overlaps nothing the callee can reach; or, for a
+//     backend whose store copies such a load as memmove does, its one use is a whole
+//     store (`*dst = *src`), at any size (AggLoadElision's
+//     AGG_LOAD_IN_PLACE_OVERLAPPING).
 //
 //   S-extract: the source is anything, but EVERY use of `ld` is an `OP_EXTRACT` (a
 //     field-precise scalar read, never an overlapping full-width copy). The extracts
@@ -62,18 +63,17 @@ import "pkg/binate/native/callconv"
 // see lastAliasUseIndex), whose consumers read the source too and so extend the
 // range every shape checks.
 func AggLoadElidable(f @ir.Func, ld @ir.Instr) bool {
-	return AggLoadElidableWithin(f, ld, 16)
+	return AggLoadElision(f, ld, false) != AGG_LOAD_COPIED
 }
 
-// AggLoadElidableWithin is AggLoadElidable for a backend whose copy of an aggregate
-// of at most safeCopyBytes loads all of it before storing any (callconv's
-// SafeCopyBytes): a load from an unknown source whose one use is a whole store
-// (storedWhole) may then read its source in place up to that size, the store's
-// copy being right even when its destination overlaps the source.
-func AggLoadElidableWithin(f @ir.Func, ld @ir.Instr, safeCopyBytes int) bool {
-	if ld.Op != iropcode.OP_LOAD { return false }
-	if !callconv.IsAggregateTyp(ld.Typ) { return false }
-	if len(ld.Args) < 1 { return false }
+// AggLoadElision classifies ld by AggLoadElidable's rules: AGG_LOAD_COPIED,
+// AGG_LOAD_IN_PLACE, or — when overlapSafeStores, the backend copying a store of such
+// a load as memmove does — AGG_LOAD_IN_PLACE_OVERLAPPING for a load from an unknown
+// source whose one use is a whole store (storedWhole) of more than 16 bytes.
+func AggLoadElision(f @ir.Func, ld @ir.Instr, overlapSafeStores bool) int {
+	if ld.Op != iropcode.OP_LOAD { return AGG_LOAD_COPIED }
+	if !callconv.IsAggregateTyp(ld.Typ) { return AGG_LOAD_COPIED }
+	if len(ld.Args) < 1 { return AGG_LOAD_COPIED }
 
 	// Locate ld's block and index.
 	var blk @ir.Block = nil
@@ -87,16 +87,16 @@ func AggLoadElidableWithin(f @ir.Func, ld @ir.Instr, safeCopyBytes int) bool {
 			}
 		}
 	}
-	if blk == nil || li < 0 { return false }
+	if blk == nil || li < 0 { return AGG_LOAD_COPIED }
 
 	// Reject any use of ld outside its own block: the same-block use-range analysis
 	// below cannot reason about it.
-	if valueUsedInOtherBlock(f, blk, ld) { return false }
+	if valueUsedInOtherBlock(f, blk, ld) { return AGG_LOAD_COPIED }
 
 	// Every same-block read of ld's bytes — through ld or an alias of it — must be a
 	// read-only consumer after li; get the last.
 	var lastUse int = lastAliasUseIndex(f, blk, li, ld)
-	if lastUse < 0 { return false }
+	if lastUse < 0 { return AGG_LOAD_COPIED }
 
 	var src @ir.Instr = ld.Args[0]
 
@@ -106,7 +106,7 @@ func AggLoadElidableWithin(f @ir.Func, ld @ir.Instr, safeCopyBytes int) bool {
 	// the source alloca (a reassignment) is a barrier.
 	if src != nil && src.Op == iropcode.OP_ALLOC && !src.IsGlobalRef &&
 			allocaAddrConfinedToLoadStore(f, src) && !storeToDestStrictlyBetween(blk, li, lastUse, src) {
-		return true
+		return AGG_LOAD_IN_PLACE
 	}
 
 	// (S-extract) EVERY use of `ld` is an `OP_EXTRACT` — a field-precise scalar read,
@@ -123,7 +123,7 @@ func AggLoadElidableWithin(f @ir.Func, ld @ir.Instr, safeCopyBytes int) bool {
 	// size <= 16 cap would otherwise force to materialize (e.g. an 8-field record).
 	if allSameBlockUsesAreExtracts(blk, li, lastUse, ld) && ld.Typ != nil && ld.Typ.AlignOf() >= 4 &&
 			onlyPureOpsStrictlyBetween(blk, li, lastUse) {
-		return true
+		return AGG_LOAD_IN_PLACE
 	}
 
 	// (S-adjacent) source is anything else (a raw `*T` deref, a heap element, ...) —
@@ -148,26 +148,22 @@ func AggLoadElidableWithin(f @ir.Func, ld @ir.Instr, safeCopyBytes int) bool {
 	// Size cap: for an UNKNOWN source the alias defers the read to the consuming
 	// store, so `*dst = *src` where dst overlaps src must still read all of src before
 	// writing dst (spec stmt.assign.parallel is RHS-first).  The elided copy is
-	// overlap-safe only when it loads the whole aggregate before storing.
-	// emitStructCopy routes every native backend through an overlap-safe
-	// load-all-then-store helper (emitAggMemcpySafe{Aarch64,X64,Arm32}), which does so
-	// up to the backend's safeCopyBytes (callconv's SafeCopyBytes, at least 16 bytes)
-	// and interleaves loads and stores beyond it.  So for any other consumer the cap is
-	// 16 bytes, the least any backend copies that way (and the budget the LLVM backend
-	// asks with, AggLoadElidable); a larger load keeps materializing.  (S-alloca is
-	// unaffected: an alloca source never overlaps the store destination, so any size
-	// copies safely.)  A load returned whole as f's one result (returnedWhole) takes
-	// no cap: the return reads it into registers or copies it into the caller's result
-	// buffer, which overlaps no source.  A load whose one use is a whole store
-	// (storedWhole) takes the caller's cap instead, safeCopyBytes: the store's copy
-	// loads all of it before storing any, so overlap is harmless.
-	if ld.Typ != nil && ld.Typ.AlignOf() >= 4 &&
-			(ld.Typ.SizeOf() <= 16 || returnedWhole(f, blk, li, ld) ||
-					(ld.Typ.SizeOf() <= safeCopyBytes && storedWhole(blk, li, ld))) &&
-			onlyPureOpsStrictlyBetween(blk, li, lastUse) {
-		return true
+	// overlap-safe only when it reads the whole aggregate before writing any of it.
+	// Every backend copies an aggregate of up to 16 bytes by loading all of it before
+	// storing any (the native emitStructCopy through emitAggMemcpySafe{Aarch64,X64,
+	// Arm32}; the LLVM backend as one value), so the cap is 16 bytes, and a larger load
+	// keeps materializing.  (S-alloca is unaffected: an alloca source never overlaps the
+	// store destination, so any size copies safely.)  A load returned whole as f's one
+	// result (returnedWhole) takes no cap: the return reads it into registers or copies
+	// it into the caller's result buffer, which overlaps no source.  Nor does a load
+	// whose one use is a whole store (storedWhole) when the backend copies that store
+	// as memmove does (overlapSafeStores): AGG_LOAD_IN_PLACE_OVERLAPPING tells it to.
+	if ld.Typ == nil || ld.Typ.AlignOf() < 4 || !onlyPureOpsStrictlyBetween(blk, li, lastUse) {
+		return AGG_LOAD_COPIED
 	}
-	return false
+	if ld.Typ.SizeOf() <= 16 || returnedWhole(f, blk, li, ld) { return AGG_LOAD_IN_PLACE }
+	if overlapSafeStores && storedWhole(blk, li, ld) { return AGG_LOAD_IN_PLACE_OVERLAPPING }
+	return AGG_LOAD_COPIED
 }
 
 // returnedWhole reports whether load ld's only use (in blk, after index li, where it

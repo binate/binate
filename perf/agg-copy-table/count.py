@@ -7,7 +7,7 @@
 # a copy that picks its direction at run time, as memmove does, is two such loops of which
 # one runs, so its descending one (`ldp q` stepping back) is not counted.
 # LLVM arm32, in the IR bnc emits (before clang, whose own inlining blurs the shapes):
-# a call to rt.MemCopy is a copy, to rt.MemZero a zero-fill.  A by-value argument's copy
+# a call to rt.MemCopy or rt.MemMove is a copy, to rt.MemZero a zero-fill.  A by-value argument's copy
 # into r0-r3 + stack is the C ABI's, made by LLVM's lowering of `byval`: not counted.
 import re, sys
 FUNCS = ['sum', 'mk', 'sumDeref', 'viaLocal', 'direct', 'retDeref', 'retLocal', 'forward',
@@ -40,7 +40,8 @@ def arm(lines):
     def big(l):
         m = re.search(r'i(?:32|64) (\d+)\)\s*$', l)
         return m is not None and int(m.group(1)) >= 400
-    c = sum(1 for l in lines if 'rt1_7_MemCopy(' in l and big(l))
+    copy = ('rt1_7_MemCopy(', 'rt1_7_MemMove(')
+    c = sum(1 for l in lines if any(k in l for k in copy) and big(l))
     z = sum(1 for l in lines if 'rt1_7_MemZero(' in l and big(l))
     return c, z
 N = split(sys.argv[1], r'^[0-9a-f]+ <_bn_F1_4_main1_\d+_(\w+)>:$')

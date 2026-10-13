@@ -6,6 +6,7 @@ import "pkg/binate/ir"
 import "pkg/binate/native/callconv"
 import "pkg/binate/native/common"
 import "pkg/binate/types"
+import "pkg/binate/types/abi"
 
 // #[c_export] multi-value-RETURN C-ABI adaptation (aarch64).
 //
@@ -14,12 +15,17 @@ import "pkg/binate/types"
 // uses the platform C struct-return ABI, which diverges for two shapes (see
 // callconv.CMultiReturnTuple*): the C ABI SRET's a tuple the internal convention
 // register-returns, or it PACKS sub-word fields per eightbyte where the internal
-// convention spreads them.  Neither the in-place narrow-register prefix nor a
+// convention spreads them, or it returns an FP-HFA tuple's struct / array field in
+// FP registers where the internal convention uses GP.  Neither the in-place
+// narrow-register prefix nor a
 // tail-branch can serve — the adaptation happens AFTER the body returns — so the C
 // entry becomes a TRAMPOLINE: it calls the mangled body, then repacks the returned
 // tuple into the C form (store the field-per-register result to a buffer via
 // storeMultiReturnTupleFieldsAA64 — at the sret buffer the caller passed in X8, or
-// a local slot it then reloads as clang's coerced words).
+// a local slot it then reloads as clang's coerced words).  A tuple the C ABI
+// register-returns but the internal convention sret's (more than 8 GP words of
+// sub-word fields, e.g. nine int8s) gets the local slot as its sret buffer (X8)
+// instead, reloaded the same way.
 //
 // On aarch64 the C and internal ARGUMENT conventions coincide (the sret buffer
 // rides X8, a dedicated register, not a GP arg register, so it shifts nothing), so
@@ -29,8 +35,10 @@ import "pkg/binate/types"
 
 // cExportRetTrampolineKindAA64 classifies f's #[c_export] return adaptation:
 // callconv.CRET_ADAPT_NONE (alias / narrow-prefix entry suffices), _SRET (store the
-// register result into the caller's X8 buffer), or _COERCE (repack into clang's
-// eightbyte-packed words).  Only a multi-value return can diverge.
+// register result into the caller's X8 buffer), _COERCE (repack into clang's
+// eightbyte-packed words, or an FP-HFA tuple's members in D/S registers), or
+// _COERCE_FROM_SRET (the body sret's into a local slot, reloaded as _COERCE does).
+// Only a multi-value return can diverge.
 func cExportRetTrampolineKindAA64(f @ir.Func, cc callconv.CallConv) int {
 	if len(f.Results) <= 1 || f.MultiReturnType == nil {
 		return callconv.CRET_ADAPT_NONE
@@ -39,7 +47,7 @@ func cExportRetTrampolineKindAA64(f @ir.Func, cc callconv.CallConv) int {
 }
 
 // emitCExportRetTrampolineAA64 emits the C-entry trampoline for a #[c_export]
-// whose multi-value return needs C-ABI adaptation (kind 1 or 2 above).  It runs
+// whose multi-value return needs C-ABI adaptation (any kind but NONE above).  It runs
 // under the export alias label(s) (already defined by the caller) and ends with
 // RET; a native caller enters at `sym` (defined immediately after) and skips it.
 func emitCExportRetTrampolineAA64(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
@@ -52,16 +60,21 @@ func emitCExportRetTrampolineAA64(a @asm.Assembler, rm @common.RegMap, f @ir.Fun
 	for pi := 0; pi < len(f.Params); pi++ {
 		paramTypes[pi] = f.Params[pi].Typ
 	}
-	// Frame: [SP .. outBytes) = the body's outgoing stack args; [SP+saveOff .. +16)
-	// = the sret-buffer stash / coercion repack slot; [SP+outBytes+16 .. +16) = saved
-	// FP/LR (the frame record FP points at).  outBytes is 16-aligned
-	// (CallStackBytes), so every offset and frameSz stay 16-aligned — SP is
-	// 16-aligned at BL.  FP/LR are pushed first with a pre-indexed STP and popped
-	// last with a post-indexed LDP, whose ±16 offset is always encodable (an STP at
-	// SP+outBytes+16 would not be once outBytes passes the pair's 504-byte reach).
+	// Frame: [SP .. outBytes) = the body's outgoing stack args; [SP+saveOff ..
+	// +slotBytes) = the sret-buffer stash / coercion repack slot (32 bytes for an
+	// FP-HFA tuple of up to four doubles, else 16); then the saved FP/LR (the frame
+	// record FP points at).  outBytes is 16-aligned (CallStackBytes), so every offset
+	// and frameSz stay 16-aligned — SP is 16-aligned at BL.  FP/LR are pushed first
+	// with a pre-indexed STP and popped last with a post-indexed LDP, whose ±16
+	// offset is always encodable (an STP at SP+outBytes+16 would not be once
+	// outBytes passes the pair's 504-byte reach).
 	var outBytes int = cc.CallStackBytes(paramTypes)
 	var saveOff int = outBytes
-	var frameSz int = outBytes + 32
+	var slotBytes int = 16
+	if kind != callconv.CRET_ADAPT_SRET && t.SizeOf() > 16 {
+		slotBytes = 32
+	}
+	var frameSz int = outBytes + slotBytes + 16
 
 	aarch64.Stp(a, true, aarch64.FP, aarch64.LR, aarch64.MemPre(aarch64.SP, -16))
 	aarch64.Mov(a, true, aarch64.FP, aarch64.Reg(aarch64.SP))
@@ -89,6 +102,12 @@ func emitCExportRetTrampolineAA64(a @asm.Assembler, rm @common.RegMap, f @ir.Fun
 	// are canonicalized by the body's own parameter spill.
 	emitCExportRegNorm(a, rm, f)
 
+	// The body sret's a tuple C register-returns: its X8 buffer is the local slot.
+	// X8 is no argument register, so the arguments stay where they are.
+	if kind == callconv.CRET_ADAPT_COERCE_FROM_SRET {
+		aarch64.Add(a, true, aarch64.X8, aarch64.SP, aarch64.Imm(saveOff))
+	}
+
 	aarch64.Bl(a, sym)
 
 	if kind == callconv.CRET_ADAPT_SRET {
@@ -99,12 +118,23 @@ func emitCExportRetTrampolineAA64(a @asm.Assembler, rm @common.RegMap, f @ir.Fun
 		aarch64.Mov(a, true, aarch64.X0, aarch64.Reg(aarch64.X9))
 	} else {
 		// In-register coercion: store the field-per-register result into the local
-		// slot at its field offsets, then reload clang's eightbyte-packed words into
-		// the GP return registers (a non-HFA in-register tuple returns in X0..).
-		storeMultiReturnTupleFieldsAA64(a, t, aarch64.SP, saveOff, aarch64.X10)
-		var words int = (t.SizeOf() + 7) / 8
-		for w := 0; w < words; w++ {
-			aarch64.Ldr(a, true, argReg(w), aarch64.MemImm(aarch64.SP, saveOff + 8 * w))
+		// slot at its field offsets (COERCE_FROM_SRET: the body already wrote it
+		// there), then reload the C form — an FP-HFA tuple's members into
+		// consecutive D / S registers (AAPCS64 returns an HFA in v0..v3), any other
+		// tuple's eightbyte-packed words into X0...
+		if kind == callconv.CRET_ADAPT_COERCE {
+			storeMultiReturnTupleFieldsAA64(a, t, aarch64.SP, saveOff, aarch64.X10)
+		}
+		if callconv.CMultiReturnTupleReturnsHfaInFpRegs(t) {
+			n, memberBytes := abi.HfaClassify(t)
+			for m := 0; m < n; m++ {
+				hfaMemberLoadToFp(a, aarch64.D0 + m, aarch64.SP, saveOff + m * memberBytes, memberBytes)
+			}
+		} else {
+			var words int = (t.SizeOf() + 7) / 8
+			for w := 0; w < words; w++ {
+				aarch64.Ldr(a, true, argReg(w), aarch64.MemImm(aarch64.SP, saveOff + 8 * w))
+			}
 		}
 	}
 

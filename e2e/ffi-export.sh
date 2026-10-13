@@ -347,6 +347,45 @@ func MretMany(p0 int64, p1 int64, p2 int64, p3 int64, p4 int64, p5 int64, p6 int
 	return p0 + p7, p8 + p39, p71
 }
 
+// Tuples with a STRUCT field.  The C struct places the field at its raw offset, so an
+// entry that reinterprets the internal return must lay each field out there:
+// (int32, FfiPair) puts the pair at offset 4 (a register-return repack), and
+// (int32, FfiPair, int64) does the same inside a 24-byte C sret buffer.  An FP-HFA
+// tuple with a struct field — (FfiVec2d, float64), (float64, FfiVec2d), (FfiVec2,
+// float32), (float32, FfiVec2) — is returned by C in d0.. / s0.. on aarch64 and arm32
+// hard-float, while the internal convention returns the struct field in GP
+// registers, so the entry repacks the members into FP registers (x86-64: SSE
+// eightbytes or sret).
+type FfiPair struct { a int32; b int32 }
+
+#[c_export("mretip")]
+func Mretip() (int32, FfiPair) { return cast(int32, 7), FfiPair{a: 8, b: 9} }
+
+#[c_export("mretipl")]
+func Mretipl() (int32, FfiPair, int64) {
+	return cast(int32, 1), FfiPair{a: 2, b: 3}, cast(int64, 4)
+}
+
+#[c_export("mretvd")]
+func Mretvd() (FfiVec2d, float64) { return FfiVec2d{x: 1.5, y: 2.5}, cast(float64, 3.5) }
+
+#[c_export("mretdv")]
+func Mretdv() (float64, FfiVec2d) { return cast(float64, 4.5), FfiVec2d{x: 5.5, y: 6.5} }
+
+#[c_export("mretvf")]
+func Mretvf() (FfiVec2, float32) { return FfiVec2{x: 7.5, y: 8.5}, cast(float32, 9.5) }
+
+#[c_export("mretfv")]
+func Mretfv() (float32, FfiVec2) { return cast(float32, 10.5), FfiVec2{x: 11.5, y: 12.5} }
+
+// Nine int8s: a 9-byte C struct C returns in two eightbytes, but more GP words than
+// the internal return registers hold (9 > 8 on aarch64, > 3 on x86-64), so the body
+// returns it through a buffer the entry supplies and the entry reloads clang's form.
+#[c_export("mret9b")]
+func Mret9b() (int8, int8, int8, int8, int8, int8, int8, int8, int8) {
+	return 1, 2, 3, 4, 5, 6, 7, 8, 9
+}
+
 // __c_entry POINTERS to multi-return functions: each getter hands C the address
 // of a callback that returns a divergent tuple, so C invokes it THROUGH the
 // pointer.  This must present the same platform struct-return ABI the #[c_export]
@@ -368,6 +407,18 @@ func GetCbMretif() *uint8 { return __c_entry(Mretif) }
 
 #[c_export("get_cb_mretpad")]
 func GetCbMretpad() *uint8 { return __c_entry(Mretpad) }
+
+#[c_export("get_cb_mretip")]
+func GetCbMretip() *uint8 { return __c_entry(Mretip) }
+
+#[c_export("get_cb_mretvd")]
+func GetCbMretvd() *uint8 { return __c_entry(Mretvd) }
+
+#[c_export("get_cb_mretfv")]
+func GetCbMretfv() *uint8 { return __c_entry(Mretfv) }
+
+#[c_export("get_cb_mret9b")]
+func GetCbMret9b() *uint8 { return __c_entry(Mret9b) }
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -536,6 +587,23 @@ struct M3f { double a, b, c; };
 struct Mif { long a; double b; };
 struct Mfi { double a; long b; };
 struct Mpad { int a; long b; };
+struct Pair { int a, b; };
+struct V2 { float x, y; };
+struct V2d { double x, y; };
+struct Mip { int a; struct Pair p; };
+struct Mipl { int a; struct Pair p; long l; };
+struct Mvd { struct V2d v; double z; };
+struct Mdv { double z; struct V2d v; };
+struct Mvf { struct V2 v; float z; };
+struct Mfv { float z; struct V2 v; };
+extern struct Mip mretip(void);
+extern struct Mipl mretipl(void);
+extern struct Mvd mretvd(void);
+extern struct Mdv mretdv(void);
+extern struct Mvf mretvf(void);
+extern struct Mfv mretfv(void);
+struct M9b { signed char a, b, c, d, e, f, g, h, i; };
+extern struct M9b mret9b(void);
 extern struct M3i mret3i(void);
 extern struct M2i mret2i(void);
 extern struct M4i mret4i(void);
@@ -557,6 +625,14 @@ int main(void) {
     struct Mif e = mretif(); printf("%ld %.0f\n", e.a, e.b);
     struct Mfi f = mretfi(); printf("%.0f %ld\n", f.a, f.b);
     struct Mpad g = mretpad(); printf("%d %ld\n", g.a, g.b);
+    struct Mip ip = mretip(); printf("%d %d %d\n", ip.a, ip.p.a, ip.p.b);
+    struct Mipl ipl = mretipl(); printf("%d %d %d %ld\n", ipl.a, ipl.p.a, ipl.p.b, ipl.l);
+    struct Mvd vd = mretvd(); printf("%.1f %.1f %.1f\n", vd.v.x, vd.v.y, vd.z);
+    struct Mdv dv = mretdv(); printf("%.1f %.1f %.1f\n", dv.z, dv.v.x, dv.v.y);
+    struct Mvf vf = mretvf(); printf("%.1f %.1f %.1f\n", vf.v.x, vf.v.y, vf.z);
+    struct Mfv fv = mretfv(); printf("%.1f %.1f %.1f\n", fv.z, fv.v.x, fv.v.y);
+    struct M9b nb = mret9b();
+    printf("%d %d %d %d %d %d %d %d %d\n", nb.a, nb.b, nb.c, nb.d, nb.e, nb.f, nb.g, nb.h, nb.i);
     struct M3i h = mret_many(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
         20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41,
         42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
@@ -572,6 +648,13 @@ WANT_MULTIRET="10 20 30
 5 6
 8 9
 11 22
+7 8 9
+1 2 3 4
+1.5 2.5 3.5
+4.5 5.5 6.5
+7.5 8.5 9.5
+10.5 11.5 12.5
+1 2 3 4 5 6 7 8 9
 9 49 72"
 
 # --- a C driver that invokes multi-return callbacks THROUGH __c_entry pointers ---
@@ -587,6 +670,21 @@ struct M2i { int a, b; };
 struct M4i { int a, b, c, d; };
 struct Mif { long a; double b; };
 struct Mpad { int a; long b; };
+struct Pair { int a, b; };
+struct V2 { float x, y; };
+struct V2d { double x, y; };
+struct Mip { int a; struct Pair p; };
+struct Mvd { struct V2d v; double z; };
+struct Mfv { float z; struct V2 v; };
+typedef struct Mip (*cb_mip)(void);
+typedef struct Mvd (*cb_mvd)(void);
+typedef struct Mfv (*cb_mfv)(void);
+extern void *get_cb_mretip(void);
+extern void *get_cb_mretvd(void);
+extern void *get_cb_mretfv(void);
+struct M9b { signed char a, b, c, d, e, f, g, h, i; };
+typedef struct M9b (*cb_m9b)(void);
+extern void *get_cb_mret9b(void);
 typedef struct M3i (*cb_m3i)(void);
 typedef struct M2i (*cb_m2i)(void);
 typedef struct M4i (*cb_m4i)(void);
@@ -603,6 +701,11 @@ int main(void) {
     struct M4i c = ((cb_m4i)get_cb_mret4i())(); printf("%d %d %d %d\n", c.a, c.b, c.c, c.d);
     struct Mif d = ((cb_mif)get_cb_mretif())(); printf("%ld %.0f\n", d.a, d.b);
     struct Mpad e = ((cb_mpad)get_cb_mretpad())(); printf("%d %ld\n", e.a, e.b);
+    struct Mip f = ((cb_mip)get_cb_mretip())(); printf("%d %d %d\n", f.a, f.p.a, f.p.b);
+    struct Mvd g = ((cb_mvd)get_cb_mretvd())(); printf("%.1f %.1f %.1f\n", g.v.x, g.v.y, g.z);
+    struct Mfv h = ((cb_mfv)get_cb_mretfv())(); printf("%.1f %.1f %.1f\n", h.z, h.v.x, h.v.y);
+    struct M9b k = ((cb_m9b)get_cb_mret9b())();
+    printf("%d %d %d %d %d %d %d %d %d\n", k.a, k.b, k.c, k.d, k.e, k.f, k.g, k.h, k.i);
     return 0;
 }
 EOF
@@ -610,7 +713,11 @@ WANT_CENTRY="10 20 30
 7 9
 1 2 3 4
 5 6
-11 22"
+11 22
+7 8 9
+1.5 2.5 3.5
+10.5 11.5 12.5
+1 2 3 4 5 6 7 8 9"
 
 # check_multiret <label> <extra-bnc-flags>
 #   Like check_backend, but links the multi-value-return driver and checks the C

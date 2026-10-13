@@ -10,7 +10,7 @@
 # is compiled too (no VM marshalling).  This test is the only place the VM's own
 # cross-mode HFA marshalling runs — the VM packs an HFA arg into ONE by-address
 # `_call_shim_*` slot and reads an HFA result back through the retbuf (sized by
-# types.AggregateReturnSize, which HFAs deliberately keep on the retbuf path) —
+# abi.AggregateReturnSize, which HFAs deliberately keep on the retbuf path) —
 # together with the compiled shim's HFA member marshalling (v0..v3).  Mirrors
 # e2e/xmiface.sh's native-injection mechanism; case (c) there covers a float
 # SCALAR arg, this covers 16/24/32-byte HFA args and a 24-byte HFA return.

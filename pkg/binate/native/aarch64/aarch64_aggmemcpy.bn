@@ -1,0 +1,165 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/native/aggcopy"
+import "pkg/binate/native/common"
+
+// The aggregate copy primitives: the plain straight-line copy, the exact sub-word
+// pieces, and the overlap-safe copies that load a whole aggregate before storing it.
+
+// emitAggMemcpyAarch64 copies `sz` bytes from [srcPtr] to [dstPtr].  Past the
+// straight-line sizes (aggCopyIsLoop) it is a loop (emitAggCopyLoopAarch64).
+// Otherwise it moves 16 bytes at a time with an LDP/STP pair through two claimed
+// scratch registers — two words per instruction, and the pair's two registers keep
+// the second word off the first word's dependency chain — then a single-word LDR/STR
+// for a trailing odd word.  This is the one aggregate-move primitive for the backend:
+// both the aggregate load (into its own region) and the aggregate store (OP_STORE
+// struct-copy) route through it.
+func emitAggMemcpyAarch64(a @asm.Assembler, rm @common.RegMap, dstPtr int, srcPtr int, sz int) {
+	if aggCopyIsLoop(sz) {
+		emitAggCopyLoopAarch64(a, rm, dstPtr, 0, srcPtr, 0, sz)
+		return
+	}
+	rm.MarkUsed(dstPtr)
+	rm.MarkUsed(srcPtr)
+	emitAggCopyStraightAarch64(a, dstPtr, srcPtr, sz, scratchReg(rm), scratchReg(rm))
+}
+
+// emitAggCopyStraightAarch64 is emitAggMemcpyAarch64's straight-line copy of sz
+// bytes from [srcPtr] to [dstPtr] through tmp1 / tmp2 (distinct from each other and
+// from both pointers), which it needs no register map for.
+func emitAggCopyStraightAarch64(a @asm.Assembler, dstPtr int, srcPtr int, sz int, tmp1 int,
+		tmp2 int) {
+	var off int = 0
+	for off + 16 <= sz {
+		aarch64.Ldp(a, true, tmp1, tmp2, aarch64.MemImm(srcPtr, off))
+		aarch64.Stp(a, true, tmp1, tmp2, aarch64.MemImm(dstPtr, off))
+		off = off + 16
+	}
+	for off + 8 <= sz {
+		aarch64.Ldr(a, true, tmp1, aarch64.MemImm(srcPtr, off))
+		aarch64.Str(a, true, tmp1, aarch64.MemImm(dstPtr, off))
+		off = off + 8
+	}
+	// A sub-word tail (sz not a multiple of 8) is copied exactly, in 4-, 2- and
+	// 1-byte pieces: the bytes after sz belong to whatever follows the
+	// destination (the next field, element or global) whenever the aggregate's
+	// alignment is below 8, so a full-word store there would overwrite it.
+	var tail @[]aggcopy.Piece = aggcopy.TailPieces(off, sz, false)
+	for i := 0; i < len(tail); i++ {
+		emitAggPieceAarch64(a, true, tmp1, srcPtr, tail[i])
+		emitAggPieceAarch64(a, false, tmp1, dstPtr, tail[i])
+	}
+}
+
+// emitAggPieceAarch64 loads (isLoad) or stores one piece of an aggregate copy:
+// p.Width bytes at [base + p.Off] through rt.  A word whose offset is not a
+// multiple of its size (the overlapping final word of TailPieces) takes the
+// unscaled LDUR / STUR form when the offset fits it.
+func emitAggPieceAarch64(a @asm.Assembler, isLoad bool, rt int, base int, p aggcopy.Piece) {
+	if p.Width == 8 || p.Width == 4 {
+		var sf bool = p.Width == 8
+		var mem aarch64.Operand = aarch64.MemImm(base, p.Off)
+		if !aarch64.LdrStrImmFitsUnsigned(sf, p.Off) && aarch64.LdurSturImmFits(p.Off) {
+			mem = aarch64.MemUnscaled(base, p.Off)
+		}
+		if isLoad {
+			aarch64.Ldr(a, sf, rt, mem)
+		} else {
+			aarch64.Str(a, sf, rt, mem)
+		}
+		return
+	}
+	if p.Width == 2 {
+		if isLoad {
+			aarch64.Ldrh(a, rt, aarch64.MemImm(base, p.Off))
+		} else {
+			aarch64.Strh(a, rt, aarch64.MemImm(base, p.Off))
+		}
+		return
+	}
+	if isLoad {
+		aarch64.Ldrb(a, rt, aarch64.MemImm(base, p.Off))
+	} else {
+		aarch64.Strb(a, rt, aarch64.MemImm(base, p.Off))
+	}
+}
+
+// emitAggMemcpySafeAarch64 is an OVERLAP-SAFE aggregate copy: it loads the WHOLE
+// source into registers first, THEN stores — so a copy whose dst aliases (overlaps)
+// its src (an elided raw-pointer `*dst = *src`) reads all of the source before
+// writing any of the destination.  Used by emitStructCopy, whose source may be an
+// aliased (elided) load.  Up to 4 words it uses core registers; up to 64 bytes
+// (callconv's SafeCopyBytes) four vector registers (emitAggMemcpyVecSafeAarch64); a
+// larger copy delegates to the interleaved emitAggMemcpyAarch64 — reached only by
+// NON-aliasing copies, since the S-adjacent elision that can alias stops at
+// SafeCopyBytes.  A copy within SafeCopyBytes that would interleave panics, so a
+// budget raised past what this loads at once fails loud instead of miscopying.
+//
+// A sub-word tail is copied exactly (TailPieces), never as a whole word past
+// sz: from 8 bytes up as one overlapping word ending at sz, which keeps the
+// register count at the rounded-up word count, and below 8 bytes as at most two
+// pieces.
+func emitAggMemcpySafeAarch64(a @asm.Assembler, rm @common.RegMap, dstPtr int, srcPtr int, sz int) {
+	var words int = sz / 8
+	var tail @[]aggcopy.Piece = aggcopy.TailPieces(words * 8, sz, true)
+	if sz > 32 && sz <= 64 {
+		emitAggMemcpyVecSafeAarch64(a, dstPtr, srcPtr, sz)
+		return
+	}
+	if sz <= 0 || words + len(tail) > 4 {
+		if sz > 0 && sz <= rm.CC.SafeCopyBytes {
+			panic("aggregate copy (aa64): a copy within SafeCopyBytes must load its whole source first")
+		}
+		emitAggMemcpyAarch64(a, rm, dstPtr, srcPtr, sz)
+		return
+	}
+	var regs @[]int = make_slice(int, words + len(tail))
+	for i := 0; i < len(regs); i = i + 1 { regs[i] = scratchReg(rm) }
+	var li int = 0
+	for li + 2 <= words {
+		aarch64.Ldp(a, true, regs[li], regs[li + 1], aarch64.MemImm(srcPtr, li * 8))
+		li = li + 2
+	}
+	if li < words {
+		aarch64.Ldr(a, true, regs[li], aarch64.MemImm(srcPtr, li * 8))
+	}
+	for i := 0; i < len(tail); i++ {
+		emitAggPieceAarch64(a, true, regs[words + i], srcPtr, tail[i])
+	}
+	var si int = 0
+	for si + 2 <= words {
+		aarch64.Stp(a, true, regs[si], regs[si + 1], aarch64.MemImm(dstPtr, si * 8))
+		si = si + 2
+	}
+	if si < words {
+		aarch64.Str(a, true, regs[si], aarch64.MemImm(dstPtr, si * 8))
+	}
+	for i := 0; i < len(tail); i++ {
+		emitAggPieceAarch64(a, false, regs[words + i], dstPtr, tail[i])
+	}
+}
+
+// emitAggMemcpyVecSafeAarch64 copies sz bytes, 16 < sz <= 64, from [srcPtr] to
+// [dstPtr] overlap-safely: it loads the whole source into V16, V17, V6 and V7 in
+// 16-byte chunks — the last ending exactly at sz, so it may overlap the one before —
+// THEN stores them.  V16 / V17 are the FP scratch pair and V0..V7 are never a value's
+// home (aarch64_regpools.bn), so none of them holds anything across the copy.
+func emitAggMemcpyVecSafeAarch64(a @asm.Assembler, dstPtr int, srcPtr int, sz int) {
+	var regs @[]int = @[]int{aarch64.V16, aarch64.V17, aarch64.V6, aarch64.V7}
+	var n int = (sz + 15) / 16
+	for i := 0; i < n; i++ {
+		aarch64.Vldr_q(a, regs[i], srcPtr, aggVecChunkOff(i, sz))
+	}
+	for i := 0; i < n; i++ {
+		aarch64.Vstr_q(a, regs[i], dstPtr, aggVecChunkOff(i, sz))
+	}
+}
+
+// aggVecChunkOff returns the offset of 16-byte chunk i of an sz-byte copy (sz >= 16):
+// 16 * i, the last chunk moved back to end exactly at sz.
+func aggVecChunkOff(i int, sz int) int {
+	if 16 * i + 16 > sz { return sz - 16 }
+	return 16 * i
+}

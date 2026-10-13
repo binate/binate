@@ -23,12 +23,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Packages to skip from linting.  bnlint is fetched from the CHECK_TOOLS_VERSION
-# bundle (bnc-0.0.12-pre3), decoupled from BUILDER_VERSION so a newer check-tool
-# feature does not require a build-ladder rung (see
-# explorations/plan-check-tools-version.md).  A skipped target stays fully
-# type-checked and compiled by every conformance mode — only bnlint's style rules
-# pause — and bnlint typechecks dependency BODIES, so a skip must cover the whole
-# transitive importer chain of the offending source.  (No skips today.)
+# bundle, decoupled from BUILDER_VERSION so a newer check-tool feature does not
+# require a build-ladder rung (see explorations/plan-check-tools-version.md).
+# A skipped target stays fully type-checked and compiled by every conformance
+# mode — only bnlint's style rules pause — and bnlint typechecks dependency
+# BODIES, so a skip must cover the whole transitive importer chain of the
+# offending source.  (No skips today.)
 #
 # Previously skipped, now linted (kept as changelog — do NOT re-add without cause):
 #   - pkg/stdx/fmt — pre2's bnlint rejected its scalar value-recovery (`case int:`

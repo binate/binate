@@ -1,0 +1,266 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/callconv"
+import "pkg/binate/stringutils"
+import "pkg/std/strings"
+
+// The tally behind bnc's experimental --x-copy-stats: the aggregate copies a native
+// backend emits through its memory-to-memory copy helpers (CountAggCopy), by kind
+// (COPY_*), by where the copied value comes from — or, for a load copying its source
+// into its own region, by what reads that copy — and by size.  A static count over the
+// whole compilation, for finding which copies remain in real code; off unless
+// SetCopyStats turned it on.  Not counted: an aggregate of at most 16 bytes or an HFA
+// moved through registers (arguments, parameters, returns, call results), such an
+// argument spilled word by word to the outgoing stack, a shim's word shuffles and
+// result stores, a #[c_export] return repack, and rt.Box's run-time copy.  A link-once
+// body (a destructor, a copy helper, a shim) counts once for each module that emits
+// it.
+
+// The details a copy is counted under: where the copied value comes from (copyFrom*),
+// or — for COPY_LOAD — what reads the load's own copy (copyLoad*).
+
+// copyFromInPlaceLoad: a load reading its source in place.
+const copyFromInPlaceLoad int = 0
+
+// copyFromCopiedLoad: a load that copied its source into its own region first.
+const copyFromCopiedLoad int = 1
+
+// copyFromCall: a call's result.
+const copyFromCall int = 2
+
+// copyFromParam: a by-value aggregate parameter.
+const copyFromParam int = 3
+
+// copyFromGlobal: a package global.
+const copyFromGlobal int = 4
+
+// copyFromExtract: a member extracted from an aggregate value.
+const copyFromExtract int = 5
+
+// copyFromOther: anything else (or a copy with no value, a shim's).
+const copyFromOther int = 6
+
+// copyLoadStored: the load's one use stores it whole.
+const copyLoadStored int = 7
+
+// copyLoadArg: the load's one use passes it to a call.
+const copyLoadArg int = 8
+
+// copyLoadReturned: the load's one use returns it.
+const copyLoadReturned int = 9
+
+// copyLoadExtracts: every use of the load extracts a member.
+const copyLoadExtracts int = 10
+
+// copyLoadSeveral: the load has several uses, not all extracts.
+const copyLoadSeveral int = 11
+
+// copyLoadOther: the load's one use is none of the above.
+const copyLoadOther int = 12
+
+// copyLoadUnused: the load has no use.
+const copyLoadUnused int = 13
+
+// copyDetails is how many details there are.
+const copyDetails int = 14
+
+// copyKinds is how many COPY_* kinds there are.
+const copyKinds int = 5
+
+// copyColumns is how many numbers a (kind, detail) row holds: count, bytes, and
+// counts of at most 16, 17-64, 65-256 and more than 256 bytes.
+const copyColumns int = 6
+
+// copyStatsOn reports whether the tally is on (SetCopyStats).
+var copyStatsOn bool
+
+// copyStats holds the tally, copyColumns numbers per (kind, detail) row.
+var copyStats @[]int
+
+// SetCopyStats turns the tally on or off, clearing it.
+func SetCopyStats(on bool) {
+	copyStatsOn = on
+	copyStats = make_slice(int, copyKinds * copyDetails * copyColumns)
+}
+
+// CountAggCopy records one copy of sz bytes of kind (a COPY_* value) of value v: under
+// what reads it (m.CopyStatsUse) for COPY_LOAD, else under where v comes from.  A copy
+// with no register map or no value (a shim's) counts under "other".
+func CountAggCopy(m @RegMap, kind int, v @ir.Instr, sz int) {
+	if !copyStatsOn || kind < 0 || kind >= copyKinds { return }
+	var detail int = copyFromOther
+	if kind == COPY_LOAD {
+		detail = copyLoadOther
+		if m != nil && v != nil && v.ID >= 0 && v.ID < len(m.CopyStatsUse) {
+			detail = m.CopyStatsUse[v.ID]
+		}
+	} else {
+		detail = copyOrigin(m, v)
+	}
+	var row int = (kind * copyDetails + detail) * copyColumns
+	copyStats[row] = copyStats[row] + 1
+	copyStats[row + 1] = copyStats[row + 1] + sz
+	var bucket int = 5
+	if sz <= 16 {
+		bucket = 2
+	} else if sz <= 64 {
+		bucket = 3
+	} else if sz <= 256 {
+		bucket = 4
+	}
+	copyStats[row + bucket] = copyStats[row + bucket] + 1
+}
+
+// copyOrigin returns the detail naming where the copied value v comes from.
+func copyOrigin(m @RegMap, v @ir.Instr) int {
+	if v == nil { return copyFromOther }
+	if v.IsGlobalRef { return copyFromGlobal }
+	if v.IsByvalParamRef || v.Op == iropcode.OP_PARAM { return copyFromParam }
+	if v.Op == iropcode.OP_LOAD {
+		if m != nil && m.LookupAlloc(v.ID) >= 0 { return copyFromCopiedLoad }
+		return copyFromInPlaceLoad
+	}
+	if isCallOp(v.Op) { return copyFromCall }
+	if v.Op == iropcode.OP_EXTRACT { return copyFromExtract }
+	return copyFromOther
+}
+
+// LoadConsumers returns, by value ID, the detail naming what reads each aggregate
+// OP_LOAD in f's blocks (not its fault pads, which only the VM runs): the one use
+// storing it whole, passing it to a call or returning it, only extracts, several uses,
+// another one use, or none.  f has no phis left (the backends run after phi
+// elimination).  Only the copy-stats tally reads it.
+func LoadConsumers(f @ir.Func) @[]int {
+	var out @[]int = make_slice(int, f.NextID)
+	var uses @[]int = make_slice(int, f.NextID)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			for k := 0; k < len(ins.Args); k++ {
+				var v @ir.Instr = ins.Args[k]
+				if !isAggregateLoad(v) || v.ID >= len(out) { continue }
+				var d int = loadUseDetail(ins, k)
+				if uses[v.ID] == 0 {
+					out[v.ID] = d
+				} else if out[v.ID] != copyLoadExtracts || d != copyLoadExtracts {
+					out[v.ID] = copyLoadSeveral
+				}
+				uses[v.ID] = uses[v.ID] + 1
+			}
+		}
+	}
+	for id := 0; id < len(out); id++ {
+		if uses[id] == 0 { out[id] = copyLoadUnused }
+	}
+	return out
+}
+
+// isAggregateLoad reports whether v is an aggregate OP_LOAD with a value ID.
+func isAggregateLoad(v @ir.Instr) bool {
+	return v != nil && v.ID >= 0 && v.Op == iropcode.OP_LOAD && callconv.IsAggregateTyp(v.Typ)
+}
+
+// loadUseDetail returns the detail naming one use of a load: operand k of ins (an
+// indirect call's callee, its Args[0], is not an argument).
+func loadUseDetail(ins @ir.Instr, k int) int {
+	if ins.Op == iropcode.OP_STORE && k == 1 { return copyLoadStored }
+	var base int = callArgBase(ins.Op)
+	if base >= 0 && k >= base { return copyLoadArg }
+	if ins.Op == iropcode.OP_RETURN { return copyLoadReturned }
+	if ins.Op == iropcode.OP_EXTRACT { return copyLoadExtracts }
+	return copyLoadOther
+}
+
+// CopyStatsReport returns the tally as a table: one line per (kind, detail) with a
+// copy, then the totals.
+func CopyStatsReport() @[]char {
+	var out @strings.Builder = strings.NewBuilder()
+	out.Write("aggregate copies through the native aarch64 copy helpers (static, per module; not\n")
+	out.Write("counted: register moves of aggregates <= 16 bytes and HFAs, their stack spills,\n")
+	out.Write("shim word shuffles, #[c_export] return repacks, rt.Box):\n")
+	copyStatsHeader(out)
+	var total @[]int = make_slice(int, copyColumns)
+	for kind := 0; kind < copyKinds; kind++ {
+		for detail := 0; detail < copyDetails; detail++ {
+			var row int = (kind * copyDetails + detail) * copyColumns
+			if len(copyStats) <= row || copyStats[row] == 0 { continue }
+			copyStatsCell(out, copyKindName(kind), 8)
+			copyStatsCell(out, copyDetailName(detail), 26)
+			for c := 0; c < copyColumns; c++ {
+				copyStatsNumber(out, copyStats[row + c], copyStatsWidth(c))
+				total[c] = total[c] + copyStats[row + c]
+			}
+			out.Write("\n")
+		}
+	}
+	copyStatsCell(out, "total", 34)
+	for c := 0; c < copyColumns; c++ { copyStatsNumber(out, total[c], copyStatsWidth(c)) }
+	out.Write("\n")
+	return buf.CopyStr(out.String())
+}
+
+// copyStatsHeader writes the table's column names.
+func copyStatsHeader(out *strings.Builder) {
+	copyStatsCell(out, "copy", 8)
+	copyStatsCell(out, "of / read as", 26)
+	var names @[]*[]readonly char = @[]*[]readonly char{"count", "bytes", "<=16", "17-64", "65-256",
+			">256"}
+	for c := 0; c < copyColumns; c++ { copyStatsRight(out, names[c], copyStatsWidth(c)) }
+	out.Write("\n")
+}
+
+// copyStatsWidth returns the width of number column c.
+func copyStatsWidth(c int) int {
+	if c == 1 { return 12 }
+	return 8
+}
+
+// copyStatsCell writes s left-aligned in a cell of width w.
+func copyStatsCell(out *strings.Builder, s *[]readonly char, w int) {
+	out.Write(s)
+	for i := len(s); i < w; i++ { out.WriteByte(' ') }
+}
+
+// copyStatsRight writes s right-aligned in a cell of width w.
+func copyStatsRight(out *strings.Builder, s *[]readonly char, w int) {
+	for i := len(s); i < w; i++ { out.WriteByte(' ') }
+	out.Write(s)
+}
+
+// copyStatsNumber writes n right-aligned in a cell of width w.
+func copyStatsNumber(out *strings.Builder, n int, w int) {
+	var s @strings.Builder = strings.NewBuilder()
+	stringutils.WriteInt(s, n)
+	copyStatsRight(out, s.String(), w)
+}
+
+// copyKindName returns the name of COPY_* kind.
+func copyKindName(kind int) *[]readonly char {
+	if kind == COPY_LOAD { return "load" }
+	if kind == COPY_STORE { return "store" }
+	if kind == COPY_ARG { return "arg" }
+	if kind == COPY_RETURN { return "return" }
+	return "shim"
+}
+
+// copyDetailName returns the name of a detail.
+func copyDetailName(detail int) *[]readonly char {
+	if detail == copyFromInPlaceLoad { return "load read in place" }
+	if detail == copyFromCopiedLoad { return "load with its own copy" }
+	if detail == copyFromCall { return "call result" }
+	if detail == copyFromParam { return "by-value parameter" }
+	if detail == copyFromGlobal { return "global" }
+	if detail == copyFromExtract { return "extracted member" }
+	if detail == copyLoadStored { return "stored whole" }
+	if detail == copyLoadArg { return "passed to a call" }
+	if detail == copyLoadReturned { return "returned" }
+	if detail == copyLoadExtracts { return "read by extracts only" }
+	if detail == copyLoadSeveral { return "several uses" }
+	if detail == copyLoadOther { return "one other use" }
+	if detail == copyLoadUnused { return "unused" }
+	return "other"
+}

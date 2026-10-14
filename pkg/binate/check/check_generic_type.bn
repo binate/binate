@@ -99,60 +99,6 @@ func resolveTypeInstantiation(c @Checker, te @ast.TypeExpr) @types.Type {
 	return instantiateGenericDeclWithArgs(c, d, isIface, argTypes, te.Pos, true)
 }
 
-// checkInstantiationConstraints verifies each concrete type-argument of a
-// generic struct/interface instantiation satisfies its type-parameter's
-// constraint -- the type-instantiation analogue of the check
-// instantiateGenericFunc performs for generic functions.  Without it
-// `type Box[T lang.Orderable] struct{...}` instantiated as `Box[NoOrder]`
-// (no `impl NoOrder : Orderable`) is wrongly accepted
-// (gen.satisfy.struct-iface-unchecked).
-//
-// Constraints are resolved under the generic decl's DEFINING-file scope and
-// package (its imports / same-package interface names) with the type-params
-// bound to their concrete args, so a constraint naming an earlier param
-// (`[X any, T Container[X]]`) resolves to the concrete `Container[arg]`.
-// Mirrors populateInstantiatedType's scope setup.  Generic type-param
-// constraints are not resolved at decl time (the body is resolved lazily at
-// instantiation), so this is their first resolution -- no double-reporting.
-//
-// usePos anchors the diagnostic at the instantiation site (the `Name[args]`
-// expression), matching the function path's use-site anchoring -- not at the
-// generic decl, which would be unhelpful and (because identical errors dedup
-// on position) could collapse distinct bad use-sites to one message.
-func checkInstantiationConstraints(c @Checker, d @ast.Decl, argTypes @[]@types.Type,
-		usePos token.Pos) {
-	if len(d.TypeParams) == 0 { return }
-	var savedScope @Scope = c.Scope
-	var savedPkgPath @[]char = c.curPkgPath
-	c.curPkgPath = genericTypeDeclPkg(c, d)
-	var defScope @Scope = lookupGenericDeclScope(c, d)
-	if defScope != nil {
-		c.Scope = NewScope(defScope)
-	} else {
-		pushScope(c)
-	}
-	for i := 0; i < len(d.TypeParams) && i < len(argTypes); i++ {
-		if isBlank(d.TypeParams[i].Name) {
-			continue
-		}
-		defineType(c.Scope, d.TypeParams[i].Name, argTypes[i])
-	}
-	for i := 0; i < len(d.TypeParams) && i < len(argTypes); i++ {
-		// Resolve a copy of the constraint: resolved under these arguments, it
-		// must not record on the declaration every instantiation shares.
-		var tp @ast.TypeParam = make(ast.TypeParam)
-		*tp = *d.TypeParams[i]
-		tp.Constraint = ast.CloneTypeExpr(d.TypeParams[i].Constraint)
-		var constraint @types.Type = resolveTypeParamConstraint(c, tp)
-		if constraint == nil || isErrType(argTypes[i]) { continue }
-		if !typeSatisfiesConstraint(c, argTypes[i], constraint) {
-			reportConstraintMiss(c, usePos, argTypes[i], constraint)
-		}
-	}
-	c.Scope = savedScope
-	c.curPkgPath = savedPkgPath
-}
-
 // instantiateGenericDeclWithArgs returns the cached instantiation of
 // generic decl d with the given concrete argTypes, building and
 // caching it on a miss.  isIface selects interface vs struct
@@ -197,6 +143,12 @@ func instantiateGenericDeclWithArgs(c @Checker, d @ast.Decl, isIface bool, argTy
 	if c.BuildingIfaceScope || c.CollectingDecls {
 		userFacing = false
 	}
+	// The impls a type argument may satisfy its constraint through are those
+	// visible where the instantiation is written, not in the generic's package,
+	// where checkInstantiationConstraints runs.  Only a user-facing
+	// instantiation is checked.
+	var view ImplView
+	if wasUserFacing { view = implViewAt(c, usePos) }
 	// Record every deferred check so recheckDeferredConstraints can replay it — at
 	// THIS use site's position — once every impl is recorded.  Recording here
 	// (before the cache lookup, on any user-facing resolution) captures the deferred
@@ -208,7 +160,7 @@ func instantiateGenericDeclWithArgs(c @Checker, d @ast.Decl, isIface bool, argTy
 	// (LoadPackageInterface precedes CheckPackage; the pending list persists between
 	// them).
 	if (c.CollectingDecls || c.BuildingIfaceScope) && wasUserFacing {
-		recordPendingConstraintCheck(c, d, argTypes, usePos)
+		recordPendingConstraintCheck(c, d, argTypes, usePos, view)
 	}
 	if !isIface && d.IsAlias && d.TypeRef != nil {
 		return instantiateGenericAlias(c, d, argTypes, usePos, userFacing)
@@ -219,7 +171,7 @@ func instantiateGenericDeclWithArgs(c @Checker, d @ast.Decl, isIface bool, argTy
 		// diagnostics not yet reported).  The first user-facing use does the
 		// deferred check, so a real constraint miss / opaque-by-value method is
 		// never swallowed just because a probe populated the cache first.
-		if userFacing && !cachedEntry.ConstraintsChecked {
+		if userFacing && !constraintsCheckedIn(cachedEntry, view) {
 			// Latch only when the diagnostics actually REACH the user: under
 			// TentativeMode (a REPL forward-ref probe) they route to
 			// c.TentativeErrors and are DISCARDED if the enclosing decl parks, so
@@ -227,9 +179,9 @@ func instantiateGenericDeclWithArgs(c @Checker, d @ast.Decl, isIface bool, argTy
 			// and silently accept a genuine miss.  Leaving it unlatched re-arms the
 			// check for the first surviving (non-tentative) use.
 			if !c.TentativeMode {
-				cachedEntry.ConstraintsChecked = true
+				markConstraintsChecked(cachedEntry, view)
 			}
-			checkInstantiationConstraints(c, d, argTypes, usePos)
+			checkInstantiationConstraints(c, d, argTypes, usePos, view)
 			if cachedEntry.Result != nil && cachedEntry.Result.Kind == types.TYP_INTERFACE {
 				requireInstantiatedIfaceMethodsSized(c, cachedEntry.Result, usePos)
 			}
@@ -282,18 +234,18 @@ func instantiateGenericDeclWithArgs(c @Checker, d @ast.Decl, isIface bool, argTy
 	// Constraint satisfaction (gen.satisfy, §12.4): each concrete type-arg must
 	// satisfy its type-parameter's constraint, exactly as instantiateGenericFunc
 	// enforces for generic FUNCTIONS.  Reported once per unique (decl, args) and
-	// only for a USER-FACING instantiation (see the header comment) -- so a
-	// repeated `Box[NoOrder]` reports the miss once and a speculative probe never
-	// reports.  Build (populate*) still proceeds after a miss so downstream
-	// field/method uses don't cascade.
+	// view (CheckedViews), and only for a USER-FACING instantiation (see the
+	// header comment) -- so a repeated `Box[NoOrder]` in one view reports the
+	// miss once and a speculative probe never reports.  Build (populate*) still
+	// proceeds after a miss so downstream field/method uses don't cascade.
 	if userFacing {
 		// Latch only when the diagnostics reach the user — see the cache-hit arm
 		// above: under TentativeMode a parked decl's tentative errors are
 		// discarded, so latching would strand a genuine miss for a later real use.
 		if !c.TentativeMode {
-			entry.ConstraintsChecked = true
+			markConstraintsChecked(entry, view)
 		}
-		checkInstantiationConstraints(c, d, argTypes, usePos)
+		checkInstantiationConstraints(c, d, argTypes, usePos, view)
 	}
 	// An alias reached while this instantiation populates goes through it, a
 	// defined type, so it is no alias cycle (instantiateGenericAlias).
@@ -444,7 +396,7 @@ func genericIfaceDeclPkg(c @Checker, d @ast.Decl) @[]char {
 
 // lookupCachedInstantiationEntry walks c.GenericInstantiations looking for a
 // (Decl, args) match — Decl pointer-equal AND each arg IdenticalStrict — and returns
-// the cache ENTRY (so callers can read/update ConstraintsChecked), or nil on miss.
+// the cache ENTRY (so callers can read/update CheckedViews), or nil on miss.
 // The match is IdenticalStrict (readonly-SIGNIFICANT), not Identical: `Foo[readonly
 // T]` and `Foo[T]` are DISTINCT monomorphizations, so a `readonly` arg must not alias
 // a non-readonly one's cache slot (see IdenticalStrict).

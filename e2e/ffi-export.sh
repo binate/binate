@@ -378,6 +378,16 @@ func Mretvf() (FfiVec2, float32) { return FfiVec2{x: 7.5, y: 8.5}, cast(float32,
 #[c_export("mretfv")]
 func Mretfv() (float32, FfiVec2) { return cast(float32, 10.5), FfiVec2{x: 11.5, y: 12.5} }
 
+// A float struct beside an int64: no HFA, so aarch64 C returns it in x0/x1 as the
+// internal convention does; x86-64 C returns the struct's SSE eightbyte in XMM0 and
+// the int64 in RAX, while the internal convention returns the struct field in GP (ABI
+// §2.7) — so there the entry repacks.  Both orders.
+#[c_export("mretvl")]
+func Mretvl() (FfiVec2, int64) { return FfiVec2{x: 1.5, y: 2.5}, cast(int64, 7) }
+
+#[c_export("mretlv")]
+func Mretlv() (int64, FfiVec2) { return cast(int64, 8), FfiVec2{x: 3.5, y: 4.5} }
+
 // Nine int8s: a 9-byte C struct C returns in two eightbytes, but more GP words than
 // the internal return registers hold (9 > 8 on aarch64, > 3 on x86-64), so the body
 // returns it through a buffer the entry supplies and the entry reloads clang's form.
@@ -419,6 +429,9 @@ func GetCbMretfv() *uint8 { return __c_entry(Mretfv) }
 
 #[c_export("get_cb_mret9b")]
 func GetCbMret9b() *uint8 { return __c_entry(Mret9b) }
+
+#[c_export("get_cb_mretvl")]
+func GetCbMretvl() *uint8 { return __c_entry(Mretvl) }
 EOF
 
 # --- a C driver that calls the exports by their C names -------------------
@@ -604,6 +617,10 @@ extern struct Mvf mretvf(void);
 extern struct Mfv mretfv(void);
 struct M9b { signed char a, b, c, d, e, f, g, h, i; };
 extern struct M9b mret9b(void);
+struct Mvl { struct V2 v; long l; };
+struct Mlv { long l; struct V2 v; };
+extern struct Mvl mretvl(void);
+extern struct Mlv mretlv(void);
 extern struct M3i mret3i(void);
 extern struct M2i mret2i(void);
 extern struct M4i mret4i(void);
@@ -633,6 +650,8 @@ int main(void) {
     struct Mfv fv = mretfv(); printf("%.1f %.1f %.1f\n", fv.z, fv.v.x, fv.v.y);
     struct M9b nb = mret9b();
     printf("%d %d %d %d %d %d %d %d %d\n", nb.a, nb.b, nb.c, nb.d, nb.e, nb.f, nb.g, nb.h, nb.i);
+    struct Mvl vl = mretvl(); printf("%.1f %.1f %ld\n", vl.v.x, vl.v.y, vl.l);
+    struct Mlv lv = mretlv(); printf("%ld %.1f %.1f\n", lv.l, lv.v.x, lv.v.y);
     struct M3i h = mret_many(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
         20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41,
         42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
@@ -655,6 +674,8 @@ WANT_MULTIRET="10 20 30
 7.5 8.5 9.5
 10.5 11.5 12.5
 1 2 3 4 5 6 7 8 9
+1.5 2.5 7
+8 3.5 4.5
 9 49 72"
 
 # --- a C driver that invokes multi-return callbacks THROUGH __c_entry pointers ---
@@ -685,6 +706,9 @@ extern void *get_cb_mretfv(void);
 struct M9b { signed char a, b, c, d, e, f, g, h, i; };
 typedef struct M9b (*cb_m9b)(void);
 extern void *get_cb_mret9b(void);
+struct Mvl { struct V2 v; long l; };
+typedef struct Mvl (*cb_mvl)(void);
+extern void *get_cb_mretvl(void);
 typedef struct M3i (*cb_m3i)(void);
 typedef struct M2i (*cb_m2i)(void);
 typedef struct M4i (*cb_m4i)(void);
@@ -706,6 +730,7 @@ int main(void) {
     struct Mfv h = ((cb_mfv)get_cb_mretfv())(); printf("%.1f %.1f %.1f\n", h.z, h.v.x, h.v.y);
     struct M9b k = ((cb_m9b)get_cb_mret9b())();
     printf("%d %d %d %d %d %d %d %d %d\n", k.a, k.b, k.c, k.d, k.e, k.f, k.g, k.h, k.i);
+    struct Mvl m = ((cb_mvl)get_cb_mretvl())(); printf("%.1f %.1f %ld\n", m.v.x, m.v.y, m.l);
     return 0;
 }
 EOF
@@ -717,7 +742,8 @@ WANT_CENTRY="10 20 30
 7 8 9
 1.5 2.5 3.5
 10.5 11.5 12.5
-1 2 3 4 5 6 7 8 9"
+1 2 3 4 5 6 7 8 9
+1.5 2.5 7"
 
 # check_multiret <label> <extra-bnc-flags>
 #   Like check_backend, but links the multi-value-return driver and checks the C

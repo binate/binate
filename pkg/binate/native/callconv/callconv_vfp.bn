@@ -1,6 +1,7 @@
 package "pkg/binate/native/callconv"
 
 import "pkg/binate/types"
+import "pkg/binate/types/abi"
 
 // ============================================================
 // AAPCS-VFP float-argument allocation (cc.VfpBackfill)
@@ -36,51 +37,69 @@ import "pkg/binate/types"
 // and the concrete register the emitter reads cannot diverge (the "one predicate"
 // discipline, mirroring how sysvSseAggFitsInRegs is shared).
 //
-// SCOPE: scalar float args only.  Hard-float HOMOGENEOUS FLOAT-AGGREGATE (HFA)
-// passing is ALSO a VFP CPRC that back-fills as a unit of N slots, but arm32
-// leaves cc.HfaAggregates false, so an HFA takes argRegWordsStackWords' ordinary
-// GP aggregate path on both backends — self-consistent between Binate callers
-// and callees, but not the AAPCS-VFP placement a hard-float C function expects.
-// This is live wherever cc.VfpBackfill is set (abi.Arm32HardFloat(): the
-// arm32-linux target).  Proper HFA support must route HFAs through this mask.
-// TODO: a `__c_call` HFA argument is therefore mis-placed on arm32-linux (the C
-// callee reads s0..); tracked as a MAJOR in explorations/claude-todo.md.
+// A HOMOGENEOUS FLOAT AGGREGATE (HFA: a struct / array folding to 1-4 same-width
+// float members) is a co-processor register candidate too, placed as ONE unit when
+// cc.HfaAggregates is set: n float32 members take the lowest run of n consecutive
+// free S-slots (any start), n float64 members the lowest run of n consecutive free D
+// registers (2n S-slots from an even base).  It is never split: when no run fits,
+// the whole aggregate goes to the stack and latches the bank exhausted, exactly like
+// a scalar that does not fit.
+//
+// TODO: cc.HfaAggregates is still false for AAPCS32 hard-float, so an HFA takes
+// argRegWordsStackWords' ordinary GP aggregate path on both backends — self-
+// consistent between Binate callers and callees, but not the AAPCS-VFP placement a
+// hard-float C function expects (a `__c_call` HFA argument is mis-placed on
+// arm32-linux; tracked as a MAJOR in explorations/claude-todo.md).
 
-// vfpArgPlace classifies FP-eligible arg t under the AAPCS-VFP allocator, given
-// the running 16-bit S-occupancy mask and the bankExhausted latch.  Returns
-// (sSlot, isDouble, isFloat, newMask, newExhausted):
-//   - isFloat reports whether t is an FP-eligible float scalar at all.  A
-//     non-float returns isFloat=false with mask/exhausted unchanged, and its
-//     sSlot/isDouble are meaningless — the caller runs the GP path.
-//   - For a float, sSlot is the assigned S-slot BASE (0..15) when it rides a
-//     register: a float32 occupies S<sSlot>, a float64 occupies the pair
-//     S<sSlot>,S<sSlot+1> (= D<sSlot/2>).  sSlot -1 means it spilled to the stack;
-//     the spill latches newExhausted true, disabling all further back-fill.
-//   - isDouble is true for a float64 (S-pair), false for a float32 (single S).
-func (cc CallConv) vfpArgPlace(t @types.Type, mask int, exh bool) (int, bool, bool, int, bool) {
-	if !IsFloatScalarTyp(t) {
-		return -1, false, false, mask, exh
+// vfpArgPlace classifies arg t under the AAPCS-VFP allocator, given the running
+// 16-bit S-occupancy mask and the bankExhausted latch.  Returns (sSlot, isDouble,
+// count, isCprc, newMask, newExhausted):
+//   - isCprc reports whether t is a co-processor register candidate at all: a float
+//     scalar, or (cc.HfaAggregates) an HFA.  Anything else returns isCprc=false with
+//     mask/exhausted unchanged, and its other results are meaningless — the caller
+//     runs the GP path.
+//   - count is how many registers of its width t takes: 1 for a scalar, the member
+//     count for an HFA.  isDouble is true for float64 members (D registers), false
+//     for float32 (S registers).
+//   - sSlot is the assigned S-slot BASE (0..15) when t rides registers: float32
+//     members occupy S<sSlot>..S<sSlot+count-1>, float64 members the S-pairs from
+//     S<sSlot> (= D<sSlot/2>..D<sSlot/2+count-1>).  sSlot -1 means it went to the
+//     stack; that latches newExhausted true, disabling all further back-fill.
+func (cc CallConv) vfpArgPlace(t @types.Type, mask int,
+		exh bool) (int, bool, int, bool, int, bool) {
+	var count int = 1
+	var isDouble bool = false
+	if IsFloatScalarTyp(t) {
+		isDouble = !FloatScalarIsI32(t)
+	} else if cc.HfaAggregates {
+		n, memberBytes := abi.HfaClassify(t)
+		if n == 0 {
+			return -1, false, 0, false, mask, exh
+		}
+		count = n
+		isDouble = memberBytes == 8
+	} else {
+		return -1, false, 0, false, mask, exh
 	}
-	var isDouble bool = !FloatScalarIsI32(t)
 	if exh {
-		return -1, isDouble, true, mask, true
+		return -1, isDouble, count, true, mask, true
 	}
+	// The lowest run of count registers of t's width: S-slots from any base for
+	// float32, S-pairs from an even base for float64.  A lone float32 may back-fill a
+	// hole below the high-water an earlier float64 or aggregate left.
+	var width int = count
+	var step int = 1
 	if isDouble {
-		// Lowest even S-slot with both it and its successor free (D_{i/2}).
-		for i := 0; i + 1 < 16; i = i + 2 {
-			if (mask & (1 << i)) == 0 && (mask & (1 << (i + 1))) == 0 {
-				return i, true, true, mask | (1 << i) | (1 << (i + 1)), false
-			}
-		}
-		return -1, true, true, mask, true
+		width = 2 * count
+		step = 2
 	}
-	// float32: lowest free single S-slot (may back-fill a hole below high-water).
-	for i := 0; i < 16; i = i + 1 {
-		if (mask & (1 << i)) == 0 {
-			return i, false, true, mask | (1 << i), false
+	var run int = (1 << width) - 1
+	for i := 0; i + width <= 16; i = i + step {
+		if (mask & (run << i)) == 0 {
+			return i, isDouble, count, true, mask | (run << i), false
 		}
 	}
-	return -1, false, true, mask, true
+	return -1, isDouble, count, true, mask, true
 }
 
 // vfpNoSplitAfterStack applies AAPCS32 C.5 to a GP argument's placement (rs, rw, sw):
@@ -128,8 +147,8 @@ func (cc CallConv) vfpCallArgRegStartV(argTypes @[]@types.Type, i int, fixedCoun
 	// variadic yet leaves fixedCount==len.
 	for k := 0; k <= i; k++ {
 		var et @types.Type = cc.variadicEffType(argTypes[k], callIsVariadic)
-		sSlot, _, isFloat, newMask, newExh := cc.vfpArgPlace(et, mask, exhausted)
-		if isFloat {
+		sSlot, _, _, isCprc, newMask, newExh := cc.vfpArgPlace(et, mask, exhausted)
+		if isCprc {
 			if k == i { return -1 }
 			mask = newMask
 			exhausted = newExh
@@ -173,8 +192,8 @@ func (cc CallConv) vfpCallArgStackOffV(argTypes @[]@types.Type, i int, fixedCoun
 	// variadic yet leaves fixedCount==len.
 	for k := 0; k <= i; k++ {
 		var et @types.Type = cc.variadicEffType(argTypes[k], callIsVariadic)
-		sSlot, _, isFloat, newMask, newExh := cc.vfpArgPlace(et, mask, exhausted)
-		if isFloat {
+		sSlot, _, _, isCprc, newMask, newExh := cc.vfpArgPlace(et, mask, exhausted)
+		if isCprc {
 			mask = newMask
 			exhausted = newExh
 			if sSlot >= 0 {
@@ -235,8 +254,8 @@ func (cc CallConv) vfpCallStackBytesV(argTypes @[]@types.Type, fixedCount int,
 	// variadic yet leaves fixedCount==len.
 	for k := 0; k < len(argTypes); k++ {
 		var et @types.Type = cc.variadicEffType(argTypes[k], callIsVariadic)
-		sSlot, _, isFloat, newMask, newExh := cc.vfpArgPlace(et, mask, exhausted)
-		if isFloat {
+		sSlot, _, _, isCprc, newMask, newExh := cc.vfpArgPlace(et, mask, exhausted)
+		if isCprc {
 			mask = newMask
 			exhausted = newExh
 			if sSlot < 0 {
@@ -262,18 +281,19 @@ func (cc CallConv) vfpCallStackBytesV(argTypes @[]@types.Type, fixedCount int,
 }
 
 // CallArgFpReg walks the same allocator to report the concrete VFP register float
-// arg i lands in.  Only float args touch the mask, so non-float args between
-// floats leave it unchanged — ngrn need not be threaded here.  Returns the D-index
-// (float64) or S-index (float32), or (-1, false) when arg i is not an in-register
-// float or cc.VfpBackfill is off.
+// arg i lands in — for an HFA (cc.HfaAggregates), the first of its consecutive
+// registers.  Only float args and HFAs touch the mask, so the args between them leave
+// it unchanged — ngrn need not be threaded here.  Returns the D-index (float64
+// members) or S-index (float32), or (-1, false) when arg i is not in VFP registers
+// or cc.VfpBackfill is off.
 func (cc CallConv) CallArgFpReg(argTypes @[]@types.Type, i int) (int, bool) {
 	if !cc.VfpBackfill { return -1, false }
 	var mask int = 0
 	var exhausted bool = false
 	for k := 0; k <= i; k++ {
-		sSlot, isDouble, isFloat, newMask, newExh := cc.vfpArgPlace(argTypes[k], mask, exhausted)
+		sSlot, isDouble, _, isCprc, newMask, newExh := cc.vfpArgPlace(argTypes[k], mask, exhausted)
 		if k == i {
-			if !isFloat { return -1, false }
+			if !isCprc { return -1, false }
 			if sSlot < 0 { return -1, false }
 			if isDouble { return sSlot / 2, true }
 			return sSlot, false
@@ -282,4 +302,13 @@ func (cc CallConv) CallArgFpReg(argTypes @[]@types.Type, i int) (int, bool) {
 		exhausted = newExh
 	}
 	return -1, false
+}
+
+// MultiReturnFieldFpReg is CallArgFpReg over a multi-value tuple's field types: only a
+// float SCALAR field uses the float return registers (ABI §2.7) — a struct / array
+// field, even an HFA, returns in core registers — so the walk places scalars alone.
+func (cc CallConv) MultiReturnFieldFpReg(fieldTypes @[]@types.Type, i int) (int, bool) {
+	var scalars CallConv = cc
+	scalars.HfaAggregates = false
+	return scalars.CallArgFpReg(fieldTypes, i)
 }

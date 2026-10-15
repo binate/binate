@@ -4,7 +4,9 @@ import "pkg/binate/types"
 
 import "pkg/binate/ast"
 import "pkg/binate/constval"
-import "pkg/stdx/slices"
+import "pkg/std/cmp"
+import "pkg/std/hash"
+import "pkg/std/table"
 
 // Composite-literal type-checking, split out of check_expr.bn for
 // file-length hygiene. Same package; checkExpr / checkExprInner
@@ -56,7 +58,13 @@ func checkCompositeLit(c @Checker, e @ast.Expr) @types.Type {
 	// length — it can't re-fold a `...`), and validate the elements.
 	if e.TypeRef != nil && e.TypeRef.Kind == ast.TEXPR_ARRAY && e.TypeRef.LenInferred {
 		var ielemT @types.Type = resolveTypeExpr(c, e.TypeRef.Base)
-		var n int = inferArrayLitLen(c, e)
+		var n int64
+		var nok bool
+		n, nok = inferArrayLitLen(c, e)
+		if !nok {
+			addCheckError(c, e.Pos, "array length is too large")
+			return types.TypError()
+		}
 		var iat @types.Type = types.MakeArrayType(ielemT, n)
 		requireSizedType(c, iat, e.Pos)
 		checkArrayLit(c, e, iat)
@@ -188,19 +196,21 @@ func checkStructLit(c @Checker, e @ast.Expr, st @types.Type) {
 // walk: an unkeyed element follows the previous index + 1; a keyed element
 // `k: v` places its value at the constant index k.  The length is the highest
 // index reached plus one — so `[...]int{1,2,3}` is 3, `[...]int{5: 1}` is 6, and
-// `[...]int{}` is 0.
-func inferArrayLitLen(c @Checker, e @ast.Expr) int {
-	var maxLen int = 0
-	var nextIdx int = 0
+// `[...]int{}` is 0 — and false when it does not fit the target's int (an index at
+// its maximum).
+func inferArrayLitLen(c @Checker, e @ast.Expr) (int64, bool) {
+	var lim int64 = targetIntMax()
+	var maxLen int64 = 0
+	var nextIdx int64 = 0
 	for i := 0; i < len(e.Elems); i++ {
-		var idx int = nextIdx
+		var idx int64 = nextIdx
 		if e.Elems[i].Key != nil {
 			var kc constval.Value
 			var kst int
 			kc, kst = evalConstNoPos(c, e.Elems[i].Key)
-			var kv int
+			var kv int64
 			var kok bool
-			kv, kok = constHostInt(kc, kst)
+			kv, kok = constTargetInt(kc, kst)
 			// A non-constant / negative key is diagnosed by checkArrayLit; for
 			// length inference treat it as the running position so the count
 			// stays sane (the diagnostic already fails the compile).
@@ -208,12 +218,15 @@ func inferArrayLitLen(c @Checker, e @ast.Expr) int {
 				idx = kv
 			}
 		}
+		if idx >= lim {
+			return 0, false
+		}
 		if idx + 1 > maxLen {
 			maxLen = idx + 1
 		}
 		nextIdx = idx + 1
 	}
-	return maxLen
+	return maxLen, true
 }
 
 // checkArrayLit validates array literal elements against the array's element type.
@@ -234,20 +247,16 @@ func checkArrayLit(c @Checker, e @ast.Expr, at @types.Type) {
 	// A length that depends on a type parameter is known only for each
 	// instantiation, whose check decides the count and the index bounds.
 	var dependent bool = at.ArrayLenDependent
-	if !dependent && !anyKey && len(e.Elems) > at.ArrayLen {
+	if !dependent && !anyKey && cast(int64, len(e.Elems)) > at.ArrayLen {
 		addCheckError(c, e.Pos, "too many elements in array literal")
 	}
-	// seen[idx] guards against a duplicate index (`[3]int{0: 1, 0: 2}`);
-	// seenDep does for a dependent length.
-	var seenLen int = at.ArrayLen
-	if dependent {
-		seenLen = 0
-	}
-	var seen @[]bool = make_slice(bool, seenLen)
-	var seenDep @[]int
-	var nextIdx int = 0
+	// seen guards against a duplicate index (`[3]int{0: 1, 0: 2}`); it holds the
+	// indices the elements take, so it is bounded by the element count, not the
+	// array's length (`[1 << 40]int8{}` is valid).
+	var seen @table.Table[int64, bool, indexHasher, indexEq] = newIndexSet()
+	var nextIdx int64 = 0
 	for i := 0; i < len(e.Elems); i++ {
-		var idx int = nextIdx
+		var idx int64 = nextIdx
 		if e.Elems[i].Key != nil {
 			var kt @types.Type = checkExpr(c, e.Elems[i].Key)
 			if kt != nil && !kt.IsInteger() {
@@ -256,14 +265,18 @@ func checkArrayLit(c @Checker, e @ast.Expr, at @types.Type) {
 			var kc constval.Value
 			var kst int
 			kc, kst = constOf(c, e.Elems[i].Key)
-			var kv int
+			var kv int64
 			var kok bool
-			kv, kok = constHostInt(kc, kst)
+			kv, kok = constTargetInt(kc, kst)
 			if !kok {
 				// No usable index (a key whose own error was already
 				// reported is POISONED): check the value alone, without
 				// index bookkeeping, so no bounds / duplicate error follows.
-				if kst != constval.POISONED {
+				// An integer constant past the target's int is past every
+				// array's bounds.
+				if kst == constval.OK && !kc.IsBool {
+					addCheckError(c, e.Elems[i].Value.Pos, "array literal index out of bounds")
+				} else if kst != constval.POISONED {
 					addCheckError(c, e.Elems[i].Key.Pos, "array literal index must be a constant")
 				}
 				var bvt @types.Type = checkExprWithFVHint(c, e.Elems[i].Value, at.Elem)
@@ -280,16 +293,10 @@ func checkArrayLit(c @Checker, e @ast.Expr, at @types.Type) {
 		}
 		if idx < 0 || (!dependent && idx >= at.ArrayLen) {
 			addCheckError(c, e.Elems[i].Value.Pos, "array literal index out of bounds")
-		} else if dependent {
-			if intInList(seenDep, idx) {
-				addCheckError(c, e.Elems[i].Value.Pos, "duplicate index in array literal")
-			} else {
-				seenDep = slices.Append[int](seenDep, idx)
-			}
-		} else if seen[idx] {
+		} else if seen.Has(idx) {
 			addCheckError(c, e.Elems[i].Value.Pos, "duplicate index in array literal")
 		} else {
-			seen[idx] = true
+			seen.Put(idx, true)
 		}
 		var vt @types.Type = checkExprWithFVHint(c, e.Elems[i].Value, at.Elem)
 		if !assignableOrBorrowsIface(c, e.Elems[i].Value, vt, at.Elem) {
@@ -297,4 +304,31 @@ func checkArrayLit(c @Checker, e @ast.Expr, at @types.Type) {
 		}
 		nextIdx = idx + 1
 	}
+}
+
+// newIndexSet returns an empty set of array-literal indices (checkArrayLit).
+func newIndexSet() @table.Table[int64, bool, indexHasher, indexEq] {
+	return table.NewTable[int64, bool, indexHasher, indexEq](indexHasher{}, indexEq{})
+}
+
+// indexHasher / indexEq key checkArrayLit's set of the indices an array literal's
+// elements take.
+type indexHasher struct {}
+
+impl indexHasher : hash.Hasher[int64]
+
+// Hash mixes an index's bits.
+func (h indexHasher) Hash(k int64) uint {
+	var u uint64 = bit_cast(uint64, k)
+	return cast(uint, u ^ (u >> 29))
+}
+
+// indexEq is the equality paired with indexHasher.
+type indexEq struct {}
+
+impl indexEq : cmp.Eq[int64]
+
+// Equal reports whether a and b are the same index.
+func (e indexEq) Equal(a int64, b int64) bool {
+	return a == b
 }

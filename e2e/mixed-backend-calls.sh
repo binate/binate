@@ -14,8 +14,10 @@
 # arguments, and a multi-value return through a func value (its shim emitted on the
 # callee's side and on the caller's), a capturing closure and an interface method.
 #
-# Both backends target the host arch.  Exit 0 on full pass; non-zero with
-# diagnostics on failure.
+# Both backends target the host arch — or, with MIXED_TARGET=arm32-linux (set by
+# e2e/arm32-mixed-backend-calls.sh), arm32 hard-float, linked with
+# arm-linux-gnueabihf-gcc and run under qemu-arm (SKIP when those are missing).
+# Exit 0 on full pass; non-zero with diagnostics on failure.
 
 set -u
 
@@ -24,16 +26,51 @@ BINATE_DIR="$(dirname "$SCRIPT_DIR")"
 [ -d "$BINATE_DIR/pkg" ] || { echo "FAIL: not a binate repo: $BINATE_DIR" >&2; exit 1; }
 
 CLANG="${CLANG:-$(command -v clang || command -v cc || echo cc)}"
+ARM32=""
+TARGET_ARGS=""
+PATHS_ARGS=""
+if [ "${MIXED_TARGET:-}" = arm32-linux ]; then
+    ARM32=1
+    QEMU_ARM="${QEMU_ARM:-$(command -v qemu-arm-static || command -v qemu-arm || true)}"
+    ARM32_CC="${ARM32_CC:-$(command -v arm-linux-gnueabihf-gcc || true)}"
+    [ -n "$QEMU_ARM" ] || { echo "SKIP: qemu-arm(-static) not found"; exit 0; }
+    [ -n "$ARM32_CC" ] || { echo "SKIP: arm-linux-gnueabihf-gcc not found"; exit 0; }
+    TARGET_ARGS="--target arm32-linux"
+    PATHS_ARGS="--target arm32-linux"
+elif [ -n "${MIXED_TARGET:-}" ]; then
+    echo "FAIL: unknown MIXED_TARGET ${MIXED_TARGET}"; exit 1
+fi
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/binate_e2e_mixbe.XXXXXX")" || true
 [ -d "$TMP" ] || { echo "FAIL: mktemp -d failed" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
+
+# arm32: gate on the whole dependency — gcc can link a static arm-linux-gnueabihf
+# binary (-static: self-contained under qemu, and non-PIE for the native backend's
+# absolute movw/movt relocations) AND qemu can run it.
+if [ -n "$ARM32" ] && ! { echo 'int main(void){return 0;}' \
+        | "$ARM32_CC" -static -x c - -o "$TMP/probe" 2>/dev/null \
+        && "$QEMU_ARM" "$TMP/probe" >/dev/null 2>&1; }; then
+    echo "SKIP: cannot cross-compile + run a static arm-linux-gnueabihf binary under qemu"
+    exit 0
+fi
+
+# link_prog <out> <objects...>: link the program for the target.
+link_prog() {
+    o="$1"; shift
+    if [ -n "$ARM32" ]; then "$ARM32_CC" -static -w -o "$o" "$@"; else "$CLANG" -w -o "$o" "$@"; fi
+}
+
+# run_prog <exe>: run the program, under qemu on arm32.
+run_prog() {
+    if [ -n "$ARM32" ]; then "$QEMU_ARM" "$1"; else "$1"; fi
+}
 
 echo "Building gen1 bnc from current source..."
 GEN1="$TMP/gen1-bnc"
 gen1_log="$("$BINATE_DIR/scripts/build-bnc.sh" -o "$GEN1" 2>&1)" || true
 [ -x "$GEN1" ] || { echo "FAIL: gen1 bnc build failed"; echo "$gen1_log" | tail -20; exit 1; }
-IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")"
-IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")"
+IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" $PATHS_ARGS)"
+IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" $PATHS_ARGS)"
 
 # --- the dependency package, compiled by one backend ----------------------
 mkdir -p "$TMP/src/pkg/mbdep"
@@ -184,7 +221,7 @@ check_mix() {
     label="dep=$depbe,main=$mainbe"
     work="$TMP/$depbe-$mainbe"
     mkdir -p "$work/dep" "$work/main"
-    if ! "$GEN1" -I "$TMP/src:$IFACE" -L "$TMP/src:$IMPL" --backend "$depbe" \
+    if ! "$GEN1" -I "$TMP/src:$IFACE" -L "$TMP/src:$IMPL" --backend "$depbe" $TARGET_ARGS \
             --build-dir "$work/dep" --pkg pkg/mbdep >"$work/dep.log" 2>&1; then
         echo "FAIL: $label: --pkg pkg/mbdep failed"; tail -5 "$work/dep.log"
         FAILS=$((FAILS + 1)); return
@@ -195,7 +232,7 @@ check_mix() {
         FAILS=$((FAILS + 1)); return
     fi
     if ! (cd "$TMP/src" && "$GEN1" -I "$TMP/src:$IFACE" -L "$TMP/src:$IMPL" \
-            --backend "$mainbe" --build-dir "$work/main" -c main.bn) >"$work/main.log" 2>&1 \
+            --backend "$mainbe" $TARGET_ARGS --build-dir "$work/main" -c main.bn) >"$work/main.log" 2>&1 \
             || [ ! -f "$work/main/main.o" ]; then
         echo "FAIL: $label: -c main.bn failed"; tail -5 "$work/main.log"
         FAILS=$((FAILS + 1)); return
@@ -208,11 +245,11 @@ check_mix() {
         FAILS=$((FAILS + 1)); return
     fi
     objs="$(ls "$work/main"/*.o | grep -v "/$depname\$" | tr '\n' ' ')"
-    if ! "$CLANG" -w -o "$work/run" $objs "$depobj" 2>"$work/link.err"; then
+    if ! link_prog "$work/run" $objs "$depobj" 2>"$work/link.err"; then
         echo "FAIL: $label: link failed"; head -5 "$work/link.err"
         FAILS=$((FAILS + 1)); return
     fi
-    got="$("$work/run" 2>&1)"
+    got="$(run_prog "$work/run" 2>&1)"
     if [ "$got" = "$WANT" ]; then
         echo "PASS: $label"
         PASSES=$((PASSES + 1))

@@ -1,0 +1,118 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/ir"
+import "pkg/binate/native/callconv"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+import "pkg/binate/types/abi"
+
+// ============================================================
+// Hard-float (AAPCS-VFP) HFA movement: direct call / return / parameter
+// ============================================================
+//
+// With cc.HfaAggregates a homogeneous float aggregate (HFA — a struct or array of
+// 1-4 float32 or 1-4 float64 members, nested ones flattened) is ONE co-processor
+// register candidate: its members ride consecutive S registers (float32) or D
+// registers (float64), placed by the same back-fill allocator as the float scalars —
+// cc.CallArgFpReg gives the first register — and an HFA result comes back in s0.. /
+// d0.. (cc.ReturnsHfaInRegs / CallReturnsHfaInRegs).  Like every aggregate, an HFA's
+// value is a pointer to its bytes, so each member moves between memory and its VFP
+// register directly (VLDR / VSTR; the members are contiguous at m * memberBytes and
+// 4-aligned), with no GP round-trip.  An HFA that overflowed the bank, one in a
+// variadic call, and one off hard-float take the GP aggregate paths: the walkers
+// place it on the stack or in the core registers.
+
+// hfaArgFpRegArm32 returns the first VFP register of the HFA argument at argTypes[i]
+// — (hwSlot, isDouble) as cc.CallArgFpReg gives them: S<hwSlot> for float32 members,
+// D<hwSlot> for float64 — its member count n and member byte width memW, or hwSlot
+// -1 when that argument is not an HFA in VFP registers.
+func hfaArgFpRegArm32(cc callconv.CallConv, argTypes @[]@types.Type, i int) (int, bool, int, int) {
+	var t @types.Type = argTypes[i]
+	if !callconv.IsAggregateTyp(t) { return -1, false, 0, 0 }
+	n, memW := abi.HfaClassify(t)
+	if n == 0 { return -1, false, 0, 0 }
+	hwSlot, isDouble := cc.CallArgFpReg(argTypes, i)
+	return hwSlot, isDouble, n, memW
+}
+
+// emitHfaLoadPtrArm32 loads the n members of the HFA at [ptr] into the VFP registers
+// from (hwSlot, isDouble) on.  The member offsets (at most 24) are within VLDR's
+// reach.
+func emitHfaLoadPtrArm32(a @asm.Assembler, hwSlot int, isDouble bool, n int, memW int, ptr int) {
+	for m := 0; m < n; m++ {
+		var reg int = fpRegForSlot(hwSlot + m, isDouble)
+		if isDouble {
+			arm32.Vldr64(a, arm32.COND_AL, reg, ptr, m * memW)
+		} else {
+			arm32.Vldr32(a, arm32.COND_AL, reg, ptr, m * memW)
+		}
+	}
+}
+
+// emitHfaStoreFrameArm32 stores the VFP registers from (hwSlot, isDouble) on into the
+// n members of the HFA at [SP + off]; IP materializes an address past VSTR's reach.
+func emitHfaStoreFrameArm32(a @asm.Assembler, hwSlot int, isDouble bool, n int, memW int, off int) {
+	for m := 0; m < n; m++ {
+		vfpStoreBaseHard(a, isDouble, fpRegForSlot(hwSlot + m, isDouble), arm32.SP, off + m * memW,
+				arm32.IP)
+	}
+}
+
+// emitCallArgHfaHard places an HFA call argument in its VFP registers, loading each
+// member from the argument's bytes.  Returns false when the argument is not an HFA in
+// VFP registers, which the caller's GP aggregate path then places.
+func emitCallArgHfaHard(a @asm.Assembler, rm @common.RegMap, argTypes @[]@types.Type, arg @ir.Instr,
+		dispatchIdx int) bool {
+	hwSlot, isDouble, n, memW := hfaArgFpRegArm32(rm.CC, argTypes, dispatchIdx)
+	if hwSlot < 0 { return false }
+	var ptr int = getOperand(a, rm, arg.ID)
+	if ptr < 0 {
+		a.SetError("native arm32: hard-float HFA call arg not materializable")
+		return true
+	}
+	emitHfaLoadPtrArm32(a, hwSlot, isDouble, n, memW, ptr)
+	return true
+}
+
+// emitSpillParamHfaHard lands an incoming HFA parameter that arrived in VFP
+// registers: each member is stored into the parameter's data region, whose address
+// then goes into its spill slot like any register-passed aggregate's.  Returns false
+// when the parameter is not an HFA in VFP registers (one that overflowed the bank
+// arrived on the stack, which the GP aggregate path uses in place).
+func emitSpillParamHfaHard(a @asm.Assembler, rm @common.RegMap, p @ir.Param,
+		paramTypes @[]@types.Type, dispatchIdx int) bool {
+	hwSlot, isDouble, n, memW := hfaArgFpRegArm32(rm.CC, paramTypes, dispatchIdx)
+	if hwSlot < 0 { return false }
+	var dataOff int = rm.NeedAlloc(a, p.ID, "native arm32: an HFA parameter")
+	if dataOff < 0 { return true }
+	emitHfaStoreFrameArm32(a, hwSlot, isDouble, n, memW, dataOff)
+	writeAggParamSpillPtr(a, rm, p, dataOff)
+	rm.ResetRegs()
+	return true
+}
+
+// emitReturnHfaHard produces a single HFA result in s0.. / d0.., loading each member
+// from the result's bytes.  The caller has checked cc.ReturnsHfaInRegs.
+func emitReturnHfaHard(a @asm.Assembler, rm @common.RegMap, arg @ir.Instr) {
+	n, memW := abi.HfaClassify(arg.Typ)
+	var ptr int = getOperand(a, rm, arg.ID)
+	if ptr < 0 {
+		a.SetError("native arm32: hard-float HFA return not materializable")
+		return
+	}
+	emitHfaLoadPtrArm32(a, 0, memW == 8, n, memW, ptr)
+}
+
+// emitCallReturnHfaHard collects a call's HFA result from s0.. / d0.. into the call
+// result's data region and points the result at it.  The caller has checked
+// cc.CallReturnsHfaInRegs.
+func emitCallReturnHfaHard(a @asm.Assembler, rm @common.RegMap, ins @ir.Instr) {
+	var dataOff int = rm.NeedAlloc(a, ins.ID, "native arm32: an HFA call result")
+	if dataOff < 0 { return }
+	n, memW := abi.HfaClassify(ins.Typ)
+	emitHfaStoreFrameArm32(a, 0, memW == 8, n, memW, dataOff)
+	var rd int = nextReg(rm, ins.ID)
+	emitFrameAddr(a, rd, dataOff)
+}

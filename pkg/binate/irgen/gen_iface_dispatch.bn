@@ -7,6 +7,7 @@ import "pkg/binate/irutil"
 import "pkg/binate/ir"
 
 import "pkg/binate/ast"
+import "pkg/binate/buf"
 import "pkg/binate/irsym"
 import "pkg/binate/types"
 import "pkg/binate/types/abi"
@@ -88,8 +89,9 @@ func isNamedRecvBase(t @types.Type) bool {
 
 // genInterfaceMethodCall lowers `iv.method(args)` where iv is a
 // TYP_INTERFACE_VALUE / TYP_INTERFACE_VALUE_MANAGED to an
-// OP_CALL_IFACE_METHOD instruction. Looks up the method's slot
-// index + return type via the per-module interface registry.
+// OP_CALL_IFACE_METHOD instruction.  The method's vtable slot comes from the
+// per-module interface registry, its signature from the checker's type of the
+// receiver (ifaceCallMethodType).
 //
 // Pointer-to-iv smoothing: when sel.X produces a
 // pointer-to-iv value, emit the load to recover the iv before
@@ -117,15 +119,14 @@ func genInterfaceMethodCall(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr
 	}
 	var ifacePkg @[]char = ifaceTyp.Elem.Pkg
 	var ifaceName @[]char = ifaceTyp.Elem.Name
-	var idx int
-	var resultTypes @[]@types.Type
-	var paramTypes @[]@types.Type
-	var isVariadic bool
-	idx, resultTypes, paramTypes, isVariadic = findInterfaceMethod(ctx.Gc.Mod, ifacePkg, ifaceName,
-			sel.Name)
+	var idx int = findInterfaceMethod(ctx.Gc.Mod, ifacePkg, ifaceName, sel.Name)
 	if idx < 0 {
 		return irbuild.EmitConstInt(b, 0, types.TypInt())
 	}
+	var resultTypes @[]@types.Type
+	var paramTypes @[]@types.Type
+	var isVariadic bool
+	resultTypes, paramTypes, isVariadic = ifaceCallSignature(ctx, sel)
 	// Build the dispatch result type from the full result list: 0 -> void,
 	// 1 -> the single type, >=2 -> the multi-return tuple struct (so a
 	// downstream multi-assign `extractvalue`s against a real struct, not the
@@ -144,8 +145,8 @@ func genInterfaceMethodCall(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr
 	// raw-slice param shifts later args), a variadic method packs its trailing
 	// individual args into the single *[]T or forwards a spread operand.  At this
 	// vtable-dispatch boundary variadic-ness is erased to a plain *[]T before the
-	// indirection (func.variadic.identity); MethodParamsFlat already carries the
-	// *[]T body type, and isVariadic rides the per-method MethodParamVariadic marker.
+	// indirection (func.variadic.identity); the variadic parameter's type is the
+	// *[]T body type.
 	// Split eval and delivery so an iface-method stack-overflow / nil PRE-CHECK sits
 	// between them, mirroring genCall's OP_STACK_CHECK for direct calls: the args are
 	// evaluated (SP reflects their growth) but not yet delivered/consumed, so
@@ -173,12 +174,51 @@ func genInterfaceMethodCall(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr
 	return result
 }
 
-// findInterfaceMethod returns the (absolute vtable slot, result
-// types, param types) of the named method on (ifacePkg, ifaceName), or
-// (-1, empty, empty) if not found.  For an inherited method the result +
-// param types come from the parent that owns it (the recursion carries
-// them up).  Results are a LIST so a 0- or >=2-result method dispatches
-// correctly (the caller builds void / single / tuple from it).  The slot
+// ifaceCallSignature returns the result types, parameter types and last-parameter
+// variadic flag of the interface method the call selector sel dispatches, from
+// the checker's signature of the method (ifaceCallMethodType) mapped to IR-gen
+// types.  The checker rejects a call through an interface value of a method that
+// mentions `Self` (iface.self.object-safety), so no such method reaches here.
+func ifaceCallSignature(ctx @GenContext, sel @ast.Expr) (@[]@types.Type, @[]@types.Type, bool) {
+	var ft @types.Type = ifaceCallMethodType(ctx, sel)
+	if ft == nil {
+		panic(buf.Concat("internal error: no checker signature for interface method ", sel.Name))
+	}
+	if types.FuncMentionsSelf(ft) {
+		panic(buf.Concat("internal error: interface dispatch of a method that uses Self: ", sel.Name))
+	}
+	var mapped @types.Type = irTypeFromChecker(ctx.Gc, ft)
+	if mapped == nil {
+		panic(buf.Concat("internal error: interface method signature has no IR-gen type: ", sel.Name))
+	}
+	var params @[]@types.Type = make_slice(@types.Type, len(mapped.Params))
+	for i := 0; i < len(mapped.Params); i++ {
+		params[i] = mapped.Params[i].Type
+	}
+	return mapped.Results, params, types.FuncIsVariadic(ft)
+}
+
+// ifaceCallMethodType returns the checker's signature of the method the call
+// selector sel names on its interface-value receiver — through aliases,
+// `readonly` and one pointer level (the pointer-to-iv smoothing) — or nil when
+// the receiver has no checker type or is not an interface value.
+func ifaceCallMethodType(ctx @GenContext, sel @ast.Expr) @types.Type {
+	if ctx.Checker == nil || sel.X == nil || sel.X.ResolvedTypeID == 0 { return nil }
+	var t @types.Type = types.ResolveAliasAndConst(ctx.Checker.ExprType(sel.X.ResolvedTypeID))
+	if t != nil && (t.Kind == types.TYP_POINTER || t.Kind == types.TYP_MANAGED_PTR) {
+		t = types.ResolveAliasAndConst(t.Elem)
+	}
+	if t == nil ||
+			(t.Kind != types.TYP_INTERFACE_VALUE && t.Kind != types.TYP_INTERFACE_VALUE_MANAGED) {
+		return nil
+	}
+	var m @types.Method = t.Elem.LookupInterfaceMethod(sel.Name)
+	if m == nil { return nil }
+	return m.FuncType
+}
+
+// findInterfaceMethod returns the absolute vtable slot of the named method on
+// (ifacePkg, ifaceName), or -1 if not found.  The slot
 // is 0-based into the canonical (R, I)
 // vtable layout: slots 0-1 = the any-block (dtor, then *TypeInfo),
 // slots 2.. populated by the concat layout (each parent's full
@@ -191,79 +231,41 @@ func genInterfaceMethodCall(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr
 // Follows alias chains; cross-package lookups require ifacePkg
 // to be the canonical package.
 func findInterfaceMethod(m @ir.Module, ifacePkg *[]readonly char, ifaceName *[]readonly char,
-		methodName *[]readonly char) (int, @[]@types.Type, @[]@types.Type, bool) {
+		methodName *[]readonly char) int {
 	return findInterfaceMethodFromBase(m, ifacePkg, ifaceName, methodName, 0)
 }
 
 // FindInterfaceMethodSlot is the exported wrapper over findInterfaceMethod for
 // host-driven interface dispatch (interp's CallIfaceMethod): given a module whose
 // interface registry covers (ifacePkg, ifaceName) and its parents, it resolves
-// methodName to the method's ABSOLUTE vtable slot plus the method's declared result
-// types, param types, and last-param variadic flag.  Slot is -1 if not found.
+// methodName to the method's ABSOLUTE vtable slot, or -1 if not found.
 func FindInterfaceMethodSlot(m @ir.Module, ifacePkg *[]readonly char, ifaceName *[]readonly char,
-		methodName *[]readonly char) (int, @[]@types.Type, @[]@types.Type, bool) {
+		methodName *[]readonly char) int {
 	return findInterfaceMethod(m, ifacePkg, ifaceName, methodName)
 }
 
 // findInterfaceMethodFromBase walks the recursive vtable structure
 // of (ifacePkg, ifaceName), treating `base` as the offset where
 // this interface's full vtable starts.  Returns the absolute slot
-// index (in the outermost vtable) of the matching method, plus
-// the method's declared result types and param types.
+// index (in the outermost vtable) of the matching method, or -1.
 func findInterfaceMethodFromBase(m @ir.Module, ifacePkg *[]readonly char,
-		ifaceName *[]readonly char, methodName *[]readonly char,
-		base int) (int, @[]@types.Type, @[]@types.Type, bool) {
-	var noTypes @[]@types.Type
+		ifaceName *[]readonly char, methodName *[]readonly char, base int) int {
 	var idx int = ir.ResolveModuleInterface(m, ifacePkg, ifaceName)
-	if idx < 0 { return -1, noTypes, noTypes, false }
+	if idx < 0 { return -1 }
 	var mi irsym.ModuleInterface = m.Interfaces[idx]
 	// Slots `base` and `base+1` are this interface's any-block (dtor,
 	// then *TypeInfo).  Parent sub-vtables follow, then own methods.
-	// Result + param types (and the last-param variadic flag) come from
-	// whichever interface in the chain OWNS the method (a parent for an
-	// inherited method), so the recursion carries them up.
 	var cursor int = base + 2
 	for i := 0; i < len(mi.ParentPkgs); i++ {
-		var pSlot int
-		var pResults @[]@types.Type
-		var pParams @[]@types.Type
-		var pVariadic bool
-		pSlot, pResults, pParams, pVariadic = findInterfaceMethodFromBase(m, mi.ParentPkgs[i],
-				mi.ParentNames[i], methodName, cursor)
-		if pSlot >= 0 { return pSlot, pResults, pParams, pVariadic }
+		var pSlot int = findInterfaceMethodFromBase(m, mi.ParentPkgs[i], mi.ParentNames[i], methodName,
+				cursor)
+		if pSlot >= 0 { return pSlot }
 		cursor = cursor + ir.IfaceFullVtableSize(m, mi.ParentPkgs[i], mi.ParentNames[i])
 	}
-	// rOffset / pOffset walk the flat result / param stores in lockstep with
-	// j, so method j's results are MethodResultsFlat[rOffset .. rOffset+rCount]
-	// and its params MethodParamsFlat[pOffset .. pOffset+pCount].
-	var rOffset int = 0
-	var pOffset int = 0
 	for j := 0; j < len(mi.MethodNames); j++ {
-		var rCount int = 0
-		if j < len(mi.MethodResultCounts) {
-			rCount = mi.MethodResultCounts[j]
-		}
-		var pCount int = 0
-		if j < len(mi.MethodParamCounts) {
-			pCount = mi.MethodParamCounts[j]
-		}
 		if irutil.CharEq(mi.MethodNames[j], methodName) {
-			var results @[]@types.Type
-			if rOffset + rCount <= len(mi.MethodResultsFlat) {
-				results = mi.MethodResultsFlat[rOffset:rOffset + rCount]
-			}
-			var params @[]@types.Type
-			if pOffset + pCount <= len(mi.MethodParamsFlat) {
-				params = mi.MethodParamsFlat[pOffset:pOffset + pCount]
-			}
-			var isVariadic bool = false
-			if j < len(mi.MethodParamVariadic) {
-				isVariadic = mi.MethodParamVariadic[j]
-			}
-			return cursor + j, results, params, isVariadic
+			return cursor + j
 		}
-		rOffset = rOffset + rCount
-		pOffset = pOffset + pCount
 	}
-	return -1, noTypes, noTypes, false
+	return -1
 }

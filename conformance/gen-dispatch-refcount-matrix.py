@@ -3,7 +3,7 @@
 MANAGED multi-return component produced through an INDIRECT call (the
 indirect-producer axis the refcount matrix never crossed).
 
-The result-side dispatch value/packing was fixed (the MethodResultsFlat SEAM,
+The result-side dispatch value/packing was fixed (the dispatch result-shape fix,
 `6c39d460`); this matrix asks the *refcount* question its value-only sibling
 (`matrix/abi`) can't see: when an interface-method dispatch returns a managed
 component, does the component arrive with exactly one added ref (Axiom-3) and get

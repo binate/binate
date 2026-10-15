@@ -1,0 +1,215 @@
+package "pkg/binate/native/arm32"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/native/callconv"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+
+// Unit tests for HFAs in the func-value shims (arm32_shim_hfa.bn and its hooks in the
+// marshal, spill and shape dispatch).  Each stamps an arm32 hard-float target, emits the
+// shim with cc.HfaAggregates forced on (or, as a control, off), restores the target,
+// then pins where the HFA goes: its members loaded from the dispatch pointer into VFP
+// registers, past the bank to the outgoing stack, and an HFA result stored from s0.. /
+// d0.. through the retbuf.
+
+// hfaShimCC is the hard-float AAPCS32 CallConv with HFA passing in VFP registers — call
+// it after stampHard.
+func hfaShimCC() callconv.CallConv {
+	var cc callconv.CallConv = callconv.AAPCS32()
+	cc.HfaAggregates = true
+	return cc
+}
+
+// hfaShimFv builds a func-value type with the given param and result types.
+func hfaShimFv(ps @[]@types.Type, rs @[]@types.Type) @types.Type {
+	var params @[]@types.Param = make_slice(@types.Param, len(ps))
+	for i := 0; i < len(ps); i++ {
+		params[i] = make(types.Param)
+		params[i].Type = ps[i]
+	}
+	return types.MakeFuncValueType(params, rs)
+}
+
+// typesOf1 returns a one-element slice holding t0.
+func typesOf1(t0 @types.Type) @[]@types.Type {
+	var ts @[]@types.Type = make_slice(@types.Type, 1)
+	ts[0] = t0
+	return ts
+}
+
+// emitHfaShim stamps hard-float, emits the func-value shim for fv with HFA passing on
+// (hfa) or off, and restores the target.
+func emitHfaShim(fv @types.Type, hfa bool) @asm.Assembler {
+	oldArch, oldAbi := stampHard()
+	var cc callconv.CallConv = callconv.AAPCS32()
+	if hfa { cc = hfaShimCC() }
+	var a @asm.Assembler = mkAsm()
+	emitFuncValueShimBody(a, cc, "bn_ref", fv)
+	restoreTarget(oldArch, oldAbi)
+	return a
+}
+
+// strWord encodes STR rt, [base, #off].
+func strWord(rt int, base int, off int) uint32 {
+	var ref @asm.Assembler = mkAsm()
+	arm32.Str(ref, arm32.COND_AL, rt, arm32.MemImm(base, off))
+	return word32(ref, 0)
+}
+
+// An F2 param arrives by address (staged at [SP], since a by-address aggregate forces
+// staging) and its members load from it into s0-s1; it takes no core register.  With
+// HFA passing off the same shim re-expands it into r0-r1.
+func TestShimHfaParamLoadsVfp() testing.TestResult {
+	var none @[]@types.Type
+	var fv @types.Type = hfaShimFv(typesOf1(hfaType("F2", types.TypFloat32(), 2)), none)
+	var a @asm.Assembler = emitHfaShim(fv, true)
+	var off @asm.Assembler = emitHfaShim(fv, false)
+	if a.HasError || off.HasError { return fail("an HFA-param shim must lower") }
+	if !containsWord(a, ldrWord(arm32.IP, arm32.SP, 0)) {
+		return fail("the HFA's address must load into IP")
+	}
+	if !containsWord(a, vldrWord(false, arm32.S0, arm32.IP, 0)) ||
+			!containsWord(a, vldrWord(false, arm32.S1, arm32.IP, 4)) {
+		return fail("F2's members must load into s0-s1")
+	}
+	if containsWord(a, ldrWord(arm32.R0, arm32.IP, 0)) {
+		return fail("F2 must not be expanded into r0")
+	}
+	if !containsWord(off, ldrWord(arm32.R0, arm32.IP, 0)) ||
+			!containsWord(off, ldrWord(arm32.R1, arm32.IP, 4)) {
+		return fail("with HFAs off, F2 must be expanded into r0-r1")
+	}
+	return ""
+}
+
+// A D2 result comes back in d0-d1, which the shim stores through the retbuf it saved in
+// R4 after a real BL.  With HFA passing off the 16-byte D2 is an sret result: the shim
+// tail-branches and stores nothing.
+func TestShimHfaReturnStoresThroughRetbuf() testing.TestResult {
+	var none @[]@types.Type
+	var fv @types.Type = hfaShimFv(none, typesOf1(hfaType("D2", types.TypFloat64(), 2)))
+	var a @asm.Assembler = emitHfaShim(fv, true)
+	var off @asm.Assembler = emitHfaShim(fv, false)
+	if a.HasError || off.HasError { return fail("an HFA-return shim must lower") }
+	if !containsWord(a, vstrWord(true, arm32.D0, arm32.R4, 0)) ||
+			!containsWord(a, vstrWord(true, arm32.D1, arm32.R4, 8)) {
+		return fail("D2's members must be stored from d0-d1 through the retbuf in R4")
+	}
+	var mv @asm.Assembler = mkAsm()
+	arm32.Mov(mv, arm32.COND_AL, false, arm32.R4, arm32.Reg(arm32.R0))
+	if !containsWord(a, word32(mv, 0)) {
+		return fail("the retbuf must be saved in R4 before the call")
+	}
+	if containsWord(off, vstrWord(true, arm32.D0, arm32.R4, 0)) {
+		return fail("with HFAs off, D2 is sret and the shim stores nothing")
+	}
+	return ""
+}
+
+// (D4, D4, F1) fits the incoming registers, but F1 is past the VFP bank: the shim takes
+// the spill path, loading the two D4s into d0-d7 and copying F1's word to the outgoing
+// stack at [SP] (through R4).
+func TestShimHfaParamPastBankSpills() testing.TestResult {
+	var d4 @types.Type = hfaType("D4", types.TypFloat64(), 4)
+	var ps @[]@types.Type = make_slice(@types.Type, 3)
+	ps[0] = d4
+	ps[1] = d4
+	ps[2] = hfaType("F1", types.TypFloat32(), 1)
+	var none @[]@types.Type
+	var a @asm.Assembler = emitHfaShim(hfaShimFv(ps, none), true)
+	if a.HasError { return fail("an HFA past the bank must route to the spill shim, not error") }
+	if !containsWord(a, vldrWord(true, arm32.D7, arm32.IP, 24)) {
+		return fail("the second D4 must end in d7")
+	}
+	if !containsWord(a, strWord(arm32.R4, arm32.SP, 0)) {
+		return fail("F1's word must go to the outgoing [SP]")
+	}
+	return ""
+}
+
+// An HFA result with more args than the registers hold takes the spill shim, which
+// reloads the retbuf into R4 after its BL and stores s0-s2 through it.
+func TestShimHfaReturnSpill() testing.TestResult {
+	var ps @[]@types.Type = make_slice(@types.Type, 5)
+	for i := 0; i < 5; i++ {
+		ps[i] = types.TypInt32()
+	}
+	var a @asm.Assembler = emitHfaShim(hfaShimFv(ps, typesOf1(hfaType("F3", types.TypFloat32(), 3))),
+			true)
+	if a.HasError { return fail("an over-budget HFA-return shim must lower") }
+	for m := 0; m < 3; m++ {
+		if !containsWord(a, vstrWord(false, arm32.S0 + m, arm32.R4, 4 * m)) {
+			return fail("F3's members must be stored from s0-s2 through the retbuf")
+		}
+	}
+	// The fifth int32 takes the outgoing stack (8 bytes, rounded), so the retbuf is
+	// stashed at [SP, #8] and reloaded from there; the first arg comes from R2 (the
+	// retbuf and data words dropped).
+	var ref @asm.Assembler = mkAsm()
+	emitFrameStore(ref, arm32.R0, 8)
+	emitFrameLoad(ref, arm32.R4, 8)
+	arm32.Mov(ref, arm32.COND_AL, false, arm32.R0, arm32.Reg(arm32.R2))
+	if !containsWord(a, word32(ref, 0)) || !containsWord(a, word32(ref, 4)) {
+		return fail("the retbuf must be stashed at [SP, #8] and reloaded into R4")
+	}
+	if !containsWord(a, word32(ref, 8)) { return fail("the first int32 must come from R2") }
+	return ""
+}
+
+// (D4, D4, f32): the two D4s fill the VFP bank, so the float32 goes to the outgoing
+// stack — few incoming words, yet the spill shim — its word copied to [SP] through R4.
+func TestShimFloatPastHfaBankSpills() testing.TestResult {
+	var d4 @types.Type = hfaType("D4", types.TypFloat64(), 4)
+	var ps @[]@types.Type = make_slice(@types.Type, 3)
+	ps[0] = d4
+	ps[1] = d4
+	ps[2] = types.TypFloat32()
+	var none @[]@types.Type
+	var a @asm.Assembler = emitHfaShim(hfaShimFv(ps, none), true)
+	if a.HasError { return fail("a float past the bank must route to the spill shim, not error") }
+	if !containsWord(a, strWord(arm32.R4, arm32.SP, 0)) {
+		return fail("the float32's word must go to the outgoing [SP]")
+	}
+	return ""
+}
+
+// The spill marshal places an HFA in VFP registers in the sret shape too (the classify
+// list led by the sret pointer): (int32, int32, int32, F2) returning a 12-byte struct
+// does not fit the registers, and F2 still loads into s0-s1.
+func TestShimHfaParamSretSpill() testing.TestResult {
+	var ps @[]@types.Type = make_slice(@types.Type, 4)
+	ps[0] = types.TypInt32()
+	ps[1] = types.TypInt32()
+	ps[2] = types.TypInt32()
+	ps[3] = hfaType("F2", types.TypFloat32(), 2)
+	var fv @types.Type = hfaShimFv(ps, typesOf1(hfaType("G3", types.TypInt32(), 3)))
+	var a @asm.Assembler = emitHfaShim(fv, true)
+	if a.HasError { return fail("an sret spill shim with an HFA param must lower") }
+	if !containsWord(a, vldrWord(false, arm32.S0, arm32.IP, 0)) ||
+			!containsWord(a, vldrWord(false, arm32.S1, arm32.IP, 4)) {
+		return fail("F2's members must load into s0-s1")
+	}
+	return ""
+}
+
+// Float scalars back-fill around an HFA in the register-only marshal: (f32, D1, f32)
+// puts the first float32 in s0, D1 in d1 and the second float32 back in s1 (the floats
+// load from the staged incoming words, D1 from its address).
+func TestShimHfaFloatBackfill() testing.TestResult {
+	var ps @[]@types.Type = make_slice(@types.Type, 3)
+	ps[0] = types.TypFloat32()
+	ps[1] = hfaType("D1", types.TypFloat64(), 1)
+	ps[2] = types.TypFloat32()
+	var none @[]@types.Type
+	var a @asm.Assembler = emitHfaShim(hfaShimFv(ps, none), true)
+	if a.HasError { return fail("a back-filling HFA shim must lower") }
+	if !containsWord(a, vldrWord(false, arm32.S0, arm32.SP, 0)) {
+		return fail("the first float32 must take s0")
+	}
+	if !containsWord(a, vldrWord(true, arm32.D1, arm32.IP, 0)) { return fail("D1 must take d1") }
+	if !containsWord(a, vldrWord(false, arm32.S1, arm32.SP, 8)) {
+		return fail("the second float32 must back-fill s1")
+	}
+	return ""
+}

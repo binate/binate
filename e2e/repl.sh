@@ -2778,6 +2778,27 @@ testing.Println(old(), id[int](4, 8))
 > 9 16
 > "
 
+# --- Case 77: the builtin packages the driver injects run as their native
+# instances, not lowered: reflect.TypeOf called through a func value runs
+# natively (a lowered copy read a VM vtable index as a pointer and crashed the
+# session), and lang's descriptor is the native one, with its satisfaction
+# entries. ---
+run_repl "injected-builtins-native" \
+"import \"pkg/builtins/reflect\"
+import \"pkg/builtins/lang\"
+var n int = 3
+var ti *reflect.TypeInfo = reflect.TypeOf(&n)
+var f *func(*any) *reflect.TypeInfo = reflect.TypeOf
+testing.Println(ti == f(&n))
+testing.Println(len(lang.__Package().SatEntries) > 0)
+" \
+"$BANNER
+> package pkg/builtins/reflect loaded
+> package pkg/builtins/lang loaded
+> > > > true
+> true
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # (Stage 2) as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

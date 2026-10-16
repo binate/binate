@@ -12,7 +12,7 @@
 // soft-float helpers, which are not yet ported.
 //
 // Written in the bnas subset (see crt0.s / semihost.s): `.arch arm32`,
-// `.section text`, `.global`, dot-less local labels, UAL mnemonics, no
+// `.section text`, `.global`, `.type`, dot-less local labels, UAL mnemonics, no
 // literal pools.  Assembled by bnc's embedded bnas at link time.
 //
 // Register conventions (confirmed against the AEABI spec + clang output,
@@ -40,6 +40,7 @@
 // r0:r1 = a (alo:ahi), r2:r3 = b (blo:bhi).
 // ============================================================
 	.global __aeabi_lmul
+	.type __aeabi_lmul, %function
 __aeabi_lmul:
 	mul     r3, r0, r3      // r3 = alo * bhi                 (bhi consumed)
 	mla     r3, r1, r2, r3  // r3 = alo*bhi + ahi*blo
@@ -55,6 +56,7 @@ __aeabi_lmul:
 // count==0 rides the count<32 arm (lo>>32 == 0 for a register shift).
 // ============================================================
 	.global __aeabi_llsl
+	.type __aeabi_llsl, %function
 __aeabi_llsl:
 	subs    r3, r2, #32          // r3 = count-32; N=1 (mi) if count<32
 	movpl   r1, r0, lsl r3       // count>=32: hi = lo << (count-32)
@@ -69,6 +71,7 @@ __aeabi_llsl:
 // __aeabi_llsr — 64-bit logical shift right, count in r2 (0..63).
 // ============================================================
 	.global __aeabi_llsr
+	.type __aeabi_llsr, %function
 __aeabi_llsr:
 	subs    r3, r2, #32          // r3 = count-32; mi if count<32
 	movpl   r0, r1, lsr r3       // count>=32: lo = hi >> (count-32)
@@ -83,6 +86,7 @@ __aeabi_llsr:
 // __aeabi_lasr — 64-bit arithmetic shift right, count in r2 (0..63).
 // ============================================================
 	.global __aeabi_lasr
+	.type __aeabi_lasr, %function
 __aeabi_lasr:
 	subs    r3, r2, #32          // r3 = count-32; mi if count<32
 	movpl   r0, r1, asr r3       // count>=32: lo = hi >>a (count-32)
@@ -104,6 +108,7 @@ __aeabi_lasr:
 //   working: q = r4:r5, rem = r6:r7, i = r8, trial = r9:r10
 // ============================================================
 	.global __aeabi_uldivmod
+	.type __aeabi_uldivmod, %function
 __aeabi_uldivmod:
 	push    {r4, r5, r6, r7, r8, r9, r10, lr}
 	mov     r4, #0              // q_lo
@@ -140,6 +145,7 @@ uldivmod_loop:
 // abs = (x ^ m) - m where m = (x < 0 ? -1 : 0) = (x >>a 31 replicated).
 // ============================================================
 	.global __aeabi_ldivmod
+	.type __aeabi_ldivmod, %function
 __aeabi_ldivmod:
 	push    {r4, r5, r6, lr}
 	mov     r4, r1, asr #31     // r4 = sign_n mask (0 or 0xFFFFFFFF)
@@ -183,6 +189,7 @@ __aeabi_ldivmod:
 //   n = r0, d = r1 ; working: rem = r2, i = r3
 // ============================================================
 	.global __aeabi_uidivmod
+	.type __aeabi_uidivmod, %function
 __aeabi_uidivmod:
 	mov     r2, #0              // rem = 0
 	mov     r3, #32             // bit counter
@@ -200,6 +207,7 @@ uidivmod_loop:
 // __aeabi_uidiv — unsigned 32/32 -> quotient r0.  Same as uidivmod but the
 // caller ignores the remainder, so tail-call it (clobbering r1 is allowed).
 	.global __aeabi_uidiv
+	.type __aeabi_uidiv, %function
 __aeabi_uidiv:
 	b       __aeabi_uidivmod
 
@@ -210,6 +218,7 @@ __aeabi_uidiv:
 // m = (x >>a 31).
 // ============================================================
 	.global __aeabi_idivmod
+	.type __aeabi_idivmod, %function
 __aeabi_idivmod:
 	push    {r4, r5, lr}
 	mov     r4, r0, asr #31     // r4 = sign_n mask
@@ -234,5 +243,6 @@ __aeabi_idivmod:
 // __aeabi_idiv — signed 32/32 -> quotient r0.  Tail-call idivmod (the caller
 // ignores the remainder left in r1).
 	.global __aeabi_idiv
+	.type __aeabi_idiv, %function
 __aeabi_idiv:
 	b       __aeabi_idivmod

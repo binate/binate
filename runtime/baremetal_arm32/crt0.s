@@ -3,7 +3,7 @@
 //
 // Written in the subset of ARM assembly that Binate's own assembler
 // (bnas, pkg/binate/asm) accepts: `//` line comments, `.section text`,
-// `.global`, dot-less local labels, and UAL mnemonics.  bnc assembles
+// `.global`, `.type`, dot-less local labels, and UAL mnemonics.  bnc assembles
 // this file with `bnas -arch arm32` at link time for arm32-baremetal
 // (both the LLVM and native backends); it is not fed to clang.
 //
@@ -23,6 +23,7 @@
 	.section text
 
 	.global _start
+	.type _start, %function
 	// External references (bnas requires referenced symbols to exist in
 	// the symbol table; declaring them global creates the undefined entry
 	// that becomes an R_ARM_{CALL,JUMP24} relocation for the linker).

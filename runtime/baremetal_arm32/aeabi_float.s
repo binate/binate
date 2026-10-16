@@ -26,6 +26,7 @@
 //   a in r0:r1 ; result in r0.  softfloat.F64ToI32(uint64) int matches.
 //   (_arm_fixdfsi.o is a single-symbol libgcc member.)
 	.global __aeabi_d2iz
+	.type __aeabi_d2iz, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToI32
 __aeabi_d2iz:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToI32
@@ -34,6 +35,7 @@ __aeabi_d2iz:
 //   a in r0:r1 ; result in r0.  softfloat.F64ToF32(uint64) uint32 matches.
 //   (_arm_truncdfsf2.o is a single-symbol libgcc member.)
 	.global __aeabi_d2f
+	.type __aeabi_d2f, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToF32
 __aeabi_d2f:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToF32
@@ -46,41 +48,49 @@ __aeabi_d2f:
 // corresponding softfloat function signatures, so each is a bare tail-call.
 // ============================================================
 	.global __aeabi_dadd
+	.type __aeabi_dadd, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F64Add
 __aeabi_dadd:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F64Add
 
 	.global __aeabi_dsub
+	.type __aeabi_dsub, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F64Sub
 __aeabi_dsub:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F64Sub
 
 	.global __aeabi_drsub
+	.type __aeabi_drsub, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_7_F64Rsub
 __aeabi_drsub:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_7_F64Rsub
 
 	.global __aeabi_f2d
+	.type __aeabi_f2d, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToF64
 __aeabi_f2d:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToF64
 
 	.global __aeabi_i2d
+	.type __aeabi_i2d, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_I32ToF64
 __aeabi_i2d:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_I32ToF64
 
 	.global __aeabi_l2d
+	.type __aeabi_l2d, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_I64ToF64
 __aeabi_l2d:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_I64ToF64
 
 	.global __aeabi_ui2d
+	.type __aeabi_ui2d, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_U32ToF64
 __aeabi_ui2d:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_U32ToF64
 
 	.global __aeabi_ul2d
+	.type __aeabi_ul2d, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_U64ToF64
 __aeabi_ul2d:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_U64ToF64
@@ -93,36 +103,43 @@ __aeabi_ul2d:
 // corresponding softfloat function signatures, so each is a bare tail-call.
 // ============================================================
 	.global __aeabi_fadd
+	.type __aeabi_fadd, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F32Add
 __aeabi_fadd:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F32Add
 
 	.global __aeabi_fsub
+	.type __aeabi_fsub, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F32Sub
 __aeabi_fsub:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F32Sub
 
 	.global __aeabi_frsub
+	.type __aeabi_frsub, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_7_F32Rsub
 __aeabi_frsub:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_7_F32Rsub
 
 	.global __aeabi_i2f
+	.type __aeabi_i2f, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_I32ToF32
 __aeabi_i2f:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_I32ToF32
 
 	.global __aeabi_l2f
+	.type __aeabi_l2f, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_I64ToF32
 __aeabi_l2f:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_I64ToF32
 
 	.global __aeabi_ui2f
+	.type __aeabi_ui2f, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_U32ToF32
 __aeabi_ui2f:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_U32ToF32
 
 	.global __aeabi_ul2f
+	.type __aeabi_ul2f, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_U64ToF32
 __aeabi_ul2f:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_U64ToF32
@@ -134,11 +151,13 @@ __aeabi_ul2f:
 // so each shim is a bare tail-call.
 // ============================================================
 	.global __aeabi_fmul
+	.type __aeabi_fmul, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F32Mul
 __aeabi_fmul:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F32Mul
 
 	.global __aeabi_fdiv
+	.type __aeabi_fdiv, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F32Div
 __aeabi_fdiv:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F32Div
@@ -150,11 +169,13 @@ __aeabi_fdiv:
 // F64Mul/F64Div, so each shim is a bare tail-call.
 // ============================================================
 	.global __aeabi_dmul
+	.type __aeabi_dmul, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F64Mul
 __aeabi_dmul:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F64Mul
 
 	.global __aeabi_ddiv
+	.type __aeabi_ddiv, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F64Div
 __aeabi_ddiv:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F64Div
@@ -171,61 +192,73 @@ __aeabi_ddiv:
 // signatures, so each shim is a bare tail-call.
 // ============================================================
 	.global __aeabi_dcmpeq
+	.type __aeabi_dcmpeq, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpEq
 __aeabi_dcmpeq:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpEq
 
 	.global __aeabi_dcmplt
+	.type __aeabi_dcmplt, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpLt
 __aeabi_dcmplt:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpLt
 
 	.global __aeabi_dcmple
+	.type __aeabi_dcmple, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpLe
 __aeabi_dcmple:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpLe
 
 	.global __aeabi_dcmpgt
+	.type __aeabi_dcmpgt, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpGt
 __aeabi_dcmpgt:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpGt
 
 	.global __aeabi_dcmpge
+	.type __aeabi_dcmpge, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpGe
 __aeabi_dcmpge:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpGe
 
 	.global __aeabi_dcmpun
+	.type __aeabi_dcmpun, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpUn
 __aeabi_dcmpun:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64CmpUn
 
 	.global __aeabi_fcmpeq
+	.type __aeabi_fcmpeq, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpEq
 __aeabi_fcmpeq:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpEq
 
 	.global __aeabi_fcmplt
+	.type __aeabi_fcmplt, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpLt
 __aeabi_fcmplt:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpLt
 
 	.global __aeabi_fcmple
+	.type __aeabi_fcmple, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpLe
 __aeabi_fcmple:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpLe
 
 	.global __aeabi_fcmpgt
+	.type __aeabi_fcmpgt, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpGt
 __aeabi_fcmpgt:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpGt
 
 	.global __aeabi_fcmpge
+	.type __aeabi_fcmpge, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpGe
 __aeabi_fcmpge:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpGe
 
 	.global __aeabi_fcmpun
+	.type __aeabi_fcmpun, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpUn
 __aeabi_fcmpun:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32CmpUn
@@ -240,36 +273,43 @@ __aeabi_fcmpun:
 // compiler guards saturation/Inf/NaN before the call (emitGuardedFloatToInt).
 // ============================================================
 	.global __aeabi_d2uiz
+	.type __aeabi_d2uiz, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToU32
 __aeabi_d2uiz:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToU32
 
 	.global __aeabi_d2lz
+	.type __aeabi_d2lz, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToI64
 __aeabi_d2lz:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToI64
 
 	.global __aeabi_d2ulz
+	.type __aeabi_d2ulz, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToU64
 __aeabi_d2ulz:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F64ToU64
 
 	.global __aeabi_f2iz
+	.type __aeabi_f2iz, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToI32
 __aeabi_f2iz:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToI32
 
 	.global __aeabi_f2uiz
+	.type __aeabi_f2uiz, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToU32
 __aeabi_f2uiz:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToU32
 
 	.global __aeabi_f2lz
+	.type __aeabi_f2lz, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToI64
 __aeabi_f2lz:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToI64
 
 	.global __aeabi_f2ulz
+	.type __aeabi_f2ulz, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToU64
 __aeabi_f2ulz:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_8_F32ToU64
@@ -282,11 +322,13 @@ __aeabi_f2ulz:
 // r0, result in the same, matching F64Neg/F32Neg — bare tail-calls.
 // ============================================================
 	.global __aeabi_dneg
+	.type __aeabi_dneg, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F64Neg
 __aeabi_dneg:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F64Neg
 
 	.global __aeabi_fneg
+	.type __aeabi_fneg, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_6_F32Neg
 __aeabi_fneg:
 	b       bn_F3_3_pkg8_builtins9_softfloat1_6_F32Neg
@@ -310,6 +352,7 @@ __aeabi_fneg:
 // libgcc versions expects.
 // ============================================================
 	.global __aeabi_cdcmple
+	.type __aeabi_cdcmple, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_10_F64Compare
 __aeabi_cdcmple:
 	push    {r0, lr}
@@ -320,10 +363,12 @@ __aeabi_cdcmple:
 	bx      lr
 
 	.global __aeabi_cdcmpeq
+	.type __aeabi_cdcmpeq, %function
 __aeabi_cdcmpeq:
 	b       __aeabi_cdcmple
 
 	.global __aeabi_cdrcmple
+	.type __aeabi_cdrcmple, %function
 __aeabi_cdrcmple:
 	mov     ip, r0          // swap a (r0:r1) <-> b (r2:r3), then compare b,a
 	mov     r0, r2
@@ -334,6 +379,7 @@ __aeabi_cdrcmple:
 	b       __aeabi_cdcmple
 
 	.global __aeabi_cfcmple
+	.type __aeabi_cfcmple, %function
 	.global bn_F3_3_pkg8_builtins9_softfloat1_10_F32Compare
 __aeabi_cfcmple:
 	push    {r0, lr}
@@ -344,10 +390,12 @@ __aeabi_cfcmple:
 	bx      lr
 
 	.global __aeabi_cfcmpeq
+	.type __aeabi_cfcmpeq, %function
 __aeabi_cfcmpeq:
 	b       __aeabi_cfcmple
 
 	.global __aeabi_cfrcmple
+	.type __aeabi_cfrcmple, %function
 __aeabi_cfrcmple:
 	mov     ip, r0          // swap a (r0) <-> b (r1), then compare b,a
 	mov     r0, r1

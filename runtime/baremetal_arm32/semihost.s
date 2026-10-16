@@ -5,7 +5,7 @@
 // Written in the subset of ARM assembly that Binate's own assembler
 // (bnas, pkg/binate/asm) accepts and assembled with `bnas -arch arm32`
 // by bnc at link time (not fed to clang): `//` line comments,
-// `.section text`, `.global`, dot-less local labels, UAL mnemonics.
+// `.section text`, `.global`, `.type`, dot-less local labels, UAL mnemonics.
 //
 // Semihosting ABI (ARM EABI / QEMU virt machine):
 //   - r0 = operation number (e.g. 0x20 = SYS_EXIT_EXTENDED,
@@ -34,6 +34,7 @@
 // loops once perf matters.
 // ============================================================
 	.global memcpy
+	.type memcpy, %function
 memcpy:
 	// r0 = dst (preserved on return), r1 = src, r2 = len
 	push    {r0, r4}        // save dst for return; r4 scratch
@@ -53,6 +54,7 @@ memcpy_done:
 // exercise overlap in user code, but compilers sometimes emit
 // memmove for type-erased aggregate copies.
 	.global memmove
+	.type memmove, %function
 memmove:
 	// r0 = dst, r1 = src, r2 = len
 	push    {r0, r4}
@@ -79,6 +81,7 @@ memmove_done:
 	bx      lr
 
 	.global memset
+	.type memset, %function
 memset:
 	// r0 = dst (preserved on return), r1 = byte, r2 = len
 	push    {r0, r4}
@@ -108,24 +111,33 @@ memset_done:
 // None returns a value.
 // ============================================================
 	.global __aeabi_memcpy
+	.type __aeabi_memcpy, %function
 	.global __aeabi_memcpy4
+	.type __aeabi_memcpy4, %function
 	.global __aeabi_memcpy8
+	.type __aeabi_memcpy8, %function
 __aeabi_memcpy:
 __aeabi_memcpy4:
 __aeabi_memcpy8:
 	b       memcpy
 
 	.global __aeabi_memmove
+	.type __aeabi_memmove, %function
 	.global __aeabi_memmove4
+	.type __aeabi_memmove4, %function
 	.global __aeabi_memmove8
+	.type __aeabi_memmove8, %function
 __aeabi_memmove:
 __aeabi_memmove4:
 __aeabi_memmove8:
 	b       memmove
 
 	.global __aeabi_memset
+	.type __aeabi_memset, %function
 	.global __aeabi_memset4
+	.type __aeabi_memset4, %function
 	.global __aeabi_memset8
+	.type __aeabi_memset8, %function
 __aeabi_memset:
 __aeabi_memset4:
 __aeabi_memset8:
@@ -135,8 +147,11 @@ __aeabi_memset8:
 	b       memset
 
 	.global __aeabi_memclr
+	.type __aeabi_memclr, %function
 	.global __aeabi_memclr4
+	.type __aeabi_memclr4, %function
 	.global __aeabi_memclr8
+	.type __aeabi_memclr8, %function
 __aeabi_memclr:
 __aeabi_memclr4:
 __aeabi_memclr8:
@@ -145,6 +160,7 @@ __aeabi_memclr8:
 	b       memset
 
 	.global memcmp
+	.type memcmp, %function
 memcmp:
 	// r0 = a, r1 = b, r2 = len; returns r0 = signed-cmp result
 	push    {r4, r5}
@@ -172,6 +188,7 @@ memcmp_done:
 // (SIGABRT convention).
 // ============================================================
 	.global abort
+	.type abort, %function
 abort:
 	mov     r0, #134        // exit_status = SIGABRT
 	push    {r0}            // stack: [exit_status]
@@ -196,6 +213,7 @@ abort_spin:
 // "pkg/semihost", func "SemihostWriteChar").
 // ============================================================
 	.global bn_F2_3_pkg8_semihost1_17_SemihostWriteChar
+	.type bn_F2_3_pkg8_semihost1_17_SemihostWriteChar, %function
 bn_F2_3_pkg8_semihost1_17_SemihostWriteChar:
 	// r0 (param) holds the byte to write — AAPCS zero-extends
 	// a `char` arg into the full 32-bit register.
@@ -216,6 +234,7 @@ bn_F2_3_pkg8_semihost1_17_SemihostWriteChar:
 // ApplicationExit signals a clean application exit (vs a fault).
 // ============================================================
 	.global bn_F2_3_pkg8_semihost1_12_SemihostExit
+	.type bn_F2_3_pkg8_semihost1_12_SemihostExit, %function
 bn_F2_3_pkg8_semihost1_12_SemihostExit:
 	// r0 (param) holds the exit code on entry.
 	push    {r0}            // stack: [exit_status]
@@ -239,6 +258,7 @@ sh_exit_spin:
 // line is the `-append` string.  Returns the length, or -1 on failure.
 // ============================================================
 	.global bn_F2_3_pkg8_semihost1_18_SemihostGetCmdline
+	.type bn_F2_3_pkg8_semihost1_18_SemihostGetCmdline, %function
 bn_F2_3_pkg8_semihost1_18_SemihostGetCmdline:
 	// r0 = buf ptr, r1 = cap (bytes).  Build the {ptr, len} block on the stack.
 	push    {r0, r1}        // stack: [ptr, len]

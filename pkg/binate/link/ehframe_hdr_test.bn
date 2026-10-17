@@ -1,0 +1,310 @@
+package "pkg/binate/link"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/asm/elf"
+import "pkg/binate/buf"
+import "pkg/builtins/testing"
+import "pkg/std/os"
+
+// `.eh_frame_hdr` (ehframe_hdr.bn): its object sized by the FDE count, its table filled from
+// the relocated `.eh_frame`, its place in the layout, and PT_GNU_EH_FRAME.  (mkSection /
+// mkObjSecs are in layout_test.bn, mkOutSec in emit_elf_test.bn.)
+
+// ehCie is a "zR" CIE whose FDEs' addresses are pcrel sdata4 (20 bytes).
+func ehCie() @[]uint8 {
+	return @[]uint8{16, 0, 0, 0, 0, 0, 0, 0, 1, 'z', 'R', 0, 1, 0x78, 0x1e, 1, 0x1b, 0, 0, 0}
+}
+
+// ehFrameOf returns an `.eh_frame` of the CIE then nFde FDEs (20 bytes each, the CIE at 0,
+// their addresses 0 until written), then a terminator when term is set.
+func ehFrameOf(nFde int, term bool) @[]uint8 {
+	var n int = 20 + 20 * nFde
+	if term { n = n + 4 }
+	var d @[]uint8 = make_slice(uint8, n)
+	var cie @[]uint8 = ehCie()
+	for i := 0; i < 20; i++ { d[i] = cie[i] }
+	for f := 0; f < nFde; f++ {
+		var q int = 20 + 20 * f
+		writeU32(d, q, 16) // length
+		writeU32(d, q + 4, cast(int64, q + 4)) // CIE pointer: back to offset 0
+	}
+	return d
+}
+
+// ehObj returns an object with a .text of textSize bytes and an `.eh_frame` (ehFrameOf).
+func ehObj(textSize int, nFde int, term bool) @InputObject {
+	var secs @[]InputSection = make_slice(InputSection, 2)
+	secs[0] = mkSection(".text", SF_READ | SF_EXEC, SHT_PROGBITS, make_slice(uint8, textSize),
+			cast(uint, textSize), 4)
+	var eh @[]uint8 = ehFrameOf(nFde, term)
+	secs[1] = mkSection(".eh_frame", SF_READ, SHT_X86_64_UNWIND, eh, cast(uint, len(eh)), 8)
+	return mkObjSecs(secs)
+}
+
+// The table is sized for every FDE of every `.eh_frame` (a terminator ending one), with a zero
+// terminator for the output `.eh_frame` beside it; there is none for a link with no `.eh_frame`
+// or only empty ones; a record running past its section is an error.
+func TestWithEhFrameHdrSizesTheTable() testing.TestResult {
+	var objs @[]@InputObject = make_slice(@InputObject, 2)
+	objs[0] = ehObj(16, 2, false)
+	objs[1] = ehObj(8, 1, true)
+	all, hdr, err := withEhFrameHdr(objs, EM_X86_64)
+	if len(err) != 0 || !present(hdr) || len(all) != 3 { return fail("no .eh_frame_hdr object") }
+	if len(hdr.Sections[0].Data) != ehFrameHdrSize + 8 * 3 { return fail("not sized for three FDEs") }
+	if len(hdr.Sections) != 2 || !isEhFrame(hdr.Sections[1].Name) || len(hdr.Sections[1].Data) != 4 ||
+			hdr.Sections[1].Data[0] != 0 {
+		return fail("no zero terminator for the output .eh_frame")
+	}
+	var emptyEh @[]InputSection = make_slice(InputSection, 1)
+	emptyEh[0] = mkSection(".eh_frame", SF_READ, SHT_PROGBITS, make_slice(uint8, 0), cast(uint, 0), 8)
+	var empty @[]@InputObject = make_slice(@InputObject, 1)
+	empty[0] = mkObjSecs(emptyEh)
+	_, eh, eerr := withEhFrameHdr(empty, EM_X86_64)
+	if len(eerr) != 0 || present(eh) { return fail("a table for a link whose .eh_frame is empty") }
+	var plain @[]@InputObject = make_slice(@InputObject, 1)
+	var secs @[]InputSection = make_slice(InputSection, 1)
+	secs[0] = mkSection(".text", SF_READ | SF_EXEC, SHT_PROGBITS, make_slice(uint8, 4), cast(uint, 4),
+			4)
+	plain[0] = mkObjSecs(secs)
+	_, none, nerr := withEhFrameHdr(plain, EM_X86_64)
+	if len(nerr) != 0 || present(none) { return fail("a table for a link with no .eh_frame") }
+	var broken @InputObject = ehObj(8, 1, false)
+	writeU32(broken.Sections[1].Data, 20, 64)
+	var bad @[]@InputObject = make_slice(@InputObject, 1)
+	bad[0] = broken
+	_, _, berr := withEhFrameHdr(bad, EM_X86_64)
+	if len(berr) == 0 { return fail("a record running past its section was accepted") }
+	return ""
+}
+
+// rel32At returns the signed 32-bit word at off in d.
+func rel32At(d *[]readonly uint8, off int) int64 {
+	var v int64 = u32(d, off)
+	if v >= 0x80000000 { v = v - 0x100000000 }
+	return v
+}
+
+// The `.eh_frame` inputs are an output section of their own, after .rodata, with the table
+// before them, both read-only.  The table points at `.eh_frame`, counts the FDEs, and lists
+// each FDE's code address (read pcrel from the relocated records) and its own, sorted by the
+// code address — here from FDEs written out of order — relative to the table.
+func TestFillEhFrameHdr() testing.TestResult {
+	var objs @[]@InputObject = make_slice(@InputObject, 2)
+	objs[0] = ehObj(16, 2, false)
+	objs[1] = ehObj(8, 1, true)
+	// A writable `.eh_frame` (as some GCC configurations emit) is laid out read-only all the same.
+	objs[1].Sections[1].Flags = SF_READ | SF_WRITE
+	all, hdr, err := withEhFrameHdr(objs, EM_X86_64)
+	if len(err) != 0 { return fail(buf.Concat("withEhFrameHdr: ", err)) }
+	var lr @LayoutResult = Layout(all, cast(uint64, 0x400000))
+	if len(lr.Sections) != 3 || !charsEqual(lr.Sections[0].Name, ".text") ||
+			!charsEqual(lr.Sections[1].Name, ".eh_frame_hdr") ||
+			!charsEqual(lr.Sections[2].Name, ".eh_frame") {
+		return fail("not .text, .eh_frame_hdr, .eh_frame")
+	}
+	if lr.Sections[1].Flags != SF_READ || lr.Sections[2].Flags != SF_READ {
+		return fail("the unwind tables are not read-only")
+	}
+	var ehOut OutputSection = lr.Sections[2]
+	var last int = len(ehOut.Data) - 4
+	if cast(uint64, hdr.Sections[1].OutOffset) != cast(uint64, last) || u32(ehOut.Data, last) != 0 {
+		return fail("the output .eh_frame does not end with the zero terminator")
+	}
+	// What Relocate would write: object 0's FDEs cover its code at +8 then +0, object 1's at +0.
+	var textA uint64 = lr.Sections[0].Addr + cast(uint64, objs[0].Sections[0].OutOffset)
+	var textB uint64 = lr.Sections[0].Addr + cast(uint64, objs[1].Sections[0].OutOffset)
+	var eh OutputSection = lr.Sections[2]
+	var fdeAddrs @[]uint64 = make_slice(uint64, 3)
+	var targets @[]uint64 = @[]uint64{textA + 8, textA, textB}
+	for i := 0; i < 3; i++ {
+		var o int = 0
+		var q int = 20 + 20 * i
+		if i == 2 {
+			o = 1
+			q = 20
+		}
+		var at int = cast(int, objs[o].Sections[1].OutOffset) + q
+		fdeAddrs[i] = eh.Addr + cast(uint64, at)
+		writeU32(eh.Data, at + 8, bit_cast(int64, targets[i] - (fdeAddrs[i] + 8)))
+	}
+	var ferr @[]readonly char = fillEhFrameHdr(all, lr, hdr, EM_X86_64)
+	if len(ferr) != 0 { return fail(buf.Concat("fillEhFrameHdr: ", ferr)) }
+	var h OutputSection = lr.Sections[1]
+	// bnlint:allow managed-to-raw-assign - h holds the table's bytes for the read
+	var d *[]readonly uint8 = h.Data
+	if d[0] != 1 || d[1] != 0x1b || d[2] != 0x03 || d[3] != 0x3b {
+		return fail("wrong version or encodings")
+	}
+	if rel32At(d, 4) != bit_cast(int64, eh.Addr - (h.Addr + 4)) {
+		return fail("wrong .eh_frame pointer")
+	}
+	if u32(d, 8) != 3 { return fail("wrong FDE count") }
+	var wantLoc @[]uint64 = @[]uint64{textA, textA + 8, textB}
+	var wantFde @[]uint64 = @[]uint64{fdeAddrs[1], fdeAddrs[0], fdeAddrs[2]}
+	for i := 0; i < 3; i++ {
+		if rel32At(d, 12 + 8 * i) != bit_cast(int64, wantLoc[i] - h.Addr) ||
+				rel32At(d, 16 + 8 * i) != bit_cast(int64, wantFde[i] - h.Addr) {
+			return fail("a wrong or unsorted table entry")
+		}
+	}
+	return ""
+}
+
+// phdrOf returns the file offset, vaddr and filesz of the first program header of type ptype in
+// the ELF64 executable exe, and whether it has one.
+func phdrOf(exe *[]readonly uint8, ptype int) (int, uint64, int, bool) {
+	var phoff int = cast(int, u64(exe, 32))
+	var phentsize int = u16(exe, 54)
+	var phnum int = u16(exe, 56)
+	for i := 0; i < phnum; i++ {
+		var p int = phoff + i * phentsize
+		if cast(int, u32(exe, p)) != ptype { continue }
+		return cast(int, u64(exe, p + 8)), bit_cast(uint64, u64(exe, p + 16)),
+			cast(int, u64(exe, p + 32)), true
+	}
+	return 0, cast(uint64, 0), 0, false
+}
+
+// ehHdrOut returns a 24-byte output section at addr whose bytes from 4 on are a 20-byte
+// `.eh_frame_hdr` stand-in, recognizable: 0xe0, 0xe1, ... 0xf3.
+func ehHdrOut(addr uint) OutputSection {
+	var d @[]uint8 = make_slice(uint8, 24)
+	for i := 0; i < 20; i++ { d[4 + i] = cast(uint8, 0xe0 + i) }
+	return mkOutSec(".eh_frame_hdr", SF_READ, addr, d, cast(uint, 24))
+}
+
+// ehHdrPhdrOk reports whether the executable at path has a PT_GNU_EH_FRAME header over the
+// 20-byte table at va (ehHdrOut's), its file offset holding the table's bytes — reading an
+// ELF32 header when elf32 is set.
+func ehHdrPhdrOk(path *[]readonly char, va uint64, elf32 bool) bool {
+	data, ok := readFile(path)
+	if !ok { return false }
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var rd *[]readonly uint8 = data
+	var off int = 0
+	var pva uint64 = 0
+	var sz int = 0
+	var found bool = false
+	if elf32 {
+		off, pva, sz, found = phdr32Of(rd, PT_GNU_EH_FRAME)
+	} else {
+		off, pva, sz, found = phdrOf(rd, PT_GNU_EH_FRAME)
+	}
+	if !found || pva != va || sz != 20 || off + 20 > len(rd) { return false }
+	return rd[off] == 0xe0 && rd[off + 19] == 0xf3
+}
+
+// phdr32Of is phdrOf for an ELF32 executable.
+func phdr32Of(exe *[]readonly uint8, ptype int) (int, uint64, int, bool) {
+	var phoff int = cast(int, u32(exe, 28))
+	var phentsize int = u16(exe, 42)
+	var phnum int = u16(exe, 44)
+	for i := 0; i < phnum; i++ {
+		var p int = phoff + i * phentsize
+		if cast(int, u32(exe, p)) != ptype { continue }
+		return cast(int, u32(exe, p + 4)), bit_cast(uint64, u32(exe, p + 8)), cast(int, u32(exe, p + 16)),
+			true
+	}
+	return 0, cast(uint64, 0), 0, false
+}
+
+// Both writers give the table a PT_GNU_EH_FRAME header over exactly its bytes, where the link
+// says it lies in its section: the static one after its load segments (ELF64 and ELF32), the
+// dynamic one after PT_DYNAMIC; with no table there is none.
+func TestEmitEhFrameHdrSegment() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer { os.RemoveAll(dir) }
+	var secs @[]OutputSection = make_slice(OutputSection, 3)
+	secs[0] = mkOutSec(".text", SF_READ | SF_EXEC, cast(uint, 0x400000), make_slice(uint8, 64),
+			cast(uint, 64))
+	secs[1] = ehHdrOut(cast(uint, 0x400040))
+	secs[2] = mkOutSec(".data", SF_READ | SF_WRITE, cast(uint, 0x401000), make_slice(uint8, 16),
+			cast(uint, 16))
+	var eh ehHdrPlace
+	eh.Sec = 1
+	eh.Off = cast(uint64, 4)
+	eh.Size = 20
+	var sp @[]char = buf.Concat(dir, "/eh_static")
+	if len(emitElfExecEh(secs, cast(uint64, 0x400000), EM_X86_64, eh, sp)) != 0 {
+		return fail("static emit failed")
+	}
+	if !ehHdrPhdrOk(sp, cast(uint64, 0x400044), false) {
+		return fail("no static PT_GNU_EH_FRAME over the table")
+	}
+	var ap @[]char = buf.Concat(dir, "/eh_static32")
+	if len(emitElfExecEh(secs, cast(uint64, 0x400000), EM_ARM, eh, ap)) != 0 {
+		return fail("ELF32 static emit failed")
+	}
+	if !ehHdrPhdrOk(ap, cast(uint64, 0x400044), true) {
+		return fail("no ELF32 PT_GNU_EH_FRAME over the table")
+	}
+	var dp @[]char = buf.Concat(dir, "/eh_dynamic")
+	var derr @[]readonly char = EmitDynElfExec(secs, cast(uint64, 0x400000), EM_AARCH64,
+			cast(uint64, 0x400000), 8, cast(uint64, 0x401000), 16, eh, dp)
+	if len(derr) != 0 { return fail("dynamic emit failed") }
+	if !ehHdrPhdrOk(dp, cast(uint64, 0x400044), false) {
+		return fail("no dynamic PT_GNU_EH_FRAME over the table")
+	}
+	var np @[]char = buf.Concat(dir, "/eh_none")
+	if len(EmitElfExec(secs, cast(uint64, 0x400000), EM_X86_64, np)) != 0 {
+		return fail("plain emit failed")
+	}
+	data, ok := readFile(np)
+	if !ok { return fail("cannot read the plain executable") }
+	_, _, _, found := phdrOf(data, PT_GNU_EH_FRAME)
+	if found { return fail("a PT_GNU_EH_FRAME for a link with no table") }
+	return ""
+}
+
+// A static link (Link) of an object with an `.eh_frame` — a CIE and an FDE for f, its code
+// address a PC-relative relocation — writes the table PT_GNU_EH_FRAME points at: one entry,
+// for f's address, and the `.eh_frame` pointer at the records, which end with the terminator.
+func TestLinkStaticEhFrameHdr() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer { os.RemoveAll(dir) }
+	var a @asm.Assembler = asm.New(8)
+	a.SetSection("text", -1)
+	a.DefineLabel("_start")
+	a.SetGlobal("_start")
+	aarch64.Ret(a)
+	a.DefineLabel("f")
+	aarch64.Ret(a)
+	a.SetSection("eh_frame", SF_READ)
+	a.EmitBytes(ehCie())
+	var fde @[]uint8 = make_slice(uint8, 8)
+	writeU32(fde, 0, 16) // length
+	writeU32(fde, 4, 24) // CIE pointer: back from offset 24 to the CIE at 0
+	a.EmitBytes(fde)
+	a.AddFixup("f", asm.FIX_DATA_PCREL32, 0, 4)
+	a.Zero(4)
+	a.EmitUint32(4) // address range
+	a.Zero(4) // augmentation data length 0, then padding
+	aarch64.ResolveFixups(a)
+	a.Finalize()
+	if a.HasError { return fail(buf.Concat("assembler error: ", a.ErrorMsg)) }
+	var obj @[]char = buf.Concat(dir, "/eh_static.o")
+	if !elf.WriteAArch64(a, obj) { return fail("cannot write the object") }
+	var paths @[]@[]char = make_slice(@[]char, 1)
+	paths[0] = obj
+	var out @[]char = buf.Concat(dir, "/eh_static")
+	var err @[]readonly char = Link(paths, "_start", EM_AARCH64, cast(uint64, 0x400000), out)
+	if len(err) != 0 { return fail(buf.Concat("Link failed: ", err)) }
+	exe, ok := readFile(out)
+	if !ok { return fail("cannot read the executable") }
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var rd *[]readonly uint8 = exe
+	off, va, sz, found := phdrOf(rd, PT_GNU_EH_FRAME)
+	if !found || sz != ehFrameHdrSize + 8 || off + sz > len(rd) { return fail("no one-entry table") }
+	if u32(rd, off + 8) != 1 { return fail("the table does not count one FDE") }
+	var fAddr uint64 = cast(uint64, 0x400004) // .text at the base: _start's ret, then f
+	if rel32At(rd, off + 12) != bit_cast(int64, fAddr - va) {
+		return fail("the entry is not f's address")
+	}
+	var ehAt int = off + 4 + cast(int, rel32At(rd, off + 4))
+	if u32(rd, ehAt) != 16 || u32(rd, ehAt + 4) != 0 { return fail("the pointer is not at the CIE") }
+	if u32(rd, ehAt + 40) != 0 { return fail("the records do not end with the terminator") }
+	return ""
+}

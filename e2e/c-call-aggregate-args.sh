@@ -5,14 +5,13 @@
 # `__c_call("sym", Ret, args...)` infers the C parameter type of each argument
 # from the argument's OWN Binate type and marshals it per the platform C ABI
 # (§7.13) plus the ordinary parameter-ownership contract (§18.5 mem.param).  This
-# test drives, through a real C callee, the argument shapes beyond the original
-# scalar/pointer set:
+# test drives, through a real C callee, the argument shapes beyond scalars and
+# pointers:
 #
 #   - a SMALL struct by value (<=16 bytes): coerced to the C small-struct register
-#     form (`[N x iW]`).  This is the case the LLVM backend miscompiled before the
-#     coercion was wired in — it passed a bare first-class `%struct` value, which
-#     LLVM lowered as a single register, so `addp(Point{20,22})` read 20 instead
-#     of 42.  The fix reuses the regular call path's C-ABI marshaling.
+#     form (`[N x iW]`), via the regular call path's C-ABI marshaling.  Passing a
+#     bare first-class `%struct` value instead miscompiles: LLVM lowers it as a
+#     single register, so `addp(Point{20,22})` reads 20 instead of 42.
 #   - a LARGE struct by value (>16 bytes): passed via the memory class (`byval`
 #     pointer to a caller-owned copy).
 #   - a RAW SLICE `*[]int32`: its two-word `{int32*, ptrdiff_t}` header maps to a
@@ -30,7 +29,7 @@
 #
 # Both backends are checked — LLVM and native (--backend native) — and a build
 # failure on either is a FAIL.  Built at -O2 so the LLVM small-struct case runs
-# through the optimizer that made the original miscompile visible.
+# through the optimizer, which makes a wrong coercion visible.
 #
 # Uses a gen1 bnc built from current source.  Auto-discovered by
 # .github/workflows/e2e-tests.yml on Linux + macOS; skips if no C compiler.
@@ -279,9 +278,9 @@ check_backend "native" "--backend native -O2"
 # (indirect pointer).  Cross-compile the same program for arm32-linux and run it
 # under qemu-arm on both backends, when a working arm32 cross-toolchain + qemu are
 # present (the Linux CI lane; self-SKIPs on macOS / a partial toolchain, exactly
-# like e2e/arm32-toolchain-smoke.sh).  This is the regression guard for the arm32
-# split-path frame-reservation fix (a >16 aggregate whose value is a call result
-# used to clobber a live spill).
+# like e2e/arm32-toolchain-smoke.sh).  This guards the arm32 split path's frame
+# reservation: a >16-byte aggregate whose value is a call result must not clobber a
+# live spill.
 ARM_QEMU="$(command -v qemu-arm-static || command -v qemu-arm || true)"
 [ -d /usr/arm-linux-gnueabihf ] && export QEMU_LD_PREFIX=/usr/arm-linux-gnueabihf
 arm32_probe() {

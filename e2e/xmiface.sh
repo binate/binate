@@ -201,7 +201,6 @@ EOF
 # guard that fires ONLY on the compiled cross-mode path (the VM's bytecode iface
 # dispatch has no such limit). Its panic proves the fixture is genuinely
 # native-injected: a bytecode-lowered version would just return the sum.
-# (9574f14ce replaced the old fixed >6 cap with this 64-slot ceiling.)
 WIDE_N=64
 wide_params=$(for i in $(seq 1 "$WIDE_N"); do printf 'p%d int, ' "$i"; done | sed 's/, $//')
 wide_body=$(for i in $(seq 1 "$WIDE_N"); do printf 'p%d + ' "$i"; done | sed 's/ + $//')
@@ -229,8 +228,8 @@ EOF
 # slice lands at slot 7.  The elements are BYTECODE-impl Areaer values (VM-index
 # vtable word), so the native callee's rest[i].Area() dispatch only works if the
 # cross-mode path substituted each element's vtable word (the slice-of-iface
-# substitution).  Regression coverage for the removed slots<7 cap: without the fix
-# a slice at slot >= 7 was dropped -> the native deref SIGSEGVs / misdispatches.
+# substitution).  A substitution capped at slots < 7 drops a slice at slot >= 7
+# -> the native deref SIGSEGVs / misdispatches.
 cat >> "$I_ROOT/pkg/xmiface.bni" <<'EOF'
 
 interface Areaer {
@@ -567,8 +566,8 @@ esac
 
 # ----- (f) cross-mode `...*Areaer` spread at slot >= 7: the slice ELEMENTS' vtable
 # words must be substituted so the native callee can dispatch Area() on each.  Seven
-# int args push the spread slice to slot 7 — the case the old slots<7 bitmap dropped
-# (a SIGSEGV / silent miscompile before the per-slot-list fix).  1+..+7 + 10+20 = 58.
+# int args push the spread slice to slot 7 — the case a slots<7 bitmap drops (a
+# SIGSEGV / silent miscompile).  1+..+7 + 10+20 = 58.
 sp_out=$("$HOST_BIN" "$TMP/prog_spread.bn" "$IFACES" "$IMPLS" 2>&1) || true
 check_eq "cross-mode-iface-slice-spread-slot7" "$sp_out" "58"
 

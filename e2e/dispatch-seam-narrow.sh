@@ -10,9 +10,9 @@
 # contrast, keeps every value 64-bit-canonical and reads its register param at full
 # width (a bool test / narrow compare is a 64-bit op).  So a native func-value SHIM
 # must re-extend an incoming narrow slot before calling the underlying, and a native
-# seam CALLER must re-canonicalize a narrow shim RESULT.  Before the fix the native
-# shims/collectors forwarded the slot/result verbatim, so dirty high bits from an
-# LLVM producer reached the native consumer and flipped a compare.
+# seam CALLER must re-canonicalize a narrow shim RESULT.  A native shim/collector
+# that forwards the slot/result verbatim lets dirty high bits from an LLVM producer
+# reach the native consumer and flip a compare.
 #
 # This can only arise CROSS-PRODUCER (a pure-native or VM<->native program keeps
 # every value canonical), so the test builds a MIXED-BACKEND program: package

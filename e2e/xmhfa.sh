@@ -88,8 +88,7 @@ EOF
 # guard that fires ONLY on the compiled cross-mode path (the VM's bytecode iface
 # dispatch has no such limit). Its panic proves the fixture is genuinely
 # native-injected: a bytecode-lowered version would just return the sum, making
-# the HFA checks above a false pass. (9574f14ce replaced the old fixed >6 cap
-# with this 64-slot ceiling; this proof tracks the ceiling.)
+# the HFA checks above a false pass. (WIDE_N tracks the 64-slot ceiling.)
 WIDE_N=64
 wide_params=$(for i in $(seq 1 "$WIDE_N"); do printf 'p%d int, ' "$i"; done | sed 's/, $//')
 wide_body=$(for i in $(seq 1 "$WIDE_N"); do printf 'p%d + ' "$i"; done | sed 's/ + $//')

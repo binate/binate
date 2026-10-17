@@ -4,11 +4,11 @@
 # BYTECODE-VM function.  A VM program hands a bytecode function (by value) to a
 # native-injected package function, which calls it back — so the native indirect
 # call goes through the VM-side trampoline (pkg/binate/vm/vm.bn):
-#   - TrampolineAggregate for a MULTI-return (int, int) value (the fixed path:
+#   - TrampolineAggregate for a MULTI-return (int, int) value (the pinned path:
 #     the compiled caller uses the retbuf shim shape for any multi-return func
-#     value, so the VM must select the retbuf trampoline; before the fix a
-#     multi-return fell through to the one-word TrampolineScalar and the caller's
-#     retbuf pointer landed in `data` — a loud closure-record-tag vmPanic, which
+#     value, so the VM must select the retbuf trampoline; a VM that lets a
+#     multi-return fall through to the one-word TrampolineScalar lands the
+#     caller's retbuf pointer in `data` — a loud closure-record-tag vmPanic, which
 #     is exactly what makes this a genuine regression pin, not a false pass).
 #   - TrampolineScalar for a scalar value (the control: the scalar path must stay
 #     correct).
@@ -316,11 +316,10 @@ check_eq() {
     fi
 }
 
-# The multi-return line (11022) is the fixed path: with the pre-fix selection
-# gate, producerMR's func value carried the one-word TrampolineScalar, so the
-# native retbuf-shape call landed its retbuf pointer in `data` and the run
-# aborted with a closure-record-tag vmPanic (no 11022 line).  The scalar line (7)
-# is the control.
+# The multi-return line (11022) is the pinned path: if producerMR's func value
+# carries the one-word TrampolineScalar, the native retbuf-shape call lands its
+# retbuf pointer in `data` and the run aborts with a closure-record-tag vmPanic
+# (no 11022 line).  The scalar line (7) is the control.
 out=$("$HOST_BIN" "$TMP/prog.bn" "$IFACES" "$IMPLS" 2>&1) || true
 check_eq "cross-mode-funcvalue-dispatch" "$out" "11022
 7"

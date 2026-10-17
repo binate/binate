@@ -6,9 +6,10 @@
 # os.Args() returns @[]readonly @[]readonly char, so an element has type `readonly
 # @[]readonly char` — an outer-`readonly`-qualified managed char-slice.  fmt's
 # writeArg fast type switch matches only the four UNqualified char-slice spellings,
-# so before ce758276 `fmt.Printf("%s", os.Args()[i])` rendered `%!?(unknown)` — the
-# single most common thing a program prints (its own argv).  The fix recovers a
-# wrapped/qualified char-slice via reflection (dynamic type peels to KIND_STRING).
+# so such an element must be recovered via reflection (its dynamic type peels to
+# KIND_STRING); a fmt that stops at the type switch renders
+# `fmt.Printf("%s", os.Args()[i])` as `%!?(unknown)` — and that is the single most
+# common thing a program prints (its own argv).
 # conformance/1196_fmt_wrapped_string pins the exact dynamic type synthetically;
 # this pins the REAL os.Args() element flowing through fmt, end to end, on both the
 # compiled and interpreted paths (the conformance runner passes no arguments, so it
@@ -47,8 +48,8 @@ BUILD_DIR="$TMP/build"
 mkdir -p "$BUILD_DIR"
 
 # Fixture: print the argument count via %d, then each ARGUMENT (Args()[1..]) via %s
-# — the element type is `readonly @[]readonly char`, the exact case that used to
-# render `%!?(unknown)`.  Element 0 (the path-dependent program name) is not printed.
+# — the element type is `readonly @[]readonly char`, the exact case that needs the
+# reflection path.  Element 0 (the path-dependent program name) is not printed.
 cat > "$TMP/fmt_os_args.bn" <<'EOF'
 package "main"
 

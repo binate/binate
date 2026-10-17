@@ -105,8 +105,8 @@ fi
 # be cross-built — derive the bnc --target key and pass it to the build-*.sh
 # scripts, which cross-EMIT Stage 2 (gen1 stays a host binary).  Binaries built
 # for a foreign platform on a host lacking the matching cross-toolchain fail
-# loudly at link — strictly better than the old behavior here, which silently
-# produced HOST binaries mislabeled with --platform.  lib/ is source, hence
+# loudly at link, rather than silently producing HOST binaries mislabeled with
+# --platform.  lib/ is source, hence
 # platform-independent, and is staged unchanged either way.
 BUILD_TARGET_OPT=""
 if [ "$PLATFORM" != "$host_os-$host_arch" ]; then

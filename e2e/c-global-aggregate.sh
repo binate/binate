@@ -4,9 +4,9 @@
 # the ABI boundary.
 #
 # `__c_global("sym", T)` yields the ADDRESS of the external C global `sym` as a raw
-# `*T`.  T was long restricted to a scalar or pointer; it now admits any type with
-# a defined ABI layout (the same widened C-representability `__c_call` applies to
-# its arguments), so a C global struct/array is reachable.  This test defines a C
+# `*T`.  T is not limited to a scalar or pointer: it admits any type with a
+# defined ABI layout (the same C-representability `__c_call` applies to its
+# arguments), so a C global struct/array is reachable.  This test defines a C
 # global `struct Cfg g_cfg = {10,20,30}`, then from Binate: reads it whole through
 # `*p` and checks the fields (10+20+30 = 60), writes a new value back through
 # `*p = ...`, and calls a C function that re-reads `g_cfg` to confirm the write

@@ -121,7 +121,7 @@ fi
 errfile="$(mktemp)" || { echo "bnfmt-format: mktemp failed" >&2; exit 1; }
 
 # $files is a newline-separated list of colon-free, glob-free paths; the intended
-# word-splitting passes them all as separate arguments (matching the old loop).
+# word-splitting passes them all as separate arguments.
 "$bnfmt" --check $files 2>"$errfile" >/dev/null
 status=$?
 

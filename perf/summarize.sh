@@ -5,7 +5,7 @@
 # <results-dir> into markdown tables on stdout: one table each for the
 # TOTAL (compile+run), COMPILE, and RUN timings.  So the summary carries
 # both the end-to-end cost (compile+run — the apples-to-apples against an
-# interpreted mode's run, now that compiled fixtures pull in real stdlib)
+# interpreted mode's run, since compiled fixtures pull in real stdlib)
 # AND the separate compile / run breakdown (run-only stays the useful
 # comparison among compiled modes).  Each table is a test×mode grid; a
 # cell shows the timing for a PASS, the status (COMPILE_ERROR / FAIL / SKIP)

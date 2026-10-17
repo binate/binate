@@ -14,8 +14,8 @@
 # The check is static (grep the isolated `--emit-llvm` output) rather than a
 # link+run, because:
 #   - the property being verified is exactly "the isolated object carries the
-#     signext/zeroext return attribute" — a use-site-marking fix would emit plain
-#     `define iN` here;
+#     signext/zeroext return attribute" — marking only at the use site would emit
+#     plain `define iN` here;
 #   - the generic "separately-compiled objects link and run" property is already
 #     covered by e2e/separate-compilation.sh, and the whole-program __c_entry run
 #     by e2e/c-entry-narrow-return.sh.

@@ -8,16 +8,17 @@
 # bits 63:32 unspecified; on SysV-AMD64 the upper bits of RAX are undefined.  Every
 # native Binate VALUE, by contrast, is kept 64-bit-canonical (a Binate `int8 -1` is
 # 0xFFFF..FF).  So a native CALLER must re-extend a foreign sub-word return before
-# using it directly.  x64 always did (movsx/movzx); the aa64 / arm32 backends did
-# NOT, so a foreign `signed char`/`short`/`int` return with non-canonical upper bits
-# used in a comparison read the wrong value — `if c_signed_char() == -1` was false on
-# aarch64.  This test guards that fix: it __c_call's C functions returning a negative
-# int8 / int16, a uint8, and a dirty-upper int32 (a truncating callee fed a
-# dirty-upper 64-bit value), and checks each is seen at full width.
+# using it directly (x64: movsx/movzx).  Without the re-extension, a foreign
+# `signed char`/`short`/`int` return with non-canonical upper bits used in a
+# comparison reads the wrong value — `if c_signed_char() == -1` is false on
+# aarch64.  This test guards the re-extension: it __c_call's C functions returning
+# a negative int8 / int16, a uint8, and a dirty-upper int32 (a truncating callee
+# fed a dirty-upper 64-bit value), and checks each is seen at full width.
 #
 # Both backends are checked — LLVM and native (--backend native) — and a build
-# failure on either is a FAIL.  The bug is native-only, so the native variant is the
-# meaningful one; the LLVM variant pins that the two backends agree.
+# failure on either is a FAIL.  The native backends are the ones that must re-extend
+# themselves, so the native variant is the meaningful one; the LLVM variant pins
+# that the two backends agree.
 #
 # Uses a gen1 bnc built from current source.  Auto-discovered by
 # .github/workflows/e2e-tests.yml on Linux + macOS; skips if no C compiler.

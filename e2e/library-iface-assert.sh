@@ -153,7 +153,7 @@ check_backend() {
     fi
 }
 
-# The fix lives in backend-neutral IR-gen, so both backends must pass.
+# The mechanism lives in backend-neutral IR-gen, so both backends must pass.
 check_backend "llvm"   ""
 check_backend "native" "--backend native"
 

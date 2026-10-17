@@ -5,11 +5,11 @@
 #
 # Apple's arm64 ABI (DarwinPCS) passes EVERY variadic argument on the stack,
 # composites included — unlike a FIXED HFA, which rides the SIMD arg registers
-# v0..v(n-1).  The native aa64 backend used to place a variadic HFA in D
-# registers anyway (it saturated only the GP cursor at the fixed/variadic
-# boundary and its FP-file emit branch lacked the VariadicStackOnly guard), so
-# clang's va_arg — which reads the composite from the stack — got garbage.  This
-# test drives that path through a real C callee:
+# v0..v(n-1).  A backend that places a variadic HFA in D registers anyway (e.g.
+# one that saturates only the GP cursor at the fixed/variadic boundary, or whose
+# FP-file emit branch lacks the VariadicStackOnly guard) hands clang's va_arg —
+# which reads the composite from the stack — garbage.  This test drives that path
+# through a real C callee:
 #
 #   - a 2xfloat32 HFA (8 bytes) as the sole variadic arg;
 #   - a FIXED HFA (rides v0/v1) followed by variadic HFAs (stack), proving the
@@ -24,8 +24,8 @@
 # argument perturbs one number.
 #
 # On x86_64 the same program exercises SysV's variadic path (a small float
-# aggregate rides XMM, AL carries the vector count) — a DIFFERENT code path that
-# this fix does not touch; it is included as a bonus cross-check.  arm32 is
+# aggregate rides XMM, AL carries the vector count) — a DIFFERENT code path from
+# the DarwinPCS stack-only rule; it is included as a bonus cross-check.  arm32 is
 # deliberately omitted: its variadic-HFA rule (AAPCS-VFP base-standard, floats
 # via GP/stack) is a separate mechanism, not the DarwinPCS stack-only rule.
 #

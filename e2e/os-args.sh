@@ -16,7 +16,7 @@
 # element 0's CONTENT: that is the program path, which differs between the
 # compiled-binary run (the binary's path) and the interpreted run (the fixture
 # path cmd/bni installs via os.SetArgs), so a cross-path check must skip it.  Both
-# paths now populate it: the hosted Binate entry (pkg/builtins/startup._entry, the
+# paths populate it: the hosted Binate entry (pkg/builtins/startup._entry, the
 # c_export'd `main`) captures the real argv[0] when compiled, and cmd/bni's
 # os.SetArgs supplies it when interpreted.  len and the argument elements are
 # identical either way.

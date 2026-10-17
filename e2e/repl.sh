@@ -873,7 +873,7 @@ testing.Println(tripled(11))
 
 # --- Case 14: multi-line const ( ... ) is recognized as a
 # continuation by the paren-aware accumulator (computeOpenDepth
-# now tracks `(` / `)` in addition to `{` / `}`).  Each non-final
+# tracks `(` / `)` in addition to `{` / `}`).  Each non-final
 # input line that leaves depth > 0 yields a `... ` continuation
 # prompt; the closing `)` triggers evaluation. ---
 run_repl "multi-line-const-group" \
@@ -903,7 +903,7 @@ testing.Println(x)
 > "
 
 # --- Case 15b (var-init): `var x T = expr` at the prompt
-# now runs the initializer right after registration, so the
+# runs the initializer right after registration, so the
 # global has its declared value before the next prompt entry
 # sees it.  Inter-decl references work too (b reads a). ---
 run_repl "var-init-eval" \
@@ -979,7 +979,7 @@ testing.Println(caller())
 > "
 
 # --- Case 20 (shadow): redefining with a DIFFERENT
-# signature now SHADOWS rather than rejects.  The OLD helper stays
+# signature SHADOWS rather than rejects.  The OLD helper stays
 # callable through any caller whose CallCache already resolved
 # it — they invoke the old shape via the still-live old idx.
 # A direct call from a fresh prompt entry (lowered AFTER the
@@ -1115,9 +1115,9 @@ testing.Println(k.n)
 # fixture struct.  The element `@Box` is a managed pointer and
 # requires RefDec at slice-free time, so `__dtor_ms_mp_Box` must
 # exist; the loaded module never uses this shape so the helper
-# is missing without EnsureReplBodyHelpers.  Before the drain
-# fix the func's end-of-statement cleanup hit a missing extern;
-# after, the helper is emitted and lowered before the body. ---
+# is missing without EnsureReplBodyHelpers, which emits and
+# lowers the helper before the body (else the func's
+# end-of-statement cleanup hits a missing extern). ---
 run_repl "body-introduces-managed-slice-of-managed-ptr" \
 "func g() { var s @[]@Box = make_slice(@Box, 2); testing.Println(len(s)) }
 g()
@@ -1161,8 +1161,8 @@ testing.Println(len(t))
 # (Note: even without retryPending's drain, the test would
 # pass — the next prompt entry's drain plus
 # backfillExternCachesForName would upgrade f's -1 cache
-# slot.  Keeping the drain in retryPending is an optimization
-# + consistency win, not a sole correctness fix.) ---
+# slot.  The drain in retryPending is an optimization that
+# keeps the paths consistent; correctness does not rest on it.) ---
 run_repl "body-introduced-shape-via-retry" \
 "func f() { var s @[]@Box = make_slice(@Box, 2); h(); testing.Println(len(s)) }
 func h() {}
@@ -1825,9 +1825,8 @@ testing.Println(repldemo.Double(5))
 # imported package; a following `var g` must be qualified under the SESSION module
 # (SetModuleContext restores it) — else MaterializeOneGlobal registers the global
 # under the import's package while the init synthetic stores under "main", a
-# null-address SIGSEGV.  Regression guard for that (pre-existing) crash. testing
-# comes from the fixture, so this exercises SetModuleContext independent of the
-# prompt-import-of-testing path. ---
+# null-address SIGSEGV.  testing comes from the fixture, so this exercises
+# SetModuleContext independent of the prompt-import-of-testing path. ---
 run_repl "var-decl-after-mid-session-import" \
 'import "pkg/repldemo"
 var g int = 42
@@ -1924,7 +1923,7 @@ testing.Println(helper(7))
 # --- Case 48 (parked-member iota-repeat).  B0 = M<<iota
 # parks (pending M); the bare B1 repeats B0's M-dependent initializer, so
 # it parks too.  When M=2 arrives both resolve, and B1 must be the
-# REPEATED value 2<<1 = 4 — NOT the plain iota index 1 (the pre-fix bug).
+# REPEATED value 2<<1 = 4 — NOT the plain iota index 1.
 # Transcript verified by driving a gen1-built bni manually. ---
 run_repl "pending-const-group-bare-iota-repeat" \
 "const ( B0 int = M << iota; B1 )

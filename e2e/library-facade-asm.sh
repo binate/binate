@@ -4,9 +4,9 @@
 #
 # The facade package is compiled on its own path in cmd/bnc/library.bn (the
 # per-package loop `continue`s past it so its `bn_init` dispatcher can see the
-# whole closure), which once assembled the facade's module object but skipped its
-# `.s` files — so a facade shipping hand-written asm produced an archive MISSING
-# those symbols.  This guards the fix: the facade here carries a data-only `.s`
+# whole closure), so that path must archive the facade's `.s` objects as well as its
+# module object — skipping them leaves a facade that ships hand-written asm with an
+# archive MISSING those symbols.  The facade here carries a data-only `.s`
 # (`.global_c libasm_answer` = the platform C symbol `_libasm_answer` / `libasm_answer`,
 # a `.uint64 42`), and a C driver reads that symbol out of the linked archive.
 # Without the facade `.s` being archived, the link fails undefined; with it, the
@@ -119,7 +119,7 @@ check_backend() {
     fi
 }
 
-# The archiving fix is backend-neutral (library.bn adds the facade's asm object to
+# The facade-asm archiving is backend-neutral (library.bn adds the facade's asm object to
 # oFiles regardless of --backend), so both backends must archive it.
 check_backend "llvm"   ""
 check_backend "native" "--backend native"

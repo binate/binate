@@ -44,9 +44,9 @@ runner_setup() {
 }
 
 # Compose the per-invocation bnc `--cflag` args from $BAREMETAL_LD_FLAGS (macOS
-# `-fuse-ld=lld` for the ELF cross-link).  The AEABI runtime helpers once pulled
-# from libgcc.a via `--link-after-objs` are now provided by
-# runtime/baremetal_arm32/aeabi_{int,float}.s, so no libgcc pass is needed.
+# `-fuse-ld=lld` for the ELF cross-link).  The AEABI runtime helpers are provided by
+# runtime/baremetal_arm32/aeabi_{int,float}.s, so no libgcc.a is passed via
+# `--link-after-objs`.
 _baremetal_bnc_extra_args() {
     set --
     if [ -n "$BAREMETAL_LD_FLAGS" ]; then

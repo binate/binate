@@ -29,8 +29,8 @@ find "$BINATE_DIR" \
     -o -type f \( -name '*.sh' -o -name '*.md' -o -name '*.yml' \) -print \
     | sort > "$TEXT_LIST"
 
-# 1. Trailing whitespace — one awk over the list (FNR = per-file line number now
-#    that a single process spans every file).
+# 1. Trailing whitespace — one awk over the list (FNR = per-file line number,
+#    since a single process spans every file).
 out=$(xargs awk '
     /[ \t]+$/ {
         rel = FILENAME; sub(BINATE "/", "", rel)

@@ -3,11 +3,10 @@
 # package with `func main`) exposes the well-known `bn_init` symbol, so a C host
 # can initialize it and call its `#[c_export]` functions WITHOUT running main.
 #
-# `bn_init` is now emitted in every artifact, not just `--library` builds: a
+# `bn_init` is emitted in every artifact, not just `--library` builds: a
 # program's `bn_entry` is literally `bn_init(); main.main()` (spec abi/06 §6.7).
-# Before that, an ordinary program had no `bn_init`, so a C host following the
-# spec and calling `bn_init` against a program-shaped link got an undefined
-# symbol.  This test builds a program to objects (`bnc -c`), archives them, and
+# Without it in a program, a C host following the spec and calling `bn_init`
+# against a program-shaped link gets an undefined symbol.  This test builds a program to objects (`bnc -c`), archives them, and
 # links a C driver that calls `bn_init` (twice) and two exports — never main.
 #
 # It proves three things: `bn_init` (and `bn_entry`) are defined external symbols
@@ -162,7 +161,7 @@ check_backend() {
     fi
 }
 
-# The fix lives in backend-neutral IR-gen, so both backends must pass.
+# The mechanism lives in backend-neutral IR-gen, so both backends must pass.
 check_backend "llvm"   ""
 check_backend "native" "--backend native"
 

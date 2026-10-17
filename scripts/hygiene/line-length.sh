@@ -22,11 +22,11 @@ find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls
     \( -name '*.bn' -o -name '*.bni' \) -not -path '*/testdata/*' 2>/dev/null \
     | sort > "$LIST"
 
-# One awk over every file (FNR = per-file line number) — was one awk fork PER
+# One awk over every file (FNR = per-file line number), not one awk fork PER
 # file (~thousands of forks).  A line opts out with the "// LONG-LINE ALLOWED"
 # marker.  Violations are reported per offending line; the summary counts
 # DISTINCT files (rel path is the pre-colon field, which file paths never
-# contain), matching the original per-file tally.  Repo paths have no spaces,
+# contain).  Repo paths have no spaces,
 # so the list feeds `xargs awk` safely.
 out=""
 if [ -s "$LIST" ]; then

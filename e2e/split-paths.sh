@@ -83,9 +83,9 @@ check() {
 # A gen1 (checkout-source) bnc compiles the fixture; the -I/-L below are bnc's
 # own search paths.  gen1 — NOT the pinned BUILDER — is used because the fixture
 # links the current-tree runtime (pkg/builtins/rt + startup), and the BUILDER
-# predates the satentry-registry contract that runtime now uses: a BUILDER-
-# compiled binary emits the OLD flat satentry structure yet calls the NEW
-# registry graph-walk, and segfaults at startup.  gen1 uses one consistent
+# predates the satentry-registry contract that runtime uses: a BUILDER-compiled
+# binary emits a flat satentry structure yet calls the runtime's registry
+# graph-walk, and segfaults at startup.  gen1 uses one consistent
 # contract on both sides.  Neither gen1 nor the BUILDER links a C runtime (the
 # runtime is pure Binate), so no --runtime is passed.  resolve-gen1.sh
 # builds+caches gen1 (the BUILDER compiling checkout cmd/bnc) once per tree
@@ -112,9 +112,9 @@ check "bnc" "$actual"
 echo "SKIP: bni (needs a builder-comp build of cmd/bni)"
 
 # ----- bnlint (lint pkg/splitlib via -I/-L) -----------------------
-# bnlint is no longer required to be bootstrap-runnable, so we build
-# it via bnc first and exercise the resulting binary.  A clean lint =
-# no diagnostic output.
+# bnlint runs only as a bnc-compiled binary, so we build it first
+# (scripts/build-bnlint.sh) and exercise the resulting binary.  A clean
+# lint = no diagnostic output.
 BNLINT_BIN="$TMP/bnlint-bin"
 bnlint_build_log=$("$BINATE_DIR/scripts/build-bnlint.sh" \
     -o "$BNLINT_BIN" 2>&1) || true

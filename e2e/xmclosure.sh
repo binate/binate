@@ -9,7 +9,7 @@
 # value INTO native code).  Here the producer is NATIVE and the caller is
 # BYTECODE, so the VM's execCallFuncValue reads the func value's `data` word.  A
 # native capturing closure's data must carry a kind discriminator the VM
-# recognizes (DATA_KIND_NATIVE_CLOSURE); without it the VM reads capture-word-0 as
+# recognizes (DATA_KIND_COMPILED_CLOSURE); without it the VM reads capture-word-0 as
 # a kind tag and either panics ("unsupported function-value data kind") or, if a
 # captured value happens to equal a VM kind (1/2), silently MISDISPATCHES.
 #
@@ -267,10 +267,10 @@ check_eq() {
     fi
 }
 
-# Without the kind-tag fix, the VM reads a capture word as the func-value data
-# kind: `add`/`sum`/`gl` panic ("unsupported function-value data kind") or, if a
-# capture equals 1/2, misdispatch.  With the fix, the native closures dispatch via
-# their vtable shim and print 15 / 7 / 3.
+# Without the DATA_KIND_COMPILED_CLOSURE discriminator, the VM reads a capture word
+# as the func-value data kind: `add`/`sum`/`gl` panic ("unsupported function-value
+# data kind") or, if a capture equals 1/2, misdispatch.  With it, the native
+# closures dispatch via their vtable shim and print 15 / 7 / 3.
 out=$("$HOST_BIN" "$TMP/prog.bn" "$IFACES" "$IMPLS" 2>&1) || true
 check_eq "native-capturing-closure-into-bytecode" "$out" "15
 7

@@ -20,17 +20,16 @@
 #      a data fixture .s yields BYTE-IDENTICAL objects (exercises the real
 #      assembler across the separately-compiled binary).
 #
-# Guards the fix that made this work at all: `--pkg` used to skip loading the
-# implicit runtime packages (rt / reflect / lang), so a package that
-# emitted a runtime-helper call — e.g. `rt.BoundsCheck` from ANY slice/array
-# index — referenced an undeclared symbol and clang rejected the IR
-# (`use of undefined value`).  Separate compilation was thus dead-on-arrival for
-# essentially every real package (pure-arithmetic leaves happened to survive).
+# Guards that `--pkg` loads the implicit runtime packages (rt / reflect / lang):
+# without them, a package that emits a runtime-helper call — e.g. `rt.BoundsCheck`
+# from ANY slice/array index — references an undeclared symbol and clang rejects
+# the IR (`use of undefined value`), which breaks separate compilation for
+# essentially every real package (only pure-arithmetic leaves survive).
 #
 # Default: a gen1 bnc built from the current source.  `--builder` also runs the
-# BUILDER bnc as a sanity-check of the test harness, but the shipped BUILDER
-# predates both `--list-deps` and the `--pkg` fix, so it reports SKIP until the
-# next BUILDER bump.
+# BUILDER bnc as a sanity-check of the test harness; a BUILDER that predates
+# `--list-deps` (and `--pkg`'s runtime-package loading) cannot drive separate
+# compilation, so that leg reports SKIP.
 #
 # Exit 0 on pass; non-zero with diagnostics on failure.
 
@@ -211,9 +210,9 @@ if [ "$WITH_BUILDER" -eq 1 ]; then
     if [ -z "${BUILDER:-}" ] || [ ! -x "$BUILDER" ]; then
         skip "builder (could not resolve a BUILDER bnc)"
     elif ! "$BUILDER" --list-deps "$TARGET" >/dev/null 2>&1; then
-        # The shipped BUILDER predates --list-deps (and the --pkg rt-load fix);
-        # it cannot drive separate compilation until it is bumped past them.
-        skip "builder ($("$BUILDER" --version 2>&1 | head -1) predates --list-deps / the --pkg fix; flips to a real check after the next BUILDER bump)"
+        # This BUILDER predates --list-deps (and --pkg's rt-load); it cannot
+        # drive separate compilation.
+        skip "builder ($("$BUILDER" --version 2>&1 | head -1) predates --list-deps / --pkg runtime-package loading)"
     else
         BLD_IFACE="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BUILDER_LIB")"
         BLD_IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BUILDER_LIB")"

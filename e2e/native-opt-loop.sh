@@ -6,20 +6,21 @@
 # across the loop's back-edge, so it flows between the body and the header blocks
 # through its spill SLOT (each native block starts with a fresh regmap; cross-
 # block values are stored/reloaded).  The aarch64 lazy-spill dead-store
-# elimination emitted the block-live-out spill AFTER the block's terminator
-# branch — dead on the taken path, and wholly unreachable after an unconditional
-# back-edge — so the counter's updated value never reached its slot and the
-# header reloaded the stale value forever: an infinite loop.  This only surfaced
-# at -O1+ (mem2reg makes the counter a register-resident SSA value that gets
-# spilled at the block boundary); -O0 keeps every local in memory, so the store
-# was already eager and correctly placed.  Conformance runs native only at -O0,
-# so nothing exercised this until now — a `func main` doing ANY loop (including
-# the environment scan in pkg/builtins/startup, which runs before main) hung at
-# startup under `--backend native -O1`.
+# elimination must emit the block-live-out spill BEFORE the block's terminator
+# branch: emitted after it, the spill is dead on the taken path, and wholly
+# unreachable after an unconditional back-edge, so the counter's updated value
+# never reaches its slot and the header reloads the stale value forever: an
+# infinite loop.  This shows only at -O1+ (mem2reg makes the counter a
+# register-resident SSA value that gets spilled at the block boundary); -O0 keeps
+# every local in memory, so the store is eager and correctly placed.  Conformance
+# runs native only at -O0, so this test is what exercises it — a misplaced spill
+# hangs a `func main` doing ANY loop (including the environment scan in
+# pkg/builtins/startup, which runs before main) at startup under
+# `--backend native -O1`.
 #
 # The program below sums 0..99 (= 4950) in an explicit loop and prints it; a
 # misplaced counter store either hangs (counter never advances) or prints a wrong
-# sum.  Checked on native -O1 and -O2 (the regression) with an LLVM -O1 control
+# sum.  Checked on native -O1 and -O2 (where it shows) with an LLVM -O1 control
 # (the two backends must agree) and a native -O0 control.  Each run is bounded by
 # a timeout so a hang is a FAIL, not a stuck test.
 #

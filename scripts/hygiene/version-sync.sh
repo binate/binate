@@ -55,8 +55,8 @@ fi
 # X.Y.Z-preN (a prerelease): three numeric components + an OPTIONAL hyphenated
 # `-pre` + optional number.  The untagged working tree between releases uses a
 # prerelease starting at -pre1 right after a release (a bare `-pre` with no
-# number, the lowest-ordered form, is still accepted but is no longer the
-# post-release convention).
+# number, the lowest-ordered form, is accepted but is not the post-release
+# convention).
 # Prerelease is always hyphenated (semver-consistent).  The
 # `#[build(at_least(version, …))]` predicate parser (pkg/binate/buildcfg) accepts
 # exactly this shape, so a stray non-hyphenated `preN`, an unknown suffix, or a

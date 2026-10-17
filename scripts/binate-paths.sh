@@ -104,7 +104,7 @@ TARGET_EXTRA=""      # newline-list of dirs prepended to BOTH -I and -L
 # arm32-baremetal needs its semihost interface + link-file dir
 # (runtime/baremetal_arm32) ahead of the default impls/core/libc; its
 # target-specific package impls are #[build]-gated in the common tree, so no
-# separate impl-search dir is required.  bnc no longer synthesizes these (it has
+# separate impl-search dir is required.  bnc does not synthesize these (it has
 # no notion of a binate root); binate-paths is the single source of these paths.
 set_target_extras() {
     case "$1" in

@@ -7,8 +7,8 @@ runner_setup() { build_interp_boot_comp; }
 runner_run() {
     bn="$1"
     # Full stdlib search paths — bare $BINATE_DIR misses the
-    # ifaces/impls split (pkg-layout migration), so even noop tests
-    # failed to resolve stdlib packages.
+    # ifaces/impls split, so even noop tests would fail to resolve
+    # stdlib packages.
     "$COMPILED_INTERP" -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" -main-file "$bn" 2>&1
 }
 

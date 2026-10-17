@@ -165,8 +165,8 @@ check_ccall_narrow() {
     fi
 }
 
-# The bug lived on the LLVM __c_call path; native must pass too (its canonical
-# full-width args over-satisfy the C ABI).
+# The LLVM __c_call path is the one that must add the extension attributes; native
+# must pass too (its canonical full-width args over-satisfy the C ABI).
 check_ccall_narrow "llvm"   ""
 check_ccall_narrow "native" "--backend native"
 

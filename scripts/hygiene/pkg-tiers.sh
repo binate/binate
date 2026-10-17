@@ -18,8 +18,7 @@
 # gets `package "<dep>" not found`.  This is the runtime enforcement of the
 # spec's "Transitive constraint" + tier table.  Nothing else catches it — it
 # only manifests when a consumer compiles the offending package from a real
-# bundle (the 2026-06-10 pkg/builtins/lang -> pkg/binate/buf bug, binate
-# 84818a77, present + undetected since bnc-0.0.7).
+# bundle.
 #
 # Refinement (std -> stdx): tier 1 (std) may depend on tier 1x (stdx) from its
 # .bn IMPL files (internal) but NOT from its .bni INTERFACE files — a .bni
@@ -96,14 +95,14 @@ trap 'rm -f "$LIST" "$IMPORTS" "$WL_CLEAN" "$VIOL"' EXIT
 find ifaces impls runtime pkg cmd -type f \( -name '*.bn' -o -name '*.bni' \) 2>/dev/null \
     | grep -v '_test\.bn$' | sort > "$LIST"
 
-# Pre-strip the exemption whitelist's comments/blanks ONCE (was re-done by two
-# greps inside is_exempt on every higher-tier import).  Repo-relative paths and
+# Pre-strip the exemption whitelist's comments/blanks ONCE (rather than two greps
+# inside is_exempt on every higher-tier import).  Repo-relative paths and
 # import paths contain no tab, so the tab-delimited pipeline below is unambiguous.
 if [ -f "$WHITELIST_FILE" ]; then
     grep -v '^[[:space:]]*#' "$WHITELIST_FILE" | grep -v '^[[:space:]]*$' > "$WL_CLEAN"
 fi
 
-# Extract every "pkg/..." import from EVERY file in ONE awk pass (was one awk
+# Extract every "pkg/..." import from EVERY file in ONE awk pass (not one awk
 # fork PER file).  Emit "<path>\t<import>".  FNR==1 resets the group-state
 # machine per file (an unterminated `import (` must not bleed into the next).
 # Handles the single-line `import "pkg/X"` / aliased `import a "pkg/X"` and the

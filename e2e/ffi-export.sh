@@ -157,7 +157,7 @@ func GetCounter() int { return counter }
 // bits[32:63] zeroed (an aarch64 w-write clears the high half), so a native callee that
 // spills the whole x0 and, at -O1+, tests it with a 64-bit signed compare sees a large
 // POSITIVE value unless it sign-extends the narrow reg param on entry.  Guards the
-// #[c_export] register-param normalization (regression: ffi_sgn(-5) returned 0).
+// #[c_export] register-param normalization (without it, ffi_sgn(-5) returns 0).
 #[c_export("ffi_sgn")]
 func Sgn(x int32) int {
 	if x < cast(int32, 0) {
@@ -182,7 +182,8 @@ func FRo(x readonly int8) int {
 // and skips its own re-extension — so an un-extended i8/i16/i1 return surfaces as
 // dirty upper bits / a wrong value.  Each derives its narrow result from a WIDER
 // argument (cast truncation) so the natural codegen would leave nonzero upper
-// bits without the signext/zeroext fix.  Read at -O2 by the narrow-returns driver.
+// bits without the signext/zeroext extension.  Read at -O2 by the narrow-returns
+// driver.
 #[c_export("ffi_reti8")]
 func RetI8(x int) int8 { return cast(int8, x) }
 
@@ -683,7 +684,7 @@ WANT_MULTIRET="10 20 30
 # right struct-returning function-pointer type and calls it.  The entry must adapt
 # the internal multi-return convention to the platform struct-return ABI just as a
 # direct #[c_export] call does — but reached through the __c_entry pointer (the weak
-# __centry.<mangled> thunk), the case #[c_export]-only wiring used to miss.
+# __centry.<mangled> thunk), a case that wiring only the #[c_export] symbol misses.
 cat > "$TMP/driver_centry.c" <<'EOF'
 #include <stdio.h>
 struct M3i { long a, b, c; };
@@ -972,7 +973,8 @@ check_multiret "native" "--backend native"
 
 # MULTI-VALUE returns reached THROUGH a __c_entry callback pointer — the entry the
 # pointer names must adapt the tuple to the C struct-return ABI too (the weak
-# __centry.<mangled> thunk), the case #[c_export]-only return wiring used to miss.
+# __centry.<mangled> thunk), a case that wiring only the #[c_export] symbol's return
+# misses.
 check_centry "llvm" ""
 check_centry "native" "--backend native"
 

@@ -1,8 +1,8 @@
 #!/bin/sh
 # e2e/bnas.sh — End-to-end test of the bnas CLI contract (cmd/bnas/main.bn):
-# a real assemble round-trip plus the tool-wiring the flags redesign
-# (7902d5de7) left uncovered — --version banner, no-input usage, unknown flag,
-# and the "multiple input files" rejection.  The generic flag-parsing behavior
+# a real assemble round-trip plus the tool wiring no other test covers —
+# --version banner, no-input usage, unknown flag, and the "multiple input
+# files" rejection.  The generic flag-parsing behavior
 # (unknown-flag/missing-value errors, positional handling) is unit-tested in
 # pkg/std/flags; the actual assemble pipeline in pkg/binate/asm/assemble — this
 # locks how cmd/bnas wires the two together end to end.

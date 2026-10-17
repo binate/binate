@@ -45,15 +45,15 @@ trap 'rm -f "$LIST" "$VIOLATIONS" "$IMPORTS" "$WL_CLEAN"' EXIT
 find "$CONFORMANCE_DIR" -type f \( -name '*.bn' -o -name '*.bni' \) \
     | sort > "$LIST"
 
-# Pre-strip the exemption whitelist's comments/blanks ONCE (was re-done via two
-# greps on every non-allowed import).  Conformance paths never contain a tab or
+# Pre-strip the exemption whitelist's comments/blanks ONCE (rather than two greps
+# on every non-allowed import).  Conformance paths never contain a tab or
 # space, so the tab-delimited pipeline below is unambiguous.
 if [ -f "$WHITELIST_FILE" ]; then
     grep -v '^[[:space:]]*#' "$WHITELIST_FILE" | grep -v '^[[:space:]]*$' > "$WL_CLEAN"
 fi
 
-# Extract every "pkg/..." import from EVERY file in ONE awk pass (was one awk
-# fork PER file — ~3,500 forks / ~10s).  Emit "<path>\t<import>".  FNR==1 resets
+# Extract every "pkg/..." import from EVERY file in ONE awk pass (one awk fork
+# PER file would be ~3,500 forks / ~10s).  Emit "<path>\t<import>".  FNR==1 resets
 # the group-state machine per file (an unterminated `import (` must not bleed
 # into the next file).  Handles the single-line `import "pkg/X"` and grouped
 # `import ( "pkg/X" ... )` forms, tolerating blanks/comments inside the group.

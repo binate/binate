@@ -28,8 +28,8 @@
 # third mechanism is shared C-boundary classification the two must agree on).
 #
 # The C driver MUST be built with gcc/bfd (NOT clang/lld): bfd relies on STT_FUNC
-# to interwork a Thumb caller into an ARM function, so a regressed symbol type
-# reappears here as a crash; clang/lld tolerates the missing type and would not
+# to interwork a Thumb caller into an ARM function, so a missing symbol type
+# shows up here as a crash; clang/lld tolerates the missing type and would not
 # catch it.
 #
 # Auto-discovered by .github/workflows/e2e-tests.yml — the `arm32` name prefix

@@ -13,9 +13,9 @@
 # scalar return unconditionally (matching the native backends' full-width canonical
 # returns), so a __c_entry target's define is C-correct in every compile; this test
 # guards that end-to-end.  Its callbacks return int8/int16/uint8 derived from a WIDER
-# argument (cast truncation), read at -O2 by a C driver.  Verified while writing
-# (against an earlier gating that leaked): without the extension the driver prints
-# `507 130944 456` (the raw untruncated args) instead of `-5 -128 200`.  The
+# argument (cast truncation), read at -O2 by a C driver.  Without the extension
+# the driver prints `507 130944 456` (the raw untruncated args) instead of
+# `-5 -128 200`.  The
 # separate-compilation counterpart is c-entry-narrow-return-separate.sh; this is the
 # return-side analogue of c-entry-narrow-callback.sh
 # (which covers the ARGUMENT side) and the __c_entry analogue of ffi-export.sh's
@@ -27,9 +27,9 @@
 # a void `__c_call`.
 #
 # Both backends are checked, and a build failure on either is a FAIL: LLVM (the
-# meaningful one, since the bug is LLVM-only) and native (--backend native).  Native
-# is unaffected by construction (full-width canonical returns), so its variant just
-# pins that the backends agree.
+# meaningful one, since only an LLVM define can lack the attribute) and native
+# (--backend native).  Native is unaffected by construction (full-width canonical
+# returns), so its variant just pins that the backends agree.
 #
 # Uses a gen1 bnc built from current source.  Auto-discovered by
 # .github/workflows/e2e-tests.yml on Linux + macOS; skips if no C compiler.
@@ -75,7 +75,7 @@ summary() {
 }
 
 # Correct results: each callback truncates its WIDER argument to its narrow return
-# and the callee extends it per the C ABI.  Without the fix, the -O2 C caller reads
+# and the callee extends it per the C ABI.  Without the extension, the -O2 C caller reads
 # the raw untruncated argument (507 / 130944 / 456) instead.
 WANT="-5 -128 200"
 
@@ -106,7 +106,7 @@ package "main"
 // None are #[c_export]; each is reached ONLY through a __c_entry pointer, so its
 // define must still carry the C-ABI narrow-return extension.  Each truncates a
 // wider argument, so the return register carries dirty upper bits absent the
-// signext/zeroext fix.
+// signext/zeroext extension.
 func retI8(x int) int8   { return cast(int8, x) }
 func retI16(x int) int16 { return cast(int16, x) }
 func retU8(x int) uint8  { return cast(uint8, x) }

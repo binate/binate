@@ -8,10 +8,10 @@
  *
  * Sections we explicitly route:
  *   .text.startup — reserved for a startup section placed first; the
- *                   crt0 now lands in plain .text and the entry point is
+ *                   crt0 lands in plain .text and the entry point is
  *                   taken from ENTRY(_start) -> e_entry (QEMU's -kernel
  *                   loader honors the ELF entry), so its physical position
- *                   in .text no longer matters.  The KEEP stays as a
+ *                   in .text does not matter.  The KEEP stays as a
  *                   forward-looking slot for a real-hardware reset vector.
  *   .text         — crt0 + Binate-compiled code + semihost helpers.
  *   .rodata       — string constants and the per-string

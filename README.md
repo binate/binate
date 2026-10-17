@@ -49,8 +49,8 @@ Requires `clang` on `PATH` (used as the final linker for compiled output).
 
 The `BUILDER_VERSION` file at the repo root names the compiler used to build the current tree's compiler. Two schemes are recognized by `scripts/fetch-builder.sh`:
 
-- **`bnc-X.Y.Z`** (the only supported scheme; current pin: `bnc-0.0.12`): downloaded from a published GitHub release as a tarball containing `bnc`, `bni`, `bnas`, `bnlint`, and a `lib/` stdlib root. Cached under `~/.cache/binate/builders/<version>/`. No source build needed.
-- **`bootstrap-X.Y.Z`** (RETIRED): formerly built the sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter and used it as the BUILDER. That scheme is gone — `fetch-builder.sh` now ERRORS on any `bootstrap-*` value; every build bootstraps from a published `bnc-X.Y.Z` release instead.
+- **`bnc-X.Y.Z`** (the only supported scheme): downloaded from a published GitHub release as a tarball containing the toolchain (`bnc`, `bni`, `bnas`, `bnld`, `bnlint`, `bnfmt`, `binate-paths`) and a `lib/` stdlib root. Cached under `~/.cache/binate/builders/<version>/`. No source build needed.
+- **`bootstrap-X.Y.Z`** (RETIRED): the scheme that built the sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter and used it as the BUILDER. `fetch-builder.sh` ERRORS on any `bootstrap-*` value; every build bootstraps from a published `bnc-X.Y.Z` release.
 
 All test runners and `scripts/build-*.sh` helpers go through `fetch-builder.sh`; you don't normally invoke it directly outside the Quick Start example.
 
@@ -187,7 +187,7 @@ cd binate
 
 ### Go-Level Tests
 
-The sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter — retired as a BUILDER (see [BUILDER_VERSION](#builder_version) above) — still has its own Go test suite (`go test ./...` in that repo), but it is no longer part of building or testing the toolchain.
+The sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter is not part of building or testing the toolchain (it is not a BUILDER — see [BUILDER_VERSION](#builder_version) above); it has its own Go test suite (`go test ./...` in that repo).
 
 ## Releases
 

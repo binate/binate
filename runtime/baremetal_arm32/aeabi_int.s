@@ -5,11 +5,8 @@
 // The native arm32 backend (and LLVM's arm32 codegen) lower 64-bit
 // multiply / divide / remainder / shift to calls to these ARM run-time ABI
 // (AEABI, IHI0043) helpers, because the 32-bit ARM ISA has no single-
-// instruction form.  Historically they were pulled from libgcc.a via
-// `--link-after-objs`; defining them here (an object linked BEFORE that
-// archive) resolves the symbols from this file, so libgcc's members are
-// never pulled — letting this land while libgcc still supplies the
-// soft-float helpers, which are not yet ported.
+// instruction form.  Defining them here (and the soft-float set in
+// aeabi_float.s) keeps the arm32-baremetal link free of libgcc.a.
 //
 // Written in the bnas subset (see crt0.s / semihost.s): `.arch arm32`,
 // `.section text`, `.global`, `.type`, dot-less local labels, UAL mnemonics, no

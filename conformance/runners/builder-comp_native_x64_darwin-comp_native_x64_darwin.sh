@@ -8,15 +8,13 @@
 #
 # This is the macOS sibling of builder-comp_native_x64-comp_native_x64
 # (which targets x86_64-linux / ELF and needs qemu-x86_64 off-x86_64).
-# Its point: make the amd64 native backend end-to-end verifiable on a
+# Its point: make the x64 native backend end-to-end verifiable on a
 # stock Apple-Silicon dev machine — no qemu, no Linux box.
 #
-# Like the ELF runner, this does NOT pre-build a native bnc: the amd64
-# backend only lowers a subset of ops today, so most tests fail as
-# COMPILE_ERROR.  That's the measurable starting point — the set
-# shrinks as amd64 op-coverage lands.  Local-only by design (not in
-# any CI modeset): Intel-macOS runners are scarce and the axis is
-# already covered in CI by native_aa64 (Mach-O) + native_x64 (ELF).
+# Like the ELF runner, this does NOT pre-build a native bnc: it invokes
+# the BUILDER-built gen1 per test.  Local-only by design (not in any CI
+# modeset): Intel-macOS runners are scarce and the axis is already
+# covered in CI by native_aa64 (Mach-O) + native_x64 (ELF).
 #
 # Required toolchain:
 #   - macOS host (Mach-O executables don't run on Linux)

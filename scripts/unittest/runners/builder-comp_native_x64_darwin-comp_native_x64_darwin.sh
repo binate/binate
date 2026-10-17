@@ -10,8 +10,7 @@
 # on a stock Apple-Silicon dev machine.
 #
 # Like the ELF conformance runner, this drives GEN1 (LLVM-built bnc)
-# rather than a pre-built native bnc: the native backend can't yet
-# self-compile a working bnc.  Local-only by design — not in any CI
+# rather than a pre-built native bnc.  Local-only by design — not in any CI
 # modeset (x64+Mach-O is the local dev axis; CI covers arch+format via
 # native_aa64 + native_x64).
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"

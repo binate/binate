@@ -632,7 +632,7 @@ run_repl_import_rejected() {
 # Banner + trailing prompt are constant across cases.  REPL emits
 # "> " before each line read; on EOF it prints a final newline and
 # exits, so every transcript ends with `> \n`.
-BANNER="Binate REPL (Tier 1 PoC). Ctrl-D to exit."
+BANNER="Binate REPL. Ctrl-D to exit."
 
 # --- Case 1: basic call into the loaded module. ---
 run_repl "basic-call" \

@@ -97,6 +97,5 @@ copy-helper) and asserts the retained ref (`== before+1`), so a dedicated copy c
 would only duplicate that path (this design uses `@Holder`, so there is no
 value-container deep-copy to exercise separately).
 
-Mode scope: green under the six default modes + native x64/aa64. `native-arm32`
-(`builder-comp_native_arm32_baremetal`) is an incomplete backend — any red there is
-backend incompleteness (xfail with a note), not a generics finding.
+Mode scope: green under the six default modes and the native aa64, x64 and arm32
+backends.

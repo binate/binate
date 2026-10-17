@@ -118,7 +118,7 @@ import "pkg/builtins/testing"
 func main() { testing.Println(0) }
 EOF2
 
-BANNER="Binate REPL (Tier 1 PoC). Ctrl-D to exit."
+BANNER="Binate REPL. Ctrl-D to exit."
 FAILS=0
 
 run_repl() { # label fixture input expected

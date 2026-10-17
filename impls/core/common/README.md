@@ -6,8 +6,7 @@ environment (e.g., the canonical primitive-type impls under
 `pkg/builtins/lang`).
 
 Holds `pkg/builtins/lang/` (canonical-impl carve-out: Stringer /
-Comparable / Orderable / Hashable + their primitive impls) and
-`pkg/builtins/testing/` (the testing framework's self-test).
-`pkg/builtins/rt/`'s platform-independent code joins when Step 4 of
-[`explorations/pkg-layout-plan.md`](../../../../explorations/pkg-layout-plan.md)
-resumes.
+Comparable / Orderable / Hashable + their primitive impls),
+`pkg/builtins/testing/` (the testing framework and its self-test),
+`pkg/builtins/rt/`, `pkg/builtins/reflect/`, `pkg/builtins/softfloat/`
+and `pkg/builtins/startup/`.

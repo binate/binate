@@ -50,7 +50,7 @@ Requires `clang` on `PATH` (used as the final linker for compiled output).
 The `BUILDER_VERSION` file at the repo root names the compiler used to build the current tree's compiler. Two schemes are recognized by `scripts/fetch-builder.sh`:
 
 - **`bnc-X.Y.Z`** (the only supported scheme; current pin: `bnc-0.0.12`): downloaded from a published GitHub release as a tarball containing `bnc`, `bni`, `bnas`, `bnlint`, and a `lib/` stdlib root. Cached under `~/.cache/binate/builders/<version>/`. No source build needed.
-- **`bootstrap-X.Y.Z`** (RETIRED): formerly built the sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter and used it as the BUILDER. That scheme is gone — `fetch-builder.sh` now ERRORS on any `bootstrap-*` value; every build bootstraps from a published `bnc-X.Y.Z` release instead. See [explorations/plan-bnc-as-builder.md](https://github.com/binate/explorations/blob/main/plan-bnc-as-builder.md).
+- **`bootstrap-X.Y.Z`** (RETIRED): formerly built the sibling [`bootstrap/`](https://github.com/binate/bootstrap) Go interpreter and used it as the BUILDER. That scheme is gone — `fetch-builder.sh` now ERRORS on any `bootstrap-*` value; every build bootstraps from a published `bnc-X.Y.Z` release instead.
 
 All test runners and `scripts/build-*.sh` helpers go through `fetch-builder.sh`; you don't normally invoke it directly outside the Quick Start example.
 

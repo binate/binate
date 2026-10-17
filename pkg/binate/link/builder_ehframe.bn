@@ -1,0 +1,125 @@
+package "pkg/binate/link"
+
+import "pkg/binate/buf"
+
+// The scripted layout's unwind tables: PlaceEhFrame places the inputs' `.eh_frame` with the
+// terminator that ends them, PlaceEhFrameHdr their search table (ehframe_hdr.bn), each between
+// the bracketing symbols a bare-metal unwinder (LLVM libunwind's) finds them by; Finish fills
+// the table and EmitElf gives it its PT_GNU_EH_FRAME header.
+
+// builderEh is a layout's unwind-table placement: whether PlaceEhFrame and PlaceEhFrameHdr have
+// run, the section and the offsets in it of the records PlaceEhFrame placed (framesStart to
+// framesEnd), and where the search table lies (Sec -1 for none: no call, or no non-empty
+// `.eh_frame` among the inputs).
+type builderEh struct {
+	placedFrames bool
+	placedHdr    bool
+	framesSec    int
+	framesStart  uint64
+	framesEnd    uint64
+	hdr          ehHdrPlace
+}
+
+// PlaceEhFrame places in the open section every input's unwind tables (`*(.eh_frame)`, kept),
+// then the zero terminator that ends them (crtend.o's `__FRAME_END__` in a C compiler's link),
+// between `__eh_frame_start` and `__eh_frame_end` — the start aligned for the records, so it is
+// the first one's address.  A second call is an error.
+func (b @LayoutBuilder) PlaceEhFrame() {
+	if b.cur < 0 { b.fail("PlaceEhFrame: no open section"); return }
+	if b.eh.placedFrames { b.fail("PlaceEhFrame: the unwind tables are already placed"); return }
+	b.eh.placedFrames = true
+	var any bool = false
+	var align int = 1
+	for o := 0; o < len(b.inputs); o++ {
+		for s := 0; s < len(b.inputs[o].Sections); s++ {
+			var sec InputSection = b.inputs[o].Sections[s]
+			if b.consumed[o][s] || !isEhFrame(sec.Name) || sec.Size == 0 { continue }
+			any = true
+			if sec.Align > align { align = sec.Align }
+		}
+	}
+	b.AlignDot(align)
+	b.ensureStarted()
+	if align > b.secs[b.cur].Align { b.secs[b.cur].Align = align }
+	b.SymbolAtDot("__eh_frame_start")
+	b.eh.framesSec = b.cur
+	b.eh.framesStart = b.dot - b.secs[b.cur].VmaStart
+	b.Place("*(.eh_frame)", true)
+	b.eh.framesEnd = b.dot - b.secs[b.cur].VmaStart
+	if any {
+		b.AlignDot(4)
+		b.EmitData(make_slice(uint8, 4))
+	}
+	b.SymbolAtDot("__eh_frame_end")
+}
+
+// PlaceEhFrameHdr places in the open section the unwind tables' search table (`.eh_frame_hdr`),
+// sized for every input's FDEs and 4-aligned, between `__eh_frame_hdr_start` and
+// `__eh_frame_hdr_end`: Finish fills it, requiring PlaceEhFrame to have placed every input's
+// `.eh_frame` (the table points at those records); EmitElf gives it a PT_GNU_EH_FRAME header when
+// it derives the segments.  With no non-empty `.eh_frame` among the inputs it places nothing.  A
+// record it cannot read, or a second call, is an error.
+func (b @LayoutBuilder) PlaceEhFrameHdr() {
+	if b.cur < 0 { b.fail("PlaceEhFrameHdr: no open section"); return }
+	if b.eh.placedHdr { b.fail("PlaceEhFrameHdr: the search table is already placed"); return }
+	b.eh.placedHdr = true
+	b.ensureStarted()
+	n, any, err := countEhFrameFdes(b.inputs)
+	if len(err) != 0 { b.fail(buf.Concat("PlaceEhFrameHdr: ", err)); return }
+	b.AlignDot(4)
+	b.SymbolAtDot("__eh_frame_hdr_start")
+	if any {
+		if b.secs[b.cur].Align < 4 { b.secs[b.cur].Align = 4 }
+		b.eh.hdr.Sec = b.cur
+		b.eh.hdr.Off = b.dot - b.secs[b.cur].VmaStart
+		b.eh.hdr.Size = ehFrameHdrSize + 8 * n
+		b.EmitData(make_slice(uint8, b.eh.hdr.Size))
+	}
+	b.SymbolAtDot("__eh_frame_hdr_end")
+}
+
+// unplacedEhFrameError returns why the layout cannot finish when it placed the search table, or
+// "": every input's `.eh_frame` with contents must be among the records PlaceEhFrame placed —
+// the table counts their FDEs and points at them, and PlaceEhFrame ends them with the terminator
+// an unwinder walking them stops at — so one unplaced, or placed by another call, is an error.
+func (b @LayoutBuilder) unplacedEhFrameError() @[]readonly char {
+	if b.eh.hdr.Sec < 0 { return "" }
+	if !b.eh.placedFrames {
+		return "the layout places .eh_frame_hdr but not the unwind tables it indexes (PlaceEhFrame "
+				"places them)"
+	}
+	for o := 0; o < len(b.inputs); o++ {
+		for s := 0; s < len(b.inputs[o].Sections); s++ {
+			var sec InputSection = b.inputs[o].Sections[s]
+			if sec.Size == 0 || !isEhFrame(sec.Name) { continue }
+			if !b.consumed[o][s] {
+				return buf.Concat(b.inputs[o].Path,
+						": .eh_frame is not placed, though .eh_frame_hdr counts its FDEs (PlaceEhFrame "
+								"places the unwind tables)")
+			}
+			var off uint64 = cast(uint64, sec.OutOffset)
+			if sec.OutIndex != b.eh.framesSec || off < b.eh.framesStart || off >= b.eh.framesEnd {
+				return buf.Concat(b.inputs[o].Path,
+						": .eh_frame is placed apart from the unwind tables PlaceEhFrame placed, which "
+								".eh_frame_hdr points at")
+			}
+		}
+	}
+	return ""
+}
+
+// fillBuilderEhHdr fills the layout's search table (PlaceEhFrameHdr), if it placed one, in the
+// relocated output lr.
+func (b @LayoutBuilder) fillBuilderEhHdr(lr @LayoutResult) @[]readonly char {
+	if b.eh.hdr.Sec < 0 { return "" }
+	var hdr @InputObject = make(InputObject)
+	hdr.Path = buf.CopyStr("<linker-made .eh_frame_hdr>")
+	hdr.Machine = b.Machine
+	hdr.Sections = make_slice(InputSection, 1)
+	hdr.Sections[0] = mkDynSection(".eh_frame_hdr", SF_READ, 4, make_slice(uint8, b.eh.hdr.Size))
+	hdr.Sections[0].OutIndex = b.eh.hdr.Sec
+	hdr.Sections[0].OutOffset = cast(uint, b.eh.hdr.Off)
+	hdr.Symbols = make_slice(InputSymbol, 0)
+	hdr.Relocs = make_slice(InputReloc, 0)
+	return fillEhFrameHdr(b.inputs, lr, hdr, b.Machine)
+}

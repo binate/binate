@@ -1,6 +1,6 @@
 #!/bin/sh
 # e2e/env-paths.sh — End-to-end test of the environment-variable fallback for
-# two-path package resolution (Stage 7 of plan-package-search-paths).
+# two-path package resolution.
 #
 # When a tool is given no -I / -L for a search path, it takes that path from the
 # environment: BINATE_PACKAGE_INTERFACE_PATH / BINATE_PACKAGE_IMPL_PATH (long

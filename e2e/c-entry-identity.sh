@@ -1,7 +1,6 @@
 #!/bin/sh
 # e2e/c-entry-identity.sh — CROSS-PRODUCER pointer identity for `__c_entry` of a
-# narrow-register-parameter function (language spec `pkg.centry.identity`, ABI
-# review #10).
+# narrow-register-parameter function (language spec `pkg.centry.identity`).
 #
 # `__c_entry(f)` must yield the SAME pointer value for the same f regardless of
 # which backend compiled the referencing translation unit.  For a narrow GP

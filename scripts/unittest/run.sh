@@ -350,8 +350,9 @@ for pkg in $PACKAGES; do
         # VM-on-VM-on-VM).  Their coverage comes from the single-VM (-int /
         # -comp-int) and native lanes; the double-VM path itself is package-
         # agnostic, so running the type-checker + IR builder under it exercises it.
-        # The real fix is bni perf (see explorations/claude-todo.md); until then
-        # this keeps the lane green and useful.  int-int-specific — the single-VM
+        # TODO: the real fix is VM execution speed (explorations/claude-todo.md,
+        # "VM execution speed (bni)"); until then this subset keeps the lane green
+        # and useful.  int-int-specific — the single-VM
         # lanes have no such cost and still use .split.vm via the non-batch
         # shard-selection below.
         b_split="$SCRIPT_DIR/${xfail_key}.split.${MODE}"

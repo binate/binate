@@ -4,7 +4,7 @@ value-correctness harness for scalar SHIFTS and CONVERSIONS.
 
 How it differs from the curated `matrix/scalar` cells: those test a handful of
 hand-picked values per op (and so miss bugs at values nobody wrote — the
-shift-by->=-width CRITICAL hid for exactly that reason). This generator emits a
+shift-by->=-width bug hid for exactly that reason). This generator emits a
 *fixed, seeded* value set per coordinate — all the type/op boundaries plus a
 deterministic pseudo-random sample — so a whole region of the input space is
 swept, not a point.
@@ -651,10 +651,10 @@ def bitwise_cell(op, w, sign):
 
 def neg_cell(w, sign):
     # Unary minus `-x` at the operand width: the result type must be the
-    # operand's exact width, not host int (the analog of the `~` bug — see
-    # bitnot/Defect-9 in claude-todo).  Each value is checked directly and,
-    # like `~`, consumed through a `>> half` so an un-narrowed host-width
-    # negation (dirty upper bits) is exposed rather than masked by a re-narrow.
+    # operand's exact width, not host int (as for `~` in bitwise_cell above).
+    # Each value is checked directly and, like `~`, consumed through a
+    # `>> half` so an un-narrowed host-width negation (dirty upper bits) is
+    # exposed rather than masked by a re-narrow.
     rng = LCG("neg", w, sign)
     t = typ(w, sign)
     vs = bit_values(w, sign, rng)

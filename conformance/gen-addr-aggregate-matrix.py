@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Generate conformance/matrix/addr-aggregate cells — 16-byte address-aggregate
-(2-word) value handling (Class 2 of the code-red taxonomy; see claude-todo.md
-TEST COVERAGE b1).
+(2-word) value handling.
 
 A managed interface value (`@Iface` = {data, vtable}) and a function value
 (`@func` = {vtable, data}) are 16-byte 2-word "address aggregates". The recurring
@@ -79,10 +78,8 @@ def body(k, op):
     if op == "return-arg":      # returned value passed DIRECTLY as an arg
         return ["testing.Println(takev(mkv()))"]
     if op == "field":           # stored in a struct field, then extracted
-        # Bind to a typed var first: a BARE func literal in a composite-literal
-        # field doesn't infer its @func/*func flavour from the field type (a
-        # separate, filed MINOR bug); this matrix tests 2-word survival, not
-        # literal-flavour inference, so it stores an already-typed value.
+        # Bind to a typed var first: this matrix tests 2-word survival, not
+        # function-literal flavour inference, so it stores an already-typed value.
         return ["var v %s = %s" % (t, inl),
                 "var s Holder = Holder{f: v}", "testing.Println(%s)" % inv("s.f")]
     if op == "array-elem":      # stored in an array element, then indexed

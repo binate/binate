@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Generate conformance/matrix/abi cells — aggregate & multi-return passing
-(Class 4 of the code-red taxonomy).
+"""Generate conformance/matrix/abi cells — aggregate & multi-return passing.
 
 Assertion: every field's VALUE survives crossing a call boundary. A backend
 that mis-packs a tuple / aggregate (the x64 multi-return drop, the aa64

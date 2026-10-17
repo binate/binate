@@ -1,17 +1,20 @@
 #!/bin/sh
-# e2e/repl.sh — End-to-end test for `bni --repl` (Tier 1 PoC).
+# e2e/repl.sh — End-to-end test for `bni --repl`.
 #
 # Builds bni via builder-comp, creates a tiny fixture module that defines a
 # `helper` function, then drives the REPL via piped stdin and
 # compares output byte-for-byte against expectations.
 #
-# Covers Tier 1 PoC behaviors:
+# Covers, among others:
 #   - bare-statement evaluation against the loaded module's scope
 #     (calling a func defined in the loaded file)
 #   - multi-statement single-line input (locals visible across
 #     semicolon-separated stmts in the same turn)
 #   - error recovery: an undefined-name error is reported and the
 #     session continues working on the next turn
+#   - declarations typed at the prompt, forward references that park
+#     until the missing name arrives, redefinition, and mid-session
+#     imports
 #
 # Exit 0 on full pass; non-zero with per-case diagnostics on
 # failure.
@@ -98,8 +101,8 @@ func main() {
 }
 EOF
 
-# ----- Sibling package fixture for Tier 5 (mid-session
-# imports) cases.  The main fixture above does NOT import
+# ----- Sibling package fixture for the mid-session
+# imports cases.  The main fixture above does NOT import
 # pkg/repldemo — that's the whole point: the user types
 # `import "pkg/repldemo"` at the prompt and the loader pulls
 # it in lazily.  The package lives under $TMP so the test's
@@ -568,7 +571,7 @@ run_repl() {
 }
 
 # run_repl_setup_error runs the REPL against a fixture with a setup-time
-# error.  Stage 2 makes NewReplSession return such errors as VALUES; the
+# error.  NewReplSession returns such errors as VALUES; the
 # CLI shell prints them and exits non-zero BEFORE the banner.  Assert the
 # error fragment appears, the banner does NOT (proving the prompt was
 # never reached), and the exit status is non-zero.  (loadBuiltinBNIs
@@ -641,9 +644,8 @@ run_repl "basic-call" \
 
 # --- Case 2: multi-statement single-line input.  Locals (declared
 # via short-var `:=`) are visible to later stmts in the same turn.
-# Note: a leading `var` would route to the Tier 2 decl path (which
-# errors "first cut") rather than the stmt-list path; short-var
-# stays on the stmt path. ---
+# Note: a leading `var` would route to the decl path rather than the
+# stmt-list path; short-var stays on the stmt path. ---
 run_repl "multi-stmt" \
 "x := 5; x = x + 10; testing.Println(x)
 " \
@@ -686,9 +688,9 @@ run_repl "braces-in-string" \
 > hello {world}
 > "
 
-# --- Case 6 (Tier 2): top-level `func` decl typed at the prompt
+# --- Case 6: top-level `func` decl typed at the prompt
 # persists, and a subsequent turn can call it. ---
-run_repl "tier2-func-persists" \
+run_repl "func-persists" \
 "func double(x int) int { return x * 2 }
 testing.Println(double(7))
 " \
@@ -696,11 +698,11 @@ testing.Println(double(7))
 > > 14
 > "
 
-# --- Case 7 (Tier 2): two prompt-defined funcs where the second
+# --- Case 7: two prompt-defined funcs where the second
 # calls the first.  Verifies cross-decl call resolution works for
 # REPL-introduced VMFuncs (not just for funcs from the loaded
 # module). ---
-run_repl "tier2-cross-decl-call" \
+run_repl "cross-decl-call" \
 "func a(x int) int { return x + 1 }
 func b(x int) int { return a(x) * 10 }
 testing.Println(b(4))
@@ -709,10 +711,10 @@ testing.Println(b(4))
 > > > 50
 > "
 
-# --- Case 8 (Tier 2): struct-type decl (no managed fields)
+# --- Case 8: struct-type decl (no managed fields)
 # at the prompt registers the type so subsequent var decls
 # and field reads work against it. ---
-run_repl "tier2-type-struct" \
+run_repl "type-struct" \
 "type Point struct { X int; Y int }
 var p Point
 p.X = 10
@@ -723,11 +725,11 @@ testing.Println(p.X + p.Y)
 > > > > > 30
 > "
 
-# --- Case 8a (Tier 2): managed-field structs work end-to-end.
+# --- Case 8a: managed-field structs work end-to-end.
 # `type T struct { S @[]int }` triggers dedup-aware emission
 # of __dtor_T + __copy_T (and the field-type's __dtor_) into
 # the module; the REPL driver lowers each new helper. ---
-run_repl "tier2-type-managed-field" \
+run_repl "type-managed-field" \
 "type Bag struct { items @[]int }
 var b Bag
 b.items = make_slice(int, 3)
@@ -738,10 +740,10 @@ testing.Println(b.items[0] + b.items[1] + b.items[2])
 > > > > > 60
 > "
 
-# --- Case 8a1 (Tier 2): an alias of a struct literal at the prompt is the
+# --- Case 8a1: an alias of a struct literal at the prompt is the
 # anonymous struct itself: a value of the alias passes where the literal type is
 # expected, and its fields read back. ---
-run_repl "tier2-type-struct-alias" \
+run_repl "type-struct-alias" \
 "type Anon = struct { a int8; b int8 }
 func getB(s struct { a int8; b int8 }) int8 { return s.b }
 var x Anon
@@ -752,12 +754,12 @@ testing.Println(getB(x), x.b)
 > > > > > 7 7
 > "
 
-# --- Case 8a2 (Tier 2): a top-level var initialized with a raw-slice
+# --- Case 8a2: a top-level var initialized with a raw-slice
 # literal keeps its elements: the literal's backing is a hidden module
 # global (materialized before the var-init synthetic runs), not a slot on
 # that one-shot function's stack — plain and managed elements alike, read
 # after a later prompt entry has reused the stack. ---
-run_repl "tier2-var-raw-slice-literal" \
+run_repl "var-raw-slice-literal" \
 "type Cell struct { b @int }
 var gb *[]readonly Cell = *[]readonly Cell{Cell{b: box(5)}, Cell{b: box(6)}}
 var g *[]readonly int = *[]readonly int{1, 2, 3}
@@ -768,10 +770,10 @@ testing.Println(g[0], g[1], g[2], *gb[0].b, *gb[1].b)
 > > > > > 1 2 3 5 6
 > "
 
-# --- Case 8b (Tier 2): methods on a prompt-defined type
+# --- Case 8b: methods on a prompt-defined type
 # work end-to-end.  Pointer receiver mutates; value receiver
 # reads.  Both invoked via the obj.M() selector path. ---
-run_repl "tier2-method-on-prompt-type" \
+run_repl "method-on-prompt-type" \
 "type Counter struct { n int }
 func (c *Counter) Inc() { c.n = c.n + 1 }
 func (c Counter) Get() int { return c.n }
@@ -783,12 +785,12 @@ testing.Println(k.Get())
 > > > > > > 3
 > "
 
-# --- Case 8c (Tier 2): methods can also attach to a type
+# --- Case 8c: methods can also attach to a type
 # defined in the loaded module (Box, from the fixture above),
 # not just to types declared at the prompt.  The receiver
 # resolution path is the same — type checker accepts any
 # local named type. ---
-run_repl "tier2-method-on-loaded-type" \
+run_repl "method-on-loaded-type" \
 "func (b *Box) Doubled() int { return b.V * 2 }
 var b Box
 b.V = 21
@@ -798,11 +800,11 @@ testing.Println(b.Doubled())
 > > > > 42
 > "
 
-# --- Case 8d (Tier 2): named non-struct type
+# --- Case 8d: named non-struct type
 # (`type Celsius int`).  No new IR-side state needed — the
 # type checker owns the symbol via collectTypeDecl; reads
 # / writes go through the underlying int. ---
-run_repl "tier2-type-named-nonstruct" \
+run_repl "type-named-nonstruct" \
 "type Celsius int
 var t Celsius
 t = 100
@@ -812,10 +814,10 @@ testing.Println(t)
 > > > > 100
 > "
 
-# --- Case 9 (Tier 2): a func decl with a body type error reports
+# --- Case 9: a func decl with a body type error reports
 # the error and does NOT register the symbol.  A subsequent turn
 # is unaffected: helpers from the loaded module still work. ---
-run_repl "tier2-bad-body-recovery" \
+run_repl "bad-body-recovery" \
 "func bad() bool { return 1 }
 testing.Println(helper(11))
 " \
@@ -824,9 +826,9 @@ testing.Println(helper(11))
 > 22
 > "
 
-# --- Case 10 (Tier 2 const): single typed const persists and is
+# --- Case 10 (const): single typed const persists and is
 # usable from a subsequent stmt-list turn. ---
-run_repl "tier2-const-typed" \
+run_repl "const-typed" \
 "const K int = 42
 testing.Println(K)
 " \
@@ -834,9 +836,9 @@ testing.Println(K)
 > > 42
 > "
 
-# --- Case 11 (Tier 2 const): single untyped const persists and
+# --- Case 11 (const): single untyped const persists and
 # is usable in arithmetic combined with a later untyped const. ---
-run_repl "tier2-const-untyped" \
+run_repl "const-untyped" \
 "const A = 7
 const B = 35
 testing.Println(A + B)
@@ -845,11 +847,10 @@ testing.Println(A + B)
 > > > 42
 > "
 
-# --- Case 12 (Tier 2 const): single-line grouped const block;
-# both members register and are usable.  (Multi-line const(...)
-# groups would need the brace-depth scanner to track parens too —
-# documented PoC limitation.) ---
-run_repl "tier2-const-group-inline" \
+# --- Case 12 (const): single-line grouped const block;
+# both members register and are usable.  (Case 14 covers the
+# multi-line const(...) form.) ---
+run_repl "const-group-inline" \
 "const ( A = 10; B = 20 )
 testing.Println(A); testing.Println(B)
 " \
@@ -858,10 +859,10 @@ testing.Println(A); testing.Println(B)
 20
 > "
 
-# --- Case 13 (Tier 2 const): a const can be referenced inside a
+# --- Case 13 (const): a const can be referenced inside a
 # func decl typed at the prompt.  Registration ordering: const
 # first, then func, then call. ---
-run_repl "tier2-const-then-func" \
+run_repl "const-then-func" \
 "const SCALE int = 3
 func tripled(x int) int { return x * SCALE }
 testing.Println(tripled(11))
@@ -887,10 +888,10 @@ testing.Println(A); testing.Println(B)
 200
 > "
 
-# --- Case 15 (Tier 2 var): a typed var registers a global,
+# --- Case 15 (var): a typed var registers a global,
 # zero-initialized when no initializer is given.  Reads and
 # writes from subsequent prompt entries see the same storage. ---
-run_repl "tier2-var-readwrite" \
+run_repl "var-readwrite" \
 "var x int
 testing.Println(x)
 x = 42
@@ -901,11 +902,11 @@ testing.Println(x)
 > > 42
 > "
 
-# --- Case 15b (Tier 2 var-init): `var x T = expr` at the prompt
+# --- Case 15b (var-init): `var x T = expr` at the prompt
 # now runs the initializer right after registration, so the
 # global has its declared value before the next prompt entry
 # sees it.  Inter-decl references work too (b reads a). ---
-run_repl "tier2-var-init-eval" \
+run_repl "var-init-eval" \
 "var a int = 5
 var b int = a * 10 + 1
 testing.Println(a); testing.Println(b)
@@ -915,11 +916,11 @@ testing.Println(a); testing.Println(b)
 51
 > "
 
-# --- Case 16 (Tier 2 var): a func defined at the prompt can
+# --- Case 16 (var): a func defined at the prompt can
 # read AND mutate a previously-declared var.  Verifies that the
 # func's lowered bytecode wires up to the same global storage
 # as bare-expr reads. ---
-run_repl "tier2-var-func-mutates" \
+run_repl "var-func-mutates" \
 "var counter int
 func bump() { counter = counter + 1 }
 bump(); bump(); bump()
@@ -929,11 +930,11 @@ testing.Println(counter)
 > > > > 3
 > "
 
-# --- Case 17 (Tier 2 var-untyped): `var x = expr` infers the type
+# --- Case 17 (var-untyped): `var x = expr` infers the type
 # from the initializer — a literal (int / bool / char-slice / etc.)
 # or any other expression (`var x = i + 100` is an int), and a
 # composite literal gives the struct type itself. ---
-run_repl "tier2-var-untyped" \
+run_repl "var-untyped" \
 "var i = 7
 var s = \"hi\"
 testing.Println(i)
@@ -950,10 +951,10 @@ testing.Println(b.V + helper(7))
 > > 19
 > "
 
-# --- Case 18 (Tier 4 redef): redefining a func with the same
+# --- Case 18 (redef): redefining a func with the same
 # signature replaces the old body.  The fixture's `helper` is
 # x*2; the new one is x*3.  Subsequent calls hit the new body. ---
-run_repl "tier4-redef-replace" \
+run_repl "redef-replace" \
 "testing.Println(helper(7))
 func helper(x int) int { return x * 3 }
 testing.Println(helper(7))
@@ -963,10 +964,10 @@ testing.Println(helper(7))
 > > 21
 > "
 
-# --- Case 19 (Tier 4 redef): a previously-defined caller continues
+# --- Case 19 (redef): a previously-defined caller continues
 # to work, but its calls now route to the redefined body.  Verifies
 # the in-place vm.Funcs rebind keeps cached call indices valid. ---
-run_repl "tier4-redef-caller-sees-new" \
+run_repl "redef-caller-sees-new" \
 "func caller() int { return helper(10) }
 testing.Println(caller())
 func helper(x int) int { return x * 5 }
@@ -977,14 +978,14 @@ testing.Println(caller())
 > > 50
 > "
 
-# --- Case 20 (Tier 4 shadow): redefining with a DIFFERENT
+# --- Case 20 (shadow): redefining with a DIFFERENT
 # signature now SHADOWS rather than rejects.  The OLD helper stays
 # callable through any caller whose CallCache already resolved
 # it — they invoke the old shape via the still-live old idx.
 # A direct call from a fresh prompt entry (lowered AFTER the
 # shadow) routes through the new sig.  The warning surfaces
 # explicitly so the user knows it happened. ---
-run_repl "tier4-shadow-diff-sig" \
+run_repl "shadow-diff-sig" \
 "func caller() int { return helper(5) }
 testing.Println(caller())
 func helper(a int, b int) int { return a + b }
@@ -998,11 +999,11 @@ testing.Println(helper(3, 4))
 > 7
 > "
 
-# --- Case 21 (Tier 3 forward refs): a func decl whose body
+# --- Case 21 (forward refs): a func decl whose body
 # references an undefined name parks rather than erroring.
 # When the missing dep arrives, the parked func is auto-
 # resolved and lowered.  Subsequent calls work normally. ---
-run_repl "tier3-forward-ref" \
+run_repl "forward-ref" \
 "func f() int { return g() + 1 }
 func g() int { return 41 }
 testing.Println(f())
@@ -1013,9 +1014,9 @@ testing.Println(f())
 > 42
 > "
 
-# --- Case 22 (Tier 3): chain forward refs (a → b → c), all
+# --- Case 22: chain forward refs (a → b → c), all
 # parked, all resolve when c arrives — dependencies first. ---
-run_repl "tier3-forward-ref-chain" \
+run_repl "forward-ref-chain" \
 "func a() int { return b() + 1 }
 func b() int { return c() + 10 }
 func c() int { return 100 }
@@ -1029,10 +1030,10 @@ function a resolved
 > 111
 > "
 
-# --- Case 23 (Tier 3): calling a still-parked func surfaces
+# --- Case 23: calling a still-parked func surfaces
 # a clean type-checker error (rather than letting the runtime
 # hit \"extern not found\"). ---
-run_repl "tier3-pending-use-site-error" \
+run_repl "pending-use-site-error" \
 "func f() int { return g() }
 testing.Println(f())
 testing.Println(helper(7))
@@ -1043,7 +1044,7 @@ testing.Println(helper(7))
 > 14
 > "
 
-# --- Case 24 (Tier 4 method redef): redefining a method with
+# --- Case 24 (method redef): redefining a method with
 # the same signature replaces the old body.  Same property as
 # the free-func replace path, keyed on the qualified
 # <pkg>.<TypeName>.<Method> name.  Subsequent calls hit the new
@@ -1051,7 +1052,7 @@ testing.Println(helper(7))
 # --- A function literal in a prompt function: the function's body is
 # the last function generating it appends (after the literal), and both
 # are lowered. ---
-run_repl "tier2-func-literal-in-prompt-func" \
+run_repl "func-literal-in-prompt-func" \
 "func k() int { var f @func(int) int = func(x int) int { return x + 1 }; return f(5) }
 testing.Println(k())
 " \
@@ -1062,7 +1063,7 @@ testing.Println(k())
 # --- A redefinition with a different signature shadows the old one; a
 # function literal in it that calls the function calls the NEW one (it is
 # lowered after the shadow re-points the name). ---
-run_repl "tier4-shadow-literal-calls-new" \
+run_repl "shadow-literal-calls-new" \
 "func k() int { return 7 }
 func k(n int) int { var f @func(int) int = func(x int) int { if x <= 0 { return 100 }; return k(x - 1) }; return f(n) }
 testing.Println(k(3))
@@ -1072,7 +1073,7 @@ testing.Println(k(3))
 > 100
 > "
 
-run_repl "tier4-method-redef-replace" \
+run_repl "method-redef-replace" \
 "type Counter struct { n int }
 func (c *Counter) Inc() { c.n = c.n + 1 }
 var k Counter
@@ -1087,12 +1088,12 @@ testing.Println(k.n)
 > > > 12
 > "
 
-# --- Case 25 (Tier 4 method redef): redefining a method with
+# --- Case 25 (method redef): redefining a method with
 # a DIFFERENT signature shadows.  Old callers retain the old
 # shape via their eager-filled CallCache; fresh calls route
 # through the new sig.  Warning prints with the qualified
 # Type.Method name. ---
-run_repl "tier4-method-shadow-diff-sig" \
+run_repl "method-shadow-diff-sig" \
 "type Counter struct { n int }
 func (c *Counter) Add() { c.n = c.n + 1 }
 var k Counter
@@ -1108,7 +1109,7 @@ testing.Println(k.n)
 > > 8
 > "
 
-# --- Case 26 (Tier 2 body-introduced shape): a prompt-typed
+# --- Case 26 (body-introduced shape): a prompt-typed
 # func body introduces a managed-aggregate shape with a
 # DESTRUCTIBLE element type — `@[]@Box`, where Box is the loaded
 # fixture struct.  The element `@Box` is a managed pointer and
@@ -1117,7 +1118,7 @@ testing.Println(k.n)
 # is missing without EnsureReplBodyHelpers.  Before the drain
 # fix the func's end-of-statement cleanup hit a missing extern;
 # after, the helper is emitted and lowered before the body. ---
-run_repl "tier2-body-introduces-managed-slice-of-managed-ptr" \
+run_repl "body-introduces-managed-slice-of-managed-ptr" \
 "func g() { var s @[]@Box = make_slice(@Box, 2); testing.Println(len(s)) }
 g()
 " \
@@ -1125,25 +1126,25 @@ g()
 > > 2
 > "
 
-# --- Case 27 (Tier 2 body-introduced shape, stmt-list path):
+# --- Case 27 (body-introduced shape, stmt-list path):
 # same shape, but typed as a bare statement list at the prompt
 # (short-var `:=` keeps the parser on the stmt-list path; a
 # leading `var` would route to the decl path instead).  Verifies
 # the drain runs on the evalReplStmtList synthetic too. ---
-run_repl "tier2-body-stmt-list-managed-slice-of-managed-ptr" \
+run_repl "body-stmt-list-managed-slice-of-managed-ptr" \
 "s := make_slice(@Box, 3); testing.Println(len(s))
 " \
 "$BANNER
 > 3
 > "
 
-# --- Case 28 (Tier 2 body-introduced shape, var-init path):
+# --- Case 28 (body-introduced shape, var-init path):
 # var-initializer evaluation runs through runReplVarInit's
 # synthetic.  A managed-slice-of-managed-ptr initializer
 # registers a pending dtor; the drain emits the helper before
 # the synthetic is lowered.  Read-back through a subsequent
 # bare-stmt testing.Println. ---
-run_repl "tier2-body-var-init-managed-slice-of-managed-ptr" \
+run_repl "body-var-init-managed-slice-of-managed-ptr" \
 "var t @[]@Box = make_slice(@Box, 4)
 testing.Println(len(t))
 " \
@@ -1151,7 +1152,7 @@ testing.Println(len(t))
 > > 4
 > "
 
-# --- Case 29 (Tier 2 + Tier 3 interaction): a parked func
+# --- Case 29 (declaration + forward-reference interaction): a parked func
 # whose body introduces a new managed-aggregate shape works
 # end-to-end when the missing name arrives.  retryPending's
 # IR-gen registers the new shape's dtor in pendingMsDtors;
@@ -1162,7 +1163,7 @@ testing.Println(len(t))
 # backfillExternCachesForName would upgrade f's -1 cache
 # slot.  Keeping the drain in retryPending is an optimization
 # + consistency win, not a sole correctness fix.) ---
-run_repl "tier3-body-introduced-shape-via-retry" \
+run_repl "body-introduced-shape-via-retry" \
 "func f() { var s @[]@Box = make_slice(@Box, 2); h(); testing.Println(len(s)) }
 func h() {}
 f()
@@ -1173,13 +1174,13 @@ f()
 > 2
 > "
 
-# --- Case 30 (Tier 2 method body-introduced shape): a method
+# --- Case 30 (method body-introduced shape): a method
 # whose body introduces a new managed-aggregate shape goes
 # through evalReplDecl's DECL_FUNC drain just like a free
 # func.  Verifies the drain runs on the genMethod IR path
 # (not just genFunc) — the call site is the same, the IR-
 # gen routine is different. ---
-run_repl "tier2-method-body-introduced-shape" \
+run_repl "method-body-introduced-shape" \
 "func (b *Box) Reset() { var s @[]@Box = make_slice(@Box, 2); b.V = len(s) }
 var k Box
 k.Reset()
@@ -1189,13 +1190,13 @@ testing.Println(k.V)
 > > > > 2
 > "
 
-# --- Case 31 (Stage 1 of pending-non-func): a typed var
+# --- Case 31 (pending var): a typed var
 # whose initializer references an undefined name parks
 # rather than erroring.  Subsequent definition of the
 # missing name resolves the var; its initializer runs
 # (via runReplVarInit's synthetic in retryPending) and
 # the value is observable on next read. ---
-run_repl "tier3-pending-var-resolves" \
+run_repl "pending-var-resolves" \
 "var x int = g() + 1
 func g() int { return 41 }
 testing.Println(x)
@@ -1207,11 +1208,10 @@ testing.Println(x)
 > "
 
 # --- Ordering pin: a parked var whose initializer PRINTS, resolved in ONE
-# turn.  Since the Inc 1 Kernel reshape, notices are returned as Result data
-# and rendered AFTER a turn's evaluated-code output (vs. the old immediate
-# sink) — so the "resolved" notice now prints AFTER the initializer's "7", not
-# before.  Pins that accepted ordering (plan-repl-kernel.md, notices-as-data
-# Decision #3); a future edit that reverts the order reddens here. ---
+# turn.  Notices are returned as Result data and rendered AFTER a turn's
+# evaluated-code output, so the "resolved" notice prints AFTER the
+# initializer's "7", not before.  Pins that ordering; a future edit that
+# reverts it reddens here. ---
 run_repl "kernel-notice-renders-after-eval-output" \
 "var x int = f()
 func f() int { testing.Println(7); return 41 }
@@ -1222,12 +1222,12 @@ func f() int { testing.Println(7); return 41 }
 variable x resolved
 > "
 
-# --- Case 32 (Stage 1): a typed const whose value expression
+# --- Case 32 (pending const): a typed const whose value expression
 # references an undefined name parks; defining the missing
 # name resolves it.  Consts are folded at IR-gen time so
 # retryPending only re-runs GenDecl (no synthetic, no slot
 # materialization). ---
-run_repl "tier3-pending-const-resolves" \
+run_repl "pending-const-resolves" \
 "const N int = M + 1
 const M int = 41
 testing.Println(N)
@@ -1238,11 +1238,11 @@ testing.Println(N)
 > 42
 > "
 
-# --- Case 33 (Stage 1): reading a still-pending var from
+# --- Case 33 (pending var use site): reading a still-pending var from
 # non-tentative code surfaces a clean "variable x is
 # unresolved" type-checker error.  Mirrors the pending-func
-# use-site error case from the Tier 3 first cut. ---
-run_repl "tier3-pending-var-use-site-error" \
+# use-site error case (Case 23). ---
+run_repl "pending-var-use-site-error" \
 "var x int = g() + 1
 testing.Println(x)
 " \
@@ -1251,14 +1251,14 @@ testing.Println(x)
 > <repl>:1:17: variable x is unresolved (pending: g)
 > "
 
-# --- Case 34 (Stage 1 (c) — per-member group parking):
+# --- Case 34 (per-member group parking):
 # a const group with one member whose value references an
 # undefined name parks ONLY that member (groups are syntactic
 # sugar with no semantic effect).  A's clean value lands
 # immediately; B parks alone with its iota position preserved
 # (so retry computes B = M + iota_at_position).  Defining M
 # resolves B independently. ---
-run_repl "tier3-pending-const-group-resolves" \
+run_repl "pending-const-group-resolves" \
 "const (
 A int = 1
 B int = M + 1
@@ -1273,7 +1273,7 @@ testing.Println(A); testing.Println(B)
 41
 > "
 
-# --- Case 35 (Stage 1 (c)): iota position is preserved across
+# --- Case 35 (per-member group parking): iota position is preserved across
 # parking.  In `const (A=iota; B=M+iota; C=iota)`, B parks at
 # position 1 with iota=1 recorded.  A's iota=0 and C's iota=2
 # land immediately.  When M=10 arrives, B's retry uses
@@ -1281,7 +1281,7 @@ testing.Println(A); testing.Println(B)
 # verifies parkPendingDeclMember + RetryPendingDecls iota
 # restoration + GenConstMember's positional iota correctness
 # end-to-end. ---
-run_repl "tier3-pending-const-group-iota-positional" \
+run_repl "pending-const-group-iota-positional" \
 "const (
 A int = iota
 B int = M + iota
@@ -1353,12 +1353,12 @@ testing.Println(measure())
 > > > > > > 2
 > " "$FWD_FIXTURE"
 
-# --- Case 36 (Stage 2 (b) of plan-repl-tier3-pending-types.md):
+# --- Case 36 (pending types):
 # a struct type whose field type references an undefined name
 # parks rather than erroring.  When the missing type arrives,
 # the parked type is auto-resolved.  After resolution a var of
 # that type works end-to-end. ---
-run_repl "tier3-pending-struct-type-resolves" \
+run_repl "pending-struct-type-resolves" \
 "type T struct { F Bag }
 type Bag struct { N int }
 var x T
@@ -1371,11 +1371,11 @@ testing.Println(x.F.N)
 > > > 42
 > "
 
-# --- Case 37 (Stage 2 (c): use-site propagation): a var of a
+# --- Case 37 (pending types: use-site propagation): a var of a
 # pending type propagates the pending dependency — the var
 # itself parks.  Resolving the pending type also resolves the
 # parked var. ---
-run_repl "tier3-pending-type-use-site-propagates" \
+run_repl "pending-type-use-site-propagates" \
 "type T struct { F Bag }
 var x T
 type Bag struct { N int }
@@ -1389,11 +1389,11 @@ variable x resolved
 > resolved
 > "
 
-# --- Case 38 (Stage 2 (d): alias forward-ref): `type R = X`
+# --- Case 38 (pending types: alias forward-ref): `type R = X`
 # where X is undefined parks the alias.  Defining X resolves
 # it.  Mirrors the struct-type parking flow for the alias
 # branch of collectTypeDecl. ---
-run_repl "tier3-pending-alias-resolves" \
+run_repl "pending-alias-resolves" \
 "type R = Bag
 type Bag struct { N int }
 var x R
@@ -1406,11 +1406,11 @@ testing.Println(x.N)
 > > > 7
 > "
 
-# --- Case 39 (Stage 2 (d): named-non-struct forward-ref):
+# --- Case 39 (pending types: named-non-struct forward-ref):
 # `type C Heat` where Heat is undefined parks; defining Heat
 # resolves it.  Covers the named-non-struct branch of
 # collectTypeDecl. ---
-run_repl "tier3-pending-named-nonstruct-resolves" \
+run_repl "pending-named-nonstruct-resolves" \
 "type Celsius Heat
 type Heat int
 var t Celsius
@@ -1425,7 +1425,7 @@ testing.Println(t)
 # --- Case 40: a pointer to a parked type parks too — a parked
 # declaration binds nothing, so `var p *T` waits for T — and
 # resolves after it. ---
-run_repl "tier3-pending-type-pointer-use-parks" \
+run_repl "pending-type-pointer-use-parks" \
 "type T struct { F Bag }
 var p *T
 type Bag struct { N int }
@@ -1442,7 +1442,7 @@ variable p resolved
 # --- Case 41: mutual recursion via managed pointers.  `type A
 # struct { Next @B }` parks waiting on B; `type B struct { Next @A }`
 # parks waiting on A; the two resolve together at that prompt. ---
-run_repl "tier3-pending-mutual-recursion-resolves" \
+run_repl "pending-mutual-recursion-resolves" \
 "type A struct { Next @B }
 type B struct { Next @A }
 testing.Println(\"resolved\")
@@ -1458,7 +1458,7 @@ type B resolved
 # --- Case 42: a function whose signature names a parked type
 # parks on it.  T parks (waiting on Bag); `func f(x T) int`
 # parks waiting on T.  When Bag arrives, T resolves, then f. ---
-run_repl "tier3-pending-func-sig-parks-func" \
+run_repl "pending-func-sig-parks-func" \
 "type T struct { F Bag }
 func f(x T) int { return 0 }
 type Bag struct { N int }
@@ -1476,7 +1476,7 @@ function f resolved
 # (waiting on Bag); a method on *T parks waiting on T.  When
 # Bag arrives: T resolves, then the method.  After that the
 # method is callable. ---
-run_repl "tier3-pending-method-on-pending-receiver" \
+run_repl "pending-method-on-pending-receiver" \
 "type T struct { F Bag }
 func (t *T) M() int { return 7 }
 type Bag struct { N int }
@@ -1497,7 +1497,7 @@ method T.M resolved
 # the by-value cycle is reported, and both stay parked (a
 # redefinition that breaks the cycle — e.g. a pointer field —
 # replaces the parked one). ---
-run_repl "tier3-pending-cycle-detected" \
+run_repl "pending-cycle-detected" \
 "type A struct { B B }
 type B struct { A A }
 " \
@@ -1509,14 +1509,14 @@ type B still parked (it does not check)
 <repl>:1:1: recursive type: a type cannot contain itself by value (hold the recursive field via a pointer -- *T or @T)
 > "
 
-# --- Case 45 (Tier 5: mid-session imports).  pkg/repldemo
+# --- Case 45 (mid-session imports).  pkg/repldemo
 # isn't imported by the loaded fixture; user types
 # `import "pkg/repldemo"` at the prompt and the loader pulls
 # it in.  After the load + type-check + lower, subsequent
 # prompt entries can call repldemo.Double. ---
 # --- A prompt import REBINDS its name: after `import "lib"`, `lib` is the local
 # package "lib", not the fixture's pkg/other/lib — its T and K. ---
-run_repl "tier5-prompt-import-rebinds-alias" \
+run_repl "prompt-import-rebinds-alias" \
 "testing.Println(lib.K)
 import \"lib\"
 var t lib.T = lib.T{X: 8}
@@ -1532,7 +1532,7 @@ testing.Println(lib.K)
 
 # --- A fixture's explicit import alias (`import L "lib"`) resolves at the
 # prompt. ---
-run_repl "tier1-fixture-explicit-alias" \
+run_repl "fixture-explicit-alias" \
 "testing.Println(L.K)
 " \
 "$BANNER
@@ -1542,7 +1542,7 @@ run_repl "tier1-fixture-explicit-alias" \
 # --- A mid-session import's impl whose receiver is the package's own alias
 # (`impl *LS : Loc`, LS = aliashome.S) keys on aliashome.S — even with a
 # same-named `LS` already declared at the prompt. ---
-run_repl "tier5-mid-session-alias-receiver-impl" \
+run_repl "mid-session-alias-receiver-impl" \
 "type LS struct { Q int }
 import \"pkg/aliashome\"
 import \"pkg/aliaslib\"
@@ -1559,7 +1559,7 @@ testing.Println(l.Label())
 # --- A mid-session import whose interface extends an indirectly loaded
 # package's generic interface (directly, and through an `expose` forwarder):
 # the parent's methods dispatch. ---
-run_repl "tier5-mid-session-indirect-generic-parent" \
+run_repl "mid-session-indirect-generic-parent" \
 "import \"pkg/gsub\"
 var s gsub.S = gsub.MkS(7)
 var sub *gsub.Sub = &s
@@ -1577,7 +1577,7 @@ testing.Println(sub.Extra())
 # at the box, and the instantiated method, reach the VM before the prompt
 # runs (not "interface vtable not found" / "interface method slot is
 # empty"). ---
-run_repl "tier5-box-generic-receiver-impl-instantiation" \
+run_repl "box-generic-receiver-impl-instantiation" \
 "import \"pkg/gcur\"
 import \"pkg/gbase\"
 var c gcur.Cursor[int] = gcur.MkInt(5)
@@ -1594,7 +1594,7 @@ testing.Println(bb.Get())
 # with it: a generic type's instantiated method used in a prompt function,
 # and an imported generic function called from a statement, a function
 # and a variable initializer (each panicked "extern not found"). ---
-run_repl "tier5-generic-instantiation-in-prompt-func" \
+run_repl "generic-instantiation-in-prompt-func" \
 "import \"pkg/gcur\"
 func f() int { var c gcur.Cursor[int] = gcur.MkInt(3); return c.Get() }
 testing.Println(f())
@@ -1604,7 +1604,7 @@ testing.Println(f())
 > > 3
 > "
 
-run_repl "tier5-imported-generic-func-at-prompt" \
+run_repl "imported-generic-func-at-prompt" \
 "import \"pkg/gfn\"
 testing.Println(gfn.Pick[int](6))
 func q() int { return gfn.Pick[int](7) }
@@ -1619,7 +1619,7 @@ testing.Println(z)
 > > 8
 > "
 
-run_repl "tier5-mid-session-indirect-generic-parent-forwarder" \
+run_repl "mid-session-indirect-generic-parent-forwarder" \
 "import \"pkg/gsubf\"
 var s gsubf.S = gsubf.MkS(7)
 var sub *gsubf.Sub = &s
@@ -1634,7 +1634,7 @@ testing.Println(sub.Extra())
 
 # --- The alias-receiver impl again, with pkg/aliashome loaded only indirectly
 # (by pkg/aliaslib's import) before it is imported at the prompt. ---
-run_repl "tier5-mid-session-alias-receiver-indirect" \
+run_repl "mid-session-alias-receiver-indirect" \
 "import \"pkg/aliaslib\"
 import \"pkg/aliashome\"
 var s aliashome.S = aliashome.MkS(4)
@@ -1649,7 +1649,7 @@ testing.Println(l.Label())
 
 # --- Type and var groups at the prompt: each member is declared as if typed on
 # its own (a const group stays whole). ---
-run_repl "tier2-type-and-var-groups" \
+run_repl "type-and-var-groups" \
 "type ( PS struct { q int }; PA = int )
 var p PS
 p.q = 3
@@ -1660,7 +1660,7 @@ testing.Println(p.q + v1 + v2)
 > > > > > 14
 > "
 
-run_repl "tier5-mid-session-import-call" \
+run_repl "mid-session-import-call" \
 'import "pkg/repldemo"
 testing.Println(repldemo.Double(21))
 ' \
@@ -1669,7 +1669,7 @@ testing.Println(repldemo.Double(21))
 > 42
 > "
 
-run_repl "tier5-imported-const-expr-own-import" \
+run_repl "imported-const-expr-own-import" \
 'import "pkg/rcexpr"
 testing.Println(cast(int, rcexpr.X * 10.0))
 ' \
@@ -1680,7 +1680,7 @@ testing.Println(cast(int, rcexpr.X * 10.0))
 
 # --- A prompt constant expression names the package `a` meant when it was
 # declared, though a later prompt import rebinds `a`. ---
-run_repl "tier5-const-expr-keeps-its-binding" \
+run_repl "const-expr-keeps-its-binding" \
 'import a "pkg/rcbase"
 const X float64 = a.B * 2.0
 import a "pkg/rcother"
@@ -1708,7 +1708,7 @@ package pkg/repldemo loaded
 # --- A variable inferred from a call returning an imported generic
 # instantiation — typed at the prompt, and parked on its initializer's function
 # then resolved — has that type: its fields and methods work. ---
-run_repl "tier5-inferred-var-imported-generic" \
+run_repl "inferred-var-imported-generic" \
 'import "pkg/replgen"
 var c = replgen.MkCell(5)
 var d = e()
@@ -1745,7 +1745,7 @@ testing.Println(replgbody.Outer[int](2))
 # --- A named type that names itself (`type Tree @[]Tree`) and two that name
 # each other (parked until both are declared, then resolved together) have those
 # types at the prompt. ---
-run_repl "tier3-named-type-self-reference" \
+run_repl "named-type-self-reference" \
 'type Tree @[]Tree
 func depth(t Tree) int { var d int = 0; for i := 0; i < len(t); i++ { var c int = depth(t[i]); if c > d { d = c } }; return d + 1 }
 var leaf Tree = make_slice(Tree, 0)
@@ -1770,7 +1770,7 @@ type SB resolved
 # --- A named type that names an alias declared after it, parked as a group with
 # it (the alias is built first), and a function whose recursive local is
 # destroyed at the prompt. ---
-run_repl "tier3-named-type-alias-cycle-and-local" \
+run_repl "named-type-alias-cycle-and-local" \
 'type TN2 @[]TA2
 type TA2 = @[]TN2
 var tn TN2 = make_slice(TA2, 1)
@@ -1790,12 +1790,12 @@ type TA2 resolved
 > > > 6 6
 > "
 
-# --- Case 46 (Tier 5 import alias): `import alt "pkg/repldemo"`
+# --- Case 46 (import alias): `import alt "pkg/repldemo"`
 # binds the package to `alt` rather than the default last-segment
 # name.  Calls through the alias work; the default name `repldemo`
 # does NOT (would be an undefined identifier).  Verifies the
 # alias-bearing branch of evalReplImport. ---
-run_repl "tier5-mid-session-import-alias" \
+run_repl "mid-session-import-alias" \
 'import alt "pkg/repldemo"
 testing.Println(alt.Double(11))
 ' \
@@ -1804,12 +1804,12 @@ testing.Println(alt.Double(11))
 > 22
 > "
 
-# --- Case 47 (Tier 5 re-import idempotence): importing the same
+# --- Case 47 (re-import idempotence): importing the same
 # package twice in a session is a no-op on the second attempt —
 # replProcessedPkgs.containsPath skips re-processing.  The
 # session scope still has the alias defined, so the call works.
 # ---
-run_repl "tier5-mid-session-reimport-idempotent" \
+run_repl "mid-session-reimport-idempotent" \
 'import "pkg/repldemo"
 import "pkg/repldemo"
 testing.Println(repldemo.Double(5))
@@ -1820,7 +1820,7 @@ testing.Println(repldemo.Double(5))
 > 10
 > "
 
-# --- Case 47b (Tier 5: a top-level `var` decl AFTER a mid-session import).  The
+# --- Case 47b (a top-level `var` decl AFTER a mid-session import).  The
 # import's per-package LowerModule leaves the VM's module-lowering context at the
 # imported package; a following `var g` must be qualified under the SESSION module
 # (SetModuleContext restores it) — else MaterializeOneGlobal registers the global
@@ -1828,7 +1828,7 @@ testing.Println(repldemo.Double(5))
 # null-address SIGSEGV.  Regression guard for that (pre-existing) crash. testing
 # comes from the fixture, so this exercises SetModuleContext independent of the
 # prompt-import-of-testing path. ---
-run_repl "tier5-var-decl-after-mid-session-import" \
+run_repl "var-decl-after-mid-session-import" \
 'import "pkg/repldemo"
 var g int = 42
 testing.Println(g)
@@ -1838,13 +1838,13 @@ testing.Println(g)
 > > 42
 > "
 
-# --- Case 47c (Tier 5: mid-session import of testing, an injected VARIADIC
+# --- Case 47c (mid-session import of testing, an injected VARIADIC
 # package, then boxing a PROMPT-DEFINED type into it).  Against NOTESTING_FIXTURE
 # so `import "pkg/builtins/testing"` is a genuine first-time mid-session import:
 # the prompt then knows testing.Println is `...*any` (RegisterImportFuncSigs) and a
 # subsequent prompt-defined `type Fahr int` value boxes + prints.  Exercises the
-# whole prompt-import-and-use-testing path (adversarial-review repro). ---
-run_repl "tier5-mid-session-import-testing-box-prompt-type" \
+# whole prompt-import-and-use-testing path. ---
+run_repl "mid-session-import-testing-box-prompt-type" \
 'import "pkg/builtins/testing"
 type Fahr int
 var f Fahr
@@ -1857,7 +1857,7 @@ testing.Println(f)
 > " \
 "$NOTESTING_FIXTURE"
 
-# --- Case 47a (Tier 5: mid-session import of a __c_call package is rejected
+# --- Case 47a (mid-session import of a __c_call package is rejected
 # cleanly, WITHOUT killing the session).  pkg/std/os uses native-only __c_call,
 # which the VM cannot interpret; importing it at the prompt must surface the
 # frontend "cannot be interpreted" type error and leave the session alive so a
@@ -1868,7 +1868,7 @@ testing.Println(f)
 # --- A mid-session import that loads a failing package (an undefined generic
 # parent) and a clean one: the error is reported, the failing package never
 # reaches IR-gen, and the session survives. ---
-run_repl_import_rejected "tier5-mid-session-import-bad-generic-parent" \
+run_repl_import_rejected "mid-session-import-bad-generic-parent" \
 'import "pkg/gbad"
 testing.Println(helper(7))
 ' \
@@ -1877,7 +1877,7 @@ testing.Println(helper(7))
 
 # --- A package importing a failed one is not imported either (and says so);
 # the session survives. ---
-run_repl_import_rejected "tier5-mid-session-import-depends-on-failed" \
+run_repl_import_rejected "mid-session-import-depends-on-failed" \
 'import "pkg/gbad"
 import "pkg/gbaddep"
 testing.Println(helper(7))
@@ -1887,7 +1887,7 @@ testing.Println(helper(7))
 
 # --- An import that fails type-checking does not rebind its alias: `x` still
 # names pkg/xa/x, in the checker and in IR-gen alike. ---
-run_repl_import_rejected "tier5-mid-session-failed-import-keeps-alias" \
+run_repl_import_rejected "mid-session-failed-import-keeps-alias" \
 'import "pkg/xa/x"
 import "pkg/xb/x"
 testing.Println(x.G(3))
@@ -1914,19 +1914,19 @@ else
     FAIL_NAMES="$FAIL_NAMES unit-failed-import-ends-unit"
 fi
 
-run_repl_import_rejected "tier5-mid-session-import-ccall-rejected" \
+run_repl_import_rejected "mid-session-import-ccall-rejected" \
 'import "pkg/std/os"
 testing.Println(helper(7))
 ' \
     "__c_call cannot be interpreted" \
     "14"
 
-# --- Case 48 (Plan-B B3: REPL parked-member iota-repeat).  B0 = M<<iota
+# --- Case 48 (parked-member iota-repeat).  B0 = M<<iota
 # parks (pending M); the bare B1 repeats B0's M-dependent initializer, so
 # it parks too.  When M=2 arrives both resolve, and B1 must be the
 # REPEATED value 2<<1 = 4 — NOT the plain iota index 1 (the pre-fix bug).
 # Transcript verified by driving a gen1-built bni manually. ---
-run_repl "tier3-pending-const-group-bare-iota-repeat" \
+run_repl "pending-const-group-bare-iota-repeat" \
 "const ( B0 int = M << iota; B1 )
 const M int = 2
 testing.Println(B1)
@@ -1942,7 +1942,7 @@ constant B1 resolved
 # --- Case 49: a parked declaration whose missing name arrives with a
 # type that does not fit stays parked: its error is shown once, and
 # a later declaration that fits resolves it. ---
-run_repl "tier3-failed-retry-stays-parked" \
+run_repl "failed-retry-stays-parked" \
 "var x int = y
 var y bool = true
 var y int = 2
@@ -1960,7 +1960,7 @@ variable x resolved
 # --- Case 50: redefining a type at the prompt is rejected (a type
 # is identified by its name, so the old type's values could not
 # keep their layout). ---
-run_repl "tier4-type-redefinition-rejected" \
+run_repl "type-redefinition-rejected" \
 "type T struct { a int }
 type T struct { b int }
 " \
@@ -1972,7 +1972,7 @@ type T struct { b int }
 # value dispatches, in a statement and in a function; a same-signature
 # method redefinition is dispatched to, a shadowing one is not (the impl
 # keeps the method it was built with). ---
-run_repl "tier2-interface-impl-at-prompt" \
+run_repl "interface-impl-at-prompt" \
 "interface Sizer { Size() int }
 type Crate struct { n int }
 func (b *Crate) Size() int { return b.n }
@@ -1998,7 +1998,7 @@ testing.Println(s.Size())
 
 # --- Case 52: impls at the prompt on a value receiver, on a named
 # managed slice, and of a generic interface. ---
-run_repl "tier2-impl-receivers-and-generic-interface" \
+run_repl "impl-receivers-and-generic-interface" \
 "interface Sizer { Size() int }
 type V struct { n int }
 func (v V) Size() int { return v.n + 100 }
@@ -2031,7 +2031,7 @@ testing.Println(g.Get())
 # --- Case 53: an impl missing a method parks on it; a type or an
 # interface is not redefined, and no declaration of another kind takes its
 # name (the checker's and IR-gen's registries identify them by name). ---
-run_repl "tier4-interface-rejections" \
+run_repl "interface-rejections" \
 "interface Sizer { Size() int }
 type Crate struct { n int }
 impl *Crate : Sizer
@@ -2055,7 +2055,7 @@ func Sizer() {}
 # --- Case 54: an impl whose type lacks a method parks on it (`C.Size`); a
 # conversion needing the impl parks on the impl (`C:Sizer`); declaring the
 # method resolves both. ---
-run_repl "tier3-impl-parks-on-method" \
+run_repl "impl-parks-on-method" \
 "interface Sizer { Size() int }
 type C struct { n int }
 impl *C : Sizer
@@ -2076,7 +2076,7 @@ variable s resolved
 
 # --- Case 55: functions converting to an interface and to its parent
 # wait on an impl; an impl of the child interface resolves both. ---
-run_repl "tier3-conversion-waits-on-impl-of-child" \
+run_repl "conversion-waits-on-impl-of-child" \
 "interface P { A() int }
 interface Q : P { B() int }
 type D struct { n int }
@@ -2099,7 +2099,7 @@ function asQ resolved
 
 # --- Case 56: an impl waiting on a method, and the method converting its
 # receiver to the impl's interface, resolve together. ---
-run_repl "tier3-impl-and-method-resolve-together" \
+run_repl "impl-and-method-resolve-together" \
 "interface Sizer { Size() int }
 type E struct { n int }
 impl *E : Sizer
@@ -2120,7 +2120,7 @@ method E.Size resolved
 # --- Case 57: an impl and a method that boxes its receiver into the
 # impl's interface and dispatches through it resolve together: the impl's
 # row is registered before the method is generated. ---
-run_repl "tier3-impl-group-boxes-in-method" \
+run_repl "impl-group-boxes-in-method" \
 "interface I { M() int; N() int }
 type K struct { n int }
 func (k *K) N() int { return k.n }
@@ -2144,7 +2144,7 @@ method K.M resolved
 # --- Case 58: an interface whose method returns an alias of a struct that
 # points back at the interface: the three resolve together, the alias
 # registered before the interface's method set. ---
-run_repl "tier3-interface-alias-struct-group" \
+run_repl "interface-alias-struct-group" \
 "interface I { M() SV }
 type SV = S
 type S struct { i *I; a int; b int; c int }
@@ -2169,7 +2169,7 @@ type S resolved
 
 # --- Case 59: an impl of an imported interface does not stand for an
 # impl of the session's interface of the same name. ---
-run_repl "tier3-impl-keys-by-package" \
+run_repl "impl-keys-by-package" \
 "import \"pkg/builtins/lang\"
 interface Stringer { String() @[]char }
 type Q struct { n int }
@@ -2191,7 +2191,7 @@ testing.Println(asMine(&q).String())
 
 # --- Case 60: an impl of a parent interface does not replace a parked
 # impl of a child interface; both resolve. ---
-run_repl "tier3-impl-of-parent-keeps-child-impl" \
+run_repl "impl-of-parent-keeps-child-impl" \
 "interface A { M() int }
 interface B : A { N() int }
 type Crate struct { n int }
@@ -2217,7 +2217,7 @@ function asB resolved
 # --- Case 61: a cast to an interface waits on an impl written through an
 # alias of a pointer to the type; at the prompt the function and the impl
 # report themselves unresolved; the method resolves both. ---
-run_repl "tier3-cast-waits-on-alias-receiver-impl" \
+run_repl "cast-waits-on-alias-receiver-impl" \
 "interface Sizer { Size() int }
 type Crate struct { n int }
 type PC = *Crate
@@ -2246,7 +2246,7 @@ function sz resolved
 # --- Case 62: an impl of a generic interface's instance parks on its
 # method, and resolves together with a method converting its receiver to
 # that instance. ---
-run_repl "tier3-impl-of-generic-interface-instance-parks" \
+run_repl "impl-of-generic-interface-instance-parks" \
 "interface Getter[T any] { Get() T }
 type Cell struct { v int }
 impl *Cell : Getter[int]
@@ -2267,7 +2267,7 @@ method Cell.Get resolved
 # --- Case 63: an impl at the prompt on value receivers of a named scalar,
 # a struct and a named bool: dispatch goes through the receiver thunk
 # (the interface value holds the data by pointer). ---
-run_repl "tier2-impl-scalar-value-receivers" \
+run_repl "impl-scalar-value-receivers" \
 "interface Sizer { Size() int }
 type N int
 func (n N) Size() int { return cast(int, n) + 1000 }
@@ -2298,7 +2298,7 @@ testing.Println(sf.Size())
 
 # --- Case 64: a value receiver with a managed field: dispatch through the
 # thunk copies the value properly, so the field's refcount holds. ---
-run_repl "tier2-impl-value-receiver-managed-fields" \
+run_repl "impl-value-receiver-managed-fields" \
 "import \"pkg/builtins/rt\"
 type Inner struct { v int }
 var inner @Inner = make(Inner)
@@ -2324,7 +2324,7 @@ testing.Println(s.Size(), rt.Refcount(ptr))
 # --- Case 65: a method shadowed after its impl, before any value is boxed:
 # the impl's vtable was built when the impl was declared, so it keeps the
 # method it was declared with. ---
-run_repl "tier4-shadow-before-first-box" \
+run_repl "shadow-before-first-box" \
 "interface Sizer { Size() int }
 type C struct { n int }
 func (c *C) Size() int { return c.n }
@@ -2343,7 +2343,7 @@ testing.Println(s.Size())
 # --- Case 66: an impl at the prompt of an interface alias whose target
 # extends a parent, and of an imported interface: dispatch through the
 # child, the parent, and the imported interface. ---
-run_repl "tier2-impl-parent-alias-imported-interfaces" \
+run_repl "impl-parent-alias-imported-interfaces" \
 "import \"pkg/builtins/lang\"
 interface Named { Name() int }
 interface Full : Named { Extra() int }
@@ -2372,7 +2372,7 @@ testing.Println(st.String())
 # --- Case 67: a named type over a struct, declared at the prompt and boxed
 # into a user interface and into @any: dropping the box releases the
 # struct's managed field (its slot-0 destructor is the struct's). ---
-run_repl "tier3-named-struct-box-releases-fields" \
+run_repl "named-struct-box-releases-fields" \
 "import \"pkg/builtins/rt\"
 interface Sizer { Size() int }
 type Inner struct { v int }
@@ -2394,7 +2394,7 @@ testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 # --- Case 68: a type and a function that use a forward-declared type before
 # its struct definition: dropping a value through either releases the
 # struct's managed field. ---
-run_repl "tier3-forward-type-defined-as-struct" \
+run_repl "forward-type-defined-as-struct" \
 "import \"pkg/builtins/rt\"
 type Inner struct { v int }
 type S5
@@ -2420,7 +2420,7 @@ testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 # --- Case 69: forward-declared types defined as a managed pointer, an array,
 # a managed slice, a named type over a struct and a scalar: functions lowered
 # before the definitions release what the values hold. ---
-run_repl "tier3-forward-type-defined-as-other-types" \
+run_repl "forward-type-defined-as-other-types" \
 "import \"pkg/builtins/rt\"
 type Inner struct { v int }
 type Wr struct { n int; p @Inner }
@@ -2460,7 +2460,7 @@ testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 # are defined (dropping only nil values) and after: once defined, the same
 # function releases what the value holds; a type never defined stays
 # usable. ---
-run_repl "tier3-forward-type-used-before-definition" \
+run_repl "forward-type-used-before-definition" \
 "import \"pkg/builtins/rt\"
 type Inner struct { v int }
 type N
@@ -2491,7 +2491,7 @@ testing.Println(t())
 # --- Case 71: an alias cannot define a forward-declared type, a named type
 # over the struct can; forward-declared types defined as a func value and as a
 # managed slice of themselves. ---
-run_repl "tier3-forward-type-alias-rejected-func-value-or-itself" \
+run_repl "forward-type-alias-rejected-func-value-or-itself" \
 "type Inner struct { v int }
 type F
 type F = Inner
@@ -2525,7 +2525,7 @@ testing.Println(f())
 
 # --- Case 72: a forward-declared type defined over another one not defined
 # yet releases what its values hold once that one is defined. ---
-run_repl "tier3-forward-type-defined-over-undefined-forward-type" \
+run_repl "forward-type-defined-over-undefined-forward-type" \
 "import \"pkg/builtins/rt\"
 type Inner struct { v int }
 type G
@@ -2550,7 +2550,7 @@ testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 # --- Case 73: closures created at the prompt — in a variable initializer, a
 # function body, a block, a raw func value and a method value — release
 # what they capture when dropped (their closure structs' dtors exist). ---
-run_repl "tier3-closure-captures-released-at-prompt" \
+run_repl "closure-captures-released-at-prompt" \
 "import \"pkg/builtins/rt\"
 type F @func() int
 var bx @Box = make(Box)
@@ -2588,7 +2588,7 @@ testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
 # shadowed (earlier functions keep the old variable), as it is when a constant
 # or function takes its name; also when the redeclaration parks and resolves
 # later. ---
-run_repl "tier3-variable-redeclared-replaced-or-shadowed" \
+run_repl "variable-redeclared-replaced-or-shadowed" \
 "import \"pkg/builtins/rt\"
 var x int = 1
 var x bool = true
@@ -2694,7 +2694,7 @@ warning: variable p shadowed (incompatible type); existing references retain the
 # also for an imported generic's instance.  A method of a generic type is
 # emitted per instance, and a redefinition replaces the instances emitted
 # before it. ---
-run_repl "tier3-generic-struct-types-at-prompt" \
+run_repl "generic-struct-types-at-prompt" \
 "import \"pkg/builtins/rt\"
 import \"pkg/std/containers/vec\"
 type G[T any] struct { v T; w Missing }
@@ -2752,7 +2752,7 @@ testing.Println(copyV(), rt.Refcount(bit_cast(*uint8, bx)) - before)
 # replaces the instances emitted before it (its type parameters renamed or
 # not), or shadows them when its signature differs — as rebinding the name to
 # a non-generic function does, so a later generic function emits its own. ---
-run_repl "tier4-generic-funcs-at-prompt" \
+run_repl "generic-funcs-at-prompt" \
 "func id[T any](x T) T { return x }
 testing.Println(id[int](3), id[bool](true))
 type Cur[T any] struct { v T }
@@ -2800,7 +2800,7 @@ testing.Println(len(lang.__Package().SatEntries) > 0)
 > "
 
 # --- Setup-error case: a type error in the loaded module surfaces
-# (Stage 2) as a NewReplSession error VALUE that the CLI shell prints
+# as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values
 # end-to-end — unreachable from a unit test since loadBuiltinBNIs
 # reads the builtins from disk. ---

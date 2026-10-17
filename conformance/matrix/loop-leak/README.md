@@ -21,8 +21,8 @@ never sees it — the leak only manifests at scale. Three lowerings bit this way
 - `var a [N]char = "..."` string→array copy — `OP_RODATA_ARRAY`
 - `box()` of a scalar/aggregate register — `OP_BOX`
 
-(see `pkg/binate/codegen/emit_debug.bn`'s alloca-hoist pre-pass and
-`claude-todo.md`).
+(see the alloca-hoist pre-pass, `emitEntryAllocaDecls` in
+`pkg/binate/codegen/emit_alloca_hoist.bn`).
 
 ## Axes & assertion
 

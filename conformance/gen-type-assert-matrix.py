@@ -15,11 +15,10 @@ everywhere else.  This matrix crosses the axes the spec pins:
   * FORM — abort `x.(K T)`, comma-ok `v, ok := x.(K T)`, type switch.
   * OUTCOME — match · wrong-type miss · unset (null-vtable) miss.
 
-The plan gated the type-switch cells on "Phase 6 IR-gen lowering" and the
-cross-mode axis on "Slice 5 (VM RTTI)"; BOTH have since landed (gen_type_switch.bn,
-vm/lower_typeinfo.bn), and every RTTI point test is green under the VM `int` and
-native modes — so this whole matrix builds NOW across the default mode set, and
-each cell's cross-mode agreement is enforced for free by run.sh running all modes.
+Type switches lower in irgen/gen_type_switch.bn and the VM carries RTTI
+(vm/lower_typeinfo.bn), so the whole matrix builds across the default mode set,
+and each cell's cross-mode agreement is enforced for free by run.sh running all
+modes.
 
 Cell shapes (coordinate-addressed matrix/type-assert/<grid>/<cell>{.bn|.error}):
   * OK cells (.expected): one program packing abort-HIT + comma-ok-HIT +

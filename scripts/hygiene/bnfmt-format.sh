@@ -13,9 +13,8 @@
 #
 # bnfmt is fetched from the CHECK_TOOLS_VERSION bundle when that release ships one
 # (`fetch-builder.sh --check-tools --tool bnfmt`, mirroring lint.sh's bnlint fetch).
-# CHECK_TOOLS_VERSION may be a pre-release ahead of the BUILDER (see
-# plan-check-tools-version.md).  The current CHECK_TOOLS_VERSION ships a bnfmt, so
-# the bundled binary is used directly.  A bundle WITHOUT a bnfmt
+# CHECK_TOOLS_VERSION may be a pre-release ahead of the BUILDER.  The current
+# CHECK_TOOLS_VERSION ships a bnfmt, so the bundled binary is used directly.  A bundle WITHOUT a bnfmt
 # (as bnc-0.0.10 was) falls back to building bnfmt from source and caching the
 # binary keyed on a hash of its build inputs (its own package plus the
 # parser/lexer/ast/token/buf it depends on): that run rebuilds only when bnfmt's
@@ -43,7 +42,7 @@ hashcmd() {
 
 # Prefer the bundled bnfmt from CHECK_TOOLS_VERSION when available (a bnc-* bundle
 # that ships bnfmt).  --check-tools resolves the CHECK-TOOLS release, which may be a
-# pre-release ahead of the BUILDER (see plan-check-tools-version.md).  Bundles
+# pre-release ahead of the BUILDER.  Bundles
 # without a bnfmt (e.g. bnc-0.0.10) make the fetcher exit non-zero;
 # then bnfmt stays empty and the from-source build + cache below runs.  This whole
 # from-source path drops out once CHECK_TOOLS_VERSION ships a bnfmt.

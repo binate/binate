@@ -5,9 +5,9 @@ A shift `x << y` / `x >> y` is asymmetric: the count `y` may be ANY integer
 type, independent of the value `x`, and the result type is the VALUE's.  This
 matrix covers the full product of (value-type, count-type) and asserts:
 
-  - PERMITTED: the shift compiles for every integer count type (it used to be
-    rejected when the operand types differed — `int64 << int` in 32-bit-int
-    modes — as "mismatched types").
+  - PERMITTED: the shift compiles for every integer count type, including when
+    the operand types differ (`int64 << int` in 32-bit-int modes), rather than
+    being rejected as "mismatched types".
   - RESULT TYPE = the value's: the result is bound to `var r <vtype>` with NO
     cast.  A result widened to the (wider) count's type would be a narrowing
     assignment and fail to COMPILE — so a cell that compiles already proves

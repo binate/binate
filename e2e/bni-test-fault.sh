@@ -1,9 +1,8 @@
 #!/bin/sh
 # e2e/bni-test-fault.sh — End-to-end check that `bni --test` reports a Test that
-# hits a recoverable VM fault (Plan 2) as a FAILURE and keeps running, rather than
-# either crashing the runner (pre-Plan-2) or silently passing (the hole 2b opened:
-# an entry-frame fault now unwinds to Status = FAULTED, which the runner must check
-# — see cmd/bni/main.bn runTests).
+# hits a recoverable VM fault as a FAILURE and keeps running, rather than either
+# crashing the runner or silently passing (an entry-frame fault unwinds to
+# Status = FAULTED, which the runner must check — see cmd/bni/main.bn runTests).
 #
 # The fixture package has TWO tests: one that indexes out of bounds (faults) and
 # one that passes.  A correct runner prints `--- FAIL:` for the faulting one with

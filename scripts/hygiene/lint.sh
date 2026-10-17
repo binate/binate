@@ -24,7 +24,7 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Packages to skip from linting.  bnlint is fetched from the CHECK_TOOLS_VERSION
 # bundle, decoupled from BUILDER_VERSION so a newer check-tool feature does not
-# require a build-ladder rung (see explorations/plan-check-tools-version.md).
+# require a build-ladder rung.
 # A skipped target stays fully type-checked and compiled by every conformance
 # mode — only bnlint's style rules pause — and bnlint typechecks dependency
 # BODIES, so a skip must cover the whole transitive importer chain of the
@@ -136,7 +136,7 @@ else
     # (bnc-* mode) — saves the per-invocation cost of compiling bnlint
     # from source.  --check-tools resolves the CHECK-TOOLS release (which may
     # be a pre-release ahead of the BUILDER, carrying newer language support
-    # like methods-on-generics — see plan-check-tools-version.md), NOT the
+    # like methods-on-generics), NOT the
     # BUILDER the tree builds with.  Falls back to building from current
     # source when the fetcher doesn't return a usable path (bundle lacks
     # bnlint, network failure, etc.).

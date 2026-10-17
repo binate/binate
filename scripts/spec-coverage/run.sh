@@ -4,7 +4,7 @@
 # Cross-references the spec's declared rule-IDs (the vendored `rule-ids.txt`
 # snapshot, exported from docs by docs/scripts/extract-rule-ids.py) against the
 # `.rules` sidecars of the spec tests under conformance/spec/, and reports the
-# bidirectional coverage findings (plan-spec-tests.md §5):
+# bidirectional coverage findings:
 #
 #   - per-chapter and overall coverage %  (covered denominator / total)
 #   - GAPS:     denominator rule-IDs with no spec test            (informational)
@@ -14,8 +14,8 @@
 # The "denominator" is the positive + constraint + constraint-candidate buckets;
 # framework + untestable rules are excluded (they are not test targets).
 #
-# This is the STATIC half: it does not run the tests. Per-mode pass/xfail status
-# (§5.3) and the Annex-C JSON (§5.5) are folded in by a later `--run` increment.
+# This is the STATIC half: it does not run the tests, so it reports no per-mode
+# pass/xfail status (nor the full Annex-C JSON, which needs that status).
 #
 # Usage:
 #   scripts/spec-coverage/run.sh [-v] [--rule-ids PATH] [--json PATH] [--chapter NN]
@@ -26,7 +26,8 @@
 #   --chapter NN   restrict the report to chapter files matching NN (e.g. 13)
 #
 # Exit status: nonzero if there are DANGLING citations or UNTAGGED tests (both
-# authoring errors); GAPS alone do not fail (driving them down is Phase B's job).
+# authoring errors); GAPS alone do not fail (driving them down is test-authoring
+# work).
 
 VERBOSE=0
 JSON_OUT=""

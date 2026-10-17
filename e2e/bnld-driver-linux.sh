@@ -1,5 +1,5 @@
 #!/bin/sh
-# e2e/bnld-driver-linux.sh — End-to-end proof of Step 7: an INTERPRETED linker driver
+# e2e/bnld-driver-linux.sh — End-to-end proof that an INTERPRETED linker driver
 # drives the COMPILED linker.  `bnld -driver drivers/elf.bn` embeds the bytecode VM,
 # injects the compiled pkg/binate/link library as an extern, and runs the driver's typed
 # `Drive(objs, out, target)` entry under the VM — the driver's link.* calls execute

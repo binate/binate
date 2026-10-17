@@ -106,14 +106,11 @@ the three `type-switch` cells (managed-source narrowing + typed-nil/unset, raw a
 managed), the four `balance` cells, and the three `legality` compile-error cells.
 Green under the six default modes + native x64/aa64.
 
-The plan gated the type-switch cells on "Phase 6 IR-gen lowering" and the
-cross-mode axis on "Slice 5 (VM RTTI)"; both have since landed
-(`pkg/binate/ir/gen_type_switch.bn`, `pkg/binate/vm/lower_typeinfo.bn`), so the
-whole matrix — including the switch form and every mode — builds now.
+Type switches lower in `pkg/binate/irgen/gen_type_switch.bn` and the VM carries
+RTTI (`pkg/binate/vm/lower_typeinfo.bn`), so the whole matrix — including the
+switch form — builds under every mode.
 
-The plan's Part B waves are all landed. (A struct-value recovery from a typed `@I`
-was the last one: it needed no new language support — value recovery matches on the
-POINTEE type, so `a.(Dog)` on an `@Animal` built from `impl *Dog` HITs by
-unwrapping the pointer, verified green across all modes.) Part A's remaining ops
-(`copy` / `destroy-populated`, cross-package dispatch) live in the sibling
-`../generic-managed/` matrix.
+Value recovery matches on the POINTEE type, so `a.(Dog)` on an `@Animal` built
+from `impl *Dog` HITs by unwrapping the pointer (the struct-value recovery cell).
+The generic-container ops (`destroy-populated`, cross-package dispatch) live in
+the sibling `../generic-managed/` matrix.

@@ -8,8 +8,8 @@
 #   - UNTAGGED: a spec test with no .rules sidecar.
 #
 # Coverage % and the GAP list (denominator rules with no test yet) are PROGRESS,
-# not pass/fail, so they do not gate here — driving the gap list down is the
-# work of Phase B (explorations/plan-spec-tests.md), not a hygiene violation.
+# not pass/fail, so they do not gate here — driving the gap list down is
+# test-authoring work, not a hygiene violation.
 #
 # The coverage tool reads the vendored scripts/spec-coverage/rule-ids.txt, so
 # this is self-contained: no toolchain build and no docs checkout required.

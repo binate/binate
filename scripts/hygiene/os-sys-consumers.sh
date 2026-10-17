@@ -2,7 +2,7 @@
 # Usage: ./scripts/hygiene/os-sys-consumers.sh
 #
 # Enforces that pkg/std/os/sys — the low-level libc-syscall layer (raw __c_call
-# syscalls + errno classification, per explorations/design-syscall.md) — is
+# syscalls + errno classification) — is
 # imported ONLY by the os family: pkg/std/os and its subpackages (os itself,
 # os/process, and any future pkg/std/os/*).  os/sys is the os abstraction's
 # private syscall foundation; OS-specific code must not leak outside of os.

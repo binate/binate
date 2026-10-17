@@ -3,11 +3,11 @@
 transparent wrapper.
 
 `readonly`/`const` is a semantic-only wrapper (like TYP_ALIAS): it must be PEELED
-by every code path that switches on Type.Kind to pick a representation. The read
-path (gen_selector) and the method-dispatch router (check_method) don't peel it,
-so a readonly-wrapped aggregate/iface silently reads literal-0 (value ops) or is
-wrongly rejected (dispatch ops). This matrix sweeps {inner-shape × operation} so a
-missed peel in any layer surfaces.
+by every code path that switches on Type.Kind to pick a representation. A read
+path (e.g. gen_selector) that misses the peel makes a readonly-wrapped
+aggregate/iface silently read literal-0 (value ops); a method-dispatch router
+(check_method) that misses it wrongly rejects the call (dispatch ops). This matrix
+sweeps {inner-shape × operation} so a missed peel in any layer surfaces.
 
 Assertion: a readonly view observes the SAME value as the corresponding
 non-readonly access (value ops), and a non-mutating method/iface call on a
@@ -56,8 +56,8 @@ CELLS = [
      ["var a [3]int", "a[0] = 7", "a[2] = 9", "var ra readonly [3]int = a",
       "testing.Println(ra[0])", "testing.Println(ra[2])"], [7, 9]),
 
-    # --- method / iface dispatch on a readonly receiver (RED: check_method does
-    #     not peel TYP_READONLY before the iface/struct method dispatch) ---
+    # --- method / iface dispatch on a readonly receiver (check_method must peel
+    #     TYP_READONLY before the iface/struct method dispatch) ---
     ("method/managed-struct", BOX_M,
      ["var p @Box = make(Box)", "p.v = 7", "var rp readonly @Box = p",
       "testing.Println(rp.getV())"], [7]),
@@ -81,24 +81,22 @@ CELLS = [
       "testing.Println(readA(s))", "testing.Println(readC(s))"], [7, 9]),
 
     # --- wrapper-ORDER: the modifier on the POINTEE (`@readonly Box` / `*readonly
-    #     Box`), not the pointer (`readonly @Box`). The inner-pointee variants the
-    #     outer-wrapper field-read fix (27c1ee8b) did not cover — gen_selector reads
-    #     an un-peeled `.Elem`. (2026-06-08 review sibling.) ---
+    #     Box`), not the pointer (`readonly @Box`). gen_selector must peel the
+    #     pointer's `.Elem` too, not only an outer wrapper. ---
     ("wrapper-order/inner-managed-ptr", BOX,
      ["var m @Box = make(Box)", "m.v = 7", "var p @readonly Box = m", "testing.Println(p.v)"], [7]),
     ("wrapper-order/inner-raw-ptr", BOX,
      ["var b Box", "b.v = 7", "var p *readonly Box = &b", "testing.Println(p.v)"], [7]),
 
-    # --- alias-typed receiver method dispatch (`type AB = @Box`): TYP_ALIAS not
-    #     peeled at the method-lookup site (ReceiverBaseNamed). Sibling of the
-    #     readonly-receiver dispatch fix. ---
+    # --- alias-typed receiver method dispatch (`type AB = @Box`): the
+    #     method-lookup site (ReceiverBaseNamed) must peel TYP_ALIAS, as it peels
+    #     the readonly wrapper. ---
     ("alias/method-receiver",
      BOX_M + "\n\ntype AB = @Box\n\nfunc mkBox(n int) @Box {\n\tvar b @Box = make(Box)\n\tb.v = n\n\treturn b\n}",
      ["var x AB = mkBox(7)", "testing.Println(x.getV())"], [7]),
 
-    # --- construct a managed interface value through a `readonly` target
-    #     (reject-only today — a concrete value can't be iface-wrapped into a
-    #     readonly @Iface). ---
+    # --- construct a managed interface value through a `readonly` target: a
+    #     concrete value must iface-wrap into a readonly @Iface. ---
     ("construct/readonly-iface", IFACE_G,
      ["var im @Impl = make(Impl)", "im.v = 7", "var iv readonly @Getter = im", "testing.Println(iv.get())"], [7]),
 ]

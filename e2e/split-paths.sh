@@ -106,9 +106,9 @@ check "bnc" "$actual"
 
 # ----- bni (bytecode VM) ------------------------------------------
 # bni is skipped here: covering it means first compiling cmd/bni (via
-# builder-comp) and then invoking the binary against the fixture.  That
-# belongs in the broader e2e build-out — see the "Build out e2e testing"
-# entry in explorations/claude-todo.md.
+# builder-comp) and then invoking the binary against the fixture.
+# TODO: cover bni in the broader e2e build-out (explorations/claude-todo.md,
+# "Build out e2e testing").
 echo "SKIP: bni (needs a builder-comp build of cmd/bni)"
 
 # ----- bnlint (lint pkg/splitlib via -I/-L) -----------------------

@@ -14,16 +14,14 @@ matrix instead.
 ## Suites
 
 - **`const-expr/`** — compile-time const-*expression* folding (distinct from
-  single-value materialization, which the `const` matrix covers). Integer
-  arithmetic / bitwise / shift / parenthesized / const-of-const fold correctly;
-  **non-integer** const-exprs are broken: IR-gen's `evalConstExpr` is int-only,
-  so a binary-float / bool-comparison / const-as-array-dimension initializer is
-  silently dropped and read back as `int 0` (all backends; filed). The `*-add`,
-  `*-div`, `*-mul`, `bool-comparison`, and `array-dim` cells are xfailed.
+  single-value materialization, which the `const` matrix covers): integer
+  arithmetic / bitwise / shift / parenthesized / const-of-const, and the
+  **non-integer** forms — a binary-float / bool-comparison /
+  const-as-array-dimension initializer, which an int-only fold would silently
+  drop and read back as `int 0` (on all backends).
 - **`c-call/`** — the `__c_call` (C-ABI FFI) call shape, self-contained against
   already-linked libc (`abs` / `labs` / `strlen` / `printf`). All cells xfail
-  the VM modes (FFI is compiled-mode-only) and the
-  arm32 modes (no native arm32 backend yet). `printf-variadic-float`
-  additionally xfails the native backends: a variadic `double` is passed wrong
-  (x64-SysV needs `AL`=vector-count; darwin-arm64 stacks varargs) → printf reads
-  `0` (filed).
+  the VM modes (FFI is compiled-mode-only) and arm32-baremetal (no libc).
+  `printf-variadic-float` pins a variadic `double` (x64-SysV needs
+  `AL`=vector-count; darwin-arm64 stacks varargs); passed wrong, printf reads
+  `0`.

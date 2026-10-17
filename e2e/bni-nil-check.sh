@@ -1,8 +1,7 @@
 #!/bin/sh
-# e2e/bni-nil-check.sh — End-to-end check of opt-in nil-pointer-deref checking
-# (Plan 2 nil-deref; explorations/plan-nil-check-opt-in.md).  A nil deref is
-# normally a bare load through address 0 — a SEGV, C-like.  With `--check-nil`
-# the VM instead raises a RECOVERABLE fault: it prints
+# e2e/bni-nil-check.sh — End-to-end check of opt-in nil-pointer-deref checking.
+# A nil deref is normally a bare load through address 0 — a SEGV, C-like.  With
+# `--check-nil` the VM instead raises a RECOVERABLE fault: it prints
 # "runtime error: nil pointer dereference" and exits non-zero, without a crash.
 #
 # This pins BOTH halves of the opt-in contract on the real `bni` binary:

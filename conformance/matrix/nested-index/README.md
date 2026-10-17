@@ -1,7 +1,7 @@
 # nested-index matrix
 
-Field/element access through a (possibly nested) array **index base** — a
-Code-Red-2 path-parity family. Coordinate-addressed:
+Field/element access through a (possibly nested) array **index base**.
+Coordinate-addressed:
 
     conformance/matrix/nested-index/<op>/<shape>.bn   (+ .expected)
 
@@ -20,18 +20,16 @@ backend.
 
 ## Current state
 
-The defect is isolated to **{nested-`[N][M]` index base} × {field selector}**:
-`a[i][j].field` reads `0` and the write stores **nowhere** — `getIndexElemType`
-(`gen_access.bn`) resolves an IDENT/SELECTOR base but does not recurse a
-nested-index base, so the struct arm is skipped (read → const-0, write → nil
-lvalue). Shared IR-gen → red on **all** backends (xfailed):
+No cell carries an `.xfail.<mode>` marker. `field/nested-value-struct` and
+`field/nested-managed-ptr` pin **{nested-`[N][M]` index base} × {field selector}**:
+`getIndexElemType` (`pkg/binate/irgen/gen_slice.bn`) must recurse a nested-index
+base as well as resolve an IDENT/SELECTOR one, or the struct arm is skipped —
+`a[i][j].field` reads `0` and the write stores **nowhere** (read → const-0, write →
+nil lvalue). It is shared IR-gen, so a failure shows on **all** backends; the
+value-struct read, the value-struct **write**, and the managed-ptr read share
+that one root.
 
-- `field/nested-value-struct`, `field/nested-managed-ptr` — RED.
-
-The controls are green and pin the isolation: `field/single-*` (single-level
-field access works), `whole/nested-value-struct` (whole-element r/w through a
-nested index works — no field selector), `scalar/nested` (nested scalar index
-works). So the break is specifically the nested-base **field-selector** path.
-
-The fix covers the value-struct read, the value-struct **write**, and the
-managed-ptr read as one root.
+The controls pin the isolation: `field/single-*` (single-level field access),
+`whole/nested-value-struct` (whole-element r/w through a nested index — no field
+selector), `scalar/nested` (nested scalar index). A failure of the two nested
+field cells alone is specifically the nested-base **field-selector** path.

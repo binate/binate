@@ -26,8 +26,8 @@
 #                          BUILDER_VERSION: the release whose bundled
 #                          HYGIENE tools (bnlint / bnfmt) we use, which
 #                          may be a pre-release AHEAD of the BUILDER the
-#                          tree builds with.  See
-#                          explorations/plan-check-tools-version.md.
+#                          tree builds with, so a newer check-tool feature
+#                          does not require a build-ladder rung.
 #
 # BUILDER_VERSION scheme (bnc-X.Y.Z):
 # Download the prebuilt release tarball for the host platform from the
@@ -41,8 +41,7 @@
 #
 # The older `bootstrap-X.Y.Z` scheme (build the sibling `../bootstrap/`
 # Go interpreter and interpret cmd/bnc directly) is retired; a
-# bootstrap-* value now errors.  See explorations/plan-bnc-as-builder.md
-# for the migration.
+# bootstrap-* value errors.
 
 set -e
 
@@ -74,7 +73,7 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Which version to resolve: BUILDER_VERSION (the stable release the tree BUILDS
 # with — a build-ladder rung) by default, or CHECK_TOOLS_VERSION (the release whose
 # bundled hygiene tools we use — may be a pre-release AHEAD of the BUILDER) under
-# --check-tools.  See explorations/plan-check-tools-version.md.
+# --check-tools.
 VERSION_FILE="$BINATE_DIR/$version_file"
 if [ ! -f "$VERSION_FILE" ]; then
     echo "fetch-builder: $VERSION_FILE not found" >&2

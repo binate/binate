@@ -1,6 +1,6 @@
 #!/bin/sh
 # e2e/ffi-export.sh — End-to-end test that a C program can call a Binate function
-# exported via #[c_export("name")] (FFI export, plan-ffi-export-detailed.md).
+# exported via #[c_export("name")] (FFI export).
 #
 # Builds a small Binate FACADE package whose functions carry #[c_export("...")],
 # compiles it to an object with `bnc --pkg`, then compiles + links a C driver
@@ -833,8 +833,8 @@ check_backend() {
 }
 
 # check_library builds the facade + its transitive closure into a static
-# archive via `bnc --library` (the Phase-5a "a Binate .a a C program inits and
-# calls into" contract), then links it into a C driver that inits it via the
+# archive via `bnc --library` (the "a Binate .a a C program inits and calls
+# into" contract), then links it into a C driver that inits it via the
 # well-known `bn_init` symbol, calls the exports, and proves bn_init ran the
 # package initializers exactly ONCE (ffi_base == 40 shows the inits ran;
 # ffi_counter == 1 across two bn_init() calls shows the run-once guard held).  The

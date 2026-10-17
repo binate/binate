@@ -1,7 +1,7 @@
 # readonly matrix
 
 The **`readonly` type-modifier transparency** member of the conformance matrix
-family (`../README.md`) — Code-Red-2 Class B. Coordinate-addressed:
+family (`../README.md`). Coordinate-addressed:
 
     conformance/matrix/readonly/<operation>/<shape>.bn   (+ .expected)
 
@@ -28,21 +28,19 @@ in any one lowering is a silent wrong-read or a spurious compile error.
 
 ## Current state
 
-The **Round-1** readonly defects are FIXED + green: `field-read/*` and
-`pass-arg/*` (the `gen_selector` literal-0, `27c1ee8b`) and `method/*` (the
-readonly-receiver dispatch / object-const model, `d3761004`/`408cc533`).
+No cell carries an `.xfail.<mode>` marker. `field-read/*` and `pass-arg/*` pin
+the `gen_selector` peel (`27c1ee8b`), and `method/*` the readonly-receiver
+dispatch / object-const model (`d3761004`/`408cc533`). The same
+wrapper-transparency root, one variant over:
 
-The **Round-2** (2026-06-08 adversarial-review) siblings are still red on **all**
-backends — the same wrapper-transparency root, one variant over (xfailed):
-
-- **`wrapper-order/inner-{managed,raw}-ptr` → silent literal-0.** The modifier on
-  the POINTEE (`@readonly Box` / `*readonly Box`) — `gen_selector` reads an
-  un-peeled `.Elem`, so only the OUTER `readonly @Box` was covered by `27c1ee8b`.
-- **`alias/method-receiver` → hard compile error.** An alias-typed receiver
-  (`type AB = @Box`) isn't peeled at the method-lookup site (`ReceiverBaseNamed`
-  has no `TYP_ALIAS` arm) — sibling of the readonly-receiver fix.
-- **`construct/readonly-iface` → reject.** A concrete value can't be iface-wrapped
-  into a `readonly @Iface` target.
+- **`wrapper-order/inner-{managed,raw}-ptr`** — the modifier on the POINTEE
+  (`@readonly Box` / `*readonly Box`): `gen_selector` must peel the pointer's
+  `.Elem` as well as an OUTER `readonly @Box`, or the read is a silent literal-0.
+- **`alias/method-receiver`** — an alias-typed receiver (`type AB = @Box`) must be
+  peeled at the method-lookup site (`ReceiverBaseNamed`'s `TYP_ALIAS` arm), or the
+  call is a hard compile error.
+- **`construct/readonly-iface`** — a concrete value must iface-wrap into a
+  `readonly @Iface` target.
 
 ## Note (language design vs bug)
 

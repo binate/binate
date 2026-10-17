@@ -1,6 +1,6 @@
 #!/bin/sh
 # e2e/bni-test-nil.sh — End-to-end check that `bni --test` enables opt-in
-# nil-pointer-deref checking (plan-nil-check-opt-in.md N3), so a Test* that
+# nil-pointer-deref checking, so a Test* that
 # dereferences a nil pointer is reported as a recoverable FAILURE (message +
 # non-zero exit) instead of SEGV-crashing the whole test runner.
 #

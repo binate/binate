@@ -1,7 +1,7 @@
 #!/bin/sh
 # e2e/satentry-retention.sh — End-to-end test that the decentralized per-package
 # `__pkg_satfrag` graph retains every package's `__satentry.<T,J>` nodes across the
-# linker's dead-strip (RTTI, plan-rtti-decentralize.md).
+# linker's dead-strip (RTTI).
 #
 # `impl T : J` emits a weak per-`(T,J)` `__satentry` record.  Each package emits a
 # `__pkg_satfrag` graph node listing its own `__pkg_satentries` array plus STRONG

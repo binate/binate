@@ -49,10 +49,7 @@ CELLS = [
     ("init/array", "", "var G [3]int = [3]int{10, 20, 30}", ["G[0]", "G[2]"], [10, 30]),
     # Named-distinct fixed-array global. The initializer uses the unnamed
     # `[3]int{...}` literal (which the unnamed→named array assignability of
-    # named-distinct transparency accepts) rather than `Row{...}`: a composite
-    # literal written with a NAMED type name (`Row{...}`) is silently
-    # miscompiled to a const-0 — genCompositeLit dispatches on TypeRef.Kind and
-    # never peels TYP_NAMED, so it drops the initializer (filed in claude-todo).
+    # named-distinct transparency accepts) rather than `Row{...}`.
     ("init/named-array", "type Row [3]int", "var G Row = [3]int{10, 20, 30}", ["G[0]", "G[2]"], [10, 30]),
     ("init/named-scalar", "type Count int", "var G Count = 42", ["cast(int, G)"], [42]),
     ("init/named-float", "type Temp float64", "var G Temp = 2.5", ["cast(int, G * 2.0)"], [5]),
@@ -91,13 +88,12 @@ CELLS = [
     # underlying struct through the global (no function references it) so
     # `%bn_S...` is declared, AND the static-zero dispatch must peel TYP_NAMED
     # so the `%bn_S...` slot gets `zeroinitializer`, not the invalid ` 0`.
-    # Compile assertion (read `0`): field access on a named-distinct VALUE is a
-    # separate unratified spec question (claude-todo), so main does not read G's
-    # fields — which also keeps the struct reachable ONLY via the global, the
-    # condition that isolates the discovery path.
+    # Compile assertion (read `0`): main does not read G's fields, which keeps
+    # the struct reachable ONLY via the global — the condition that isolates the
+    # discovery path.
     ("noinit/named-struct", STRUCT_S + "\n\ntype NS S", "var G NS", ["0"], [0]),
 
-    # --- readonly global (overlaps Class B readonly field-read) ---
+    # --- readonly global (overlaps the readonly matrix's field-read cells) ---
     ("readonly/struct", STRUCT_S, "var G readonly S = S{10, 20}", ["G.a", "G.b"], [10, 20]),
 ]
 

@@ -2,10 +2,9 @@
 # e2e/separate-compilation.sh — End-to-end test that bnc supports SEPARATE
 # COMPILATION: compiling each package of a program in its OWN bnc invocation
 # (`--pkg`), then linking the independently-produced objects into a working
-# binary.  This is the "separate compilation per package" the toolchain's
-# architecture promises (explorations/claude-plan-3.md: "Each package compiles
-# to its own .ll -> .o, then all are linked together ... enables partial
-# recompilation") — but which nothing had ever exercised end-to-end.
+# binary.  This is the separate compilation per package the toolchain's
+# architecture promises: each package compiles to its own object, then all are
+# linked together, which enables partial recompilation.
 #
 # It builds a NONTRIVIAL real target — cmd/bnas (the assembler, ~21 packages,
 # including all four implicit runtime packages) — ENTIRELY via separate

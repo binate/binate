@@ -290,9 +290,8 @@ CELLS.append(dict(site="inpkg", rel="method-value/call-result", inv=MV_INV, hold
                          "func mkbox[T any](v T) @Box[T] {\n\tvar b @Box[T] = make(Box[T])\n\tb.val = v\n\treturn b\n}"),
                   body=["var f *func() int = mkbox[int](42).Get", "testing.Println(f())"]))
 
-# --- second-wave dispatch cells (plan's deferred axes; in-package minimal per the
-# plan's "after a minimal cell of each compiles").  Each exercises a DISTINCT
-# generic-dispatch path the method-value/balance cells do not.
+# --- generic-dispatch cells.  Each exercises a DISTINCT generic-dispatch path the
+# method-value/balance cells do not.
 # method EXPRESSION off a generic instantiation (unbound `Box[int].Get`).  Covers
 # ptr / managed / value receiver; the method-expr as the SOLE/FIRST mention of the
 # instantiation (drives struct + method emission from the expression itself); an
@@ -364,8 +363,8 @@ CELLS.append(dict(site="inpkg", rel="constraint/dispatch", inv=GC_INV, holder=Fa
                   body=["var w Widget", "w.v = 42", "var p *Widget = &w",
                         "testing.Println(showIt[*Widget](p))"]))
 
-# cross-package variants of the two dispatch cells — the plan's bug-dense mangling
-# axis (in-package coincidentally aligns the mangled prefixes; cross-package
+# cross-package variants of the two dispatch cells — the bug-dense mangling axis
+# (in-package coincidentally aligns the mangled prefixes; cross-package
 # diverges).  The generic + impl / constraint live in pkg/gh (gh_decls); the
 # consumer monomorphizes and dispatches.
 CELLS.append(dict(site="xpkg", rel="xpkg/param-impl/dispatch", inv=PI_XPKG_INV, holder=False, exp=[42],

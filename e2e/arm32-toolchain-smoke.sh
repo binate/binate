@@ -10,9 +10,9 @@
 # Each tool is cross-built for arm32-linux (`bnc --target arm32-linux`) and run
 # under qemu-arm on a tiny input.  Covers all six: bni, bnas, bnlint, bnfmt, bnc
 # (compile a program and run the result), and bnld (assemble an object with bnas,
-# link it, structure-check the ELF).  bnc + bnld became arm32-buildable once the
-# link address-width fix landed (b2c68b22b — 64-bit Mach-O addresses moved from
-# word-sized int/uint to uint64).  See explorations/plan-arm32-toolchain-smoke.md.
+# link it, structure-check the ELF).  bnc + bnld are arm32-buildable because the
+# linker keeps 64-bit Mach-O addresses in uint64, not word-sized int/uint
+# (b2c68b22b).
 #
 # Auto-discovered by .github/workflows/e2e-tests.yml.  SKIPs (exit 0) unless a
 # qemu-arm(-static) + a WORKING arm-linux-gnueabihf cross-toolchain (clang that can

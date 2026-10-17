@@ -60,8 +60,7 @@ CELLS = [
       "var x int", "var g @func() int", "x, g = m.mk()",
       "testing.Println(cast(int, rt.Refcount(po) == before + 1))",
       "testing.Println(g())",
-      # drop g via a var-init (the FV hint applies there) — a bare
-      # `g = func(){…}` assignment hits the separate func-literal-flavour bug.
+      # drop g through a typed var, like the other cells drop their aliases.
       "var drp @func() int = func() int { return 0 }", "g = drp",
       "testing.Println(cast(int, rt.Refcount(po) == before))"]),
 
@@ -101,9 +100,9 @@ CELLS = [
       "var drp @[]int = make_slice(int, 1)", "g = drp",
       "testing.Println(cast(int, rt.Refcount(po) == before))"]),
 
-    # --- funcval producer (a NON-capturing func reading a global — a capturing
-    #     closure returning a multi-return is the separate LLVM bug filed in
-    #     claude-todo CRITICAL). ---
+    # --- funcval producer (a NON-capturing func reading a global; a capturing
+    #     closure returning a multi-return is covered by
+    #     regressions/capturing-closure-multi-return). ---
     ("funcval/managed-ptr",
      "type Counter struct {\n\tn int\n}\n\n"
      "var gc @Counter = make(Counter)\n\n"

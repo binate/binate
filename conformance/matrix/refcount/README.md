@@ -1,8 +1,8 @@
 # Refcount matrix
 
-The **managed-value refcount discipline** (Class 1) member of the conformance
+The **managed-value refcount discipline** member of the conformance
 matrix family (`../README.md`) — a systematic, **coordinate-addressed** body of
-tests for the code-red's "every cell must be exercised" thesis. Each test's
+tests in which every cell of the axes' product is exercised. Each test's
 identity is its *coordinates*,
 encoded as its path, not an allocated number:
 
@@ -11,8 +11,8 @@ encoded as its path, not an allocated number:
 Because the path *is* the coordinates, names are **stable and collision-free**:
 two workers adding different cells touch different paths by construction, and
 nothing ever needs renumbering (so no references in code/plans/todos break).
-A generator will eventually fill the product from one axes table; regeneration
-is idempotent (same coordinates → same path), so adding a dimension value
+The generator (`conformance/gen-matrix.py`) fills the product from one axes
+table; regeneration is idempotent (same coordinates → same path), so adding a dimension value
 creates new paths and touches nothing existing. The hand-authored cells here
 pin the pattern the generator reproduces.
 
@@ -101,16 +101,12 @@ pass in `builder-comp`, `-int`, `-int-int`, and `-comp-comp-comp`.
 
 ## Gotchas (pinned while authoring)
 
-- A **bare func literal in assignment position** (`existingVar = func(){…}`)
-  fails to resolve its managed/raw flavour from the LHS — use a typed drop
-  variable (as 587 does). Var-init (`var x @func() … = func(){…}`) is fine.
 - `rt.Refcount` works in `-int-int` for a **single-file** test that imports
-  `pkg/builtins/rt` directly; the `-int-int` xfails on 586/592 are the
-  cross-package loader issue (136/383), not `rt.Refcount` itself.
+  `pkg/builtins/rt` directly.
 
 ## `../regressions/`
 
-Hand-written bug repros (the §8 audit leads) live under
+Hand-written bug repros live under
 `conformance/regressions/<descriptive-name>.bn`, discovered by the same
 recursive runner pass — semantic names there beat allocated numbers for the
 same stability reason.

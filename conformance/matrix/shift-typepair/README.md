@@ -21,9 +21,9 @@ one value-type against all ten count-types.
 
 Each (value-type, count-type) pair asserts three things:
 
-- **PERMITTED** — the shift compiles for every count type. (It used to be
-  rejected when the operand types differed — `int64 << int` in 32-bit-int modes
-  — as "mismatched types"; see `claude-todo.md`.)
+- **PERMITTED** — the shift compiles for every count type, including when the
+  operand types differ (`int64 << int` in 32-bit-int modes), rather than being
+  rejected as "mismatched types".
 - **RESULT TYPE = the value's** — the result is bound to `var r <value-type>`
   with NO cast. A result widened to the (wider) count's type would be a
   narrowing assignment and fail to COMPILE, so a cell that compiles already
@@ -43,4 +43,4 @@ result-type + small value.
 All cells pass on `builder-comp`, `builder-comp-int`, and `builder-comp-comp`.
 The matrix is the coverage layer behind the point regression
 `regressions/shift-count-any-int-type` and the unit test
-`pkg/binate/types TestCheckShiftMixedCountType` (binate `fd3cb7ac`).
+`pkg/binate/check TestCheckShiftMixedCountType` (binate `fd3cb7ac`).

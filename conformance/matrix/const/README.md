@@ -1,8 +1,8 @@
 # const matrix
 
 The **compile-time constant materialization** member of the conformance matrix
-family (`../README.md`) — it realizes the named-constant invariant, distinct
-from the 8-class bug taxonomy. Coordinate-addressed:
+family (`../README.md`) — it realizes the named-constant invariant.
+Coordinate-addressed:
 
     conformance/matrix/const/<read-form>/<type>/<value>.bn   (+ .expected)
 
@@ -28,32 +28,28 @@ Each value is printed as its 16-bit little-endian lanes via
 `0..65535`, so the single `.expected` matches on both ILP32 (`int`=32-bit) and
 LP64 (`int`=64-bit). The masking is done at 64-bit width on purpose: extracting
 a lane with a sub-word reinterpret (`bit_cast(uint16, …)`) would leave dirty
-upper bits on native (the Class-5 sub-word gap) and misreport, conflating the
-two matrices.
+upper bits on a backend with a sub-word narrowing defect (the `scalar` matrix's
+subject) and misreport, conflating the two matrices.
 
 ## Current state
 
-51 cells pass on every backend. The failures cluster into four defects (xfailed;
-filed in `claude-todo.md`):
+No cell carries an `.xfail.<mode>` marker. Among what the cells pin:
 
-- **local-const → 0 (all types, all backends)** — a `const` inside a function
-  body materializes 0; the value is dropped. MAJOR. (`local-const/*`, 12 cells.)
-- **float32 not narrowed at `call-arg` / `field` / `return` (all backends)** —
-  an untyped float literal flowing into a `float32` slot at these positions is
-  not narrowed double→float32: `call-arg`/`field` produce a silent wrong value,
-  `return` emits invalid IR. CRITICAL — the var-init / named-const / const-group
-  forms narrow correctly, so it is a front-end coercion gap at these three
-  positions. (`{call-arg,field,return}/float32/*`, 9 cells.)
+- **local-const** — a `const` inside a function body must materialize its value,
+  not 0 (`local-const/*`).
+- **float32 narrowing at `call-arg` / `field` / `return`** — an untyped float
+  literal flowing into a `float32` slot at these positions must be narrowed
+  double→float32, as at var-init / named-const / const-group; un-narrowed,
+  `call-arg`/`field` read a silent wrong value and `return` emits invalid IR
+  (`{call-arg,field,return}/float32/*`).
 - **float32 const on VM/native** — `named-const` / `const-group` of a `float32`
-  load the `float64` bit pattern (LLVM's `fptrunc` is correct). DEFERRED
-  (539/844). (6 cells, xfailed VM + native only.)
-- **float64 38-digit tie on VM/native** — the integer float-literal converter
-  drops the round bit (LLVM's `strtod` is correct). DEFERRED (538/777). (6
-  cells, xfailed VM + native only.)
+  must load the `float32` bit pattern, not the `float64` one (also pinned by
+  conformance `539`).
+- **float64 38-digit tie** — the float-literal converter must keep the round bit
+  (`*/float64/tie`; also pinned by conformance `538`).
 
 ## Planned
 
 A **const-expr-folding** axis (a distinct class from single-value
-materialization): a probe already confirmed `const X float64 = 0.1 + 0.2` is
-routed through the integer const path → invalid IR (filed MAJOR). A future axis
-would cover binary/parenthesized const arithmetic across int and float.
+materialization) covering binary/parenthesized const arithmetic across int and
+float; today the point tests in `conformance/regressions/const-expr/` cover it.

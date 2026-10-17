@@ -1,6 +1,6 @@
 # addr-aggregate matrix
 
-The **16-byte address-aggregate (2-word) value handling** (Class 2) member of the
+The **16-byte address-aggregate (2-word) value handling** member of the
 conformance matrix family (`../README.md`). Coordinate-addressed:
 
     conformance/matrix/addr-aggregate/<kind>/<operation>.bn   (+ .expected)
@@ -35,17 +35,12 @@ binate `e337e413`) and the 2-word-slice-len-drop-through-vtable.
 
 ## Current state
 
-All 14 cells pass on LLVM (`comp`), the VM (`int`), and x64-native — i.e. the
-2-word-handling fixes that landed in P2 hold across the grid; this is regression
-coverage. **aa64-native is currently collateral-red** (every aa64-native program
-fails to link due to the self-hosting `BNC_NATIVE` miscompile — see
-`claude-todo.md`), not a defect in these cells; no per-cell xfail is added for
-it, consistent with the other matrices.
+No cell carries an `.xfail.<mode>` marker: the 2-word value handling holds across
+the grid, and the matrix is regression coverage for it.
 
 ## Note
 
 The `field` / `array-elem` cells store an already-**typed** value (bound to a
-`var` first), not a bare `func(){}` literal: a bare func literal in a
-composite-field / element-assignment position doesn't infer its `@func`/`*func`
-flavour from the target type — a separate, filed MINOR bug, distinct from the
-2-word survival this matrix tests.
+`var` first), not a bare `func(){}` literal, so they test 2-word survival alone
+rather than the inference of a function literal's `@func`/`*func` flavour from the
+target type.

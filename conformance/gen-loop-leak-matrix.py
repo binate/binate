@@ -11,8 +11,8 @@ it; the leak only shows up at scale.  This bit:
   - default-init managed aggregates (`var m @[]char`)         — OP_CONST_NIL
   - `var a [N]char = "..."` string→array copies               — OP_RODATA_ARRAY
   - box() of a scalar register                                — OP_BOX
-(see claude-todo.md and the codegen alloca-hoist pre-pass in
-pkg/binate/codegen/emit_debug.bn).
+(see the codegen alloca-hoist pre-pass, emitEntryAllocaDecls in
+pkg/binate/codegen/emit_alloca_hoist.bn).
 
 THE ASSERTION.  Each cell repeats a construct in a high-iteration loop and
 then prints `42`.  On a backend that leaks per iteration the stack overflows
@@ -127,7 +127,7 @@ import "pkg/builtins/testing"
 // Repeats `{name}` in a high-iteration loop, then prints 42.  A backend that
 // leaks native stack per iteration (an un-hoisted alloca in the loop body)
 // SIGSEGVs before the print; a correct backend / the VM prints 42.  See
-// ../../check-alloca-hoist.py and claude-todo.md.
+// ../../check-alloca-hoist.py.
 
 '''
 

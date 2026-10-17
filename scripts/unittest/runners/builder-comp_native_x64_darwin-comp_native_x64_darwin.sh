@@ -5,17 +5,15 @@
 # producing an x86-64 Mach-O test binary that runs under Rosetta on
 # Apple Silicon (natively on Intel).
 #
-# macOS sibling of the (not-yet-present) ELF unit runner; the point is
-# to exercise the amd64 native backend's test output end-to-end on a
-# stock Apple-Silicon dev machine.  The amd64 backend only lowers a
-# subset of ops today, so most packages fail to compile — that's the
-# measurable starting point, shrinking as op-coverage lands.
+# macOS sibling of the ELF unit runner (builder-comp_native_x64-comp_native_x64);
+# the point is to exercise the amd64 native backend's test output end-to-end
+# on a stock Apple-Silicon dev machine.
 #
 # Like the ELF conformance runner, this drives GEN1 (LLVM-built bnc)
 # rather than a pre-built native bnc: the native backend can't yet
 # self-compile a working bnc.  Local-only by design — not in any CI
-# modeset (see plan-backend-objformat-decoupling.md: x64+Mach-O is the
-# local dev axis; CI covers arch+format via native_aa64 + native_x64).
+# modeset (x64+Mach-O is the local dev axis; CI covers arch+format via
+# native_aa64 + native_x64).
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 
 # host_is_macos returns 0 (true) on a Darwin host.

@@ -23,8 +23,8 @@
 # NOTE (what this static check does NOT catch): a custom error type whose
 # Unwrap() returns an empty @errors.Error is the same defect (roots in no base)
 # but is not statically detectable here — that relies on review plus the
-# package's own errors.Is tests.  (That exact bug was fixed in strconv's numError
-# — see explorations/claude-todo-done.md.)
+# package's own errors.Is tests.  (strconv's numError is such a type: its
+# Unwrap() roots each parse failure in errors.BadData / errors.OutOfRange.)
 #
 # Sanctioned exceptions live in stdlib-error-rooting.whitelist, one
 # <repo-relative-file> per line.

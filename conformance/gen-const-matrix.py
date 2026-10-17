@@ -5,10 +5,10 @@ named-constant invariant).
 
 Assertion: a constant of a given type, appearing in a given syntactic position,
 materializes to the EXACT bit pattern of its type. The discriminating axis is
-the **read-form** (where the constant appears) — the front-end inserts the
-width-narrowing coercion at some positions (var-init, typed const decl) but not
-others (call-arg, composite-literal field, return), so an untyped float literal
-can reach a typed slot un-narrowed. Float values also stress decimal->binary
+the **read-form** (where the constant appears) — the front-end must insert the
+width-narrowing coercion at every position (var-init, typed const decl, call-arg,
+composite-literal field, return); a position it misses lets an untyped float
+literal reach a typed slot un-narrowed. Float values also stress decimal->binary
 rounding (float32 must round to float32, not a truncated float64); 64-bit values
 stress multi-lane materialization (movz/movk on aa64, imm64 on x64, splitInt64
 on ILP32).
@@ -95,9 +95,9 @@ def widen64(type_key, var):
     Everything is reinterpreted/widened to uint64 so the per-lane `& 0xFFFF`
     masks at 64-bit width — a real mask the native backends honor. Extracting a
     lane with a sub-word reinterpret (`bit_cast(uint16, ...)`) instead would
-    leave dirty upper bits in the register on native (the known sub-word
-    narrowing gap) and misreport a wrong lane — that would conflate Class 5
-    (scalar) with this constant-materialization (const) matrix.
+    leave dirty upper bits in the register on a backend with a sub-word
+    narrowing defect and misreport a wrong lane — that would conflate the scalar
+    matrix's subject with this constant-materialization (const) matrix.
     """
     kind, width = TYPES[type_key]
     if type_key == "float32":

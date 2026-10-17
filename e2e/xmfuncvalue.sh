@@ -325,7 +325,7 @@ out=$("$HOST_BIN" "$TMP/prog.bn" "$IFACES" "$IMPLS" 2>&1) || true
 check_eq "cross-mode-funcvalue-dispatch" "$out" "11022
 7"
 
-# Captured-@func refcount balance (Class 7): the trampoline round-trip for a
+# Captured-@func refcount balance: the trampoline round-trip for a
 # native call to a captured bytecode @func must not perturb the captured managed
 # value's refcount.  A stray RefDec per call would drop the final sample below 2
 # (and, at 5 calls, free the Box mid-run -> wrong 42 / crash); a stray RefInc

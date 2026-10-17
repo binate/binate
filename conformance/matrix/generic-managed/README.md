@@ -49,18 +49,18 @@ fixture mirrors `conformance/995`'s `gholder.bni`.
 
 ## Status / scope
 
-Landed (36 cells): the `balance` core over seven element kinds (managed-ptr,
+The 36 cells: the `balance` core over seven element kinds (managed-ptr,
 managed-slice, managed-struct, func-value, iface, **nested-generic** — a generic
 instantiation `@Box[int]` held inside the container — and **array-of-managed** — a
 bare `[2]@Counter` array held by value, which needs a generic-CALL array type arg
-`New[[2]@Counter]()`, unblocked by the array-typearg parser fix) × both sites; the
+`New[[2]@Counter]()`) × both sites; the
 `empty` never-populated-destroy op over named-wrapper / named-array × both sites;
 the `destroy-populated` scope-exit-destroy op (managed-ptr × both sites);
 the
 **method-value** operation (`method-value/scalar`, `method-value/call-result`,
 mirroring `146`/`167`/`168`); the **type-distinctness** compile-error `.error`
 pair cells (array-length `[3]`vs`[5]` per `1017`, func-signature
-`(int)uint`vs`(bool)uint` per `1016`); and two **second-wave dispatch** cells —
+`(int)uint`vs`(bool)uint` per `1016`); and two **generic-dispatch** cells —
 `param-impl/dispatch` (a parameterized-receiver impl `impl @Box[T] : Getter[T]`
 dispatched through a per-instantiation vtable, mirroring `447`) and
 `constraint/dispatch` (a generic function calling a method on its type param's
@@ -74,29 +74,25 @@ unbound `Box[int].Get` form, described below).  The `iface` balance element's `x
 cell uses `gh.At[@Numbered](h,0).num()` — an iface-method CALL on a generic-call
 result — so it regression-guards conformance/1027 (fixed in `dfbdf1dd`).
 
-The plan's third second-wave axis, a method EXPRESSION off a generic
-instantiation (`Box[int].Get`, the unbound form of the method value — receiver as
-Params[0]), was a compiler gap: the checker + IR-gen only recognized a method
-expression off a bare type name, not a generic instantiation. Now fixed — the func
-value binds the mangled instantiation method, the SAME symbol the bound `bp.Get`
-form and a direct call use. The `method-expression/*` cells cover ptr / managed /
+A method EXPRESSION off a generic instantiation (`Box[int].Get`, the unbound form
+of the method value — receiver as Params[0]) is recognized by the checker + IR-gen
+just like one off a bare type name: the func value binds the mangled instantiation
+method, the SAME symbol the bound `bp.Get` form and a direct call use. The
+`method-expression/*` cells cover ptr / managed /
 value receiver (`scalar` / `managed` / `value-recv`), the method-expr as the
 **sole/first mention** of the instantiation (`sole-mention`, driving struct +
 method emission from the expression), an **array type arg** (`array-arg`,
 `Box[[4]int].Tag`), and the **parenthesized** form (`paren`, `(Box[int]).Get`). The
 cross-package form (`mp.Box[int].Get`) is covered by `conformance/1211`.
 
-`array-typearg/scalar` is a passing regression cell for a parser fix: a
-generic-function CALL with an array type argument (`zero[[2]int]()`) used to be
-rejected (`expected {, got ]`) — array types were routed to the type parser only
-in a TYPE position (`@Box[[2]int]`, `make(Box[[2]int])`, cf. `distinct/array-len`),
-not in a call's bracket type-arg list. `startsBracketTypeArg` now routes a leading
-`[` to the type parser, so `New[[N]@T]()` (the shape an array-of-managed element
-needs) parses. This cell guards that.
+`array-typearg/scalar` pins a generic-function CALL with an array type argument
+(`zero[[2]int]()`): `startsBracketTypeArg` routes a leading `[` in a call's bracket
+type-arg list to the type parser, as in a TYPE position (`@Box[[2]int]`,
+`make(Box[[2]int])`, cf. `distinct/array-len`), so `New[[N]@T]()` (the shape an
+array-of-managed element needs) parses rather than failing with `expected {, got ]`.
 
-The plan's operation axis is complete. `destroy-populated` and the cross-package
-dispatch variants have landed; a separate `copy` op is subsumed by the `balance`
-cells — `Put[T](h, x)` field-wise-copies the element into the slot (the element
+There is no separate `copy` op: the `balance` cells subsume it —
+`Put[T](h, x)` field-wise-copies the element into the slot (the element
 copy-helper) and asserts the retained ref (`== before+1`), so a dedicated copy cell
 would only duplicate that path (this design uses `@Holder`, so there is no
 value-container deep-copy to exercise separately).

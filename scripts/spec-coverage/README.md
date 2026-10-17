@@ -2,8 +2,7 @@
 
 Cross-references the language specification's declared **rule-IDs** against the
 `.rules` sidecars of the **spec conformance tests** (`conformance/spec/`), and
-reports how much of the normative, testable surface is covered. Background and
-phasing: `explorations/plan-spec-tests.md`.
+reports how much of the normative, testable surface is covered.
 
 ## Running
 
@@ -24,8 +23,8 @@ It prints per-chapter and overall coverage %, then the three findings:
 | **DANGLING** | a `.rules` sidecar cites a rule-ID the spec doesn't declare (typo / rename) | yes |
 | **UNTAGGED** | a spec test with no `.rules` sidecar | yes |
 
-This is the **static** half (it does not run the tests). Per-mode pass/xfail
-status and the full Annex-C JSON are a later `--run` increment.
+This is the **static** half: it does not run the tests, so it reports no
+per-mode pass/xfail status (nor the full Annex-C JSON, which needs that status).
 
 ## The rule-ID inventory
 

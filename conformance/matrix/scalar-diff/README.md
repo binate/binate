@@ -14,7 +14,7 @@ A property-based **differential** harness for scalar **shifts** and
 ## Why this exists alongside `../scalar`
 
 `../scalar` tests a few hand-picked values per op, so it only catches a bug
-*at a value someone thought to write* — the shift-by-≥-width CRITICAL hid for
+*at a value someone thought to write* — a shift-by-≥-width bug hid for
 exactly that reason (the matrix only used in-range counts). This harness emits
 a **fixed, seeded value set** per coordinate — every type/op boundary plus a
 deterministic pseudo-random sample — so a whole region of the input space is
@@ -40,15 +40,14 @@ only a `0`/`1` is emitted. So a 64-bit result never truncates through
 hits the native sub-word print path — the cell's output is target-stable.
 Every `.expected` is therefore a column of `1`s; a `0` on line N means tuple N
 (commented in the `.bn`) diverged from the spec. (The trade-off is that a
-failure shows *which* tuple, not the wrong value; flavor B — a self-checking
-corpus that prints `got…want…` — is a planned future variant for the
-highest-volume ops. The comparison families (`cmp`/`fcmp`) instead print the
-comparison result directly, so a failure already shows got-vs-want.)
+failure shows *which* tuple, not the wrong value. The comparison families
+(`cmp`/`fcmp`) instead print the comparison result directly, so a failure
+already shows got-vs-want.)
 
 ## What each family asserts
 
 - **shl / shr** — `x OP c` for operand and count `var`s of the same type
-  (Binate ties the shift count's type to the operand's). Counts span
+  (`../shift-typepair` crosses the count's type). Counts span
   in-range, `0`, `width-1`, `width`, `width+1`, `width+2`, `2·width`,
   `2·width+3`, and a seeded-random value, crossing the overshift edge
   (spec: `<<` / logical `>>` → 0, arithmetic `>>` → sign-fill). `shr` is
@@ -104,39 +103,21 @@ decision or per-target expecteds would be needed to cover them):
 
 ## Current state
 
-131 cells / 5511 tuples. The `all` modeset run found backend defects across
-both build-outs; cell↔mode failures are pinned with `.xfail.<mode>` markers
-(verified non-stale via `run.sh --check-xpass`). One defect it surfaced was a
-*reference*-backend bug, since fixed:
+131 cells / 5623 tuples; no cell carries an `.xfail.<mode>` marker. Among the
+defects the cells pin:
 
-- **`~` (bitwise complement) — FIXED** (binate `ee7c05ac`): IR-gen hardcoded the
-  `~` result type to `int`, so `~x` on a sub-word int emitted invalid IR
-  (`xor i64 %i8`) and `(~v) >> k` on `uint64` did an arithmetic shift. The
-  `bitwise/not` cells caught it; all are green on LLVM now. See `claude-todo.md`
-  (`bitnot-result-type`).
+- **`~` result type** — IR-gen types `~x` at its operand's type (binate
+  `ee7c05ac`); typed as `int`, `~x` on a sub-word int emits invalid IR (`xor i64
+  %i8`) and `(~v) >> k` on `uint64` shifts arithmetically. The `bitwise/not`
+  cells catch this on the *reference* (LLVM) backend too.
+- **`int → float32`** — every `cast(float32, <int>)` must produce a real float32
+  value (the float-conversion cells), separately from `float64`, `float32→int`
+  truncation, `float32` literals and float32 compare (`fcmp/32`, binate
+  `fc11d862`).
+- **sub-word results** — a sub-word op's result must be narrowed / sign-extended
+  to its type width: sub-word `shl`/`shr` and `int-cast`, signed sub-word
+  conversions, signed `arith/{add,sub,mul}/8`, `bitwise/{and,or,xor}/{8,16}`,
+  `cmp/{8,16,32}`, and `bitwise/not/{8,16,32}/unsigned` (a 64-bit complement
+  ignores the operand width).
 
-- **LLVM** (`builder-comp`, `-comp-comp`, `-comp-comp-comp`): all 123 green —
-  the reference.
-- **Bytecode VM** (`builder-comp-int`, `-int-int`, `-comp-comp-int`): 20 cells
-  xfailed each. v1: the 17 float-conversion cells — **`int → float32` is
-  broken** (every `cast(float32, <int>)` diverges; `float64`, `float32→int`
-  truncation, and `float32` literals work). v2: `bitwise/not/{8,16,32}/unsigned`
-  (the sub-word dirty-bit gap reaching `~` — see `sub-word-not-narrowed`). See
-  `vm-int-to-float32`. (`fcmp/32` is *not* xfailed: float32 compare was fixed by
-  binate `fc11d862`. The remaining `float32` *conversion* cells stay xfailed —
-  that gap is separate from compare/arithmetic.)
-- **native-aa64** (`builder-comp_native_aa64-…`): 32 cells xfailed. v1: the
-  sub-word `shl`/`shr` 8/16/32 *signed*, all `int-cast`, signed sub-word
-  conversions. v2: sub-word *signed* `arith/{add,sub,mul}/8`,
-  `bitwise/{and,or,xor}/{8,16}`, `cmp/{8,16,32}`; `bitwise/not/{8,16,32}/
-  unsigned` (native's 64-bit `Mvn` ignores the operand width). A sub-word op's
-  result is not narrowed / sign-extended to its type width. See
-  `claude-todo.md` (`aa64-subword`). (`fcmp/32` fixed by `fc11d862`.)
-- **native-x64**: not evaluable on the current host — the x86_64 C runtime
-  headers (`stdio.h`) are absent, so *every* cell `COMPILE_ERROR`s uniformly
-  (an environment limitation, not a backend result). No x64 xfails are placed
-  (that would mask real x64 bugs in a properly-provisioned CI); re-evaluate on
-  an x64 host — the aa64 sub-word defects likely have x64 analogs.
-- **arm32** (`-linux`, `-baremetal`): not evaluated this run (no `qemu-arm` /
-  `qemu-system-arm`). Both use the LLVM codegen, so the `~` fix applies; the
-  64-bit-width cells exercise 64-on-32 lib calls and want a qemu-equipped host.
+On the arm32 modes the 64-bit-width cells exercise 64-on-32 library calls.

@@ -8,7 +8,7 @@ wrong, all asserting the target-independent correct result:
   - arithmetic (add/sub/mul): the op's true result OVERFLOWS the width and is
     consumed DIRECTLY by a width-sensitive right shift (no intermediate sized
     var to re-narrow). A backend that leaves dirty upper bits in the host
-    register (the VM / natives) diverges; LLVM is correct. The 64-bit
+    register diverges. The 64-bit
     cells are a baseline (a uint64 IS the host word, so no narrowing needed).
   - div/rem: signed (sdiv/srem) vs unsigned (udiv/urem) dispatch on a value
     with the high bit set. (A regression net for a previously-fixed VM bug.)
@@ -140,11 +140,11 @@ def float_to_int_cell(width):
 
 def shift_cell(op, width, sign):
     # Shift by a count >= the operand width. Per the spec (Go semantics):
-    # `<<` / logical `>>` shift away to 0; arithmetic `>>` sign-fills. The bug
-    # masks the count mod width, so count == width masks to 0 (identity): the
-    # `1 << 64 == 1` / `full >> 64 == full` symptom. The count is a runtime
-    # `var` (not a literal) so this exercises the backend shift, not the
-    # const-fold path. CRITICAL — see claude-todo.md (shift-by->=-width).
+    # `<<` / logical `>>` shift away to 0; arithmetic `>>` sign-fills. A backend
+    # that masks the count mod width turns count == width into a shift by 0
+    # (identity): the `1 << 64 == 1` / `full >> 64 == full` symptom. The count is
+    # a runtime `var` (not a literal) so this exercises the backend shift, not
+    # the const-fold path.
     t = typ(width, sign)
     m = 1 << width
     count = width                       # canonical overshift (masks to 0)
@@ -156,7 +156,7 @@ def shift_cell(op, width, sign):
         x, expected, sym = -(m >> 1), -1, ">>"  # arithmetic >>: min >> width -> -1
     body = [
         f"var x {t} = {x}",
-        f"var c {t} = {count}",   # Binate ties the shift count's type to the operand's
+        f"var c {t} = {count}",   # the count is typed like the operand
         f"testing.Println(cast(int, x {sym} c))",
     ]
     return body, [expected], [expected]

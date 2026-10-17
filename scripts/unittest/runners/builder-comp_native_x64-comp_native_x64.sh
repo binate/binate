@@ -5,8 +5,7 @@
 # through pkg/binate/native/x64.EmitObject (a full SysV-AMD64 / ELF backend),
 # then runs the produced test binary (natively on an x86_64 host, else under
 # qemu-x86_64).  ELF sibling of the local-only native_x64_darwin (Mach-O);
-# with native_aa64 this is the CI arch+format unit coverage
-# (plan-backend-objformat-decoupling.md).
+# with native_aa64 this is the CI arch+format unit coverage.
 #
 # Like the conformance native_x64 runner, this drives GEN1 (the LLVM-built
 # bnc) per package rather than a bnc pre-built with the native backend.

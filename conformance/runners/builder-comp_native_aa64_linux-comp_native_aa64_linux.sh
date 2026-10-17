@@ -8,14 +8,14 @@
 #
 # This is the AArch64/Linux/ELF sibling of
 # builder-comp_native_aa64-comp_native_aa64 (which is AArch64/macOS/Mach-O), and
-# the FIRST mode to exercise the aarch64 native backend's ELF output end-to-end:
-# the aarch64 ELF data + GOT relocations (R_AARCH64_ADD_ABS_LO12_NC /
-# LDST64_ABS_LO12_NC / ADR_GOT_PAGE / LD64_GOT_LO12_NC, landed `9e866a43`) were
-# until now only clang-cross-verified, never link+run-verified.
+# the mode that exercises the aarch64 native backend's ELF output end-to-end: it
+# link+run-verifies the aarch64 ELF data + GOT relocations
+# (R_AARCH64_ADD_ABS_LO12_NC / LDST64_ABS_LO12_NC / ADR_GOT_PAGE /
+# LD64_GOT_LO12_NC), which are otherwise only clang-cross-verified.
 #
-# EXPERIMENTAL / red-signal: the aarch64-linux native path has never been run,
-# so failures are expected until it is built out (this mode is what surfaces
-# them + drives the xfail set / fixes).  Marked experimental in
+# EXPERIMENTAL / red-signal: failures are expected while the aarch64-linux
+# native path is built out (this mode surfaces them and drives the xfail set /
+# fixes).  Marked experimental in
 # .github/workflows/conformance-tests.yml (continue-on-error), NOT in
 # scripts/modesets/all.
 #

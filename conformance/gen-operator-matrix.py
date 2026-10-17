@@ -94,8 +94,8 @@ def cells():
 
 
 def compound_cells():
-    """Compound-assign × lvalue-form: does a guard/fix on the `ident` lvalue
-    (e.g. the overshift guard, `fa265629`) reach the field/index lvalue forms?
+    """Compound-assign × lvalue-form: does a guard on the `ident` lvalue
+    (e.g. the overshift guard) reach the field/index lvalue forms?
     The overshift cells (`x <<= 40` etc.) are the path-parity-sensitive ones; the
     `add` cells are controls that the lvalue forms work for compound-assign."""
     lvals = [
@@ -131,9 +131,10 @@ def _relop(name, a, b):
 def binary_rel_cells():
     """Relational op × operand-POSITION × signed width. The untyped-int literal
     on the LEFT of a signed operand must use a SIGNED comparison (`5 < x` for
-    `x = -1` is false); the bug `b54c9fdf` fixed made it unsigned. The lit-left
-    cells guard that fix; lit-right is the control. Signed operands only (the
-    signedness is what the literal-position bug turns on)."""
+    `x = -1` is false); a lowering that keeps the literal's untyped (unsigned)
+    type makes it unsigned. The lit-left cells guard that; lit-right is the
+    control. Signed operands only (the signedness is what the literal position
+    turns on)."""
     LIT = 5
     X = -1
     relops = [("lt", "<"), ("gt", ">"), ("le", "<="), ("ge", ">=")]
@@ -167,7 +168,7 @@ _IFACE_EQ = ("interface G {\n\tget() int\n}\n\n"
 
 # (name, helpers, decl-a, decl-b, expected error substring). These types are
 # NEVER comparable with `==`/`!=`; the cells regression-guard the reject.  A
-# plain struct / array of comparable fields IS now comparable (lowered
+# plain struct / array of comparable fields IS comparable (lowered
 # field/element-wise — see conformance/spec/13-expressions/015,016 and
 # 07-types/044), so the aggregate reject cells use a struct / array that
 # transitively CONTAINS a non-comparable (slice) field.

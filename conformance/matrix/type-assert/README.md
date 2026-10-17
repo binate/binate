@@ -98,7 +98,7 @@ everywhere else. This matrix crosses the axes the spec pins.
 
 ## Status / scope
 
-Landed (27 cells): the `iface` grid (raw/mgd × concrete/iface/ancestor, ok +
+27 cells: the `iface` grid (raw/mgd × concrete/iface/ancestor, ok +
 abort — every `ok` cell packs HIT + wrong-type-MISS + unset-MISS) plus a
 value-struct recovery from a typed `@I`, `any` value recovery (scalar from both
 box kinds + a slice-from-raw balance cell + a generic-instantiation value target),

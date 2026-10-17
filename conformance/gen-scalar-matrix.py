@@ -11,7 +11,7 @@ wrong, all asserting the target-independent correct result:
     register diverges. The 64-bit
     cells are a baseline (a uint64 IS the host word, so no narrowing needed).
   - div/rem: signed (sdiv/srem) vs unsigned (udiv/urem) dispatch on a value
-    with the high bit set. (A regression net for a previously-fixed VM bug.)
+    with the high bit set. (A regression net for the VM's signedness dispatch.)
   - int-to-float: an unsigned int with the top bit set converts to a large
     POSITIVE float; a backend that uses a SIGNED conversion reads it as
     negative. Only width 64 triggers it on a 64-bit host (a uint32 is

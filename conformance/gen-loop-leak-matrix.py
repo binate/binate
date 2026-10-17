@@ -68,8 +68,8 @@ CONSTRUCTS = [
      ["var p *int", "var q *int", "p, q = rawPair(&gx, &gy)",
       "sink(*p + *q)"], 840000),                          # 16 B/iter
     # --- controls: a default-init plain struct / array lowers via
-    #     OP_ALLOC, which the entry-block alloca has always hoisted; these
-    #     guard against a regression there (they never leaked). ---
+    #     OP_ALLOC, which the entry-block alloca always hoists; these
+    #     guard that path against a leak. ---
     ("alloc-bigstruct", "",
      ["var s Big", "sink(s.data[0])"], 6500),             # 2 KB OP_ALLOC
     ("alloc-bigarray", "",

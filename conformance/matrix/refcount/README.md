@@ -70,7 +70,7 @@ is meaningless); invalid cells are simply absent — absence *is* the documentat
 
 Each cell constructs a **mortal** managed value — `make` / `make_slice` / a
 capturing closure, **never an immortal string literal** (whose refcount never
-moves, which is exactly the coincidence that hid the original bugs) — flows it
+moves, which would hide a missing or extra RefInc/RefDec) — flows it
 through the cell's `(form, shape, type)` operation, and asserts via
 `rt.Refcount` that the refcount rises by exactly one per live alias and returns
 to baseline when the alias is dropped. The `.expected` is the printed sequence
@@ -80,7 +80,7 @@ Per-type refcount observation (the idiom each cell uses):
 
 - `managed-ptr` — `rt.Refcount(bit_cast(*uint8, theValue))` directly.
 - `managed-slice` — `rt.Refcount(bit_cast(*uint8, p[2]))` where
-  `p = bit_cast(*int, &theSlice)` (word 2 of the 3-word header is the backing
+  `p = bit_cast(*int, &theSlice)` (word 2 of the 4-word managed-slice is the backing
   refptr).
 - `func-value` — watch a **captured** tracer `@Counter`: the closure record
   holds one ref to it, so copying the `@func` (RefInc-ing the record) keeps the

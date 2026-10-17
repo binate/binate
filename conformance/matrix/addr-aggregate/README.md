@@ -29,9 +29,10 @@ value (call the func / call the iface method) after it crosses the boundary. A
 dropped or swapped word faults (nil-vtable dispatch) or returns a wrong value.
 Every cell expects `42`.
 
-This systematizes the neighborhood that produced real CRITICALs — the VM
-func-value-returned-then-passed nil-vtable (`return-arg`/`func-value`, fixed by
-binate `e337e413`) and the 2-word-slice-len-drop-through-vtable.
+This systematizes a neighborhood with critical failure modes — a VM func value
+that is returned and then passed arriving with a nil vtable
+(`return-arg`/`func-value`), and a 2-word slice losing its length through a
+vtable.
 
 ## Current state
 

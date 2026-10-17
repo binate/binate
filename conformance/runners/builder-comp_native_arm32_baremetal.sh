@@ -57,9 +57,9 @@ runner_setup() {
 }
 
 # Compose the host-specific bnc args: macOS needs `-fuse-ld=lld` (Apple's `ld`
-# is Mach-O only) to link the ELF cross-object.  The AEABI runtime helpers that
-# once came from libgcc.a via `--link-after-objs` are now provided by
-# runtime/baremetal_arm32/aeabi_{int,float}.s, so no libgcc pass is needed.
+# is Mach-O only) to link the ELF cross-object.  The AEABI runtime helpers are
+# provided by runtime/baremetal_arm32/aeabi_{int,float}.s, so no libgcc pass
+# (`--link-after-objs`) is needed.
 _baremetal_bnc_extra_args() {
     set --
     if [ -n "$BAREMETAL_LD_FLAGS" ]; then

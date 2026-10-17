@@ -3,13 +3,13 @@
 MANAGED multi-return component produced through an INDIRECT call (the
 indirect-producer axis the refcount matrix never crossed).
 
-The result-side dispatch value/packing was fixed (the dispatch result-shape fix,
-`6c39d460`); this matrix asks the *refcount* question its value-only sibling
-(`matrix/abi`) can't see: when an interface-method dispatch returns a managed
-component, does the component arrive with exactly one added ref (Axiom-3) and get
-released when the destructured alias drops — no leak, no use-after-free — on every
-backend? (A compile-only or VM-only check would miss a native refcount divergence,
-exactly as the abi result-side sweep found for value/packing.)
+The value-only sibling (`matrix/abi`) covers the result-side dispatch
+value/packing; this matrix asks the *refcount* question that one can't see: when
+an interface-method dispatch returns a managed component, does the component
+arrive with exactly one added ref (Axiom-3) and get released when the destructured
+alias drops — no leak, no use-after-free — on every backend? (A compile-only or
+VM-only check would miss a native refcount divergence, just as it would a
+value/packing one.)
 
 Each cell holds a managed value alive through a surviving alias (so its refcount
 observable stays valid), captures the refcount BEFORE the dispatch, destructures

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Generate conformance/matrix/generic-managed cells — link+run and refcount
 balance for a generic CONTAINER holding a MANAGED element, across the two axes
-that hid the recent bug cluster:
+where such a container is most likely to go wrong:
 
   * SITE — in-package vs cross-package.  In-package coincidentally aligns the
-    mangled call/def prefixes; cross-package diverges (8d9e7577's dtor-mangling
-    mismatch, c14dd95e/aba92526's named-wrapper helper emission).
+    mangled call/def prefixes; cross-package diverges (a dtor-mangling mismatch,
+    or a missing named-wrapper helper, shows up only there).
   * ELEMENT KIND — managed-ptr @Counter, managed-slice @[]int, named-distinct
     wrapper `type Buf @[]@Box`, named array `type NArr [3]@Box`, …
 
@@ -16,7 +16,7 @@ Two invariants, two cell shapes:
     no leak, no UAF, on every backend.  Output column [1, <value>, 1].
   * LINK+RUN cells (named wrapper / array element): construct an EMPTY / never-
     populated Holder and let it drop at scope end — the element dtor/copy helper
-    must be EMITTED (the empty case is exactly what hid c14dd95e/aba92526).
+    must be EMITTED (the empty case is exactly where a missing helper hides).
     Output the element count (0).
 
 Cross-package cells put the body-included generic Holder in a per-cell
@@ -114,9 +114,8 @@ def iface(pfx):
     # Observe the UNDERLYING @Counter box (bit_cast the managed ptr) — holding the
     # iface value in the container RefIncs that box (mirrors dispatch-refcount's
     # iface cell).  The xpkg `use` (`gh.At[@Numbered](h,0).num()`) is an iface-method
-    # CALL on a generic-call RESULT — the exact shape of the bug this element first
-    # surfaced (conformance/1027; fixed in `66666980`'s sibling `dfbdf1dd`), so this
-    # cell now regression-guards it.
+    # CALL on a generic-call RESULT — the shape conformance/1027 pins, so this cell
+    # also guards it.
     return dict(
         decls=("type Counter struct {\n\tn int\n}\n\n"
                "func (c *Counter) num() int {\n\treturn c.n\n}\n\n"
@@ -148,7 +147,7 @@ def array_of_managed(pfx):
     # destroy releases them.  Observe element 0's box: before storing it is held by
     # `c0` + `src[0]` (=before), Put adds the container's copy (before+1), the
     # container drop releases it (before).  Needs a generic-CALL array type arg
-    # (`New[[2]@Counter]()`), the shape the array-typearg parser fix unblocked.
+    # (`New[[2]@Counter]()`), which relies on the parser's array-typearg routing.
     return dict(
         decls="type Counter struct {\n\tn int\n}",
         t="[2]@Counter",
@@ -166,12 +165,12 @@ BALANCE_KINDS = {"managed-ptr": managed_ptr, "managed-slice": managed_slice,
 
 
 def named_wrapper(pfx):
-    # element is a named-distinct managed-slice wrapper (the c14dd95e shape).
+    # element is a named-distinct managed-slice wrapper.
     return dict(decls="type Box struct {\n\tv int\n}\n\ntype Buf @[]@Box", t="Buf")
 
 
 def named_array(pfx):
-    # element is a named array of managed pointers (the aba92526 arm-ii shape).
+    # element is a named array of managed pointers.
     return dict(decls="type Box struct {\n\tv int\n}\n\ntype NArr [3]@Box", t="NArr")
 
 
@@ -240,7 +239,7 @@ import "pkg/builtins/rt"
 '''
 
 BAL_INV = "A managed element held in a generic container gains exactly one ref and is released when the container drops (== before+1, then == before) — no leak, no UAF."
-LR_INV = "A cross/in-package generic container over a named-wrapper/array element must EMIT the element dtor helper even when EMPTY (the c14dd95e/aba92526 trigger); links + runs, Count == 0."
+LR_INV = "A cross/in-package generic container over a named-wrapper/array element must EMIT the element dtor helper even when EMPTY (where a missing helper hides); links + runs, Count == 0."
 DP_INV = "A POPULATED generic container dropped at a helper's SCOPE EXIT releases its managed element (the Holder dtor RefDec's it) — a distinct cleanup trigger from the balance op's reassignment-destroy; after the helper returns the element refcount is back to baseline (no scope-exit-destroy leak), on every backend and both sites."
 
 
@@ -255,7 +254,7 @@ MV_INV = "A method VALUE taken off a generic instantiation (or a generic-call re
 DISTINCT_INV = "Two generic instantiations differing ONLY within a structured type arg (array LENGTH, func SIGNATURE) are DISTINCT types; assigning one to the other is a compile error (42b3bc83)."
 PI_INV = "A parameterized-receiver impl (`impl @Box[T] : Getter[T]`) lets a concrete `@Box[int]` box into a `@Getter[int]` interface value and dispatch through the per-instantiation vtable (gen.impl.generic-recv; mirrors 447)."
 ME_INV = "A method EXPRESSION off a generic instantiation (`Box[int].Get`, receiver as Params[0] — the unbound form of the method value) links + runs: the func value binds the mangled instantiation method, the SAME symbol the bound form (`bp.Get`) and direct calls use."
-ATC_INV = "A generic-function CALL with an ARRAY type argument (`zero[[2]int]()`) instantiates over `[2]int` and runs — the array type is routed to the type parser in a call's bracket type-arg list, exactly as in a TYPE position (`@Box[[2]int]`, `make(Box[[2]int])`, per `distinct/array-len`).  Regression-guards the `startsBracketTypeArg` array-type fix; also the shape an array-of-managed container element needs (`New[[N]@T]()`)."
+ATC_INV = "A generic-function CALL with an ARRAY type argument (`zero[[2]int]()`) instantiates over `[2]int` and runs — the array type is routed to the type parser in a call's bracket type-arg list, exactly as in a TYPE position (`@Box[[2]int]`, `make(Box[[2]int])`, per `distinct/array-len`).  Guards the `startsBracketTypeArg` array-type routing; also the shape an array-of-managed container element needs (`New[[N]@T]()`)."
 GC_INV = "A generic function body that calls a method on its type param's CONSTRAINT interface (`func f[T Show](x T) int { return x.show() }`) dispatches correctly in the instantiation (mirrors 434)."
 PI_XPKG_INV = "A parameterized-receiver impl (`impl @Box[T] : Getter[T]`) declared CROSS-PACKAGE (in pkg/gh): a `@gh.Box[int]` boxes into a `@gh.Getter[int]` and dispatches through the per-instantiation vtable monomorphized in the consumer — the mangling-divergent site (the in-package prefix-alignment does not hide a mismatch here)."
 GC_XPKG_INV = "A CROSS-PACKAGE generic-constraint dispatch: the constraint interface + generic function live in pkg/gh, the concrete type and its `impl *Widget : gh.Show` live in the consumer, and `gh.showIt[*Widget](p)` dispatches the method — exercising the impl-in-consumer / constraint-in-provider mangling the in-package cell cannot."
@@ -340,7 +339,7 @@ CELLS.append(dict(site="inpkg", rel="method-expression/direct-call", inv=ME_INV,
                         "testing.Println(Box[int].Get(&bx))"]))
 # generic-function CALL with an ARRAY type argument (`zero[[2]int]()`).  `zero` has
 # no value args, so the explicit type arg is required — no inference hides it.
-# Regression-guards the startsBracketTypeArg array-type fix.
+# Guards the startsBracketTypeArg array-type routing.
 CELLS.append(dict(site="inpkg", rel="array-typearg/scalar", inv=ATC_INV, holder=False, exp=[42],
                   decls="type Box[T any] struct {\n\tv T\n}\n\nfunc zero[T any]() @Box[T] {\n\treturn make(Box[T])\n}",
                   body=["var b @Box[[2]int] = zero[[2]int]()", "b.v[0] = 42",

@@ -19,8 +19,9 @@ not covered.
 
 `relop {<, >, <=, >=} × operand-position {lit-left, lit-right} × signed type
 {int, int8}`. The untyped-int literal on the LEFT of a signed operand must use a
-SIGNED comparison (`5 < x` for `x = -1` is `false`); `b54c9fdf` fixed a bug that
-made it unsigned. The `lit-left` cells guard that fix; `lit-right` is the control.
+SIGNED comparison (`5 < x` for `x = -1` is `false`); a lowering that keeps the
+literal's untyped (unsigned) type makes it unsigned. The `lit-left` cells guard
+that; `lit-right` is the control.
 **All green** on every backend — a regression net for the literal-position
 signedness.
 
@@ -45,7 +46,7 @@ confirm compound-assign works through field/index. A pure regression net.
 iface, struct, array}` must be REJECTED at the checker.  These are negative
 (`.error`) cells: green = the checker correctly rejects.  **All green** on every
 backend (front-end reject).  Slices, interface values, and function values are
-never comparable.  A plain struct / array of comparable fields IS now comparable
+never comparable.  A plain struct / array of comparable fields IS comparable
 (lowered field/element-wise — see `spec/13-expressions/015,016` and
 `spec/07-types/044`), so the `struct` / `array` cells use an aggregate that
 transitively CONTAINS a slice field (e.g. `struct { n int; v @[]int }`), which

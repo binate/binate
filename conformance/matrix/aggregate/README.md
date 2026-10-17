@@ -41,23 +41,23 @@ fails to compile).  This is the self-checking, target-stable style of the
 `scalar-diff` matrix — no dependence on float→int conversion or print
 formatting.
 
-## Defects this caught
+## What the cells catch
 
-Validated by reverting the fix (binate `65f79253`) and re-running: 13 cells
-fail on the pre-fix compiler, exactly the buggy forms —
+13 cells catch two failure modes —
 
 - **whole-aggregate `=` assignment silently dropped** — `assign/{array,struct}-
   {int,float}` and `deref/{array,struct}-{int,float}`: a composite-literal RHS
-  arrived as an `OP_ALLOC` pointer and the ident/deref store wrote the pointer,
-  not the contents.  The `global/{array,struct}-*` cells fail for the same
-  reason (the initializer routes through `__init`'s `x = expr`).
+  arrives as an `OP_ALLOC` pointer, and an ident/deref store that writes the
+  pointer, not the contents, drops the assignment.  The `global/{array,struct}-*`
+  cells catch the same failure (the initializer routes through `__init`'s
+  `x = expr`).
 - **global float `var` emitting invalid LLVM** (`@g = global double 0`) —
   `global/scalar-float`.
 
-Cells that were already correct pre-fix pass and stand as regression nets:
-`decl-init` (a different lowering path), `copy` (a var RHS is a loaded value,
-not an alloca), `field` (the selector store arm already loaded the aggregate),
-`param`, and `return`.
+The other cells take lowering paths those failures do not reach, and stand as
+regression nets: `decl-init` (a different lowering path), `copy` (a var RHS is a
+loaded value, not an alloca), `field` (the selector store arm loads the
+aggregate), `param`, and `return`.
 
 ## Current state
 

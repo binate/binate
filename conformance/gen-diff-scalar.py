@@ -575,8 +575,7 @@ def fcmp_cell(fw):
     """Float comparisons across all six relops over {0, -0, +-1, +-Inf, NaN}.
     Pins the IEEE ordered/unordered semantics (`==` and the
     relationals are ordered -> false on NaN; `!=` is unordered -> true on NaN;
-    `+0.0 == -0.0`). The `!=`-unordered rule was corrected 2026-06-06, so this
-    guards a fresh fix. Python's float comparisons are IEEE, so they give the
+    `+0.0 == -0.0`). Python's float comparisons are IEEE, so they give the
     spec truth directly."""
     f = "float%d" % fw
     ut = "uint%d" % fw

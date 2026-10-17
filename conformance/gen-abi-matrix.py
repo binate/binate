@@ -229,11 +229,10 @@ def funcval_multi_return_cell(tname, arity, form="short"):
 # cell threads N persistent @Node through an N-return call (direct free function
 # / interface-method dispatch / func-value call) in a `thread` helper that binds
 # the returned components (`:=` or `=`) and drops them at scope end; `main` then
-# asserts each Node's rc returned to its baseline (1).  A skipped copy-RefInc —
-# the multi-return-dispatch defect (fixed in f8916b88, previously covered only at
-# the IR-unit level) — leaves an rc wrong (leak) or double-frees (crash).  The
-# `=` (genMultiAssign) form on an iface/func-value RHS is the exact site the
-# defect hid.
+# asserts each Node's rc returned to its baseline (1).  A skipped copy-RefInc on
+# a multi-return dispatch (also covered at the IR-unit level) leaves an rc wrong
+# (leak) or double-frees (crash).  The `=` (genMultiAssign) form on an
+# iface/func-value RHS is the site where that copy-RefInc is easiest to miss.
 
 def managed_mr_cell(arity, form, dispatch):
     vals = [mr_value("int", i) for i in range(arity)]
@@ -391,8 +390,8 @@ def all_cells():
                    helper, body, vals)
             # `=` (assignment) binding form — exercises genMultiAssign (the
             # `:=` cells above exercise genShortVar).  For an iface/func-value
-            # RHS this is the path that mistyped non-int components before
-            # `f8916b88`; the same-IR property means each cell's per-mode
+            # RHS this path must type the non-int components correctly; the
+            # same-IR property means each cell's per-mode
             # pass/xfail matches its `:=` sibling (xfail markers mirrored).
             helper, body, vals = mr_cell(tname, arity, "assign")
             yield (os.path.join("multi-return-assign", tname, str(arity)),

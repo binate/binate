@@ -84,7 +84,7 @@ CELLS = [
     ("noinit/named-func", "type Fn @func() int", "var G Fn", ["0"], [0]),
     # named-distinct OVER a struct (TYP_NAMED → TYP_STRUCT — NOT a plain named
     # struct, which is TYP_STRUCT directly). The one cell exercising BOTH codegen
-    # global fixes at once: discoverStructFromType's TYP_NAMED arm must reach the
+    # global requirements at once: discoverStructFromType's TYP_NAMED arm must reach the
     # underlying struct through the global (no function references it) so
     # `%bn_S...` is declared, AND the static-zero dispatch must peel TYP_NAMED
     # so the `%bn_S...` slot gets `zeroinitializer`, not the invalid ` 0`.

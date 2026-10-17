@@ -29,38 +29,6 @@ BINATE_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # mode — only bnlint's style rules pause — and bnlint typechecks dependency
 # BODIES, so a skip must cover the whole transitive importer chain of the
 # offending source.  (No skips today.)
-#
-# Previously skipped, now linted (kept as changelog — do NOT re-add without cause):
-#   - pkg/stdx/fmt — pre2's bnlint rejected its scalar value-recovery (`case int:`
-#     etc.) with "value-recovery type assertion not yet supported"; value-recovery
-#     landed at `89b41531`, so it cleared at the bnc-0.0.12-pre3 CHECK_TOOLS bump —
-#     the first bundle carrying that fix.
-#   - pkg/stdx/containers/setfn — a multi-root checker-state-leak: within ONE bnlint
-#     process, linting a target AFTER a package whose dependency closure interns a
-#     `readonly uint8` slice element (e.g. pkg/binate/format, via pkg/std/strings'
-#     `Builder.Write(p *[]readonly uint8)`, or any `vec.Vec[@[]readonly char]` site)
-#     leaked that element type into the later target's typecheck, spuriously rejecting
-#     an `@[]char` (== @[]uint8) assignment ("cannot assign @[]readonly uint8 to
-#     @[]uint8").  The checker's generic-instantiation cache conflating
-#     `readonly`-differing type args was FIXED in `962450cf`; setfn cleared at the
-#     bnc-0.0.12-pre1 CHECK_TOOLS bump — the first bundle past that fix.  (The same
-#     leak, once main gained more `vec.Vec[@[]readonly char]` instantiations, also
-#     began mis-firing on pkg/binate/repl/loop_test.bn — a victim that shifts with the
-#     instantiation set across the Vec sweep, so the CHECK_TOOLS bump, not a per-package
-#     LINT_SKIP, was the right fix.)
-#   - the rest of the injectable-key-policy + Table container cone (pkg/stdx/{hash,
-#     cmp} + pkg/stdx/containers/{table,mapfn,hashmap,set}) — LEFT the skip at the
-#     bnc-0.0.11 bump, which carries the generic-instantiation-as-constraint-arg /
-#     genericImplSatisfies fixes (2f8969e8 / 6647c49f) that pre2 lacked, so pre2's
-#     false "type argument H does not satisfy Hasher[T]" / "K does not satisfy
-#     Hashable" at their blanket impls is gone;
-#   - the container-adoption methods-on-generics cone (pkg/stdx/containers/{vec,
-#     hashmap,set} + pkg/binate/format + cmd/bnfmt), pkg/binate/interp, and
-#     pkg/binate/asm/{arm32,elf,macho,parse,x64} — all cleared at the bnc-0.0.11pre2
-#     bump + the --tests wiring (methods-on-generics parsing, the generic
-#     name-collision fix, `undefined: __Package` resolution, and per-site
-#     `// bnlint:allow managed-to-raw-assign` directives; the 1 real asm UAF was fixed
-#     separately in 8a883450).
 LINT_SKIP=""
 
 # Discover targets:

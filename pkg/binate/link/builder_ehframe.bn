@@ -5,19 +5,25 @@ import "pkg/binate/buf"
 // The scripted layout's unwind tables: PlaceEhFrame places the inputs' `.eh_frame` with the
 // terminator that ends them, PlaceEhFrameHdr their search table (ehframe_hdr.bn), each between
 // the bracketing symbols a bare-metal unwinder (LLVM libunwind's) finds them by; Finish fills
-// the table and EmitElf gives it its PT_GNU_EH_FRAME header.
+// the table and EmitElf gives it its PT_GNU_EH_FRAME header.  PlaceArmExidx places arm32's
+// unwind index (arm_exidx.bn) between `__exidx_start` and `__exidx_end`, which EmitElf gives
+// PT_ARM_EXIDX.
 
-// builderEh is a layout's unwind-table placement: whether PlaceEhFrame and PlaceEhFrameHdr have
-// run, the section and the offsets in it of the records PlaceEhFrame placed (framesStart to
-// framesEnd), and where the search table lies (Sec -1 for none: no call, or no non-empty
-// `.eh_frame` among the inputs).
+// builderEh is a layout's unwind-table placement: whether PlaceEhFrame, PlaceEhFrameHdr and
+// PlaceArmExidx have run, the section and the offsets in it of the records PlaceEhFrame placed
+// (framesStart to framesEnd), the number of code sections the unwind index covers (exidxCode),
+// and where the search table and the index lie (Sec -1 for none: no call, or nothing among the
+// inputs to place).
 type builderEh struct {
 	placedFrames bool
 	placedHdr    bool
+	placedExidx  bool
+	exidxCode    int
 	framesSec    int
 	framesStart  uint64
 	framesEnd    uint64
-	hdr          ehHdrPlace
+	hdr          secSpan
+	exidx        secSpan
 }
 
 // PlaceEhFrame places in the open section every input's unwind tables (`*(.eh_frame)`, kept),
@@ -122,4 +128,149 @@ func (b @LayoutBuilder) fillBuilderEhHdr(lr @LayoutResult) @[]readonly char {
 	hdr.Symbols = make_slice(InputSymbol, 0)
 	hdr.Relocs = make_slice(InputReloc, 0)
 	return fillEhFrameHdr(b.inputs, lr, hdr, b.Machine)
+}
+
+// PlaceArmExidx places in the open section arm32's unwind index, between `__exidx_start` and
+// `__exidx_end`: walking the placed code in address order, each code section's `.ARM.exidx`
+// inputs, or a synthesized EXIDX_CANTUNWIND entry for one with none, then a CANTUNWIND sentinel
+// at the end of the code (as Layout merges it, arm_exidx.bn).  The index covers the code placed
+// so far: an index of code never placed is dropped with it, and Finish rejects code placed after
+// (unwindIndexError).  With no index among the inputs it places nothing.  It may run once.
+func (b @LayoutBuilder) PlaceArmExidx() {
+	if b.cur < 0 { b.fail("PlaceArmExidx: no open section"); return }
+	if b.eh.placedExidx { b.fail("PlaceArmExidx: the unwind index is already placed"); return }
+	b.eh.placedExidx = true
+	b.eh.exidxCode = b.placedCodeCount()
+	var any bool = false
+	for o := 0; o < len(b.inputs); o++ {
+		for s := 0; s < len(b.inputs[o].Sections); s++ {
+			var sec InputSection = b.inputs[o].Sections[s]
+			if !b.consumed[o][s] && isArmExidx(sec.Type, sec.Link) && b.isPlacedCode(o, sec.Link) {
+				any = true
+			}
+		}
+	}
+	b.AlignDot(4)
+	b.SymbolAtDot("__exidx_start")
+	if any {
+		b.ensureStarted()
+		if b.secs[b.cur].Align < 4 { b.secs[b.cur].Align = 4 }
+		var start uint64 = b.dot - b.secs[b.cur].VmaStart
+		b.placeExidxEntries()
+		b.eh.exidx.Sec = b.cur
+		b.eh.exidx.Off = start
+		b.eh.exidx.Size = cast(int, b.dot - b.secs[b.cur].VmaStart - start)
+	}
+	b.SymbolAtDot("__exidx_end")
+}
+
+// placeExidxEntries places, at dot, the index entries of every placed code section in address
+// order — its `.ARM.exidx` inputs, or a CANTUNWIND entry — then the sentinel (PlaceArmExidx).
+func (b @LayoutBuilder) placeExidxEntries() {
+	var n int = 0
+	for o := 0; o < len(b.inputs); o++ {
+		for s := 0; s < len(b.inputs[o].Sections); s++ { if b.isPlacedCode(o, s) { n = n + 1 } }
+	}
+	var objs @[]int = make_slice(int, n)
+	var secs @[]int = make_slice(int, n)
+	var addrs @[]uint64 = make_slice(uint64, n)
+	var k int = 0
+	var codeEnd uint64 = 0
+	for o := 0; o < len(b.inputs); o++ {
+		for s := 0; s < len(b.inputs[o].Sections); s++ {
+			if !b.isPlacedCode(o, s) { continue }
+			var sec InputSection = b.inputs[o].Sections[s]
+			var a uint64 = b.secs[sec.OutIndex].VmaStart + cast(uint64, sec.OutOffset)
+			// Insertion into address order: n is the count of code sections.
+			var j int = k
+			for j > 0 && addrs[j - 1] > a {
+				objs[j] = objs[j - 1]
+				secs[j] = secs[j - 1]
+				addrs[j] = addrs[j - 1]
+				j = j - 1
+			}
+			objs[j] = o
+			secs[j] = s
+			addrs[j] = a
+			k = k + 1
+			if a + cast(uint64, sec.Size) > codeEnd { codeEnd = a + cast(uint64, sec.Size) }
+		}
+	}
+	for i := 0; i < n; i++ {
+		var obj @InputObject = b.inputs[objs[i]]
+		var indexed bool = false
+		if obj.Sections[secs[i]].Size == 0 { continue }
+		for x := 0; x < len(obj.Sections); x++ {
+			if b.consumed[objs[i]][x] || !isArmExidx(obj.Sections[x].Type, obj.Sections[x].Link) ||
+					obj.Sections[x].Link != secs[i] {
+				continue
+			}
+			b.placeInput(objs[i], x)
+			indexed = true
+		}
+		if !indexed { b.emitCantUnwind(addrs[i]) }
+	}
+	b.emitCantUnwind(codeEnd)
+	b.secs[b.cur].Size = b.dot - b.secs[b.cur].VmaStart
+}
+
+// isPlacedCode reports whether section s of input o is code the layout has placed.
+func (b @LayoutBuilder) isPlacedCode(o int, s int) bool {
+	var sec InputSection = b.inputs[o].Sections[s]
+	return b.consumed[o][s] && sec.OutIndex >= 0 && (sec.Flags & SF_EXEC) != 0
+}
+
+// emitCantUnwind emits at dot (4-aligned) an EXIDX_CANTUNWIND entry for the code at target,
+// failing for code beyond a PREL31 offset's reach.
+func (b @LayoutBuilder) emitCantUnwind(target uint64) {
+	b.AlignDot(4)
+	var e @[]uint8 = make_slice(uint8, 8)
+	if !putCantUnwind(e, 0, target, b.dot) { b.fail(buf.Concat("PlaceArmExidx: ", exidxRangeError())) }
+	b.EmitData(e)
+}
+
+// unwindIndexError returns why the layout cannot finish for the unwind index, or "": with an
+// index among the inputs, code placed after PlaceArmExidx is not in it — a PC there would fall
+// into the entry of the code before it and be unwound with that code's opcodes.
+func (b @LayoutBuilder) unwindIndexError() @[]readonly char {
+	if !b.eh.placedExidx || b.placedCodeCount() == b.eh.exidxCode { return "" }
+	for o := 0; o < len(b.inputs); o++ {
+		for s := 0; s < len(b.inputs[o].Sections); s++ {
+			var sec InputSection = b.inputs[o].Sections[s]
+			if !isArmExidx(sec.Type, sec.Link) { continue }
+			return "code is placed after PlaceArmExidx, so the unwind index does not cover it (place "
+					"the index after all the code)"
+		}
+	}
+	return ""
+}
+
+// placedCodeCount returns the number of code sections the layout has placed.
+func (b @LayoutBuilder) placedCodeCount() int {
+	var n int = 0
+	for o := 0; o < len(b.inputs); o++ {
+		for s := 0; s < len(b.inputs[o].Sections); s++ { if b.isPlacedCode(o, s) { n = n + 1 } }
+	}
+	return n
+}
+
+// refusesArmExidx reports — failing the layout — whether section s of input o, which a Place
+// glob matched, is an arm32 unwind index: only PlaceArmExidx places one, sorted by its code
+// and completed, where a glob would take its entries as plain bytes.
+func (b @LayoutBuilder) refusesArmExidx(o int, s int) bool {
+	var sec InputSection = b.inputs[o].Sections[s]
+	if !isArmExidx(sec.Type, sec.Link) { return false }
+	b.fail(
+			buf.Concat(buf.Concat(buf.Concat(buf.Concat("Place: ", b.inputs[o].Path), ": "), sec.Name),
+					" is an arm32 unwind index (PlaceArmExidx places it, sorted and completed)"))
+	return true
+}
+
+// setExidxResult records in lr the unwind index PlaceArmExidx placed (Exidx, ExidxStart /
+// ExidxEnd), or none.
+func (b @LayoutBuilder) setExidxResult(lr @LayoutResult) {
+	lr.Exidx = b.eh.exidx.Sec
+	if lr.Exidx < 0 { return }
+	lr.ExidxStart = b.secs[lr.Exidx].VmaStart + b.eh.exidx.Off
+	lr.ExidxEnd = lr.ExidxStart + cast(uint64, b.eh.exidx.Size)
 }

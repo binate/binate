@@ -155,6 +155,83 @@ fi
 echo "PASS: the C constructor image links (.init_array placed between its bracketing symbols)"
 fi
 
+# --- the unwind-index image: linked whenever clang is available ---
+# exidx.c is built with its unwind tables (`.ARM.exidx`, each entry a PREL31 offset to its function
+# and its unwind data).  The driver places the index after the code (PlaceArmExidx); check() then
+# looks functions up in [__exidx_start, __exidx_end) as libgcc's __gnu_Unwind_Find_exidx does and
+# writes 'X' when the table is sorted, leaf's entry starts at leaf and carries unwind data, big's
+# (whose frame's opcodes do not fit an entry) points into `.ARM.extab`, which the driver places
+# too, emit_msg (asm, with no index) has an EXIDX_CANTUNWIND entry of its own, and a CANTUNWIND
+# sentinel ends the table — else a letter naming the failed check.  So the console must show
+# "XOK".  The stub defines the personality routines the entries name (libgcc's otherwise).
+if [ "$HAVE_CTOR" = 1 ]; then
+cat > "$TMP/exidx.c" <<'EOF'
+extern const unsigned int __exidx_start[], __exidx_end[];
+extern void emit_msg(void);
+static unsigned long fn(const unsigned int *e) { long v = (long)(e[0] << 1) >> 1; return (unsigned long)e + v; }
+static const unsigned int *find(unsigned long pc) {
+	int l = 0, h = (int)(__exidx_end - __exidx_start) / 2 - 1;
+	const unsigned int *best = 0;
+	while (l <= h) {
+		int m = (l + h) / 2;
+		const unsigned int *e = __exidx_start + 2 * m;
+		if (fn(e) <= pc) { best = e; l = m + 1; } else { h = m - 1; }
+	}
+	return best;
+}
+int leaf(int x) { return x + 1; }
+int big(int x) { volatile char buf[5000]; buf[x] = 1; return buf[x]; }
+void check(void) {
+	char r = 'X';
+	int n = (int)(__exidx_end - __exidx_start) / 2;
+	for (int i = 0; i + 1 < n; i++) {
+		if (fn(__exidx_start + 2 * i) > fn(__exidx_start + 2 * i + 2)) r = 's';
+	}
+	const unsigned int *e = find((unsigned long)leaf);
+	if (!e || fn(e) != (unsigned long)leaf || e[1] == 1) r = 'l';
+	e = find((unsigned long)big);
+	if (!e || fn(e) != (unsigned long)big || e[1] == 1 || (e[1] & 0x80000000u)) r = 'x';
+	else if (*(const unsigned int *)fn(e + 1) == 0) r = 'y';
+	e = find((unsigned long)emit_msg);
+	if (!e || fn(e) != (unsigned long)emit_msg || e[1] != 1) r = 'm';
+	if (n < 1 || __exidx_end[-1] != 1) r = 'z';
+	*(volatile unsigned int *)0x09000000 = r;
+}
+EOF
+cat > "$TMP/start_exidx.s" <<'EOF'
+.arch arm32
+.section text
+.global _start
+.global check
+.global emit_msg
+.global __aeabi_unwind_cpp_pr0
+.global __aeabi_unwind_cpp_pr1
+_start:
+	movw sp, #0x0000
+	movt sp, #0x4100
+	bl check
+	bl emit_msg
+exidx_halt:
+	b exidx_halt
+__aeabi_unwind_cpp_pr0:
+__aeabi_unwind_cpp_pr1:
+	bx lr
+EOF
+if ! clang -c -O0 -target armv7a-none-eabi -mfloat-abi=soft -ffreestanding -funwind-tables \
+        -o "$TMP/exidx.o" "$TMP/exidx.c" > "$TMP/exidx.cc.log" 2>&1; then
+    echo "FAIL: clang could not compile exidx.c" >&2; cat "$TMP/exidx.cc.log" >&2; exit 1
+fi
+if ! "$BNAS" -arch arm32 -o "$TMP/start_exidx.o" "$TMP/start_exidx.s" > "$TMP/start_exidx.asm.log" 2>&1; then
+    echo "FAIL: bnas could not assemble start_exidx.s" >&2; cat "$TMP/start_exidx.asm.log" >&2; exit 1
+fi
+if ! "$BNLD" -driver "$DRIVER" -I "$IFACE_DIRS" --impl-path "$IMPL_DIRS" -target arm32-baremetal \
+        -o "$TMP/exidx.elf" "$TMP/start_exidx.o" "$TMP/emit.o" "$TMP/exidx.o" > "$TMP/exidx.link.log" 2>&1; then
+    echo "FAIL: bnld -driver (baremetal-arm) could not link the unwind-index image" >&2
+    cat "$TMP/exidx.link.log" >&2; exit 1
+fi
+echo "PASS: the unwind-index image links (.ARM.exidx placed between __exidx_start and __exidx_end)"
+fi
+
 # --- boot it under qemu-system-arm, if available ---
 QEMU="${QEMU_SYSTEM_ARM:-$(command -v qemu-system-arm || true)}"
 if [ -z "$QEMU" ]; then
@@ -190,4 +267,11 @@ if ! printf '%s' "$OUT" | grep -qF "COK"; then
     exit 1
 fi
 echo "PASS: the C constructor ran from .init_array before emit_msg (printed COK)"
+OUT="$($TO "$QEMU" -M virt -cpu cortex-a15 -m 16M -nographic -no-reboot -kernel "$TMP/exidx.elf" 2>&1 || true)"
+if ! printf '%s' "$OUT" | grep -qF "XOK"; then
+    echo "FAIL: the unwind-index image did not print XOK (its table lookup failed)" >&2
+    printf '%s\n' "$OUT" | head -8 >&2
+    exit 1
+fi
+echo "PASS: the unwind index is sorted and covers the C and asm code (printed XOK)"
 exit 0

@@ -1,0 +1,210 @@
+package "pkg/binate/link"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/arm32"
+import "pkg/binate/asm/elf"
+import "pkg/binate/buf"
+import "pkg/builtins/testing"
+import "pkg/std/os"
+
+// arm32's unwind index (arm_exidx.bn): the reader keeping `.ARM.exidx` with the code section it
+// indexes, Layout merging the inputs in code order with synthesized CANTUNWIND entries and a
+// sentinel, and a static link's bracketing symbols and PT_ARM_EXIDX.  (mkSection / mkObjSecs are
+// in layout_test.bn, sectionHeaderNamed in parse_elf_keep_test.bn, phdr32Of in
+// ehframe_hdr_test.bn.)
+
+// exidxObj returns an arm32 object with a .text of textSize bytes and, when indexed, an 8-byte
+// `.ARM.exidx` for it whose unwind word is tag.
+func exidxObj(textSize int, indexed bool, tag int64) @InputObject {
+	var n int = 1
+	if indexed { n = 2 }
+	var secs @[]InputSection = make_slice(InputSection, n)
+	secs[0] = mkSection(".text", SF_READ | SF_EXEC, SHT_PROGBITS, make_slice(uint8, textSize),
+			cast(uint, textSize), 4)
+	if indexed {
+		var d @[]uint8 = make_slice(uint8, 8)
+		writeU32(d, 4, tag)
+		secs[1] = mkSection(".ARM.exidx", SF_READ, SHT_ARM_EXIDX, d, cast(uint, 8), 4)
+		secs[1].Link = 0
+	}
+	var obj @InputObject = mkObjSecs(secs)
+	obj.Machine = EM_ARM
+	return obj
+}
+
+// prel31At returns the address the PREL31 word at offset off of out points at.
+func prel31At(out OutputSection, off int) uint64 {
+	var v int64 = u32(out.Data, off) & 0x7fffffff
+	if (v & 0x40000000) != 0 { v = v - 0x80000000 }
+	return out.Addr + cast(uint64, off) + bit_cast(uint64, v)
+}
+
+// The merged `.ARM.exidx` follows the code: each code section's index (a, c), a synthesized
+// EXIDX_CANTUNWIND entry for one with none (b), then a CANTUNWIND sentinel at the end of the
+// code; ExidxStart / ExidxEnd bracket it.  With no index among the inputs there is none.
+func TestLayoutArmExidx() testing.TestResult {
+	var objs @[]@InputObject = make_slice(@InputObject, 3)
+	objs[0] = exidxObj(8, true, 0x0a)
+	objs[1] = exidxObj(4, false, 0)
+	objs[2] = exidxObj(8, true, 0x0c)
+	var lr @LayoutResult = Layout(objs, cast(uint64, 0x10000))
+	if len(lr.Sections) != 2 || !charsEqual(lr.Sections[1].Name, ".ARM.exidx") || lr.Exidx != 1 {
+		return fail("not .text then .ARM.exidx")
+	}
+	var text OutputSection = lr.Sections[0]
+	var x OutputSection = lr.Sections[1]
+	if x.Size != cast(uint64, 32) || lr.ExidxStart != x.Addr ||
+			lr.ExidxEnd != x.Addr + cast(uint64, 32) {
+		return fail("not four entries, bracketed")
+	}
+	if u32(x.Data, 4) != 0x0a || u32(x.Data, 20) != 0x0c {
+		return fail("the inputs are not in code order")
+	}
+	var textB uint64 = text.Addr + cast(uint64, objs[1].Sections[0].OutOffset)
+	if prel31At(x, 8) != textB || u32(x.Data, 12) != cast(int64, EXIDX_CANTUNWIND) {
+		return fail("no CANTUNWIND entry for the code with no index")
+	}
+	if prel31At(x, 24) != text.Addr + text.Size || u32(x.Data, 28) != cast(int64, EXIDX_CANTUNWIND) {
+		return fail("no CANTUNWIND sentinel at the end of the code")
+	}
+	var plain @[]@InputObject = make_slice(@InputObject, 1)
+	plain[0] = exidxObj(8, false, 0)
+	var lp @LayoutResult = Layout(plain, cast(uint64, 0x10000))
+	if len(lp.Sections) != 1 || lp.Exidx != -1 || lp.ExidxStart != lp.ExidxEnd {
+		return fail("an unwind index for a link with no index")
+	}
+	return ""
+}
+
+// armExidxObject writes, to dir/name, an arm32 object with a code section (_start, global), a
+// data section with words for `__exidx_start` and `__exidx_end`, and an 8-byte `.ARM.exidx`
+// whose type and sh_link are patched (the assembler writes neither) to index the section whose
+// ELF index is linkTo — returning its bytes, empty on failure.
+func armExidxObject(dir *[]readonly char, name *[]readonly char, linkTo int) @[]uint8 {
+	var a @asm.Assembler = asm.New(4)
+	a.SetSection("text", -1)
+	a.DefineLabel("_start")
+	a.SetGlobal("_start")
+	arm32.Bx(a, arm32.COND_AL, arm32.LR)
+	a.SetSection("data", -1)
+	a.SetGlobal("__exidx_start")
+	a.SetGlobal("__exidx_end")
+	a.EmitAddr("__exidx_start")
+	a.EmitAddr("__exidx_end")
+	a.SetSection("ARM.exidx", SF_READ)
+	a.EmitUint32(0)
+	a.EmitUint32(cast(uint32, EXIDX_CANTUNWIND))
+	var none @[]uint8
+	if !arm32.ResolveFixups(a) { return none }
+	a.Finalize()
+	if a.HasError { return none }
+	var path @[]char = buf.Concat(dir, name)
+	if !elf.WriteARM32(a, path, false) { return none }
+	data, ok := readFile(path)
+	if !ok { return none }
+	var sh int = sectionHeaderNamed(data, ".ARM.exidx")
+	if sh < 0 { return none }
+	writeU32(data, sh + 4, cast(int64, SHT_ARM_EXIDX))
+	writeU32(data, sh + 24, cast(int64, linkTo))
+	if !writeBytes(path, data) { return none }
+	return data
+}
+
+// elf32SectionIndex returns the ELF index of the section named name in the ELF32 object data.
+func elf32SectionIndex(data *[]readonly uint8, name *[]readonly char) int {
+	return (sectionHeaderNamed(data, name) - cast(int, u32(data, 32))) / u16(data, 46)
+}
+
+// The reader keeps an arm32 `.ARM.exidx` with the code section it indexes (Link); one indexing
+// no section, or a section without code, is an error.
+func TestReadElfKeepsArmExidx() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer { os.RemoveAll(dir) }
+	var probe @[]uint8 = armExidxObject(dir, "/x0.o", 0)
+	if len(probe) == 0 { return fail("cannot build the fixture") }
+	var data @[]uint8 = armExidxObject(dir, "/x1.o", elf32SectionIndex(probe, ".text"))
+	obj, err := parseObjectBytes(data, "x1.o")
+	if len(err) != 0 { return fail(buf.Concat("an .ARM.exidx should be kept: ", err)) }
+	var xi int = findSection(obj, ".ARM.exidx")
+	var ti int = findSection(obj, ".text")
+	if xi < 0 || obj.Sections[xi].Type != SHT_ARM_EXIDX || obj.Sections[xi].Link != ti {
+		return fail("the .ARM.exidx is not kept indexing .text")
+	}
+	_, nerr := parseObjectBytes(probe, "x0.o")
+	if !startsWith(nerr, ".ARM.exidx indexes a section bnld does not link") {
+		return fail(buf.Concat("an index of no section: ", nerr))
+	}
+	var dataSec @[]uint8 = armExidxObject(dir, "/x2.o", elf32SectionIndex(probe, ".data"))
+	_, derr := parseObjectBytes(dataSec, "x2.o")
+	if !startsWith(derr, ".ARM.exidx indexes a section that holds no code") {
+		return fail(buf.Concat("an index of data: ", derr))
+	}
+	return ""
+}
+
+// A static arm32 link merges the index (the input's entry, then the sentinel), defines
+// `__exidx_start` / `__exidx_end` at its ends, and gives it a PT_ARM_EXIDX header.
+func TestLinkArmExidx() testing.TestResult {
+	var dir @[]char = testTmpDir()
+	if len(dir) == 0 { return fail("cannot create a temporary directory") }
+	defer { os.RemoveAll(dir) }
+	var probe @[]uint8 = armExidxObject(dir, "/l0.o", 0)
+	if len(probe) == 0 { return fail("cannot build the fixture") }
+	if len(armExidxObject(dir, "/l1.o", elf32SectionIndex(probe, ".text"))) == 0 {
+		return fail("cannot build the object")
+	}
+	var paths @[]@[]char = make_slice(@[]char, 1)
+	paths[0] = buf.Concat(dir, "/l1.o")
+	var out @[]char = buf.Concat(dir, "/l1")
+	var err @[]readonly char = Link(paths, "_start", EM_ARM, cast(uint64, 0x10000), out)
+	if len(err) != 0 { return fail(buf.Concat("Link failed: ", err)) }
+	exe, ok := readFile(out)
+	if !ok { return fail("cannot read the executable") }
+	// bnlint:allow managed-to-raw-assign - live local, read-only borrow
+	var rd *[]readonly uint8 = exe
+	off, va, sz, found := phdr32Of(rd, PT_ARM_EXIDX)
+	if !found || sz != 16 { return fail("no two-entry PT_ARM_EXIDX") }
+	if u32(rd, off + 4) != cast(int64, EXIDX_CANTUNWIND) ||
+			u32(rd, off + 12) != cast(int64, EXIDX_CANTUNWIND) {
+		return fail("not the input's entry then the sentinel")
+	}
+	// The data words for the bracketing symbols follow the code page: find them by value.
+	var startOk bool = false
+	var endOk bool = false
+	for p := 0; p + 8 <= len(rd); p = p + 4 {
+		if bit_cast(uint64, u32(rd, p)) == va &&
+				bit_cast(uint64, u32(rd, p + 4)) == va + cast(uint64, 16) {
+			startOk = true
+			endOk = true
+		}
+	}
+	if !startOk || !endOk { return fail("__exidx_start / __exidx_end do not bracket the index") }
+	return ""
+}
+
+// An index is known by its type and the code section it indexes, whatever its name (LLVM names
+// one `.ARM.exidx` plus its code section's name); an index of empty code is dropped, and with no
+// code at all there is no merged index.
+func TestLayoutArmExidxByTypeAndEmptyCode() testing.TestResult {
+	var objs @[]@InputObject = make_slice(@InputObject, 1)
+	objs[0] = exidxObj(8, true, 0x0a)
+	objs[0].Sections[1].Name = buf.CopyStr(".ARM.exidxramfunc")
+	var lr @LayoutResult = Layout(objs, cast(uint64, 0x10000))
+	if lr.Exidx < 0 || u32(lr.Sections[lr.Exidx].Data, 4) != 0x0a {
+		return fail("an index named after its code section is not merged")
+	}
+	var empty @[]@InputObject = make_slice(@InputObject, 2)
+	empty[0] = exidxObj(0, true, 0x0e)
+	empty[1] = exidxObj(8, false, 0)
+	var le @LayoutResult = Layout(empty, cast(uint64, 0x10000))
+	if le.Exidx < 0 || le.Sections[le.Exidx].Size != cast(uint64, 16) ||
+			empty[0].Sections[1].OutIndex != -1 {
+		return fail("the index of empty code is not dropped")
+	}
+	var none @[]@InputObject = make_slice(@InputObject, 1)
+	none[0] = exidxObj(0, true, 0x0e)
+	var ln @LayoutResult = Layout(none, cast(uint64, 0x10000))
+	if ln.Exidx != -1 || len(ln.Err) != 0 { return fail("a merged index with no code") }
+	return ""
+}

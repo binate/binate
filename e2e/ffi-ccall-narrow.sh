@@ -22,8 +22,7 @@
 # default) and NATIVE (--backend native).  Native passes narrow args as canonical
 # full-width values, so it over-satisfies the C ABI and must pass too.
 #
-# Uses a gen1 bnc built from current source (the shipped BUILDER predates
-# #[c_export] / __c_call and would reject the facade).  Auto-discovered by
+# Uses a gen1 bnc built from current source — the compiler under test.  Auto-discovered by
 # .github/workflows/e2e-tests.yml on Linux + macOS; needs only a host C compiler
 # (no cross-toolchain / qemu — it runs on the host arch).  Exit 0 on pass.
 

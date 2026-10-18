@@ -82,11 +82,10 @@ check() {
 # ----- bnc (compile to native binary, then run) -------------------
 # A gen1 (checkout-source) bnc compiles the fixture; the -I/-L below are bnc's
 # own search paths.  gen1 — NOT the pinned BUILDER — is used because the fixture
-# links the current-tree runtime (pkg/builtins/rt + startup), and the BUILDER
-# predates the satentry-registry contract that runtime uses: a BUILDER-compiled
-# binary emits a flat satentry structure yet calls the runtime's registry
-# graph-walk, and segfaults at startup.  gen1 uses one consistent
-# contract on both sides.  Neither gen1 nor the BUILDER links a C runtime (the
+# links the current-tree runtime (pkg/builtins/rt + startup), whose contracts with
+# the compiler (e.g. the satentry registry the startup walks) must match the
+# compiler that emitted the code; gen1 is built from the same tree, so both sides
+# agree.  Neither gen1 nor the BUILDER links a C runtime (the
 # runtime is pure Binate), so no --runtime is passed.  resolve-gen1.sh
 # builds+caches gen1 (the BUILDER compiling checkout cmd/bnc) once per tree
 # state, so this stays cheap across the e2e run — the same caching the other

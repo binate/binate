@@ -207,10 +207,12 @@ class FlowBase(unittest.TestCase):
     def bnc(self, name, **behavior):
         return fake_bnc(self.d, name, **behavior)
 
-    def run_ab(self, arms, *extra, workload="bench", seeds="1-3", tmpdir=None):
+    def run_ab(self, arms, *extra, workload="bench", seeds="1-3", tmpdir=None,
+               allow_short=True):
+        # The fake programs run for milliseconds, far under MIN_RUN_CPU.
         argv = ["run", "--work", self.work, "--seeds", seeds, "--workload", workload,
                 "--subject", self.subject, "--aslr", "on", "--tmpdir", tmpdir or self.tmpdir,
-                "--jobs", "2"]
+                "--jobs", "2"] + (["--allow-short-runs"] if allow_short else [])
         if workload == "bench":
             argv += ["--bench", self.bench]
         for name, path in arms:

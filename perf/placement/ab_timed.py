@@ -43,13 +43,19 @@ import runner
 import schedule
 
 
-# CPU seconds below which a reference run is reported as too short for its
-# user time to mean much (a few clock ticks at the usual 100-1000 Hz).
-SHORT_RUN = 0.05
+# CPU seconds a reference run must reach.  Linux splits a run's CPU time into
+# user and system time by clock-tick sampling (100-1000 Hz), so a short run's
+# user time is off by up to a tick or two: at 0.5 s that is a few tenths of a
+# percent, well under the differences being measured.
+MIN_RUN_CPU = 0.5
 
 
 class OutputMismatch(RuntimeError):
     """A run's output failed its check."""
+
+
+class RunTooShort(RuntimeError):
+    """A reference run used less than MIN_RUN_CPU seconds of CPU time."""
 
 
 def run_argv(item, binp, work_flags, paths, run_dir):
@@ -161,13 +167,13 @@ class Timed:
 
     def __init__(self, work, arms, items, seeds, reps, aslr, env, run_dir, work_flags,
                  subject_paths, samples, log, max_load=None, spawn=runner.spawn,
-                 load=os.getloadavg, sleep=time.sleep):
+                 load=os.getloadavg, sleep=time.sleep, allow_short=False):
         self.work, self.arms, self.items, self.seeds = work, arms, items, seeds
         self.reps, self.aslr, self.env, self.run_dir = reps, aslr, env, run_dir
         self.work_flags, self.paths, self.samples, self.log = work_flags, subject_paths, \
             samples, log
         self.max_load, self.spawn, self.load, self.sleep = max_load, spawn, load, sleep
-        self.refs = {}
+        self.allow_short, self.refs = allow_short, {}
 
     def _bin(self, arm, seed, item):
         return st.bin_path(self.work, arm.idx, seed, item.sub)
@@ -199,11 +205,14 @@ class Timed:
                 data = out if item.kind == "bench" else s.out_hash.encode()
                 if item.kind == "selfcompile" and not s.out_hash:
                     raise OutputMismatch("reference self-compile wrote no output")
-                if s.user + s.sys < SHORT_RUN:
-                    self.log("WARNING: the reference run of %s took %.4f s of CPU time: Linux "
-                             "splits so short a run's user and system time by clock-tick "
-                             "sampling, so its user time is unreliable (raise N)"
-                             % (item.name, s.user + s.sys))
+                if s.user + s.sys < MIN_RUN_CPU:
+                    why = ("the reference run of %s took %.4f s of CPU time, under %.1f s: "
+                           "Linux splits so short a run's user and system time by clock-tick "
+                           "sampling, so its user time is unreliable (raise N with --n)"
+                           % (item.name, s.user + s.sys, MIN_RUN_CPU))
+                    if not self.allow_short:
+                        raise RunTooShort(why + ", or pass --allow-short-runs")
+                    self.log("WARNING: " + why)
                 exp = expected_bytes(item)
                 if exp is not None and not benchcfg.outputs_agree(data, exp, item.compare):
                     kept = self.keep_evidence(item, "reference-" + item.name)

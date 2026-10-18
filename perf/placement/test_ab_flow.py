@@ -49,6 +49,13 @@ class HappyPathTest(tu.FlowBase):
         with open(os.path.join(self.work, "ref", "foo.out")) as fh:
             self.assertEqual(fh.read(), "Result(7) = 42\n")
 
+    def test_short_reference_run_stops_unless_allowed(self):
+        a = self.bnc("a")
+        self.assertEqual(self.run_ab([("A", a)], "--only", "foo", seeds="1",
+                                     allow_short=False), 3, self.stderr)
+        self.assertIn("--allow-short-runs", self.stderr)
+        self.assertEqual(self.samples(), [])
+
     def test_timed_env_does_not_come_from_the_shell(self):
         a = self.bnc("a")
         long_path = "/a/much/longer/path/entry/that/a/venv/would/add:" + os.environ["PATH"]

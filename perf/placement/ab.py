@@ -7,7 +7,7 @@
              | --workload bench --subject TREE --bench BENCH [--only B,...] [--n B=N])
             --seeds 1-40 [--reps 2] [--jobs 4] [--mode phase|shift]
             [--aslr off|on] [--aa same|salted] [--static-report] [--resume]
-            [--dry-run] [--max-load X] [--tmpdir DIR]
+            [--dry-run] [--max-load X] [--tmpdir DIR] [--allow-short-runs]
 
 Compares compilers ("arms"; the first is the base) on how fast the code they
 generate runs, with the code's placement randomized: every round seed S gives
@@ -37,9 +37,14 @@ stats.py DIR analyses it.
                 its covariates, which stats.py relates to per-seed timing
   --tmpdir DIR  the tmpfs directory the runs use for TMPDIR and their output
                 (default: a fresh directory under the first tmpfs mount)
+  --allow-short-runs  only warn when an item's reference run uses less than
+                ab_timed.MIN_RUN_CPU seconds of CPU time; without it that
+                stops the experiment, since so short a run's user time is
+                unreliable (raise the item's N with --n instead)
 
 Exit status: 0 done; 1 a build or tool failed; 2 bad usage; 3 a check stopped
-the experiment (build checks, output checks, ASLR, stack preflight); 130
+the experiment (build checks, output checks, a too-short reference run, ASLR,
+stack preflight); 130
 interrupted.  LLVM arms are allowed and are reported as "placement not
 randomized".
 
@@ -239,7 +244,7 @@ def experiment(cfg, log, meta):
                 % len(drop))
         timed = tm.Timed(cfg.work, cfg.arms, cfg.items, cfg.seeds, a.reps, aslr, env, run_dir,
                          cfg.work_flags, bld.search_paths(cfg.subject), samples, log,
-                         a.max_load)
+                         a.max_load, allow_short=a.allow_short_runs)
         timed.references()
         log("timed phase: %d rounds (%d already done)" % (len(cfg.seeds), len(done)))
         timed.run(done)
@@ -286,6 +291,9 @@ def parse_args(argv):
     r.add_argument("--resume", action="store_true")
     r.add_argument("--dry-run", action="store_true")
     r.add_argument("--max-load", type=float, metavar="X")
+    r.add_argument("--allow-short-runs", action="store_true",
+                   help="only warn, instead of stopping, when a reference run uses less than "
+                        "%.1f s of CPU time" % tm.MIN_RUN_CPU)
     r.add_argument("--tmpdir", metavar="DIR")
     return ap.parse_args(argv)
 
@@ -315,7 +323,7 @@ def main(argv=None):
         status, why = 130, "interrupted"
     except bld.Abort as e:
         status, why = 3, "; ".join(e.args[0])
-    except (tm.OutputMismatch, runner.AslrError, runner.PreflightError) as e:
+    except (tm.OutputMismatch, tm.RunTooShort, runner.AslrError, runner.PreflightError) as e:
         status, why = 3, str(e)
     except (bld.BuildError, OSError, RuntimeError, ValueError) as e:
         status, why = 1, str(e)

@@ -1,0 +1,299 @@
+package "pkg/binate/iropt"
+
+import "pkg/binate/ir"
+import "pkg/std/vec"
+
+import "pkg/binate/iropcode"
+
+// Copy propagation between stack slots.
+//
+// `var y T = x` with x a local copies x into y: a whole load of x and a whole
+// store of it into y.  When nothing touches x after the copy, y can be x itself:
+// every use of y becomes a use of x and the load and the store go, with y's slot.
+// For an aggregate that is a whole copy saved — `var x Big = mk(k); var y Big =
+// x; return sum(y)` copied 808 bytes for nothing.
+//
+// The copy is `v = OP_LOAD x; OP_STORE y, v` in one block B, where:
+//   - x and y are distinct stack slots (not a package global's reference) of the
+//     same type, named in no fault pad, whose type holds no managed reference (a
+//     copy of one acquires references that x and y release separately); y is not
+//     a parameter's slot;
+//   - v loads all of x and is used by the store alone, which writes all of y;
+//   - y's OP_ALLOC is in B before the store, and nothing between them uses y: the
+//     store is y's first write, so y never holds anything but x's copy;
+//   - x is confined — every use of x, or of a field or element address computed
+//     from it, is the address of a load or a store or the base of a further such
+//     address — and none of those uses comes after v in B or is in a block
+//     reachable from B.  So x keeps the bytes y would hold for as long as anything
+//     can read y (y's uses are all after the store, in B or in blocks B
+//     dominates), and a write through y, now a write of x, is seen by nothing
+//     that reads x;
+//   - B cannot run again after the copy unless it re-creates x first: if B can
+//     reach itself, x's OP_ALLOC must be in B before v.  Otherwise the writes
+//     through y of one execution of B, now writes of x, would reach the next
+//     execution's copy (`var x Big; …; for … { var y Big = x; y.n++ }`).
+// y's own uses are unrestricted: a pointer into y becomes a pointer into x, which
+// nothing else reads.
+//
+// Each round folds every copy it finds whose slots no other copy of the round
+// involves, against one use index of f, and rebuilds each block once; chains
+// (`var z = y` after `var y = x`) take one round per link.
+
+// propagateFuncSlotCopies replaces copied slots by their sources in f, returning
+// whether it changed anything.
+func propagateFuncSlotCopies(f @ir.Func) bool {
+	if f.NextID <= 0 || len(f.Blocks) == 0 { return false }
+	// The pass never changes f's control flow, so one dominance computation
+	// serves every round.
+	var d @DomInfo = ComputeDom(f)
+	var changed bool = false
+	for {
+		var folds @vec.Vec[slotCopy] = findSlotCopies(f, d)
+		if folds.Len() == 0 { break }
+		applySlotCopies(f, folds)
+		changed = true
+	}
+	return changed
+}
+
+// slotCopy is one copy to fold: the load of src whose one use stores it into dst.
+type slotCopy struct {
+	load @ir.Instr
+	src  @ir.Instr
+	dst  @ir.Instr
+}
+
+// copyScan is one round's view of f: its use index, each instruction's block and
+// index, the values its fault pads name, the blocks reachable from each block
+// (computed when first asked), and a stamp array for address walks.
+type copyScan struct {
+	d     @DomInfo
+	ui    @useIndex
+	n     int
+	blkOf @[]int
+	idxOf @[]int
+	inPad @[]bool
+	reach @[]@[]bool
+	seen  @[]int
+	stamp int
+}
+
+// findSlotCopies returns the copies of f that may be folded together: each
+// passes the checks above, and no two share a slot.
+func findSlotCopies(f @ir.Func, d @DomInfo) @vec.Vec[slotCopy] {
+	var out @vec.Vec[slotCopy] = vec.New[slotCopy]()
+	var sc @copyScan = newCopyScan(f, d)
+	var n int = sc.n
+	var taken @[]bool = make_slice(bool, n)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var s @ir.Instr = b.Instrs[ii]
+			if !copyStoreShape(s, sc.inPad, n) { continue }
+			var y @ir.Instr = s.Args[0]
+			var v @ir.Instr = s.Args[1]
+			var x @ir.Instr = v.Args[0]
+			if taken[x.ID] || taken[y.ID] { continue }
+			if sc.blkOf[v.ID] != bi || sc.idxOf[v.ID] > ii || len(sc.ui.usesOf(v)) != 1 { continue }
+			if sc.blkOf[y.ID] != bi || sc.idxOf[y.ID] > ii || usedBetween(sc, y, bi, sc.idxOf[y.ID], ii) {
+				continue
+			}
+			if !srcUntouchedAfter(sc, bi, sc.idxOf[v.ID], x) { continue }
+			taken[x.ID] = true
+			taken[y.ID] = true
+			var cp slotCopy
+			cp.load = v
+			cp.src = x
+			cp.dst = y
+			out.Push(cp)
+		}
+	}
+	return out
+}
+
+// newCopyScan indexes f for one round.
+func newCopyScan(f @ir.Func, d @DomInfo) @copyScan {
+	var sc @copyScan = make(copyScan)
+	sc.d = d
+	sc.n = f.NextID
+	sc.ui = buildUseIndex(f)
+	sc.blkOf = make_slice(int, sc.n)
+	sc.idxOf = make_slice(int, sc.n)
+	for i := 0; i < sc.n; i++ { sc.blkOf[i] = -1 }
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var id int = b.Instrs[ii].ID
+			if id >= 0 && id < sc.n {
+				sc.blkOf[id] = bi
+				sc.idxOf[id] = ii
+			}
+		}
+	}
+	sc.inPad = make_slice(bool, sc.n)
+	markPadValues(f, sc.inPad, sc.n)
+	sc.reach = make_slice(@[]bool, len(f.Blocks))
+	sc.seen = make_slice(int, sc.n)
+	return sc
+}
+
+// copyStoreShape reports whether s is `OP_STORE y, (OP_LOAD x)` copying all of
+// stack slot x into a distinct stack slot y of the same pointer-free type, with
+// neither named in a fault pad (inPad) and y not a parameter's slot.
+func copyStoreShape(s @ir.Instr, inPad @[]bool, n int) bool {
+	if s.Op != iropcode.OP_STORE || len(s.Args) < 2 { return false }
+	var y @ir.Instr = s.Args[0]
+	var v @ir.Instr = s.Args[1]
+	if !isPlainStackSlot(y, inPad, n) || y.ParamIndex != 0 || v == nil || v.Op != iropcode.OP_LOAD ||
+			len(v.Args) < 1 || v.ID < 0 || v.ID >= n {
+		return false
+	}
+	var x @ir.Instr = v.Args[0]
+	if x == y || !isPlainStackSlot(x, inPad, n) || x.TypeArg == nil || y.TypeArg == nil ||
+			!x.TypeArg.Identical(y.TypeArg) || sroaAggregateContainsManaged(x.TypeArg) {
+		return false
+	}
+	return v.Typ != nil && v.Typ.SizeOf() == x.TypeArg.SizeOf() && isWholeStoreTo(s, y)
+}
+
+// isPlainStackSlot reports whether a is a stack slot's OP_ALLOC (not a package
+// global's reference) named in no fault pad.
+func isPlainStackSlot(a @ir.Instr, inPad @[]bool, n int) bool {
+	return a != nil && a.Op == iropcode.OP_ALLOC && !a.IsGlobalRef && a.ID >= 0 && a.ID < n &&
+			!inPad[a.ID]
+}
+
+// markPadValues marks every value a fault pad of f uses.
+func markPadValues(f @ir.Func, inPad @[]bool, n int) {
+	for bi := 0; bi < len(f.FaultPads); bi++ {
+		var b @ir.Block = f.FaultPads[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			for k := 0; k < len(ins.Args); k++ {
+				var a @ir.Instr = ins.Args[k]
+				if a != nil && a.ID >= 0 && a.ID < n { inPad[a.ID] = true }
+			}
+		}
+	}
+}
+
+// usedBetween reports whether anything in block bi strictly between indexes lo
+// and hi uses y.
+func usedBetween(sc @copyScan, y @ir.Instr, bi int, lo int, hi int) bool {
+	var uses @[]valueUse = sc.ui.usesOf(y)
+	for i := 0; i < len(uses); i++ {
+		var u valueUse = uses[i]
+		if !u.inPad && u.blockIdx == bi && u.pos > lo && u.pos < hi { return true }
+	}
+	return false
+}
+
+// srcUntouchedAfter reports whether slot x is confined — every use of x, or of a
+// field or element address computed from it, is the address (Args[0]) of a load or
+// a store or the base of a further such address — with none of those uses after
+// index vi of block bi or in a block reachable from bi, and whether a block bi that
+// can run again re-creates x first (x's OP_ALLOC is in bi before vi).
+func srcUntouchedAfter(sc @copyScan, bi int, vi int, x @ir.Instr) bool {
+	if !(sc.blkOf[x.ID] == bi && sc.idxOf[x.ID] < vi) && reachableFromBlock(sc, bi)[bi] {
+		return false
+	}
+	sc.stamp++
+	var work @vec.Vec[@ir.Instr] = vec.New[@ir.Instr]()
+	work.Push(x)
+	sc.seen[x.ID] = sc.stamp
+	for wi := 0; wi < work.Len(); wi++ {
+		var uses @[]valueUse = sc.ui.usesOf(work.Get(wi))
+		for i := 0; i < len(uses); i++ {
+			var u valueUse = uses[i]
+			if u.inPad || u.argIdx != 0 { return false }
+			var op int = u.user.Op
+			if op == iropcode.OP_GET_FIELD_PTR || op == iropcode.OP_GET_ELEM_PTR {
+				var g @ir.Instr = u.user
+				if g.ID < 0 || g.ID >= sc.n { return false }
+				if sc.seen[g.ID] != sc.stamp {
+					sc.seen[g.ID] = sc.stamp
+					work.Push(g)
+				}
+			} else if op != iropcode.OP_LOAD && op != iropcode.OP_STORE {
+				return false
+			}
+			if u.blockIdx == bi {
+				if u.pos > vi { return false }
+			} else if reachableFromBlock(sc, bi)[u.blockIdx] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// reachableFromBlock returns the blocks reachable from block bi by one or more
+// edges (bi itself only when a path leads back to it), computed once per round.
+func reachableFromBlock(sc @copyScan, bi int) @[]bool {
+	if len(sc.reach[bi]) > 0 { return sc.reach[bi] }
+	var d @DomInfo = sc.d
+	var reach @[]bool = make_slice(bool, d.NumBlocks)
+	var work @vec.Vec[int] = vec.New[int]()
+	work.Push(bi)
+	for wi := 0; wi < work.Len(); wi++ {
+		var b int = work.Get(wi)
+		for k := 0; k < len(d.Succs[b]); k++ {
+			var s int = d.Succs[b][k]
+			if !reach[s] {
+				reach[s] = true
+				work.Push(s)
+			}
+		}
+	}
+	sc.reach[bi] = reach
+	return reach
+}
+
+// applySlotCopies folds copies: every use of a copy's destination becomes a use of
+// its source, and its load, its store and the destination's OP_ALLOC go.  No two
+// copies share a slot, so each block is rebuilt once.  A store has no value id, so
+// a copy's store is found as the store of a dropped load (the load's one use).
+func applySlotCopies(f @ir.Func, copies @vec.Vec[slotCopy]) {
+	var n int = f.NextID
+	var repl @[]@ir.Instr = make_slice(@ir.Instr, n)
+	var drop @[]bool = make_slice(bool, n)
+	for i := 0; i < copies.Len(); i++ {
+		var cp slotCopy = copies.Get(i)
+		repl[cp.dst.ID] = cp.src
+		drop[cp.load.ID] = true
+		drop[cp.dst.ID] = true
+	}
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		var hit bool = false
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			if copyDropped(ins, drop, n) { hit = true }
+			for k := 0; k < len(ins.Args); k++ {
+				var a @ir.Instr = ins.Args[k]
+				if a != nil && a.ID >= 0 && a.ID < n && repl[a.ID] != nil { ins.Args[k] = repl[a.ID] }
+			}
+			for k := 0; k < len(ins.Phis); k++ {
+				var pv *ir.Instr = ins.Phis[k].Val
+				if pv != nil && pv.ID >= 0 && pv.ID < n && repl[pv.ID] != nil { ins.Phis[k].Val = repl[pv.ID] }
+			}
+		}
+		if !hit { continue }
+		var kept @vec.Vec[@ir.Instr] = vec.New[@ir.Instr]()
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			if !copyDropped(ins, drop, n) { kept.Push(ins) }
+		}
+		b.InstrsVec = kept
+		b.Instrs = kept.Items()
+	}
+}
+
+// copyDropped reports whether ins goes with a folded copy: a dropped value (the
+// copy's load or the destination's OP_ALLOC), or the store of a dropped load.
+func copyDropped(ins @ir.Instr, drop @[]bool, n int) bool {
+	if ins.ID >= 0 && ins.ID < n && drop[ins.ID] { return true }
+	if ins.Op != iropcode.OP_STORE || len(ins.Args) < 2 { return false }
+	var v @ir.Instr = ins.Args[1]
+	return v != nil && v.Op == iropcode.OP_LOAD && v.ID >= 0 && v.ID < n && drop[v.ID]
+}

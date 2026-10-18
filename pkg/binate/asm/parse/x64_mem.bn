@@ -9,9 +9,11 @@ import "pkg/binate/asm/x64"
 //     `reg*s` or `s*reg` (s 1, 2, 4 or 8, a number or a constant's name); an unscaled
 //     second register is the index (scale 1).  A register is never subtracted, and RSP is
 //     no index: `[rbx + rsp]` takes RSP as the base and RBX as the index, as clang does;
-//   - displacement terms, each a number (`8`, `N*2`, `(l2 - l1)`), summing to a signed
+//   - displacement terms, each a number (`8`, `K*2`, `(l2 - l1)`), summing to a signed
 //     32-bit value (clang silently keeps the low 32 bits of a wider one).  An operand of
-//     displacements alone is the absolute address [disp32].
+//     displacements alone is the absolute address [disp32].  A label-difference constant
+//     (x64_imm.bn) is at most one term, added (`[rbx + N]`, not `[rbx - N]`, which clang
+//     misreads as rbx + N).
 // clang reads the operand with C's precedences, under which | ^ & << >> bind more loosely
 // than + and -, while a term here ends at + and -; so a displacement term using one of them
 // outside parentheses is taken only as the operand's one displacement term, not subtracted
@@ -39,12 +41,22 @@ func parseX64MemOperand(p @Parser, l Lexer, size int) (Lexer, Token, x64.Operand
 	var disp int64 = 0
 	var nDisp int = 0
 	var loose bool = false // a displacement term used | ^ & << >> outside parentheses
+	var diffConsts int = 0 // label-difference constant terms (x64_imm.bn)
+	var diffTerms int = 0 // terms a label difference decided, written or a constant
+	if tok.Kind == TOK_PLUS {
+		setErr(p, intelUnaryPlusError().Err)
+		return l, tok, x64.Imm(0)
+	}
 	var neg bool = tok.Kind == TOK_MINUS
-	if tok.Kind == TOK_MINUS || tok.Kind == TOK_PLUS {
+	if tok.Kind == TOK_MINUS {
 		l, tok = LexNext(l)
 		// A leading sign is a unary operator to clang (unlike a sign between terms).
 		if tok.Kind == TOK_TILDE {
 			setErr(p, intelTildeError().Err)
+			return l, tok, x64.Imm(0)
+		}
+		if tok.Kind == TOK_MINUS {
+			setErr(p, intelMinusMinusError().Err)
 			return l, tok, x64.Imm(0)
 		}
 	}
@@ -70,8 +82,16 @@ func parseX64MemOperand(p @Parser, l Lexer, size int) (Lexer, Token, x64.Operand
 		} else {
 			var v int64 = 0
 			var groups int = 0
-			l, tok, v, groups = parseX64DispTerm(p, l, tok)
+			var dc bool = false
+			var fd bool = false
+			l, tok, v, groups, dc, fd = parseX64DispTerm(p, l, tok)
 			if p.HasError { return l, tok, x64.Imm(0) }
+			if fd { diffTerms = diffTerms + 1 }
+			if dc {
+				if neg { return l, tok, x64DiffConstTermError(p) }
+				diffConsts = diffConsts + 1
+			}
+			if diffConsts > 0 && diffTerms > 1 { return l, tok, x64DiffConstTermError(p) }
 			if (groups & (EG_BIT | EG_SHIFT)) != 0 {
 				if neg { return l, tok, x64LooseTermError(p) }
 				loose = true
@@ -86,6 +106,10 @@ func parseX64MemOperand(p @Parser, l Lexer, size int) (Lexer, Token, x64.Operand
 		if tok.Kind != TOK_PLUS && tok.Kind != TOK_MINUS { break }
 		neg = tok.Kind == TOK_MINUS
 		l, tok = LexNext(l)
+		if neg && tok.Kind == TOK_MINUS {
+			setErr(p, intelMinusMinusError().Err)
+			return l, tok, x64.Imm(0)
+		}
 	}
 	if tok.Kind != TOK_RBRACKET {
 		setErr(p, "expected '+', '-' or ']' in the memory operand")
@@ -105,9 +129,12 @@ func parseX64MemOperand(p @Parser, l Lexer, size int) (Lexer, Token, x64.Operand
 		index = base
 		base = x64.RSP
 	}
-	if index >= 0 { return l, tok, x64.MemIdx(base, index, scale, cast(int, disp), size) }
-	if base >= 0 { return l, tok, x64.Mem(base, cast(int, disp), size) }
-	return l, tok, x64.MemAbs(cast(int, disp), size)
+	if index < 0 && base < 0 { return l, tok, x64.MemAbs(cast(int, disp), size) }
+	var op x64.Operand = x64.Mem(base, cast(int, disp), size)
+	if index >= 0 { op = x64.MemIdx(base, index, scale, cast(int, disp), size) }
+	// clang gives a displacement it reads as a symbol 32 bits, whatever its value.
+	op.Disp32 = diffConsts > 0
+	return l, tok, op
 }
 
 // x64LooseTermError sets the error for a displacement term using | ^ & << >> outside
@@ -201,6 +228,10 @@ func parseX64Scale(p @Parser, l Lexer, tok Token) (Lexer, Token, int) {
 		return l, tok, 0
 	}
 	if r.Pending { return l, tok, 1 } // an x86-64 instruction with one is an error
+	if r.DiffConst {
+		setErr(p, "a label-difference constant is no scale (clang reads it as a symbol)")
+		return l, tok, 0
+	}
 	if r.Val != 1 && r.Val != 2 && r.Val != 4 && r.Val != 8 {
 		setErr(p, "a memory operand's scale is 1, 2, 4 or 8")
 		return l, tok, 0
@@ -209,9 +240,10 @@ func parseX64Scale(p @Parser, l Lexer, tok Token) (Lexer, Token, int) {
 }
 
 // parseX64DispTerm parses a displacement term at tok (l just after it) — operators binding
-// tighter than + and - over a number — returning its value and the operator groups used
-// outside parentheses.
-func parseX64DispTerm(p @Parser, l Lexer, tok Token) (Lexer, Token, int64, int) {
+// tighter than + and - over a number — returning its value, the operator groups used
+// outside parentheses, whether it is a label-difference constant (ExprResult.DiffConst), and
+// whether a label difference decided it (ExprResult.FromDiff).
+func parseX64DispTerm(p @Parser, l Lexer, tok Token) (Lexer, Token, int64, int, bool, bool) {
 	var first Token = tok
 	var r ExprResult
 	var groups int = 0
@@ -222,9 +254,16 @@ func parseX64DispTerm(p @Parser, l Lexer, tok Token) (Lexer, Token, int64, int) 
 	if r.Ok && !r.Pending && (isSymbolic(r) || hasNeg(r)) { r = numberContextError(p, first, r) }
 	if !r.Ok {
 		setErr(p, exprErr(r, "invalid displacement in memory operand"))
-		return l, tok, 0, 0
+		return l, tok, 0, 0, false, false
 	}
-	return l, tok, r.Val, groups
+	return l, tok, r.Val, groups, r.DiffConst, r.FromDiff && !r.Pending
+}
+
+// x64DiffConstTermError sets the error for a label-difference constant subtracted in a memory
+// operand, or beside another term a label difference decided (parseX64MemOperand).
+func x64DiffConstTermError(p @Parser) x64.Operand {
+	setErr(p, intelDiffConstError().Err)
+	return x64.Imm(0)
 }
 
 // parseX64RipMem parses the rest of a RIP-relative memory operand (l just after `rip`): `+`
@@ -244,12 +283,8 @@ func parseX64RipMem(p @Parser, l Lexer) (Lexer, Token, x64.Operand) {
 	if tok.Kind == TOK_PLUS { l, tok = LexNext(l) }
 	var rr ExprResult
 	l, tok, rr = parseSymExpr(p, l, tok)
-	if !rr.Ok || rr.Dot {
+	if !rr.Ok {
 		setErr(p, exprErr(rr, "invalid rip-relative operand (a symbol plus numbers)"))
-		return l, tok, x64.Imm(0)
-	}
-	if isX64RegisterName(rr.Sym) {
-		setErr(p, "rip combines with a symbol, not a register")
 		return l, tok, x64.Imm(0)
 	}
 	if len(rr.Sym) == 0 {

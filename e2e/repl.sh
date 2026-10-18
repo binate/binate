@@ -432,6 +432,31 @@ cat > "$TMP/pkg/gbad/gbad.bn" <<'EOF'
 package "pkg/gbad"
 EOF
 
+# ----- pkg/rsecret names a `secret` it neither declares nor imports, in its .bn
+# and in its interface's generic body: it fails type-checking even when the
+# session has declared a `secret` at the prompt. ---
+mkdir -p "$TMP/pkg/rsecret"
+cat > "$TMP/pkg/rsecret.bni" <<'EOF'
+package "pkg/rsecret"
+
+// Get returns 5.
+func Get() int
+
+// Echo returns x, holding a secret meanwhile.
+func Echo[T any](x T) T {
+    var s secret
+    _ = s
+    return x
+}
+EOF
+cat > "$TMP/pkg/rsecret/rsecret.bn" <<'EOF'
+package "pkg/rsecret"
+
+func use(x @secret) {}
+
+func Get() int { return 5 }
+EOF
+
 # ----- pkg/gbaddep imports the failing pkg/gbad; pkg/xa/x and pkg/xb/x share
 # the short name `x`, and pkg/xb/x fails type-checking. ---
 mkdir -p "$TMP/pkg/gbaddep" "$TMP/pkg/xa/x" "$TMP/pkg/xb/x"
@@ -1872,6 +1897,17 @@ run_repl_import_rejected "mid-session-import-bad-generic-parent" \
 testing.Println(helper(7))
 ' \
     "Nope" \
+    "14"
+
+# --- A package imported mid-session is checked apart from the session: a name
+# declared at the prompt is not one the package can use, in its .bn or its
+# interface's generic bodies; the session survives. ---
+run_repl_import_rejected "mid-session-import-no-prompt-names" \
+'type secret int
+import "pkg/rsecret"
+testing.Println(helper(7))
+' \
+    "undefined: secret" \
     "14"
 
 # --- A package importing a failed one is not imported either (and says so);

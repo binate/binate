@@ -15,9 +15,12 @@
 #      it -- a declaration is not kept, a redefinition leaves the old definition, an
 #      import of a package that needs it (or imports one that does) is not made --
 #      and the session goes on;
-#   5. bni --test of a package that needs it reports it and exits non-zero.
+#   5. bni --test of a package that needs it reports it and exits non-zero;
+#   6. an embedder's interp.LoadCallable of a driver package that needs it returns
+#      the load error.
 #
-# bnc is a gen1 (BUILDER -> gen1) and bni is built by it, as in e2e/bni-nil-check.sh.
+# bnc is a gen1 (BUILDER -> gen1) and bni is built by it, as in e2e/bni-nil-check.sh,
+# and so is step 6's host.
 #
 # Exit 0 on full pass; non-zero with diagnostics on any mismatch.
 
@@ -272,6 +275,80 @@ elif ! printf '%s\n' "$test_out" | grep -qxF "$UNDEF_V (used by pkg/user.U, line
     FAILS=$((FAILS + 1))
 else
     echo "PASS: bni --test reports the package's load error"
+fi
+
+# ----- 6. interp.LoadCallable: a driver package that does not load is an error. -----
+mkdir -p "$TMP/host" "$TMP/b6"
+cat > "$TMP/host/host.bn" <<'EOF'
+package "main"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/interp"
+import "pkg/binate/parser"
+import "pkg/builtins/testing"
+import "pkg/std/os"
+
+// driverSrc is a driver package whose D reads solo.V.
+var driverSrc *[]readonly char = "package \"driver\"\n"
+		"import \"pkg/solo\"\n"
+		"func D() int { return solo.V }\n"
+		"func E() int { return 6 }\n"
+
+// main loads driverSrc with LoadCallable and prints the errors it returns, or
+// "loaded".  Its arguments are the interface and implementation search paths, as
+// colon-separated lists.
+func main() {
+	var args @[]readonly @[]readonly char = os.Args()
+	if len(args) != 3 {
+		testing.Println("usage: host <I-paths> <L-paths>")
+		os.Exit(2)
+	}
+	var it @interp.Interp = interp.New(8 * 1024 * 1024, interp.StandardPackages())
+	addPaths(it, args[1], false)
+	addPaths(it, args[2], true)
+	var src @[]uint8 = make_slice(uint8, len(driverSrc))
+	for i := 0; i < len(driverSrc); i++ { src[i] = cast(uint8, driverSrc[i]) }
+	var p @parser.Parser = parser.New(src, "driver.bn")
+	var files @[]@ast.File = make_slice(@ast.File, 1)
+	files[0] = p.ParseFile()
+	var errs @[]@[]char = it.LoadCallable(files, buf.CopyStr("driver"))
+	if len(errs) == 0 { testing.Println("loaded") }
+	for i := 0; i < len(errs); i++ { testing.Println(errs[i]) }
+}
+
+// addPaths adds each directory of the colon-separated list as an implementation
+// search path (isImpl) or an interface one.
+func addPaths(it @interp.Interp, list *[]readonly char, isImpl bool) {
+	var start int = 0
+	for i := 0; i <= len(list); i++ {
+		if i < len(list) && list[i] != ':' { continue }
+		if i > start && isImpl {
+			it.AddImplPath(buf.CopyStr(list[start:i]))
+		} else if i > start {
+			it.AddBniPath(buf.CopyStr(list[start:i]))
+		}
+		start = i + 1
+	}
+}
+EOF
+host_build=$("$GEN1_BNC" -I "$IFACES" -L "$IMPLS" --build-dir "$TMP/b6" \
+    -o "$TMP/host-bin" "$TMP/host" 2>&1)
+if [ ! -x "$TMP/host-bin" ]; then
+    echo "FAIL: the LoadCallable host did not build:"
+    printf '%s\n' "$host_build" | tail -5
+    FAILS=$((FAILS + 1))
+else
+    host_out=$("$TMP/host-bin" "$IFACES" "$IMPLS" 2>&1)
+    host_rc=$?
+    if [ "$host_rc" -ne 0 ] ||
+            ! printf '%s\n' "$host_out" | grep -qxF "$UNDEF_V (used by driver.D, line 3)"; then
+        echo "FAIL: LoadCallable should return the load error (rc=$host_rc):"
+        printf '%s\n' "$host_out" | tail -5
+        FAILS=$((FAILS + 1))
+    else
+        echo "PASS: LoadCallable returns the driver package's load error"
+    fi
 fi
 
 [ "$FAILS" -eq 0 ] || exit 1

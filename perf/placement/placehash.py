@@ -19,9 +19,12 @@ symbol.
 
 On Mach-O the object divides into per-symbol atoms and bnc links with
 -dead_strip, so the filler before an object's first function (and after any
-function the link strips) may be discarded.  Phase mode is unaffected, since
-.text is aligned to PLACE_SPAN and the linker keeps each atom's address modulo
-it; but shift-mode offsets on Mach-O are not exact.
+function the link strips) may be discarded.  Phase mode then holds only if the
+linker keeps each atom's offset modulo PLACE_SPAN.  ld64.lld does not: it aligns
+an atom only to the largest power of two dividing its offset, so once a
+stripped atom is dropped the functions after it can move off their phase.
+Shift-mode offsets on Mach-O are not exact either.  `layout.py BIN
+--expect-seed S` shows whether a given link kept the phases.
 
 Keep this module in step with place.bn: test_placehash.py and
 pkg/binate/native/place/place_test.bn pin the same vectors, but nothing runs

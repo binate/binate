@@ -1,0 +1,275 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/std/strconv"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// Building a generic instance's members, and what an infinite family
+// (check_generic_expand.bn) changes about it.  An instance of a generic in an
+// infinite family is not built when its type arguments are concrete — naming it
+// is an error — nor when they grow from a generic struct's fields, whose
+// declaration is rejected.  Checking the family's own declarations, with their
+// type parameters abstract, builds abstract instances of it (`Box[Opt[V]]` in
+// `func (b *Box[V]) Wrap() Box[Opt[V]]`), and building one derives its methods'
+// signatures, which name the next (`Box[Opt[Opt[V]]]`): so an abstract instance
+// of the family built while another instance is (its methods derived, or its
+// structure built) gets its structure — an interface its parents — but not its
+// methods until code uses it (ensureMembers): when an expression has it as its
+// type, or it is assigned to or from, one level at a time.  Its parents are
+// never deferred: what walks an interface's ancestors (method lookup, impl
+// coverage, the extension cycle and conflict checks) would find none, and a
+// family that grows through parents alone is blocked like one through fields.
+
+// MAX_INSTANCES_PER_BUILD bounds the instances one outermost instantiation
+// builds, those its fields and its members' signatures name included (spec
+// §21.4: an implementation limit, at least 4096).  A family whose type argument
+// grows through array-length arithmetic (`*N[[sizeof(T) + 1]uint8]`), which the
+// expansion check cannot decide, and which branches, would otherwise build
+// exponentially many before a depth bound stops it.  A generic whose build went
+// past it is not instantiated again (InstanceState.OverBudget), so the instances
+// queued meanwhile do not each start another.
+const MAX_INSTANCES_PER_BUILD int = 4096
+
+// beginBuildBudget starts the count of instances built (MAX_INSTANCES_PER_BUILD)
+// for an outermost instantiation, the instance of d with args named at pos.
+func beginBuildBudget(c @Checker, d @ast.Decl, args @[]@types.Type, pos token.Pos) {
+	var st @InstanceState = instanceState(c)
+	st.BuildCount = 0
+	st.BuildOver = false
+	st.BuildRoot = d
+	st.BuildRootArgs = args
+	st.BuildRootPos = pos
+}
+
+// buildBudgetSpent counts the instance of d with args, about to be built, against
+// the budget of the outermost instantiation in progress (MAX_INSTANCES_PER_BUILD)
+// — starting it when this is the outermost — and reports whether it is spent,
+// reported once, where that instantiation is named; the caller then does not
+// build the instance.
+func buildBudgetSpent(c @Checker, d @ast.Decl, args @[]@types.Type, usePos token.Pos) bool {
+	if overBudget(c, d) { return true }
+	if c.GenericInstDepth == 0 { beginBuildBudget(c, d, args, usePos) }
+	var st @InstanceState = instanceState(c)
+	if st.BuildOver { return true }
+	st.BuildCount = st.BuildCount + 1
+	if st.BuildCount <= MAX_INSTANCES_PER_BUILD { return false }
+	st.BuildOver = true
+	st.OverBudget = slices.Append[@ast.Decl](st.OverBudget, st.BuildRoot)
+	if !same(d, st.BuildRoot) { st.OverBudget = slices.Append[@ast.Decl](st.OverBudget, d) }
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("generic instantiation ")
+	cb.Write(instanceLabel(st.BuildRoot.Name, st.BuildRootArgs))
+	cb.Write(" builds more than ")
+	cb.Write(strconv.Itoa(MAX_INSTANCES_PER_BUILD))
+	cb.Write(" instances (an implementation limit): its generic's fields or methods may name")
+	cb.Write(" instances with ever-growing type arguments")
+	addCheckError(c, st.BuildRootPos, buf.CopyStr(cb.String()))
+	return true
+}
+
+// overBudget reports whether an instantiation of the generic d went past
+// MAX_INSTANCES_PER_BUILD (reported then), since the generic declarations or
+// methods last changed (Checker.GenericGen) — a REPL redefinition may make it
+// finite.
+func overBudget(c @Checker, d @ast.Decl) bool {
+	if c.Instances == nil { return false }
+	if c.Instances.OverBudgetGen != c.GenericGen {
+		var none @[]@ast.Decl
+		c.Instances.OverBudget = none
+		c.Instances.OverBudgetGen = c.GenericGen
+	}
+	for i := 0; i < len(c.Instances.OverBudget); i++ {
+		if same(c.Instances.OverBudget[i], d) { return true }
+	}
+	return false
+}
+
+// expansionBlocked reports whether the instance of the generic d with the type
+// arguments args is not built (the caller makes it the error type): with
+// concrete arguments, of a generic in an infinite family, reported at usePos;
+// with abstract ones, of a generic whose structure alone (a struct's fields, an
+// interface's parents) is in one, whose declaration is rejected
+// (checkGenericDeclAbstract).
+func expansionBlocked(c @Checker, d @ast.Decl, args @[]@types.Type, usePos token.Pos) bool {
+	if argsAreOwnParams(d, args) || !genericExpanding(c, d) { return false }
+	if !typeArgsAbstract(args) {
+		errInfiniteInstantiation(c, d, args, usePos)
+		return true
+	}
+	return genericFieldsExpanding(c, d)
+}
+
+// errInfiniteInstantiation reports, at pos, that the instance of the generic d
+// with the concrete arguments args names infinitely many instantiations — in
+// the instance being checked, if any, as its other errors are.
+func errInfiniteInstantiation(c @Checker, d @ast.Decl, args *[]@types.Type, pos token.Pos) {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("generic instantiation ")
+	cb.Write(instanceLabel(d.Name, args))
+	cb.Write(" names infinitely many instantiations: its generic's fields or methods name instances")
+	cb.Write(" with ever-growing type arguments")
+	var cur @InstWork = instanceState(c).Current
+	if cur != nil { cb.Write(instanceContext(cur, cur.Label)) }
+	addCheckError(c, pos, buf.CopyStr(cb.String()))
+}
+
+// errFieldsExpanding reports, at the generic declaration d, that its structure
+// alone — a struct's fields, an interface's parents — names ever-growing
+// instances (spec gen.mono.instances).
+func errFieldsExpanding(c @Checker, d @ast.Decl) {
+	var cb @strings.Builder = strings.NewBuilder()
+	if d.Kind == ast.DECL_INTERFACE {
+		cb.Write("the parents of generic interface ")
+	} else {
+		cb.Write("the fields of generic type ")
+	}
+	cb.Write(d.Name)
+	cb.Write(" name instances with ever-growing type arguments:")
+	cb.Write(" none of its instantiations can be named")
+	addCheckError(c, d.Pos, buf.CopyStr(cb.String()))
+}
+
+// deferMembersHere reports whether the instance of d with the arguments args,
+// being built, waits for its methods until code uses it: abstract arguments, not
+// d's own parameters, of a generic in an infinite family, built while another
+// instance is.
+func deferMembersHere(c @Checker, d @ast.Decl, args @[]@types.Type) bool {
+	return (c.DerivingInstanceSig || c.GenericInstDepth > 1) && typeArgsAbstract(args) &&
+			!argsAreOwnParams(d, args) && genericExpanding(c, d)
+}
+
+// typeArgsAbstract reports whether a type argument in args depends on a type
+// parameter: mentions one, or holds an array whose length does (a generic body's
+// `[sizeof(T)]uint8`, whose placeholder length looks concrete).
+func typeArgsAbstract(args *[]@types.Type) bool {
+	if typeListMentionsTypeParam(args) { return true }
+	for i := 0; i < len(args); i++ {
+		if containsDependentArray(args[i]) { return true }
+	}
+	return false
+}
+
+// buildInstanceMembers builds the members of the new instance entry from its
+// clone: an interface's methods and parents, judged where it is named
+// (requireIfaceInstanceArgsKept); a type's underlying type and methods, with
+// the instance as the one its fields and methods' signatures are named from
+// (work), so a chain of instances each naming the next grows its chain
+// (gen.mono.instances), as one through bodies does.  When the instance waits
+// for its methods (deferMembersHere), the rest is built.
+func buildInstanceMembers(c @Checker, entry @GenericInstantiation, isIface bool, usePos token.Pos,
+		userFacing bool, view ImplView, work @InstWork) {
+	var st @InstanceState = instanceState(c)
+	var waits bool = deferMembersHere(c, entry.Decl, entry.TypeArgs)
+	if waits {
+		entry.MembersDeferred = true
+		entry.DeferredUserFacing = userFacing
+		st.Deferred = slices.Append[@GenericInstantiation](st.Deferred, entry)
+	}
+	if isIface {
+		populateIfaceInstance(c, entry, userFacing, !waits)
+		if userFacing && !waits { requireIfaceInstanceArgsKept(c, entry.Result, usePos, view) }
+		return
+	}
+	var savedCur @InstWork = st.Current
+	if work != nil { st.Current = work }
+	populateInstantiatedType(c, entry.Decl, entry.Clone, entry.TypeArgs, entry.Result, !waits)
+	st.Current = savedCur
+}
+
+// populateIfaceInstance populates the interface instance entry from its clone —
+// its methods only withMethods — marking it in progress so a parent that loops
+// back to it (an inheritance cycle across distinct instantiations) is detected
+// in resolveInterfaceExtension.
+func populateIfaceInstance(c @Checker, entry @GenericInstantiation, userFacing bool,
+		withMethods bool) {
+	c.GenericIfacePopulating = slices.Append[@types.Type](c.GenericIfacePopulating, entry.Result)
+	populateInstantiatedInterface(c, entry.Decl, entry.Clone, entry.TypeArgs, entry.Result, userFacing,
+			withMethods)
+	c.GenericIfacePopulating = c.GenericIfacePopulating[0:len(c.GenericIfacePopulating) - 1]
+}
+
+// ensureMembers builds the methods of the instance t is — through pointers,
+// interface values, `readonly` and aliases — when it waits for them
+// (buildInstanceMembers), and those of an interface's ancestors and of a type
+// parameter's constraint, which a method lookup on t walks: code is about to use
+// it.
+func ensureMembers(c @Checker, t @types.Type) {
+	if c == nil || c.Instances == nil || len(c.Instances.Deferred) == 0 { return }
+	var seen typeVisits
+	ensureMembersIn(c, t, &seen)
+}
+
+// ensureMembersIn is ensureMembers, entering each interface once (seen): its
+// ancestors form a DAG, which walked as a tree takes time exponential in its
+// depth.
+func ensureMembersIn(c @Checker, t @types.Type, seen *typeVisits) {
+	for t != nil {
+		var k int = t.Kind
+		if k == types.TYP_POINTER || k == types.TYP_MANAGED_PTR || k == types.TYP_READONLY ||
+				k == types.TYP_INTERFACE_VALUE || k == types.TYP_INTERFACE_VALUE_MANAGED {
+			t = t.Elem
+		} else if k == types.TYP_ALIAS {
+			t = t.Target
+		} else {
+			break
+		}
+	}
+	if t == nil { return }
+	if t.Kind == types.TYP_TYPE_PARAM {
+		ensureMembersIn(c, t.TpConstraint, seen)
+		return
+	}
+	if t.Kind == types.TYP_INTERFACE && !seen.enter(t) { return }
+	if t.InstDecl != nil {
+		var st @InstanceState = c.Instances
+		for i := 0; i < len(st.Deferred); i++ {
+			var entry @GenericInstantiation = st.Deferred[i]
+			if same(entry.Result, t) {
+				st.Deferred = withoutEntry(st.Deferred, i)
+				entry.MembersDeferred = false
+				completeMembers(c, entry)
+				break
+			}
+		}
+	}
+	if t.Kind == types.TYP_INTERFACE {
+		for i := 0; i < len(t.Parents); i++ {
+			ensureMembersIn(c, t.Parents[i], seen)
+		}
+	}
+}
+
+// completeMembers builds the methods the instance entry waited for, as an
+// instantiation in progress (GenericInstDepth) — what they name in the family
+// waiting in turn.
+func completeMembers(c @Checker, entry @GenericInstantiation) {
+	if c.GenericInstDepth == 0 { beginBuildBudget(c, entry.Decl, entry.TypeArgs, entry.NamedAt) }
+	c.GenericInstDepth = c.GenericInstDepth + 1
+	if entry.Result.Kind == types.TYP_INTERFACE {
+		completeIfaceInstanceMethods(c, entry.Decl, entry.Clone, entry.TypeArgs, entry.Result,
+				entry.DeferredUserFacing)
+	} else {
+		var saved instanceBinding = bindInstance(c, entry.Decl, entry.TypeArgs)
+		copyPlaceholderMethods(c, entry.Decl, entry.TypeArgs, entry.Result)
+		unbindInstance(c, saved)
+	}
+	c.GenericInstDepth = c.GenericInstDepth - 1
+	if c.GenericInstDepth == 0 { flushPendingChecks(c) }
+}
+
+// withoutEntry returns a copy of entries without the one at index i.
+func withoutEntry(entries @[]@GenericInstantiation, i int) @[]@GenericInstantiation {
+	var out @[]@GenericInstantiation = make_slice(@GenericInstantiation, len(entries) - 1)
+	for k := 0; k < i; k++ {
+		out[k] = entries[k]
+	}
+	for k := i + 1; k < len(entries); k++ {
+		out[k - 1] = entries[k]
+	}
+	return out
+}

@@ -2834,6 +2834,30 @@ testing.Println(len(lang.__Package().SatEntries) > 0)
 > true
 > "
 
+# --- A parked declaration's retry checks its syntax afresh: y's first attempt
+# reads `v.Inc()` with v a T value (an implicit `&v` for the *T method); by the
+# retry v is a *T, and the call takes v itself.  An `&v` left from the first
+# attempt passed a **T, and the VM found no method `main..Inc`. ---
+run_repl "retry-reads-syntax-afresh" \
+"type T struct { n int }
+func (t *T) Inc() int { t.n = t.n + 1; return t.n }
+func add(a int, b int) int { return a + b }
+var v T
+var y int = add(v.Inc(), u)
+var w T = T{n: 40}
+var v *T = &w
+var u int = 1
+testing.Println(y)
+testing.Println(w.n)
+" \
+"$BANNER
+> > > > > variable y parked (pending: u)
+> > warning: variable v shadowed (incompatible type); existing references retain the old variable
+> variable y resolved
+> 42
+> 41
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

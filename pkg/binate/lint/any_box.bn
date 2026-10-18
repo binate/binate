@@ -1,0 +1,235 @@
+package "pkg/binate/lint"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+import "pkg/binate/types"
+
+// ============================================================
+// Rules: func-into-any-variadic, iface-pointer-into-any
+// ============================================================
+//
+// Two conversions into `any` that type-check but are almost always mistakes:
+//
+// - func-into-any-variadic: a function passed as a `...*any` argument — the
+//   argument of a print (`fmt.Println(add)`, `testing.Println(f)`).  A function
+//   name decays to its `@func` value (func.ref.decay), and a function value is
+//   boxed as itself, so the print shows `%!?(unknown)` rather than a result: a
+//   missing call.
+// - iface-pointer-into-any: a pointer to an interface value (`&g` for `g
+//   @Getter`, a `@(@Getter)`) converted to `*any` / `@any`.  Its dynamic type is
+//   the interface-value type itself, which no assertion target but `*any` /
+//   `@any` names (iface.assert), so the boxed value can never be recovered as a
+//   Getter: the interface value itself was almost certainly meant.
+//
+// Both rules visit every place a value converts to a destination of known type
+// (anyBoxSite): a call's argument (its parameter's type; a `...T` argument, the
+// element type), a declared variable's initializer, an assignment's right-hand
+// side, a return operand (the function's result type), and a composite literal's
+// element (the field's or element's type), and a `cast` to an interface value.
+// Types are resolved as IR-gen resolves a box's source (aliases and `readonly`
+// only): a named type over a pointer or a function value is a value of its own
+// type (iface.construct.named-pointer), boxed with that named type, which an
+// assertion recovers — the very wrapper a recoverable box is written with.
+
+// lintAnyBoxes runs both rules over every declaration of the package.
+func lintAnyBoxes(ctx @lintCtx, file @ast.File) {
+	for i := 0; i < len(file.Decls); i++ {
+		abDecl(ctx, file.Decls[i])
+	}
+}
+
+// abDecl visits a declaration: a function body (with its results, for a
+// top-level function), a typed variable's initializer, or a group's members.
+func abDecl(ctx @lintCtx, d @ast.Decl) {
+	if d == nil { return }
+	if d.Kind == ast.DECL_FUNC && d.Body != nil {
+		var results @[]@types.Type
+		var ft @types.Type = types.StripWrappers(ctx.Checker.ExprType(d.ResolvedTypeID))
+		if ft != nil && ft.Kind == types.TYP_FUNC { results = ft.Results }
+		abStmt(ctx, d.Body, results)
+	}
+	if d.Kind == ast.DECL_VAR && d.Value != nil {
+		if d.TypeRef != nil { anyBoxSite(ctx, ctx.Checker.ExprType(d.ResolvedTypeID), d.Value, false) }
+		abExpr(ctx, d.Value)
+	}
+	if d.Kind == ast.DECL_GROUP {
+		for i := 0; i < len(d.Decls); i++ {
+			abDecl(ctx, d.Decls[i])
+		}
+	}
+}
+
+// abStmt visits a statement and everything in it.  results is the enclosing
+// function's result types (empty when unknown), for its return operands.
+func abStmt(ctx @lintCtx, s @ast.Stmt, results @[]@types.Type) {
+	if s == nil { return }
+	if s.Kind == ast.STMT_DECL {
+		abDecl(ctx, s.DeclRef)
+		return
+	}
+	if s.Kind == ast.STMT_ASSIGN && s.Op == cast(int, token.ASSIGN) && len(s.Exprs) == len(s.Exprs2) {
+		for i := 0; i < len(s.Exprs); i++ {
+			anyBoxSite(ctx, ctx.Checker.ExprType(s.Exprs[i].ResolvedTypeID), s.Exprs2[i], false)
+		}
+	}
+	if s.Kind == ast.STMT_RETURN && len(s.Exprs) == len(results) {
+		for i := 0; i < len(s.Exprs); i++ {
+			anyBoxSite(ctx, results[i], s.Exprs[i], false)
+		}
+	}
+	for i := 0; i < len(s.Stmts); i++ {
+		abStmt(ctx, s.Stmts[i], results)
+	}
+	for i := 0; i < len(s.Exprs); i++ {
+		abExpr(ctx, s.Exprs[i])
+	}
+	for i := 0; i < len(s.Exprs2); i++ {
+		abExpr(ctx, s.Exprs2[i])
+	}
+	abExpr(ctx, s.X)
+	abStmt(ctx, s.Init, results)
+	abStmt(ctx, s.Body, results)
+	abStmt(ctx, s.Else, results)
+	abStmt(ctx, s.Post, results)
+	for i := 0; i < len(s.Cases); i++ {
+		var cc @ast.CaseClause = s.Cases[i]
+		if cc == nil { continue }
+		for j := 0; j < len(cc.Exprs); j++ {
+			abExpr(ctx, cc.Exprs[j])
+		}
+		for j := 0; j < len(cc.Body); j++ {
+			abStmt(ctx, cc.Body[j], results)
+		}
+	}
+}
+
+// abExpr visits an expression and everything in it: a call's arguments and a
+// composite literal's elements are conversion sites, and a function literal's
+// body is walked with the literal's own results.
+func abExpr(ctx @lintCtx, e @ast.Expr) {
+	if e == nil { return }
+	if e.Kind == ast.EXPR_CALL { abCallArgs(ctx, e) }
+	if e.Kind == ast.EXPR_BUILTIN && e.Op == cast(int, token.CAST) && len(e.Args) == 1 {
+		anyBoxSite(ctx, ctx.Checker.ExprType(e.ResolvedTypeID), e.Args[0], false)
+	}
+	if e.Kind == ast.EXPR_COMPOSITE {
+		var st @types.Type = types.StripWrappers(ctx.Checker.ExprType(e.ResolvedTypeID))
+		for i := 0; i < len(e.Elems); i++ {
+			var el @ast.Element = e.Elems[i]
+			if el == nil { continue }
+			if st != nil { anyBoxSite(ctx, aggregateElemTargetType(st, el, i), el.Value, false) }
+			abExpr(ctx, el.Value)
+		}
+	}
+	if e.Kind == ast.EXPR_FUNC_LIT {
+		if e.DeclRef != nil && e.DeclRef.Body != nil {
+			var results @[]@types.Type
+			var ft @types.Type = types.StripWrappers(ctx.Checker.ExprType(e.ResolvedTypeID))
+			if ft != nil { results = ft.Results }
+			abStmt(ctx, e.DeclRef.Body, results)
+		}
+		return
+	}
+	abExpr(ctx, e.X)
+	abExpr(ctx, e.Y)
+	abExpr(ctx, e.Z)
+	for i := 0; i < len(e.Args); i++ {
+		abExpr(ctx, e.Args[i])
+	}
+}
+
+// abCallArgs visits a call's arguments against its parameters: a `...T`
+// parameter binds each remaining argument to T (unless the call spreads a slice
+// into it).
+func abCallArgs(ctx @lintCtx, e @ast.Expr) {
+	var params @[]@types.Param
+	var known bool
+	params, known = abCallParams(ctx, e)
+	if !known { return }
+	var n int = len(params)
+	for i := 0; i < len(e.Args); i++ {
+		if i < n - 1 || (i == n - 1 && !params[i].IsVariadic) {
+			anyBoxSite(ctx, params[i].Type, e.Args[i], false)
+		} else if n > 0 && params[n - 1].IsVariadic && !e.Spread {
+			var body @types.Type = types.StripWrappers(params[n - 1].Type)
+			if body != nil { anyBoxSite(ctx, body.Elem, e.Args[i], true) }
+		}
+	}
+}
+
+// abCallParams returns the parameters a call's arguments bind to, and whether
+// they are known: a function's or function value's (the callee's recorded type),
+// or — for a method call, whose selector the checker leaves untyped — the
+// method's, found through the receiver's recorded type as checkResolvedMethodCall
+// finds it: an interface value's (or a type parameter's constraint's) method, or
+// the receiver's named base type's method without its receiver parameter.
+func abCallParams(ctx @lintCtx, e @ast.Expr) (@[]@types.Param, bool) {
+	var none @[]@types.Param
+	var ft @types.Type = resolveCalleeFuncType(ctx, e.X)
+	if ft != nil { return ft.Params, true }
+	var sel @ast.Expr = e.X
+	if sel == nil || sel.Kind != ast.EXPR_SELECTOR || sel.X == nil { return none, false }
+	var rt @types.Type = types.ResolveAliasAndConst(ctx.Checker.ExprType(sel.X.ResolvedTypeID))
+	if rt == nil { return none, false }
+	if rt.Kind == types.TYP_POINTER || rt.Kind == types.TYP_MANAGED_PTR {
+		var pointee @types.Type = types.ResolveAliasAndConst(rt.Elem)
+		if pointee != nil &&
+				(pointee.Kind == types.TYP_INTERFACE_VALUE ||
+						pointee.Kind == types.TYP_INTERFACE_VALUE_MANAGED) {
+			rt = pointee
+		}
+	}
+	var m @types.Method
+	if rt.Kind == types.TYP_INTERFACE_VALUE || rt.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		if rt.Elem != nil { m = rt.Elem.LookupInterfaceMethod(sel.Name) }
+		if m == nil || m.FuncType == nil { return none, false }
+		return m.FuncType.Params, true
+	}
+	if rt.Kind == types.TYP_TYPE_PARAM {
+		if rt.TpConstraint != nil { m = rt.TpConstraint.LookupInterfaceMethod(sel.Name) }
+		if m == nil || m.FuncType == nil { return none, false }
+		return m.FuncType.Params, true
+	}
+	var named @types.Type = rt.ReceiverBaseNamed()
+	if named != nil { m = named.LookupMethod(sel.Name) }
+	if m == nil || m.FuncType == nil || len(m.FuncType.Params) == 0 { return none, false }
+	return m.FuncType.Params[1:], true
+}
+
+// anyBoxSite applies both rules to src converting to dst.  variadic marks an
+// argument bound to a `...T` parameter's element.
+func anyBoxSite(ctx @lintCtx, dst @types.Type, src @ast.Expr, variadic bool) {
+	if dst == nil || src == nil || !isAnyIfaceType(dst) { return }
+	var st @types.Type = types.ResolveAliasAndConst(ctx.Checker.ExprType(src.ResolvedTypeID))
+	if st == nil { return }
+	if variadic && typeIsRawIfaceValue(dst) &&
+			(st.Kind == types.TYP_FUNC || st.Kind == types.TYP_FUNC_VALUE ||
+					st.Kind == types.TYP_MANAGED_FUNC_VALUE) {
+		addDiag(ctx, src.Pos, "func-into-any-variadic",
+				"a function passed as a `...*any` argument is boxed as its function value, "
+						"not a call's result: a missing call?")
+	}
+	if st.Kind == types.TYP_POINTER || st.Kind == types.TYP_MANAGED_PTR {
+		var pt @types.Type = types.ResolveAliasAndConst(st.Elem)
+		if pt != nil &&
+				(pt.Kind == types.TYP_INTERFACE_VALUE || pt.Kind == types.TYP_INTERFACE_VALUE_MANAGED) {
+			addDiag(ctx, src.Pos, "iface-pointer-into-any",
+					"a pointer to an interface value converted to any boxes the interface value's "
+							"type, which no assertion recovers: pass the interface value itself?")
+		}
+	}
+}
+
+// isAnyIfaceType reports whether t is a raw or managed interface value of the
+// universal interface `any` (`*any`, `@any`), through aliases and `readonly`
+// (a named type over one is a value of its own type).
+func isAnyIfaceType(t @types.Type) bool {
+	t = types.ResolveAliasAndConst(t)
+	if t == nil ||
+			(t.Kind != types.TYP_INTERFACE_VALUE && t.Kind != types.TYP_INTERFACE_VALUE_MANAGED) {
+		return false
+	}
+	var iface @types.Type = t.Elem
+	return iface != nil && iface.Kind == types.TYP_INTERFACE && len(iface.Pkg) == 0 &&
+			types.CharEq(iface.Name, "any")
+}

@@ -3,6 +3,7 @@ package "pkg/binate/check"
 import "pkg/binate/types"
 
 import "pkg/binate/token"
+import "pkg/std/vec"
 import "pkg/stdx/slices"
 
 // Whether an instance still needs its check.  Each instance — a FuncInstance,
@@ -25,20 +26,27 @@ import "pkg/stdx/slices"
 // Namers the instances whose check named it while it was queued or in the
 // drain that checked it (the one its chain's parent among them); Deps the
 // instances its last check named, and for a struct instance those its fields
-// refer to; Reach the last markProgramInstances stamp that reached it.
+// refer to; Reach the last markProgramInstances stamp that reached it.  Owners
+// are the packages whose opaque exports the instance's type arguments carry,
+// Lenders those of them whose exports its body sees (its lender class), and
+// Next the state of the instance's next lender class, if any
+// (check_instance_lenders.bn).
 // Namers and Deps refer to other states without owning them: the states live
 // as long as their instances' records (FuncInstance, GenericInstantiation) --
 // a record dropped with an undone REPL declaration takes the edges to its
-// state with it (dropInstCaches) -- and the edges can form cycles.
+// states with it (dropInstCaches) -- and the edges can form cycles.
 type InstCheckState struct {
-	Queued bool
-	OK     bool
-	Epoch  int
-	Site   token.Pos
-	Live   int
-	Namers @[]*InstCheckState
-	Deps   @[]*InstCheckState
-	Reach  int
+	Queued  bool
+	OK      bool
+	Epoch   int
+	Site    token.Pos
+	Live    int
+	Namers  @[]*InstCheckState
+	Deps    @[]*InstCheckState
+	Reach   int
+	Owners  @[]@[]char
+	Lenders @[]@[]char
+	Next    @InstCheckState
 }
 
 // newInstCheckState returns the check state of an instance first named at
@@ -155,6 +163,48 @@ func discardInstWork(st @InstanceState, floor int) {
 	st.Top = floor
 }
 
+// A bniWork is an instance check the .bni of the package Pkg queued as it was
+// loaded (keepBniWork).
+type bniWork struct {
+	Pkg  @[]char
+	Work @InstWork
+}
+
+// keepBniWork keeps, for the package path's own check (requeueBniWork), the
+// instance checks queued above floor while its .bni was loaded, which are then
+// dropped: an instance a .bni names is named where its package's exports are
+// opaque, a lender class the package's .bn may never name it in.
+func keepBniWork(c @Checker, path @[]char, floor int) {
+	var st @InstanceState = instanceState(c)
+	if st.Top <= floor { return }
+	if st.BniWork == nil { st.BniWork = vec.New[bniWork]() }
+	for i := floor; i < st.Top; i++ {
+		var b bniWork
+		b.Pkg = path
+		b.Work = st.Queue.Get(i)
+		st.BniWork.Push(b)
+	}
+}
+
+// requeueBniWork queues again, in the package path's own check, each instance
+// check its .bni queued as it was loaded (keepBniWork) that still needs one
+// (needsInstanceCheck).
+func requeueBniWork(c @Checker, path *[]readonly char) {
+	var st @InstanceState = instanceState(c)
+	if st.BniWork == nil { return }
+	var rest @vec.Vec[bniWork] = vec.New[bniWork]()
+	for i := 0; i < st.BniWork.Len(); i++ {
+		var b bniWork = st.BniWork.Get(i)
+		if !types.CharEq(b.Pkg, path) {
+			rest.Push(b)
+		} else if needsInstanceCheck(c, b.Work.State) {
+			b.Work.State.Queued = true
+			pushInstWork(st, b.Work)
+		}
+	}
+	st.BniWork = rest
+}
+
 // reverseInstWork reverses st's stack above floor, so the instances one body
 // named, pushed in the order it names them, are popped in that order.
 func reverseInstWork(st @InstanceState, floor int) {
@@ -214,12 +264,19 @@ func drainTentativeInstances(c @Checker, floor int) {
 // and queues that check, unless the instance is derived for a method a REPL
 // input copies into an existing instance (backfillQueueSkipped), noting it
 // named (noteInstanceNamed) when the program names it there (namedByProgram).
+// For a concrete interface instance it records the lender class it is named
+// in (ifaceClassNew): its population names its methods' struct instances in it.
 func queueStructInstance(c @Checker, entry @GenericInstantiation, isIface bool, site token.Pos,
 		userFacing bool) {
-	if isIface || typeListMentionsTypeParam(entry.TypeArgs) {
+	if typeListMentionsTypeParam(entry.TypeArgs) {
 		return
 	}
-	entry.InstState = newInstCheckState(c, site)
+	if isIface {
+		entry.IfaceOwners = exportOwners(c, entry.TypeArgs)
+		_ = ifaceClassNew(c, entry)
+		return
+	}
+	entry.InstState = firstInstState(c, entry.TypeArgs, site)
 	if backfillQueueSkipped(c) {
 		return
 	}
@@ -230,30 +287,33 @@ func queueStructInstance(c @Checker, entry @GenericInstantiation, isIface bool, 
 }
 
 // requeueStructInstance queues again, named at site, the check of the cached
-// instantiation entry when it needs it (needsInstanceCheck) — unless named
+// instantiation entry, in the lender class it is named in (instStateFor), when
+// it needs it (needsInstanceCheck) — unless named
 // for a method a REPL input copies into an existing instance
 // (backfillQueueSkipped) — and notes it named (noteInstanceNamed) when the
-// program names it there (namedByProgram).  At the REPL, for a generic
-// interface instance it does so for the struct instances its methods refer to
-// (noteInterfaceInstances); a compilation queued those when it populated the
-// interface.
+// program names it there (namedByProgram).  For a generic interface instance it
+// does so for the struct instances its methods refer to
+// (noteInterfaceInstances): at the REPL, each time; in a compilation, when it
+// is named in a lender class it was not named in before (ifaceClassNew) — those
+// of its first were queued when it was populated.
 func requeueStructInstance(c @Checker, entry @GenericInstantiation, site token.Pos,
 		userFacing bool) {
 	if backfillQueueSkipped(c) {
 		return
 	}
 	if entry.InstState == nil {
-		if instanceState(c).TrackNamed && entry.Result != nil &&
-				entry.Result.Kind == types.TYP_INTERFACE {
+		if entry.Result != nil && entry.Result.Kind == types.TYP_INTERFACE &&
+				(instanceState(c).TrackNamed || ifaceClassNew(c, entry)) {
 			noteInterfaceInstances(c, entry.Result, site, userFacing)
 		}
 		return
 	}
-	if needsInstanceCheck(c, entry.InstState) {
-		enqueueTypeWork(c, entry.Decl, entry.TypeArgs, site, entry.InstState)
+	var s @InstCheckState = instStateFor(c, entry.InstState, site)
+	if needsInstanceCheck(c, s) {
+		enqueueTypeWork(c, entry.Decl, entry.TypeArgs, site, s)
 	}
 	if namedByProgram(c, userFacing) {
-		noteInstanceNamed(c, entry.InstState)
+		noteInstanceNamed(c, s)
 	}
 }
 

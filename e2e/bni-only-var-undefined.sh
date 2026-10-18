@@ -13,8 +13,8 @@
 #      folded from `len` of an array var: bnc builds and runs it, and so does bni;
 #   4. the REPL reports each prompt entry whose code needs the var, keeps none of
 #      it -- a declaration is not kept, a redefinition leaves the old definition, an
-#      import of a package that needs it (or imports one that does) is not made --
-#      and the session goes on;
+#      import of a package that needs it (or imports one that does) is not made, a
+#      parked declaration resolving later stays parked -- and the session goes on;
 #   5. bni --test of a package that needs it reports it and exits non-zero;
 #   6. an embedder's interp.LoadCallable of a driver package that needs it returns
 #      the load error.
@@ -230,6 +230,9 @@ repl_out=$(cd "$SRC" && printf '%s\n' \
     'func Q[T any]() int { return 3 }' \
     '_ = Q[int]() + solo.V' \
     'testing.Println(Q[int]())' \
+    'func pf() int { return pg() + solo.V }' \
+    'func pg() int { return 1 }' \
+    'testing.Println(pg())' \
     'import "pkg/userdep"' \
     'testing.Println(userdep.Y())' \
     'testing.Println(7)' |
@@ -241,21 +244,22 @@ if [ "$repl_rc" -ne 0 ] || printf '%s\n' "$repl_out" | grep -q 'panic'; then
     echo "FAIL: the REPL session did not survive the entries (rc=$repl_rc):"
     printf '%s\n' "$repl_out" | tail -8
     FAILS=$((FAILS + 1))
-elif [ "$undef_count" -ne 9 ]; then
-    echo "FAIL: expected 9 load errors (x, f, G[int] twice, v, h, K, Q's use, pkg/user), got $undef_count:"
+elif [ "$undef_count" -ne 10 ]; then
+    echo "FAIL: expected 10 load errors (x, f, G[int] twice, v, h, K, Q's use, pf, pkg/user), got $undef_count:"
     printf '%s\n' "$repl_out" | tail -12
     FAILS=$((FAILS + 1))
 elif ! printf '%s\n' "$repl_out" | grep -q 'undefined: f$' ||
         ! printf '%s\n' "$repl_out" | grep -q 'undefined: v$' ||
+        ! printf '%s\n' "$repl_out" | grep -q 'function pf still parked (it does not load)$' ||
         ! printf '%s\n' "$repl_out" | grep -q 'not imported.*: pkg/userdep$' ||
         ! printf '%s\n' "$repl_out" | grep -q 'undefined: userdep$'; then
-    echo "FAIL: f, v and the import of pkg/userdep should not be kept:"
+    echo "FAIL: f, v and the import of pkg/userdep should not be kept, nor pf resolve:"
     printf '%s\n' "$repl_out" | tail -12
     FAILS=$((FAILS + 1))
 elif [ "$(printf '%s\n' "$repl_out" | grep -E '^(> )+[0-9]+$' | sed 's/^[> ]*//' | tr '\n' ' ')" != \
-        "4 1 2 2 3 7 " ]; then
+        "4 1 2 2 3 1 7 " ]; then
     echo "FAIL: expected N (4), the old h (1), K[int] around its failed redefinition (2, 2),"
-    echo "      Q[int], generated in a failed entry, kept (3), and 7:"
+    echo "      Q[int], generated again after a failed entry (3), pg, kept as pf fails (1), and 7:"
     printf '%s\n' "$repl_out" | tail -12
     FAILS=$((FAILS + 1))
 else

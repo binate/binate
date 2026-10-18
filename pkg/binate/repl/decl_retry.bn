@@ -1,34 +1,34 @@
 package "pkg/binate/repl"
 
 import "pkg/binate/ast"
+import "pkg/binate/buf"
 import "pkg/binate/check"
 import "pkg/binate/ir"
 import "pkg/binate/irgen"
 import "pkg/binate/types"
-import "pkg/binate/vm"
+import "pkg/stdx/slices"
 
 // Retrying parked declarations after each declaring prompt entry: a group of
-// parked declarations whose missing names are now declared is emitted; one
-// that then fails to check stays parked and its errors are shown.
+// parked declarations whose missing names are now declared is emitted, unless
+// its code does not load; one that does not check, or does not load, stays
+// parked and its errors are shown.
 
-// retryPending checks the parked declarations again (RetryPendingDecls) and
-// handles each group it checked, dependencies first: a resolved group is
-// announced and emitted, a failed one reported when its errors are new.
+// retryPending checks the parked declarations again
+// (RetryPendingDeclsLoading), handling each group as it is checked,
+// dependencies first (handleRetried).
 func (s @kernel) retryPending() {
-	var retried @[]@types.RetriedDecl = s.Chk.RetryPendingDecls()
-	var i int = 0
-	for i < len(retried) {
-		var j int = i
-		for j < len(retried) && retried[j].Group == retried[i].Group {
-			j = j + 1
-		}
-		if retried[i].Resolved {
-			s.emitResolvedGroup(retried[i:j])
-		} else {
-			s.reportFailedGroup(retried[i:j])
-		}
-		i = j
-	}
+	_ = s.Chk.RetryPendingDeclsLoading(s.handleRetried)
+}
+
+// handleRetried handles a group of parked declarations the retry sweep checked:
+// a resolved group is emitted unless it does not load (emitResolvedGroup), and
+// its load errors returned, for the checker to park it again; a failed one is
+// reported (reportFailedGroup).
+func (s @kernel) handleRetried(group @[]@types.RetriedDecl) @[]@[]char {
+	var none @[]@[]char
+	if group[0].Resolved { return s.emitResolvedGroup(group) }
+	s.reportFailedGroup(group)
+	return none
 }
 
 // reportFailedGroup shows the errors of a group of parked declarations that
@@ -45,23 +45,124 @@ func (s @kernel) reportFailedGroup(group *[]@types.RetriedDecl) {
 	}
 }
 
-// emitResolvedGroup announces and emits a group of parked declarations that
-// resolved together.  Resolved declarations are first definitions to IR-gen
-// (nothing was emitted while they were parked), emitted by kind so each
-// kind's dependencies come first: the types and interfaces (GenTypeDecls
-// registers the structs and interfaces before building any struct), the
-// impls' rows (a function boxing into one of their interfaces needs its row),
-// the constants, the functions and methods — those that redefine a function
-// first, so a member that calls one binds to the new definition — then the
-// impls' vtables, and the variables, all materialized before any
-// initializer runs, initializers in dependency order (the checker's order).
-func (s @kernel) emitResolvedGroup(group *[]@types.RetriedDecl) {
-	var vmInst @vm.VM = s.Vm
-	var m @ir.Module = s.MainMod
+// reportUnloaded shows the load errors of a group of parked declarations that
+// resolved but does not load — why — and that they stay parked.  A group
+// failing to load again with the same errors is not reported again.
+func (s @kernel) reportUnloaded(group *[]@types.RetriedDecl, errs *[]@[]char,
+		why *[]readonly char) {
+	if sameMessages(errs, group[0].PrevLoadErrs) { return }
+	for i := 0; i < len(errs); i++ {
+		s.errln(errs[i])
+	}
+	for i := 0; i < len(group); i++ {
+		s.out(parkedDeclLabel(group[i].Decl))
+		s.out(" still parked (")
+		s.out(why)
+		s.outln(")")
+	}
+}
+
+// sameMessages reports whether a and b are the same messages in the same order.
+func sameMessages(a *[]@[]char, b *[]@[]char) bool {
+	if len(a) != len(b) { return false }
+	for i := 0; i < len(a); i++ {
+		if !streq(a[i], b[i]) { return false }
+	}
+	return true
+}
+
+// resolvedFunc is a function or method of a resolved group, generated before the
+// group is kept (genResolvedFunc) and lowered once it is: the functions
+// generating it appended to the session module, from From to To — its body among
+// them, Body (nil for a generic function, whose instances are emitted where they
+// are used) — and the instances a redefined generic emits again (Redone;
+// reemitRedefined).
+type resolvedFunc struct {
+	Rd     @types.RetriedDecl
+	From   int
+	To     int
+	Body   @ir.Func
+	Redone @[]@ir.Func
+}
+
+// resolvedGroup is a resolved group of parked declarations as generated
+// (genResolvedGroup), to lower once it is kept (lowerResolvedGroup): its
+// generation entry; the functions generating it appended to the session module
+// from From, the types' destructor and copy helpers up to TypesTo, the helpers
+// drained at the end from HelpersFrom to HelpersTo; its functions and methods;
+// the global variables its names shadow; the
+// globals generating its variables added, from Globals; its variables, with
+// their initializations; and Err, the message of a declaration IR-gen does not
+// lower (generation stops there).
+type resolvedGroup struct {
+	Entry       @irgen.ReplEntry
+	From        int
+	TypesTo     int
+	HelpersFrom int
+	HelpersTo   int
+	Funcs       @[]resolvedFunc
+	Shadows     @[]replShadow
+	Globals     int
+	Vars        @[]@types.RetriedDecl
+	Inits       @[]replInit
+	Err         @[]char
+}
+
+// emitResolvedGroup emits a group of parked declarations that resolved together
+// and returns its load errors.  The whole group is generated first
+// (genResolvedGroup) and load-checked (entryLoadErrors), as a declaration typed
+// at the prompt is: a group that does not load is not kept — what its names
+// shadowed gets them back, and IR-gen's state is put back — and is reported
+// (reportUnloaded).  A declaration IR-gen does not lower is the group's load
+// error, reported as one that cannot be generated.  Its errors name a variable's
+// initialization in the prompt's terms (relabelLoadErrs), so they read the same
+// at each retry.  A group that loads is announced and lowered
+// (lowerResolvedGroup).
+func (s @kernel) emitResolvedGroup(group *[]@types.RetriedDecl) @[]@[]char {
+	var g @resolvedGroup = s.genResolvedGroup(group)
+	var errs @[]@[]char
+	var why *[]readonly char = "it does not load"
+	if len(g.Err) > 0 {
+		why = "it cannot be generated"
+		irgen.UndoReplEntry(s.MainGc, g.Entry)
+		errs = slices.Append[@[]char](errs, g.Err)
+	} else {
+		errs = s.entryLoadErrors(g.From, g.Entry)
+		for i := 0; i < len(g.Vars); i++ {
+			if g.Inits[i].Fn == nil { continue }
+			errs = relabelLoadErrs(errs, g.Inits[i].Fn,
+					buf.Concat("the initializer of ", g.Vars[i].Decl.Name))
+		}
+	}
+	if len(errs) > 0 {
+		s.unshadow(g.Shadows)
+		s.reportUnloaded(group, errs, why)
+		return errs
+	}
 	for i := 0; i < len(group); i++ {
 		s.out(parkedDeclLabel(group[i].Decl))
 		s.outln(" resolved")
 	}
+	s.commitShadows(g.Shadows)
+	s.lowerResolvedGroup(g)
+	return errs
+}
+
+// genResolvedGroup generates a resolved group of parked declarations
+// (resolvedGroup).  Resolved declarations are first definitions to IR-gen
+// (nothing was generated while they were parked), generated by kind so each
+// kind's dependencies come first: the types and interfaces (GenTypeDecls
+// registers the structs and interfaces before building any struct), the impls'
+// rows (a function boxing into one of their interfaces needs its row), the
+// constants, the functions and methods — those that redefine a function first,
+// so a member that calls one binds to the new definition — then the variables,
+// and their initializations.  The destructor and copy helpers it all needs are
+// drained last.
+func (s @kernel) genResolvedGroup(group *[]@types.RetriedDecl) @resolvedGroup {
+	var m @ir.Module = s.MainMod
+	var g @resolvedGroup = make(resolvedGroup)
+	g.Entry = irgen.BeginReplEntry(s.MainGc)
+	g.From = len(m.Funcs)
 	var typeDecls @[]@ast.Decl = make_slice(@ast.Decl, len(group))
 	var nTypes int = 0
 	for i := 0; i < len(group); i++ {
@@ -71,108 +172,120 @@ func (s @kernel) emitResolvedGroup(group *[]@types.RetriedDecl) {
 		}
 	}
 	if nTypes > 0 {
-		var preFuncCount int = len(m.Funcs)
-		var msg @[]char = irgen.GenTypeDecls(typeDecls[:nTypes], s.MainGc)
-		if len(msg) > 0 {
-			s.errln(msg)
-			return
-		}
-		// A managed-field struct adds destructor / copy helpers.
-		for k := preFuncCount; k < len(m.Funcs); k++ {
-			vmInst.LowerOneFunc(m, m.Funcs[k])
-		}
+		g.Err = irgen.GenTypeDecls(typeDecls[:nTypes], s.MainGc)
 	}
-	// The impls' rows are registered before the functions are generated: a
-	// function of the group boxing into one of their interfaces finds its row.
-	for i := 0; i < len(group); i++ {
+	g.TypesTo = len(m.Funcs)
+	for i := 0; i < len(group) && len(g.Err) == 0; i++ {
 		if group[i].Decl.Kind == ast.DECL_IMPL {
-			s.genResolvedDecl(group[i].Decl)
+			g.Err = irgen.GenDecl(group[i].Decl, s.MainGc)
 		}
 	}
-	for i := 0; i < len(group); i++ {
+	for i := 0; i < len(group) && len(g.Err) == 0; i++ {
 		var rd @types.RetriedDecl = group[i]
 		if rd.Decl.Kind != ast.DECL_CONST { continue }
+		s.addShadows(g, s.shadowRebound(rd.Decl))
 		if rd.IotaIdx >= 0 {
 			// A const-group member: GenConstMember takes its iota position
 			// (GenDecl would fold a bare DECL_CONST at iota 0).
-			s.commitShadows(s.shadowRebound(rd.Decl))
 			irgen.GenConstMember(rd.Decl, s.MainGc, rd.IotaIdx)
 		} else {
-			s.genRebinding(rd.Decl)
+			g.Err = irgen.GenDecl(rd.Decl, s.MainGc)
 		}
 	}
 	for pass := 0; pass < 2; pass++ {
-		for i := 0; i < len(group); i++ {
+		for i := 0; i < len(group) && len(g.Err) == 0; i++ {
 			var rd @types.RetriedDecl = group[i]
 			if rd.Decl.Kind != ast.DECL_FUNC || (rd.PrevFunc != nil) != (pass == 0) { continue }
-			s.emitResolvedFunc(rd)
+			s.genResolvedFunc(g, rd)
 		}
 	}
-	// The impls' vtables are built after the methods (and dispatch thunks)
-	// they name are lowered (see evalReplOneDecl), and after the destructor
-	// helpers the impls queued (drained here, if no function drained them).
-	var none @ir.Func
-	s.lowerGenerated(len(m.Funcs), none)
-	s.lowerPendingImpls()
-	var preGlobalCount int = len(m.Globals)
+	s.genResolvedVars(g, group)
+	if len(g.Err) == 0 {
+		g.HelpersFrom = len(m.Funcs)
+		irgen.EnsureReplBodyHelpers(m)
+		g.HelpersTo = len(m.Funcs)
+	}
+	return g
+}
+
+// genResolvedFunc generates function or method rd of resolved group g
+// (resolvedFunc), shadowing what its name rebinds (decl_var.bn).  A blank
+// `func _` generates nothing.
+func (s @kernel) genResolvedFunc(g @resolvedGroup, rd @types.RetriedDecl) {
+	var m @ir.Module = s.MainMod
+	var f resolvedFunc
+	f.Rd = rd
+	f.From = len(m.Funcs)
+	var shadows @[]replShadow = s.shadowRebound(rd.Decl)
+	s.addShadows(g, shadows)
+	g.Err = irgen.GenDecl(rd.Decl, s.MainGc)
+	if len(g.Err) > 0 || (rd.Decl.Recv == nil && isBlankReplName(rd.Decl.Name)) { return }
+	if !irgen.IsGenericDecl(rd.Decl) {
+		f.Body = m.Funcs[len(m.Funcs) - 1]
+	}
+	f.Redone = s.reemitRedefined(rd.Decl, shadows)
+	f.To = len(m.Funcs)
+	g.Funcs = slices.Append[resolvedFunc](g.Funcs, f)
+}
+
+// genResolvedVars generates the variables of resolved group g, in the order
+// group lists them (the checker's order for their initializers), shadowing what
+// their names rebind — a variable redeclared with its own type keeps its global
+// (decl_var.bn) — and then their initializations (genVarInit).
+func (s @kernel) genResolvedVars(g @resolvedGroup, group *[]@types.RetriedDecl) {
+	g.Globals = len(s.MainMod.Globals)
 	var replaced @[]bool = make_slice(bool, len(group))
-	for i := 0; i < len(group); i++ {
-		if group[i].Decl.Kind == ast.DECL_VAR {
-			// A variable redeclared with its own type keeps its global (decl_var.bn).
-			replaced[i] = s.replVarReplaced(group[i].Decl, group[i].PrevVar)
-			if !replaced[i] {
-				s.genRebinding(group[i].Decl)
-			}
+	for i := 0; i < len(group) && len(g.Err) == 0; i++ {
+		if group[i].Decl.Kind != ast.DECL_VAR { continue }
+		replaced[i] = s.replVarReplaced(group[i].Decl, group[i].PrevVar)
+		if !replaced[i] {
+			s.addShadows(g, s.shadowRebound(group[i].Decl))
+			g.Err = irgen.GenDecl(group[i].Decl, s.MainGc)
 		}
 	}
-	for g := preGlobalCount; g < len(m.Globals); g++ {
-		vmInst.MaterializeOneGlobal(m.Globals[g])
+	for i := 0; i < len(group) && len(g.Err) == 0; i++ {
+		if group[i].Decl.Kind != ast.DECL_VAR { continue }
+		g.Vars = slices.Append[@types.RetriedDecl](g.Vars, group[i])
+		g.Inits = slices.Append[replInit](g.Inits, s.genVarInit(group[i].Decl, replaced[i]))
 	}
-	for i := 0; i < len(group); i++ {
+}
+
+// addShadows adds shadows to what resolved group g's names shadow.
+func (s @kernel) addShadows(g @resolvedGroup, shadows *[]replShadow) {
+	for i := 0; i < len(shadows); i++ {
+		g.Shadows = slices.Append[replShadow](g.Shadows, shadows[i])
+	}
+}
+
+// lowerResolvedGroup lowers resolved group g, which loads: its variables are
+// materialized first, then the types' helpers and the helpers drained at the end
+// are lowered, the functions and methods in the order generated — each replacing
+// or shadowing the definition it redefines, as a redefinition typed at the
+// prompt does (lowerReplFuncIn) — and what generating the initializers
+// appended, then the impls' vtables, after the methods (and dispatch thunks)
+// they name (see evalReplOneDecl), an instance's an initializer boxes among
+// them, and last the initializers, run in dependency order.
+func (s @kernel) lowerResolvedGroup(g @resolvedGroup) {
+	var m @ir.Module = s.MainMod
+	var none @ir.Func
+	for i := g.Globals; i < len(m.Globals); i++ {
+		s.Vm.MaterializeOneGlobal(m.Globals[i])
+	}
+	s.lowerRange(g.From, g.TypesTo, none)
+	s.lowerRange(g.HelpersFrom, g.HelpersTo, none)
+	for i := 0; i < len(g.Funcs); i++ {
+		var f resolvedFunc = g.Funcs[i]
+		s.lowerReplFuncIn(f.Rd.Decl, f.From, f.To, f.Body, f.Rd.PrevFunc, f.Redone)
+	}
+	for i := 0; i < len(g.Inits); i++ {
+		s.lowerRange(g.Inits[i].PreFuncs, g.Inits[i].PostFuncs, g.Inits[i].Fn)
+	}
+	s.lowerPendingImpls()
+	for i := 0; i < len(g.Vars); i++ {
 		// A blank var (`var _ T = expr`) has no global but still runs its
 		// initializer for its side effects.
-		if group[i].Decl.Kind == ast.DECL_VAR {
-			s.initReplVar(group[i].Decl, replaced[i])
-		}
+		var vi replInit = g.Inits[i]
+		if vi.Fn == nil { continue }
+		_ = s.callVarInit(vi, g.Vars[i].Decl)
 	}
-}
-
-// emitResolvedFunc IR-gens and lowers a resolved function or method,
-// replacing or shadowing the definition it redefines (rd.PrevFunc) as a
-// redefinition typed at the prompt does.  A blank `func _` lowers nothing.
-func (s @kernel) emitResolvedFunc(rd @types.RetriedDecl) {
-	var m @ir.Module = s.MainMod
-	var preFuncCount int = len(m.Funcs)
-	if !s.genRebinding(rd.Decl) { return }
-	if rd.Decl.Recv == nil && isBlankReplName(rd.Decl.Name) { return }
-	var redone @[]@ir.Func
-	if irgen.IsGenericDecl(rd.Decl) {
-		redone = irgen.ReemitGeneric(s.MainGc, rd.Decl)
-	}
-	s.lowerReplFunc(rd.Decl, preFuncCount, rd.PrevFunc, redone)
-}
-
-// genRebinding IR-gens resolved declaration d as genResolvedDecl does, first
-// shadowing a global variable its names rebind (decl_var.bn) — reported once d
-// is emitted, given its name back if d is not — and, once d is emitted, the
-// instances of a generic function they rebind.
-func (s @kernel) genRebinding(d @ast.Decl) bool {
-	var shadows @[]replShadow = s.shadowRebound(d)
-	if !s.genResolvedDecl(d) {
-		s.unshadow(shadows)
-		return false
-	}
-	s.commitShadows(shadows)
-	return true
-}
-
-// genResolvedDecl IR-gens resolved declaration d, reporting a declaration
-// IR-gen does not support; reports whether it succeeded.
-func (s @kernel) genResolvedDecl(d @ast.Decl) bool {
-	var msg @[]char = irgen.GenDecl(d, s.MainGc)
-	if len(msg) > 0 {
-		s.errln(msg)
-		return false
-	}
-	return true
 }

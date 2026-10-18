@@ -160,7 +160,7 @@ testing.Println(f())
 "$BANNER
 > package pkg/hv loaded
 initialization of package pkg/bad faulted: runtime error: nil pointer dereference
-error: package not imported (it, or a package it imports, failed type-checking or initialization): pkg/usesbad
+error: package not imported (it, or a package it imports, failed type-checking, loading or initialization): pkg/usesbad
 > 2
 > > 7
 > "

@@ -5,8 +5,17 @@
 # ships as interface + library (§16.5.1).  So with no implementation anywhere, a
 # program reading such a var must fail loudly instead of reading storage of its own:
 #   1. bnc's link reports the var's undefined symbol and exits non-zero;
-#   2. bni stops with "nothing in the program defines the package variable
-#      pkg/solo.V" and exits non-zero.
+#   2. bni does not load the program -- the VM's counterpart of that link error --
+#      reporting "nothing in the program defines the package variable pkg/solo.V
+#      (used by main.main, line 7)", and exits non-zero;
+#   3. a reference only in code that is never lowered or linked -- a generic
+#      function nothing instantiates -- is no error on either, nor is a constant
+#      folded from `len` of an array var: bnc builds and runs it, and so does bni;
+#   4. the REPL reports each prompt entry whose code needs the var, keeps none of
+#      it -- a declaration is not kept, a redefinition leaves the old definition, an
+#      import of a package that needs it (or imports one that does) is not made --
+#      and the session goes on;
+#   5. bni --test of a package that needs it reports it and exits non-zero.
 #
 # bnc is a gen1 (BUILDER -> gen1) and bni is built by it, as in e2e/bni-nil-check.sh.
 #
@@ -66,8 +75,9 @@ mkdir -p "$SRC/pkg"
 cat > "$SRC/pkg/solo.bni" <<'EOF'
 package "pkg/solo"
 
-// V is declared, but nothing defines it.
+// V and A are declared, but nothing defines them.
 var V int
+var A [4]int
 EOF
 cat > "$SRC/main.bn" <<'EOF'
 package "main"
@@ -79,10 +89,49 @@ func main() {
 	testing.Println(solo.V)
 }
 EOF
+# pkg/user's .bn reads solo.V; pkg/userdep imports pkg/user.
+mkdir -p "$SRC/pkg/user" "$SRC/pkg/userdep"
+cat > "$SRC/pkg/user.bni" <<'EOF'
+package "pkg/user"
+
+func U() int
+func W() int
+EOF
+cat > "$SRC/pkg/user/user.bn" <<'EOF'
+package "pkg/user"
+
+import "pkg/solo"
+
+func U() int { return solo.V }
+func W() int { return 5 }
+EOF
+cat > "$SRC/pkg/user/user_test.bn" <<'EOF'
+package "pkg/user"
+
+import "pkg/builtins/testing"
+
+func TestW() testing.TestResult {
+	if W() != 5 { return "W should be 5" }
+	return ""
+}
+EOF
+cat > "$SRC/pkg/userdep.bni" <<'EOF'
+package "pkg/userdep"
+
+func Y() int
+EOF
+cat > "$SRC/pkg/userdep/userdep.bn" <<'EOF'
+package "pkg/userdep"
+
+import "pkg/user"
+
+func Y() int { return user.W() }
+EOF
 IFACES="$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR" --prepend "$SRC")"
 IMPLS="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --prepend "$SRC")"
 
 FAILS=0
+UNDEF_V='nothing in the program defines the package variable pkg/solo.V'
 
 # ----- 1. bnc: the link fails, naming the var's symbol (bn_G…solo…V). -----
 mkdir -p "$TMP/b1"
@@ -100,19 +149,129 @@ else
     echo "PASS: bnc's link reports the undefined var"
 fi
 
-# ----- 2. bni: the VM stops, naming the var. -----
+# ----- 2. bni: the program does not load, naming the var and its use. -----
 bni_out=$(cd "$SRC" && "$BNI_BIN" -I "$IFACES" -L "$IMPLS" main.bn 2>&1)
 bni_rc=$?
 if [ "$bni_rc" -eq 0 ]; then
     echo "FAIL: bni ran a program reading a var nothing defines (it printed: $bni_out)"
     FAILS=$((FAILS + 1))
-elif ! printf '%s\n' "$bni_out" |
-        grep -q 'nothing in the program defines the package variable pkg/solo.V'; then
+elif ! printf '%s\n' "$bni_out" | grep -qxF "$UNDEF_V (used by main.main, line 7)"; then
     echo "FAIL: bni failed, but not naming the var:"
     printf '%s\n' "$bni_out" | tail -5
     FAILS=$((FAILS + 1))
 else
     echo "PASS: bni reports the undefined var"
+fi
+
+# ----- 3. A reference in code never lowered, and a folded constant, need nothing. -----
+mkdir -p "$SRC/unused"
+cat > "$SRC/unused/main.bn" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+import "pkg/solo"
+
+func G[T any]() int { return solo.V }
+
+const N int = len(solo.A)
+
+func main() {
+	testing.Println(N)
+}
+EOF
+mkdir -p "$TMP/b3"
+unused_bnc=$(cd "$SRC/unused" && "$GEN1_BNC" -I "$IFACES" -L "$IMPLS" --build-dir "$TMP/b3" \
+    -o "$TMP/unused" main.bn 2>&1 && "$TMP/unused" 2>&1)
+unused_bnc_rc=$?
+unused_bni=$(cd "$SRC/unused" && "$BNI_BIN" -I "$IFACES" -L "$IMPLS" main.bn 2>&1)
+unused_bni_rc=$?
+if [ "$unused_bnc_rc" -ne 0 ] || [ "$unused_bnc" != "4" ]; then
+    echo "FAIL: bnc should build and run it (rc=$unused_bnc_rc):"
+    printf '%s\n' "$unused_bnc" | tail -5
+    FAILS=$((FAILS + 1))
+elif [ "$unused_bni_rc" -ne 0 ] || [ "$unused_bni" != "4" ]; then
+    echo "FAIL: bni should run it (rc=$unused_bni_rc):"
+    printf '%s\n' "$unused_bni" | tail -5
+    FAILS=$((FAILS + 1))
+else
+    echo "PASS: an uninstantiated generic and a folded constant need no definition"
+fi
+
+# ----- 4. bni --repl: each entry needing the var fails alone; the session goes on. -----
+cat > "$SRC/repl.bn" <<'EOF'
+package "main"
+
+func main() {
+}
+EOF
+repl_out=$(cd "$SRC" && printf '%s\n' \
+    'import "pkg/builtins/testing"' \
+    'import "pkg/solo"' \
+    'x := solo.V' \
+    'func f() int { return solo.V }' \
+    'f()' \
+    'func G[T any]() int { return solo.V }' \
+    'x2 := G[int]()' \
+    'y := G[int]()' \
+    'const N int = len(solo.A)' \
+    'testing.Println(N)' \
+    'var v int = solo.V' \
+    'testing.Println(v)' \
+    'func h() int { return 1 }' \
+    'func h() int { return solo.V }' \
+    'testing.Println(h())' \
+    'func K[T any]() int { return 2 }' \
+    'testing.Println(K[int]())' \
+    'func K[T any]() int { return solo.V }' \
+    'testing.Println(K[int]())' \
+    'func Q[T any]() int { return 3 }' \
+    '_ = Q[int]() + solo.V' \
+    'testing.Println(Q[int]())' \
+    'import "pkg/userdep"' \
+    'testing.Println(userdep.Y())' \
+    'testing.Println(7)' |
+    "$BNI_BIN" -I "$IFACES" -L "$IMPLS" --repl repl.bn 2>&1)
+repl_rc=$?
+undef_count=$(printf '%s\n' "$repl_out" |
+    grep -c 'nothing in the program defines the package variable pkg/solo\.')
+if [ "$repl_rc" -ne 0 ] || printf '%s\n' "$repl_out" | grep -q 'panic'; then
+    echo "FAIL: the REPL session did not survive the entries (rc=$repl_rc):"
+    printf '%s\n' "$repl_out" | tail -8
+    FAILS=$((FAILS + 1))
+elif [ "$undef_count" -ne 9 ]; then
+    echo "FAIL: expected 9 load errors (x, f, G[int] twice, v, h, K, Q's use, pkg/user), got $undef_count:"
+    printf '%s\n' "$repl_out" | tail -12
+    FAILS=$((FAILS + 1))
+elif ! printf '%s\n' "$repl_out" | grep -q 'undefined: f$' ||
+        ! printf '%s\n' "$repl_out" | grep -q 'undefined: v$' ||
+        ! printf '%s\n' "$repl_out" | grep -q 'not imported.*: pkg/userdep$' ||
+        ! printf '%s\n' "$repl_out" | grep -q 'undefined: userdep$'; then
+    echo "FAIL: f, v and the import of pkg/userdep should not be kept:"
+    printf '%s\n' "$repl_out" | tail -12
+    FAILS=$((FAILS + 1))
+elif [ "$(printf '%s\n' "$repl_out" | grep -E '^(> )+[0-9]+$' | sed 's/^[> ]*//' | tr '\n' ' ')" != \
+        "4 1 2 2 3 7 " ]; then
+    echo "FAIL: expected N (4), the old h (1), K[int] around its failed redefinition (2, 2),"
+    echo "      Q[int], generated in a failed entry, kept (3), and 7:"
+    printf '%s\n' "$repl_out" | tail -12
+    FAILS=$((FAILS + 1))
+else
+    echo "PASS: the REPL reports each entry needing the var, keeps none of it, and goes on"
+fi
+
+# ----- 5. bni --test: a package that does not load is reported. -----
+test_out=$(cd "$SRC" && "$BNI_BIN" -I "$IFACES" -L "$IMPLS" --test pkg/user 2>&1)
+test_rc=$?
+if [ "$test_rc" -eq 0 ]; then
+    echo "FAIL: bni --test ran a package that needs a var nothing defines:"
+    printf '%s\n' "$test_out" | tail -5
+    FAILS=$((FAILS + 1))
+elif ! printf '%s\n' "$test_out" | grep -qxF "$UNDEF_V (used by pkg/user.U, line 5)"; then
+    echo "FAIL: bni --test failed, but not naming the var and its use:"
+    printf '%s\n' "$test_out" | tail -5
+    FAILS=$((FAILS + 1))
+else
+    echo "PASS: bni --test reports the package's load error"
 fi
 
 [ "$FAILS" -eq 0 ] || exit 1

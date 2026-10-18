@@ -1881,7 +1881,7 @@ run_repl_import_rejected "mid-session-import-depends-on-failed" \
 import "pkg/gbaddep"
 testing.Println(helper(7))
 ' \
-    "failed type-checking or initialization): pkg/gbaddep" \
+    "failed type-checking, loading or initialization): pkg/gbaddep" \
     "14"
 
 # --- An import that fails type-checking does not rebind its alias: `x` still
@@ -1891,7 +1891,7 @@ run_repl_import_rejected "mid-session-failed-import-keeps-alias" \
 import "pkg/xb/x"
 testing.Println(x.G(3))
 ' \
-    "failed type-checking or initialization): pkg/xb/x" \
+    "failed type-checking, loading or initialization): pkg/xb/x" \
     "103"
 
 # --- An import that fails ends its code unit: the statement after it on the
@@ -1901,7 +1901,7 @@ testing.Println(77)
 ' | "$BNI_BIN" --repl \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
     -I "$TMP" -L "$TMP" -main-file "$FIXTURE" 2>&1)
-if printf '%s' "$actual" | grep -qF "failed type-checking or initialization): pkg/xb/x" \
+if printf '%s' "$actual" | grep -qF "failed type-checking, loading or initialization): pkg/xb/x" \
         && printf '%s' "$actual" | grep -qF "77" && ! printf '%s' "$actual" | grep -qF "4242"; then
     echo "PASS: unit-failed-import-ends-unit"
     PASSES=$((PASSES + 1))

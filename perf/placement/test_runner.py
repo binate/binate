@@ -19,6 +19,7 @@ from unittest import mock
 
 import ab_store as st
 import runner
+from ab_testutil import default_sigint
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LINUX = sys.platform.startswith("linux")
@@ -106,6 +107,9 @@ class StorePathTest(unittest.TestCase):
 
 
 class SpawnTest(unittest.TestCase):
+    def setUp(self):
+        default_sigint(self)
+
     def test_sample_fields_and_hash(self):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "o")

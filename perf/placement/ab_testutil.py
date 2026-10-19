@@ -41,6 +41,7 @@ import hashlib
 import io
 import json
 import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -202,12 +203,24 @@ def read_meta(work):
         return json.load(fh)
 
 
+def default_sigint(test):
+    """Give the test (a TestCase) the default SIGINT handling for its
+    duration.  A process started as a non-interactive shell's background job
+    starts with SIGINT ignored, and its children inherit that, so a program
+    that signals itself with SIGINT would not die of it and the tests of how
+    a Ctrl-C is handled would fail for that reason alone."""
+    if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        test.addCleanup(signal.signal, signal.SIGINT, signal.SIG_IGN)
+
+
 class FlowBase(unittest.TestCase):
     """A fake Binate tree, benchmarks (foo: exact, with expected.txt; flo:
     float) and layout.py, and run_ab to run ab.py on them with ASLR left as
     it is (--aslr on), so the test process's personality is not changed."""
 
     def setUp(self):
+        default_sigint(self)
         self.tmp = tempfile.TemporaryDirectory()
         d = self.d = os.path.realpath(self.tmp.name)
         self.subject = subject_tree(d)

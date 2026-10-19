@@ -1,6 +1,8 @@
 """Function extents for layout.py: cutting a section's items into spans at
 function symbols, deciding which NOP runs are executed, trimming code a
-function cannot reach, and reading the material that trails each span.
+function cannot reach, splitting what lies between a function's own body and
+the end of its span into pieces, and reading the material that trails each
+span.
 
 A span runs from one function symbol to the next.  Its trailing material is
 the run of filler, NOPs, pad and gap items at its end: on x86-64 the last
@@ -9,10 +11,12 @@ placement filler for the next function, and before that whatever the linker
 put between two objects (NOPs, zeros, lld's 0xD4D4D4D4 on Arm, or lld's 0xCC
 on x86-64, which merges with an INT3 filler run).
 
-Python standard library only; the unit tests are in test_layout.py.
+Python standard library only; the unit tests are in test_layout.py and
+(pieces) test_layout_probe_copies.py.
 """
 
 from layout_disasm import CODE, FILL, NOP, PAD, GAP, FUNC, LABEL, OTHER
+from placehash import PLACE_SPAN
 
 # Classes of the items a span's trailing material consists of.
 TRAIL = (FILL, PAD, NOP, GAP)
@@ -116,6 +120,38 @@ def trail_start(recs):
     return k
 
 
+def pieces(recs, lo, hi):
+    """The pieces of unsymbolized material recs[lo:hi] holds, where lo indexes
+    the first item after a function's own body and hi the first item of the
+    span's trailing material: code the function cannot reach (a weak
+    definition whose symbol the link bound to another object's copy, which
+    kept the filler bnc put around it) and data.  Filler runs split it; per
+    piece (run_start, run_len, start, end, phases): the filler run directly
+    before the piece (run_len 0 and run_start start when there is none), the
+    extent from its first item that is not pad to its last one, and a mask
+    with bit p set when an item of the piece other than its first starts at
+    phase p (an address modulo PLACE_SPAN)."""
+    out, run_start, run_len, cur = [], None, 0, None
+    for r in recs[lo:hi]:
+        if r.cls == FILL:
+            if cur is not None:
+                out.append(tuple(cur))
+                cur, run_start, run_len = None, None, 0
+            run_start = r.addr if run_start is None else run_start
+            run_len += r.size
+        elif r.cls in TRAIL:
+            continue
+        elif cur is None:
+            start = r.addr if run_start is None else run_start
+            cur = [start, run_len, r.addr, r.end, 0]
+        else:
+            cur[3] = r.end
+            cur[4] |= 1 << (r.addr % PLACE_SPAN)
+    if cur is not None:
+        out.append(tuple(cur))
+    return out
+
+
 class Tail:
     """The trailing material of a span, which ends at entry (where the next
     function symbol starts).  body_end is where the span's last other item
@@ -123,10 +159,13 @@ class Tail:
     before entry; fill the filler run directly before that pad, starting at
     start; last_fill_end the end of the last filler run anywhere in the
     material (None when there is none); prev the span's function (None for
-    the items before a section's first function)."""
-    __slots__ = ("body_end", "pad", "fill", "start", "entry", "last_fill_end", "prev")
+    the items before a section's first function); pieces the unsymbolized
+    material between prev's own body and body_end (see pieces; empty when
+    there is none)."""
+    __slots__ = ("body_end", "pad", "fill", "start", "entry", "last_fill_end", "prev",
+                 "pieces")
 
-    def __init__(self, recs, entry, prev=None):
+    def __init__(self, recs, entry, prev=None, pieces=()):
         k, self.pad = len(recs), 0
         while k > 0 and recs[k - 1].cls in (PAD, NOP):
             k -= 1
@@ -140,7 +179,7 @@ class Tail:
         self.body_end = recs[t - 1].end if t > 0 else (recs[0].addr if recs else entry)
         fills = [r.end for r in recs[t:] if r.cls == FILL]
         self.last_fill_end = fills[-1] if fills else None
-        self.entry, self.prev = entry, prev
+        self.entry, self.prev, self.pieces = entry, prev, list(pieces)
 
     @property
     def gap(self):

@@ -22,6 +22,12 @@ the fake is written (the builds run in a scrubbed environment):
   nondet         the self-compile writes a different output every run
   float=NAME     benchmark NAME prints float lines, with seed-dependent
                  noise below the 1e-8 tolerance
+  probe_misses   -fnative-place-probe matches no function: the probe
+                 switches change nothing, and the fake layout.py's --probe
+                 finds no such function (exit 3)
+
+The fake layout.py checks a --probe SYM --probe-phase P against the probe the
+fake bnc recorded in the payload, and exits 1 when they differ.
 
 Every invocation is logged, one line, to <fake>.calls.  FlowBase is the base
 of the tests that run ab.py end to end with these stand-ins.
@@ -51,7 +57,7 @@ B = %(behavior)r
 with open(%(calls)r, "a") as fh:
     fh.write(" ".join(sys.argv[1:]) + "\n")
 args = sys.argv[1:]
-seed = mode = out = backend = bdir = None
+seed = mode = out = backend = bdir = probe = phase = None
 i = 0
 while i < len(args):
     a = args[i]
@@ -59,6 +65,10 @@ while i < len(args):
         seed = int(a.split("=", 1)[1])
     elif a.startswith("-fnative-place-mode="):
         mode = a.split("=", 1)[1]
+    elif a.startswith("-fnative-place-probe="):
+        probe = a.split("=", 1)[1]
+    elif a.startswith("-fnative-place-probe-phase="):
+        phase = int(a.split("=", 1)[1])
     elif a in ("-o", "--backend", "--build-dir", "-I", "-L", "--cflag"):
         val = args[i + 1]
         if a == "-o":
@@ -83,6 +93,8 @@ if seed == 0 and B.get("seed0_differs"):
 payload = "%%s:%%s:%%s:%%s" %% (B.get("tag", ""), backend, eff, mode if seed else "")
 if B.get("bad_layout") and seed:
     payload += ":badlayout"
+if probe is not None and not B.get("probe_misses"):
+    payload += ":probe=%%s@%%d" %% (probe, phase)
 if pkg.rstrip("/").endswith("cmd/bnc"):
     body = ('o=""; while [ $# -gt 0 ]; do [ "$1" = -o ] && o="$2"; shift; done\n'
             + ('echo "compiled $$" > "$o"\n' if B.get("nondet") else 'echo compiled > "$o"\n'))
@@ -106,6 +118,14 @@ import json, sys
 path, seed = sys.argv[1], int(sys.argv[3])
 with open(path) as fh:
     payload = [l for l in fh if l.startswith("# TEXT ")][0][7:].strip()
+if "--probe" in sys.argv:
+    i = sys.argv.index("--probe")
+    want = "%%s@%%s" %% (sys.argv[i + 1], sys.argv[sys.argv.index("--probe-phase") + 1])
+    if ":probe=" not in payload:
+        print("fake layout: no function has the probe symbol", file=sys.stderr)
+        sys.exit(3)
+    if not payload.endswith(":probe=" + want):
+        sys.exit(1)
 if "--json" in sys.argv:
     loops = [{"innermost": True, "windows": 3 + seed %% 2, "windows_min": 3,
               "lines": 2, "lines_min": 2, "jcc": seed %% 3}]

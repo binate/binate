@@ -2,7 +2,8 @@
 """Static code-placement report for programs built by bnc's native backends.
 
   layout.py BIN [--arch auto] [--func RE]... [--hot PERF_REPORT] [--loops]
-            [--compare OTHER] [--expect-seed S --mode phase|shift]
+            [--compare OTHER]
+            [--expect-seed S [--mode phase|shift] [--probe SYM --probe-phase P]]
             [--window N --line N] [--tsv|--json]
 
 Reads ELF (x86-64, aarch64, arm32, arm32 bare metal) and Mach-O (x86-64,
@@ -12,7 +13,11 @@ table, the x86 JCC-erratum and dense-window checks, and with --loops each
 natural loop's footprint.  --compare diffs two builds; --expect-seed checks
 the function-placement filler bnc's -fnative-place-seed / -fnative-place-mode
 put before each Binate function against placehash.py's prediction and exits
-1 on a mismatch (or when there is no Binate function to check); --hot reads
+1 on a mismatch (or when there is no Binate function to check), and with
+--probe SYM --probe-phase P checks a build that also had
+-fnative-place-probe=SYM -fnative-place-probe-phase=P: SYM's first entry at
+phase P and the filler around it, exiting 3 when no function that receives
+placement filler has the symbol SYM (the probe matched nothing); --hot reads
 `perf report --stdio` text, credits each reported symbol (block labels
 included) to the function and loops holding it, and orders both tables by
 that overhead.
@@ -66,7 +71,7 @@ import layout_seed
 import layout_x86
 import placehash
 from layout_disasm import CODE, FILL, NOP, PAD, GAP, DATA, FUNC, LABEL, OTHER
-from layout_span import Tail, cut_spans, classify_nops, owned_end, trail_start
+from layout_span import Tail, cut_spans, classify_nops, owned_end, pieces, trail_start
 
 ROLE_ORDER = {FUNC: 0, ld.MAPC: 1, ld.MAPD: 1, LABEL: 2, OTHER: 3}
 BODY_TRAIL = (FILL, PAD, GAP)
@@ -117,34 +122,6 @@ def make_marks(syms, headers=None):
     for v in out.values():
         v.sort()
     return out
-
-
-def loop_keys(loops, labels, prefixes):
-    """Set each loop's key, by which --compare matches it across builds: the
-    block part of its header's label when that is one of the function's own
-    block labels (L<sym>__<blk>), else '<blk>#<k>' for the k-th such loop
-    after the nearest own block label <blk> before its header ('' for none).
-    The backends label every block but the entry, so <blk> is the block that
-    holds the loop (an aggregate copy's, say), which block layout moves along
-    with it, and the key does not depend on the labeled loops around it."""
-    own = sorted((a, n) for a, n in labels.items() if n.startswith(prefixes))
-    addrs = [a for a, _ in own]
-    count = Counter()
-    for lp in loops:
-        if lp["label"].startswith(prefixes):
-            lp["key"] = _blk(lp["label"], prefixes)
-            continue
-        i = bisect.bisect_right(addrs, lp["header"]) - 1
-        anchor = _blk(own[i][1], prefixes) if i >= 0 else ""
-        lp["key"] = "%s#%d" % (anchor, count[anchor])
-        count[anchor] += 1
-
-
-def _blk(label, prefixes):
-    for p in prefixes:
-        if label.startswith(p):
-            return label[len(p):]
-    return label
 
 
 class Layout:
@@ -240,9 +217,9 @@ class Layout:
                 if self.rules.HAS_ERRATUM else None
             f.loops = layout_loops.analyze(body, [span.addr], labels, self.window,
                                            self.line, hits)
-            loop_keys(f.loops, labels, prefixes)
+            layout_loops.loop_keys(f.loops, labels, prefixes)
         self.funcs.append(f)
-        self.tails[span.end] = Tail(recs, span.end, f)
+        self.tails[span.end] = Tail(recs, span.end, f, pieces(recs, len(body), trail_start(recs)))
 
     def _resolve_others(self, span, labels):
         """Index where the span's data begins: a symbol that is neither a
@@ -330,9 +307,10 @@ class Layout:
         """Bytes by class, with the linker's part of each filler run counted
         as gap where the linker's gap fill can be the filler's encoding
         (lld's INT3 on x86-64): a run before a function that receives no
-        filler is all gap, and of any other run only whole filler units are
-        filler, or exactly the predicted filler of an object's first
-        function once a passing expect_seed has settled it."""
+        filler is all gap (except a probed function's trailing filler, once
+        a passing expect_seed has settled it), and of any other run only
+        whole filler units are filler, or exactly the predicted filler of an
+        object's first function once a passing expect_seed has settled it."""
         out = Counter(self.bytes)
         if not self.rules.GAP_FILL_IS_FILLER:
             return out
@@ -342,7 +320,9 @@ class Layout:
         for end, n in self.fill_runs.items():
             entry = before_entry.get(end)
             if entry is not None and entry not in entries:
-                filler = 0
+                # All gap, unless a passing expect_seed found a probed
+                # function's trailing filler here.
+                filler = self.known_fill.get(end, 0)
             else:
                 filler = self.known_fill.get(end, n - n % self.unit)
             moved += n - filler
@@ -350,9 +330,10 @@ class Layout:
         out[GAP] += moved
         return out
 
-    def expect_seed(self, seed, mode):
-        """--expect-seed rows; see layout_seed."""
-        return layout_seed.expect_seed(self, seed, mode)
+    def expect_seed(self, seed, mode, probe=None):
+        """--expect-seed rows (with --probe, probe is (SYM, PHASE)); see
+        layout_seed."""
+        return layout_seed.expect_seed(self, seed, mode, probe)
 
 
 def analyze(path, arch=None, window=None, line=64, loops=False, tool=None):
@@ -411,6 +392,11 @@ def main(argv=None):
                          "exit 1 on a mismatch")
     ap.add_argument("--mode", choices=sorted(placehash.MODES),
                     help="the -fnative-place-mode of that build (default phase)")
+    ap.add_argument("--probe", metavar="SYM",
+                    help="the -fnative-place-probe of that build; exit 3 when no function "
+                         "that receives placement filler has this symbol")
+    ap.add_argument("--probe-phase", type=int, metavar="P",
+                    help="the -fnative-place-probe-phase of that build")
     ap.add_argument("--window", type=int,
                     help="window size in bytes (default 32 on x86-64, 16 on Arm)")
     ap.add_argument("--line", type=int, default=64, help="cache-line size in bytes")
@@ -420,6 +406,14 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.mode and args.expect_seed is None:
         ap.error("--mode needs --expect-seed")
+    if (args.probe is None) != (args.probe_phase is None):
+        ap.error("--probe and --probe-phase go together")
+    if args.probe is not None and args.expect_seed is None:
+        ap.error("--probe needs --expect-seed")
+    if args.probe is not None and not args.probe:
+        ap.error("--probe needs a symbol")
+    if args.probe_phase is not None and not 0 <= args.probe_phase < placehash.PLACE_SPAN:
+        ap.error("--probe-phase must be in 0..%d" % (placehash.PLACE_SPAN - 1))
     if args.expect_seed is not None and not 0 <= args.expect_seed <= placehash.PLACE_SEED_MAX:
         ap.error("--expect-seed must be in 0..%d" % placehash.PLACE_SEED_MAX)
     for n, v in (("--window", args.window), ("--line", args.line)):
@@ -445,13 +439,22 @@ def main(argv=None):
         print("layout.py: %s" % e, file=sys.stderr)
         return 2
     seed_rows = None
+    probe = None if args.probe is None else (args.probe, args.probe_phase)
     if args.expect_seed is not None:
-        seed_rows = lay.expect_seed(args.expect_seed, args.mode or "phase")
+        try:
+            seed_rows = lay.expect_seed(args.expect_seed, args.mode or "phase", probe)
+        except ValueError as e:
+            print("layout.py: %s" % e, file=sys.stderr)
+            return 2
     try:
         layout_report.emit(lay, other, seed_rows, funcs, args, sys.stdout)
         sys.stdout.flush()
     except BrokenPipeError:
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    if probe is not None and layout_seed.probe_row(seed_rows) is None:
+        print("layout.py: --probe %s: no function that receives placement filler has this "
+              "symbol" % args.probe, file=sys.stderr)
+        return 3
     if seed_rows is not None and (not seed_rows or not all(r["ok"] for r in seed_rows)):
         return 1
     return 0

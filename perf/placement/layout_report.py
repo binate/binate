@@ -14,7 +14,7 @@ brden (branches per 100 instructions) and maxbr (most branches in one
 window).  With --hot, hot is the perf overhead in percent credited to a
 function or loop, and both tables are sorted by it.  In --compare, dm64 is
 the function's move modulo 64 (its b address minus its a address), a loop
-is matched by its function and key (see layout.loop_keys), and functions
+is matched by its function and key (see layout_loops.loop_keys), and functions
 and loops found in one build only are counted (only_a / only_b,
 loops_only_a / loops_only_b).
 """
@@ -267,6 +267,8 @@ def emit(lay, other, seed_rows, funcs, args, out):
     if seed_rows is not None:
         data["expect_seed"] = {"seed": args.expect_seed, "mode": args.mode or "phase",
                                "stats": seed_stats(seed_rows), "rows": seed_rows}
+        if getattr(args, "probe", None) is not None:
+            data["expect_seed"]["probe"] = {"sym": args.probe, "phase": args.probe_phase}
     if args.json:
         json.dump(data, out, indent=1)
         out.write("\n")
@@ -291,7 +293,8 @@ def _tsv(data, out):
     if "expect_seed" in data:
         e = data["expect_seed"]
         out.write("\n")
-        _tsv_pairs("expect-seed-stats", [("seed", e["seed"]), ("mode", e["mode"])]
+        probe = [("probe", e["probe"])] if "probe" in e else []
+        _tsv_pairs("expect-seed-stats", [("seed", e["seed"]), ("mode", e["mode"])] + probe
                    + list(e["stats"].items()), out)
     blocks = [("functions", data["functions"]), ("loops", data.get("loops")),
               ("compare-functions", data.get("compare", {}).get("functions")),
@@ -338,6 +341,8 @@ def _text(data, fcols, lcols, out):
         if st["unparsed"]:
             out.write("  %d checked by symbol whose names the mangling grammar does not "
                       "parse\n" % st["unparsed"])
+        if "probe" in e:
+            _text_probe(e["probe"], e["rows"], out)
         bad = [r for r in e["rows"] if not r["ok"] or r["status"] == "inexact"]
         if bad:
             cols = ["entry", "phase", "want_phase", "dphase", "fill", "want_fill", "gap",
@@ -345,3 +350,22 @@ def _text(data, fcols, lcols, out):
             table(bad[:SEED_TEXT_ROWS], cols, out, "name")
             if len(bad) > SEED_TEXT_ROWS:
                 out.write("  ... %d more\n" % (len(bad) - SEED_TEXT_ROWS))
+
+
+def _text_probe(probe, rows, out):
+    """The probe line of the expect-seed text: where the probed function's
+    first entry landed, its filler before and after it, and the whole filler
+    run after it (its own trailing filler, then the next function's when a
+    Binate function or unsymbolized code follows)."""
+    r = next((r for r in rows if r["probe"]), None)
+    if r is None:
+        out.write("  probe %s: FAILED, no function that receives placement filler has this "
+                  "symbol\n" % probe["sym"])
+        return
+    want = _fmt(r.get("want_after"))
+    if r.get("after_code"):
+        want += " and then the leading filler of the unsymbolized code after it"
+    out.write("  probe %s: entry 0x%x at phase %d (want %d), filler %s before and %s after; "
+              "the filler run after it %s bytes (want %s); %s\n"
+              % (probe["sym"], r["entry"], r["phase"], probe["phase"], _fmt(r.get("pre")),
+                 _fmt(r.get("post")), _fmt(r.get("after")), want, r["status"]))

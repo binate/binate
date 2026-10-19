@@ -6,8 +6,9 @@
             (--workload selfcompile --subject TREE [--work-flags '...']
              | --workload bench --subject TREE --bench BENCH [--only B,...] [--n B=N])
             --seeds 1-40 [--reps 2] [--jobs 4] [--mode phase|shift]
-            [--aslr off|on] [--aa same|salted] [--static-report] [--resume]
-            [--dry-run] [--max-load X] [--tmpdir DIR] [--allow-short-runs]
+            [--aslr off|on] [--aa same|salted] [--probe SYM --probe-phases P,...]
+            [--static-report] [--resume] [--dry-run] [--max-load X]
+            [--tmpdir DIR] [--allow-short-runs]
 
 Compares compilers ("arms"; the first is the base) on how fast the code they
 generate runs, with the code's placement randomized: every round seed S gives
@@ -28,6 +29,13 @@ stats.py DIR analyses it.
   --aa same     A/A: arms may build identical binaries (the run-noise floor)
   --aa salted   A/A: arm i is placed with placehash.salted_seed applied i
                 times, so identical compilers still get different placements
+  --probe SYM --probe-phases P,...
+                time one function's placement: the one --arm becomes one arm
+                per phase P (NAME.pPP, the first the base), each built with
+                -fnative-place-probe=SYM -fnative-place-probe-phase=P on top
+                of the round's seed, so only SYM moves between the arms;
+                layout.py checks SYM's phase in every seeded build, and a SYM
+                that names no function stops the experiment (see ab_config)
   --resume      continue an interrupted experiment in DIR (same configuration,
                 sources, timed environment, stack limit and personality, see
                 ab_config; the seed list may be extended)
@@ -105,8 +113,9 @@ def dry_run(cfg, out=None):
     w("ab.py dry run: nothing is built or run; work dir %s\n" % cfg.work)
     w("arms (base first):\n")
     for arm in cfg.arms:
-        w("  a%02d %-12s %-6s %s %s%s\n" % (arm.idx, arm.name, arm.backend, arm.bnc,
-                                             " ".join(arm.flags), not_randomized(arm)))
+        probe = "  (probe %s at phase %d)" % arm.probe if arm.probe is not None else ""
+        w("  a%02d %-12s %-6s %s %s%s%s\n" % (arm.idx, arm.name, arm.backend, arm.bnc,
+                                               " ".join(arm.flags), not_randomized(arm), probe))
     w("items:\n")
     for it in cfg.items:
         if it.kind == "bench":
@@ -287,6 +296,10 @@ def parse_args(argv):
     r.add_argument("--mode", choices=sorted(placehash.MODES), default="phase")
     r.add_argument("--aslr", choices=["off", "on"], default="off")
     r.add_argument("--aa", choices=["same", "salted"])
+    r.add_argument("--probe", metavar="SYM",
+                   help="probe the function with this mangled symbol (one arm per phase)")
+    r.add_argument("--probe-phases", metavar="P,...",
+                   help="the probe phases, e.g. 0,16,32,48 (x86-64) or 0,4,...,60 (Arm)")
     r.add_argument("--static-report", action="store_true")
     r.add_argument("--resume", action="store_true")
     r.add_argument("--dry-run", action="store_true")

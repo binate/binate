@@ -1,7 +1,7 @@
 """Command-line configuration of a placement A/B experiment (ab.py run).
 
 Config validates the parsed arguments into arms (ab_build.Arm: name, compiler
-and its SHA-256, extra flags, backend) and workload items (ab_build.Item: the
+and its SHA-256, extra flags, backend, probe) and workload items (ab_build.Item: the
 self-compile of SUBJECT/cmd/bnc, or each benchmark with its size, COMPARE
 rule and expected.txt), and record() gives the part of the configuration a
 resumed experiment must share.  Every problem raises ConfigError.
@@ -17,6 +17,13 @@ tree and each benchmark's binate/ tree, ab_store.source_digest) and of each
 expected.txt.  A resume with any of them changed would mix builds of
 different code, or different address layouts, in one experiment.
 
+With --probe SYM --probe-phases P,... the experiment has one compiler (one
+--arm, native) and one arm per phase, named NAME.pPP in the order given (the
+first is the base), each building with -fnative-place-probe=SYM
+-fnative-place-probe-phase=PP on top of the round's seed.  The phases must be
+distinct, at least two, in 0..63, and multiples of the host's filler unit
+(placehash.UNIT) when the host architecture is known; --aa does not apply.
+
 Python standard library only.  The tests are in test_ab.py; nothing runs them
 automatically:
   python3 -m unittest discover perf/placement
@@ -24,6 +31,7 @@ automatically:
 
 import hashlib
 import os
+import platform
 import re
 import resource
 import shlex
@@ -31,10 +39,14 @@ import shlex
 import ab_build as bld
 import ab_store as st
 import benchcfg
+import placehash
 import runner
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]*$")
 DEFAULT_WORK_FLAGS = "--backend native --linker bnld"
+# platform.machine() spellings of the architectures placehash.UNIT knows.
+HOST_ARCH = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64",
+             "armv7l": "arm32", "armv6l": "arm32", "armv8l": "arm32"}
 
 
 class ConfigError(ValueError):
@@ -108,9 +120,45 @@ def make_arms(args):
         extra = sorted(set(d) - names)
         if extra:
             raise ConfigError("%s names unknown arm(s): %s" % (what, ", ".join(extra)))
+    if args.probe is not None or args.probe_phases is not None:
+        arms = probe_arms(args, arms)
     if len(arms) > st.MAX_ARMS:
         raise ConfigError("at most %d arms" % st.MAX_ARMS)
     return arms
+
+
+def parse_phases(spec, unit=None):
+    """Probe phases from '0,16,32,48': distinct, at least two, each in
+    0..PLACE_SPAN-1 and, given the filler unit, a multiple of it."""
+    try:
+        out = [int(p) for p in spec.split(",")]
+    except ValueError:
+        raise ConfigError("bad --probe-phases %r: want integers like 0,16,32,48" % spec)
+    if len(out) < 2 or len(set(out)) != len(out):
+        raise ConfigError("--probe-phases wants at least two distinct phases")
+    bad = [p for p in out if not 0 <= p < placehash.PLACE_SPAN or (unit and p % unit)]
+    if bad:
+        raise ConfigError("probe phases must be multiples of %d in 0..%d: %s"
+                          % (unit or 1, placehash.PLACE_SPAN - 1, bad))
+    return out
+
+
+def probe_arms(args, arms):
+    """The one arm per probe phase that --probe makes of the single --arm."""
+    if args.probe is None or args.probe_phases is None:
+        raise ConfigError("--probe and --probe-phases go together")
+    if not args.probe:
+        raise ConfigError("--probe needs a symbol")
+    if len(arms) != 1 or not arms[0].native:
+        raise ConfigError("--probe builds one arm per phase from one native compiler: "
+                          "give exactly one --arm")
+    if args.aa:
+        raise ConfigError("--aa does not apply to a probe experiment")
+    arch = HOST_ARCH.get(platform.machine())
+    phases = parse_phases(args.probe_phases, placehash.UNIT.get(arch))
+    a = arms[0]
+    return [bld.Arm(i, "%s.p%02d" % (a.name, p), a.bnc, a.flags, a.backend, a.sha,
+                    (args.probe, p)) for i, p in enumerate(phases)]
 
 
 def make_items(args):
@@ -208,6 +256,14 @@ class Config:
             self._sources = out
         return dict(self._sources)
 
+    @staticmethod
+    def _arm_record(arm):
+        rec = {"name": arm.name, "bnc": arm.bnc, "sha256": arm.sha, "flags": arm.flags,
+               "backend": arm.backend}
+        if arm.probe is not None:
+            rec["probe"] = list(arm.probe)
+        return rec
+
     def record(self):
         """The part of the configuration a resumed experiment must share
         (see the module doc)."""
@@ -216,8 +272,7 @@ class Config:
                 "bench": os.path.realpath(a.bench) if a.bench else None,
                 "work": self.work, "work_flags": self.work_flags,
                 "items": [{"name": i.name, "n": i.n, "compare": i.compare} for i in self.items],
-                "arms": [{"name": r.name, "bnc": r.bnc, "sha256": r.sha, "flags": r.flags,
-                          "backend": r.backend} for r in self.arms],
+                "arms": [self._arm_record(r) for r in self.arms],
                 "seeds": self.seeds, "reps": a.reps, "mode": a.mode, "aslr": a.aslr,
                 "aa": a.aa, "static_report": a.static_report,
                 "timed_env": self.timed_env(),

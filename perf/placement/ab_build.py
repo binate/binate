@@ -15,7 +15,10 @@ runs that same binary (hard-linked into each seed's path), so its placement is
 not randomized.
 
 Each native arm also gets two control builds per item: seed 0 (placement
-switches given, placement off) and one without any placement switch.  The
+switches given, placement off) and one without any placement switch.  An arm
+of a probe experiment (ab.py --probe) adds -fnative-place-probe=SYM
+-fnative-place-probe-phase=P to every one of its builds, the controls
+included, so its controls check that seed 0 adds nothing to the probe.  The
 experiment is aborted when
 
 - a native arm's .text is byte-identical for two seeds (the switches did
@@ -24,8 +27,10 @@ experiment is aborted when
 - under --aa same, the arms built different binaries for a seed (the
   compiler's output is not deterministic);
 - a native arm's seed-0 binary differs from its no-switch binary;
-- `layout.py BIN --expect-seed S --mode M` fails on a seeded build (the
-  filler is not where placehash predicts).
+- `layout.py BIN --expect-seed S --mode M` (with --probe SYM --probe-phase P
+  for a probe arm) fails on a seeded build: the filler is not where
+  placehash predicts, or no function has the probe symbol (layout.py exits
+  3), so the probe matched nothing and every phase built the same program.
 
 With --static-report the layout.py run also writes its --json --loops report
 (gzipped) and the per-binary covariates stats.py relates to per-seed timing.
@@ -56,12 +61,14 @@ NATIVE, LLVM = "native", "llvm"
 
 
 class Arm:
-    """One compiler configuration under test; idx 0 is the base."""
-    __slots__ = ("idx", "name", "bnc", "flags", "backend", "sha")
+    """One compiler configuration under test; idx 0 is the base.  probe is
+    None or the (symbol, phase) every build of the arm probes."""
+    __slots__ = ("idx", "name", "bnc", "flags", "backend", "sha", "probe")
 
-    def __init__(self, idx, name, bnc, flags=(), backend=NATIVE, sha=""):
+    def __init__(self, idx, name, bnc, flags=(), backend=NATIVE, sha="", probe=None):
         self.idx, self.name, self.bnc = idx, name, bnc
         self.flags, self.backend, self.sha = list(flags), backend, sha
+        self.probe = probe
 
     @property
     def native(self):
@@ -136,6 +143,9 @@ def compile_argv(b, mode, iface, impl, bdir):
     arm = b.arm
     if arm.native:
         argv = [arm.bnc, "--backend", "native", "-O2"] + arm.flags
+        if arm.probe is not None:
+            argv += ["-fnative-place-probe=%s" % arm.probe[0],
+                     "-fnative-place-probe-phase=%d" % arm.probe[1]]
         if b.kind != "noflag":
             argv += ["-fnative-place-seed=%d" % b.place_seed, "-fnative-place-mode=%s" % mode]
     else:
@@ -180,6 +190,13 @@ def covariates(report):
     return cov
 
 
+# Why a seeded build's layout.py check stops the experiment, by its verdict.
+EXPECT_WHY = {"fail": "found the filler different from placehash's prediction",
+              "error": "could not check",
+              "noprobe": "found no function with the --probe symbol, so the probe matched "
+                         "nothing"}
+
+
 def _norm(row):
     return {k: st._cell(v) for k, v in row.items()}
 
@@ -203,11 +220,10 @@ def abort_reasons(rows, aa):
                                "placement switches had no effect"
                                % (arm, item, seen[r["text_sha256"]], r["seed"]))
             seen.setdefault(r["text_sha256"], r["seed"])
-            if r["expect_seed"] in ("fail", "error"):
+            if r["expect_seed"] in ("fail", "error", "noprobe"):
                 reasons.append("arm %s, %s, seed %s: layout.py --expect-seed %s %s (see %s)"
                                % (arm, item, r["seed"], r["place_seed"],
-                                  "found the filler different from placehash's prediction"
-                                  if r["expect_seed"] == "fail" else "could not check",
+                                  EXPECT_WHY[r["expect_seed"]],
                                   os.path.join(os.path.dirname(r["path"]), "layout.err")))
         ctl = {r["kind"]: r["sha256"] for r in rs if r["kind"] in ("seed0", "noflag")}
         if len(ctl) == 2 and ctl["seed0"] != ctl["noflag"]:
@@ -346,13 +362,15 @@ class Builder:
         d = os.path.dirname(b.path)
         argv = [sys.executable, LAYOUT_PY, b.path, "--expect-seed", str(b.place_seed),
                 "--mode", self.mode]
+        if b.arm.probe is not None:
+            argv += ["--probe", b.arm.probe[0], "--probe-phase", str(b.arm.probe[1])]
         out = os.path.join(d, "layout.json" if self.static else "layout.txt")
         if self.static:
             argv += ["--json", "--loops"]
         rc = self._call(argv, out, os.path.join(d, "layout.err"))
-        verdict = {0: "ok", 1: "fail"}.get(rc, "error")
+        verdict = {0: "ok", 1: "fail", 3: "noprobe"}.get(rc, "error")
         cov = ""
-        if self.static and rc in (0, 1):
+        if self.static and rc in (0, 1, 3):
             with open(out) as fh:
                 report = json.load(fh)
             st.write_json(os.path.join(d, "cov.json"), covariates(report))

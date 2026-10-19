@@ -1,14 +1,22 @@
 """Python twin of the native backends' function-placement filler.
 
 bnc's -fnative-place-seed=S / -fnative-place-mode=M put trap-instruction filler
-before each Binate function (pkg/binate/native/place: place.bni specifies the
-formulas, place/place.bn implements them).  This module reproduces those
-placements exactly, so measurement tools can predict and check where every
-function lands without running the compiler:
+before each Binate function, and -fnative-place-probe=SYM /
+-fnative-place-probe-phase=P put the one function SYM at phase P with filler
+around it that totals PLACE_SPAN (pkg/binate/native/place: place.bni
+specifies the formulas, place/place.bn implements them).  This module
+reproduces those placements exactly, so measurement tools can predict and
+check where every function lands without running the compiler:
 
-  place_hash(seed, key)                      place.PlaceHash
-  fill_before(seed, mode, sym, unit, off)    place.PlaceFillBefore (+ PlaceCheck)
-  entry_phase(seed, sym, unit)               the phase phase mode gives sym
+  place_hash(seed, key)                         place.PlaceHash
+  fill_before(seed, mode, sym, unit, off, probe)
+                                                place.PlaceFillBefore (+ PlaceCheck)
+  fill_after(sym, before, probe)                place.PlaceFillAfter
+  entry_phase(seed, sym, unit, probe)           the phase phase mode or the
+                                                probe gives sym
+  check_probe(probe, unit)                      PlaceCheck's probe rules
+
+probe is None or (SYM, P), as bnc's two probe switches give them.
 
 The hash key is a function's mangled symbol without an object-format prefix,
 but what the filler positions is the function's FIRST entry point: its first
@@ -117,33 +125,76 @@ def _align_up(off, unit):
     return (off + unit - 1) // unit * unit
 
 
-def fill_before(seed, mode, sym, unit, off):
+def check_probe(probe, unit):
+    """place.PlaceCheck's probe rules: probe is None, or (sym, phase) with a
+    phase that is a multiple of unit in 0..PLACE_SPAN-1 (a sym that is empty
+    means no probe, and then the phase must be 0).  Raises ValueError
+    otherwise, and for a unit that does not divide PLACE_SPAN."""
+    _check_unit(unit)
+    if probe is None:
+        return
+    sym, phase = probe
+    if not isinstance(phase, int) or isinstance(phase, bool):
+        raise ValueError("probe phase %r is not an integer" % (phase,))
+    if not _key_bytes(sym):
+        if phase != 0:
+            raise ValueError("a probe phase needs a probe symbol")
+        return
+    if not 0 <= phase < PLACE_SPAN or phase % unit:
+        raise ValueError("probe phase %d is not a multiple of %d in 0..%d"
+                         % (phase, unit, PLACE_SPAN - 1))
+
+
+def is_probe(sym, probe):
+    """Whether sym is the probed symbol of probe (None: no probe)."""
+    return probe is not None and bool(_key_bytes(probe[0])) \
+        and _key_bytes(sym) == _key_bytes(probe[0])
+
+
+def fill_before(seed, mode, sym, unit, off, probe=None):
     """place.PlaceFillBefore: the filler bytes emitted before the function
     whose mangled symbol (no object-format prefix) is sym, at .text offset off,
-    for filler granularity unit.  mode is PLACE_SHIFT / PLACE_PHASE or its
-    name.  Raises ValueError for what place.PlaceCheck rejects: a seed outside
-    0..PLACE_SEED_MAX, an unknown mode, or a unit that does not divide
-    PLACE_SPAN."""
+    for filler granularity unit, with the probe (sym, phase) or None.  mode is
+    PLACE_SHIFT / PLACE_PHASE or its name.  The probed function, at any seed
+    and in either mode, gets the fill that brings alignUp(off, unit) to its
+    phase.  Raises ValueError for what place.PlaceCheck rejects: a seed
+    outside 0..PLACE_SEED_MAX, an unknown mode, a unit that does not divide
+    PLACE_SPAN, or a probe check_probe rejects."""
     _check_seed(seed)
     mode = _mode_value(mode)
-    _check_unit(unit)
-    if seed == 0:
-        return 0
-    k = PLACE_SPAN // unit
-    phi = unit * (place_hash(seed, sym) % k)
-    if mode == PLACE_SHIFT:
-        return phi
+    check_probe(probe, unit)
+    if is_probe(sym, probe):
+        phi = probe[1]
+    else:
+        if seed == 0:
+            return 0
+        phi = unit * (place_hash(seed, sym) % (PLACE_SPAN // unit))
+        if mode == PLACE_SHIFT:
+            return phi
     return (phi - _align_up(off, unit)) % PLACE_SPAN
 
 
-def entry_phase(seed, sym, unit):
-    """The offset modulo PLACE_SPAN at which phase mode puts the first entry
+def fill_after(sym, before, probe=None):
+    """place.PlaceFillAfter: the filler bytes emitted right after the
+    function whose mangled symbol is sym, when fill_before gave `before` bytes
+    in front of it: PLACE_SPAN - before for the probed function, 0 for every
+    other one."""
+    return PLACE_SPAN - before if is_probe(sym, probe) else 0
+
+
+def entry_phase(seed, sym, unit, probe=None):
+    """The offset modulo PLACE_SPAN at which the filler puts the first entry
     point of the function whose mangled symbol is sym (its first #[c_export]
-    alias, if it has one).  Meaningful only for a nonzero seed: seed 0 adds no
-    filler.  Raises ValueError for a seed outside 0..PLACE_SEED_MAX or a unit
-    that does not divide PLACE_SPAN."""
+    alias, if it has one): the probe's phase for the probed function, else
+    the phase phase mode gives it.  Except for the probed function, meaningful
+    only for a nonzero seed in phase mode: seed 0 adds no filler and shift
+    mode predicts no phase.  Raises ValueError for a seed outside
+    0..PLACE_SEED_MAX, a unit that does not divide PLACE_SPAN, or a probe
+    check_probe rejects."""
     _check_seed(seed)
-    _check_unit(unit)
+    check_probe(probe, unit)
+    if is_probe(sym, probe):
+        return probe[1]
     return unit * (place_hash(seed, sym) % (PLACE_SPAN // unit))
 
 

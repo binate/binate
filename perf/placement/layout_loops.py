@@ -248,3 +248,31 @@ def analyze(recs, entries, labels, window, line, hits=None):
             lp["jcc"] = sum(hit_blocks.get(i, 0) for i in body)
         out.append(lp)
     return out
+
+
+def loop_keys(loops, labels, prefixes):
+    """Set each loop's key, by which --compare matches it across builds: the
+    block part of its header's label when that is one of the function's own
+    block labels (L<sym>__<blk>), else '<blk>#<k>' for the k-th such loop
+    after the nearest own block label <blk> before its header ('' for none).
+    The backends label every block but the entry, so <blk> is the block that
+    holds the loop (an aggregate copy's, say), which block layout moves along
+    with it, and the key does not depend on the labeled loops around it."""
+    own = sorted((a, n) for a, n in labels.items() if n.startswith(prefixes))
+    addrs = [a for a, _ in own]
+    count = Counter()
+    for lp in loops:
+        if lp["label"].startswith(prefixes):
+            lp["key"] = _blk(lp["label"], prefixes)
+            continue
+        i = bisect.bisect_right(addrs, lp["header"]) - 1
+        anchor = _blk(own[i][1], prefixes) if i >= 0 else ""
+        lp["key"] = "%s#%d" % (anchor, count[anchor])
+        count[anchor] += 1
+
+
+def _blk(label, prefixes):
+    for p in prefixes:
+        if label.startswith(p):
+            return label[len(p):]
+    return label

@@ -1,7 +1,8 @@
 """Tests for placehash.py, the Python twin of the native backends' placement.
 
-The pinned vectors are the same as pkg/binate/native/place/place_test.bn pins
-for place.PlaceHash / place.PlaceFillBefore.  Only the Binate tests run with
+The pinned vectors are the same as pkg/binate/native/place/place_test.bn and
+place_probe_test.bn pin for place.PlaceHash / place.PlaceFillBefore /
+place.PlaceFillAfter.  Only the Binate tests run with
 the unit-test suite; nothing runs these automatically, so run them whenever
 either implementation or either set of vectors changes:
 
@@ -109,6 +110,73 @@ class FillBeforeTest(unittest.TestCase):
                     self.assertTrue(0 <= fill < ph.PLACE_SPAN and fill % unit == 0)
                     aligned = (off + unit - 1) // unit * unit
                     self.assertEqual((aligned + fill) % ph.PLACE_SPAN, phi)
+
+
+class ProbeTest(unittest.TestCase):
+    def test_pinned_vectors(self):
+        # The same vectors as pkg/binate/native/place/place_probe_test.bn.
+        vectors = [
+            (0, "phase", FOO, (FOO, 32), 16, 5, 16),
+            (12345, "shift", FOO, (FOO, 0), 16, 100, 16),
+            (7, "phase", FOO, (FOO, 60), 4, 3, 56),
+            (0, "shift", FOO, (FOO, 48), 16, 48, 0),
+            (0, "phase", MAIN, (FOO, 32), 16, 5, 0),
+            (7, "phase", MAIN, (FOO, 32), 4, 0, 60),
+            (7, "shift", MAIN, (FOO, 32), 4, 100, 60),
+        ]
+        for seed, mode, sym, probe, unit, off, want in vectors:
+            with self.subTest(seed=seed, mode=mode, sym=sym, probe=probe, unit=unit, off=off):
+                self.assertEqual(ph.fill_before(seed, mode, sym, unit, off, probe), want)
+        self.assertEqual(ph.fill_after(FOO, 16, (FOO, 32)), 48)
+        self.assertEqual(ph.fill_after(FOO, 0, (FOO, 48)), 64)
+        self.assertEqual(ph.fill_after(MAIN, 60, (FOO, 32)), 0)
+        self.assertEqual(ph.fill_after(FOO, 16, None), 0)
+
+    def test_lands_on_phase_and_restores_offsets(self):
+        for unit in (4, 16):
+            for seed, mode in ((0, "phase"), (0, "shift"), (12345, "phase"), (12345, "shift")):
+                for off in range(0, 131, 5):
+                    aligned = (off + unit - 1) // unit * unit
+                    ends = set()
+                    for phase in range(0, ph.PLACE_SPAN, unit):
+                        probe = (FOO, phase)
+                        pre = ph.fill_before(seed, mode, FOO, unit, off, probe)
+                        self.assertTrue(0 <= pre < ph.PLACE_SPAN and pre % unit == 0)
+                        self.assertEqual((aligned + pre) % ph.PLACE_SPAN, phase)
+                        self.assertEqual(ph.entry_phase(seed, FOO, unit, probe), phase)
+                        post = ph.fill_after(FOO, pre, probe)
+                        self.assertEqual(pre + post, ph.PLACE_SPAN)
+                        ends.add(aligned + pre + 37 + post)
+                    self.assertEqual(len(ends), 1)
+
+    def test_leaves_other_functions(self):
+        for seed, mode in ((0, "phase"), (7, "phase"), (7, "shift")):
+            for i in range(100):
+                sym = "sym%d" % i
+                for off in range(0, 70, 7):
+                    self.assertEqual(ph.fill_before(seed, mode, sym, 4, off, ("bn_probe", 16)),
+                                     ph.fill_before(seed, mode, sym, 4, off))
+
+    def test_bytes_and_str_symbols_agree(self):
+        self.assertEqual(ph.fill_before(0, "phase", FOO.encode(), 16, 5, (FOO, 32)), 16)
+        self.assertTrue(ph.is_probe(FOO, (FOO.encode(), 0)))
+        self.assertFalse(ph.is_probe(FOO, None))
+        self.assertFalse(ph.is_probe("", ("", 0)))
+
+    def test_check_probe(self):
+        for probe, unit in (((FOO, 0), 16), ((FOO, 48), 16), ((FOO, 60), 4), (None, 4),
+                            (("", 0), 16)):
+            with self.subTest(probe=probe, unit=unit):
+                ph.check_probe(probe, unit)
+                ph.fill_before(0, "phase", FOO, unit, 0, probe)
+        for probe, unit in (((FOO, 8), 16), ((FOO, 6), 4), ((FOO, 64), 16), ((FOO, 128), 4),
+                            ((FOO, -16), 16), (("", 16), 16), ((FOO, "16"), 16),
+                            ((FOO, 16), 24)):
+            with self.subTest(probe=probe, unit=unit):
+                with self.assertRaises(ValueError):
+                    ph.check_probe(probe, unit)
+                with self.assertRaises(ValueError):
+                    ph.fill_before(7, "phase", MAIN, unit, 0, probe)
 
 
 class FillInsnTest(unittest.TestCase):

@@ -69,18 +69,22 @@ class Prog:
             (self.int3_to if gap == "int3" else self.nops_to)(align)
         self.obj = self.pc
 
-    def placed(self, key, seed, mode, extra=0, zero=False):
+    def placed(self, key, seed, mode, extra=0, zero=False, probe=None, post=0):
         """Filler before the Binate function keyed key, as EmitObject puts it
         (offset within the current object), then x86-64's entry alignment;
-        extra adds that many bytes of filler, as a broken backend might, and
-        zero writes zero bytes in the filler's place."""
-        n = extra + placehash.fill_before(seed, mode, key, self.unit, self.pc - self.obj)
+        returns the filler placehash predicts.  post is the trailing filler of
+        a probed function the previous one was, which comes first; extra adds
+        that many bytes of filler, as a broken backend might, and zero writes
+        zero bytes in the filler's place."""
+        pre = placehash.fill_before(seed, mode, key, self.unit, self.pc - self.obj + post, probe)
+        n = extra + post + pre
         if zero:
             self.skip(n)
         else:
             self.fill(n)
         if self.arch == "x86_64":
             self.nops_to(16)
+        return pre
 
     # --- rendering ---
 
@@ -166,15 +170,27 @@ PKG_B = "bn_F1_1_p1_9___Package"
 LOOP = "Lbn_F1_4_main1_2_f1__for.cond.1"
 
 
-def x86_program(seed, mode="phase", gap="nop", extra=None, zero=()):
+def x86_program(seed, mode="phase", gap="nop", extra=None, zero=(), probe=None, post=True):
     """Two objects.  main: f1 (a loop), f2, f3 behind a #[c_export] alias
     `cexp` with a C-entry normalization, then the package descriptor.  p:
     g1, a generic instantiation g2, its descriptor, then a C helper.  extra
     maps a function to bytes of filler added beyond the prediction; the
-    functions in zero get zero bytes in place of their filler."""
+    functions in zero get zero bytes in place of their filler.  probe is the
+    build's (SYM, PHASE) or None; post False leaves out the probed
+    function's trailing filler, as a broken backend might."""
     extra = extra or {}
     p = Prog("x86_64", 0x1000)
-    p.placed(F1, seed, mode, zero=F1 in zero)
+    trail = [0]
+
+    def place(key):
+        pre = p.placed(key, seed, mode, extra.get(key, 0), key in zero, probe, trail[0])
+        trail[0] = placehash.fill_after(key, pre, probe) if post else 0
+
+    def unplaced():
+        p.fill(trail[0])
+        trail[0] = 0
+
+    place(F1)
     p.sym(F1)
     p.op(b"\x55", "pushq\t%rbp")
     p.op(b"\x48\x89\xe5", "movq\t%rsp, %rbp")
@@ -192,11 +208,11 @@ def x86_program(seed, mode="phase", gap="nop", extra=None, zero=()):
     p.label("Lbn_F1_4_main1_2_f1__for.exit.3")
     p.op(b"\x5d", "popq\t%rbp")
     p.op(b"\xc3", "retq")
-    p.placed(F2, seed, mode, extra.get(F2, 0), F2 in zero)
+    place(F2)
     p.sym(F2)
     p.op(b"\x48\xc7\xc0\x07\x00\x00\x00", "movq\t$0x7, %rax")
     p.op(b"\xc3", "retq")
-    p.placed(F3, seed, mode, zero=F3 in zero)
+    place(F3)
     p.sym("cexp")
     p.op(b"\x48\x63\xff", "movslq\t%edi, %rdi")
     p.op(b"\xe9\x08\x00\x00\x00", "jmp\t{t}", None)
@@ -206,21 +222,23 @@ def x86_program(seed, mode="phase", gap="nop", extra=None, zero=()):
     p.items[alias_jmp] = p.items[alias_jmp][:3] + (f3, False)
     p.op(b"\xe8\x00\x01\x00\x00", "callq\t{t}", 0x1000)
     p.op(b"\xc3", "retq")
+    unplaced()
     p.nops_to(16)
     p.sym(PKG_A)
     p.op(b"\x48\x8d\x05\x10\x00\x00\x00", "leaq\t0x10(%rip), %rax")
     p.op(b"\xc3", "retq")
     p.start_object(64, gap)
-    p.placed(G1, seed, mode, extra.get(G1, 0), G1 in zero)
+    place(G1)
     p.sym(G1)
     p.op(b"\x31\xc0", "xorl\t%eax, %eax")
     p.op(b"\xc3", "retq")
-    p.placed(G2, seed, mode, extra.get(G2, 0), G2 in zero)
+    place(G2)
     p.sym(G2, " w    F")
     p.op(b"\x48\x85\xff", "testq\t%rdi, %rdi")
     p.op(b"\x74\x01", "je\t{t}", p.pc + 2 + 1)
     p.op(b"\xc3", "retq")
     p.op(b"\xc3", "retq")
+    unplaced()
     p.nops_to(16)
     p.sym(PKG_B)
     p.op(b"\xc3", "retq")

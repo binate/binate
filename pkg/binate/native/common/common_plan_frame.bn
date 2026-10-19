@@ -1,20 +1,26 @@
 package "pkg/binate/native/common"
 
+import "pkg/binate/asm"
 import "pkg/binate/ir"
 import "pkg/binate/iropcode"
 import "pkg/binate/native/callconv"
+import "pkg/binate/stringutils"
 import "pkg/binate/types"
+import "pkg/std/strings"
 import "pkg/std/vec"
 
 // PlanFrame assigns a stack slot to every function parameter and every
 // value-producing SSA instruction. Returns the 16-byte-aligned total
-// frame size (also cached on m.FrameSize).
+// frame size (also cached on m.FrameSize).  Sizes and offsets are int64 (a
+// 64-bit target's frame may pass a 32-bit host's int), summed saturating; a frame
+// past the target's address space sets m.FrameTooLarge, which the backend reports
+// (CheckFrameFits).
 //
 // Slot sizes:
-//   - OP_ALLOC: TypeArg.SizeOf(), rounded up to 8.
+//   - OP_ALLOC: TypeArg.Size(), rounded up to 8.
 //   - Aggregate-producing OPs whose SSA value is a *pointer* to a
 //     dedicated data region (OP_MAKE_SLICE; aggregate OP_CONST_NIL):
-//     a Typ.SizeOf() data region (via AllocIDs) PLUS an 8-byte
+//     a Typ.Size() data region (via AllocIDs) PLUS an 8-byte
 //     spill slot for the pointer.
 //   - Multi-return calls (OP_CALL returning TYP_STRUCT):
 //     N*8-byte spill slot so X0..X(N-1) can be packed at slot + 8*i.
@@ -26,12 +32,12 @@ import "pkg/std/vec"
 // Under the "spill everything" policy, the register allocator is
 // trivial: a rotating small pool, with operands reloaded from their
 // slot on use. Correct but slow; a real allocator can reclaim later.
-func (m @RegMap) PlanFrame(f @ir.Func) int {
+func (m @RegMap) PlanFrame(f @ir.Func) int64 {
 	// Walk every call in f to find the largest outgoing-args area
 	// any single call needs. That region sits at [sp+0..outgoing) so
 	// the caller can write stack args without disturbing its own SP.
 	// Spill/alloc offsets are shifted up by `outgoing` below.
-	var outgoing int = 0
+	var outgoing int64 = 0
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var b @ir.Block = f.Blocks[bi]
 		for ii := 0; ii < len(b.Instrs); ii++ {
@@ -67,7 +73,7 @@ func (m @RegMap) PlanFrame(f @ir.Func) int {
 			// leaves fixedCount==len).  Drives the per-CALL AAPCS-VFP float->GP
 			// reclassification in the outgoing-args sizing, matching the emitter.
 			var callIsVariadic bool = ins.Op == iropcode.OP_C_CALL && ins.CVariadic
-			var sb int = callCC.CallStackBytesV(argTypes, fixedCount, callIsVariadic)
+			var sb int64 = cast(int64, callCC.CallStackBytesV(argTypes, fixedCount, callIsVariadic))
 			if sb > outgoing { outgoing = sb }
 		}
 	}
@@ -75,20 +81,21 @@ func (m @RegMap) PlanFrame(f @ir.Func) int {
 	m.SretSlotOff = -1
 	m.RetbufSlotID = -1
 	m.MultiReturnType = f.MultiReturnType
-	var offset int = outgoing
+	m.FrameTooLarge = false
+	var offset int64 = outgoing
 
 	// Callee-saved save area (set by AllocateRegisters; 0 when the register
 	// allocator was not run).  Placed just above the outgoing-args region and
 	// inside the frame, so the prologue's fp/lr push and x29 chain are
 	// untouched and the incoming stack-arg base (frameSize + 16) self-adjusts.
 	m.SavedRegsOff = offset
-	offset = offset + m.SavedRegsBytes
+	offset = frameAdd(offset, cast(int64, m.SavedRegsBytes))
 
 	// FP callee-saved save area (set by AllocateFpRegisters), laid down right
 	// above the GP save area.  Both are 16-aligned, so their sum keeps the frame
 	// aligned.  Zero (no-op) until the FP pass runs.
 	m.SavedFpRegsOff = offset
-	offset = offset + m.SavedFpRegsBytes
+	offset = frameAdd(offset, cast(int64, m.SavedFpRegsBytes))
 
 	// If f returns a single aggregate larger than the internal sret
 	// threshold (cc.InternalSretBytes — 16 on AAPCS64), or a multi-
@@ -98,7 +105,7 @@ func (m @RegMap) PlanFrame(f @ir.Func) int {
 	// function entry so emitReturn can load it back.
 	if m.CC.FuncReturnsBigAggregate(f) || m.CC.FuncReturnsBigMultiReturn(f) {
 		m.SretSlotOff = offset
-		offset = offset + 8
+		offset = frameAdd(offset, 8)
 	}
 
 	// Parameters come first so entry-point register stores can find
@@ -110,15 +117,15 @@ func (m @RegMap) PlanFrame(f @ir.Func) int {
 	// The slot tables grow with the function, so they are built with amortized
 	// appends and stored back once at the end.
 	var allocIDs @vec.Vec[int] = intVecFrom(m.AllocIDs)
-	var allocSizes @vec.Vec[int] = intVecFrom(m.AllocSizes)
-	var allocOffsets @vec.Vec[int] = intVecFrom(m.AllocOffsets)
+	var allocSizes @int64List = newInt64List(m.AllocSizes)
+	var allocOffsets @int64List = newInt64List(m.AllocOffsets)
 	var spillIDs @vec.Vec[int] = intVecFrom(m.SpillIDs)
-	var spillOffsets @vec.Vec[int] = intVecFrom(m.SpillOffsets)
-	var paramSpill @[]int = make_slice(int, len(f.Params))
+	var spillOffsets @int64List = newInt64List(m.SpillOffsets)
+	var paramSpill @[]int64 = make_slice(int64, len(f.Params))
 	var inPlace @[]int = InPlaceParamSlots(f)
 	var placed @[]int = CallResultSlots(f)
 	var placedCalls @vec.Vec[int] = vec.New[int]()
-	var placedSizes @vec.Vec[int] = vec.New[int]()
+	var placedSizes @int64List = newInt64List(make_slice(int64, 0))
 	var placedDirectSret @vec.Vec[bool] = vec.New[bool]()
 	var toRetbuf @[]bool
 	if m.CC.FuncReturnsBigAggregate(f) { toRetbuf = ReturnedCallResults(f) }
@@ -139,7 +146,7 @@ func (m @RegMap) PlanFrame(f @ir.Func) int {
 		// A parameter whose bytes arrive in memory the callee owns
 		// (paramInCallerMemory) uses them as its value: no region of its own.
 		if callconv.IsAggregateTyp(p.Typ) && !m.paramInCallerMemory(cts, cbase + pi) {
-			var dataSz int = p.Typ.SizeOf()
+			var dataSz int64 = p.Typ.Size()
 			if dataSz > 0 {
 				// Round up to an 8-byte multiple, exactly as the OP_ALLOC
 				// and aggregate-value data-region branches below do.  Two
@@ -153,19 +160,17 @@ func (m @RegMap) PlanFrame(f @ir.Func) int {
 				// from those slots (`add rN, sp, #odd`), and a downstream
 				// deref hits an unaligned/out-of-bounds address → Data Abort
 				// → the bare-metal default vector loops forever.
-				if dataSz % 8 != 0 {
-					dataSz = dataSz + (8 - dataSz % 8)
-				}
+				dataSz = roundUp8(dataSz)
 				allocIDs.Push(p.ID)
 				allocSizes.Push(dataSz)
 				allocOffsets.Push(offset)
-				offset = offset + dataSz
+				offset = frameAdd(offset, dataSz)
 			}
 		}
 		spillIDs.Push(p.ID)
 		spillOffsets.Push(offset)
 		paramSpill[pi] = offset
-		offset = offset + 8
+		offset = frameAdd(offset, 8)
 	}
 
 	for bi := 0; bi < len(f.Blocks); bi++ {
@@ -194,14 +199,14 @@ func (m @RegMap) PlanFrame(f @ir.Func) int {
 				spillOffsets.Push(m.SretSlotOff)
 				m.RetbufSlotID = ins.ID
 			} else if ins.Op == iropcode.OP_ALLOC {
-				var sz int = 8
-				if ins.TypeArg != nil { sz = ins.TypeArg.SizeOf() }
+				var sz int64 = 8
+				if ins.TypeArg != nil { sz = ins.TypeArg.Size() }
 				if sz < 8 { sz = 8 }
-				if sz % 8 != 0 { sz = sz + (8 - sz % 8) }
+				sz = roundUp8(sz)
 				allocIDs.Push(ins.ID)
 				allocSizes.Push(sz)
 				allocOffsets.Push(offset)
-				offset = offset + sz
+				offset = frameAdd(offset, sz)
 			} else if ins.ID >= 0 && (!InstrIsVoid(ins) || isIndirectCallOp(ins.Op)) {
 				// These ops produce an aggregate VALUE that must live in
 				// the frame: each gets a dedicated data region, and its
@@ -254,7 +259,7 @@ func (m @RegMap) PlanFrame(f @ir.Func) int {
 					// (CallResultSlots): it takes the slot's region, assigned
 					// after the walk, since the slot may come later.
 					placedCalls.Push(ins.ID)
-					placedSizes.Push(roundUp8(ins.Typ.SizeOf()))
+					placedSizes.Push(roundUp8(ins.Typ.Size()))
 					placedDirectSret.Push(ins.Op == iropcode.OP_CALL && m.CC.CallReturnsBigAggregate(ins))
 				} else if region {
 					// OP_RODATA_MSLICE / OP_RODATA_SLICE deliberately do NOT
@@ -266,20 +271,18 @@ func (m @RegMap) PlanFrame(f @ir.Func) int {
 					// resolve an operand via LookupAlloc FIRST (emitAggLoad), and
 					// would read the unwritten slot instead of the register.
 
-					var dataSz int = ins.Typ.SizeOf()
+					var dataSz int64 = ins.Typ.Size()
 					if dataSz > 0 {
 						// Round up to 8-byte multiple so subsequent
 						// 64-bit STR/LDR stay aligned and so that
 						// emitStringToArray's word-wise zero-fill
 						// doesn't run past the buffer end (e.g. a
 						// [5]char array gets 8 bytes here).
-						if dataSz % 8 != 0 {
-							dataSz = dataSz + (8 - dataSz % 8)
-						}
+						dataSz = roundUp8(dataSz)
 						allocIDs.Push(ins.ID)
 						allocSizes.Push(dataSz)
 						allocOffsets.Push(offset)
-						offset = offset + dataSz
+						offset = frameAdd(offset, dataSz)
 					}
 				}
 				spillIDs.Push(ins.ID)
@@ -289,19 +292,16 @@ func (m @RegMap) PlanFrame(f @ir.Func) int {
 				// FieldOffset(tuple, i). Named struct returns go
 				// through the pointer-form branch above instead, so
 				// we key on IsMultiReturnCall rather than bare
-				// TYP_STRUCT. The byte count is tuple.SizeOf()
+				// TYP_STRUCT. The byte count is tuple.Size()
 				// — fields can themselves be aggregates (e.g. a
 				// multi-return of `(Tab, int)` where Tab is 5 words)
 				// so 8 * field-count would under-allocate.
-				var slotSz int = 8
+				var slotSz int64 = 8
 				if callconv.IsMultiReturnCall(ins) {
-					slotSz = ins.Typ.SizeOf()
-					if slotSz % 8 != 0 {
-						slotSz = slotSz + (8 - slotSz % 8)
-					}
+					slotSz = roundUp8(ins.Typ.Size())
 					if slotSz < 8 { slotSz = 8 }
 				}
-				offset = offset + slotSz
+				offset = frameAdd(offset, slotSz)
 			}
 		}
 	}
@@ -326,12 +326,60 @@ func (m @RegMap) PlanFrame(f @ir.Func) int {
 	m.InPlaceSlotIDs = inPlaceIDs.Items()
 	m.InPlaceSlotParams = inPlaceParams.Items()
 	offset = m.planArgCopies(f, offset)
-	var size int = offset
-	if size % 16 != 0 {
-		size = size + (16 - size % 16)
-	}
+	var size int64 = roundUpPow2(offset, 16)
+	// A saturated size (frameAdd) is the int64 maximum, which no frame rounded to 16
+	// can be, so it is too large even where it does not pass frameLimit.
+	m.FrameTooLarge = size > frameLimit() || size == frameSaturated
 	m.FrameSize = size
 	return size
+}
+
+// frameLimit returns the largest frame the target allows (spec §21.4, the size of a
+// function's frame): its address space, 2^32 - 1 bytes on a 32-bit target — so a
+// local of the largest type (type.layout.max-size, 2^31 - 1) fits beside the rest of
+// the frame — and the int64 range on a 64-bit one.
+func frameLimit() int64 {
+	if types.GetTarget().PointerSize == 4 { return 0xFFFFFFFF }
+	return 0x7FFFFFFFFFFFFFFF
+}
+
+// frameSaturated is the value a frame size or offset saturates to (the int64
+// maximum) instead of wrapping: frameAdd, roundUpPow2.
+const frameSaturated int64 = 0x7FFFFFFFFFFFFFFF
+
+// frameAdd returns a + b for frame sizes and offsets a, b >= 0, saturating at
+// frameSaturated instead of wrapping.
+func frameAdd(a int64, b int64) int64 {
+	if b > frameSaturated - a { return frameSaturated }
+	return a + b
+}
+
+// roundUp8 rounds the frame size n >= 0 up to a multiple of 8 (saturating).
+func roundUp8(n int64) int64 {
+	return roundUpPow2(n, 8)
+}
+
+// roundUpPow2 rounds n >= 0 up to a multiple of the power of two p (saturating at
+// frameSaturated).
+func roundUpPow2(n int64, p int64) int64 {
+	if n > frameSaturated - (p - 1) { return frameSaturated }
+	return (n + (p - 1)) & ~(p - 1)
+}
+
+// CheckFrameFits reports whether the frame PlanFrame planned for m, the frame of the
+// function named name, fits the target (FrameTooLarge), recording an error on a when
+// it does not: a function whose frame passes the target's address space is a compile
+// error.
+func CheckFrameFits(a @asm.Assembler, m @RegMap, name *[]readonly char) bool {
+	if !m.FrameTooLarge { return true }
+	var msg @strings.Builder = strings.NewBuilder()
+	msg.Write("the frame of ")
+	msg.Write(name)
+	msg.Write(" is larger than the target allows (at most ")
+	stringutils.WriteInt64(msg, frameLimit())
+	msg.Write(" bytes)")
+	a.SetError(msg.String())
+	return false
 }
 
 // instrHasDataRegion reports whether ins produces an aggregate value that PlanFrame

@@ -32,6 +32,11 @@
 #   preference to the generic file when the current MODE matches.
 #   Lets a target-specific output (e.g. ILP32 sizeof) override the
 #   canonical LP64 .expected without rewriting the .bn.
+#   NNN_name.error.<mode>.<arch> / <dir>/error.<mode>.<arch> apply only
+#   when the host arch (HOST_ARCH below) matches, ahead of every other
+#   .expected / .error file: a non-cross mode targets the host, so this
+#   pins an error only one target's build reports (e.g. the LLVM
+#   backend's frame limit on x86-64) to that target.
 
 # Parse flags
 VERBOSE=0
@@ -153,6 +158,8 @@ if [ -z "$MODE" ]; then
     echo "Per-mode .expected / .error: NNN_name.{expected,error}.<mode>"
     echo "                             overrides the generic file for that mode"
     echo "                             (e.g. LP64-vs-ILP32 size output)."
+    echo "                             NNN_name.error.<mode>.<arch> applies"
+    echo "                             only on that host arch (target == host)."
     echo ""
     echo "Environment:"
     echo "  BINATE_FLAGS              Extra flags for the compiler (e.g. \"-g\")"
@@ -210,9 +217,13 @@ export SCRIPT_DIR BINATE_DIR
 # the build's arch on NON-cross modes (where target == host) — e.g. a test
 # printing the selected arch passes on both an aarch64 dev box and an x64 CI
 # runner. Cross-compile modes pin the target via `expected.<MODE>` (higher
-# precedence), so this tier never overrides them.
+# precedence), so this tier never overrides them.  It also selects the
+# `error.<MODE>.<arch>` tier, which takes precedence over every other
+# expectation (an error only that target's build reports).
 # Honor a pre-set HOST_ARCH (lets a developer cross-check another arch's
-# expected.<arch> resolution without that hardware); otherwise derive it.
+# expected.<arch> / error.<MODE>.<arch> resolution without that hardware;
+# with BINATE_FLAGS="--target <key>" a non-cross mode then builds for that
+# arch); otherwise derive it.
 if [ -z "$HOST_ARCH" ]; then
     case "$(uname -m)" in
         arm64|aarch64) HOST_ARCH=aarch64 ;;
@@ -513,6 +524,9 @@ for bn in "$SCRIPT_DIR"/*.bn; do
     if [ -f "$SCRIPT_DIR/${name}.error.${MODE}" ]; then
         errorfile="$SCRIPT_DIR/${name}.error.${MODE}"
     fi
+    if [ -f "$SCRIPT_DIR/${name}.error.${MODE}.${HOST_ARCH}" ]; then
+        errorfile="$SCRIPT_DIR/${name}.error.${MODE}.${HOST_ARCH}"
+    fi
     if [ -f "$errorfile" ]; then
         run_error_test "$name" "$bn" "$errorfile" ""
     elif [ -f "$expected" ]; then
@@ -561,6 +575,9 @@ for dir in "$SCRIPT_DIR"/[0-9][0-9][0-9]*_*/; do
     fi
     if [ -f "$dir/error.${MODE}" ]; then
         errorfile="$dir/error.${MODE}"
+    fi
+    if [ -f "$dir/error.${MODE}.${HOST_ARCH}" ]; then
+        errorfile="$dir/error.${MODE}.${HOST_ARCH}"
     fi
     if [ ! -f "$main_bn" ]; then
         echo "SKIP: $name (no main.bn)"
@@ -639,6 +656,9 @@ for bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DIR/spe
     if [ -f "$SCRIPT_DIR/${name}.error.${MODE}" ]; then
         errorfile="$SCRIPT_DIR/${name}.error.${MODE}"
     fi
+    if [ -f "$SCRIPT_DIR/${name}.error.${MODE}.${HOST_ARCH}" ]; then
+        errorfile="$SCRIPT_DIR/${name}.error.${MODE}.${HOST_ARCH}"
+    fi
     if [ -f "$errorfile" ]; then
         run_error_test "$name" "$bn" "$errorfile" ""
     elif [ -f "$expected" ]; then
@@ -671,6 +691,7 @@ for main_bn in $(find "$SCRIPT_DIR/matrix" "$SCRIPT_DIR/regressions" "$SCRIPT_DI
     if [ -f "$dir/expected.${MODE}" ]; then expected="$dir/expected.${MODE}"; fi
     if [ -n "$OVERRIDE_MODE" ] && [ -f "$dir/error.${OVERRIDE_MODE}" ]; then errorfile="$dir/error.${OVERRIDE_MODE}"; fi
     if [ -f "$dir/error.${MODE}" ]; then errorfile="$dir/error.${MODE}"; fi
+    if [ -f "$dir/error.${MODE}.${HOST_ARCH}" ]; then errorfile="$dir/error.${MODE}.${HOST_ARCH}"; fi
     if [ -f "$errorfile" ]; then
         run_error_test "$name" "$main_bn" "$errorfile" "$dir"
     elif [ -f "$expected" ]; then

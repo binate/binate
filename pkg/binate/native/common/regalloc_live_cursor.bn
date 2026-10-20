@@ -1,0 +1,163 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/std/vec"
+
+// LiveCursor answers, block by block in emission order, which allocatable values
+// are live at each point of the block: just before an instruction, or after its
+// last one.  It holds two id-indexed sets, updated in place, rather than a set per
+// instruction: entering a block scans it once backward from its live-out, recording
+// for each instruction the uses that are its operands' last (they leave the live
+// set after it) and whether its def is live after it; a point is then reached from
+// an earlier one by applying those changes.  So the points of a function share two
+// id-indexed sets instead of taking one each; the cursor also keeps the function's
+// block-level liveness (LivenessInfo), whose live-out sets it reads on entering
+// each block.
+type LiveCursor struct {
+	lv @LivenessInfo
+	f  @ir.Func
+	// sets holds the two live sets; point[k] is the point sets[k] currently holds
+	// (an instruction index, or the block's length for its end), and last the one
+	// most recently returned by LiveAt.
+	sets  @[]@[]bool
+	point @[]int
+	last  int
+	// touched[k] lists the ids set in sets[k] since the block was entered (with
+	// repeats), so entering the next block clears exactly those.
+	touched @[]@vec.Vec[int]
+	// The current block's changes: instruction ii's operands whose last use it is
+	// are dies[diesLo[ii]:diesHi[ii]], and defAfter[ii] is its def when that is live
+	// after it, else -1.
+	dies     @vec.Vec[int]
+	diesLo   @[]int
+	diesHi   @[]int
+	defAfter @[]int
+	// inScan[id] == stamp marks id live at the backward scan's current point; a new
+	// stamp per block empties the set without touching it.
+	inScan @[]int
+	stamp  int
+}
+
+// NewLiveCursor computes f's liveness (as ComputeLivenessFused) and returns a cursor
+// over it; call EnterBlock before LiveAt.
+func NewLiveCursor(f @ir.Func, wordBytes int, fusable @[]bool) @LiveCursor {
+	var c @LiveCursor = make(LiveCursor)
+	c.lv = ComputeLivenessFused(f, wordBytes, fusable)
+	c.f = f
+	c.sets = make_slice(@[]bool, 2)
+	c.sets[0] = make_slice(bool, f.NextID)
+	c.sets[1] = make_slice(bool, f.NextID)
+	c.point = make_slice(int, 2)
+	c.touched = make_slice(@vec.Vec[int], 2)
+	c.touched[0] = vec.New[int]()
+	c.touched[1] = vec.New[int]()
+	c.inScan = make_slice(int, f.NextID)
+	return c
+}
+
+// EnterBlock moves the cursor to the start of block bi (an index into f.Blocks).
+func (c @LiveCursor) EnterBlock(bi int) {
+	for k := 0; k < 2; k++ {
+		var t @vec.Vec[int] = c.touched[k]
+		for j := 0; j < t.Len(); j++ { c.sets[k][t.Get(j)] = false }
+		c.touched[k] = vec.New[int]()
+		c.point[k] = 0
+	}
+	c.last = 0
+	c.scanBlock(bi)
+}
+
+// scanBlock records block bi's per-instruction changes by one backward scan from
+// its live-out, reading uses and defs as the block liveness does (useIdOf / defIdOf,
+// through the fused-GEP redirection), and sets both sets to the live set at the
+// block's start.
+func (c @LiveCursor) scanBlock(bi int) {
+	var lv @LivenessInfo = c.lv
+	var b @ir.Block = c.f.Blocks[bi]
+	var n int = len(b.Instrs)
+	c.stamp = c.stamp + 1
+	var stamp int = c.stamp
+	var seen @vec.Vec[int] = vec.New[int]()
+	var out @[]bool = lv.LiveOut[bi]
+	for id := 0; id < len(out); id++ {
+		if out[id] {
+			c.inScan[id] = stamp
+			seen.Push(id)
+		}
+	}
+	// Each instruction's dies are pushed after those of every later instruction.
+	c.dies = vec.New[int]()
+	c.diesLo = make_slice(int, n)
+	c.diesHi = make_slice(int, n)
+	c.defAfter = make_slice(int, n)
+	for ii := n - 1; ii >= 0; ii-- {
+		var ins @ir.Instr = b.Instrs[ii]
+		c.diesLo[ii] = c.dies.Len()
+		c.defAfter[ii] = -1
+		var d int = defIdOf(lv, ins, lv.WordBytes)
+		if d >= 0 {
+			if c.inScan[d] == stamp { c.defAfter[ii] = d }
+			c.inScan[d] = 0
+		}
+		for ai := 0; ai < len(ins.Args); ai++ {
+			base, idx := fusedGepBaseIdx(lv, ins, ai, ins.Args[ai])
+			if base != nil {
+				c.scanUse(base, seen)
+				c.scanUse(idx, seen)
+			} else {
+				c.scanUse(ins.Args[ai], seen)
+			}
+		}
+		c.diesHi[ii] = c.dies.Len()
+	}
+	for j := 0; j < seen.Len(); j++ {
+		var id int = seen.Get(j)
+		if c.inScan[id] == stamp && !c.sets[0][id] {
+			for k := 0; k < 2; k++ {
+				c.sets[k][id] = true
+				c.touched[k].Push(id)
+			}
+		}
+	}
+}
+
+// scanUse records arg's use at the backward scan's current instruction: when arg is
+// an allocatable value not yet live there, this is its last use, and it becomes live.
+func (c @LiveCursor) scanUse(arg @ir.Instr, seen @vec.Vec[int]) {
+	var u int = useIdOf(c.lv, arg)
+	if u < 0 || c.inScan[u] == c.stamp { return }
+	c.inScan[u] = c.stamp
+	c.dies.Push(u)
+	seen.Push(u)
+}
+
+// LiveAt returns the allocatable ids live at point p of the current block — just
+// before instruction p, or after the block's last instruction when p is its
+// length — as an id-indexed set.  Points are requested in nondecreasing order; the
+// sets returned for the two most recently requested points stay valid (the cursor
+// reuses the older one's storage when a later point is requested), so a caller may
+// hold the sets before and after one instruction at once.  The sets belong to the
+// cursor: a caller must not write to them.
+func (c @LiveCursor) LiveAt(p int) @[]bool {
+	if c.point[c.last] == p { return c.sets[c.last] }
+	var k int = 1 - c.last
+	if p < c.point[c.last] || c.point[k] > p {
+		panic("internal error: LiveCursor.LiveAt: points must be requested in nondecreasing order")
+	}
+	for ii := c.point[k]; ii < p; ii++ { c.applyStep(k, ii) }
+	c.point[k] = p
+	c.last = k
+	return c.sets[k]
+}
+
+// applyStep turns sets[k] from the live set before instruction ii into the one
+// after it.
+func (c @LiveCursor) applyStep(k int, ii int) {
+	var s @[]bool = c.sets[k]
+	for j := c.diesLo[ii]; j < c.diesHi[ii]; j++ { s[c.dies.Get(j)] = false }
+	var d int = c.defAfter[ii]
+	if d >= 0 {
+		s[d] = true
+		c.touched[k].Push(d)
+	}
+}

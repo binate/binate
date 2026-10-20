@@ -209,6 +209,19 @@ def set_aslr(mode, persona="auto", log=_log):
 
 # --- one run --------------------------------------------------------------------
 
+DROP_CACHES = "/proc/sys/vm/drop_caches"
+
+
+def drop_page_cache(path=DROP_CACHES):
+    """Write dirty pages back and drop the clean page cache (Linux, root), so
+    every binary is read back from disk when it first runs.  A binary's
+    page-cache pages then come in the order the timed runs first use them
+    rather than the order the builds wrote them.  OSError when not allowed."""
+    os.sync()
+    with open(path, "w") as fh:
+        fh.write("3\n")
+
+
 def read_steal(path="/proc/stat"):
     """Total stolen CPU time in clock ticks (the 'cpu' line's 8th value), or
     None if unavailable."""

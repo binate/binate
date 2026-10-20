@@ -157,12 +157,24 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(kinds[:8], ["seed0", "noflag"] * 4)
         self.assertEqual(len(builds), 8 + 3 * 3 * 2)
         llvm = [b for b in builds if b.arm.name == "L"]
-        self.assertEqual([b.link is None for b in llvm], [True, False, False] * 2)
+        # Seed-major: the first seed builds both items; later seeds link to them.
+        self.assertEqual([b.link is None for b in llvm], [True, True] + [False] * 4)
+        self.assertEqual([b.link.item.name for b in llvm if b.link], ["foo", "bar"] * 2)
         self.assertTrue(all(b.place_seed is None for b in llvm))
         b_arm = [b for b in builds if b.arm.name == "B" and b.kind == "seed"]
         self.assertEqual(b_arm[0].place_seed, placehash.salted_seed(1))
         self.assertEqual(len({len(b.path) for b in builds}), 1)
         self.assertEqual(len({b.path for b in builds}), len(builds))
+
+    def test_seeded_builds_alternate_the_arms(self):
+        # Seed by seed, with the arm order reversed on every other seed, so no
+        # arm's binaries are all written after another's.
+        builds = bld.plan_builds("/w", self.arms(), self.items(), [1, 2, 3], "salted")
+        order = [(b.seed, b.item.name, b.arm.name) for b in builds if b.kind == "seed"]
+        self.assertEqual(order[:6], [(1, "foo", "A"), (1, "foo", "B"), (1, "foo", "L"),
+                                     (1, "bar", "A"), (1, "bar", "B"), (1, "bar", "L")])
+        self.assertEqual(order[6:9], [(2, "foo", "L"), (2, "foo", "B"), (2, "foo", "A")])
+        self.assertEqual([s for s, _, _ in order], [1] * 6 + [2] * 6 + [3] * 6)
 
     def test_compile_argv(self):
         a, _, l = self.arms()

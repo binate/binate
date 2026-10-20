@@ -49,6 +49,27 @@ class HappyPathTest(tu.FlowBase):
         with open(os.path.join(self.work, "ref", "foo.out")) as fh:
             self.assertEqual(fh.read(), "Result(7) = 42\n")
 
+    def test_drop_caches_between_build_and_timed_phases(self):
+        calls = []
+        drop = lambda: calls.append(len(self.samples()))  # noqa: E731
+        with mock.patch.object(runner, "drop_page_cache", drop):
+            self.assertEqual(self.run_ab([("A", self.bnc("a"))], "--only", "foo", seeds="1",
+                                         drop="auto"), 0, self.stderr)
+        self.assertEqual(calls, [0])  # once, after the builds, before any timed run
+        self.assertIn("page cache dropped", self.stderr)
+        self.assertEqual(self.meta()["config"]["drop_caches"], "auto")
+
+    def test_drop_caches_failure_warns_on_auto_and_stops_on_on(self):
+        def denied():
+            raise PermissionError(13, "Permission denied")
+        with mock.patch.object(runner, "drop_page_cache", denied):
+            self.assertEqual(self.run_ab([("A", self.bnc("a"))], "--only", "foo", seeds="1",
+                                         drop="auto"), 0, self.stderr)
+            self.assertIn("WARNING: could not drop the page cache", self.stderr)
+            self.work = os.path.join(self.d, "work2")
+            self.assertEqual(self.run_ab([("A", self.bnc("a"))], "--only", "foo", seeds="1",
+                                         drop="on"), 1, self.stderr)
+
     def test_short_reference_run_stops_unless_allowed(self):
         a = self.bnc("a")
         self.assertEqual(self.run_ab([("A", a)], "--only", "foo", seeds="1",

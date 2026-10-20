@@ -120,20 +120,27 @@ def arm_seed(arm_idx, seed, aa):
 
 def plan_builds(work, arms, items, seeds, aa):
     """Every build, the native control builds first so a broken seed-0
-    identity stops the experiment before the long part."""
-    controls, seeded = [], []
-    for arm in arms:
-        for item in items:
+    identity stops the experiment before the long part.  The seeded builds go
+    seed by seed, the arms in turn and in reverse order on every other seed,
+    so no arm's binaries are written, and their page-cache pages allocated,
+    systematically later than another's: when one arm's binaries were all
+    built after the other's, a 14 MB-text bnc ran ~0.7% slower in the later
+    arm although both arms used the same compiler."""
+    controls, seeded, first = [], [], {}
+    for item in items:
+        for arm in arms:
             if arm.native:
                 for kind, seed in (("seed0", 0), ("noflag", None)):
                     controls.append(Build(arm, item, kind, seed, seed,
                                           st.bin_path(work, arm.idx, seed, item.sub)))
-            first = None
-            for s in seeds:
+    for i, s in enumerate(seeds):
+        for item in items:
+            for arm in (arms if i % 2 == 0 else arms[::-1]):
+                key = (arm.idx, item.idx)
                 ps = arm_seed(arm.idx, s, aa) if arm.native else None
                 b = Build(arm, item, "seed", s, ps, st.bin_path(work, arm.idx, s, item.sub),
-                          None if arm.native else first)
-                first = first or b
+                          None if arm.native else first.get(key))
+                first.setdefault(key, b)
                 seeded.append(b)
     return controls + seeded
 

@@ -275,6 +275,6 @@ class Config:
                 "arms": [self._arm_record(r) for r in self.arms],
                 "seeds": self.seeds, "reps": a.reps, "mode": a.mode, "aslr": a.aslr,
                 "aa": a.aa, "static_report": a.static_report,
-                "timed_env": self.timed_env(),
+                "drop_caches": a.drop_caches, "timed_env": self.timed_env(),
                 "stack_limit": list(resource.getrlimit(resource.RLIMIT_STACK)),
                 "personality": runner.persona_bits(), "sources": self.sources()}

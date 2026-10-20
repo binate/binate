@@ -8,7 +8,7 @@
             --seeds 1-40 [--reps 2] [--jobs 4] [--mode phase|shift]
             [--aslr off|on] [--aa same|salted] [--probe SYM --probe-phases P,...]
             [--static-report] [--resume] [--dry-run] [--max-load X]
-            [--tmpdir DIR] [--allow-short-runs]
+            [--tmpdir DIR] [--drop-caches auto|on|off] [--allow-short-runs]
 
 Compares compilers ("arms"; the first is the base) on how fast the code they
 generate runs, with the code's placement randomized: every round seed S gives
@@ -45,6 +45,14 @@ stats.py DIR analyses it.
                 its covariates, which stats.py relates to per-seed timing
   --tmpdir DIR  the tmpfs directory the runs use for TMPDIR and their output
                 (default: a fresh directory under the first tmpfs mount)
+  --drop-caches auto|on|off
+                drop the page cache (Linux, as root) between the build and
+                timed phases, so every binary is paged in when it first runs,
+                in the balanced run order.  Without it, in A/A runs of one
+                compiler on the native self-compile (a 14 MB-text bnc), the
+                second arm ran ~0.6-1.9% slower in all four experiments; with
+                it, in neither of two.  auto (the default) drops when it can
+                and warns when it cannot; on makes a failed drop an error
   --allow-short-runs  only warn when an item's reference run uses less than
                 ab_timed.MIN_RUN_CPU seconds of CPU time; without it that
                 stops the experiment, since so short a run's user time is
@@ -236,6 +244,16 @@ def experiment(cfg, log, meta):
         log("build phase: %d builds, %d at a time" % (len(plan), a.jobs))
         # One row per build, in plan order, even after a resume rebuilt some.
         builds_log.rewrite(builder.run(plan))
+        if a.drop_caches != "off":
+            try:
+                runner.drop_page_cache()
+                log("page cache dropped")
+            except OSError as e:
+                if a.drop_caches == "on":
+                    raise
+                log("WARNING: could not drop the page cache (%s): binaries that stay in the "
+                    "page cache since their build can bias a large program's timings between "
+                    "arms; run as root, or pass --drop-caches off" % e)
         for arm in cfg.arms:
             if not arm.native:
                 log("arm %s:%s" % (arm.name, not_randomized(arm)))
@@ -304,6 +322,9 @@ def parse_args(argv):
     r.add_argument("--resume", action="store_true")
     r.add_argument("--dry-run", action="store_true")
     r.add_argument("--max-load", type=float, metavar="X")
+    r.add_argument("--drop-caches", choices=("auto", "on", "off"), default="auto",
+                   help="drop the page cache (Linux, root) after the build phase, so each "
+                        "binary is paged in when it first runs (default auto: when possible)")
     r.add_argument("--allow-short-runs", action="store_true",
                    help="only warn, instead of stopping, when a reference run uses less than "
                         "%.1f s of CPU time" % tm.MIN_RUN_CPU)

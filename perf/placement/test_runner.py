@@ -259,6 +259,15 @@ class SpawnTest(unittest.TestCase):
                     p.wait()
             self.assertEqual(out.strip(), "KeyboardInterrupt")
 
+    def test_drop_page_cache_writes_3(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "drop_caches")
+            runner.drop_page_cache(p)
+            with open(p) as fh:
+                self.assertEqual(fh.read(), "3\n")
+            with self.assertRaises(OSError):
+                runner.drop_page_cache(os.path.join(d, "missing", "drop_caches"))
+
     def test_read_steal(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "stat")

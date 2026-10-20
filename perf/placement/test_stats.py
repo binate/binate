@@ -20,6 +20,7 @@ import stats
 import stats_core as sc
 import stats_data as sd
 import stats_est as se
+import stats_select as sel
 from stats_testutil import synth
 
 
@@ -63,6 +64,37 @@ class CoreTest(unittest.TestCase):
         c = sc.Resampler(200, 6).ci(10, lambda ix: sum(ix) / 10.0)
         self.assertEqual(a, b)
         self.assertNotEqual(a, c)
+
+    def test_holm(self):
+        # Thresholds 0.05/4, /3, /2, /1: 0.005 and 0.01 pass, 0.03 > 0.025
+        # stops the test, so 0.04 is kept although it is below 0.05.
+        self.assertEqual(sc.holm([0.01, 0.04, 0.03, 0.005], 0.05), [True, False, False, True])
+        self.assertEqual(sc.holm([0.02, 0.011], 0.05), [True, True])
+        # 0.03 > 0.05 / 2: testing each at alpha / m would keep it.
+        self.assertEqual(sc.holm([0.02, 0.03], 0.05), [True, True])
+        self.assertEqual(sc.holm([float("nan"), 0.001], 0.05), [False, True])
+        self.assertEqual(sc.holm([0.03, 0.03], 0.05), [False, False])
+        self.assertEqual(sc.holm([0.025], 0.025), [True])
+        self.assertEqual(sc.holm([], 0.05), [])
+
+    def test_t_p_slower(self):
+        rng = random.Random(3)
+        res = sc.Resampler(200, 9)
+        for shift in (0.008, 0.0, -0.002):
+            d = [rng.gauss(shift, 0.01) for _ in range(30)]
+            p = se.difference(d, res)["p_slower"]
+            t = sc.mean(d) / (sc.sd(d) / math.sqrt(30))
+            self.assertAlmostEqual(p, 1.0 - sc.t_cdf(t, 29), places=12)
+            # Below 0.025 exactly when the 95% t interval lies above 0.
+            self.assertEqual(p < 0.025, sc.t_interval(d)[0] > 0)
+        # Upper tail: t = 2.0452 at 29 df leaves 0.025 above it.
+        d = [1.0 + x for x in (-1, 1) * 15]
+        p = sc.t_p_above([x - 1.0 + 2.0452 * sc.sd(d) / math.sqrt(30) for x in d])
+        self.assertAlmostEqual(p, 0.025, places=4)
+        self.assertEqual(se.difference([0.01] * 5, res)["p_slower"], 0.0)
+        self.assertEqual(se.difference([-0.01] * 5, res)["p_slower"], 1.0)
+        self.assertEqual(se.difference([0.0] * 5, res)["p_slower"], 1.0)
+        self.assertIsNone(se.difference([0.5], res)["p_slower"])
 
 
 class EstimateTest(Tmp):
@@ -261,6 +293,34 @@ class SelectionTest(Tmp):
         self.assertIn("budget", " ".join(rows["B"]["why"]))
         self.assertEqual(rows["C"]["slower"], ["y"])
         self.assertTrue(s["keep_current"])
+
+    def test_slower_is_holm_corrected(self):
+        d = self.dir()
+        synth(d, arms=("base", "B"), items=("x", "y", "z"), effect={"B": 0.0}, seeds=40,
+              text={(it, a): 10000 for it in "xyz" for a in ("base", "B")},
+              rng=random.Random(8))
+        data = sd.load([d])
+        res = sc.Resampler(2000, 7)
+        a = stats.analyze(data, 1000, 7)
+        # Holm over 3 items at 0.025: x (0.004 <= 0.025/3) is slower; y
+        # (0.02 > 0.025/2) stops the test, though 0.02 < 0.025 puts its own
+        # t interval above 0.
+        for it, p in (("x", 0.004), ("y", 0.02), ("z", None)):
+            (item,) = [i for i in a["items"] if i["name"] == it]
+            item["arms"]["B"]["diff"]["p_slower"] = p
+        s = sel.selection(data, a, res)
+        rows = {r["arm"]: r for r in s["rows"]}
+        self.assertEqual(rows["B"]["slower"], ["x"])
+        self.assertIn("slower on x (Holm over 3 items)", rows["B"]["why"])
+        self.assertFalse(rows["B"]["eligible"])
+        self.assertIn("B: not slower by the Holm test over its 3 items, though its own 95% "
+                      "t interval lies above 0, on y", s["notes"])
+        # 0.01 > 0.025 / 3 stops the test at the first item.
+        (item,) = [i for i in a["items"] if i["name"] == "x"]
+        item["arms"]["B"]["diff"]["p_slower"] = 0.01
+        s = sel.selection(data, a, res)
+        self.assertEqual(s["rows"][1]["slower"], [])
+        self.assertTrue(s["rows"][1]["eligible"])
 
     def test_tie_broken_by_spread(self):
         d = self.dir()

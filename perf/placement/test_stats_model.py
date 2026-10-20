@@ -220,7 +220,8 @@ class PooledSpreadTest(Base):
             text = {("x", "A"): 1000, ("x", "B"): 990}
 
         def arm(var):
-            return {"diff": {"n": 3, "boot": [-1.0, 1.0]}, "spread": {"place_var": var}}
+            return {"diff": {"n": 3, "boot": [-1.0, 1.0], "p_slower": 0.5},
+                    "spread": {"place_var": var}}
         an = {"items": [{"name": "x", "workload": "bench",
                          "arms": {"A": arm(-1e-6), "B": arm(1e-6)}}],
               "geomean": {"B": {"seeds": [1, 2, 3], "g": [0.01, -0.01, 0.0], "pct": 0.0,

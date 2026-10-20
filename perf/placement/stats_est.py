@@ -6,8 +6,11 @@ of that (seed, arm) cell, and d[r,a] = m[r,a] - m[r,base].
 
 - difference: D = mean over seeds of d[r,a], as a ratio exp(D) and as a
   percentage, with a 95% percentile bootstrap over seeds and a Student-t
-  interval (warned about when there are fewer than 20 seeds), and the
-  fraction of seeds in which the arm is faster;
+  interval (warned about when there are fewer than 20 seeds), the one-sided
+  Student-t p-value of the null "the arm is not slower" (p_slower: small
+  when it is slower; the selection guard tests it with a multiplicity
+  correction over the items), and the fraction of seeds in which the arm is
+  faster;
 - spread: the placement SD of an arm, the SD over seeds of its cell means
   with the fitted order terms removed (stats_model: position effects and
   within-round drift) and the run noise of a cell mean (sigma_run^2 times
@@ -88,7 +91,7 @@ def difference(d, res):
     lo, hi = res.ci(n, lambda ix: sc.mean([d[i] for i in ix]))
     tlo, thi = sc.t_interval(d)
     return {"n": n, "mean": D, "ratio": math.exp(D), "pct": sc.pct(D),
-            "boot": [sc.pct(lo), sc.pct(hi)],
+            "boot": [sc.pct(lo), sc.pct(hi)], "p_slower": sc.t_p_above(d),
             "t": [sc.pct(tlo), sc.pct(thi)] if n >= 2 else None,
             "faster": sum(1 for x in d if x < 0) / n, "few": n < FEW_SEEDS,
             "sd": sc.sd(d)}

@@ -5,11 +5,10 @@ Selection applies the rule fixed for choosing a placement policy before any
 measurement:
 
   1. an arm is eligible when its placement is randomized (native), it ran
-     every workload item, no item is slower than the base beyond its 95% CI
-     (the bootstrap interval of its difference lies above 0), and its text
-     grew by at most TEXT_BUDGET_PCT over the base's (summed over the items'
-     binaries), or by more only with a speedup beyond its CI (the geometric
-     mean's interval lies below 0);
+     every workload item, no item is slower than the base (see below), and
+     its text grew by at most TEXT_BUDGET_PCT over the base's (summed over
+     the items' binaries), or by more only with a speedup beyond its CI (the
+     geometric mean's interval lies below 0);
   2. among the base and the eligible arms, the one with the lowest geometric
      mean time over the items is chosen;
   3. arms tied with it (the 95% interval of the per-seed difference of the
@@ -22,6 +21,23 @@ measurement:
 The rule asks for the 8 benchmarks plus the native self-compile over at least
 MIN_SEEDS placements.  When the data falls short the table still ranks the
 arms but gives no verdict ("decided" is false), and says why.
+
+"Slower" is decided per arm by Holm's step-down test over the items it ran,
+on each item's one-sided Student-t p-value of the null "the arm is not
+slower" (p_slower), at family-wise level SLOWER_ALPHA: the lower tail of a
+95% interval.  When the per-seed differences are normal, a neutral arm is
+then rejected for a slowdown on some item at most 2.5% of the time however
+many items there are; rejecting an arm when any item's own 95% interval lies
+above 0 would reject a neutral one ~20% of the time over 9 items.  Negatively
+skewed differences (a long tail of seeds where the arm is faster) raise the
+actual level and positively skewed ones lower it: a skew of -1.2 over 40
+seeds rejects ~3-5 times the nominal rate at the smallest threshold,
+0.025 / 9.  The t p-value is used rather than one from the bootstrap draws
+because the percentile bootstrap's tails are thinner than t's (its spread is
+too small by sqrt((n - 1) / n), and its tails are normal rather than t's),
+which for normal differences doubles the rejection rate at 0.025 / 9.  An
+item whose own 95% t interval lies above 0 (p_slower below 0.025) but that
+the test keeps is named in a note.
 
 Python standard library only.  The tests are in test_stats.py; nothing runs
 them automatically:
@@ -37,6 +53,7 @@ import stats_model as sm
 TEXT_BUDGET_PCT = 1.0
 MIN_SEEDS = 40
 RULE_BENCHES = 8
+SLOWER_ALPHA = 0.025
 
 
 def text_growth(data, arm, items):
@@ -73,6 +90,20 @@ def pooled_spread(analysis, arm, base):
     return math.sqrt(max(va, 0.0) / vb)
 
 
+def slower_items(analysis, arm):
+    """(the items on which arm is slower than the base by the Holm test,
+    the items whose own 95% t interval lies above 0 but the test keeps, the
+    number of items tested).  An item with one seed has no p-value and is
+    not slower."""
+    fam = [(it["name"], it["arms"][arm]["diff"]) for it in analysis["items"]
+           if arm in it["arms"] and it["arms"][arm]["diff"]["n"]]
+    ps = [d["p_slower"] if d["p_slower"] is not None else 1.0 for _, d in fam]
+    hit = sc.holm(ps, SLOWER_ALPHA)
+    slower = [name for (name, _), h in zip(fam, hit) if h]
+    kept = [name for (name, _), h, p in zip(fam, hit, ps) if not h and p < SLOWER_ALPHA]
+    return slower, kept, len(fam)
+
+
 def _tie(g_best, g_arm, res):
     """Whether the 95% interval of the per-seed difference covers 0."""
     common = sorted(set(g_best) & set(g_arm))
@@ -103,9 +134,10 @@ def selection(data, analysis, res, budget=TEXT_BUDGET_PCT):
         g = gm.get(arm)
         row["text_pct"] = text_growth(data, arm, names)
         row["spread"] = pooled_spread(analysis, arm, base)
-        row["slower"] = [it["name"] for it in analysis["items"]
-                         if arm in it["arms"] and it["arms"][arm]["diff"]["n"]
-                         and it["arms"][arm]["diff"]["boot"][0] > 0]
+        row["slower"], kept, tested = slower_items(analysis, arm)
+        if kept:
+            notes.append("%s: not slower by the Holm test over its %d items, though its own 95%% "
+                         "t interval lies above 0, on %s" % (arm, tested, ", ".join(kept)))
         if data.backend[arm] != "native":
             row["why"].append("placement not randomized")
         if g is None:
@@ -115,7 +147,8 @@ def selection(data, analysis, res, budget=TEXT_BUDGET_PCT):
             seeds = len(g["seeds"]) if seeds is None else min(seeds, len(g["seeds"]))
             row.update(geomean_pct=g["pct"], ci=g["boot"], g=dict(zip(g["seeds"], g["g"])))
             if row["slower"]:
-                row["why"].append("slower beyond its CI on " + ", ".join(row["slower"]))
+                row["why"].append("slower on %s (Holm over %d items)"
+                                  % (", ".join(row["slower"]), tested))
             tp = row["text_pct"]
             if tp is None:
                 row["budget"] = "?"

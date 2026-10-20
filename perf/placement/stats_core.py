@@ -1,5 +1,5 @@
 """Numerical helpers for stats.py: moments, quantiles, Student's t, the seed
-bootstrap and simple regression.
+bootstrap, Holm's multiple-test correction and simple regression.
 
 The bootstrap resamples placement seeds (the unit an experiment draws at
 random) with replacement.  Resample index lists come from random.Random with a
@@ -162,6 +162,21 @@ def t_ppf(p, df):
     return 0.5 * (lo + hi)
 
 
+def t_p_above(xs):
+    """The one-sided Student-t p-value of the null 'the mean of xs is <= 0':
+    P(T >= m / (s / sqrt(n))) with n - 1 degrees of freedom, so it is below
+    (1 - level) / 2 exactly when t_interval's lower end is above 0.  When xs
+    are all equal it is 0 for a positive value and 1 otherwise; None for
+    fewer than two values."""
+    n = len(xs)
+    if n < 2:
+        return None
+    m, s = mean(xs), sd(xs)
+    if s == 0:
+        return 0.0 if m > 0 else 1.0
+    return 1.0 - t_cdf(m / (s / math.sqrt(n)), n - 1)
+
+
 def t_interval(xs, level=0.95):
     """(lo, hi) Student-t confidence interval for the mean of xs; (nan, nan)
     for fewer than two values."""
@@ -193,6 +208,25 @@ class Resampler:
             return (float("nan"), float("nan"))
         a = (1.0 - level) / 2.0
         return (quantile(vals, a), quantile(vals, 1.0 - a))
+
+
+def holm(ps, alpha):
+    """Holm's step-down test of hypotheses with p-values ps at family-wise
+    level alpha: which of them are rejected.  Taken in increasing order, the
+    k-th smallest p (k from 0) is rejected while it is at most
+    alpha / (m - k), m = len(ps); the first that is not stops the test, so
+    every larger p is kept even when it is below its own threshold.  Unlike
+    testing each at alpha, the chance of rejecting any true hypothesis stays
+    at most alpha whatever m is and however the tests are correlated.  A NaN
+    p is never rejected and sorts last."""
+    m = len(ps)
+    out = [False] * m
+    order = sorted(range(m), key=lambda i: ps[i] if not math.isnan(ps[i]) else math.inf)
+    for k, i in enumerate(order):
+        if not ps[i] <= alpha / (m - k):
+            break
+        out[i] = True
+    return out
 
 
 def pearson(xs, ys):

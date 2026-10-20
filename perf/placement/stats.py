@@ -9,9 +9,10 @@ against the base (the first arm), it reports from the user CPU times:
 - the mean over seeds of d[r,a] (the per-seed mean over replicates of ln t,
   minus the base's), as a ratio and in percent, with a 95% percentile
   bootstrap over seeds (--boot draws from a fixed --boot-seed) and a t
-  interval, warning when there are fewer than 20 seeds; the same difference
-  in user+sys time (and, where recorded, cycles and instructions) as a
-  cross-check;
+  interval, warning when there are fewer than 20 seeds, and the one-sided t
+  p-value of the null "the arm is not slower" that the selection guard uses
+  ("p slower"); the same difference in user+sys time (and, where recorded,
+  cycles and instructions) as a cross-check;
 - the placement spread: each arm's SD over seeds of its per-seed mean ln t
   with the fitted position and drift terms and the replicates' run noise
   removed, its ratio to the base's with a bootstrap interval, the worst
@@ -23,8 +24,8 @@ against the base (the first arm), it reports from the user CPU times:
   with the difference reported with and without them;
 - with several items, the geometric mean over them, bootstrapped jointly
   over seeds; then the selection table (stats_select's rule: lowest geometric
-  mean, no item slower beyond its CI, text within the budget, ties broken by
-  smaller placement spread, then smaller text);
+  mean, no item slower by a Holm test over the items, text within the budget,
+  ties broken by smaller placement spread, then smaller text);
 - for experiments run with --static-report, each layout.py covariate that
   varies over the seeds against the per-seed timing;
 - with --plan HALFWIDTH, the seeds needed for a 95% interval of +-HALFWIDTH
@@ -102,9 +103,9 @@ def text_item(it, backends, out):
     if "error" in it:
         w("  %s\n" % it["error"])
         return
-    w("  %-12s %5s %7s %8s %20s %20s %7s %9s\n" % ("arm", "seeds", "ratio", "time%",
-                                                  "95% bootstrap", "95% t", "faster",
-                                                  "user+sys%"))
+    w("  %-12s %5s %7s %8s %20s %20s %8s %7s %9s\n" % ("arm", "seeds", "ratio", "time%",
+                                                       "95% bootstrap", "95% t", "p slower",
+                                                       "faster", "user+sys%"))
     for arm, r in it["arms"].items():
         if "diff" not in r:
             continue
@@ -113,9 +114,10 @@ def text_item(it, backends, out):
             w("  %-12s no seed has both arms\n" % arm)
             continue
         us = r.get("diff_user+sys")
-        w("  %-12s %5d %7s %8s %20s %20s %6.0f%% %9s%s\n"
+        w("  %-12s %5d %7s %8s %20s %20s %8s %6.0f%% %9s%s\n"
           % (arm, d["n"], _f(d["ratio"], "%.4f"), _f(d["pct"]), _ci(d["boot"]), _ci(d["t"]),
-             100 * d["faster"], _f(us["pct"]) if us else "-", _flag(backends[arm])))
+             _f(d["p_slower"], "%.4f"), 100 * d["faster"], _f(us["pct"]) if us else "-",
+             _flag(backends[arm])))
         for m in ("cycles", "insns"):
             if "diff_" + m in r:
                 x = r["diff_" + m]

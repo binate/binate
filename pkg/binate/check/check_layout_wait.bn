@@ -1,0 +1,268 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+import "pkg/stdx/slices"
+
+// Instances whose build reads the layout of a type not built yet.  Building an
+// instance resolves its structure and its methods' signatures, which may take
+// the size of a type argument (`[sizeof(T)]uint8`, builtin.sizeof).  The type
+// argument may still be being built — a type declaration the package is
+// collecting, or an instance being built — when it names the instance through a
+// pointer, a slice or a function value: `type N struct { v int64; next *Box[N] }`
+// builds Box[N] while N is collected, `type N[T any] struct { v T; next
+// *Box[N[T]] }` while N[T] is built.  Its layout does not depend on the
+// instance, so the instance waits: its build is undone, and done again once
+// nothing is being built (flushLayoutWaits).  When a round of builds again
+// builds none — each still reads a layout not built, which depends on itself
+// (`type N struct { v int64; b Box[N] }`) — the last build reports the cycle.
+
+// buildInstance builds the members of the instance entry (buildInstanceMembers),
+// the innermost instance being built (enterLayoutFrame), recording how, so a
+// build that read a layout not built yet can be done again; such a build is
+// undone, and the instance waits (InstanceState.LayoutWaiting).
+func buildInstance(c @Checker, entry @GenericInstantiation, isIface bool, usePos token.Pos,
+		userFacing bool, view ImplView, work @InstWork) {
+	entry.BuildUserFacing = userFacing
+	entry.BuildView = view
+	buildInstanceMembers(c, entry, isIface, usePos, userFacing, view, work)
+	if entry.LayoutBlocked {
+		undoInstanceBuild(c, entry)
+	}
+}
+
+// undoInstanceBuild empties the instance entry, whose build read a layout not
+// built yet, and makes it wait to be built again.
+func undoInstanceBuild(c @Checker, entry @GenericInstantiation) {
+	var st @InstanceState = instanceState(c)
+	var t @types.Type = entry.Result
+	var noMethods @[]@types.Method
+	t.Methods = noMethods
+	if t.Kind == types.TYP_INTERFACE {
+		var noParents @[]@types.Type
+		t.Parents = noParents
+	} else {
+		t.Underlying = nil
+	}
+	st.LayoutWaiting = slices.Append[@GenericInstantiation](st.LayoutWaiting, entry)
+}
+
+// enterLayoutFrame starts the resolution of the instance entry, from the point
+// its instantiation is in progress until it is built, as the innermost
+// (InstanceState.Populating) — or, entry nil, a resolution no `sizeof` in which
+// makes an instance wait (waitForLayoutHere): a generic declaration resolved
+// with its type parameters abstract, a waiting instance's members completed —
+// until leaveLayoutFrame.
+func enterLayoutFrame(c @Checker, entry @GenericInstantiation) {
+	var st @InstanceState = instanceState(c)
+	st.Populating = slices.Append[@GenericInstantiation](st.Populating, entry)
+}
+
+// leaveLayoutFrame ends what enterLayoutFrame started.
+func leaveLayoutFrame(c @Checker) {
+	var st @InstanceState = instanceState(c)
+	st.Populating = st.Populating[:len(st.Populating) - 1]
+}
+
+// waitForLayoutHere makes the instance being built, if any, wait for a layout
+// its build reads that is not built yet, and reports whether it does — not on
+// its last build (InstanceState.LayoutNoWait), when the caller reports the cycle.
+func waitForLayoutHere(c @Checker) bool {
+	var st @InstanceState = instanceState(c)
+	if st.LayoutNoWait || len(st.Populating) == 0 {
+		return false
+	}
+	var top @GenericInstantiation = st.Populating[len(st.Populating) - 1]
+	if top == nil {
+		return false
+	}
+	top.LayoutBlocked = true
+	return true
+}
+
+// layoutNotBuilt handles a `sizeof` / `alignof` at pos of the type t when t
+// holds by value an instance not built yet (instanceNotBuiltIn): the instance
+// being built waits (waitForLayoutHere), or — t's layout depends on itself —
+// the cycle is reported, naming t (an instance by its generic, so the cycle in
+// a generic's declaration is one error, whatever instances it is found in).  It
+// reports whether t was such a type, whose layout is then not read.
+func layoutNotBuilt(c @Checker, t @types.Type, pos token.Pos) bool {
+	var seen typeVisits
+	if !instanceNotBuiltIn(c, t, &seen) {
+		return false
+	}
+	if !waitForLayoutHere(c) {
+		var name @[]char = t.TypeName()
+		if t.Kind == types.TYP_NAMED && t.InstDecl != nil {
+			var d @ast.Decl = bit_cast(@ast.Decl, t.InstDecl)
+			name = d.Name
+		}
+		errCyclicType(c, pos, name)
+	}
+	return true
+}
+
+// instanceNotBuiltIn reports whether t holds by value an instance not built
+// yet (instanceInProgress).
+func instanceNotBuiltIn(c @Checker, t @types.Type, seen *typeVisits) bool {
+	if t == nil || !seen.enter(t) {
+		return false
+	}
+	if t.Kind == types.TYP_NAMED {
+		if t.Underlying == nil {
+			return instanceInProgress(c, t)
+		}
+		return instanceNotBuiltIn(c, t.Underlying, seen)
+	}
+	if t.Kind == types.TYP_ALIAS {
+		return instanceNotBuiltIn(c, t.Target, seen)
+	}
+	if t.Kind == types.TYP_ARRAY || t.Kind == types.TYP_READONLY {
+		return instanceNotBuiltIn(c, t.Elem, seen)
+	}
+	if t.Kind == types.TYP_STRUCT {
+		for i := 0; i < len(t.Fields); i++ {
+			if instanceNotBuiltIn(c, t.Fields[i].Type, seen) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// instanceInProgress reports whether the named type t is an instance being
+// built or waiting to be built again.
+func instanceInProgress(c @Checker, t @types.Type) bool {
+	if t.InstDecl == nil || c.Instances == nil {
+		return false
+	}
+	var st @InstanceState = c.Instances
+	for i := 0; i < len(st.Populating); i++ {
+		if st.Populating[i] != nil && same(st.Populating[i].Result, t) {
+			return true
+		}
+	}
+	for i := 0; i < len(st.LayoutWaiting); i++ {
+		if same(st.LayoutWaiting[i].Result, t) {
+			return true
+		}
+	}
+	for i := 0; i < len(st.LayoutRound); i++ {
+		if st.LayoutRound[i].LayoutBlocked && same(st.LayoutRound[i].Result, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// typeInProgress reports whether t is a named type with no underlying type yet
+// because it is being built — a type declaration the package is collecting, or
+// an instance being built or waiting to be — not because it is opaque.
+func typeInProgress(c @Checker, t @types.Type) bool {
+	if c == nil {
+		return false
+	}
+	var base @types.Type
+	base, _ = peelFieldAccessBase(t)
+	if base == nil || base.Kind != types.TYP_NAMED || base.Underlying != nil {
+		return false
+	}
+	if instanceInProgress(c, base) {
+		return true
+	}
+	if c.Batch == nil || !c.Batch.Collecting {
+		return false
+	}
+	var d @ast.Decl = batchTypeDeclOf(c, base)
+	return d != nil && declInList(c.Batch.TypesCollecting, d)
+}
+
+// flushLayoutWaits builds again the instances waiting for a layout once nothing
+// is being built — no instance (InstanceState.BuildDepth) and no type
+// declaration of the package's batch (flushLayoutRounds).
+func flushLayoutWaits(c @Checker) {
+	if c.Batch != nil && len(c.Batch.TypesCollecting) > 0 {
+		return
+	}
+	flushLayoutRounds(c, false)
+}
+
+// flushLayoutWaitsAfterType builds again, once a type declaration of the
+// package's batch is collected, the instances waiting for a layout — while
+// another is still collected (around it), those that need only what is built.
+func flushLayoutWaitsAfterType(c @Checker) {
+	flushLayoutRounds(c, c.Batch != nil && len(c.Batch.TypesCollecting) > 0)
+}
+
+// flushLayoutRounds builds again the instances waiting for a layout, when no
+// instance is being built, round by round, as one's build may wait for
+// another's; until an entry of a round is built again it still counts as
+// waiting (InstanceState.LayoutRound).  A round that builds none ends it while
+// a type declaration is still collected (collecting: what waits for one is
+// built when it is done), and is otherwise followed by a last build of each,
+// which waits for nothing and reports the cycles.  The checks deferred while
+// instances were built (flushPendingChecks) are made after.
+func flushLayoutRounds(c @Checker, collecting bool) {
+	if c.Instances == nil {
+		return
+	}
+	var st @InstanceState = c.Instances
+	if st.LayoutFlushing || len(st.LayoutWaiting) == 0 || st.BuildDepth > 0 {
+		return
+	}
+	st.LayoutFlushing = true
+	var none @[]@GenericInstantiation
+	for len(st.LayoutWaiting) > 0 {
+		var waiting @[]@GenericInstantiation = st.LayoutWaiting
+		st.LayoutWaiting = none
+		st.LayoutRound = waiting
+		var built bool = false
+		for i := 0; i < len(waiting); i++ {
+			rebuildInstance(c, waiting[i])
+			if !waiting[i].LayoutBlocked {
+				built = true
+			}
+		}
+		if !built && collecting {
+			break
+		}
+		if !built {
+			var last @[]@GenericInstantiation = st.LayoutWaiting
+			st.LayoutWaiting = none
+			st.LayoutRound = last
+			st.LayoutNoWait = true
+			for i := 0; i < len(last); i++ {
+				rebuildInstance(c, last[i])
+			}
+			st.LayoutNoWait = false
+		}
+	}
+	st.LayoutRound = none
+	st.LayoutFlushing = false
+	if c.GenericInstDepth == 0 {
+		flushPendingChecks(c)
+	}
+}
+
+// rebuildInstance builds the waiting instance entry again, from a new copy of
+// its generic's declaration, as it was built the first time (buildInstance).
+func rebuildInstance(c @Checker, entry @GenericInstantiation) {
+	var st @InstanceState = instanceState(c)
+	entry.LayoutBlocked = false
+	entry.Clone = ast.CloneDecl(entry.Decl)
+	var isIface bool = entry.Result.Kind == types.TYP_INTERFACE
+	var savedAliasResolving @[]@GenericInstantiation = c.AliasResolving
+	var noAliases @[]@GenericInstantiation
+	c.AliasResolving = noAliases
+	c.GenericInstDepth = c.GenericInstDepth + 1
+	st.BuildDepth = st.BuildDepth + 1
+	var noWork @InstWork
+	enterLayoutFrame(c, entry)
+	buildInstance(c, entry, isIface, entry.NamedAt, entry.BuildUserFacing, entry.BuildView, noWork)
+	leaveLayoutFrame(c)
+	st.BuildDepth = st.BuildDepth - 1
+	c.GenericInstDepth = c.GenericInstDepth - 1
+	c.AliasResolving = savedAliasResolving
+}

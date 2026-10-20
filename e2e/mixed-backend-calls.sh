@@ -12,7 +12,9 @@
 # a struct / array field (a float HFA and not — struct and array, 8 to 32 bytes, word-
 # multiple and word-rounded, first and last, five of them), a single HFA result, HFA
 # arguments, and a multi-value return through a func value (its shim emitted on the
-# callee's side and on the caller's), a capturing closure and an interface method.
+# callee's side and on the caller's), a capturing closure and an interface method, and
+# zero-size struct arguments (no register, no stack: on x86-64 the arguments after one
+# are placed as if it were absent).
 #
 # Both backends target the host arch — or, with MIXED_TARGET=arm32-linux (set by
 # e2e/arm32-mixed-backend-calls.sh), arm32 hard-float, linked with
@@ -92,6 +94,12 @@ type D4 struct { a float64; b float64; c float64; d float64 }
 // S3 is a 12-byte non-float struct.
 type S3 struct { a int32; b int32; c int32 }
 
+// E is a zero-size struct.
+type E struct {}
+
+// P2 is a two-int struct (16 bytes on a 64-bit target).
+type P2 struct { a int; b int }
+
 func PairVf(a float32) (V2f, int32)
 func PairIv(a float32) (int32, V3f)
 func PairDf(a float64) (D2, float64)
@@ -102,6 +110,8 @@ func PairD4(a float64) (D4, int32)
 func Five(a float32) (V2f, V2f, V2f, V2f, V2f)
 func OneV3(a float32) V3f
 func SumD2(p D2, q D2, r float64) float64
+func ZeroFirst(e E, a int, b int, c int, d int, s P2) int
+func ZeroAfterFull(a int, b int, c int, d int, e2 int, f int, e E, s P2, t P2) int
 func PairVfFn() *func(float32) (V2f, int32)
 func MakePairer(k int32) @func(float32) (V2f, int32)
 
@@ -143,6 +153,12 @@ func OneV3(a float32) V3f { return V3f{x: a, y: a + 1.0, z: a + 2.0} }
 
 func SumD2(p D2, q D2, r float64) float64 { return p.x + p.y + q.x + q.y + r }
 
+func ZeroFirst(e E, a int, b int, c int, d int, s P2) int { return a + 10 * s.a + 100 * s.b }
+
+func ZeroAfterFull(a int, b int, c int, d int, e2 int, f int, e E, s P2, t P2) int {
+	return f + 10 * s.b + 100 * t.a + 1000 * t.b
+}
+
 func PairVfFn() *func(float32) (V2f, int32) { return PairVf }
 
 func MakePairer(k int32) @func(float32) (V2f, int32) {
@@ -179,6 +195,9 @@ func main() {
 	var o mbdep.V3f = mbdep.OneV3(5.5)
 	testing.Println(o.x, o.y, o.z)
 	testing.Println(mbdep.SumD2(mbdep.D2{x: 1.25, y: 2.5}, mbdep.D2{x: 3.75, y: 5.0}, 0.5))
+	var ze mbdep.E
+	testing.Println(mbdep.ZeroFirst(ze, 1, 2, 3, 4, mbdep.P2{a: 5, b: 6}))
+	testing.Println(mbdep.ZeroAfterFull(1, 2, 3, 4, 5, 6, ze, mbdep.P2{a: 7, b: 8}, mbdep.P2{a: 2, b: 3}))
 	var f *func(float32) (mbdep.V2f, int32) = mbdep.PairVfFn()
 	fv, fn := f(6.5)
 	testing.Println(fv.x, fv.y, fn)
@@ -205,6 +224,8 @@ WANT="1.500000 2.500000 7
 1.500000 4.500000 5.500000 8.500000 9.500000 10.500000
 5.500000 6.500000 7.500000
 13.000000
+651
+3286
 6.500000 7.500000 7
 3.500000 4.500000 7
 2.500000 5.000000 12

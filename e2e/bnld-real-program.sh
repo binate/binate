@@ -246,6 +246,25 @@ fi
 # two W^X segments (R+X then R+W). -----
 byte() { od -An -tu1 -j"$2" -N1 "$1" | tr -d ' \n'; }
 u16le() { _lo="$(byte "$1" "$2")"; _hi="$(byte "$1" $(($2 + 1)))"; echo $((_lo + _hi * 256)); }
+u32le() { _w0="$(u16le "$1" "$2")"; _w1="$(u16le "$1" $(($2 + 2)))"; echo $((_w0 + _w1 * 65536)); }
+# phdr_types FILE / load_flags FILE: each program header's p_type, and each PT_LOAD's
+# p_flags (PF_X=1, PF_W=2, PF_R=4), in table order.  e_phoff is read as 32 bits — the
+# table sits right after the 64-byte header in every file these tests make.
+phdr_types() {
+    _off=$(u32le "$1" 32); _ent=$(u16le "$1" 54); _n=$(u16le "$1" 56); _i=0
+    while [ "$_i" -lt "$_n" ]; do printf '%s ' "$(u32le "$1" $((_off + _i * _ent)))"; _i=$((_i + 1)); done
+}
+load_flags() {
+    _off=$(u32le "$1" 32); _ent=$(u16le "$1" 54); _n=$(u16le "$1" 56); _i=0
+    while [ "$_i" -lt "$_n" ]; do
+        _p=$((_off + _i * _ent))
+        [ "$(u32le "$1" "$_p")" = 1 ] && printf '%s ' "$(u32le "$1" $((_p + 4)))"
+        _i=$((_i + 1))
+    done
+}
+# phdr_count FILE TYPE: how many program headers have p_type TYPE (PT_LOAD = 1,
+# PT_GNU_EH_FRAME = 0x6474e550 = 1685382480).
+phdr_count() { _c=0; for _t in $(phdr_types "$1"); do [ "$_t" = "$2" ] && _c=$((_c + 1)); done; echo "$_c"; }
 P="$TMP/prog"
 if [ "$(od -An -tx1 -N4 "$P" | tr -d ' \n')" != "7f454c46" ]; then
     echo "FAIL: output is not an ELF file" >&2; exit 1
@@ -254,10 +273,9 @@ fi
 [ "$(u16le "$P" 16)" = 2 ] || { echo "FAIL: not ET_EXEC" >&2; exit 1; }
 [ "$(u16le "$P" 18)" = 62 ] || { echo "FAIL: not EM_X86_64" >&2; exit 1; }
 [ -x "$P" ] || { echo "FAIL: output not owner-executable" >&2; exit 1; }
-[ "$(u16le "$P" 56)" = 2 ] || { echo "FAIL: expected two PT_LOAD segments" >&2; exit 1; }
-# phdr0 p_flags at 64+4, phdr1 at 64+56+4 (PF_X=1,PF_W=2,PF_R=4): R+X=5, R+W=6.
-[ "$(byte "$P" 68)" = 5 ] || { echo "FAIL: first segment should be R+X (5)" >&2; exit 1; }
-[ "$(byte "$P" 124)" = 6 ] || { echo "FAIL: second segment should be R+W (6)" >&2; exit 1; }
+[ "$(phdr_count "$P" 1)" = 2 ] || { echo "FAIL: expected two PT_LOAD segments" >&2; exit 1; }
+# The PT_LOADs' p_flags in order (PF_X=1,PF_W=2,PF_R=4): R+X=5, then R+W=6.
+[ "$(load_flags "$P")" = "5 6 " ] || { echo "FAIL: segments should be R+X then R+W" >&2; exit 1; }
 echo "PASS: a real bnc program links to a static ELF64 x86-64 W^X executable"
 
 # ----- run it (this host is native x86-64 Linux, gated at the top) -----
@@ -367,7 +385,11 @@ AAEOF
         echo "FAIL: aarch64 output is not an ELF file" >&2; exit 1
     fi
     [ "$(u16le "$PA" 18)" = 183 ] || { echo "FAIL: aarch64 output not EM_AARCH64" >&2; exit 1; }
-    [ "$(u16le "$PA" 56)" = 2 ] || { echo "FAIL: aarch64 output not two PT_LOAD segments" >&2; exit 1; }
+    [ "$(phdr_count "$PA" 1)" = 2 ] || { echo "FAIL: aarch64 output not two PT_LOAD segments" >&2; exit 1; }
+    # clang's objects carry .eh_frame, so bnld adds the .eh_frame_hdr search table and its
+    # PT_GNU_EH_FRAME header.
+    [ "$(phdr_count "$PA" 1685382480)" = 1 ] || {
+        echo "FAIL: aarch64 output has no PT_GNU_EH_FRAME header" >&2; exit 1; }
     echo "PASS: aarch64 LLVM-backend objects link with bnld (GOT relaxed; not run cross-arch)"
 else
     echo "SKIP: LLVM-backend link not exercised (no clang) — native path verified"

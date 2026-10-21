@@ -22,8 +22,8 @@ import "pkg/stdx/slices"
 // the latch OP_COPY would clobber a value the header still reads.
 
 // LivenessInfo bundles the linearization and liveness of one function.
-// All sets are indexed by SSA id in [0, NextID); block-indexed arrays are
-// indexed by position in f.Blocks.
+// Id-indexed arrays are indexed by SSA id in [0, NextID); block-indexed
+// arrays by position in f.Blocks.
 type LivenessInfo struct {
 	// NextID is f.NextID at analysis time — the exclusive upper bound of
 	// every SSA id, and the length of the per-id arrays below.
@@ -61,10 +61,18 @@ type LivenessInfo struct {
 	// from scalar params and from defs in reachable blocks.
 	Allocatable @[]bool
 
-	// LiveIn[b] / LiveOut[b] are the converged liveness of allocatable ids
-	// at block b's entry / exit, id-indexed bool sets.
-	LiveIn  @[]@[]bool
-	LiveOut @[]@[]bool
+	// Globals lists, in order of discovery, the allocatable ids upward-exposed
+	// in some reachable block (used there before any def of them in it) — the
+	// only ids a block boundary can see live; GlobalIndex[id] is id's index in
+	// Globals, or -1.
+	Globals     @[]int
+	GlobalIndex @[]int
+	// liveIn[b] / liveOut[b] are the converged liveness at block b's entry /
+	// exit, bitsets over Globals (regalloc_live_dataflow.bn); read them
+	// through IsLiveIn / IsLiveOut / LiveInIDs / LiveOutIDs.  An unreachable
+	// block's are empty.
+	liveIn  @[]@[]uint32
+	liveOut @[]@[]uint32
 
 	// Fusable[id] flags a GEP that folds into its consuming load/store's memory
 	// operand — the UNION of the fusable element GEPs (scaled register offset;
@@ -119,7 +127,7 @@ func isAllocatableDef(ins @ir.Instr, wordBytes int) bool {
 // it to decide whether a result participates in register allocation / lazy
 // spill (a scalar that lives in a register) versus an aggregate / float /
 // wide-int / alloca that lives in memory and is eagerly spilled.  Its true
-// set is exactly the liveness universe (LiveIn/LiveOut, Allocatable), so a
+// set is exactly the liveness universe (the block live sets, Allocatable), so a
 // value marked dirty by lazy spill is always covered by the liveness sets.
 func IsAllocatableDef(ins @ir.Instr, wordBytes int) bool {
 	return isAllocatableDef(ins, wordBytes)
@@ -305,94 +313,6 @@ func seedAllocatable(lv @LivenessInfo, f @ir.Func, wordBytes int) {
 	}
 }
 
-// livenessFixpoint computes LiveIn/LiveOut by iterating the backward
-// dataflow equations to convergence:
-//   LiveOut[b] = union over s in succ(b) of LiveIn[s]
-//   LiveIn[b]  = upwardUse[b] ∪ (LiveOut[b] − def[b])
-// where upwardUse[b] is the ids used in b before any def of them in b, and
-// def[b] the ids defined in b.  Only allocatable ids participate.  Blocks
-// are visited in postorder (successors before predecessors) so most
-// updates propagate in a single sweep; iteration repeats until stable.
-func livenessFixpoint(lv @LivenessInfo, f @ir.Func, succs @[]@[]int, wordBytes int) {
-	var n int = lv.NumBlocks
-	var nid int = lv.NextID
-	var def @[]@[]bool
-	var upwardUse @[]@[]bool
-	lv.LiveIn = make_empty_bool_sets(n, nid)
-	lv.LiveOut = make_empty_bool_sets(n, nid)
-	def = make_empty_bool_sets(n, nid)
-	upwardUse = make_empty_bool_sets(n, nid)
-
-	for k := 0; k < len(lv.RPO); k++ {
-		var b int = lv.RPO[k]
-		computeBlockDefUse(lv, f.Blocks[b], def[b], upwardUse[b], wordBytes)
-	}
-
-	var changed bool = true
-	for changed {
-		changed = false
-		// Postorder = RPO reversed: visit successors before predecessors.
-		for k := len(lv.RPO) - 1; k >= 0; k-- {
-			var b int = lv.RPO[k]
-			// LiveOut[b] = union of successors' LiveIn.
-			for si := 0; si < len(succs[b]); si++ {
-				var s int = succs[b][si]
-				if !lv.Reachable[s] { continue }
-				for id := 0; id < nid; id++ {
-					if lv.LiveIn[s][id] && !lv.LiveOut[b][id] {
-						lv.LiveOut[b][id] = true
-						changed = true
-					}
-				}
-			}
-			// LiveIn[b] = upwardUse[b] ∪ (LiveOut[b] − def[b]).
-			for id := 0; id < nid; id++ {
-				var live bool = upwardUse[b][id] || (lv.LiveOut[b][id] && !def[b][id])
-				if live && !lv.LiveIn[b][id] {
-					lv.LiveIn[b][id] = true
-					changed = true
-				}
-			}
-		}
-	}
-}
-
-// computeBlockDefUse fills def / upwardUse for one block with a forward
-// scan: an id used before it is (re)defined in the block is upward-exposed
-// (its value comes from a predecessor); an id defined anywhere in the block
-// is in def.  Only allocatable ids are recorded.
-func computeBlockDefUse(lv @LivenessInfo, b @ir.Block, def @[]bool, upwardUse @[]bool,
-		wordBytes int) {
-	var definedSoFar @[]bool = make_slice(bool, lv.NextID)
-	for ii := 0; ii < len(b.Instrs); ii++ {
-		var ins @ir.Instr = b.Instrs[ii]
-		if ins.Op == iropcode.OP_PHI {
-			// This analysis reads value operands only from ins.Args, but a phi
-			// carries its inputs in ins.Phis (live on the predecessor edges,
-			// not here).  iropt.EliminatePhis must run before native emission, so
-			// a phi reaching here is a contract violation, not a shape to
-			// silently mishandle (which would drop the phi inputs' liveness).
-			panic(
-					"internal error: register-allocator liveness saw an OP_PHI; "
-							"iropt.EliminatePhis must run before native emission")
-		}
-		for ai := 0; ai < len(ins.Args); ai++ {
-			base, idx := fusedGepBaseIdx(lv, ins, ai, ins.Args[ai])
-			if base != nil {
-				markUpwardUse(lv, definedSoFar, upwardUse, base)
-				markUpwardUse(lv, definedSoFar, upwardUse, idx)
-			} else {
-				markUpwardUse(lv, definedSoFar, upwardUse, ins.Args[ai])
-			}
-		}
-		var d int = defIdOf(lv, ins, wordBytes)
-		if d >= 0 {
-			definedSoFar[d] = true
-			def[d] = true
-		}
-	}
-}
-
 // defIdOf returns the allocatable id ins defines, or -1.
 func defIdOf(lv @LivenessInfo, ins @ir.Instr, wordBytes int) int {
 	if isFusedGepDef(lv, ins) { return -1 } // folded into a load/store; defines nothing
@@ -409,13 +329,4 @@ func useIdOf(lv @LivenessInfo, arg @ir.Instr) int {
 	if arg.ID < 0 || arg.ID >= lv.NextID { return -1 }
 	if !lv.Allocatable[arg.ID] { return -1 }
 	return arg.ID
-}
-
-// make_empty_bool_sets returns n freshly-zeroed id-indexed bool sets.
-func make_empty_bool_sets(n int, nid int) @[]@[]bool {
-	var sets @[]@[]bool = make_slice(@[]bool, n)
-	for i := 0; i < n; i++ {
-		sets[i] = make_slice(bool, nid)
-	}
-	return sets
 }

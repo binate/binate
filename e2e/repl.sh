@@ -2985,6 +2985,144 @@ new g
 114
 > "
 
+# --- Two redefinitions in one group, the later one shadowing (another
+# signature): the new h is lowered before the earlier f, so f calls it, while
+# useh, lowered before the group, keeps the old h (lowered in the order
+# generated, f binds to the old h and reads its 1000 as an int8: -23). ---
+run_repl "group-earlier-redefinition-calls-later-shadowing-one" \
+"func P(n int) int { if n == 0 { return 1 }; return f() + cast(int, h()) + q(n) }
+func h() int { return 1000 }
+func useh() int { return h() }
+func f() int { return 0 }
+func f() int { return cast(int, h()) + P(0) }
+func h() int8 { var _ int = P(0); return 2 }
+func q(n int) int { return 100 + n }
+testing.Println(f())
+testing.Println(useh())
+testing.Println(P(1))
+" \
+"$BANNER
+> function P parked (pending: f, h, q)
+> > > > function f parked (pending: P)
+> function h parked (pending: P)
+> function P resolved
+function f resolved
+function h resolved
+warning: h shadowed (incompatible signature); existing callers retain old definition
+> 3
+> 1000
+> 106
+> "
+
+# --- A generic type's method redefined in a group with another signature: the
+# instance emitted before it (Cell[int].get, for use) is forgotten when the group
+# is declared, so f, generated before it, emits the new instance and calls it with
+# its float64 result, while use keeps the old one (with the instance still
+# emitted, f calls it with the old int result). ---
+run_repl "group-earlier-redefinition-calls-shadowing-generic-method" \
+"type Cell[T any] struct { v T }
+func P(n int) int { if n == 0 { return 1 }; var b Cell[int]; return f() + q(n) + cast(int, b.get()) }
+func (b *Cell[T]) get() int { return 1000 }
+func use() int { var b Cell[int]; return b.get() }
+testing.Println(use())
+func f() int { return 0 }
+func f() int { var b Cell[int]; return cast(int, b.get()) + P(0) }
+func (b *Cell[T]) get() float64 { var _ int = P(0); return 2.5 }
+func q(n int) int { return 100 + n }
+testing.Println(f())
+testing.Println(use())
+testing.Println(P(1))
+" \
+"$BANNER
+> > function P parked (pending: f, q, Cell.get)
+> > > 1000
+> > function f parked (pending: P)
+> method Cell.get parked (pending: P)
+> function P resolved
+function f resolved
+method Cell.get resolved
+warning: Cell.get shadowed (incompatible signature); existing callers retain old definition
+> 3
+> 1000
+> 106
+> "
+
+# --- A value-receiver method redefined in a group with another signature: its
+# new body and interface-dispatch thunk are lowered before the earlier f, so f
+# calls the new method; a vtable built before keeps the old thunk, and one built
+# after uses the new one (lowered in the order generated, f reads the old 1000
+# as an int8: -23). ---
+run_repl "group-earlier-redefinition-calls-shadowing-value-method" \
+"interface Sz { Size() int }
+type Vq struct { n int }
+func P(n int) int { if n == 0 { return 1 }; var v Vq; return f() + q(n) + cast(int, v.Size()) }
+func (v Vq) Size() int { return 1000 }
+impl Vq : Sz
+func useold() int { var v Vq; return v.Size() }
+var vv Vq
+var s0 *Sz = &vv
+func viaif() int { return s0.Size() }
+testing.Println(useold(), viaif())
+func f() int { return 0 }
+func f() int { var v Vq; var x int8 = v.Size(); return cast(int, x) + P(0) }
+func (v Vq) Size() int8 { var _ int = P(0); return 2 }
+func q(n int) int { return 100 + n }
+testing.Println(f())
+testing.Println(useold(), viaif())
+testing.Println(P(1))
+interface Sz8 { Size() int8 }
+impl Vq : Sz8
+var s8 *Sz8 = &vv
+testing.Println(s8.Size())
+" \
+"$BANNER
+> > > function P parked (pending: f, q, Vq.Size)
+> > > > > > > 1000 1000
+> > function f parked (pending: P)
+> method Vq.Size parked (pending: P)
+> function P resolved
+function f resolved
+method Vq.Size resolved
+warning: Vq.Size shadowed (incompatible signature); existing callers retain old definition
+> 3
+> 1000 1000
+> 106
+> > > > 2
+> "
+
+# --- Several redefinitions in one group shadow (another signature) and call one
+# another, a generic function among them: each calls the others' new definitions,
+# while olds, lowered before the group, keeps the old ones (lowered in the order
+# generated, g calls the old h and reads its 2000 as an int8: -38). ---
+run_repl "group-shadowing-redefinitions-call-each-other" \
+"func P(n int) int { if n == 0 { return 1 }; return cast(int, g(0)) + cast(int, h(0)) + q(n) + cast(int, gf[int](0)) }
+func g(k int) int { return 1000 }
+func h(k int) int { return 2000 }
+func gf[T any](x T) int { return 3000 }
+func olds() int { return g(0) + h(0) + gf[int](0) }
+testing.Println(olds())
+func g(k int) int8 { var _ int = P(0); if k > 0 { return 1 }; return cast(int8, h(1)) + 10 }
+func h(k int) int16 { var _ int = P(0); if k > 0 { return 2 }; return cast(int16, g(1)) + cast(int16, gf[bool](true)) + 20 }
+func gf[T any](x T) int8 { var _ int = P(0); return 30 }
+func q(n int) int { return 100 + n }
+testing.Println(g(0), h(0), gf[int](0), olds(), P(1))
+" \
+"$BANNER
+> function P parked (pending: g, h, q, gf)
+> > > > > 6000
+> function g parked (pending: P)
+> function h parked (pending: P)
+> function gf parked (pending: P)
+> function P resolved
+function g resolved
+function h resolved
+function gf resolved
+warning: g shadowed (incompatible signature); existing callers retain old definition
+warning: h shadowed (incompatible signature); existing callers retain old definition
+warning: gf shadowed (incompatible signature); existing callers retain old definition
+> 12 51 30 6000 194
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

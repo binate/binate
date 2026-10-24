@@ -1,0 +1,445 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/std/containers/vec"
+
+// Register-slot assignment for the bytecode VM.  A register is numbered by the
+// slot it occupies, and values whose live ranges do not overlap share a slot.
+// One slot per IR value would make a frame grow with the whole function's size,
+// and pushFrame zeroes every slot on each call; a deeply recursive interpreted
+// program (the type checker under bni) would then run out of VM stack far short
+// of the depth compiled code reaches.
+//
+// Each instruction gets a position in a linear order of the lowered blocks, and
+// each value an interval of positions covering every instruction that defines or
+// reads it and every instruction on a path from one to a later read.  Values
+// whose intervals are disjoint share a slot.  An instruction's operands and its
+// result meet at its position, so they never share one: no lowering has to order
+// its register writes after its reads.  A value defined by an instruction nothing
+// reads still occupies a slot at that instruction, as its bytecode may write it.
+//
+// Position 0 is the frame's entry, where the parameters arrive and every other
+// slot reads zero: a parameter's interval starts there, and so does that of a
+// value read on some path before anything defines it, which must see the zero.
+// Parameters keep the packed slots a call copies them into (0, 1, ... with a
+// two-slot value taking two).  A cleanup pad's blocks are numbered right after the
+// instruction they are attached to — a pad runs instead of what follows that
+// instruction — so the values a pad reads stay live only to there, not to the end
+// of the function, where the pads' bytecode is emitted.
+
+// slotPlan is what the slot assignment of one function works from.  Instructions
+// are numbered by a global index over blocks, in order.
+type slotPlan struct {
+	blocks @[]@ir.Block
+	gBase  @[]int // each block's first global instruction index
+	gBlock @[]int // each instruction's block
+	pos    @[]int // each instruction's position
+	nPos   int
+	padOf  @[]int // each instruction's cleanup pad block, or -1
+	succA  @[]int // each block's successors (-1: none)
+	succB  @[]int
+	// Each block's predecessors (predStart[b] up to predStart[b+1]), and the
+	// instructions a cleanup pad's entry block is attached to (tagStart / tags).
+	predStart @[]int
+	preds     @[]int
+	tagStart  @[]int
+	tags      @[]int
+	// The instructions reading each value id (useStart / uses).
+	useStart @[]int
+	uses     @[]int
+}
+
+// assignSlots gives each value id of f, carried by an instruction of blocks (the
+// function's body and cleanup-pad blocks), a parameter or an operand, the
+// register slot it occupies, and returns the map (-1 for an id nothing carries)
+// and the number of slots.  wide flags the ids whose value takes two consecutive
+// slots (a 64-bit scalar on a host whose word is smaller).
+func assignSlots(f @ir.Func, blocks @[]@ir.Block, wide *[]bool) (@[]int, int) {
+	var numIDs int = f.NextID
+	var p @slotPlan = buildSlotPlan(f, blocks, numIDs)
+	var lo @[]int = make_slice(int, numIDs)
+	var hi @[]int = make_slice(int, numIDs)
+	for v := 0; v < numIDs; v++ {
+		lo[v] = p.nPos
+		hi[v] = -1
+	}
+	for g := 0; g < len(p.pos); g++ {
+		var id int = slotInstrAt(p, g).ID
+		if id >= 0 && id < numIDs { hullInclude(lo, hi, id, p.pos[g]) }
+	}
+	for i := 0; i < len(f.Params); i++ {
+		var pid int = f.Params[i].ID
+		if pid >= 0 && pid < numIDs { hullInclude(lo, hi, pid, 0) }
+	}
+	var seen @[]int = make_slice(int, len(p.pos))
+	var seenIn @[]int = make_slice(int, len(blocks))
+	var work @vec.Vec[int] = vec.New[int]()
+	for v := 0; v < numIDs; v++ {
+		if p.useStart[v + 1] > p.useStart[v] { extendHull(p, v, lo, hi, seen, seenIn, work) }
+	}
+	return pickSlots(f, p, lo, hi, wide)
+}
+
+// slotInstrAt returns the instruction with global index g.
+func slotInstrAt(p @slotPlan, g int) @ir.Instr {
+	var b int = p.gBlock[g]
+	return p.blocks[b].Instrs[g - p.gBase[b]]
+}
+
+// hullInclude extends value v's interval [lo[v], hi[v]] to cover position x.
+func hullInclude(lo *[]int, hi *[]int, v int, x int) {
+	if x < lo[v] { lo[v] = x }
+	if x > hi[v] { hi[v] = x }
+}
+
+// buildSlotPlan numbers f's instructions over blocks and records the control
+// flow and the reads the liveness walk follows.
+func buildSlotPlan(f @ir.Func, blocks @[]@ir.Block, numIDs int) @slotPlan {
+	var p @slotPlan = make(slotPlan)
+	p.blocks = blocks
+	var nb int = len(blocks)
+	p.gBase = make_slice(int, nb)
+	var n int = 0
+	for b := 0; b < nb; b++ {
+		p.gBase[b] = n
+		n = n + len(blocks[b].Instrs)
+	}
+	p.gBlock = make_slice(int, n)
+	p.padOf = make_slice(int, n)
+	for b := 0; b < nb; b++ {
+		for k := 0; k < len(blocks[b].Instrs); k++ {
+			var g int = p.gBase[b] + k
+			p.gBlock[g] = b
+			p.padOf[g] = -1
+			var pad *ir.Block = blocks[b].Instrs[k].PadBlock
+			if pad != nil { p.padOf[g] = blockIndexOf(blocks, pad) }
+		}
+	}
+	p.succA = make_slice(int, nb)
+	p.succB = make_slice(int, nb)
+	for b := 0; b < nb; b++ {
+		var sa int
+		var sb int
+		sa, sb = blockSuccs(blocks, b)
+		p.succA[b] = sa
+		p.succB[b] = sb
+	}
+	p.pos = make_slice(int, n)
+	numberSlotPositions(p, len(f.Blocks))
+	buildSlotPreds(p)
+	buildSlotUses(p, numIDs)
+	return p
+}
+
+// blockSuccs returns the blocks control may pass to from the end of block b: a
+// jump's target, a branch's two, none after a return, an unwind or an
+// unreachable, and otherwise the next block, which the bytecode runs into.
+func blockSuccs(blocks @[]@ir.Block, b int) (int, int) {
+	var blk @ir.Block = blocks[b]
+	var n int = len(blk.Instrs)
+	if n > 0 {
+		var term @ir.Instr = blk.Instrs[n - 1]
+		if term.Op == iropcode.OP_JUMP { return blockIndexOf(blocks, term.Block1), -1 }
+		if term.Op == iropcode.OP_BRANCH {
+			return blockIndexOf(blocks, term.Block1), blockIndexOf(blocks, term.Block2)
+		}
+		if term.Op == iropcode.OP_RETURN || term.Op == iropcode.OP_UNWIND_RETURN ||
+				term.Op == iropcode.OP_UNREACHABLE {
+			return -1, -1
+		}
+	}
+	if b + 1 < len(blocks) { return b + 1, -1 }
+	return -1, -1
+}
+
+// numberSlotPositions gives every instruction its position: the body blocks
+// (the first nBody) in order, each cleanup pad right after the first instruction
+// attached to it, and any pad nothing is attached to at the end.
+func numberSlotPositions(p @slotPlan, nBody int) {
+	var placed @[]bool = make_slice(bool, len(p.blocks))
+	var next int = 1
+	for b := 0; b < len(p.blocks); b++ {
+		if !placed[b] { next = placeSlotBlock(p, b, placed, next, nBody) }
+	}
+	p.nPos = next
+}
+
+// placeSlotBlock numbers block b's instructions from position next, placing
+// after each instruction the cleanup pad attached to it (if not yet placed), and
+// returns the next free position.
+func placeSlotBlock(p @slotPlan, b int, placed *[]bool, next int, nBody int) int {
+	placed[b] = true
+	for k := 0; k < len(p.blocks[b].Instrs); k++ {
+		var g int = p.gBase[b] + k
+		p.pos[g] = next
+		next = next + 1
+		var pad int = p.padOf[g]
+		if pad >= 0 && !placed[pad] { next = placeSlotPad(p, pad, placed, next, nBody) }
+	}
+	return next
+}
+
+// placeSlotPad numbers the cleanup pad whose entry block is entry — the entry and
+// the pad blocks reachable from it — from position next, and returns the next
+// free position.
+func placeSlotPad(p @slotPlan, entry int, placed *[]bool, next int, nBody int) int {
+	var stack @vec.Vec[int] = vec.New[int]()
+	stack.Push(entry)
+	for stack.Len() > 0 {
+		var b int
+		var ok bool
+		b, ok = stack.Pop()
+		_ = ok
+		if placed[b] { continue }
+		next = placeSlotBlock(p, b, placed, next, nBody)
+		if p.succB[b] >= nBody && !placed[p.succB[b]] { stack.Push(p.succB[b]) }
+		if p.succA[b] >= nBody && !placed[p.succA[b]] { stack.Push(p.succA[b]) }
+	}
+	return next
+}
+
+// buildSlotPreds inverts the successor lists into each block's predecessors, and
+// lists the instructions each cleanup pad is attached to.
+func buildSlotPreds(p @slotPlan) {
+	var nb int = len(p.blocks)
+	var count @[]int = make_slice(int, nb + 1)
+	for b := 0; b < nb; b++ {
+		if p.succA[b] >= 0 { count[p.succA[b]] = count[p.succA[b]] + 1 }
+		if p.succB[b] >= 0 && p.succB[b] != p.succA[b] { count[p.succB[b]] = count[p.succB[b]] + 1 }
+	}
+	p.predStart = prefixStarts(count)
+	p.preds = make_slice(int, p.predStart[nb])
+	var fill @[]int = make_slice(int, nb)
+	for b := 0; b < nb; b++ {
+		if p.succA[b] >= 0 { fill = csrAdd(p.predStart, p.preds, fill, p.succA[b], b) }
+		if p.succB[b] >= 0 && p.succB[b] != p.succA[b] {
+			fill = csrAdd(p.predStart, p.preds, fill, p.succB[b], b)
+		}
+	}
+	var tcount @[]int = make_slice(int, nb + 1)
+	for g := 0; g < len(p.padOf); g++ {
+		if p.padOf[g] >= 0 { tcount[p.padOf[g]] = tcount[p.padOf[g]] + 1 }
+	}
+	p.tagStart = prefixStarts(tcount)
+	p.tags = make_slice(int, p.tagStart[nb])
+	var tfill @[]int = make_slice(int, nb)
+	for g := 0; g < len(p.padOf); g++ {
+		if p.padOf[g] >= 0 { tfill = csrAdd(p.tagStart, p.tags, tfill, p.padOf[g], g) }
+	}
+}
+
+// buildSlotUses lists, for each value id below numIDs, the instructions that read
+// it.  A global-address operand is no value of the function (lowerFunc loads it
+// into a register of its own at each use).
+func buildSlotUses(p @slotPlan, numIDs int) {
+	var count @[]int = make_slice(int, numIDs + 1)
+	for g := 0; g < len(p.pos); g++ {
+		var ins @ir.Instr = slotInstrAt(p, g)
+		for a := 0; a < len(ins.Args); a++ {
+			var id int = slotOperandID(ins.Args[a], numIDs)
+			if id >= 0 { count[id] = count[id] + 1 }
+		}
+	}
+	p.useStart = prefixStarts(count)
+	p.uses = make_slice(int, p.useStart[numIDs])
+	var fill @[]int = make_slice(int, numIDs)
+	for g := 0; g < len(p.pos); g++ {
+		var ins @ir.Instr = slotInstrAt(p, g)
+		for a := 0; a < len(ins.Args); a++ {
+			var id int = slotOperandID(ins.Args[a], numIDs)
+			if id >= 0 { fill = csrAdd(p.useStart, p.uses, fill, id, g) }
+		}
+	}
+}
+
+// slotOperandID returns the value id an operand reads, or -1 for none: an absent
+// operand, a global address, or an id outside the function's.
+func slotOperandID(arg @ir.Instr, numIDs int) int {
+	if arg == nil || arg.IsGlobalRef { return -1 }
+	if arg.ID < 0 || arg.ID >= numIDs { return -1 }
+	return arg.ID
+}
+
+// prefixStarts turns per-key counts (one spare entry at the end) into the start
+// offset of each key's run, in place, and returns it: key k's entries are at
+// [starts[k], starts[k+1]).
+func prefixStarts(count @[]int) @[]int {
+	var sum int = 0
+	for k := 0; k < len(count); k++ {
+		var c int = count[k]
+		count[k] = sum
+		sum = sum + c
+	}
+	return count
+}
+
+// csrAdd appends x to key k's run in the flat list, fill[k] counting the entries
+// already there, and returns fill.
+func csrAdd(starts *[]int, list *[]int, fill @[]int, k int, x int) @[]int {
+	list[starts[k] + fill[k]] = x
+	fill[k] = fill[k] + 1
+	return fill
+}
+
+// extendHull extends value v's interval over every instruction on a path that
+// reaches one of its reads without passing a definition of it, walking backwards
+// from each read.  seen and seenIn mark (with v + 1) the instructions and block
+// entries already walked for v; work is an empty stack of (block, instruction
+// index) pairs to walk down from.
+func extendHull(p @slotPlan, v int, lo *[]int, hi *[]int, seen *[]int, seenIn *[]int,
+		work @vec.Vec[int]) {
+	for u := p.useStart[v]; u < p.useStart[v + 1]; u++ {
+		var g int = p.uses[u]
+		hullInclude(lo, hi, v, p.pos[g])
+		pushSlotWalk(p, v, g, work)
+	}
+	for work.Len() > 0 {
+		var k int
+		var b int
+		var ok bool
+		k, ok = work.Pop()
+		b, ok = work.Pop()
+		_ = ok
+		var reachedEntry bool = true
+		for k >= 0 {
+			var g int = p.gBase[b] + k
+			if seen[g] == v + 1 {
+				reachedEntry = false
+				break
+			}
+			seen[g] = v + 1
+			hullInclude(lo, hi, v, p.pos[g])
+			if p.blocks[b].Instrs[k].ID == v {
+				reachedEntry = false
+				break
+			}
+			k = k - 1
+		}
+		if reachedEntry && seenIn[b] != v + 1 {
+			seenIn[b] = v + 1
+			if b == 0 { hullInclude(lo, hi, v, 0) }
+			for i := p.predStart[b]; i < p.predStart[b + 1]; i++ {
+				var pb int = p.preds[i]
+				work.Push(pb)
+				work.Push(len(p.blocks[pb].Instrs) - 1)
+			}
+			// A pad runs at an instruction attached to it, before that
+			// instruction's result exists: v is live there.
+			for i := p.tagStart[b]; i < p.tagStart[b + 1]; i++ {
+				hullInclude(lo, hi, v, p.pos[p.tags[i]])
+				pushSlotWalk(p, v, p.tags[i], work)
+			}
+		}
+	}
+}
+
+// pushSlotWalk queues the walk for v back from instruction g, which needs v's
+// value from before it: from g itself, or from the instruction before it when g
+// defines v (its own result is not the value it needs).
+func pushSlotWalk(p @slotPlan, v int, g int, work @vec.Vec[int]) {
+	var b int = p.gBlock[g]
+	var k int = g - p.gBase[b]
+	if p.blocks[b].Instrs[k].ID == v { k = k - 1 }
+	work.Push(b)
+	work.Push(k)
+}
+
+// pickSlots gives each value with an interval its slot: the parameters their
+// packed slots, then the others in order of where their intervals start, each
+// the lowest slot (pair of slots, if wide) whose occupant's interval has ended.
+func pickSlots(f @ir.Func, p @slotPlan, lo *[]int, hi *[]int, wide *[]bool) (@[]int, int) {
+	var numIDs int = len(lo)
+	var slotOf @[]int = make_slice(int, numIDs)
+	var isParam @[]bool = make_slice(bool, numIDs)
+	for v := 0; v < numIDs; v++ { slotOf[v] = -1 }
+	var busy @vec.Vec[int] = vec.New[int]()
+	var next int = 0
+	for i := 0; i < len(f.Params); i++ {
+		var pid int = f.Params[i].ID
+		var w int = 1
+		if pid >= 0 && pid < numIDs {
+			if wide[pid] { w = 2 }
+			slotOf[pid] = next
+			isParam[pid] = true
+		}
+		growSlots(busy, next + w)
+		for s := next; s < next + w; s++ {
+			if pid >= 0 && pid < numIDs { busy.Set(s, hi[pid]) } else { busy.Set(s, 0) }
+		}
+		next = next + w
+	}
+	// Order the other values by where their intervals start (a counting sort).
+	var count @[]int = make_slice(int, p.nPos + 1)
+	for v := 0; v < numIDs; v++ {
+		if hi[v] >= 0 && !isParam[v] { count[lo[v]] = count[lo[v]] + 1 }
+	}
+	var starts @[]int = prefixStarts(count)
+	var order @[]int = make_slice(int, starts[p.nPos])
+	var fill @[]int = make_slice(int, p.nPos)
+	for v := 0; v < numIDs; v++ {
+		if hi[v] >= 0 && !isParam[v] { fill = csrAdd(starts, order, fill, lo[v], v) }
+	}
+	for i := 0; i < len(order); i++ {
+		var v int = order[i]
+		var w int = 1
+		if wide[v] { w = 2 }
+		var s int = 0
+		for {
+			growSlots(busy, s + w)
+			if busy.Get(s) < lo[v] && (w == 1 || busy.Get(s + 1) < lo[v]) { break }
+			s = s + 1
+		}
+		slotOf[v] = s
+		busy.Set(s, hi[v])
+		if w == 2 { busy.Set(s + 1, hi[v]) }
+	}
+	return slotOf, busy.Len()
+}
+
+// growSlots extends the per-slot table of busy-until positions to n slots, a new
+// slot free (-1).
+func growSlots(busy @vec.Vec[int], n int) {
+	for busy.Len() < n { busy.Push(-1) }
+}
+
+// renumberValues sets the ID of every IR value lowering reads registers from —
+// each instruction of blocks, each of their operands, each parameter
+// placeholder — to its slot (slotOf), recording each changed instruction and its
+// former ID in objs / ids so restoreValueIDs can put them back.  The IDs are all
+// recorded before any is changed: one instruction may be reached more than once.
+func renumberValues(f @ir.Func, blocks @[]@ir.Block, slotOf *[]int, objs @vec.Vec[@ir.Instr],
+		ids @vec.Vec[int]) {
+	for b := 0; b < len(blocks); b++ {
+		for k := 0; k < len(blocks[b].Instrs); k++ {
+			var ins @ir.Instr = blocks[b].Instrs[k]
+			recordValueID(ins, slotOf, objs, ids)
+			for a := 0; a < len(ins.Args); a++ {
+				var arg @ir.Instr = ins.Args[a]
+				if arg != nil && !arg.IsGlobalRef { recordValueID(arg, slotOf, objs, ids) }
+			}
+		}
+	}
+	if f.ParamRefs != nil {
+		for i := 0; i < f.ParamRefs.Len(); i++ { recordValueID(f.ParamRefs.Get(i), slotOf, objs, ids) }
+	}
+	for i := 0; i < objs.Len(); i++ {
+		var ins @ir.Instr = objs.Get(i)
+		ins.ID = slotOf[ids.Get(i)]
+	}
+}
+
+// recordValueID records ins and its ID for renumberValues when the ID has a slot.
+func recordValueID(ins @ir.Instr, slotOf *[]int, objs @vec.Vec[@ir.Instr], ids @vec.Vec[int]) {
+	if ins.ID < 0 || ins.ID >= len(slotOf) || slotOf[ins.ID] < 0 { return }
+	objs.Push(ins)
+	ids.Push(ins.ID)
+}
+
+// restoreValueIDs puts back the IDs renumberValues changed.
+func restoreValueIDs(objs @vec.Vec[@ir.Instr], ids @vec.Vec[int]) {
+	for i := 0; i < objs.Len(); i++ {
+		var ins @ir.Instr = objs.Get(i)
+		ins.ID = ids.Get(i)
+	}
+}

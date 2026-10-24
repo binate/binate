@@ -107,22 +107,6 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 	// per-function (matching curNames' per-function lifetime).
 	vm.curArgIfaceLayouts = vec.New[@vmdata.ArgIfaceLayout]()
 
-	// Reserve extra registers for call arg packing and globals.
-	var maxArgs int = findMaxCallArgs(vm, f)
-	var callArgBase int = f.NextID
-	// Distinct registers for global-address temporaries: an instruction
-	// with N global-address args (e.g. `return &G, &H`, `&G == &H`) needs
-	// N registers so the per-arg LOAD_IMMs don't clobber one another
-	// before the instruction consumes them.
-	var globalRegBase int = f.NextID + maxArgs
-	// Reserve one register per global-address arg of the widest
-	// instruction, but always at least one (the prior frame size — a
-	// function with 0 or 1 global args keeps exactly one global slot, so
-	// only genuinely multi-global instructions change the layout).
-	var globalRegs int = findMaxGlobalsPerInstr(vm, f)
-	if globalRegs < 1 { globalRegs = 1 }
-	vmf.NumRegs = f.NextID + maxArgs + globalRegs
-
 	// `blocks` is the function's body blocks followed by its VM-only cleanup
 	// pads (Func.FaultPads); the VM lowers both (pads get PCs after the body so a
 	// fault can branch to one), while the compiled backends iterate only
@@ -130,60 +114,34 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 	// change).  See combinedBlocks.
 	var blocks @[]@ir.Block = combinedBlocks(f)
 
-	// First pass: compute stack frame layout (alloca offsets)
-	var frameOffset int = 0
-	var allocaOffsets @[]int = make_slice(int, f.NextID)
-	for i := 0; i < len(blocks); i++ {
-		var blk @ir.Block = blocks[i]
-		for j := 0; j < len(blk.Instrs); j++ {
-			var instr @ir.Instr = blk.Instrs[j]
-			if instr.Op == iropcode.OP_ALLOC && instr.TypeArg != nil {
-				var size int = instr.TypeArg.SizeOf()
-				// Align to 8 bytes
-				frameOffset = (frameOffset + 7) / 8 * 8
-				allocaOffsets[instr.ID] = frameOffset
-				frameOffset = frameOffset + size
-			} else if instr.Op == iropcode.OP_LOAD && isAggregateLoadTyp(instr.Typ) {
-				// An aggregate OP_LOAD owns its bytes: reserve a region
-				// it copies into (BC_LOAD_AGGREGATE), so the loaded value
-				// can't alias a source the cleanup frees first (e.g.
-				// `return container[i]`).  Same shape as an alloca region.
-				var lsize int = instr.Typ.SizeOf()
-				frameOffset = (frameOffset + 7) / 8 * 8
-				allocaOffsets[instr.ID] = frameOffset
-				frameOffset = frameOffset + lsize
-			} else if instr.Op == iropcode.OP_FUNC_VALUE && funcValueNeedsFrameRec(instr) {
-				// A raw *func capturing value's VM closure record is a frame-lived
-				// borrow (funcValueNeedsFrameRec): reserve a 4-word region
-				// ({kind, vm, fnIdx+1, captured}) for it here, keyed by the
-				// OP_FUNC_VALUE's own instr.ID (distinct from its result register), so
-				// it is reclaimed on frame pop and never leaks.  lowerCallOp carries the
-				// offset to the handler via Imm; BC_FUNC_VALUE writes the record into
-				// this slot instead of rt.Alloc.  (A managed @func's record stays on the
-				// heap, freed by RefDec; a non-capturing value has no record.)
-				frameOffset = (frameOffset + 7) / 8 * 8
-				allocaOffsets[instr.ID] = frameOffset
-				frameOffset = frameOffset + 4 * REG_SLOT
-			} else if instr.Op == iropcode.OP_CONST_NIL && isAggregateLoadTyp(instr.Typ) {
-				// An aggregate nil is an address-aggregate: the VM carries
-				// a slice / struct / iface- / func-value by the address of
-				// its in-memory image, not as an immediate.  Reserve a
-				// dedicated region for the nil image — zeroed at frame entry
-				// by pushFrame and never written — so the value's register
-				// points at a valid {0, ...} image.  Without it the scalar-0
-				// fallback (BC_LOAD_IMM) yields a null address, and any
-				// by-address consumer (a call argument, an OP_EXTRACT such as
-				// len()) reads through null.  Mirrors the native "dedicated
-				// data region" and the LLVM alloca + zero-fill for aggregate
-				// OP_CONST_NIL.
-				var nsize int = instr.Typ.SizeOf()
-				frameOffset = (frameOffset + 7) / 8 * 8
-				allocaOffsets[instr.ID] = frameOffset
-				frameOffset = frameOffset + nsize
-			}
-		}
-	}
-	vmf.FrameSize = frameOffset
+	// Each value's register is the slot assignSlots gives it (values whose live
+	// ranges do not overlap share one), then come the extra registers for call
+	// arg packing and globals.
+	var wide @[]bool = regWidths(f, f.NextID, REG_SLOT)
+	var slotOf @[]int
+	var numSlots int
+	slotOf, numSlots = assignSlots(f, blocks, wide)
+	var maxArgs int = findMaxCallArgs(vm, f)
+	var callArgBase int = numSlots
+	// Distinct registers for global-address temporaries: an instruction
+	// with N global-address args (e.g. `return &G, &H`, `&G == &H`) needs
+	// N registers so the per-arg LOAD_IMMs don't clobber one another
+	// before the instruction consumes them.
+	var globalRegBase int = numSlots + maxArgs
+	// Reserve one register per global-address arg of the widest
+	// instruction, but always at least one (the prior frame size — a
+	// function with 0 or 1 global args keeps exactly one global slot, so
+	// only genuinely multi-global instructions change the layout).
+	var globalRegs int = findMaxGlobalsPerInstr(vm, f)
+	if globalRegs < 1 { globalRegs = 1 }
+	vmf.NumRegs = numSlots + maxArgs + globalRegs
+
+	// First pass: compute the stack frame layout — each region-owning
+	// instruction's offset, by its index over `blocks` (planFrameRegions).
+	var regionOffs @[]int
+	var frameSize int
+	regionOffs, frameSize = planFrameRegions(blocks)
+	vmf.FrameSize = frameSize
 
 	// Second pass: compute block offsets (label → bytecode index)
 	// We need to know how many bytecodes each block produces.
@@ -278,12 +236,21 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 	var faultPadIdxs @[]int = make_slice(int, faultCount)
 	var faultIdx int = 0
 
+	// While the bytecode is emitted each value's ID is its slot, so every
+	// register a lowering forms from an ID is the slot; the IDs are put back
+	// after.
+	var renumbered @vec.Vec[@ir.Instr] = vec.New[@ir.Instr]()
+	var formerIDs @vec.Vec[int] = vec.New[int]()
+	renumberValues(f, blocks, slotOf, renumbered, formerIDs)
+	var instrIdx int = 0
 	for i := 0; i < len(blocks); i++ {
 		blockOffsets[i] = codeIdx
 		var blk @ir.Block = blocks[i]
 
 		for j := 0; j < len(blk.Instrs); j++ {
 			var instr @ir.Instr = blk.Instrs[j]
+			var regionOff int = regionOffs[instrIdx]
+			instrIdx = instrIdx + 1
 
 			// Fix up global references: IR generation may share
 			// the same pseudo-global-ref @Instr across multiple
@@ -395,7 +362,7 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 					packOff = packOff + w
 				}
 			}
-			var bc BCInstr = lowerInstr(vm, instr, allocaOffsets, blockOffsets, f, callArgBase)
+			var bc BCInstr = lowerInstr(vm, instr, regionOff, blockOffsets, f, callArgBase)
 			code[codeIdx] = bc
 			codeIdx = codeIdx + 1
 			if instr.PadBlock != nil {
@@ -435,6 +402,7 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 		}
 	}
 
+	restoreValueIDs(renumbered, formerIDs)
 	vmf.Code = code[:codeIdx]
 
 	// Pass 2 counted faultCount pad-tagged ops; pass 3 must have emitted exactly
@@ -459,20 +427,6 @@ func lowerFunc(vm @VM, f @ir.Func) @VMFunc {
 		}
 		vmf.FaultTable = ft
 	}
-
-	// Remap register numbers to slots.  Until here a register number
-	// is the IR value id (plus the call-arg and global-address register
-	// extras), one slot each — vmf.NumRegs still holds that old count.
-	// On a host whose word is < 8 bytes, a 64-bit value needs a
-	// two-slot pair,
-	// so slotOf shifts later registers up; on a 64-bit host slotOf is
-	// the identity and this is a no-op.
-	var wide @[]bool = regWidths(f, vmf.NumRegs, REG_SLOT)
-	var slotOf @[]int
-	var numSlots int
-	slotOf, numSlots = buildSlotMap(wide)
-	remapRegisters(vmf.Code, slotOf)
-	vmf.NumRegs = numSlots
 
 	vmf.Names = vm.curNames.Items()
 	vmf.ArgIfaceLayouts = vm.curArgIfaceLayouts.Items()

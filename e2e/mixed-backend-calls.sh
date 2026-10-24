@@ -15,7 +15,8 @@
 # callee's side and on the caller's), a capturing closure and an interface method, and
 # zero-size arguments (no register, no stack: the arguments after one are placed as if
 # it were absent — on x86-64, and on arm32 even for an 8-aligned one, which pads no
-# register to even).
+# register to even — except through a func value, whose dispatch gives one a pointer
+# slot like any other aggregate).
 #
 # Both backends target the host arch — or, with MIXED_TARGET=arm32-linux (set by
 # e2e/arm32-mixed-backend-calls.sh), arm32 hard-float, linked with
@@ -118,6 +119,7 @@ func ZeroFirst(e E, a int, b int, c int, d int, s P2) int
 func ZeroAfterFull(a int, b int, c int, d int, e2 int, f int, e E, s P2, t P2) int
 func ZeroEven(a int32, b int32, c int32, z Z, d int32) int32
 func ZeroEvenArr(a int32, b int32, c int32, z [0]float64, d int32) int32
+func ZeroEvenFn() *func(int32, int32, int32, Z, int32) int32
 func PairVfFn() *func(float32) (V2f, int32)
 func MakePairer(k int32) @func(float32) (V2f, int32)
 
@@ -171,6 +173,8 @@ func ZeroEvenArr(a int32, b int32, c int32, z [0]float64, d int32) int32 {
 	return a + 10 * b + 100 * c + 1000 * d
 }
 
+func ZeroEvenFn() *func(int32, int32, int32, Z, int32) int32 { return ZeroEven }
+
 func PairVfFn() *func(float32) (V2f, int32) { return PairVf }
 
 func MakePairer(k int32) @func(float32) (V2f, int32) {
@@ -214,6 +218,8 @@ func main() {
 	testing.Println(mbdep.ZeroEven(1, 2, 3, zz, 4))
 	var zf [0]float64
 	testing.Println(mbdep.ZeroEvenArr(5, 6, 7, zf, 8))
+	var zfn *func(int32, int32, int32, mbdep.Z, int32) int32 = mbdep.ZeroEvenFn()
+	testing.Println(zfn(2, 3, 4, zz, 5))
 	var f *func(float32) (mbdep.V2f, int32) = mbdep.PairVfFn()
 	fv, fn := f(6.5)
 	testing.Println(fv.x, fv.y, fn)
@@ -244,6 +250,7 @@ WANT="1.500000 2.500000 7
 3286
 4321
 8765
+5432
 6.500000 7.500000 7
 3.500000 4.500000 7
 2.500000 5.000000 12

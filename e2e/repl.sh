@@ -2858,6 +2858,133 @@ testing.Println(w.n)
 > 41
 > "
 
+# --- Functions that resolve together are all declared before any is generated,
+# so a member's call to one generated after it takes the callee's signature: f's
+# string literal is converted to g's raw-slice parameter (lowered without g's
+# signature, the call passes the literal unconverted and len(s) reads 0). ---
+run_repl "group-call-takes-later-member-signature" \
+"func f(n int) int { if n == 0 { return 0 }; return g(\"hello\", n - 1) }
+func g(s *[]readonly char, n int) int { if n == 0 { return len(s) }; return f(n - 1) }
+testing.Println(f(1))
+" \
+"$BANNER
+> function f parked (pending: g)
+> function g parked (pending: f)
+function f resolved
+function g resolved
+> 5
+> "
+
+# --- So too f's *Thing is boxed into g's interface parameter (lowered without
+# g's signature, the call passes the bare pointer, and the call through it aborts
+# with \"call of nil interface value\"). ---
+run_repl "group-call-boxes-into-later-member-interface" \
+"interface Greeter { greet() int }
+type Thing struct { x int }
+func (t *Thing) greet() int { return t.x }
+impl *Thing : Greeter
+var th Thing
+func f(n int) int { if n == 0 { return 0 }; th.x = 7; return g(&th, n - 1) }
+func g(gr *Greeter, n int) int { if n == 0 { return gr.greet() }; return f(n - 1) }
+testing.Println(f(1))
+" \
+"$BANNER
+> > > > > > function f parked (pending: g)
+> function g parked (pending: f)
+function f resolved
+function g resolved
+> 7
+> "
+
+# --- And f instantiates g, a generic function of its group declared after it
+# (generated before g is stashed, f's call names no instance, and the VM aborts
+# with \"extern not found\"). ---
+run_repl "group-call-instantiates-later-generic-member" \
+"func f(n int) int { if n == 0 { return 0 }; return g[int](n - 1, 7) }
+func g[T any](n int, x T) T { if n == 0 { return x }; var _ int = f(n - 1); return x }
+testing.Println(f(1))
+" \
+"$BANNER
+> function f parked (pending: g)
+> function g parked (pending: f)
+function f resolved
+function g resolved
+> 7
+> "
+
+# --- So is a generic type's method: f's call instantiates it (generated before
+# the method is stashed, the call names no instance, and the VM aborts with
+# \"extern not found\"). ---
+run_repl "group-call-instantiates-later-generic-method" \
+"type Cell[T any] struct { v T }
+func f(n int) int { var b Cell[int]; b.v = 3; if n == 0 { return 0 }; return b.get(\"hello\", n - 1) }
+func (b *Cell[T]) get(s *[]readonly char, n int) T { if n == 0 { testing.Println(len(s)); return b.v }; var _ int = f(n - 1); return b.v }
+testing.Println(f(1))
+" \
+"$BANNER
+> > function f parked (pending: Cell.get)
+> method Cell.get parked (pending: f)
+function f resolved
+method Cell.get resolved
+> 5
+3
+> "
+
+# --- A redefinition, generated before the group's new functions, calls one of
+# them with its signature (lowered without it, f passes p's string literal
+# unconverted and len(s) reads 0). ---
+run_repl "group-redefinition-calls-later-new-member" \
+"func p(s *[]readonly char, n int) int { if n == 0 { return f() }; return q(n) + len(s) }
+func f() int { return 1 }
+func f() int { return p(\"abc\", 1) + 10 }
+func q(n int) int { return 100 + n }
+testing.Println(f())
+testing.Println(p(\"\", 0))
+" \
+"$BANNER
+> function p parked (pending: f, q)
+> > function f parked (pending: p)
+> function p resolved
+function f resolved
+> 114
+> 114
+> "
+
+# --- A redefined generic function is stashed before any body is generated, so
+# the redefinition of f, generated first, instantiates the new g (generated
+# before g is stashed, f's g[int8] is instantiated from the old g, which has no
+# checked copy for it, and IR-gen panics). ---
+run_repl "group-redefinition-instantiates-later-redefined-generic" \
+"func P(n int) int { if n == 0 { return 1 }; var _ int = g[int](n); return f() + q(n) }
+func g[T any](x T) T { return x }
+testing.Println(g[int](5))
+func f() int { return 0 }
+func f() int { return cast(int, g[int8](2)) + g[int](10) + P(0) }
+func g[T any](x T) T { var _ int = P(0); testing.Println(\"new g\"); return x }
+func q(n int) int { return 100 + n }
+testing.Println(f())
+testing.Println(g[int](4))
+testing.Println(P(1))
+" \
+"$BANNER
+> function P parked (pending: g, f, q)
+> > 5
+> > function f parked (pending: P)
+> function g parked (pending: P)
+> function P resolved
+function f resolved
+function g resolved
+> new g
+new g
+13
+> new g
+4
+> new g
+new g
+new g
+114
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

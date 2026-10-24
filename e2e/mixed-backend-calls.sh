@@ -13,8 +13,9 @@
 # multiple and word-rounded, first and last, five of them), a single HFA result, HFA
 # arguments, and a multi-value return through a func value (its shim emitted on the
 # callee's side and on the caller's), a capturing closure and an interface method, and
-# zero-size struct arguments (no register, no stack: on x86-64 the arguments after one
-# are placed as if it were absent).
+# zero-size arguments (no register, no stack: the arguments after one are placed as if
+# it were absent — on x86-64, and on arm32 even for an 8-aligned one, which pads no
+# register to even).
 #
 # Both backends target the host arch — or, with MIXED_TARGET=arm32-linux (set by
 # e2e/arm32-mixed-backend-calls.sh), arm32 hard-float, linked with
@@ -100,6 +101,9 @@ type E struct {}
 // P2 is a two-int struct (16 bytes on a 64-bit target).
 type P2 struct { a int; b int }
 
+// Z is a zero-size struct aligned to 8.
+type Z struct { x [0]int64 }
+
 func PairVf(a float32) (V2f, int32)
 func PairIv(a float32) (int32, V3f)
 func PairDf(a float64) (D2, float64)
@@ -112,6 +116,8 @@ func OneV3(a float32) V3f
 func SumD2(p D2, q D2, r float64) float64
 func ZeroFirst(e E, a int, b int, c int, d int, s P2) int
 func ZeroAfterFull(a int, b int, c int, d int, e2 int, f int, e E, s P2, t P2) int
+func ZeroEven(a int32, b int32, c int32, z Z, d int32) int32
+func ZeroEvenArr(a int32, b int32, c int32, z [0]float64, d int32) int32
 func PairVfFn() *func(float32) (V2f, int32)
 func MakePairer(k int32) @func(float32) (V2f, int32)
 
@@ -159,6 +165,12 @@ func ZeroAfterFull(a int, b int, c int, d int, e2 int, f int, e E, s P2, t P2) i
 	return f + 10 * s.b + 100 * t.a + 1000 * t.b
 }
 
+func ZeroEven(a int32, b int32, c int32, z Z, d int32) int32 { return a + 10 * b + 100 * c + 1000 * d }
+
+func ZeroEvenArr(a int32, b int32, c int32, z [0]float64, d int32) int32 {
+	return a + 10 * b + 100 * c + 1000 * d
+}
+
 func PairVfFn() *func(float32) (V2f, int32) { return PairVf }
 
 func MakePairer(k int32) @func(float32) (V2f, int32) {
@@ -198,6 +210,10 @@ func main() {
 	var ze mbdep.E
 	testing.Println(mbdep.ZeroFirst(ze, 1, 2, 3, 4, mbdep.P2{a: 5, b: 6}))
 	testing.Println(mbdep.ZeroAfterFull(1, 2, 3, 4, 5, 6, ze, mbdep.P2{a: 7, b: 8}, mbdep.P2{a: 2, b: 3}))
+	var zz mbdep.Z
+	testing.Println(mbdep.ZeroEven(1, 2, 3, zz, 4))
+	var zf [0]float64
+	testing.Println(mbdep.ZeroEvenArr(5, 6, 7, zf, 8))
 	var f *func(float32) (mbdep.V2f, int32) = mbdep.PairVfFn()
 	fv, fn := f(6.5)
 	testing.Println(fv.x, fv.y, fn)
@@ -226,6 +242,8 @@ WANT="1.500000 2.500000 7
 13.000000
 651
 3286
+4321
+8765
 6.500000 7.500000 7
 3.500000 4.500000 7
 2.500000 5.000000 12

@@ -85,152 +85,6 @@ func shimReturnIsFloatScalar_x64(fvTyp @types.Type) bool {
 	return callconv.IsFloatScalarTyp(fvTyp.Results[0])
 }
 
-// emitShimArgMarshal_x64 marshals the func-value shim's incoming all-int,
-// positional-GP user args into the SysV layout the underlying function
-// expects, FOR THE REGISTER-ONLY CASE (every word in a GP/XMM register).  The
-// shim is entered under the uniform all-int dispatch ABI (the VM's
-// rt._call_shim_scalar and the compiled emitCallFuncValue both place every arg
-// word — float bits included — in a GP register): incoming user-arg word w
-// sits in argReg(srcPrefix + w), where `srcPrefix` is the count of leading GP
-// words to skip (1 = data, for the scalar/void shape; 2 = retbuf + data, for
-// the pack/sret shapes).
-//
-// Each float-scalar param is moved (movq/movd) from its GP slot into the XMM
-// register the underlying reads (xmm[nsrn], an independent FP-register
-// counter); every other param stays in GP at argReg(gpDestBase + ngrn).
-// `gpDestBase` is the first GP arg register the underlying uses: 0 normally,
-// but 1 for the sret shape (RDI holds the sret pointer, so explicit args
-// start at RSI).  This is the native half of the float shim ABI;
-// the LLVM shim does the same bitcast in IR.
-//
-// A by-address aggregate — a coerced in-register struct/array (named ≤ 16 B), OR
-// a raw slice / iface-value — arrives as ONE by-address pointer word
-// (shimInWordsForTypeX64 == 1); the shim copies that pointer to R10 (a scratch —
-// not a SysV arg reg nor the return reg) and loads its ArgWords value-words from
-// [R10 + 8k] into the consecutive outgoing GP regs the underlying's real ABI
-// reads.  The incoming cursor (srcWord) advances by 1 word but the outgoing cursor
-// (ngrn) by ArgWords — the two DIVERGE here (elsewhere they move in lockstep).
-// Scalars are one incoming = one outgoing word and keep the generic
-// register-shift path.
-//
-// Clobber-safety: for the register-shift path the GP destination index never
-// exceeds the GP source index (gpDestBase + ngrn <= srcPrefix + srcWord), so
-// left-to-right MOVs read each source before it is overwritten; the by-address
-// path reads only through R10 (loads from memory, distinct from any arg reg), so
-// it can't clobber a not-yet-consumed source either; the XMM moves target the
-// disjoint FP register file and never clobber a GP source.
-//
-// This path assumes everything fits in registers — callers gate it on the
-// register budget and route genuine overflow to emitShimArgSpill_x64.
-func emitShimArgMarshal_x64(a @asm.Assembler, cc callconv.CallConv, fvTyp @types.Type,
-		srcPrefix int, gpDestBase int) {
-	// Clobber-safe staging, ONLY when a by-address aggregate is present.  Such an
-	// arg makes the OUTGOING register cursor (ArgWords words) advance faster than
-	// the INCOMING by-address cursor (one pointer word), so an outgoing write can
-	// land in a LATER param's not-yet-read incoming arg register (a register-
-	// permutation hazard).  Without one, incoming and outgoing advance in
-	// lockstep (a constant down-shift), already clobber-safe, so we skip staging.
-	// When staging: x86-64 has too few caller-saved scratch regs to stage in
-	// registers (cf. aarch64's X9..X15), so stage the incoming dispatch words to
-	// a scratch stack frame (balanced Sub/Add, so the caller shape's RSP-relative
-	// slots are untouched) and read each from the frame.  R10 is the transient
-	// value-load scratch.
-	var needStage bool = false
-	for pi := 0; pi < len(fvTyp.Params); pi++ {
-		if isByAddressAggX64(cc, fvTyp.Params[pi].Type) { needStage = true }
-	}
-	var frame int = 0
-	if needStage {
-		var nIn int = 0
-		for pi := 0; pi < len(fvTyp.Params); pi++ {
-			nIn = nIn + shimInWordsForTypeX64(cc, fvTyp.Params[pi].Type)
-		}
-		frame = nIn * 8
-		if frame % 16 != 0 { frame = frame + 8 }
-		if frame > 0 {
-			x64.Sub(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frame))
-			for w := 0; w < nIn; w++ {
-				x64.Mov(a, x64.Mem(x64.RSP, 8 * w, x64.SZ64), x64.Reg(argReg(srcPrefix + w), x64.SZ64))
-			}
-		}
-	}
-	var ngrn int = 0
-	var nsrn int = 0
-	var srcWord int = 0
-	for pi := 0; pi < len(fvTyp.Params); pi++ {
-		var pt @types.Type = fvTyp.Params[pi].Type
-		if callconv.IsFloatScalarTyp(pt) {
-			if nsrn < 8 {
-				var fsrc int = argReg(srcPrefix + srcWord)
-				if needStage {
-					x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Mem(x64.RSP, 8 * srcWord, x64.SZ64))
-					fsrc = x64.R10
-				}
-				if callconv.FloatScalarIsI32(pt) {
-					x64.Movd_gp_to_xmm(a, x64.XMM0 + nsrn, fsrc)
-				} else {
-					x64.Movq_gp_to_xmm(a, x64.XMM0 + nsrn, fsrc)
-				}
-				nsrn = nsrn + 1
-			}
-			srcWord = srcWord + 1
-			continue
-		}
-		if isByAddressAggX64(cc, pt) {
-			// By-address aggregate (a coerced in-register struct/array, OR a
-			// raw slice / iface-value): the staged word at
-			// [RSP + 8*srcWord] is its by-address pointer (needStage is true
-			// here); load its value-words into the registers the underlying's
-			// real ABI reads.  Incoming consumed ONE pointer word; outgoing
-			// advanced ArgWords value-regs (the cursors DIVERGE).
-			x64.Mov(a, x64.Reg(x64.R10, x64.SZ64), x64.Mem(x64.RSP, 8 * srcWord, x64.SZ64))
-			if cc.PassesSseInRegs(pt) {
-				// SSE aggregate: expand the by-address image into XMM/GP by
-				// eightbyte class (SSE -> XMM(nsrn), INTEGER -> GP), not all-GP;
-				// advances both cursors.  The register-only shim only takes this
-				// path when the whole aggregate fits in registers (guaranteed:
-				// the outgoing budget counts its ArgWords eightbytes, so a wider
-				// call routes to the spill shim instead).
-				ngrn, nsrn = emitSseShimArgFromPtr(a, pt, x64.R10, gpDestBase, ngrn, nsrn)
-				srcWord = srcWord + 1
-				continue
-			}
-			var n int = callconv.ArgWords(pt)
-			for k := 0; k < n; k++ {
-				x64.Mov(a, x64.Reg(argReg(gpDestBase + ngrn + k), x64.SZ64), x64.Mem(x64.R10, 8 * k, x64.SZ64))
-			}
-			ngrn = ngrn + n
-			srcWord = srcWord + 1
-			continue
-		}
-		// Generic register-shift path: scalars and floats-as-GP — each occupies
-		// shimInWordsForTypeX64 incoming = outgoing words.  By-address aggregates
-		// were handled above; nothing reaching here diverges, so incoming and
-		// outgoing move in lockstep.
-		var w int = shimInWordsForTypeX64(cc, pt)
-		for k := 0; k < w; k++ {
-			var dst int = argReg(gpDestBase + ngrn + k)
-			if needStage {
-				x64.Mov(a, x64.Reg(dst, x64.SZ64), x64.Mem(x64.RSP, 8 * (srcWord + k), x64.SZ64))
-			} else {
-				var src int = argReg(srcPrefix + srcWord + k)
-				if dst != src {
-					x64.Mov(a, x64.Reg(dst, x64.SZ64), x64.Reg(src, x64.SZ64))
-				}
-			}
-		}
-		// Re-extend a narrow reg-passed slot the foreign producer may have left
-		// dirty (abi/03 §3.3): the native callee reads the full 64-bit register.
-		// canonicalizeSubWordSeamX64 is a no-op for pointer/word-size/float; w is 1.
-		canonicalizeSubWordSeamX64(a, argReg(gpDestBase + ngrn), pt)
-		ngrn = ngrn + w
-		srcWord = srcWord + w
-	}
-	if frame > 0 {
-		x64.Add(a, x64.Reg(x64.RSP, x64.SZ64), x64.Imm(frame))
-	}
-}
-
 // funcValMultiReturnTuple_x64 builds the anonymous multi-return tuple struct
 // for a function value's results (one field per result type, in order — field
 // names don't affect layout), or nil when the function value isn't a
@@ -325,6 +179,12 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Modu
 			continue
 		}
 		var nUserWords int = 0
+		// nInWords is the INCOMING dispatch-word count, budgeted separately: a
+		// zero-size by-address aggregate takes one incoming word (its address) but
+		// no outgoing one, so the outgoing count alone can fit the registers while
+		// the incoming words run onto the caller's stack, which the register-only
+		// shapes cannot read.
+		var nInWords int = funcvalPackedWords_x64(cc, fvTyp)
 		for pi := 0; pi < len(fvTyp.Params); pi++ {
 			var pt @types.Type = fvTyp.Params[pi].Type
 			// Budget the SHIM's register/spill routing on the OUTGOING (real
@@ -379,7 +239,7 @@ func emitFuncValueShims(a @asm.Assembler, pkgName *[]readonly char, mod @ir.Modu
 		var ccOut callconv.CallConv = cc
 		if useSret || bigMultiRet { ccOut.NumGpArgRegs = cc.NumGpArgRegs - 1 }
 		var needStack bool = ccOut.CallStackBytes(shimUserTypes_x64(fvTyp)) > 0
-		if nUserWords > userBudget || needStack {
+		if nUserWords > userBudget || nInWords > userBudget || needStack {
 			emitFuncvalSpillShim_x64(a, cc, fnLabel, fvTyp, retSz, usePack, useSret || bigMultiRet,
 					shimReturnIsFloatScalar_x64(fvTyp), smallMultiRet)
 			continue

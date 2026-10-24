@@ -4,6 +4,7 @@ import "pkg/binate/ir"
 import "pkg/binate/iropcode"
 import "pkg/binate/iropt"
 import "pkg/binate/native/callconv"
+import "pkg/std/vec"
 
 // AggLoadElision decides whether the aggregate `OP_LOAD` `ld` in function `f` may
 // SKIP its private materialization region (reserved by PlanFrame) and instead ALIAS
@@ -64,32 +65,42 @@ import "pkg/binate/native/callconv"
 // The result is AGG_LOAD_COPIED, AGG_LOAD_IN_PLACE, or AGG_LOAD_IN_PLACE_OVERLAPPING
 // for a load from an unknown source whose one use is a whole store (storedWhole) of
 // more than 16 bytes: the backend then copies that store as memmove does.
-func AggLoadElision(f @ir.Func, ld @ir.Instr) int {
+func AggLoadElision(f @ir.Func, ld @ir.Instr) int { return newFuncUses(f).aggLoadElision(ld) }
+
+// AggLoadElider answers AggLoadElision for the loads of one function from one use
+// index (see common.bni).
+type AggLoadElider struct {
+	uses @funcUses
+}
+
+// NewAggLoadElider returns an AggLoadElider for f.
+func NewAggLoadElider(f @ir.Func) @AggLoadElider {
+	var e @AggLoadElider = make(AggLoadElider)
+	e.uses = newFuncUses(f)
+	return e
+}
+
+// Elision is AggLoadElision(f, ld) for the elider's function f.
+func (e @AggLoadElider) Elision(ld @ir.Instr) int { return e.uses.aggLoadElision(ld) }
+
+// aggLoadElision is AggLoadElision over u's function.
+func (u @funcUses) aggLoadElision(ld @ir.Instr) int {
+	var f @ir.Func = u.f
 	if ld.Op != iropcode.OP_LOAD { return AGG_LOAD_COPIED }
 	if !callconv.IsAggregateTyp(ld.Typ) { return AGG_LOAD_COPIED }
 	if len(ld.Args) < 1 { return AGG_LOAD_COPIED }
 
-	// Locate ld's block and index.
-	var blk @ir.Block = nil
-	var li int = -1
-	for bi := 0; bi < len(f.Blocks); bi++ {
-		var b @ir.Block = f.Blocks[bi]
-		for ii := 0; ii < len(b.Instrs); ii++ {
-			if b.Instrs[ii] == ld {
-				blk = b
-				li = ii
-			}
-		}
-	}
-	if blk == nil || li < 0 { return AGG_LOAD_COPIED }
+	bi, li := u.locate(ld)
+	if bi < 0 { return AGG_LOAD_COPIED }
+	var blk @ir.Block = f.Blocks[bi]
 
 	// Reject any use of ld outside its own block: the same-block use-range analysis
 	// below cannot reason about it.
-	if valueUsedInOtherBlock(f, blk, ld) { return AGG_LOAD_COPIED }
+	if u.valueUsedInOtherBlock(blk, ld) { return AGG_LOAD_COPIED }
 
 	// Every same-block read of ld's bytes — through ld or an alias of it — must be a
 	// read-only consumer after li; get the last.
-	var lastUse int = lastAliasUseIndex(f, blk, li, ld)
+	var lastUse int = u.lastAliasUseIndex(blk, li, ld)
 	if lastUse < 0 { return AGG_LOAD_COPIED }
 
 	var src @ir.Instr = ld.Args[0]
@@ -99,7 +110,7 @@ func AggLoadElision(f @ir.Func, ld @ir.Instr) int {
 	// to OTHER slots between the load and its uses cannot disturb it — only a store to
 	// the source alloca (a reassignment) is a barrier.
 	if src != nil && src.Op == iropcode.OP_ALLOC && !src.IsGlobalRef &&
-			allocaAddrConfinedToLoadStore(f, src) && !storeToDestStrictlyBetween(blk, li, lastUse, src) {
+			u.allocaAddrConfinedToLoadStore(src) && !storeToDestStrictlyBetween(blk, li, lastUse, src) {
 		return AGG_LOAD_IN_PLACE
 	}
 
@@ -206,28 +217,15 @@ func storedWhole(blk @ir.Block, li int, ld @ir.Instr) bool {
 	return found
 }
 
-// valueUsedInOtherBlock reports whether value v is referenced in any block of f
-// other than `home` (its fault pads left out).
-func valueUsedInOtherBlock(f @ir.Func, home @ir.Block, v @ir.Instr) bool {
-	for bi := 0; bi < len(f.Blocks); bi++ {
-		if f.Blocks[bi] == home { continue }
-		if blockReferencesValue(f.Blocks[bi], v) { return true }
-	}
-	return false
-}
-
-// blockReferencesValue reports whether any instruction in b (other than v's own
-// definition) names v as an argument or a phi entry.
-func blockReferencesValue(b @ir.Block, v @ir.Instr) bool {
-	for ii := 0; ii < len(b.Instrs); ii++ {
-		var ins @ir.Instr = b.Instrs[ii]
-		if ins == v { continue }
-		for k := 0; k < len(ins.Args); k++ {
-			if ins.Args[k] == v { return true }
-		}
-		for k := 0; k < len(ins.Phis); k++ {
-			if ins.Phis[k].Val == v { return true }
-		}
+// valueUsedInOtherBlock reports whether value v is referenced — as an argument or a
+// phi entry, by an instruction other than v itself — in any block of f other than
+// home (its fault pads left out).  It reads v's use sites; a value the index does not
+// record (an id outside [0, NextID), which no load or alias has) counts as used.
+func (u @funcUses) valueUsedInOtherBlock(home @ir.Block, v @ir.Instr) bool {
+	if !u.indexed(v.ID) { return true }
+	for j := u.siteLo[v.ID]; j < u.siteLo[v.ID + 1]; j++ {
+		if u.f.Blocks[u.siteBlock[j]] == home { continue }
+		if u.siteIns(j) != v && u.siteNames(j, v) { return true }
 	}
 	return false
 }
@@ -276,7 +274,7 @@ func lastReadOnlyUseIndex(blk @ir.Block, li int, ld @ir.Instr) int {
 // copying: its consumers read ld's bytes later, at their own position.  Those reads
 // belong to ld's use range, or a write between the pass-through and its consumer
 // would go unchecked and the consumer would read the overwritten source.
-func lastAliasUseIndex(f @ir.Func, blk @ir.Block, li int, ld @ir.Instr) int {
+func (u @funcUses) lastAliasUseIndex(blk @ir.Block, li int, ld @ir.Instr) int {
 	// A use earlier in the block than the definition (a phi reached around a
 	// back edge) is outside the forward range analysis: reject it.
 	if valueReadInBlockRange(blk, 0, li, ld) { return -1 }
@@ -291,7 +289,7 @@ func lastAliasUseIndex(f @ir.Func, blk @ir.Block, li int, ld @ir.Instr) int {
 		for ii := ai + 1; ii < len(blk.Instrs); ii++ {
 			var ins @ir.Instr = blk.Instrs[ii]
 			if !isAggregateAlias(ins) || ins.Args[0] != a { continue }
-			if valueUsedInOtherBlock(f, blk, ins) { return -1 }
+			if u.valueUsedInOtherBlock(blk, ins) { return -1 }
 			if valueReadInBlockRange(blk, 0, ii, ins) { return -1 }
 			var al int = lastReadOnlyUseIndex(blk, ii, ins)
 			if al < 0 {
@@ -371,48 +369,36 @@ func allSameBlockUsesAreExtracts(blk @ir.Block, li int, lastUse int, ld @ir.Inst
 // field pointer, a phi entry) means `a`'s address escapes or `a`'s bytes may be
 // written indirectly, so the confinement — and with it the "only a direct store to
 // `a` writes `a`" guarantee this elision relies on — does not hold.
-func allocaAddrConfinedToLoadStore(f @ir.Func, a @ir.Instr) bool {
-	// derived[id]: a field or element pointer based on a (through others), whose
-	// uses must all be reads; grown to a fixpoint, one nesting level per sweep, and
-	// allocated at the first one found (most slots have none).
-	var derived @[]bool
-	var changed bool = true
-	for changed {
-		changed = false
-		for bi := 0; bi < len(f.Blocks); bi++ {
-			var b @ir.Block = f.Blocks[bi]
-			for ii := 0; ii < len(b.Instrs); ii++ {
-				var ins @ir.Instr = b.Instrs[ii]
-				if ins == a { continue }
-				for k := 0; k < len(ins.Phis); k++ {
-					var pv *ir.Instr = ins.Phis[k].Val
-					if pv != nil && (pv == a || isDerivedFrom(pv, derived)) { return false }
-				}
-				for k := 0; k < len(ins.Args); k++ {
-					var v @ir.Instr = ins.Args[k]
-					if v == nil || (v != a && !isDerivedFrom(v, derived)) { continue }
-					if k == 0 && ins.Op == iropcode.OP_LOAD { continue }
-					if k == 0 && ins.Op == iropcode.OP_STORE && v == a { continue }
-					var derives bool = k == 0 &&
-							(ins.Op == iropcode.OP_GET_FIELD_PTR || ins.Op == iropcode.OP_GET_ELEM_PTR)
-					// A derived pointer it cannot track would have its own uses go
-					// unchecked: fail closed.
-					if !derives || ins.ID < 0 || ins.ID >= f.NextID { return false }
-					if len(derived) == 0 { derived = make_slice(bool, f.NextID) }
-					if !derived[ins.ID] {
-						derived[ins.ID] = true
-						changed = true
-					}
-				}
-			}
+func (u @funcUses) allocaAddrConfinedToLoadStore(a @ir.Instr) bool {
+	// An alloca the index does not record (which no stack slot is) is not confined.
+	if !u.indexed(a.ID) { return false }
+	// derived: the field and element pointers based on a (through others), whose
+	// uses must all be reads — a worklist over the uses of a and of each one found.
+	if u.derived == nil { u.derived = newIDSet(u.f.NextID) }
+	var derived @idSet = u.derived
+	derived.reset()
+	var work @vec.Vec[int] = vec.New[int]()
+	work.Push(a.ID)
+	for work.Len() > 0 {
+		id, _ := work.Pop()
+		var isA bool = id == a.ID
+		for j := u.siteLo[id]; j < u.siteLo[id + 1]; j++ {
+			var ins @ir.Instr = u.siteIns(j)
+			var k int = u.siteOp[j]
+			// Of the operands with a's id, only a itself is a's address.
+			if ins == a || (isA && !u.siteNames(j, a)) { continue }
+			if k < 0 { return false }
+			if k == 0 && ins.Op == iropcode.OP_LOAD { continue }
+			if k == 0 && ins.Op == iropcode.OP_STORE && isA { continue }
+			var derives bool = k == 0 &&
+					(ins.Op == iropcode.OP_GET_FIELD_PTR || ins.Op == iropcode.OP_GET_ELEM_PTR)
+			// A derived pointer it cannot track would have its own uses go
+			// unchecked: fail closed.  So would one carrying a's id, taken for a.
+			if !derives || !u.indexed(ins.ID) || ins.ID == a.ID { return false }
+			if derived.add(ins.ID) { work.Push(ins.ID) }
 		}
 	}
 	return true
-}
-
-// isDerivedFrom reports whether v is one of the pointers derived marks.
-func isDerivedFrom(v *ir.Instr, derived @[]bool) bool {
-	return v.ID >= 0 && v.ID < len(derived) && derived[v.ID]
 }
 
 // storeToDestStrictlyBetween reports whether any `OP_STORE` whose destination

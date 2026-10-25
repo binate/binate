@@ -1,0 +1,176 @@
+package "pkg/binate/native/x64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/x64"
+
+// Frame slots past a 32-bit displacement.
+//
+// An x86-64 memory operand holds a signed 32-bit displacement, but a frame may pass
+// 2 GiB (spec §21.4: up to the target's address space), and PlanFrame lays the slots
+// out in instruction order, so after a large local every later slot is far.  A frame
+// access — RSP-relative for the frame, RBP-relative for the incoming stack arguments —
+// whose displacement, through the last one the access encodes, passes farDispLimit
+// goes through a register loaded with base + displacement (MOV imm64; LEA) instead —
+// neither instruction touches the flags, which a plain frame access leaves intact too
+// (a spill store can sit between a compare and its branch).  A load or a LEA computes
+// that address into its own destination.  An access without a free register (a store,
+// a copy loop) saves a scratch register in one of the red zone's two bottom slots,
+// [RSP - 128] and [RSP - 120], and restores it after: the frame never uses the red
+// zone, the multi-return tuple image (emitMultiReturnPack) stays above them, and RSP
+// never moves, so the access's other RSP-relative operands stay put.  Only an RSP- or
+// RBP-based access is rebased; another base's displacement is the assembler's to check.
+
+// farDispLimitDefault is a signed 32-bit displacement's limit.
+const farDispLimitDefault int64 = 0x7FFFFFFF
+
+// farDispLimit is the largest displacement a frame access encodes directly:
+// farDispLimitDefault, or a smaller one (Options.FarDisp, bnc -fx64-far-disp, a test
+// aid) under which an ordinary program takes the far paths too.
+var farDispLimit int64 = farDispLimitDefault
+
+// farSaveSlotOff is the displacement from RSP of red-zone save slot 0; slot 1 is 8
+// above it.
+const farSaveSlotOff int = -128
+
+// setFarDispLimit sets farDispLimit from Options.FarDisp (0 keeps the default).
+func setFarDispLimit(farDisp int) {
+	farDispLimit = farDispLimitDefault
+	if farDisp > 0 && cast(int64, farDisp) < farDispLimitDefault {
+		farDispLimit = cast(int64, farDisp)
+	}
+}
+
+// isFrameBase reports whether base is a frame base (RSP or RBP), whose accesses this
+// file rebases.
+func isFrameBase(base int) bool {
+	return base == x64.RSP || base == x64.RBP
+}
+
+// frameNear reports whether an access at [base + off] whose displacements run through
+// off + span - 1 encodes them directly: base is not a frame base, or they all lie within
+// farDispLimit.
+func frameNear(base int, off int64, span int64) bool {
+	if !isFrameBase(base) { return true }
+	return off >= -farDispLimit - 1 && off + span - 1 <= farDispLimit
+}
+
+// regBit is the avoid-mask bit for general register r (RAX..R15); none for any other
+// r (a negative one, or an XMM register, which a frame access never borrows).
+func regBit(r int) int {
+	if r < 0 || r > x64.R15 { return 0 }
+	return 1 << r
+}
+
+// frameAddr loads dst with base + off, leaving the flags intact.  dst must not be base.
+func frameAddr(a @asm.Assembler, dst int, base int, off int64) {
+	x64.Mov(a, x64.Reg(dst, x64.SZ64), x64.Imm64(off))
+	x64.Lea(a, x64.Reg(dst, x64.SZ64), x64.MemIdx(base, dst, 1, 0, x64.SZ64))
+}
+
+// frameLea loads rd with the address base + off: a LEA when the displacement is near,
+// else frameAddr.
+func frameLea(a @asm.Assembler, rd int, base int, off int64) {
+	if frameNear(base, off, 1) {
+		x64.Lea(a, x64.Reg(rd, x64.SZ64), x64.Mem(base, cast(int, off), x64.SZ64))
+		return
+	}
+	frameAddr(a, rd, base, off)
+}
+
+// farRef is the base register and displacement a frame access encodes, and the
+// scratch register saved for it (-1 for none) with its red-zone save slot.
+type farRef struct {
+	base  int
+	disp  int
+	saved int
+	slot  int
+}
+
+// farBegin returns the base and displacement for an access at [base + off] whose
+// displacements run through off + span - 1.  Near, they are base and off.  Far, it saves
+// a scratch register — one that avoid (a mask of regBit) does not name, nor base — in
+// red-zone save slot `slot` (0 or 1; two accesses open at once take one each), loads it
+// with base + off, and returns it with displacement 0; farEnd restores it.
+func farBegin(a @asm.Assembler, base int, off int64, span int64, avoid int, slot int) farRef {
+	var r farRef
+	r.saved = -1
+	r.slot = slot
+	if frameNear(base, off, span) {
+		r.base = base
+		r.disp = cast(int, off)
+		return r
+	}
+	var s int = farScratch(avoid | regBit(base))
+	x64.Mov(a, x64.Mem(x64.RSP, farSaveSlotOff + 8 * slot, x64.SZ64), x64.Reg(s, x64.SZ64))
+	frameAddr(a, s, base, off)
+	r.base = s
+	r.disp = 0
+	r.saved = s
+	return r
+}
+
+// farEnd restores the scratch register farBegin saved for r, if any.
+func farEnd(a @asm.Assembler, r farRef) {
+	if r.saved < 0 { return }
+	x64.Mov(a, x64.Reg(r.saved, x64.SZ64), x64.Mem(x64.RSP, farSaveSlotOff + 8 * r.slot, x64.SZ64))
+}
+
+// farScratch returns the first general register avoid does not name, from those with
+// no fixed role in a frame access (RSP and RBP never).
+func farScratch(avoid int) int {
+	if (avoid & regBit(x64.R11)) == 0 { return x64.R11 }
+	if (avoid & regBit(x64.R10)) == 0 { return x64.R10 }
+	if (avoid & regBit(x64.RAX)) == 0 { return x64.RAX }
+	if (avoid & regBit(x64.RCX)) == 0 { return x64.RCX }
+	if (avoid & regBit(x64.RDX)) == 0 { return x64.RDX }
+	if (avoid & regBit(x64.RSI)) == 0 { return x64.RSI }
+	if (avoid & regBit(x64.RDI)) == 0 { return x64.RDI }
+	if (avoid & regBit(x64.R8)) == 0 { return x64.R8 }
+	if (avoid & regBit(x64.R9)) == 0 { return x64.R9 }
+	panic("native x64: no scratch register for a far frame access")
+	return -1
+}
+
+// emitFrameLoad loads the sz-byte value at frame slot [base + off] into rd, as
+// emitScalarLoad does; far, through rd itself (or, for an XMM rd, a saved scratch).
+func emitFrameLoad(a @asm.Assembler, rd int, base int, off int64, sz int, signed bool) {
+	if frameNear(base, off, cast(int64, sz)) {
+		emitScalarLoad(a, rd, base, cast(int, off), sz, signed)
+		return
+	}
+	if isFpReg(rd) {
+		var r farRef = farBegin(a, base, off, cast(int64, sz), 0, 0)
+		emitScalarLoad(a, rd, r.base, r.disp, sz, signed)
+		farEnd(a, r)
+		return
+	}
+	frameAddr(a, rd, base, off)
+	emitScalarLoad(a, rd, rd, 0, sz, signed)
+}
+
+// emitFrameStore stores rt's low sz bytes to frame slot [base + off], as
+// emitScalarStore does.
+func emitFrameStore(a @asm.Assembler, rt int, base int, off int64, sz int) {
+	var r farRef = farBegin(a, base, off, cast(int64, sz), regBit(rt), 0)
+	emitScalarStore(a, rt, r.base, r.disp, sz)
+	farEnd(a, r)
+}
+
+// emitFrameStoreImm stores imm (a sign-extended 32-bit immediate) to the 8-byte frame
+// slot [base + off].
+func emitFrameStoreImm(a @asm.Assembler, imm int, base int, off int64) {
+	var r farRef = farBegin(a, base, off, 8, 0, 0)
+	x64.Mov(a, x64.Mem(r.base, r.disp, x64.SZ64), x64.Imm(imm))
+	farEnd(a, r)
+}
+
+// emitFrameCopyLoopX64 is emitCopyLoopX64 for offsets that may be far frame
+// displacements: each far side is addressed through its own saved scratch register.
+func emitFrameCopyLoopX64(a @asm.Assembler, dstBase int, dstOff int64, srcBase int, srcOff int64,
+		sz int, idx int) {
+	var d farRef = farBegin(a, dstBase, dstOff, 32, regBit(idx) | regBit(srcBase), 0)
+	var s farRef = farBegin(a, srcBase, srcOff, 32, regBit(idx) | regBit(d.base) | regBit(dstBase), 1)
+	emitCopyLoopX64(a, d.base, d.disp, s.base, s.disp, sz, idx)
+	farEnd(a, s)
+	farEnd(a, d)
+}

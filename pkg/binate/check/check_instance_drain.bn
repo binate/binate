@@ -1,0 +1,248 @@
+package "pkg/binate/check"
+
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/std/strconv"
+import "pkg/std/strings"
+import "pkg/std/vec"
+
+// Draining the stack of instances to check.  Spec gen.mono.instances bounds,
+// for each instance the program names, the shortest chain to it from one the
+// program writes.  The stack is drained depth-first, so a chain that grows
+// without bound reaches MAX_INSTANCE_DEPTH soon; but the chain an instance is
+// first named through need not be its shortest.  So an instance first reached
+// through too long a chain is set aside, and once nothing else is left the
+// chains are measured again over what the drain's instances named
+// (relaxInstanceDepths): those set aside that now fit are checked, and one that
+// still does not fit is reported.  A family that grows and fans out (`f[T]`
+// naming `f[@T]` and `f[*T]`) has a branch for every combination, each passing
+// MAX_INSTANCE_DEPTH in turn, so the stack would not empty; an instance set
+// aside is also measured again, and reported if it still does not fit, once
+// MAX_CHAIN_SEARCH more instances have been checked.
+
+// MAX_CHAIN_SEARCH bounds the instances checked, after one is set aside, while
+// a shorter chain to it may turn up (spec §21.4: at least 256).
+const MAX_CHAIN_SEARCH int = 256
+
+// instanceDrain is one drain of the stack: Seen holds the instances it checked,
+// Aside those set aside, their chains too long, with the count of its checks
+// (Checks) when each was set aside in AsideAt.
+type instanceDrain struct {
+	Seen    @vec.Vec[@InstWork]
+	Aside   @vec.Vec[@InstWork]
+	AsideAt @vec.Vec[int]
+	Checks  int
+}
+
+// A chainEdge records that the instance whose state is To, queued or checked in
+// a drain, was named from the instance From — by From's check, or as From was
+// built or its signature resolved — or, From nil, by the program at Site.  It
+// holds To: a REPL declaration that parks drops the records of the instances it
+// named, with their states.
+type chainEdge struct {
+	From @InstWork
+	To   @InstCheckState
+	Site token.Pos
+}
+
+// noteChainEdge records that the instance whose state is s, queued or checked
+// in this drain, was named at site from the instance from (nil: by the
+// program).
+func noteChainEdge(st @InstanceState, from @InstWork, s @InstCheckState, site token.Pos) {
+	var e chainEdge
+	e.From = from
+	e.To = s
+	e.Site = site
+	st.Edges.Push(e)
+}
+
+// truncateChainEdges drops the links of chains recorded since st.Edges held
+// mark of them.
+func truncateChainEdges(st @InstanceState, mark int) {
+	for st.Edges.Len() > mark {
+		_, _ = st.Edges.Pop()
+	}
+}
+
+// drainInstances checks every queued instance (drainInstancesAbove), unless
+// declarations are being checked tentatively (checkDeclsTentative drains
+// their instances itself).
+func drainInstances(c @Checker) {
+	if c.Instances == nil || c.TentativeMode {
+		return
+	}
+	drainInstancesAbove(c, 0)
+}
+
+// drainInstancesAbove checks the instances queued above floor on the stack, and
+// those queued while checking them: depth-first, each body's instances in the
+// order it names them, an instance whose chain is longer than
+// MAX_INSTANCE_DEPTH set aside until nothing else is left, or MAX_CHAIN_SEARCH
+// more instances are checked (requeueFitting).  It stops at the first instance
+// set aside that a shorter chain does not reach by then.
+func drainInstancesAbove(c @Checker, floor int) {
+	var st @InstanceState = instanceState(c)
+	var d @instanceDrain = make(instanceDrain)
+	d.Seen = vec.New[@InstWork]()
+	d.Aside = vec.New[@InstWork]()
+	d.AsideAt = vec.New[int]()
+	reverseInstWork(st, floor)
+	for !st.Overflowed && (st.Top > floor || requeueFitting(st, d)) {
+		endSpentSearch(c, st, d)
+		if !st.Overflowed {
+			// TODO: keep the pop in popInstWork — the pinned BUILDER skips a
+			// loop body opening with `st.Top--` (claude-todo: "Until
+			// BUILDER_VERSION includes binate 1f29d31e9").
+			var w @InstWork = popInstWork(st)
+			var mark int = st.Top
+			drainInstanceWork(c, d, w)
+			reverseInstWork(st, mark)
+		}
+	}
+	if !st.Overflowed && d.Aside.Len() > 0 {
+		errInstanceTooDeep(c, d.Aside.Get(0))
+		st.Overflowed = true
+	}
+	// What the drain set aside is dropped unchecked with the rest of the stack.
+	for i := 0; i < d.Aside.Len(); i++ {
+		pushInstWork(st, d.Aside.Get(i))
+	}
+	if floor == 0 {
+		st.Edges = vec.New[chainEdge]()
+	}
+	finishInstanceDrain(st, floor)
+}
+
+// drainInstanceWork checks the instance w, popped in the drain d, unless its
+// chain is longer than MAX_INSTANCE_DEPTH: then it is set aside, still queued.
+func drainInstanceWork(c @Checker, d @instanceDrain, w @InstWork) {
+	if w.Depth > MAX_INSTANCE_DEPTH {
+		d.Aside.Push(w)
+		d.AsideAt.Push(d.Checks)
+		return
+	}
+	d.Checks = d.Checks + 1
+	d.Seen.Push(w)
+	checkInstanceWork(c, w)
+}
+
+// endSpentSearch, once MAX_CHAIN_SEARCH instances have been checked since the
+// first instance still set aside in the drain d was, queues again those set
+// aside that now fit (requeueFitting); then, if the search for the first one
+// still set aside is spent too, it reports that one, stopping the drain.
+func endSpentSearch(c @Checker, st @InstanceState, d @instanceDrain) {
+	if !chainSearchSpent(d) {
+		return
+	}
+	_ = requeueFitting(st, d)
+	if chainSearchSpent(d) {
+		errInstanceTooDeep(c, d.Aside.Get(0))
+		st.Overflowed = true
+	}
+}
+
+// chainSearchSpent reports whether MAX_CHAIN_SEARCH instances have been checked
+// since the first instance still set aside in the drain d was.
+func chainSearchSpent(d @instanceDrain) bool {
+	return d.Aside.Len() > 0 && d.Checks - d.AsideAt.Get(0) >= MAX_CHAIN_SEARCH
+}
+
+// requeueFitting measures the chains of the drain d's instances again
+// (relaxInstanceDepths) and queues again those set aside whose chain now fits
+// in MAX_INSTANCE_DEPTH, the first set aside on top; reports whether it queued
+// any.
+func requeueFitting(st @InstanceState, d @instanceDrain) bool {
+	if d.Aside.Len() == 0 {
+		return false
+	}
+	relaxInstanceDepths(st, d)
+	var mark int = st.Top
+	var rest @vec.Vec[@InstWork] = vec.New[@InstWork]()
+	var restAt @vec.Vec[int] = vec.New[int]()
+	for i := 0; i < d.Aside.Len(); i++ {
+		var w @InstWork = d.Aside.Get(i)
+		if w.Depth > MAX_INSTANCE_DEPTH {
+			rest.Push(w)
+			restAt.Push(d.AsideAt.Get(i))
+		} else {
+			pushInstWork(st, w)
+		}
+	}
+	d.Aside = rest
+	d.AsideAt = restAt
+	reverseInstWork(st, mark)
+	return st.Top > mark
+}
+
+// relaxInstanceDepths lowers the chain length (Depth) of each instance the drain
+// d checked or set aside to its shortest chain through the links recorded
+// (InstanceState.Edges), and its parent (Parent) to the instance that chain
+// names it from.  An instance's chain is longer than its parent's, and the
+// lengths only fall, so the parents never form a cycle.
+func relaxInstanceDepths(st @InstanceState, d @instanceDrain) {
+	st.RelaxStamp = st.RelaxStamp + 1
+	var nodes @vec.Vec[@InstWork] = vec.New[@InstWork]()
+	for i := 0; i < d.Seen.Len(); i++ {
+		nodes.Push(d.Seen.Get(i))
+	}
+	for i := 0; i < d.Aside.Len(); i++ {
+		nodes.Push(d.Aside.Get(i))
+	}
+	for i := 0; i < nodes.Len(); i++ {
+		var s @InstCheckState = nodes.Get(i).State
+		if s != nil {
+			s.RelaxStamp = st.RelaxStamp
+			s.RelaxIdx = i
+		}
+	}
+	var changed bool = true
+	for changed {
+		changed = false
+		for i := 0; i < st.Edges.Len(); i++ {
+			var e chainEdge = st.Edges.Get(i)
+			if e.To.RelaxStamp == st.RelaxStamp && relaxChainEdge(nodes.Get(e.To.RelaxIdx), e) {
+				changed = true
+			}
+		}
+	}
+}
+
+// relaxChainEdge shortens the chain of the instance to through the link e — to
+// is one level past e.From, or, with no From, written in the program at e.Site —
+// and reports whether it did.
+func relaxChainEdge(to @InstWork, e chainEdge) bool {
+	var depth int = 1
+	if e.From != nil {
+		depth = e.From.Depth + 1
+	}
+	if depth >= to.Depth {
+		return false
+	}
+	to.Depth = depth
+	to.Parent = e.From
+	if e.From == nil {
+		to.Site = e.Site
+	}
+	return true
+}
+
+// errInstanceTooDeep reports, at the site of the chain's first instance, that
+// the chain of instances from it grew beyond MAX_INSTANCE_DEPTH: `F[int]` names
+// `F[@int]`, which names …
+func errInstanceTooDeep(c @Checker, w @InstWork) {
+	var root @InstWork = w
+	var next @InstWork = w
+	for root.Parent != nil {
+		next = root
+		root = root.Parent
+	}
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("generic instantiation nested too deeply (polymorphic recursion?): ")
+	cb.Write(root.Label)
+	cb.Write(" names ")
+	cb.Write(next.Label)
+	cb.Write(", and so on through ")
+	cb.Write(strconv.Itoa(MAX_INSTANCE_DEPTH))
+	cb.Write(" levels")
+	addCheckError(c, root.Site, buf.CopyStr(cb.String()))
+}

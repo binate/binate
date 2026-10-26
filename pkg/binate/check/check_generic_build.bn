@@ -37,6 +37,78 @@ import "pkg/stdx/slices"
 // queued meanwhile do not each start another.
 const MAX_INSTANCES_PER_BUILD int = 4096
 
+// MAX_BUILD_NESTING bounds the instantiations of generic types and generic
+// aliases' targets in progress one inside another (GenericInstDepth), well
+// below the native stack budget: each level adds several resolver frames, so a
+// high cap (e.g. 1024) overflows the stack before the diagnostic fires.  It is
+// far above any realistic hand-written generic nesting.
+const MAX_BUILD_NESTING int = 128
+
+// errBuildNestedTooDeeply reports, at pos, an instantiation nested more than
+// MAX_BUILD_NESTING deep.
+func errBuildNestedTooDeeply(c @Checker, pos token.Pos) {
+	addCheckError(c, pos,
+			"generic instantiation nested too deeply (cyclic or unbounded type argument?)")
+}
+
+// buildNewInstance builds the new instance entry, named at at — user-facing or
+// not, in view, from the instance whose check named it (work, if any) —
+// checking its type arguments against their constraints first when constrain.
+// The instantiation is in progress until it is built: what it reaches
+// meanwhile may name it, unbuilt (flushPendingChecks waits for it).
+func buildNewInstance(c @Checker, entry @GenericInstantiation, isIface bool, at token.Pos,
+		userFacing bool, view ImplView, work @InstWork, constrain bool) {
+	var d @ast.Decl = entry.Decl
+	c.GenericInstDepth = c.GenericInstDepth + 1
+	var st @InstanceState = instanceState(c)
+	st.BuildDepth = st.BuildDepth + 1
+	var savedIndirect int = enterByValue(c)
+	enterLayoutFrame(c, entry)
+	// An alias reached while this instantiation is resolved — its generic's
+	// declaration with the type parameters abstract, then its members — is
+	// reached through a defined type, so it is no alias cycle
+	// (instantiateGenericAlias), even when this instantiation is named in that
+	// alias's own target.
+	var savedAliasResolving @[]@GenericInstantiation = c.AliasResolving
+	var noAliases @[]@GenericInstantiation
+	c.AliasResolving = noAliases
+	// The shared declaration is resolved once with its type parameters abstract,
+	// and this instantiation from its own clone, whose resolution under the
+	// concrete arguments records on the clone, not on the shared declaration
+	// (a length that depends on a type parameter would otherwise be stamped with
+	// this instantiation's value, which every instantiation's IR reads).
+	resolveGenericTypeDeclAbstract(c, d, isIface)
+	entry.Clone = ast.CloneDecl(d)
+	if constrain { checkNewInstanceConstraints(c, entry, at, view) }
+	buildInstance(c, entry, isIface, at, userFacing, view, work)
+	leaveLayoutFrame(c)
+	leaveByValue(c, savedIndirect)
+	c.AliasResolving = savedAliasResolving
+	c.GenericInstDepth = c.GenericInstDepth - 1
+	st.BuildDepth = st.BuildDepth - 1
+	flushLayoutWaits(c)
+	if c.GenericInstDepth == 0 { flushPendingChecks(c) }
+}
+
+// checkNewInstanceConstraints checks the type arguments of the new instance
+// entry, named user-facing at at in view, against their constraints (gen.satisfy,
+// §12.4), exactly as instantiateGenericFunc does for generic functions.  Reported
+// once per unique (decl, args) and view (CheckedViews), and only for a
+// user-facing instantiation (instantiateGenericDeclWithArgs) -- so a repeated
+// `Box[NoOrder]` in one view reports the miss once and a speculative probe never
+// reports.  The build still proceeds after a miss so downstream field and method
+// uses do not cascade.
+func checkNewInstanceConstraints(c @Checker, entry @GenericInstantiation, at token.Pos,
+		view ImplView) {
+	// Latch only when the diagnostics reach the user: under TentativeMode a
+	// parked decl's tentative errors are discarded, so latching would strand a
+	// genuine miss for a later real use.
+	if !c.TentativeMode {
+		markConstraintsChecked(entry, view)
+	}
+	checkInstantiationConstraints(c, entry.Decl, entry.TypeArgs, at, view, namingAt(c, view))
+}
+
 // An ownBuildBudget is the count of instances built for an outermost
 // instantiation (MAX_INSTANCES_PER_BUILD) that enterOwnBuildBudget set aside.
 type ownBuildBudget struct {
@@ -241,13 +313,18 @@ func populateIfaceInstance(c @Checker, entry @GenericInstantiation, userFacing b
 	c.GenericIfacePopulating = c.GenericIfacePopulating[0:len(c.GenericIfacePopulating) - 1]
 }
 
-// ensureMembers builds the methods of the instance t is — through pointers,
-// interface values, `readonly` and aliases — when it waits for them
+// ensureMembers builds the instance t is — through pointers, slices, arrays,
+// interface values, `readonly`, aliases and the underlying types of named types
+// (`type Ref[T any] *Node[T]`, whose field access reaches Node[T]) — when it is
+// postponed (check_generic_postpone.bn), and its methods when it waits for them
 // (buildInstanceMembers), and those of an interface's ancestors and of a type
 // parameter's constraint, which a method lookup on t walks: code is about to use
 // it.
 func ensureMembers(c @Checker, t @types.Type) {
-	if c == nil || c.Instances == nil || len(c.Instances.Deferred) == 0 { return }
+	if c == nil || c.Instances == nil ||
+			(len(c.Instances.Deferred) == 0 && len(c.Instances.Postponed) == 0) {
+		return
+	}
 	var seen typeVisits
 	ensureMembersIn(c, t, &seen)
 }
@@ -259,7 +336,8 @@ func ensureMembersIn(c @Checker, t @types.Type, seen *typeVisits) {
 	for t != nil {
 		var k int = t.Kind
 		if k == types.TYP_POINTER || k == types.TYP_MANAGED_PTR || k == types.TYP_READONLY ||
-				k == types.TYP_INTERFACE_VALUE || k == types.TYP_INTERFACE_VALUE_MANAGED {
+				k == types.TYP_INTERFACE_VALUE || k == types.TYP_INTERFACE_VALUE_MANAGED ||
+				k == types.TYP_SLICE || k == types.TYP_MANAGED_SLICE || k == types.TYP_ARRAY {
 			t = t.Elem
 		} else if k == types.TYP_ALIAS {
 			t = t.Target
@@ -274,6 +352,7 @@ func ensureMembersIn(c @Checker, t @types.Type, seen *typeVisits) {
 	}
 	if t.Kind == types.TYP_INTERFACE && !seen.enter(t) { return }
 	if t.InstDecl != nil {
+		buildIfPostponed(c, t)
 		var st @InstanceState = c.Instances
 		for i := 0; i < len(st.Deferred); i++ {
 			var entry @GenericInstantiation = st.Deferred[i]
@@ -290,6 +369,9 @@ func ensureMembersIn(c @Checker, t @types.Type, seen *typeVisits) {
 			ensureMembersIn(c, t.Parents[i], seen)
 		}
 	}
+	if t.Kind == types.TYP_NAMED && t.Underlying != nil && seen.enter(t) {
+		ensureMembersIn(c, t.Underlying, seen)
+	}
 }
 
 // completeMembers builds the methods the instance entry waited for, as an
@@ -300,6 +382,7 @@ func completeMembers(c @Checker, entry @GenericInstantiation) {
 	if st.BuildDepth == st.BuildBase { beginBuildBudget(c, entry.Decl, entry.TypeArgs, entry.NamedAt) }
 	st.BuildDepth = st.BuildDepth + 1
 	c.GenericInstDepth = c.GenericInstDepth + 1
+	var savedIndirect int = enterByValue(c)
 	var noEntry @GenericInstantiation
 	enterLayoutFrame(c, noEntry)
 	if entry.Result.Kind == types.TYP_INTERFACE {
@@ -311,6 +394,7 @@ func completeMembers(c @Checker, entry @GenericInstantiation) {
 		unbindInstance(c, saved)
 	}
 	leaveLayoutFrame(c)
+	leaveByValue(c, savedIndirect)
 	c.GenericInstDepth = c.GenericInstDepth - 1
 	st.BuildDepth = st.BuildDepth - 1
 	flushLayoutWaits(c)

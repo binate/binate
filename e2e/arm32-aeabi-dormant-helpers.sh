@@ -2,7 +2,9 @@
 # e2e/arm32-aeabi-dormant-helpers.sh — regression coverage for the arm32-baremetal
 # AEABI helpers that NO Binate codegen ever emits, so the conformance/unittest
 # suites never exercise them: the flag-setting float comparisons
-# __aeabi_c{d,f}cmp{eq,le} / c{d,f}rcmple and the negates __aeabi_{d,f}neg.
+# __aeabi_c{d,f}cmp{eq,le} / c{d,f}rcmple, the negates __aeabi_{d,f}neg, and the
+# 32-bit divides __aeabi_{u,}idiv{,mod} (both backends target armv7ve, whose
+# sdiv / udiv divide in one instruction).
 #
 # They exist only so a linked GCC/clang-compiled C object resolves.  To exercise
 # them we link a hand-written ARM asm object whose `probe_*` functions call each
@@ -14,7 +16,7 @@
 #
 # Only the LLVM arm32 path is exercised: __c_call is not yet supported by the
 # native arm32 backend (it errors "native backend failed to emit object").  The
-# helper asm is target runtime (aeabi_float.s), linked identically for both
+# helper asm is target runtime (aeabi_float.s, aeabi_int.s), linked identically for both
 # backends, so the LLVM path fully covers the helpers.
 #
 # Auto-discovered by .github/workflows/e2e-tests.yml.  SKIPs unless a
@@ -140,6 +142,27 @@ f_gt:	push {lr}
 d_neg:	b __aeabi_dneg
 	.global f_neg
 f_neg:	b __aeabi_fneg
+
+// 32-bit divides: n in r0, d in r1 -> the quotient in r0, or the remainder
+// (left in r1 by the divmod forms) moved there.
+	.global si_q
+si_q:	b __aeabi_idiv
+	.global si_qm
+si_qm:	b __aeabi_idivmod
+	.global si_r
+si_r:	push {lr}
+	bl __aeabi_idivmod
+	mov r0, r1
+	pop {pc}
+	.global ui_q
+ui_q:	b __aeabi_uidiv
+	.global ui_qm
+ui_qm:	b __aeabi_uidivmod
+	.global ui_r
+ui_r:	push {lr}
+	bl __aeabi_uidivmod
+	mov r0, r1
+	pop {pc}
 EOF
 
 # --- the Binate driver: __c_call each probe, print each observable result --
@@ -210,6 +233,33 @@ func main() {
 	testing.Println(b2i(__c_call("d_neg", uint64, pinf) == 0xFFF0000000000000))  // 1  +inf -> -inf
 	testing.Println(b2i(__c_call("f_neg", uint32, f1) == cast(uint32, 0xBF800000))) // 1
 	testing.Println(b2i(__c_call("f_neg", uint32, cast(uint32, 0)) == cast(uint32, 0x80000000))) // 1
+
+	// 32-bit signed divides: truncating quotient, remainder with the dividend's sign
+	var imin int = -2147483647 - 1
+	testing.Println(__c_call("si_q", int, 7, 2))        // 3
+	testing.Println(__c_call("si_q", int, -7, 2))       // -3
+	testing.Println(__c_call("si_q", int, 7, -2))       // -3
+	testing.Println(__c_call("si_q", int, -7, -2))      // 3
+	testing.Println(__c_call("si_q", int, imin, 1))     // -2147483648
+	testing.Println(__c_call("si_q", int, imin, 7))     // -306783378
+	testing.Println(__c_call("si_qm", int, -100, 7))    // -14
+	testing.Println(__c_call("si_r", int, 7, 2))        // 1
+	testing.Println(__c_call("si_r", int, -7, 2))       // -1
+	testing.Println(__c_call("si_r", int, 7, -2))       // 1
+	testing.Println(__c_call("si_r", int, -7, -2))      // -1
+	testing.Println(__c_call("si_r", int, imin, 7))     // -2
+	testing.Println(__c_call("si_r", int, imin, imin))  // 0
+	// 32-bit unsigned divides, the top bit set too
+	var umax uint32 = 0xFFFFFFFF
+	var utop uint32 = 0x80000000
+	testing.Println(__c_call("ui_q", int, 100, 7))      // 14
+	testing.Println(__c_call("ui_qm", int, 5, 9))       // 0
+	testing.Println(__c_call("ui_r", int, 100, 7))      // 2
+	testing.Println(__c_call("ui_r", int, 5, 9))        // 5
+	testing.Println(b2i(__c_call("ui_q", uint32, umax, cast(uint32, 2)) == cast(uint32, 0x7FFFFFFF))) // 1
+	testing.Println(b2i(__c_call("ui_r", uint32, umax, cast(uint32, 10)) == cast(uint32, 5)))         // 1
+	testing.Println(b2i(__c_call("ui_q", uint32, umax, umax) == cast(uint32, 1)))                     // 1
+	testing.Println(b2i(__c_call("ui_q", uint32, utop, cast(uint32, 3)) == cast(uint32, 0x2AAAAAAA))) // 1
 }
 
 func b2i(x bool) int {
@@ -228,7 +278,10 @@ WANT="$(printf '%s\n' \
 	1 0 0 0 1 \
 	1 0 1 0 1 \
 	1 0 1 1 0 1 0 \
-	1 1 1 1 1)"
+	1 1 1 1 1 \
+	3 -3 -3 3 -2147483648 -306783378 -14 \
+	1 -1 1 -1 -2 0 \
+	14 0 2 5 1 1 1 1)"
 
 # --- build gen1 bnc from current source -----------------------------------
 GEN1="$TMP/gen1-bnc"
@@ -240,7 +293,7 @@ if [ ! -x "$GEN1" ]; then
 fi
 
 # --- assemble the probes, compile+link the Binate program, run under qemu --
-if ! "$CLANG" -target arm-none-eabi -march=armv7-a -mfloat-abi=soft -c \
+if ! "$CLANG" -target arm-none-eabi -march=armv7ve -mfloat-abi=soft -c \
         "$TMP/probes.s" -o "$TMP/probes.o" 2>"$TMP/as.err"; then
     echo "FAIL: assembling probes.s failed" >&2
     head -6 "$TMP/as.err" >&2
@@ -268,7 +321,7 @@ GOT="$(timeout 15 "$QEMU" -M virt -cpu cortex-a15 -m 16M -nographic -semihosting
 
 if [ "$GOT" = "$WANT" ]; then
     n=$(printf '%s\n' "$GOT" | grep -c .)
-    echo "PASS: arm32 AEABI dormant helpers (cdcmp*/cfcmp*/dneg/fneg) — $n checks match under qemu"
+    echo "PASS: arm32 AEABI dormant helpers (cdcmp*/cfcmp*/dneg/fneg/idiv*) — $n checks match under qemu"
     exit 0
 fi
 

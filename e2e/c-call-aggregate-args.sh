@@ -286,7 +286,7 @@ ARM_QEMU="$(command -v qemu-arm-static || command -v qemu-arm || true)"
 arm32_probe() {
     [ -n "$ARM_QEMU" ] || return 1
     echo 'int main(void){return 0;}' \
-        | "$CLANG" -target arm-linux-gnueabihf -march=armv7-a -x c - -o "$TMP/_a32probe" 2>/dev/null \
+        | "$CLANG" -target arm-linux-gnueabihf -march=armv7ve -x c - -o "$TMP/_a32probe" 2>/dev/null \
         && "$ARM_QEMU" "$TMP/_a32probe" >/dev/null 2>&1
 }
 
@@ -297,7 +297,7 @@ check_arm32() {
     label="arm32-$1"; extra="$2"
     work="$TMP/$label"
     mkdir -p "$work"
-    if ! "$CLANG" -target arm-linux-gnueabihf -march=armv7-a -c -o "$work/cagg.o" "$TMP/cagg.c" 2>"$work/cc.err"; then
+    if ! "$CLANG" -target arm-linux-gnueabihf -march=armv7ve -c -o "$work/cagg.o" "$TMP/cagg.c" 2>"$work/cc.err"; then
         fail "$label: arm32 C callee compile failed" "$(head -4 "$work/cc.err")"
         return
     fi

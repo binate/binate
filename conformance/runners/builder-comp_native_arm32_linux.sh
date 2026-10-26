@@ -49,7 +49,7 @@ runner_setup() {
     fi
     # Sanity check: clang can produce arm-linux-gnueabihf output (deps still go
     # through LLVM).  Catches a missing cross-toolchain early.
-    if ! echo 'int main(void){return 0;}' | clang -target arm-linux-gnueabihf -march=armv7-a -x c -c - -o /tmp/_bn_narm32_probe.o 2>/dev/null; then
+    if ! echo 'int main(void){return 0;}' | clang -target arm-linux-gnueabihf -march=armv7ve -x c -c - -o /tmp/_bn_narm32_probe.o 2>/dev/null; then
         echo "error: clang cannot target arm-linux-gnueabihf — install cross-toolchain" >&2
         echo "  Linux:  sudo apt-get install gcc-arm-linux-gnueabihf" >&2
         echo "  macOS:  no easy native path; use Docker or a Linux VM" >&2

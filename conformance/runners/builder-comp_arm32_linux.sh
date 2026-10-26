@@ -2,7 +2,7 @@
 # Runner: builder-comp_arm32_linux — current-tree cmd/bnc (compiled via
 # the BUILDER during runner_setup → GEN1_COMPILER) cross-compiles
 # each conformance test for arm-linux-gnueabihf (32-bit ARMv7-A
-# Linux) via clang's `--target=arm-linux-gnueabihf -march=armv7-a`.
+# Linux) via clang's `--target=arm-linux-gnueabihf -march=armv7ve`.
 # The resulting binary is executed under qemu-arm user-mode emulation.
 
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
@@ -44,7 +44,7 @@ runner_setup() {
     # Sanity check: ensure clang can produce arm-linux-gnueabihf
     # output.  Catches missing cross-toolchain early instead of
     # failing test-by-test.
-    if ! echo 'int main(void){return 0;}' | clang -target arm-linux-gnueabihf -march=armv7-a -x c -c - -o /tmp/_bn_arm32_probe.o 2>/dev/null; then
+    if ! echo 'int main(void){return 0;}' | clang -target arm-linux-gnueabihf -march=armv7ve -x c -c - -o /tmp/_bn_arm32_probe.o 2>/dev/null; then
         echo "error: clang cannot target arm-linux-gnueabihf — install cross-toolchain" >&2
         echo "  Linux:  sudo apt-get install gcc-arm-linux-gnueabihf" >&2
         echo "  macOS:  no easy native path; use Docker or a Linux VM" >&2

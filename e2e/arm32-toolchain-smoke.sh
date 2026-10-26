@@ -50,7 +50,7 @@ trap 'rm -rf "$TMP"' EXIT
 # — a compile-only check passes on any clang and would red a partial-toolchain
 # runner at the tool runs instead of skipping.
 if ! { echo 'int main(void){return 0;}' \
-        | "$CLANG" -target arm-linux-gnueabihf -march=armv7-a -x c - -o "$TMP/probe" 2>/dev/null \
+        | "$CLANG" -target arm-linux-gnueabihf -march=armv7ve -x c - -o "$TMP/probe" 2>/dev/null \
         && "$QEMU_ARM" "$TMP/probe" >/dev/null 2>&1; }; then
     echo "SKIP: cannot cross-compile + run an arm-linux-gnueabihf binary under qemu" \
          "(need gcc-arm-linux-gnueabihf + its arm32 glibc)"

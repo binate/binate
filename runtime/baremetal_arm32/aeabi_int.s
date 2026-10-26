@@ -177,12 +177,12 @@ __aeabi_ldivmod:
 // Binary long division, in place: shift the {rem:num} pair left one bit per
 // step (bringing num's top bit into rem's LSB); whenever rem >= den, subtract
 // and set the just-vacated num LSB as the quotient bit.  After 32 steps num
-// holds the quotient and r2 the remainder.  The 32-bit ISA has no divide
-// instruction, so this open-codes it (the LLVM arm32 backend lowers `/` to
-// these calls; the native backend inlines divide and never calls them, but
-// they are provided for the LLVM path and for C interop).  Inputs arrive
-// pre-guarded against a zero divisor and INT32_MIN / -1 (the IR's
-// OP_DIV_CHECK), so a valid den is assumed.
+// holds the quotient and r2 the remainder.  Neither Binate backend calls
+// these: both target armv7ve, whose sdiv / udiv divide in one instruction.
+// They are here for C objects built for a core without hardware divide (GCC's
+// default armv7-a, say), which call them for `/` and `%`.  A valid den is
+// assumed: nonzero, and for the signed forms not -1 with INT32_MIN (C leaves
+// both undefined).
 //   n = r0, d = r1 ; working: rem = r2, i = r3
 // ============================================================
 	.global __aeabi_uidivmod

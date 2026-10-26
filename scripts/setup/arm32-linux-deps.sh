@@ -60,7 +60,7 @@ esac
 # Sanity-check the installed toolchain.
 echo ">>> sanity check"
 echo 'int main(void){return 0;}' \
-    | clang -target arm-linux-gnueabihf -march=armv7-a -x c -c - -o /tmp/_bn_arm32_probe.o
+    | clang -target arm-linux-gnueabihf -march=armv7ve -x c -c - -o /tmp/_bn_arm32_probe.o
 rm -f /tmp/_bn_arm32_probe.o
 qemu_arm=""
 if command -v qemu-arm-static >/dev/null 2>&1; then

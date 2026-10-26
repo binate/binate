@@ -154,7 +154,7 @@ if [ ! -x "$GEN1" ]; then
     exit 1
 fi
 
-if ! "$CLANG" -target arm-none-eabi -march=armv7-a -mfloat-abi=soft -c \
+if ! "$CLANG" -target arm-none-eabi -march=armv7ve -mfloat-abi=soft -c \
         "$TMP/probes.s" -o "$TMP/probes.o" 2>"$TMP/as.err"; then
     echo "FAIL: assembling probes.s failed" >&2
     head -6 "$TMP/as.err" >&2

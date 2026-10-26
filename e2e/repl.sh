@@ -3123,6 +3123,30 @@ warning: gf shadowed (incompatible signature); existing callers retain old defin
 > 12 51 30 6000 194
 > "
 
+# --- A method of a generic type whose underlying type is not a struct,
+# redefined: with the same signature the redefinition replaces the instances
+# emitted before it (ps and pb run the new Second), with another one it shadows
+# them (ps keeps the replaced Second, ps2 runs the new one), as for a struct
+# type. ---
+run_repl "generic-non-struct-method-redefined" \
+"type Pair[T any] [2]T
+func (p Pair[T]) Second() T { return p[1] }
+func ps() int { var p Pair[int]; p[0] = 3; p[1] = 4; return p.Second() }
+func pb() bool { var p Pair[bool]; p[0] = true; return p.Second() }
+testing.Println(ps(), pb())
+func (p Pair[T]) Second() T { return p[0] }
+testing.Println(ps(), pb())
+func (p Pair[T]) Second(k int) int { return k + 10 }
+func ps2() int { var p Pair[int]; return p.Second(5) }
+testing.Println(ps2(), ps())
+" \
+"$BANNER
+> > > > > 4 false
+> > 3 true
+> warning: Pair.Second shadowed (incompatible signature); existing callers retain old definition
+> > 15 3
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

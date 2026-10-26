@@ -3147,6 +3147,134 @@ testing.Println(ps2(), ps())
 > > 15 3
 > "
 
+# --- A method value taken after its method is redefined with another signature
+# calls the new method, with its arguments; one taken before keeps calling the
+# old method (mvold). ---
+run_repl "method-value-after-shadow" \
+"type Mv struct { n int }
+func (v *Mv) Size() int { return 1000 }
+var mv Mv
+func mvold() int { var m *func() int = mv.Size; return m() }
+testing.Println(mvold())
+func (v *Mv) Size() int8 { return 5 }
+func mvnew() int8 { var m *func() int8 = mv.Size; return m() }
+testing.Println(mvnew(), mv.Size())
+func (v *Mv) Size(k int) int { return k }
+func mvk() int { var m *func(int) int = mv.Size; return m(42) }
+testing.Println(mvk(), mv.Size(42), mvold())
+" \
+"$BANNER
+> > > > > 1000
+> warning: Mv.Size shadowed (incompatible signature); existing callers retain old definition
+> > 5 5
+> warning: Mv.Size shadowed (incompatible signature); existing callers retain old definition
+> > 42 42 1000
+> "
+
+# --- A method value an earlier member of a resolved group takes of a method a
+# later member redefines with another signature calls the new method (P, parked
+# on Mv.Size, groups them); mvold, lowered before, keeps the old one (with the old
+# wrapper reused, f reads the old 1000 as an int8: -23). ---
+run_repl "group-method-value-of-shadowing-method" \
+"type Mv struct { n int }
+func P(n int) int { if n == 0 { return 1 }; var v Mv; return f() + q(n) + cast(int, v.Size()) }
+func (v *Mv) Size() int { return 1000 }
+var mv Mv
+func mvold() int { var m *func() int = mv.Size; return m() }
+testing.Println(mvold())
+func f() int { return 0 }
+func f() int { var m = mv.Size; return cast(int, m()) + P(0) }
+func (v *Mv) Size() int8 { var _ int = P(0); return 5 }
+func q(n int) int { return 100 + n }
+testing.Println(f())
+testing.Println(mvold())
+testing.Println(P(1))
+" \
+"$BANNER
+> > function P parked (pending: f, q, Mv.Size)
+> > > > 1000
+> > function f parked (pending: P)
+> method Mv.Size parked (pending: P)
+> function P resolved
+function f resolved
+method Mv.Size resolved
+warning: Mv.Size shadowed (incompatible signature); existing callers retain old definition
+> 6
+> 1000
+> 112
+> "
+
+# --- Method values of value-receiver methods, taken from a value, a raw pointer
+# and a managed pointer, and of a method of a named non-struct type, after the
+# method is redefined with another signature, call the new method; those taken
+# before keep the old one. ---
+run_repl "method-value-after-shadow-receiver-kinds" \
+"type Va struct { n int }
+func (v Va) Get() int { return v.n + 1000 }
+var va Va
+va.n = 7
+var pva *Va = &va
+var mva @Va = make(Va)
+mva.n = 9
+func g1() int { var m *func() int = va.Get; return m() }
+func g2() int { var m *func() int = pva.Get; return m() }
+func g3() int { var m *func() int = mva.Get; return m() }
+testing.Println(g1(), g2(), g3())
+func (v Va) Get() int8 { return cast(int8, v.n) }
+func h1() int8 { var m *func() int8 = va.Get; return m() }
+func h2() int8 { var m *func() int8 = pva.Get; return m() }
+func h3() int8 { var m *func() int8 = mva.Get; return m() }
+testing.Println(h1(), h2(), h3(), g1(), g2(), g3())
+type Ni int
+func (n Ni) Dbl() int { return cast(int, n) * 1000 }
+var ni Ni = 3
+func n1() int { var m *func() int = ni.Dbl; return m() }
+testing.Println(n1())
+func (n Ni) Dbl() int8 { return cast(int8, n) * 2 }
+func n2() int8 { var m *func() int8 = ni.Dbl; return m() }
+testing.Println(n2(), n1())
+" \
+"$BANNER
+> > > > > > > > > > > 1007 1007 1009
+> warning: Va.Get shadowed (incompatible signature); existing callers retain old definition
+> > > > 7 7 9 1007 1007 1009
+> > > > > 3000
+> warning: Ni.Dbl shadowed (incompatible signature); existing callers retain old definition
+> > 6 3000
+> "
+
+# --- So do method values of a generic non-struct type's method, of each of its
+# instances, and one a prompt variable's initializer takes. ---
+run_repl "method-value-after-shadow-generic-non-struct-and-var-init" \
+"type Pr[T any] [2]T
+func (p Pr[T]) Sec() int { return 1000 }
+var pi Pr[int]
+var pb Pr[bool]
+func q1() int { var m *func() int = pi.Sec; return m() }
+func q2() int { var m *func() int = pb.Sec; return m() }
+testing.Println(q1(), q2())
+func (p Pr[T]) Sec() int8 { return 5 }
+func q3() int8 { var m *func() int8 = pi.Sec; return m() }
+func q4() int8 { var m *func() int8 = pb.Sec; return m() }
+testing.Println(q3(), q4(), q1(), q2())
+type Mv struct { n int }
+func (v *Mv) Size() int { return 1000 }
+var mv Mv
+var gm *func() int = mv.Size
+testing.Println(gm())
+func (v *Mv) Size(k int) int { return k }
+var gk *func(int) int = mv.Size
+testing.Println(gk(42), gm())
+" \
+"$BANNER
+> > > > > > > 1000 1000
+> warning: Pr.Sec shadowed (incompatible signature); existing callers retain old definition
+> > > 5 5 1000 1000
+> > > > > 1000
+> warning: Mv.Size shadowed (incompatible signature); existing callers retain old definition
+> > 42 1000
+> "
+
 # --- Setup-error case: a type error in the loaded module surfaces
 # as a NewReplSession error VALUE that the CLI shell prints
 # and exits on, BEFORE the banner/prompt.  Pins errors-as-values

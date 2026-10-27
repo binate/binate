@@ -19,6 +19,33 @@ import "pkg/stdx/slices"
 // builds none — each still reads a layout not built, which depends on itself
 // (`type N struct { v int64; b Box[N] }`) — the last build reports the cycle.
 
+// A build may also resolve one of the package's own declarations on demand,
+// before collection reaches it (check_decl_batch.bn) — a type whose layout it
+// reads, or a constant, variable, function or method an array length names —
+// or a generic function instance's signature, and that resolution may read a
+// layout not built yet: `type N struct { v int64; p *Box[X] }` builds Box[X],
+// whose `[sizeof(T)]uint8` collects X, whose `[sizeof(N)]uint8` reads N while N
+// is collected.  The resolution is a frame of its own (enterDemandFrame) that
+// waits with the build below it.  It is undone — its binding, and what its
+// check recorded on its syntax (ast.ClearCheckerAnnotations) — and done again,
+// on demand or when collection reaches it, once that layout is built.  Kept, X
+// would hold an array length never read, which IR-gen, folding sizeof(N)
+// itself, would not agree with.  What a frame that waits goes on to report is
+// dropped (layoutFrameBlocked): read from what could not be built — `[len(v) -
+// 1]uint8` of a `[0]uint8` — it may be false, and what stands is reported when
+// the frame is done again.  Nor is anything more resolved on demand inside a
+// build that waits (skipDemand), which would only be undone with it.
+
+// A layoutFrame is one entry of InstanceState.Populating: the build of the
+// instance Inst; with Inst nil, a resolution no `sizeof` in which makes anything
+// wait; or, Demand, one of the package's declarations resolved on demand,
+// Blocked once a layout its resolution read was not built yet.
+type layoutFrame struct {
+	Inst    @GenericInstantiation
+	Demand  bool
+	Blocked bool
+}
+
 // buildInstance builds the members of the instance entry (buildInstanceMembers),
 // the innermost instance being built (enterLayoutFrame), recording how, so a
 // build that read a layout not built yet can be done again; such a build is
@@ -57,7 +84,9 @@ func undoInstanceBuild(c @Checker, entry @GenericInstantiation) {
 // until leaveLayoutFrame.
 func enterLayoutFrame(c @Checker, entry @GenericInstantiation) {
 	var st @InstanceState = instanceState(c)
-	st.Populating = slices.Append[@GenericInstantiation](st.Populating, entry)
+	var f layoutFrame
+	f.Inst = entry
+	st.Populating = slices.Append[layoutFrame](st.Populating, f)
 }
 
 // leaveLayoutFrame ends what enterLayoutFrame started.
@@ -66,19 +95,98 @@ func leaveLayoutFrame(c @Checker) {
 	st.Populating = st.Populating[:len(st.Populating) - 1]
 }
 
-// waitForLayoutHere makes the instance being built, if any, wait for a layout
-// its build reads that is not built yet, and reports whether it does — not on
-// its last build (InstanceState.LayoutNoWait), when the caller reports the cycle.
+// enterDemandFrame starts the resolution of one of the package's declarations
+// on demand as a layout frame (layoutFrame.Demand), until leaveDemandFrame, and
+// reports whether it did: with no frame around it — nothing being built —
+// nothing the resolution reads makes it wait.
+func enterDemandFrame(c @Checker) bool {
+	if c.Instances == nil || len(c.Instances.Populating) == 0 {
+		return false
+	}
+	var f layoutFrame
+	f.Demand = true
+	c.Instances.Populating = slices.Append[layoutFrame](c.Instances.Populating, f)
+	return true
+}
+
+// leaveDemandFrame ends the resolution enterDemandFrame started (framed: it did)
+// and reports whether it waited for a layout not built yet.  The caller then
+// undoes it: the read that asked for it, in the build that waits too, finds it
+// unresolved, and what that read reports is dropped (layoutFrameBlocked).
+func leaveDemandFrame(c @Checker, framed bool) bool {
+	if !framed {
+		return false
+	}
+	var st @InstanceState = c.Instances
+	var waited bool = st.Populating[len(st.Populating) - 1].Blocked
+	st.Populating = st.Populating[:len(st.Populating) - 1]
+	return waited
+}
+
+// layoutFrameBlocked reports whether the innermost layout frame waits for a
+// layout not built yet — a declaration resolved on demand, or an instance's
+// build — so that it is undone: what it reports meanwhile is dropped.
+func layoutFrameBlocked(c @Checker) bool {
+	if c.Instances == nil || len(c.Instances.Populating) == 0 {
+		return false
+	}
+	var f layoutFrame = c.Instances.Populating[len(c.Instances.Populating) - 1]
+	if f.Demand {
+		return f.Blocked
+	}
+	return f.Inst != nil && f.Inst.LayoutBlocked
+}
+
+// skipDemand reports whether a declaration asked for on demand is left
+// unresolved: the innermost instance being built already waits for a layout,
+// and is undone with whatever reads the declaration.  It makes those reads wait
+// with it (waitForLayoutHere), as the resolution would have.
+func skipDemand(c @Checker) bool {
+	if c.Instances == nil || c.Instances.LayoutNoWait {
+		return false
+	}
+	var st @InstanceState = c.Instances
+	var i int = len(st.Populating) - 1
+	for i >= 0 && st.Populating[i].Demand {
+		i--
+	}
+	if i < 0 || st.Populating[i].Inst == nil || !st.Populating[i].Inst.LayoutBlocked {
+		return false
+	}
+	return waitForLayoutHere(c)
+}
+
+// restoreBinding returns name in the scope s to its binding prev, or to unbound
+// when prev is nil: a declaration resolved on demand that waited is undone.
+func restoreBinding(s @Scope, name *[]readonly char, prev @Symbol) {
+	if prev != nil {
+		s.Define(prev)
+	} else {
+		s.Undefine(name)
+	}
+}
+
+// waitForLayoutHere makes the innermost instance being built wait for a layout
+// its build reads that is not built yet, with the declarations resolved on
+// demand inside it, and reports whether it does — not when a resolution in
+// which nothing waits is innermost, nor on the instance's last build
+// (InstanceState.LayoutNoWait): the caller then reports the cycle.
 func waitForLayoutHere(c @Checker) bool {
 	var st @InstanceState = instanceState(c)
-	if st.LayoutNoWait || len(st.Populating) == 0 {
+	if st.LayoutNoWait {
 		return false
 	}
-	var top @GenericInstantiation = st.Populating[len(st.Populating) - 1]
-	if top == nil {
+	var i int = len(st.Populating) - 1
+	for i >= 0 && st.Populating[i].Demand {
+		i--
+	}
+	if i < 0 || st.Populating[i].Inst == nil {
 		return false
 	}
-	top.LayoutBlocked = true
+	st.Populating[i].Inst.LayoutBlocked = true
+	for j := i + 1; j < len(st.Populating); j++ {
+		st.Populating[j].Blocked = true
+	}
 	return true
 }
 
@@ -140,7 +248,7 @@ func instanceInProgress(c @Checker, t @types.Type) bool {
 	}
 	var st @InstanceState = c.Instances
 	for i := 0; i < len(st.Populating); i++ {
-		if st.Populating[i] != nil && same(st.Populating[i].Result, t) {
+		if st.Populating[i].Inst != nil && same(st.Populating[i].Inst.Result, t) {
 			return true
 		}
 	}

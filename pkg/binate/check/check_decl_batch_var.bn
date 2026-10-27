@@ -1,0 +1,180 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// Package variables resolved on demand while a package's declarations are
+// collected (check_decl_batch.bn), and the checks deferred for them.
+
+// batchVarOnDemand defines the batch's package variable name, which is not
+// defined yet, and returns its symbol (nil when name is no such variable): one
+// with a declared type that collection has not reached, or one whose type is
+// inferred from its initializer, checked now rather than when pass 2 reaches
+// it.  A variable read while its own declaration is being checked is an
+// initialization cycle, which resolveTopLevelVarOrder reports
+// (prog.init.var-cycle); it is defined with the error type, so the read reports
+// nothing more.
+func batchVarOnDemand(c @Checker, name *[]readonly char) @Symbol {
+	var b @DeclBatch = c.Batch
+	if b == nil || !b.VarsOpen {
+		return nil
+	}
+	var d @ast.Decl = findDeclIn(b.Vars, name)
+	if d == nil {
+		return nil
+	}
+	var saved declContext = enterPackageDecl(c, d)
+	if d.TypeRef != nil {
+		var vt @types.Type = resolveTypeExpr(c, d.TypeRef)
+		if !prepareLayout(c, vt, d.Pos) {
+			vt = types.TypError()
+		}
+		defineVar(c.Scope, d.Name, vt)
+		b.VarsDefined = slices.Append[@ast.Decl](b.VarsDefined, d)
+	} else if declInList(b.VarsChecking, d) {
+		// Named from its own initializer.  A function literal's type is its
+		// signature, known before its body (which names the variable) is
+		// checked; anything else is a cycle.  The initialization order reports
+		// one it sees; while types are collected the cycle may run through a
+		// function's signature defined on demand (`var t = mk()`, `func mk()
+		// [len(t)]int`), which it does not see, so it is reported here — and
+		// the check reading the variable early is deferred for it.
+		if b.Collecting && (d.Value == nil || d.Value.Kind != ast.EXPR_FUNC_LIT) {
+			errVarCycle(c, d.Pos, d.Name)
+		}
+		defineVar(c.Scope, d.Name, funcLitDefaultType(c, d.Value))
+	} else {
+		var before checkMark = markChecks(c)
+		var funcs int = len(b.FuncsDefined)
+		var methods int = len(b.MethodsDefined)
+		var generics @[]@GenericMethodEntry = c.GenericMethods
+		checkBatchVarDecl(c, d)
+		finalizeUntypedNonConst(c)
+		if b.Collecting && checksSince(c, before) {
+			// Checked while types are collected (an array length reads it), the
+			// initializer sees only the declarations collected so far, and its
+			// errors may just name the others as undefined or opaque: it is
+			// checked again once collection is done (recheckDeferredVars).  The
+			// functions and methods it defined on demand are left to collection,
+			// which reports their own errors, dropped here with the rest.
+			dropChecksSince(c, before)
+			b.FuncsDefined = b.FuncsDefined[:funcs]
+			undoBatchMethods(c, methods, generics)
+			defineVar(c.Scope, d.Name, types.TypError())
+			b.VarsDeferred = slices.Append[@ast.Decl](b.VarsDeferred, d)
+		}
+	}
+	leavePackageDecl(c, saved)
+	return c.Scope.Lookup(name)
+}
+
+// recheckDeferredVars checks again, now that collection is done, each variable
+// whose check while types were collected had errors.  If it now checks
+// cleanly, those errors came from declarations not collected yet: the one error
+// is that its type was needed too early (errVarNeededDuringCollection).
+// Otherwise its own errors stand.
+func recheckDeferredVars(c @Checker) {
+	var b @DeclBatch = c.Batch
+	for i := 0; i < len(b.VarsDeferred); i++ {
+		var d @ast.Decl = b.VarsDeferred[i]
+		var saved declContext = enterPackageDecl(c, d)
+		var before checkMark = markChecks(c)
+		checkVarDecl(c, d)
+		finalizeUntypedNonConst(c)
+		if !checksSince(c, before) {
+			errVarNeededDuringCollection(c, d)
+		}
+		leavePackageDecl(c, saved)
+	}
+}
+
+// checkMark counts what checking has reported so far: the errors — in
+// TentativeMode the captured errors and missing names, a missing name being
+// an error deferred to its declaration (a REPL declaration batch).
+type checkMark struct {
+	Errs    int
+	Missing int
+}
+
+// markChecks returns the current checkMark.
+func markChecks(c @Checker) checkMark {
+	var m checkMark
+	if c.TentativeMode {
+		m.Errs = len(c.TentativeErrors)
+		m.Missing = len(c.TentativeMissing)
+	} else {
+		m.Errs = len(c.Errors)
+	}
+	return m
+}
+
+// checksSince reports whether checking has reported anything since m.
+func checksSince(c @Checker, m checkMark) bool {
+	var now checkMark = markChecks(c)
+	return now.Errs > m.Errs || now.Missing > m.Missing
+}
+
+// dropChecksSince discards what checking has reported since m.
+func dropChecksSince(c @Checker, m checkMark) {
+	if c.TentativeMode {
+		c.TentativeErrors = c.TentativeErrors[:m.Errs]
+		c.TentativeMissing = c.TentativeMissing[:m.Missing]
+	} else {
+		c.Errors = c.Errors[:m.Errs]
+	}
+}
+
+// errVarNeededDuringCollection reports that the type of the variable d, which
+// is inferred from its initializer, is needed while the package's types are
+// collected, before the declarations its initializer uses are.
+func errVarNeededDuringCollection(c @Checker, d @ast.Decl) {
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write("the type of `")
+	cb.Write(d.Name)
+	cb.Write("` is needed while the package's types are collected (an array length reads it), but ")
+	cb.Write("its initializer uses declarations not collected yet: declare its type")
+	addCheckError(c, d.Pos, buf.CopyStr(cb.String()))
+}
+
+// funcLitDefaultType returns the type a variable initialized with the function
+// literal e has when nothing hints its form — a managed function value of the
+// literal's signature (checkFuncLit) — or the error type when e is not a
+// function literal.
+func funcLitDefaultType(c @Checker, e @ast.Expr) @types.Type {
+	if e == nil || e.Kind != ast.EXPR_FUNC_LIT || e.DeclRef == nil {
+		return types.TypError()
+	}
+	var ft @types.Type = resolveFuncDeclType(c, e.DeclRef)
+	if ft == nil {
+		return types.TypError()
+	}
+	return types.MakeManagedFuncValueType(ft.Params, ft.Results)
+}
+
+// varDefinedOnDemand reports whether the declared-type variable d was defined
+// on demand, before collection reached it.
+func varDefinedOnDemand(c @Checker, d @ast.Decl) bool {
+	return c.Batch != nil && declInList(c.Batch.VarsDefined, d)
+}
+
+// checkBatchVarDecl checks the package variable declaration d; one whose type
+// is inferred from its initializer is checked once — on demand, or when pass 2
+// reaches it.
+func checkBatchVarDecl(c @Checker, d @ast.Decl) {
+	var b @DeclBatch = c.Batch
+	if b == nil || d.TypeRef != nil || isBlank(d.Name) {
+		checkVarDecl(c, d)
+		return
+	}
+	if declInVec(b.VarsChecked, d) || declInList(b.VarsChecking, d) {
+		return
+	}
+	b.VarsChecking = slices.Append[@ast.Decl](b.VarsChecking, d)
+	checkVarDecl(c, d)
+	b.VarsChecking = b.VarsChecking[:len(b.VarsChecking) - 1]
+	b.VarsChecked.Push(d)
+}

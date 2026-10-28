@@ -1,0 +1,313 @@
+package "pkg/binate/check"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/std/vec"
+
+// Members read from a type not built yet.  A selector `x.f` or a method call
+// `x.m()` may read a member while the package's declarations are collected
+// (check_decl_batch.bn) — in an array length, or in a declaration one names —
+// or while an instance is built (check_layout_wait.bn):
+//
+//   - of a type or an interface collection has not reached, which a value's
+//     type reaches only through a pointer or an interface value (prepareLayout
+//     collects what a value holds).  It is collected on demand, as a type whose
+//     layout is read is: an interface always, as its methods are its members; a
+//     type only when its declaration gives it a field of that name (fieldPath),
+//     with the declarations that field is defined through — a field takes
+//     precedence over a method of the same name, while a method is found
+//     without it (batchMethodOnDemand), and collecting a type earlier than it
+//     is needed can make a `sizeof` in it read a type still being collected;
+//   - of a type or an interface being collected, or an instance being built or
+//     waiting to be, which does not have the member yet.  The innermost instance
+//     being built waits for it (waitForLayoutHere), as for a `sizeof` of it;
+//     where nothing can wait, the member depends on the declaration that reads
+//     it, and the cycle is reported.
+
+// memberBaseOf returns the type whose members a selector reads from a value of
+// type t when it may not be built yet — a named type with no underlying type
+// yet, or the interface of an interface value (through one pointer level, as a
+// method call smooths) — or nil.
+func memberBaseOf(t @types.Type) @types.Type {
+	var r @types.Type = types.ResolveAliasAndConst(t)
+	if r != nil && (r.Kind == types.TYP_POINTER || r.Kind == types.TYP_MANAGED_PTR) && r.Elem != nil {
+		var inner @types.Type = types.ResolveAliasAndConst(r.Elem)
+		if inner != nil &&
+				(inner.Kind == types.TYP_INTERFACE_VALUE || inner.Kind == types.TYP_INTERFACE_VALUE_MANAGED) {
+			r = inner
+		}
+	}
+	if r != nil &&
+			(r.Kind == types.TYP_INTERFACE_VALUE || r.Kind == types.TYP_INTERFACE_VALUE_MANAGED) {
+		if r.Elem != nil && r.Elem.Kind == types.TYP_INTERFACE {
+			return r.Elem
+		}
+		return nil
+	}
+	var base @types.Type
+	base, _ = selectorFieldBase(t)
+	if base != nil && base.Kind == types.TYP_NAMED && base.Underlying == nil {
+		return base
+	}
+	return nil
+}
+
+// readyMemberBase readies, before a selector at pos looks up the member name
+// on a value of type t, the type it reads the member from (memberBaseOf), and
+// reports whether the member cannot be read now: an interface collection has
+// not reached is collected on demand, and a type when its declaration gives it
+// a field of that name, with the declarations that field is defined through
+// (fieldPath, readyFieldPath); a type being built with such a field cannot be
+// read (memberNotBuilt), nor one whose collection on demand waits.
+func readyMemberBase(c @Checker, t @types.Type, name *[]readonly char, pos token.Pos) bool {
+	var base @types.Type = memberBaseOf(t)
+	if base == nil {
+		return false
+	}
+	if instanceInProgress(c, base) {
+		var gd @ast.Decl = bit_cast(@ast.Decl, base.InstDecl)
+		var through @vec.Vec[@ast.Decl] = vec.New[@ast.Decl]()
+		return fieldPath(c, gd.TypeRef, name, true, through, 0) && memberNotBuilt(c, gd.Name, pos)
+	}
+	var b @DeclBatch = c.Batch
+	if b == nil || !b.Collecting {
+		return false
+	}
+	if base.Kind == types.TYP_INTERFACE {
+		var id @ast.Decl = batchIfaceDeclOf(c, base)
+		if id == nil || declInList(b.IfacesCollecting, id) || declInVec(b.IfacesCollected, id) {
+			return false
+		}
+		return collectIfaceOnDemand(c, id, base)
+	}
+	var d @ast.Decl = batchTypeDeclOf(c, base)
+	if d == nil {
+		return false
+	}
+	var path @vec.Vec[@ast.Decl] = vec.New[@ast.Decl]()
+	if !fieldPath(c, d.TypeRef, name, false, path, 0) {
+		return false
+	}
+	path.Push(d)
+	return readyFieldPath(c, path, pos)
+}
+
+// readyFieldPath collects the batch's type declarations path, through which a
+// selector at pos reaches a field, where collection has not reached them
+// (collectTypeOnDemand), and reports whether the field cannot be read now: one
+// of them is being collected (memberNotBuilt), or its collection on demand
+// waits.
+func readyFieldPath(c @Checker, path @vec.Vec[@ast.Decl], pos token.Pos) bool {
+	for i := 0; i < path.Len(); i++ {
+		var d @ast.Decl = path.Get(i)
+		if declInList(c.Batch.TypesCollecting, d) {
+			return memberNotBuilt(c, d.Name, pos)
+		}
+		if !batchTypeCollected(c, d) && collectTypeOnDemand(c, d) {
+			return true
+		}
+	}
+	return false
+}
+
+// batchTypeCollected reports whether the batch's type declaration d is
+// collected: on demand, or in its turn, which gave its named type an
+// underlying type.
+func batchTypeCollected(c @Checker, d @ast.Decl) bool {
+	if declInVec(c.Batch.TypesCollected, d) {
+		return true
+	}
+	var sym @Symbol = c.PackageScope.LookupLocal(d.Name)
+	return sym == nil || sym.Type == nil || sym.Type.Kind != types.TYP_NAMED ||
+			sym.Type.Underlying != nil
+}
+
+// memberMissingNotBuilt handles a selector at pos whose member name was found
+// on a value of type t neither as a field nor as a method, when the type it
+// reads is being built: an instance being built or waiting to be, which has no
+// members yet, or an interface being collected whose declaration has that
+// method, not added yet.  The read waits or its cycle is reported
+// (memberNotBuilt), and it reports true.
+func memberMissingNotBuilt(c @Checker, t @types.Type, name *[]readonly char, pos token.Pos) bool {
+	var base @types.Type = memberBaseOf(t)
+	if base == nil {
+		return false
+	}
+	if instanceInProgress(c, base) {
+		var gd @ast.Decl = bit_cast(@ast.Decl, base.InstDecl)
+		return memberNotBuilt(c, gd.Name, pos)
+	}
+	if base.Kind != types.TYP_INTERFACE || c.Batch == nil || !c.Batch.Collecting {
+		return false
+	}
+	var d @ast.Decl = batchIfaceDeclOf(c, base)
+	if d == nil || !declInList(c.Batch.IfacesCollecting, d) || !ifaceDeclHasMethod(d, name) {
+		return false
+	}
+	return memberNotBuilt(c, d.Name, pos)
+}
+
+// memberNotBuilt handles a selector at pos reading a member of the declaration
+// named name, which is not built yet: the innermost instance being built waits
+// for it (waitForLayoutHere), or — nothing can wait — the member depends on the
+// declaration that reads it, and the cycle is reported.  It reports true.
+func memberNotBuilt(c @Checker, name *[]readonly char, pos token.Pos) bool {
+	if !waitForLayoutHere(c) {
+		errCyclicType(c, pos, buf.CopyStr(name))
+	}
+	return true
+}
+
+// fieldPath reports whether a selector reaches a field named name in a value
+// of the type the type expression te defines, and appends to path the batch's
+// type declarations (not aliases) it reaches the field through, by name: a
+// struct with a field of that name (an embedded field is a field with no name,
+// which promotes nothing), or a type that has one — through a pointer, whose
+// pointee's fields a selector reaches, a type name, or an instance of a generic
+// struct; an array, a slice or a function value has none.  Within a generic
+// declaration (generic), a type name may be a type parameter, and is taken to
+// have such a field; so is a type name past maxFieldPathDepth declarations.
+func fieldPath(c @Checker, te @ast.TypeExpr, name *[]readonly char, generic bool,
+		path @vec.Vec[@ast.Decl], depth int) bool {
+	for te != nil &&
+			(te.Kind == ast.TEXPR_PAREN || te.Kind == ast.TEXPR_CONST || te.Kind == ast.TEXPR_POINTER ||
+					te.Kind == ast.TEXPR_MANAGED) {
+		te = te.Base
+	}
+	if te == nil {
+		return false
+	}
+	if te.Kind == ast.TEXPR_STRUCT {
+		for i := 0; i < len(te.Fields); i++ {
+			if types.CharEq(te.Fields[i].Name, name) {
+				return true
+			}
+		}
+		return false
+	}
+	if te.Kind == ast.TEXPR_INSTANTIATE {
+		var gd @ast.Decl
+		if te.Base != nil {
+			gd = lookupGenericTypeDeclPkg(c, te.Base.Pkg, te.Base.Name)
+		}
+		return gd == nil || depth >= maxFieldPathDepth ||
+				fieldPath(c, gd.TypeRef, name, true, path, depth + 1)
+	}
+	if te.Kind == ast.TEXPR_NAMED {
+		return generic || depth >= maxFieldPathDepth || namedFieldPath(c, te, name, path, depth)
+	}
+	return te.Kind == ast.TEXPR_TYPE_PARAM
+}
+
+// maxFieldPathDepth bounds the type names fieldPath follows, through which a
+// definition cycle (`type A B; type B A`, reported where it is declared) would
+// otherwise loop.
+const maxFieldPathDepth int = 32
+
+// namedFieldPath is fieldPath for the type name te: a type declaration of the
+// batch through its definition — pushed to path unless an alias, which has no
+// collection of its own — and any other type through the type it names.
+func namedFieldPath(c @Checker, te @ast.TypeExpr, name *[]readonly char, path @vec.Vec[@ast.Decl],
+		depth int) bool {
+	if len(te.Pkg) == 0 && c.Batch != nil {
+		var d @ast.Decl = findDeclIn(c.Batch.Types, te.Name)
+		if d != nil {
+			if !fieldPath(c, d.TypeRef, name, false, path, depth + 1) {
+				return false
+			}
+			if !d.IsAlias {
+				path.Push(d)
+			}
+			return true
+		}
+	}
+	var sym @Symbol
+	if len(te.Pkg) == 0 {
+		sym = c.Scope.Lookup(te.Name)
+	} else {
+		var psym @Symbol = c.Scope.Lookup(te.Pkg)
+		if psym != nil && psym.Kind == types.SYM_PKG {
+			var ps @Scope = lookupPackage(c, psym.PkgPath)
+			if ps != nil {
+				sym = ps.Lookup(te.Name)
+			}
+		}
+	}
+	if sym == nil || sym.Type == nil {
+		return true
+	}
+	var base @types.Type
+	base, _ = selectorFieldBase(sym.Type)
+	if base != nil && base.Kind == types.TYP_STRUCT {
+		return base.FieldByName(name) != nil
+	}
+	return base != nil && base.Kind == types.TYP_NAMED
+}
+
+// ifaceDeclHasMethod reports whether the interface declaration d declares a
+// method named name.
+func ifaceDeclHasMethod(d @ast.Decl, name *[]readonly char) bool {
+	for i := 0; i < len(d.Decls); i++ {
+		var m @ast.Decl = d.Decls[i]
+		if m != nil && m.Kind == ast.DECL_FUNC && types.CharEq(m.Name, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// collectTypeOnDemand collects, for a member read from it, the batch's type
+// declaration d, which collection has not reached, and reports whether it was
+// not: inside an instance's build that waits — for a layout its collection read
+// (enterDemandFrame), d then undone, or already (skipDemand).
+func collectTypeOnDemand(c @Checker, d @ast.Decl) bool {
+	if skipDemand(c) {
+		return true
+	}
+	var saved declContext = enterPackageDecl(c, d)
+	var framed bool = enterDemandFrame(c)
+	collectBatchTypeDecl(c, d)
+	var waited bool = leaveDemandFrame(c, framed)
+	var sym @Symbol = c.Scope.Lookup(d.Name)
+	leavePackageDecl(c, saved)
+	if waited {
+		if sym != nil && sym.Type != nil && sym.Type.Kind == types.TYP_NAMED {
+			sym.Type.Underlying = nil
+		}
+		ast.ClearCheckerAnnotations(d)
+		return true
+	}
+	c.Batch.TypesCollected.Push(d)
+	return false
+}
+
+// collectIfaceOnDemand collects, for a method read from it, the batch's
+// interface declaration d, of the interface iface, which collection has not
+// reached, and reports whether it was not, as collectTypeOnDemand does; one
+// that waited is no longer recorded as collected.
+func collectIfaceOnDemand(c @Checker, d @ast.Decl, iface @types.Type) bool {
+	if skipDemand(c) {
+		return true
+	}
+	var saved declContext = enterPackageDecl(c, d)
+	var framed bool = enterDemandFrame(c)
+	collectInterfaceMethods(c, d)
+	var waited bool = leaveDemandFrame(c, framed)
+	leavePackageDecl(c, saved)
+	if waited {
+		var noMethods @[]@types.Method
+		iface.Methods = noMethods
+		ast.ClearCheckerAnnotations(d)
+		var kept @vec.Vec[@ast.Decl] = vec.New[@ast.Decl]()
+		for i := 0; i < c.Batch.IfacesCollected.Len(); i++ {
+			if !same(c.Batch.IfacesCollected.Get(i), d) {
+				kept.Push(c.Batch.IfacesCollected.Get(i))
+			}
+		}
+		c.Batch.IfacesCollected = kept
+		return true
+	}
+	return false
+}

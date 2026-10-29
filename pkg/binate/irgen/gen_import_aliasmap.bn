@@ -3,6 +3,9 @@ package "pkg/binate/irgen"
 import "pkg/binate/ir"
 
 import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/irutil"
+import "pkg/stdx/slices"
 
 // pushFileImports snapshots the alias map and overlays file's own
 // imports (the explicit alias, else the path's last segment) so the
@@ -17,10 +20,10 @@ import "pkg/binate/ast"
 // "pkg/other/lib" — is dropped for the duration, so the file's `lib`
 // never resolves to the importer's package (a wrong-package type or
 // impl binding).  Pop with popFileImports.
-func pushFileImports(m @ir.Module, file @ast.File) AliasMapSnapshot {
-	var snap AliasMapSnapshot = SaveAliasMapState(m)
+func pushFileImports(gc @GenCtx, file @ast.File) AliasMapSnapshot {
+	var snap AliasMapSnapshot = SaveAliasMapState(gc.Mod)
 	if file == nil { return snap }
-	overlayFileImports(m, snap, file)
+	overlayFileImports(gc, snap, file)
 	return snap
 }
 
@@ -52,4 +55,135 @@ func SaveAliasMapState(m @ir.Module) AliasMapSnapshot {
 func RestoreAliasMapState(m @ir.Module, snap AliasMapSnapshot) {
 	m.ImportAliasNames = snap.Names
 	m.ImportAliasPaths = snap.Paths
+}
+
+// overlayFileImports resets the alias map to `base` then overlays just ONE
+// file's imports, so the current module's qualifiers resolve per-file: a
+// qualifier `dep` in file F binds to F's `import dep "..."`, not whichever
+// file won the merged first-wins dedup.  F's own imports are AUTHORITATIVE:
+// any base entry whose alias F also rebinds is dropped before F's imports are
+// recorded, so F wins even when `base` already carries a DIFFERENT package
+// under the same short alias.  This matters because RecordImportPath is
+// first-wins: the generic-instantiation sites (ensureInstantiated*) pass a
+// `base` captured at the USE site, which carries the CONSUMER's short aliases;
+// without the drop, a consumer `import dep "pkg/other"` would defeat the
+// generic's own `import dep "pkg/dep"`, binding a qualified field/method type
+// to the WRONG package (wrong layout/GEP — silent miscompile).  For the per-decl
+// callers in GeneratePackage `base` is the clean post-RegisterImports snapshot
+// (full-path entries, no short aliases), so the drop is a no-op there.
+//
+// The overlay of a given base and import list is built once, then reused
+// (overlayCacheLookup): GeneratePackage overlays each declaration's own file,
+// pass after pass, and rebuilding the map for every declaration would cost the
+// declaration count times the map's size.  A kept map is right to reuse because
+// the overlay depends only on base and f's import list, both identified by
+// `same`: an alias map's lists are only ever replaced whole, never written in
+// place, and a file's import specs are never changed once parsed.
+func overlayFileImports(gc @GenCtx, base AliasMapSnapshot, f @ast.File) {
+	var m @ir.Module = gc.Mod
+	if f == nil {
+		RestoreAliasMapState(m, base)
+		return
+	}
+	var hit int = overlayCacheLookup(gc, base, f)
+	if hit >= 0 {
+		RestoreAliasMapState(m, gc.OverlayCache[hit].Result)
+		return
+	}
+	// Each import's alias (the explicit alias, else the path's last segment) and
+	// path.
+	var n int = len(f.Imports)
+	var aliases @[]@[]char = make_slice(@[]char, n)
+	var paths @[]@[]char = make_slice(@[]char, n)
+	for i := 0; i < n; i++ {
+		paths[i] = unquote(f.Imports[i].Path)
+		if len(f.Imports[i].Alias) > 0 {
+			aliases[i] = buf.CopyStr(f.Imports[i].Alias)
+		} else {
+			aliases[i] = lastPathSegment(paths[i])
+		}
+	}
+	// The overlaid map: base's entries less those whose alias f rebinds, then each
+	// import that binds its alias (bindsAlias).  Counted first, so each list is
+	// allocated once.
+	var size int = 0
+	for i := 0; i < len(base.Names); i++ {
+		if aliasIndex(aliases, base.Names[i]) < 0 { size++ }
+	}
+	for i := 0; i < n; i++ {
+		if bindsAlias(aliases, paths, i) { size++ }
+	}
+	var res AliasMapSnapshot
+	res.Names = make_slice(@[]char, size)
+	res.Paths = make_slice(@[]char, size)
+	var k int = 0
+	for i := 0; i < len(base.Names); i++ {
+		if aliasIndex(aliases, base.Names[i]) < 0 {
+			res.Names[k] = base.Names[i]
+			res.Paths[k] = base.Paths[i]
+			k++
+		}
+	}
+	for i := 0; i < n; i++ {
+		if bindsAlias(aliases, paths, i) {
+			res.Names[k] = aliases[i]
+			res.Paths[k] = paths[i]
+			k++
+		}
+	}
+	overlayCacheAdd(gc, base, f, res)
+	RestoreAliasMapState(m, res)
+}
+
+// aliasIndex returns the index of the first of aliases equal to alias, or -1.
+func aliasIndex(aliases @[]@[]char, alias *[]readonly char) int {
+	for i := 0; i < len(aliases); i++ {
+		if irutil.Streq(aliases[i], alias) { return i }
+	}
+	return -1
+}
+
+// bindsAlias reports whether a file's import i, with the given aliases and
+// paths, binds its alias in the overlay: it has a path, and no earlier import
+// with a path has the same alias — RecordImportPath's first-wins rule, which
+// also ignores an empty path.
+func bindsAlias(aliases @[]@[]char, paths @[]@[]char, i int) bool {
+	if len(paths[i]) == 0 { return false }
+	for j := 0; j < i; j++ {
+		if len(paths[j]) > 0 && irutil.Streq(aliases[j], aliases[i]) { return false }
+	}
+	return true
+}
+
+// overlayCacheSize is how many overlays a GenCtx keeps: enough for the current
+// declaration's file and the overlays of the generic instantiations it reaches,
+// each of which overlays its own defining file.
+const overlayCacheSize int = 8
+
+// overlayCacheLookup returns the index in gc.OverlayCache of the overlay of f's
+// current import list onto base, or -1.
+func overlayCacheLookup(gc @GenCtx, base AliasMapSnapshot, f @ast.File) int {
+	for i := 0; i < len(gc.OverlayCache); i++ {
+		if same(gc.OverlayCache[i].Imports, f.Imports) &&
+				same(gc.OverlayCache[i].Base.Names, base.Names) &&
+				same(gc.OverlayCache[i].Base.Paths, base.Paths) {
+			return i
+		}
+	}
+	return -1
+}
+
+// overlayCacheAdd records res as the overlay of f's current import list onto
+// base, replacing the oldest entry once the cache holds overlayCacheSize.
+func overlayCacheAdd(gc @GenCtx, base AliasMapSnapshot, f @ast.File, res AliasMapSnapshot) {
+	var e AliasOverlay
+	e.Base = base
+	e.Imports = f.Imports
+	e.Result = res
+	if len(gc.OverlayCache) < overlayCacheSize {
+		gc.OverlayCache = slices.Append[AliasOverlay](gc.OverlayCache, e)
+		return
+	}
+	gc.OverlayCache[gc.OverlayNext] = e
+	gc.OverlayNext = (gc.OverlayNext + 1) % overlayCacheSize
 }

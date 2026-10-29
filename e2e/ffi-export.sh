@@ -397,6 +397,17 @@ func Mret9b() (int8, int8, int8, int8, int8, int8, int8, int8, int8) {
 	return 1, 2, 3, 4, 5, 6, 7, 8, 9
 }
 
+// An eight-int64 struct beside a float64: on aarch64 the internal convention returns
+// the struct's eight words in X0..X7 and the float in D0, the most a register-returned
+// tuple holds, where the C ABI returns the 72-byte struct through a buffer, so the entry
+// stores the registers into it.
+type FfiS64 struct { a int64; b int64; c int64; d int64; e int64; f int64; g int64; h int64 }
+
+#[c_export("mret8w")]
+func Mret8w() (FfiS64, float64) {
+	return FfiS64{a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8}, cast(float64, 9.5)
+}
+
 // __c_entry POINTERS to multi-return functions: each getter hands C the address
 // of a callback that returns a divergent tuple, so C invokes it THROUGH the
 // pointer.  This must present the same platform struct-return ABI the #[c_export]
@@ -622,6 +633,9 @@ struct Mvl { struct V2 v; long l; };
 struct Mlv { long l; struct V2 v; };
 extern struct Mvl mretvl(void);
 extern struct Mlv mretlv(void);
+struct S64 { long a, b, c, d, e, f, g, h; };
+struct M8w { struct S64 s; double z; };
+extern struct M8w mret8w(void);
 extern struct M3i mret3i(void);
 extern struct M2i mret2i(void);
 extern struct M4i mret4i(void);
@@ -653,6 +667,9 @@ int main(void) {
     printf("%d %d %d %d %d %d %d %d %d\n", nb.a, nb.b, nb.c, nb.d, nb.e, nb.f, nb.g, nb.h, nb.i);
     struct Mvl vl = mretvl(); printf("%.1f %.1f %ld\n", vl.v.x, vl.v.y, vl.l);
     struct Mlv lv = mretlv(); printf("%ld %.1f %.1f\n", lv.l, lv.v.x, lv.v.y);
+    struct M8w w8 = mret8w();
+    printf("%ld %ld %ld %ld %ld %ld %ld %ld %.1f\n", w8.s.a, w8.s.b, w8.s.c, w8.s.d, w8.s.e,
+        w8.s.f, w8.s.g, w8.s.h, w8.z);
     struct M3i h = mret_many(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
         20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41,
         42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
@@ -677,6 +694,7 @@ WANT_MULTIRET="10 20 30
 1 2 3 4 5 6 7 8 9
 1.5 2.5 7
 8 3.5 4.5
+1 2 3 4 5 6 7 8 9.5
 9 49 72"
 
 # --- a C driver that invokes multi-return callbacks THROUGH __c_entry pointers ---

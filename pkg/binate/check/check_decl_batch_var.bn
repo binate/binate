@@ -19,7 +19,8 @@ import "pkg/stdx/slices"
 // at its head, or a placeholder (check_var_placeholder.bn).  One whose
 // definition read a layout not built yet, inside an instance's build, is left
 // undefined (defineVarOnDemand), and none is defined inside a build that waits
-// already (skipDemand).
+// already (skipDemand).  One read while its type is found, inside a build that
+// started there, is left undefined too: the build waits for it (declReadWaits).
 func batchVarOnDemand(c @Checker, name *[]readonly char) @Symbol {
 	var b @DeclBatch = c.Batch
 	if b == nil || !b.VarsOpen {
@@ -30,6 +31,12 @@ func batchVarOnDemand(c @Checker, name *[]readonly char) @Symbol {
 		return nil
 	}
 	var saved declContext = enterPackageDecl(c, d)
+	if varBeingTyped(b, d) && declReadWaits(c, d) {
+		// Read inside a build its type's resolution started, which waits for
+		// it (check_layout_wait_decl.bn).
+		leavePackageDecl(c, saved)
+		return nil
+	}
 	if d.TypeRef != nil && declInList(b.VarsResolving, d) {
 		// Named in its own type (an array length): a placeholder, defined on
 		// demand as far as collection is concerned.
@@ -77,11 +84,13 @@ func batchVarOnDemand(c @Checker, name *[]readonly char) @Symbol {
 // reports whether that read a layout not built yet, inside an instance's build:
 // d is then undone — its binding, its record as defined or checked, what its
 // check recorded on its syntax — to be defined again when next read or when
-// collection reaches it.
+// collection reaches it.  The layout waits are flushed once it is defined when a
+// read waited for it (leaveDeclResolution).
 func defineVarOnDemand(c @Checker, d @ast.Decl) bool {
 	var b @DeclBatch = c.Batch
 	var ds @Scope = declScope(c)
 	var prev @Symbol = ds.LookupLocal(d.Name)
+	enterDeclResolution(c, d)
 	var framed bool = enterDemandFrame(c)
 	var deferred bool = false
 	var ht @types.Type = nil
@@ -110,7 +119,7 @@ func defineVarOnDemand(c @Checker, d @ast.Decl) bool {
 		var funcs int = len(b.FuncsDefined)
 		var methods int = len(b.MethodsDefined)
 		var generics @[]@GenericMethodEntry = c.GenericMethods
-		checkBatchVarDecl(c, d)
+		_ = checkBatchVarDecl(c, d)
 		finalizeUntypedNonConst(c)
 		if b.Collecting && ownChecksSince(c, before, cycleErrs) {
 			// Checked while types are collected (an array length reads it), the
@@ -131,6 +140,7 @@ func defineVarOnDemand(c @Checker, d @ast.Decl) bool {
 			deferred = true
 		}
 	}
+	var waited bool = leaveDeclResolution(c)
 	if leaveDemandFrame(c, framed) {
 		restoreBinding(ds, d.Name, prev)
 		var kept @[]@ast.Decl
@@ -154,6 +164,9 @@ func defineVarOnDemand(c @Checker, d @ast.Decl) bool {
 		defineVar(c.Scope, d.Name, types.TypError())
 		b.VarsDeferred = slices.Append[@ast.Decl](b.VarsDeferred, d)
 	}
+	if waited {
+		flushLayoutWaits(c)
+	}
 	return false
 }
 
@@ -169,6 +182,7 @@ func recheckDeferredVars(c @Checker) {
 	for i := 0; i < len(b.VarsDeferred); i++ {
 		var d @ast.Decl = b.VarsDeferred[i]
 		var saved declContext = enterPackageDecl(c, d)
+		enterDeclResolution(c, d)
 		var before checkMark = markChecks(c)
 		var poisons int = b.SilentPoisons
 		// As it is checked again, its type is the one its initializer spells at
@@ -182,17 +196,20 @@ func recheckDeferredVars(c @Checker) {
 		if ht != nil {
 			defineVar(c.Scope, d.Name, ht)
 		}
-		var m varCheckMark = beginVarCheck(b, d)
+		var m varCheckMark = beginVarCheck(c, d)
 		checkVarDecl(c, d)
 		finalizeUntypedNonConst(c)
 		var selfRead bool = freeReadOf(b, d, m)
-		endVarCheck(c, d, m)
+		_ = endVarCheck(c, d, m)
 		if declInList(b.VarsCycled, d) {
 			defineDeclVar(c, d, types.TypError())
 		} else if !checksSince(c, before) && b.SilentPoisons == poisons && !selfRead {
 			errVarNeededDuringCollection(c, d)
 		}
 		leavePackageDecl(c, saved)
+		if leaveDeclResolution(c) {
+			flushLayoutWaits(c)
+		}
 	}
 }
 
@@ -259,6 +276,14 @@ func funcLitDefaultType(c @Checker, e @ast.Expr) @types.Type {
 	return types.MakeManagedFuncValueType(ft.Params, ft.Results)
 }
 
+// varBeingTyped reports whether the type of the batch's variable d is being
+// found: its declared type resolved, the type its initializer spells at its
+// head taken, or its initializer checked.
+func varBeingTyped(b @DeclBatch, d @ast.Decl) bool {
+	return d.TypeRef != nil && declInList(b.VarsResolving, d) || declInList(b.VarsHeadTyping, d) ||
+			declInList(b.VarsChecking, d)
+}
+
 // varDefinedOnDemand reports whether the declared-type variable d was defined
 // on demand, before collection reached it.
 func varDefinedOnDemand(c @Checker, d @ast.Decl) bool {
@@ -269,18 +294,22 @@ func varDefinedOnDemand(c @Checker, d @ast.Decl) bool {
 // is inferred from its initializer is checked once — on demand, or when pass 2
 // reaches it — and the placeholders its initializer read are judged then
 // (endVarCheck).  One whose type cycle is reported has the error type, so
-// nothing more is reported about it.
-func checkBatchVarDecl(c @Checker, d @ast.Decl) {
+// nothing more is reported about it.  It reports whether a read waited for a
+// declaration being resolved (leaveDeclResolution): the caller then flushes the
+// layout waits, once the variable's definition is kept.
+func checkBatchVarDecl(c @Checker, d @ast.Decl) bool {
 	var b @DeclBatch = c.Batch
+	var waited bool = false
 	if b == nil || d.TypeRef != nil || isBlank(d.Name) {
 		checkVarDecl(c, d)
 	} else if !declInVec(b.VarsChecked, d) && !declInList(b.VarsChecking, d) {
-		var m varCheckMark = beginVarCheck(b, d)
+		var m varCheckMark = beginVarCheck(c, d)
 		checkVarDecl(c, d)
-		endVarCheck(c, d, m)
+		waited = endVarCheck(c, d, m)
 		b.VarsChecked.Push(d)
 	}
 	if b != nil && declInList(b.VarsCycled, d) {
 		defineDeclVar(c, d, types.TypError())
 	}
+	return waited
 }

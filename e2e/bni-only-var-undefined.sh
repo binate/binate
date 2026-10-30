@@ -314,8 +314,14 @@ func main() {
 	var src @[]uint8 = make_slice(uint8, len(driverSrc))
 	for i := 0; i < len(driverSrc); i++ { src[i] = cast(uint8, driverSrc[i]) }
 	var p @parser.Parser = parser.New(src, "driver.bn")
+	var f @ast.File = p.ParseFile()
+	var perrs @[]parser.ParseError = p.Errors()
+	if len(perrs) > 0 {
+		for i := 0; i < len(perrs); i++ { testing.Println(parser.FormatParseError(perrs[i])) }
+		os.Exit(1)
+	}
 	var files @[]@ast.File = make_slice(@ast.File, 1)
-	files[0] = p.ParseFile()
+	files[0] = f
 	var errs @[]@[]char = it.LoadCallable(files, buf.CopyStr("driver"))
 	if len(errs) == 0 { testing.Println("loaded") }
 	for i := 0; i < len(errs); i++ { testing.Println(errs[i]) }

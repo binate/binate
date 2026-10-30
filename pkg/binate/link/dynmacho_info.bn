@@ -1,0 +1,158 @@
+package "pkg/binate/link"
+
+// The dyld info of a dynamic Mach-O (LC_DYLD_INFO_ONLY), for LinkDynMacho: the bind opcodes
+// that bind each import's __got slot, the rebase opcodes for the pointers the image's slide
+// moves, and the symbol table naming the imports.
+
+// writeUleb writes value (non-negative) to out at off as an unsigned LEB128 varint
+// and returns the offset past it.
+func writeUleb(out @[]uint8, off int, value int) int {
+	var v int = value
+	var p int = off
+	for {
+		var b int = v & 0x7f
+		v = v >> 7
+		if v != 0 {
+			out[p] = cast(uint8, b | 0x80)
+			p = p + 1
+		} else {
+			out[p] = cast(uint8, b)
+			return p + 1
+		}
+	}
+}
+
+// buildMachoBind builds the LC_DYLD_INFO_ONLY bind stream: for each import, bind its
+// __got slot (segment segIndex, offset gotSegOff + i*8) to the named symbol from
+// libSystem.  gotSegOff is the __got's byte offset within the writable segment — 0 when
+// the __got is at the segment start, non-zero when program .data precedes it in __DATA.
+// A weak import (binds[i] == BIND_WEAK) carries BIND_SYMBOL_FLAGS_WEAK_IMPORT, so dyld
+// binds it to 0 rather than failing the load if it is absent.  A non-lazy POINTER bind,
+// so dyld resolves it at load.  Returns the opcode bytes.
+func buildMachoBind(imports @[]@[]char, segIndex int, gotSegOff int, binds @[]int) @[]uint8 {
+	// Upper bound: 2 header opcodes + per import (1 flags + name + NUL + 1 seg + a uleb
+	// offset + 1 do_bind) + 1 done.  Budget a full 10-byte uleb for the offset.
+	var cap int = 3
+	for i := 0; i < len(imports); i++ { cap = cap + len(imports[i]) + 14 }
+	var out @[]uint8 = make_slice(uint8, cap)
+	var p int = 0
+	out[p] = cast(uint8, BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | MACHO_LIBSYSTEM_ORDINAL)
+	p = p + 1
+	out[p] = cast(uint8, BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER)
+	p = p + 1
+	for i := 0; i < len(imports); i++ {
+		var flags int = 0
+		if binds[i] == BIND_WEAK { flags = BIND_SYMBOL_FLAGS_WEAK_IMPORT }
+		out[p] = cast(uint8, BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | flags)
+		p = p + 1
+		for j := 0; j < len(imports[i]); j++ { out[p] = cast(uint8, imports[i][j]); p = p + 1 }
+		out[p] = cast(uint8, 0) // NUL-terminate the symbol name
+		p = p + 1
+		out[p] = cast(uint8, BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segIndex)
+		p = p + 1
+		p = writeUleb(out, p, gotSegOff + i * machoPtrSize)
+		out[p] = cast(uint8, BIND_OPCODE_DO_BIND)
+		p = p + 1
+	}
+	out[p] = cast(uint8, BIND_OPCODE_DONE)
+	p = p + 1
+	return out[0:p]
+}
+
+// collectMachoRebaseSites returns the virtual address of every absolute in-image pointer
+// bnld patched — one per R_AARCH64_ABS64 relocation whose target is an address in the
+// image (targetInImage), not a constant that is the same wherever the image is loaded.
+// bnld rejects a direct ABS64 reference to an import (those must go through the __got),
+// so every such target is a defined in-image symbol whose stored address dyld must slide.
+// A site in a writable section (rodata_relro / .data) lies in the __DATA segment, where
+// Layout groups those, and the caller turns it into a segment-relative rebase offset; one in
+// a read-only or executable section (`.uint64 sym` in text) cannot be rebased, which the
+// caller reports.
+func collectMachoRebaseSites(t @SymbolTable, lr @LayoutResult) @[]uint64 {
+	var n int = 0 // the ABS64 relocations: at most one site each
+	for o := 0; o < len(t.Objs); o++ {
+		for r := 0; r < len(t.Objs[o].Relocs); r++ {
+			if t.Objs[o].Relocs[r].Kind == R_AARCH64_ABS64 { n = n + 1 }
+		}
+	}
+	var sites @[]uint64 = make_slice(uint64, n)
+	var k int = 0
+	for o := 0; o < len(t.Objs); o++ {
+		var obj @InputObject = t.Objs[o]
+		for r := 0; r < len(obj.Relocs); r++ {
+			var rel InputReloc = obj.Relocs[r]
+			if !isMachoRebaseSite(t, o, rel) { continue }
+			var outIdx int = obj.Sections[rel.SecIndex].OutIndex
+			var secOff uint = obj.Sections[rel.SecIndex].OutOffset
+			sites[k] = lr.Sections[outIdx].Addr + cast(uint64, secOff) + cast(uint64, rel.Offset)
+			k = k + 1
+		}
+	}
+	return sites[0:k]
+}
+
+// isMachoRebaseSite reports whether relocation rel of object objIdx stores an in-image
+// address dyld must slide (collectMachoRebaseSites): a placed ABS64 whose target is an
+// address in the image (targetInImage).
+func isMachoRebaseSite(t @SymbolTable, objIdx int, rel InputReloc) bool {
+	var obj @InputObject = t.Objs[objIdx]
+	if rel.Kind != R_AARCH64_ABS64 { return false }
+	if rel.SecIndex < 0 || rel.SecIndex >= len(obj.Sections) { return false }
+	if obj.Sections[rel.SecIndex].OutIndex < 0 { return false }
+	if rel.SymIndex < 0 || rel.SymIndex >= len(obj.Symbols) { return false }
+	oo, ss, found := chosenDef(t, objIdx, rel.SymIndex)
+	return targetInImage(t, objIdx, rel.SymIndex, oo, ss, found)
+}
+
+// buildMachoRebase encodes the LC_DYLD_INFO rebase opcode stream: set the POINTER type
+// once, then for each site set its (segment, offset) and rebase one slot.  segOffsets are
+// byte offsets within segment segIndex (the writable __DATA); they need not be sorted,
+// since every site resets the cursor with SET_SEGMENT_AND_OFFSET.  Returns an empty slice
+// when there is nothing to rebase.
+func buildMachoRebase(segOffsets @[]int, segIndex int) @[]uint8 {
+	if len(segOffsets) == 0 { return make_slice(uint8, 0) }
+	// Upper bound: 1 type opcode + per site (1 set-seg + a <=10-byte uleb + 1 do-rebase)
+	// + 1 done.
+	var out @[]uint8 = make_slice(uint8, 2 + len(segOffsets) * 12)
+	var p int = 0
+	out[p] = cast(uint8, REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER)
+	p = p + 1
+	for i := 0; i < len(segOffsets); i++ {
+		out[p] = cast(uint8, REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | segIndex)
+		p = p + 1
+		p = writeUleb(out, p, segOffsets[i])
+		out[p] = cast(uint8, REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1)
+		p = p + 1
+	}
+	out[p] = cast(uint8, REBASE_OPCODE_DONE)
+	p = p + 1
+	return out[0:p]
+}
+
+// buildMachoSymtab builds the symbol table (one UND external nlist_64 per import) and
+// the matching string table (a leading NUL, then each NUL-terminated name).  dyld
+// binds by name via the bind opcodes; the symtab is the conventional companion.  A weak
+// import (binds[i] == BIND_WEAK) additionally sets N_WEAK_REF in n_desc.  Returns (nlist
+// bytes, strtab bytes).
+func buildMachoSymtab(imports @[]@[]char, binds @[]int) (@[]uint8, @[]uint8) {
+	var n int = len(imports)
+	var syms @[]uint8 = make_slice(uint8, n * machoNlistSize)
+	var strTotal int = 1
+	for i := 0; i < n; i++ { strTotal = strTotal + len(imports[i]) + 1 }
+	var strs @[]uint8 = make_slice(uint8, strTotal)
+	var sp int = 1 // strs[0] is the empty string (a leading NUL)
+	for i := 0; i < n; i++ {
+		var e int = i * machoNlistSize
+		writeLE(syms, e + 0, sp, 4) // n_strx
+		syms[e + 4] = cast(uint8, MACHO_N_EXT) // n_type: undefined external
+		// n_sect(1) stays 0; n_desc(2) carries the dylib ordinal in its high byte, plus
+		// N_WEAK_REF in the low byte for a weak reference.
+		var nDesc int = MACHO_LIBSYSTEM_ORDINAL << 8
+		if binds[i] == BIND_WEAK { nDesc = nDesc | MACHO_N_WEAK_REF }
+		writeLE(syms, e + 6, nDesc, 2)
+		// n_value(8) stays 0.
+		for j := 0; j < len(imports[i]); j++ { strs[sp] = cast(uint8, imports[i][j]); sp = sp + 1 }
+		sp = sp + 1 // NUL
+	}
+	return syms, strs
+}

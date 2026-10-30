@@ -2993,7 +2993,7 @@ run_repl "group-earlier-redefinition-calls-later-shadowing-one" \
 "func P(n int) int { if n == 0 { return 1 }; return f() + cast(int, h()) + q(n) }
 func h() int { return 1000 }
 func useh() int { return h() }
-func f() int { return 0 }
+func f() bool { return false }
 func f() int { return cast(int, h()) + P(0) }
 func h() int8 { var _ int = P(0); return 2 }
 func q(n int) int { return 100 + n }
@@ -3008,6 +3008,7 @@ testing.Println(P(1))
 > function P resolved
 function f resolved
 function h resolved
+warning: f shadowed (incompatible signature); existing callers retain old definition
 warning: h shadowed (incompatible signature); existing callers retain old definition
 > 3
 > 1000
@@ -3025,7 +3026,7 @@ func P(n int) int { if n == 0 { return 1 }; var b Cell[int]; return f() + q(n) +
 func (b *Cell[T]) get() int { return 1000 }
 func use() int { var b Cell[int]; return b.get() }
 testing.Println(use())
-func f() int { return 0 }
+func f() bool { return false }
 func f() int { var b Cell[int]; return cast(int, b.get()) + P(0) }
 func (b *Cell[T]) get() float64 { var _ int = P(0); return 2.5 }
 func q(n int) int { return 100 + n }
@@ -3041,6 +3042,7 @@ testing.Println(P(1))
 > function P resolved
 function f resolved
 method Cell.get resolved
+warning: f shadowed (incompatible signature); existing callers retain old definition
 warning: Cell.get shadowed (incompatible signature); existing callers retain old definition
 > 3
 > 1000
@@ -3063,7 +3065,7 @@ var vv Vq
 var s0 *Sz = &vv
 func viaif() int { return s0.Size() }
 testing.Println(useold(), viaif())
-func f() int { return 0 }
+func f() bool { return false }
 func f() int { var v Vq; var x int8 = v.Size(); return cast(int, x) + P(0) }
 func (v Vq) Size() int8 { var _ int = P(0); return 2 }
 func q(n int) int { return 100 + n }
@@ -3083,6 +3085,7 @@ testing.Println(s8.Size())
 > function P resolved
 function f resolved
 method Vq.Size resolved
+warning: f shadowed (incompatible signature); existing callers retain old definition
 warning: Vq.Size shadowed (incompatible signature); existing callers retain old definition
 > 3
 > 1000 1000
@@ -3111,7 +3114,7 @@ testing.Println(g(0), h(0), gf[int](0), olds(), P(1))
 > function P parked (pending: g, h, q, gf)
 > > > > > 6000
 > function g parked (pending: P)
-> function h parked (pending: P)
+> function h parked (pending: P, g)
 > function gf parked (pending: P)
 > function P resolved
 function g resolved
@@ -3182,7 +3185,7 @@ func (v *Mv) Size() int { return 1000 }
 var mv Mv
 func mvold() int { var m *func() int = mv.Size; return m() }
 testing.Println(mvold())
-func f() int { return 0 }
+func f() bool { return false }
 func f() int { var m = mv.Size; return cast(int, m()) + P(0) }
 func (v *Mv) Size() int8 { var _ int = P(0); return 5 }
 func q(n int) int { return 100 + n }
@@ -3198,10 +3201,181 @@ testing.Println(P(1))
 > function P resolved
 function f resolved
 method Mv.Size resolved
+warning: f shadowed (incompatible signature); existing callers retain old definition
 warning: Mv.Size shadowed (incompatible signature); existing callers retain old definition
 > 6
 > 1000
 > 112
+> "
+
+# --- A redefinition with another signature, parked, is checked in the group of
+# the parked declarations that use its name, however they parked: f, which uses
+# h but parked only on P, sees the new h (its int8 use of h checks), while
+# useh, lowered before, keeps the old one. ---
+run_repl "group-shadowing-redefinition-seen-by-parked-user" \
+"func P(n int) int { if n == 0 { return 1 }; return f() + q(n) }
+func h() int { return 1000 }
+func useh() int { return h() }
+func f() bool { return false }
+func f() int { var x int8 = h(); return cast(int, x) + P(0) }
+func h() int8 { var _ int = P(0); return 5 }
+func q(n int) int { return 100 + n }
+testing.Println(f(), useh(), P(1))
+" \
+"$BANNER
+> function P parked (pending: f, q)
+> > > > function f parked (pending: P)
+> function h parked (pending: P)
+> function P resolved
+function f resolved
+function h resolved
+warning: f shadowed (incompatible signature); existing callers retain old definition
+warning: h shadowed (incompatible signature); existing callers retain old definition
+> 6 1000 107
+> "
+
+# --- So is a method's: f, which calls mv.Size but parked only on P, calls the
+# new method. ---
+run_repl "group-shadowing-method-seen-by-parked-user" \
+"type Mv struct { n int }
+func P(n int) int { if n == 0 { return 1 }; return f() + q(n) }
+func (v *Mv) Size() int { return 1000 }
+var mv Mv
+func f() bool { return false }
+func f() int { return cast(int, mv.Size()) + P(0) }
+func (v *Mv) Size() int8 { var _ int = P(0); return 5 }
+func q(n int) int { return 100 + n }
+testing.Println(f())
+" \
+"$BANNER
+> > function P parked (pending: f, q)
+> > > > function f parked (pending: P)
+> method Mv.Size parked (pending: P)
+> function P resolved
+function f resolved
+method Mv.Size resolved
+warning: f shadowed (incompatible signature); existing callers retain old definition
+warning: Mv.Size shadowed (incompatible signature); existing callers retain old definition
+> 6
+> "
+
+# --- And a generic type's method's: f calls the new Cell[int].get, with its
+# float64 result, while use keeps the old instance. ---
+run_repl "group-shadowing-generic-method-seen-by-parked-user" \
+"type Cell[T any] struct { v T }
+func P(n int) int { if n == 0 { return 1 }; return f() + q(n) }
+func (b *Cell[T]) get() int { return 1000 }
+func use() int { var b Cell[int]; return b.get() }
+testing.Println(use())
+func f() bool { return false }
+func f() int { var b Cell[int]; return cast(int, b.get()) + P(0) }
+func (b *Cell[T]) get() float64 { var _ int = P(0); return 2.5 }
+func q(n int) int { return 100 + n }
+testing.Println(f(), use())
+" \
+"$BANNER
+> > function P parked (pending: f, q)
+> > > 1000
+> > function f parked (pending: P)
+> method Cell.get parked (pending: P)
+> function P resolved
+function f resolved
+method Cell.get resolved
+warning: f shadowed (incompatible signature); existing callers retain old definition
+warning: Cell.get shadowed (incompatible signature); existing callers retain old definition
+> 3 1000
+> "
+
+# --- A generic instance a parked group names first is checked with the group,
+# so the group waits for the parked redefinition of a name the instance's body
+# uses: gf[bool] calls the new h, however the others parked. ---
+run_repl "group-instance-body-sees-parked-redefinition" \
+"func h() int { return 1000 }
+func gf[T any](x T) int { return cast(int, h()) }
+func P(n int) int { if n == 0 { return 1 }; return f() + q(n) }
+func f() bool { return false }
+func f() int { return gf[bool](true) + P(0) }
+func h() int8 { var _ int = P(0); return 5 }
+func q(n int) int { return 100 + n }
+testing.Println(f())
+" \
+"$BANNER
+> > > function P parked (pending: f, q)
+> > function f parked (pending: P)
+> function h parked (pending: P)
+> function P resolved
+function f resolved
+function h resolved
+warning: f shadowed (incompatible signature); existing callers retain old definition
+warning: h shadowed (incompatible signature); existing callers retain old definition
+> 6
+> "
+
+# --- A declaration typed at the prompt that uses a name a parked declaration
+# redefines with another signature parks on it, though it misses nothing, and
+# calls the new h once that resolves, as f2, parked on P too, does. ---
+run_repl "prompt-declaration-waits-for-parked-redefinition" \
+"func h() int { return 1000 }
+func h() int8 { return cast(int8, 3 + Q(0)) }
+func f() int { return cast(int, h()) }
+func f2() int { return cast(int, h()) + P(0) }
+func P(n int) int { return 0 }
+func Q(n int) int { return 0 }
+testing.Println(f(), f2(), h())
+" \
+"$BANNER
+> > function h parked (pending: Q)
+> function f parked (pending: h)
+> function f2 parked (pending: P, h)
+> > function h resolved
+warning: h shadowed (incompatible signature); existing callers retain old definition
+function f resolved
+function f2 resolved
+> 3 3 3
+> "
+
+# --- A parked redefinition of the same signature is not waited for: it replaces
+# the old definition, so A, resolved before it, calls the new h through its
+# function value once it resolves. ---
+run_repl "replacing-redefinition-not-waited-for" \
+"func h() int { return 1000 }
+var fp *func() int = h
+func A() int { var g *func() int = h; return g() + P(0) }
+func h() int { return 5 + Q(0) }
+func P(n int) int { return 0 }
+A()
+func Q(n int) int { return 0 }
+testing.Println(A())
+" \
+"$BANNER
+> > > function A parked (pending: P)
+> function h parked (pending: Q)
+> function A resolved
+> > function h resolved
+> 5
+> "
+
+# --- A parked declaration whose missing names are declared waits for a parked
+# redefinition of a name it uses — here found only once mk is declared — and
+# says so; it resolves after the redefinition, against it. ---
+run_repl "parked-user-waits-for-parked-redefinition" \
+"type Mv struct { n int }
+func (v Mv) Size() int { return 1000 }
+func f() int8 { return mk().Size() }
+func (v Mv) Size() int8 { return cast(int8, z) }
+func mk() Mv { var v Mv; return v }
+f()
+var z int = 7
+testing.Println(f(), mk().Size())
+" \
+"$BANNER
+> > > function f parked (pending: mk)
+> method Mv.Size parked (pending: z)
+> > <repl>:1:1: function f is unresolved (pending: Mv.Size)
+> method Mv.Size resolved
+warning: Mv.Size shadowed (incompatible signature); existing callers retain old definition
+function f resolved
+> 7 7
 > "
 
 # --- Method values of value-receiver methods, taken from a value, a raw pointer

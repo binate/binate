@@ -4,7 +4,9 @@ import "pkg/binate/irbuild"
 
 import "pkg/binate/ir"
 
+import "pkg/binate/ast"
 import "pkg/binate/iropcode"
+import "pkg/binate/token"
 import "pkg/binate/types"
 
 // ============================================================
@@ -19,13 +21,19 @@ import "pkg/binate/types"
 //
 // The walk mirrors the proven aggregate-copy machinery
 // (EmitGetFieldPtr for struct fields; byte-offset EmitGetElemPtr for array
-// elements) — but compares and conjoins instead of RefInc-ing.  It is fully
-// unrolled and straight-line (no new blocks), so it needs no block threading.
-//
-// TODO: a very large array `[N]T` unrolls to N comparisons; a loop form
-// (mirroring genArrayCopy's counted loop, with a bool accumulator slot) would
-// keep the IR compact for big N.  Deferred — correctness first; the common
-// case is small aggregates.
+// elements) — but compares and conjoins instead of RefInc-ing.  An array whose
+// comparison has at most aggEqUnrollLeaves scalar leaves is unrolled,
+// straight-line; a longer one is compared by a counted loop over its elements
+// that leaves at the first unequal one (emitArrayEqLoop), so the IR is the size
+// of one element's comparison however long the array — `[1 << 24]int` unrolled
+// would be 16M compares.  An aggregate with no scalar leaf (an empty struct, a
+// zero-length array, an array of those) holds no data and compares equal with
+// no compare at all, whatever its length.  Flow continues in ctx.CurBlock,
+// which a loop moves to its exit block.
+
+// aggEqUnrollLeaves is the most scalar leaves an array comparison unrolls; one with
+// more is a loop.
+const aggEqUnrollLeaves int64 = 16
 
 // aggregateEqType returns the peeled struct / array type when `t` is a struct
 // or array (the operand kinds whose == / != is compared field/element-wise),
@@ -41,24 +49,107 @@ func aggregateEqType(t @types.Type) @types.Type {
 	return nil
 }
 
-// genAggregateEq lowers a struct / array == / != by materializing both
-// operands to stack scratch and walking them (emitAggregateEq).  `op` is
-// OP_EQ or OP_NE; `aggTyp` is the peeled aggregate type.  The result is the
-// structural-equality bool, negated for OP_NE.  Each operand is materialized
-// with a plain alloc+store — a bitwise scratch copy, no refcount traffic:
-// managed fields stay owned by the original temporaries, which the normal
-// end-of-statement cleanup handles, and the scratch alloca is an unmanaged
-// raw slot (never registered for destruction).
+// genAggregateEq lowers a struct / array == / != in block b by materializing
+// both operand values to stack scratch and walking them (genAggregateEqAt).
+// `op` is OP_EQ or OP_NE; `aggTyp` is the peeled aggregate type.  Each operand
+// is materialized with a plain alloc+store — a bitwise scratch copy, no
+// refcount traffic: managed fields stay owned by the original temporaries,
+// which the normal end-of-statement cleanup handles, and the scratch alloca is
+// an unmanaged raw slot (never registered for destruction).
 func genAggregateEq(ctx @GenContext, b @ir.Block, op int, lhs @ir.Instr, rhs @ir.Instr,
 		aggTyp @types.Type) @ir.Instr {
 	var u8ptr @types.Type = types.MakePointerType(types.TypUint8())
 	var rawA @ir.Instr = aggregateOperandBase(b, lhs, u8ptr)
 	var rawB @ir.Instr = aggregateOperandBase(b, rhs, u8ptr)
-	var eq @ir.Instr = emitAggregateEq(b, rawA, rawB, aggTyp)
+	return genAggregateEqAt(ctx, b, op, rawA, rawB, aggTyp)
+}
+
+// genAggregateEqAt lowers a struct / array == / != in block b of the aggregates
+// of the peeled type aggTyp whose bytes rawA and rawB (uint8 pointers) point at.
+// The result is the structural-equality bool, negated for OP_NE, in
+// ctx.CurBlock (b, or the exit block of a loop the comparison needed).
+func genAggregateEqAt(ctx @GenContext, b @ir.Block, op int, rawA @ir.Instr, rawB @ir.Instr,
+		aggTyp @types.Type) @ir.Instr {
+	ctx.CurBlock = b
+	var eq @ir.Instr = emitAggregateEq(ctx, rawA, rawB, aggTyp)
 	if op == iropcode.OP_NE {
-		return irbuild.EmitUnary(b, iropcode.OP_NOT, eq, types.TypBool())
+		return irbuild.EmitUnary(ctx.CurBlock, iropcode.OP_NOT, eq, types.TypBool())
 	}
 	return eq
+}
+
+// genAggregateEqExpr lowers the struct / array == / != expression e (op OP_EQ or OP_NE)
+// whose operands have the peeled aggregate type aggTyp, reading an operand's bytes where it
+// is stored when that cannot change what is compared: a variable, or a field or element of
+// one, reached with no side effect (aggEqPure), when nothing evaluated after it can write
+// memory — the left operand when the right one has no side effect either, the right one
+// always.  Any other operand is a scratch copy of its value (aggregateOperandBase).  A
+// read-only compare would otherwise copy each operand — an array of megabytes, twice, on
+// the stack (and on LLVM a third time, the loaded value's own copy).  The walk takes the
+// operands' types as IR-gen gives them (an instance's IR type, not the checker's), the
+// checker's aggTyp only when neither operand has an aggregate one.
+func genAggregateEqExpr(ctx @GenContext, b @ir.Block, op int, e @ast.Expr,
+		aggTyp @types.Type) @ir.Instr {
+	rawA, typA := aggEqOperand(ctx, b, e.X, aggEqPure(e.Y))
+	b = ctx.CurBlock
+	rawB, typB := aggEqOperand(ctx, b, e.Y, true)
+	b = ctx.CurBlock
+	var irTyp @types.Type = aggregateEqType(typA)
+	if irTyp == nil { irTyp = aggregateEqType(typB) }
+	if irTyp == nil { irTyp = aggTyp }
+	return genAggregateEqAt(ctx, b, op, rawA, rawB, irTyp)
+}
+
+// aggEqOperand returns a uint8 pointer to the bytes of aggregate operand x, evaluated in
+// block b, and the IR type of x's value: its storage when inPlace and x is a side-effect
+// free (aggEqPure) variable, field or element — the address a load of it would read,
+// faulting as that load would — else a scratch copy of its value.  Flow continues in
+// ctx.CurBlock.
+func aggEqOperand(ctx @GenContext, b @ir.Block, x @ast.Expr,
+		inPlace bool) (@ir.Instr, @types.Type) {
+	var u8ptr @types.Type = types.MakePointerType(types.TypUint8())
+	ctx.CurBlock = b
+	if inPlace && aggEqPure(x) {
+		var p @ir.Instr = nil
+		if x.Kind == ast.EXPR_IDENT { p = lookupVar(ctx, x.Name) }
+		if x.Kind == ast.EXPR_SELECTOR { p = genSelectorPtr(ctx, b, x, true) }
+		if x.Kind == ast.EXPR_INSTANTIATE_OR_INDEX { p = genIndexPtr(ctx, b, x, true) }
+		var pt @types.Type = nil
+		if p != nil { pt = types.StripWrappers(p.Typ) }
+		if pt != nil && pt.Kind == types.TYP_POINTER && pt.Elem != nil {
+			return irbuild.EmitBitCast(ctx.CurBlock, p, u8ptr), pt.Elem
+		}
+		b = ctx.CurBlock
+	}
+	var v @ir.Instr = genExpr(ctx, b, x)
+	return aggregateOperandBase(ctx.CurBlock, v, u8ptr), v.Typ
+}
+
+// aggEqPure reports whether evaluating e has no side effect — no call, allocation or write
+// (a fault or a panic ends the compare, so it changes nothing compared) — so an operand
+// evaluated before it may be read where it is stored: a name, a literal, and a selector,
+// index, unary or binary expression, `cast`, `bit_cast`, `len`, `sizeof` or `alignof` of
+// such.
+func aggEqPure(e @ast.Expr) bool {
+	if e == nil { return true }
+	var k int = e.Kind
+	if k == ast.EXPR_IDENT || k == ast.EXPR_INT_LIT || k == ast.EXPR_FLOAT_LIT ||
+			k == ast.EXPR_STRING_LIT || k == ast.EXPR_CHAR_LIT || k == ast.EXPR_BOOL_LIT ||
+			k == ast.EXPR_NIL_LIT {
+		return true
+	}
+	if k == ast.EXPR_SELECTOR || k == ast.EXPR_UNARY { return aggEqPure(e.X) }
+	if k == ast.EXPR_BINARY { return aggEqPure(e.X) && aggEqPure(e.Y) }
+	var builtin bool = k == ast.EXPR_BUILTIN &&
+			(e.Op == cast(int, token.CAST) || e.Op == cast(int, token.BIT_CAST) ||
+					e.Op == cast(int, token.LEN) || e.Op == cast(int, token.SIZEOF) ||
+					e.Op == cast(int, token.ALIGNOF))
+	if k != ast.EXPR_INSTANTIATE_OR_INDEX && !builtin { return false }
+	if k == ast.EXPR_INSTANTIATE_OR_INDEX && !aggEqPure(e.X) { return false }
+	for i := 0; i < len(e.Args); i++ {
+		if !aggEqPure(e.Args[i]) { return false }
+	}
+	return true
 }
 
 // aggregateOperandBase returns a uint8* pointing at operand `v`'s element bytes.
@@ -79,26 +170,53 @@ func aggregateOperandBase(b @ir.Block, v @ir.Instr, u8ptr @types.Type) @ir.Instr
 	return irbuild.EmitBitCast(b, slot, u8ptr)
 }
 
-// emitAggregateEq emits the field/element-wise equality of two aggregate
-// values, each given as a pointer to a value of (peeled) aggregate type `t`,
-// and returns the conjoined-equality bool.  Recurses for nested struct /
-// array fields/elements via emitFieldEq.  An empty struct / zero-length
-// array compares equal (const true).
-func emitAggregateEq(b @ir.Block, ptrA @ir.Instr, ptrB @ir.Instr, t @types.Type) @ir.Instr {
+// aggEqLeaves returns how many scalar leaves an == of type t compares, or limit + 1 when
+// that is more than limit (so a huge array's count cannot overflow).
+func aggEqLeaves(t @types.Type, limit int64) int64 {
+	var p @types.Type = types.StripWrappers(t)
+	if p == nil { return 1 }
+	if p.Kind == types.TYP_STRUCT {
+		var n int64 = 0
+		for i := 0; i < len(p.Fields); i++ {
+			n = n + aggEqLeaves(p.Fields[i].Type, limit)
+			if n > limit { return limit + 1 }
+		}
+		return n
+	}
+	if p.Kind == types.TYP_ARRAY {
+		if p.ArrayLen == 0 { return 0 }
+		var e int64 = aggEqLeaves(p.Elem, limit)
+		if e == 0 { return 0 }
+		if e > limit || p.ArrayLen > limit / e { return limit + 1 }
+		return p.ArrayLen * e
+	}
+	return 1
+}
+
+// emitAggregateEq emits, in ctx.CurBlock, the field/element-wise equality of two
+// aggregate values, each given as a pointer to a value of (peeled) aggregate type
+// `t`, and returns the conjoined-equality bool.  Recurses for nested struct /
+// array fields/elements via emitFieldEq.  An aggregate with no scalar leaf
+// compares equal (const true).
+func emitAggregateEq(ctx @GenContext, ptrA @ir.Instr, ptrB @ir.Instr, t @types.Type) @ir.Instr {
+	if aggEqLeaves(t, 0) == 0 { return irbuild.EmitConstBool(ctx.CurBlock, true) }
 	if t.Kind == types.TYP_STRUCT {
 		// A typed struct pointer is required for EmitGetFieldPtr to compute
 		// the field offsets from the struct layout.
-		var pa @ir.Instr = irbuild.EmitBitCast(b, ptrA, types.MakePointerType(t))
-		var pb @ir.Instr = irbuild.EmitBitCast(b, ptrB, types.MakePointerType(t))
+		var pa @ir.Instr = irbuild.EmitBitCast(ctx.CurBlock, ptrA, types.MakePointerType(t))
+		var pb @ir.Instr = irbuild.EmitBitCast(ctx.CurBlock, ptrB, types.MakePointerType(t))
 		var acc @ir.Instr = nil
 		for i := 0; i < len(t.Fields); i++ {
 			var ft @types.Type = t.Fields[i].Type
-			var fpa @ir.Instr = irbuild.EmitGetFieldPtr(b, pa, i, ft)
-			var fpb @ir.Instr = irbuild.EmitGetFieldPtr(b, pb, i, ft)
-			acc = conjoinEq(b, acc, emitFieldEq(b, fpa, fpb, ft))
+			var fpa @ir.Instr = irbuild.EmitGetFieldPtr(ctx.CurBlock, pa, i, ft)
+			var fpb @ir.Instr = irbuild.EmitGetFieldPtr(ctx.CurBlock, pb, i, ft)
+			var feq @ir.Instr = emitFieldEq(ctx, fpa, fpb, ft)
+			acc = conjoinEq(ctx.CurBlock, acc, feq)
 		}
-		if acc == nil { return irbuild.EmitConstBool(b, true) }
 		return acc
+	}
+	if t.ArrayLen > 1 && aggEqLeaves(t, aggEqUnrollLeaves) > aggEqUnrollLeaves {
+		return emitArrayEqLoop(ctx, ptrA, ptrB, t)
 	}
 	// Array: walk N elements at byte offsets i*sizeof(elem).  EmitGetElemPtr
 	// scales the index by its third argument (here uint8 = 1 byte), treating
@@ -108,23 +226,68 @@ func emitAggregateEq(b @ir.Block, ptrA @ir.Instr, ptrB @ir.Instr, t @types.Type)
 	var elemSize int64 = elemTyp.Size()
 	var acc @ir.Instr = nil
 	for i := cast(int64, 0); i < t.ArrayLen; i++ {
-		var off @ir.Instr = irbuild.EmitConstInt64(b, i * elemSize, types.TypInt())
-		var ea @ir.Instr = irbuild.EmitGetElemPtr(b, ptrA, off, types.TypUint8())
-		var eb @ir.Instr = irbuild.EmitGetElemPtr(b, ptrB, off, types.TypUint8())
-		acc = conjoinEq(b, acc, emitFieldEq(b, ea, eb, elemTyp))
+		var off @ir.Instr = irbuild.EmitConstInt64(ctx.CurBlock, i * elemSize, types.TypInt())
+		var ea @ir.Instr = irbuild.EmitGetElemPtr(ctx.CurBlock, ptrA, off, types.TypUint8())
+		var eb @ir.Instr = irbuild.EmitGetElemPtr(ctx.CurBlock, ptrB, off, types.TypUint8())
+		var feq @ir.Instr = emitFieldEq(ctx, ea, eb, elemTyp)
+		acc = conjoinEq(ctx.CurBlock, acc, feq)
 	}
-	if acc == nil { return irbuild.EmitConstBool(b, true) }
 	return acc
 }
 
-// emitFieldEq compares one field / element of type `ft`, given pointers to it
-// in both copies.  A nested struct / array recurses through emitAggregateEq;
-// a scalar / pointer is loaded through a typed pointer and compared with a
-// single OP_EQ.
-func emitFieldEq(b @ir.Block, ptrA @ir.Instr, ptrB @ir.Instr, ft @types.Type) @ir.Instr {
+// emitArrayEqLoop compares the arrays of type t at ptrA and ptrB by a counted loop over their
+// elements that leaves at the first unequal one: a result slot starts true and is cleared
+// there.  The index, the length and each element's byte offset are `uint` — the target's
+// address width, unsigned — so a 32-bit target's array of 2^31 or more elements or bytes
+// still counts and addresses right.  Flow continues in the loop's exit block, which it makes
+// ctx.CurBlock.
+func emitArrayEqLoop(ctx @GenContext, ptrA @ir.Instr, ptrB @ir.Instr, t @types.Type) @ir.Instr {
+	var f @ir.Func = ctx.Func
+	var b @ir.Block = ctx.CurBlock
+	var u @types.Type = types.TypUint()
+	var iSlot @ir.Instr = irbuild.EmitAlloc(b, u)
+	irbuild.EmitStore(b, iSlot, irbuild.EmitConstInt(b, 0, u))
+	var res @ir.Instr = irbuild.EmitAlloc(b, types.TypBool())
+	irbuild.EmitStore(b, res, irbuild.EmitConstBool(b, true))
+	var condBlk @ir.Block = ir.AddBlock(f, "arr_eq_cond")
+	var bodyBlk @ir.Block = ir.AddBlock(f, "arr_eq_body")
+	var nextBlk @ir.Block = ir.AddBlock(f, "arr_eq_next")
+	var missBlk @ir.Block = ir.AddBlock(f, "arr_eq_miss")
+	var exitBlk @ir.Block = ir.AddBlock(f, "arr_eq_exit")
+	irbuild.EmitJump(b, condBlk)
+
+	var i @ir.Instr = irbuild.EmitLoad(condBlk, iSlot, u)
+	var n @ir.Instr = irbuild.EmitConstInt64(condBlk, t.ArrayLen, u)
+	irbuild.EmitBranch(condBlk, irbuild.EmitBinop(condBlk, iropcode.OP_LT, i, n, types.TypBool()),
+			bodyBlk, exitBlk)
+
+	var size @ir.Instr = irbuild.EmitConstInt64(bodyBlk, t.Elem.Size(), u)
+	var off @ir.Instr = irbuild.EmitBinop(bodyBlk, iropcode.OP_MUL, i, size, u)
+	var ea @ir.Instr = irbuild.EmitGetElemPtr(bodyBlk, ptrA, off, types.TypUint8())
+	var eb @ir.Instr = irbuild.EmitGetElemPtr(bodyBlk, ptrB, off, types.TypUint8())
+	ctx.CurBlock = bodyBlk
+	var eq @ir.Instr = emitFieldEq(ctx, ea, eb, t.Elem)
+	irbuild.EmitBranch(ctx.CurBlock, eq, nextBlk, missBlk)
+
+	var one @ir.Instr = irbuild.EmitConstInt(nextBlk, 1, u)
+	irbuild.EmitStore(nextBlk, iSlot, irbuild.EmitBinop(nextBlk, iropcode.OP_ADD, i, one, u))
+	irbuild.EmitJump(nextBlk, condBlk)
+
+	irbuild.EmitStore(missBlk, res, irbuild.EmitConstBool(missBlk, false))
+	irbuild.EmitJump(missBlk, exitBlk)
+
+	ctx.CurBlock = exitBlk
+	return irbuild.EmitLoad(exitBlk, res, types.TypBool())
+}
+
+// emitFieldEq compares, in ctx.CurBlock, one field / element of type `ft`, given
+// pointers to it in both copies.  A nested struct / array recurses through
+// emitAggregateEq; a scalar / pointer is loaded through a typed pointer and
+// compared with a single OP_EQ.
+func emitFieldEq(ctx @GenContext, ptrA @ir.Instr, ptrB @ir.Instr, ft @types.Type) @ir.Instr {
 	var fp @types.Type = types.StripWrappers(ft)
 	if fp != nil && (fp.Kind == types.TYP_STRUCT || fp.Kind == types.TYP_ARRAY) {
-		return emitAggregateEq(b, ptrA, ptrB, fp)
+		return emitAggregateEq(ctx, ptrA, ptrB, fp)
 	}
 	// Defense-in-depth: a non-comparable leaf (slice / interface value / function
 	// value) means a non-comparable aggregate was compared — the checker rejects
@@ -138,6 +301,7 @@ func emitFieldEq(b @ir.Block, ptrA @ir.Instr, ptrB @ir.Instr, ft @types.Type) @i
 						"the checker should have rejected it (compiler bug: an ill-typed "
 						"comparison slipped the checker) -- see gen_eq_aggregate.bn")
 	}
+	var b @ir.Block = ctx.CurBlock
 	var pa @ir.Instr = irbuild.EmitBitCast(b, ptrA, types.MakePointerType(ft))
 	var pb @ir.Instr = irbuild.EmitBitCast(b, ptrB, types.MakePointerType(ft))
 	var va @ir.Instr = irbuild.EmitLoad(b, pa, ft)

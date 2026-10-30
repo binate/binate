@@ -4,7 +4,6 @@ import "pkg/binate/ir"
 import "pkg/binate/irbuild"
 import "pkg/binate/iropcode"
 import "pkg/std/vec"
-import "pkg/stdx/slices"
 
 // coalesceSliceExtracts hoists a materialized slice value's field extracts to one
 // canonical OP_EXTRACT per field, placed right after that value's definition.
@@ -29,76 +28,108 @@ import "pkg/stdx/slices"
 // dominates E, so l0 — and the canonical placed right after it — dominates every use
 // of E (a normal-block use, a phi operand measured at its predecessor edge, or a
 // fault-pad use alike).  This needs no assumption about WHERE l0 sits.
+//
+// Fault-pad extracts of an l0 keep their own (cold) instructions; only their uses
+// of a dropped normal extract are redirected — the canonical after l0 dominates the
+// pads.
+//
+// All the l0s are coalesced together — one scan of the function, one rebuild, one
+// rewrite of the uses: each l0 is a distinct fresh load (applyRLE), never an
+// extract of another, so coalescing one leaves the others' extracts alone.  The
+// canonicals are made l0 by l0, each l0's in the order its field indices are first
+// seen.  An l0 listed twice, outside f's ids, or itself one of the extracts being
+// dropped breaks that, and panics.
 func coalesceSliceExtracts(f @ir.Func, l0s @[]@ir.Instr) {
+	var oldCap int = f.NextID
+	// Each l0's index in l0s, by id (-1: not an l0).
+	var l0At @[]int = make_slice(int, oldCap)
+	for id := 0; id < oldCap; id++ {
+		l0At[id] = -1
+	}
 	for i := 0; i < len(l0s); i++ {
 		if l0s[i] == nil {
 			continue
 		}
-		coalesceOneSliceExtracts(f, l0s[i])
+		if l0s[i].ID < 0 || l0s[i].ID >= oldCap || l0At[l0s[i].ID] >= 0 {
+			panic("coalesceSliceExtracts: an l0 outside the function's ids, or listed twice")
+		}
+		l0At[l0s[i].ID] = i
 	}
-}
 
-// coalesceOneSliceExtracts coalesces the normal-block OP_EXTRACT uses of a single
-// materialized slice value l0: it creates one canonical extract per distinct field
-// index right after l0, redirects every use (in normal blocks AND fault pads) to the
-// canonical, and drops the originals.  Fault-pad extracts of l0 keep their own
-// (cold) instructions; only their uses of a now-dropped normal extract are redirected
-// — the canonical at entry dominates the pads.
-func coalesceOneSliceExtracts(f @ir.Func, l0 @ir.Instr) {
-	var oldCap int = f.NextID
-	var replByID @[]@ir.Instr = instrTable(oldCap)
-	var deleted @[]bool = boolTable(oldCap)
-
-	// One canonical extract per distinct field index, in first-seen order.  Scan
-	// normal blocks only: that is where l0 and the hot per-access extracts live.
-	var idxSeen @vec.Vec[int] = vec.New[int]()
-	var canon @[]@ir.Instr
-	var any bool = false
+	// Each l0's normal-block extracts, in block order.  Scan normal blocks only:
+	// that is where the l0s and the hot per-access extracts live.
+	var extractsOf @[]@vec.Vec[@ir.Instr] = make_slice(@vec.Vec[@ir.Instr], len(l0s))
+	var found bool = false
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var blk @ir.Block = f.Blocks[bi]
 		for ii := 0; ii < len(blk.Instrs); ii++ {
 			var ins @ir.Instr = blk.Instrs[ii]
-			if ins.Op != iropcode.OP_EXTRACT {
+			var li int = extractedL0(ins, l0s, l0At, oldCap)
+			if li < 0 {
 				continue
 			}
-			if len(ins.Args) < 1 || ins.Args[0] != l0 {
-				continue
+			if extractsOf[li] == nil {
+				extractsOf[li] = vec.New[@ir.Instr]()
 			}
-			any = true
-			var c @ir.Instr = findCanonExtract(idxSeen.Items(), canon, ins.Index)
+			extractsOf[li].Push(ins)
+			found = true
+		}
+	}
+	if !found {
+		return
+	}
+
+	// One canonical extract per l0 and distinct field index: made l0 by l0, each
+	// l0's in the order its field indices are first seen.  replByID maps each
+	// gathered extract to its canonical, and deleted marks it for dropping.
+	var replByID @[]@ir.Instr = instrTable(oldCap)
+	var deleted @[]bool = boolTable(oldCap)
+	var canonOf @[]@[]@ir.Instr = make_slice(@[]@ir.Instr, len(l0s))
+	for i := 0; i < len(l0s); i++ {
+		if extractsOf[i] == nil {
+			continue
+		}
+		var idxSeen @vec.Vec[int] = vec.New[int]()
+		var canon @vec.Vec[@ir.Instr] = vec.New[@ir.Instr]()
+		var exts @[]@ir.Instr = extractsOf[i].Items()
+		for k := 0; k < len(exts); k++ {
+			var ins @ir.Instr = exts[k]
+			var c @ir.Instr = findCanonExtract(idxSeen.Items(), canon.Items(), ins.Index)
 			if c == nil {
 				c = ir.NewInstr(f, iropcode.OP_EXTRACT, ins.Typ)
-				c.Args = irbuild.MakeArgs1(l0)
+				c.Args = irbuild.MakeArgs1(l0s[i])
 				c.Index = ins.Index
 				idxSeen.Push(ins.Index)
-				canon = slices.Append[@ir.Instr](canon, c)
+				canon.Push(c)
 			}
 			if ins.ID >= 0 && ins.ID < oldCap {
 				replByID[ins.ID] = c
 				deleted[ins.ID] = true
 			}
 		}
-	}
-	if !any {
-		return
+		canonOf[i] = canon.Items()
 	}
 
 	// The dropped extracts, kept alive until their uses (a phi's among them, which
 	// does not own its operand) are redirected below.
 	var dropped @vec.Vec[@ir.Instr] = vec.New[@ir.Instr]()
-	// Rebuild normal blocks: drop the coalesced extracts, and emit the canonicals
-	// right after l0's own instruction (l0 lives in a normal block).
+	// Rebuild normal blocks: drop the coalesced extracts, and emit each l0's
+	// canonicals right after its own instruction (an l0 lives in a normal block).
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var blk @ir.Block = f.Blocks[bi]
 		var kept @vec.Vec[@ir.Instr] = vec.New[@ir.Instr]()
 		for ii := 0; ii < len(blk.Instrs); ii++ {
 			var ins @ir.Instr = blk.Instrs[ii]
 			if ins.ID >= 0 && ins.ID < oldCap && deleted[ins.ID] {
+				if l0At[ins.ID] >= 0 {
+					panic("coalesceSliceExtracts: an l0 is an extract of another l0")
+				}
 				dropped.Push(ins)
 				continue
 			}
 			kept.Push(ins)
-			if ins == l0 {
+			if ins.ID >= 0 && ins.ID < oldCap && l0At[ins.ID] >= 0 && l0s[l0At[ins.ID]] == ins {
+				var canon @[]@ir.Instr = canonOf[l0At[ins.ID]]
 				for k := 0; k < len(canon); k++ {
 					kept.Push(canon[k])
 				}
@@ -120,6 +151,19 @@ func coalesceOneSliceExtracts(f @ir.Func, l0 @ir.Instr) {
 	var noAllocaDeleted @[]bool = make_slice(bool, oldCap)
 	assertNoSurvivingUses(f.Blocks, replByID, noAllocaDeleted, oldCap)
 	assertNoSurvivingUses(f.FaultPads, replByID, noAllocaDeleted, oldCap)
+}
+
+// extractedL0 returns the index in l0s of the l0 that ins is an OP_EXTRACT of
+// (l0At maps an l0's id below cap to that index), or -1.
+func extractedL0(ins @ir.Instr, l0s @[]@ir.Instr, l0At @[]int, cap int) int {
+	if ins.Op != iropcode.OP_EXTRACT || len(ins.Args) < 1 {
+		return -1
+	}
+	var x @ir.Instr = ins.Args[0]
+	if x == nil || x.ID < 0 || x.ID >= cap || l0At[x.ID] < 0 || l0s[l0At[x.ID]] != x {
+		return -1
+	}
+	return l0At[x.ID]
 }
 
 // findCanonExtract returns the canonical extract already created for field index

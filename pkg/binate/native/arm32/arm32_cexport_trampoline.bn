@@ -70,9 +70,10 @@ func loadHfaTupleReturn_arm32(a @asm.Assembler, t @types.Type, baseOff int64) {
 // carrying a local buffer for the body to write.  `shift` is that difference; 0
 // whenever the two conventions agree.  AAPCS32 may split an aggregate across r0-r3
 // and the stack, so each word is placed by its own register-vs-stack test on both
-// sides.  Register writes never clobber a live source: phase 1 stages r0-r3, phase
-// 2 reads only from that staging or the incoming stack.  A native caller enters at
-// `sym`.
+// sides.  Register writes never clobber a live source: r0-r3 are staged first, each
+// argument's long stack run is then copied with a loop before any register is placed
+// (emitCExportStackRunsArm32), and the per-word moves read only from that staging or the
+// incoming stack.  A native caller enters at `sym`.
 func emitCExportTrampolineArm32(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
 		sym *[]readonly char) {
 	var cc callconv.CallConv = rm.CC
@@ -132,7 +133,9 @@ func emitCExportTrampolineArm32(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
 	var frameSz int64 = alignFrameArm32(cc, retSlotOff + cast(int64, retSlotBytes))
 	var savedBytes int64 = 8 // {r4, lr}
 	var inBase int64 = frameSz + savedBytes
-	if !common.CheckShimFrameFits(a, inBase, f.Name) { return }
+	// The trampoline reads its caller's stack arguments right above its own frame, so the
+	// two must fit the address space together.
+	if !common.CheckShimFrameFits(a, inBase + cc.CallStackBytes64(paramTypesC), f.Name) { return }
 
 	arm32.Push(a, arm32.COND_AL, 0x4010) // {r4, lr}
 	if frameSz > 0 {
@@ -141,6 +144,7 @@ func emitCExportTrampolineArm32(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
 	for r := 0; r < cc.NumGpArgRegs; r++ {
 		emitFrameStore(a, argReg(r), stageOff + cast(int64, w * r))
 	}
+	emitCExportStackRunsArm32(a, cc, paramTypesInt, paramTypesC, shift, intSret && !cSret, inBase)
 
 	for i := 0; i < len(paramTypesInt); i++ {
 		var t @types.Type = paramTypesInt[i]
@@ -173,16 +177,16 @@ func emitCExportTrampolineArm32(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
 		var nWords int = ccArgWordsArm32(cc, t)
 		var cReg int = cc.CallArgRegStart(paramTypesC, cIdx)
 		var cOff int64 = cc.CallArgStackOff64(paramTypesC, cIdx)
-		var cRegWords int = 0
-		if cReg >= 0 {
-			cRegWords = nWords
-			if cOff >= 0 {
-				cRegWords = cc.NumGpArgRegs - cReg
-			}
-		}
+		var cRegWords int = gpRegWordsArm32(cc, cReg, cOff, nWords)
+		var iRegWords int = gpRegWordsArm32(cc, nReg, nOff, nWords)
+		// The words past both register parts, a long run of them, were copied by the
+		// pre-pass (emitCExportStackRunsArm32).
+		var stop int = nWords
+		k0, isLoop := cexportStackRunArm32(cc, t, nWords, cRegWords, iRegWords)
+		if isLoop { stop = k0 }
 
 		var isScalar bool = !callconv.IsAggregateTyp(t)
-		for wi := 0; wi < nWords; wi++ {
+		for wi := 0; wi < stop; wi++ {
 			if wi < cRegWords {
 				emitFrameLoad(a, arm32.R4, stageOff + cast(int64, w * (cReg + wi)))
 			} else {
@@ -190,13 +194,6 @@ func emitCExportTrampolineArm32(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
 			}
 			if isScalar {
 				normalizeNarrowRegParamArm32(a, arm32.R4, t)
-			}
-			var iRegWords int = 0
-			if nReg >= 0 {
-				iRegWords = nWords
-				if nOff >= 0 {
-					iRegWords = cc.NumGpArgRegs - nReg
-				}
 			}
 			if wi < iRegWords {
 				arm32.Mov(a, arm32.COND_AL, false, argReg(nReg + wi), arm32.Reg(arm32.R4))
@@ -235,4 +232,60 @@ func emitCExportTrampolineArm32(a @asm.Assembler, rm @common.RegMap, f @ir.Func,
 		emitSpAdjust(a, true, wordArm32(frameSz))
 	}
 	arm32.Pop(a, arm32.COND_AL, 0x8010) // {r4, pc}
+}
+
+// gpRegWordsArm32 returns how many of an argument's nWords travel in GP registers, given
+// its first register reg and stack offset off: none when it has no register, all when it
+// has no stack part, else the registers left from reg (AAPCS32 splits it there).
+func gpRegWordsArm32(cc callconv.CallConv, reg int, off int64, nWords int) int {
+	if reg < 0 { return 0 }
+	if off < 0 { return nWords }
+	return cc.NumGpArgRegs - reg
+}
+
+// cexportStackRunArm32 returns the first word k0 of an nWords argument of type t that is
+// on the stack on both sides of the trampoline -- past its C register words cRegWords and
+// its internal ones iRegWords -- and whether the run from k0 is an aggregate's, long
+// enough to be copied with a loop (aggCopyIsLoop) rather than word by word.
+func cexportStackRunArm32(cc callconv.CallConv, t @types.Type, nWords int, cRegWords int,
+		iRegWords int) (int, bool) {
+	var k0 int = cRegWords
+	if iRegWords > k0 { k0 = iRegWords }
+	return k0, callconv.IsAggregateTyp(t) && aggCopyIsLoop(stackRunBytesArm32(cc, nWords - k0), false)
+}
+
+// stackRunBytesArm32 returns the bytes of n argument words as int: an argument of the
+// largest type's size rounds up to 2^31 bytes of words, so it is formed in int64, and
+// narrows fail-loud past a 32-bit host's int.
+func stackRunBytesArm32(cc callconv.CallConv, n int) int {
+	return types.HostInt(cast(int64, cc.WordBytes) * cast(int64, n))
+}
+
+// emitCExportStackRunsArm32 copies, before the trampoline writes any argument register,
+// each GP argument's long stack run (cexportStackRunArm32) from the C caller's stack
+// arguments, at inBase above SP, to sym's outgoing ones, with a loop
+// (emitShimCopyLoopArm32): R2 (the source) and R3 (the destination) as cursors, through
+// R4 / LR, counted in IP.  All are free here: r0-r3 are staged, R4 and LR are saved, and
+// nothing is placed yet.  A large by-value aggregate is otherwise one load and store a
+// word -- 2^29 of each for one of 2 GiB.  skipFirst marks the internal sret
+// pointer, which C does not pass (paramTypesInt[0] is no argument of C's); shift is the
+// C index of internal argument i, less i.
+func emitCExportStackRunsArm32(a @asm.Assembler, cc callconv.CallConv, paramTypesInt @[]@types.Type,
+		paramTypesC @[]@types.Type, shift int, skipFirst bool, inBase int64) {
+	var w int = cc.WordBytes
+	for i := 0; i < len(paramTypesInt); i++ {
+		var t @types.Type = paramTypesInt[i]
+		if skipFirst && i == 0 { continue }
+		if abi.Arm32HardFloat() && (callconv.IsFloatScalarTyp(t) || isVfpHfaArm32(cc, t)) { continue }
+		var nWords int = ccArgWordsArm32(cc, t)
+		var nOff int64 = cc.CallArgStackOff64(paramTypesInt, i)
+		var cOff int64 = cc.CallArgStackOff64(paramTypesC, i + shift)
+		var cRegWords int = gpRegWordsArm32(cc, cc.CallArgRegStart(paramTypesC, i + shift), cOff, nWords)
+		var iRegWords int = gpRegWordsArm32(cc, cc.CallArgRegStart(paramTypesInt, i), nOff, nWords)
+		k0, isLoop := cexportStackRunArm32(cc, t, nWords, cRegWords, iRegWords)
+		if !isLoop { continue }
+		emitFrameAddr(a, arm32.R2, inBase + cOff + cast(int64, w * (k0 - cRegWords)))
+		emitFrameAddr(a, arm32.R3, nOff + cast(int64, w * (k0 - iRegWords)))
+		emitShimCopyLoopArm32(a, arm32.R3, arm32.R2, stackRunBytesArm32(cc, nWords - k0), false)
+	}
 }

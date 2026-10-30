@@ -187,6 +187,65 @@ func retBa() (int8, [3]int8) { return cast(int8, 5), [3]int8{6, 7, 8} }
 #[c_export("a32_mip")]
 func retIp() (int32, Pair) { return cast(int32, 7), Pair{a: 8, b: 9} }
 
+// Large structs passed by value to entries that are trampolines (C and Binate return
+// the result differently), which copy the structs' stack words past the registers with
+// a loop; each result checksums every word.  The reads are unsafe_index: the facade
+// links without the runtime, whose bounds-check failure a checked index calls.  A 160-byte struct, then a scalar, with a
+// two-word result C returns through a buffer: C passes the struct in r1-r3 (r0 holds
+// the buffer) and the stack, Binate in r0-r3 and the stack.
+type Blob struct { w [40]int32 }
+
+func blobSum(x Blob) int32 {
+	var s int32 = 0
+	for i := 0; i < 40; i++ { s = s + unsafe_index(x.w, i) * cast(int32, i + 1) }
+	return s
+}
+
+#[c_export("a32_blob")]
+func takeBlob(x Blob, k int32) (int32, int32) { return blobSum(x) + k, unsafe_index(x.w, 20) }
+
+// A second struct wholly on the stack, at different offsets on the two sides.
+#[c_export("a32_blob2")]
+func takeBlob2(x Blob, y Blob) (int32, int32) { return blobSum(x), blobSum(y) }
+
+// 41 words: an odd run of words past the registers.
+type Blob41 struct { w [41]int32 }
+
+#[c_export("a32_blob41")]
+func takeBlob41(x Blob41) (int32, int32) {
+	var s int32 = 0
+	for i := 0; i < 41; i++ { s = s + unsafe_index(x.w, i) * cast(int32, i + 1) }
+	return s, unsafe_index(x.w, 40)
+}
+
+// 161 bytes: the last word holds one byte.
+type Bytes161 struct { b [161]uint8 }
+
+#[c_export("a32_bytes161")]
+func takeBytes161(x Bytes161) (int32, int32) {
+	var s int32 = 0
+	for i := 0; i < 161; i++ { s = s + cast(int32, unsafe_index(x.b, i)) * cast(int32, i + 1) }
+	return s, cast(int32, unsafe_index(x.b, 160))
+}
+
+// A result C returns in d0-d3 but Binate through a buffer: Binate passes the struct in
+// r1-r3 (r0 holds the buffer) and the stack, C in r0-r3 and the stack.
+#[c_export("a32_blobd3")]
+func takeBlobD3(x Blob) (D3, float64) {
+	var v D3 = D3{x: cast(float64, blobSum(x)), y: cast(float64, unsafe_index(x.w, 0)),
+		z: cast(float64, unsafe_index(x.w, 39))}
+	return v, cast(float64, 0.5)
+}
+
+// A result both return in r0, packed differently: the struct is at the same place on both
+// sides.
+#[c_export("a32_blobba")]
+func takeBlobBa(x Blob) (int8, [3]int8) {
+	var b [3]int8 = [3]int8{cast(int8, unsafe_index(x.w, 3)), cast(int8, unsafe_index(x.w, 4)),
+		cast(int8, unsafe_index(x.w, 39))}
+	return cast(int8, blobSum(x)), b
+}
+
 // The (D3, float64) entry reached through a __c_entry pointer.
 #[c_export("a32_get_md3")]
 func getMd3() *uint8 { return __c_entry(retD3) }
@@ -230,6 +289,21 @@ struct Mba { signed char a; signed char b[3]; };
 extern struct Mba a32_mba(void);
 extern void *a32_get_md3(void);
 typedef struct Md3 (*md3_fn)(void);
+struct Blob { int w[40]; };
+struct Rblob { int a, b; };
+extern struct Rblob a32_blob(struct Blob, int);
+extern struct Rblob a32_blob2(struct Blob, struct Blob);
+struct Blob41 { int w[41]; };
+extern struct Rblob a32_blob41(struct Blob41);
+struct Bytes161 { unsigned char b[161]; };
+extern struct Rblob a32_bytes161(struct Bytes161);
+extern struct Md3 a32_blobd3(struct Blob);
+extern struct Mba a32_blobba(struct Blob);
+static int wsum(const int *w, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) s += w[i] * (i + 1);
+    return s;
+}
 
 static int fails = 0;
 static void chk(const char *n, long long got, long long want) {
@@ -271,6 +345,32 @@ int main(void) {
     chk("a32_mba", ba.a * 1000 + ba.b[0] * 100 + ba.b[1] * 10 + ba.b[2], 5678);
     struct Mip ip = a32_mip();
     chk("a32_mip", ip.a * 100 + ip.p.a * 10 + ip.p.b, 789);
+    struct Blob bl, bl2;
+    struct Blob41 b41;
+    struct Bytes161 b161;
+    for (int i = 0; i < 40; i++) { bl.w[i] = i + 1; bl2.w[i] = 100 - i; }
+    for (int i = 0; i < 41; i++) b41.w[i] = 3 * i + 7;
+    for (int i = 0; i < 161; i++) b161.b[i] = (unsigned char)(i * 7 + 3);
+    int bs = wsum(bl.w, 40);
+    struct Rblob rb = a32_blob(bl, 1000);
+    chk("a32_blob", rb.a, bs + 1000);
+    chk("a32_blob.w20", rb.b, 21);
+    struct Rblob rb2 = a32_blob2(bl, bl2);
+    chk("a32_blob2.x", rb2.a, bs);
+    chk("a32_blob2.y", rb2.b, wsum(bl2.w, 40));
+    struct Rblob r41 = a32_blob41(b41);
+    chk("a32_blob41", r41.a, wsum(b41.w, 41));
+    chk("a32_blob41.w40", r41.b, 127);
+    int b161s = 0;
+    for (int i = 0; i < 161; i++) b161s += b161.b[i] * (i + 1);
+    struct Rblob r161 = a32_bytes161(b161);
+    chk("a32_bytes161", r161.a, b161s);
+    chk("a32_bytes161.b160", r161.b, 99);
+    struct Md3 bd = a32_blobd3(bl);
+    chk4("a32_blobd3", bd.v.x, bd.v.y, bd.v.z, bd.z, bs, 1, 40, 0.5);
+    struct Mba bb = a32_blobba(bl);
+    chk("a32_blobba", bb.a * 1000000 + bb.b[0] * 10000 + bb.b[1] * 100 + bb.b[2],
+        (signed char)bs * 1000000 + 4 * 10000 + 5 * 100 + 40);
     if (fails) { printf("%d FAILURE(S)\n", fails); return 1; }
     printf("ALL PASS\n"); return 0;
 }

@@ -6,7 +6,6 @@ import "pkg/std/vec"
 
 import "pkg/binate/iropcode"
 import "pkg/binate/types"
-import "pkg/stdx/slices"
 
 // Non-managed scalar SSA promotion (mem2reg) — the first OP_PHI producer.
 //
@@ -35,16 +34,25 @@ func promoteFuncScalars(f @ir.Func) {
 	// kept terminator (no reachable block targets an unreachable one), so it is
 	// a sound precondition that also drops the offending orphan->merge edges.
 	pruneUnreachableBlocks(f)
+	if !hasPromotableAlloca(f) {
+		return
+	}
 
 	var d @DomInfo = ComputeDom(f)
 	var n int = d.NumBlocks
 	var domChildren @[]@[]int = buildDomChildren(d)
+	// Every value's reads, indexed once: each alloca's escape check, its stores'
+	// blocks and its rename walk then visit the alloca's own uses rather than every
+	// instruction, which would cost the alloca count times the instruction count.
+	// The analysis below creates phis and zero constants but inserts nothing, so
+	// the index stays exact until applyPromotion.
+	var ui @useIndex = buildUseIndex(f)
 
 	// Global accumulators, applied in one mutation phase after all analysis so
 	// the CFG (blocks + terminators — untouched by promotion) stays stable and
 	// every alloca is analyzed against the original IR.
-	var gPhi @[]@ir.Instr
-	var gPhiBlock @[]int
+	var gPhi @vec.Vec[@ir.Instr] = vec.New[@ir.Instr]()
+	var gPhiBlock @vec.Vec[int] = vec.New[int]()
 	var gReplID @vec.Vec[int] = vec.New[int]()
 	var gReplVal @vec.Vec[@ir.Instr] = vec.New[@ir.Instr]()
 	var gGroundLoad @vec.Vec[@ir.Instr] = vec.New[@ir.Instr]()
@@ -60,19 +68,20 @@ func promoteFuncScalars(f @ir.Func) {
 			if !isPromotableAlloca(instr) {
 				continue
 			}
-			if allocaEscapes(f, instr) {
+			var uses @[]valueUse = ui.usesOf(instr)
+			if allocaEscapes(instr, uses) {
 				continue
 			}
-			var defBlocks @[]int = allocaDefBlocks(f, instr)
-			var res @m2rResult = analyzeAlloca(f, d, domChildren, n, instr, defBlocks)
+			var defBlocks @[]int = allocaDefBlocks(uses)
+			var res @m2rResult = analyzeAlloca(f, d, domChildren, n, instr, defBlocks, uses)
 			if !res.ok {
 				continue
 			}
 			// Merge this alloca's promotion into the global accumulators.
 			for b := 0; b < n; b++ {
 				if res.phiOfBlock[b] != nil {
-					gPhi = slices.Append[@ir.Instr](gPhi, res.phiOfBlock[b])
-					gPhiBlock = slices.Append[int](gPhiBlock, b)
+					gPhi.Push(res.phiOfBlock[b])
+					gPhiBlock.Push(b)
 				}
 			}
 			for k := 0; k < len(res.replIDs); k++ {
@@ -95,9 +104,9 @@ func promoteFuncScalars(f @ir.Func) {
 		return
 	}
 
-	applyPromotion(f, n, gPhi, gPhiBlock, gReplID.Items(), gReplVal.Items(), gGroundLoad.Items(),
-			gGroundVal.Items(), gZeroVal.Items(), gDeletedAlloca.Items())
-	assertPromotion(f, d, gPhi, gPhiBlock)
+	applyPromotion(f, n, gPhi.Items(), gPhiBlock.Items(), gReplID.Items(), gReplVal.Items(),
+			gGroundLoad.Items(), gGroundVal.Items(), gZeroVal.Items(), gDeletedAlloca.Items())
+	assertPromotion(f, d, gPhi.Items(), gPhiBlock.Items())
 }
 
 // isPromotableAlloca reports whether instr is an OP_ALLOC of a non-managed
@@ -113,58 +122,45 @@ func isPromotableAlloca(instr @ir.Instr) bool {
 	return isScalarPromotableType(instr.TypeArg)
 }
 
-// allocaEscapes reports whether the alloca's result is used as anything other
-// than the address (Args[0]) of a plain OP_LOAD / OP_STORE, or by a load or
-// store that reinterprets the slot's bits (accessReinterpretsSlot).  Over-broad
-// by design: ANY other appearance — as a store's value (Args[1]), any operand of
-// any other op, a phi entry, or ANY appearance inside FaultPads — pins the slot
-// unpromotable.  A scalar slot never legitimately appears in a pad; treating
-// any pad appearance as escape is a belt-and-suspenders that essentially never
-// fires.
-func allocaEscapes(f @ir.Func, a @ir.Instr) bool {
+// hasPromotableAlloca reports whether any instruction of f's blocks is a
+// promotable alloca, so a function with none skips the dominator tree and the use
+// index.
+func hasPromotableAlloca(f @ir.Func) bool {
 	for bi := 0; bi < len(f.Blocks); bi++ {
-		if blockUsesAllocaNonLoadStore(f.Blocks[bi], a) {
-			return true
-		}
-	}
-	for pi := 0; pi < len(f.FaultPads); pi++ {
-		if blockReferencesAlloca(f.FaultPads[pi], a) {
-			return true
+		for ii := 0; ii < len(f.Blocks[bi].Instrs); ii++ {
+			if isPromotableAlloca(f.Blocks[bi].Instrs[ii]) { return true }
 		}
 	}
 	return false
 }
 
-// blockUsesAllocaNonLoadStore reports whether any instr in b references a as an
-// operand in a way that is NOT the Args[0] pointer of a plain load/store.
-func blockUsesAllocaNonLoadStore(b @ir.Block, a @ir.Instr) bool {
-	for ii := 0; ii < len(b.Instrs); ii++ {
-		var instr @ir.Instr = b.Instrs[ii]
-		if instr == a {
-			continue // the alloca definition itself is not a use
+// allocaEscapes reports whether alloca a, whose reads are uses, is used as
+// anything other than the address (Args[0]) of a plain OP_LOAD / OP_STORE, or by
+// a load or store that reinterprets the slot's bits (accessReinterpretsSlot).
+// Over-broad by design: ANY other appearance — as a store's value (Args[1]), any
+// operand of any other op, a phi entry, or ANY appearance inside FaultPads — pins
+// the slot unpromotable.  A scalar slot never legitimately appears in a pad;
+// treating any pad appearance as escape is a belt-and-suspenders that essentially
+// never fires.
+func allocaEscapes(a @ir.Instr, uses @[]valueUse) bool {
+	for i := 0; i < len(uses); i++ {
+		if uses[i].inPad { return true }
+		var instr @ir.Instr = uses[i].user
+		if instr == a { continue } // the alloca definition itself is not a use
+		var k int = uses[i].argIdx
+		if k < 0 { return true } // a phi entry
+		var okLoad bool = instr.Op == iropcode.OP_LOAD && k == 0
+		var okStore bool = instr.Op == iropcode.OP_STORE && k == 0
+		if !okLoad && !okStore {
+			return true
 		}
-		for k := 0; k < len(instr.Args); k++ {
-			if instr.Args[k] != a {
-				continue
-			}
-			var okLoad bool = instr.Op == iropcode.OP_LOAD && k == 0
-			var okStore bool = instr.Op == iropcode.OP_STORE && k == 0
-			if !okLoad && !okStore {
-				return true
-			}
-			var none @ir.Instr
-			if okLoad && accessReinterpretsSlot(a.TypeArg, instr.Typ, none) {
-				return true
-			}
-			if okStore && len(instr.Args) > 1 && instr.Args[1] != nil &&
-					accessReinterpretsSlot(a.TypeArg, instr.Args[1].Typ, instr.Args[1]) {
-				return true
-			}
+		var none @ir.Instr
+		if okLoad && accessReinterpretsSlot(a.TypeArg, instr.Typ, none) {
+			return true
 		}
-		for k := 0; k < len(instr.Phis); k++ {
-			if instr.Phis[k].Val == a {
-				return true
-			}
+		if okStore && len(instr.Args) > 1 && instr.Args[1] != nil &&
+				accessReinterpretsSlot(a.TypeArg, instr.Args[1].Typ, instr.Args[1]) {
+			return true
 		}
 	}
 	return false
@@ -202,40 +198,14 @@ func accessReinterpretsSlot(slotTyp @types.Type, accTyp @types.Type, v @ir.Instr
 	return slotFloat && at.Width != st.Width
 }
 
-// blockReferencesAlloca reports whether any instr in b references a at all (any
-// arg or phi entry) — used to treat ANY FaultPad appearance as an escape.
-func blockReferencesAlloca(b @ir.Block, a @ir.Instr) bool {
-	for ii := 0; ii < len(b.Instrs); ii++ {
-		var instr @ir.Instr = b.Instrs[ii]
-		for k := 0; k < len(instr.Args); k++ {
-			if instr.Args[k] == a {
-				return true
-			}
-		}
-		for k := 0; k < len(instr.Phis); k++ {
-			if instr.Phis[k].Val == a {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// allocaDefBlocks returns the deduped block indices containing a store to a.
-func allocaDefBlocks(f @ir.Func, a @ir.Instr) @[]int {
+// allocaDefBlocks returns the indices, ascending and deduped, of the blocks
+// holding a store to the alloca whose reads are uses (which run in block order).
+func allocaDefBlocks(uses @[]valueUse) @[]int {
 	var out @vec.Vec[int] = vec.New[int]()
-	for bi := 0; bi < len(f.Blocks); bi++ {
-		var blk @ir.Block = f.Blocks[bi]
-		var found bool = false
-		for ii := 0; ii < len(blk.Instrs); ii++ {
-			var instr @ir.Instr = blk.Instrs[ii]
-			if instr.Op == iropcode.OP_STORE && len(instr.Args) >= 1 && instr.Args[0] == a {
-				found = true
-			}
-		}
-		if found {
-			out.Push(bi)
-		}
+	for i := 0; i < len(uses); i++ {
+		if uses[i].inPad || uses[i].argIdx != 0 || uses[i].user.Op != iropcode.OP_STORE { continue }
+		var b int = uses[i].blockIdx
+		if out.Len() == 0 || out.Get(out.Len() - 1) != b { out.Push(b) }
 	}
 	return out.Items()
 }
@@ -295,20 +265,20 @@ func pruneUnreachableBlocks(f @ir.Func) {
 		return
 	}
 	var reachable @[]bool = make_slice(bool, n)
-	var stack @[]int
+	var stack @vec.Vec[int] = vec.New[int]()
 	reachable[0] = true
-	stack = slices.Append[int](stack, 0)
-	for len(stack) > 0 {
-		var b int = stack[len(stack) - 1]
-		stack = popInt(stack)
+	stack.Push(0)
+	for stack.Len() > 0 {
+		var b int
+		b, _ = stack.Pop()
 		var blk @ir.Block = f.Blocks[b]
 		var ni int = len(blk.Instrs)
 		if ni == 0 {
 			continue
 		}
 		var term @ir.Instr = blk.Instrs[ni - 1]
-		stack = pushIfUnvisited(f, term.Block1, reachable, stack)
-		stack = pushIfUnvisited(f, term.Block2, reachable, stack)
+		pushIfUnvisited(f, term.Block1, reachable, stack)
+		pushIfUnvisited(f, term.Block2, reachable, stack)
 	}
 	var anyDead bool = false
 	for i := 0; i < n; i++ {
@@ -328,16 +298,16 @@ func pruneUnreachableBlocks(f @ir.Func) {
 	f.Blocks = kept.Items()
 }
 
-// pushIfUnvisited marks succ reachable and pushes it if it is a real,
-// not-yet-visited block of f; returns the (possibly grown) stack.
-func pushIfUnvisited(f @ir.Func, succ *ir.Block, reachable @[]bool, stack @[]int) @[]int {
+// pushIfUnvisited marks succ reachable and pushes it onto stack if it is a real,
+// not-yet-visited block of f.
+func pushIfUnvisited(f @ir.Func, succ *ir.Block, reachable @[]bool, stack @vec.Vec[int]) {
 	if succ == nil {
-		return stack
+		return
 	}
 	var si int = irbuild.BlockIndexIn(f, succ)
 	if si < 0 || reachable[si] {
-		return stack
+		return
 	}
 	reachable[si] = true
-	return slices.Append[int](stack, si)
+	stack.Push(si)
 }

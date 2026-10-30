@@ -18,7 +18,10 @@ import "pkg/stdx/slices"
 // STABLE dependency order (Go-style: a var initializes after every package var
 // its initializer reads), which IR-gen's buildInitBody then emits in.  A
 // self / mutual / transitive cycle (`var a = b; var b = a`) is reported as a
-// "variable initialization cycle" error.
+// "variable initialization cycle" error.  The order is found once pass 2 has
+// checked the initializers, so what an initializer reads can depend on the types
+// they have: `len` of an array does not read it (builtin.len), whether its type
+// is declared or inferred.
 //
 // Only SYNTACTIC edges are collected: an initializer that directly names
 // another package var, plus a direct-call IIFE's body.  Transitive edges
@@ -30,11 +33,24 @@ import "pkg/stdx/slices"
 // would be a silent wrong-value miscompile, whereas a spurious edge is at
 // worst a loud (over-eager) cycle error.
 
+// orderBatchVars computes the initialization order of the batch's variables
+// once pass 2 has checked the declarations decls (resolveTopLevelVarOrder), and
+// then judges the variables whose initializers read their own placeholders where
+// reads alone may have made the cycle (judgeSelfReads).  Outside a batch
+// (ReplDeclMode) there is none.
+func orderBatchVars(c @Checker, decls *[]@ast.Decl) {
+	if c.ReplDeclMode || c.Batch == nil {
+		return
+	}
+	resolveTopLevelVarOrder(c, decls)
+	judgeSelfReads(c)
+}
+
 // resolveTopLevelVarOrder computes the dependency order of the package's
 // top-level init-vars and records it under c.curPkgPath (and in
 // c.VarOrdered) for IR-gen's buildInitBody — and for the REPL, which runs
 // the initializers of a group of declarations resolved together in this
-// order.  Batch path only (its caller gates on !c.ReplDeclMode).
+// order.  Batch path only (orderBatchVars).
 func resolveTopLevelVarOrder(c @Checker, decls *[]@ast.Decl) {
 	var names @[]@[]char
 	var vdecls @[]@ast.Decl
@@ -105,10 +121,6 @@ func visitVarByName(c @Checker, name @[]char, names @[]@[]char, vdecls @[]@ast.D
 	var saved declContext = enterPackageDecl(c, d)
 	deps = collectVarDeps(c, d.Value, deps)
 	leavePackageDecl(c, saved)
-	if c.Batch != nil {
-		c.Batch.InitVarNames = slices.Append[@[]char](c.Batch.InitVarNames, name)
-		c.Batch.InitVarDeps = slices.Append[@[]@[]char](c.Batch.InitVarDeps, deps)
-	}
 	for i := 0; i < len(deps); i++ {
 		if nameInList(names, deps[i]) {
 			visitVarByName(c, deps[i], names, vdecls)
@@ -120,9 +132,10 @@ func visitVarByName(c @Checker, name @[]char, names @[]@[]char, vdecls @[]@ast.D
 
 // recordVarInitOrder stores `order` for package `pkgPath` in the checker's
 // per-package parallel arrays.  Overwrites an existing entry in place rather
-// than appending a second one, so a decls-only dependency pre-check of the
-// same path (which would carry an empty/partial order) can't shadow the full
-// package check via VarInitOrder's first-match lookup.
+// than appending a second one, so the order of a later check of the same
+// package (a group of declarations resolved together in a REPL session's
+// package) replaces an earlier one rather than hiding behind it in
+// VarInitOrder's first-match lookup.
 func recordVarInitOrder(c @Checker, pkgPath *[]readonly char, order @[]@[]char) {
 	for i := 0; i < len(c.VarInitOrderPaths); i++ {
 		if types.CharEq(c.VarInitOrderPaths[i], pkgPath) {
@@ -225,9 +238,10 @@ func collectVarDepsIn(c @Checker, e @ast.Expr, deps @[]@[]char, scope @varDepSco
 	}
 	if e.Kind == ast.EXPR_BUILTIN {
 		// len of an array does not read its operand: its length is its type's
-		// (builtin.len).
+		// (builtin.len).  Nor is `len` of a variable whose type cycle is
+		// reported counted as a read (lenOfTypeCycled).
 		if e.Op == cast(int, token.LEN) && len(e.Args) == 1 && !declaredTypeShadowed(e.Args[0], scope) &&
-				isArrayType(declaredType(c, e.Args[0])) {
+				(isArrayType(declaredType(c, e.Args[0])) || lenOfTypeCycled(c, e.Args[0])) {
 			return deps
 		}
 		for i := 0; i < len(e.Args); i++ {
@@ -255,14 +269,37 @@ func collectVarDepsIn(c @Checker, e @ast.Expr, deps @[]@[]char, scope @varDepSco
 	return deps
 }
 
-// declaredType returns the type initializer expression e has from the package's
-// declarations alone — all the initialization order can know, decided before
-// initializers are checked — or nil when it cannot tell: a variable's declared
-// type, a field or an element of one, a dereference of one, a function call's
-// single result, the type a type assertion recovers.  A function literal's
-// locals are not seen — a name one of them shadows reads as the package's — so
-// it is asked of an expression in a literal's body only when the body binds no
-// name it looks up there (declaredTypeShadowed).
+// lenOfTypeCycled reports whether `len`'s operand e — a variable, or a field,
+// an element or a dereference of one — reads a batch variable whose type cycle
+// is reported (VarsCycled): its type is the error type, so whether `len` reads
+// it is not known, and a cycle of reads through it would only follow from the
+// type cycle (`var x = [3]int{len(d), 0, 0}`, checked after d's type cycle made
+// d the error type).
+func lenOfTypeCycled(c @Checker, e @ast.Expr) bool {
+	for e != nil &&
+			(e.Kind == ast.EXPR_SELECTOR || e.Kind == ast.EXPR_INSTANTIATE_OR_INDEX ||
+					e.Kind == ast.EXPR_UNARY && e.Op == cast(int, token.STAR)) {
+		e = e.X
+	}
+	if e == nil || e.Kind != ast.EXPR_IDENT || c.Batch == nil {
+		return false
+	}
+	var d @ast.Decl = findDeclIn(c.Batch.Vars, e.Name)
+	return d != nil && declInList(c.Batch.VarsCycled, d)
+}
+
+// declaredType returns the type initializer expression e has — the one its
+// check found, or before it is checked (varOnInitCycle, from recheckDeferredVars
+// or pass 2) the one the package's declarations, and the variables' types found
+// so far, give it — or nil when it cannot tell: a variable's type, a field or an
+// element of one, a dereference of one, a function call's single result, the
+// type a type assertion recovers.  A read of a variable's placeholder keeps the
+// error type its check found, so the views during and after pass 2 agree on it;
+// a variable's own type, which a type cycle reported makes the error type, may
+// not.
+// A function literal's locals are not seen — a name one of them shadows reads as
+// the package's — so it is asked of an expression in a literal's body only when
+// the body binds no name it looks up there (declaredTypeShadowed).
 func declaredType(c @Checker, e @ast.Expr) @types.Type {
 	if e == nil { return nil }
 	if e.ResolvedTypeID != 0 { return c.ExprType(e.ResolvedTypeID) }

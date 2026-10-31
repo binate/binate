@@ -1,13 +1,15 @@
 package "pkg/binate/check"
 
 import "pkg/binate/ast"
+import "pkg/binate/buf"
 import "pkg/binate/types"
 import "pkg/stdx/slices"
 
 // Declarations of a `.bni` resolved before their turn, by name, because a
 // constant's initializer or an array length names them (resolveBniConstByName,
-// bni_scope_const.bn): its variables, and its types, with the walks that find
-// the names an initializer or a type expression needs.
+// bni_scope_const.bn, and lookupDeclOnDemand): its variables, its functions and
+// its types, with the walks that find the names an initializer or a type
+// expression needs.
 
 // defineBniVarDecl defines the `.bni` variable d — an extern declaration `var X T`
 // of the file being built, top-level or in a var group — in the package scope s
@@ -19,10 +21,15 @@ import "pkg/stdx/slices"
 // (`var A [len(A)]int`) is not a constant (and is rejected as such) instead of
 // recursing.  As a constant is (resolveBniConstByName), one defined inside an
 // instance's build whose type reads a layout not built yet is not defined, nor
-// is one inside a build that waits already.
+// is one inside a build that waits already; a read of it while it is defined
+// waits, or is a type cycle, after which it has the error type
+// (bniVarOnDemand).
 func defineBniVarDecl(c @Checker, s @Scope, d @ast.Decl, constNames @[]@[]char,
 		constDecls @[]@ast.Decl, visiting @[]@[]char) {
 	if skipDemand(c) { return }
+	var bb @BniBuild = c.BniBuild
+	bb.VarsDefining = slices.Append[@[]char](bb.VarsDefining, d.Name)
+	enterBniDeclResolution(c, d.Name)
 	var framed bool = enterDemandFrame(c)
 	var inner @[]@[]char = slices.Append[@[]char](visiting, d.Name)
 	var deps @[]@[]char
@@ -35,13 +42,149 @@ func defineBniVarDecl(c @Checker, s @Scope, d @ast.Decl, constNames @[]@[]char,
 		}
 	}
 	var vtyp @types.Type = resolveTypeExpr(c, d.TypeRef)
+	bb.VarsDefining = bb.VarsDefining[:len(bb.VarsDefining) - 1]
+	var waited bool = leaveBniDeclResolution(c)
 	if leaveDemandFrame(c, framed) {
 		ast.ClearCheckerAnnotations(d)
 		return
 	}
+	if nameInList(bb.VarsCycled, d.Name) {
+		vtyp = types.TypError()
+	}
 	if vtyp == nil { return }
 	defineVar(s, d.Name, vtyp)
 	defineVar(c.Scope, d.Name, vtyp)
+	if waited { flushLayoutWaits(c) }
+}
+
+// bniVarOnDemand defines the `.bni`'s variable name (defineBniVarByName), read
+// where the `.bni`'s declarations are in scope before it is defined — by an
+// array length of a declaration resolved first, or an instance's build — and
+// returns its symbol, or nil.  One read while it is being defined, by a build
+// its definition started, waits for it (bniDeclReadWaits); otherwise its type
+// depends on itself, which is reported once, as the batch reports it, and the
+// variable has the error type, so nothing more is reported about it.
+func bniVarOnDemand(c @Checker, name *[]readonly char) @Symbol {
+	var bb @BniBuild = c.BniBuild
+	if bb == nil || !scopeReaches(c.Scope, bb.TempScope) {
+		return nil
+	}
+	var d @ast.Decl = findBniVarDecl(c.BniDecls, name)
+	if d == nil {
+		return nil
+	}
+	if nameInList(bb.VarsDefining, name) {
+		if bniDeclReadWaits(c, name) {
+			return nil
+		}
+		if !nameInList(bb.VarsCycled, name) {
+			reportVarTypeCycle(c, d)
+			bb.VarsCycled = slices.Append[@[]char](bb.VarsCycled, buf.CopyStr(name))
+		}
+		defineVar(bb.TempScope, d.Name, types.TypError())
+		return bb.TempScope.LookupLocal(name)
+	}
+	var saved bniDeclContext = enterBniDecl(c, d)
+	var noVisiting @[]@[]char
+	defineBniVarByName(c, bb.Scope, name, bb.ConstNames, bb.ConstDecls, noVisiting)
+	leaveBniDecl(c, saved)
+	return c.Scope.Lookup(name)
+}
+
+// defineBniFunc defines the `.bni`'s function d — not a method, generic or not
+// — from its signature (resolveFuncDeclType), in the package scope s (importers
+// resolve `pkg.F`) and in the scope the declarations resolve in (an array
+// length's `len(F())` calls it there) — unless an import is bound there by its
+// name, whose clash is reported (checkImportDeclCollisions) and through which
+// a qualified name still resolves — marked as being defined meanwhile.  As a
+// constant is (resolveBniConstByName), one defined inside an instance's build
+// whose signature reads a layout not built yet is not defined, none inside a
+// build that waits already, and none again while it is being defined; the
+// layout waits are flushed once it is, when a read has waited for it.
+func defineBniFunc(c @Checker, s @Scope, d @ast.Decl) {
+	var bb @BniBuild = c.BniBuild
+	if nameInList(bb.FuncsDefining, d.Name) || skipDemand(c) {
+		return
+	}
+	bb.FuncsDefining = slices.Append[@[]char](bb.FuncsDefining, d.Name)
+	enterBniDeclResolution(c, d.Name)
+	var framed bool = enterDemandFrame(c)
+	var ft @types.Type = resolveFuncDeclType(c, d)
+	bb.FuncsDefining = bb.FuncsDefining[:len(bb.FuncsDefining) - 1]
+	var waited bool = leaveBniDeclResolution(c)
+	if leaveDemandFrame(c, framed) {
+		ast.ClearCheckerAnnotations(d)
+		return
+	}
+	defineFunc(s, d.Name, ft)
+	var bound @Symbol = bb.TempScope.LookupLocal(d.Name)
+	if bound == nil || bound.Kind != types.SYM_PKG {
+		defineFunc(bb.TempScope, d.Name, ft)
+	}
+	if len(d.TypeParams) > 0 {
+		recordGenericHome(c, d)
+	}
+	if waited { flushLayoutWaits(c) }
+}
+
+// bniFuncOnDemand defines the `.bni`'s function name (defineBniFunc), named
+// where the `.bni`'s declarations are in scope before its turn — an array
+// length's `len(f())` — and returns its symbol, or nil.  One named while its own
+// signature is being resolved is not defined again: a build its definition
+// started waits for it (bniDeclReadWaits), and otherwise the name is undefined.
+func bniFuncOnDemand(c @Checker, name *[]readonly char) @Symbol {
+	var bb @BniBuild = c.BniBuild
+	if bb == nil || !scopeReaches(c.Scope, bb.TempScope) {
+		return nil
+	}
+	var d @ast.Decl = findBniFuncDecl(c.BniDecls, name)
+	if d == nil {
+		return nil
+	}
+	if nameInList(bb.FuncsDefining, name) {
+		_ = bniDeclReadWaits(c, name)
+		return nil
+	}
+	var saved bniDeclContext = enterBniDecl(c, d)
+	defineBniFunc(c, bb.Scope, d)
+	leaveBniDecl(c, saved)
+	return c.Scope.Lookup(name)
+}
+
+// bniCallTyped reports whether the call e, an operand of `len` in a `.bni`
+// array length or constant, is typed: its function is named — a `.bni`
+// function (defineBniFunc), a generic one's instance, a variable, or another
+// package's function.  A method's call is not: the `.bni`'s methods are not on
+// its types while its declarations are resolved, and the length is left to the
+// declaring package's check.
+func bniCallTyped(c @Checker, e @ast.Expr) bool {
+	if e.Kind != ast.EXPR_CALL || e.X == nil {
+		return false
+	}
+	var f @ast.Expr = e.X
+	if f.Kind == ast.EXPR_INSTANTIATE_OR_INDEX && f.X != nil {
+		f = f.X
+	}
+	if f.Kind == ast.EXPR_IDENT {
+		return true
+	}
+	if f.Kind != ast.EXPR_SELECTOR || f.X == nil || f.X.Kind != ast.EXPR_IDENT {
+		return false
+	}
+	var pkg @Symbol = c.Scope.Lookup(f.X.Name)
+	return pkg != nil && pkg.Kind == types.SYM_PKG
+}
+
+// findBniFuncDecl returns the `.bni` declaration of the function name — not a
+// method — among decls, or nil.
+func findBniFuncDecl(decls *[]@ast.Decl, name *[]readonly char) @ast.Decl {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d.Kind == ast.DECL_FUNC && d.Recv == nil && types.CharEq(d.Name, name) {
+			return d
+		}
+	}
+	return nil
 }
 
 // defineBniVarByName defines the `.bni` variable name (defineBniVarDecl) when a
@@ -76,16 +219,27 @@ func findBniVarDecl(decls *[]@ast.Decl, name *[]readonly char) @ast.Decl {
 // being built before its turn (resolveBniTypeDecl), after what its layout
 // needs: the `.bni` constants its array lengths name (names / cdecls, from
 // listBniConsts) and the later types it holds by value (BniTypesResolved
-// records it).  A generic type is not resolved — each instance is built where
-// it is named — but the later types it holds by value are, for its instances'
-// layouts.  A no-op when name is no such type, is resolved already, or is being
-// resolved further up (visiting: a type that holds itself by value).
+// records it).  A no-op when name is a generic type — each instance is built
+// where it is named, and what it reads is resolved on demand then
+// (bni_scope_demand.bn), or waited for while it is resolved — is no such type,
+// is resolved already, or is being resolved further up (visiting: a type that
+// holds itself by value).  It counts as being resolved while what it needs is
+// (TypesResolving): a declaration resolved on the way that reads its layout —
+// an alias `type A = [sizeof(X)]uint8` that `type X struct { b A }` holds —
+// waits for it, or closes a cycle, which is reported as one (prepareBniType).
 func resolveBniTypeByName(c @Checker, s @Scope, name *[]readonly char, names @[]@[]char,
 		cdecls @[]@ast.Decl, visiting @[]@[]char) {
 	if nameInList(visiting, name) { return }
 	var d @ast.Decl = findBniTypeDecl(c.BniDecls, name)
-	if d == nil || d.TypeRef == nil || declInList(c.BniTypesResolved, d) { return }
+	if d == nil || d.TypeRef == nil || len(d.TypeParams) > 0 || declInList(c.BniTypesResolved, d) {
+		return
+	}
+	var bb @BniBuild = c.BniBuild
+	if declInList(bb.TypesResolving, d) {
+		return
+	}
 	var inner @[]@[]char = slices.Append[@[]char](visiting, d.Name)
+	bb.TypesResolving = slices.Append[@ast.Decl](bb.TypesResolving, d)
 	var cdeps @[]@[]char
 	cdeps = collectTypeExprConstDeps(d.TypeRef, cdeps)
 	for i := 0; i < len(cdeps); i++ {
@@ -98,7 +252,7 @@ func resolveBniTypeByName(c @Checker, s @Scope, name *[]readonly char, names @[]
 	for i := 0; i < len(tdeps); i++ {
 		resolveBniTypeByName(c, s, tdeps[i], names, cdecls, inner)
 	}
-	if len(d.TypeParams) > 0 { return }
+	bb.TypesResolving = bb.TypesResolving[:len(bb.TypesResolving) - 1]
 	resolveBniTypeDecl(c, s, d)
 }
 
@@ -136,8 +290,10 @@ func collectExprTypeNames(e @ast.Expr, names @[]@[]char) @[]@[]char {
 }
 
 // collectTypeExprNames appends the unqualified type names te holds by value,
-// whose layouts its layout needs: through element, field and type-argument
-// types, not behind a pointer, a slice or a function value.
+// whose layouts its layout needs: through element and field types, not behind
+// a pointer, a slice or a function value, nor through type arguments — an
+// instance may hold its argument through a pointer, and the layout it does hold
+// is readied, on demand, where it is read (prepareBniType).
 func collectTypeExprNames(te @ast.TypeExpr, names @[]@[]char) @[]@[]char {
 	if te == nil { return names }
 	if te.Kind == ast.TEXPR_POINTER || te.Kind == ast.TEXPR_MANAGED || te.Kind == ast.TEXPR_SLICE ||
@@ -151,9 +307,6 @@ func collectTypeExprNames(te @ast.TypeExpr, names @[]@[]char) @[]@[]char {
 	names = collectTypeExprNames(te.Base, names)
 	for i := 0; i < len(te.Fields); i++ {
 		if te.Fields[i] != nil { names = collectTypeExprNames(te.Fields[i].Type, names) }
-	}
-	for i := 0; i < len(te.TypeArgs); i++ {
-		names = collectTypeExprNames(te.TypeArgs[i], names)
 	}
 	return names
 }

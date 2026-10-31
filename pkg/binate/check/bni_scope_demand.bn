@@ -1,0 +1,323 @@
+package "pkg/binate/check"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/stdx/slices"
+
+// A `.bni`'s declarations are resolved in their order (buildScopeFromFile), a
+// constant after the constants, variables and types its initializer names
+// (resolveBniConstByName), a type after the ones it holds by value
+// (resolveBniTypeByName).  An instance built meanwhile — of a generic type a
+// declaration names — may read one that order has not reached: the layout of a
+// type (`type N struct { v int64; p *Box[M] }` before `type M struct { a
+// [3]int64 }`, with `type Box[T any] struct { a [sizeof(T)]uint8 }`), or a
+// constant (`type U struct { p *Bx[int64] }` before `const S = 5`, with `type
+// Bx[T any] struct { a [S]uint8; t T }`).  It is resolved then, on demand, as
+// the batch resolves a `.bn`'s type or constant (check_decl_batch.bn), and so is
+// each declaration resolved on the way — a constant, a variable, a type or an
+// alias its declaration names — each in a frame of its own (enterDemandFrame),
+// undone when it reads a layout not built yet.  One read while it is being
+// resolved — `type N struct { v int64; next *Box[N] }`,
+// or `const S = sizeof(W[int64])` with `type W[T any] struct { v T; p *Bx[T] }`
+// — makes a build started after it wait for it, as for a layout not built yet
+// (check_layout_wait.bn), to be done again once it is resolved
+// (flushLayoutWaits); the last round, which reports cycles, waits until no
+// `.bni` declaration a build may wait for is being resolved (bniDeclResolving).
+
+// BniBuild is the state of the `.bni` declarations buildScopeFromFile resolves.
+type BniBuild struct {
+	// Scope is the package scope built, TempScope the scope its declarations
+	// resolve in, and PkgPath the package's path.
+	Scope     @Scope
+	TempScope @Scope
+	PkgPath   @[]char
+	// ConstNames / ConstDecls list the `.bni`'s constants (listBniConsts).
+	ConstNames @[]@[]char
+	ConstDecls @[]@ast.Decl
+	// TypesResolving lists the type declarations being resolved.
+	TypesResolving @[]@ast.Decl
+	// ConstStarts lists the constants being resolved, innermost last, and
+	// ReadWaited is true once a read of one has waited for it, until the
+	// outermost is defined.
+	ConstStarts @[]bniConstStart
+	ReadWaited  bool
+}
+
+// bniConstStart is a `.bni` constant being resolved, with the number of layout
+// frames open (InstanceState.Populating) when its resolution started.
+type bniConstStart struct {
+	Name   @[]char
+	Frames int
+}
+
+// bniDeclContext is the checker state a `.bni` declaration resolved on demand
+// sets aside.
+type bniDeclContext struct {
+	decl    declContext
+	pkgPath @[]char
+}
+
+// beginBniBuild starts resolving the declarations of the `.bni` whose package
+// scope is s, in c.Scope, whose constants are names / cdecls, and returns the
+// build it is inside of, for endBniBuild.
+func beginBniBuild(c @Checker, s @Scope, names @[]@[]char, cdecls @[]@ast.Decl) @BniBuild {
+	var saved @BniBuild = c.BniBuild
+	var bb @BniBuild = make(BniBuild)
+	bb.Scope = s
+	bb.TempScope = c.Scope
+	bb.PkgPath = buf.CopyStr(c.curPkgPath)
+	bb.ConstNames = names
+	bb.ConstDecls = cdecls
+	c.BniBuild = bb
+	return saved
+}
+
+// endBniBuild builds the instances still waiting, or reports their cycles, once
+// every declaration is resolved, and ends the build.
+func endBniBuild(c @Checker, saved @BniBuild) {
+	flushLayoutWaits(c)
+	c.BniBuild = saved
+}
+
+// bniDeclResolving reports whether a `.bni` declaration a build may wait for is
+// being resolved: a type, or a constant once a read has waited for one.
+func bniDeclResolving(c @Checker) bool {
+	var bb @BniBuild = c.BniBuild
+	return bb != nil && (len(bb.TypesResolving) > 0 || bb.ReadWaited)
+}
+
+// enterBniDecl sets the checker up for resolving the `.bni`'s declaration d on
+// demand: in the `.bni`'s scope, of its package, outside any function.
+func enterBniDecl(c @Checker, d @ast.Decl) bniDeclContext {
+	var s bniDeclContext
+	s.decl = enterPackageDecl(c, d)
+	s.pkgPath = c.curPkgPath
+	c.Scope = c.BniBuild.TempScope
+	c.curPkgPath = c.BniBuild.PkgPath
+	return s
+}
+
+// leaveBniDecl restores the state enterBniDecl set aside.
+func leaveBniDecl(c @Checker, s bniDeclContext) {
+	leavePackageDecl(c, s.decl)
+	c.curPkgPath = s.pkgPath
+}
+
+// bniTypeDeclOf returns the `.bni`'s declaration of the named type t, or nil
+// when t is none of its types, or its declaration is an alias, a forward
+// (opaque) declaration or a generic one.
+func bniTypeDeclOf(c @Checker, t @types.Type) @ast.Decl {
+	var none @ast.Decl
+	if t.InstDecl != nil {
+		return none
+	}
+	var sym @Symbol = c.BniBuild.Scope.LookupLocal(t.Name)
+	if sym == nil || !same(sym.Type, t) {
+		return none
+	}
+	var d @ast.Decl = findBniTypeDecl(c.BniDecls, t.Name)
+	if d == nil || d.IsAlias || d.IsForward || d.TypeRef == nil || len(d.TypeParams) > 0 {
+		return none
+	}
+	return d
+}
+
+// prepareBniType readies the layout of the `.bni`'s type declaration d, of the
+// named type t, and reports whether it may be read: d is resolved first if it is
+// not yet, the types it holds by value are prepared in the same walk
+// (prepareLayoutIn), which ends at a type it has reached already, and a type
+// holding itself by value is reported (checkTypeByValueCycle), which breaks the
+// cycle the layout would recurse through.  A type being resolved has no layout
+// yet: the instance being built waits for it, or — its layout depends on itself
+// — the cycle is reported; reached softly (through a slice's element), it is no
+// cycle.  Inside a build that waits already (skipDemand) nothing is prepared:
+// what it reports would be dropped, and a cycle broken without its error, which
+// a build done again would then not find.
+func prepareBniType(c @Checker, d @ast.Decl, t @types.Type, pos token.Pos, seen *layoutVisits,
+		soft bool) bool {
+	var bb @BniBuild = c.BniBuild
+	if declInList(bb.TypesResolving, d) {
+		if soft {
+			return true
+		}
+		if !waitForLayoutHere(c) {
+			errCyclicType(c, pos, buf.CopyStr(d.Name))
+		}
+		return false
+	}
+	if skipDemand(c) {
+		return false
+	}
+	if t.Underlying == nil {
+		var saved bniDeclContext = enterBniDecl(c, d)
+		var noVisiting @[]@[]char
+		resolveBniTypeByName(c, bb.Scope, d.Name, bb.ConstNames, bb.ConstDecls, noVisiting)
+		leaveBniDecl(c, saved)
+		if t.Underlying == nil {
+			return false
+		}
+	}
+	var ok bool = prepareLayoutIn(c, t.Underlying, pos, seen, soft)
+	checkTypeByValueCycle(c, t, d)
+	return ok
+}
+
+// resolveBniTypeDecl resolves the `.bni`'s type or alias declaration d
+// (resolveTypeDeclInScope) in the package scope s, marked as being resolved
+// meanwhile, so that a build reading its layout waits for it (prepareBniType),
+// then builds the instances waiting.  When that reads a layout not built yet,
+// inside an instance's build (enterDemandFrame), it is undone — its name bound
+// as before (restoreBniBinding), an alias pending again — to be resolved again
+// when next read or in its turn.  None is resolved inside a build that waits
+// already (skipDemand), nor again while it is: a declaration resolved on demand
+// inside its resolution may name it (`type M struct { b [sizeof(X)]uint8 }` with
+// `type X struct { m M }`, a cycle reported once).
+func resolveBniTypeDecl(c @Checker, s @Scope, d @ast.Decl) {
+	var bb @BniBuild = c.BniBuild
+	if d.IsForward {
+		resolveTypeDeclInScope(c, s, d)
+		c.BniTypesResolved = slices.Append[@ast.Decl](c.BniTypesResolved, d)
+		return
+	}
+	if declInList(bb.TypesResolving, d) || skipDemand(c) {
+		return
+	}
+	var prev bniBinding = saveBniBinding(s, bb.TempScope, d.Name)
+	var framed bool = enterDemandFrame(c)
+	bb.TypesResolving = slices.Append[@ast.Decl](bb.TypesResolving, d)
+	resolveTypeDeclInScope(c, s, d)
+	bb.TypesResolving = bb.TypesResolving[:len(bb.TypesResolving) - 1]
+	if leaveDemandFrame(c, framed) {
+		restoreBniBinding(s, bb.TempScope, d.Name, prev)
+		if d.IsAlias {
+			reopenAliasDecl(c, d)
+		}
+		ast.ClearCheckerAnnotations(d)
+		return
+	}
+	c.BniTypesResolved = slices.Append[@ast.Decl](c.BniTypesResolved, d)
+	flushLayoutWaits(c)
+}
+
+// bniBinding is what the name of a `.bni` declaration is bound to in the package
+// scope and in the scope the declarations resolve in: the symbol, or none, and
+// the type it held.
+type bniBinding struct {
+	pkgSym   @Symbol
+	pkgType  @types.Type
+	tempSym  @Symbol
+	tempType @types.Type
+}
+
+// saveBniBinding returns what name is bound to in the package scope s and the
+// scope temp, before its declaration is resolved on demand.
+func saveBniBinding(s @Scope, temp @Scope, name *[]readonly char) bniBinding {
+	var b bniBinding
+	b.pkgSym = s.LookupLocal(name)
+	if b.pkgSym != nil {
+		b.pkgType = b.pkgSym.Type
+	}
+	b.tempSym = temp.LookupLocal(name)
+	if b.tempSym != nil {
+		b.tempType = b.tempSym.Type
+	}
+	return b
+}
+
+// restoreBniBinding binds name in s and temp as saveBniBinding found it, once
+// its declaration's resolution on demand is undone: the symbol it had, with the
+// type it held — a type's declaration sets its placeholder's underlying type,
+// an alias's binds the alias in place of the placeholder (resolveTypeDeclInScope)
+// — or none, and the placeholder is left without an underlying type again.
+func restoreBniBinding(s @Scope, temp @Scope, name *[]readonly char, b bniBinding) {
+	restoreBniSymbol(s, name, b.pkgSym, b.pkgType)
+	restoreBniSymbol(temp, name, b.tempSym, b.tempType)
+	if b.pkgType != nil && b.pkgType.Kind == types.TYP_NAMED {
+		b.pkgType.Underlying = nil
+	}
+}
+
+// restoreBniSymbol binds name in s to sym, holding typ again, or to nothing.
+func restoreBniSymbol(s @Scope, name *[]readonly char, sym @Symbol, typ @types.Type) {
+	if sym != nil {
+		sym.Type = typ
+	}
+	restoreBinding(s, name, sym)
+}
+
+// bniConstOnDemand defines the `.bni`'s constant name, read where the `.bni`'s
+// declarations are in scope before it is defined — by an instance's build — and
+// returns its symbol, or nil.  One read while it is being resolved is not
+// defined again: the build waits for it (bniConstReadWaits), or the read finds
+// no constant.
+func bniConstOnDemand(c @Checker, name *[]readonly char) @Symbol {
+	var bb @BniBuild = c.BniBuild
+	if bb == nil || !scopeReaches(c.Scope, bb.TempScope) || nameInList(c.ConstResolved, name) ||
+			!nameInList(bb.ConstNames, name) {
+		return nil
+	}
+	if nameInList(c.ConstResolving, name) {
+		_ = bniConstReadWaits(c, name)
+		return nil
+	}
+	var saved bniDeclContext = enterBniDecl(c, findConstDecl(bb.ConstNames, bb.ConstDecls, name))
+	resolveBniConstByName(c, bb.Scope, buf.CopyStr(name), bb.ConstNames, bb.ConstDecls)
+	leaveBniDecl(c, saved)
+	return c.Scope.Lookup(name)
+}
+
+// scopeReaches reports whether s is target or one of its parents is.
+func scopeReaches(s @Scope, target @Scope) bool {
+	for p := s; p != nil; p = p.Parent {
+		if same(p, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// enterBniConstResolution records that the `.bni`'s constant name starts being
+// resolved, until leaveBniConstResolution.
+func enterBniConstResolution(c @Checker, name @[]char) {
+	var bb @BniBuild = c.BniBuild
+	var s bniConstStart
+	s.Name = name
+	if c.Instances != nil {
+		s.Frames = len(c.Instances.Populating)
+	}
+	bb.ConstStarts = slices.Append[bniConstStart](bb.ConstStarts, s)
+}
+
+// leaveBniConstResolution ends what enterBniConstResolution started and reports
+// whether a read has waited for a constant being resolved since the outermost
+// started (bniConstReadWaits): the layout waits are then flushed once the
+// constant is defined.
+func leaveBniConstResolution(c @Checker) bool {
+	var bb @BniBuild = c.BniBuild
+	bb.ConstStarts = bb.ConstStarts[:len(bb.ConstStarts) - 1]
+	var waited bool = bb.ReadWaited
+	if len(bb.ConstStarts) == 0 {
+		bb.ReadWaited = false
+	}
+	return waited
+}
+
+// bniConstReadWaits makes the innermost layout frame wait for the `.bni`'s
+// constant name, read while it is being resolved, when that frame was entered
+// after its resolution started (framesWaitFrom), and reports whether it does.
+func bniConstReadWaits(c @Checker, name *[]readonly char) bool {
+	var bb @BniBuild = c.BniBuild
+	var from int = -1
+	for i := 0; i < len(bb.ConstStarts); i++ {
+		if types.CharEq(bb.ConstStarts[i].Name, name) {
+			from = bb.ConstStarts[i].Frames
+		}
+	}
+	if from < 0 || !framesWaitFrom(c, from) {
+		return false
+	}
+	bb.ReadWaited = true
+	return true
+}

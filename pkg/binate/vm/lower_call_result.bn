@@ -1,0 +1,168 @@
+package "pkg/binate/vm"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/callconv"
+import "pkg/binate/native/common"
+
+// A direct call whose aggregate result is stored whole into a stack slot the call may
+// write directly (common.CallResultSlots) delivers its result straight into the slot:
+// its BC_CALL carries the slot's frame offset in Src2 (plus one; 0 for none), a VM
+// callee's BC_RETURN then copies its result image into the slot (deliverResult) and an
+// extern callee writes its result there, and the store is a BC_NOP.  Otherwise the
+// image is put on the caller's stack first, beside the slot it is then copied into:
+// twice the aggregate's size of VM stack.  The slot is named by its frame offset, not
+// its register: its OP_ALLOC, which sets the register, may come after the call.
+
+// resultSlots returns, by value ID of f, the value ID of the stack slot each direct
+// call of f delivers its result into, or -1: CallResultSlots narrowed to an OP_CALL
+// returning one value the VM handles by address -- a multi-word aggregate or a
+// function / interface value, whose image BC_RETURN copies -- into a slot that no
+// fault pad able to run before the store names (padsBeforeStoreName).  CallResultSlots
+// leaves the pads out (the compiled backends emit none).  A pad may name the call
+// itself, releasing its result: the call's register holds the slot's address.
+// Computed once, before the lowering renumbers the IDs, which the analysis reads.
+func resultSlots(f @ir.Func) @[]int {
+	var slots @[]int = common.CallResultSlots(f)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			if ins.ID < 0 || ins.ID >= len(slots) || slots[ins.ID] < 0 { continue }
+			if ins.Op != iropcode.OP_CALL || callconv.IsMultiReturnCall(ins) ||
+					!(isMultiWordField(ins.Typ) || isVMAddressAggregate(ins.Typ)) ||
+					padsBeforeStoreName(f, b, ii, slots[ins.ID]) {
+				slots[ins.ID] = -1
+			}
+		}
+	}
+	return slots
+}
+
+// padsBeforeStoreName reports whether a fault pad of the call at blk.Instrs[ci], or of
+// an op between it and the store of its result (its one use, in blk), names the value
+// with ID id, following each pad's chain.  Such a pad runs before the store, while the
+// slot holds the delivered result, or what it held before when the callee faulted.
+func padsBeforeStoreName(f @ir.Func, blk @ir.Block, ci int, id int) bool {
+	var call @ir.Instr = blk.Instrs[ci]
+	for i := ci; i < len(blk.Instrs); i++ {
+		var ins @ir.Instr = blk.Instrs[i]
+		if i > ci && ins.Op == iropcode.OP_STORE && len(ins.Args) >= 2 && ins.Args[1] == call {
+			return false
+		}
+		if ins.PadBlock != nil && padChainNamesID(f, ins.PadBlock, id) { return true }
+	}
+	return false
+}
+
+// padChainNamesID reports whether pad, or a pad block reached from it by a jump or
+// branch, names the value with ID id.
+func padChainNamesID(f @ir.Func, pad *ir.Block, id int) bool {
+	var seen @[]bool = make_slice(bool, len(f.FaultPads))
+	var work @[]int = make_slice(int, len(f.FaultPads) + 1)
+	var n int = 0
+	var at int = blockIndexOf(f.FaultPads, pad)
+	if at < 0 { return false }
+	seen[at] = true
+	work[0] = at
+	n = 1
+	for n > 0 {
+		n = n - 1
+		var b @ir.Block = f.FaultPads[work[n]]
+		for j := 0; j < len(b.Instrs); j++ {
+			var ins @ir.Instr = b.Instrs[j]
+			for k := 0; k < len(ins.Args); k++ {
+				if ins.Args[k] != nil && ins.Args[k].ID == id { return true }
+			}
+			var targets @[]*ir.Block = make_slice(*ir.Block, 2)
+			targets[0] = ins.Block1
+			targets[1] = ins.Block2
+			for t := 0; t < 2; t++ {
+				if targets[t] == nil { continue }
+				var ti int = blockIndexOf(f.FaultPads, targets[t])
+				if ti >= 0 && !seen[ti] {
+					seen[ti] = true
+					work[n] = ti
+					n = n + 1
+				}
+			}
+		}
+	}
+	return false
+}
+
+// resultSlotPlan holds, by instruction index over the lowered blocks, the frame offset
+// plus one of the slot each call delivers its result into (callSlot, 0 for none),
+// whether a store is one the delivery leaves nothing to do (noopStore), and whether an
+// OP_ALLOC is such a slot's (slotAlloc), which is not zeroed: it may run after the
+// delivery.
+type resultSlotPlan struct {
+	callSlot  @[]int
+	noopStore @[]bool
+	slotAlloc @[]bool
+}
+
+// planResultSlots returns f's resultSlotPlan over blocks (f's body, then its fault
+// pads) for its resultSlots, slots, the blocks' instructions' frame regions being at
+// regionOffs (planFrameRegions).  Computed before the lowering renumbers the IDs.
+func planResultSlots(f @ir.Func, blocks @[]@ir.Block, regionOffs @[]int,
+		slots @[]int) @resultSlotPlan {
+	var n int = 0
+	for i := 0; i < len(blocks); i++ { n = n + len(blocks[i].Instrs) }
+	var p @resultSlotPlan = make(resultSlotPlan)
+	p.callSlot = make_slice(int, n)
+	p.noopStore = make_slice(bool, n)
+	p.slotAlloc = make_slice(bool, n)
+	// Each slot's index over blocks, by value ID: its frame region's offset is there.
+	var slotAt @[]int = make_slice(int, len(slots))
+	var base int = 0
+	for i := 0; i < len(blocks); i++ {
+		for j := 0; j < len(blocks[i].Instrs); j++ {
+			var ins @ir.Instr = blocks[i].Instrs[j]
+			if ins.Op == iropcode.OP_ALLOC && ins.ID >= 0 && ins.ID < len(slotAt) {
+				slotAt[ins.ID] = base + j
+			}
+		}
+		base = base + len(blocks[i].Instrs)
+	}
+	base = 0
+	for i := 0; i < len(f.Blocks); i++ {
+		var blk @ir.Block = blocks[i]
+		for j := 0; j < len(blk.Instrs); j++ {
+			var call @ir.Instr = blk.Instrs[j]
+			if call.ID < 0 || call.ID >= len(slots) || slots[call.ID] < 0 { continue }
+			// The store is the call's one use, in its block (CallResultSlots).
+			for k := j + 1; k < len(blk.Instrs); k++ {
+				var st @ir.Instr = blk.Instrs[k]
+				if st.Op != iropcode.OP_STORE || len(st.Args) < 2 || st.Args[1] != call { continue }
+				if st.Args[0].ID != slots[call.ID] {
+					vmPanic("vm: a call's result slot is not the slot its result is stored into")
+				}
+				p.callSlot[base + j] = regionOffs[slotAt[st.Args[0].ID]] + 1
+				p.noopStore[base + k] = true
+				p.slotAlloc[slotAt[st.Args[0].ID]] = true
+				break
+			}
+		}
+		base = base + len(blk.Instrs)
+	}
+	return p
+}
+
+// applyResultSlot adjusts the bytecode bc lowered from the instruction at index pos
+// for p: a call delivering its result into a slot carries the slot's frame offset plus
+// one, the store the delivery replaces is a BC_NOP, and the slot's OP_ALLOC zeroes
+// nothing.
+func applyResultSlot(bc BCInstr, p @resultSlotPlan, pos int) BCInstr {
+	if p.slotAlloc[pos] && bc.Op == BC_STACK_ALLOC { bc.Aux = 0 }
+	if p.noopStore[pos] {
+		var nop BCInstr
+		nop.Op = BC_NOP
+		return nop
+	}
+	if p.callSlot[pos] > 0 {
+		if bc.Op != BC_CALL { vmPanic("vm: a result slot on a call not lowered to BC_CALL") }
+		bc.Src2 = p.callSlot[pos]
+	}
+	return bc
+}

@@ -1,0 +1,322 @@
+package "pkg/binate/check"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/std/vec"
+import "pkg/stdx/slices"
+
+// Members a `.bni`'s array length or constant reads — `len(V.a)`, `len(V.M())`,
+// `len(I0.M())`, `len(T{}.a)` — while an importer builds the package's scope
+// from its `.bni` (buildScopeFromFile).  As the batch readies a member it
+// reads (check_member_read.bn), what the read needs is readied on demand where
+// the `.bni`'s declarations resolve:
+//
+//   - a type the `.bni`'s order has not reached is resolved when its
+//     declaration gives it a field of the name (fieldPath), with the types that
+//     field is defined through, and an interface always, as its methods are its
+//     members, with its parents.  One being resolved cannot be read: the
+//     innermost instance being built waits for it, or the cycle is reported
+//     (memberNotBuilt);
+//   - a method of one of its types is defined from its `.bni` declaration in a
+//     table of the build (BniBuild.Methods), not on the type, whose methods the
+//     package's own check collects onto the same type — from its `.bn` where
+//     that defines them — and an instance of one of its generic types takes the
+//     generic's methods (bniCopiesLater);
+//   - a type a composite literal holds by value is resolved
+//     (collectLiteralTypes), so the literal does not take it for an opaque type.
+
+// inBniBuild reports whether c resolves a `.bni`'s declarations (BniBuild), in
+// the scope they resolve in.
+func inBniBuild(c @Checker) bool {
+	var bb @BniBuild = c.BniBuild
+	return bb != nil && scopeReaches(c.Scope, bb.TempScope)
+}
+
+// readyBniMemberBase is readyMemberBase while a `.bni`'s declarations are
+// resolved, for base, the type a selector at pos reads the member name from
+// (memberBaseOf): one of the `.bni`'s interfaces is resolved on demand, with its
+// parents (readyBniIface), and one of its types when its declaration gives it
+// a field of that name, with the types the field is defined through
+// (readyBniFieldPath).  It reports whether the member cannot be read now.
+func readyBniMemberBase(c @Checker, base @types.Type, name *[]readonly char, pos token.Pos) bool {
+	if base.Kind == types.TYP_INTERFACE {
+		var visiting @[]@ast.Decl
+		return readyBniIface(c, base, visiting)
+	}
+	var d @ast.Decl = bniTypeDeclOf(c, base)
+	if d == nil {
+		return false
+	}
+	var path @vec.Vec[@ast.Decl] = vec.New[@ast.Decl]()
+	if !fieldPath(c, d.TypeRef, name, false, path, 0) {
+		return false
+	}
+	path.Push(d)
+	return readyBniFieldPath(c, path, pos)
+}
+
+// readyBniFieldPath resolves the `.bni`'s type declarations path, through which
+// a selector at pos reaches a field, that the `.bni`'s order has not reached
+// (resolveBniTypeOnDemand), and reports whether the field cannot be read now:
+// one of them is being resolved (memberNotBuilt), or its resolution on demand
+// waits.
+func readyBniFieldPath(c @Checker, path @vec.Vec[@ast.Decl], pos token.Pos) bool {
+	for i := 0; i < path.Len(); i++ {
+		var d @ast.Decl = path.Get(i)
+		if declInList(c.BniBuild.TypesResolving, d) {
+			return memberNotBuilt(c, d.Name, pos)
+		}
+		if !declInList(c.BniTypesResolved, d) && !resolveBniTypeOnDemand(c, d) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveBniTypeOnDemand resolves the `.bni`'s type declaration d, which the
+// `.bni`'s order has not reached, where its declarations resolve, after what its
+// layout needs (resolveBniTypeByName), and reports whether it is resolved: not
+// inside a build that waits, already or for a layout its resolution read.
+func resolveBniTypeOnDemand(c @Checker, d @ast.Decl) bool {
+	var bb @BniBuild = c.BniBuild
+	var saved bniDeclContext = enterBniDecl(c, d)
+	var noVisiting @[]@[]char
+	resolveBniTypeByName(c, bb.Scope, d.Name, bb.ConstNames, bb.ConstDecls, noVisiting)
+	leaveBniDecl(c, saved)
+	return declInList(c.BniTypesResolved, d)
+}
+
+// readyBniIface resolves the `.bni`'s interface iface on demand, when the
+// `.bni`'s order has not reached it (resolveBniIfaceDecl), and readies its
+// parents, so that a method it inherits can be read before the `.bni`'s
+// extension clauses are resolved (resolveBniInterfaceParents): they are
+// resolved now, without their method-conflict check, which that pass makes,
+// each of the `.bni`'s own readied in turn (visiting: the interfaces whose
+// parents are readied further up).  One being resolved is left as it is
+// (memberMissingNotBuilt).  It reports whether a resolution on demand waits.
+func readyBniIface(c @Checker, iface @types.Type, visiting @[]@ast.Decl) bool {
+	var bb @BniBuild = c.BniBuild
+	var d @ast.Decl = bniIfaceDeclOf(c, iface)
+	if d == nil || declInList(bb.IfacesResolving, d) || declInList(visiting, d) {
+		return false
+	}
+	if !declInList(bb.IfacesResolved, d) {
+		var saved bniDeclContext = enterBniDecl(c, d)
+		resolveBniIfaceDecl(c, bb.Scope, d)
+		leaveBniDecl(c, saved)
+		if !declInList(bb.IfacesResolved, d) {
+			return true
+		}
+	}
+	if len(d.Interfaces) == 0 {
+		return false
+	}
+	var saved bniDeclContext = enterBniDecl(c, d)
+	resolveInterfaceParents(c, d, iface, false)
+	leaveBniDecl(c, saved)
+	var inner @[]@ast.Decl = slices.Append[@ast.Decl](visiting, d)
+	for i := 0; i < len(iface.Parents); i++ {
+		if readyBniIface(c, iface.Parents[i], inner) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveBniIfaceDecl gives the `.bni`'s interface declaration d its methods
+// (resolveInterfaceDeclInScope) in the package scope s, in its turn or on
+// demand, marked as being resolved meanwhile — a method of it read then, not
+// added yet, makes the build reading it wait or is reported as a cycle
+// (memberMissingNotBuilt) — then builds the instances waiting.  When that reads
+// a layout not built yet, inside an instance's build (enterDemandFrame), it is
+// undone, its methods dropped, to be resolved again when next read or in its
+// turn.  None is resolved inside a build that waits already (skipDemand), nor
+// twice.
+func resolveBniIfaceDecl(c @Checker, s @Scope, d @ast.Decl) {
+	var bb @BniBuild = c.BniBuild
+	if declInList(bb.IfacesResolving, d) || declInList(bb.IfacesResolved, d) || skipDemand(c) {
+		return
+	}
+	var framed bool = enterDemandFrame(c)
+	bb.IfacesResolving = slices.Append[@ast.Decl](bb.IfacesResolving, d)
+	resolveInterfaceDeclInScope(c, s, d)
+	bb.IfacesResolving = bb.IfacesResolving[:len(bb.IfacesResolving) - 1]
+	if leaveDemandFrame(c, framed) {
+		var sym @Symbol = s.LookupLocal(d.Name)
+		if sym != nil && sym.Type != nil {
+			var noMethods @[]@types.Method
+			sym.Type.Methods = noMethods
+		}
+		ast.ClearCheckerAnnotations(d)
+		return
+	}
+	bb.IfacesResolved = slices.Append[@ast.Decl](bb.IfacesResolved, d)
+	flushLayoutWaits(c)
+}
+
+// bniIfaceDeclOf returns the `.bni`'s declaration of the interface iface, or nil
+// when iface is none of its interfaces, or its declaration is an alias or a
+// generic one.
+func bniIfaceDeclOf(c @Checker, iface @types.Type) @ast.Decl {
+	var sym @Symbol = c.BniBuild.Scope.LookupLocal(iface.Name)
+	if sym == nil || sym.Kind != types.SYM_INTERFACE || !same(sym.Type, iface) {
+		return nil
+	}
+	for i := 0; i < len(c.BniDecls); i++ {
+		var d @ast.Decl = c.BniDecls[i]
+		if d.Kind == ast.DECL_INTERFACE && !d.IsAlias && len(d.TypeParams) == 0 &&
+				types.CharEq(d.Name, iface.Name) {
+			return d
+		}
+	}
+	return nil
+}
+
+// bniMethodOnDemand returns the method name of the `.bni`'s type named, read
+// where the `.bni`'s declarations resolve (lookupVisibleMethod), defined from
+// its `.bni` declaration (defineBniMethod), or nil.  One read while its own
+// signature is being resolved is not defined again: a build its definition
+// started waits for it (bniDeclReadWaits), and otherwise the method is
+// undefined.
+func bniMethodOnDemand(c @Checker, named @types.Type, name *[]readonly char) @types.Method {
+	if named == nil || named.Kind != types.TYP_NAMED || !inBniBuild(c) {
+		return nil
+	}
+	if named.InstDecl != nil {
+		// An instance of one of its generic types takes the generic's methods
+		// once one is selected (bniCopiesLater).
+		if !bniCopiesLater(c, bit_cast(@ast.Decl, named.InstDecl)) {
+			return nil
+		}
+		attachInstanceMethods(c, named)
+		return named.LookupMethod(name)
+	}
+	var bb @BniBuild = c.BniBuild
+	for i := 0; i < len(bb.Methods); i++ {
+		if same(bb.MethodOwners[i], named) && types.CharEq(bb.Methods[i].Name, name) {
+			return bb.Methods[i]
+		}
+	}
+	var sym @Symbol = bb.Scope.LookupLocal(named.Name)
+	if sym == nil || !same(sym.Type, named) {
+		return nil
+	}
+	var d @ast.Decl = findBniMethodDecl(c.BniDecls, named.Name, name)
+	if d == nil {
+		return nil
+	}
+	if declInList(bb.MethodsDefining, d) {
+		_ = bniDeclReadWaits(c, bniMethodKey(d))
+		return nil
+	}
+	var saved bniDeclContext = enterBniDecl(c, d)
+	var m @types.Method = defineBniMethod(c, d, named)
+	leaveBniDecl(c, saved)
+	return m
+}
+
+// defineBniMethod defines the `.bni`'s method d of named from its receiver and
+// signature, as collecting it does (collectMethodDecl), in the build's table
+// (BniBuild.Methods), marked as being defined meanwhile, and returns it, or nil
+// — for a receiver the package's own check rejects too.  As a function is
+// (defineBniFunc), none is defined inside a build that waits already, and one
+// whose signature reads a layout not built yet, inside an instance's build, is
+// not kept; the layout waits are flushed once one is defined, when a read has
+// waited for it.
+func defineBniMethod(c @Checker, d @ast.Decl, named @types.Type) @types.Method {
+	if skipDemand(c) {
+		return nil
+	}
+	var bb @BniBuild = c.BniBuild
+	bb.MethodsDefining = slices.Append[@ast.Decl](bb.MethodsDefining, d)
+	enterBniDeclResolution(c, bniMethodKey(d))
+	var framed bool = enterDemandFrame(c)
+	var recvType @types.Type = resolveTypeExpr(c, d.Recv.Type)
+	var ft @types.Type = resolveFuncDeclType(c, d)
+	bb.MethodsDefining = bb.MethodsDefining[:len(bb.MethodsDefining) - 1]
+	var waited bool = leaveBniDeclResolution(c)
+	if leaveDemandFrame(c, framed) {
+		ast.ClearCheckerAnnotations(d)
+		return nil
+	}
+	if isErrType(recvType) || !declaredReceiverKindOK(recvType) {
+		return nil
+	}
+	var params @[]@types.Param = prependRecvParam(d.Recv.Name, recvType, ft.Params)
+	var m @types.Method = MakeMethod(d.Name, recvType, types.MakeFuncType(params, ft.Results))
+	bb.Methods = slices.Append[@types.Method](bb.Methods, m)
+	bb.MethodOwners = slices.Append[@types.Type](bb.MethodOwners, named)
+	if waited { flushLayoutWaits(c) }
+	return m
+}
+
+// bniCopiesLater reports whether an instance of the generic type d, built now,
+// takes its generic's methods later than its build: d is a generic of the
+// `.bni` whose declarations are being resolved (BniBuild).  A copied method's
+// signature may read one of them being resolved — whose resolution built the
+// instance, for its layout, which does not depend on its methods: `func (t T)
+// M() [sizeof(Box[int])]int` with `func (b Box[X]) Get() [len(V.M())]X` — and
+// with nothing around that resolution to wait (a `.bn` resolves the generic's
+// declaration abstractly first), the read would be taken for a cycle.  So the
+// instance takes them when one of them is selected (bniMethodOnDemand), and
+// once every declaration is resolved (copyBniInstanceMethods).
+func bniCopiesLater(c @Checker, d @ast.Decl) bool {
+	return c.BniBuild != nil && types.CharEq(genericTypeDeclPkg(c, d), c.BniBuild.PkgPath)
+}
+
+// copyBniInstanceMethods gives each instance of the `.bni`'s generic types,
+// built while its declarations were resolved, its generic's methods
+// (copyPlaceholderMethods), as the back-fill does once a package's
+// declarations are collected (backfillInstantiationMethods), then builds the
+// instances the copies left waiting.
+func copyBniInstanceMethods(c @Checker) {
+	for i := 0; i < len(c.Generics.Instantiations); i++ {
+		var entry @GenericInstantiation = c.Generics.Instantiations[i]
+		if entry == nil || entry.MembersDeferred || entry.LayoutBlocked || entry.Postponed ||
+				!bniCopiesLater(c, entry.Decl) ||
+				!typeArgsAbstract(entry.TypeArgs) && genericExpanding(c, entry.Decl) {
+			continue
+		}
+		copyPlaceholderMethods(c, entry.Decl, entry.TypeArgs, entry.Result)
+	}
+	flushLayoutWaits(c)
+}
+
+// bniMethodKey names the `.bni`'s method d among the declarations being resolved
+// (BniBuild.DeclStarts) by its receiver's type and its name, `T.M`, which names
+// no constant, variable or function.
+func bniMethodKey(d @ast.Decl) @[]char {
+	return buf.Concat(buf.Concat(recvBaseName(d), "."), d.Name)
+}
+
+// findBniMethodDecl returns the `.bni` declaration of the method name whose
+// receiver's base type is the type typeName — not one of a generic type, nor
+// one with type parameters of its own — among decls, or nil.
+func findBniMethodDecl(decls *[]@ast.Decl, typeName *[]readonly char,
+		name *[]readonly char) @ast.Decl {
+	for i := 0; i < len(decls); i++ {
+		var d @ast.Decl = decls[i]
+		if d.Kind == ast.DECL_FUNC && d.Recv != nil && len(d.TypeParams) == 0 &&
+				receiverBaseInstantiation(d.Recv.Type) == nil && types.CharEq(d.Name, name) &&
+				types.CharEq(recvBaseName(d), typeName) {
+			return d
+		}
+	}
+	return nil
+}
+
+// bniMemberAbsent reports whether a selector of name reads the `.bni`'s type
+// base, which the `.bni`'s order has not reached, whose declaration declares
+// neither a field (fieldPath) nor a method of that name, as memberAbsentFromDecl
+// does for the batch.
+func bniMemberAbsent(c @Checker, base @types.Type, name *[]readonly char) bool {
+	var d @ast.Decl = bniTypeDeclOf(c, base)
+	if d == nil {
+		return false
+	}
+	var through @vec.Vec[@ast.Decl] = vec.New[@ast.Decl]()
+	return !fieldPath(c, d.TypeRef, name, false, through, 0) &&
+			findBniMethodDecl(c.BniDecls, base.Name, name) == nil
+}

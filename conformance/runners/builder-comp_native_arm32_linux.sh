@@ -5,8 +5,8 @@
 # `--backend native`, rather than codegen→clang -c (the LLVM path).  Dependency
 # packages still go through LLVM; the native .o must link cleanly against them.
 #
-# arm-linux-gnueabihf is the HARD-float (AAPCS-VFP) ABI: applyTarget stamps
-# types.SetFloatABI(FLOAT_ABI_HARD), so the native backend + codegen classify
+# arm-linux-gnueabihf is the HARD-float (AAPCS-VFP) ABI: applyTarget sets
+# FLOAT_ABI_HARD (buildcfg.TargetFor), so the native backend + codegen classify
 # floats in VFP registers (hard-float ABI).  Like the LLVM sibling it
 # links against the cross-glibc and runs under qemu-arm user-mode — NOT the
 # freestanding semihosting path of builder-comp_native_arm32_baremetal.

@@ -248,10 +248,9 @@ failures=""
 # types/ir/ast) once.  But batching ALL packages per shard loads ALL ~50 package
 # impls on EVERY shard — a per-shard-CONSTANT floor no shard count can reduce.  So
 # the batch runs a REPRESENTATIVE SUBSET (see the classification loop below):
-#   - HEAVY = the INTINT_HEAVY representative set (types, check, ir, irgen —
-#     moderate-cost per test at double-VM, but with the most tests): TEST-sharded —
-#     loaded on EVERY shard, each running 1/N of its own tests via --shard.
-#     Collected into BATCH_HEAVY_PKGS.
+#   - HEAVY = the INTINT_HEAVY representative set (types, ir — moderate-cost at
+#     double-VM): TEST-sharded — loaded on EVERY shard, each running 1/N of its
+#     own tests via --shard.  Collected into BATCH_HEAVY_PKGS.
 #   - CHEAP packages (not .split.vm): PACKAGE-sharded — each assigned to ONE shard
 #     by position, running its FULL tests there.  Collected into BATCH_LIGHT_PKGS.
 #   - Other .split.vm packages (native/* backends, asm/*, lint/bnlint/bnfmt,
@@ -266,18 +265,15 @@ if [ "$CHECK_XPASS" -eq 0 ]; then
     case "$MODE" in *-int-int) BATCH_MODE=1 ;; esac
 fi
 # The double-VM representative set: the .split.vm packages whose tests are only
-# MODERATELY expensive under double-VM — types (the type model), check (the type
-# checker), ir (the IR model) and irgen (IR generation), measured ~0.9s/test for
-# types and ir.  check (~1800 tests) and irgen (~800) are test-sharded rather than
-# assigned whole to one shard, which alone would outrun the cap.  Deliberately
-# EXCLUDES codegen / vm / native-* etc.: their
+# MODERATELY expensive under double-VM — types (typecheck) and ir (IR build),
+# measured ~0.9s/test.  Deliberately EXCLUDES codegen / vm / native-* etc.: their
 # tests compile or RUN whole programs, which under the VM-interpreting-the-VM
 # becomes ~100× (vm's own tests run a bytecode VM, so double-VM makes them
 # VM-on-VM-on-VM) — a full shard of {types,ir,vm,codegen} measured 5h44m locally.
 # Running the type-checker + IR builder under the VM still exercises the double-VM
 # path thoroughly; codegen/vm/native double-VM coverage waits on bni perf work.
 # Kept test-sharded; every other .split.vm package is dropped from this lane.
-INTINT_HEAVY="pkg/binate/types pkg/binate/check pkg/binate/ir pkg/binate/irgen"
+INTINT_HEAVY="pkg/binate/types pkg/binate/ir"
 BATCH_LIGHT_PKGS=""
 BATCH_LIGHT_SKIPS=""
 BATCH_HEAVY_PKGS=""

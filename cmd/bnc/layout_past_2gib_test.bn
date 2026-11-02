@@ -1,0 +1,228 @@
+package "main"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/check"
+import "pkg/binate/codegen"
+import "pkg/binate/ir"
+import "pkg/binate/irgen"
+import "pkg/binate/iropt"
+import "pkg/binate/link"
+import "pkg/binate/mangle"
+import "pkg/binate/native"
+import "pkg/binate/parser"
+import "pkg/binate/types"
+import "pkg/builtins/testing"
+import "pkg/std/os"
+
+// Types past 2 GiB compile for a 64-bit target on any host, a 32-bit one included,
+// through both backends: layout is computed in int64, so on a 32-bit host a size or
+// offset past 2^31 neither wraps nor stops the compiler.  Each program compiles for
+// aarch64 and x86-64, with no IR passes and with every pass, to LLVM IR text and to
+// native ELF and Mach-O objects.  Nothing runs, so no host needs the memory.
+
+// bigLayoutSrc has a field past 2 GiB read, written and addressed through a pointer,
+// an element larger than 2 GiB read through a raw slice, an aggregate larger than
+// 2 GiB copied through pointers and made on the heap, a zero global of such a type,
+// and that type's size as a constant.
+func bigLayoutSrc() *[]readonly char {
+	return "package \"main\"\n"
+			"type Big struct {\n"
+			"\tpad  [0x7FFFFFF0]uint8\n"
+			"\tmore [0x20]uint8\n"
+			"\tx    int\n"
+			"\ty    uint8\n"
+			"}\n"
+			"type Bytes struct {\n"
+			"\tb [0x80000013]uint8\n"
+			"}\n"
+			"var g Big\n"
+			"var run bool\n"
+			"func fieldOf(p *Big) int { return p.x }\n"
+			"func setField(p *Big, v int) {\n"
+			"\tp.x = v\n"
+			"\tp.y = 7\n"
+			"}\n"
+			"func addrOf(p *Big) *int { return &p.x }\n"
+			"func elemField(s *[]Big, i int) int { return s[i].x }\n"
+			"func copyBytes(d *Bytes, s *Bytes) { *d = *s }\n"
+			"func newBig() @Big { return make(Big) }\n"
+			"func sizeOfBig() uint { return sizeof(Big) }\n"
+			"func main() {\n"
+			"\tif run {\n"
+			"\t\tsetField(&g, 1)\n"
+			"\t\tvar s *[]Big\n"
+			"\t\tvar q *Bytes = nil\n"
+			"\t\tcopyBytes(q, q)\n"
+			"\t\tvar m @Big = newBig()\n"
+			"\t\t_ = fieldOf(&g) + *addrOf(&g) + elemField(s, 0) + m.x + cast(int, sizeOfBig())\n"
+			"\t}\n"
+			"}\n"
+}
+
+// bigFrameSrc has a frame of two 1.5 GiB locals and three 1.5 GiB arrays passed by
+// value (on the stack on x86-64), with their caller.
+func bigFrameSrc() *[]readonly char {
+	return "package \"main\"\n"
+			"type Half [0x60000000]uint8\n"
+			"var k int\n"
+			"var run bool\n"
+			"func frame() int {\n"
+			"\tvar a Half\n"
+			"\tvar b Half\n"
+			"\ta[k] = 1\n"
+			"\tb[0x5FFFFFFF - k] = 2\n"
+			"\treturn cast(int, a[k]) + cast(int, b[0x5FFFFFFF - k])\n"
+			"}\n"
+			"func args(a Half, b Half, c Half) int {\n"
+			"\treturn cast(int, a[k]) + cast(int, b[k]) + cast(int, c[0x5FFFFFFF - k])\n"
+			"}\n"
+			"func main() {\n"
+			"\tif run {\n"
+			"\t\tvar p *Half = nil\n"
+			"\t\t_ = frame() + args(*p, *p, *p)\n"
+			"\t}\n"
+			"}\n"
+}
+
+// bigModule parses, checks and IR-generates src for the active target and runs the
+// IR passes level implies.  It returns the first error when src does not compile.
+func bigModule(src *[]readonly char, level int) (@ir.Module, @[]char) {
+	var b @[]uint8 = make_slice(uint8, len(src))
+	for i := 0; i < len(src); i++ { b[i] = src[i] }
+	var p @parser.Parser = parser.New(b, "big.bn")
+	var file @ast.File = p.ParseFile()
+	var perrs @[]parser.ParseError = p.Errors()
+	if len(perrs) > 0 { return nil, parser.FormatParseError(perrs[0]) }
+	var c @check.Checker = check.NewChecker()
+	c.Check(file)
+	var cerrs @[]types.CheckError = c.CheckerErrors()
+	if len(cerrs) > 0 { return nil, check.FormatCheckError(cerrs[0]) }
+	var m @ir.Module = irgen.GenModule(c, file)
+	iropt.RunOptConfig(m, iropt.LevelOptConfig(level))
+	var none @[]char
+	return m, none
+}
+
+// bigContains reports whether text contains sub.
+func bigContains(text *[]readonly char, sub *[]readonly char) bool {
+	for i := 0; i + len(sub) <= len(text); i++ {
+		if seq(text[i:i + len(sub)], sub) { return true }
+	}
+	return false
+}
+
+// bigLLVM compiles src at level to LLVM IR text and checks that the text holds each
+// of wants.
+func bigLLVM(src *[]readonly char, level int, wants *[]*[]readonly char) @[]char {
+	m, err := bigModule(src, level)
+	if len(err) > 0 { return err }
+	var text @[]char = codegen.EmitModule(m)
+	if len(codegen.EmitError()) > 0 { return buf.Concat("LLVM: ", codegen.EmitError()) }
+	for i := 0; i < len(wants); i++ {
+		if !bigContains(text, wants[i]) { return buf.Concat("the LLVM IR lacks ", wants[i]) }
+	}
+	var none @[]char
+	return none
+}
+
+// bigObject compiles src at level to a native object for arch in format, at path.
+func bigObject(src *[]readonly char, level int, arch *[]readonly char, format *[]readonly char,
+		path *[]readonly char) @[]char {
+	m, err := bigModule(src, level)
+	if len(err) > 0 { return err }
+	if !native.EmitObject(m, arch, format, path, native.Options{}) {
+		return buf.Concat(buf.Concat("cannot emit the ", format), " object")
+	}
+	var none @[]char
+	return none
+}
+
+// bigSymbol returns the offset of the ELF object's defined symbol name within its
+// section, and the section's index (-1 when there is no such symbol).
+func bigSymbol(obj @link.InputObject, name *[]readonly char) (int64, int) {
+	for i := 0; i < len(obj.Symbols); i++ {
+		if seq(obj.Symbols[i].Name, name) && obj.Symbols[i].SecIndex >= 0 {
+			return cast(int64, obj.Symbols[i].Value), obj.Symbols[i].SecIndex
+		}
+	}
+	return -1, -1
+}
+
+// bigCheckGlobals reads the ELF object at path and checks that g, a Big, fits the
+// section it shares with run, and that run does not overlap it.  (The native
+// backends give a symbol no size.)
+func bigCheckGlobals(path *[]readonly char) @[]char {
+	obj, err := link.ReadObject(path)
+	if len(err) > 0 { return buf.Concat("cannot read the ELF object: ", err) }
+	gOff, gSec := bigSymbol(obj, mangle.GlobalName("main", "g"))
+	runOff, runSec := bigSymbol(obj, mangle.GlobalName("main", "run"))
+	if gSec < 0 || runSec != gSec { return "g and run must be defined in one section" }
+	var bigSize int64 = 0x80000020
+	if gOff + bigSize > cast(int64, obj.Sections[gSec].Size) { return "g does not fit its section" }
+	if runOff >= gOff && runOff < gOff + bigSize { return "run overlaps g" }
+	var none @[]char
+	return none
+}
+
+// checkBigTarget compiles both programs for the target key through both backends,
+// with no IR passes and with every pass, writing the objects into dir.
+func checkBigTarget(dir *[]readonly char, key *[]readonly char, arch *[]readonly char) @[]char {
+	var saved types.TargetInfo = types.GetTarget()
+	defer { types.SetTarget(saved) }
+	resetTargetState()
+	defer { resetTargetState() }
+	applyTarget(key)
+	var path @[]char = buf.Concat(buf.Concat(buf.Concat(dir, "/"), arch), ".o")
+	var arrays @[]*[]readonly char = @[]*[]readonly char{"[2147483632 x i8]", "[2147483667 x i8]"}
+	for level := 0; level <= 1; level++ {
+		var err @[]char = bigLLVM(bigLayoutSrc(), level, arrays)
+		if len(err) > 0 { return err }
+		err = bigObject(bigLayoutSrc(), level, arch, "elf", path)
+		if len(err) > 0 { return err }
+		err = bigCheckGlobals(path)
+		if len(err) > 0 { return err }
+		err = bigObject(bigLayoutSrc(), level, arch, "macho", path)
+		if len(err) > 0 { return err }
+		err = bigObject(bigFrameSrc(), level, arch, "elf", path)
+		if len(err) > 0 { return err }
+		err = bigObject(bigFrameSrc(), level, arch, "macho", path)
+		if len(err) > 0 { return err }
+	}
+	var none @[]char
+	return none
+}
+
+// The LLVM backend compiles the frame program for aarch64, and rejects it for x86-64,
+// where LLVM addresses at most 2^31 - 1 bytes above the frame pointer.
+func checkBigFrameLLVM() @[]char {
+	var saved types.TargetInfo = types.GetTarget()
+	defer { types.SetTarget(saved) }
+	resetTargetState()
+	defer { resetTargetState() }
+	applyTarget("aarch64-linux")
+	var err @[]char = bigLLVM(bigFrameSrc(), 0, @[]*[]readonly char{"[1610612736 x i8]"})
+	if len(err) > 0 { return err }
+	applyTarget("x86_64-linux")
+	m, merr := bigModule(bigFrameSrc(), 0)
+	if len(merr) > 0 { return merr }
+	_ = codegen.EmitModule(m)
+	if !bigContains(codegen.EmitError(), "LLVM backend addresses on x86-64") {
+		return buf.Concat("x86-64 LLVM must reject the stack arguments; got: ", codegen.EmitError())
+	}
+	var none @[]char
+	return none
+}
+
+func TestTypesPast2GiBCompileFor64BitTargets() testing.TestResult {
+	dir, derr := os.MkdirTemp("/tmp", "binate_bnc_test_")
+	if present(derr) { return fail("cannot create a temporary directory") }
+	defer { os.RemoveAll(dir) }
+	var err @[]char = checkBigTarget(dir, "aarch64-linux", "aarch64")
+	if len(err) > 0 { return fail(buf.Concat("aarch64: ", err)) }
+	err = checkBigTarget(dir, "x86_64-linux", "x86_64")
+	if len(err) > 0 { return fail(buf.Concat("x86_64: ", err)) }
+	err = checkBigFrameLLVM()
+	if len(err) > 0 { return fail(err) }
+	return ""
+}

@@ -515,6 +515,21 @@ func main() {
 }
 EOF
 
+# ----- Twice-importing fixture: its file imports pkg/builtins/testing twice,
+# which is an error (spec pkg.import.once) though the loader's merge of the
+# program's files holds the import once — see the setup-import-twice case. ---
+TWICE_FIXTURE="$TMP/twice_fixture.bn"
+cat > "$TWICE_FIXTURE" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+import "pkg/builtins/testing"
+
+func main() {
+    testing.Println(1)
+}
+EOF
+
 # ----- No-`testing` fixture: it does NOT import pkg/builtins/testing, so a
 # prompt `import "pkg/builtins/testing"` is a genuine FIRST-time mid-session
 # import of that injected package (exercises RegisterImportFuncSigs — the
@@ -3456,6 +3471,11 @@ testing.Println(gk(42), gm())
 # reads the builtins from disk. ---
 run_repl_setup_error "setup-type-error" "$BAD_FIXTURE" \
     "undefined: undefinedThing"
+
+# --- A package imported twice by the loaded file is a setup error: the check
+# reads the file's own imports, not the merged program's. ---
+run_repl_setup_error "setup-import-twice" "$TWICE_FIXTURE" \
+    "twice_fixture.bn:4:8: package pkg/builtins/testing is imported more than once in this file"
 
 echo ""
 echo "=== Summary: $PASSES passed, $FAILS failed ==="

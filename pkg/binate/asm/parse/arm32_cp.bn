@@ -1,0 +1,309 @@
+package "pkg/binate/asm/parse"
+
+import "pkg/binate/asm/arm32"
+import "pkg/binate/asm/arm32/sys"
+import "pkg/binate/buf"
+import "pkg/binate/stringutils"
+import "pkg/std/strings"
+
+// The coprocessor instructions (asm/arm32/sys), as clang takes them: MCR / MRC{2} coproc, opc1,
+// Rt, CRn, CRm{, opc2}; MCRR / MRRC{2} coproc, opc1, Rt, Rt2, CRm; CDP{2} coproc, opc1, CRd, CRn,
+// CRm, opc2; LDC / STC{2}{L} coproc, CRd, a memory operand, `[Rn], {option}` or a label or `.±N`
+// (in place: a local label in its own section).  A coprocessor is p0..p15 (or pr0..pr15) and its
+// registers c0..c15 (or cr0..cr15), in any case; an opcode's `#` is optional.  The 2 forms have no
+// condition; ARMv8 keeps only coprocessors 14 and 15 and drops CDP and the 2 forms.
+
+// The coprocessor instructions' kinds (arm32CpKind).
+const (
+	cpMcr int = 1
+	cpMrc int = 2
+	cpMcrr int = 3
+	cpMrrc int = 4
+	cpCdp int = 5
+	cpLdc int = 6
+	cpStc int = 7
+)
+
+// arm32CpKind returns the kind of the coprocessor instruction name, whether it is a 2 form, whether
+// it is an L (long) LDC / STC, and whether name is one.
+func arm32CpKind(name *[]readonly char) (int, bool, bool, bool) {
+	var bases @[]*[]readonly char = @[]*[]readonly char{"mcr", "mrc", "mcrr", "mrrc", "cdp", "ldc",
+			"stc"}
+	for k := 0; k < len(bases); k++ {
+		var b *[]readonly char = bases[k]
+		if len(name) < len(b) || !mnemIs(name[0:len(b)], b) { continue }
+		var rest *[]readonly char = name[len(b):len(name)]
+		var two bool = len(rest) > 0 && rest[0] == '2'
+		if two { rest = rest[1:len(rest)] }
+		var long bool = len(rest) == 1 && arm32Lower(rest[0]) == 'l' && k + 1 >= cpLdc
+		if long { rest = rest[1:len(rest)] }
+		if len(rest) == 0 { return k + 1, two, long, true }
+	}
+	return 0, false, false, false
+}
+
+// arm32CpNumber returns the number in name, `p0`..`p15` (letter: 'p') or `c0`..`c15` ('c'), in
+// any case and without a leading zero, or -1.  As clang reads it, an `r` may follow the letter
+// (`pr15`, `cr1`).
+func arm32CpNumber(name *[]readonly char, letter char) int {
+	if len(name) < 2 || arm32Lower(name[0]) != letter { return -1 }
+	var digits *[]readonly char = name[1:len(name)]
+	if arm32Lower(digits[0]) == 'r' { digits = digits[1:len(digits)] }
+	if len(digits) < 1 || len(digits) > 2 { return -1 }
+	var n int = 0
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' || (i == 0 && digits[i] == '0' && len(digits) > 1) {
+			return -1
+		}
+		n = n * 10 + cast(int, digits[i]) - cast(int, '0')
+	}
+	if n > 15 { return -1 }
+	return n
+}
+
+// arm32CpOperands holds a coprocessor instruction's operands as they are parsed in turn.
+type arm32CpOperands struct {
+	l   Lexer
+	tok Token
+	ok  bool
+}
+
+// cpNext moves past the comma that must follow an operand (tok), then reads the next operand's
+// first token; at the end of the line it is clang's "too few operands" error.
+func cpNext(p @Parser, o arm32CpOperands) arm32CpOperands {
+	if !o.ok { return o }
+	if o.tok.Kind == TOK_EOF {
+		setErr(p, "too few operands for instruction")
+		o.ok = false
+		return o
+	}
+	if o.tok.Kind != TOK_COMMA {
+		setErr(p, "unexpected token in operand")
+		o.ok = false
+		return o
+	}
+	o.l, o.tok = LexNext(o.l)
+	if o.tok.Kind == TOK_EOF {
+		setErr(p, "too few operands for instruction")
+		o.ok = false
+	}
+	return o
+}
+
+// cpName reads a coprocessor (letter 'p') or coprocessor register ('c') operand at o.tok.
+func cpName(p @Parser, o arm32CpOperands, letter char) (arm32CpOperands, int) {
+	if !o.ok { return o, 0 }
+	var n int = -1
+	if o.tok.Kind == TOK_IDENT { n = arm32CpNumber(o.tok.Text, letter) }
+	if n < 0 || (letter == 'p' && p.Arm32Feats & armV8 != 0 && n < 14) {
+		setErr(p, "invalid operand for instruction")
+		o.ok = false
+		return o, 0
+	}
+	o.l, o.tok = LexNext(o.l)
+	return o, n
+}
+
+// cpImm reads an opcode operand, 0..max, at o.tok (`#` optional).
+func cpImm(p @Parser, o arm32CpOperands, max int) (arm32CpOperands, int) {
+	if !o.ok { return o, 0 }
+	var r ExprResult
+	o.l, o.tok, r = parseArm32OperandExpr(p, o.l, o.tok)
+	if !r.Ok || r.FromDiff || r.Val < 0 || r.Val > cast(int64, max) {
+		var b @strings.Builder = strings.NewBuilder()
+		b.Write("operand must be an immediate in the range [0,")
+		stringutils.WriteInt(b, max)
+		b.WriteByte(']')
+		setErr(p, buf.CopyStr(b.String()))
+		o.ok = false
+		return o, 0
+	}
+	return o, cast(int, r.Val)
+}
+
+// cpReg reads a core register operand at o.tok, PC only when pcOk (MRC's APSR_nzcv standing for
+// it when nzcv), with clang's message for anything else.
+func cpReg(p @Parser, o arm32CpOperands, pcOk bool, nzcv bool) (arm32CpOperands, int) {
+	if !o.ok { return o, 0 }
+	var r int = -1
+	if nzcv && o.tok.Kind == TOK_IDENT && mnemIs(o.tok.Text, "apsr_nzcv") {
+		r = arm32.PC
+	} else if o.tok.Kind == TOK_IDENT {
+		r = parseArm32Reg(o.tok.Text)
+		if r == arm32.PC && !pcOk { r = -1 }
+	}
+	if r < 0 {
+		if nzcv {
+			setErr(p, "operand must be a register in range [r0, r14] or apsr_nzcv")
+		} else if pcOk {
+			setErr(p, "operand must be a register in range [r0, r15]")
+		} else {
+			setErr(p, "operand must be a register in range [r0, r14]")
+		}
+		o.ok = false
+		return o, 0
+	}
+	o.l, o.tok = LexNext(o.l)
+	return o, r
+}
+
+// cpEnd reports whether o.tok ends the line, setting clang's error for another operand.
+func cpEnd(p @Parser, o arm32CpOperands) bool {
+	if !o.ok { return false }
+	return arm32EndOfOperands(p, o.tok)
+}
+
+// parseArm32Coproc assembles a coprocessor instruction (baseMnem, cond; l the lexer after the
+// mnemonic), reporting whether baseMnem is one.
+func parseArm32Coproc(p @Parser, l Lexer, baseMnem *[]readonly char, cond int) bool {
+	kind, two, long, ok := arm32CpKind(baseMnem)
+	if !ok { return false }
+	if two && cond != arm32.COND_AL {
+		arm32NotPredicable(p, baseMnem)
+		return true
+	}
+	if p.Arm32Feats & armV8 != 0 && (two || kind == cpCdp) {
+		setErr(p, "invalid instruction")
+		return true
+	}
+	var o arm32CpOperands
+	o.l = l
+	o.ok = true
+	o.l, o.tok = LexNext(o.l)
+	if o.tok.Kind == TOK_EOF {
+		setErr(p, "too few operands for instruction")
+		return true
+	}
+	var cp int
+	o, cp = cpName(p, o, 'p')
+	o = cpNext(p, o)
+	if kind == cpLdc || kind == cpStc {
+		var crd int
+		o, crd = cpName(p, o, 'c')
+		o = cpNext(p, o)
+		if o.ok { parseArm32CpTransfer(p, o.l, o.tok, cond, two, kind == cpLdc, long, cp, crd) }
+		return true
+	}
+	var opcMax int = 7
+	if kind != cpMcr && kind != cpMrc { opcMax = 15 }
+	var opc1 int
+	o, opc1 = cpImm(p, o, opcMax)
+	o = cpNext(p, o)
+	if kind == cpMcrr || kind == cpMrrc {
+		var rt int
+		var rt2 int
+		var crm int
+		o, rt = cpReg(p, o, false, false)
+		o = cpNext(p, o)
+		o, rt2 = cpReg(p, o, false, false)
+		o = cpNext(p, o)
+		o, crm = cpName(p, o, 'c')
+		if !cpEnd(p, o) { return true }
+		if kind == cpMcrr {
+			sys.Mcrr(p.Asm, cond, two, cp, opc1, rt, rt2, crm)
+		} else {
+			sys.Mrrc(p.Asm, cond, two, cp, opc1, rt, rt2, crm)
+		}
+		return true
+	}
+	var first int
+	if kind == cpCdp {
+		o, first = cpName(p, o, 'c')
+	} else {
+		o, first = cpReg(p, o, kind == cpMcr, kind == cpMrc)
+	}
+	o = cpNext(p, o)
+	var crn int
+	o, crn = cpName(p, o, 'c')
+	o = cpNext(p, o)
+	var crm int
+	o, crm = cpName(p, o, 'c')
+	var opc2 int = 0
+	if kind == cpCdp || (o.ok && o.tok.Kind == TOK_COMMA) {
+		o = cpNext(p, o)
+		o, opc2 = cpImm(p, o, 7)
+	}
+	if !cpEnd(p, o) { return true }
+	if kind == cpCdp { sys.Cdp(p.Asm, cond, two, cp, opc1, first, crn, crm, opc2) }
+	if kind == cpMcr { sys.Mcr(p.Asm, cond, two, cp, opc1, first, crn, crm, opc2) }
+	if kind == cpMrc { sys.Mrc(p.Asm, cond, two, cp, opc1, first, crn, crm, opc2) }
+	return true
+}
+
+// parseArm32CpTransfer assembles LDC (STC when !load) from its memory operand starting at tok: a
+// memory operand with an immediate offset, `[Rn], {option}`, or a PC-relative target.
+func parseArm32CpTransfer(p @Parser, l Lexer, tok Token, cond int, two bool, load bool, long bool,
+		cp int, crd int) {
+	if tok.Kind == TOK_LBRACKET {
+		// [Rn], {option}: look past the base and the comma for the brace.
+		var la Lexer = l
+		var t1 Token
+		la, t1 = LexNext(la)
+		var t2 Token
+		la, t2 = LexNext(la)
+		var t3 Token
+		la, t3 = LexNext(la)
+		var t4 Token
+		la, t4 = LexNext(la)
+		var rn int = -1
+		if t1.Kind == TOK_IDENT { rn = parseArm32Reg(t1.Text) }
+		if rn >= 0 && t2.Kind == TOK_RBRACKET && t3.Kind == TOK_COMMA && t4.Kind == TOK_LBRACE {
+			var r ExprResult
+			var t Token
+			la, t = LexNext(la)
+			la, t, r = ParseExpr(p, la, t)
+			if !r.Ok || r.FromDiff || r.Val < 0 || r.Val > 255 || t.Kind != TOK_RBRACE {
+				setErr(p, "coprocessor option must be an immediate in range [0, 255]")
+				return
+			}
+			la, t = LexNext(la)
+			if !arm32EndOfOperands(p, t) { return }
+			if load {
+				sys.LdcOption(p.Asm, cond, two, long, cp, crd, rn, cast(int, r.Val))
+			} else {
+				sys.StcOption(p.Asm, cond, two, long, cp, crd, rn, cast(int, r.Val))
+			}
+			return
+		}
+		var op arm32.Operand
+		l, tok, op, _ = parseArm32MemOperand(p, l, false, false)
+		if p.HasError { return }
+		if op.Kind != arm32.OP_MEM_IMM && op.Kind != arm32.OP_MEM_PRE && op.Kind != arm32.OP_MEM_POST {
+			setErr(p, "invalid operand for instruction")
+			return
+		}
+		if !arm32EndOfOperands(p, tok) { return }
+		parseArm32CpEmit(p, cond, two, load, long, cp, crd, op)
+		return
+	}
+	if tok.Kind == TOK_IDENT && arm32CpNumber(tok.Text, 'c') >= 0 {
+		// A coprocessor register's name is no label here, as clang reads it.
+		setErr(p, "invalid operand for instruction")
+		return
+	}
+	var target arm32.Operand
+	l, tok, target = parseArm32MemTarget(p, l, tok)
+	if p.HasError || !arm32EndOfOperands(p, tok) { return }
+	if target.Kind != arm32.OP_LABEL && (target.Imm >= 1024 || target.Imm <= -1024) {
+		// `.±N` past the word count's reach (a nearer one that is no multiple of 4 is
+		// parseArm32CpEmit's error).
+		setErr(p, "out of range pc-relative fixup value")
+		return
+	}
+	parseArm32CpEmit(p, cond, two, load, long, cp, crd, target)
+}
+
+// parseArm32CpEmit emits LDC (STC when !load) with op, its offset checked as clang checks it (a
+// multiple of 4 within +/-1020) so the error is clang's.
+func parseArm32CpEmit(p @Parser, cond int, two bool, load bool, long bool, cp int, crd int,
+		op arm32.Operand) {
+	if op.Kind != arm32.OP_LABEL && (op.Imm % 4 != 0 || op.Imm > 1020 || op.Imm < -1020) {
+		setErr(p, "invalid operand for instruction")
+		return
+	}
+	if load {
+		sys.Ldc(p.Asm, cond, two, long, cp, crd, op)
+	} else {
+		sys.Stc(p.Asm, cond, two, long, cp, crd, op)
+	}
+}

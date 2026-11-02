@@ -256,9 +256,9 @@ _set_bni_pass_flags() {
 
 # Build the compiled interpreter (bni) CROSS-COMPILED for arm32-linux, using
 # current-tree cmd/bnc (GEN1_COMPILER) with --target arm32-linux.  The result is
-# a 32-bit-HOST bytecode VM (host int == 4 bytes); because cmd/bni bakes in
-# ConfigForTarget("") it interprets 32-bit-target bytecode — so running it (under
-# qemu-arm) exercises the VM's 32-bit-host paths.  Built -O2 like the host
+# a 32-bit-HOST bytecode VM (host int == 4 bytes); because cmd/bni uses its own
+# host's config and target (UseHostTarget) it interprets 32-bit-target bytecode
+# — so running it (under qemu-arm) exercises the VM's 32-bit-host paths.  Built -O2 like the host
 # bni (this tree's IR passes, plus clang -O2 for the cross target).  Requires the
 # arm32 cross-toolchain (clang -target arm-linux-gnueabihf); NOT buildable on
 # macOS.  Run it via conformance/runners/builder-comp_arm32_linux_int.sh.

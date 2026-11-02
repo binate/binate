@@ -4,7 +4,7 @@
 # current-tree cmd/bnc (compiled via the BUILDER during runner_setup ->
 # GEN1_COMPILER) CROSS-COMPILES cmd/bni itself to arm-linux-gnueabihf (32-bit
 # ARMv7-A Linux), producing a 32-bit-host bytecode VM (host int == 4 bytes).
-# Because cmd/bni bakes in ConfigForTarget("") (its own host config), that arm32
+# Because cmd/bni uses its own host's config and target (UseHostTarget), that arm32
 # bni interprets 32-bit-TARGET bytecode — so each conformance test's .bn is run
 # through the VM ON A 32-BIT HOST, under qemu-arm user-mode emulation.  This is
 # the configuration that exposes the VM's latent 32-bit-host bugs (int64/target-

@@ -1,0 +1,387 @@
+package "pkg/binate/asm/parse"
+
+import "pkg/binate/asm/arm32"
+import "pkg/binate/buf"
+
+// A conversion's operands matched against its encodings as clang's matcher does: an encoding
+// whose types and operands all match, its features in effect, is the instruction; one off by a
+// single type or operand, by too few or too many operands, or by its features alone, is a near
+// miss, and the near misses (one message each, duplicates dropped as clang drops them) make the
+// error: none "invalid instruction", one its message, more clang's "invalid instruction, any one
+// of the following would fix this:".
+
+// The kinds of operand read (arm32CvtItem.kind).
+const (
+	cvtItemS int = iota + 1
+	cvtItemD
+	cvtItemQ
+	cvtItemImm
+	cvtItemOther
+)
+
+// arm32CvtItem is an operand as written: an S, D or Q register (n its number), an expression (val
+// its value when known, a number rather than a symbol, a location or a difference of them), or
+// anything else; bang for a register or a prefixed immediate with a `!` after it, which clang reads
+// as one more operand.
+type arm32CvtItem struct {
+	kind  int
+	n     int
+	val   int64
+	known bool
+	bang  bool
+}
+
+// arm32CvtSkip returns the lexer and token at the end of an operand clang reads as no register or
+// number this encoding can take: the next comma, or the end of the line.
+func arm32CvtSkip(l Lexer, tok Token) (Lexer, Token) {
+	for tok.Kind != TOK_EOF && tok.Kind != TOK_COMMA { l, tok = LexNext(l) }
+	return l, tok
+}
+
+// arm32CvtOperand reads the operand at tok as clang does: an S, D (D16 .. D31 only with 32 D
+// registers; clang reads the name as a symbol otherwise) or Q register, another register (either
+// with a `!` after it), an expression after `#` or a lone `$` (a `!` after it too), or one with no
+// prefix that does not start with a sign or a floating-point literal -- a floating-point zero in
+// it is 0, and another floating-point literal makes it no number clang's matcher takes -- or
+// another operand clang reads (arm32CvtOtherStart), which no encoding here takes.  It returns the
+// lexer and the token after it, the operand, and whether it was read, setting the error if not.
+func arm32CvtOperand(p @Parser, l Lexer, tok Token) (Lexer, Token, arm32CvtItem, bool) {
+	var it arm32CvtItem
+	it.kind = cvtItemOther
+	if tok.Kind == TOK_IDENT && tok.Text[0] != '$' && arm32RegisterName(tok.Text) {
+		var s int = arm32VfpReg(tok.Text, 's')
+		var d int = arm32VfpReg(tok.Text, 'd')
+		var q int = arm32VfpReg(tok.Text, 'q')
+		if s >= 0 {
+			it.kind = cvtItemS
+			it.n = s
+		} else if d >= 0 && (d < 16 || p.Arm32FP & armFpD32 != 0) {
+			it.kind = cvtItemD
+			it.n = d
+		} else if q >= 0 {
+			it.kind = cvtItemQ
+			it.n = q
+		}
+		if it.kind != cvtItemOther || d < 0 {
+			l, tok = LexNext(l)
+			if tok.Kind == TOK_BANG {
+				it.bang = true
+				l, tok = LexNext(l)
+			}
+			return l, tok, it, true
+		}
+	}
+	if tok.Kind == TOK_FLOAT || arm32SignedStart(tok) {
+		setErr(p, "unexpected token in operand")
+		return l, tok, it, false
+	}
+	var expr bool = tok.Kind == TOK_HASH || tok.Kind == TOK_DOLLAR || tok.Kind == TOK_IDENT ||
+			tok.Kind == TOK_INT || tok.Kind == TOK_CHAR || tok.Kind == TOK_LPAREN || tok.Kind == TOK_DOT
+	if !expr {
+		if !arm32CvtOtherStart(tok) {
+			setErr(p, "unexpected token in operand")
+			return l, tok, it, false
+		}
+		if tok.Kind == TOK_COLON || tok.Kind == TOK_STRING { it.kind = cvtItemImm }
+		l, tok = arm32CvtSkip(l, tok)
+		return l, tok, it, true
+	}
+	var negative bool = arm32PrefixedMinus(l, tok)
+	var prefixed bool = tok.Kind == TOK_HASH || tok.Kind == TOK_DOLLAR
+	// A `!` after an immediate with a prefix (`$4` lexes as a name) is an operand of its own.
+	var bangOk bool = prefixed || (tok.Kind == TOK_IDENT && tok.Text[0] == '$')
+	if prefixed {
+		l, tok = LexNext(l)
+		if tok.Kind == TOK_EOF || tok.Kind == TOK_COMMA {
+			setErr(p, "unknown token in expression")
+			return l, tok, it, false
+		}
+		if tok.Kind == TOK_COLON || tok.Kind == TOK_STRING {
+			it.kind = cvtItemImm
+			l, tok = arm32CvtSkip(l, tok)
+			return l, tok, it, true
+		}
+	}
+	var r ExprResult
+	p.ExprZeroReals = true
+	l, tok, r = parseSymExpr(p, l, tok)
+	p.ExprZeroReals = false
+	it.kind = cvtItemImm
+	if !r.Ok {
+		// A floating-point literal other than zero (Parser.ExprZeroReals) is a number no encoding
+		// here takes; any other failure is clang's parse error.
+		if !charsEqual(r.Err, "invalid operand for instruction") {
+			setErr(p, exprErr(r, "unknown token in expression"))
+			return l, tok, it, false
+		}
+		l, tok = arm32CvtSkip(l, tok)
+		return l, tok, it, true
+	}
+	it.known = !r.FromDiff && !r.Pending && !isSymbolic(r) && !hasNeg(r)
+	it.val = r.Val
+	if negative && it.known && it.val == 0 { it.val = -2147483648 }
+	if bangOk && tok.Kind == TOK_BANG {
+		it.bang = true
+		l, tok = LexNext(l)
+	}
+	return l, tok, it, true
+}
+
+// arm32CvtOtherStart reports whether tok starts an operand clang reads that no encoding here
+// takes: a memory operand, a register list, or an immediate this reader leaves unread -- one with
+// a `:lower16:`-style prefix, a quoted symbol name.
+func arm32CvtOtherStart(tok Token) bool {
+	return tok.Kind == TOK_LBRACKET || tok.Kind == TOK_LBRACE || tok.Kind == TOK_COLON ||
+			tok.Kind == TOK_STRING
+}
+
+// arm32CvtOperands reads the operands after l, keeping the first six (more are only counted),
+// and returns them, how many there are, and whether they were read, setting the error if not.
+func arm32CvtOperands(p @Parser, l Lexer) (@[]arm32CvtItem, int, bool) {
+	var items @[]arm32CvtItem = make_slice(arm32CvtItem, 6)
+	var n int = 0
+	var tok Token
+	l, tok = LexNext(l)
+	for tok.Kind != TOK_EOF {
+		var it arm32CvtItem
+		var ok bool
+		l, tok, it, ok = arm32CvtOperand(p, l, tok)
+		if !ok { return items, n, false }
+		if n < len(items) { items[n] = it }
+		n = n + 1
+		if it.bang {
+			if n < len(items) { items[n].kind = cvtItemOther }
+			n = n + 1
+		}
+		if tok.Kind == TOK_EOF { break }
+		if tok.Kind != TOK_COMMA {
+			setErr(p, "unexpected token in argument list")
+			return items, n, false
+		}
+		l, tok = LexNext(l)
+		if tok.Kind == TOK_EOF || tok.Kind == TOK_COMMA {
+			setErr(p, "unexpected token in operand")
+			return items, n, false
+		}
+	}
+	return items, n, true
+}
+
+// arm32CvtKindAt returns the kind of operand i (from 0) of an encoding's ops, 0 past the last.
+func arm32CvtKindAt(ops int, i int) int { return (ops >> (4 * i)) & 15 }
+
+// arm32CvtItemIs reports whether operand it is of kind k (cvtKind*).
+func arm32CvtItemIs(k int, it arm32CvtItem) bool {
+	if k == cvtKindS { return it.kind == cvtItemS }
+	if k == cvtKindD { return it.kind == cvtItemD }
+	if k == cvtKindQ { return it.kind == cvtItemQ }
+	if k == cvtKindMQ { return it.kind == cvtItemQ && it.n <= 7 }
+	if k == cvtKindImm { return it.kind == cvtItemImm }
+	if it.kind != cvtItemImm || !it.known { return false }
+	if k == cvtKindFbits16 { return it.val >= 0 && it.val <= 17 }
+	if k == cvtKindFbits32 { return it.val >= 1 && it.val <= 33 }
+	if k == cvtKindMFbits16 { return it.val >= 1 && it.val <= 16 }
+	if k == cvtKindMFbits32 { return it.val >= 1 && it.val <= 32 }
+	return it.val == 0
+}
+
+// arm32CvtMissing returns the features need (cvtNeed*) asks for that are not in effect.
+func arm32CvtMissing(p @Parser, need int) int {
+	var fp uint64 = p.Arm32FP
+	var have int = 0
+	if fp & armFpBF16 != 0 { have = have | cvtNeedBF16 }
+	if fp & armFpDP != 0 { have = have | cvtNeedDP }
+	if fp & armFpHalf != 0 { have = have | cvtNeedHalf }
+	if fp & armFpV8D16SP != 0 { have = have | cvtNeedV8FP }
+	if fp & armFpFullFP16 != 0 { have = have | cvtNeedFull16 }
+	if fp & armFpNEON != 0 { have = have | cvtNeedNEON }
+	if p.Arm32Feats & armV8 != 0 { have = have | cvtNeedV8 }
+	if p.Arm32Feats & armV8_3 != 0 { have = have | cvtNeedV8_3 }
+	if fp & armFpVFP2SP != 0 { have = have | cvtNeedVFP2 }
+	return need & ~have
+}
+
+// arm32CvtFeatureNames returns clang's "instruction requires:" message for the missing features
+// missing (cvtNeed*), named in clang's order.
+func arm32CvtFeatureNames(missing int) @[]char {
+	var names @[]*[]readonly char = @[]*[]readonly char{"BFloat16 floating point extension",
+			"double precision VFP", "half-float conversions", "FPARMv8", "full half-float", "mve.fp", "NEON",
+			"armv8", "armv8.3a", "VFP2"}
+	var out @[]char = buf.CopyStr("instruction requires:")
+	for i := 0; i < len(names); i++ {
+		if missing & (1 << i) != 0 { out = buf.Concat(buf.Concat(out, " "), names[i]) }
+	}
+	return out
+}
+
+// The ways an encoding can be off (arm32CvtMiss.kind): matched outright, by one type or operand,
+// by too few operands, by features only, or by more.
+const (
+	cvtMissNone int = iota
+	cvtMissOperand
+	cvtMissTooFew
+	cvtMissFeature
+	cvtMissFar
+)
+
+// arm32CvtMiss is how an encoding matches: kind (cvtMiss*); for one type or operand off, its
+// place in what was written (a condition first, then types, then operands), the class of what was
+// wanted there (cvtKindS, cvtKindD, cvtKindQ or cvtKindMQ, which clang names; 0 for a type or a
+// number, which it does not) and whether it was an operand past the last; for features only, the
+// missing ones.
+type arm32CvtMiss struct {
+	kind     int
+	at       int
+	class    int
+	tooMany  bool
+	features int
+}
+
+// arm32CvtTry matches encoding c against what was written -- a condition other than AL (cond),
+// then the nt types, then the ni operands (items holding the first of them) -- place by place
+// against the encoding's own, its condition operand first where it has one.
+func arm32CvtTry(p @Parser, c arm32CvtCand, cond int, types @[]int, nt int, items @[]arm32CvtItem,
+		ni int) arm32CvtMiss {
+	var m arm32CvtMiss
+	var lead int = 0
+	if cond != arm32.COND_AL { lead = 1 }
+	var slot int = 0
+	if lead == 1 && arm32CvtHasCond(c) { slot = 1 }
+	var ft int = 0
+	if c.t1 != 0 { ft = 1 }
+	if c.t2 != 0 { ft = 2 }
+	var fk int = 0
+	for arm32CvtKindAt(c.ops, fk) != 0 { fk = fk + 1 }
+	var written int = lead + nt + ni
+	var places int = slot + ft + fk
+	var problems int = 0
+	for i := 0; i < places; i++ {
+		if i >= written {
+			if problems == 0 { m.kind = cvtMissTooFew }
+			problems = problems + 1
+			break
+		}
+		var ok bool = i < slot
+		var class int = 0
+		if i >= slot && i < slot + ft {
+			var want int = c.t1
+			if i - slot == 1 { want = c.t2 }
+			ok = i >= lead && i - lead < nt && types[i - lead] == want
+		} else if i >= slot + ft {
+			var k int = arm32CvtKindAt(c.ops, i - slot - ft)
+			if k <= cvtKindQ || k == cvtKindMQ { class = k }
+			var at int = i - lead - nt
+			ok = at >= 0 && at < len(items) && arm32CvtItemIs(k, items[at])
+		}
+		if !ok {
+			problems = problems + 1
+			if problems > 1 { break }
+			m.kind = cvtMissOperand
+			m.at = i
+			m.class = class
+		}
+	}
+	// Each operand past the last is one more mismatch (clang matches it against no operand).
+	if problems <= 1 && written > places {
+		if problems == 0 {
+			m.kind = cvtMissOperand
+			m.at = places
+			m.tooMany = true
+		}
+		problems = problems + written - places
+	}
+	var missing int = arm32CvtMissing(p, c.need)
+	if problems > 1 || (problems == 1 && missing != 0) {
+		m.kind = cvtMissFar
+	} else if problems == 0 && missing != 0 {
+		m.kind = cvtMissFeature
+		m.features = missing
+	}
+	return m
+}
+
+// arm32CvtOperandMessage returns clang's message for an operand of class (arm32CvtMiss.class)
+// wanted where another was written, or for one past the last (tooMany).
+func arm32CvtOperandMessage(p @Parser, class int, tooMany bool) *[]readonly char {
+	if class == cvtKindS { return "operand must be a register in range [s0, s31]" }
+	if class == cvtKindD { return arm32VfpRange(p, 64) }
+	if class == cvtKindQ { return "operand must be a register in range [q0, q15]" }
+	if class == cvtKindMQ { return "operand must be a register in range [q0, q7]" }
+	if tooMany { return "too many operands for instruction" }
+	return "invalid operand for instruction"
+}
+
+// arm32CvtReport sets clang's error for the n encodings' matches misses, taken last first as
+// clang takes them: an operand at a place already reported with the same class (or, wanting a
+// type or number, the same) is dropped, as are a set of missing features already reported and a
+// second "too few operands".
+func arm32CvtReport(p @Parser, misses @[]arm32CvtMiss, n int) {
+	var count int = 0
+	var message @[]char = ""
+	var seenAt @[]int = make_slice(int, n)
+	var seenClass @[]int = make_slice(int, n)
+	var seenFeatures @[]int = make_slice(int, n)
+	var operands int = 0
+	var features int = 0
+	var tooFew bool = false
+	for i := n - 1; i >= 0; i-- {
+		var m arm32CvtMiss = misses[i]
+		var text @[]char = ""
+		if m.kind == cvtMissOperand {
+			var dup bool = false
+			for j := 0; j < operands; j++ {
+				if seenAt[j] == m.at && seenClass[j] == m.class { dup = true }
+			}
+			if dup { continue }
+			seenAt[operands] = m.at
+			seenClass[operands] = m.class
+			operands = operands + 1
+			text = buf.CopyStr(arm32CvtOperandMessage(p, m.class, m.tooMany))
+		} else if m.kind == cvtMissFeature {
+			var dup bool = false
+			for j := 0; j < features; j++ {
+				if seenFeatures[j] == m.features { dup = true }
+			}
+			if dup { continue }
+			seenFeatures[features] = m.features
+			features = features + 1
+			text = arm32CvtFeatureNames(m.features)
+		} else if m.kind == cvtMissTooFew {
+			if tooFew { continue }
+			tooFew = true
+			text = buf.CopyStr("too few operands for instruction")
+		} else {
+			continue
+		}
+		count = count + 1
+		message = text
+	}
+	if count == 0 {
+		setErr(p, "invalid instruction")
+	} else if count == 1 {
+		setErr(p, message)
+	} else {
+		setErr(p, "invalid instruction, any one of the following would fix this:")
+	}
+}
+
+// parseArm32CvtOperands assembles conversion instruction idx under cond, its nt data types types
+// (the first three kept), from its operands after l: the first of its encodings that matches, or
+// clang's error.
+func parseArm32CvtOperands(p @Parser, l Lexer, idx int, cond int, types @[]int, nt int) {
+	items, ni, ok := arm32CvtOperands(p, l)
+	if !ok { return }
+	var list @arm32CvtCandList = arm32CvtCands(idx)
+	var misses @[]arm32CvtMiss = make_slice(arm32CvtMiss, list.n)
+	for i := 0; i < list.n; i++ {
+		misses[i] = arm32CvtTry(p, list.c[i], cond, types, nt, items, ni)
+		if misses[i].kind != cvtMissNone { continue }
+		if !arm32CvtIsVFP(list.c[i]) {
+			setErr(p, "NEON (Advanced SIMD) instructions are not supported yet")
+		} else {
+			arm32CvtEmit(p, idx, cond, list.c[i], items)
+		}
+		return
+	}
+	arm32CvtReport(p, misses, list.n)
+}

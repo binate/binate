@@ -274,6 +274,18 @@ fi
 # path thoroughly; codegen/vm/native double-VM coverage waits on bni perf work.
 # Kept test-sharded; every other .split.vm package is dropped from this lane.
 INTINT_HEAVY="pkg/binate/types pkg/binate/ir"
+# The packages too heavy to run whole on one shard under the double VM, run in
+# parts instead: pkg:K splits the package's tests into K parts, part j (1..K) on a
+# shard of its own, as an invocation of its own (cmd/bni --test --shard-index j
+# --shard-count K).  The parts take shards in order from a counter of their own
+# (part_pos), so no two land on one shard while the counts sum to at most the shard
+# count, and each costs one extra load on its shard only.  Whole, check (~1800
+# tests) needs ~90 min under the double VM, irgen (~800) and link (~370) ~25-30
+# min.  Unsharded, these run whole in the light batch.
+INTINT_PARTS="pkg/binate/check:6 pkg/binate/irgen:2 pkg/binate/link:2"
+part_pos=0
+BATCH_PART_PKGS=""
+BATCH_PART_SKIPS=""
 BATCH_LIGHT_PKGS=""
 BATCH_LIGHT_SKIPS=""
 BATCH_HEAVY_PKGS=""
@@ -369,6 +381,23 @@ for pkg in $PACKAGES; do
             fi
             BATCH_LIGHT_PKGS="$BATCH_LIGHT_PKGS $pkg"
             BATCH_LIGHT_SKIPS="$BATCH_LIGHT_SKIPS$b_pkg_skips"
+            continue
+        fi
+        b_parts=0
+        for b_pp in $INTINT_PARTS; do
+            case "$b_pp" in "$pkg:"*) b_parts="${b_pp##*:}" ;; esac
+        done
+        if [ "$b_parts" -gt 0 ]; then
+            # Split into parts: part j on the shard part_pos picks, as pkg:j:K.
+            b_pj=1
+            while [ "$b_pj" -le "$b_parts" ]; do
+                if [ $((part_pos % SHARD_COUNT)) -eq $((SHARD_IDX - 1)) ]; then
+                    BATCH_PART_PKGS="$BATCH_PART_PKGS $pkg:$b_pj:$b_parts"
+                    BATCH_PART_SKIPS="$BATCH_PART_SKIPS$b_pkg_skips"
+                fi
+                part_pos=$((part_pos + 1))
+                b_pj=$((b_pj + 1))
+            done
             continue
         fi
         if [ "$b_is_heavy" -eq 1 ]; then
@@ -583,16 +612,17 @@ done
 # shard's floor is core + (its light subset's impls) + (the heavy impls), not all
 # ~50 impls.  Output is tee'd to a temp file when verbose (live progress in CI; a
 # diagnosable tail survives a timeout) and grepped afterward.
-if [ "$BATCH_MODE" -eq 1 ] && { [ -n "$BATCH_LIGHT_PKGS" ] || [ -n "$BATCH_HEAVY_PKGS" ]; }; then
+if [ "$BATCH_MODE" -eq 1 ] && { [ -n "$BATCH_LIGHT_PKGS" ] || [ -n "$BATCH_HEAVY_PKGS" ] ||
+        [ -n "$BATCH_PART_PKGS" ]; }; then
     b_tmp="$(mktemp)"
     : > "$b_tmp"
     # emit_batch runs one batch, appending its output to $b_tmp; streams live to
     # stdout when verbose (CI passes -v), else silent-to-file.
     emit_batch() {
         if [ "$VERBOSE" -eq 1 ]; then
-            runner_test_batch "$1" "$2" "$3" 2>&1 | tee -a "$b_tmp"
+            runner_test_batch "$1" "$2" "$3" "$4" "$5" 2>&1 | tee -a "$b_tmp"
         else
-            runner_test_batch "$1" "$2" "$3" >> "$b_tmp" 2>&1
+            runner_test_batch "$1" "$2" "$3" "$4" "$5" >> "$b_tmp" 2>&1
         fi
     }
     b_start=$(date +%s)
@@ -606,9 +636,18 @@ if [ "$BATCH_MODE" -eq 1 ] && { [ -n "$BATCH_LIGHT_PKGS" ] || [ -n "$BATCH_HEAVY
         if [ "$VERBOSE" -eq 1 ]; then echo "STARTING (batched heavy/1-of-$SHARD_COUNT): $b_hn packages"; fi
         emit_batch "$BATCH_HEAVY_PKGS" "${BATCH_HEAVY_SKIPS#,}" 1
     fi
+    # Each part (pkg:j:K) of a package split into parts runs on its own.
+    b_part_names=""
+    for b_part in $BATCH_PART_PKGS; do
+        b_ppkg="${b_part%%:*}"
+        b_prest="${b_part#*:}"
+        if [ "$VERBOSE" -eq 1 ]; then echo "STARTING (batched part ${b_prest%%:*}-of-${b_prest#*:}): $b_ppkg"; fi
+        emit_batch "$b_ppkg" "${BATCH_PART_SKIPS#,}" part "${b_prest%%:*}" "${b_prest#*:}"
+        b_part_names="$b_part_names $b_ppkg"
+    done
     b_elapsed=$(( $(date +%s) - b_start ))
     if [ "$VERBOSE" -eq 1 ]; then echo "batched run: ${b_elapsed}s"; fi
-    for p in $BATCH_LIGHT_PKGS $BATCH_HEAVY_PKGS; do
+    for p in $BATCH_LIGHT_PKGS $BATCH_HEAVY_PKGS $b_part_names; do
         # cmd/bni prints one line per package: `FAIL<TAB>pkg`, `ok  <TAB>pkg<TAB>…`,
         # or `?   <TAB>pkg<TAB>[no test functions]` (also `ok` with the full count
         # for a heavy package whose tests all fell on other shards).  A package with

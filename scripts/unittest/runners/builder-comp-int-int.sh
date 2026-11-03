@@ -29,8 +29,10 @@ runner_test() {
 # (`ti % count == idx-1`, ti resetting per package), so a package whose tests all
 # fall on other shards still emits `ok` with its full count.  run.sh's hybrid uses
 # both forms: LIGHT packages (already package-sharded to one shard) run with $3=0;
-# the HEAVY .split.vm set (loaded on every shard) runs with $3=1.  cmd/bni emits a
-# per-package `ok`/`FAIL`/`?` line, which run.sh parses.
+# the HEAVY .split.vm set (loaded on every shard) runs with $3=1.  $3=part runs
+# part $4 of $5 of each package (--shard-index $4 --shard-count $5): one part of a
+# package run's INTINT_PARTS split.  cmd/bni emits a per-package `ok`/`FAIL`/`?`
+# line, which run.sh parses.
 runner_test_batch() {
     pkgs="$1"
     skips="$2"
@@ -42,6 +44,7 @@ runner_test_batch() {
     [ -n "$skips" ] && tflags="$tflags --skip $skips"
     [ "$do_shard" = "1" ] && [ "$SHARD_COUNT" -gt 0 ] && \
         tflags="$tflags --shard-index $SHARD_IDX --shard-count $SHARD_COUNT"
+    [ "$do_shard" = "part" ] && tflags="$tflags --shard-index $4 --shard-count $5"
     # shellcheck disable=SC2086
     "$COMPILED_INTERP" -I "$_I" -L "$_L" -main-dir "$BINATE_DIR/cmd/bni" -- \
         $tflags -I "$_I" -L "$_L"

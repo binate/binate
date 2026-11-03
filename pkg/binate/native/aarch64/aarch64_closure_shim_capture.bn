@@ -1,0 +1,117 @@
+package "pkg/binate/native/aarch64"
+
+import "pkg/binate/asm"
+import "pkg/binate/asm/aarch64"
+import "pkg/binate/ir"
+import "pkg/binate/native/callconv"
+import "pkg/binate/native/common"
+import "pkg/binate/types"
+
+// The capture loads of the native aarch64 closure shims.  A capturing closure value
+// points at its closure struct, which holds the captures at their natural sizes and
+// offsets and ends with the last one; each capture is read out of it the way a Binate
+// caller passes the parameter the capture becomes.
+
+// loadCaptureWordAA64 loads word k of a capture of type t at [base + ofs] into dst
+// the way a Binate caller passes a parameter of type t.  A scalar is loaded at its own
+// width, a narrow integer (1, 2 or 4 bytes) sign- or zero-extended from it: the body
+// keeps a sub-word value extended in its 64-bit register and, once the parameter is
+// promoted, compares it at 64 bits.  An aggregate's word is read no further than the
+// aggregate's end (loadAggWordAtAA64), as the closure struct may end there.  tmp is
+// the scratch for a word put together from pieces (capturePiecedAA64), whose dst,
+// base and tmp differ.
+func loadCaptureWordAA64(a @asm.Assembler, dst int, base int, ofs int64, k int, t @types.Type,
+		tmp int) {
+	if !callconv.IsAggregateTyp(t) {
+		var signed bool
+		_, signed = common.SubWordNarrow(t, 64)
+		emitScalarLoad(a, dst, base, ofs, cast(int, t.Size()), signed)
+		return
+	}
+	loadAggWordAtAA64(a, dst, base, ofs, k, t.Size(), tmp)
+}
+
+// capturePiecedAA64 reports whether a capture of type t has a word put together from
+// pieces -- an aggregate of 3, 5, 6 or 7 bytes (loadAggWordAtAA64) -- which cannot be
+// loaded into its own base register.
+func capturePiecedAA64(t @types.Type) bool {
+	if !callconv.IsAggregateTyp(t) { return false }
+	var sz int64 = t.Size()
+	return sz == 3 || sz == 5 || sz == 6 || sz == 7
+}
+
+// capturesPiecedAA64 reports whether any of f's captures is capturePiecedAA64.
+func capturesPiecedAA64(f @ir.Func) bool {
+	for i := 0; i < f.NumCaptureParams; i++ {
+		if capturePiecedAA64(f.ClosureStruct.Fields[i].Type) { return true }
+	}
+	return false
+}
+
+// emitClosureCaptureSpillAA64 spills every stack-bound capture portion to the
+// outgoing-args area [SP + stkOff], reading capture fields from [baseReg +
+// fieldOfs] and shuttling through X16.  Two cases: an indirect-large capture
+// that overflowed (pointer-pass: ADD X16, baseReg, #ofs; Str) and a per-word
+// capture that went to the stack (an aggregate one wholly — AAPCS64 never
+// splits it), each word loaded by loadCaptureWordAA64.  A narrow scalar
+// capture is stored at its natural width (StackArgStoreSize) so it does not
+// overrun its neighbor's natural-sized slot.  Shared by the scalar and
+// aggregate closure stack-spill shims; baseReg is the closure-struct pointer
+// (X0 for the scalar shim, where it is still live, or X9 for the aggregate
+// shim, which parks it in a non-arg scratch).
+func emitClosureCaptureSpillAA64(a @asm.Assembler, cc callconv.CallConv, f @ir.Func,
+		argTypes @[]@types.Type, baseReg int) {
+	for i := 0; i < f.NumCaptureParams; i = i + 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var regStart int = cc.CallArgRegStart(argTypes, i)
+		var stkOff int64 = cc.CallArgStackOff(argTypes, i)
+		var fieldOfs int64 = f.ClosureStruct.Offset(i)
+		if stkOff < 0 { continue }
+		if isIndirectLargeCapAA64(cc, ft) {
+			aarch64.Add(a, true, aarch64.X16, baseReg, aarch64.Imm64(fieldOfs))
+			aarch64.Str(a, true, aarch64.X16, aarch64.MemImm64(aarch64.SP, stkOff))
+			continue
+		}
+		var nWords int = byValueWordsAA64(ft)
+		var firstStackWord int = regWordsAA64(a, regStart, stkOff, nWords)
+		var capStoreSize int = cc.StackArgStoreSize(ft, false)
+		for k := firstStackWord; k < nWords; k = k + 1 {
+			loadCaptureWordAA64(a, aarch64.X16, baseReg, fieldOfs, k, ft, aarch64.X17)
+			aarch64.StrSized(a, capStoreSize, aarch64.X16,
+					aarch64.MemImm64(aarch64.SP, stkOff + cast(int64, (k - firstStackWord) * 8)))
+		}
+	}
+}
+
+// emitClosureCaptureRegLoadAA64 loads every register-bound capture portion into
+// its outgoing arg register from [baseReg + fieldOfs].  Indirect-large captures
+// pass a pointer (ADD); per-word captures load each reg word (loadCaptureWordAA64;
+// a stack-bound capture was spilled instead).  Iterates
+// captures right-to-left so the i==0 case (which may target X0 when
+// regStart==0) runs last — required when baseReg IS X0 (the scalar shim keeps
+// the base live until the final load), harmless when baseReg is a separate
+// scratch (the aggregate shim's X9).  A capture word put together from pieces
+// cannot load over its own base, so with such a capture an argument-register base
+// is first copied to X16.  Shared by both stack-spill shims.
+func emitClosureCaptureRegLoadAA64(a @asm.Assembler, cc callconv.CallConv, f @ir.Func,
+		argTypes @[]@types.Type, baseReg int) {
+	if baseReg < aarch64.X8 && capturesPiecedAA64(f) {
+		aarch64.Mov(a, true, aarch64.X16, aarch64.Reg(baseReg))
+		baseReg = aarch64.X16
+	}
+	for i := f.NumCaptureParams - 1; i >= 0; i = i - 1 {
+		var ft @types.Type = f.ClosureStruct.Fields[i].Type
+		var regStart int = cc.CallArgRegStart(argTypes, i)
+		var fieldOfs int64 = f.ClosureStruct.Offset(i)
+		if regStart < 0 { continue }
+		if isIndirectLargeCapAA64(cc, ft) {
+			aarch64.Add(a, true, argReg(regStart), baseReg, aarch64.Imm64(fieldOfs))
+			continue
+		}
+		var nWords int = byValueWordsAA64(ft)
+		var regWords int = regWordsAA64(a, regStart, cc.CallArgStackOff(argTypes, i), nWords)
+		for k := regWords - 1; k >= 0; k = k - 1 {
+			loadCaptureWordAA64(a, argReg(regStart + k), baseReg, fieldOfs, k, ft, aarch64.X17)
+		}
+	}
+}

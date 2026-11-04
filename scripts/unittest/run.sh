@@ -279,9 +279,13 @@ INTINT_HEAVY="pkg/binate/types pkg/binate/ir"
 # shard of its own, as an invocation of its own (cmd/bni --test --shard-index j
 # --shard-count K).  The parts take shards in order from a counter of their own
 # (part_pos), so no two land on one shard while the counts sum to at most the shard
-# count, and each costs one extra load on its shard only.  Whole, check (~1800
-# tests) needs ~90 min under the double VM, irgen (~800) and link (~370) ~25-30
-# min.  Unsharded, these run whole in the light batch.
+# count, and each costs one extra load on its shard only.  The check tests that
+# drive the checker to one of its limits (a 4096-instance build, a 128-deep chain)
+# take minutes to hours each under the double VM, ~200x the single VM, so this lane
+# skips them (pkg-binate-check.skip.builder-comp-int-int: each one taking 0.5 s or
+# more on the single VM); check's other ~1830 tests need ~70 min on CI's runners,
+# irgen (~800) and link (~370) ~25-30 min.  Unsharded, these run whole in the light
+# batch.
 INTINT_PARTS="pkg/binate/check:6 pkg/binate/irgen:2 pkg/binate/link:2"
 part_pos=0
 BATCH_PART_PKGS=""

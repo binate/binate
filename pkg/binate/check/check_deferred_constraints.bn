@@ -29,20 +29,61 @@ import "pkg/stdx/slices"
 // signature); the pending list captures whatever was actually deferred, so nothing
 // is dropped.
 
-// recordPendingConstraintCheck notes that the constraint check for instantiation
-// (d, args) requested at usePos was deferred; recheckDeferredConstraints replays
-// it.  Called from instantiateGenericDeclWithArgs on every user-facing resolution
-// while CollectingDecls or BuildingIfaceScope is set, except one whose type
-// arguments mention `Self`, which is queued with its interface instead
-// (deferSelfConstraintCheck).
+// collectionDefersChecks reports whether what a user-facing instantiation checks
+// where it is named waits for the replay at the end of the collection
+// (recheckDeferredConstraints): while a package's `.bni` surface is built
+// (BuildingIfaceScope) or its declarations are collected (CollectingDecls), the
+// package's interfaces do not have their parents yet, so a check would wrongly
+// reject a type argument satisfying the constraint through an impl of a child
+// interface.
+func collectionDefersChecks(c @Checker) bool {
+	return c.BuildingIfaceScope || c.CollectingDecls
+}
+
+// listDefersConstraints reports whether the constraint check of an instantiation
+// waits for the end of the resolution of a type-parameter list's constraints
+// (resolveTypeParamConstraints), where a parameter later in the list has no bound
+// yet (gen.typeparams.scope) -- that check only: the instantiation is user-facing
+// in every other way.
+func listDefersConstraints(c @Checker) bool {
+	return c.Generics.ConstraintListDepth > 0 && !collectionDefersChecks(c)
+}
+
+// resolveTypeParamConstraints sets the constraint of each of params from the
+// parameter of tps at its position (resolveTypeParamConstraint), in a scope that
+// binds every parameter of the list.  A constraint may name a later parameter
+// (gen.typeparams.scope), whose bound is set only at its own turn, so the
+// constraint checks of the instantiations the constraints form wait until every
+// parameter has its bound, then are made -- or, while a batch's declarations are
+// collected or a `.bni` surface is built, left for its replay.
+func resolveTypeParamConstraints(c @Checker, params *[]@types.Type, tps *[]@ast.TypeParam) {
+	var fromChecks int = len(c.PendingChecks)
+	var fromFuncChecks int = len(c.PendingFuncChecks)
+	c.Generics.ConstraintListDepth = c.Generics.ConstraintListDepth + 1
+	for i := 0; i < len(tps) && i < len(params); i++ {
+		params[i].TpConstraint = resolveTypeParamConstraint(c, tps[i])
+	}
+	c.Generics.ConstraintListDepth = c.Generics.ConstraintListDepth - 1
+	if c.Generics.ConstraintListDepth == 0 && !collectionDefersChecks(c) {
+		replayPendingChecks(c, fromChecks, fromFuncChecks)
+	}
+}
+
+// recordPendingConstraintCheck notes that the checks a user-facing use of
+// instantiation (d, args) at usePos makes were deferred -- only its constraint
+// check when constraintOnly (listDefersConstraints) -- and replayPendingChecks
+// makes them.  Called from instantiateGenericDeclWithArgs on every user-facing
+// resolution while they wait, except one whose type arguments mention `Self`,
+// which is queued with its interface instead (deferSelfConstraintCheck).
 func recordPendingConstraintCheck(c @Checker, d @ast.Decl, args @[]@types.Type, usePos token.Pos,
-		view ImplView) {
+		view ImplView, constraintOnly bool) {
 	var p @PendingConstraintCheck = make(PendingConstraintCheck)
 	p.Decl = d
 	p.Args = args
 	p.Pos = usePos
 	p.View = view
 	p.Naming = namingAt(c, view)
+	p.ConstraintOnly = constraintOnly
 	c.PendingChecks = slices.Append[@PendingConstraintCheck](c.PendingChecks, p)
 }
 
@@ -54,12 +95,19 @@ func recordPendingConstraintCheck(c @Checker, d @ast.Decl, args @[]@types.Type, 
 // for a first user-facing use, including the interface-method sizing check.  Runs
 // once at the end of collectDecls, then clears the list for the next package.
 func recheckDeferredConstraints(c @Checker) {
-	for i := 0; i < len(c.PendingChecks); i++ {
+	replayPendingChecks(c, 0, 0)
+}
+
+// replayPendingChecks makes the constraint checks recorded from position
+// fromChecks of Checker.PendingChecks and fromFuncChecks of PendingFuncChecks on
+// (recheckDeferredConstraints, resolveTypeParamConstraints), then drops them.
+func replayPendingChecks(c @Checker, fromChecks int, fromFuncChecks int) {
+	for i := fromChecks; i < len(c.PendingChecks); i++ {
 		var p @PendingConstraintCheck = c.PendingChecks[i]
 		if p == nil {
 			continue
 		}
-		if p.Decl != nil && p.Decl.Kind == ast.DECL_TYPE && p.Decl.IsAlias {
+		if !p.ConstraintOnly && p.Decl != nil && p.Decl.Kind == ast.DECL_TYPE && p.Decl.IsAlias {
 			requireAliasArgsKept(c, p.Decl, p.Args, p.Pos, p.View)
 		}
 		var entry @GenericInstantiation = lookupCachedInstantiationEntry(c, p.Decl, p.Args)
@@ -71,34 +119,44 @@ func recheckDeferredConstraints(c @Checker) {
 		}
 		// Each deferred use judges the parts that come from the arguments where
 		// it is written, as instantiateGenericDeclWithArgs's arms do.
-		if entry != nil && entry.Result != nil && entry.Result.Kind == types.TYP_INTERFACE {
+		if !p.ConstraintOnly && entry != nil && entry.Result != nil &&
+				entry.Result.Kind == types.TYP_INTERFACE {
 			requireIfaceInstanceArgsKept(c, entry.Result, p.Pos, p.View)
 		}
 		if entry == nil || constraintsCheckedIn(entry, p.View) {
 			continue
 		}
-		// Latch only when the diagnostics reach the user: under TentativeMode
-		// (a REPL declaration that may park) they are discarded if it parks,
-		// and a later real use must still report them (see
-		// instantiateGenericDeclWithArgs's cache-hit arm).
-		if !c.Repl.TentativeMode {
+		// Latch only when the diagnostics reach the user: not under TentativeMode
+		// (a REPL declaration that may park), whose diagnostics are discarded if it
+		// parks (see instantiateGenericDeclWithArgs's cache-hit arm), nor in a layout
+		// frame that waits for a layout (layoutFrameBlocked), whose diagnostics are
+		// dropped and whose resolution is done again -- which the check itself can
+		// make it, reading a layout not built yet.  A later real use must still
+		// report them.
+		var latched bool = !c.Repl.TentativeMode && !layoutFrameBlocked(c)
+		if latched {
 			markConstraintsChecked(entry, p.View)
 		}
 		checkInstantiationConstraints(c, p.Decl, p.Args, p.Pos, p.View, p.Naming)
-		if entry.Result != nil && entry.Result.Kind == types.TYP_INTERFACE {
+		if latched && layoutFrameBlocked(c) {
+			unmarkConstraintsChecked(entry, p.View)
+		}
+		// A use while a list's constraints are resolved sized its instance if it
+		// built it user-facing (buildInstance); one it found built otherwise is
+		// sized here.
+		if entry.Result != nil && entry.Result.Kind == types.TYP_INTERFACE &&
+				(!p.ConstraintOnly || !entry.BuildUserFacing) {
 			requireInstantiatedIfaceMethodsSized(c, entry.Result, p.Pos)
 		}
 	}
-	var empty @[]@PendingConstraintCheck
-	c.PendingChecks = empty
-	for i := 0; i < len(c.PendingFuncChecks); i++ {
+	c.PendingChecks = c.PendingChecks[:fromChecks]
+	for i := fromFuncChecks; i < len(c.PendingFuncChecks); i++ {
 		var p @PendingFuncConstraintCheck = c.PendingFuncChecks[i]
 		if !typeSatisfiesConstraint(c, p.Arg, p.Constraint, p.View) {
 			reportConstraintMiss(c, p.Pos, p.Arg, p.Constraint, p.View)
 		}
 	}
-	var noFuncChecks @[]@PendingFuncConstraintCheck
-	c.PendingFuncChecks = noFuncChecks
+	c.PendingFuncChecks = c.PendingFuncChecks[:fromFuncChecks]
 }
 
 // PendingFuncConstraintCheck is the deferred check that a generic-function
@@ -112,8 +170,9 @@ type PendingFuncConstraintCheck struct {
 }
 
 // deferFuncConstraintCheck records a generic-function instantiation's
-// constraint check, deferred while the batch's declarations are collected
-// (instantiateGenericFunc), for recheckDeferredConstraints.
+// constraint check, deferred while the batch's declarations are collected or a
+// type-parameter list's constraints are resolved (instantiateGenericFunc), for
+// replayPendingChecks.
 func deferFuncConstraintCheck(c @Checker, arg @types.Type, constraint @types.Type, view ImplView,
 		pos token.Pos) {
 	var p @PendingFuncConstraintCheck = make(PendingFuncConstraintCheck)
@@ -126,11 +185,12 @@ func deferFuncConstraintCheck(c @Checker, arg @types.Type, constraint @types.Typ
 
 // PendingConstraintCheck records one generic instantiation whose type-parameter
 // constraint check was DEFERRED -- during batch collection or a .bni surface's
-// build, so it would see the package's COMPLETE impl set, or, for type arguments
-// mentioning `Self`, until its interface's parents are known -- together with
-// the source position of the user-facing use that requested it.
-// recheckDeferredConstraints replays these after every impl is recorded, firing
-// each check at the site the user wrote.  Recording the exact deferred (decl,
+// build, so it would see the package's COMPLETE impl set; while a type-parameter
+// list's constraints are resolved, until each parameter has its bound; or, for
+// type arguments mentioning `Self`, until its interface's parents are known --
+// together with the source position of the user-facing use that requested it.
+// replayPendingChecks replays these, firing each check at the site the user
+// wrote.  Recording the exact deferred (decl,
 // args, pos) — rather than re-walking decls by kind — keeps the re-fire COMPLETE:
 // no use-site shape (type alias, named-distinct wrapper, interface extension
 // parent or alias target, generic-receiver method signature, …) can be missed.
@@ -147,6 +207,10 @@ type PendingConstraintCheck struct {
 	// Naming is the use site's naming context, in whose lender class the
 	// instances the constraint names are named (namingHere).
 	Naming namingContext
+	// ConstraintOnly is set for a check deferred while a type-parameter list's
+	// constraints are resolved (listDefersConstraints): the use made its other
+	// checks where it is named, and the replay makes only the constraint check.
+	ConstraintOnly bool
 }
 
 // checkInstantiationConstraints verifies each concrete type-argument of a

@@ -1,0 +1,274 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/std/strings"
+import "pkg/stdx/slices"
+
+// An error found in an instance of a generic names the instance (gen.mono.check:
+// the instantiation the program writes, and the chain that led to it): one an
+// instance's check finds (contextualizeInstanceErrors), and one found while an
+// instance is built (buildNewInstance, rebuildInstance), while a method's
+// signature is copied onto it (copyGenericMethod), while a generic function
+// instance's signature is derived (resolveFuncInstanceSig), while a generic
+// alias's target is resolved for its arguments (instantiateGenericAlias), or
+// when a check recorded then is made (replayPendingChecks).  Those name it as
+// they are reported (reportCheckError): InstanceState.Naming holds the
+// instances being worked on and the declarations they are worked from,
+// innermost last, and an error in one of those declarations names its instance
+// (nameReportedError).  What is resolved meanwhile on its own -- a generic's
+// declaration with its type parameters abstract, an abstract instance, a
+// declaration resolved on demand -- is an entry naming no instance, which ends
+// the search: its errors are its own.
+//
+// A constraint miss found with an instance's type arguments bound, where the
+// same declaration's check (no type arguments bound) reported the same type
+// parameter's miss at the same position, is the same miss spelled with the
+// instance's types (`Eq[[8]uint8]` for `Eq[[0]uint8]`, `Eq[int64]` for `Eq[U]`):
+// it is not reported again (repeatsDeclarationMiss).  And an error naming no
+// instance stands for one with its text that names instances, which a build
+// made before the declaration's check reported (supersedeNamedError).
+
+// An instanceNaming is the instance Work being worked on from the declaration
+// Decl; Work nil for a resolution that names no instance.
+type instanceNaming struct {
+	Work @InstWork
+	Decl @ast.Decl
+}
+
+// pushInstanceNaming records that the instance w (nil: none) is being worked on
+// from the declaration d, until popInstanceNaming.
+func pushInstanceNaming(c @Checker, w @InstWork, d @ast.Decl) {
+	var st @InstanceState = instanceState(c)
+	var n instanceNaming
+	n.Work = w
+	n.Decl = d
+	st.Naming = slices.Append[instanceNaming](st.Naming, n)
+}
+
+// popInstanceNaming ends what pushInstanceNaming began.
+func popInstanceNaming(c @Checker) {
+	var st @InstanceState = instanceState(c)
+	st.Naming = st.Naming[:len(st.Naming) - 1]
+}
+
+// currentInstanceNaming returns the innermost instance being worked on and the
+// declaration it is worked from, or a nil work.
+func currentInstanceNaming(c @Checker) (@InstWork, @ast.Decl) {
+	var nw @InstWork
+	var nd @ast.Decl
+	if c.Instances == nil || len(c.Instances.Naming) == 0 {
+		return nw, nd
+	}
+	var n instanceNaming = c.Instances.Naming[len(c.Instances.Naming) - 1]
+	return n.Work, n.Decl
+}
+
+// instanceNamingFor returns the instance named, a generic struct's instance, for
+// the errors in a method's signature copied onto it: the innermost instance being
+// worked on when that is it, else a record of it named where it first was
+// (newInstWork); none for an abstract instance.
+func instanceNamingFor(c @Checker, named @types.Type) @InstWork {
+	var none @InstWork
+	if named == nil || named.InstDecl == nil || typeArgsAbstract(named.InstArgs) {
+		return none
+	}
+	var d @ast.Decl = bit_cast(@ast.Decl, named.InstDecl)
+	var w @InstWork
+	var wd @ast.Decl
+	w, wd = currentInstanceNaming(c)
+	if w != nil && same(wd, d) && typeListsIdentical(w.Args, named.InstArgs) {
+		return w
+	}
+	var at token.Pos = d.Pos
+	var entry @GenericInstantiation = lookupCachedInstantiationEntry(c, d, named.InstArgs)
+	if entry != nil { at = entry.NamedAt }
+	return newInstWork(c, d.Name, named.InstArgs, at)
+}
+
+// namingEntryFor returns the index in InstanceState.Naming of the innermost
+// instance being worked on from a declaration pos lies in, searching outward
+// until an entry naming no instance; -1 for none.
+func namingEntryFor(c @Checker, pos token.Pos) int {
+	if c.Instances == nil {
+		return -1
+	}
+	var ns @[]instanceNaming = c.Instances.Naming
+	for i := len(ns) - 1; i >= 0 && ns[i].Work != nil; i-- {
+		if inDecl(pos, ns[i].Decl) { return i }
+	}
+	return -1
+}
+
+// errorsFrom returns the first index of the errors being reported (Checker.Errors,
+// or under TentativeMode Repl.TentativeErrors) a new one is compared with.
+func errorsFrom(c @Checker) int {
+	if c.Repl.TentativeMode { return 0 }
+	return c.DedupFrom
+}
+
+// errorsEditable reports whether the reported error at index i may be changed: in
+// Checker.Errors, one from the REPL's edit floor on (InstanceState.EditFloor).
+func errorsEditable(c @Checker, i int) bool {
+	return c.Repl.TentativeMode || i >= instanceState(c).EditFloor
+}
+
+// nameReportedError returns the error e, being reported, named for the instance
+// being worked on from a declaration it lies in (namingEntryFor); merged reports
+// whether an identical error was reported already instead, as instanceErrorAt
+// finds one for an instance's check: one naming no instance stands, and one
+// naming instances names this one too.
+func nameReportedError(c @Checker, e types.CheckError) (types.CheckError, bool) {
+	if e.Named {
+		return e, false
+	}
+	var k int = namingEntryFor(c, e.Pos)
+	if k < 0 {
+		return e, false
+	}
+	var context @[]char = instanceNamingContext(c, k)
+	var errs @[]types.CheckError = c.Errors
+	if c.Repl.TentativeMode { errs = c.Repl.TentativeErrors }
+	for i := errorsFrom(c); i < len(errs); i++ {
+		if !samePos(errs[i].Pos, e.Pos) || !hasPrefixAt(errs[i].Msg, 0, e.Msg) {
+			continue
+		}
+		if len(errs[i].Msg) == len(e.Msg) {
+			return e, true
+		}
+		if errs[i].Named && hasPrefixAt(errs[i].Msg, len(e.Msg), " (in ") {
+			if errorsEditable(c, i) {
+				errs[i].Msg = addInstanceContext(errs[i].Msg, context)
+			}
+			return e, true
+		}
+	}
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(e.Msg)
+	cb.Write(context)
+	e.Msg = buf.CopyStr(cb.String())
+	e.Named = true
+	return e, false
+}
+
+// supersedeNamedError puts e, an error the declaration's own check reports (no
+// type arguments bound), in place of a reported error that is e naming instances
+// (`… (in F[int64], …)`): what a build found before the declaration's check is
+// the declaration's.  Reports whether it did.
+func supersedeNamedError(c @Checker, e types.CheckError) bool {
+	var errs @[]types.CheckError = c.Errors
+	if c.Repl.TentativeMode { errs = c.Repl.TentativeErrors }
+	for i := errorsFrom(c); i < len(errs); i++ {
+		if errs[i].Named && samePos(errs[i].Pos, e.Pos) && errorsEditable(c, i) &&
+				hasPrefixAt(errs[i].Msg, 0, e.Msg) && hasPrefixAt(errs[i].Msg, len(e.Msg), " (in ") {
+			errs[i] = e
+			return true
+		}
+	}
+	return false
+}
+
+// instanceNamingContext returns ` (in F[int64], instantiated at file:line:col via
+// R)` for the instance of the entry k of InstanceState.Naming: its chain is that
+// of the outermost instance of the run of instances being worked on it is in,
+// the chain of the instance check it is worked on in (instanceContext) if any.
+func instanceNamingContext(c @Checker, k int) @[]char {
+	var st @InstanceState = instanceState(c)
+	var w @InstWork = st.Naming[k].Work
+	var outer @InstWork = w
+	for i := k - 1; i >= 0 && st.Naming[i].Work != nil; i-- {
+		outer = st.Naming[i].Work
+	}
+	var root @InstWork = outer
+	for root.Parent != nil {
+		root = root.Parent
+	}
+	var cb @strings.Builder = strings.NewBuilder()
+	cb.Write(" (in ")
+	cb.Write(w.Label)
+	cb.Write(", instantiated at ")
+	cb.Write(posString(root.Site))
+	if !same(root, w) {
+		cb.Write(" via ")
+		cb.Write(root.Label)
+	}
+	cb.Write(")")
+	return buf.CopyStr(cb.String())
+}
+
+// repeatsDeclarationMiss reports whether e, a constraint miss found with an
+// instance's type arguments bound, repeats one the declaration's own check
+// reported: the same type parameter of the same generic, at the same position,
+// found with no type arguments bound (DeclLevel).
+func repeatsDeclarationMiss(c @Checker, e types.CheckError) bool {
+	if e.MissDecl == nil || e.DeclLevel {
+		return false
+	}
+	var errs @[]types.CheckError = c.Errors
+	if c.Repl.TentativeMode { errs = c.Repl.TentativeErrors }
+	for i := errorsFrom(c); i < len(errs); i++ {
+		var o types.CheckError = errs[i]
+		if o.DeclLevel && o.MissDecl == e.MissDecl && o.MissParam == e.MissParam &&
+				samePos(o.Pos, e.Pos) {
+			return true
+		}
+	}
+	return false
+}
+
+// foldInstanceMiss puts e, a constraint miss the declaration's own check
+// reports, in place of one an instance reported before it at the same position
+// for the same type parameter (repeatsDeclarationMiss, the other way round).
+// Reports whether it did.
+func foldInstanceMiss(c @Checker, e types.CheckError) bool {
+	if e.MissDecl == nil {
+		return false
+	}
+	var errs @[]types.CheckError = c.Errors
+	if c.Repl.TentativeMode { errs = c.Repl.TentativeErrors }
+	for i := errorsFrom(c); i < len(errs); i++ {
+		var o types.CheckError = errs[i]
+		if !o.DeclLevel && o.MissDecl == e.MissDecl && o.MissParam == e.MissParam &&
+				samePos(o.Pos, e.Pos) && errorsEditable(c, i) {
+			errs[i] = e
+			return true
+		}
+	}
+	return false
+}
+
+// inDecl reports whether pos lies in the declaration d: from its start to its
+// end (declEnd).
+func inDecl(pos token.Pos, d @ast.Decl) bool {
+	if d == nil || !types.CharEq(pos.File, d.Pos.File) {
+		return false
+	}
+	return !posBefore(pos, d.Pos) && !posBefore(declEnd(d), pos)
+}
+
+// declEnd returns where the declaration d ends: its End, or past it its body's
+// (a function's), its last member's (an interface's methods) or its last
+// parent's or interface's.
+func declEnd(d @ast.Decl) token.Pos {
+	var end token.Pos = d.End
+	if posBefore(end, d.Pos) {
+		end = d.Pos
+	}
+	if d.Body != nil && posBefore(end, d.Body.End) {
+		end = d.Body.End
+	}
+	for i := 0; i < len(d.Decls); i++ {
+		if d.Decls[i] != nil && posBefore(end, d.Decls[i].End) {
+			end = d.Decls[i].End
+		}
+	}
+	for i := 0; i < len(d.Interfaces); i++ {
+		if d.Interfaces[i] != nil && posBefore(end, d.Interfaces[i].End) {
+			end = d.Interfaces[i].End
+		}
+	}
+	return end
+}

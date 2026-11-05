@@ -205,8 +205,10 @@ PACKAGES=""
 # Search roots: collocated (pkg/, cmd/) and split-tree impls. Each impls/.../pkg/X
 # path strips down to pkg/X as the package's logical name — the loader resolves
 # an `import "pkg/X"` against any matching search root, so the canonical package
-# name is the trailing pkg/... portion.
-for testfile in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/impls" -name '*_test.bn' -not -path '*/testdata/*' 2>/dev/null); do
+# name is the trailing pkg/... portion.  Sorted: each shard picks its packages and parts by
+# their position in this list, so every shard must list them in the same order, and find's
+# order is the filesystem's, which differs from one runner to another.
+for testfile in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/impls" -name '*_test.bn' -not -path '*/testdata/*' 2>/dev/null | LC_ALL=C sort); do
     [ -f "$testfile" ] || continue
     dir="$(dirname "$testfile")"
     # Convert absolute path to package path:
@@ -252,11 +254,14 @@ failures=""
 #     double-VM): TEST-sharded — loaded on EVERY shard, each running 1/N of its
 #     own tests via --shard.  Collected into BATCH_HEAVY_PKGS.
 #   - CHEAP packages (not .split.vm): PACKAGE-sharded — each assigned to ONE shard
-#     by position, running its FULL tests there.  Collected into BATCH_LIGHT_PKGS.
+#     by its cost (INTINT_LIGHT_COST), running its FULL tests there.  Collected into
+#     BATCH_LIGHT_PKGS.
 #   - Other .split.vm packages (native/* backends, asm/*, lint/bnlint/bnfmt,
 #     parser, irdata): SKIPPED here — priciest at double-VM, covered by the
 #     single-VM / native lanes.  (Running ALL ~15 heavies was a ~16-min/shard load
-#     floor that blew the 45-min cap; the real fix is bni perf.)
+#     floor that blew the 45-min cap; the real fix is bni perf.)  So are the
+#     packages a <pkg>.skip-pkg.builder-comp-int-int marker names, for the same
+#     reason: the rest of asm/*, cmd/bnc, format, interp, repl.
 # An unsharded run (SHARD_COUNT=0) runs the subset full in one batch.  Off under
 # --check-xpass (which needs the per-package XPASS detection path).  BATCH_*_SKIPS
 # accumulate package-qualified skip patterns (pkg:pattern) for their batch.
@@ -287,6 +292,25 @@ INTINT_HEAVY="pkg/binate/types pkg/binate/ir"
 # irgen (~800) and link (~370) ~25-30 min.  Unsharded, these run whole in the light
 # batch.
 INTINT_PARTS="pkg/binate/check:6 pkg/binate/irgen:2 pkg/binate/link:2"
+# The light packages go to the shards by their cost, so that none carries more than its
+# share: INTINT_PART_COST is a part's cost and INTINT_LIGHT_COST a light package's, in
+# minutes on the CI runner (estimated from a package's time on the single VM: its load
+# x ~60 and its tests x ~200, both x ~2.7 for the runner), 1 for a package not listed.
+# After the loop, each light package in turn -- the costliest first, ties by name --
+# goes to the shard whose parts and light packages so far cost least (ties: the lowest
+# index); every shard computes the same assignment and keeps its own share.
+INTINT_PART_COST="pkg/binate/check:24 pkg/binate/irgen:16 pkg/binate/link:27"
+INTINT_LIGHT_COST="cmd/bni:11 cmd/bnld:11 pkg/binate/native:11 pkg/binate/iropt:6 cmd/bnas:5
+pkg/binate/native/fold:4 pkg/binate/native/blockplan:4 pkg/binate/native/callconv:3
+pkg/binate/native/strength:3 pkg/binate/irbuild:3 pkg/binate/optflags:3"
+# intint_cost <table> <pkg>: pkg's cost in table, 1 if it is not listed.
+intint_cost() {
+    for c_entry in $1; do
+        case "$c_entry" in "$2:"*) echo "${c_entry##*:}"; return ;; esac
+    done
+    echo 1
+}
+INTINT_LIGHT_CANDS=""
 part_pos=0
 BATCH_PART_PKGS=""
 BATCH_PART_SKIPS=""
@@ -394,11 +418,14 @@ for pkg in $PACKAGES; do
         if [ "$b_parts" -gt 0 ]; then
             # Split into parts: part j on the shard part_pos picks, as pkg:j:K.
             b_pj=1
+            b_pcost=$(intint_cost "$INTINT_PART_COST" "$pkg")
             while [ "$b_pj" -le "$b_parts" ]; do
                 if [ $((part_pos % SHARD_COUNT)) -eq $((SHARD_IDX - 1)) ]; then
                     BATCH_PART_PKGS="$BATCH_PART_PKGS $pkg:$b_pj:$b_parts"
                     BATCH_PART_SKIPS="$BATCH_PART_SKIPS$b_pkg_skips"
                 fi
+                b_k=$((part_pos % SHARD_COUNT + 1))
+                eval "b_load_$b_k=\$((\${b_load_$b_k:-0} + b_pcost))"
                 part_pos=$((part_pos + 1))
                 b_pj=$((b_pj + 1))
             done
@@ -414,15 +441,10 @@ for pkg in $PACKAGES; do
             # Expensive but NOT in the int-int subset: skip for this lane.
             pkgskipped=$((pkgskipped + 1)); continue
         fi
-        # Cheap package: package-shard — assigned to ONE shard by position
-        # (shard_pos % count == index-1), running its full tests there.  shard_pos
-        # advances for every cheap package on every shard identically (deterministic
-        # order + exclusions), so each lands on exactly one shard.
-        if [ $((shard_pos % SHARD_COUNT)) -eq $((SHARD_IDX - 1)) ]; then
-            BATCH_LIGHT_PKGS="$BATCH_LIGHT_PKGS $pkg"
-            BATCH_LIGHT_SKIPS="$BATCH_LIGHT_SKIPS$b_pkg_skips"
-        fi
-        shard_pos=$((shard_pos + 1))
+        # Cheap package: package-shard — it runs whole on ONE shard, chosen by cost
+        # after the loop (INTINT_LIGHT_COST), with its skips beside it.
+        INTINT_LIGHT_CANDS="$INTINT_LIGHT_CANDS
+$(intint_cost "$INTINT_LIGHT_COST" "$pkg") $pkg|$b_pkg_skips"
         continue
     fi
 
@@ -606,6 +628,29 @@ for pkg in $PACKAGES; do
         fi
     fi
 done
+
+# The int-int lane's light packages, by cost (INTINT_LIGHT_COST): each in turn to the
+# shard whose load so far is least, this shard keeping its own.
+if [ "$BATCH_MODE" -eq 1 ] && [ "$SHARD_COUNT" -gt 0 ] && [ -n "$INTINT_LIGHT_CANDS" ]; then
+    b_sorted=$(printf '%s\n' "$INTINT_LIGHT_CANDS" | grep -v '^$' | LC_ALL=C sort -k1,1nr -k2,2)
+    while read -r b_cost b_entry; do
+        b_best=1
+        b_best_load=${b_load_1:-0}
+        b_k=2
+        while [ "$b_k" -le "$SHARD_COUNT" ]; do
+            eval "b_l=\${b_load_$b_k:-0}"
+            if [ "$b_l" -lt "$b_best_load" ]; then b_best=$b_k; b_best_load=$b_l; fi
+            b_k=$((b_k + 1))
+        done
+        eval "b_load_$b_best=\$((b_best_load + b_cost))"
+        if [ "$b_best" -eq "$SHARD_IDX" ]; then
+            BATCH_LIGHT_PKGS="$BATCH_LIGHT_PKGS ${b_entry%%|*}"
+            BATCH_LIGHT_SKIPS="$BATCH_LIGHT_SKIPS${b_entry#*|}"
+        fi
+    done <<EOF
+$b_sorted
+EOF
+fi
 
 # Run the collected batches (double-VM lane), then map cmd/bni's per-package
 # ok/FAIL/? lines back to the tallies.  Two invocations so the two sharding

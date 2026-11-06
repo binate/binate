@@ -1,0 +1,208 @@
+package "pkg/binate/check"
+
+import "pkg/binate/buf"
+import "pkg/binate/types"
+import "pkg/std/table"
+import "pkg/std/vec"
+
+// The pointer rule's walk (pointeeEmbedsOpaque): from a pointer, through every
+// pointer it points to, to the type at the end of the chain, which must not embed an
+// opaque type by value unless it is one.  Each declaration of a chain of pointer
+// types (`type P0 *P1`, `type P1 *P2`, ...) walks the chain below it, so the answers
+// found for the pointees are kept across a batch's declarations (pointeeMemo), and a
+// chain is walked once.
+
+// pointeeEmbedsOpaque reports whether t is a pointer / handle (possibly nested,
+// alias / named peeled) whose ULTIMATE pointee embeds an opaque type by value
+// but is not itself bare opaque.  Peels through every pointer/handle level; a
+// self-referential pointer chain (`type P *P`) terminates via the visited-name
+// set (walkName) with no opaque found.  Returns false for a non-pointer t (the value case
+// is handled by embedsOpaqueByValue) and for the bare `*Opaque` / `@Opaque`
+// escape hatch (the pointee is bare opaque).  view gives the view
+// (opaqueInView).
+func pointeeEmbedsOpaque(c @Checker, t @types.Type, view int, f *opaqueFrame) bool {
+	var w opaqueWalk
+	var kept @pointeeAnswers = pointeeAnswersHere(c, view, f)
+	if kept != nil { return pointeeEmbedsOpaqueKept(c, t, &w, view, kept) }
+	return pointeeEmbedsOpaqueIn(c, t, &w, view, f)
+}
+
+// pointeeEmbedsOpaqueIn is pointeeEmbedsOpaque with w the walk of the arguments
+// of an instance it meets (argsMayBringOpaqueIn), shared with the walk it is part
+// of (partsMayBreak).
+func pointeeEmbedsOpaqueIn(c @Checker, t @types.Type, w *opaqueWalk, view int,
+		f *opaqueFrame) bool {
+	var seen nameVisits
+	var cur @types.Type = t
+	var peeledPointer bool = false
+	for cur != nil {
+		cur, view, f = bindFrame(cur, view, f)
+		// A generic instance's own parts were judged at its generic's declaration
+		// (requireGenericPartsKept), so only its type arguments can bring an
+		// opaque type into its pointee (argsMayBringOpaque).  Following one they
+		// cannot would build, at each declaration of a chain of generics each
+		// naming the next through a pointer, the whole rest of the chain.
+		if cur.Kind == types.TYP_NAMED && len(cur.InstArgs) > 0 &&
+				!argsMayBringOpaqueIn(c, cur, w, view, f) {
+			return false
+		}
+		buildPostponedBase(c, cur)
+		// A pointee that is itself opaque here is the escape hatch, whatever its
+		// definition — even one naming itself (`type Tree @[]Tree` exported as
+		// `type Tree`), whose peeled underlying embeds the opaque Tree.
+		if peeledPointer && opaqueInView(c, cur, view) {
+			return false
+		}
+		if len(cur.Name) > 0 && !seen.enter(walkName(cur)) {
+			return false
+		}
+		var base @types.Type
+		base, _ = peelFieldAccessBase(cur)
+		if base == nil {
+			return false
+		}
+		if base.Kind == types.TYP_TYPE_PARAM && f != nil && bindFrameType(base, f) != nil {
+			cur = base
+			continue
+		}
+		if base.Kind == types.TYP_POINTER || base.Kind == types.TYP_MANAGED_PTR {
+			cur = base.Elem
+			peeledPointer = true
+			continue
+		}
+		// base is the ultimate non-pointer pointee.  Flag it only if t was
+		// actually a pointer (otherwise embedsOpaqueByValue already covered it).
+		if !peeledPointer {
+			return false
+		}
+		return embedsOpaqueByValueFramed(c, base, view, f) && !opaqueInView(c, base, view)
+	}
+	return false
+}
+
+// walkName is the name the pointer walk knows t by, to stop where it meets a type
+// again: a named type's qualified name (types.NamedIdentityName), as two packages'
+// types of one name are two types; any other type's own name.
+func walkName(t @types.Type) @[]char {
+	if t.Kind == types.TYP_NAMED { return types.NamedIdentityName(t) }
+	return t.Name
+}
+
+// pointeeMemo holds, while a batch's declarations are checked (checkValueEmbedding),
+// the answers pointeeEmbedsOpaque has found, one table per view (opaqueInView), for
+// the package being checked (pkg).
+type pointeeMemo struct {
+	here @pointeeAnswers
+	pure @pointeeAnswers
+	none @pointeeAnswers
+	pkg  @[]char
+}
+
+// pointeeAnswers holds, for one view, the answer the pointer walk found from each
+// pointee on a chain of pointers with no generic instance on it: whether the type at
+// the chain's end, reached from that pointee, embeds an opaque type by value -- the
+// same from any pointer to it, as the walk stops only at a type it has met before
+// (walkName).  Whether the walk goes past an instance depends on the instance's type
+// arguments, which the instances on a chain judge in one walk, so the answer from a
+// pointee past one can depend on the instances before it, and a chain through one is
+// not kept.  The answers hold while no type changes (typeChanges counts the changes
+// it was made after).
+type pointeeAnswers struct {
+	answers @table.Table[@types.Type, bool, typeIdentityHasher, typeIdentityEq]
+	changes int
+}
+
+// newPointeeMemo returns an empty pointeeMemo.
+func newPointeeMemo(c @Checker) @pointeeMemo {
+	var m @pointeeMemo = make(pointeeMemo)
+	m.here = newPointeeAnswers(c)
+	m.pure = newPointeeAnswers(c)
+	m.none = newPointeeAnswers(c)
+	m.pkg = buf.CopyStr(c.curPkgPath)
+	return m
+}
+
+// newPointeeAnswers returns an empty pointeeAnswers, made after the type changes so
+// far.
+func newPointeeAnswers(c @Checker) @pointeeAnswers {
+	var a @pointeeAnswers = make(pointeeAnswers)
+	a.answers = table.NewTable[@types.Type, bool, typeIdentityHasher, typeIdentityEq](
+			typeIdentityHasher{}, typeIdentityEq{})
+	a.changes = typeChanges(c)
+	return a
+}
+
+// pointeeAnswersHere returns the answers kept for view, emptied if a type has changed
+// since they were found, or nil where none are kept: outside a batch's check of its
+// declarations (c.PointeeMemo), inside an instance frame f, and where the view differs
+// from the batch's -- another package's (opaqueExportHiddenHere), an instance's body
+// (lentHere), the package interface's view, a collection in progress
+// (typeInProgress).
+func pointeeAnswersHere(c @Checker, view int, f *opaqueFrame) @pointeeAnswers {
+	var m @pointeeMemo = c.PointeeMemo
+	if m == nil || f != nil || c.BniBuild != nil || c.Batch != nil && c.Batch.Collecting {
+		return nil
+	}
+	if !types.CharEq(m.pkg, c.curPkgPath) { return nil }
+	if c.Instances != nil && c.Instances.BodyDepth > 0 || inBniView(c) { return nil }
+	var a @pointeeAnswers = m.none
+	if view == viewHere { a = m.here }
+	if view == viewPure { a = m.pure }
+	if a.changes != typeChanges(c) {
+		a.answers = table.NewTable[@types.Type, bool, typeIdentityHasher, typeIdentityEq](
+				typeIdentityHasher{}, typeIdentityEq{})
+		a.changes = typeChanges(c)
+	}
+	return a
+}
+
+// pointeeEmbedsOpaqueKept is pointeeEmbedsOpaqueIn outside any frame, taking the
+// answer kept for a pointee it reaches, and keeping its answer for each pointee it
+// met, unless it met a generic instance (pointeeAnswers) or a type changed while it
+// walked (a build it made).
+func pointeeEmbedsOpaqueKept(c @Checker, t @types.Type, w *opaqueWalk, view int,
+		kept @pointeeAnswers) bool {
+	var none *opaqueFrame
+	var changes int = typeChanges(c)
+	var seen nameVisits
+	var met @vec.Vec[@types.Type] = vec.New[@types.Type]()
+	var keep bool = true
+	var answer bool = false
+	var cur @types.Type = t
+	var peeledPointer bool = false
+	for cur != nil {
+		if peeledPointer && keep {
+			a, known := kept.answers.Get(cur)
+			if known {
+				answer = a
+				break
+			}
+			met.Push(cur)
+		}
+		if cur.Kind == types.TYP_NAMED && len(cur.InstArgs) > 0 {
+			keep = false
+			if !argsMayBringOpaqueIn(c, cur, w, view, none) { break }
+		}
+		buildPostponedBase(c, cur)
+		if peeledPointer && opaqueInView(c, cur, view) { break }
+		if len(cur.Name) > 0 && !seen.enter(walkName(cur)) { break }
+		var base @types.Type
+		base, _ = peelFieldAccessBase(cur)
+		if base == nil { break }
+		if base.Kind == types.TYP_POINTER || base.Kind == types.TYP_MANAGED_PTR {
+			cur = base.Elem
+			peeledPointer = true
+			continue
+		}
+		if peeledPointer {
+			answer = embedsOpaqueByValueFramed(c, base, view, none) && !opaqueInView(c, base, view)
+		}
+		break
+	}
+	if keep && typeChanges(c) == changes {
+		for i := 0; i < met.Len(); i++ {
+			kept.answers.Put(met.Get(i), answer)
+		}
+	}
+	return answer
+}

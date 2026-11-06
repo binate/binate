@@ -288,18 +288,20 @@ INTINT_HEAVY="pkg/binate/types pkg/binate/ir"
 # drive the checker to one of its limits (a 4096-instance build, a 128-deep chain)
 # take minutes to hours each under the double VM, ~200x the single VM, so this lane
 # skips them (pkg-binate-check.skip.builder-comp-int-int: each one taking 0.5 s or
-# more on the single VM); check's other ~1830 tests need ~70 min on CI's runners,
-# irgen (~800) and link (~370) ~25-30 min.  Unsharded, these run whole in the light
-# batch.
-INTINT_PARTS="pkg/binate/check:6 pkg/binate/irgen:2 pkg/binate/link:2"
+# more on the single VM); check's other ~1830 tests need ~90 min on CI's runners (in
+# six parts they took 14-27 min each, a ~7-min load of check included, so it runs in
+# seven), irgen (~800) and link (~370) ~25-35 min.  Unsharded, these run whole in the
+# light batch.
+INTINT_PARTS="pkg/binate/check:7 pkg/binate/irgen:2 pkg/binate/link:2"
 # The light packages go to the shards by their cost, so that none carries more than its
 # share: INTINT_PART_COST is a part's cost and INTINT_LIGHT_COST a light package's, in
-# minutes on the CI runner (estimated from a package's time on the single VM: its load
-# x ~60 and its tests x ~200, both x ~2.7 for the runner), 1 for a package not listed.
+# minutes on the CI runner -- a part's from its time in CI, a light package's estimated
+# from its time on the single VM (its load x ~60 and its tests x ~200, both x ~2.7 for
+# the runner), 1 for a package not listed.
 # After the loop, each light package in turn -- the costliest first, ties by name --
 # goes to the shard whose parts and light packages so far cost least (ties: the lowest
 # index); every shard computes the same assignment and keeps its own share.
-INTINT_PART_COST="pkg/binate/check:24 pkg/binate/irgen:16 pkg/binate/link:27"
+INTINT_PART_COST="pkg/binate/check:20 pkg/binate/irgen:15 pkg/binate/link:20"
 INTINT_LIGHT_COST="cmd/bni:11 cmd/bnld:11 pkg/binate/native:11 pkg/binate/iropt:6 cmd/bnas:5
 pkg/binate/native/fold:4 pkg/binate/native/blockplan:4 pkg/binate/native/callconv:3
 pkg/binate/native/strength:3 pkg/binate/irbuild:3 pkg/binate/optflags:3"

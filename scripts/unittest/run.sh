@@ -403,20 +403,20 @@ for pkg in $PACKAGES; do
         fi
         b_is_heavy=0
         case " $INTINT_HEAVY " in *" $pkg "*) b_is_heavy=1 ;; esac
+        b_parts=0
+        for b_pp in $INTINT_PARTS; do
+            case "$b_pp" in "$pkg:"*) b_parts="${b_pp##*:}" ;; esac
+        done
         if [ "$SHARD_COUNT" -eq 0 ]; then
-            # Unsharded: run the subset (INTINT_HEAVY + cheap) full in one batch,
-            # but still exclude the non-subset expensive (.split.vm) packages.
-            if [ "$b_is_heavy" -eq 0 ] && [ -f "$b_split" ]; then
+            # Unsharded: run the subset (INTINT_HEAVY, INTINT_PARTS + cheap) full in one
+            # batch, but still exclude the non-subset expensive (.split.vm) packages.
+            if [ "$b_is_heavy" -eq 0 ] && [ "$b_parts" -eq 0 ] && [ -f "$b_split" ]; then
                 pkgskipped=$((pkgskipped + 1)); continue
             fi
             BATCH_LIGHT_PKGS="$BATCH_LIGHT_PKGS $pkg"
             BATCH_LIGHT_SKIPS="$BATCH_LIGHT_SKIPS$b_pkg_skips"
             continue
         fi
-        b_parts=0
-        for b_pp in $INTINT_PARTS; do
-            case "$b_pp" in "$pkg:"*) b_parts="${b_pp##*:}" ;; esac
-        done
         if [ "$b_parts" -gt 0 ]; then
             # Split into parts: part j on the shard part_pos picks, as pkg:j:K.
             b_pj=1

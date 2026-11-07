@@ -5,7 +5,7 @@
 // refcount layer lives once in rt_managed.bn and the fault handlers in rt_diag.bn.
 //
 // The allocator is TagCoalesce: size-classed segregated free lists carved from one
-// static arena, with SPLITTING and boundary-tag COALESCING.  Both matter for a
+// fixed arena, with SPLITTING and boundary-tag COALESCING.  Both matter for a
 // large-variable-buffer workload — the embeddable interpreter, which churns many
 // differently-sized large buffers (1 MiB VM stacks + doubling @vec.Vec backings) —
 // which fragments a segregated-list allocator without them to exhaustion of the
@@ -39,8 +39,8 @@
 //      payload 8-aligned by induction (8-aligned base + 8-multiple `PREFIX+size+FOOTER`
 //      extents), and the whole arena stays exactly tiled so a forward walk
 //      (base+PREFIX+size+FOOTER) always lands on the next block's base.
-//   3. RawAllocZero MUST MemZero — reused blocks are dirty (only a never-reused .bss
-//      carve is known zero).  It zeroes only the `size` payload
+//   3. RawAllocZero MUST MemZero — no block is known zero: reused blocks are dirty, and
+//      the arena is not loaded memory.  It zeroes only the `size` payload
 //      bytes; the footer (at payload end) is written by writeTags and left intact.
 //   4. The FREE_BIT is the allocation state of record: every alloc / carve / split-served
 //      path writes it CLEAR, every free / split-remainder path writes it SET, in BOTH
@@ -56,11 +56,6 @@
 package "pkg/builtins/rt"
 
 import "pkg/semihost"
-
-// ARENA_BYTES is the size of the single static backing region.  4 MiB fits inside the
-// linker script's 16 MiB RAM with ample room for .text / .rodata / other .bss / stack.
-// With reclamation the arena need only hold the PEAK-LIVE set, so this is generous.
-const ARENA_BYTES int = 4194304
 
 // SMALL_MAX is the largest payload served from the segregated small-class lists; a
 // request whose rounded payload exceeds it uses the large first-fit list.
@@ -81,8 +76,8 @@ const (
 )
 
 // FREE_BIT flags a block free in its size word (header + footer); SIZE_MASK recovers the
-// payload size.  Sizes are <= ARENA_BYTES = 0x400000 (bit 22), so bit 30 is free for the
-// flag with room to spare and no sign-bit interaction on ILP32.
+// payload size.  Sizes are below the arena's size, which initArena holds to SIZE_MASK, so
+// bit 30 is free for the flag with no sign-bit interaction on ILP32.
 const (
 	FREE_BIT int = 0x40000000
 	SIZE_MASK int = 0x3FFFFFFF
@@ -96,13 +91,6 @@ const (
 	MIN_PAYLOAD int = 8
 	MIN_SPLIT_EXTENT int = 24
 )
-
-// arena is the backing region.  Element type uint64 (NOT uint8) so its TYPE alignment
-// is 8: the object emitter places each global at its type alignment, so a uint8 arena
-// could land at an odd address after an odd-sized .bss global and every allocation
-// would then be misaligned (a data abort that hangs bare metal).  A uint64 arena is
-// placed 8-aligned.  524288 * 8 == ARENA_BYTES (4 MiB).
-var arena [524288]uint64
 
 // frontier is the ABSOLUTE address of the next never-yet-carved byte (the bump front;
 // reuse never touches it).  0 means "not yet initialized" — a valid frontier is always
@@ -122,14 +110,43 @@ func alignUp(n int, alignment int) int {
 	return (n + alignment - 1) & ~(alignment - 1)
 }
 
-// arenaBase returns the arena's absolute base address (8-aligned by the uint64 element
-// type).  Cheap — the address of a global — so recomputed rather than cached.
+// arenaBase returns the arena's absolute base address: `__heap_start`, which the target's
+// linker script defines just past the image's .bss — runtime/baremetal_arm32/baremetal.ld
+// gives a program a 4 MiB heap, and baremetal_test.ld gives a test binary all the RAM its
+// stack does not take.  Cheap — the address of a symbol — so recomputed rather than cached.
 //
 // Addresses are held in `int` (pointer-width; ILP32 arm32 int=4).  carve bounds a request
 // by offsets within the arena; RawFree compares absolute addresses as signed, which assumes
-// the arena does not straddle 0x80000000 (arm32 bare metal places it at 0x40000000).
+// the arena does not straddle 0x80000000 (initArena checks it).
+//
+// The symbols are read as uint8 so that nothing assumes their alignment: initArena
+// checks it.
 func arenaBase() int {
-	return bit_cast(int, &arena[0])
+	return bit_cast(int, __c_global("__heap_start", uint8))
+}
+
+// arenaEnd returns the absolute address just past the arena: `__heap_end`, from the same
+// linker script.
+func arenaEnd() int {
+	return bit_cast(int, __c_global("__heap_end", uint8))
+}
+
+// arenaBytes returns the arena's size in bytes.
+func arenaBytes() int {
+	return arenaEnd() - arenaBase()
+}
+
+// initArena checks the linker script's heap region and starts the frontier at its base
+// (invariant #1: absolute).  The region must be 8-aligned (invariant #2), must not run
+// past the int's sign bit (RawFree compares addresses as signed), and must be no larger
+// than SIZE_MASK, so that no block's size reaches FREE_BIT.
+func initArena() {
+	var abase int = arenaBase()
+	var aend int = arenaEnd()
+	if (abase & 7) != 0 || aend <= abase || aend - abase > SIZE_MASK {
+		abortWithMessage("rt: the linker script's heap region is unusable\n")
+	}
+	frontier = abase
 }
 
 // --- boundary tags -------------------------------------------------------------
@@ -236,10 +253,10 @@ func unlinkFree(base int) {
 // `need` with the space the arena has left: the frontier plus a large `need` would wrap
 // the int, and a wrapped frontier would pass the check and hand out memory past the arena.
 func carve(need int) int {
+	if frontier == 0 { initArena() }
 	var abase int = arenaBase()
-	if frontier == 0 { frontier = abase } // lazy init (invariant #1: absolute)
 	var base int = frontier
-	if need > ARENA_BYTES - (base - abase) - PREFIX - FOOTER {
+	if need > arenaBytes() - (base - abase) - PREFIX - FOOTER {
 		abortWithMessage("rt.RawAlloc: arena exhausted\n")
 	}
 	frontier = base + PREFIX + need + FOOTER
@@ -283,7 +300,7 @@ func RawAlloc(size int) *uint8 {
 	}
 	// A request larger than the whole arena can never be served; rejecting it here
 	// also keeps alignUp below from wrapping a size near the int's maximum.
-	if size > ARENA_BYTES {
+	if size > arenaBytes() {
 		abortWithMessage("rt.RawAlloc: arena exhausted\n")
 	}
 	// Every non-aborting path below returns a block; RawAllocZero rides RawAlloc,

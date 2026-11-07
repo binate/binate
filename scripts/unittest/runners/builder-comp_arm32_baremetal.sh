@@ -6,6 +6,9 @@
 # the semihosting console (SYS_WRITEC) and the binary exits via
 # semihosting (SYS_EXIT_EXTENDED).
 #
+# `bnc --test` links a test binary with runtime/baremetal_arm32/baremetal_test.ld,
+# whose RAM region is 256 MiB, so QEMU runs it with `-m 256M` to match.
+#
 # The BUILDER is used once during runner_setup to compile current
 # cmd/bnc → GEN1_COMPILER; every per-test compile then goes through
 # GEN1, so the "comp" link is always current-tree cmd/bnc.
@@ -81,11 +84,11 @@ runner_test() {
     [ -n "$TEST_SHARD_COUNT" ] && \
         append="$append --shard-index $TEST_SHARD_IDX --shard-count $TEST_SHARD_COUNT"
     if [ -n "$append" ]; then
-        "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 16M \
+        "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 256M \
             -nographic -semihosting -no-reboot \
             -kernel "$testbin" -append "$append" 2>&1
     else
-        "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 16M \
+        "$QEMU_SYSTEM_ARM" -M virt -cpu cortex-a15 -m 256M \
             -nographic -semihosting -no-reboot \
             -kernel "$testbin" 2>&1
     fi

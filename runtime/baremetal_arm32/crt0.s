@@ -9,7 +9,8 @@
 //
 // Tuned for QEMU's `virt` machine running ARMv7-A in ARM mode:
 //   - RAM starts at 0x40000000.
-//   - The linker script (baremetal.ld) links this at the RAM base and
+//   - The linker script (baremetal.ld, or baremetal_test.ld for a test binary)
+//     links this at the RAM base and
 //     drives the entry point via ENTRY(_start) -> e_entry, so QEMU's
 //     `-kernel` loader jumps to _start wherever it lands in .text.
 //   - Stack is a full-descending stack from the top of RAM.
@@ -30,17 +31,10 @@
 	.global bn_entry
 	.global bn_F2_3_pkg8_semihost1_12_SemihostExit
 _start:
-	// Set up the stack pointer at the top of RAM.
-	//
-	// NOTE: this hardcodes _stack_top = ORIGIN(RAM) + LENGTH(RAM) =
-	// 0x40000000 + 16 MiB = 0x41000000, which is the value baremetal.ld
-	// computes as `_stack_top`.  bnas has no literal-pool / symbol-load
-	// pseudo-instruction, so a linker-resolved `ldr sp, =_stack_top`
-	// isn't available; the value is duplicated here instead.  If you
-	// change RAM ORIGIN or LENGTH in baremetal.ld, update this pair too
-	// (a full-descending stack wants sp = one-past-the-top-of-RAM).
-	movw    sp, #0x0000     // low16  of 0x41000000
-	movt    sp, #0x4100     // high16 of 0x41000000
+	// Set up the stack pointer at the top of RAM: `_stack_top`, which the
+	// linker script defines one past the top (as a full-descending stack
+	// wants).  The literal pool holding its address follows the code.
+	ldr     sp, =_stack_top
 
 	// Hand control to Binate.  bn_entry runs init dispatchers and then
 	// calls main; returns when main returns.

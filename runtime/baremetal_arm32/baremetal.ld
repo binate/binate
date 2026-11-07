@@ -1,86 +1,36 @@
-/* Linker script for the v1 arm32-baremetal target — QEMU's `virt`
- * ARMv7-A machine.
+/* Linker script for the arm32-baremetal target — QEMU's `virt` ARMv7-A machine.
  *
- * Memory map: a single 16 MiB region starting at 0x40000000 (the
- * default `virt` RAM base).  Code and rodata go at the bottom of
- * the region, then data + bss, then stack growing down from the
- * top.  No MMU / paging in v1; identity-mapped flat.
+ * Memory map: a single 16 MiB region starting at 0x40000000 (the default `virt`
+ * RAM base), so a program runs under `-m 16M`.  Code and rodata go at the bottom
+ * of the region, then data + bss (baremetal_sections.ld), then the heap, and the
+ * stack grows down from the top.
  *
- * Sections we explicitly route:
- *   .text.startup — reserved for a startup section placed first; the
- *                   crt0 lands in plain .text and the entry point is
- *                   taken from ENTRY(_start) -> e_entry (QEMU's -kernel
- *                   loader honors the ELF entry), so its physical position
- *                   in .text does not matter.  The KEEP stays as a
- *                   forward-looking slot for a real-hardware reset vector.
- *   .text         — crt0 + Binate-compiled code + semihost helpers.
- *   .rodata       — string constants and the per-string
- *                   %BnManagedSlice globals bnc emits.
- *   .data / .bss  — initialized / zero-init globals.
+ *   heap   — 4 MiB from `__heap_start` (8-aligned, just past .bss) to `__heap_end`:
+ *            the arena pkg/builtins/rt allocates from.  Only symbols, not a section,
+ *            so the image does not carry it and the loader does not zero it.
+ *   stack  — full-descending from `_stack_top` (the top of RAM, which crt0.s loads
+ *            into sp) down to the heap.
  *
- * `_stack_top` = ORIGIN(RAM) + LENGTH(RAM) (the top of RAM).  crt0.s
- * does NOT load this symbol — bnas (the assembler for crt0.s) has no
- * literal-pool / symbol-load pseudo-instruction, so crt0.s hardcodes the
- * same value via a movw/movt pair.  If you change RAM ORIGIN/LENGTH below,
- * update crt0.s's movw/movt to match.
+ * bnc links a `--test` binary with baremetal_test.ld instead, which gives a whole
+ * test suite more RAM.  bnc puts this directory on the link's search path (-L), where
+ * the INCLUDE below finds the shared sections.
  */
 
 ENTRY(_start)
 
 MEMORY
 {
-	/* QEMU virt's default RAM is 1 GiB; the
-	 * `builder-comp_arm32_baremetal` runner explicitly launches
-	 * QEMU with `-m 16M`, so use the full 16 MiB here.  Code +
-	 * rodata + .bss (which includes the bump allocator's heap
-	 * `var heap [N]uint8`) all sit in this region; the stack
-	 * grows down from `_stack_top = ORIGIN + LENGTH`.  At 8 MiB,
-	 * `pkg/native/aarch64` and `pkg/native/x64` test binaries
-	 * overflowed `.bss` by 92 KB and 676 KB respectively (the
-	 * native-backend test suites are comprehensive, so each
-	 * binary aggregates many test-data globals).  16 MiB clears
-	 * both with comfortable headroom.  Bumping further would
-	 * require also bumping QEMU's `-m` flag in lockstep.
-	 */
 	RAM (rwx) : ORIGIN = 0x40000000, LENGTH = 16M
 }
 
+INCLUDE baremetal_sections.ld
+
 SECTIONS
 {
-	.text : ALIGN(4) {
-		KEEP(*(.text.startup))
-		*(.text*)
-		*(.rodata*)
-	} > RAM
-
-	/* ARM unwind tables.  We don't run the unwinder in v1, but
-	 * compiled rt helpers (e.g. rt.BoundsCheck) plus libgcc.a's
-	 * __aeabi_* helpers reference `__exidx_start` and `__exidx_end`
-	 * even when no actual unwinding happens — so we must keep the
-	 * section + define the markers (an empty exidx is fine; libgcc
-	 * just walks start..end looking for matching PCs).
-	 */
-	.ARM.exidx : ALIGN(4) {
-		__exidx_start = .;
-		*(.ARM.exidx*)
-		__exidx_end = .;
-	} > RAM
-
-	.ARM.extab : ALIGN(4) {
-		*(.ARM.extab*)
-	} > RAM
-
-	.data : ALIGN(4) {
-		*(.data*)
-	} > RAM
-
-	.bss : ALIGN(4) {
-		__bss_start = .;
-		*(.bss*)
-		*(COMMON)
-		__bss_end = .;
-	} > RAM
-
 	. = ALIGN(8);
+	__heap_start = .;
+	__heap_end = __heap_start + 4M;
 	_stack_top = ORIGIN(RAM) + LENGTH(RAM);
 }
+
+ASSERT(__heap_end <= _stack_top, "baremetal.ld: the image and its 4 MiB heap do not fit in RAM")

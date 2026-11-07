@@ -25,11 +25,11 @@ or a symbol's definition before it); a tab at the start is dropped.  A list
 whose name ends in -ctx.txt holds `<context><TAB><instruction>` lines, the
 context (`.arch armv6`, `|` for a newline too) put before the instruction's
 section.  The arm32 lists are the A32 core's instructions, by class, and the
-VFP's: every mnemonic in every operand form with PC and SP in each register,
-each immediate and shift at and past the ends of its range, the operand
-spellings clang takes, conditions, `s`, case and the old pre-UAL names, and in
-the -ctx lists each base architecture.  They hold no expected results: the
-sweep compares two builds with each other, not a build with clang.
+VFP's (vmov the moves): every mnemonic in every operand form with PC and SP in
+each register, each immediate and shift at and past the ends of its range, the
+operand spellings clang takes, conditions, `s`, case and the old pre-UAL names,
+and in the -ctx lists each base architecture or FPU.  They hold no expected
+results: the sweep compares two builds with each other, not a build with clang.
 """
 import os
 import struct

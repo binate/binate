@@ -1,0 +1,419 @@
+package "pkg/binate/check"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/std/table"
+import "pkg/std/vec"
+
+// Layouts needed during collection (see check_decl_batch.bn): a `sizeof` /
+// `alignof` read while collectDeclsBody runs — in an array length, or in a
+// constant an array length reads — needs the layout of types collection may
+// not have reached yet.
+
+// prepareLayout readies the layout of the type t for a `sizeof` / `alignof` at
+// pos (or a variable's type read during collection) while collection runs: the
+// package's type declarations t holds by value — through struct fields, array
+// elements, alias and readonly wrappers and the underlying types of named types
+// and instances, not through pointers or function values — are collected first
+// where collection has not reached them, and checked for holding themselves by
+// value; a slice's element is collected too (the opaque rule looks at it), but
+// never reported as a cycle.  It walks the type as resolved, not as written: an
+// instance's `[sizeof(T)]uint8` reaches its argument, and a name in a generic's
+// declaration is the generic's, never a type of the package being checked that
+// happens to share it.  A type whose own collection reads its layout (`type A
+// [sizeof(A)]uint8`, or through a constant: `type A [S]uint8; const S =
+// sizeof(A)`) is a cycle, reported at pos; prepareLayout then returns false.
+// While a `.bni`'s declarations are resolved, its types are readied the same way.
+// The walk goes as deep as t's parts go, with no recursion (prepareMachine), and finds
+// the height of each type it reaches: the levels in its longest chain of parts held by
+// value (prepareFrame).  A type higher than maxTypeDepth nests too deeply
+// (type.named.depth) whatever else it holds, and the walks that read a layout go down
+// that chain, so when t, or a type t holds by value or as a slice's element, is one,
+// it is reported at pos and t's layout is not read (false).
+func prepareLayout(c @Checker, t @types.Type, pos token.Pos) bool {
+	ok, _ := readyLayout(c, t, pos)
+	return ok
+}
+
+// readyLayout is prepareLayout, and reports too whether t's layout is not read because
+// a type its walk reaches nests too deeply.
+func readyLayout(c @Checker, t @types.Type, pos token.Pos) (bool, bool) {
+	if c.BniBuild == nil && (c.Batch == nil || !c.Batch.Collecting) {
+		return true, false
+	}
+	var m @prepareMachine = newPrepareMachine(pos)
+	var ok bool = runPrepareMachine(c, m, t)
+	if m.deep != nil {
+		var name @[]char
+		if m.deep.Kind == types.TYP_NAMED || m.deep.Kind == types.TYP_ALIAS { name = m.deep.TypeName() }
+		errNestsTooDeeply(c, pos, name)
+		return false, true
+	}
+	return ok, false
+}
+
+// prepareMachine is a prepareLayout walk: the frames of the types and declarations it
+// is inside, innermost last; the visited sets of its walks, one for the type
+// prepareLayout readies and one for each declaration's type a batch frame walks, the
+// innermost last; the result and the height of the frame last done, for the frame it
+// was pushed by; the type last found higher than maxTypeDepth, if any; the position the
+// layout is read at; the batch declarations it is walking (made on first use); the
+// number of times it has met a declaration another walk is walking -- one this read
+// is made inside, whose height it cannot know, and counts as none; and the heights of
+// the declarations it has walked that met one (made on first use).
+type prepareMachine struct {
+	frames     @vec.Vec[prepareFrame]
+	seens      @vec.Vec[@layoutVisits]
+	done       bool
+	result     bool
+	height     int
+	deep       @types.Type
+	pos        token.Pos
+	walking    @declSet
+	outerMet   int
+	incomplete @table.Table[@ast.Decl, int, instanceDeclHasher, instanceDeclEq]
+}
+
+// The kinds of a prepareFrame: a type walked by value, or softly through a slice's
+// element; the batch's declaration of a named type, collected on demand and its type
+// walked (in a visited set of its own); a `.bni`'s declaration of a named type,
+// resolved on demand and its type walked.
+const (
+	prepareWalk int = iota
+	prepareBatch
+	prepareBni
+)
+
+// prepareFrame is a type or declaration a prepareMachine is inside (prepareWalk,
+// prepareBatch, prepareBni): the type t and declaration d; whether it is reached softly;
+// the visited set (seens) its walk enters types in; for a struct, the greatest height of
+// the fields walked so far, the field to walk next and whether every field walked so far
+// may be read; for a batch declaration, the checker state set aside, whether a demand
+// frame was opened and the declaration collected, its symbol, whether its type is being
+// walked, and the machine's outerMet when its walk began.  A type's height is the number
+// of levels in the longest chain of parts it holds by value -- a struct's fields, an
+// array's element, a named type's underlying type -- counted as a type's nesting depth
+// counts them (a named type and an alias add none, ownLevel): a slice's element is
+// walked, but adds nothing to the slice's height; a type the walk is still inside counts
+// as none, and a declaration prepared already (or walked already by this machine) as the
+// height its walk found.
+type prepareFrame struct {
+	kind      int
+	t         @types.Type
+	d         @ast.Decl
+	soft      bool
+	seen      int
+	height    int
+	next      int
+	ok        bool
+	saved     declContext
+	framed    bool
+	collected bool
+	sym       @Symbol
+	walked    bool
+	outerAt   int
+}
+
+// newPrepareMachine returns a prepareMachine for a layout read at pos.
+func newPrepareMachine(pos token.Pos) @prepareMachine {
+	var m @prepareMachine = make(prepareMachine)
+	m.frames = vec.New[prepareFrame]()
+	m.seens = vec.New[@layoutVisits]()
+	m.pos = pos
+	return m
+}
+
+// runPrepareMachine walks t from m and returns whether its layout may be read: each
+// frame is started when it is pushed and resumed, with the result of the frame it
+// pushed, when that one is done, so the declarations are collected in the order a
+// walk recursing over the types' parts collects them.
+func runPrepareMachine(c @Checker, m @prepareMachine, t @types.Type) bool {
+	m.seens.Push(make(layoutVisits))
+	pushPrepareFrame(m, prepareWalk, t, nil, false, 0)
+	for m.frames.Len() > 0 {
+		var top int = m.frames.Len() - 1
+		var f prepareFrame = m.frames.Get(top)
+		if m.done {
+			m.done = false
+			resumePrepareFrame(c, m, top, f, m.result)
+		} else {
+			startPrepareFrame(c, m, top, f)
+		}
+	}
+	return m.result
+}
+
+// pushPrepareFrame pushes a frame of kind on m, for t and d, reached softly when soft,
+// in visited set seen.
+func pushPrepareFrame(m @prepareMachine, kind int, t @types.Type, d @ast.Decl, soft bool,
+		seen int) {
+	var f prepareFrame
+	f.kind = kind
+	f.t = t
+	f.d = d
+	f.soft = soft
+	f.seen = seen
+	m.frames.Push(f)
+}
+
+// prepareFrameDone takes the innermost frame off m, its result r and its height h.
+func prepareFrameDone(m @prepareMachine, r bool, h int) {
+	_, _ = m.frames.Pop()
+	m.done = true
+	m.result = r
+	m.height = h
+}
+
+// walkFrameDone takes the walk frame f off m, its result r: its type's height, the
+// level it adds (layoutLevel) over partsHeight, its parts' greatest, is recorded in its
+// visited set, and the type in m if it is higher than maxTypeDepth.
+func walkFrameDone(m @prepareMachine, f prepareFrame, r bool, partsHeight int) {
+	var h int = partsHeight + layoutLevel(f.t)
+	if h > maxTypeDepth { m.deep = f.t }
+	var v @layoutVisits = m.seens.Get(f.seen)
+	v.heights.put(f.t, h)
+	prepareFrameDone(m, r, h)
+}
+
+// layoutLevel is the level t adds to the height of a walk through it: none for a
+// named type or an alias, one for any other (ownLevel).
+func layoutLevel(t @types.Type) int {
+	if t.Kind == types.TYP_NAMED || t.Kind == types.TYP_ALIAS { return 0 }
+	return 1
+}
+
+// startPrepareFrame starts frame f, at top: it pushes the frame of the part it walks
+// first, or is done.
+func startPrepareFrame(c @Checker, m @prepareMachine, top int, f prepareFrame) {
+	if f.kind == prepareBatch {
+		startBatchFrame(c, m, top, f)
+		return
+	}
+	if f.kind == prepareBni {
+		startBniFrame(c, m, f)
+		return
+	}
+	var t @types.Type = f.t
+	if t == nil {
+		prepareFrameDone(m, true, 0)
+		return
+	}
+	var v @layoutVisits = m.seens.Get(f.seen)
+	if !v.enter(t, f.soft) {
+		h, _ := v.heights.get(t)
+		prepareFrameDone(m, true, h)
+		return
+	}
+	var none @ast.Decl
+	if t.Kind == types.TYP_NAMED && c.BniBuild != nil {
+		var bd @ast.Decl = bniTypeDeclOf(c, t)
+		if bd == nil {
+			pushPrepareFrame(m, prepareWalk, t.Underlying, none, f.soft, f.seen)
+		} else {
+			pushPrepareFrame(m, prepareBni, t, bd, f.soft, f.seen)
+		}
+	} else if t.Kind == types.TYP_NAMED {
+		var d @ast.Decl = batchTypeDeclOf(c, t)
+		if d == nil {
+			pushPrepareFrame(m, prepareWalk, t.Underlying, none, f.soft, f.seen)
+		} else {
+			pushPrepareFrame(m, prepareBatch, t, d, f.soft, f.seen)
+		}
+	} else if t.Kind == types.TYP_ALIAS {
+		pushPrepareFrame(m, prepareWalk, t.Target, none, f.soft, f.seen)
+	} else if t.Kind == types.TYP_ARRAY || t.Kind == types.TYP_READONLY {
+		pushPrepareFrame(m, prepareWalk, t.Elem, none, f.soft, f.seen)
+	} else if t.Kind == types.TYP_SLICE || t.Kind == types.TYP_MANAGED_SLICE {
+		pushPrepareFrame(m, prepareWalk, t.Elem, none, true, f.seen)
+	} else if t.Kind == types.TYP_STRUCT && len(t.Fields) > 0 {
+		f.ok = true
+		f.next = 1
+		m.frames.Set(top, f)
+		pushPrepareFrame(m, prepareWalk, t.Fields[0].Type, none, f.soft, f.seen)
+	} else {
+		walkFrameDone(m, f, true, 0)
+	}
+}
+
+// resumePrepareFrame resumes frame f, at top, the frame it pushed done with result r
+// and height m.height: a struct walks its next field, a batch or `.bni` declaration
+// finishes, and any other frame is done with r -- a slice with no height from its
+// element.
+func resumePrepareFrame(c @Checker, m @prepareMachine, top int, f prepareFrame, r bool) {
+	if f.kind == prepareBatch {
+		finishBatchFrame(c, m, f, r, m.height)
+		return
+	}
+	if f.kind == prepareBni {
+		checkCycleUnlessBlocked(c, f.t, f.d)
+		prepareFrameDone(m, r, m.height)
+		return
+	}
+	var t @types.Type = f.t
+	if t.Kind == types.TYP_SLICE || t.Kind == types.TYP_MANAGED_SLICE {
+		walkFrameDone(m, f, r, 0)
+		return
+	}
+	if t.Kind != types.TYP_STRUCT {
+		walkFrameDone(m, f, r, m.height)
+		return
+	}
+	f.ok = r && f.ok
+	if m.height > f.height { f.height = m.height }
+	if f.next >= len(t.Fields) {
+		walkFrameDone(m, f, f.ok, f.height)
+		return
+	}
+	var none @ast.Decl
+	var field @types.Type = t.Fields[f.next].Type
+	f.next = f.next + 1
+	m.frames.Set(top, f)
+	pushPrepareFrame(m, prepareWalk, field, none, f.soft, f.seen)
+}
+
+// startBatchFrame starts the batch declaration frame f, at top: it collects f.d if
+// collection has not reached it, then walks the types it holds by value, in a visited
+// set of its own; it finishes at once when the declaration is prepared (true, the
+// height its walk found; or the height this machine's walk of it found, if that met a
+// declaration another walk is walking) or being walked already (true), or being
+// collected -- reached
+// softly, no cycle (true); else a cycle, reported unless the instance being built waits
+// for it (false) -- or inside a build that waits already (skipDemand: false).
+func startBatchFrame(c @Checker, m @prepareMachine, top int, f prepareFrame) {
+	var b @DeclBatch = c.Batch
+	var d @ast.Decl = f.d
+	h, prepared := b.TypesPrepared.Get(d)
+	if !prepared && m.incomplete != nil { h, prepared = m.incomplete.Get(d) }
+	if prepared {
+		prepareFrameDone(m, true, h)
+		return
+	}
+	if b.TypesWalking.has(d) {
+		if m.walking == nil || !m.walking.has(d) { m.outerMet = m.outerMet + 1 }
+		prepareFrameDone(m, true, 0)
+		return
+	}
+	if b.TypesCollecting.has(d) {
+		if !f.soft && !waitForLayoutHere(c) {
+			errCyclicType(c, m.pos, buf.CopyStr(d.Name))
+		}
+		prepareFrameDone(m, f.soft, 0)
+		return
+	}
+	if skipDemand(c) {
+		prepareFrameDone(m, false, 0)
+		return
+	}
+	f.saved = enterPackageDecl(c, d)
+	f.framed = enterDemandFrame(c)
+	var sym @Symbol = c.Scope.Lookup(d.Name)
+	if sym != nil && sym.Type != nil && sym.Type.Kind == types.TYP_NAMED &&
+			sym.Type.Underlying == nil {
+		collectBatchTypeDecl(c, d)
+		f.collected = true
+	}
+	b.TypesWalking.push(d)
+	if m.walking == nil { m.walking = newDeclSet() }
+	m.walking.push(d)
+	f.outerAt = m.outerMet
+	f.sym = c.Scope.Lookup(d.Name)
+	f.walked = f.sym != nil && f.sym.Type != nil
+	m.frames.Set(top, f)
+	if !f.walked {
+		finishBatchFrame(c, m, f, true, 0)
+		return
+	}
+	m.seens.Push(make(layoutVisits))
+	var none @ast.Decl
+	pushPrepareFrame(m, prepareWalk, f.sym.Type.Underlying, none, f.soft, m.seens.Len() - 1)
+}
+
+// finishBatchFrame finishes the batch declaration frame f, whose type's walk gave ok
+// and height h: d is checked not to hold itself by value, and recorded as collected
+// and prepared, with h -- unless its collection read a layout not built yet, inside an
+// instance's build (leaveDemandFrame): the instance waits, the collection is undone and
+// its layout is not read (false).  A walk that met a declaration another walk is
+// walking may have found h too low, so d is not prepared, and a later read walks it
+// again; this machine keeps h (m.incomplete), so it walks d once.
+func finishBatchFrame(c @Checker, m @prepareMachine, f prepareFrame, ok bool, h int) {
+	var b @DeclBatch = c.Batch
+	if f.walked { _, _ = m.seens.Pop() }
+	b.TypesWalking.pop()
+	m.walking.pop()
+	if f.sym != nil {
+		checkCycleUnlessBlocked(c, f.sym.Type, f.d)
+	}
+	var waited bool = leaveDemandFrame(c, f.framed)
+	leavePackageDecl(c, f.saved)
+	if waited {
+		if f.collected {
+			setUnderlying(c, f.sym.Type, nil)
+			ast.ClearCheckerAnnotations(f.d)
+		}
+		prepareFrameDone(m, false, h)
+		return
+	}
+	if f.collected {
+		b.TypesCollected.push(f.d)
+	}
+	if !f.soft && m.outerMet > f.outerAt {
+		if m.incomplete == nil {
+			m.incomplete = table.NewTable[@ast.Decl, int, instanceDeclHasher, instanceDeclEq](
+					instanceDeclHasher{}, instanceDeclEq{})
+		}
+		m.incomplete.Put(f.d, h)
+	} else if !f.soft {
+		b.TypesPrepared.Put(f.d, h)
+	}
+	prepareFrameDone(m, ok, h)
+}
+
+// checkCycleUnlessBlocked checks that the named type t, declared by d, does not hold
+// itself by value (checkTypeByValueCycle) -- unless the innermost layout frame waits for
+// a layout not built yet (layoutFrameBlocked): what it reports would be dropped, while
+// the field it poisons would stay poisoned once the frame is undone, if d was collected
+// in its turn, so nothing after would find the cycle (an invalid program accepted).
+// The frame is done again, and checks then.
+func checkCycleUnlessBlocked(c @Checker, t @types.Type, d @ast.Decl) {
+	if !layoutFrameBlocked(c) { checkTypeByValueCycle(c, t, d) }
+}
+
+// startBniFrame starts the `.bni` declaration frame f, of the named type f.t: f.d is
+// resolved first if it is not yet, then the types it holds by value are walked in the
+// same visited set, and a type holding itself by value is reported when the walk is
+// done (resumePrepareFrame: checkCycleUnlessBlocked), which breaks the cycle the layout
+// would go round.  A type being resolved has no layout yet: the instance being built
+// waits for it, or -- its layout depends on itself -- the cycle is reported; reached
+// softly (through a slice's element), it is no cycle.  Inside a build that waits
+// already (skipDemand) nothing is prepared: what it reports would be dropped, and a
+// cycle broken without its error, which a build done again would then not find.
+func startBniFrame(c @Checker, m @prepareMachine, f prepareFrame) {
+	var bb @BniBuild = c.BniBuild
+	var d @ast.Decl = f.d
+	var t @types.Type = f.t
+	if declInList(bb.TypesResolving, d) {
+		if !f.soft && !waitForLayoutHere(c) {
+			errCyclicType(c, m.pos, buf.CopyStr(d.Name))
+		}
+		prepareFrameDone(m, f.soft, 0)
+		return
+	}
+	if skipDemand(c) {
+		prepareFrameDone(m, false, 0)
+		return
+	}
+	if t.Underlying == nil {
+		var saved bniDeclContext = enterBniDecl(c, d)
+		var noVisiting @[]@[]char
+		resolveBniTypeByName(c, bb.Scope, d.Name, bb.ConstNames, bb.ConstDecls, noVisiting)
+		leaveBniDecl(c, saved)
+		if t.Underlying == nil {
+			prepareFrameDone(m, false, 0)
+			return
+		}
+	}
+	var none @ast.Decl
+	pushPrepareFrame(m, prepareWalk, t.Underlying, none, f.soft, f.seen)
+}

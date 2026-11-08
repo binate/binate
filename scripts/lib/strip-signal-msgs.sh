@@ -14,11 +14,15 @@
 #   - GNU `timeout` (used by the arm32 runners to cap wall-clock)
 #     prints "the monitored command dumped core" when it observes
 #     SIGSEGV (its own postscript, separate from the guest's).
+#   - on arm32 bare metal, a CPU fault goes to crt0.s's exception
+#     vectors, which print "fatal: <exception> at pc 0x<pc>" (with
+#     ", address 0x<address>" for an abort) and exit 1 -- the
+#     bare-metal counterpart of a hosted program's signal death.
 #
 # Sourced by conformance/run.sh and tested by
 # scripts/hygiene/strip-signal-msgs.sh.
 strip_signal_msgs() {
     printf '%s\n' "$1" | grep -Ev \
-        '^(Segmentation fault|Killed|Aborted|Bus error|Floating point exception|Trace/breakpoint trap)( \(core dumped\))?$|^qemu(-[^:]*)?: uncaught target signal .*$|^timeout: the monitored command dumped core$' \
+        '^(Segmentation fault|Killed|Aborted|Bus error|Floating point exception|Trace/breakpoint trap)( \(core dumped\))?$|^qemu(-[^:]*)?: uncaught target signal .*$|^timeout: the monitored command dumped core$|^fatal: (data abort|prefetch abort|undefined instruction|unexpected (supervisor call|IRQ|FIQ|exception)) at pc 0x[0-9a-f]{8}(, address 0x[0-9a-f]{8})?$' \
         | awk 'BEGIN { first = 1 } { if (!first) printf "\n"; printf "%s", $0; first = 0 }'
 }

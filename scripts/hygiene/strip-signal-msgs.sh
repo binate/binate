@@ -2,8 +2,9 @@
 # Smoke-test scripts/lib/strip-signal-msgs.sh against the patterns
 # it's expected to filter (Linux shell signal messages, qemu-user
 # `uncaught target signal` lines, GNU timeout's dumped-core
-# postscript) and the things it must NOT filter (real program
-# output that happens to look adjacent).
+# postscript, the arm32 bare-metal CPU-fault report) and the things
+# it must NOT filter (real program output that happens to look
+# adjacent).
 
 set -e
 
@@ -69,6 +70,20 @@ qemu: uncaught target signal 11 (Segmentation fault) - core dumped
 timeout: the monitored command dumped core" \
     "before"
 
+# --- arm32 bare-metal CPU-fault report (crt0.s's exception vectors) ---
+check "bare-metal data abort" \
+    "before
+fatal: data abort at pc 0x40001a2c, address 0x60000000" \
+    "before"
+check "bare-metal undefined instruction" \
+    "before
+fatal: undefined instruction at pc 0x4000f010" \
+    "before"
+check "bare-metal unexpected IRQ" \
+    "before
+fatal: unexpected IRQ at pc 0x40000100" \
+    "before"
+
 # --- pass-through: real program output that mentions signals
 # but isn't an out-of-band diagnostic.  These look superficially
 # similar but don't match the anchored patterns (Segmentation fault
@@ -79,6 +94,12 @@ check "user mentions Segmentation fault mid-line" \
 check "user emits qemu prefix with extra text" \
     "qemu: something else entirely" \
     "qemu: something else entirely"
+check "user's fatal line that is not a fault report" \
+    "fatal: data abort at pc 0x40001a2c, which is odd" \
+    "fatal: data abort at pc 0x40001a2c, which is odd"
+check "user's fatal line with a short pc" \
+    "fatal: undefined instruction at pc 0x1010" \
+    "fatal: undefined instruction at pc 0x1010"
 check "empty input" "" ""
 check "no-op single line" "hello world" "hello world"
 

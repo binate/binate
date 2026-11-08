@@ -1,0 +1,434 @@
+package "pkg/binate/check"
+
+import "pkg/binate/types"
+import "pkg/std/vec"
+
+// Whether an instance's type arguments may bring an opaque type into its structure
+// (argsMayBringOpaque) and whether a pointer's ultimate pointee embeds one
+// (pointeeEmbedsOpaque) depend on each other at every level of a type: a pointee walk
+// judges the arguments of each instance it passes, and an argument's parts include
+// pointers whose pointees it walks.  The two run as one walk on an explicit stack of
+// calls (bringCall), so a type nested to any depth is judged: a call either returns its
+// answer (bringReturn) or starts another (bringPush) and is resumed with that one's
+// answer (bringRet).  The frames are kept from one walk to the next; a walk starts
+// above the frames in use -- one can start another, through an instance it builds --
+// and leaves them as it found them.
+
+// The calls of the walk, each one judgement's.
+const (
+	bringArgs int = iota // whether an instance's arguments may bring an opaque type
+	bringArg             // whether a type argument may hold one (stepBringArg)
+	bringParts           // whether a type's parts may break a rule (stepBringParts)
+	bringPointee         // the pointer rule's walk (stepBringPointee)
+	bringPointeeKept     // the walk with the answers kept (stepBringPointeeKept)
+)
+
+// The loops of a bringParts call, by the parts they judge, and the point it resumes at
+// once its pointee is judged.
+const (
+	bringLoopArgs int = iota + 1 // an instance's type arguments, each a bringArg
+	bringLoopSig                 // a function type's parameters, then results, each a bringArg
+	bringLoopFields              // a struct's fields, each a bringParts
+	bringAfterPointee            // a pointer's pointee judged; its element is next
+)
+
+// A bringCall is a call of the walk: which (proc), where it resumes (pc), a loop's
+// position (i), its type (t; the pointee walks' current type is cur), the view, frame
+// and walk it runs in, and the pointee walks' state -- whether a pointer was peeled
+// (peeled), the names met (seen), and for the walk with the answers kept (kept), the
+// pointees met (met), whether their answers are kept (keep), the answer found and the
+// type changes made before the walk (changes).
+type bringCall struct {
+	proc    int
+	pc      int
+	i       int
+	t       @types.Type
+	cur     @types.Type
+	view    int
+	f       *opaqueFrame
+	w       *opaqueWalk
+	peeled  bool
+	seen    nameVisits
+	kept    @pointeeAnswers
+	met     @vec.Vec[@types.Type]
+	keep    bool
+	answer  bool
+	changes int
+}
+
+// bringCalls holds the walk's frames, the first bringDepth of them in use, the call
+// running last.
+var bringCalls @vec.Vec[@bringCall]
+
+// bringDepth is how many of bringCalls are in use.
+var bringDepth int
+
+// bringRet is the answer of the call that returned last.
+var bringRet bool
+
+// bringPush starts a call proc of the walk on t, in view, the frame f and the walk w,
+// on the next frame, and returns the frame.
+func bringPush(proc int, t @types.Type, view int, f *opaqueFrame, w *opaqueWalk) @bringCall {
+	if bringCalls == nil { bringCalls = vec.New[@bringCall]() }
+	if bringDepth == bringCalls.Len() { bringCalls.Push(make(bringCall)) }
+	var k @bringCall = bringCalls.Get(bringDepth)
+	bringDepth = bringDepth + 1
+	k.w = w
+	bringTail(k, proc, t, view, f)
+	return k
+}
+
+// bringTail turns the running call k into a call proc on t, in view and the frame f.
+func bringTail(k @bringCall, proc int, t @types.Type, view int, f *opaqueFrame) {
+	k.proc = proc
+	k.pc = 0
+	k.i = 0
+	k.t = t
+	k.cur = t
+	k.view = view
+	k.f = f
+	k.peeled = false
+}
+
+// bringReturn ends the running call k with the answer v, letting go of what it holds.
+func bringReturn(k @bringCall, v bool) {
+	var none @types.Type
+	var noNames nameVisits
+	k.t = none
+	k.cur = none
+	k.seen = noNames
+	k.kept = nil
+	k.met = nil
+	bringRet = v
+	bringDepth = bringDepth - 1
+}
+
+// bringRun runs the call just started (bringPush), and the calls it makes, to its
+// answer.
+func bringRun(c @Checker) bool {
+	var base int = bringDepth - 1
+	for bringDepth > base {
+		var k @bringCall = bringCalls.Get(bringDepth - 1)
+		if k.proc == bringArgs {
+			stepBringArgs(c, k)
+		} else if k.proc == bringArg {
+			stepBringArg(c, k)
+		} else if k.proc == bringParts {
+			stepBringParts(c, k)
+		} else if k.proc == bringPointee {
+			stepBringPointee(c, k)
+		} else {
+			stepBringPointeeKept(c, k)
+		}
+	}
+	return bringRet
+}
+
+// argsMayBringOpaque reports whether the instance t, entered in view inside the
+// frame f (if any), can bring an opaque type into its structure through its type
+// arguments, the only parts of it not judged at its generic's declaration — for
+// the walks of the pointer rules (partsPointToOpaqueEmbedding) and the signature
+// rules (funcSignaturesSized).  An argument can bring one only when it mentions
+// one — inside a frame, through a parameter the frame binds to an argument
+// written elsewhere; outside, through a named type — and only when, its
+// parameters bound, it may break an opaque rule where the structure puts it
+// (stepBringArg): wherever the structure puts any other argument — by
+// value, behind pointers, in a pointee, as a parameter or result of a function
+// type — no rule fires.  Skipping t then also spares the walk the abstract
+// instances its structure names, which a chain of generics each naming the
+// next twice makes exponentially many (check_generic_postpone.bn).  One walk
+// judges all the arguments, so a part they share is judged once.
+func argsMayBringOpaque(c @Checker, t @types.Type, view int, f *opaqueFrame) bool {
+	var w opaqueWalk
+	_ = bringPush(bringArgs, t, view, f, &w)
+	return bringRun(c)
+}
+
+// stepBringArgs runs a bringArgs call: whether an argument of the instance k.t that
+// mentions a named type (in a frame, a parameter the frame binds) may hold an opaque
+// type, in the walk k.w, which a pointee walk that meets the instance shares: a fresh
+// walk there would judge again, at each level of nested type arguments, the arguments
+// the enclosing walk judges.
+func stepBringArgs(c @Checker, k @bringCall) {
+	if k.pc == 1 && bringRet {
+		bringReturn(k, true)
+		return
+	}
+	for k.i < len(k.t.InstArgs) {
+		var a @types.Type = k.t.InstArgs[k.i]
+		k.i = k.i + 1
+		var mentions bool
+		if k.f != nil { mentions = typeMentionsOwner(a, k.f) } else { mentions = typeMentionsNamed(a) }
+		if mentions {
+			k.pc = 1
+			_ = bringPush(bringArg, a, k.view, k.f, k.w)
+			return
+		}
+	}
+	bringReturn(k, false)
+}
+
+// stepBringArg runs a bringArg call: whether the type argument k.t, in view inside
+// the frame (if any), which binds its parameters, may break an opaque rule where a
+// structure puts it: it is opaque or holds an opaque type by value, or one of its
+// parts may break one (stepBringParts).  The walk holds the parts judged, shared by
+// every argument the check reaches: a part entered before was judged and broke no
+// rule, or is on the current path.
+func stepBringArg(c @Checker, k @bringCall) {
+	b, bv, bf := bindFrame(k.t, k.view, k.f)
+	if embedsOpaqueByValueFramed(c, b, bv, bf) {
+		bringReturn(k, true)
+		return
+	}
+	bringTail(k, bringParts, b, bv, bf)
+}
+
+// stepBringParts runs a bringParts call: whether k.t, in view inside the frame (if
+// any), is or spells out — as a pointee, an element, a field or an interface value's
+// interface — a pointer or handle to a type that embeds an opaque type by value
+// (stepBringPointee), a function type with a parameter or result that may break the
+// opaque rules (stepBringArg), which a structure that puts it in a signature breaks
+// (funcSignaturesSized), or an instance with such a type argument, which its
+// structure may put behind a pointer or in a signature.  An instance's own parts — a
+// named pointer instance's pointee among them — were judged at its generic's
+// declaration, so its arguments are all of it that counts.  One walk judges both the
+// pointer rules and the signature rules: two would each judge an instance's arguments
+// again, doubling the work at each level of nested type arguments.  Each part is
+// entered before it is judged, so one reached again — a nested type argument
+// repeated — is judged once.
+func stepBringParts(c @Checker, k @bringCall) {
+	if k.pc == 0 {
+		if !bringPartsStart(c, k) { return }
+	} else if k.pc == bringAfterPointee {
+		if bringRet {
+			bringReturn(k, true)
+			return
+		}
+		bringTail(k, bringParts, k.t.Elem, k.view, k.f)
+		return
+	} else if bringRet {
+		bringReturn(k, true)
+		return
+	}
+	var n int = len(k.t.Fields)
+	if k.pc == bringLoopArgs { n = len(k.t.InstArgs) }
+	if k.pc == bringLoopSig { n = len(k.t.Params) + len(k.t.Results) }
+	if k.i >= n {
+		bringReturn(k, false)
+		return
+	}
+	var part @types.Type
+	var proc int = bringArg
+	if k.pc == bringLoopArgs {
+		part = k.t.InstArgs[k.i]
+	} else if k.pc == bringLoopSig {
+		if k.i < len(k.t.Params) { part = k.t.Params[k.i].Type } else {
+			part = k.t.Results[k.i - len(k.t.Params)]
+		}
+	} else {
+		part = k.t.Fields[k.i].Type
+		proc = bringParts
+	}
+	k.i = k.i + 1
+	_ = bringPush(proc, part, k.view, k.f, k.w)
+}
+
+// bringPartsStart starts the bringParts call k: it peels k.t's aliases, readonly and
+// bound type parameters, then returns, calls or tail-calls as the type's kind
+// decides -- or sets up the loop over its parts and reports that it did.
+func bringPartsStart(c @Checker, k @bringCall) bool {
+	var t @types.Type = k.t
+	var view int = k.view
+	var f *opaqueFrame = k.f
+	for t != nil {
+		t, view, f = bindFrame(t, view, f)
+		if t.Kind == types.TYP_ALIAS {
+			t = t.Target
+		} else if t.Kind == types.TYP_READONLY {
+			t = t.Elem
+		} else {
+			break
+		}
+	}
+	k.t = t
+	k.view = view
+	k.f = f
+	if t == nil {
+		bringReturn(k, false)
+		return false
+	}
+	var kd int = t.Kind
+	if (kd == types.TYP_NAMED || kd == types.TYP_INTERFACE) && len(t.InstArgs) > 0 {
+		if !k.w.enter(t, view) {
+			bringReturn(k, false)
+			return false
+		}
+		k.pc = bringLoopArgs
+		return true
+	}
+	if kd == types.TYP_NAMED {
+		bringTail(k, bringPointee, t, view, f)
+		return false
+	}
+	var loop int = 0
+	if isFuncKind(kd) { loop = bringLoopSig }
+	if kd == types.TYP_STRUCT { loop = bringLoopFields }
+	var handle bool = kd == types.TYP_POINTER || kd == types.TYP_MANAGED_PTR
+	var elem bool = kd == types.TYP_ARRAY || kd == types.TYP_SLICE || kd == types.TYP_MANAGED_SLICE ||
+			kd == types.TYP_INTERFACE_VALUE || kd == types.TYP_INTERFACE_VALUE_MANAGED
+	if (loop == 0 && !handle && !elem) || !k.w.enter(t, view) {
+		bringReturn(k, false)
+		return false
+	}
+	if loop != 0 {
+		k.pc = loop
+		return true
+	}
+	if handle {
+		k.pc = bringAfterPointee
+		_ = bringPush(bringPointee, t, view, f, k.w)
+		return false
+	}
+	bringTail(k, bringParts, t.Elem, view, f)
+	return false
+}
+
+// pointeeEmbedsOpaque reports whether t is a pointer / handle (possibly nested,
+// alias / named peeled) whose ULTIMATE pointee embeds an opaque type by value
+// but is not itself bare opaque.  Peels through every pointer/handle level; a
+// self-referential pointer chain (`type P *P`) terminates via the visited-name
+// set (walkName) with no opaque found.  Returns false for a non-pointer t (the value case
+// is handled by embedsOpaqueByValue) and for the bare `*Opaque` / `@Opaque`
+// escape hatch (the pointee is bare opaque).  view gives the view
+// (opaqueInView).
+func pointeeEmbedsOpaque(c @Checker, t @types.Type, view int, f *opaqueFrame) bool {
+	var w opaqueWalk
+	var kept @pointeeAnswers = pointeeAnswersHere(c, view, f)
+	if kept == nil {
+		_ = bringPush(bringPointee, t, view, f, &w)
+		return bringRun(c)
+	}
+	var none *opaqueFrame
+	var k @bringCall = bringPush(bringPointeeKept, t, view, none, &w)
+	k.kept = kept
+	k.changes = typeChanges(c)
+	k.met = vec.New[@types.Type]()
+	k.keep = true
+	k.answer = false
+	return bringRun(c)
+}
+
+// stepBringPointee runs a bringPointee call, the pointer rule's walk from k.t down its
+// chain of pointers, with k.w the walk of the arguments of an instance it meets
+// (stepBringArgs), shared with the walk it is part of (stepBringParts).  A generic
+// instance's own parts were judged at its generic's declaration
+// (requireGenericPartsKept), so only its type arguments can bring an opaque type into
+// its pointee: following one they cannot would build, at each declaration of a chain
+// of generics each naming the next through a pointer, the whole rest of the chain.  A
+// pointee that is itself opaque here is the escape hatch, whatever its definition —
+// even one naming itself (`type Tree @[]Tree` exported as `type Tree`), whose peeled
+// underlying embeds the opaque Tree.  The type at the chain's end is flagged only if
+// t was a pointer (otherwise embedsOpaqueByValue covers it).
+func stepBringPointee(c @Checker, k @bringCall) {
+	var resumed bool = k.pc == 1
+	k.pc = 0
+	for {
+		if resumed {
+			resumed = false
+			if !bringRet {
+				bringReturn(k, false)
+				return
+			}
+		} else {
+			if k.cur == nil {
+				bringReturn(k, false)
+				return
+			}
+			bc, bv, bf := bindFrame(k.cur, k.view, k.f)
+			k.cur = bc
+			k.view = bv
+			k.f = bf
+			if bc.Kind == types.TYP_NAMED && len(bc.InstArgs) > 0 {
+				k.pc = 1
+				_ = bringPush(bringArgs, bc, bv, bf, k.w)
+				return
+			}
+		}
+		var cur @types.Type = k.cur
+		buildPostponedBase(c, cur)
+		if k.peeled && opaqueInView(c, cur, k.view) || len(cur.Name) > 0 && !k.seen.enter(walkName(cur)) {
+			bringReturn(k, false)
+			return
+		}
+		var base @types.Type
+		base, _ = peelFieldAccessBase(cur)
+		if base == nil {
+			bringReturn(k, false)
+			return
+		}
+		if base.Kind == types.TYP_TYPE_PARAM && k.f != nil && bindFrameType(base, k.f) != nil {
+			k.cur = base
+		} else if base.Kind == types.TYP_POINTER || base.Kind == types.TYP_MANAGED_PTR {
+			k.cur = base.Elem
+			k.peeled = true
+		} else {
+			bringReturn(k,
+					k.peeled && embedsOpaqueByValueFramed(c, base, k.view, k.f) && !opaqueInView(c, base, k.view))
+			return
+		}
+	}
+}
+
+// stepBringPointeeKept runs a bringPointeeKept call, the pointer rule's walk outside
+// any frame, taking the answer kept for a pointee it reaches, and keeping its answer
+// for each pointee it met, unless it met a generic instance (pointeeAnswers) or a type
+// changed while it walked (a build it made).
+func stepBringPointeeKept(c @Checker, k @bringCall) {
+	var resumed bool = k.pc == 1
+	k.pc = 0
+	for k.cur != nil {
+		var cur @types.Type = k.cur
+		if resumed {
+			resumed = false
+			if !bringRet { break }
+		} else {
+			if k.peeled && k.keep {
+				a, known := k.kept.answers.Get(cur)
+				if known {
+					k.answer = a
+					break
+				}
+				k.met.Push(cur)
+			}
+			if cur.Kind == types.TYP_NAMED && len(cur.InstArgs) > 0 {
+				k.keep = false
+				k.pc = 1
+				var none *opaqueFrame
+				_ = bringPush(bringArgs, cur, k.view, none, k.w)
+				return
+			}
+		}
+		buildPostponedBase(c, cur)
+		if k.peeled && opaqueInView(c, cur, k.view) { break }
+		if len(cur.Name) > 0 && !k.seen.enter(walkName(cur)) { break }
+		var base @types.Type
+		base, _ = peelFieldAccessBase(cur)
+		if base == nil { break }
+		if base.Kind == types.TYP_POINTER || base.Kind == types.TYP_MANAGED_PTR {
+			k.cur = base.Elem
+			k.peeled = true
+			continue
+		}
+		if k.peeled {
+			var none *opaqueFrame
+			k.answer = embedsOpaqueByValueFramed(c, base, k.view, none) && !opaqueInView(c, base, k.view)
+		}
+		break
+	}
+	if k.keep && typeChanges(c) == k.changes {
+		for i := 0; i < k.met.Len(); i++ {
+			k.kept.answers.Put(k.met.Get(i), k.answer)
+		}
+	}
+	bringReturn(k, k.answer)
+}

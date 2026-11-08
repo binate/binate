@@ -17,14 +17,11 @@ MEMORY
 	RAM (rwx) : ORIGIN = 0x40000000, LENGTH = 256M
 }
 
-INCLUDE baremetal_sections.ld
-
 SECTIONS
 {
-	. = ALIGN(8);
-	__heap_start = .;
+	__heap_start = ALIGN(__bss_end, 8);
 	_stack_top = ORIGIN(RAM) + LENGTH(RAM);
 	__heap_end = _stack_top - 16M;
 }
 
-ASSERT(__heap_start < __heap_end, "baremetal_test.ld: the image does not fit in RAM below the stack")
+ASSERT(__heap_start < __heap_end, "baremetal_test.ld: the image does not fit below the stack")

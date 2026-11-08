@@ -11,9 +11,9 @@
  *   stack  — full-descending from `_stack_top` (the top of RAM, which crt0.s loads
  *            into sp) down to the heap.
  *
- * bnc links a `--test` binary with baremetal_test.ld instead, which gives a whole
- * test suite more RAM.  bnc puts this directory on the link's search path (-L), where
- * the INCLUDE below finds the shared sections.
+ * bnc links this script with the output sections (baremetal_sections.ld), and links
+ * a `--test` binary with baremetal_test.ld in its place, which gives a whole test
+ * suite more RAM.
  */
 
 ENTRY(_start)
@@ -23,12 +23,9 @@ MEMORY
 	RAM (rwx) : ORIGIN = 0x40000000, LENGTH = 16M
 }
 
-INCLUDE baremetal_sections.ld
-
 SECTIONS
 {
-	. = ALIGN(8);
-	__heap_start = .;
+	__heap_start = ALIGN(__bss_end, 8);
 	__heap_end = __heap_start + 4M;
 	_stack_top = ORIGIN(RAM) + LENGTH(RAM);
 }

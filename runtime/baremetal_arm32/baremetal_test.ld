@@ -7,7 +7,9 @@
  *
  *   heap   — from `__heap_start` (8-aligned, just past .bss) to `__heap_end`, 16 MiB
  *            below the top of RAM.
- *   stack  — full-descending from `_stack_top` (the top of RAM) down to the heap.
+ *   stack  — full-descending from `_stack_top` (the top of RAM) down to the heap --
+ *            or, where the core has an MMU, to the unmapped guard stack_guard.s
+ *            leaves above the heap.
  */
 
 ENTRY(_start)

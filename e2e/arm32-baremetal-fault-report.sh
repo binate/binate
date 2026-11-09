@@ -13,6 +13,15 @@
 # Each must print the report -- the pc of the faulting instruction (checked
 # exactly for the two probes), and the faulting address for an abort -- and
 # exit 1 within the timeout, where a missing handler would loop forever.
+#
+# The stack guard (runtime/baremetal_arm32/stack_guard.s, on by default where the
+# core has an MMU, as QEMU's cortex-a15 does) leaves 64 KiB at the bottom of the
+# stack unmapped, and crt0.s reports a data abort there as "stack overflow":
+#   - a recursion with no end must report a stack overflow and exit 1;
+#   - a store to the guard's first byte (__heap_end rounded up to 64 KiB), after
+#     stores to the bytes just below and just above the guard, must report a stack
+#     overflow at that address -- and, built with -fno-baremetal-stack-guard, must
+#     instead succeed and exit 0.
 
 set -u
 
@@ -101,6 +110,44 @@ func main() {
 	testing.Println("not reached")
 }
 EOF
+mkdir -p "$TMP/overflow" "$TMP/guardbyte" "$TMP/guardoff"
+cat > "$TMP/overflow/main.bn" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+
+func down(n int) int {
+	var pad [64]int
+	pad[n & 63] = n
+	if n == 0 { return 0 }
+	return down(n - 1) + pad[n & 63] - n + 1
+}
+
+func main() {
+	testing.Println("recursing")
+	testing.Println(down(100000000))
+}
+EOF
+cat > "$TMP/guardbyte/main.bn" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+
+func main() {
+	var heapEnd int = bit_cast(int, __c_global("__heap_end", uint8))
+	var lo int = (heapEnd + 0xffff) & ~0xffff
+	testing.Println(lo)
+	var below *uint8 = bit_cast(*uint8, lo - 1)
+	below[0] = 1
+	var above *uint8 = bit_cast(*uint8, lo + 0x10000)
+	above[0] = 1
+	testing.Println("edges mapped")
+	var p *uint8 = bit_cast(*uint8, lo)
+	p[0] = 1
+	testing.Println("wrote")
+}
+EOF
+cp "$TMP/guardbyte/main.bn" "$TMP/guardoff/main.bn"
 cat > "$TMP/pabort/main.bn" <<'EOF'
 package "main"
 
@@ -134,12 +181,13 @@ IMPL="$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR" --targ
 LD_EXTRA=""
 if [ "$(uname -s)" = "Darwin" ]; then LD_EXTRA="--cflag -fuse-ld=lld"; fi
 
-# build_and_run <name>: compile and link $TMP/<name>/main.bn, run it under qemu,
-# and leave its output in RUN_OUT and its exit status in RUN_RC.
+# build_and_run <name> [<flags>]: compile and link $TMP/<name>/main.bn (with any
+# extra bnc flags), run it under qemu, and leave its output in RUN_OUT and its
+# exit status in RUN_RC.
 build_and_run() {
     mkdir -p "$TMP/$1/build"
     if ! "$GEN1" -I "$IFACE" -L "$IMPL" -I "$BINATE_DIR" -L "$BINATE_DIR" \
-            --target arm32-baremetal \
+            --target arm32-baremetal ${2:-} \
             --runtime "$BINATE_DIR/runtime/baremetal_arm32/crt0.s" \
             $LD_EXTRA --link-after-objs "$TMP/probes.o" \
             --build-dir "$TMP/$1/build" -o "$TMP/$1/prog" "$TMP/$1/main.bn" >"$TMP/$1/comp.log" 2>&1 \
@@ -179,5 +227,27 @@ expect "undefined instruction" "$(printf '%s\nfatal: undefined instruction at pc
 build_and_run pabort
 expect "prefetch abort" "$(printf 'jumping\nfatal: prefetch abort at pc %s, address %s' "$NOWHERE" "$NOWHERE")"
 
-echo "PASS: arm32 bare-metal CPU faults (data abort, undefined instruction, prefetch abort) are reported and exit 1 under qemu"
+build_and_run overflow
+pc="$(printf '%s\n' "$RUN_OUT" | sed -n 's/^fatal: stack overflow at pc \(0x[0-9a-f]\{8\}\), address 0x[0-9a-f]\{8\}$/\1/p')"
+at="$(printf '%s\n' "$RUN_OUT" | sed -n 's/^fatal: stack overflow at pc 0x[0-9a-f]\{8\}, address \(0x[0-9a-f]\{8\}\)$/\1/p')"
+expect "stack overflow (recursion)" "$(printf 'recursing\nfatal: stack overflow at pc %s, address %s' "${pc:-<none>}" "${at:-<none>}")"
+
+build_and_run guardbyte
+lo="$(printf '%s\n' "$RUN_OUT" | head -1)"
+case "$lo" in
+    ''|*[!0-9]*) echo "FAIL: the guardbyte program did not print the guard's address: $lo" >&2; exit 1 ;;
+esac
+pc="$(printf '%s\n' "$RUN_OUT" | sed -n 's/^fatal: stack overflow at pc \(0x[0-9a-f]\{8\}\), address .*/\1/p')"
+expect "stack overflow (guard byte)" "$(printf '%s\nedges mapped\nfatal: stack overflow at pc %s, address 0x%08x' "$lo" "${pc:-<none>}" "$lo")"
+
+build_and_run guardoff -fno-baremetal-stack-guard
+want="$(printf '%s\nedges mapped\nwrote' "$lo")"
+if [ "$RUN_RC" -ne 0 ] || [ "$RUN_OUT" != "$want" ]; then
+    echo "FAIL: with -fno-baremetal-stack-guard the store to the guard's byte must succeed (status $RUN_RC)" >&2
+    echo "--- got ---"  >&2; printf '%s\n' "$RUN_OUT" >&2
+    echo "--- want ---" >&2; printf '%s\n' "$want" >&2
+    exit 1
+fi
+
+echo "PASS: arm32 bare-metal CPU faults (data abort, undefined instruction, prefetch abort, stack overflow) are reported and exit 1 under qemu, and -fno-baremetal-stack-guard leaves the guard off"
 exit 0

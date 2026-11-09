@@ -3,8 +3,8 @@
  * machine.  bnc links this script with one of those, which defines the RAM region
  * these sections go into and lays out the heap and the stack past `__bss_end`.  The
  * two name each other's region and symbols only, which lld (bnc's bare-metal linker)
- * resolves once it has read both, so their order does not matter.  No MMU / paging;
- * identity-mapped flat.
+ * resolves once it has read both, so their order does not matter.  Addresses are
+ * physical: where the core has an MMU, stack_guard.s maps every address to itself.
  *
  * Sections we explicitly route:
  *   .text.startup — reserved for a startup section placed first; the

@@ -9,7 +9,8 @@
  *            the arena pkg/builtins/rt allocates from.  Only symbols, not a section,
  *            so the image does not carry it and the loader does not zero it.
  *   stack  — full-descending from `_stack_top` (the top of RAM, which crt0.s loads
- *            into sp) down to the heap.
+ *            into sp) down to the heap -- or, where the core has an MMU, to the
+ *            unmapped guard stack_guard.s leaves above the heap.
  *
  * bnc links this script with the output sections (baremetal_sections.ld), and links
  * a `--test` binary with baremetal_test.ld in its place, which gives a whole test

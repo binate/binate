@@ -34,6 +34,8 @@
 	.global bn_entry
 	.global bn_F2_3_pkg8_semihost1_12_SemihostExit
 	.global bn_F2_3_pkg8_semihost1_17_SemihostWriteChar
+	.global bn_stack_guard_init
+	.global bn_stack_guard_bounds
 _start:
 	// Take exceptions at bn_vectors (below).
 	ldr     r0, =bn_vectors
@@ -43,6 +45,11 @@ _start:
 	// linker script defines one past the top (as a full-descending stack
 	// wants).  The literal pool holding its address follows the code.
 	ldr     sp, =_stack_top
+
+	// Guard the bottom of the stack with an unmapped region where the core has an
+	// MMU (stack_guard.s; bnc links a no-op in its place under
+	// -fno-baremetal-stack-guard).
+	bl      bn_stack_guard_init
 
 	// Hand control to Binate.  bn_entry runs init dispatchers and then
 	// calls main; returns when main returns.
@@ -103,6 +110,15 @@ vec_dabort:
 	sub     r5, lr, #8
 	mrc     p15, 0, r6, c6, c0, 0   // DFAR
 	mov     r7, #1
+	// An abort inside the stack guard is the stack running past its end.
+	ldr     r0, =bn_stack_guard_bounds
+	ldr     r1, [r0]
+	ldr     r2, [r0, #4]
+	cmp     r6, r1
+	blo     vec_report
+	cmp     r6, r2
+	bhs     vec_report
+	ldr     r4, =msg_stack_overflow
 	b       vec_report
 vec_svc:
 	ldr     r4, =msg_svc
@@ -193,6 +209,8 @@ msg_pabort:
 	.asciz  "prefetch abort"
 msg_dabort:
 	.asciz  "data abort"
+msg_stack_overflow:
+	.asciz  "stack overflow"
 msg_svc:
 	.asciz  "unexpected supervisor call"
 msg_irq:
@@ -207,6 +225,11 @@ msg_address:
 	.asciz  ", address 0x"
 
 	.section bss
+// bn_stack_guard_bounds holds the stack guard's [low, high) bounds, which
+// stack_guard.s records when it sets the guard up; both stay 0 without one.
+	.balign 4
+bn_stack_guard_bounds:
+	.zero   8
 	.balign 8
 vec_stack:
 	.zero   1024

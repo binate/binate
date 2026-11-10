@@ -1,0 +1,215 @@
+package "pkg/binate/check"
+
+import "pkg/binate/ast"
+import "pkg/binate/types"
+import "pkg/std/vec"
+
+// The by-name walk's call that collects a type declaration of the batch
+// (collectBatchTypeDecl): marked as being collected, it first resolves what its
+// array lengths read, in the order its collection reads them -- the batch's constants
+// they name, and the batch's types whose layouts they read, collected in turn -- so
+// that its own collection finds them resolved, however long a chain of such
+// declarations is (`type T0 [sizeof(T1)]uint8`, or `type T0 [C1]uint8` with
+// `const C1 = sizeof(T1)`, ...).  One that is being collected, or read by a layout
+// walk, is not collected again: its collection, or the read, finds the cycle, as it
+// would have.  Only reads made through forms the scans model are resolved ahead
+// (check_by_name_reads.bn); the first other read -- a call, a selector, an instance,
+// an alias, a variable or function of the batch, a type named as a value ... -- is left
+// in its place, and so are the reads after it, in their order.
+// A type whose layout is read is collected with the types it holds by
+// value, each in turn, as the read's walk collects them (startBatchFrame), and marked
+// as being walked meanwhile, as that walk marks it, so that a collection on the way
+// reading its layout finds the cycle the same way.  An alias resolves what its target
+// reads where it reads it, as it is
+// marked as being resolved only then (beginAliasDecl).  While an instance is built,
+// what a collection reads is resolved where it reads it, as an instance's build may
+// wait for it (enterDemandFrame).
+
+// stepBatchType runs the batch type declaration's call k to its next call or its end.
+// One made for another declaration (k.onDemand) is for a layout that declaration
+// reads: it collects k.name's declaration as a layout read collects it on demand
+// (startBatchFrame) -- when it is still a placeholder, in its own declaration's
+// context -- and records it collected, then the types it holds by value.
+func stepBatchType(c @Checker, k @byNameCall) {
+	var b @DeclBatch = c.Batch
+	if k.pc == byNameStart {
+		if !startBatchType(c, k) {
+			byNameReturn(k)
+			return
+		}
+		k.pc = byNameLoopConsts
+	}
+	for k.i < k.reads.count() {
+		var at int = k.i
+		k.i = k.i + 1
+		var next int = pushReadFrom(c, k, k.reads.names[at], k.reads.layout[at], true)
+		if next == byNameReadPushed { return }
+		if next == byNameReadStop { k.i = k.reads.count() }
+	}
+	if k.pc == byNameLoopConsts {
+		if k.collecting {
+			collectTypeDecl(c, k.d)
+			b.TypesCollecting.pop()
+			flushLayoutWaits(c)
+			if k.onDemand { b.TypesCollected.push(k.d) }
+		}
+		if !k.onDemand {
+			byNameReturn(k)
+			return
+		}
+		// The types it holds by value follow its reads, collected while it is marked
+		// as walked.
+		b.TypesReadied.push(k.d)
+		b.TypesWalking.push(k.d)
+		appendLayoutParts(c, k.d, &k.reads)
+		k.pc = byNameLoopParts
+		if k.i < k.reads.count() { return }
+	}
+	b.TypesWalking.pop()
+	leavePackageDecl(c, k.saved)
+	byNameReturn(k)
+}
+
+// startBatchType starts the batch type declaration's call k: it reports whether there
+// is anything to do -- for one made for another declaration, a type whose layout is
+// not prepared, nor its by-value types collected ahead already, that is not being
+// collected or read by a layout walk -- and finds whether the declaration is to be
+// collected (k.collecting: in its turn, or, on demand, while its name is still bound to
+// its placeholder).  One that is it marks as being collected, and finds what its
+// array lengths read (k.reads, collectTypeExprReads), unless it is an alias or
+// generic, or an instance is being built.
+func startBatchType(c @Checker, k @byNameCall) bool {
+	var b @DeclBatch = c.Batch
+	k.collecting = true
+	if k.onDemand {
+		var d @ast.Decl = batchTypeDeclNamed(c, k.name)
+		if d == nil || b.TypesCollecting.has(d) || b.TypesWalking.has(d) || b.TypesReadied.has(d) {
+			return false
+		}
+		_, prepared := b.TypesPrepared.Get(d)
+		if prepared { return false }
+		k.saved = enterPackageDecl(c, d)
+		var sym @Symbol = c.Scope.Lookup(d.Name)
+		if sym == nil || sym.Type == nil || sym.Type.Kind != types.TYP_NAMED {
+			leavePackageDecl(c, k.saved)
+			return false
+		}
+		k.d = d
+		k.collecting = !b.TypesCollected.has(d) && sym.Type.Underlying == nil
+	}
+	if !k.collecting { return true }
+	b.TypesCollecting.push(k.d)
+	if !buildingInstances(c) && len(k.d.TypeParams) == 0 && !k.d.IsAlias {
+		collectTypeExprReads(c, k.d.TypeRef, &k.reads)
+	}
+	return true
+}
+
+// The next step of a call resolving its declaration's reads ahead, in their order,
+// after one of them (pushReadFrom).
+const (
+	byNameReadNext int = iota // the read needs nothing resolved ahead
+	byNameReadPushed          // a call is started for it
+	byNameReadStop            // it and the reads after it are made in their place
+)
+
+// pushReadFrom starts, from the running call k, the call that resolves the read of
+// name ahead -- for its layout when layout -- and reports what follows: a type of the
+// batch whose layout is read is collected, and a constant of the batch read is
+// resolved as one read on demand is (when consts: otherwise the constants are resolved
+// already).  A stop (no name), an alias of the batch (its target is resolved, or
+// followed, where it is named), and any other name read as a value -- a variable or
+// function, a type, an undefined name ... -- but `iota`, `true` and `false`, are left
+// where they are read, so they and the reads after them are made in their place
+// (byNameReadStop): the evaluation may resolve something there, or stop at an error
+// before the reads after them.
+func pushReadFrom(c @Checker, k @byNameCall, name @[]char, layout bool, consts bool) int {
+	var b @DeclBatch = c.Batch
+	if len(name) == 0 || pendingAliasIdx(c, name) >= 0 { return byNameReadStop }
+	if layout {
+		if callBatchTypeFrom(c, k, name) { return byNameReadPushed }
+		return byNameReadNext
+	}
+	if nameInList(b.ConstNames, name) {
+		if !consts { return byNameReadNext }
+		var r @byNameCall = byNameCallFrom(k, byNameConst, name)
+		r.onDemand = true
+		return byNameReadPushed
+	}
+	if types.CharEq(name, "iota") || types.CharEq(name, "true") || types.CharEq(name, "false") {
+		return byNameReadNext
+	}
+	return byNameReadStop
+}
+
+// pendingAliasNamed reports whether name is a pending alias of the batch not resolved
+// yet (check_pending_alias.bn).
+func pendingAliasNamed(c @Checker, name *[]readonly char) bool {
+	var i int = pendingAliasIdx(c, name)
+	return i >= 0 && c.PendingAliases.States[i] != ALIAS_DONE
+}
+
+// callBatchTypeFrom starts, from the running call k, the call that collects the
+// batch's type name, whose layout k's declaration reads, and reports whether it did:
+// not when name is no non-generic type declaration of the batch.
+func callBatchTypeFrom(c @Checker, k @byNameCall, name @[]char) bool {
+	if batchTypeDeclNamed(c, name) == nil { return false }
+	var r @byNameCall = byNameCallFrom(k, byNameBatchType, name)
+	r.onDemand = true
+	return true
+}
+
+// appendLayoutParts appends to r, as layout reads, the batch's type declarations that a
+// layout read's walk of d's type reaches (startPrepareFrame), in the order it reaches them:
+// through alias targets, array and readonly elements, struct fields and the underlying
+// types of named types not the batch's -- an instance's -- each type entered once,
+// stopping at each of the batch's types.  It walks the type as resolved, as that walk
+// does: an instance's field reaches its argument, and an invalid part stops it.
+func appendLayoutParts(c @Checker, d @ast.Decl, r *byNameReads) {
+	var sym @Symbol = c.Scope.Lookup(d.Name)
+	if sym == nil || sym.Type == nil || sym.Type.Kind != types.TYP_NAMED ||
+			sym.Type.Underlying == nil {
+		return
+	}
+	var seen typeVisits
+	var v *typeVisits = &seen
+	var stack @vec.Vec[@types.Type] = vec.New[@types.Type]()
+	stack.Push(sym.Type.Underlying)
+	for stack.Len() > 0 {
+		t, _ := stack.Pop()
+		if t == nil || !v.enter(t) { continue }
+		if t.Kind == types.TYP_NAMED {
+			var bd @ast.Decl = batchTypeDeclOf(c, t)
+			if bd != nil {
+				r.add(bd.Name, true)
+			} else {
+				stack.Push(t.Underlying)
+			}
+		} else if t.Kind == types.TYP_ALIAS {
+			stack.Push(t.Target)
+		} else if t.Kind == types.TYP_ARRAY || t.Kind == types.TYP_READONLY {
+			stack.Push(t.Elem)
+		} else if t.Kind == types.TYP_STRUCT {
+			for i := len(t.Fields) - 1; i >= 0; i-- {
+				stack.Push(t.Fields[i].Type)
+			}
+		}
+	}
+}
+
+// batchTypeDeclNamed returns the batch's declaration of the type name -- not an
+// alias, a generic or a blank one -- or nil.
+func batchTypeDeclNamed(c @Checker, name *[]readonly char) @ast.Decl {
+	var none @ast.Decl
+	if c.Batch == nil || isBlank(name) { return none }
+	var d @ast.Decl = batchTypeDecl(c.Batch, name)
+	if d == nil || d.IsAlias || len(d.TypeParams) > 0 { return none }
+	return d
+}
+
+// buildingInstances reports whether an instance is being built (or a generic's
+// declaration resolved abstractly): what a declaration resolved then reads may wait
+// for it.
+func buildingInstances(c @Checker) bool {
+	return c.Instances != nil && len(c.Instances.Populating) > 0
+}

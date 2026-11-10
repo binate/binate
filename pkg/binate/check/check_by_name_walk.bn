@@ -1,0 +1,280 @@
+package "pkg/binate/check"
+
+import "pkg/binate/ast"
+import "pkg/std/vec"
+import "pkg/stdx/slices"
+
+// A declaration resolved before its turn, by name, first resolves what it names: a
+// constant of the batch (resolveConstByName) the constants its initializer names; a
+// `.bni`'s type, constant or variable what bni_by_name_walk.bn says -- each of those
+// first resolving what it names in turn.  They run as one walk on an explicit stack
+// of calls (byNameCall), so a chain of declarations of any length is resolved: a call
+// either returns (byNameReturn) or starts another (byNamePush) and is resumed once
+// that one returns.  A declaration's own resolution, after what it names, may start
+// another walk (a layout it reads: startBniFrame); a walk starts above the frames in
+// use and leaves them as it found them.  The frames are kept from one walk to the
+// next (a few of them, byNameFramesKept).
+
+// The calls of the walk.
+const (
+	byNameConst int = iota // resolveConstByName (stepConstByName)
+	byNameBniType          // resolveBniTypeByName (stepBniType)
+	byNameBniConst         // resolveBniConstByName (stepBniConst)
+	byNameBniVar           // defineBniVarByName (stepBniVar)
+)
+
+// The points a call resumes at.
+const (
+	byNameStart int = iota // its guards, then what it names
+	byNameByDecl           // a variable's definition, its declaration found
+	byNameAfterRepeated    // a bare const-group member's repeated member resolved
+	byNameLoopConsts       // the constants (and a variable's, variables) it names
+	byNameLoopTypes        // the types it holds by value
+)
+
+// A byNameCall is a call of the walk: which (proc), where it resumes (pc), a loop's
+// position (i), the declaration's name and, once found, the declaration (d), the
+// scope a `.bni`'s is defined in (s) with the constants of the batch or the `.bni`
+// (names / cdecls), the build it runs in (bb), the names its loops go through (deps,
+// tdeps), a constant's initializer (init), const-group member index (member) and the
+// index of the member whose initializer it has or repeats (explicit), whether it
+// entered a demand frame (framed), and for a variable the first call of the chain of
+// variables whose array lengths named the next, ending at it (chain).
+type byNameCall struct {
+	proc     int
+	pc       int
+	i        int
+	name     @[]char
+	d        @ast.Decl
+	s        @Scope
+	names    @[]@[]char
+	cdecls   @[]@ast.Decl
+	bb       @BniBuild
+	deps     @[]@[]char
+	tdeps    @[]@[]char
+	init     @ast.Expr
+	member   int
+	explicit int
+	framed   bool
+	chain    int
+}
+
+// byNameCalls holds the walk's frames, the first byNameDepth of them in use, the call
+// running last.
+var byNameCalls @vec.Vec[@byNameCall]
+
+// byNameDepth is how many of byNameCalls are in use.
+var byNameDepth int
+
+// byNameFramesKept is how many of the walk's frames are kept for the next walk.
+const byNameFramesKept int = 256
+
+// byNamePush starts a call proc of the walk on the declaration name, with the
+// constants names / cdecls (and for a `.bni`'s, defined in s), on the next frame,
+// and returns the frame.  A variable's call starts a chain of its own.
+func byNamePush(proc int, name @[]char, s @Scope, names @[]@[]char,
+		cdecls @[]@ast.Decl) @byNameCall {
+	if byNameCalls == nil { byNameCalls = vec.New[@byNameCall]() }
+	if byNameDepth == byNameCalls.Len() { byNameCalls.Push(make(byNameCall)) }
+	var k @byNameCall = byNameCalls.Get(byNameDepth)
+	byNameDepth = byNameDepth + 1
+	k.proc = proc
+	k.pc = byNameStart
+	k.i = 0
+	k.name = name
+	k.s = s
+	k.names = names
+	k.cdecls = cdecls
+	k.member = -1
+	k.explicit = -1
+	k.framed = false
+	k.chain = byNameDepth - 1
+	return k
+}
+
+// byNameCallFrom starts, from the running call k, a call proc on the declaration name.
+func byNameCallFrom(k @byNameCall, proc int, name @[]char) @byNameCall {
+	return byNamePush(proc, name, k.s, k.names, k.cdecls)
+}
+
+// byNameReturn ends the running call k, letting go of what it holds.
+func byNameReturn(k @byNameCall) {
+	var noName @[]char
+	var noNames @[]@[]char
+	var noDecl @ast.Decl
+	var noDecls @[]@ast.Decl
+	var noExpr @ast.Expr
+	k.name = noName
+	k.d = noDecl
+	k.s = nil
+	k.names = noNames
+	k.cdecls = noDecls
+	k.bb = nil
+	k.deps = noNames
+	k.tdeps = noNames
+	k.init = noExpr
+	byNameDepth = byNameDepth - 1
+}
+
+// byNameRun runs the call just started (byNamePush), and the calls it makes, to its
+// end.
+func byNameRun(c @Checker) {
+	var base int = byNameDepth - 1
+	for byNameDepth > base {
+		var k @byNameCall = byNameCalls.Get(byNameDepth - 1)
+		if k.proc == byNameConst {
+			stepConstByName(c, k)
+		} else if k.proc == byNameBniType {
+			stepBniType(c, k)
+		} else if k.proc == byNameBniConst {
+			stepBniConst(c, k)
+		} else {
+			stepBniVar(c, k)
+		}
+	}
+	// A long chain leaves a frame per declaration; past a few, let them go once no
+	// walk runs.
+	if byNameDepth == 0 && byNameCalls.Len() > byNameFramesKept { byNameCalls = nil }
+}
+
+// stepConstByName runs the batch constant's call k (resolveConstByName) to its next
+// call or its end.
+func stepConstByName(c @Checker, k @byNameCall) {
+	if k.pc == byNameStart {
+		ok, repeated := startConstByName(c, k)
+		if !ok {
+			byNameReturn(k)
+			return
+		}
+		k.pc = byNameAfterRepeated
+		if repeated >= 0 {
+			// A bare member repeats member e's initializer, so its one dependency
+			// is member e, which resolves the initializer's own dependencies and is
+			// checked first.
+			_ = byNameCallFrom(k, byNameConst, k.d.Decls[repeated].Name)
+			return
+		}
+	}
+	if k.pc == byNameAfterRepeated {
+		k.deps = collectConstDeps(k.init, k.deps)
+		k.pc = byNameLoopConsts
+	}
+	for k.i < len(k.deps) {
+		var dep @[]char = k.deps[k.i]
+		k.i = k.i + 1
+		if nameInList(k.names, dep) {
+			_ = byNameCallFrom(k, byNameConst, dep)
+			return
+		}
+	}
+	finishConstByName(c, k)
+	byNameReturn(k)
+}
+
+// startConstByName starts the batch constant's call k: it reports whether the
+// constant is to be resolved -- not resolved already, unless resolved while a
+// placeholder its resolution read stood, which no longer does (resolved again:
+// check_const_pending.bn); a constant of the batch's; not read inside a build that
+// waits already -- and if so marks it as being resolved and finds its initializer
+// (k.init).  One being resolved further up, read by a build its resolution started,
+// waits for it (declReadWaits); otherwise it is a cycle: the consts from its entry to
+// the top of the stack are on it, reported once -- a const already on a reported
+// cycle, read again (a bare group member re-reading itself after its explicit
+// member's cycle), is not reported again.  For a bare const-group member, which
+// repeats an earlier member's initializer, it returns that member's index, resolved
+// first (else -1).
+func startConstByName(c @Checker, k @byNameCall) (bool, int) {
+	if nameInList(c.ConstResolved, k.name) && !releasePendingAt(c, pendingConstNamed(c, k.name)) {
+		return false, -1
+	}
+	if nameInList(c.ConstResolving, k.name) {
+		var cd @ast.Decl = findConstDecl(k.names, k.cdecls, k.name)
+		if cd != nil && declReadWaits(c, constDeclOf(cd, k.name)) {
+			return false, -1
+		}
+		if !nameInList(c.Batch.ConstCycleMembers, k.name) {
+			if cd != nil {
+				errConstCycle(c, constDeclOf(cd, k.name).Pos, k.name)
+			}
+			markConstCycle(c, k.name)
+		}
+		c.ConstResolved = slices.Append[@[]char](c.ConstResolved, k.name)
+		return false, -1
+	}
+	var d @ast.Decl = findConstDecl(k.names, k.cdecls, k.name)
+	if d == nil || skipDemand(c) { return false, -1 }
+	c.ConstResolving = slices.Append[@[]char](c.ConstResolving, k.name)
+	enterDeclResolution(c, constDeclOf(d, k.name))
+	k.framed = enterDemandFrame(c)
+	k.d = d
+	k.init = d.Value
+	if d.Kind == ast.DECL_GROUP {
+		k.member = constGroupMemberIndex(d, k.name)
+		k.explicit = constGroupExplicit(d, k.member)
+		var noExpr @ast.Expr
+		k.init = noExpr
+		if k.explicit == k.member {
+			k.init = d.Decls[k.member].Value
+		} else if k.explicit >= 0 {
+			return true, k.explicit
+		}
+	}
+	return true, -1
+}
+
+// finishConstByName checks the batch constant of the call k, what its initializer
+// names resolved, under its own file scope (the calls before it may leave c.Scope at
+// another constant's file scope; see checkPackageImpl), and records it resolved --
+// unless that read a layout not built yet, inside an instance's build
+// (leaveDemandFrame): the name is bound to its placeholder again, to be resolved when
+// next read.  A name resolved while a placeholder its resolution read stood is
+// recorded pending (notePendingConst), and the layout waits are flushed when a read
+// has waited for it.
+func finishConstByName(c @Checker, k @byNameCall) {
+	var d @ast.Decl = k.d
+	var name @[]char = k.name
+	if fileScopedActive(c) {
+		c.Scope = scopeForFile(c, d.Pos.File)
+	}
+	var ds @Scope = declScope(c)
+	var placeholder @Symbol = ds.LookupLocal(name)
+	var constMark checkMark = markChecks(c)
+	var readMark placeholderMark = markPlaceholders(c)
+	if k.member >= 0 {
+		checkConstGroupMember(c, d, k.member)
+	} else {
+		checkConstDecl(c, d)
+	}
+	c.ConstResolving = c.ConstResolving[:len(c.ConstResolving) - 1]
+	var constWaited bool = leaveDeclResolution(c)
+	if leaveDemandFrame(c, k.framed) {
+		_ = takeConstReads(c, readMark)
+		restoreBinding(ds, name, placeholder)
+		if k.member >= 0 {
+			ast.ClearCheckerAnnotations(d.Decls[k.member])
+		} else {
+			ast.ClearCheckerAnnotations(d)
+		}
+		return
+	}
+	noteConstErrs(c, constMark)
+	var init @ast.Expr = k.init
+	if init == nil && k.explicit >= 0 {
+		// A bare member repeats member e's initializer, and what left it
+		// without a value.
+		init = d.Decls[k.explicit].Value
+	}
+	noteConstPoisoner(c, ds.LookupLocal(name), init, constMark)
+	var repeats @Symbol = nil
+	if k.member >= 0 && k.explicit >= 0 && k.explicit != k.member {
+		repeats = ds.LookupLocal(d.Decls[k.explicit].Name)
+	}
+	notePendingConst(c, name, ds, placeholder, constDeclOf(d, name), readMark, repeats)
+	if k.member >= 0 {
+		c.ConstMembersResolved = slices.Append[@ast.Decl](c.ConstMembersResolved, d.Decls[k.member])
+	}
+	c.ConstResolved = slices.Append[@[]char](c.ConstResolved, name)
+	if constWaited {
+		flushLayoutWaits(c)
+	}
+}

@@ -2,63 +2,94 @@ package "pkg/binate/asm/parse"
 
 import "pkg/binate/asm/x64"
 
-// An x86-64 memory operand (`[...]` in Intel syntax) is a sum of terms joined by `+` and `-`,
-// each sign applying to the term after it alone (`[rbx - 8 + 4]` is rbx - 4):
+// An x86-64 memory operand (`[...]` in Intel syntax) is a sum of terms: those of each bracket
+// group (`[rbx][rcx*4]` is [rbx + rcx*4]) and of a displacement written before them (`8[rbx]`,
+// x64_disp.bn).  A group's terms are joined by `+` and `-`, each sign applying to the term after
+// it alone (`[rbx - 8 + 4]` is rbx - 4):
 //   - at most two 64-bit general registers — a base, and an index, scaled when written
 //     `reg*s` or `s*reg` (s 1, 2, 4 or 8, a number or a constant's name); an unscaled
 //     second register is the index (scale 1).  A register is never subtracted, and RSP is
 //     no index: `[rbx + rsp]` takes RSP as the base and RBX as the index, as clang does;
+//   - `rip`, the RIP-relative form, anywhere (`[rip + x]`, `[x + rip]`, `x[rip]`) but with no
+//     other register (clang drops rip beside one) and a symbol (x64_disp.bn's x64MemOperandOf);
 //   - displacement terms, each a number (`8`, `K*2`, `(l2 - l1)`), summing to a signed
-//     32-bit value (clang silently keeps the low 32 bits of a wider one).  An operand of
-//     displacements alone is the absolute address [disp32].  A label-difference constant
+//     32-bit value (clang silently keeps the low 32 bits of a wider one, and relocates a wider
+//     addend of a symbol, which the encoder rejects) — but any 64-bit addend beside rip, as
+//     clang's relocation takes it.  An operand of displacements alone is the absolute address
+//     [disp32].  A label-difference constant
 //     (x64_imm.bn) is at most one term, added (`[rbx + N]`, not `[rbx - N]`, which clang
-//     misreads as rbx + N).
+//     misreads as rbx + N);
+//   - at most one symbol term, added: a symbol plus numbers (`x`, `x + 8`, `(x + 8)`), relocated
+//     as the displacement (x64.MemSym, R_X86_64_32S), or a symbol and its '@' operator
+//     (`x@TPOFF`, `x@GOTPCREL`; x64_tls.bn).  clang adds a subtracted symbol (`[rbx - x]` is
+//     rbx + x) and drops a scale on one (`[x*2]`), so those are errors.
 // clang reads the operand with C's precedences, under which | ^ & << >> bind more loosely
 // than + and -, while a term here ends at + and -; so a displacement term using one of them
 // outside parentheses is taken only as the operand's one displacement term, not subtracted
 // (`[rbx + 8 | 4]`, `[1 << 2 + rbx]`), and is an error otherwise (`[rbx + 3 | 4 + 1]` is
-// 7 in clang).  `[rip + expr]` is the RIP-relative form (parseX64RipMem).  A term may be a
-// thread-local offset, `sym@TPOFF` or `sym@DTPOFF` (x64_tls.bn).
+// 7 in clang).
 
-// parseX64MemOperand parses a memory operand after its '[' (l just after it) for an access
-// of size bits (0: not written, x64_size.bn).
+// x64MemAcc is a memory operand's terms summed so far, across the displacement written before
+// its brackets and each bracket group (parseX64MemTerms).
+type x64MemAcc struct {
+	Base       int // the base register, -1 for none
+	Index      int // the index register, -1 for none
+	Scale      int // the index's scale
+	Rip        bool // a `rip` term
+	Disp       int64 // the numbers' sum, the symbol term's included
+	NDisp      int // the displacement terms, the symbol term included
+	Loose      bool // a displacement term used | ^ & << >> outside parentheses
+	DiffConsts int // label-difference constant terms (x64_imm.bn)
+	DiffTerms  int // terms a label difference decided, written or a constant
+	Groups     int // the bracket groups
+	Sym        @[]char // the symbol term's symbol, empty for none
+	Op         int // its operator (x64OperatorKind), 0 for none
+}
+
+// newX64MemAcc returns an x64MemAcc with no terms.
+func newX64MemAcc() x64MemAcc {
+	var m x64MemAcc
+	m.Base = -1
+	m.Index = -1
+	m.Scale = 1
+	return m
+}
+
+// parseX64MemOperand parses a memory operand after its first '[' (l just after it) — that
+// group, then any after it — for an access of size bits (0: not written, x64_size.bn).
 func parseX64MemOperand(p @Parser, l Lexer, size int) (Lexer, Token, x64.Operand) {
 	var tok Token
 	l, tok = LexNext(l)
-	var op x64.Operand
-	l, tok, op = parseX64MemTerms(p, l, tok, size, false)
-	return l, tok, op
+	var m x64MemAcc = newX64MemAcc()
+	l, tok, m = parseX64MemTerms(p, l, tok, m, false)
+	if !p.HasError { l, tok, m = parseX64MemGroups(p, l, tok, m) }
+	if p.HasError { return l, tok, x64.Imm(0) }
+	return l, tok, x64MemOperandOf(p, m, size)
 }
 
-// parseX64MemTerms parses a memory operand's terms from tok (l just after it) for an access of
-// size bits: those after its '[', through its ']' — or, bare, a segment override's bare
-// displacement (x64_seg.bn), numbers and a thread-local term ending at the first token that is
-// not + or -.
-func parseX64MemTerms(p @Parser, l Lexer, tok Token, size int,
-		bare bool) (Lexer, Token, x64.Operand) {
-	if !bare && tok.Kind == TOK_IDENT && mnemIs(tok.Text, "rip") {
-		var rop x64.Operand
-		l, tok, rop = parseX64RipMem(p, l)
-		rop.Size = size
-		return l, tok, rop
+// parseX64MemGroups adds to m the bracket groups at tok (l just after it): each '[', its terms
+// and its ']', up to a token that is no '['.
+func parseX64MemGroups(p @Parser, l Lexer, tok Token, m x64MemAcc) (Lexer, Token, x64MemAcc) {
+	for tok.Kind == TOK_LBRACKET {
+		l, tok = LexNext(l)
+		l, tok, m = parseX64MemTerms(p, l, tok, m, false)
+		if p.HasError { break }
 	}
+	return l, tok, m
+}
+
+// parseX64MemTerms adds to m the terms from tok (l just after it): a bracket group's, after its
+// '[', through its ']' — or, bare, a displacement written before any bracket (x64_disp.bn),
+// which takes no register, up to the first token that is not + or -.
+func parseX64MemTerms(p @Parser, l Lexer, tok Token, m x64MemAcc,
+		bare bool) (Lexer, Token, x64MemAcc) {
 	if !bare && tok.Kind == TOK_RBRACKET {
 		setErr(p, "empty memory operand")
-		return l, tok, x64.Imm(0)
+		return l, tok, m
 	}
-	var base int = -1
-	var index int = -1
-	var scale int = 1
-	var disp int64 = 0
-	var nDisp int = 0
-	var loose bool = false // a displacement term used | ^ & << >> outside parentheses
-	var diffConsts int = 0 // label-difference constant terms (x64_imm.bn)
-	var diffTerms int = 0 // terms a label difference decided, written or a constant
-	var tlsSym @[]char // a thread-local term's symbol (x64_tls.bn)
-	var tlsKind int = 0 // and its fixup kind, 0 for none
 	if tok.Kind == TOK_PLUS {
 		setErr(p, intelUnaryPlusError().Err)
-		return l, tok, x64.Imm(0)
+		return l, tok, m
 	}
 	var neg bool = tok.Kind == TOK_MINUS
 	if tok.Kind == TOK_MINUS {
@@ -66,110 +97,148 @@ func parseX64MemTerms(p @Parser, l Lexer, tok Token, size int,
 		// A leading sign is a unary operator to clang (unlike a sign between terms).
 		if tok.Kind == TOK_TILDE {
 			setErr(p, intelTildeError().Err)
-			return l, tok, x64.Imm(0)
+			return l, tok, m
 		}
 		if tok.Kind == TOK_MINUS {
 			setErr(p, intelMinusMinusError().Err)
-			return l, tok, x64.Imm(0)
+			return l, tok, m
 		}
 	}
 	for {
-		var reg int = -1
-		var sc int = 0
-		l, tok, reg, sc = parseX64RegTerm(p, l, tok)
-		if p.HasError { return l, tok, x64.Imm(0) }
-		if reg >= 0 && bare {
-			setErr(p, "a segment override's bare operand is a displacement; a register goes in brackets")
-			return l, tok, x64.Imm(0)
-		}
-		if reg >= 0 {
-			if neg {
-				setErr(p, "a register cannot be subtracted in a memory operand")
-				return l, tok, x64.Imm(0)
-			}
-			if sc == 0 && base < 0 {
-				base = reg
-			} else if index < 0 {
-				index = reg
-				if sc > 0 { scale = sc }
-			} else {
-				setErr(p, "a memory operand takes at most a base and an index register")
-				return l, tok, x64.Imm(0)
-			}
-		} else if x64TlsTermStart(l, tok) {
-			if neg || tlsKind != 0 { return l, tok, x64TlsTermError(p, neg) }
-			var tv int64 = 0
-			l, tok, tlsSym, tlsKind, tv = parseX64TlsTerm(p, l, tok)
-			if p.HasError { return l, tok, x64.Imm(0) }
-			disp = disp + tv
-			nDisp = nDisp + 1
-		} else {
-			var v int64 = 0
-			var groups int = 0
-			var dc bool = false
-			var fd bool = false
-			l, tok, v, groups, dc, fd = parseX64DispTerm(p, l, tok)
-			if p.HasError { return l, tok, x64.Imm(0) }
-			if fd { diffTerms = diffTerms + 1 }
-			if dc {
-				if neg { return l, tok, x64DiffConstTermError(p) }
-				diffConsts = diffConsts + 1
-			}
-			if diffConsts > 0 && diffTerms > 1 { return l, tok, x64DiffConstTermError(p) }
-			if (groups & (EG_BIT | EG_SHIFT)) != 0 {
-				if neg { return l, tok, x64LooseTermError(p) }
-				loose = true
-			}
-			if neg {
-				disp = disp - v
-			} else {
-				disp = disp + v
-			}
-			nDisp = nDisp + 1
-		}
+		l, tok, m = parseX64MemTerm(p, l, tok, m, neg, bare)
+		if p.HasError { return l, tok, m }
 		if tok.Kind != TOK_PLUS && tok.Kind != TOK_MINUS { break }
 		neg = tok.Kind == TOK_MINUS
 		l, tok = LexNext(l)
 		if neg && tok.Kind == TOK_MINUS {
 			setErr(p, intelMinusMinusError().Err)
-			return l, tok, x64.Imm(0)
+			return l, tok, m
 		}
 	}
-	if !bare {
-		if tok.Kind != TOK_RBRACKET {
-			setErr(p, "expected '+', '-' or ']' in the memory operand")
-			return l, tok, x64.Imm(0)
+	if bare { return l, tok, m }
+	if tok.Kind != TOK_RBRACKET {
+		setErr(p, "expected '+', '-' or ']' in the memory operand")
+		return l, tok, m
+	}
+	l, tok = LexNext(l)
+	m.Groups = m.Groups + 1
+	return l, tok, m
+}
+
+// parseX64MemTerm adds to m the term at tok (l just after it), subtracted when neg: `rip`, a
+// register term, a symbol and its operator, or a displacement term — a number, or a symbol plus
+// numbers.  bare is parseX64MemTerms's.
+func parseX64MemTerm(p @Parser, l Lexer, tok Token, m x64MemAcc, neg bool,
+		bare bool) (Lexer, Token, x64MemAcc) {
+	var rip bool = tok.Kind == TOK_IDENT && mnemIs(tok.Text, "rip")
+	var reg int = -1
+	var sc int = 0
+	if !rip {
+		l, tok, reg, sc = parseX64RegTerm(p, l, tok)
+		if p.HasError { return l, tok, m }
+	}
+	if (rip || reg >= 0) && bare {
+		setErr(p,
+				"a displacement before a memory operand's brackets, or with none, takes no register; a "
+						"register goes in brackets")
+		return l, tok, m
+	}
+	if rip || reg >= 0 {
+		if neg {
+			setErr(p, "a register cannot be subtracted in a memory operand")
+			return l, tok, m
 		}
-		l, tok = LexNext(l)
-	}
-	if loose && nDisp > 1 { return l, tok, x64LooseTermError(p) }
-	if disp < -2147483648 || disp > 2147483647 {
-		setErr(p, "a memory operand's displacement is a signed 32-bit value")
-		return l, tok, x64.Imm(0)
-	}
-	if index == x64.RSP {
-		if scale != 1 || base < 0 || base == x64.RSP {
-			setErr(p, "rsp cannot be a memory operand's index")
-			return l, tok, x64.Imm(0)
+		if rip { return x64RipTerm(p, l, tok, m) }
+		if sc == 0 && m.Base < 0 {
+			m.Base = reg
+		} else if m.Index < 0 {
+			m.Index = reg
+			if sc > 0 { m.Scale = sc }
+		} else {
+			setErr(p, "a memory operand takes at most a base and an index register")
 		}
-		index = base
-		base = x64.RSP
+		return l, tok, m
 	}
-	if tlsKind != 0 {
-		// clang reads a label-difference constant as a second symbol.
-		if diffConsts > 0 { return l, tok, x64DiffConstTermError(p) }
-		return l, tok, x64.MemSym(base, index, scale, tlsSym, tlsKind, cast(int, disp), size)
+	if x64OpTermStart(l, tok) {
+		var sym @[]char
+		var kind int = 0
+		var v int64 = 0
+		l, tok, sym, kind, v = parseX64OpTerm(p, l, tok)
+		if p.HasError { return l, tok, m }
+		if binPrec(tok.Kind) >= 2 {
+			setErr(p, "only + or - follows a symbol's '@' operator (clang drops `* 2` after `x@TPOFF`)")
+			return l, tok, m
+		}
+		return l, tok, x64AddSymbol(p, m, sym, kind, v, neg)
 	}
-	if index < 0 && base < 0 { return l, tok, x64.MemAbs(cast(int, disp), size) }
-	var op x64.Operand = x64.Mem(base, cast(int, disp), size)
-	if index >= 0 { op = x64.MemIdx(base, index, scale, cast(int, disp), size) }
-	// clang gives a displacement it reads as a symbol 32 bits, whatever its value.
-	op.Disp32 = diffConsts > 0
-	return l, tok, op
+	var r ExprResult
+	var groups int = 0
+	l, tok, r, groups = parseX64DispTerm(p, l, tok)
+	if p.HasError { return l, tok, m }
+	if !r.Pending && isSymbolic(r) { return l, tok, x64AddSymbol(p, m, r.Sym, 0, r.Val, neg) }
+	if r.FromDiff && !r.Pending { m.DiffTerms = m.DiffTerms + 1 }
+	if r.DiffConst {
+		if neg {
+			x64DiffConstTermError(p)
+			return l, tok, m
+		}
+		m.DiffConsts = m.DiffConsts + 1
+	}
+	if m.DiffConsts > 0 && m.DiffTerms > 1 {
+		x64DiffConstTermError(p)
+		return l, tok, m
+	}
+	if (groups & (EG_BIT | EG_SHIFT)) != 0 {
+		if neg {
+			x64LooseTermError(p)
+			return l, tok, m
+		}
+		m.Loose = true
+	}
+	if neg {
+		m.Disp = m.Disp - r.Val
+	} else {
+		m.Disp = m.Disp + r.Val
+	}
+	m.NDisp = m.NDisp + 1
+	return l, tok, m
+}
+
+// x64RipTerm adds to m the `rip` term at tok (l just after it): once, unscaled.
+func x64RipTerm(p @Parser, l Lexer, tok Token, m x64MemAcc) (Lexer, Token, x64MemAcc) {
+	if m.Rip {
+		setErr(p, "a memory operand takes rip once")
+		return l, tok, m
+	}
+	m.Rip = true
+	l, tok = LexNext(l)
+	if binPrec(tok.Kind) >= 2 { setErr(p, "rip takes no scale: [rip + symbol]") }
+	return l, tok, m
+}
+
+// x64AddSymbol adds to m the symbol term sym — its operator kind (x64OperatorKind, 0 for none)
+// and v the number with it — subtracted when neg: an error, as is a second symbol term (clang
+// adds a lone subtracted symbol, and takes one symbol per operand).
+func x64AddSymbol(p @Parser, m x64MemAcc, sym @[]char, kind int, v int64, neg bool) x64MemAcc {
+	if neg {
+		setErr(p,
+				"a symbol cannot be subtracted or negated in a memory operand (clang adds a lone one); a "
+						"label difference goes in parentheses, (l2 - l1)")
+		return m
+	}
+	if len(m.Sym) > 0 {
+		setErr(p, "a memory operand takes one symbol")
+		return m
+	}
+	m.Sym = sym
+	m.Op = kind
+	m.Disp = m.Disp + v
+	m.NDisp = m.NDisp + 1
+	return m
 }
 
 // x64LooseTermError sets the error for a displacement term using | ^ & << >> outside
-// parentheses beside another displacement term or subtracted (parseX64MemOperand).
+// parentheses beside another displacement term or subtracted (parseX64MemTerms).
 func x64LooseTermError(p @Parser) x64.Operand {
 	setErr(p,
 			"ambiguous operator precedence in a memory operand (clang binds | ^ & << >> more "
@@ -231,7 +300,7 @@ func x64MemReg(p @Parser, name *[]readonly char) int {
 		return -1
 	}
 	if mnemIs(name, "rip") {
-		setErr(p, "rip only begins a memory operand: [rip + symbol]")
+		setErr(p, "rip takes no scale: [rip + symbol]")
 		return -1
 	}
 	setErr(p, quotedName(name, " is not a base or index register"))
@@ -271,71 +340,27 @@ func parseX64Scale(p @Parser, l Lexer, tok Token) (Lexer, Token, int) {
 }
 
 // parseX64DispTerm parses a displacement term at tok (l just after it) — operators binding
-// tighter than + and - over a number — returning its value, the operator groups used
-// outside parentheses, whether it is a label-difference constant (ExprResult.DiffConst), and
-// whether a label difference decided it (ExprResult.FromDiff).
-func parseX64DispTerm(p @Parser, l Lexer, tok Token) (Lexer, Token, int64, int, bool, bool) {
+// tighter than + and - over a number, or a symbol plus numbers (a symbol only added to, or
+// subtracted from on its right: `x*2` is an error) — returning it and the operator groups used
+// outside parentheses.
+func parseX64DispTerm(p @Parser, l Lexer, tok Token) (Lexer, Token, ExprResult, int) {
 	var first Token = tok
 	var r ExprResult
 	var groups int = 0
+	var folds int = p.AcrossFolds
 	l, tok, r, groups = parseBinary(p, l, tok, 2, 0)
 	if r.Ok && ambiguousMix(groups) {
 		r = exprFail("ambiguous operator precedence (Mach-O and ELF differ); add parentheses")
 	}
-	if r.Ok && !r.Pending && (isSymbolic(r) || hasNeg(r)) { r = numberContextError(p, first, r) }
-	if !r.Ok {
-		setErr(p, exprErr(r, "invalid displacement in memory operand"))
-		return l, tok, 0, 0, false, false
-	}
-	return l, tok, r.Val, groups, r.DiffConst, r.FromDiff && !r.Pending
+	r = acrossAtomsResult(p, folds, r)
+	if r.Ok && !r.Pending && (hasNeg(r) || r.Dot) { r = numberContextError(p, first, r) }
+	if !r.Ok { setErr(p, exprErr(r, "invalid displacement in memory operand")) }
+	return l, tok, r, groups
 }
 
 // x64DiffConstTermError sets the error for a label-difference constant subtracted in a memory
-// operand, or beside another term a label difference decided (parseX64MemOperand).
+// operand, or beside another term a label difference decided (parseX64MemTerm).
 func x64DiffConstTermError(p @Parser) x64.Operand {
 	setErr(p, intelDiffConstError().Err)
 	return x64.Imm(0)
-}
-
-// parseX64RipMem parses the rest of a RIP-relative memory operand (l just after `rip`): `+`
-// or `-` and one expression, a symbol plus numbers, optionally with `@GOTPCREL` (a
-// GOT-indirect load), Mach-O's `@TLVP` or a thread-local `@GOTTPOFF`, `@TLSGD`, `@TLSLD` or
-// `@tlsdesc`, each with no addend (parseX64RipSpec), then `]`.
-func parseX64RipMem(p @Parser, l Lexer) (Lexer, Token, x64.Operand) {
-	var tok Token
-	l, tok = LexNext(l)
-	if tok.Kind == TOK_RBRACKET {
-		setErr(p, "rip-relative operand needs a symbol: [rip + label]")
-		return l, tok, x64.Imm(0)
-	}
-	if tok.Kind != TOK_PLUS && tok.Kind != TOK_MINUS {
-		setErr(p, "expected '+' or '-' after rip")
-		return l, tok, x64.Imm(0)
-	}
-	if tok.Kind == TOK_PLUS { l, tok = LexNext(l) }
-	var rr ExprResult
-	l, tok, rr = parseSymExpr(p, l, tok)
-	if !rr.Ok {
-		setErr(p, exprErr(rr, "invalid rip-relative operand (a symbol plus numbers)"))
-		return l, tok, x64.Imm(0)
-	}
-	if len(rr.Sym) == 0 {
-		// `[rip + disp]` with no symbol has no relocation to form.
-		setErr(p, "rip-relative operand needs a symbol: [rip + label]")
-		return l, tok, x64.Imm(0)
-	}
-	var spec int = 0
-	if tok.Kind == TOK_AT {
-		l, tok, spec = parseX64RipSpec(p, l, rr)
-		if p.HasError { return l, tok, x64.Imm(0) }
-	}
-	if tok.Kind != TOK_RBRACKET {
-		setErr(p, "expected ']' after the rip-relative operand")
-		return l, tok, x64.Imm(0)
-	}
-	l, tok = LexNext(l)
-	if spec == x64SpecGot { return l, tok, x64.RipGotLabel(rr.Sym) }
-	if spec == x64SpecTlvp { return l, tok, x64.RipTlvp(rr.Sym) }
-	if spec != 0 { return l, tok, x64.RipTls(rr.Sym, spec) }
-	return l, tok, x64.RipLabelAddend(rr.Sym, rr.Val)
 }

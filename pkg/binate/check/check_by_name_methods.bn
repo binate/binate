@@ -1,0 +1,163 @@
+package "pkg/binate/check"
+
+import "pkg/binate/ast"
+import "pkg/binate/types"
+import "pkg/std/vec"
+import "pkg/stdx/slices"
+
+// The by-name walk's calls that define a method of the batch: one when collection
+// reaches it or a selection defines it on demand (defineBatchMethod), and one a
+// declaration's resolution makes for a method it calls on a receiver whose type it
+// can name (pushMethodReadFrom).  Marked as being defined, each resolves what its
+// signature reads ahead, so that a chain of methods whose signatures each call the
+// next (`func (s S0) M() [len(S1{}.M())]int8`, ...) is defined with no recursion.
+
+// byNameMethodWaited is whether the definition the last method call not made for
+// another declaration made read a declaration being resolved (defineBatchMethod).
+var byNameMethodWaited bool
+
+// stepBatchMethod runs the method's call k to its next call or its end.
+func stepBatchMethod(c @Checker, k @byNameCall) {
+	if k.pc == byNameStart {
+		if !startBatchMethod(c, k) {
+			byNameReturn(k)
+			return
+		}
+		k.pc = byNameLoopReads
+	}
+	if stepReadsAhead(c, k) { return }
+	finishBatchMethod(c, k)
+	byNameReturn(k)
+}
+
+// startBatchMethod starts the method's call k: one made for another declaration defines
+// k.d on demand only while the batch's declarations are collected, when it is not
+// defined -- on demand or in its turn -- nor being defined, in its own declaration's
+// context and a demand frame, as batchMethodOnDemand defines one -- and reports whether
+// it does.  The method is marked as being defined (MethodsDefining,
+// enterDeclResolution), and what its parameters' and results' types read is found
+// (k.reads) -- unless collection resolves no signature for it (type parameters, a blank
+// name, a receiver it rejects: methodReceiverAccepted), it is a generic type's, or an
+// instance is being built.
+func startBatchMethod(c @Checker, k @byNameCall) bool {
+	var b @DeclBatch = c.Batch
+	var d @ast.Decl = k.d
+	if k.onDemand {
+		if b == nil || !b.Collecting || declInVec(b.MethodsCollected, d) ||
+				declInList(b.MethodsDefined, d) || declInList(b.MethodsDefining, d) || skipDemand(c) {
+			return false
+		}
+		k.saved = enterPackageDecl(c, d)
+		k.undo = snapshotDecl(c, d)
+		k.mark = len(b.MethodsDefined)
+		k.generics = c.Generics.Methods
+		k.framed = enterDemandFrame(c)
+	}
+	b.MethodsDefining = slices.Append[@ast.Decl](b.MethodsDefining, d)
+	enterDeclResolution(c, d)
+	if !buildingInstances(c) && len(d.TypeParams) == 0 && !isBlank(d.Name) &&
+			receiverBaseInstantiation(d.Recv.Type) == nil && methodReceiverAccepted(c, d) {
+		for i := 0; i < len(d.Params); i++ {
+			collectTypeExprReads(c, d.Params[i].Type, &k.reads)
+		}
+		for i := 0; i < len(d.Results); i++ {
+			collectTypeExprReads(c, d.Results[i], &k.reads)
+		}
+	}
+	return true
+}
+
+// finishBatchMethod defines the method of the call k (collectMethodDecl), what its
+// signature reads resolved, and, for one made for another declaration, keeps the
+// definition as batchMethodOnDemand does: taken back, with what was defined on demand
+// after it, when it read a layout not built yet, inside an instance's build.
+func finishBatchMethod(c @Checker, k @byNameCall) {
+	var b @DeclBatch = c.Batch
+	var d @ast.Decl = k.d
+	collectMethodDecl(c, d)
+	b.MethodsDefining = b.MethodsDefining[:len(b.MethodsDefining) - 1]
+	var readWaited bool = leaveDeclResolution(c)
+	if !k.onDemand {
+		byNameMethodWaited = readWaited
+		return
+	}
+	var waited bool = leaveDemandFrame(c, k.framed)
+	leavePackageDecl(c, k.saved)
+	b.MethodsDefined = slices.Append[@ast.Decl](b.MethodsDefined, d)
+	b.MethodsUndo = slices.Append[@DeclRollback](b.MethodsUndo, k.undo)
+	if waited {
+		undoBatchMethods(c, k.mark, k.generics)
+		ast.ClearCheckerAnnotations(d)
+		return
+	}
+	if readWaited { flushLayoutWaits(c) }
+}
+
+// pushMethodReadFrom starts, from the running call k, the call that defines the batch's
+// method name of the receiver read through owner (as kind says: methodReadRecv) ahead,
+// and reports what follows, as pushReadFrom does: one not defined yet is defined as one
+// selected on demand is (batchMethodOnDemand), and one defined needs nothing.  A name
+// the receiver's type has a field of -- which the selection calls instead (spec
+// expr.member) --, a method being defined or one the type does not declare (a promoted
+// method, an undefined one ...), and a receiver whose type is no named type of the
+// package -- an instance, an interface ... -- are left where they are read, with the
+// reads after them.
+func pushMethodReadFrom(c @Checker, k @byNameCall, owner *[]readonly char, name @[]char,
+		kind int) int {
+	var b @DeclBatch = c.Batch
+	if b == nil || !b.Collecting || inBniBuild(c) || !types.CharEq(c.curPkgPath, b.Pkg) {
+		return byNameReadStop
+	}
+	var named @types.Type = methodReadRecv(c, owner, kind)
+	if named == nil { return byNameReadStop }
+	var td @ast.Decl = batchTypeDeclOf(c, named)
+	if td != nil && td.TypeRef != nil &&
+			fieldPath(c, td.TypeRef, name, false, vec.New[@ast.Decl](), 0) {
+		return byNameReadStop
+	}
+	if named.LookupMethod(name) != nil { return byNameReadNext }
+	var none @ast.Decl
+	var d @ast.Decl = batchMethodDecl(c, named, none, name)
+	if d == nil || declInList(b.MethodsDefining, d) { return byNameReadStop }
+	if declInVec(b.MethodsCollected, d) || declInList(b.MethodsDefined, d) { return byNameReadNext }
+	var r @byNameCall = byNameCallFrom(k, byNameBatchMethod, name)
+	r.d = d
+	r.onDemand = true
+	return byNameReadPushed
+}
+
+// methodReadRecv returns the named type of a method read's receiver, through owner:
+// the type a composite literal is of (readMethodOfType), a variable's or constant's
+// type (readMethodOfValue), or the result of a function returning one value
+// (readMethodOfCall) -- through a pointer -- or nil when it is none of these, or no
+// named type, or an instance.
+func methodReadRecv(c @Checker, owner *[]readonly char, kind int) @types.Type {
+	var none @types.Type
+	var sym @Symbol = c.Scope.Lookup(owner)
+	if sym == nil || sym.Type == nil { return none }
+	var t @types.Type = sym.Type
+	if kind == readMethodOfType {
+		if sym.Kind != types.SYM_TYPE { return none }
+	} else if kind == readMethodOfValue {
+		if sym.Kind != types.SYM_VAR && sym.Kind != types.SYM_CONST { return none }
+	} else {
+		if sym.Kind != types.SYM_FUNC || t.Kind != types.TYP_FUNC || len(t.Results) != 1 { return none }
+		t = t.Results[0]
+	}
+	if t != nil && (t.Kind == types.TYP_POINTER || t.Kind == types.TYP_MANAGED_PTR) { t = t.Elem }
+	if t == nil || t.Kind != types.TYP_NAMED || t.InstDecl != nil { return none }
+	return t
+}
+
+// methodReceiverAccepted reports whether collection accepts the method d's receiver
+// before it resolves its signature (collectMethodDecl): a named type of the package
+// (methodBaseTypeForDecl -- not an alias, a builtin or another package's type) at most
+// one pointer level down (declaredReceiverKindOK).
+func methodReceiverAccepted(c @Checker, d @ast.Decl) bool {
+	if methodBaseTypeForDecl(c, d) == nil { return false }
+	var levels int = 0
+	for te := d.Recv.Type; te != nil && te.Kind != ast.TEXPR_NAMED; te = te.Base {
+		if te.Kind == ast.TEXPR_POINTER || te.Kind == ast.TEXPR_MANAGED { levels = levels + 1 }
+	}
+	return levels <= 1
+}

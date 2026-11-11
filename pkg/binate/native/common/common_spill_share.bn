@@ -1,0 +1,148 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/std/vec"
+
+// Spill slots shared by lifetime.  A value the register allocator does not home is
+// stored to its spill slot only while it is live (a dirty value is stored on
+// eviction only if it is in CurLive, StoreOnEvict) and reloaded from it only at a
+// use, which the liveness sees (every read of a value is one the liveness covers,
+// or a backend fold moves the use there).  So the slots of two values whose live
+// spans do not meet can be the same 8 bytes.  PlanFrame gives the values whose spans
+// it knows (noteLiveSpans) such shared slots (planSharedSpills); any other value
+// keeps a slot of its own.
+
+// noteLiveSpans records in m.liveSpans the span of each value in intervals: its
+// first live position, its last live position plus one, and the position of its
+// definition (-1 for a parameter), three ints per value id, -1 where absent.
+// AllocateRegisters calls it with fresh set, clearing every earlier entry, and
+// AllocateFpRegisters then adds its own class's values; positions are the ones
+// ComputeLiveness assigns, the same for both classes.
+func (m @RegMap) noteLiveSpans(f @ir.Func, intervals @[]@LiveInterval, fresh bool) {
+	if fresh || len(m.liveSpans) < 3 * f.NextID {
+		var spans @[]int = make_slice(int, 3 * f.NextID)
+		for i := 0; i < len(spans); i++ {
+			spans[i] = -1
+			if !fresh && i < len(m.liveSpans) { spans[i] = m.liveSpans[i] }
+		}
+		m.liveSpans = spans
+	}
+	for i := 0; i < len(intervals); i++ {
+		var iv @LiveInterval = intervals[i]
+		if iv.ID < 0 || iv.ID >= f.NextID || len(iv.Ranges) == 0 { continue }
+		m.liveSpans[3 * iv.ID] = iv.Start()
+		m.liveSpans[3 * iv.ID + 1] = iv.End()
+		m.liveSpans[3 * iv.ID + 2] = iv.DefPos
+	}
+}
+
+// sharedSpan returns the span in which the spill slot of the value ins is used, and
+// whether PlanFrame may give it a shared slot: whether its span is known, which also
+// makes it a scalar the allocator classes, with an 8-byte slot.  A value with no
+// home uses its slot while it is live; so does a homed indirect call target (the
+// call saves it there, while it is live).  A homed call or OP_BOX result's slot is
+// used only by the instruction that defines it (needsSpillSlot), so its span is that
+// one position.
+func (m @RegMap) sharedSpan(ins @ir.Instr, targets @[]bool) (int, int, bool) {
+	var id int = ins.ID
+	if id < 0 || 3 * id + 2 >= len(m.liveSpans) || m.liveSpans[3 * id] < 0 {
+		return -1, -1, false
+	}
+	if m.LookupHome(id) >= 0 && !(id < len(targets) && targets[id]) {
+		var def int = m.liveSpans[3 * id + 2]
+		if def < 0 { return -1, -1, false }
+		return def, def + 1, true
+	}
+	return m.liveSpans[3 * id], m.liveSpans[3 * id + 1], true
+}
+
+// planSharedSpills gives every value of f that needs a spill slot (needsSpillSlot,
+// targets as indirectCallTargets returns them) and has a known span (sharedSpan) a
+// shared slot from offset up (packSpillSlots), appending each to spillIDs and
+// spillOffsets, and returns which values it placed (by id) and the offset past the
+// slots.  PlanFrame calls it before it lays down the regions and allocas, so the
+// spill slots sit nearest SP, where their frequent accesses take the shortest
+// offsets, and its walk skips the values placed here.
+func (m @RegMap) planSharedSpills(f @ir.Func, targets @[]bool, spillIDs @vec.Vec[int],
+		spillOffsets @int64List, offset int64) (@[]bool, int64) {
+	var placed @[]bool = make_slice(bool, f.NextID)
+	var ids @vec.Vec[int] = vec.New[int]()
+	var starts @vec.Vec[int] = vec.New[int]()
+	var ends @vec.Vec[int] = vec.New[int]()
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			if ins.ID < 0 || ins.ID >= f.NextID || placed[ins.ID] || ins.Op == iropcode.OP_ALLOC ||
+					InstrIsVoid(ins) || !m.needsSpillSlot(ins, targets) {
+				continue
+			}
+			start, end, ok := m.sharedSpan(ins, targets)
+			if !ok { continue }
+			placed[ins.ID] = true
+			ids.Push(ins.ID)
+			starts.Push(start)
+			ends.Push(end)
+		}
+	}
+	offs, past := packSpillSlots(starts.Items(), ends.Items(), offset)
+	for k := 0; k < len(offs); k++ {
+		spillIDs.Push(ids.Get(k))
+		spillOffsets.Push(offs[k])
+	}
+	return placed, past
+}
+
+// packSpillSlots gives value k (its span [starts[k], ends[k]), ends[k] > starts[k] >=
+// 0) an 8-byte slot at offs[k], from offset up, and returns offs and the offset past
+// the last slot (both saturating, frameAdd).  Values whose spans do not meet may
+// share a slot: the values are taken in order of span start, each into a slot whose
+// last value's span has ended, or a new one.  Spans are intervals, so this uses as
+// many slots as the most spans that meet at one position -- the fewest possible.
+// Both orders come from buckets by position, so the cost is linear in the values and
+// the positions.
+func packSpillSlots(starts @[]int, ends @[]int, offset int64) (@[]int64, int64) {
+	var n int = len(starts)
+	var offs @[]int64 = make_slice(int64, n)
+	var last int = 0
+	for k := 0; k < n; k++ {
+		if ends[k] > last { last = ends[k] }
+	}
+	// Values by span start, and slots by the end of their last value's span: each a
+	// list per position, threaded through next arrays and ended by -1.
+	var byStart @[]int = make_slice(int, last + 1)
+	var byEnd @[]int = make_slice(int, last + 1)
+	for p := 0; p <= last; p++ {
+		byStart[p] = -1
+		byEnd[p] = -1
+	}
+	var nextValue @[]int = make_slice(int, n)
+	for k := n - 1; k >= 0; k-- {
+		nextValue[k] = byStart[starts[k]]
+		byStart[starts[k]] = k
+	}
+	var nextSlot @[]int = make_slice(int, n)
+	var free @[]int = make_slice(int, n)
+	var nFree int = 0
+	var slots int = 0
+	for p := 0; p <= last; p++ {
+		for s := byEnd[p]; s >= 0; s = nextSlot[s] {
+			free[nFree] = s
+			nFree++
+		}
+		for k := byStart[p]; k >= 0; k = nextValue[k] {
+			var s int = slots
+			if nFree > 0 {
+				nFree--
+				s = free[nFree]
+			} else {
+				slots++
+			}
+			offs[k] = frameAdd(offset, cast(int64, 8 * s))
+			nextSlot[s] = byEnd[ends[k]]
+			byEnd[ends[k]] = s
+		}
+	}
+	return offs, frameAdd(offset, cast(int64, 8 * slots))
+}

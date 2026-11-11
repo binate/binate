@@ -1,0 +1,188 @@
+package "pkg/binate/parser"
+
+import "pkg/binate/ast"
+import "pkg/binate/token"
+
+// parseType parses a type expression and stamps its End (the position past the last
+// token consumed) on it and on every type expression nested in it.
+//
+// A chain of prefixes -- `readonly`, `*`, `@`, `[N]`, `[]` and `[...]` -- is read in a
+// loop (parseTypePrefix), not with a call per prefix, so a chain nested as deeply as a
+// type may be (type.named.depth: `[1]` 1024 times over int) takes the stack of one
+// prefix, not of each.  Each prefix's node wraps the next one's, the last one wraps the
+// type the chain prefixes (parseTypeInner, or a function value's parameters and results,
+// parseFuncTypeBody), and every one of them ends where that type does.  The forms those
+// parse -- a parenthesized type, a struct, a function value's parameters and results --
+// still take a call per level of their own nesting.
+func parseType(p @Parser) @ast.TypeExpr {
+	var head @ast.TypeExpr
+	var tail @ast.TypeExpr
+	var nodes int = 0
+	var t @ast.TypeExpr
+	var whole bool = false
+	for {
+		var outer @ast.TypeExpr
+		var inner @ast.TypeExpr
+		var n int
+		outer, inner, n = parseTypePrefix(p)
+		if n < 0 {
+			// A function value's head: its parameters and results are parsed here,
+			// once parseTypePrefix's frame is gone.
+			t = parseFuncTypeBody(p, outer.Pos, outer.Kind)
+			whole = true
+			break
+		}
+		if n == 0 { break }
+		if nodes == 0 {
+			head = outer
+		} else {
+			tail.Base = outer
+		}
+		tail = inner
+		nodes = nodes + n
+	}
+	if !whole { t = parseTypeInner(p) }
+	// A type that consumed no token (an error's) keeps its own position as its End.
+	if t != nil { t.End = endFrom(t.Pos, p.prev.End) }
+	if nodes == 0 { return t }
+	tail.Base = t
+	var w @ast.TypeExpr = head
+	for i := 0; i < nodes; i++ {
+		w.End = p.prev.End
+		w = w.Base
+	}
+	return head
+}
+
+// parseTypePrefix reads one prefix of a type expression and returns what it made as
+// (outer, inner, n):
+//   - n > 0: the n nodes it made (1, or 2 for a prefix recovered from a syntax error),
+//     outer wrapping inner, whose Base the type the prefix applies to fills;
+//   - n < 0: the tokens began a function value (`*func(...)` / `@func(...)`); it
+//     consumed `*func` / `@func`, and outer carries the value's kind and position, for
+//     parseType to parse its parameters and results;
+//   - n == 0: no prefix starts here; nothing was consumed.
+func parseTypePrefix(p @Parser) (@ast.TypeExpr, @ast.TypeExpr, int) {
+	var none @ast.TypeExpr
+	if p.tok.Typ == token.READONLY {
+		// `readonly T` — type-expression modifier marking the value
+		// at this storage as read-only through this access path.
+		var ro @ast.TypeExpr = typePrefixNode(ast.TEXPR_CONST, p.tok.Pos)
+		p.next() // consume readonly
+		return ro, ro, 1
+	}
+	if p.tok.Typ == token.STAR {
+		// *T, *[]T, or *func(...) ret
+		var pos token.Pos = p.tok.Pos
+		p.next()
+		if p.tok.Typ == token.FUNC {
+			// *func(args) ret — raw function value (16-byte
+			// {vtable, data} pair, not a 1-word pointer).
+			p.next() // consume func
+			return typePrefixNode(ast.TEXPR_FUNC_VALUE, pos), none, -1
+		}
+		if p.tok.Typ == token.LBRACKET {
+			var lbrack token.Pos = p.tok.Pos
+			p.next() // consume [
+			if p.tok.Typ == token.RBRACKET {
+				// *[]T — raw slice sugar (same AST as *[]T).
+				p.next() // consume ]
+				var sl @ast.TypeExpr = typePrefixNode(ast.TEXPR_SLICE, lbrack)
+				return sl, sl, 1
+			}
+			// Bare "*[<expr>" is not valid — force parens.
+			p.errMsg(
+					"bare \"*[\" is raw-slice sugar (*[]T); "
+							"use \"*([N]T)\" for pointer to array or "
+							"\"*(*[]T)\" for pointer to slice")
+			// Recover as pointer-to-array.
+			return recoveredArrayPrefix(p, ast.TEXPR_POINTER, pos, lbrack)
+		}
+		var ptr @ast.TypeExpr = typePrefixNode(ast.TEXPR_POINTER, pos)
+		return ptr, ptr, 1
+	}
+	if p.tok.Typ == token.AT {
+		// @T, @[]T, or @func(...) ret
+		var pos token.Pos = p.tok.Pos
+		p.next()
+		if p.tok.Typ == token.FUNC {
+			// @func(args) ret — managed function value.
+			p.next() // consume func
+			return typePrefixNode(ast.TEXPR_MANAGED_FUNC_VALUE, pos), none, -1
+		}
+		if p.tok.Typ == token.LBRACKET {
+			var lbrack token.Pos = p.tok.Pos
+			p.next() // consume [
+			if p.tok.Typ == token.RBRACKET {
+				// @[]T — managed slice
+				p.next() // consume ]
+				var ms @ast.TypeExpr = typePrefixNode(ast.TEXPR_MANAGED_SLICE, pos)
+				return ms, ms, 1
+			}
+			// Bare "@[<expr>" is not valid: "@[" is managed-slice
+			// sugar ("@[]T"), so a managed pointer to an array needs
+			// parens ("@([N]T)").  Mirrors the "*[" rejection above so
+			// the "@[" / "*[" sugar is unambiguously a slice.
+			p.errMsg(
+					"bare \"@[\" is managed-slice sugar (@[]T); "
+							"use \"@([N]T)\" for managed pointer to array")
+			// Recover as managed pointer-to-array.
+			return recoveredArrayPrefix(p, ast.TEXPR_MANAGED, pos, lbrack)
+		}
+		var mp @ast.TypeExpr = typePrefixNode(ast.TEXPR_MANAGED, pos)
+		return mp, mp, 1
+	}
+	if p.tok.Typ == token.LBRACKET {
+		// [N]T — array type; bare []T is not valid.
+		var pos token.Pos = p.tok.Pos
+		p.next() // consume [
+		if p.tok.Typ == token.RBRACKET {
+			// Bare []T is not valid — use *[]T.
+			p.errMsg("bare \"[\" \"]\" is no longer valid raw-slice syntax; use \"*[]T\" instead")
+			p.next() // consume ]
+			var bs @ast.TypeExpr = typePrefixNode(ast.TEXPR_SLICE, pos)
+			return bs, bs, 1
+		}
+		if p.tok.Typ == token.ELLIPSIS {
+			// [...]T — inferred-length array.  The length is the element count
+			// of the composite literal this heads; it has no value as a bare
+			// type, so the checker (resolveTypeExpr) rejects `[...]` outside a
+			// composite-literal head.  Len stays nil; LenInferred marks it.
+			p.next() // consume ...
+			p.expect(token.RBRACKET)
+			var ia @ast.TypeExpr = typePrefixNode(ast.TEXPR_ARRAY, pos)
+			ia.LenInferred = true
+			return ia, ia, 1
+		}
+		// [N]T — array type
+		var length @ast.Expr = parseExprAllowComposite(p)
+		p.expect(token.RBRACKET)
+		var arr @ast.TypeExpr = typePrefixNode(ast.TEXPR_ARRAY, pos)
+		arr.Len = length
+		return arr, arr, 1
+	}
+	return none, none, 0
+}
+
+// recoveredArrayPrefix reads the rest of a `*[N]` / `@[N]` prefix after its error --
+// the length and the `]` -- and returns it as the two nodes it recovers to, a pointer
+// of kind ptrKind at pos (`*` / `@`) wrapping an array at lbrack.
+func recoveredArrayPrefix(p @Parser, ptrKind int, pos token.Pos,
+		lbrack token.Pos) (@ast.TypeExpr, @ast.TypeExpr, int) {
+	var length @ast.Expr = parseExpr(p)
+	p.expect(token.RBRACKET)
+	var arr @ast.TypeExpr = typePrefixNode(ast.TEXPR_ARRAY, lbrack)
+	arr.Len = length
+	var ptr @ast.TypeExpr = typePrefixNode(ptrKind, pos)
+	ptr.Base = arr
+	return ptr, arr, 2
+}
+
+// typePrefixNode returns a type-expression node of the given kind at pos, its Base
+// (the type it prefixes) still to be filled.
+func typePrefixNode(kind int, pos token.Pos) @ast.TypeExpr {
+	var te @ast.TypeExpr = make(ast.TypeExpr)
+	te.Kind = kind
+	te.Pos = pos
+	return te
+}

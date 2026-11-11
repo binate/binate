@@ -1,8 +1,8 @@
 /* Linker script bnc links an arm32-baremetal `--test` binary with: baremetal.ld's
- * layout over 256 MiB of RAM, where the heap takes everything the image and a 16 MiB
+ * layout over 512 MiB of RAM, where the heap takes everything the image and a 16 MiB
  * stack leave.  A test binary carries a package's whole test suite — its code, its
  * test data, and the allocations a run of the whole suite adds up to — so it gets far
- * more memory than a program.  The unit-test runner launches QEMU with `-m 256M` to
+ * more memory than a program.  The unit-test runner launches QEMU with `-m 512M` to
  * match.
  *
  *   heap   — from `__heap_start` (8-aligned, just past .bss) to `__heap_end`, 16 MiB
@@ -16,7 +16,7 @@ ENTRY(_start)
 
 MEMORY
 {
-	RAM (rwx) : ORIGIN = 0x40000000, LENGTH = 256M
+	RAM (rwx) : ORIGIN = 0x40000000, LENGTH = 512M
 }
 
 SECTIONS

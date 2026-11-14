@@ -1,0 +1,240 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/std/table"
+import "pkg/std/vec"
+
+// The checker's records of what a type expression -- or an expression that names a
+// type -- denotes, as IR-gen reads them.  A record is concrete or abstract: an
+// abstract one holds a type parameter or Self, or an array length that depends on
+// a type parameter, so it describes a generic declaration rather than a type IR-gen
+// can lay out.  Resolving a type (resolveTypeExpr, typeArgExprToType,
+// genericInstanceName) maps the record, and an abstract one there is an internal
+// error (requireConcreteRecord): IR-gen generates only instances, whose records
+// the checker made concrete.  The readers a generic declaration's own syntax
+// reaches -- a generic method's receiver, an impl's keys, an interface alias's
+// target -- take only a concrete record (concreteRecord) and read the written
+// name otherwise.
+
+// typeExprRecord returns the checker's record of what te denotes, or nil: no
+// checker (IR-gen's unit tests), or no record (syntax IR-gen made itself).
+func typeExprRecord(gc @GenCtx, te @ast.TypeExpr) @types.Type {
+	if te == nil || gc.Mod == nil || gc.Mod.Checker == nil { return nil }
+	return gc.Mod.Checker.TypeExprType(te)
+}
+
+// exprDenotedRecord is typeExprRecord for an expression e that names a type (a
+// type argument, a method expression's base).
+func exprDenotedRecord(gc @GenCtx, e @ast.Expr) @types.Type {
+	if e == nil || gc.Mod == nil || gc.Mod.Checker == nil { return nil }
+	return gc.Mod.Checker.ExprDenotedType(e)
+}
+
+// concreteRecord returns the checker's record of what te denotes when it is
+// concrete (isAbstractType), or nil: no checker, no record, or an abstract one.
+func concreteRecord(gc @GenCtx, te @ast.TypeExpr) @types.Type {
+	return concreteOrNil(typeExprRecord(gc, te))
+}
+
+// concreteOrNil returns rec when it is concrete, nil when it is nil or abstract.
+func concreteOrNil(rec @types.Type) @types.Type {
+	if rec == nil || isAbstractType(rec) { return nil }
+	return rec
+}
+
+// requireConcreteRecord returns rec, the checker's record of the type written at
+// pos (what names the place), for IR-gen to map; an abstract record is an
+// internal error.
+func requireConcreteRecord(rec @types.Type, pos token.Pos, what *[]readonly char) @types.Type {
+	if isAbstractType(rec) {
+		var msg @[]char = buf.Concat("internal error: IR-gen reached the abstract type ", rec.TypeName())
+		msg = buf.Concat(msg, buf.Concat(" for ", what))
+		msg = buf.Concat(msg, buf.Concat(" at ", token.PosString(pos)))
+		panic(buf.Concat(msg, " (compiler bug)"))
+	}
+	return rec
+}
+
+// isAbstractType reports whether the checker type t is abstract: a type parameter
+// or Self occurs in it, or an array length depends on a type parameter.  It walks
+// into a composite type's parts, an instance's type arguments and an unnamed
+// struct's fields, but not into a named type's definition, and it visits each type
+// once (typeWalk), so it ends however deep, shared or self-referring the types; the
+// walk is a loop, so the depth of a type costs no stack.  A chain of types with one
+// part each (`*T`, `@[]char`), the commonest, is followed here without a walk.
+func isAbstractType(t @types.Type) bool {
+	var u @types.Type = t
+	for u != nil {
+		if isAbstractPart(u) { return true }
+		var slots int = typePartSlots(u)
+		var only @types.Type
+		var count int
+		for i := 0; i < slots; i++ {
+			var p @types.Type = typePart(u, i)
+			if p == nil { continue }
+			count++
+			only = p
+		}
+		if count > 1 { return isAbstractWalk(u) }
+		u = only
+	}
+	return false
+}
+
+// isAbstractPart reports whether t itself, apart from its parts, makes a type
+// abstract: it is a type parameter or Self, or an array whose length depends on a
+// type parameter.
+func isAbstractPart(t @types.Type) bool {
+	if t.Kind == types.TYP_TYPE_PARAM || t.Kind == types.TYP_SELF { return true }
+	return t.Kind == types.TYP_ARRAY && t.ArrayLenDependent
+}
+
+// isAbstractWalk is isAbstractType for a type t with two or more parts.
+func isAbstractWalk(t @types.Type) bool {
+	var w typeWalk
+	var u @types.Type = t
+	for u != nil {
+		if isAbstractPart(u) { return true }
+		u = w.next(u)
+	}
+	return false
+}
+
+// typeWalkInlineVisits is how many types isAbstractType's walk visits before it
+// keeps the types it has pushed: so few visits cannot multiply along shared paths.
+const typeWalkInlineVisits = 64
+
+// typeWalk is isAbstractType's walk.  The parts still to visit are held in pending
+// while they fit and the walk has made at most typeWalkInlineVisits visits, so a
+// type with a few parts makes no allocation; past either, they move to the work
+// list, and every type pushed from then on is kept in seen, so that one reached
+// along several paths -- shared through aliases or type arguments -- is visited
+// once.  (A type visited before the switch is visited at most once more.)
+type typeWalk struct {
+	pending  [8]@types.Type
+	npending int
+	visits   int
+	work     @vec.Vec[@types.Type]
+	seen     @table.Table[@types.Type, bool, TypeHasher, TypeEq]
+}
+
+// next returns the type to visit after t, or nil when the walk is done.
+func (w *typeWalk) next(t @types.Type) @types.Type {
+	w.visits += 1
+	if w.work == nil && w.visits > typeWalkInlineVisits { w.spill() }
+	var slots int = typePartSlots(t)
+	for i := 0; i < slots; i++ {
+		var p @types.Type = typePart(t, i)
+		if p == nil { continue }
+		if w.work == nil && w.npending == len(w.pending) { w.spill() }
+		if w.work == nil {
+			w.pending[w.npending] = p
+			w.npending += 1
+		} else if !w.seen.Has(p) {
+			w.seen.Put(p, true)
+			w.work.Push(p)
+		}
+	}
+	if w.work == nil {
+		if w.npending == 0 { return nil }
+		w.npending -= 1
+		var u @types.Type = w.pending[w.npending]
+		w.pending[w.npending] = nil
+		return u
+	}
+	if w.work.Len() == 0 { return nil }
+	var u @types.Type
+	u, _ = w.work.Pop()
+	return u
+}
+
+// spill moves the pending parts to the work list, which it makes, with the set of
+// the types pushed.
+func (w *typeWalk) spill() {
+	w.work = vec.New[@types.Type]()
+	w.seen = table.NewTable[@types.Type, bool, TypeHasher, TypeEq](TypeHasher{}, TypeEq{})
+	for i := 0; i < w.npending; i++ {
+		if !w.seen.Has(w.pending[i]) {
+			w.seen.Put(w.pending[i], true)
+			w.work.Push(w.pending[i])
+		}
+		w.pending[i] = nil
+	}
+	w.npending = 0
+}
+
+// typeHasParts reports whether t has a part isAbstractType walks into (typePart).
+func typeHasParts(t @types.Type) bool {
+	if t == nil { return false }
+	var slots int = typePartSlots(t)
+	for i := 0; i < slots; i++ {
+		if typePart(t, i) != nil { return true }
+	}
+	return false
+}
+
+// typePartSlots returns how many slots typePart enumerates for t.
+func typePartSlots(t @types.Type) int {
+	var n int = 2 + len(t.InstArgs) + len(t.Params) + len(t.Results)
+	if t.Kind == types.TYP_STRUCT && len(t.Name) == 0 { n += len(t.Fields) }
+	return n
+}
+
+// typePart returns slot i of the parts of t that isAbstractType walks into (nil
+// for an empty one): its element, its alias target, its type arguments, an unnamed
+// struct's field types, its parameter types and its result types.
+func typePart(t @types.Type, i int) @types.Type {
+	if i == 0 { return t.Elem }
+	if i == 1 { return t.Target }
+	var j int = i - 2
+	if j < len(t.InstArgs) { return t.InstArgs[j] }
+	j -= len(t.InstArgs)
+	if t.Kind == types.TYP_STRUCT && len(t.Name) == 0 {
+		if j < len(t.Fields) { return t.Fields[j].Type }
+		j -= len(t.Fields)
+	}
+	if j < len(t.Params) { return t.Params[j].Type }
+	j -= len(t.Params)
+	return t.Results[j]
+}
+
+// irAliasFromChecker maps the checker alias t to its target's type -- while a
+// record is mapped in lookup mode (typeFromRecord), once per mapping: an alias
+// reached along several paths of one type (`type A1 = struct { x A0; y A0 }`, and
+// so on up) would otherwise be mapped once per path, in time exponential in the
+// depth.  An alias of a type with no parts (`char`, a named type) is mapped
+// directly, which costs no more than a lookup; a nil mapping (the type is not
+// registered yet) is not kept.
+func irAliasFromChecker(gc @GenCtx, t @types.Type) @types.Type {
+	if gc.RecordMappings == 0 || gc.NamingInstances || !typeHasParts(t.Target) {
+		return irTypeFromChecker(gc, t.Target)
+	}
+	if gc.AliasesMapped != nil {
+		var known @types.Type
+		var have bool
+		known, have = gc.AliasesMapped.Get(t)
+		if have { return known }
+	}
+	var mapped @types.Type = irTypeFromChecker(gc, t.Target)
+	if mapped == nil { return nil }
+	if gc.AliasesMapped == nil {
+		gc.AliasesMapped = table.NewTable[@types.Type, @types.Type, TypeHasher, TypeEq](TypeHasher{},
+				TypeEq{})
+	}
+	gc.AliasesMapped.Put(t, mapped)
+	return mapped
+}
+
+// TypeHasher.Hash hashes a type's address.
+func (h TypeHasher) Hash(k @types.Type) uint {
+	var p uint = bit_cast(uint, bit_cast(*uint8, k))
+	return p ^ (p >> 7)
+}
+
+// TypeEq.Equal reports whether a and b are the same type.
+func (e TypeEq) Equal(a @types.Type, b @types.Type) bool {
+	return same(a, b)
+}

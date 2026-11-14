@@ -250,11 +250,9 @@ failures=""
 # types/ir/ast) once.  But batching ALL packages per shard loads ALL ~50 package
 # impls on EVERY shard — a per-shard-CONSTANT floor no shard count can reduce.  So
 # the batch runs a REPRESENTATIVE SUBSET (see the classification loop below):
-#   - HEAVY = the INTINT_HEAVY representative set (types, ir — moderate-cost at
-#     double-VM): TEST-sharded — loaded on EVERY shard, each running 1/N of its
-#     own tests via --shard.  Collected into BATCH_HEAVY_PKGS.
-#   - CHEAP packages (not .split.vm): PACKAGE-sharded — each assigned to ONE shard
-#     by its cost (INTINT_LIGHT_COST), running its FULL tests there.  Collected into
+#   - CHEAP packages (not .split.vm) and the INTINT_WHOLE representative set
+#     (types, ir): PACKAGE-sharded — each assigned to ONE shard by its cost
+#     (INTINT_LIGHT_COST), running its FULL tests there.  Collected into
 #     BATCH_LIGHT_PKGS.
 #   - Other .split.vm packages (native/* backends, asm/*, lint/bnlint/bnfmt,
 #     parser, irdata): SKIPPED here — priciest at double-VM, covered by the
@@ -270,15 +268,19 @@ if [ "$CHECK_XPASS" -eq 0 ]; then
     case "$MODE" in *-int-int) BATCH_MODE=1 ;; esac
 fi
 # The double-VM representative set: the .split.vm packages whose tests are only
-# MODERATELY expensive under double-VM — types (typecheck) and ir (IR build),
-# measured ~0.9s/test.  Deliberately EXCLUDES codegen / vm / native-* etc.: their
+# MODERATELY expensive under double-VM — types (typecheck) and ir (IR build).
+# Deliberately EXCLUDES codegen / vm / native-* etc.: their
 # tests compile or RUN whole programs, which under the VM-interpreting-the-VM
 # becomes ~100× (vm's own tests run a bytecode VM, so double-VM makes them
 # VM-on-VM-on-VM) — a full shard of {types,ir,vm,codegen} measured 5h44m locally.
 # Running the type-checker + IR builder under the VM still exercises the double-VM
 # path thoroughly; codegen/vm/native double-VM coverage waits on bni perf work.
-# Kept test-sharded; every other .split.vm package is dropped from this lane.
-INTINT_HEAVY="pkg/binate/types pkg/binate/ir"
+# Each runs whole on one shard, placed by its cost like a cheap package (its tests
+# take a few minutes there: on the single VM ir's take 0.9 s and types' 0.1 s),
+# rather than on every shard in an invocation of its own, whose load cost each
+# shard ~6 min to run 1/N of the tests.  Every other .split.vm package is dropped
+# from this lane.
+INTINT_WHOLE="pkg/binate/types pkg/binate/ir"
 # The packages too heavy to run whole on one shard under the double VM, run in
 # parts instead: pkg:K splits the package's tests into K parts, part j (1..K) on a
 # shard of its own, as an invocation of its own (cmd/bni --test --shard-index j
@@ -302,7 +304,8 @@ INTINT_PARTS="pkg/binate/check:7 pkg/binate/irgen:2 pkg/binate/link:2"
 # goes to the shard whose parts and light packages so far cost least (ties: the lowest
 # index); every shard computes the same assignment and keeps its own share.
 INTINT_PART_COST="pkg/binate/check:20 pkg/binate/irgen:15 pkg/binate/link:20"
-INTINT_LIGHT_COST="cmd/bni:11 cmd/bnld:11 pkg/binate/native:11 pkg/binate/iropt:6 cmd/bnas:5
+INTINT_LIGHT_COST="cmd/bni:11 cmd/bnld:11 pkg/binate/native:11 pkg/binate/ir:8 pkg/binate/iropt:6
+cmd/bnas:5 pkg/binate/types:2
 pkg/binate/native/fold:4 pkg/binate/native/blockplan:4 pkg/binate/native/callconv:3
 pkg/binate/native/strength:3 pkg/binate/irbuild:3 pkg/binate/optflags:3"
 # intint_cost <table> <pkg>: pkg's cost in table, 1 if it is not listed.
@@ -318,8 +321,6 @@ BATCH_PART_PKGS=""
 BATCH_PART_SKIPS=""
 BATCH_LIGHT_PKGS=""
 BATCH_LIGHT_SKIPS=""
-BATCH_HEAVY_PKGS=""
-BATCH_HEAVY_SKIPS=""
 
 # Counter for the shard's modulo selection.  Incremented for every
 # package that survives the substring filter (i.e. would have been
@@ -382,8 +383,8 @@ for pkg in $PACKAGES; do
             done
         fi
         # int-int representative subset: the double-VM lane runs only the
-        # INTINT_HEAVY set test-sharded (loaded on every shard, 1/N tests each)
-        # PLUS all cheap (non-.split.vm) packages package-sharded.  Every OTHER
+        # INTINT_WHOLE set and the cheap (non-.split.vm) packages, each whole on
+        # one shard, and the INTINT_PARTS packages in parts.  Every OTHER
         # .split.vm package — codegen, vm, the native/* backends, asm/*, lint/
         # bnlint/bnfmt, parser, irdata — is SKIPPED here: their tests compile or
         # RUN whole programs, which is pathological under the VM-interpreting-the-
@@ -401,16 +402,16 @@ for pkg in $PACKAGES; do
         if [ ! -f "$b_split" ]; then
             case "$MODE" in *int*) b_split="$SCRIPT_DIR/${xfail_key}.split.vm" ;; esac
         fi
-        b_is_heavy=0
-        case " $INTINT_HEAVY " in *" $pkg "*) b_is_heavy=1 ;; esac
+        b_is_whole=0
+        case " $INTINT_WHOLE " in *" $pkg "*) b_is_whole=1 ;; esac
         b_parts=0
         for b_pp in $INTINT_PARTS; do
             case "$b_pp" in "$pkg:"*) b_parts="${b_pp##*:}" ;; esac
         done
         if [ "$SHARD_COUNT" -eq 0 ]; then
-            # Unsharded: run the subset (INTINT_HEAVY, INTINT_PARTS + cheap) full in one
+            # Unsharded: run the subset (INTINT_WHOLE, INTINT_PARTS + cheap) full in one
             # batch, but still exclude the non-subset expensive (.split.vm) packages.
-            if [ "$b_is_heavy" -eq 0 ] && [ "$b_parts" -eq 0 ] && [ -f "$b_split" ]; then
+            if [ "$b_is_whole" -eq 0 ] && [ "$b_parts" -eq 0 ] && [ -f "$b_split" ]; then
                 pkgskipped=$((pkgskipped + 1)); continue
             fi
             BATCH_LIGHT_PKGS="$BATCH_LIGHT_PKGS $pkg"
@@ -433,18 +434,13 @@ for pkg in $PACKAGES; do
             done
             continue
         fi
-        if [ "$b_is_heavy" -eq 1 ]; then
-            # Core pipeline: test-shard — on every shard, tests split 1/N via --shard.
-            BATCH_HEAVY_PKGS="$BATCH_HEAVY_PKGS $pkg"
-            BATCH_HEAVY_SKIPS="$BATCH_HEAVY_SKIPS$b_pkg_skips"
-            continue
-        fi
-        if [ -f "$b_split" ]; then
+        if [ "$b_is_whole" -eq 0 ] && [ -f "$b_split" ]; then
             # Expensive but NOT in the int-int subset: skip for this lane.
             pkgskipped=$((pkgskipped + 1)); continue
         fi
-        # Cheap package: package-shard — it runs whole on ONE shard, chosen by cost
-        # after the loop (INTINT_LIGHT_COST), with its skips beside it.
+        # A cheap package or an INTINT_WHOLE one: package-shard — it runs whole on ONE
+        # shard, chosen by cost after the loop (INTINT_LIGHT_COST), with its skips
+        # beside it.
         INTINT_LIGHT_CANDS="$INTINT_LIGHT_CANDS
 $(intint_cost "$INTINT_LIGHT_COST" "$pkg") $pkg|$b_pkg_skips"
         continue
@@ -655,16 +651,13 @@ EOF
 fi
 
 # Run the collected batches (double-VM lane), then map cmd/bni's per-package
-# ok/FAIL/? lines back to the tallies.  Two invocations so the two sharding
-# policies coexist on one shard: the LIGHT batch (already package-sharded to this
-# shard) runs its packages' FULL tests (no --shard); the HEAVY batch (.split.vm,
-# loaded on every shard) runs 1/N of each package's tests (--shard).  Each cmd/bni
-# load pays the shared core (cmd/bni + types/ir/ast) once for its whole batch, so a
-# shard's floor is core + (its light subset's impls) + (the heavy impls), not all
-# ~50 impls.  Output is tee'd to a temp file when verbose (live progress in CI; a
+# ok/FAIL/? lines back to the tallies.  The LIGHT batch (already package-sharded to
+# this shard) runs its packages' FULL tests (no --shard) in one invocation, and each
+# part (pkg:j:K) runs in one of its own.  Each cmd/bni load pays the shared core
+# (cmd/bni + types/ir/ast) once for its whole batch, so a shard's floor is core + its
+# light subset's impls, not all ~50 impls.  Output is tee'd to a temp file when verbose (live progress in CI; a
 # diagnosable tail survives a timeout) and grepped afterward.
-if [ "$BATCH_MODE" -eq 1 ] && { [ -n "$BATCH_LIGHT_PKGS" ] || [ -n "$BATCH_HEAVY_PKGS" ] ||
-        [ -n "$BATCH_PART_PKGS" ]; }; then
+if [ "$BATCH_MODE" -eq 1 ] && { [ -n "$BATCH_LIGHT_PKGS" ] || [ -n "$BATCH_PART_PKGS" ]; }; then
     b_tmp="$(mktemp)"
     : > "$b_tmp"
     # emit_batch runs one batch, appending its output to $b_tmp; streams live to
@@ -682,11 +675,6 @@ if [ "$BATCH_MODE" -eq 1 ] && { [ -n "$BATCH_LIGHT_PKGS" ] || [ -n "$BATCH_HEAVY
         if [ "$VERBOSE" -eq 1 ]; then echo "STARTING (batched light/full): $b_ln packages"; fi
         emit_batch "$BATCH_LIGHT_PKGS" "${BATCH_LIGHT_SKIPS#,}" 0
     fi
-    if [ -n "$BATCH_HEAVY_PKGS" ]; then
-        b_hn=$(echo $BATCH_HEAVY_PKGS | wc -w | tr -d ' ')
-        if [ "$VERBOSE" -eq 1 ]; then echo "STARTING (batched heavy/1-of-$SHARD_COUNT): $b_hn packages"; fi
-        emit_batch "$BATCH_HEAVY_PKGS" "${BATCH_HEAVY_SKIPS#,}" 1
-    fi
     # Each part (pkg:j:K) of a package split into parts runs on its own.
     b_part_names=""
     for b_part in $BATCH_PART_PKGS; do
@@ -698,7 +686,7 @@ if [ "$BATCH_MODE" -eq 1 ] && { [ -n "$BATCH_LIGHT_PKGS" ] || [ -n "$BATCH_HEAVY
     done
     b_elapsed=$(( $(date +%s) - b_start ))
     if [ "$VERBOSE" -eq 1 ]; then echo "batched run: ${b_elapsed}s"; fi
-    for p in $BATCH_LIGHT_PKGS $BATCH_HEAVY_PKGS $b_part_names; do
+    for p in $BATCH_LIGHT_PKGS $b_part_names; do
         # cmd/bni prints one line per package: `FAIL<TAB>pkg`, `ok  <TAB>pkg<TAB>…`,
         # or `?   <TAB>pkg<TAB>[no test functions]` (also `ok` with the full count
         # for a heavy package whose tests all fell on other shards).  A package with

@@ -82,9 +82,12 @@ one() {
     if [ -n "$TIMEOUT" ] && { [ "$rb" -eq 124 ] || [ "$ra" -eq 124 ]; }; then
         echo "TIMEOUT $f"
     elif [ "$rb" -ne 0 ] && [ "$ra" -ne 0 ]; then
-        # A build's output names its build directory; the two differ.
-        sed "s#$d/b#BUILD#g" "$d/b.out" > "$d/b.norm"
-        sed "s#$d/a#BUILD#g" "$d/a.out" > "$d/a.norm"
+        # A build's output names its build directory, and a crash's the pid
+        # the shell reports it under (`line 72:  1091 Abort trap: 6`); the
+        # two differ.
+        pidnorm='s/^\(.*: line [0-9][0-9]*: *\)[0-9][0-9]* /\1PID /'
+        sed -e "s#$d/b#BUILD#g" -e "$pidnorm" "$d/b.out" > "$d/b.norm"
+        sed -e "s#$d/a#BUILD#g" -e "$pidnorm" "$d/a.out" > "$d/a.norm"
         if cmp -s "$d/b.norm" "$d/a.norm"; then
             echo "BOTHFAIL $f"
         else

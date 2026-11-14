@@ -1,0 +1,271 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/ast"
+import "pkg/binate/buf"
+import "pkg/binate/check"
+import "pkg/binate/irutil"
+import "pkg/binate/types"
+import "pkg/std/errors"
+import "pkg/std/os"
+
+// The value differential: a diagnostic a driver switches on (bnc / bni
+// --x-value-differential) that notes where IR-gen's own reading of a value name
+// -- by its spelling, in the scopes and registries IR-gen keeps -- differs from
+// the checker's record of what the name resolves to (check.Checker.ExprSymbol).
+// It covers an identifier read as a value (genExpr); an identifier asked whether
+// it names a variable (identVar, identVarType), a value that shadows a function,
+// type or package of its name (identValueBound), or a constant (irgenEnv.Const,
+// isFloatExpr, isPackageConstIdent); a captured name (noteCaptureLookup); the
+// function a `_func_handle` or `__c_entry` operand names; and the package a
+// package-qualified member `pkg.X` resolves to (pkgMemberQualName,
+// noteMemberFound).  One line each, appended to the file the driver names:
+//
+//	<file>:<line>:<col>: value differs: IR-gen <answer>, checker <answer>
+//	<file>:<line>:<col>: value unrecorded: IR-gen <answer>
+//
+// An answer is `none`, `local`, `local const`, a package-level `var`, `const` or
+// `func` with its declaring package's path and its name (`var pkg/q.x`), and,
+// from a record, `predeclared <name>`, any other kind of symbol (`package
+// q.lib`, an import), or `type` for a name the checker recorded as denoting a
+// type; a member's is `member <package path>.<name>`.  Where the question is
+// whether a name is a variable, a value that shadows, or a constant, any other
+// answer reads as `none`.  An expression the checker checked and recorded
+// neither a symbol nor a type for is noted only where IR-gen takes it for a
+// value.  Syntax the checker never saw -- IR-gen's
+// own, such as the assignment that runs a package variable's initializer
+// (MakeInitAssignStmt) -- is not noted: it has no record to compare with.
+
+// valueDiffPath is the file the value differential appends to; empty when off.
+var valueDiffPath @[]char
+
+// VALUE_NONE is IR-gen's answer that a name is no value it knows.
+const VALUE_NONE int = 0
+
+// VALUE_LOCAL is IR-gen's answer that a name is a function's variable or
+// parameter.
+const VALUE_LOCAL int = 1
+
+// VALUE_LOCAL_CONST is IR-gen's answer that a name is a function's constant.
+const VALUE_LOCAL_CONST int = 2
+
+// VALUE_VAR is IR-gen's answer that a name is a package variable.
+const VALUE_VAR int = 3
+
+// VALUE_CONST is IR-gen's answer that a name is a package constant.
+const VALUE_CONST int = 4
+
+// VALUE_FUNC is IR-gen's answer that a name is a package function.
+const VALUE_FUNC int = 5
+
+// DIFF_READ compares the whole answer: what a name read as a value means.
+const DIFF_READ int = 0
+
+// DIFF_VAR compares the answer to whether a name is a variable, and which.
+const DIFF_VAR int = 1
+
+// DIFF_CONST compares the answer to whether a name is a constant, and which.
+const DIFF_CONST int = 2
+
+// DIFF_BOUND compares the answer to whether a name is bound to a value that
+// shadows a function, type or package of its name -- a variable, or a function's
+// constant -- and which.
+const DIFF_BOUND int = 3
+
+// SetValueDifferential switches the value differential on, appending its
+// findings to the file at path, or off for an empty path; false, leaving it off,
+// when the file cannot be opened for appending.
+func SetValueDifferential(path *[]readonly char) bool {
+	var none @[]char
+	valueDiffPath = none
+	if len(path) == 0 { return true }
+	var f @os.File
+	var err @errors.Error
+	f, err = os.OpenFile(path, os.O_WRONLY | os.O_CREATE | os.O_APPEND, cast(os.FileMode, 0o644))
+	if present(err) { return false }
+	_ = f.Close()
+	valueDiffPath = buf.CopyStr(path)
+	return true
+}
+
+// valueDiffApplies reports whether the value differential is on and gc's module
+// has the checker whose records it compares with.
+func valueDiffApplies(gc @GenCtx) bool {
+	return len(valueDiffPath) > 0 && gc != nil && gc.Mod != nil && gc.Mod.Checker != nil
+}
+
+// noteValueReading notes, under the value differential, IR-gen's answer for the
+// identifier e under the question mode (a DIFF_* constant): of kind kind (a
+// VALUE_* constant), for a package-level one the name it is registered under in
+// the module (regName: qualified, or bare for the module's own package).
+func noteValueReading(gc @GenCtx, e @ast.Expr, mode int, kind int, regName *[]readonly char) {
+	if !valueDiffApplies(gc) || e == nil { return }
+	var k int = valueInMode(mode, kind)
+	var mine @[]char = irgenValueAnswer(gc, k, regName)
+	var sym @check.Symbol = gc.Mod.Checker.ExprSymbol(e)
+	if sym != nil {
+		noteIfDiffers(e, mine, recordValueAnswer(sym, mode, e.Name))
+		return
+	}
+	if gc.Mod.Checker.ExprDenotedType(e) != nil {
+		var theirs *[]readonly char = "none"
+		if mode == DIFF_READ { theirs = "type" }
+		noteIfDiffers(e, mine, theirs)
+		return
+	}
+	if k != VALUE_NONE && e.ResolvedTypeID > 0 {
+		writeDiff(valueDiffPath, e.Pos, buf.Concat("value unrecorded: IR-gen ", mine))
+	}
+}
+
+// noteNameLookup notes, under the value differential, IR-gen's answer by name
+// for the identifier e (lookupVar's, which localValueBound's agrees with) to the
+// question mode.
+func noteNameLookup(ctx @GenContext, e @ast.Expr, mode int) {
+	if !valueDiffApplies(ctx.Gc) || e == nil { return }
+	var kind int
+	var regName @[]char
+	kind, regName = byNameVarAnswer(ctx, e.Name)
+	noteValueReading(ctx.Gc, e, mode, kind, regName)
+}
+
+// noteCaptureLookup notes, under the value differential, IR-gen's answer by name
+// for the captured name cap where it is not a local: the checker captures only a
+// variable of an enclosing function.
+func noteCaptureLookup(ctx @GenContext, cap @ast.Capture) {
+	if !valueDiffApplies(ctx.Gc) || cap == nil { return }
+	var kind int
+	var regName @[]char
+	kind, regName = byNameVarAnswer(ctx, cap.Name)
+	if kind == VALUE_LOCAL { return }
+	var s @[]char = buf.Concat("value differs: IR-gen ", irgenValueAnswer(ctx.Gc, kind, regName))
+	writeDiff(valueDiffPath, cap.Pos, buf.Concat(s, ", checker local (a capture)"))
+}
+
+// noteConstLookup notes, under the value differential, IR-gen's answer by name
+// to whether the identifier e is a constant: the Module.Consts entry at idx, or
+// none for -1.
+func noteConstLookup(gc @GenCtx, e @ast.Expr, idx int) {
+	if !valueDiffApplies(gc) || e == nil { return }
+	if idx < 0 {
+		noteValueReading(gc, e, DIFF_CONST, VALUE_NONE, e.Name)
+		return
+	}
+	var kind int = VALUE_CONST
+	if gc.Mod.Consts[idx].Local { kind = VALUE_LOCAL_CONST }
+	noteValueReading(gc, e, DIFF_CONST, kind, gc.Mod.Consts[idx].Name)
+}
+
+// noteMemberPkg notes, under the value differential, IR-gen's qualified name
+// qualName for the package-qualified member e (`pkg.X`) when the checker recorded
+// X as declared in another package.  A selector with no record is looked up as
+// a member speculatively (a method expression `T.M` too) and noted only where
+// IR-gen finds it (noteMemberFound).
+func noteMemberPkg(gc @GenCtx, e @ast.Expr, qualName *[]readonly char) {
+	if !valueDiffApplies(gc) || e == nil { return }
+	var mine @[]char = buf.Concat("member ", qualName)
+	var sym @check.Symbol = gc.Mod.Checker.ExprSymbol(e)
+	if sym == nil { return }
+	var theirs @[]char = buf.Concat("member ", qualNameInPkg(sym.DeclPkg(), e.Name))
+	if !sym.IsPackageLevel() { theirs = recordValueAnswer(sym, DIFF_READ, e.Name) }
+	noteIfDiffers(e, mine, theirs)
+}
+
+// noteMemberFound notes, under the value differential, that IR-gen found the
+// package-qualified member e (`pkg.X`) under qualName where the checker checked e
+// and recorded no symbol for it.  `__Package`, which no package declares, has
+// none.
+func noteMemberFound(gc @GenCtx, e @ast.Expr, qualName *[]readonly char) {
+	if !valueDiffApplies(gc) || e == nil || e.ResolvedTypeID <= 0 { return }
+	if irutil.Streq(e.Name, "__Package") || gc.Mod.Checker.ExprSymbol(e) != nil { return }
+	writeDiff(valueDiffPath, e.Pos, buf.Concat("value unrecorded: IR-gen member ", qualName))
+}
+
+// noteIfDiffers writes the differential's finding for e when IR-gen's answer
+// mine is not the checker's, theirs.
+func noteIfDiffers(e @ast.Expr, mine *[]readonly char, theirs *[]readonly char) {
+	if irutil.Streq(mine, theirs) { return }
+	var s @[]char = buf.Concat("value differs: IR-gen ", mine)
+	s = buf.Concat(s, ", checker ")
+	writeDiff(valueDiffPath, e.Pos, buf.Concat(s, theirs))
+}
+
+// byNameVarAnswer is IR-gen's answer by name to what name is, as lookupVar
+// finds it: the innermost local binding of the name (a variable or a constant),
+// else a global (bareGlobalIdx), with the global's registered name.
+func byNameVarAnswer(ctx @GenContext, name *[]readonly char) (int, @[]char) {
+	for i := len(ctx.Vars) - 1; i >= 0; i-- {
+		if irutil.Streq(ctx.Vars[i].Name, name) {
+			if ctx.Vars[i].ConstIdx > 0 { return VALUE_LOCAL_CONST, buf.CopyStr(name) }
+			return VALUE_LOCAL, buf.CopyStr(name)
+		}
+	}
+	var gi int = bareGlobalIdx(ctx.Gc, name)
+	if gi >= 0 { return VALUE_VAR, ctx.Gc.Mod.GlobalVars[gi].Name }
+	return VALUE_NONE, buf.CopyStr(name)
+}
+
+// valueInMode returns the answer kind as the question mode sees it: none for an
+// answer that is not a variable (DIFF_VAR), not a constant (DIFF_CONST), or not a
+// variable or a function's constant (DIFF_BOUND).
+func valueInMode(mode int, kind int) int {
+	if mode == DIFF_VAR && kind != VALUE_LOCAL && kind != VALUE_VAR { return VALUE_NONE }
+	if mode == DIFF_CONST && kind != VALUE_LOCAL_CONST && kind != VALUE_CONST { return VALUE_NONE }
+	if mode == DIFF_BOUND && kind != VALUE_LOCAL && kind != VALUE_LOCAL_CONST && kind != VALUE_VAR {
+		return VALUE_NONE
+	}
+	return kind
+}
+
+// irgenValueAnswer formats IR-gen's answer of kind kind; a package-level one is
+// named by regName, qualified with the module's own package when it is bare.
+func irgenValueAnswer(gc @GenCtx, kind int, regName *[]readonly char) @[]char {
+	if kind == VALUE_LOCAL { return buf.CopyStr("local") }
+	if kind == VALUE_LOCAL_CONST { return buf.CopyStr("local const") }
+	if kind != VALUE_VAR && kind != VALUE_CONST && kind != VALUE_FUNC { return buf.CopyStr("none") }
+	var word *[]readonly char = "var "
+	if kind == VALUE_CONST { word = "const " }
+	if kind == VALUE_FUNC { word = "func " }
+	if len(qualifierTypeName(regName)) > 0 { return buf.Concat(word, regName) }
+	return buf.Concat(word, qualNameInPkg(gc.PkgPath, regName))
+}
+
+// recordValueAnswer formats the checker's answer, the symbol sym, for the
+// name name under the question mode.
+func recordValueAnswer(sym @check.Symbol, mode int, name *[]readonly char) @[]char {
+	var k int = sym.Kind()
+	if !recordInMode(sym, mode) { return buf.CopyStr("none") }
+	if sym.IsPredeclared() { return buf.Concat("predeclared ", name) }
+	if !sym.IsPackageLevel() {
+		if k == types.SYM_VAR { return buf.CopyStr("local") }
+		if k == types.SYM_CONST { return buf.CopyStr("local const") }
+		return buf.Concat("local ", symKindWord(k))
+	}
+	var s @[]char = buf.Concat(symKindWord(k), " ")
+	return buf.Concat(s, qualNameInPkg(sym.DeclPkg(), name))
+}
+
+// recordInMode reports whether the checker's answer sym is one the question mode
+// asks about: a variable (DIFF_VAR), a constant (DIFF_CONST), a variable or a
+// function's constant (DIFF_BOUND), anything (DIFF_READ).
+func recordInMode(sym @check.Symbol, mode int) bool {
+	var k int = sym.Kind()
+	if mode == DIFF_VAR { return k == types.SYM_VAR }
+	if mode == DIFF_CONST { return k == types.SYM_CONST }
+	if mode == DIFF_BOUND {
+		return k == types.SYM_VAR ||
+				(k == types.SYM_CONST && !sym.IsPackageLevel() && !sym.IsPredeclared())
+	}
+	return true
+}
+
+// symKindWord names a symbol kind (a types.SYM_* constant) in the differential's
+// answers.
+func symKindWord(k int) *[]readonly char {
+	if k == types.SYM_VAR { return "var" }
+	if k == types.SYM_CONST { return "const" }
+	if k == types.SYM_FUNC { return "func" }
+	if k == types.SYM_TYPE { return "type" }
+	if k == types.SYM_PKG { return "package" }
+	if k == types.SYM_INTERFACE { return "interface" }
+	return "symbol"
+}

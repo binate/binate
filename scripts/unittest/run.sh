@@ -570,8 +570,9 @@ $(intint_cost "$INTINT_LIGHT_COST" "$pkg") $pkg|$b_pkg_skips"
 
     # Per-test skip file: <pkg-key>.skip.<mode>.  Contents are a
     # substring pattern; tests whose name contains the pattern are
-    # skipped (passed as --skip to the runner).  Only the bni-based
-    # runners (builder-comp-int, builder-comp-int-int, builder-comp-comp-int)
+    # skipped (passed as --skip to the runner).  The bni-based runners
+    # (builder-comp-int, builder-comp-int-int, builder-comp-comp-int) and
+    # the arm32 ones (builder-comp_arm32_baremetal, builder-comp_arm32_linux)
     # honor this; other modes ignore SKIP_FILTER.
     skip_file="$SCRIPT_DIR/${xfail_key}.skip.${MODE}"
     SKIP_FILTER=""

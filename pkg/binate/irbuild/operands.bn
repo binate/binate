@@ -1,0 +1,257 @@
+package "pkg/binate/irbuild"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/std/cmp"
+import "pkg/std/containers/table"
+import "pkg/std/strconv"
+
+// The operand check runs on every function a backend lowers, so its walk over the
+// instructions borrows: the helpers take raw pointers and slices, and the loops hold each
+// block and instruction in a raw local, so nothing is retained or released per block,
+// instruction or operand.  What they point at stays alive for the whole check, which
+// changes nothing: f and mv are held by ForeignOperandError's caller, f's blocks by
+// f.Blocks and f.FaultPads (and f.AddedBlocks), each block's instructions by its Instrs,
+// and the parameter refs by the managed-slice ForeignOperandError keeps of them.
+
+// ModuleValues — see irbuild.bni.
+type ModuleValues struct {
+	// mod is the module whose global-address pseudos an operand may be, and whose functions
+	// an error names as a foreign operand's owner.
+	mod @ir.Module
+	// globals holds the addresses of mod's global-address pseudos, gathered the first time
+	// an operand is one (moduleHolds); nil until then.
+	globals @table.Table[int, bool, ir.AddrHasher, cmp.Default[int]]
+	// byID is the id-indexed array of the instructions of the function being checked
+	// (fillByID), kept from one check to the next rather than allocated for each.  A check
+	// clears and fills only the front of it, its function's id range, and looks only there:
+	// an entry past that range is left from an earlier function -- a pointer to one of its
+	// instructions -- and would otherwise pass that instruction for the function's own.
+	byID @[]*ir.Instr
+}
+
+// NewModuleValues — see irbuild.bni.
+func NewModuleValues(m @ir.Module) @ModuleValues {
+	var mv @ModuleValues = make(ModuleValues)
+	mv.mod = m
+	return mv
+}
+
+// moduleHolds reports whether v, a global-address pseudo, is one of mv's module's,
+// gathering their addresses on the first call.
+func moduleHolds(mv *ModuleValues, v *ir.Instr) bool {
+	if mv.globals == nil {
+		mv.globals = table.NewTable[int, bool, ir.AddrHasher, cmp.Default[int]](ir.AddrHasher{},
+				cmp.Default[int]{})
+		if mv.mod.GlobalRefs != nil {
+			addInstrs(mv.globals, mv.mod.GlobalRefs.Items())
+		}
+	}
+	return mv.globals.Has(bit_cast(int, v))
+}
+
+// ForeignOperandError — see irbuild.bni.
+func ForeignOperandError(f @ir.Func, mv @ModuleValues) @[]char {
+	if f.PhisEliminated {
+		var why *[]readonly char = " has had its phis eliminated, after which its operands cannot "
+				"be checked (they may read phis no block holds)"
+		return buf.Concat(f.Name, why)
+	}
+	var n int = fillByID(f, mv)
+	// f's parameter refs, fetched once (Items makes a managed-slice) and held here while the
+	// check reads them.
+	var refs @[]@ir.Instr
+	if f.ParamRefs != nil { refs = f.ParamRefs.Items() }
+	// The walk looks an operand up only in mv.byID's front n entries, f's id range: past it
+	// it would find an earlier function's instruction.
+	var msg @[]char = foreignOperandIn(f, f.Blocks, "block", mv.byID[0:n], refs, mv)
+	if len(msg) > 0 { return msg }
+	return foreignOperandIn(f, f.FaultPads, "pad", mv.byID[0:n], refs, mv)
+}
+
+// fillByID records in mv.byID, at its id, each instruction of f.Blocks and f.FaultPads that
+// has an id (not -1) -- the first of them for an id two have, nil for an id none has -- and
+// returns f's id range n, the larger of f.NextID and one past the largest such id; it
+// clears mv.byID's front n entries first, growing mv.byID when it is shorter.  It reads
+// each block's Instrs, never InstrsVec, which keeps the instructions a pass removed from
+// Instrs.  Ids are dense per function (below f.NextID), so this is one array, not a table.
+func fillByID(f *ir.Func, mv *ModuleValues) int {
+	var n int = f.NextID
+	n = maxIDAfter(f.Blocks, n)
+	n = maxIDAfter(f.FaultPads, n)
+	if n > len(mv.byID) {
+		// Grown at least twofold, so a run of ever larger functions reallocates it only a
+		// few times; make_slice clears it.
+		var size int = 2 * len(mv.byID)
+		if size < n { size = n }
+		mv.byID = make_slice(*ir.Instr, size)
+	} else {
+		clearAll(mv.byID[0:n])
+	}
+	recordIDs(mv.byID, f.Blocks)
+	recordIDs(mv.byID, f.FaultPads)
+	return n
+}
+
+// clearAll sets every entry of byID to nil.  The loop is bounded by byID's own length, so a
+// compiler can drop its index check and clear the entries as one block of memory.
+func clearAll(byID *[]*ir.Instr) {
+	for i := 0; i < len(byID); i++ { byID[i] = nil }
+}
+
+// maxIDAfter returns the larger of n and one past the largest id of an instruction of
+// blocks.
+func maxIDAfter(blocks *[]@ir.Block, n int) int {
+	for bi := 0; bi < len(blocks); bi++ {
+		var b *ir.Block = blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins *ir.Instr = b.Instrs[ii]
+			if ins.ID >= n { n = ins.ID + 1 }
+		}
+	}
+	return n
+}
+
+// recordIDs records each instruction of blocks that has an id in byID at that id, unless
+// an earlier one has it.
+func recordIDs(byID *[]*ir.Instr, blocks *[]@ir.Block) {
+	for bi := 0; bi < len(blocks); bi++ {
+		var b *ir.Block = blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins *ir.Instr = b.Instrs[ii]
+			if ins.ID >= 0 && byID[ins.ID] == nil { byID[ins.ID] = ins }
+		}
+	}
+}
+
+// foreignOperandIn describes the first operand of an instruction of blocks, f's blocks or
+// pads as kind says, that is not one of f's own values, or returns "".  byID is f's
+// instructions by id (fillByID), as long as f's id range, and refs f's parameter refs.  An
+// operand is f's own when it is nil (no operand) or the instruction of f's blocks and pads
+// with its id, compared by identity, so another function's value of that id is not -- the
+// test made here, for every operand -- or else, as otherOwnValue finds, one of mv's
+// module's global-address pseudos or one of f's parameter refs.
+func foreignOperandIn(f *ir.Func, blocks *[]@ir.Block, kind *[]readonly char, byID *[]*ir.Instr,
+		refs *[]@ir.Instr, mv *ModuleValues) @[]char {
+	for bi := 0; bi < len(blocks); bi++ {
+		var b *ir.Block = blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins *ir.Instr = b.Instrs[ii]
+			for k := 0; k < len(ins.Args); k++ {
+				var v *ir.Instr = ins.Args[k]
+				if v == nil || (v.ID >= 0 && v.ID < len(byID) && byID[v.ID] == v) { continue }
+				if !otherOwnValue(f, refs, mv, v) { return operandFault(f, b, kind, ins, k, v, mv) }
+			}
+			// A phi's operands are its entries' values (Phis is empty on every other
+			// instruction).
+			for k := 0; k < len(ins.Phis); k++ {
+				var v *ir.Instr = ins.Phis[k].Val
+				if v == nil || (v.ID >= 0 && v.ID < len(byID) && byID[v.ID] == v) { continue }
+				if !otherOwnValue(f, refs, mv, v) { return operandFault(f, b, kind, ins, k, v, mv) }
+			}
+		}
+	}
+	return ""
+}
+
+// otherOwnValue reports whether v, an operand of an instruction of f that is not the
+// instruction of f's blocks and pads with v's id, is one of f's own values all the same:
+// one of mv's module's global-address pseudos, compared by address whatever its id (their
+// ids are not f's), or one of refs (f.ParamRefs' items) under the id of one of f.Params
+// (the backends read a parameter ref as the parameter of its id).
+func otherOwnValue(f *ir.Func, refs *[]@ir.Instr, mv *ModuleValues, v *ir.Instr) bool {
+	if v.IsGlobalRef { return moduleHolds(mv, v) }
+	return v.Op == iropcode.OP_PARAM && holdsInstr(refs, v) && isParamID(f.Params, v.ID)
+}
+
+// isParamID reports whether id is the id of one of params.
+func isParamID(params *[]@ir.Param, id int) bool {
+	for i := 0; i < len(params); i++ {
+		var p *ir.Param = params[i]
+		if p.ID == id { return true }
+	}
+	return false
+}
+
+// holdsInstr reports whether instrs holds v.
+func holdsInstr(instrs *[]@ir.Instr, v *ir.Instr) bool {
+	for i := 0; i < len(instrs); i++ {
+		var ins *ir.Instr = instrs[i]
+		if ins == v { return true }
+	}
+	return false
+}
+
+// operandFault describes v, operand k of ins -- an instruction of b, one of f's blocks or
+// pads as kind says -- which is not one of f's own values: "<op> in <f> (<kind> <label>) has
+// its operand <k>" followed by what v is (operandOwner).
+func operandFault(f *ir.Func, b *ir.Block, kind *[]readonly char, ins *ir.Instr, k int, v *ir.Instr,
+		mv *ModuleValues) @[]char {
+	var op *[]readonly char = iropcode.OpName(ins.Op)
+	var s @[]char = buf.Concat(buf.Concat(article(op), op), " in ")
+	s = buf.Concat(buf.Concat(buf.Concat(s, f.Name), " ("), kind)
+	s = buf.Concat(buf.Concat(buf.Concat(s, " "), b.Label), ") has its operand ")
+	return buf.Concat(buf.Concat(s, strconv.Itoa(k)), operandOwner(f, v, mv))
+}
+
+// article returns "an " for a word that starts with a vowel, else "a ".
+func article(word *[]readonly char) *[]readonly char {
+	if len(word) > 0 {
+		var c char = word[0]
+		if c == 'a' || c == 'e' || c == 'i' || c == 'o' || c == 'u' { return "an " }
+	}
+	return "a "
+}
+
+// operandOwner describes where v, an operand of an instruction of f that is not one of f's
+// own values, comes from: a global-address pseudo not among mv's module's; an instruction
+// of f with no id, or with an id an instruction before it has; a parameter ref of f under
+// an id none of f's parameters has; an instruction of a block or pad a pass dropped from
+// f.Blocks or f.FaultPads; another function's instruction or parameter (one of mv's
+// module's functions); a parameter ref no function of the module holds; or an instruction
+// in none of f's blocks and pads.
+func operandOwner(f *ir.Func, v *ir.Instr, mv *ModuleValues) @[]char {
+	if v.IsGlobalRef {
+		return buf.Concat(buf.Concat(", the address of ", v.StrVal),
+				", outside the module (not one of its global address pseudos)")
+	}
+	var s @[]char = buf.Concat(buf.Concat(" (v", strconv.Itoa(v.ID)), ") ")
+	if blocksHold(f.Blocks, v) || blocksHold(f.FaultPads, v) {
+		if v.ID < 0 { return buf.Concat(s, "inside the function, but with no value (no id)") }
+		return buf.Concat(s, "inside the function, but under an id an instruction before it has")
+	}
+	if f.ParamRefs != nil && holdsInstr(f.ParamRefs.Items(), v) {
+		var why *[]readonly char = "inside the function, but a parameter ref under an id none of "
+				"its parameters has"
+		return buf.Concat(s, why)
+	}
+	if f.AddedBlocks != nil && blocksHold(f.AddedBlocks.Items(), v) {
+		return buf.Concat(s, "outside the function's blocks and pads (in one dropped from them)")
+	}
+	var fs @[]@ir.Func = mv.mod.Funcs
+	for i := 0; i < len(fs); i++ {
+		var g *ir.Func = fs[i]
+		if g == f { continue }
+		var what *[]readonly char = ""
+		if blocksHold(g.Blocks, v) || blocksHold(g.FaultPads, v) {
+			what = "outside the function (an instruction of "
+		} else if g.ParamRefs != nil && holdsInstr(g.ParamRefs.Items(), v) {
+			what = "outside the function (a parameter of "
+		}
+		if len(what) > 0 { return buf.Concat(buf.Concat(buf.Concat(s, what), g.Name), ")") }
+	}
+	if v.Op == iropcode.OP_PARAM {
+		return buf.Concat(s, "outside the function (a parameter ref no function of the module holds)")
+	}
+	return buf.Concat(s, "outside the function (in none of its blocks and pads)")
+}
+
+// blocksHold reports whether one of blocks holds v in its Instrs.
+func blocksHold(blocks *[]@ir.Block, v *ir.Instr) bool {
+	for bi := 0; bi < len(blocks); bi++ {
+		var b *ir.Block = blocks[bi]
+		if holdsInstr(b.Instrs, v) { return true }
+	}
+	return false
+}

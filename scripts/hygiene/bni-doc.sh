@@ -51,8 +51,10 @@ for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/ifaces" "$BINATE_DIR/impls" -name
         NF == 0 { next }
 
         # Package declaration: must have a doc above. Resets state because
-        # the package doc does not document subsequent decls.
-        /^package "/ {
+        # the package doc does not document subsequent decls.  bnfmt keeps a
+        # comment between `package` and the path, so the path may not follow
+        # the keyword directly.
+        /^package[^A-Za-z0-9_]/ || /^package$/ {
             if (!doc_pending) flag("package")
             doc_pending = 0
             next

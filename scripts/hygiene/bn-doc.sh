@@ -55,7 +55,7 @@ for f in $(find "$BINATE_DIR/pkg" "$BINATE_DIR/cmd" "$BINATE_DIR/ifaces" "$BINAT
         # Note: package-level doc comments are not required in .bn; the
         # .bni carries the package doc, and main packages are entry
         # points whose role is obvious from context.
-        /^package "/ { doc_pending = 0; next }
+        /^package[^A-Za-z0-9_]/ || /^package$/ { doc_pending = 0; next }
         /^func /     { if (!doc_pending) flag("func");    doc_pending = 0; next }
         /^type /     { if (!doc_pending) flag("type");    doc_pending = 0; next }
         /^const /    { if (!doc_pending) flag("const");   doc_pending = 0; next }

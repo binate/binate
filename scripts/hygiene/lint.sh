@@ -65,9 +65,43 @@ done
 # (impl .bn, interface .bni, or test .bn — interface-only packages and
 # test-only packages both need to be found) and lint each by path (bnlint
 # resolves the right impl variant via -L).
+#
+# PKG_PATH_AWK prints each file's package path: the first string after its
+# `package` keyword, past comments and line breaks (bnfmt keeps a comment
+# between the keyword and the path, and a line comment there puts the path on
+# the next line).  Strings and comments before the keyword are skipped.
+PKG_PATH_AWK='
+FNR == 1 { blk = 0; kw = 0; done = 0 }
+done { next }
+{
+    n = length($0); i = 1
+    while (i <= n && !done) {
+        c = substr($0, i, 1)
+        if (blk) {
+            if (substr($0, i, 2) == "*/") { blk = 0; i += 2 } else i++
+            continue
+        }
+        if (substr($0, i, 2) == "//") break
+        if (substr($0, i, 2) == "/*") { blk = 1; i += 2; continue }
+        if (c == "\"") {
+            j = i + 1
+            while (j <= n && substr($0, j, 1) != "\"") {
+                if (substr($0, j, 1) == "\\") j++
+                j++
+            }
+            if (kw) { print substr($0, i + 1, j - i - 1); done = 1 }
+            i = j + 1
+            continue
+        }
+        if (kw && c !~ /[ \t\r]/) { done = 1; break }
+        if (!kw && substr($0, i, 7) == "package" && \
+                (i == 1 || substr($0, i - 1, 1) !~ /[A-Za-z0-9_]/) && \
+                substr($0, i + 7, 1) !~ /[A-Za-z0-9_]/) { kw = 1; i += 7; continue }
+        i++
+    }
+}'
 for pp in $(find "$BINATE_DIR/impls" "$BINATE_DIR/ifaces" \( -name '*.bn' -o -name '*.bni' \) 2>/dev/null \
-        | xargs grep -hE '^package "' 2>/dev/null \
-        | sed -E 's/^package "([^"]+)".*/\1/' | sort -u); do
+        | xargs awk "$PKG_PATH_AWK" 2>/dev/null | sort -u); do
     case " $LINT_SKIP " in
         *" $pp "*) continue ;;
     esac

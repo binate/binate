@@ -7,7 +7,11 @@
 # build directory, which is removed with its objects, so lldb can only be reading the
 # bundle.  The checks:
 #   - prog.dSYM exists;
-#   - a breakpoint on a source line resolves to an address at that line.
+#   - a breakpoint on a source line resolves to an address at that line;
+#   - stopped on the function's first statement's line, and stopped by a breakpoint on
+#     the function (by its linkage name: lldb finds no function by the debug name
+#     `main.add`), lldb reads the function's parameters, a struct one included: the
+#     setup of their frame slots comes before the first location in the function.
 #
 # macOS only: lldb, dsymutil and the debug map are the Mach-O side.  An ELF link copies
 # the DWARF into the program itself.
@@ -80,4 +84,17 @@ if ! grep -q "at main.bn:$LINE" "$TMP/static.log"; then
     exit 1
 fi
 
-echo "PASS: a bnc -g program debugs under lldb (prog.dSYM, line breakpoint)"
+# Running: stopped at add's first statement, or on add itself, the parameters hold
+# their arguments.
+for bp in "-f main.bn -l $LINE" "-n bn_F1_4_main1_3_add"; do
+    lldb -b -o "breakpoint set $bp" -o run -o "frame variable first second p" -o kill \
+            "$PROG" > "$TMP/run.log" 2>&1 || true
+    if ! grep -q "first = 1234" "$TMP/run.log" || ! grep -q "second = 4321" "$TMP/run.log" ||
+            ! grep -q "a = 5, b = 6" "$TMP/run.log"; then
+        echo "FAIL: stopped by breakpoint set $bp, lldb did not read add's parameters" >&2
+        cat "$TMP/run.log" >&2
+        exit 1
+    fi
+done
+
+echo "PASS: a bnc -g program debugs under lldb (prog.dSYM, line breakpoint, parameters)"

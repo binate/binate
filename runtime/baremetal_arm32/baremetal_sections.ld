@@ -1,10 +1,10 @@
 /* Output sections shared by the arm32-baremetal linker scripts — baremetal.ld (a
  * program) and baremetal_test.ld (a `bnc --test` binary) — for QEMU's `virt` ARMv7-A
- * machine.  bnc links this script with one of those, which defines the RAM region
- * these sections go into and lays out the heap and the stack past `__bss_end`.  The
- * two name each other's region and symbols only, which lld (bnc's bare-metal linker)
- * resolves once it has read both, so their order does not matter.  Addresses are
- * physical: where the core has an MMU, stack_guard.s maps every address to itself.
+ * machine.  bnc links this script after one of those, which defines the RAM region
+ * these sections go into and lays out the heap and the stack past `__bss_end`: GNU ld
+ * reads the scripts in order and warns of a region a section names before the region
+ * is declared (lld takes either order).  Addresses are physical: where the core has an
+ * MMU, stack_guard.s maps every address to itself.
  *
  * Sections we explicitly route:
  *   .text.startup — reserved for a startup section placed first; the
@@ -29,6 +29,9 @@ SECTIONS
 	.text : ALIGN(4) {
 		KEEP(*(.text.startup))
 		*(.text*)
+		/* The stubs GNU ld synthesizes for ARM (lld makes none): ARM / Thumb
+		 * interworking glue, VFP11 erratum veneers and ARMv4 BX veneers. */
+		*(.glue_7) *(.glue_7t) *(.vfp11_veneer) *(.v4_bx)
 		*(.rodata*)
 	} > RAM
 
@@ -49,6 +52,12 @@ SECTIONS
 		*(.ARM.extab*)
 	} > RAM
 
+	/* GNU ld's sections for IFUNC calls (lld makes none).  GNU ld drops them empty, and
+	 * the ASSERT below fails a link that fills them. */
+	.iplt : ALIGN(4) { *(.iplt) } > RAM
+	.rel.iplt : ALIGN(4) { *(.rel.iplt) } > RAM
+	.igot.plt : ALIGN(4) { *(.igot.plt) } > RAM
+
 	.data : ALIGN(4) {
 		*(.data*)
 	} > RAM
@@ -65,6 +74,9 @@ SECTIONS
 	 * (see above).
 	 */
 	.ARM.attributes 0 : { KEEP(*(.ARM.attributes)) KEEP(*(.gnu.attributes)) }
+	/* Whether the stack is executable is a hosted ELF's PT_GNU_STACK question; there is
+	 * no loader here to ask. */
+	/DISCARD/ : { *(.note.GNU-stack) }
 	.comment 0 : { *(.comment) }
 	.symtab 0 : { *(.symtab) }
 	.strtab 0 : { *(.strtab) }
@@ -92,3 +104,9 @@ SECTIONS
 	.debug_str_offsets 0 : { *(.debug_str_offsets) }
 	.debug_sup 0 : { *(.debug_sup) }
 }
+
+/* Nothing here applies an IFUNC's R_ARM_IRELATIVE relocation (there is no loader), so a
+ * link that needs one fails rather than calling through an unrelocated slot.  (lld, which
+ * has no rule for its own IFUNC sections, fails it as an orphan.) */
+ASSERT(SIZEOF(.iplt) == 0 && SIZEOF(.rel.iplt) == 0 && SIZEOF(.igot.plt) == 0,
+	"baremetal_sections.ld: an IFUNC needs a loader to apply its R_ARM_IRELATIVE, and there is none")

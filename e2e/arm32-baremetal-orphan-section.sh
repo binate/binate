@@ -3,8 +3,8 @@
 # section its linker scripts do not name, rather than placing it on the heap.
 #
 # runtime/baremetal_arm32/baremetal_sections.ld names every section a bare-metal link
-# expects, and bnc links with --orphan-handling=error: lld places a section no script
-# names past .bss, which is where the heap (__heap_start) begins.  A program reads a
+# expects, and bnc links with --orphan-handling=error: a linker places a section no
+# script names past .bss, which is where the heap (__heap_start) begins.  A program reads a
 # buffer from an asm object linked with --link-after-objs:
 #   - with the buffer in `.bss.<name>`, the link succeeds and the program runs;
 #   - with it in `.noinit` (an allocated NOBITS section the scripts do not name), the
@@ -121,7 +121,9 @@ if build noinit; then
     echo "FAIL: the program with its buffer in .noinit linked; an unnamed section must fail the link" >&2
     exit 1
 fi
-if ! grep -q "is being placed in '.noinit'" "$TMP/noinit.log"; then
+# lld says the section "is being placed in '.noinit'", GNU ld that it is an "unplaced
+# orphan section `.noinit'" (clang picks GNU ld when it finds a GCC toolchain).
+if ! grep -q -e "is being placed in '.noinit'" -e "unplaced orphan section \`.noinit'" "$TMP/noinit.log"; then
     echo "FAIL: the link with a .noinit section failed for another reason:" >&2
     tail -8 "$TMP/noinit.log" >&2
     exit 1

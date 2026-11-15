@@ -24,7 +24,7 @@
 # member in the wrong register shows up as a wrong number.
 #
 # Auto-discovered by .github/workflows/e2e-tests.yml — the `arm32` name prefix gates
-# in qemu-user-static + gcc-arm-linux-gnueabihf on the Linux runner.  SKIPs unless
+# in qemu-user + gcc-arm-linux-gnueabihf on the Linux runner.  SKIPs unless
 # that toolchain is present; skips on macOS via the .skip.darwin marker (qemu-user
 # emulates the Linux syscall ABI and cannot run on macOS).
 

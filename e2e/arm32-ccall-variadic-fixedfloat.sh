@@ -18,7 +18,7 @@
 # mis-placed fixed double shows up as a wrong result under qemu-arm.
 #
 # Auto-discovered by .github/workflows/e2e-tests.yml — the `arm32` name prefix
-# gates in qemu-user-static + gcc-arm-linux-gnueabihf on the Linux runner.  SKIPs
+# gates in qemu-user + gcc-arm-linux-gnueabihf on the Linux runner.  SKIPs
 # unless that toolchain is present; skips on macOS via the .skip.darwin marker
 # (qemu-user emulates the Linux syscall ABI, cannot run on macOS).
 

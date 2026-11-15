@@ -22,7 +22,7 @@ case "$os" in
         if ! command -v apt-get >/dev/null 2>&1; then
             echo "error: this helper only supports apt-based distros."
             echo "       install equivalents for clang + gcc-arm-linux-gnueabihf"
-            echo "       + qemu-user-static manually."
+            echo "       + qemu-user manually."
             exit 1
         fi
         echo ">>> sudo apt-get update"
@@ -31,7 +31,7 @@ case "$os" in
         sudo apt-get install -y \
             clang \
             gcc-arm-linux-gnueabihf \
-            qemu-user-static
+            qemu-user
         ;;
     Darwin)
         cat <<'EOF'

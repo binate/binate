@@ -33,7 +33,7 @@
 # catch it.
 #
 # Auto-discovered by .github/workflows/e2e-tests.yml — the `arm32` name prefix
-# gates in the qemu-user-static + gcc-arm-linux-gnueabihf install on the Linux
+# gates in the qemu-user + gcc-arm-linux-gnueabihf install on the Linux
 # runner.  SKIPs (exit 0) unless qemu-arm + a working arm-linux-gnueabihf gcc
 # cross-toolchain is present; skips on macOS via arm32-ffi-export.skip.darwin
 # (qemu-user emulates the Linux syscall ABI and cannot run on macOS).

@@ -16,7 +16,7 @@
 #
 # Required toolchain (same as builder-comp_arm32_linux; NOT available on macOS):
 #   - clang (host) + gcc-arm-linux-gnueabihf cross-toolchain
-#   - qemu-user-static (qemu-arm-static / qemu-arm)
+#   - qemu-user (qemu-arm-static / qemu-arm)
 # See scripts/setup/arm32-linux-deps.sh.
 
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
@@ -33,7 +33,7 @@ fi
 runner_setup() {
     if [ -z "$QEMU_ARM" ]; then
         echo "error: builder-comp_arm32_linux_int requires qemu-arm or qemu-arm-static" >&2
-        echo "  Linux:  sudo apt-get install qemu-user-static" >&2
+        echo "  Linux:  sudo apt-get install qemu-user" >&2
         echo "  macOS:  no user-mode qemu-arm; use Docker or a Linux VM" >&2
         echo "  Override with QEMU_ARM=<path>" >&2
         exit 2

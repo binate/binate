@@ -21,7 +21,7 @@ fi
 runner_setup() {
     if [ -z "$QEMU_ARM" ]; then
         echo "error: builder-comp_arm32_linux requires qemu-arm or qemu-arm-static" >&2
-        echo "  Linux:  sudo apt-get install qemu-user-static" >&2
+        echo "  Linux:  sudo apt-get install qemu-user" >&2
         echo "  macOS:  brew install qemu" >&2
         echo "  Override with QEMU_ARM=<path>" >&2
         exit 2

@@ -24,7 +24,7 @@
 #   - on Linux aarch64: nothing extra (host runs the binary)
 #   - on x86_64 / non-aarch64 host: gcc-aarch64-linux-gnu (cross-libc + cross-ld,
 #     which clang -target aarch64-linux-gnu auto-discovers, as for arm32) plus
-#     qemu-aarch64 (qemu-user-static) to run the resulting binary.
+#     qemu-aarch64 (qemu-user) to run the resulting binary.
 
 . "$BINATE_DIR/scripts/lib/build-compilers.sh"
 

@@ -14,7 +14,7 @@
 #     libc6-armhf-cross + libc6-dev-armhf-cross as deps; gives clang
 #     a complete cross-toolchain it can auto-discover under
 #     /usr/arm-linux-gnueabihf/)
-#   - qemu-user-static (provides qemu-arm-static / qemu-arm)
+#   - qemu-user (provides qemu-arm-static / qemu-arm)
 #
 # Why this exists: validates the v0 ARM32-Linux derisking path end-
 # to-end — type system at 32 bits, LLVM IR with intLL() = i32,
@@ -32,7 +32,7 @@ fi
 runner_setup() {
     if [ -z "$QEMU_ARM" ]; then
         echo "error: builder-comp_arm32_linux requires qemu-arm or qemu-arm-static" >&2
-        echo "  Linux:  sudo apt-get install qemu-user-static" >&2
+        echo "  Linux:  sudo apt-get install qemu-user" >&2
         echo "  macOS:  brew install qemu" >&2
         echo "  Override with QEMU_ARM=<path>" >&2
         exit 2

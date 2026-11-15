@@ -6,7 +6,7 @@
 # own AAPCS-VFP rules, which both backends must agree on.
 #
 # Auto-discovered by .github/workflows/e2e-tests.yml — the `arm32` name prefix gates
-# in qemu-user-static + gcc-arm-linux-gnueabihf on the Linux runner.  SKIPs unless that
+# in qemu-user + gcc-arm-linux-gnueabihf on the Linux runner.  SKIPs unless that
 # toolchain is present; skips on macOS via the .skip.darwin marker.
 
 MIXED_TARGET=arm32-linux exec "$(dirname "$0")/mixed-backend-calls.sh"

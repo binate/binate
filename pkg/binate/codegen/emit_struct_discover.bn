@@ -1,0 +1,155 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/irdata"
+import "pkg/binate/mangle"
+import "pkg/binate/types"
+import "pkg/std/table"
+import "pkg/std/vec"
+
+// Struct discovery finds the named struct types a module's types reach, each to get an
+// LLVM `%bn_S... = type {...}` definition (moduleStructDefs), depth first: a struct is
+// registered when it is first reached, and then its fields are looked at, each
+// completely before the next.  A struct's field reaches further structs through a
+// pointer, a slice or another indirect part, so a ring of structs each holding a
+// pointer to the next is followed struct by struct, and it is as long as a program
+// makes it (it nests two levels, type.named.depth: a chain ends at a cycle through an
+// indirect part).  So the structs whose fields are still to be looked at are kept on
+// a stack of their own (structWalk), not a call per struct.
+
+// A structWalkFrame is a struct on the discovery stack and the next of its fields to
+// look at.
+type structWalkFrame struct {
+	t    @types.Type
+	next int
+}
+
+// structWalk holds the structs discovered whose fields are still to be looked at,
+// innermost last.
+var structWalk @vec.Vec[structWalkFrame]
+
+// moduleStructIndex finds a struct in moduleStructDefs by its mangled name.
+var moduleStructIndex @table.Table[*[]readonly char, int, irdata.FuncSigHasher, irdata.FuncSigEq]
+
+// resetStructDiscovery empties what discovery records, at the start of EmitModule.
+func resetStructDiscovery() {
+	moduleStructDefs = vec.New[StructDef]()
+	moduleStructIndex = table.NewTable[*[]readonly char, int, irdata.FuncSigHasher, irdata.FuncSigEq](
+			irdata.FuncSigHasher{}, irdata.FuncSigEq{})
+	discoveredNamedTypes = table.NewTable[*[]readonly char, @[]char, irdata.FuncSigHasher,
+			irdata.FuncSigEq](irdata.FuncSigHasher{}, irdata.FuncSigEq{})
+	structWalk = vec.New[structWalkFrame]()
+}
+
+// discoverStructFromType discovers the named structs t reaches (moduleStructDefs), and
+// those their fields reach, and so on.
+func discoverStructFromType(t @types.Type) {
+	discoverStructRef(t)
+	for structWalk.Len() > 0 {
+		var top int = structWalk.Len() - 1
+		var f structWalkFrame = structWalk.Get(top)
+		if f.next >= len(f.t.Fields) {
+			_, _ = structWalk.Pop()
+			continue
+		}
+		var field @types.Type = f.t.Fields[f.next].Type
+		f.next = f.next + 1
+		structWalk.Set(top, f)
+		discoverStructRef(field)
+	}
+}
+
+// discoverStructRef registers the struct type a type reference reaches, if any,
+// through readonly, pointers, slices, named types and arrays -- one path, so it is
+// followed in a loop: a chain of named types is as long as a program makes it (a named
+// type adds no level to a type's depth, type.named.depth).
+func discoverStructRef(t @types.Type) {
+	for t != nil {
+		// Peel const wrappers — const doesn't affect layout / struct
+		// registration.
+		if t.Kind == types.TYP_READONLY {
+			t = t.Elem
+		} else if t.Kind == types.TYP_STRUCT {
+			addStructDef(t)
+			return
+		} else if t.Kind == types.TYP_MANAGED_PTR || t.Kind == types.TYP_POINTER {
+			t = t.Elem
+		} else if t.Kind == types.TYP_SLICE || t.Kind == types.TYP_MANAGED_SLICE {
+			t = t.Elem
+		} else if t.Kind == types.TYP_NAMED {
+			// A named distinct type is a transparent wrapper (`type Alias @Other`,
+			// named-over-struct).  A named *struct* is already TYP_STRUCT, but a
+			// named-over-struct flows as TYP_NAMED, so follow the underlying to
+			// discover the wrapped struct — once: a named type that reaches itself
+			// (`type Tree @[]Tree`) would be followed forever, and a repeat walk
+			// finds nothing new.
+			if discoveredNamedTypes.Has(t.Name) { return }
+			discoveredNamedTypes.Put(t.Name, t.Name)
+			t = t.Underlying
+		} else if t.Kind == types.TYP_ARRAY {
+			// [N]Struct must reach its element so the struct is declared
+			// before an array-of-struct value (e.g. an array-typed global)
+			// references it.
+			t = t.Elem
+		} else {
+			return
+		}
+	}
+}
+
+// structShapesMatch reports whether two struct types would emit the SAME
+// LLVM type body — equal field count and each field's LLVM representation.
+// Used by addStructDef's symbol-collision guard to tell a legitimate
+// re-discovery of one struct (same body — dedup) from a genuine collision
+// between two differently-shaped structs (different body — abort).
+func structShapesMatch(a @types.Type, b @types.Type) bool {
+	if len(a.Fields) != len(b.Fields) { return false }
+	for i := 0; i < len(a.Fields); i++ {
+		if !charsEqual(llvmType(a.Fields[i].Type), llvmType(b.Fields[i].Type)) {
+			return false
+		}
+	}
+	return true
+}
+
+// addStructDef registers a named struct type for LLVM type definition emission, and
+// puts it on the discovery stack for its fields to be looked at (structWalk).
+func addStructDef(t @types.Type) {
+	// Truly anonymous — shouldn't happen, IR gen assigns
+	// synthetic names.
+	if len(t.Name) == 0 { return }
+	// Check if already registered (by mangled LLVM name to catch
+	// both "Foo" and "pkg.Foo" mapping to the same %bn_S...)
+	var mangledName @[]char = mangle.StructName(modulePkgName, t.Name)
+	var at int
+	var known bool
+	at, known = moduleStructIndex.Get(mangledName)
+	if known {
+		// Same mangled symbol.  Normally a re-discovery of the SAME
+		// struct, so dedup.  But if the two disagree in SHAPE, two
+		// distinct structs collide on one LLVM symbol — the cross-
+		// package collision class that package-qualified struct
+		// names eliminate (e.g. reflect.Package vs a module's own
+		// Package, were names unqualified).  Silently keeping the
+		// first would give the later struct the first's layout (an
+		// out-of-range field GEP / wrong-code).  With qualified names
+		// this must not happen; abort loudly as a codegen
+		// precondition rather than miscompile.
+		if !structShapesMatch(t, moduleStructDefs.Get(at).Typ) {
+			panic("codegen: differently-shaped structs collide on one mangled symbol")
+		}
+		return
+	}
+	// Register first, before its fields are looked at, so a struct its fields reach
+	// again is a re-discovery.
+	var sd StructDef
+	sd.Name = t.Name
+	sd.MangledName = mangledName
+	sd.Typ = t
+	moduleStructIndex.Put(mangledName, moduleStructDefs.Len())
+	moduleStructDefs.Push(sd)
+	if len(t.Fields) > 0 {
+		var f structWalkFrame
+		f.t = t
+		structWalk.Push(f)
+	}
+}

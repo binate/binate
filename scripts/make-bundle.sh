@@ -157,6 +157,15 @@ for b in bnc bni bnas bnlint bnfmt bnld; do
     test -x "$dest/bin/$b" || { echo "make-bundle: missing binary: $b" >&2; exit 1; }
 done
 
+# A linux-x64 bundle must run on any x86-64 CPU: fail if a binary asks for more
+# than the x86-64 baseline (see check-elf-isa.sh: an input built for a higher ISA
+# level marks the whole program).
+if [ "$PLATFORM" = linux-x64 ]; then
+    echo "==> checking the binaries' x86-64 ISA level"
+    "$SCRIPT_DIR/check-elf-isa.sh" "$dest/bin/bnc" "$dest/bin/bni" "$dest/bin/bnas" \
+        "$dest/bin/bnlint" "$dest/bin/bnfmt" "$dest/bin/bnld" || exit 1
+fi
+
 # Ship the search-path helper next to the binaries (bin/ goes on PATH).  It
 # emits the standard -I/-L for the bundle's lib/, self-locating the
 # base as ../lib from bin/, so a consumer never re-derives the layout by hand.

@@ -1,0 +1,249 @@
+package "pkg/binate/irutil"
+
+import "pkg/binate/buf"
+import "pkg/binate/mangle"
+import "pkg/binate/stringutils"
+import "pkg/binate/types"
+import "pkg/std/containers/vec"
+import "pkg/std/strings"
+
+// The type encoding a destructor or copy helper's name ends with.  It is written by a
+// loop over the type, not a call per part: a chain of named types each over the next
+// (`type N0 N1`, `type N1 N2`, ...) adds no level to a type's depth, so it is as long as
+// a package makes it.  An anonymous struct's fields are written from a stack of their
+// own.
+
+// DtorTypeSuffix appends the type-encoding suffix for a dtor/copy function name.
+func DtorTypeSuffix(cb *strings.Builder, t @types.Type) {
+	writeDtorTypeSuffix(cb, t, false)
+}
+
+// An anonFields is an anonymous struct whose fields' encodings are being written:
+// where its encoding goes, the struct, the field being written and that field's
+// encoding so far.
+type anonFields struct {
+	out   *strings.Builder
+	st    @types.Type
+	field int
+	enc   @strings.Builder
+}
+
+// writeDtorTypeSuffix writes DtorTypeSuffix's encoding of t to cb.  `nested` is true
+// for a type that appears INSIDE a `mp_` / `ms_` / `arr` wrapper (an element-walk
+// suffix), false for the top-level type DtorTypeSuffix was invoked on.
+//
+// A NESTED struct/named type is encoded with `mangle.LpTypeArgNamedRaw` — the
+// length-prefixed, IDENTIFIER-ONLY, injective encoding of its FULL qualified name
+// (`pkg/binate/ast.File` -> `N3_3_pkg6_binate3_ast4_File`) — rather than the bare
+// leaf.  This makes the NESTED element-walk sub-language (the weak_odr
+// `__dtor_ms_*` / `__dtor_mp_*` / `__dtor_arr*` helpers, and the `__copy_` twins)
+// INJECTIVE among itself, which a bare-leaf encoding would not be:
+//   - The encoding is self-delimiting (segment length prefixes) and begins with `N`
+//     followed by a digit, which no kind token (`mp_`, `ms_`, `arr`, `interface`,
+//     `func`, primitive names, `anon`) can be — so a struct name can never
+//     reconstruct as a kind-token sequence: a struct named e.g. `mp_Node` /
+//     `elems_ms_mp_Node` cannot collide with `@Node` / a `@[]@Node` elems helper.
+//   - The FULL path (not the leaf) distinguishes same-leaf structs from different
+//     packages, so `@[]pkg/a.Config` and `@[]pkg/b.Config` do not both mangle to
+//     `__dtor_ms_Config` — aligning with §16.6 `pkg.identity` (symbol identity is the
+//     full import path, not the last segment).
+//   - It is identifier-only (no `/` or `.`), so it survives both LLVM's symbol
+//     charset AND mangle_lp's own name parsing (which splits on `.` / `/`); embedding
+//     the raw qualified name would break clang on the `/`.
+// The TOP-LEVEL struct is written as its length-prefixed leaf (WriteStructLeafToken),
+// as DtorName / qualifiedDtorNameForType write it (its package carried by the `pkg.`
+// qualifier), so definition and reference agree; the leading digit keeps a struct
+// source-named like a wrapper helper (`struct mp_N1_1_M4_Node`) from colliding with
+// that helper.  The nested element-walk suffix's def (the dtor generators, through
+// DtorNameForType) and ref (`elemDtorName` / MsElemsDtorName) both route through this
+// function.
+//
+// An anonymous struct is written `anon<fieldcount>` then, per field, `_<bytelen>_` and
+// the field's (nested) encoding.  Length-prefixing each field removes the ambiguity of
+// a bare `_` separator — a field encoding may itself contain `_` (e.g.
+// `mp_N0_4_Node`).  There is no length cap and no hash fallback: a hash (e.g. a 32-bit
+// FNV) is non-injective by construction (two distinct large anon structs could share
+// it → one dtor/copy body for both), so a very large anon struct just gets a long
+// (valid, backend length-prefixed) symbol.  Each field's encoding is written to a
+// builder of its own (an anonFields on `structs`) and copied into the struct's once
+// complete, its length known.
+func writeDtorTypeSuffix(cb *strings.Builder, t @types.Type, nested bool) {
+	var structs @vec.Vec[@anonFields] = vec.New[@anonFields]()
+	var out *strings.Builder = cb
+	for {
+		// ResolveAliasAndConst (not ResolveAlias): a `readonly T` element shares
+		// `T`'s dtor, so peel the readonly wrapper too — else it falls through to the
+		// "unknown" fallback below (e.g. `ms_ms_unknown` instead of `ms_ms_int`).
+		t = t.ResolveAliasAndConst()
+		if t != nil && t.Kind == types.TYP_NAMED && t.Underlying != nil {
+			// A named distinct type's dtor/copy is its underlying's (identical layout
+			// and managed fields), so name it by the underlying — `@[]Celsius` shares
+			// `__dtor_ms_int` with `@[]int` rather than emitting `ms_unknown` (which
+			// would collide across distinct named scalar element types).  Except where it
+			// is nested and its underlying names a named type with a definition (`type
+			// Tree @[]Tree`, `type Strings @[]String`): spelled by its underlying, its name
+			// would go on into one declaration after another (round a ring of them, for
+			// ever), so it is written by name, as a nested named struct is — the name of
+			// the last of a chain of named types each over the next, the one whose
+			// underlying that is.  Which is decided from the underlying's own expression
+			// (namesDefinedType), so the name is a function of the type alone — Tree and
+			// @[]Tree both name `ms_<Tree>` — and a helper's definition and its
+			// references agree.
+			var last @types.Type
+			t, last = peelNamedLinks(t)
+			if !nested || !namesDefinedType(t) { continue }
+			out.Write(mangle.LpTypeArgNamedRaw(last.Name))
+		} else if (t.Kind == types.TYP_STRUCT || (t.Kind == types.TYP_NAMED && t.Underlying == nil)) &&
+				len(t.Name) == 0 {
+			out.Write("anon")
+			stringutils.WriteInt(out, len(t.Fields))
+			if len(t.Fields) > 0 {
+				var s @anonFields = make(anonFields)
+				s.out = out
+				s.st = t
+				s.enc = strings.NewBuilder()
+				structs.Push(s)
+				out = s.enc
+				t = t.Fields[0].Type
+				nested = true
+				continue
+			}
+		} else if t.Kind == types.TYP_MANAGED_PTR || t.Kind == types.TYP_MANAGED_SLICE ||
+				t.Kind == types.TYP_ARRAY {
+			writeElemKindToken(out, t)
+			t = t.Elem
+			nested = true
+			continue
+		} else {
+			writeLeafToken(out, t, nested)
+		}
+		// t's encoding is complete, and with it any fields of the structs being written
+		// that it completes.
+		for {
+			if structs.Len() == 0 { return }
+			var s @anonFields = structs.Get(structs.Len() - 1)
+			var fs @[]char = buf.CopyStr(s.enc.String())
+			s.out.WriteByte('_')
+			stringutils.WriteInt(s.out, len(fs))
+			s.out.WriteByte('_')
+			s.out.Write(fs)
+			s.field += 1
+			if s.field < len(s.st.Fields) {
+				s.enc = strings.NewBuilder()
+				out = s.enc
+				t = s.st.Fields[s.field].Type
+				nested = true
+				break
+			}
+			_, _ = structs.Pop()
+		}
+	}
+}
+
+// writeElemKindToken writes the kind token of t, a managed pointer, a managed-slice or
+// an array, which its element's encoding follows.
+func writeElemKindToken(out *strings.Builder, t @types.Type) {
+	if t.Kind == types.TYP_MANAGED_PTR {
+		out.Write("mp_")
+	} else if t.Kind == types.TYP_MANAGED_SLICE {
+		out.Write("ms_")
+	} else {
+		out.Write("arr")
+		stringutils.WriteInt64(out, t.ArrayLen)
+		out.WriteByte('_')
+	}
+}
+
+// writeLeafToken writes the whole encoding of t, a type with no element or field the
+// encoding goes on to: a named struct, or a named type whose definition is not
+// visible, by name, and every other kind by its token.
+func writeLeafToken(out *strings.Builder, t @types.Type, nested bool) {
+	// A named type whose definition is not visible — an imported opaque type, or a
+	// REPL type only forward-declared so far — is named like a struct, by its own
+	// name: helpers built while it is opaque are then distinct per type, and a
+	// definition as a struct literal keeps the name.
+	if t.Kind == types.TYP_STRUCT || (t.Kind == types.TYP_NAMED && t.Underlying == nil) {
+		if nested {
+			// Injective, identifier-only full-name encoding (see writeDtorTypeSuffix).
+			out.Write(mangle.LpTypeArgNamedRaw(t.Name))
+		} else {
+			// Top-level: the length-prefixed leaf token, matching dtorName /
+			// qualifiedDtorNameForType (writeStructLeafToken — closes the top-level
+			// residual where a struct source-named like a wrapper helper collided).
+			WriteStructLeafToken(out, DotSuffix(t.Name))
+		}
+		return
+	}
+	// A managed interface value (@Iface) and a managed func value (@func)
+	// each get ONE suffix — NOT a per-interface or per-signature one.  Their
+	// element dtor/copy bodies (in genManagedSliceDtor / the copy generator)
+	// are type-INDEPENDENT: an @Iface element RefDec's via the dtor fetched
+	// from its own runtime vtable, an @func element via emitManagedFuncValueRefDec;
+	// so a single `__dtor_ms_<tok>` (and `__copy_`) body is correct for every
+	// interface / signature.  The tokens must be injective against EVERY other
+	// kind — including user struct names, which the struct arm above emits
+	// verbatim.  Use the reserved keywords `interface` / `func`: a struct can
+	// never be named a keyword, so `@[]@I` and `@[]structNamed_interface` can't
+	// collide (a bare `iv` / `fv` WOULD — they are legal identifiers — producing
+	// one `__dtor_ms_iv` body for two structurally-different slices — a leak /
+	// SIGSEGV).  No other kind maps to these tokens
+	// (a non-managed *func / bare interface is not destructible, so never reaches
+	// here).
+	if t.Kind == types.TYP_INTERFACE_VALUE_MANAGED {
+		out.Write("interface")
+		return
+	}
+	if t.Kind == types.TYP_MANAGED_FUNC_VALUE {
+		out.Write("func")
+		return
+	}
+	// Primitive types (used in managed-slice naming, e.g., @[]@[]char → ms_ms_uint8)
+	if t.Kind == types.TYP_INT {
+		out.Write(t.Name)
+		return
+	}
+	if t.Kind == types.TYP_BOOL {
+		out.Write("bool")
+		return
+	}
+	out.Write("unknown")
+}
+
+// peelNamedLinks follows the chain of named types t starts — each one's underlying
+// the next — and returns the type the chain ends at and the chain's last link, whose
+// underlying that is.
+func peelNamedLinks(t @types.Type) (@types.Type, @types.Type) {
+	var last @types.Type = t
+	for t != nil && t.Kind == types.TYP_NAMED && t.Underlying != nil {
+		last = t
+		t = t.Underlying.ResolveAliasAndConst()
+	}
+	return t, last
+}
+
+// namesDefinedType reports whether t's own expression names a named type with a
+// definition (an underlying): t itself, or a part writeDtorTypeSuffix spells — a
+// managed pointer's, a managed-slice's or an array's element, a nameless struct's
+// fields.  A named struct, a named type whose definition is not visible, a function or
+// interface value and a primitive end a path, so the walk stays within t's expression.
+func namesDefinedType(t @types.Type) bool {
+	var stack @vec.Vec[@types.Type] = vec.New[@types.Type]()
+	stack.Push(t)
+	for stack.Len() > 0 {
+		var u @types.Type
+		u, _ = stack.Pop()
+		u = u.ResolveAliasAndConst()
+		if u == nil { continue }
+		if u.Kind == types.TYP_NAMED {
+			if u.Underlying != nil { return true }
+		} else if u.Kind == types.TYP_MANAGED_PTR || u.Kind == types.TYP_MANAGED_SLICE ||
+				u.Kind == types.TYP_ARRAY {
+			stack.Push(u.Elem)
+		} else if u.Kind == types.TYP_STRUCT && len(u.Name) == 0 {
+			for j := 0; j < len(u.Fields); j++ {
+				stack.Push(u.Fields[j].Type)
+			}
+		}
+	}
+	return false
+}

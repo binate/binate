@@ -1,10 +1,13 @@
 package "pkg/binate/interp"
 
 import "pkg/binate/buf"
+import "pkg/binate/ir"
 import "pkg/binate/types"
 import "pkg/binate/types/abi"
 import "pkg/binate/vm"
-import "pkg/stdx/slices"
+import "pkg/std/cmp"
+import "pkg/std/containers/table"
+import "pkg/std/containers/vec"
 
 // RunFuncTyped calls the package-level function `pkgPath.funcName` (pkgPath is
 // the FULL import path, e.g. "pkg/std/strconv") with typed arguments and returns
@@ -270,64 +273,72 @@ func unmarshalResults(results @[]@types.Type, retWord int, retbuf @[]uint8) @[]V
 // backings), so both stay rejected.
 //
 // A recursive type (`type Tree @[]Tree`, `type Node struct { kids @[]Node }`)
-// is marshalable when its parts are: the walk answers yes for a (type,
-// allowIface) pair it is already inside, since every condition is a conjunction
-// over the parts and a repeat adds none (releaseImage walks the finite data).
+// is marshalable when its parts are: every condition is a conjunction over the
+// parts, so the answer is whether every (type, allowIface) pair reachable from t
+// passes its own check, each checked once (releaseImage walks the finite data).
 // allowIface is part of the key, so a struct allowed an iface field as a result
-// is checked again, without it, where it is a slice element.
+// is checked again, without it, where it is a slice element.  The pairs are
+// visited from a stack of their own, not a call per part: a managed-slice's element
+// can be a struct whose fields hold the next one, and a ring of such structs is as
+// long as a package makes it.
 func marshalableType(t @types.Type, allowIface bool) bool {
-	var noTypes @[]@types.Type
-	var noFlags @[]bool
-	return marshalableIn(t, allowIface, noTypes, noFlags)
-}
-
-// marshalableIn is marshalableType's walk; inT / inIface hold the (stripped
-// type, allowIface) pairs being checked further up.
-func marshalableIn(t @types.Type, allowIface bool, inT @[]@types.Type, inIface @[]bool) bool {
-	if t == nil {
-		return false
-	}
-	var st @types.Type = types.StripWrappers(t)
-	if st == nil {
-		return false
-	}
-	for i := 0; i < len(inT); i++ {
-		if same(inT[i], st) && inIface[i] == allowIface { return true }
-	}
-	var subT @[]@types.Type = slices.Append[@types.Type](inT, st)
-	var subIface @[]bool = slices.Append[bool](inIface, allowIface)
-	if allowIface &&
-			(st.Kind == types.TYP_INTERFACE_VALUE_MANAGED || st.Kind == types.TYP_INTERFACE_VALUE) {
-		return true
-	}
-	if !isByAddressType(st) {
-		// Single-word by-value type.  Admit only a genuine (non-managed) scalar that
-		// fits in a register word — a managed word (@T / @func, all NeedsDestruction)
-		// would leak, and an over-word-size non-managed value does not fit a slot.
-		if st.NeedsDestruction() {
+	var stack @vec.Vec[marshalPart] = vec.New[marshalPart]()
+	var seen @table.Table[int, bool, ir.AddrHasher, cmp.Default[int]] = table.NewTable[int, bool,
+			ir.AddrHasher, cmp.Default[int]](ir.AddrHasher{}, cmp.Default[int]{})
+	stack.Push(marshalPart{typ: t, allowIface: allowIface})
+	for stack.Len() > 0 {
+		var p marshalPart
+		p, _ = stack.Pop()
+		if p.typ == nil {
 			return false
 		}
-		return st.Size() <= cast(int64, sizeof(int))
-	}
-	if st.Kind == types.TYP_STRUCT {
-		// A by-value struct rides the retbuf (a result) or one by-address slot (an
-		// arg), whatever its size, and every field must itself be marshalable so
-		// releaseImage's field walk stays total.  Fields inherit allowIface (a
-		// struct result may carry an iface field; a struct param may not).
-		for i := 0; i < len(st.Fields); i++ {
-			if !marshalableIn(st.Fields[i].Type, allowIface, subT, subIface) {
+		var st @types.Type = types.StripWrappers(p.typ)
+		if st == nil {
+			return false
+		}
+		// The stripped type's address keys it, its low bit (zero by alignment) the flag;
+		// every type keyed is held by t's graph throughout, so no address is reused.
+		var key int = bit_cast(int, st)
+		if p.allowIface { key = key + 1 }
+		var found bool
+		_, found = seen.GetOrPut(key, true)
+		if found { continue }
+		if p.allowIface &&
+				(st.Kind == types.TYP_INTERFACE_VALUE_MANAGED || st.Kind == types.TYP_INTERFACE_VALUE) {
+			continue
+		}
+		if !isByAddressType(st) {
+			// Single-word by-value type.  Admit only a genuine (non-managed) scalar that
+			// fits in a register word — a managed word (@T / @func, all NeedsDestruction)
+			// would leak, and an over-word-size non-managed value does not fit a slot.
+			if st.NeedsDestruction() || st.Size() > cast(int64, sizeof(int)) {
 				return false
 			}
+		} else if st.Kind == types.TYP_STRUCT {
+			// A by-value struct rides the retbuf (a result) or one by-address slot (an
+			// arg), whatever its size, and every field must itself be marshalable so
+			// releaseImage's field walk stays total.  Fields inherit allowIface (a
+			// struct result may carry an iface field; a struct param may not).
+			for i := 0; i < len(st.Fields); i++ {
+				stack.Push(marshalPart{typ: st.Fields[i].Type, allowIface: p.allowIface})
+			}
+		} else if st.Kind == types.TYP_MANAGED_SLICE {
+			// The element must itself be marshalable/releasable, recursively — but NEVER
+			// an interface (allowIface=false): collectIfaceVtOffsets does not descend
+			// into slice backings, so a @[]@I element word would go unsubstituted.
+			stack.Push(marshalPart{typ: st.Elem, allowIface: false})
+		} else {
+			return false // raw slice / array: not marshalable
 		}
-		return true
 	}
-	if st.Kind == types.TYP_MANAGED_SLICE {
-		// The element must itself be marshalable/releasable, recursively — but NEVER
-		// an interface (allowIface=false): collectIfaceVtOffsets does not descend
-		// into slice backings, so a @[]@I element word would go unsubstituted.
-		return marshalableIn(st.Elem, false, subT, subIface)
-	}
-	return false // raw slice / array: not marshalable
+	return true
+}
+
+// A marshalPart is a type marshalableType has still to check, and whether an
+// interface value is admitted there.
+type marshalPart struct {
+	typ        @types.Type
+	allowIface bool
 }
 
 // supportedMarshalType is the non-interface predicate (params, slice elements).

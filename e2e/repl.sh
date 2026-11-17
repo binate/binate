@@ -435,6 +435,44 @@ cat > "$TMP/pkg/vfwd2/vfwd2.bn" <<'EOF'
 package "pkg/vfwd2"
 EOF
 
+# ----- A package (pkg/valias) that imports pkg/vlib under another name and
+# declares a type alias named vlib, and a fixture importing the forwarder
+# pkg/vfwd. ---
+mkdir -p "$TMP/pkg/valias"
+cat > "$TMP/pkg/valias.bni" <<'EOF'
+package "pkg/valias"
+
+func Run() int
+EOF
+cat > "$TMP/pkg/valias/valias.bn" <<'EOF'
+package "pkg/valias"
+
+import v "pkg/vlib"
+
+type P struct { x int }
+
+func (p P) Add(a int, b int) int { return p.x + a + b }
+
+type vlib = P
+
+// vlib.Add is P's method: this package names pkg/vlib v.
+func Run() int {
+    var g *func(P, int, int) int = vlib.Add
+    return g(P{x: 1}, 2, 3) + v.Add(0, 0)
+}
+EOF
+VFWD_FIXTURE="$TMP/vfwd_fixture.bn"
+cat > "$VFWD_FIXTURE" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+import "pkg/vfwd"
+
+func main() {
+    testing.Println(vfwd.MAX)
+}
+EOF
+
 # ----- A generic type with a generic-receiver impl of pkg/gbase's generic
 # interface: boxing an instantiation at the prompt mints its impl row on the
 # session module. ---
@@ -1783,6 +1821,69 @@ testing.Println(vlib.Version)
 > 43
 > > package pkg/vlib loaded
 > 11
+> "
+
+# --- A type alias named like a package the session holds but binds no name to
+# (one an import exposes, pkg/builtins/lang, pkg/builtins/rt) is a method
+# expression's receiver like any other: here at startup. ---
+run_repl "prompt-type-alias-named-like-exposed-pkg" \
+"type P struct { x int }
+func (p P) Add(a int, b int) int { return p.x + a + b }
+type vlib = P
+var g *func(P, int, int) int = vlib.Add
+testing.Println(g(P{x: 1}, 2, 3))
+" \
+"$BANNER
+> > > > > 6
+> " "$VFWD_FIXTURE"
+
+# --- The same after a forwarder imported at the prompt. ---
+run_repl "prompt-type-alias-named-like-pkg-exposed-at-prompt" \
+"import \"pkg/vfwd\"
+type P struct { x int }
+func (p P) Add(a int, b int) int { return p.x + a + b }
+type vlib = P
+var g *func(P, int, int) int = vlib.Add
+testing.Println(g(P{x: 1}, 2, 3))
+" \
+"$BANNER
+> package pkg/vfwd loaded
+> > > > > 6
+> "
+
+# --- The same named lang. ---
+run_repl "prompt-type-alias-named-lang" \
+"type P struct { x int }
+func (p P) Add(a int, b int) int { return p.x + a + b }
+type lang = P
+var g *func(P, int, int) int = lang.Add
+testing.Println(g(P{x: 1}, 2, 3))
+" \
+"$BANNER
+> > > > > 6
+> "
+
+# --- The same named rt. ---
+run_repl "prompt-type-alias-named-rt" \
+"type P struct { x int }
+func (p P) Add(a int, b int) int { return p.x + a + b }
+type rt = P
+var g *func(P, int, int) int = rt.Add
+testing.Println(g(P{x: 1}, 2, 3))
+" \
+"$BANNER
+> > > > > 6
+> "
+
+# --- A loaded package's type alias named like a package it imports under
+# another name. ---
+run_repl "loaded-pkg-type-alias-named-like-aliased-import" \
+"import \"pkg/valias\"
+testing.Println(valias.Run())
+" \
+"$BANNER
+> package pkg/valias loaded
+> 6
 > "
 
 # --- The alias-receiver impl again, with pkg/aliashome loaded only indirectly

@@ -382,6 +382,59 @@ func MkS(n int) S { return S{v: n} }
 EOF
 done
 
+# ----- A forwarder (pkg/vfwd) exposing a package (pkg/vlib) with a function, a
+# variable, a constant and a type with a method and an impl, and a forwarder
+# (pkg/vfwd2) exposing pkg/vfwd, all imported only at the prompt. ---
+mkdir -p "$TMP/pkg/vlib" "$TMP/pkg/vfwd" "$TMP/pkg/vfwd2"
+cat > "$TMP/pkg/vlib.bni" <<'EOF'
+package "pkg/vlib"
+
+func Add(a int, b int) int
+
+var Version int
+
+const MAX int = 42
+
+type S struct { v int }
+
+func (s *S) Get() int
+
+interface Getter {
+    Get() int
+}
+
+impl *S : Getter
+
+func MkS(n int) S
+EOF
+cat > "$TMP/pkg/vlib/vlib.bn" <<'EOF'
+package "pkg/vlib"
+
+func Add(a int, b int) int { return a + b }
+
+var Version int = 9
+
+func (s *S) Get() int { return s.v }
+
+func MkS(n int) S { return S{v: n} }
+EOF
+cat > "$TMP/pkg/vfwd.bni" <<'EOF'
+package "pkg/vfwd"
+
+expose "pkg/vlib"
+EOF
+cat > "$TMP/pkg/vfwd/vfwd.bn" <<'EOF'
+package "pkg/vfwd"
+EOF
+cat > "$TMP/pkg/vfwd2.bni" <<'EOF'
+package "pkg/vfwd2"
+
+expose "pkg/vfwd"
+EOF
+cat > "$TMP/pkg/vfwd2/vfwd2.bn" <<'EOF'
+package "pkg/vfwd2"
+EOF
+
 # ----- A generic type with a generic-receiver impl of pkg/gbase's generic
 # interface: boxing an instantiation at the prompt mints its impl row on the
 # session module. ---
@@ -1670,6 +1723,66 @@ testing.Println(sub.Extra())
 > package pkg/gsubf loaded
 > > > 7
 > 8
+> "
+
+# --- A forwarder imported at the prompt: a call, a function value, a constant,
+# a variable, a method and an interface of the package it exposes, all through
+# the forwarder. ---
+run_repl "mid-session-forwarder-members" \
+"import \"pkg/vfwd\"
+testing.Println(vfwd.Add(2, 3))
+var f *func(int, int) int = vfwd.Add
+testing.Println(f(4, 5))
+testing.Println(vfwd.MAX)
+testing.Println(vfwd.Version)
+vfwd.Version = 11
+testing.Println(vfwd.Version)
+var s vfwd.S = vfwd.MkS(4)
+testing.Println(s.Get())
+var gt *vfwd.Getter = &s
+testing.Println(gt.Get())
+" \
+"$BANNER
+> package pkg/vfwd loaded
+> 5
+> > 9
+> 42
+> 9
+> > 11
+> > 4
+> > 4
+> "
+
+# --- The same with the exposed package imported first: the forwarder's members
+# are that package's own (one variable, written through either name). ---
+run_repl "mid-session-forwarder-after-home" \
+"import \"pkg/vlib\"
+import \"pkg/vfwd\"
+vfwd.Version = 11
+testing.Println(vlib.Version)
+testing.Println(vfwd.Add(vlib.MAX, 1))
+" \
+"$BANNER
+> package pkg/vlib loaded
+> package pkg/vfwd loaded
+> > 11
+> 43
+> "
+
+# --- A chain of forwarders imported at the prompt and used, then the package at
+# its end. ---
+run_repl "mid-session-forwarder-chain-then-home" \
+"import \"pkg/vfwd2\"
+testing.Println(vfwd2.Add(vfwd2.MAX, 1))
+vfwd2.Version = 11
+import \"pkg/vlib\"
+testing.Println(vlib.Version)
+" \
+"$BANNER
+> package pkg/vfwd2 loaded
+> 43
+> > package pkg/vlib loaded
+> 11
 > "
 
 # --- The alias-receiver impl again, with pkg/aliashome loaded only indirectly

@@ -307,7 +307,7 @@ INTINT_PART_COST="pkg/binate/check:20 pkg/binate/irgen:15 pkg/binate/link:20"
 INTINT_LIGHT_COST="cmd/bni:11 cmd/bnld:11 pkg/binate/native:11 pkg/binate/ir:8 pkg/binate/iropt:6
 cmd/bnas:5 pkg/binate/types:2
 pkg/binate/native/fold:4 pkg/binate/native/blockplan:4 pkg/binate/native/callconv:3
-pkg/binate/native/strength:3 pkg/binate/irbuild:3 pkg/binate/optflags:3"
+pkg/binate/native/strength:3 pkg/binate/irbuild:3 pkg/binate/optflags:3 pkg/binate/irgather:2"
 # intint_cost <table> <pkg>: pkg's cost in table, 1 if it is not listed.
 intint_cost() {
     for c_entry in $1; do

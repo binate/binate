@@ -3,7 +3,7 @@
 # a program running under the bytecode VM dispatching interface methods whose
 # implementations live in a NATIVELY-compiled package.
 #
-# This path (dispatchCompiledIfaceMethod in pkg/binate/vm/vm_exec_iface.bn) is
+# This path (dispatchCompiledIfaceMethod in pkg/binate/vm/vm_exec_ifacecall.bn) is
 # reachable only when a package is NATIVE-INJECTED into the VM (its @__ivt /
 # @__ivtshim vtables registered), which cmd/bni does for pkg/std/* only.  A
 # synthetic conformance-test package is instead lowered to bytecode in the VM

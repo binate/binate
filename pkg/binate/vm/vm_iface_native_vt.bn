@@ -4,10 +4,12 @@ import "pkg/binate/vmdata"
 
 import "pkg/binate/types"
 import "pkg/builtins/rt"
+import "pkg/stdx/slices"
 
 // g_crossModeVmAddr is the VM currently dispatching an injected-native callee — set
-// (and restored, for re-entrancy) around each native extern dispatch
-// (dispatchExternBinding) so that a native rt.SatLookup MISS, routed through the
+// (and restored, for re-entrancy) around each native dispatch (dispatchExternBinding,
+// dispatchCompiledFuncValue, dispatchCompiledIfaceMethod) so that a native
+// rt.SatLookup MISS, routed through the
 // installed rt fallback (satFallbackFn), can reach THIS VM's satentry registry.  A
 // raw address, not an @VM, so the global never perturbs the VM's own refcount.
 // 0 = no VM is currently dispatching native code, so the fallback declines.
@@ -50,7 +52,8 @@ func satFallbackFn(ti *uint8, id *uint8) *uint8 {
 // 1-based index into vm.IfaceVtables), which an injected-NATIVE stdlib callee
 // (e.g. errors.Is) cannot dereference — native code treats the vtable word as
 // a native @__ivt pointer and faults on the small index.  At the bytecode →
-// native marshalling boundary (dispatchExternBinding), every interface-typed
+// native marshalling boundary (the extern, func-value and native interface-method
+// dispatchers), every interface-typed
 // arg whose word is a VM index is replaced by a COPY pointing at a NATIVE
 // handle-based vtable built from the same vm.IfaceVtables entry, so the callee's
 // RefDec (slot 0) and method dispatch (method slots) re-enter the VM through the
@@ -109,27 +112,35 @@ func buildNativeIfaceVtable(vm @VM, vt @vmdata.IfaceVtable) int {
 // substituteSliceIfaceArgs is the slice-element analog of the per-arg-slot
 // substitution (substArgSlotIface): it rewrites the flagged RAW-SLICE args whose
 // ELEMENTS are raw interface values.  For each arg SLOT k in `slots` (the layout's
-// SliceIfaceSlots),
-// args[k] is the by-address pointer to a 2-word raw slice `{data, len}` whose
-// backing holds `len` raw interface values (2 words each, `{data, vtable_word}` —
-// e.g. the `*[]*any` a `...*any` variadic packs).  A bytecode impl's element
-// carries a VM-index vtable word an injected-native callee cannot dereference; the
-// per-arg-slot arg-iface layout (substArgSlotIface) covers interface words WITHIN
-// an arg image (top-level OR nested in a by-value aggregate) but never reaches
-// values NESTED behind a slice's data pointer, so those elements would reach native
-// code untranslated (a SIGSEGV when the callee reads the small index as a native
-// @__ivt).  This copies the backing array to vm.Stack, translating each VM-index
-// element to the impl's native handle-vtable (buildNativeIfaceVtable) while keeping
-// its data pointer, copies the `{data, len}` header pointing at that translated
-// backing, and repoints args[k] at the copy.  A native/nil element word is copied
-// verbatim.
+// SliceIfaceSlots), args[k] is the by-address pointer to a 2-word raw slice
+// `{data, len}` whose backing holds `len` raw interface values (2 words each,
+// `{data, vtable_word}` — e.g. the `*[]*any` a `...*any` variadic packs).  A bytecode
+// impl's element carries a VM-index vtable word an injected-native callee cannot
+// dereference; the per-arg-slot arg-iface layout (substArgSlotIface) covers interface
+// words WITHIN an arg image (top-level OR nested in a by-value aggregate) but never
+// reaches values NESTED behind a slice's data pointer, so those elements would reach
+// native code untranslated (a SIGSEGV when the callee reads the small index as a
+// native @__ivt).  This copies the backing, translating each VM-index element to the
+// impl's native handle-vtable (buildNativeIfaceVtable) while keeping its data
+// pointer, copies the `{data, len}` header pointing at that translated backing, and
+// repoints args[k] at the copy.  A native/nil element word is copied verbatim, and a
+// slice with no VM-index element is passed as it is.
 //
-// Like substArgSlotIface the copies ride vm.Stack (scratch reclaimed at the next
-// BC_SP_RESTORE) and the ORIGINAL backing is never mutated — a spread `s...` of a
-// user slice must see its own elements unchanged.  Only RAW interface elements
-// (2-word) are handled; a slice of MANAGED interface elements is not flagged by the
-// lower-time classifier (argIsSliceOfRawIface), so it never reaches here.
-func substituteSliceIfaceArgs(vm @VM, argsBase *int, slots @[]int) {
+// The ORIGINAL backing is never written: the native vtable words are for the callee
+// only, and the caller's own values keep their VM words.  A copy rides vm.Stack
+// (scratch reclaimed at the next BC_SP_RESTORE) when it fits with `reserve` bytes
+// more and the red zone still free (wouldFrameOverflow): the reserve is what may
+// still be pushed after it -- the rest of the calling statement's growth (its
+// function's MaxStmtTempGrowth, all the frame-entry reservation covers) and the
+// return buffer the dispatch takes -- so a stack copy never moves a later push past
+// the limit.  Otherwise it goes on the heap, and is returned for the caller to free once the
+// native call has returned (releaseSliceCopies).  Nothing faults here: the call's
+// arguments are delivered by now, and its cleanup pad leaves delivered arguments
+// alone, so a fault would leak them.  Only RAW interface elements (2-word) are
+// handled; a slice of MANAGED interface elements is not flagged by the lower-time
+// classifier (argIsSliceOfRawIface), so it never reaches here.
+func substituteSliceIfaceArgs(vm @VM, argsBase *int, slots @[]int, reserve int) @[]int {
+	var heapCopies @[]int
 	for si := 0; si < len(slots); si++ {
 		var k int = slots[si]
 		var hdrInt int = argsBase[k]
@@ -142,25 +153,21 @@ func substituteSliceIfaceArgs(vm @VM, argsBase *int, slots @[]int) {
 		if dataInt == 0 || n <= 0 {
 			continue
 		}
-		// Unlike substArgSlotIface (a static arg-image size) and the aggregate retbuf (a
-		// static return-type size), this scratch bump is a RUNTIME slice length — the
-		// one temp growth the frame-entry reservation (MaxStmtTempGrowth) can't cover —
-		// so it keeps a runtime check.  A pathologically large cross-mode `...*any`
-		// spread raises a recoverable stack-overflow fault (unwound by the extern call
-		// op's cleanup pad) instead of a process-fatal vmPanic or a write past
-		// vm.Stack's end.  wouldFrameOverflow (not a bare `> StackSize`) leaves the red
-		// zone free so the unwind has headroom.  The check is BEFORE any growth, so on
-		// overflow no partial copy is written; the caller aborts before packing args.
-		if wouldFrameOverflow(vm, (n * 2 + 2) * REG_SLOT) {
-			setFault(vm, "runtime error: stack overflow")
-			return
-		}
 		var src *int = bit_cast(*int, dataInt)
-		// Copy the backing (n elements x 2 words) onto vm.Stack, translating each
-		// element's vtable word.
-		var copyBackingInt int = bit_cast(int, vm.Stack) + vm.SP
-		var copyBacking *int = bit_cast(*int, copyBackingInt)
-		vm.SP = vm.SP + n * 2 * REG_SLOT
+		if !sliceHoldsVmIface(vm, src, n) {
+			continue
+		}
+		// The backing (n elements x 2 words), then the {data, len} header.
+		var size int = (n * 2 + 2) * REG_SLOT
+		var copyInt int
+		if wouldFrameOverflow(vm, size + reserve) {
+			copyInt = bit_cast(int, rt.Alloc(size))
+			heapCopies = slices.Append[int](heapCopies, copyInt)
+		} else {
+			copyInt = bit_cast(int, vm.Stack) + vm.SP
+			vm.SP = vm.SP + size
+		}
+		var copyBacking *int = bit_cast(*int, copyInt)
 		for e := 0; e < n; e++ {
 			var dataIdx int = e * 2 + types.IfaceValueDataIndex()
 			var vtIdx int = e * 2 + types.IfaceValueVtableIndex()
@@ -172,12 +179,29 @@ func substituteSliceIfaceArgs(vm @VM, argsBase *int, slots @[]int) {
 				copyBacking[vtIdx] = buildNativeIfaceVtable(vm, vm.IfaceVtables.Get(vtWord - 1))
 			}
 		}
-		// Copy the {data, len} header pointing at the translated backing.
-		var copyHdrInt int = bit_cast(int, vm.Stack) + vm.SP
+		var copyHdrInt int = copyInt + n * 2 * REG_SLOT
 		var copyHdr *int = bit_cast(*int, copyHdrInt)
-		vm.SP = vm.SP + 2 * REG_SLOT
-		copyHdr[0] = copyBackingInt
+		copyHdr[0] = copyInt
 		copyHdr[1] = n
 		argsBase[k] = copyHdrInt
+	}
+	return heapCopies
+}
+
+// sliceHoldsVmIface reports whether any of the n raw interface values at src carries
+// a VM-index vtable word (a bytecode impl's), which a native callee cannot
+// dereference.
+func sliceHoldsVmIface(vm @VM, src *int, n int) bool {
+	for e := 0; e < n; e++ {
+		if !ifaceVtIsNative(vm, src[e * 2 + types.IfaceValueVtableIndex()]) { return true }
+	}
+	return false
+}
+
+// releaseSliceCopies frees the heap copies substituteSliceIfaceArgs made, once the
+// native call they were passed to has returned.
+func releaseSliceCopies(copies @[]int) {
+	for i := 0; i < len(copies); i++ {
+		rt.Free(bit_cast(*uint8, copies[i]))
 	}
 }

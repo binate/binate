@@ -461,6 +461,58 @@ func Run() int {
     return g(P{x: 1}, 2, 3) + v.Add(0, 0)
 }
 EOF
+# ----- A package with a single-segment path (locv), a forwarder exposing it
+# (pkg/lfwd), and a package (pkg/lalias) that imports it under another name and
+# declares a type alias named locv. ---
+mkdir -p "$TMP/locv" "$TMP/pkg/lfwd" "$TMP/pkg/lalias"
+cat > "$TMP/locv.bni" <<'EOF'
+package "locv"
+
+func Add(a int, b int) int
+
+var Mul *func(int, int) int
+EOF
+cat > "$TMP/locv/locv.bn" <<'EOF'
+package "locv"
+
+func Add(a int, b int) int { return a + b + 1000 }
+
+func mul(a int, b int) int { return a * b + 5000 }
+
+var Mul *func(int, int) int = mul
+EOF
+cat > "$TMP/pkg/lfwd.bni" <<'EOF'
+package "pkg/lfwd"
+
+expose "locv"
+EOF
+cat > "$TMP/pkg/lfwd/lfwd.bn" <<'EOF'
+package "pkg/lfwd"
+EOF
+cat > "$TMP/pkg/lalias.bni" <<'EOF'
+package "pkg/lalias"
+
+func Run() int
+EOF
+cat > "$TMP/pkg/lalias/lalias.bn" <<'EOF'
+package "pkg/lalias"
+
+import v "locv"
+
+type P struct { x int }
+
+func (p P) Add(a int, b int) int { return p.x * 100 + a + b }
+
+func (p P) Mul(a int, b int) int { return p.x * 1000 + a * b }
+
+type locv = P
+
+// locv.Add and locv.Mul are P's methods: this package names its import of locv v.
+func Run() int {
+    var g *func(P, int, int) int = locv.Add
+    return g(P{x: 1}, 2, 3) + v.Add(0, 0) + locv.Mul(P{x: 2}, 3, 4)
+}
+EOF
 VFWD_FIXTURE="$TMP/vfwd_fixture.bn"
 cat > "$VFWD_FIXTURE" <<'EOF'
 package "main"
@@ -1884,6 +1936,37 @@ testing.Println(valias.Run())
 "$BANNER
 > package pkg/valias loaded
 > 6
+> "
+
+# --- A type alias named like a package whose path is a single segment, which a
+# forwarder imported at the prompt exposes. ---
+run_repl "prompt-type-alias-named-like-single-segment-pkg" \
+"import \"pkg/lfwd\"
+type P struct { x int }
+func (p P) Add(a int, b int) int { return p.x + a + b }
+func (p P) Mul(a int, b int) int { return p.x * 100 + a * b }
+type locv = P
+var g *func(P, int, int) int = locv.Add
+testing.Println(g(P{x: 1}, 2, 3))
+testing.Println(locv.Mul(P{x: 1}, 2, 3))
+testing.Println(lfwd.Add(1, 2))
+" \
+"$BANNER
+> package pkg/lfwd loaded
+> > > > > > 6
+> 106
+> 1003
+> "
+
+# --- A loaded package's type alias named like a single-segment package it
+# imports under another name. ---
+run_repl "loaded-pkg-type-alias-named-like-single-segment-import" \
+"import \"pkg/lalias\"
+testing.Println(lalias.Run())
+" \
+"$BANNER
+> package pkg/lalias loaded
+> 3117
 > "
 
 # --- The alias-receiver impl again, with pkg/aliashome loaded only indirectly

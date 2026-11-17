@@ -11,7 +11,7 @@
 # package moves, so existing importers keep resolving while they migrate.
 
 # is_pure_forwarder <binate-dir> <bni-path> <pkg-path>: succeed iff the stdlib package
-# <pkg-path> (e.g. pkg/std/vec), whose interface file is <bni-path>, is a pure
+# <pkg-path> (e.g. pkg/std/strings), whose interface file is <bni-path>, is a pure
 # forwarder.  Any top-level declaration (an annotation always precedes one, so the
 # declaration keywords suffice) or a .bn file directly in impls/stdlib/<pkg-path>/ (the
 # loader's test for an implementation directory, which skips dot-files) makes the

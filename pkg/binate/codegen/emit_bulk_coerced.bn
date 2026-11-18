@@ -1,0 +1,181 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/stringutils"
+import "pkg/binate/types"
+import "pkg/binate/types/abi"
+import "pkg/std/strings"
+
+// Memory-backed values (emit_bulk_value.bn) passed and returned in registers.
+//
+// An aggregate that travels in registers crosses a call boundary through a
+// stack slot that holds its bytes: a parameter's incoming registers are stored
+// to its `%v<ID>.agp` slot, an argument is stored to the call's `.agA<i>` slot
+// (a function-value or interface-method call's `.cas<i>`, a closure's capture
+// to its shim's `%cap<i>_ags`) and passed as the registers loaded from it, a
+// call's result registers are stored to its `.agRB`
+// slot (`.mrRB` for several results), and a returned value is stored to
+// `%aggret.slot` (several values to `%mrret.slot`, or to the caller's buffer
+// `%v.retbuf` when they return through it).  A bulk value at such a boundary is
+// memory-backed there, so it never takes its SSA form: a parameter's memory is
+// its `.agp` slot (on x86-64, for one passed in memory, `%v<ID>.bv`, the
+// caller's copy), a call result's is its `.agRB` / `.mrRB` slot, and an argument,
+// a capture or a returned value is copied into its slot by one bulk copy.  Only the
+// prologue writes a parameter's slot, and a call's result slot holds the result
+// as a call's buffer does (emit_bulk_result.bn).  Neither is handed to a callee
+// as its own copy (bulkArgDirect).
+
+// curBulkParamInMemory[id] reports whether the memory-backed parameter with value
+// ID id of the function being emitted arrives in the caller's copy `%v<ID>.bv`
+// (x86-64's memory class, aggMemClass) rather than in registers.
+var curBulkParamInMemory @[]bool
+
+// markBulkParams marks as memory-backed candidates the bulk parameters of f whose
+// value emitAggParamCoercion rebuilds at entry: those that arrive in registers and,
+// on x86-64, those passed in memory.
+func markBulkParams(f @ir.Func, n int) {
+	curBulkParamInMemory = make_slice(bool, n)
+	var argTypes @[]@types.Type
+	var haveArgTypes bool = false
+	var sretOff int = 0
+	if currentFuncUsesSret { sretOff = 1 }
+	for i := 0; i < len(f.Params); i++ {
+		var p @ir.Param = f.Params[i]
+		if p.ID < 0 || p.ID >= n || !isBulkAggregate(p.Typ) { continue }
+		if !haveArgTypes {
+			argTypes = defineArgTypes(f, currentFuncUsesSret)
+			haveArgTypes = true
+		}
+		if aggMemClass(argTypes, i + sretOff) {
+			curBulkParamInMemory[p.ID] = true
+		} else if !aggParamCoerced(p.Typ) {
+			continue
+		}
+		curBulkMem[p.ID] = true
+	}
+}
+
+// isBulkMemID reports whether the value with ID id of the function being emitted
+// is memory-backed — for a parameter, whether its prologue leaves it in its slot.
+func isBulkMemID(id int) bool {
+	return id >= 0 && id < len(curBulkMem) && curBulkMem[id]
+}
+
+// bulkParamSuffix returns the name suffix of memory-backed parameter v's memory:
+// `.bv` for the caller's copy of a parameter passed in memory, else `.agp`.
+func bulkParamSuffix(v @ir.Instr) *[]readonly char {
+	if v.ID < len(curBulkParamInMemory) && curBulkParamInMemory[v.ID] { return ".bv" }
+	return ".agp"
+}
+
+// bulkCoercedCallResult reports whether direct call or __c_call ins returns its
+// result in registers, bound through its `.agRB` slot (`.mrRB` for several
+// results).
+func bulkCoercedCallResult(ins @ir.Instr) bool {
+	if ins.Op != iropcode.OP_CALL && ins.Op != iropcode.OP_C_CALL { return false }
+	return aggCallResultCoerced(ins) || callMultiRetCoerced(ins)
+}
+
+// callSlotRef returns the name `%v<callID><suffix><i>` of call callID's slot for
+// its argument i.
+func callSlotRef(callID int, suffix *[]readonly char, i int) @[]char {
+	var sb @strings.Builder = strings.NewBuilder()
+	emitRef(sb, callID)
+	sb.Write(suffix)
+	stringutils.WriteInt(sb, i)
+	return buf.CopyStr(sb.String())
+}
+
+// emitBulkSlotCopy emits the fill of the slot at slotRef from memory-backed value
+// v: one bulk copy of v's bytes.  The line ends with the next line's indent.
+func emitBulkSlotCopy(out *strings.Builder, slotRef *[]readonly char, v @ir.Instr) {
+	emitMemCopy(out, slotRef, bulkMemRef(v), v.Typ.Size())
+	out.Write("  ")
+}
+
+// emitBulkMemCoercedReturn lowers `return v` of memory-backed value v from a
+// function returning it in registers: one bulk copy of v's bytes into
+// `%aggret.slot`, then the load of the registers' form from it and the `ret`.
+func emitBulkMemCoercedReturn(out *strings.Builder, v @ir.Instr) {
+	emitBulkSlotCopy(out, "%aggret.slot", v)
+	if abi.SysVInSse(v.Typ) {
+		sysvEmitReturnFromSlot(out, v.Typ)
+		return
+	}
+	emitAggReturnFromSlot(out, v.Typ)
+}
+
+// bulkMultiReturn reports whether the return of several values ins returns a
+// memory-backed one (bulkReturnSupported allows one only where the values are
+// returned through memory).
+func bulkMultiReturn(ins @ir.Instr) bool {
+	for k := 0; k < len(ins.Args); k++ {
+		if isBulkMem(ins.Args[k]) { return true }
+	}
+	return false
+}
+
+// emitBulkMemMultiReturn lowers the return of several values, of tuple type t,
+// among them a memory-backed one: each value is written at its offset in the
+// caller's buffer `%v.retbuf` (sret) or in `%mrret.slot`, a memory-backed one by
+// one bulk copy and any other by a store, and the function returns: `ret void`,
+// or the gather of the registers' form from `%mrret.slot` (emitMultiRetGather).
+func emitBulkMemMultiReturn(out *strings.Builder, instr @ir.Instr, t @types.Type) {
+	var seq int = retSeq
+	retSeq++
+	var base *[]readonly char = "%mrret.slot"
+	if currentFuncUsesSret { base = "%v.retbuf" }
+	for i := 0; i < len(instr.Args); i++ {
+		var a @ir.Instr = instr.Args[i]
+		var p @strings.Builder = strings.NewBuilder()
+		p.Write("%v.retm.")
+		stringutils.WriteInt(p, seq)
+		p.WriteByte('.')
+		stringutils.WriteInt(p, i)
+		out.Write(p.String())
+		out.Write(" = getelementptr i8, ptr ")
+		out.Write(base)
+		out.Write(", i64 ")
+		stringutils.WriteInt64(out, t.Offset(i))
+		out.Write("\n  ")
+		if isBulkMem(a) {
+			emitBulkSlotCopy(out, p.String(), a)
+			continue
+		}
+		out.Write("store ")
+		out.Write(llvmType(a.Typ))
+		out.WriteByte(' ')
+		emitValRef(out, a)
+		out.Write(", ptr ")
+		out.Write(p.String())
+		out.Write("\n  ")
+	}
+	if currentFuncUsesSret {
+		out.Write("ret void\n")
+		return
+	}
+	emitMultiRetGather(out, instr, seq)
+}
+
+// emitBulkCaptureLoad emits, in a closure's shim, the `[N x iW]` value
+// `%cap<i>_ag` of bulk capture i, of type t, that the lifted body takes in
+// registers: a bulk copy of the capture's bytes from the closure record
+// (`%cap<i>_ptr`) into a slot of the registers' size, `%cap<i>_ags`, and a load
+// of the registers' form from it.  Each line ends with the next line's indent.
+func emitBulkCaptureLoad(out *strings.Builder, i int, t @types.Type) {
+	var slot @[]char = sysvName("%cap", i, "_ags")
+	out.Write(slot)
+	out.Write(" = alloca ")
+	aggCoerceLLTy(out, t)
+	out.Write("\n")
+	emitMemCopy(out, slot, sysvName("%cap", i, "_ptr"), t.Size())
+	out.Write("  ")
+	out.Write(sysvName("%cap", i, "_ag"))
+	out.Write(" = load ")
+	aggCoerceLLTy(out, t)
+	out.Write(", ptr ")
+	out.Write(slot)
+	out.Write("\n  ")
+}

@@ -1,0 +1,366 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/std/containers/vec"
+
+// Allocas shared by scope.  The storage of a block's local ends when the block
+// exits (spec mem.scope-exit): IR-gen gives a named variable's slot its scope's id
+// (ir.Instr.Scope) and ends the scope (OP_SCOPE_END) wherever control leaves it.  So a
+// slot with a scope holds something only from an access of it -- its OP_ALLOC, an
+// instruction naming it, or a call that writes its result into it (CallResultSlots)
+// -- up to an end of its scope, and two such slots whose spans never meet may share
+// bytes.  planSharedAllocas finds them with a forward dataflow over f's blocks: a slot
+// becomes live at each access and dies at an end of its scope, and two slots
+// interfere when one is accessed where the other is live.  That covers every overlap:
+// a write of one slot between a write and a read of the other's bytes happens where
+// the other is live, since nothing but an end of its scope ends it.  The slots are
+// packed first fit, in order of their first access, each at the lowest offset no
+// interfering slot overlaps.
+//
+// The dataflow is right only if no slot's bytes are read across an end of its scope.
+// A program may carry a slot's address past the scope (a pointer to a block's local
+// kept after the block), and only reading through it there is undefined; after
+// mem2reg that read can be a load of the slot itself, past the end.  So a slot with a
+// load not reached, on every path, by a write of the whole slot (its OP_ALLOC, a
+// whole store, a call placed into it) since its scope last ended keeps bytes of its
+// own: the program then reads what it would with no sharing.  A read through a value
+// aliasing the slot -- an aggregate load read in place (AggLoadElision), a load
+// passed as an argument in place (LastUseArgLoads) -- is no load of the slot: those
+// analyses keep the slot's scope end out of the span between the load and its uses
+// (scopeEndStrictlyBetween).
+
+// The kinds of a slot event (slotEvents): an access that uses the slot's address
+// only, a load of its bytes, a write of the whole slot, and an end of the slot's
+// scope (the event's slot field then holds the scope).
+const (
+	EV_USE int = 0
+	EV_LOAD int = 1
+	EV_WHOLE int = 2
+	EV_END int = 3
+)
+
+// slotEvents is a block's slot events in order: the slot (or, for EV_END, the scope)
+// and the kind of each.  An instruction's events come loads and uses first, then
+// whole writes, so an instruction that reads and writes a slot is seen reading first.
+type slotEvents struct {
+	slot @vec.Vec[int]
+	kind @vec.Vec[int]
+}
+
+// allocaShare is planSharedAllocas' state over f: the shared slots (k = 0..n-1, value
+// id ids[k]), the slot of each value id (slotOf, -1 for none), the slot a call writes
+// its result into (placed, by call id), the slots of each scope (byScope), each
+// block's events, f's blocks in reverse postorder and their predecessors, and the
+// uint64 words a set of the slots takes.
+type allocaShare struct {
+	f       @ir.Func
+	ids     @[]int
+	slotOf  @[]int
+	placed  @[]int
+	byScope @[]@vec.Vec[int]
+	events  @[]@slotEvents
+	rpo     @[]int
+	preds   @[]@vec.Vec[int]
+	words   int
+}
+
+// newAllocaShare returns the state for sharing the slots ids of f, whose calls write
+// their results into the slots placed gives (CallResultSlots).
+func newAllocaShare(f @ir.Func, ids @[]int, placed @[]int) @allocaShare {
+	var s @allocaShare = make(allocaShare)
+	s.f = f
+	s.ids = ids
+	s.placed = placed
+	s.slotOf = make_slice(int, f.NextID)
+	for i := 0; i < len(s.slotOf); i++ { s.slotOf[i] = -1 }
+	for k := 0; k < len(ids); k++ { s.slotOf[ids[k]] = k }
+	s.byScope = make_slice(@vec.Vec[int], f.NumScopes + 1)
+	for i := 0; i < len(s.byScope); i++ { s.byScope[i] = vec.New[int]() }
+	s.words = (len(ids) + 63) / 64
+	var n int = len(f.Blocks)
+	s.events = make_slice(@slotEvents, n)
+	for bi := 0; bi < n; bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			var k int = s.slotOfValue(ins)
+			if ins.Op == iropcode.OP_ALLOC && k >= 0 && ins.Scope > 0 && ins.Scope < len(s.byScope) {
+				s.byScope[ins.Scope].Push(k)
+			}
+		}
+		s.events[bi] = s.blockEvents(b)
+	}
+	var succs @[]@[]int = buildSuccs(f)
+	var lv @LivenessInfo = make(LivenessInfo)
+	lv.NumBlocks = n
+	if n > 0 { computeReachableRPO(lv, succs) }
+	s.rpo = lv.RPO
+	s.preds = make_slice(@vec.Vec[int], n)
+	for bi := 0; bi < n; bi++ { s.preds[bi] = vec.New[int]() }
+	for bi := 0; bi < n; bi++ {
+		for j := 0; j < len(succs[bi]); j++ { s.preds[succs[bi][j]].Push(bi) }
+	}
+	return s
+}
+
+// slotOfValue returns the shared slot v is, or -1.
+func (s @allocaShare) slotOfValue(v *ir.Instr) int {
+	if v == nil || v.ID < 0 || v.ID >= len(s.slotOf) { return -1 }
+	return s.slotOf[v.ID]
+}
+
+// blockEvents returns block b's slot events (see slotEvents).
+func (s @allocaShare) blockEvents(b @ir.Block) @slotEvents {
+	var ev @slotEvents = make(slotEvents)
+	ev.slot = vec.New[int]()
+	ev.kind = vec.New[int]()
+	for ii := 0; ii < len(b.Instrs); ii++ {
+		var ins @ir.Instr = b.Instrs[ii]
+		var whole int = -1
+		for a := 0; a < len(ins.Args); a++ {
+			var k int = s.slotOfValue(ins.Args[a])
+			if k < 0 { continue }
+			if a == 0 && ins.Op == iropcode.OP_STORE && s.storesWhole(ins) {
+				whole = k
+			} else if a == 0 && ins.Op == iropcode.OP_LOAD {
+				ev.add(k, EV_LOAD)
+			} else {
+				ev.add(k, EV_USE)
+			}
+		}
+		for p := 0; p < len(ins.Phis); p++ {
+			var k int = s.slotOfValue(ins.Phis[p].Val)
+			if k >= 0 { ev.add(k, EV_USE) }
+		}
+		if whole >= 0 { ev.add(whole, EV_WHOLE) }
+		if ins.Op == iropcode.OP_ALLOC && s.slotOfValue(ins) >= 0 { ev.add(s.slotOfValue(ins), EV_WHOLE) }
+		var into int = -1
+		if ins.ID >= 0 && ins.ID < len(s.placed) { into = s.placed[ins.ID] }
+		if into >= 0 && into < len(s.slotOf) && s.slotOf[into] >= 0 { ev.add(s.slotOf[into], EV_WHOLE) }
+		if ins.Op == iropcode.OP_SCOPE_END && ins.Scope > 0 && ins.Scope < len(s.byScope) {
+			ev.add(ins.Scope, EV_END)
+		}
+	}
+	return ev
+}
+
+// add appends an event of slot k (a scope, for EV_END) and kind.
+func (ev @slotEvents) add(k int, kind int) {
+	ev.slot.Push(k)
+	ev.kind.Push(kind)
+}
+
+// storesWhole reports whether ins, a store into a slot, stores a value of the slot's size.
+func (s @allocaShare) storesWhole(ins @ir.Instr) bool {
+	if len(ins.Args) < 2 || ins.Args[1] == nil || ins.Args[1].Typ == nil { return false }
+	var slot @ir.Instr = ins.Args[0]
+	return slot.TypeArg != nil && ins.Args[1].Typ.Size() == slot.TypeArg.Size()
+}
+
+// newSlotSet returns an empty set of the slots, or a full one.
+func (s @allocaShare) newSlotSet(full bool) @[]uint64 {
+	var w @[]uint64 = make_slice(uint64, s.words)
+	if full {
+		for i := 0; i < len(w); i++ { w[i] = ~cast(uint64, 0) }
+	}
+	return w
+}
+
+// setSlotBit adds slot k to set w, or (on false) removes it.
+func setSlotBit(w @[]uint64, k int, on bool) {
+	var bit uint64 = cast(uint64, 1) << cast(uint, k & 63)
+	if on {
+		w[k >> 6] = w[k >> 6] | bit
+	} else {
+		w[k >> 6] = w[k >> 6] & ~bit
+	}
+}
+
+// hasSlotBit reports whether set w holds slot k.
+func hasSlotBit(w @[]uint64, k int) bool {
+	return w[k >> 6] & (cast(uint64, 1) << cast(uint, k & 63)) != 0
+}
+
+// copySlotSet returns a copy of set w.
+func copySlotSet(w @[]uint64) @[]uint64 {
+	var c @[]uint64 = make_slice(uint64, len(w))
+	for i := 0; i < len(w); i++ { c[i] = w[i] }
+	return c
+}
+
+// applyEvents updates set cur over block bi's events: for the live sets (written
+// false) every access adds its slot, and for the written sets (written true) every
+// whole write does; an end of a scope removes its slots from both.
+func (s @allocaShare) applyEvents(bi int, cur @[]uint64, written bool) {
+	var ev @slotEvents = s.events[bi]
+	for j := 0; j < ev.kind.Len(); j++ {
+		var kind int = ev.kind.Get(j)
+		if kind == EV_END {
+			var ended @vec.Vec[int] = s.byScope[ev.slot.Get(j)]
+			for e := 0; e < ended.Len(); e++ { setSlotBit(cur, ended.Get(e), false) }
+		} else if !written || kind == EV_WHOLE {
+			setSlotBit(cur, ev.slot.Get(j), true)
+		}
+	}
+}
+
+// blockIns returns the set at the start of each of f's blocks, by a forward dataflow
+// in reverse postorder to a fixpoint: for the live sets (written false) the union of
+// the predecessors' ends, from empty; for the written sets (written true) their
+// intersection, from full -- the entry's empty, as nothing is written when the
+// function starts -- so an unreachable block keeps the full set (nothing to check).
+func (s @allocaShare) blockIns(written bool) @[]@[]uint64 {
+	var n int = len(s.f.Blocks)
+	var ins @[]@[]uint64 = make_slice(@[]uint64, n)
+	var outs @[]@[]uint64 = make_slice(@[]uint64, n)
+	for b := 0; b < n; b++ {
+		ins[b] = s.newSlotSet(written && b > 0)
+		outs[b] = copySlotSet(ins[b])
+		s.applyEvents(b, outs[b], written)
+	}
+	var changed bool = true
+	for changed {
+		changed = false
+		for r := 0; r < len(s.rpo); r++ {
+			var b int = s.rpo[r]
+			if s.preds[b].Len() == 0 || (written && b == 0) { continue }
+			var next @[]uint64 = ins[b]
+			var unchanged bool = true
+			for w := 0; w < s.words; w++ {
+				var v uint64 = 0
+				if written { v = ~cast(uint64, 0) }
+				for j := 0; j < s.preds[b].Len(); j++ {
+					var o uint64 = outs[s.preds[b].Get(j)][w]
+					if written { v = v & o } else { v = v | o }
+				}
+				if v != next[w] {
+					next[w] = v
+					unchanged = false
+				}
+			}
+			if !unchanged {
+				var out @[]uint64 = copySlotSet(next)
+				s.applyEvents(b, out, written)
+				outs[b] = out
+				changed = true
+			}
+		}
+	}
+	return ins
+}
+
+// interference returns, for each slot, the set of slots it interferes with (one is
+// accessed where the other is live) and the order of the slots' first accesses.  A
+// slot loaded where it is not written since its scope last ended, on some path,
+// interferes with every slot.
+func (s @allocaShare) interference() (@[]@[]uint64, @[]int) {
+	var n int = len(s.ids)
+	var rows @[]@[]uint64 = make_slice(@[]uint64, n)
+	for k := 0; k < n; k++ { rows[k] = s.newSlotSet(false) }
+	var liveIns @[]@[]uint64 = s.blockIns(false)
+	var writtenIns @[]@[]uint64 = s.blockIns(true)
+	var order @vec.Vec[int] = vec.New[int]()
+	var seen @[]bool = make_slice(bool, n)
+	var alone @[]bool = make_slice(bool, n)
+	for bi := 0; bi < len(s.f.Blocks); bi++ {
+		var live @[]uint64 = copySlotSet(liveIns[bi])
+		var written @[]uint64 = copySlotSet(writtenIns[bi])
+		var ev @slotEvents = s.events[bi]
+		for j := 0; j < ev.kind.Len(); j++ {
+			var kind int = ev.kind.Get(j)
+			if kind == EV_END {
+				var ended @vec.Vec[int] = s.byScope[ev.slot.Get(j)]
+				for e := 0; e < ended.Len(); e++ {
+					setSlotBit(live, ended.Get(e), false)
+					setSlotBit(written, ended.Get(e), false)
+				}
+				continue
+			}
+			var k int = ev.slot.Get(j)
+			if kind == EV_LOAD && !hasSlotBit(written, k) { alone[k] = true }
+			if kind == EV_WHOLE { setSlotBit(written, k, true) }
+			for w := 0; w < s.words; w++ { rows[k][w] = rows[k][w] | live[w] }
+			setSlotBit(live, k, true)
+			if !seen[k] {
+				seen[k] = true
+				order.Push(k)
+			}
+		}
+	}
+	for k := 0; k < n; k++ {
+		if alone[k] { rows[k] = s.newSlotSet(true) }
+	}
+	for k := 0; k < n; k++ {
+		setSlotBit(rows[k], k, false)
+		for j := 0; j < n; j++ {
+			if hasSlotBit(rows[k], j) { setSlotBit(rows[j], k, true) }
+		}
+	}
+	for k := 0; k < n; k++ {
+		if !seen[k] { order.Push(k) }
+	}
+	return rows, order.Items()
+}
+
+// planSharedAllocas gives the slots ids of f (sizes, each a multiple of 8) shared
+// offsets from 0 (see above) and returns them and the bytes they take.
+func planSharedAllocas(f @ir.Func, ids @[]int, sizes @[]int64, placed @[]int) (@[]int64, int64) {
+	var offs @[]int64 = make_slice(int64, len(ids))
+	if len(ids) == 0 { return offs, 0 }
+	var s @allocaShare = newAllocaShare(f, ids, placed)
+	rows, order := s.interference()
+	var done @[]bool = make_slice(bool, len(ids))
+	var total int64 = 0
+	for i := 0; i < len(order); i++ {
+		var k int = order[i]
+		offs[k] = firstFitOffset(k, sizes, offs, done, rows[k])
+		done[k] = true
+		if frameAdd(offs[k], sizes[k]) > total { total = frameAdd(offs[k], sizes[k]) }
+	}
+	return offs, total
+}
+
+// firstFitOffset returns the lowest offset, a multiple of 8, at which slot k (sizes[k]
+// bytes) overlaps no placed slot (done) it interferes with (row).  Each pass moves
+// past an overlapping slot, so the offset only grows.
+func firstFitOffset(k int, sizes @[]int64, offs @[]int64, done @[]bool, row @[]uint64) int64 {
+	var at int64 = 0
+	var moved bool = true
+	for moved {
+		moved = false
+		for j := 0; j < len(sizes); j++ {
+			if !done[j] || !hasSlotBit(row, j) { continue }
+			if at < frameAdd(offs[j], sizes[j]) && offs[j] < frameAdd(at, sizes[k]) {
+				at = frameAdd(offs[j], sizes[j])
+				moved = true
+			}
+		}
+	}
+	return at
+}
+
+// placeSharedAllocas lays the slots ids (sizes) of f down from offset with shared
+// bytes (planSharedAllocas), appending each to allocIDs / allocSizes / allocOffsets,
+// and returns the offset past them.
+func placeSharedAllocas(f @ir.Func, ids @vec.Vec[int], sizes @vec.Vec[int64], placed @[]int,
+		allocIDs @vec.Vec[int], allocSizes @vec.Vec[int64], allocOffsets @vec.Vec[int64],
+		offset int64) int64 {
+	offs, total := planSharedAllocas(f, ids.Items(), sizes.Items(), placed)
+	for k := 0; k < len(offs); k++ {
+		allocIDs.Push(ids.Get(k))
+		allocSizes.Push(sizes.Get(k))
+		allocOffsets.Push(frameAdd(offset, offs[k]))
+	}
+	return frameAdd(offset, total)
+}
+
+// scopeEndStrictlyBetween reports whether block b ends scope (an OP_SCOPE_END of it)
+// strictly between instructions from and to.  Scope 0 is never ended.
+func scopeEndStrictlyBetween(b @ir.Block, from int, to int, scope int) bool {
+	if scope <= 0 { return false }
+	for i := from + 1; i < to && i < len(b.Instrs); i++ {
+		if b.Instrs[i].Op == iropcode.OP_SCOPE_END && b.Instrs[i].Scope == scope { return true }
+	}
+	return false
+}

@@ -2,14 +2,11 @@ package "pkg/binate/irgen"
 
 import "pkg/binate/irbuild"
 
-import "pkg/binate/irdata"
-
 import "pkg/binate/irutil"
 
 import "pkg/binate/ir"
 
 import "pkg/binate/ast"
-import "pkg/binate/buf"
 import "pkg/binate/types"
 import "pkg/stdx/slices"
 
@@ -32,7 +29,8 @@ import "pkg/stdx/slices"
 //   4. Function-value call where the callee is an IDENT bound to
 //      a function-value-typed local.
 //   5. Direct function call by name (with package qualification
-//      for SELECTOR forms like `pkg.Func`).
+//      for SELECTOR forms like `pkg.Func`): genNamedCall
+//      (gen_call_named.bn), which a generic instance's call uses too.
 //
 // Method-call lowering lives in gen_method.bn. This file is the
 // generic-call + function-value-call dispatch.
@@ -214,158 +212,7 @@ func genCall(ctx @GenContext, b @ir.Block, e @ast.Expr) @ir.Instr {
 		}
 	}
 
-	// One signature lookup for the whole call site (params, variadic-ness, and
-	// result type) instead of a qualify+probe per field.
-	var sig irdata.FuncSig
-	var funcFound bool
-	sig, funcFound = lookupFuncSig(ctx.Gc, name)
-	var paramTypes @[]@types.Type = sig.Params
-	// A variadic callee packs its trailing individual args into the single *[]T
-	// variadic argument (func.variadic.pack), or forwards a spread operand's
-	// {data,len} directly (func.variadic.spread); a non-variadic callee binds
-	// positionally.  evalCallArgs / deliverCallArgs handle all three.
-	//
-	// Split eval and delivery so a recoverable-stack-overflow PRE-CHECK sits
-	// between them: at this point the args are evaluated (vm.SP reflects their
-	// growth) but not yet delivered/consumed, so OP_STACK_CHECK's cleanup pad still
-	// covers every owned arg, and delivery is SP-neutral so the check exactly
-	// predicts the callee's frame push.  Faulting here — instead of at the later
-	// pushFrame, after a moved arg is consumed — is what keeps that arg from
-	// leaking on overflow.  VM-only: the compiled backends no-op OP_STACK_CHECK
-	// (no recoverable stack overflow).  A non-VM (extern) or unresolved callee
-	// makes the check a runtime no-op.
-	var args @[]@ir.Instr = evalCallArgs(ctx, b, e.Args, paramTypes, sig.IsVariadic, e.Spread)
-	b = ctx.CurBlock
-	irbuild.EmitStackCheck(b, name)
-	attachFaultPad(ctx, b)
-	args = deliverCallArgs(ctx, b, args, paramTypes, sig.IsVariadic)
-	b = ctx.CurBlock
-
-	// Look up return type from function signature
-	var resultTyp @types.Type = nil
-	var results @[]@types.Type = sig.Results
-	if len(results) == 0 {
-		if !funcFound {
-			var msg @[]char = buf.Concat("internal error: IR-gen has no signature for the called function ",
-					name)
-			panic(buf.Concat(msg, " (compiler bug)"))
-		}
-		resultTyp = types.TypVoid()
-	} else if len(results) == 1 {
-		resultTyp = results[0]
-	} else if len(results) > 1 {
-		// Multi-return: use the callee's anonymous struct type
-		if sig.MultiReturnType != nil {
-			resultTyp = sig.MultiReturnType
-		} else {
-			resultTyp = irutil.MakeMultiReturnStructType(results)
-		}
-	}
-	// Compiler-internal indirect-call magics.  Two dispatch shapes:
-	//   * `_call_dtor` / `_call_free_fn`: Args[0] is a function-value
-	//     HANDLE POINTER (result of `_func_handle(F)`, or — for
-	//     `_call_dtor` — the dtor handle
-	//     emitManagedPtrRefDec emits via EmitFuncHandle).  Lowers
-	//     to OP_CALL_HANDLE.
-	//   * `_call_shim_scalar` / `_call_shim_aggregate`:
-	//     Args[0] is a SHIM/raw-fn ADDRESS directly; the next arg is the
-	//     closure-data / receiver argument; the rest are user args.  Lowers
-	//     to OP_CALL_INDIRECT — pkg/binate/vm internal dispatch
-	//     (dispatchExternBinding / dispatchNativeIndirect /
-	//     dispatchCompiledIfaceMethod) already splits the handle into
-	//     shim+data before invoking these.
-	// In all cases the .bni declarations are type-checking shapes
-	// only — there are no callable symbols to link against.
-	if irutil.Streq(name, "_call_dtor") || irutil.Streq(name, "pkg/builtins/rt._call_dtor") ||
-			irutil.Streq(name, "_call_free_fn") || irutil.Streq(name, "pkg/builtins/rt._call_free_fn") {
-		assertShimHandleScalarResult(results)
-		if len(args) >= 1 {
-			var handle @ir.Instr = args[0]
-			var callArgs @[]@ir.Instr = make_slice(@ir.Instr, len(args) - 1)
-			for i := 0; i < len(callArgs); i++ {
-				callArgs[i] = args[i + 1]
-			}
-			return irbuild.EmitCallHandle(b, handle, callArgs, resultTyp)
-		}
-	}
-	if irutil.Streq(name, "_call_shim_scalar") ||
-			irutil.Streq(name, "pkg/builtins/rt._call_shim_scalar") ||
-			irutil.Streq(name, "_call_shim_scalar64") ||
-			irutil.Streq(name, "pkg/builtins/rt._call_shim_scalar64") ||
-			irutil.Streq(name, "_call_shim_aggregate") ||
-			irutil.Streq(name, "pkg/builtins/rt._call_shim_aggregate") {
-		assertShimHandleScalarResult(results)
-		if len(args) >= 1 {
-			var fnPtr @ir.Instr = args[0]
-			var callArgs @[]@ir.Instr = make_slice(@ir.Instr, len(args) - 1)
-			for i := 0; i < len(callArgs); i++ {
-				callArgs[i] = args[i + 1]
-			}
-			return irbuild.EmitCallIndirect(b, fnPtr, callArgs, resultTyp)
-		}
-	}
-
-	// Reflection intrinsics.  `reflect.TypeOf(x)` reads the record of x's dynamic
-	// type (emitReflectTypeOf), typed as the declared
-	// `*reflect.TypeInfo` result (that struct is overlaid on the record bytes) —
-	// produced directly as a pointer value, so it behaves like any
-	// `*T`-returning call (no OP_BIT_CAST, whose TypeArg a field-access selector
-	// would clobber).  `reflect.DataOf(x)` extracts x's data word — a plain word,
-	// backend-uniform, so unlike the vtable word it needs no dedicated op.  A
-	// DIRECT call is lowered here with no callable symbol; reflect's impl
-	// (impls/.../reflect/reflect.bn) provides fallback BODIES only for the
-	// non-inlined path (the func taken as a value / VM-dispatched by name).
-	// Matched ONLY by the fully-qualified `pkg/builtins/reflect.*` name (NOT the
-	// bare `reflect.*` form the shim/handle magics above also accept): reflect's
-	// bodies do NOT call TypeOf / DataOf, so no bare spelling is ever produced for
-	// a legitimate call, and matching the bare form would silently hijack a user
-	// package imported at the single-segment path "reflect" into an
-	// OP_IFACE_TYPEINFO / OP_EXTRACT miscompile.
-	if irutil.Streq(name, "pkg/builtins/reflect.TypeOf") {
-		if len(args) >= 1 {
-			return emitReflectTypeOf(ctx, b, args[0], resultTyp)
-		}
-	}
-	if irutil.Streq(name, "pkg/builtins/reflect.DataOf") {
-		if len(args) >= 1 {
-			return irbuild.EmitExtract(b, args[0], types.IfaceValueDataIndex(), resultTyp)
-		}
-	}
-
-	// `debug._stack_frames(skip, into)` is a compiler intrinsic (no linkable
-	// symbol) lowered to OP_STACK_FRAMES; recognized by name in gen_stackframes.bn.
-	var sfResult @ir.Instr = tryEmitStackFrames(b, ctx.Gc.PkgPath, name, args, resultTyp)
-	if sfResult != nil {
-		return sfResult
-	}
-
-	var result @ir.Instr = irbuild.EmitCall(b, name, args, resultTyp)
-	// Call-site cleanup pad: if the callee faults, the unwind pops back
-	// here and RefDecs the caller's live managed set at this call before continuing
-	// up.  Tagged BEFORE registerManagedCallResult so the pad excludes the
-	// not-yet-produced result (which anyway reads nil on a fault).  Every call needs
-	// a pad — even with nothing to clean — so the unwind can relay through this frame.
-	attachFaultPad(ctx, b)
-	registerManagedCallResult(ctx, result, resultTyp)
-	return result
-}
-
-// assertShimHandleScalarResult guards the compiler-internal indirect-call magics
-// (_call_dtor / _call_free_fn / _call_shim_scalar{,64} / _call_shim_aggregate):
-// their .bni signatures return at most one value, so the resultTyp handed to
-// EmitCallHandle / EmitCallIndirect is scalar or void — never a multi-return
-// tuple (makeMultiReturnStructType, built only when len(results) > 1).  The
-// shims/handles physically cannot multi-return, so this holds by construction;
-// enforce it here rather than let a mis-shaped anonymous-tuple result reach the
-// backend collect silently.  A firing means the magic's declared signature grew
-// a second result (or a caller mislabeled a real multi-return call as a magic).
-func assertShimHandleScalarResult(results *[]@types.Type) {
-	if len(results) > 1 {
-		panic(
-				"internal error: a compiler-internal indirect-call magic "
-						"(_call_dtor / _call_shim_*) carries a multi-return result -- these "
-						"shim/handle ops are scalar/void by construction (compiler bug)")
-	}
+	return genNamedCall(ctx, b, e, name)
 }
 
 // genFuncValueCall lowers `f(args)` where f is a local of type

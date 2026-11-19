@@ -6,7 +6,9 @@
 # Usage: perf/frame-sizes.sh <bnc> <target> <pkg> <func>...
 #   target: host | x86_64-darwin | arm32-linux | ... (a bnc --target key)
 #   e.g. perf/frame-sizes.sh /tmp/bnc host pkg/binate/parser parseType parseStructType
-# The package is read from the tree the script is in, or from $BINATE_ROOT.
+# The package is read from the tree the script is in, or from $BINATE_ROOT.  The
+# backend is native unless $BINATE_BACKEND names another (llvm), and $BINATE_FLAGS adds
+# bnc flags (-O2).
 #
 # A function is matched by the end of its mangled symbol, `<len>_<name>` (Binate's
 # mangling ends a name with its length and the name).  The frame is the sum of the
@@ -14,14 +16,15 @@
 # aarch64's `#N, lsl #12` is N * 4096) or `sub rsp, N` (x86-64), a large frame
 # taking more than one.
 set -e
-[ $# -ge 4 ] || { sed -n '2,15p' "$0"; exit 2; }
+[ $# -ge 4 ] || { sed -n '2,17p' "$0"; exit 2; }
 BNC=$1; TARGET=$2; PKG=$3; shift 3
 ROOT=${BINATE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 IFACE=$("$ROOT/scripts/binate-paths.sh" --iface --base "$ROOT")
 IMPL=$("$ROOT/scripts/binate-paths.sh" --impl --base "$ROOT")
-(cd "$WORK" && "$BNC" -I "$IFACE" -L "$IMPL" --backend native --target "$TARGET" -c --pkg "$PKG" > "$WORK/bnc.log" 2>&1) ||
+(cd "$WORK" && "$BNC" -I "$IFACE" -L "$IMPL" --backend "${BINATE_BACKEND:-native}" --target "$TARGET" \
+		$BINATE_FLAGS -c --pkg "$PKG" > "$WORK/bnc.log" 2>&1) ||
 	{ cat "$WORK/bnc.log"; exit 1; }
 OBJ=$(ls "$WORK"/*.o | head -1)
 objdump -d --no-show-raw-insn "$OBJ" > "$WORK/dis.txt"

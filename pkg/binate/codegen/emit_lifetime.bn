@@ -1,0 +1,176 @@
+package "pkg/binate/codegen"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/std/containers/vec"
+import "pkg/std/strings"
+
+// Allocas' lifetimes.  A slot IR-gen gives a scope (ir.Instr.Scope) is in use from its
+// declaration to an end of its scope (OP_SCOPE_END; spec mem.scope-exit), so it is
+// bracketed by llvm.lifetime.start where the declaration runs and llvm.lifetime.end at
+// each end of its scope, and LLVM's stack colouring then gives slots whose lifetimes
+// never meet the same bytes.  LLVM takes an alloca with a lifetime.start to be dead
+// before it, so a start comes before every access of the slot: at its OP_ALLOC, before
+// its zero-fill -- or, for a slot a call writes its result into before the slot's
+// OP_ALLOC (CallResultSlots), before the call, and then not again at the OP_ALLOC, as a
+// second start would leave the result undefined.  Only a slot emitted as an alloca
+// takes the markers: not the local kept in the caller's buffer (%v.retbuf) nor a
+// parameter's incoming copy.  A return ends them all too, just before its `ret` (after
+// any copy of the result out of a slot): a `return` leaves its scopes with no
+// OP_SCOPE_END, and once LLVM inlines the function, a slot started and never ended
+// would stay live through the rest of the caller (ending a dead slot does nothing).
+
+// curScopeSlots holds, per scope id, the value ids of the function's slots of that
+// scope that take lifetime markers.
+var curScopeSlots @[]@vec.Vec[int]
+
+// curStartAtCall holds, per call value id, the slot whose start goes before the call
+// (-1 for none).
+var curStartAtCall @[]int
+
+// curStartedAtCall holds, per slot value id, whether its start is at a call.
+var curStartedAtCall @[]bool
+
+// computeLifetimes records f's slots that take lifetime markers, by scope, and the
+// calls their starts go before.  It runs after computeCallResultSlots and
+// computeInPlaceParamSlots, whose answers it reads.
+func computeLifetimes(f @ir.Func) {
+	curScopeSlots = make_slice(@vec.Vec[int], f.NumScopes + 1)
+	for i := 0; i < len(curScopeSlots); i++ { curScopeSlots[i] = vec.New[int]() }
+	curStartAtCall = make_slice(int, f.NextID)
+	for i := 0; i < len(curStartAtCall); i++ { curStartAtCall[i] = -1 }
+	curStartedAtCall = make_slice(bool, f.NextID)
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			if lifetimeTracked(ins) && ins.Scope < len(curScopeSlots) {
+				curScopeSlots[ins.Scope].Push(ins.ID)
+			}
+			var slot int = -1
+			if ins.ID >= 0 { slot = callResultSlot(ins.ID) }
+			if slot < 0 || slot >= len(curStartedAtCall) { continue }
+			for jj := ii + 1; jj < len(b.Instrs); jj++ {
+				var later @ir.Instr = b.Instrs[jj]
+				if later.ID == slot {
+					if lifetimeTracked(later) {
+						curStartAtCall[ins.ID] = slot
+						curStartedAtCall[slot] = true
+					}
+					break
+				}
+				// The store of the result ends the span CallResultSlots allows.
+				if later.Op == iropcode.OP_STORE && len(later.Args) > 1 && later.Args[1] == ins { break }
+			}
+		}
+	}
+}
+
+// clearLifetimes forgets the lifetime records of the function just emitted.
+func clearLifetimes() {
+	var noSlots @[]@vec.Vec[int]
+	var noCalls @[]int
+	var noStarts @[]bool
+	curScopeSlots = noSlots
+	curStartAtCall = noCalls
+	curStartedAtCall = noStarts
+}
+
+// lifetimeTracked reports whether ins is a slot that takes lifetime markers: an
+// OP_ALLOC with a scope, emitted as an alloca.
+func lifetimeTracked(ins @ir.Instr) bool {
+	return ins.Op == iropcode.OP_ALLOC && ins.Scope > 0 && !ins.IsGlobalRef && !isRetbufSlot(ins.ID) &&
+			inPlaceParamID(ins.ID) < 0
+}
+
+// emitLifetimeStartAtAlloc writes the start of the slot ins declares, unless it
+// takes no markers or its start is at a call, and reports whether it wrote one.
+// The caller has written the line's indent; the next line needs its own.
+func emitLifetimeStartAtAlloc(out *strings.Builder, ins @ir.Instr) bool {
+	if !lifetimeTracked(ins) { return false }
+	if ins.ID < len(curStartedAtCall) && curStartedAtCall[ins.ID] { return false }
+	writeLifetimeCall(out, "start", ins.ID)
+	return true
+}
+
+// emitLifetimeStartAtCall writes, as a line of its own, the start of the slot the
+// call ins writes its result into before the slot's declaration, if there is one.
+func emitLifetimeStartAtCall(out *strings.Builder, ins @ir.Instr) {
+	if ins.ID < 0 || ins.ID >= len(curStartAtCall) || curStartAtCall[ins.ID] < 0 { return }
+	out.Write("  ")
+	writeLifetimeCall(out, "start", curStartAtCall[ins.ID])
+}
+
+// emitLifetimeEnds writes, each as a line of its own, the end of every slot of the
+// scope the OP_SCOPE_END ins ends.
+func emitLifetimeEnds(out *strings.Builder, ins @ir.Instr) {
+	if ins.Scope <= 0 || ins.Scope >= len(curScopeSlots) { return }
+	var slots @vec.Vec[int] = curScopeSlots[ins.Scope]
+	for i := 0; i < slots.Len(); i++ {
+		out.Write("  ")
+		writeLifetimeCall(out, "end", slots.Get(i))
+	}
+}
+
+// writeLifetimeCall writes `call void @llvm.lifetime.<which>.p0(i64 -1, ptr %v<id>)`
+// and a newline: -1 for the size covers the whole alloca.
+func writeLifetimeCall(out *strings.Builder, which *[]readonly char, id int) {
+	out.Write("call void @llvm.lifetime.")
+	out.Write(which)
+	out.Write(".p0(i64 -1, ptr ")
+	emitRef(out, id)
+	out.Write(")\n")
+}
+
+// emitLifetimeDecls declares the lifetime intrinsics when a function of m has a slot
+// with a scope.
+func emitLifetimeDecls(out *strings.Builder, m @ir.Module) {
+	if !moduleHasScopedSlot(m) { return }
+	out.Write("declare void @llvm.lifetime.start.p0(i64, ptr)\n")
+	out.Write("declare void @llvm.lifetime.end.p0(i64, ptr)\n")
+}
+
+// moduleHasScopedSlot reports whether a function of m has an OP_ALLOC with a scope.
+func moduleHasScopedSlot(m @ir.Module) bool {
+	for fi := 0; fi < len(m.Funcs); fi++ {
+		var f @ir.Func = m.Funcs[fi]
+		if f.NumScopes == 0 { continue }
+		for bi := 0; bi < len(f.Blocks); bi++ {
+			var b @ir.Block = f.Blocks[bi]
+			for ii := 0; ii < len(b.Instrs); ii++ {
+				if b.Instrs[ii].Op == iropcode.OP_ALLOC && b.Instrs[ii].Scope > 0 { return true }
+			}
+		}
+	}
+	return false
+}
+
+// emitReturnWithEnds writes seg -- an OP_RETURN's lines, the indent of the first
+// written already -- with the end of every slot taking markers before its last line,
+// the `ret`.
+func emitReturnWithEnds(out *strings.Builder, seg *[]readonly char) {
+	var last int = len(seg) - 1
+	for last > 0 && seg[last - 1] != '\n' { last = last - 1 }
+	if last < 0 { last = 0 }
+	out.Write(seg[:last])
+	var indented bool = last == 0
+	for s := 0; s < len(curScopeSlots); s++ {
+		var slots @vec.Vec[int] = curScopeSlots[s]
+		for i := 0; i < slots.Len(); i++ {
+			if !indented { out.Write("  ") }
+			writeLifetimeCall(out, "end", slots.Get(i))
+			indented = false
+		}
+	}
+	if !indented && last == 0 { out.Write("  ") }
+	out.Write(seg[last:])
+}
+
+// hasLifetimeSlots reports whether the function being emitted has a slot taking
+// lifetime markers.
+func hasLifetimeSlots() bool {
+	for s := 0; s < len(curScopeSlots); s++ {
+		if curScopeSlots[s].Len() > 0 { return true }
+	}
+	return false
+}

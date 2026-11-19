@@ -1,7 +1,6 @@
 #!/bin/sh
-# Measure native stack frames: compile a package with a given bnc for the native
-# backend and print each named function's frame size (the stack adjustment its
-# prologue makes), for one target.
+# Measure stack frames: compile a package with a given bnc and print each named
+# function's frame size (the stack adjustment its prologue makes), for one target.
 #
 # Usage: perf/frame-sizes.sh <bnc> <target> <pkg> <func>...
 #   target: host | x86_64-darwin | arm32-linux | ... (a bnc --target key)

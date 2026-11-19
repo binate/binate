@@ -1182,6 +1182,58 @@ testing.Println(helper(3, 4))
 > 7
 > "
 
+# --- A constant redefined shadows the old one, with a warning: code already
+# lowered keeps the old value, code written afterwards reads the new one. ---
+run_repl "shadow-const" \
+"const K int = 1
+func k1() int { return K }
+const K int8 = 2
+testing.Println(k1())
+testing.Println(K)
+" \
+"$BANNER
+> > > warning: constant K shadowed; existing references retain the old constant
+> 1
+> 2
+> "
+
+# --- A generic function redefined with another signature shadows the old one:
+# a use afterwards emits its instance from the new definition. ---
+run_repl "shadow-generic-func" \
+"func f[T any](x T) int { return 1 }
+testing.Println(f[int](1))
+func f[T any](x T) int8 { return 2 }
+testing.Println(f[int](1))
+" \
+"$BANNER
+> > 1
+> warning: f shadowed (incompatible signature); existing callers retain old definition
+> 2
+> "
+
+# --- An import takes the name of a variable and of a function: each is shadowed
+# at the import (the variable with a warning), so the code written before it
+# keeps them, and a later declaration of the name is a new one. ---
+run_repl "shadow-by-import" \
+"var strings int = 5
+func gs() int { return strings }
+import \"pkg/std/strings\"
+var strings bool = true
+testing.Println(gs(), strings)
+func strconv() int { return 1 }
+func cs() int { return strconv() }
+import \"pkg/std/strconv\"
+func strconv() int8 { return 2 }
+testing.Println(cs(), strconv())
+" \
+"$BANNER
+> > > package pkg/std/strings loaded
+warning: variable strings shadowed (redeclared as an import); existing references retain the old variable
+> > 5 true
+> > > package pkg/std/strconv loaded
+> > 1 2
+> "
+
 # --- Case 21 (forward refs): a func decl whose body
 # references an undefined name parks rather than erroring.
 # When the missing dep arrives, the parked func is auto-
@@ -2934,7 +2986,7 @@ testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
 # initializer it is reset, releasing what it held), with another type it is
 # shadowed (earlier functions keep the old variable), as it is when a constant
 # or function takes its name; also when the redeclaration parks and resolves
-# later. ---
+# later.  A constant a variable takes the name of is shadowed, with a warning. ---
 run_repl "variable-redeclared-replaced-or-shadowed" \
 "import \"pkg/builtins/rt\"
 var x int = 1
@@ -3028,11 +3080,13 @@ warning: variable p shadowed (incompatible type); existing references retain the
 > 9
 > > > warning: variable q shadowed (redeclared as a constant); existing references retain the old variable
 > 2 1
-> > 5 8 1
+> warning: constant q shadowed; existing references retain the old constant
+> 5 8 1
 > > warning: variable u shadowed (redeclared as a function); existing references retain the old variable
 > 2
 > > 9
-> ... ... ... > > 4
+> ... ... ... > warning: constant cx shadowed; existing references retain the old constant
+> 4
 > "
 
 # --- Case 75: generic struct types declared at the prompt are instantiated

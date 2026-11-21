@@ -12,7 +12,9 @@
 #      function nothing instantiates -- is no error on either, nor is a constant
 #      folded from `len` of an array var: bnc builds and runs it, and so does bni;
 #   4. the REPL reports each prompt entry whose code needs the var, keeps none of
-#      it -- a declaration is not kept, a redefinition leaves the old definition, an
+#      it -- a declaration is not kept, a redefinition leaves the old definition (one
+#      that would shadow it -- a function, a constant, a variable, a function over a
+#      generic -- leaves it under its name, for a later shadowing one to take), an
 #      import of a package that needs it (or imports one that does) is not made, a
 #      parked declaration resolving later stays parked -- and the session goes on;
 #   5. bni --test of a package that needs it reports it and exits non-zero;
@@ -223,9 +225,21 @@ repl_out=$(cd "$SRC" && printf '%s\n' \
     'func h() int { return 1 }' \
     'func h() int { return solo.V }' \
     'testing.Println(h())' \
+    'func ch() int { return h() }' \
+    'func h() int8 { return cast(int8, solo.V) }' \
+    'testing.Println(h())' \
+    'testing.Println(ch())' \
+    'const KC int = 5' \
+    'var KC int = solo.V' \
+    'testing.Println(KC)' \
+    'var w int = 6' \
+    'var w int8 = cast(int8, solo.V)' \
+    'testing.Println(w)' \
     'func K[T any]() int { return 2 }' \
     'testing.Println(K[int]())' \
     'func K[T any]() int { return solo.V }' \
+    'testing.Println(K[int]())' \
+    'func K() int8 { return cast(int8, solo.V) }' \
     'testing.Println(K[int]())' \
     'func Q[T any]() int { return 3 }' \
     '_ = Q[int]() + solo.V' \
@@ -235,6 +249,11 @@ repl_out=$(cd "$SRC" && printf '%s\n' \
     'testing.Println(pg())' \
     'import "pkg/userdep"' \
     'testing.Println(userdep.Y())' \
+    'func h() int8 { return 8 }' \
+    'testing.Println(h())' \
+    'testing.Println(ch())' \
+    'func K() int8 { return 9 }' \
+    'testing.Println(K())' \
     'testing.Println(7)' |
     "$BNI_BIN" -I "$IFACES" -L "$IMPLS" --repl repl.bn 2>&1)
 repl_rc=$?
@@ -244,8 +263,9 @@ if [ "$repl_rc" -ne 0 ] || printf '%s\n' "$repl_out" | grep -q 'panic'; then
     echo "FAIL: the REPL session did not survive the entries (rc=$repl_rc):"
     printf '%s\n' "$repl_out" | tail -8
     FAILS=$((FAILS + 1))
-elif [ "$undef_count" -ne 10 ]; then
-    echo "FAIL: expected 10 load errors (x, f, G[int] twice, v, h, K, Q's use, pf, pkg/user), got $undef_count:"
+elif [ "$undef_count" -ne 14 ]; then
+    echo "FAIL: expected 14 load errors (x, f, G[int] twice, v, h twice, KC, w, K twice, Q's use,"
+    echo "      pf, pkg/user), got $undef_count:"
     printf '%s\n' "$repl_out" | tail -12
     FAILS=$((FAILS + 1))
 elif ! printf '%s\n' "$repl_out" | grep -q 'undefined: f$' ||
@@ -257,9 +277,12 @@ elif ! printf '%s\n' "$repl_out" | grep -q 'undefined: f$' ||
     printf '%s\n' "$repl_out" | tail -12
     FAILS=$((FAILS + 1))
 elif [ "$(printf '%s\n' "$repl_out" | grep -E '^(> )+[0-9]+$' | sed 's/^[> ]*//' | tr '\n' ' ')" != \
-        "4 1 2 2 3 1 7 " ]; then
-    echo "FAIL: expected N (4), the old h (1), K[int] around its failed redefinition (2, 2),"
-    echo "      Q[int], generated again after a failed entry (3), pg, kept as pf fails (1), and 7:"
+        "4 1 1 1 5 6 2 2 2 3 1 8 1 9 7 " ]; then
+    echo "FAIL: expected N (4), the old h (1); after failed shadowing redefinitions, the old"
+    echo "      h and its caller (1, 1), KC (5) and w (6); K[int] around its failed"
+    echo "      redefinitions (2, 2, 2); Q[int], generated again after a failed entry (3); pg,"
+    echo "      kept as pf fails (1); a shadowing h and the old h's caller (8, 1); a function"
+    echo "      shadowing K (9); and 7:"
     printf '%s\n' "$repl_out" | tail -12
     FAILS=$((FAILS + 1))
 else

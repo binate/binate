@@ -1197,6 +1197,36 @@ testing.Println(K)
 > 2
 > "
 
+# --- A floating-point constant's initializer, lowered again at each read, reads
+# the constants it was declared against, not the ones that shadow them later; a
+# group member's repeated initializer, with its iota, alike. ---
+run_repl "shadow-const-float-initializer" \
+"const H float64 = 2.5
+const J float64 = H + 1.0
+const H float64 = 0.5
+func hj() int { return cast(int, J * 10.0) }
+testing.Println(hj())
+testing.Println(cast(int, J * 10.0))
+" \
+"$BANNER
+> > > warning: constant H shadowed; existing references retain the old constant
+> > 35
+> 35
+> "
+
+run_repl "shadow-const-float-group-initializer" \
+"const F float64 = 1.5
+const ( A float64 = F * cast(float64, iota + 1); B )
+func ab0() int { return cast(int, (A + B) * 10.0) }
+const F int = 7
+func ab1() int { return cast(int, (A + B) * 10.0) }
+testing.Println(ab0(), ab1())
+" \
+"$BANNER
+> > > > warning: constant F shadowed; existing references retain the old constant
+> > 45 45
+> "
+
 # --- A generic function redefined with another signature shadows the old one:
 # a use afterwards emits its instance from the new definition. ---
 run_repl "shadow-generic-func" \

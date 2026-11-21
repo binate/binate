@@ -3089,6 +3089,23 @@ warning: variable p shadowed (incompatible type); existing references retain the
 > 4
 > "
 
+# --- A group typed at the prompt that declares a name twice is rejected, as in a
+# file, and binds nothing: its members are taken one at a time (a var group's as
+# entries of their own), and the later would otherwise be taken for a
+# redefinition of the earlier. ---
+run_repl "group-name-declared-twice" \
+"const ( X float64 = 1.5; Y float64 = X * 2.0; X float64 = 9.0 )
+var ( b int = 1; b int = 2 )
+const X int = 4
+var b bool = true
+testing.Println(X, b)
+" \
+"$BANNER
+> <repl>:1:47: X redeclared in this block
+> <repl>:1:18: b redeclared in this block
+> > > 4 true
+> "
+
 # --- Case 75: generic struct types declared at the prompt are instantiated
 # where used — the right size and fields, also over a type declared after,
 # through an alias, in a global — and an instance's destructor and copy exist,

@@ -1,0 +1,208 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/callconv"
+import "pkg/std/containers/vec"
+
+// Data regions shared by lifetime.  An aggregate value given a data region of its own
+// (instrHasDataRegion) has its bytes written by the instruction defining it and read
+// through its pointer: by its uses, and by the uses of every value that passes the
+// pointer on -- an aggregate alias (isAggregateAlias: an aggregate member extracted, an
+// aggregate cast or managed-to-raw conversion) -- transitively.  (There are no aggregate
+// phis to pass it on: EliminatePhis rejects them.)  The liveness of aggregate values
+// (REGCLASS_AGG), over the positions the register allocator's liveness uses, gives each
+// such value an interval; a region is in use over the hull of its value's and its
+// aliases' intervals, from the write at the definition to the last read, and regions
+// whose spans never meet share bytes (placeSharedRegions).
+
+// regionSpans returns, indexed by value id, the [start, end) span over which the data
+// region of each aggregate value of f is in use -- the hull of the live intervals of the
+// value and of the values that alias it -- or -1 for a value whose span is not known:
+// one the liveness gives no interval, or one that an instruction uses in a way not known
+// to stay where the instruction stands (readsInPlace), which might pass a pointer into
+// its bytes on.  (A value defined and never used has an interval at its definition,
+// which writes its region.)  f must have no phis (EliminatePhis has run).
+func regionSpans(f @ir.Func, wordBytes int) (@[]int, @[]int) {
+	var n int = f.NextID
+	var starts @[]int = make_slice(int, n)
+	var ends @[]int = make_slice(int, n)
+	for i := 0; i < n; i++ {
+		starts[i] = -1
+		ends[i] = -1
+	}
+	var none @[]bool
+	var ivs @[]@LiveInterval = BuildIntervals(f, computeLivenessImpl(f, wordBytes, none, REGCLASS_AGG))
+	for i := 0; i < len(ivs); i++ {
+		var iv @LiveInterval = ivs[i]
+		if iv.ID < 0 || iv.ID >= n || len(iv.Ranges) == 0 { continue }
+		starts[iv.ID] = iv.Start()
+		ends[iv.ID] = iv.End()
+	}
+	var unknown @[]bool = make_slice(bool, n)
+	for i := 0; i < n; i++ { unknown[i] = starts[i] < 0 }
+	// Alias edges, as pairs (the operand, the value passing its pointer on), in the order
+	// of the instructions defining the second.
+	var edges @vec.Vec[int] = vec.New[int]()
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			for k := 0; k < len(ins.Args); k++ {
+				var a @ir.Instr = ins.Args[k]
+				if a == nil || a.ID < 0 || a.ID >= n || !callconv.IsAggregateTyp(a.Typ) { continue }
+				if k == 0 && ins.ID >= 0 && ins.ID < n && isAggregateAlias(ins) {
+					edges.Push(a.ID)
+					edges.Push(ins.ID)
+				} else if !readsInPlace(ins) {
+					unknown[a.ID] = true
+				}
+			}
+		}
+	}
+	// A value's span covers its aliases'; one unknown makes it unknown.  An alias mostly
+	// follows its operand, so the edges are taken last to first, which carries a chain
+	// in one pass; a block listed before the one defining an alias's operand can hold
+	// the alias, so this runs until nothing changes.
+	var changed bool = true
+	for changed {
+		changed = false
+		for e := edges.Len() - 2; e >= 0; e = e - 2 {
+			var p int = edges.Get(e)
+			var c int = edges.Get(e + 1)
+			if unknown[c] {
+				if !unknown[p] {
+					unknown[p] = true
+					changed = true
+				}
+				continue
+			}
+			if unknown[p] { continue }
+			if starts[c] < starts[p] {
+				starts[p] = starts[c]
+				changed = true
+			}
+			if ends[c] > ends[p] {
+				ends[p] = ends[c]
+				changed = true
+			}
+		}
+	}
+	for i := 0; i < n; i++ {
+		if unknown[i] {
+			starts[i] = -1
+			ends[i] = -1
+		}
+	}
+	return starts, ends
+}
+
+// readsInPlace reports whether ins, not an alias (isAggregateAlias), uses an aggregate
+// operand's bytes only where ins stands, passing no pointer into them on: it has no
+// result (a store copies the bytes), it is a call (which reads a by-reference argument,
+// or whose callee writes it, during the call), or its result is read out of the bytes --
+// a scalar member, a comparison, a boxed copy, an upcast interface, an interface's type
+// info, an interface or function value's destructor.  Anything else (a field or element
+// pointer, a cast to a pointer, a value built around the operand) might keep a pointer
+// into them.
+func readsInPlace(ins @ir.Instr) bool {
+	if InstrIsVoid(ins) || isCallOp(ins.Op) { return true }
+	var op int = ins.Op
+	if op == iropcode.OP_EXTRACT { return !callconv.IsAggregateTyp(ins.Typ) }
+	return op == iropcode.OP_EQ || op == iropcode.OP_NE || op == iropcode.OP_BOX ||
+			op == iropcode.OP_IFACE_UPCAST || op == iropcode.OP_IFACE_TYPEINFO ||
+			op == iropcode.OP_IFACE_DTOR || op == iropcode.OP_FUNC_VALUE_DTOR
+}
+
+// placeSharedRegions lays the data regions ids (sizes, each a positive multiple of 8) of
+// f down from offset, appending each to allocIDs / allocSizes / allocOffsets, and returns
+// the offset past them.  With two or more, their spans are computed (regionSpans): a
+// region whose span is not known keeps bytes of its own, and the others share bytes where
+// their spans do not meet, each placed at the lowest offset clear of the regions placed
+// before it, in order of span start.  The regions in use at a region's start are the
+// placed ones whose spans have not ended there; they all hold that position, so their
+// bytes are disjoint, and they are kept in order of offset for the search.
+func placeSharedRegions(f @ir.Func, wordBytes int, ids @vec.Vec[int], sizes @vec.Vec[int64],
+		allocIDs @vec.Vec[int], allocSizes @vec.Vec[int64], allocOffsets @vec.Vec[int64],
+		offset int64) int64 {
+	var n int = ids.Len()
+	if n == 0 { return offset }
+	var starts @[]int
+	var ends @[]int
+	if n >= 2 { starts, ends = regionSpans(f, wordBytes) }
+	var known @vec.Vec[int] = vec.New[int]()
+	var maxStart int = 0
+	for k := 0; k < n; k++ {
+		var id int = ids.Get(k)
+		if id < len(starts) && starts[id] >= 0 {
+			known.Push(k)
+			if starts[id] > maxStart { maxStart = starts[id] }
+			continue
+		}
+		allocIDs.Push(id)
+		allocSizes.Push(sizes.Get(k))
+		allocOffsets.Push(offset)
+		offset = frameAdd(offset, sizes.Get(k))
+	}
+	if known.Len() == 0 { return offset }
+	var order @[]int = orderByStart(known, ids, starts, maxStart)
+	var offs @[]int64 = make_slice(int64, n)
+	var act @[]int = make_slice(int, n)
+	var na int = 0
+	var total int64 = 0
+	for i := 0; i < len(order); i++ {
+		var k int = order[i]
+		var s int = starts[ids.Get(k)]
+		var sz int64 = sizes.Get(k)
+		var w int = 0
+		for j := 0; j < na; j++ {
+			if ends[ids.Get(act[j])] > s {
+				act[w] = act[j]
+				w++
+			}
+		}
+		na = w
+		var at int64 = 0
+		var pos int = na
+		for j := 0; j < na; j++ {
+			if frameAdd(at, sz) <= offs[act[j]] {
+				pos = j
+				break
+			}
+			var e int64 = frameAdd(offs[act[j]], sizes.Get(act[j]))
+			if e > at { at = e }
+		}
+		for j := na; j > pos; j-- { act[j] = act[j - 1] }
+		act[pos] = k
+		na++
+		offs[k] = at
+		if frameAdd(at, sz) > total { total = frameAdd(at, sz) }
+	}
+	for i := 0; i < known.Len(); i++ {
+		var k int = known.Get(i)
+		allocIDs.Push(ids.Get(k))
+		allocSizes.Push(sizes.Get(k))
+		allocOffsets.Push(frameAdd(offset, offs[k]))
+	}
+	return frameAdd(offset, total)
+}
+
+// orderByStart returns the indexes known (into ids) in order of their regions' span
+// starts (starts, by id; none past maxStart), a counting sort that keeps known's order
+// among equal starts.
+func orderByStart(known @vec.Vec[int], ids @vec.Vec[int], starts @[]int, maxStart int) @[]int {
+	var first @[]int = make_slice(int, maxStart + 2)
+	for i := 0; i < known.Len(); i++ {
+		var after int = starts[ids.Get(known.Get(i))] + 1
+		first[after] = first[after] + 1
+	}
+	for p := 1; p < len(first); p++ { first[p] = first[p] + first[p - 1] }
+	var order @[]int = make_slice(int, known.Len())
+	for i := 0; i < known.Len(); i++ {
+		var k int = known.Get(i)
+		var s int = starts[ids.Get(k)]
+		order[first[s]] = k
+		first[s] = first[s] + 1
+	}
+	return order
+}

@@ -1290,6 +1290,35 @@ testing.Println(by.get(), f[int](1))
 > 112 3
 > "
 
+# --- A generic selects a method of a type it names as of its declaration too:
+# an instance checked after the method is redefined with another signature calls
+# the method the generic was declared against -- by a call, a method value or a
+# method expression -- as the instances emitted before do. ---
+run_repl "shadow-method-generic-keeps-declared-method" \
+"type T struct { v int }
+func (t *T) M() int { return t.v + 1 }
+func (t T) N() int { return t.v + 2 }
+func call[X any](t *T, x X) int { return t.M() }
+func val[X any](t *T, x X) int { var f *func() int = t.M; return f() }
+func expr[X any](t *T, x X) int { return T.N(*t) }
+var t T
+t.v = 10
+testing.Println(call[int](&t, 1), val[int](&t, 1), expr[int](&t, 1))
+func (t *T) M(k int) int { return k }
+func (t T) N(k int) int { return k }
+testing.Println(t.M(5), t.N(6))
+testing.Println(call[int](&t, 1), val[int](&t, 1), expr[int](&t, 1))
+testing.Println(call[bool](&t, true), val[bool](&t, true), expr[bool](&t, true))
+" \
+"$BANNER
+> > > > > > > > > 11 11 12
+> warning: T.M shadowed (incompatible signature); existing callers retain old definition
+> warning: T.N shadowed (incompatible signature); existing callers retain old definition
+> 5 6
+> 11 11 12
+> 11 11 12
+> "
+
 # --- A generic type, its methods and a generic alias resolve their names as of
 # their declaration: an instance formed after the constant, the variable and the
 # function they use are shadowed reads those it was declared with. ---

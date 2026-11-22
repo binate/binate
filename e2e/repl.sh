@@ -1319,6 +1319,37 @@ testing.Println(call[bool](&t, true), val[bool](&t, true), expr[bool](&t, true))
 > 11 11 12
 > "
 
+# --- A call through a type parameter's constraint calls the method bound by the
+# impl that makes the type argument satisfy the constraint: after T's M is
+# redefined with another signature, the impl of I made before still binds the old
+# M -- for an instance of a generic declared before or after the redefinition and
+# of a generic type's method, and beside a parameter whose constraint J an impl
+# made after the redefinition satisfies with the new M. ---
+run_repl "shadow-method-constraint-call-calls-impl-method" \
+"interface I { M() int }
+interface J { M(k int) int }
+type T struct { v int }
+func (t T) M() int { return t.v }
+impl T : I
+func h[X I](x X) int { return x.M() }
+type Holder[X I] struct { v X }
+func (b Holder[X]) Get() int { return b.v.M() }
+var t T
+t.v = 7
+func (t T) M(k int) int { return k }
+impl T : J
+func h2[X I](x X) int { return x.M() }
+func j[X I, Y J](x X, y Y) int { return x.M() + y.M(100) }
+var i *I = &t
+var b Holder[T]
+b.v = t
+testing.Println(h[T](t), h2[T](t), i.M(), j[T, T](t, t), b.Get())
+" \
+"$BANNER
+> > > > > > > > > > > warning: T.M shadowed (incompatible signature); existing callers retain old definition
+> > > > > > > 7 7 7 107 7
+> "
+
 # --- A generic type, its methods and a generic alias resolve their names as of
 # their declaration: an instance formed after the constant, the variable and the
 # function they use are shadowed reads those it was declared with. ---

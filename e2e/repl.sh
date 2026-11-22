@@ -1241,6 +1241,114 @@ testing.Println(f[int](1))
 > 2
 > "
 
+# --- A generic function resolves its names as of its declaration: an instance
+# checked after they are shadowed reads the bindings the generic was declared
+# against.  A generic shadowed in turn stays the one the code written before
+# instantiates, under its hidden name. ---
+run_repl "shadow-generic-reads-declared-names" \
+"var x int = 5
+const K int = 6
+func h() int { return 7 }
+func f[T any](v T) int { return x + K + h() }
+func w[T any](v T) int { return f[T](v) }
+testing.Println(f[int](1))
+var x bool = true
+const K bool = false
+func h() int8 { return 1 }
+testing.Println(f[bool](true), w[int8](1))
+func f[T any](v T) bool { return x }
+testing.Println(f[int](1), w[int16](2), w[int](3))
+" \
+"$BANNER
+> > > > > > 18
+> warning: variable x shadowed (incompatible type); existing references retain the old variable
+> warning: constant K shadowed; existing references retain the old constant
+> warning: h shadowed (incompatible signature); existing callers retain old definition
+> 18 18
+> warning: f shadowed (incompatible signature); existing callers retain old definition
+> true 18 18
+> "
+
+# --- A generic function redefined with the same signature replaces the old one:
+# the code checked before the redefinition and emitted after it calls the new
+# one, and still does once the new one is shadowed in turn. ---
+run_repl "replaced-generic-reached-by-earlier-code" \
+"func f[T any](v T) int { return 1 }
+func w[T any](v T) int { return f[T](v) + 10 }
+type Bag[T any] struct { v T }
+func (b *Bag[T]) get() int { return w[T](b.v) + 100 }
+var bx Bag[int]
+var by Bag[int8]
+func f[T any](v T) int { return 2 }
+testing.Println(bx.get())
+func f[T any](v T) int8 { return 3 }
+testing.Println(by.get(), f[int](1))
+" \
+"$BANNER
+> > > > > > > > 112
+> warning: f shadowed (incompatible signature); existing callers retain old definition
+> 112 3
+> "
+
+# --- A generic type, its methods and a generic alias resolve their names as of
+# their declaration: an instance formed after the constant, the variable and the
+# function they use are shadowed reads those it was declared with. ---
+run_repl "shadow-generic-type-reads-declared-names" \
+"const K int = 3
+var x int = 10
+func h() int { return 7 }
+type Arr[T any] struct { a [K]T }
+func (b *Arr[T]) get() int { return h() + x + K }
+type A[T any] = [K]T
+testing.Println(sizeof(Arr[int8]), sizeof(A[int8]))
+const K bool = true
+var x bool = false
+func h() int8 { return 1 }
+testing.Println(sizeof(Arr[int16]), sizeof(A[int16]))
+func u() int { var b Arr[uint8]; return b.get() }
+testing.Println(u())
+var bb Arr[int32]
+testing.Println(bb.get(), len(bb.a))
+var aa A[int64]
+testing.Println(len(aa))
+" \
+"$BANNER
+> > > > > > > 3 3
+> warning: constant K shadowed; existing references retain the old constant
+> warning: variable x shadowed (incompatible type); existing references retain the old variable
+> warning: h shadowed (incompatible signature); existing callers retain old definition
+> 6 6
+> > 20
+> > 20 3
+> > 3
+> "
+
+# --- A generic interface resolves its names as of its declaration: an instance
+# formed after the constant its method's result uses is shadowed takes the
+# array length it was declared with. ---
+run_repl "shadow-generic-interface-reads-declared-names" \
+"const K int = 3
+interface I[T any] { M() [K]T }
+type S struct { v int }
+func (s *S) M() [3]int { var r [3]int; r[0] = s.v; return r }
+impl *S : I[int]
+const K int = 4
+func use(i *I[int]) int { return len(i.M()) }
+var s S
+testing.Println(use(&s))
+type S2 struct { v int }
+func (s *S2) M() [3]int8 { var r [3]int8; return r }
+impl *S2 : I[int8]
+func use2(i *I[int8]) int { return len(i.M()) }
+var s2 S2
+testing.Println(use2(&s2))
+" \
+"$BANNER
+> > > > > > warning: constant K shadowed; existing references retain the old constant
+> > > 3
+> > > > > > 3
+> "
+
 # --- An import takes the name of a variable and of a function: each is shadowed
 # at the import (the variable with a warning), so the code written before it
 # keeps them, and a later declaration of the name is a new one. ---
@@ -3700,9 +3808,9 @@ warning: Cell.get shadowed (incompatible signature); existing callers retain old
 > "
 
 # --- A generic instance a parked group names first is checked with the group,
-# so the group waits for the parked redefinition of a name the instance's body
-# uses: gf[bool] calls the new h, however the others parked. ---
-run_repl "group-instance-body-sees-parked-redefinition" \
+# and its body reads the names the generic was declared against: gf[bool] calls
+# the h gf was declared with, not the parked redefinition. ---
+run_repl "group-instance-body-keeps-declared-names" \
 "func h() int { return 1000 }
 func gf[T any](x T) int { return cast(int, h()) }
 func P(n int) int { if n == 0 { return 1 }; return f() + q(n) }
@@ -3721,7 +3829,7 @@ function f resolved
 function h resolved
 warning: f shadowed (incompatible signature); existing callers retain old definition
 warning: h shadowed (incompatible signature); existing callers retain old definition
-> 6
+> 1001
 > "
 
 # --- A declaration typed at the prompt that uses a name a parked declaration

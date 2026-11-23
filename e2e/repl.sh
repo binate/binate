@@ -4021,8 +4021,9 @@ warning: Cell.get shadowed (incompatible signature); existing callers retain old
 > "
 
 # --- A generic instance a parked group names first is checked with the group,
-# and its body reads the names the generic was declared against: gf[bool] calls
-# the h gf was declared with, not the parked redefinition. ---
+# but its body reads the names the generic was declared against: gf[bool] calls
+# the h gf was declared with, so the group does not wait for h's parked
+# redefinition, which resolves after it. ---
 run_repl "group-instance-body-keeps-declared-names" \
 "func h() int { return 1000 }
 func gf[T any](x T) int { return cast(int, h()) }
@@ -4039,8 +4040,8 @@ testing.Println(f())
 > function h parked (pending: P)
 > function P resolved
 function f resolved
-function h resolved
 warning: f shadowed (incompatible signature); existing callers retain old definition
+function h resolved
 warning: h shadowed (incompatible signature); existing callers retain old definition
 > 1001
 > "

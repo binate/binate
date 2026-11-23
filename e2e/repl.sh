@@ -1355,6 +1355,75 @@ testing.Println(call[bool](&t, true), val[bool](&t, true), expr[bool](&t, true))
 > 11 11 12
 > "
 
+# --- A method of a generic type redefined with another signature is superseded:
+# the methods declared before it -- Twice -- call the method they were declared
+# against on every instance, those formed before and after the redefinition, and
+# code written after it calls the new one. ---
+run_repl "shadow-generic-method-keeps-declared-sibling" \
+"type Cur[T any] struct { v T }
+func (c *Cur[T]) Get() T { return c.v }
+func (c *Cur[T]) Twice() T { return c.Get() }
+var a Cur[int]
+a.v = 5
+testing.Println(a.Twice())
+func (c *Cur[T]) Get(k int) int { return k }
+testing.Println(a.Twice(), a.Get(7))
+var b Cur[bool]
+b.v = true
+testing.Println(b.Twice(), b.Get(8))
+" \
+"$BANNER
+> > > > > > 5
+> warning: Cur.Get shadowed (incompatible signature); existing callers retain old definition
+> 5 7
+> > > true 8
+> "
+
+# --- A method of a generic type calls the function it was declared against:
+# after g is redefined with another signature, get still calls the old g, on an
+# instance formed before the redefinition or after it, beside a method declared
+# since. ---
+run_repl "shadow-generic-method-reads-declared-names" \
+"func g() int { return 1000 }
+type Cell[T any] struct { v T }
+func (b *Cell[T]) get() int { return g() }
+func use() int { var b Cell[int]; return b.get() }
+testing.Println(use())
+func g() int8 { return 3 }
+func (b *Cell[T]) get2() int { return 7 }
+var cb Cell[int]
+testing.Println(cb.get(), cb.get2())
+var cc Cell[bool]
+testing.Println(cc.get())
+" \
+"$BANNER
+> > > > > 1000
+> warning: g shadowed (incompatible signature); existing callers retain old definition
+> > > 1000 7
+> > 1000
+> "
+
+# --- A method expression on an instance of a generic type, in a generic declared
+# before the method was superseded, names the method it was declared against --
+# called and taken as a function value, on an instance formed before the
+# redefinition and on one formed after it. ---
+run_repl "shadow-generic-method-expression-keeps-declared-method" \
+"type Cur[T any] struct { v T }
+func (c Cur[T]) Get() T { return c.v }
+func me[X any](c Cur[X]) X { return Cur[X].Get(c) }
+func mf[X any](c Cur[X]) X { var f *func(Cur[X]) X = Cur[X].Get; return f(c) }
+var a Cur[int]
+a.v = 5
+func (c Cur[T]) Get(k int) int { return k + 1000 }
+var b Cur[int16]
+b.v = 77
+testing.Println(me[int](a), mf[int](a), me[int16](b), mf[int16](b), a.Get(1))
+" \
+"$BANNER
+> > > > > > > warning: Cur.Get shadowed (incompatible signature); existing callers retain old definition
+> > > 5 5 77 77 1001
+> "
+
 # --- A call through a type parameter's constraint calls the method bound by the
 # impl that makes the type argument satisfy the constraint: after T's M is
 # redefined with another signature, the impl of I made before still binds the old

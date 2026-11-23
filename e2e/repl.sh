@@ -152,6 +152,42 @@ cat > "$TMP/pkg/rcother/rcother.bn" <<'EOF'
 package "pkg/rcother"
 EOF
 
+# ----- Two packages declaring the same names differently, for an import that
+# takes the name of another. ---
+mkdir -p "$TMP/pkg/replpa" "$TMP/pkg/replpb"
+cat > "$TMP/pkg/replpa.bni" <<'EOF'
+package "pkg/replpa"
+
+type T struct { A int }
+
+func F() int
+
+func (t *T) Get() int
+EOF
+cat > "$TMP/pkg/replpa/replpa.bn" <<'EOF'
+package "pkg/replpa"
+
+func F() int { return 1 }
+
+func (t *T) Get() int { return t.A }
+EOF
+cat > "$TMP/pkg/replpb.bni" <<'EOF'
+package "pkg/replpb"
+
+type T struct { A int; B int }
+
+func F() int
+
+func (t *T) Get() int
+EOF
+cat > "$TMP/pkg/replpb/replpb.bn" <<'EOF'
+package "pkg/replpb"
+
+func F() int { return 2 }
+
+func (t *T) Get() int { return t.A + 100 }
+EOF
+
 # ----- A package with a generic struct and a function returning one of its
 # instantiations: a prompt variable inferred from it is typed as that
 # instantiation. ---
@@ -1350,6 +1386,48 @@ testing.Println(h[T](t), h2[T](t), i.M(), j[T, T](t, t), b.Get())
 > > > > > > > 7 7 7 107 7
 > "
 
+# --- An import that takes the name of another keeps the package the name named
+# for the generics declared before it, as a variable's shadowing does: an
+# instance made after it calls the old package's function and its type's method,
+# with a warning.  An import of the package the name already names changes
+# nothing, and a declaration that takes an import's name keeps it the same way. ---
+run_repl "shadow-import-generic-keeps-declared-package" \
+"import s \"pkg/replpa\"
+func g[X any](x X) int { var t s.T; t.A = 5; return s.F() * 1000 + t.Get() }
+func k() int { return s.F() }
+testing.Println(g[int](1), k())
+import s \"pkg/replpb\"
+testing.Println(g[bool](true), g[int](1), k(), s.F())
+import s \"pkg/replpb\"
+var s int = 4
+testing.Println(g[int8](1), s)
+" \
+"$BANNER
+> package pkg/replpa loaded
+> > > 1005 1
+> package pkg/replpb loaded
+warning: import s shadowed; existing references retain the old package
+> 1005 1005 1 2
+> package pkg/replpb loaded
+> warning: import s shadowed; existing references retain the old package
+> 1005 4
+> "
+
+# --- A main-file import is a binding of the session's first generation: after an
+# input that took its name failed, a declaration that takes it keeps the package
+# for the generics declared before it, with a warning. ---
+run_repl "shadow-main-file-import-after-failed-input" \
+"func pr[X any](x X) int { testing.Println(7); return 0 }
+var testing int = \"x\"
+var testing int = 3
+var b int = pr[bool](true)
+" \
+"$BANNER
+> > <repl>:1:19: cannot assign [1]readonly uint8 to int
+> warning: import testing shadowed; existing references retain the old package
+> 7
+> "
+
 # --- A generic type, its methods and a generic alias resolve their names as of
 # their declaration: an instance formed after the constant, the variable and the
 # function they use are shadowed reads those it was declared with. ---
@@ -1411,7 +1489,8 @@ testing.Println(use2(&s2))
 
 # --- An import takes the name of a variable and of a function: each is shadowed
 # at the import (the variable with a warning), so the code written before it
-# keeps them, and a later declaration of the name is a new one. ---
+# keeps them, and a later declaration of the name is a new one, which shadows
+# the import (with a warning). ---
 run_repl "shadow-by-import" \
 "var strings int = 5
 func gs() int { return strings }
@@ -1427,9 +1506,11 @@ testing.Println(cs(), strconv())
 "$BANNER
 > > > package pkg/std/strings loaded
 warning: variable strings shadowed (redeclared as an import); existing references retain the old variable
-> > 5 true
+> warning: import strings shadowed; existing references retain the old package
+> 5 true
 > > > package pkg/std/strconv loaded
-> > 1 2
+> warning: import strconv shadowed; existing references retain the old package
+> 1 2
 > "
 
 # --- Case 21 (forward refs): a func decl whose body
@@ -1947,8 +2028,9 @@ type B still parked (it does not check)
 # `import "pkg/repldemo"` at the prompt and the loader pulls
 # it in.  After the load + type-check + lower, subsequent
 # prompt entries can call repldemo.Double. ---
-# --- A prompt import REBINDS its name: after `import "lib"`, `lib` is the local
-# package "lib", not the fixture's pkg/other/lib — its T and K. ---
+# --- A prompt import REBINDS its name, with a warning: after `import "lib"`,
+# `lib` is the local package "lib", not the fixture's pkg/other/lib — its T and
+# K. ---
 run_repl "prompt-import-rebinds-alias" \
 "testing.Println(lib.K)
 import \"lib\"
@@ -1959,6 +2041,7 @@ testing.Println(lib.K)
 "$BANNER
 > 7
 > package lib loaded
+warning: import lib shadowed; existing references retain the old package
 > > 8
 > 1000
 > " "$OTHERLIB_FIXTURE"
@@ -2276,6 +2359,7 @@ testing.Println(cast(int, X * 10.0), cast(int, a.B))
 "$BANNER
 > package pkg/rcbase loaded
 > > package pkg/rcother loaded
+warning: import a shadowed; existing references retain the old package
 > 30 100
 > "
 

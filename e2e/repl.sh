@@ -357,6 +357,52 @@ func main() {
     testing.Println(0)
 }
 EOF
+# A main file with generic types whose value-receiver methods implement an
+# interface -- a named int, and a struct holding a managed pointer -- and an
+# instance of one, for the cases on an interface call through an instance whose
+# methods are emitted at the prompt.
+RECV_FIXTURE="$TMP/recv_fixture.bn"
+cat > "$RECV_FIXTURE" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+
+interface Sizer { Size() int }
+
+type Num[T any] int
+
+func (n Num[T]) Size() int { return 1 + cast(int, n) }
+
+impl Num[T] : Sizer
+
+type Holder[T any] struct { p @int }
+
+func (h Holder[T]) Size() int { return *h.p }
+
+impl Holder[T] : Sizer
+
+var a Num[int]
+
+func main() {
+    testing.Println(0)
+}
+EOF
+# A package with such a generic type, for a prompt import of it.
+mkdir -p "$TMP/pkg/replrecv"
+cat > "$TMP/pkg/replrecv.bni" <<'EOF'
+package "pkg/replrecv"
+
+interface Sizer { Size() int }
+
+type G[T any] int
+
+func (g G[T]) Size() int { return 10 + cast(int, g) }
+
+impl G[T] : Sizer
+EOF
+cat > "$TMP/pkg/replrecv/replrecv.bn" <<'EOF'
+package "pkg/replrecv"
+EOF
 ALIASLIB_FIXTURE="$TMP/aliaslib_fixture.bn"
 cat > "$ALIASLIB_FIXTURE" <<'EOF'
 package "main"
@@ -1521,6 +1567,70 @@ testing.Println(bg.Size(), bg.Age(), bg.Extra(), sz.Size(), d.Size(), d.Age())
 > warning: Pair.Age shadowed (incompatible signature); existing callers retain old definition
 > > > > > 301 500 4 301 2 3
 > " "$PIMPL_FIXTURE"
+
+# --- An interface call on a value-receiver method of a generic type's instance
+# whose methods are emitted at the prompt passes the method the receiver's value
+# (its dispatch thunk loads it): instances boxed by a statement and by a
+# variable's initializer, and the main file's instance boxed at the prompt. ---
+run_repl "generic-value-receiver-dispatch-at-prompt" \
+"a = 100
+var q Num[bool] = 5
+var s *Sizer = &q
+var t *Sizer = &a
+testing.Println(s.Size(), t.Size(), q.Size(), a.Size())
+" \
+"$BANNER
+> > > > > 6 101 6 101
+> " "$RECV_FIXTURE"
+
+# --- The same for a struct receiver holding a managed pointer: each call through
+# the interface takes the reference the method releases, so the pointer stays
+# live. ---
+run_repl "generic-managed-value-receiver-dispatch-at-prompt" \
+"var h Holder[bool]
+h.p = make(int)
+*h.p = 7
+var hs *Sizer = &h
+testing.Println(hs.Size(), hs.Size(), hs.Size(), hs.Size())
+var other @int = make(int)
+*other = 9
+testing.Println(*h.p, *other, h.Size())
+" \
+"$BANNER
+> > > > > 7 7 7 7
+> > > 7 9 7
+> " "$RECV_FIXTURE"
+
+# --- The same for an instance boxed in a function (one parked until Q is
+# defined), through a redefinition of the method with the same signature (the
+# functions call the new one) and with another (the impl keeps the old one), and
+# for an instance of a generic type of a package imported at the prompt. ---
+run_repl "generic-value-receiver-dispatch-in-declarations" \
+"func g() int { var q Num[int16] = cast(Num[int16], Q(0)); var s *Sizer = &q; return s.Size() }
+func f() int { var q Num[int8] = 40; var s *Sizer = &q; return s.Size() }
+func Q(n int) int { return 60 }
+testing.Println(f(), g())
+func (n Num[T]) Size() int { return 2 + cast(int, n) }
+testing.Println(f(), g())
+func (n Num[T]) Size() int8 { return 3 }
+var r Num[uint8] = 50
+var s2 *Sizer = &r
+testing.Println(f(), g(), s2.Size(), r.Size())
+import \"pkg/replrecv\"
+var x replrecv.G[int] = 4
+var xs *replrecv.Sizer = &x
+testing.Println(xs.Size())
+" \
+"$BANNER
+> function g parked (pending: Q)
+> > function g resolved
+> 41 61
+> > 42 62
+> warning: Num.Size shadowed (incompatible signature); existing callers retain old definition
+> > > 42 62 52 3
+> package pkg/replrecv loaded
+> > > 14
+> " "$RECV_FIXTURE"
 
 # --- A call through a type parameter's constraint calls the method bound by the
 # impl that makes the type argument satisfy the constraint: after T's M is

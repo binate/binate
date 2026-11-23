@@ -315,6 +315,48 @@ func main() {
     testing.Println(lib.K)
 }
 EOF
+# A main file with a generic type its parameterized impls cover, and an instance of
+# it, for the cases on a redefinition of a method an impl covers.
+PIMPL_FIXTURE="$TMP/pimpl_fixture.bn"
+cat > "$PIMPL_FIXTURE" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+
+interface Sizer { Size() int }
+
+interface Namer { Name() int }
+
+type Cell[T any] struct { v T }
+
+func (b *Cell[T]) Size() int { return 1 }
+
+func (b Cell[T]) Name() int { return 3 }
+
+impl *Cell[T] : Sizer
+
+impl *Cell[T] : Namer
+
+interface Ager { Age() int }
+
+interface Big : Sizer, Ager { Extra() int }
+
+type Pair[T any] struct { k int }
+
+func (p *Pair[T]) Size() int { return 1 + p.k }
+
+func (p *Pair[T]) Age() int { return 200 + p.k }
+
+func (p *Pair[T]) Extra() int { return 4 }
+
+impl *Pair[T] : Big
+
+var a Cell[int]
+
+func main() {
+    testing.Println(0)
+}
+EOF
 ALIASLIB_FIXTURE="$TMP/aliaslib_fixture.bn"
 cat > "$ALIASLIB_FIXTURE" <<'EOF'
 package "main"
@@ -1423,6 +1465,62 @@ testing.Println(me[int](a), mf[int](a), me[int16](b), mf[int16](b), a.Get(1))
 > > > > > > > warning: Cur.Get shadowed (incompatible signature); existing callers retain old definition
 > > > 5 5 77 77 1001
 > "
+
+# --- A parameterized impl binds the methods of its generation: after the methods
+# it covers are redefined with other signatures -- with a pointer receiver and a
+# value one -- an instance formed before or after the redefinition calls the old
+# method through the interface, and the new one directly. ---
+run_repl "shadow-generic-method-parameterized-impl-keeps-its-method" \
+"func (b *Cell[T]) Size() int8 { return 2 }
+var c Cell[bool]
+var s *Sizer = &c
+var t *Sizer = &a
+func (b Cell[T]) Name() int8 { return 20 }
+var n *Namer = &c
+testing.Println(s.Size(), t.Size(), c.Size(), a.Size(), n.Name(), c.Name())
+" \
+"$BANNER
+> warning: Cell.Size shadowed (incompatible signature); existing callers retain old definition
+> > > > warning: Cell.Name shadowed (incompatible signature); existing callers retain old definition
+> > 1 1 2 2 3 20
+> " "$PIMPL_FIXTURE"
+
+# --- A function declared while a redefinition of a method a parameterized impl
+# covers is parked boxes an instance with the impl's method; the redefinition
+# resolves later, and the function still calls the impl's method through it. ---
+run_repl "shadow-generic-method-parameterized-impl-parked-redefinition" \
+"func (b *Cell[T]) Size() int8 { return cast(int8, Q(0)) }
+func f() int { var b Cell[bool]; var s *Sizer = &b; return s.Size() }
+func Q(n int) int { return 2 }
+var c Cell[int8]
+var s *Sizer = &c
+testing.Println(f(), s.Size(), c.Size(), a.Size())
+" \
+"$BANNER
+> method Cell.Size parked (pending: Q)
+> > method Cell.Size resolved
+warning: Cell.Size shadowed (incompatible signature); existing callers retain old definition
+> > > 1 1 2 2
+> " "$PIMPL_FIXTURE"
+
+# --- A parameterized impl of an interface with parents binds the methods of its
+# generation in the parents' slots of its vtable too: after Size and Age are
+# redefined with other signatures, Big's Size and Age, and Sizer's through an
+# upcast, call the old methods. ---
+run_repl "shadow-generic-method-parameterized-impl-inherited-methods" \
+"func (p *Pair[T]) Size() int8 { return 2 }
+func (p *Pair[T]) Age() int8 { return 3 }
+var d Pair[int16]
+d.k = 300
+var bg *Big = &d
+var sz *Sizer = bg
+testing.Println(bg.Size(), bg.Age(), bg.Extra(), sz.Size(), d.Size(), d.Age())
+" \
+"$BANNER
+> warning: Pair.Size shadowed (incompatible signature); existing callers retain old definition
+> warning: Pair.Age shadowed (incompatible signature); existing callers retain old definition
+> > > > > 301 500 4 301 2 3
+> " "$PIMPL_FIXTURE"
 
 # --- A call through a type parameter's constraint calls the method bound by the
 # impl that makes the type argument satisfy the constraint: after T's M is

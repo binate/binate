@@ -15,7 +15,8 @@ import "pkg/std/containers/vec"
 // (REGCLASS_AGG), over the positions the register allocator's liveness uses, gives each
 // such value an interval; a region is in use over the hull of its value's and its
 // aliases' intervals, from the write at the definition to the last read, and regions
-// whose spans never meet share bytes (placeSharedRegions).
+// whose spans never meet share bytes (placeSharedRegions), as do the calls' argument
+// regions (collectArgCopies), each in use only at its call's position.
 
 // aggregateHulls returns, indexed by value id, the live hull of each aggregate value of
 // f -- the start and end of its interval (buildHulls) in the liveness of aggregate values
@@ -136,30 +137,38 @@ func readsInPlace(ins @ir.Instr) bool {
 			op == iropcode.OP_IFACE_DTOR || op == iropcode.OP_FUNC_VALUE_DTOR
 }
 
-// placeSharedRegions lays the data regions ids (sizes, each a positive multiple of 8) of
-// f (lo / hi: aggregateHulls) down from offset, appending each to allocIDs / allocSizes /
-// allocOffsets, and returns the offset past them.  With two or more, their spans are
-// computed (regionSpans): a region whose span is not known keeps bytes of its own, and
-// the others share bytes where their spans do not meet, each placed at the lowest offset
-// clear of the regions placed before it, in order of span start.  The regions in use at a
-// region's start are the placed ones whose spans have not ended there; they all hold that
-// position, so their bytes are disjoint, and they are kept in order of offset for the
-// search.
+// placeSharedRegions lays down, from offset, the data regions ids (sizes, each a
+// positive multiple of 8) of f (lo / hi: aggregateHulls), appending each to allocIDs /
+// allocSizes / allocOffsets, and the argument regions of copies, setting each one's
+// offset (copies.offs); it returns the offset past them.  A data region is in use over
+// its span (regionSpans, computed when there are two or more regions, one of them a
+// data region); an argument region only at its call's position.  A data region whose
+// span regionSpans cannot follow keeps bytes of its own; the argument regions of calls
+// the entry does not reach lie in one area, each such call's side by side, as large as
+// the largest call's; the others share bytes where their spans do not meet
+// (packByStart).
 func placeSharedRegions(f @ir.Func, lo @[]int, hi @[]int, ids @vec.Vec[int], sizes @vec.Vec[int64],
-		allocIDs @vec.Vec[int], allocSizes @vec.Vec[int64], allocOffsets @vec.Vec[int64],
-		offset int64) int64 {
+		copies @argCopyPlan, allocIDs @vec.Vec[int], allocSizes @vec.Vec[int64],
+		allocOffsets @vec.Vec[int64], offset int64) int64 {
 	var n int = ids.Len()
-	if n == 0 { return offset }
+	var nc int = copies.calls.Len()
+	if n + nc == 0 { return offset }
 	var starts @[]int
 	var ends @[]int
-	if n >= 2 { starts, ends = regionSpans(f, lo, hi) }
-	var known @vec.Vec[int] = vec.New[int]()
-	var maxStart int = 0
+	if n >= 1 && n + nc >= 2 { starts, ends = regionSpans(f, lo, hi) }
+	// The regions whose spans are known, as items: k < n is data region k, n + i the
+	// argument region i.
+	var itemOf @vec.Vec[int] = vec.New[int]()
+	var itemStarts @vec.Vec[int] = vec.New[int]()
+	var itemEnds @vec.Vec[int] = vec.New[int]()
+	var itemSizes @vec.Vec[int64] = vec.New[int64]()
 	for k := 0; k < n; k++ {
 		var id int = ids.Get(k)
 		if id < len(starts) && starts[id] >= 0 {
-			known.Push(k)
-			if starts[id] > maxStart { maxStart = starts[id] }
+			itemOf.Push(k)
+			itemStarts.Push(starts[id])
+			itemEnds.Push(ends[id])
+			itemSizes.Push(sizes.Get(k))
 			continue
 		}
 		allocIDs.Push(id)
@@ -167,19 +176,67 @@ func placeSharedRegions(f @ir.Func, lo @[]int, hi @[]int, ids @vec.Vec[int], siz
 		allocOffsets.Push(offset)
 		offset = frameAdd(offset, sizes.Get(k))
 	}
-	if known.Len() == 0 { return offset }
-	var order @[]int = orderByStart(known, ids, starts, maxStart)
+	// A call's regions are listed together (collectArgCopies).
+	var deadCall int = -1
+	var deadBytes int64 = 0
+	var deadArea int64 = 0
+	for i := 0; i < nc; i++ {
+		var p int = copies.pos.Get(i)
+		if p >= 0 {
+			itemOf.Push(n + i)
+			itemStarts.Push(p)
+			itemEnds.Push(p + 1)
+			itemSizes.Push(copies.sizes.Get(i))
+			continue
+		}
+		if copies.calls.Get(i) != deadCall {
+			deadCall = copies.calls.Get(i)
+			deadBytes = 0
+		}
+		copies.offs[i] = frameAdd(offset, deadBytes)
+		deadBytes = frameAdd(deadBytes, copies.sizes.Get(i))
+		if deadBytes > deadArea { deadArea = deadBytes }
+	}
+	offset = frameAdd(offset, deadArea)
+	if itemOf.Len() == 0 { return offset }
+	offs, total := packByStart(itemStarts.Items(), itemEnds.Items(), itemSizes.Items())
+	for j := 0; j < itemOf.Len(); j++ {
+		var k int = itemOf.Get(j)
+		if k < n {
+			allocIDs.Push(ids.Get(k))
+			allocSizes.Push(sizes.Get(k))
+			allocOffsets.Push(frameAdd(offset, offs[j]))
+		} else {
+			copies.offs[k - n] = frameAdd(offset, offs[j])
+		}
+	}
+	return frameAdd(offset, total)
+}
+
+// packByStart places items (starts / ends: their half-open spans; sizes) so that two
+// whose spans meet never share bytes: each, in order of span start (orderByStart), at
+// the lowest offset clear of the ones placed before it.  The ones in use at an item's
+// start are the placed ones whose spans have not ended there; they all hold that
+// position, so their bytes are disjoint, and they are kept in order of offset for the
+// search.  It returns each item's offset from 0 and the bytes the items take.
+func packByStart(starts @[]int, ends @[]int, sizes @[]int64) (@[]int64, int64) {
+	var n int = len(starts)
+	var maxStart int = 0
+	for k := 0; k < n; k++ {
+		if starts[k] > maxStart { maxStart = starts[k] }
+	}
+	var order @[]int = orderByStart(starts, maxStart)
 	var offs @[]int64 = make_slice(int64, n)
 	var act @[]int = make_slice(int, n)
 	var na int = 0
 	var total int64 = 0
-	for i := 0; i < len(order); i++ {
+	for i := 0; i < n; i++ {
 		var k int = order[i]
-		var s int = starts[ids.Get(k)]
-		var sz int64 = sizes.Get(k)
+		var s int = starts[k]
+		var sz int64 = sizes[k]
 		var w int = 0
 		for j := 0; j < na; j++ {
-			if ends[ids.Get(act[j])] > s {
+			if ends[act[j]] > s {
 				act[w] = act[j]
 				w++
 			}
@@ -192,7 +249,7 @@ func placeSharedRegions(f @ir.Func, lo @[]int, hi @[]int, ids @vec.Vec[int], siz
 				pos = j
 				break
 			}
-			var e int64 = frameAdd(offs[act[j]], sizes.Get(act[j]))
+			var e int64 = frameAdd(offs[act[j]], sizes[act[j]])
 			if e > at { at = e }
 		}
 		for j := na; j > pos; j-- { act[j] = act[j - 1] }
@@ -201,30 +258,22 @@ func placeSharedRegions(f @ir.Func, lo @[]int, hi @[]int, ids @vec.Vec[int], siz
 		offs[k] = at
 		if frameAdd(at, sz) > total { total = frameAdd(at, sz) }
 	}
-	for i := 0; i < known.Len(); i++ {
-		var k int = known.Get(i)
-		allocIDs.Push(ids.Get(k))
-		allocSizes.Push(sizes.Get(k))
-		allocOffsets.Push(frameAdd(offset, offs[k]))
-	}
-	return frameAdd(offset, total)
+	return offs, total
 }
 
-// orderByStart returns the indexes known (into ids) in order of their regions' span
-// starts (starts, by id; none past maxStart), a counting sort that keeps known's order
-// among equal starts.
-func orderByStart(known @vec.Vec[int], ids @vec.Vec[int], starts @[]int, maxStart int) @[]int {
+// orderByStart returns the indexes of starts (none past maxStart) in order of start, a
+// counting sort that keeps their order among equal starts.
+func orderByStart(starts @[]int, maxStart int) @[]int {
 	var first @[]int = make_slice(int, maxStart + 2)
-	for i := 0; i < known.Len(); i++ {
-		var after int = starts[ids.Get(known.Get(i))] + 1
+	for i := 0; i < len(starts); i++ {
+		var after int = starts[i] + 1
 		first[after] = first[after] + 1
 	}
 	for p := 1; p < len(first); p++ { first[p] = first[p] + first[p - 1] }
-	var order @[]int = make_slice(int, known.Len())
-	for i := 0; i < known.Len(); i++ {
-		var k int = known.Get(i)
-		var s int = starts[ids.Get(k)]
-		order[first[s]] = k
+	var order @[]int = make_slice(int, len(starts))
+	for i := 0; i < len(starts); i++ {
+		var s int = starts[i]
+		order[first[s]] = i
 		first[s] = first[s] + 1
 	}
 	return order

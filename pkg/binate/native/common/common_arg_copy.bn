@@ -11,25 +11,43 @@ import "pkg/std/containers/vec"
 // and write to it.  An argument is passed as its own data region only when that
 // region is a private copy nothing reads after the call (argOwnsRegion); for every
 // other one PlanFrame reserves an argument region (LookupArgCopy), into which the
-// call copies the value before passing the region's address.  A call's argument
-// regions are dead once it returns, and a call fills them only as its lowering
-// begins — after every call nested in its arguments has returned — so all calls
-// share one argument area, as large as the largest call's regions.
+// call copies the value before passing the region's address.  A call fills its
+// argument regions only as its lowering begins — after every call nested in its
+// arguments has returned — and they are dead once it returns, so each is in use only
+// at its call's position: it shares bytes with the other calls' argument regions and
+// with the data regions not in use there (placeSharedRegions).
+
+// argCopyPlan is the argument regions of a function's calls (collectArgCopies):
+// region i is for operand args[i] of the call with value ID calls[i], sizes[i] bytes
+// (8-byte rounded), in use at pos[i], the call's position in the function's liveness
+// (-1 for a call the entry does not reach), and placed at offs[i]
+// (placeSharedRegions).
+type argCopyPlan struct {
+	calls @vec.Vec[int]
+	args  @vec.Vec[int]
+	sizes @vec.Vec[int64]
+	pos   @vec.Vec[int]
+	offs  @[]int64
+}
 
 // argOwnsRegion reports whether argument v of call may be passed as the address of
-// v's own data region: v has a private region (one PlanFrame already reserved —
-// instrHasDataRegion — not a parameter, whose region is the function's own), the
-// call is v's only use, and the call is in v's block — so each fill of the region
-// reaches the call at most once (a call in a loop whose body does not recompute v
-// would otherwise pass, from its second iteration on, a region an earlier callee may
-// have written).  uses counts each value's operand references; blockOf gives each
-// value's block index (-1 outside the function's blocks).
-func (m @RegMap) argOwnsRegion(call @ir.Instr, v @ir.Instr, uses @[]int, blockOf @[]int) bool {
+// v's own data region: v has bytes of its own (owns, regionPlan — never a parameter,
+// whose region is the function's own), the call is v's only use, and the call is in
+// v's block — so each fill of the region reaches the call at most once (a call in a
+// loop whose body does not recompute v would otherwise pass, from its second
+// iteration on, a region an earlier callee may have written).  A load reading its slot
+// in place for this one use (IsLastUseArgLoad) passes the slot.  uses counts each
+// value's operand references; blockOf gives each value's block index (-1 outside the
+// function's blocks).
+func (m @RegMap) argOwnsRegion(call @ir.Instr, v @ir.Instr, uses @[]int, blockOf @[]int,
+		owns @[]bool) bool {
 	if v.ID < 0 || v.ID >= len(uses) || call.ID < 0 || call.ID >= len(blockOf) { return false }
 	// A load reading its slot in place, the slot dead after the call
 	// (inplace.LastUseArgLoads), passes the slot itself.
 	if m.IsLastUseArgLoad(v.ID) { return true }
-	if v.Op == iropcode.OP_PARAM || m.LookupAlloc(v.ID) < 0 || uses[v.ID] != 1 { return false }
+	if v.Op == iropcode.OP_PARAM || v.ID >= len(owns) || !owns[v.ID] || uses[v.ID] != 1 {
+		return false
+	}
 	return blockOf[v.ID] >= 0 && blockOf[v.ID] == blockOf[call.ID]
 }
 
@@ -52,26 +70,27 @@ func countValueUses(uses @[]int, blocks @[]@ir.Block, limit int) {
 	}
 }
 
-// planArgCopies reserves, in the argument area from offset up, an argument region
-// (8-byte rounded) for every PassesIndirect argument of a call in f that does not own
-// its own region, records them for LookupArgCopy, and returns the offset past the
-// area.  It runs after PlanFrame has recorded the data regions (LookupAlloc).  A call
-// with no value ID (never one built by ir.NewInstr) gets no regions; the backend
-// reports one that needs them.
-func (m @RegMap) planArgCopies(f @ir.Func, offset int64) int64 {
-	var calls @vec.Vec[int] = vec.New[int]()
-	var args @vec.Vec[int] = vec.New[int]()
-	var offs @vec.Vec[int64] = vec.New[int64]()
+// collectArgCopies returns the argument regions f's calls need: one for every
+// PassesIndirect argument that does not own its region (argOwnsRegion, given the
+// values with bytes of their own, owns), in use at its call's position over cfg.  It
+// runs once m.LastUseLoads is recorded.  A call with no value ID (never one built by
+// ir.NewInstr) gets none; the backend reports one that needs them.
+func (m @RegMap) collectArgCopies(f @ir.Func, cfg @LiveCFG, owns @[]bool) @argCopyPlan {
+	var plan @argCopyPlan = make(argCopyPlan)
+	plan.calls = vec.New[int]()
+	plan.args = vec.New[int]()
+	plan.sizes = vec.New[int64]()
+	plan.pos = vec.New[int]()
 	var uses @[]int
 	var blockOf @[]int
-	var area int64 = 0
 	for bi := 0; bi < len(f.Blocks); bi++ {
 		var b @ir.Block = f.Blocks[bi]
+		var from int = -1
+		if bi < len(cfg.blockFrom) { from = cfg.blockFrom[bi] }
 		for ii := 0; ii < len(b.Instrs); ii++ {
 			var ins @ir.Instr = b.Instrs[ii]
 			var base int = callconv.CallArgBase(ins.Op)
 			if base < 0 || ins.ID < 0 { continue }
-			var callBytes int64 = 0
 			for k := base; k < len(ins.Args); k++ {
 				var v @ir.Instr = ins.Args[k]
 				if v == nil || v.Typ == nil || !m.CC.PassesIndirect(v.Typ) { continue }
@@ -81,20 +100,25 @@ func (m @RegMap) planArgCopies(f @ir.Func, offset int64) int64 {
 					countValueUses(uses, f.Blocks, f.NextID)
 					blockOf = valueBlocks(f)
 				}
-				if m.argOwnsRegion(ins, v, uses, blockOf) { continue }
-				var sz int64 = roundUp8(v.Typ.Size())
-				calls.Push(ins.ID)
-				args.Push(k)
-				offs.Push(frameAdd(offset, callBytes))
-				callBytes = frameAdd(callBytes, sz)
+				if m.argOwnsRegion(ins, v, uses, blockOf, owns) { continue }
+				plan.calls.Push(ins.ID)
+				plan.args.Push(k)
+				plan.sizes.Push(roundUp8(v.Typ.Size()))
+				var p int = -1
+				if from >= 0 { p = from + ii }
+				plan.pos.Push(p)
 			}
-			if callBytes > area { area = callBytes }
 		}
 	}
-	m.ArgCopyCalls = calls.Items()
-	m.ArgCopyArgs = args.Items()
-	m.ArgCopyOffsets = offs.Items()
-	return frameAdd(offset, area)
+	plan.offs = make_slice(int64, plan.calls.Len())
+	return plan
+}
+
+// noteArgCopies records plan's placed argument regions for LookupArgCopy.
+func (m @RegMap) noteArgCopies(plan @argCopyPlan) {
+	m.ArgCopyCalls = plan.calls.Items()
+	m.ArgCopyArgs = plan.args.Items()
+	m.ArgCopyOffsets = plan.offs
 }
 
 // valueBlocks returns, indexed by value ID, the index of the block of f that

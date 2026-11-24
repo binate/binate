@@ -12,8 +12,8 @@ import "pkg/std/strings"
 
 // PlanFrame assigns a stack slot to every function parameter and to every
 // value-producing SSA instruction that needs one (needsSpillSlot: not a value the
-// register allocator homes for its whole life, which never touches a slot, nor one a
-// fold elides).  It
+// register allocator homes for its whole life, which never touches a slot, one a fold
+// elides, nor one with bytes of its own but an indirect call, regionPlan).  It
 // runs after AllocateRegisters / AllocateFpRegisters; values whose live spans they
 // recorded, and aggregate values (whose spans it computes, noteAggregateSpans), share
 // 8-byte spill slots where the spans do not meet (planSharedSpills).
@@ -30,15 +30,16 @@ import "pkg/std/strings"
 //     the slots whose scopes it never meets (placeSharedAllocas).
 //   - Aggregate-producing OPs whose SSA value is a *pointer* to a
 //     dedicated data region (OP_MAKE_SLICE; aggregate OP_CONST_NIL):
-//     a Typ.Size() data region (via AllocIDs) PLUS an 8-byte
-//     spill slot for the pointer.  A region whose span is known shares bytes with
-//     the regions whose spans it never meets (regionSpans, placeSharedRegions), and
-//     the pointer slot is shared by the value's own live span like a scalar's
-//     (noteAggregateSpans).
+//     a Typ.Size() data region (via AllocIDs) and no spill slot, the value being
+//     the region's address (regionPlan).  A region whose span is known shares bytes
+//     with the regions whose spans it never meets (regionSpans, placeSharedRegions).
+//     An aggregate value with no bytes of its own (a member extracted from another,
+//     a load read in place) has an 8-byte slot holding their address, shared by the
+//     value's own live span like a scalar's (noteAggregateSpans).
 //   - Multi-return calls (OP_CALL returning TYP_STRUCT):
 //     N*8-byte spill slot so X0..X(N-1) can be packed at slot + 8*i.
-//   - Aggregate params: same as OP_MAKE_SLICE — data region + pointer
-//     spill slot. Callee prologue writes the N arg-reg words into the
+//   - Aggregate params: a data region and, like every parameter, a spill
+//     slot. Callee prologue writes the N arg-reg words into the
 //     data region.
 //   - Everything else that needs a slot: 8 bytes.
 func (m @RegMap) PlanFrame(f @ir.Func) int64 {
@@ -121,9 +122,9 @@ func (m @RegMap) PlanFrame(f @ir.Func) int64 {
 	// Parameters come first so entry-point register stores can find
 	// their slots by ID. Aggregate (slice) params are passed spread
 	// across multiple arg registers; we reserve a data region for the
-	// bytes plus an 8-byte spill slot that holds a pointer to that
-	// region, matching OP_MAKE_SLICE / OP_LOAD's aggregate form so
-	// downstream OP_STORE-struct-copy and OP_EXTRACT just work.
+	// bytes, whose address is the parameter's value (getOperand), plus
+	// the 8-byte spill slot every parameter has, which the prologue
+	// fills with that address.
 	// The slot tables grow with the function, so they are built with amortized
 	// appends and stored back once at the end.
 	var allocIDs @vec.Vec[int] = intVecFrom(m.AllocIDs)
@@ -137,14 +138,10 @@ func (m @RegMap) PlanFrame(f @ir.Func) int64 {
 	// One index of f's uses serves the slot analyses below.
 	var fu @inplace.FuncUses = inplace.NewFuncUses(f)
 	var placed @[]int = fu.CallResultSlots(inPlace)
-	var placedCalls @vec.Vec[int] = vec.New[int]()
-	var placedSizes @vec.Vec[int64] = vec.New[int64]()
-	var placedDirectSret @vec.Vec[bool] = vec.New[bool]()
 	var sharedIDs @vec.Vec[int] = vec.New[int]()
 	var sharedSizes @vec.Vec[int64] = vec.New[int64]()
 	var toRetbuf @[]bool
 	if m.CC.FuncReturnsBigAggregate(f) { toRetbuf = inplace.ReturnedCallResults(f) }
-	var retbufCalls @vec.Vec[int] = vec.New[int]()
 	var rbSlot int = -1
 	var rbLoads @[]bool
 	if m.CC.FuncReturnsBigAggregate(f) { rbSlot, rbLoads = fu.RetbufLocal(inPlace) }
@@ -156,9 +153,6 @@ func (m @RegMap) PlanFrame(f @ir.Func) int64 {
 	m.SplitSaveBytes = m.splitSaveBytes(cts)
 	var inPlaceIDs @vec.Vec[int] = vec.New[int]()
 	var inPlaceParams @vec.Vec[int] = vec.New[int]()
-	// The data regions of aggregate values, laid down after the walk (placeSharedRegions).
-	var regionIDs @vec.Vec[int] = vec.New[int]()
-	var regionSizes @vec.Vec[int64] = vec.New[int64]()
 	for pi := 0; pi < len(f.Params); pi++ {
 		var p @ir.Param = f.Params[pi]
 		// A parameter whose bytes arrive in memory the callee owns
@@ -196,7 +190,10 @@ func (m @RegMap) PlanFrame(f @ir.Func) int64 {
 	aggLo, aggHi := aggregateHulls(f, cfg, m.CC.WordBytes,
 			UnionFusable(m.FusableGep, m.FusableFieldGep))
 	m.noteAggregateSpans(f, aggLo, aggHi)
-	shared, sharedPast := m.planSharedSpills(f, targets, spillIDs, spillOffsets, offset)
+	// Where each aggregate value's bytes live is settled first: a value with bytes of its
+	// own needs no spill slot (regionPlan).
+	var rp @regionPlan = m.planRegions(f, fu, toRetbuf, rbSlot, rbLoads, lastUse, placed)
+	shared, sharedPast := m.planSharedSpills(f, targets, rp.owns, spillIDs, spillOffsets, offset)
 	offset = sharedPast
 
 	for bi := 0; bi < len(f.Blocks); bi++ {
@@ -243,92 +240,17 @@ func (m @RegMap) PlanFrame(f @ir.Func) int64 {
 				// An indirect call has a slot even when it is void: x64 keeps the callee
 				// there while it places the arguments (its scratch R11 is in the pool the
 				// argument loop allocates from), then reloads it just before the CALL;
-				// aarch64 keeps it in X17, outside the pool.
-				//
-				// These ops produce an aggregate VALUE that must live in
-				// the frame: each gets a dedicated data region, and its
-				// spill slot then holds a *pointer* to that region, so
-				// downstream OP_EXTRACT / OP_STORE can treat every
-				// aggregate value uniformly (a pointer to its bytes).
-				//
-				// OP_LOAD is included so an aggregate load OWNS its bytes
-				// rather than aliasing the source object.  The alias is
-				// unsound when the source is a local the function's
-				// cleanup RefDecs before the loaded value is consumed —
-				// e.g. `return container[i]`, whose element header lives
-				// in `container`'s backing and is copied into the sret
-				// buffer only after `container`'s dtor has freed that
-				// backing, yielding an empty/garbage result.  Copying at
-				// the load point (before any cleanup) matches the LLVM
-				// backend, which loads the aggregate into an SSA value at
-				// the load site.  EXCEPT: inplace.AggLoadElision proves the alias
-				// safe when nothing can write or free the source before the
-				// last read of the loaded value (a confined stack alloca not
-				// reassigned, or only non-writing instructions in between) —
-				// those skip the region and alias the source (emitAggLoad's
-				// no-region path), removing the redundant src->temp copy.  One
-				// read in place by a whole store that may overlap it is
-				// recorded, for the store to copy as memmove does.
-				var loadKind int = inplace.AGG_LOAD_COPIED
-				if ins.Op == iropcode.OP_LOAD { loadKind = fu.AggLoadElision(ins) }
-				if loadKind == inplace.AGG_LOAD_IN_PLACE_OVERLAPPING {
-					// An id the flag set cannot hold (none should be) keeps its copy.
-					if len(m.InPlaceOverlapping) == 0 { m.InPlaceOverlapping = make_slice(bool, f.NextID) }
-					if ins.ID >= 0 && ins.ID < len(m.InPlaceOverlapping) {
-						m.InPlaceOverlapping[ins.ID] = true
-					} else {
-						loadKind = inplace.AGG_LOAD_COPIED
-					}
-				}
-				var region bool = instrHasDataRegion(ins, loadKind)
-				if region && ins.ID < len(toRetbuf) && toRetbuf[ins.ID] && m.CC.CallReturnsBigAggregate(ins) {
-					// The call writes the aggregate this function returns straight
-					// into the caller's buffer (inplace.ReturnedCallResults): no region.
-					retbufCalls.Push(ins.ID)
-				} else if region && ins.ID < len(lastUse) && lastUse[ins.ID] {
-					// A load reading its slot in place for its one by-value argument
-					// use (inplace.LastUseArgLoads): no region, it aliases the slot.
-				} else if region && ins.ID < len(rbLoads) && rbLoads[ins.ID] {
-					// A returned load of the local living in the caller's buffer
-					// (inplace.RetbufLocal): no region, it aliases the local.
-				} else if region && ins.ID < len(placed) && placed[ins.ID] >= 0 {
-					// The call writes its result straight into a slot
-					// (inplace.CallResultSlots): it takes the slot's region, assigned
-					// after the walk, since the slot may come later.
-					placedCalls.Push(ins.ID)
-					placedSizes.Push(roundUp8(ins.Typ.Size()))
-					placedDirectSret.Push(ins.Op == iropcode.OP_CALL && m.CC.CallReturnsBigAggregate(ins))
-				} else if region {
-					// OP_RODATA_MSLICE / OP_RODATA_SLICE deliberately do NOT
-					// reserve a data slot: their result is a pointer to the
-					// string's STATIC `.ms` header (emitRodataMSliceOrSlice LEAs
-					// it into the result register), so the value lives in
-					// immortal static data, not a per-use stack region.  A slot
-					// here would shadow that pointer — aggregate consumers
-					// resolve an operand via LookupAlloc FIRST (emitAggLoad), and
-					// would read the unwritten slot instead of the register.
-
-					var dataSz int64 = ins.Typ.Size()
-					if dataSz > 0 {
-						// Round up to 8-byte multiple so subsequent
-						// 64-bit STR/LDR stay aligned and so that
-						// emitStringToArray's word-wise zero-fill
-						// doesn't run past the buffer end (e.g. a
-						// [5]char array gets 8 bytes here).
-						dataSz = roundUp8(dataSz)
-						regionIDs.Push(ins.ID)
-						regionSizes.Push(dataSz)
-					}
-				}
-				if !m.needsSpillSlot(ins, targets) || (ins.ID < len(shared) && shared[ins.ID]) {
+				// aarch64 keeps it in X17, outside the pool.  A value with bytes of its own
+				// (rp.owns) has none: it is read as their address (needsSpillSlot).
+				if !m.needsSpillSlot(ins, targets, rp.owns) || (ins.ID < len(shared) && shared[ins.ID]) {
 					continue
 				}
 				spillIDs.Push(ins.ID)
 				spillOffsets.Push(offset)
 				// Multi-return calls reserve enough contiguous bytes
 				// for the entire tuple so X0..X(N-1) can land at
-				// Offset(tuple, i). Named struct returns go
-				// through the pointer-form branch above instead, so
+				// Offset(tuple, i). Named struct returns have
+				// data regions instead (regionPlan), so
 				// we key on IsMultiReturnCall rather than bare
 				// TYP_STRUCT. The byte count is tuple.Size()
 				// — fields can themselves be aggregates (e.g. a
@@ -343,14 +265,14 @@ func (m @RegMap) PlanFrame(f @ir.Func) int64 {
 			}
 		}
 	}
-	offset = placeSharedRegions(f, aggLo, aggHi, regionIDs, regionSizes, allocIDs, allocSizes,
+	offset = placeSharedRegions(f, aggLo, aggHi, rp.regionIDs, rp.regionSizes, allocIDs, allocSizes,
 			allocOffsets, offset)
 	// Before placeCallResults, which gives a call writing into a slot that slot's offset.
 	offset = placeSharedAllocas(f, cfg, sharedIDs, sharedSizes, placed, allocIDs, allocSizes,
 			allocOffsets, offset)
-	offset = m.placeCallResults(placed, placedCalls, placedSizes, placedDirectSret, retbufCalls,
-			allocIDs, allocSizes, allocOffsets, offset)
-	m.RetbufCalls = retbufCalls.Items()
+	offset = m.placeCallResults(placed, rp.placedCalls, rp.placedSizes, rp.placedToRetbuf,
+			rp.retbufCalls, allocIDs, allocSizes, allocOffsets, offset)
+	m.RetbufCalls = rp.retbufCalls.Items()
 	// Every returned load is recorded, an elided one (inplace.AggLoadElision: no region
 	// either way) too, so no return copies the buffer onto itself.
 	for id := 0; m.RetbufSlotID >= 0 && id < len(rbLoads); id++ {
@@ -432,7 +354,7 @@ func reportFrameTooLarge(a @asm.Assembler, what *[]readonly char, name *[]readon
 }
 
 // instrHasDataRegion reports whether ins produces an aggregate value that PlanFrame
-// gives a data region of its own (its spill slot then holds a pointer to the region):
+// gives a data region of its own (the value is then the region's address, regionPlan):
 // a made slice, an aggregate load that is copied (loadKind, its inplace.AggLoadElision), an
 // aggregate nil, a read-only-data array or managed-slice copy, a function or interface
 // value, an interface upcast, or the aggregate result of a call that is not a

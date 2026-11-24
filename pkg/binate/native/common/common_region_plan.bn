@@ -1,0 +1,131 @@
+package "pkg/binate/native/common"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/inplace"
+import "pkg/std/containers/vec"
+
+// regionPlan is where PlanFrame puts each aggregate value's bytes, decided before it
+// plans the spill slots.  A value with bytes of its own -- a data region, or the slot
+// a call writes its result into -- is read as their address, which getOperand forms
+// from the region (LookupAlloc), so it needs no spill slot (owns, needsSpillSlot).
+type regionPlan struct {
+	// owns says, by value id, whether the value has bytes of its own.
+	owns @[]bool
+	// regionIDs / regionSizes are the values given data regions and the regions'
+	// sizes, laid down after the walk (placeSharedRegions).
+	regionIDs   @vec.Vec[int]
+	regionSizes @vec.Vec[int64]
+	// placedCalls / placedSizes / placedToRetbuf are the calls that write their
+	// results straight into slots (inplace.CallResultSlots), the results' sizes and
+	// whether each passes its caller's buffer on instead; each other one takes its
+	// slot's region after the walk, since the slot may come later (placeCallResults).
+	placedCalls    @vec.Vec[int]
+	placedSizes    @vec.Vec[int64]
+	placedToRetbuf @vec.Vec[bool]
+	// retbufCalls are the calls that write the aggregate f returns straight into its
+	// caller's buffer (inplace.ReturnedCallResults): no region.
+	retbufCalls @vec.Vec[int]
+}
+
+// planRegions returns f's regionPlan, given the analyses PlanFrame runs first: f's use
+// index fu, the calls writing f's result into its caller's buffer (toRetbuf), the local
+// f keeps in that buffer (rbSlot, or -1) and the loads of it f returns (rbLoads), the
+// loads read in place by their one by-value argument use (lastUse) and the slots calls
+// write their results into (placed).  It records the loads read in place by a whole
+// store that may overlap them (m.InPlaceOverlapping).
+func (m @RegMap) planRegions(f @ir.Func, fu @inplace.FuncUses, toRetbuf @[]bool, rbSlot int,
+		rbLoads @[]bool, lastUse @[]bool, placed @[]int) @regionPlan {
+	var rp @regionPlan = make(regionPlan)
+	rp.owns = make_slice(bool, f.NextID)
+	rp.regionIDs = vec.New[int]()
+	rp.regionSizes = vec.New[int64]()
+	rp.placedCalls = vec.New[int]()
+	rp.placedSizes = vec.New[int64]()
+	rp.placedToRetbuf = vec.New[bool]()
+	rp.retbufCalls = vec.New[int]()
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for ii := 0; ii < len(b.Instrs); ii++ {
+			var ins @ir.Instr = b.Instrs[ii]
+			if ins.ID < 0 || ins.ID >= f.NextID || ins.Op == iropcode.OP_ALLOC || InstrIsVoid(ins) {
+				continue
+			}
+			// These ops produce an aggregate VALUE that must live in the frame: each
+			// gets a data region of its own, and the value is the region's address, so
+			// downstream OP_EXTRACT / OP_STORE can treat every aggregate value
+			// uniformly (a pointer to its bytes).
+			//
+			// OP_LOAD is included so an aggregate load OWNS its bytes rather than
+			// aliasing the source object.  The alias is unsound when the source is a
+			// local the function's cleanup RefDecs before the loaded value is consumed
+			// — e.g. `return container[i]`, whose element header lives in
+			// `container`'s backing and is copied into the sret buffer only after
+			// `container`'s dtor has freed that backing, yielding an empty/garbage
+			// result.  Copying at the load point (before any cleanup) matches the LLVM
+			// backend, which loads the aggregate into an SSA value at the load site.
+			// EXCEPT: inplace.AggLoadElision proves the alias safe when nothing can
+			// write or free the source before the last read of the loaded value (a
+			// confined stack alloca not reassigned, or only non-writing instructions in
+			// between) — those skip the region and alias the source (emitAggLoad's
+			// no-region path), removing the redundant src->temp copy.  One read in
+			// place by a whole store that may overlap it is recorded, for the store to
+			// copy as memmove does.
+			var loadKind int = inplace.AGG_LOAD_COPIED
+			if ins.Op == iropcode.OP_LOAD { loadKind = fu.AggLoadElision(ins) }
+			if loadKind == inplace.AGG_LOAD_IN_PLACE_OVERLAPPING {
+				// An id the flag set cannot hold (none should be) keeps its copy.
+				if len(m.InPlaceOverlapping) == 0 { m.InPlaceOverlapping = make_slice(bool, f.NextID) }
+				if ins.ID < len(m.InPlaceOverlapping) {
+					m.InPlaceOverlapping[ins.ID] = true
+				} else {
+					loadKind = inplace.AGG_LOAD_COPIED
+				}
+			}
+			var region bool = instrHasDataRegion(ins, loadKind)
+			if region && ins.ID < len(toRetbuf) && toRetbuf[ins.ID] && m.CC.CallReturnsBigAggregate(ins) {
+				// The call writes the aggregate this function returns straight into
+				// the caller's buffer (inplace.ReturnedCallResults): no region.
+				rp.retbufCalls.Push(ins.ID)
+			} else if region && ins.ID < len(lastUse) && lastUse[ins.ID] {
+				// A load reading its slot in place for its one by-value argument use
+				// (inplace.LastUseArgLoads): no region, it aliases the slot.
+			} else if region && ins.ID < len(rbLoads) && rbLoads[ins.ID] {
+				// A returned load of the local living in the caller's buffer
+				// (inplace.RetbufLocal): no region, it aliases the local.
+			} else if region && ins.ID < len(placed) && placed[ins.ID] >= 0 {
+				// The call writes its result straight into a slot
+				// (inplace.CallResultSlots): it takes the slot's region.  The local f
+				// keeps in its caller's buffer (rbSlot) has none: a direct call
+				// returning through a buffer passes that buffer on, owning no bytes (as
+				// for inplace.ReturnedCallResults); any other call keeps a region of its
+				// own (placeCallResults).
+				var toCaller bool = placed[ins.ID] == rbSlot && ins.Op == iropcode.OP_CALL &&
+						m.CC.CallReturnsBigAggregate(ins)
+				rp.owns[ins.ID] = !toCaller
+				rp.placedCalls.Push(ins.ID)
+				rp.placedSizes.Push(roundUp8(ins.Typ.Size()))
+				rp.placedToRetbuf.Push(toCaller)
+			} else if region {
+				// OP_RODATA_MSLICE / OP_RODATA_SLICE deliberately do NOT reserve a data
+				// slot: their result is a pointer to the string's STATIC `.ms` header
+				// (emitRodataMSliceOrSlice LEAs it into the result register), so the
+				// value lives in immortal static data, not a per-use stack region.  A
+				// slot here would shadow that pointer — aggregate consumers resolve an
+				// operand via LookupAlloc FIRST (emitAggLoad), and would read the
+				// unwritten slot instead of the register.
+				var dataSz int64 = ins.Typ.Size()
+				if dataSz > 0 {
+					rp.owns[ins.ID] = true
+					rp.regionIDs.Push(ins.ID)
+					// Round up to an 8-byte multiple so subsequent 64-bit STR/LDR stay
+					// aligned and so that emitStringToArray's word-wise zero-fill
+					// doesn't run past the buffer end (e.g. a [5]char array gets 8
+					// bytes here).
+					rp.regionSizes.Push(roundUp8(dataSz))
+				}
+			}
+		}
+	}
+	return rp
+}

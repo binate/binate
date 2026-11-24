@@ -1,0 +1,166 @@
+package "pkg/binate/native/inplace"
+
+import "pkg/binate/ir"
+import "pkg/binate/iropcode"
+import "pkg/binate/native/callconv"
+import "pkg/std/containers/vec"
+
+// An aggregate load of a stack slot whose only use is a by-value argument of a call
+// copies the slot into a private copy, which the argument then passes (or copies
+// into the call's argument area).  When the slot is dead after the call the load can
+// read the slot in place instead: nothing reads the slot afterwards, so the callee may
+// even own it (AAPCS64 passes a large aggregate as a pointer to memory the callee may
+// write — argOwnsRegion).  The load qualifies when
+//   - it is an aggregate OP_LOAD of a stack slot S of its size (not a package global;
+//     a parameter's slot qualifies), whose only use is an argument of a call in its
+//     block;
+//   - S's address never leaves the function -- not even to a call that keeps none of
+//     its pointer arguments, which CallResultSlots allows;
+//   - every instruction touching S — with an operand among S, the pointers based on
+//     it, and the values that may alias its memory (an aggregate load through one of
+//     those pointers — AggLoadElision may make it read S at its use — and what
+//     passes such a load's pointer on: IsAggregateAlias, phis) — is in the call's
+//     block, none between the load and the call and none after it, the call's own
+//     use of the load excepted;
+//   - S's scope does not end between the load and the call: past its end another slot
+//     may hold its bytes (native/common's alloca sharing);
+//   - each execution of the block sets S before touching it: S's OP_ALLOC is in the
+//     block before the first touch (its zero-fill; a NoZeroInit slot's first use in
+//     its block is a whole store — the dead-store pass marks only those), or the
+//     first touch is a whole store of S — so a later execution never reads what a
+//     callee left in S.
+
+// LastUseArgLoads reports, indexed by value ID, the loads of f that may read their
+// slot in place for their one by-value argument use (see above).
+func LastUseArgLoads(f @ir.Func) @[]bool { return NewFuncUses(f).LastUseArgLoads() }
+
+// LastUseArgLoads is the function LastUseArgLoads over u's function.
+func (u @FuncUses) LastUseArgLoads() @[]bool {
+	var f @ir.Func = u.f
+	var out @[]bool = make_slice(bool, f.NextID)
+	// The qualifying loads, by slot: what a slot reaches and what may alias it do not
+	// depend on the load, so they are computed once for all the slot's loads.
+	var groups @slotGroups
+	for bi := 0; bi < len(f.Blocks); bi++ {
+		var b @ir.Block = f.Blocks[bi]
+		for li := 0; li < len(b.Instrs); li++ {
+			var ld @ir.Instr = b.Instrs[li]
+			if ld.Op != iropcode.OP_LOAD || ld.ID < 0 || ld.ID >= len(out) || len(ld.Args) < 1 ||
+					ld.Typ == nil || !callconv.IsAggregateTyp(ld.Typ) || ld.Typ.Size() <= 0 {
+				continue
+			}
+			var s @ir.Instr = ld.Args[0]
+			if s == nil || s.Op != iropcode.OP_ALLOC || s.IsGlobalRef || s.ID < 0 || s.ID >= len(out) ||
+					s.TypeArg == nil || s.TypeArg.Size() != ld.Typ.Size() {
+				continue
+			}
+			if u.useCount(ld.ID) != 1 { continue }
+			var ci int = nextUseIndex(b, li, ld)
+			if ci < 0 || !isArgUse(b.Instrs[ci], ld) { continue }
+			if scopeEndStrictlyBetween(b, li, ci, s.Scope) { continue }
+			if groups == nil { groups = newSlotGroups(f.NextID) }
+			groups.add(s.ID, bi, li, ci)
+		}
+	}
+	if groups == nil { return out }
+	var reach @idSet = newIDSet(f.NextID)
+	var ptr @idSet = newIDSet(f.NextID)
+	var alias @idSet = newIDSet(f.NextID)
+	for k := 0; k < groups.slots.Len(); k++ {
+		var c int = groups.last[groups.slots.Get(k)]
+		var s @ir.Instr = f.Blocks[groups.block.Get(c)].Instrs[groups.at.Get(c)].Args[0]
+		if !u.slotReach(s, reach, ptr, false) { continue }
+		u.slotAliases(ptr, alias)
+		for c >= 0 {
+			var bi int = groups.block.Get(c)
+			var li int = groups.at.Get(c)
+			var ld @ir.Instr = f.Blocks[bi].Instrs[li]
+			out[ld.ID] = u.slotDeadAfterLoad(bi, li, ptr, alias, s, ld)
+			c = groups.prev.Get(c)
+		}
+	}
+	return out
+}
+
+// isArgUse reports whether v is an argument operand of call (not its callee).
+func isArgUse(call @ir.Instr, v @ir.Instr) bool {
+	var base int = callconv.CallArgBase(call.Op)
+	if base < 0 { return false }
+	for k := base; k < len(call.Args); k++ {
+		if call.Args[k] != nil && call.Args[k].ID == v.ID { return true }
+	}
+	return false
+}
+
+// slotDeadAfterLoad reports whether slot s (its pointers ptr, the values alias that may
+// alias it) is touched only in block bi and only before index li, where load ld is —
+// not at or after the load's call — and the block sets s before its first touch (see
+// LastUseArgLoads).  An instruction touches the slot when one of its operands (or phi
+// incomings) other than ld is in ptr or alias; s's own instruction does not.
+func (u @FuncUses) slotDeadAfterLoad(bi int, li int, ptr @idSet, alias @idSet, s @ir.Instr,
+		ld @ir.Instr) bool {
+	ok, first := u.firstTouchBefore(ptr, bi, li, s, ld, li)
+	if !ok { return false }
+	ok, first = u.firstTouchBefore(alias, bi, li, s, ld, first)
+	if !ok { return false }
+	var allocAt int = u.lastIDIn(bi, s.ID)
+	if allocAt >= 0 && allocAt < first { return true }
+	var ft @ir.Instr = u.f.Blocks[bi].Instrs[first]
+	return ft.Op == iropcode.OP_STORE && len(ft.Args) >= 2 && ft.Args[0] != nil &&
+			ft.Args[0].ID == s.ID && ft.Args[1] != nil && ft.Args[1].Typ != nil &&
+			ft.Args[1].Typ.Size() == s.TypeArg.Size()
+}
+
+// firstTouchBefore reports whether every instruction using a value of set as an
+// operand — ld itself excepted as a used value, and s's own instruction and the one at
+// index li of block bi excepted as users — is in block bi before index li, returning
+// first lowered to the earliest of them.
+func (u @FuncUses) firstTouchBefore(set @idSet, bi int, li int, s @ir.Instr, ld @ir.Instr,
+		first int) (bool, int) {
+	for i := 0; i < set.ids.Len(); i++ {
+		var id int = set.ids.Get(i)
+		if id == ld.ID { continue }
+		for j := u.siteLo[id]; j < u.siteLo[id + 1]; j++ {
+			var bj int = u.siteBlock[j]
+			var ii int = u.siteInstr[j]
+			if u.siteIns(j).ID == s.ID || (bj == bi && ii == li) { continue }
+			if bj != bi || ii > li { return false, first }
+			if ii < first { first = ii }
+		}
+	}
+	return true, first
+}
+
+// slotAliases computes into alias the values of f that may alias the memory of the
+// slot whose pointers are ptr: the aggregate loads through one of them (an elided
+// load reads its source at each use — AggLoadElision), the aggregate results that
+// pass one of those on (IsAggregateAlias), and aggregate phis of them — by a
+// worklist over their uses.  f's fault pads are left out, as FuncUses leaves them out.
+func (u @FuncUses) slotAliases(ptr @idSet, alias @idSet) {
+	alias.reset()
+	var work @vec.Vec[int] = vec.New[int]()
+	for i := 0; i < ptr.ids.Len(); i++ {
+		var p int = ptr.ids.Get(i)
+		for j := u.siteLo[p]; j < u.siteLo[p + 1]; j++ {
+			var ins @ir.Instr = u.siteIns(j)
+			if u.siteOp[j] == 0 && ins.Op == iropcode.OP_LOAD && u.aliasCandidate(ins) && alias.add(ins.ID) {
+				work.Push(ins.ID)
+			}
+		}
+	}
+	for work.Len() > 0 {
+		a, _ := work.Pop()
+		for j := u.siteLo[a]; j < u.siteLo[a + 1]; j++ {
+			var ins @ir.Instr = u.siteIns(j)
+			var op int = u.siteOp[j]
+			var is bool = (op == 0 && IsAggregateAlias(ins)) || (op < 0 && ins.Op == iropcode.OP_PHI)
+			if is && u.aliasCandidate(ins) && alias.add(ins.ID) { work.Push(ins.ID) }
+		}
+	}
+}
+
+// aliasCandidate reports whether ins can be one of a slot's aliases (slotAliases):
+// an indexed value of aggregate type.
+func (u @FuncUses) aliasCandidate(ins @ir.Instr) bool {
+	return u.indexed(ins.ID) && callconv.IsAggregateTyp(ins.Typ)
+}

@@ -3542,10 +3542,11 @@ testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
 
 # --- Case 74: a variable redeclared at the prompt — with its own type it is
 # replaced (same storage: earlier functions see the new value; without an
-# initializer it is reset, releasing what it held), with another type it is
-# shadowed (earlier functions keep the old variable), as it is when a constant
-# or function takes its name; also when the redeclaration parks and resolves
-# later.  A constant a variable takes the name of is shadowed, with a warning. ---
+# initializer it is reset, releasing what it held, a struct's or an array's
+# managed fields and elements too), with another type it is shadowed (earlier
+# functions keep the old variable), as it is when a constant or function takes
+# its name; also when the redeclaration parks and resolves later.  A constant a
+# variable takes the name of is shadowed, with a warning. ---
 run_repl "variable-redeclared-replaced-or-shadowed" \
 "import \"pkg/builtins/rt\"
 var x int = 1
@@ -3610,6 +3611,16 @@ const (
 )
 var cx @[]char = make_slice(char, 4)
 testing.Println(len(cx))
+type Pair struct { b @Box; n int }
+var pv Pair = Pair{b: inr, n: 3}
+var pa [2]@Box = [2]@Box{inr, inr}
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
+var pv Pair
+var pa [2]@Box
+testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before, pv.n, pv.b == nil, pa[1] == nil)
+var ms @[]char = make_slice(char, 3)
+var ms @[]char
+testing.Println(len(ms))
 " \
 "$BANNER
 > package pkg/builtins/rt loaded
@@ -3646,6 +3657,9 @@ warning: variable p shadowed (incompatible type); existing references retain the
 > > 9
 > ... ... ... > warning: constant cx shadowed; existing references retain the old constant
 > 4
+> > > > 4
+> > > 1 0 true true
+> > > 0
 > "
 
 # --- A group typed at the prompt that declares a name twice is rejected, as in a

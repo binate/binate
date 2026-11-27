@@ -1,0 +1,137 @@
+package "pkg/binate/irgen"
+
+import "pkg/binate/buf"
+import "pkg/binate/ir"
+import "pkg/binate/iriface"
+import "pkg/binate/irsym"
+import "pkg/binate/token"
+import "pkg/binate/types"
+import "pkg/std/containers/vec"
+import "pkg/stdx/slices"
+
+// A type the mapper meets unregistered -- a named struct, a named type or an
+// interface no registration pass registered -- is registered from the checker's
+// type on the spot, so no pass order leaves one nil.  The passes still register
+// every declaration, in declaration order (gen_type_steps.bn); what they reach
+// later finds the entry made here.  The type is registered by name, and its
+// fields, underlying or method set -- whose mapping may meet more such types --
+// are filled when the outermost mapping returns (drainLazyTypes), in a loop over
+// the types queued, so a ring of thousands of structs, each pointing to the next,
+// is registered without a call per link.
+
+// queueLazyType queues the checker type t, registered by name, for its fill.
+func queueLazyType(gc @GenCtx, t @types.Type) {
+	if gc.LazyTypes == nil { gc.LazyTypes = vec.New[@types.Type]() }
+	gc.LazyTypes.Push(t)
+}
+
+// registerMetStruct registers, under qual (qualified for the module, as a lookup
+// qualifies it), the struct the checker's struct type st is (a named struct, or the
+// one a forward declaration's named type is defined as), with no fields yet, queues
+// its fill, and returns it.
+func registerMetStruct(gc @GenCtx, qual *[]readonly char, st @types.Type) @types.Type {
+	requireDeclaredName(qual)
+	var ms irsym.ModuleStruct
+	ms.Name = qualifyForCurrentModule(gc, qual)
+	var noFields @[]@types.Field
+	ms.Typ = types.MakeStructType(ms.Name, noFields)
+	ir.RegisterModuleStruct(gc.Mod, ms)
+	queueLazyType(gc, st)
+	return ms.Typ
+}
+
+// registerMetNamed registers, under qual (qualified for the module, as a lookup
+// qualifies it), the named non-struct type the checker's t is, and returns it: its
+// underlying pending (addPendingNamedType) and queued, or -- an opaque type nothing
+// defines -- none, the type marked opaque-exported by its package as
+// registerOpaqueForwards marks one.
+func registerMetNamed(gc @GenCtx, qual *[]readonly char, t @types.Type) @types.Type {
+	requireDeclaredName(qual)
+	var named @types.Type = types.MakeNamedType(buf.CopyStr(qual))
+	var ta irsym.ModuleTypeAlias
+	ta.Name = qualifyForCurrentModule(gc, qual)
+	ta.Typ = named
+	ir.RegisterModuleTypeAlias(gc.Mod, ta)
+	if t.Underlying == nil {
+		named.OpaqueExportPkg = buf.CopyStr(unquotePkg(t.Pkg))
+		return named
+	}
+	addPendingNamedType(gc, ta.Name)
+	queueLazyType(gc, t)
+	return named
+}
+
+// ensureMetIface registers, unless one is, the interface pkg.t (the checker's
+// interface type t) as a stub and queues its method set -- while types are looked
+// up, not named (GenCtx.NamingInstances).  The universe's (no package) is no
+// module's.
+func ensureMetIface(gc @GenCtx, pkg *[]readonly char, t @types.Type) {
+	if gc.NamingInstances || gc.Mod == nil || len(pkg) == 0 { return }
+	if iriface.LookupModuleInterfaceIndex(gc.Mod, pkg, t.Name) >= 0 { return }
+	var mi irsym.ModuleInterface
+	mi.Pkg = buf.CopyStr(pkg)
+	mi.Name = buf.CopyStr(t.Name)
+	mi.IsStub = true
+	gc.Mod.Interfaces = slices.Append[irsym.ModuleInterface](gc.Mod.Interfaces, mi)
+	queueLazyType(gc, t)
+}
+
+// requireDeclaredName stops on a checker type named as no declaration is -- an
+// instance's (`pkg.Box[int]`), which IR-gen registers under the instance's own name
+// (ensureInstantiatedStruct) and never meets by the checker's: registering one would
+// make a second type.
+func requireDeclaredName(qual *[]readonly char) {
+	for i := 0; i < len(qual); i++ {
+		if qual[i] == '[' {
+			panic(buf.Concat(buf.Concat("internal error: IR-gen met the checker's instance type ", qual),
+					" by its checker name (compiler bug)"))
+		}
+	}
+}
+
+// drainLazyTypes fills each type queued (queueLazyType), those its fill queues
+// included, once the outermost mapping has returned.
+func drainLazyTypes(gc @GenCtx) {
+	gc.Draining = true
+	for i := 0; i < gc.LazyTypes.Len(); i++ { fillLazyType(gc, gc.LazyTypes.Get(i)) }
+	gc.LazyTypes = nil
+	gc.Draining = false
+}
+
+// fillLazyType fills the entry registered for the checker type t -- a struct's
+// fields, a named type's underlying, an interface's method set -- unless something
+// filled it since.
+func fillLazyType(gc @GenCtx, t @types.Type) {
+	var noPos token.Pos
+	if t.Kind == types.TYP_STRUCT {
+		var si int = lookupStructIdx(gc, t.Name)
+		if si < 0 { lazyLookupICE(t.Name) }
+		if len(gc.Mod.Structs[si].Typ.Fields) == 0 {
+			var fields @[]@types.Field = structFieldsFromRecord(gc, t, noPos)
+			gc.Mod.Structs[si].Typ.Fields = fields
+			gc.Mod.Structs[si].Fields = fields
+		}
+		return
+	}
+	if t.Kind == types.TYP_NAMED {
+		var qual @[]char = types.QualifyName(buf.CopyStr(unquotePkg(t.Pkg)), t.Name)
+		if !isPendingNamedType(gc, qual) { return }
+		var named @types.Type = lookupTypeAlias(gc, qual)
+		if named == nil { lazyLookupICE(qual) }
+		noteUnderlying(gc, named)
+		named.Underlying = typeFromRecord(gc,
+				requireConcreteRecord(gc, t.Underlying, noPos, "a named type's underlying"))
+		removePendingNamedType(gc, qual)
+		return
+	}
+	var idx int = iriface.LookupModuleInterfaceIndex(gc.Mod, unquotePkg(t.Pkg), t.Name)
+	if idx < 0 { lazyLookupICE(t.Name) }
+	if gc.Mod.Interfaces[idx].IsStub { completeInterface(gc, idx, t, noPos) }
+}
+
+// lazyLookupICE stops on a type queued for its fill that is not registered under
+// the name it was registered by.
+func lazyLookupICE(name *[]readonly char) {
+	panic(buf.Concat(buf.Concat("internal error: IR-gen registered ", name),
+			" on meeting it, and finds it no more (compiler bug)"))
+}

@@ -1,0 +1,255 @@
+package "pkg/binate/check"
+
+import "pkg/binate/ast"
+import "pkg/binate/types"
+import "pkg/std/cmp"
+import "pkg/std/containers/table"
+import "pkg/std/containers/vec"
+import "pkg/std/hash"
+import "pkg/stdx/slices"
+
+// The value of an array length `len(e)` needs e's type, found as an initializer's
+// is (spec decl.var.type-acyclic): the type e spells at its head (initHeadType) --
+// a call's one result, a composite literal's written type, a cast's type -- or
+// else the type of each variable e names outside the array lengths in it, a
+// function literal's body included.  So while the batch's declarations are
+// resolved, an operand with a head gives the length of its head type, and is
+// checked in full only once every declaration has its type (drainLenChecks): a
+// variable whose type is still being found has only a placeholder then, and the
+// operand's call arguments, literal elements and function literal bodies, which
+// the length does not need, would be checked against it.  An operand with no head
+// is checked at once, and a placeholder it reads is that variable's type cycle
+// (judgeHeadlessReads).
+
+// A lenCheck is an operand typed by its head, to be checked in full later: the
+// operand, its head type and the declaration context it was evaluated in.
+type lenCheck struct {
+	e    @ast.Expr
+	head @types.Type
+	ctx  declContext
+}
+
+// A lenHeadState is what the batch's operands typed by their heads need: the ones
+// to check later (Checks, each once: Queued), whether they have been checked
+// (Drained, after which an operand is checked at once), how many checks that report
+// in their own way are being made (AtOnce, a bare const-group member's copy of its
+// initializer, whose errors are claimed for it), during which an operand is checked
+// at once too, and the functions, methods and instances whose result type is being
+// resolved alone (ResultsAlone), which a head does not read again.
+type lenHeadState struct {
+	Checks       @vec.Vec[lenCheck]
+	Queued       @table.Table[@ast.Expr, bool, lenExprHasher, lenExprEq]
+	Drained      bool
+	AtOnce       int
+	ResultsAlone @[]resultAlone
+}
+
+// A resultAlone is a result type being resolved alone: of the function or method d,
+// for the generic function's type arguments args, or for the generic type's
+// instance inst a method is copied onto.
+type resultAlone struct {
+	d    @ast.Decl
+	inst @types.Type
+	args @[]@types.Type
+}
+
+// newLenHeadState returns an empty lenHeadState.
+func newLenHeadState() @lenHeadState {
+	var s @lenHeadState = make(lenHeadState)
+	s.Checks = vec.New[lenCheck]()
+	s.Queued = table.NewTable[@ast.Expr, bool, lenExprHasher, lenExprEq](lenExprHasher{}, lenExprEq{})
+	return s
+}
+
+// lenOperandType returns the type of `len`'s operand e in an array length, not an
+// identifier nor a string literal: its head type while the batch's declarations are
+// resolved (lenChecksQueue), e checked later -- one that is no array is no constant
+// length, which the length reports; else e checked now.  A head of the error type
+// whose error its resolution reported is the operand's type: nothing more is reported
+// about it.
+func lenOperandType(c @Checker, e @ast.Expr) @types.Type {
+	if !lenChecksQueue(c) {
+		return checkDimOperand(c, e)
+	}
+	var before checkMark = markChecks(c)
+	var h @types.Type = initHeadType(c, e)
+	if h != nil && isErrType(h) && checksSince(c, before) {
+		return h
+	}
+	if h != nil && !isErrType(h) {
+		queueLenCheck(c, e, h)
+		return h
+	}
+	var m placeholderMark = markPlaceholders(c)
+	var t @types.Type = checkDimOperand(c, e)
+	judgeHeadlessReads(c, m, c.Batch.LenDepth)
+	return t
+}
+
+// lenChecksQueue reports whether an operand typed by its head is checked later: the
+// batch is collecting or resolving a declaration, at its top level (not in a
+// function, nor in an instance's build or a generic's declaration resolved
+// abstractly), and its operands are not checked yet.
+func lenChecksQueue(c @Checker) bool {
+	var b @DeclBatch = c.Batch
+	if b == nil || b.LenHeads.Drained || b.LenHeads.AtOnce > 0 || c.BuildingIfaceScope ||
+			c.Generics.Speculative || c.Generics.DerivingInstanceSig {
+		return false
+	}
+	if c.Instances != nil && len(c.Instances.Populating) > 0 {
+		return false
+	}
+	if !b.Collecting && b.DeclStarts.Len() == 0 {
+		return false
+	}
+	return c.Scope != nil && c.Scope.Level == SCOPE_PACKAGE
+}
+
+// queueLenCheck queues the operand e, typed by its head h, to be checked in full in
+// the declaration context it is evaluated in -- once.
+func queueLenCheck(c @Checker, e @ast.Expr, h @types.Type) {
+	var s @lenHeadState = c.Batch.LenHeads
+	if s.Queued.Has(e) {
+		return
+	}
+	s.Queued.Put(e, true)
+	var k lenCheck
+	k.e = e
+	k.head = h
+	k.ctx = currentDeclContext(c)
+	s.Checks.Push(k)
+}
+
+// judgeHeadlessReads reports, for an operand with no head of the array length at
+// depth (LenDepth) checked since m, the type cycle of the first variable whose
+// placeholder it read outside the array lengths in it: the length depends on that
+// variable's type, which is being found.  A length within it is judged by its own
+// evaluation.  An operand whose check reported an error of its own leaves the length
+// without a value already, and a layout frame that waits is done again, and judged
+// then.
+func judgeHeadlessReads(c @Checker, m placeholderMark, depth int) {
+	var b @DeclBatch = c.Batch
+	if layoutFrameBlocked(c) || checksSince(c, m.checks) {
+		return
+	}
+	for i := m.reads; i < len(b.PlaceholderReads); i++ {
+		if b.ReadLens[i] == depth {
+			errVarTypeCycle(c, b.PlaceholderReads[i])
+			return
+		}
+	}
+}
+
+// drainLenChecks checks in full each operand typed by its head, in the context it
+// was evaluated in, now that every declaration of the batch has its type; from then
+// on an operand is checked at once.  Its type is its head's (the spec defines it so),
+// or the error type with its error reported: anything else is an internal error.
+func drainLenChecks(c @Checker) {
+	var b @DeclBatch = c.Batch
+	if b == nil {
+		return
+	}
+	var s @lenHeadState = b.LenHeads
+	s.Drained = true
+	for i := 0; i < s.Checks.Len(); i++ {
+		var k lenCheck = s.Checks.Get(i)
+		var saved declContext = currentDeclContext(c)
+		leavePackageDecl(c, k.ctx)
+		c.UntypedNonConst = nil
+		var t @types.Type = checkExpr(c, k.e)
+		finalizeUntypedNonConst(c)
+		leavePackageDecl(c, saved)
+		if !isErrType(t) && !t.Identical(k.head) {
+			panic("internal error: a len operand's type differs from its head's")
+		}
+	}
+	s.Checks = vec.New[lenCheck]()
+}
+
+// currentDeclContext returns the checker's declaration state (declContext), which
+// leavePackageDecl sets again.
+func currentDeclContext(c @Checker) declContext {
+	var s declContext
+	s.scope = c.Scope
+	s.funcRet = c.FuncRet
+	s.iota = c.Iota
+	s.inLoop = c.InLoop
+	s.inSwitch = c.InSwitch
+	s.inDefer = c.InDefer
+	s.captures = c.CaptureStack
+	s.untyped = c.UntypedNonConst
+	s.expectedFV = c.ExpectedFVType
+	s.borrowPos = c.BorrowPosKind
+	s.bareMember = c.InGroupBareMember
+	s.bareIota = c.BareExplicitIota
+	return s
+}
+
+// enterResultAlone records that the result type of the function or method d -- for
+// the type arguments args of a generic function, or the instance inst of a generic
+// type -- is being resolved alone (definingFuncResult), until leaveResultAlone, and
+// reports whether it was not already: a head that reaches it again has none, so
+// `func f() [len(f())]int` is checked as one with no head, not resolved without end.
+func enterResultAlone(c @Checker, d @ast.Decl, inst @types.Type, args @[]@types.Type) bool {
+	var b @DeclBatch = c.Batch
+	if b == nil {
+		return true
+	}
+	var s @lenHeadState = b.LenHeads
+	for i := 0; i < len(s.ResultsAlone); i++ {
+		var r resultAlone = s.ResultsAlone[i]
+		if same(r.d, d) && same(r.inst, inst) && sameTypeArgs(r.args, args) {
+			return false
+		}
+	}
+	var r resultAlone
+	r.d = d
+	r.inst = inst
+	r.args = args
+	s.ResultsAlone = slices.Append[resultAlone](s.ResultsAlone, r)
+	return true
+}
+
+// sameTypeArgs reports whether the type arguments a and b are the same ones.
+func sameTypeArgs(a *[]@types.Type, b *[]@types.Type) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if !a[i].IdenticalStrict(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// leaveResultAlone ends what enterResultAlone started.
+func leaveResultAlone(c @Checker) {
+	var b @DeclBatch = c.Batch
+	if b == nil {
+		return
+	}
+	var s @lenHeadState = b.LenHeads
+	s.ResultsAlone = s.ResultsAlone[:len(s.ResultsAlone) - 1]
+}
+
+// lenExprHasher / lenExprEq key lenHeadState.Queued by an expression's identity.
+type lenExprHasher struct {}
+
+impl lenExprHasher : hash.Hasher[@ast.Expr]
+
+// Hash hashes an expression's address.
+func (h lenExprHasher) Hash(k @ast.Expr) uint {
+	var p uint = bit_cast(uint, bit_cast(*uint8, k))
+	return p ^ (p >> 7)
+}
+
+// lenExprEq is the identity equality paired with lenExprHasher.
+type lenExprEq struct {}
+
+impl lenExprEq : cmp.Eq[@ast.Expr]
+
+// Equal reports whether a and b are the same expression.
+func (e lenExprEq) Equal(a @ast.Expr, b @ast.Expr) bool {
+	return same(a, b)
+}

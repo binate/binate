@@ -136,28 +136,38 @@ run_repl() { # label fixture input expected
 }
 
 run_repl "startup-import" imports.bn \
-"testing.Println(hv.V, hv.GetV(), hv.GetW(), gv.Read[int](), Count)
+"import \"pkg/builtins/testing\"
+import \"pkg/gv\"
+import \"pkg/hv\"
+testing.Println(hv.V, hv.GetV(), hv.GetW(), gv.Read[int](), Count)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
+> package pkg/gv loaded
+> package pkg/hv loaded
 > 2 2 3 2 50
 > "
 
 run_repl "prompt-import" plain.bn \
-'import "pkg/hv"
+'import "pkg/builtins/testing"
+import "pkg/hv"
 testing.Println(hv.V, hv.GetV(), hv.GetW())
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/hv loaded
 > 2 2 3
 > "
 
 run_repl "prompt-import-faults" plain.bn \
-'import ("pkg/usesbad"; "pkg/hv")
+'import "pkg/builtins/testing"
+import ("pkg/usesbad"; "pkg/hv")
 testing.Println(hv.V)
 func f() int { return 7 }
 testing.Println(f())
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/hv loaded
 initialization of package pkg/bad faulted: runtime error: nil pointer dereference
 error: package not imported (it, or a package it imports, failed type-checking, loading or initialization): pkg/usesbad

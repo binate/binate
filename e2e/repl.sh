@@ -813,6 +813,21 @@ func main() {
 }
 EOF
 
+# ----- A fixture whose generic prints through the file's own import. -----
+IMPFILE_FIXTURE="$TMP/impfile_fixture.bn"
+cat > "$IMPFILE_FIXTURE" <<'EOF'
+package "main"
+
+import "pkg/builtins/testing"
+
+func show[X any](x X) {
+    testing.Println(x)
+}
+
+func main() {
+}
+EOF
+
 # ----- Forward-declaring fixture: its file declares `type T` and `type U` and
 # defines them nowhere, so a prompt may define them; hold drops a nil `@T`, and
 # release drops the `@U` keep held. ---
@@ -943,9 +958,11 @@ BANNER="Binate REPL. Ctrl-D to exit."
 
 # --- Case 1: basic call into the loaded module. ---
 run_repl "basic-call" \
-"testing.Println(helper(7))
+"import \"pkg/builtins/testing\"
+testing.Println(helper(7))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > 14
 > "
 
@@ -954,19 +971,23 @@ run_repl "basic-call" \
 # Note: a leading `var` would route to the decl path rather than the
 # stmt-list path; short-var stays on the stmt path. ---
 run_repl "multi-stmt" \
-"x := 5; x = x + 10; testing.Println(x)
+"import \"pkg/builtins/testing\"
+x := 5; x = x + 10; testing.Println(x)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > 15
 > "
 
 # --- Case 3: error recovery.  An undefined-name error is reported
 # and the next turn still works against the loaded module. ---
 run_repl "error-recovery" \
-"undefined_name
+"import \"pkg/builtins/testing\"
+undefined_name
 testing.Println(helper(3))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > <repl>:1:1: undefined: undefined_name
 > 6
 > "
@@ -976,11 +997,13 @@ testing.Println(helper(3))
 # fires once `}` closes the block.  Output of the loop body
 # concatenates onto the same prompt line as the leading `... `s. ---
 run_repl "multi-line-for" \
-"for i := 0; i < 3; i++ {
+"import \"pkg/builtins/testing\"
+for i := 0; i < 3; i++ {
 testing.Println(helper(i))
 }
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > ... ... 0
 2
 4
@@ -989,19 +1012,23 @@ testing.Println(helper(i))
 # --- Case 5: braces inside a string literal must NOT trigger
 # multi-line accumulation.  This input is one balanced line. ---
 run_repl "braces-in-string" \
-'testing.Println("hello {world}")
+'import "pkg/builtins/testing"
+testing.Println("hello {world}")
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > hello {world}
 > "
 
 # --- Case 6: top-level `func` decl typed at the prompt
 # persists, and a subsequent turn can call it. ---
 run_repl "func-persists" \
-"func double(x int) int { return x * 2 }
+"import \"pkg/builtins/testing\"
+func double(x int) int { return x * 2 }
 testing.Println(double(7))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 14
 > "
 
@@ -1010,11 +1037,13 @@ testing.Println(double(7))
 # REPL-introduced VMFuncs (not just for funcs from the loaded
 # module). ---
 run_repl "cross-decl-call" \
-"func a(x int) int { return x + 1 }
+"import \"pkg/builtins/testing\"
+func a(x int) int { return x + 1 }
 func b(x int) int { return a(x) * 10 }
 testing.Println(b(4))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > 50
 > "
 
@@ -1022,13 +1051,15 @@ testing.Println(b(4))
 # at the prompt registers the type so subsequent var decls
 # and field reads work against it. ---
 run_repl "type-struct" \
-"type Point struct { X int; Y int }
+"import \"pkg/builtins/testing\"
+type Point struct { X int; Y int }
 var p Point
 p.X = 10
 p.Y = 20
 testing.Println(p.X + p.Y)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 30
 > "
 
@@ -1037,13 +1068,15 @@ testing.Println(p.X + p.Y)
 # of __dtor_T + __copy_T (and the field-type's __dtor_) into
 # the module; the REPL driver lowers each new helper. ---
 run_repl "type-managed-field" \
-"type Bag struct { items @[]int }
+"import \"pkg/builtins/testing\"
+type Bag struct { items @[]int }
 var b Bag
 b.items = make_slice(int, 3)
 b.items[0] = 10; b.items[1] = 20; b.items[2] = 30
 testing.Println(b.items[0] + b.items[1] + b.items[2])
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 60
 > "
 
@@ -1051,13 +1084,15 @@ testing.Println(b.items[0] + b.items[1] + b.items[2])
 # anonymous struct itself: a value of the alias passes where the literal type is
 # expected, and its fields read back. ---
 run_repl "type-struct-alias" \
-"type Anon = struct { a int8; b int8 }
+"import \"pkg/builtins/testing\"
+type Anon = struct { a int8; b int8 }
 func getB(s struct { a int8; b int8 }) int8 { return s.b }
 var x Anon
 x.b = 7
 testing.Println(getB(x), x.b)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 7 7
 > "
 
@@ -1067,13 +1102,15 @@ testing.Println(getB(x), x.b)
 # that one-shot function's stack — plain and managed elements alike, read
 # after a later prompt entry has reused the stack. ---
 run_repl "var-raw-slice-literal" \
-"type Cell struct { b @int }
+"import \"pkg/builtins/testing\"
+type Cell struct { b @int }
 var gb *[]readonly Cell = *[]readonly Cell{Cell{b: box(5)}, Cell{b: box(6)}}
 var g *[]readonly int = *[]readonly int{1, 2, 3}
 var a [64]int = [64]int{9, 9, 9, 9}
 testing.Println(g[0], g[1], g[2], *gb[0].b, *gb[1].b)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 1 2 3 5 6
 > "
 
@@ -1081,7 +1118,8 @@ testing.Println(g[0], g[1], g[2], *gb[0].b, *gb[1].b)
 # work end-to-end.  Pointer receiver mutates; value receiver
 # reads.  Both invoked via the obj.M() selector path. ---
 run_repl "method-on-prompt-type" \
-"type Counter struct { n int }
+"import \"pkg/builtins/testing\"
+type Counter struct { n int }
 func (c *Counter) Inc() { c.n = c.n + 1 }
 func (c Counter) Get() int { return c.n }
 var k Counter
@@ -1089,6 +1127,7 @@ k.Inc(); k.Inc(); k.Inc()
 testing.Println(k.Get())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > 3
 > "
 
@@ -1098,12 +1137,14 @@ testing.Println(k.Get())
 # resolution path is the same — type checker accepts any
 # local named type. ---
 run_repl "method-on-loaded-type" \
-"func (b *Box) Doubled() int { return b.V * 2 }
+"import \"pkg/builtins/testing\"
+func (b *Box) Doubled() int { return b.V * 2 }
 var b Box
 b.V = 21
 testing.Println(b.Doubled())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > 42
 > "
 
@@ -1112,12 +1153,14 @@ testing.Println(b.Doubled())
 # type checker owns the symbol via collectTypeDecl; reads
 # / writes go through the underlying int. ---
 run_repl "type-named-nonstruct" \
-"type Celsius int
+"import \"pkg/builtins/testing\"
+type Celsius int
 var t Celsius
 t = 100
 testing.Println(t)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > 100
 > "
 
@@ -1125,10 +1168,12 @@ testing.Println(t)
 # the error and does NOT register the symbol.  A subsequent turn
 # is unaffected: helpers from the loaded module still work. ---
 run_repl "bad-body-recovery" \
-"func bad() bool { return 1 }
+"import \"pkg/builtins/testing\"
+func bad() bool { return 1 }
 testing.Println(helper(11))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > <repl>:1:26: cannot assign untyped int to bool
 > 22
 > "
@@ -1136,21 +1181,25 @@ testing.Println(helper(11))
 # --- Case 10 (const): single typed const persists and is
 # usable from a subsequent stmt-list turn. ---
 run_repl "const-typed" \
-"const K int = 42
+"import \"pkg/builtins/testing\"
+const K int = 42
 testing.Println(K)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 42
 > "
 
 # --- Case 11 (const): single untyped const persists and
 # is usable in arithmetic combined with a later untyped const. ---
 run_repl "const-untyped" \
-"const A = 7
+"import \"pkg/builtins/testing\"
+const A = 7
 const B = 35
 testing.Println(A + B)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > 42
 > "
 
@@ -1158,10 +1207,12 @@ testing.Println(A + B)
 # both members register and are usable.  (Case 14 covers the
 # multi-line const(...) form.) ---
 run_repl "const-group-inline" \
-"const ( A = 10; B = 20 )
+"import \"pkg/builtins/testing\"
+const ( A = 10; B = 20 )
 testing.Println(A); testing.Println(B)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 10
 20
 > "
@@ -1170,11 +1221,13 @@ testing.Println(A); testing.Println(B)
 # func decl typed at the prompt.  Registration ordering: const
 # first, then func, then call. ---
 run_repl "const-then-func" \
-"const SCALE int = 3
+"import \"pkg/builtins/testing\"
+const SCALE int = 3
 func tripled(x int) int { return x * SCALE }
 testing.Println(tripled(11))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > 33
 > "
 
@@ -1184,13 +1237,15 @@ testing.Println(tripled(11))
 # input line that leaves depth > 0 yields a `... ` continuation
 # prompt; the closing `)` triggers evaluation. ---
 run_repl "multi-line-const-group" \
-"const (
+"import \"pkg/builtins/testing\"
+const (
 A = 100
 B = 200
 )
 testing.Println(A); testing.Println(B)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > ... ... ... > 100
 200
 > "
@@ -1199,12 +1254,14 @@ testing.Println(A); testing.Println(B)
 # zero-initialized when no initializer is given.  Reads and
 # writes from subsequent prompt entries see the same storage. ---
 run_repl "var-readwrite" \
-"var x int
+"import \"pkg/builtins/testing\"
+var x int
 testing.Println(x)
 x = 42
 testing.Println(x)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 0
 > > 42
 > "
@@ -1214,11 +1271,13 @@ testing.Println(x)
 # global has its declared value before the next prompt entry
 # sees it.  Inter-decl references work too (b reads a). ---
 run_repl "var-init-eval" \
-"var a int = 5
+"import \"pkg/builtins/testing\"
+var a int = 5
 var b int = a * 10 + 1
 testing.Println(a); testing.Println(b)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > 5
 51
 > "
@@ -1228,12 +1287,14 @@ testing.Println(a); testing.Println(b)
 # func's lowered bytecode wires up to the same global storage
 # as bare-expr reads. ---
 run_repl "var-func-mutates" \
-"var counter int
+"import \"pkg/builtins/testing\"
+var counter int
 func bump() { counter = counter + 1 }
 bump(); bump(); bump()
 testing.Println(counter)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > 3
 > "
 
@@ -1242,7 +1303,8 @@ testing.Println(counter)
 # or any other expression (`var x = i + 100` is an int), and a
 # composite literal gives the struct type itself. ---
 run_repl "var-untyped" \
-"var i = 7
+"import \"pkg/builtins/testing\"
+var i = 7
 var s = \"hi\"
 testing.Println(i)
 testing.Println(s)
@@ -1252,6 +1314,7 @@ var b = Box{V: 5}
 testing.Println(b.V + helper(7))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > 7
 > hi
 > > 107
@@ -1262,11 +1325,13 @@ testing.Println(b.V + helper(7))
 # signature replaces the old body.  The fixture's `helper` is
 # x*2; the new one is x*3.  Subsequent calls hit the new body. ---
 run_repl "redef-replace" \
-"testing.Println(helper(7))
+"import \"pkg/builtins/testing\"
+testing.Println(helper(7))
 func helper(x int) int { return x * 3 }
 testing.Println(helper(7))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > 14
 > > 21
 > "
@@ -1275,12 +1340,14 @@ testing.Println(helper(7))
 # to work, but its calls now route to the redefined body.  Verifies
 # the in-place vm.Funcs rebind keeps cached call indices valid. ---
 run_repl "redef-caller-sees-new" \
-"func caller() int { return helper(10) }
+"import \"pkg/builtins/testing\"
+func caller() int { return helper(10) }
 testing.Println(caller())
 func helper(x int) int { return x * 5 }
 testing.Println(caller())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 20
 > > 50
 > "
@@ -1293,13 +1360,15 @@ testing.Println(caller())
 # shadow) routes through the new sig.  The warning surfaces
 # explicitly so the user knows it happened. ---
 run_repl "shadow-diff-sig" \
-"func caller() int { return helper(5) }
+"import \"pkg/builtins/testing\"
+func caller() int { return helper(5) }
 testing.Println(caller())
 func helper(a int, b int) int { return a + b }
 testing.Println(caller())
 testing.Println(helper(3, 4))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 10
 > warning: helper shadowed (incompatible signature); existing callers retain old definition
 > 10
@@ -1309,13 +1378,15 @@ testing.Println(helper(3, 4))
 # --- A constant redefined shadows the old one, with a warning: code already
 # lowered keeps the old value, code written afterwards reads the new one. ---
 run_repl "shadow-const" \
-"const K int = 1
+"import \"pkg/builtins/testing\"
+const K int = 1
 func k1() int { return K }
 const K int8 = 2
 testing.Println(k1())
 testing.Println(K)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > warning: constant K shadowed; existing references retain the old constant
 > 1
 > 2
@@ -1325,7 +1396,8 @@ testing.Println(K)
 # the constants it was declared against, not the ones that shadow them later; a
 # group member's repeated initializer, with its iota, alike. ---
 run_repl "shadow-const-float-initializer" \
-"const H float64 = 2.5
+"import \"pkg/builtins/testing\"
+const H float64 = 2.5
 const J float64 = H + 1.0
 const H float64 = 0.5
 func hj() int { return cast(int, J * 10.0) }
@@ -1333,13 +1405,15 @@ testing.Println(hj())
 testing.Println(cast(int, J * 10.0))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > warning: constant H shadowed; existing references retain the old constant
 > > 35
 > 35
 > "
 
 run_repl "shadow-const-float-group-initializer" \
-"const F float64 = 1.5
+"import \"pkg/builtins/testing\"
+const F float64 = 1.5
 const ( A float64 = F * cast(float64, iota + 1); B )
 func ab0() int { return cast(int, (A + B) * 10.0) }
 const F int = 7
@@ -1347,6 +1421,7 @@ func ab1() int { return cast(int, (A + B) * 10.0) }
 testing.Println(ab0(), ab1())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > warning: constant F shadowed; existing references retain the old constant
 > > 45 45
 > "
@@ -1354,12 +1429,14 @@ testing.Println(ab0(), ab1())
 # --- A generic function redefined with another signature shadows the old one:
 # a use afterwards emits its instance from the new definition. ---
 run_repl "shadow-generic-func" \
-"func f[T any](x T) int { return 1 }
+"import \"pkg/builtins/testing\"
+func f[T any](x T) int { return 1 }
 testing.Println(f[int](1))
 func f[T any](x T) int8 { return 2 }
 testing.Println(f[int](1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 1
 > warning: f shadowed (incompatible signature); existing callers retain old definition
 > 2
@@ -1370,7 +1447,8 @@ testing.Println(f[int](1))
 # against.  A generic shadowed in turn stays the one the code written before
 # instantiates, under its hidden name. ---
 run_repl "shadow-generic-reads-declared-names" \
-"var x int = 5
+"import \"pkg/builtins/testing\"
+var x int = 5
 const K int = 6
 func h() int { return 7 }
 func f[T any](v T) int { return x + K + h() }
@@ -1384,6 +1462,7 @@ func f[T any](v T) bool { return x }
 testing.Println(f[int](1), w[int16](2), w[int](3))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > 18
 > warning: variable x shadowed (incompatible type); existing references retain the old variable
 > warning: constant K shadowed; existing references retain the old constant
@@ -1397,7 +1476,8 @@ testing.Println(f[int](1), w[int16](2), w[int](3))
 # the code checked before the redefinition and emitted after it calls the new
 # one, and still does once the new one is shadowed in turn. ---
 run_repl "replaced-generic-reached-by-earlier-code" \
-"func f[T any](v T) int { return 1 }
+"import \"pkg/builtins/testing\"
+func f[T any](v T) int { return 1 }
 func w[T any](v T) int { return f[T](v) + 10 }
 type Bag[T any] struct { v T }
 func (b *Bag[T]) get() int { return w[T](b.v) + 100 }
@@ -1409,6 +1489,7 @@ func f[T any](v T) int8 { return 3 }
 testing.Println(by.get(), f[int](1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > > > 112
 > warning: f shadowed (incompatible signature); existing callers retain old definition
 > 112 3
@@ -1419,7 +1500,8 @@ testing.Println(by.get(), f[int](1))
 # the method the generic was declared against -- by a call, a method value or a
 # method expression -- as the instances emitted before do. ---
 run_repl "shadow-method-generic-keeps-declared-method" \
-"type T struct { v int }
+"import \"pkg/builtins/testing\"
+type T struct { v int }
 func (t *T) M() int { return t.v + 1 }
 func (t T) N() int { return t.v + 2 }
 func call[X any](t *T, x X) int { return t.M() }
@@ -1435,6 +1517,7 @@ testing.Println(call[int](&t, 1), val[int](&t, 1), expr[int](&t, 1))
 testing.Println(call[bool](&t, true), val[bool](&t, true), expr[bool](&t, true))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > > > > 11 11 12
 > warning: T.M shadowed (incompatible signature); existing callers retain old definition
 > warning: T.N shadowed (incompatible signature); existing callers retain old definition
@@ -1448,7 +1531,8 @@ testing.Println(call[bool](&t, true), val[bool](&t, true), expr[bool](&t, true))
 # against on every instance, those formed before and after the redefinition, and
 # code written after it calls the new one. ---
 run_repl "shadow-generic-method-keeps-declared-sibling" \
-"type Cur[T any] struct { v T }
+"import \"pkg/builtins/testing\"
+type Cur[T any] struct { v T }
 func (c *Cur[T]) Get() T { return c.v }
 func (c *Cur[T]) Twice() T { return c.Get() }
 var a Cur[int]
@@ -1461,6 +1545,7 @@ b.v = true
 testing.Println(b.Twice(), b.Get(8))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > 5
 > warning: Cur.Get shadowed (incompatible signature); existing callers retain old definition
 > 5 7
@@ -1472,7 +1557,8 @@ testing.Println(b.Twice(), b.Get(8))
 # instance formed before the redefinition or after it, beside a method declared
 # since. ---
 run_repl "shadow-generic-method-reads-declared-names" \
-"func g() int { return 1000 }
+"import \"pkg/builtins/testing\"
+func g() int { return 1000 }
 type Cell[T any] struct { v T }
 func (b *Cell[T]) get() int { return g() }
 func use() int { var b Cell[int]; return b.get() }
@@ -1485,6 +1571,7 @@ var cc Cell[bool]
 testing.Println(cc.get())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 1000
 > warning: g shadowed (incompatible signature); existing callers retain old definition
 > > > 1000 7
@@ -1496,7 +1583,8 @@ testing.Println(cc.get())
 # called and taken as a function value, on an instance formed before the
 # redefinition and on one formed after it. ---
 run_repl "shadow-generic-method-expression-keeps-declared-method" \
-"type Cur[T any] struct { v T }
+"import \"pkg/builtins/testing\"
+type Cur[T any] struct { v T }
 func (c Cur[T]) Get() T { return c.v }
 func me[X any](c Cur[X]) X { return Cur[X].Get(c) }
 func mf[X any](c Cur[X]) X { var f *func(Cur[X]) X = Cur[X].Get; return f(c) }
@@ -1508,6 +1596,7 @@ b.v = 77
 testing.Println(me[int](a), mf[int](a), me[int16](b), mf[int16](b), a.Get(1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > > warning: Cur.Get shadowed (incompatible signature); existing callers retain old definition
 > > > 5 5 77 77 1001
 > "
@@ -1517,7 +1606,8 @@ testing.Println(me[int](a), mf[int](a), me[int16](b), mf[int16](b), a.Get(1))
 # value one -- an instance formed before or after the redefinition calls the old
 # method through the interface, and the new one directly. ---
 run_repl "shadow-generic-method-parameterized-impl-keeps-its-method" \
-"func (b *Cell[T]) Size() int8 { return 2 }
+"import \"pkg/builtins/testing\"
+func (b *Cell[T]) Size() int8 { return 2 }
 var c Cell[bool]
 var s *Sizer = &c
 var t *Sizer = &a
@@ -1526,6 +1616,7 @@ var n *Namer = &c
 testing.Println(s.Size(), t.Size(), c.Size(), a.Size(), n.Name(), c.Name())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > warning: Cell.Size shadowed (incompatible signature); existing callers retain old definition
 > > > > warning: Cell.Name shadowed (incompatible signature); existing callers retain old definition
 > > 1 1 2 2 3 20
@@ -1535,7 +1626,8 @@ testing.Println(s.Size(), t.Size(), c.Size(), a.Size(), n.Name(), c.Name())
 # covers is parked boxes an instance with the impl's method; the redefinition
 # resolves later, and the function still calls the impl's method through it. ---
 run_repl "shadow-generic-method-parameterized-impl-parked-redefinition" \
-"func (b *Cell[T]) Size() int8 { return cast(int8, Q(0)) }
+"import \"pkg/builtins/testing\"
+func (b *Cell[T]) Size() int8 { return cast(int8, Q(0)) }
 func f() int { var b Cell[bool]; var s *Sizer = &b; return s.Size() }
 func Q(n int) int { return 2 }
 var c Cell[int8]
@@ -1543,6 +1635,7 @@ var s *Sizer = &c
 testing.Println(f(), s.Size(), c.Size(), a.Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > method Cell.Size parked (pending: Q)
 > > method Cell.Size resolved
 warning: Cell.Size shadowed (incompatible signature); existing callers retain old definition
@@ -1554,7 +1647,8 @@ warning: Cell.Size shadowed (incompatible signature); existing callers retain ol
 # redefined with other signatures, Big's Size and Age, and Sizer's through an
 # upcast, call the old methods. ---
 run_repl "shadow-generic-method-parameterized-impl-inherited-methods" \
-"func (p *Pair[T]) Size() int8 { return 2 }
+"import \"pkg/builtins/testing\"
+func (p *Pair[T]) Size() int8 { return 2 }
 func (p *Pair[T]) Age() int8 { return 3 }
 var d Pair[int16]
 d.k = 300
@@ -1563,6 +1657,7 @@ var sz *Sizer = bg
 testing.Println(bg.Size(), bg.Age(), bg.Extra(), sz.Size(), d.Size(), d.Age())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > warning: Pair.Size shadowed (incompatible signature); existing callers retain old definition
 > warning: Pair.Age shadowed (incompatible signature); existing callers retain old definition
 > > > > > 301 500 4 301 2 3
@@ -1573,13 +1668,15 @@ testing.Println(bg.Size(), bg.Age(), bg.Extra(), sz.Size(), d.Size(), d.Age())
 # (its dispatch thunk loads it): instances boxed by a statement and by a
 # variable's initializer, and the main file's instance boxed at the prompt. ---
 run_repl "generic-value-receiver-dispatch-at-prompt" \
-"a = 100
+"import \"pkg/builtins/testing\"
+a = 100
 var q Num[bool] = 5
 var s *Sizer = &q
 var t *Sizer = &a
 testing.Println(s.Size(), t.Size(), q.Size(), a.Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 6 101 6 101
 > " "$RECV_FIXTURE"
 
@@ -1587,7 +1684,8 @@ testing.Println(s.Size(), t.Size(), q.Size(), a.Size())
 # the interface takes the reference the method releases, so the pointer stays
 # live. ---
 run_repl "generic-managed-value-receiver-dispatch-at-prompt" \
-"var h Holder[bool]
+"import \"pkg/builtins/testing\"
+var h Holder[bool]
 h.p = make(int)
 *h.p = 7
 var hs *Sizer = &h
@@ -1597,6 +1695,7 @@ var other @int = make(int)
 testing.Println(*h.p, *other, h.Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 7 7 7 7
 > > > 7 9 7
 > " "$RECV_FIXTURE"
@@ -1606,7 +1705,8 @@ testing.Println(*h.p, *other, h.Size())
 # functions call the new one) and with another (the impl keeps the old one), and
 # for an instance of a generic type of a package imported at the prompt. ---
 run_repl "generic-value-receiver-dispatch-in-declarations" \
-"func g() int { var q Num[int16] = cast(Num[int16], Q(0)); var s *Sizer = &q; return s.Size() }
+"import \"pkg/builtins/testing\"
+func g() int { var q Num[int16] = cast(Num[int16], Q(0)); var s *Sizer = &q; return s.Size() }
 func f() int { var q Num[int8] = 40; var s *Sizer = &q; return s.Size() }
 func Q(n int) int { return 60 }
 testing.Println(f(), g())
@@ -1622,6 +1722,7 @@ var xs *replrecv.Sizer = &x
 testing.Println(xs.Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function g parked (pending: Q)
 > > function g resolved
 > 41 61
@@ -1639,7 +1740,8 @@ testing.Println(xs.Size())
 # of a generic type's method, and beside a parameter whose constraint J an impl
 # made after the redefinition satisfies with the new M. ---
 run_repl "shadow-method-constraint-call-calls-impl-method" \
-"interface I { M() int }
+"import \"pkg/builtins/testing\"
+interface I { M() int }
 interface J { M(k int) int }
 type T struct { v int }
 func (t T) M() int { return t.v }
@@ -1659,6 +1761,7 @@ b.v = t
 testing.Println(h[T](t), h2[T](t), i.M(), j[T, T](t, t), b.Get())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > > > > > > warning: T.M shadowed (incompatible signature); existing callers retain old definition
 > > > > > > > 7 7 7 107 7
 > "
@@ -1669,7 +1772,8 @@ testing.Println(h[T](t), h2[T](t), i.M(), j[T, T](t, t), b.Get())
 # with a warning.  An import of the package the name already names changes
 # nothing, and a declaration that takes an import's name keeps it the same way. ---
 run_repl "shadow-import-generic-keeps-declared-package" \
-"import s \"pkg/replpa\"
+"import \"pkg/builtins/testing\"
+import s \"pkg/replpa\"
 func g[X any](x X) int { var t s.T; t.A = 5; return s.F() * 1000 + t.Get() }
 func k() int { return s.F() }
 testing.Println(g[int](1), k())
@@ -1680,6 +1784,7 @@ var s int = 4
 testing.Println(g[int8](1), s)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/replpa loaded
 > > > 1005 1
 > package pkg/replpb loaded
@@ -1690,26 +1795,42 @@ warning: import s shadowed; existing references retain the old package
 > 1005 4
 > "
 
-# --- A main-file import is a binding of the session's first generation: after an
-# input that took its name failed, a declaration that takes it keeps the package
-# for the generics declared before it, with a warning. ---
-run_repl "shadow-main-file-import-after-failed-input" \
-"func pr[X any](x X) int { testing.Println(7); return 0 }
+# --- An import's binding outlasts an input that took its name and failed: a
+# declaration that takes it then keeps the package for the generics declared
+# before it, with a warning. ---
+run_repl "shadow-import-after-failed-input" \
+"import \"pkg/builtins/testing\"
+func pr[X any](x X) int { testing.Println(7); return 0 }
 var testing int = \"x\"
 var testing int = 3
 var b int = pr[bool](true)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > <repl>:1:19: cannot assign [1]readonly uint8 to int
 > warning: import testing shadowed; existing references retain the old package
 > 7
 > "
 
+# --- A main file's import is the file's alone (pkg.import.scope): the prompt does
+# not see it and may take its name, and a generic the file declares keeps the
+# file's package for it. ---
+run_repl "main-file-import-is-the-files" \
+"testing.Println(1)
+var testing int = 3
+show[int](testing)
+" \
+"$BANNER
+> <repl>:1:1: undefined: testing
+> > 3
+> " "$IMPFILE_FIXTURE"
+
 # --- A generic type, its methods and a generic alias resolve their names as of
 # their declaration: an instance formed after the constant, the variable and the
 # function they use are shadowed reads those it was declared with. ---
 run_repl "shadow-generic-type-reads-declared-names" \
-"const K int = 3
+"import \"pkg/builtins/testing\"
+const K int = 3
 var x int = 10
 func h() int { return 7 }
 type Arr[T any] struct { a [K]T }
@@ -1728,6 +1849,7 @@ var aa A[int64]
 testing.Println(len(aa))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > > 3 3
 > warning: constant K shadowed; existing references retain the old constant
 > warning: variable x shadowed (incompatible type); existing references retain the old variable
@@ -1742,7 +1864,8 @@ testing.Println(len(aa))
 # formed after the constant its method's result uses is shadowed takes the
 # array length it was declared with. ---
 run_repl "shadow-generic-interface-reads-declared-names" \
-"const K int = 3
+"import \"pkg/builtins/testing\"
+const K int = 3
 interface I[T any] { M() [K]T }
 type S struct { v int }
 func (s *S) M() [3]int { var r [3]int; r[0] = s.v; return r }
@@ -1759,6 +1882,7 @@ var s2 S2
 testing.Println(use2(&s2))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > warning: constant K shadowed; existing references retain the old constant
 > > > 3
 > > > > > > 3
@@ -1769,7 +1893,8 @@ testing.Println(use2(&s2))
 # keeps them, and a later declaration of the name is a new one, which shadows
 # the import (with a warning). ---
 run_repl "shadow-by-import" \
-"var strings int = 5
+"import \"pkg/builtins/testing\"
+var strings int = 5
 func gs() int { return strings }
 import \"pkg/std/strings\"
 var strings bool = true
@@ -1781,6 +1906,7 @@ func strconv() int8 { return 2 }
 testing.Println(cs(), strconv())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > package pkg/std/strings loaded
 warning: variable strings shadowed (redeclared as an import); existing references retain the old variable
 > warning: import strings shadowed; existing references retain the old package
@@ -1795,11 +1921,13 @@ warning: variable strings shadowed (redeclared as an import); existing reference
 # When the missing dep arrives, the parked func is auto-
 # resolved and lowered.  Subsequent calls work normally. ---
 run_repl "forward-ref" \
-"func f() int { return g() + 1 }
+"import \"pkg/builtins/testing\"
+func f() int { return g() + 1 }
 func g() int { return 41 }
 testing.Println(f())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function f parked (pending: g)
 > function f resolved
 > 42
@@ -1808,12 +1936,14 @@ testing.Println(f())
 # --- Case 22: chain forward refs (a → b → c), all
 # parked, all resolve when c arrives — dependencies first. ---
 run_repl "forward-ref-chain" \
-"func a() int { return b() + 1 }
+"import \"pkg/builtins/testing\"
+func a() int { return b() + 1 }
 func b() int { return c() + 10 }
 func c() int { return 100 }
 testing.Println(a())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function a parked (pending: b)
 > function b parked (pending: c)
 > function b resolved
@@ -1825,11 +1955,13 @@ function a resolved
 # a clean type-checker error (rather than letting the runtime
 # hit \"extern not found\"). ---
 run_repl "pending-use-site-error" \
-"func f() int { return g() }
+"import \"pkg/builtins/testing\"
+func f() int { return g() }
 testing.Println(f())
 testing.Println(helper(7))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function f parked (pending: g)
 > <repl>:1:17: function f is unresolved (pending: g)
 > 14
@@ -1844,10 +1976,12 @@ testing.Println(helper(7))
 # the last function generating it appends (after the literal), and both
 # are lowered. ---
 run_repl "func-literal-in-prompt-func" \
-"func k() int { var f @func(int) int = func(x int) int { return x + 1 }; return f(5) }
+"import \"pkg/builtins/testing\"
+func k() int { var f @func(int) int = func(x int) int { return x + 1 }; return f(5) }
 testing.Println(k())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 6
 > "
 
@@ -1855,17 +1989,20 @@ testing.Println(k())
 # function literal in it that calls the function calls the NEW one (it is
 # lowered after the shadow re-points the name). ---
 run_repl "shadow-literal-calls-new" \
-"func k() int { return 7 }
+"import \"pkg/builtins/testing\"
+func k() int { return 7 }
 func k(n int) int { var f @func(int) int = func(x int) int { if x <= 0 { return 100 }; return k(x - 1) }; return f(n) }
 testing.Println(k(3))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > warning: k shadowed (incompatible signature); existing callers retain old definition
 > 100
 > "
 
 run_repl "method-redef-replace" \
-"type Counter struct { n int }
+"import \"pkg/builtins/testing\"
+type Counter struct { n int }
 func (c *Counter) Inc() { c.n = c.n + 1 }
 var k Counter
 k.Inc(); k.Inc()
@@ -1875,6 +2012,7 @@ k.Inc()
 testing.Println(k.n)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 2
 > > > 12
 > "
@@ -1885,7 +2023,8 @@ testing.Println(k.n)
 # through the new sig.  Warning prints with the qualified
 # Type.Method name. ---
 run_repl "method-shadow-diff-sig" \
-"type Counter struct { n int }
+"import \"pkg/builtins/testing\"
+type Counter struct { n int }
 func (c *Counter) Add() { c.n = c.n + 1 }
 var k Counter
 k.Add()
@@ -1895,6 +2034,7 @@ k.Add(7)
 testing.Println(k.n)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 1
 > warning: Counter.Add shadowed (incompatible signature); existing callers retain old definition
 > > 8
@@ -1910,10 +2050,12 @@ testing.Println(k.n)
 # lowers the helper before the body (else the func's
 # end-of-statement cleanup hits a missing extern). ---
 run_repl "body-introduces-managed-slice-of-managed-ptr" \
-"func g() { var s @[]@Box = make_slice(@Box, 2); testing.Println(len(s)) }
+"import \"pkg/builtins/testing\"
+func g() { var s @[]@Box = make_slice(@Box, 2); testing.Println(len(s)) }
 g()
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 2
 > "
 
@@ -1923,9 +2065,11 @@ g()
 # leading `var` would route to the decl path instead).  Verifies
 # the drain runs on the evalReplStmtList synthetic too. ---
 run_repl "body-stmt-list-managed-slice-of-managed-ptr" \
-"s := make_slice(@Box, 3); testing.Println(len(s))
+"import \"pkg/builtins/testing\"
+s := make_slice(@Box, 3); testing.Println(len(s))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > 3
 > "
 
@@ -1936,10 +2080,12 @@ run_repl "body-stmt-list-managed-slice-of-managed-ptr" \
 # the synthetic is lowered.  Read-back through a subsequent
 # bare-stmt testing.Println. ---
 run_repl "body-var-init-managed-slice-of-managed-ptr" \
-"var t @[]@Box = make_slice(@Box, 4)
+"import \"pkg/builtins/testing\"
+var t @[]@Box = make_slice(@Box, 4)
 testing.Println(len(t))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 4
 > "
 
@@ -1955,11 +2101,13 @@ testing.Println(len(t))
 # slot.  The drain in retryPending is an optimization that
 # keeps the paths consistent; correctness does not rest on it.) ---
 run_repl "body-introduced-shape-via-retry" \
-"func f() { var s @[]@Box = make_slice(@Box, 2); h(); testing.Println(len(s)) }
+"import \"pkg/builtins/testing\"
+func f() { var s @[]@Box = make_slice(@Box, 2); h(); testing.Println(len(s)) }
 func h() {}
 f()
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function f parked (pending: h)
 > function f resolved
 > 2
@@ -1972,12 +2120,14 @@ f()
 # (not just genFunc) — the call site is the same, the IR-
 # gen routine is different. ---
 run_repl "method-body-introduced-shape" \
-"func (b *Box) Reset() { var s @[]@Box = make_slice(@Box, 2); b.V = len(s) }
+"import \"pkg/builtins/testing\"
+func (b *Box) Reset() { var s @[]@Box = make_slice(@Box, 2); b.V = len(s) }
 var k Box
 k.Reset()
 testing.Println(k.V)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > 2
 > "
 
@@ -1988,11 +2138,13 @@ testing.Println(k.V)
 # (via runReplVarInit's synthetic in retryPending) and
 # the value is observable on next read. ---
 run_repl "pending-var-resolves" \
-"var x int = g() + 1
+"import \"pkg/builtins/testing\"
+var x int = g() + 1
 func g() int { return 41 }
 testing.Println(x)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > variable x parked (pending: g)
 > variable x resolved
 > 42
@@ -2004,10 +2156,12 @@ testing.Println(x)
 # initializer's "7", not before.  Pins that ordering; a future edit that
 # reverts it reddens here. ---
 run_repl "kernel-notice-renders-after-eval-output" \
-"var x int = f()
+"import \"pkg/builtins/testing\"
+var x int = f()
 func f() int { testing.Println(7); return 41 }
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > variable x parked (pending: f)
 > 7
 variable x resolved
@@ -2019,11 +2173,13 @@ variable x resolved
 # retryPending only re-runs GenDecl (no synthetic, no slot
 # materialization). ---
 run_repl "pending-const-resolves" \
-"const N int = M + 1
+"import \"pkg/builtins/testing\"
+const N int = M + 1
 const M int = 41
 testing.Println(N)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > constant N parked (pending: M)
 > constant N resolved
 > 42
@@ -2034,10 +2190,12 @@ testing.Println(N)
 # unresolved" type-checker error.  Mirrors the pending-func
 # use-site error case (Case 23). ---
 run_repl "pending-var-use-site-error" \
-"var x int = g() + 1
+"import \"pkg/builtins/testing\"
+var x int = g() + 1
 testing.Println(x)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > variable x parked (pending: g)
 > <repl>:1:17: variable x is unresolved (pending: g)
 > "
@@ -2050,7 +2208,8 @@ testing.Println(x)
 # (so retry computes B = M + iota_at_position).  Defining M
 # resolves B independently. ---
 run_repl "pending-const-group-resolves" \
-"const (
+"import \"pkg/builtins/testing\"
+const (
 A int = 1
 B int = M + 1
 )
@@ -2058,6 +2217,7 @@ const M int = 40
 testing.Println(A); testing.Println(B)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > ... ... ... constant B parked (pending: M)
 > constant B resolved
 > 1
@@ -2073,7 +2233,8 @@ testing.Println(A); testing.Println(B)
 # restoration + GenConstMember's positional iota correctness
 # end-to-end. ---
 run_repl "pending-const-group-iota-positional" \
-"const (
+"import \"pkg/builtins/testing\"
+const (
 A int = iota
 B int = M + iota
 C int = iota
@@ -2082,6 +2243,7 @@ const M int = 10
 testing.Println(A); testing.Println(B); testing.Println(C)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > ... ... ... ... constant B parked (pending: M)
 > constant B resolved
 > 0
@@ -2092,7 +2254,8 @@ testing.Println(A); testing.Println(B); testing.Println(C)
 # --- A const group's bare members repeat the previous initializer at their own
 # iota, typed or untyped, and after a later explicit value. ---
 run_repl "const-group-bare-members-iota" \
-"const ( A = iota * 10; B; C )
+"import \"pkg/builtins/testing\"
+const ( A = iota * 10; B; C )
 testing.Println(A, B, C)
 const ( D int = iota * 15; E; F )
 testing.Println(D, E, F)
@@ -2102,6 +2265,7 @@ const ( J = 100 + iota; K; L = 7; M )
 testing.Println(J, K, L, M)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 0 10 20
 > > 0 15 30
 > > 3 6 9
@@ -2112,7 +2276,8 @@ testing.Println(J, K, L, M)
 # as a named type or as a struct — and prompt code sees the definition; before
 # that, the file's code drops a nil `@T` through T's placeholder destructor. ---
 run_repl "file-forward-type-defined-at-prompt" \
-"testing.Println(hold())
+"import \"pkg/builtins/testing\"
+testing.Println(hold())
 type T int
 var x T = 3
 testing.Println(x + 4)
@@ -2122,6 +2287,7 @@ u.n = 5
 testing.Println(u.n)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > 1
 > > > 7
 > > > > 5
@@ -2133,7 +2299,9 @@ testing.Println(u.n)
 # against): both blocks are freed, measured within one call (release is called
 # once first, with nothing held). ---
 run_repl "file-forward-type-dtor-replaced" \
-"type U struct { n int; s @[]int }
+"import \"pkg/builtins/rt\"
+import \"pkg/builtins/testing\"
+type U struct { n int; s @[]int }
 func mk() @U { var x @U = make(U); x.s = make_slice(int, 4); return x }
 func measure() int { var base int = rt.LiveBlocks(); release(); return base - rt.LiveBlocks() }
 release()
@@ -2141,6 +2309,8 @@ keep(mk())
 testing.Println(measure())
 " \
 "$BANNER
+> package pkg/builtins/rt loaded
+> package pkg/builtins/testing loaded
 > > > > > > 2
 > " "$FWD_FIXTURE"
 
@@ -2150,13 +2320,15 @@ testing.Println(measure())
 # the parked type is auto-resolved.  After resolution a var of
 # that type works end-to-end. ---
 run_repl "pending-struct-type-resolves" \
-"type T struct { F Bag }
+"import \"pkg/builtins/testing\"
+type T struct { F Bag }
 type Bag struct { N int }
 var x T
 x.F.N = 42
 testing.Println(x.F.N)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > type T parked (pending: Bag)
 > type T resolved
 > > > 42
@@ -2167,12 +2339,14 @@ testing.Println(x.F.N)
 # itself parks.  Resolving the pending type also resolves the
 # parked var. ---
 run_repl "pending-type-use-site-propagates" \
-"type T struct { F Bag }
+"import \"pkg/builtins/testing\"
+type T struct { F Bag }
 var x T
 type Bag struct { N int }
 testing.Println(\"resolved\")
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > type T parked (pending: Bag)
 > variable x parked (pending: T)
 > type T resolved
@@ -2185,13 +2359,15 @@ variable x resolved
 # it.  Mirrors the struct-type parking flow for the alias
 # branch of collectTypeDecl. ---
 run_repl "pending-alias-resolves" \
-"type R = Bag
+"import \"pkg/builtins/testing\"
+type R = Bag
 type Bag struct { N int }
 var x R
 x.N = 7
 testing.Println(x.N)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > type R parked (pending: Bag)
 > type R resolved
 > > > 7
@@ -2202,12 +2378,14 @@ testing.Println(x.N)
 # resolves it.  Covers the named-non-struct branch of
 # collectTypeDecl. ---
 run_repl "pending-named-nonstruct-resolves" \
-"type Celsius Heat
+"import \"pkg/builtins/testing\"
+type Celsius Heat
 type Heat int
 var t Celsius
 testing.Println(t)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > type Celsius parked (pending: Heat)
 > type Celsius resolved
 > > 0
@@ -2217,12 +2395,14 @@ testing.Println(t)
 # declaration binds nothing, so `var p *T` waits for T — and
 # resolves after it. ---
 run_repl "pending-type-pointer-use-parks" \
-"type T struct { F Bag }
+"import \"pkg/builtins/testing\"
+type T struct { F Bag }
 var p *T
 type Bag struct { N int }
 testing.Println(\"reached\")
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > type T parked (pending: Bag)
 > variable p parked (pending: T)
 > type T resolved
@@ -2234,11 +2414,13 @@ variable p resolved
 # struct { Next @B }` parks waiting on B; `type B struct { Next @A }`
 # parks waiting on A; the two resolve together at that prompt. ---
 run_repl "pending-mutual-recursion-resolves" \
-"type A struct { Next @B }
+"import \"pkg/builtins/testing\"
+type A struct { Next @B }
 type B struct { Next @A }
 testing.Println(\"resolved\")
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > type A parked (pending: B)
 > type B parked (pending: A)
 type A resolved
@@ -2250,12 +2432,14 @@ type B resolved
 # parks on it.  T parks (waiting on Bag); `func f(x T) int`
 # parks waiting on T.  When Bag arrives, T resolves, then f. ---
 run_repl "pending-func-sig-parks-func" \
-"type T struct { F Bag }
+"import \"pkg/builtins/testing\"
+type T struct { F Bag }
 func f(x T) int { return 0 }
 type Bag struct { N int }
 testing.Println(\"done\")
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > type T parked (pending: Bag)
 > function f parked (pending: T)
 > type T resolved
@@ -2268,13 +2452,15 @@ function f resolved
 # Bag arrives: T resolves, then the method.  After that the
 # method is callable. ---
 run_repl "pending-method-on-pending-receiver" \
-"type T struct { F Bag }
+"import \"pkg/builtins/testing\"
+type T struct { F Bag }
 func (t *T) M() int { return 7 }
 type Bag struct { N int }
 var x T
 testing.Println(x.M())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > type T parked (pending: Bag)
 > method T.M parked (pending: T)
 > type T resolved
@@ -2306,16 +2492,20 @@ type B still parked (it does not check)
 # it in.  After the load + type-check + lower, subsequent
 # prompt entries can call repldemo.Double. ---
 # --- A prompt import REBINDS its name, with a warning: after `import "lib"`,
-# `lib` is the local package "lib", not the fixture's pkg/other/lib — its T and
-# K. ---
+# `lib` is the local package "lib", not pkg/other/lib, which the prompt imported
+# first — its T and K. ---
 run_repl "prompt-import-rebinds-alias" \
-"testing.Println(lib.K)
+"import \"pkg/builtins/testing\"
+import \"pkg/other/lib\"
+testing.Println(lib.K)
 import \"lib\"
 var t lib.T = lib.T{X: 8}
 testing.Println(t.X)
 testing.Println(lib.K)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
+> package pkg/other/lib loaded
 > 7
 > package lib loaded
 warning: import lib shadowed; existing references retain the old package
@@ -2323,12 +2513,18 @@ warning: import lib shadowed; existing references retain the old package
 > 1000
 > " "$OTHERLIB_FIXTURE"
 
-# --- A fixture's explicit import alias (`import L "lib"`) resolves at the
-# prompt. ---
-run_repl "fixture-explicit-alias" \
-"testing.Println(L.K)
+# --- A fixture's import alias (`import L "lib"`) is the fixture's alone: the
+# prompt has no L until it imports lib as L itself. ---
+run_repl "fixture-alias-not-at-prompt" \
+"import \"pkg/builtins/testing\"
+testing.Println(L.K)
+import L \"lib\"
+testing.Println(L.K)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
+> <repl>:1:17: undefined: L
+> package lib loaded
 > 1000
 > " "$ALIASLIB_FIXTURE"
 
@@ -2336,7 +2532,8 @@ run_repl "fixture-explicit-alias" \
 # (`impl *LS : Loc`, LS = aliashome.S) keys on aliashome.S — even with a
 # same-named `LS` already declared at the prompt. ---
 run_repl "mid-session-alias-receiver-impl" \
-"type LS struct { Q int }
+"import \"pkg/builtins/testing\"
+type LS struct { Q int }
 import \"pkg/aliashome\"
 import \"pkg/aliaslib\"
 var s aliashome.S = aliashome.MkS(4)
@@ -2344,6 +2541,7 @@ var l *aliaslib.Loc = &s
 testing.Println(l.Label())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > package pkg/aliashome loaded
 > package pkg/aliaslib loaded
 > > > 40
@@ -2353,13 +2551,15 @@ testing.Println(l.Label())
 # package's generic interface (directly, and through an `expose` forwarder):
 # the parent's methods dispatch. ---
 run_repl "mid-session-indirect-generic-parent" \
-"import \"pkg/gsub\"
+"import \"pkg/builtins/testing\"
+import \"pkg/gsub\"
 var s gsub.S = gsub.MkS(7)
 var sub *gsub.Sub = &s
 testing.Println(sub.Get())
 testing.Println(sub.Extra())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/gsub loaded
 > > > 7
 > 8
@@ -2371,13 +2571,15 @@ testing.Println(sub.Extra())
 # runs (not "interface vtable not found" / "interface method slot is
 # empty"). ---
 run_repl "box-generic-receiver-impl-instantiation" \
-"import \"pkg/gcur\"
+"import \"pkg/builtins/testing\"
+import \"pkg/gcur\"
 import \"pkg/gbase\"
 var c gcur.Cursor[int] = gcur.MkInt(5)
 var bb *gbase.Base[int] = &c
 testing.Println(bb.Get())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/gcur loaded
 > package pkg/gbase loaded
 > > > 5
@@ -2388,17 +2590,20 @@ testing.Println(bb.Get())
 # and an imported generic function called from a statement, a function
 # and a variable initializer (each panicked "extern not found"). ---
 run_repl "generic-instantiation-in-prompt-func" \
-"import \"pkg/gcur\"
+"import \"pkg/builtins/testing\"
+import \"pkg/gcur\"
 func f() int { var c gcur.Cursor[int] = gcur.MkInt(3); return c.Get() }
 testing.Println(f())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/gcur loaded
 > > 3
 > "
 
 run_repl "imported-generic-func-at-prompt" \
-"import \"pkg/gfn\"
+"import \"pkg/builtins/testing\"
+import \"pkg/gfn\"
 testing.Println(gfn.Pick[int](6))
 func q() int { return gfn.Pick[int](7) }
 testing.Println(q())
@@ -2406,6 +2611,7 @@ var z int = gfn.Pick[int](8)
 testing.Println(z)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/gfn loaded
 > 6
 > > 7
@@ -2413,13 +2619,15 @@ testing.Println(z)
 > "
 
 run_repl "mid-session-indirect-generic-parent-forwarder" \
-"import \"pkg/gsubf\"
+"import \"pkg/builtins/testing\"
+import \"pkg/gsubf\"
 var s gsubf.S = gsubf.MkS(7)
 var sub *gsubf.Sub = &s
 testing.Println(sub.Get())
 testing.Println(sub.Extra())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/gsubf loaded
 > > > 7
 > 8
@@ -2429,7 +2637,8 @@ testing.Println(sub.Extra())
 # a variable, a method and an interface of the package it exposes, all through
 # the forwarder. ---
 run_repl "mid-session-forwarder-members" \
-"import \"pkg/vfwd\"
+"import \"pkg/builtins/testing\"
+import \"pkg/vfwd\"
 testing.Println(vfwd.Add(2, 3))
 var f *func(int, int) int = vfwd.Add
 testing.Println(f(4, 5))
@@ -2443,6 +2652,7 @@ var gt *vfwd.Getter = &s
 testing.Println(gt.Get())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/vfwd loaded
 > 5
 > > 9
@@ -2456,13 +2666,15 @@ testing.Println(gt.Get())
 # --- The same with the exposed package imported first: the forwarder's members
 # are that package's own (one variable, written through either name). ---
 run_repl "mid-session-forwarder-after-home" \
-"import \"pkg/vlib\"
+"import \"pkg/builtins/testing\"
+import \"pkg/vlib\"
 import \"pkg/vfwd\"
 vfwd.Version = 11
 testing.Println(vlib.Version)
 testing.Println(vfwd.Add(vlib.MAX, 1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/vlib loaded
 > package pkg/vfwd loaded
 > > 11
@@ -2472,13 +2684,15 @@ testing.Println(vfwd.Add(vlib.MAX, 1))
 # --- A chain of forwarders imported at the prompt and used, then the package at
 # its end. ---
 run_repl "mid-session-forwarder-chain-then-home" \
-"import \"pkg/vfwd2\"
+"import \"pkg/builtins/testing\"
+import \"pkg/vfwd2\"
 testing.Println(vfwd2.Add(vfwd2.MAX, 1))
 vfwd2.Version = 11
 import \"pkg/vlib\"
 testing.Println(vlib.Version)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/vfwd2 loaded
 > 43
 > > package pkg/vlib loaded
@@ -2489,19 +2703,7 @@ testing.Println(vlib.Version)
 # (one an import exposes, pkg/builtins/lang, pkg/builtins/rt) is a method
 # expression's receiver like any other: here at startup. ---
 run_repl "prompt-type-alias-named-like-exposed-pkg" \
-"type P struct { x int }
-func (p P) Add(a int, b int) int { return p.x + a + b }
-type vlib = P
-var g *func(P, int, int) int = vlib.Add
-testing.Println(g(P{x: 1}, 2, 3))
-" \
-"$BANNER
-> > > > > 6
-> " "$VFWD_FIXTURE"
-
-# --- The same after a forwarder imported at the prompt. ---
-run_repl "prompt-type-alias-named-like-pkg-exposed-at-prompt" \
-"import \"pkg/vfwd\"
+"import \"pkg/builtins/testing\"
 type P struct { x int }
 func (p P) Add(a int, b int) int { return p.x + a + b }
 type vlib = P
@@ -2509,41 +2711,63 @@ var g *func(P, int, int) int = vlib.Add
 testing.Println(g(P{x: 1}, 2, 3))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
+> > > > > 6
+> " "$VFWD_FIXTURE"
+
+# --- The same after a forwarder imported at the prompt. ---
+run_repl "prompt-type-alias-named-like-pkg-exposed-at-prompt" \
+"import \"pkg/builtins/testing\"
+import \"pkg/vfwd\"
+type P struct { x int }
+func (p P) Add(a int, b int) int { return p.x + a + b }
+type vlib = P
+var g *func(P, int, int) int = vlib.Add
+testing.Println(g(P{x: 1}, 2, 3))
+" \
+"$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/vfwd loaded
 > > > > > 6
 > "
 
 # --- The same named lang. ---
 run_repl "prompt-type-alias-named-lang" \
-"type P struct { x int }
+"import \"pkg/builtins/testing\"
+type P struct { x int }
 func (p P) Add(a int, b int) int { return p.x + a + b }
 type lang = P
 var g *func(P, int, int) int = lang.Add
 testing.Println(g(P{x: 1}, 2, 3))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 6
 > "
 
 # --- The same named rt. ---
 run_repl "prompt-type-alias-named-rt" \
-"type P struct { x int }
+"import \"pkg/builtins/testing\"
+type P struct { x int }
 func (p P) Add(a int, b int) int { return p.x + a + b }
 type rt = P
 var g *func(P, int, int) int = rt.Add
 testing.Println(g(P{x: 1}, 2, 3))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 6
 > "
 
 # --- A loaded package's type alias named like a package it imports under
 # another name. ---
 run_repl "loaded-pkg-type-alias-named-like-aliased-import" \
-"import \"pkg/valias\"
+"import \"pkg/builtins/testing\"
+import \"pkg/valias\"
 testing.Println(valias.Run())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/valias loaded
 > 6
 > "
@@ -2551,7 +2775,8 @@ testing.Println(valias.Run())
 # --- A type alias named like a package whose path is a single segment, which a
 # forwarder imported at the prompt exposes. ---
 run_repl "prompt-type-alias-named-like-single-segment-pkg" \
-"import \"pkg/lfwd\"
+"import \"pkg/builtins/testing\"
+import \"pkg/lfwd\"
 type P struct { x int }
 func (p P) Add(a int, b int) int { return p.x + a + b }
 func (p P) Mul(a int, b int) int { return p.x * 100 + a * b }
@@ -2562,6 +2787,7 @@ testing.Println(locv.Mul(P{x: 1}, 2, 3))
 testing.Println(lfwd.Add(1, 2))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/lfwd loaded
 > > > > > > 6
 > 106
@@ -2571,10 +2797,12 @@ testing.Println(lfwd.Add(1, 2))
 # --- A loaded package's type alias named like a single-segment package it
 # imports under another name. ---
 run_repl "loaded-pkg-type-alias-named-like-single-segment-import" \
-"import \"pkg/lalias\"
+"import \"pkg/builtins/testing\"
+import \"pkg/lalias\"
 testing.Println(lalias.Run())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/lalias loaded
 > 3117
 > "
@@ -2582,13 +2810,15 @@ testing.Println(lalias.Run())
 # --- The alias-receiver impl again, with pkg/aliashome loaded only indirectly
 # (by pkg/aliaslib's import) before it is imported at the prompt. ---
 run_repl "mid-session-alias-receiver-indirect" \
-"import \"pkg/aliaslib\"
+"import \"pkg/builtins/testing\"
+import \"pkg/aliaslib\"
 import \"pkg/aliashome\"
 var s aliashome.S = aliashome.MkS(4)
 var l *aliaslib.Loc = &s
 testing.Println(l.Label())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/aliaslib loaded
 > package pkg/aliashome loaded
 > > > 40
@@ -2597,30 +2827,36 @@ testing.Println(l.Label())
 # --- Type and var groups at the prompt: each member is declared as if typed on
 # its own (a const group stays whole). ---
 run_repl "type-and-var-groups" \
-"type ( PS struct { q int }; PA = int )
+"import \"pkg/builtins/testing\"
+type ( PS struct { q int }; PA = int )
 var p PS
 p.q = 3
 var ( v1 PA = 5; v2 int = 6 )
 testing.Println(p.q + v1 + v2)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 14
 > "
 
 run_repl "mid-session-import-call" \
-'import "pkg/repldemo"
+'import "pkg/builtins/testing"
+import "pkg/repldemo"
 testing.Println(repldemo.Double(21))
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/repldemo loaded
 > 42
 > "
 
 run_repl "imported-const-expr-own-import" \
-'import "pkg/rcexpr"
+'import "pkg/builtins/testing"
+import "pkg/rcexpr"
 testing.Println(cast(int, rcexpr.X * 10.0))
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/rcexpr loaded
 > 30
 > "
@@ -2628,12 +2864,14 @@ testing.Println(cast(int, rcexpr.X * 10.0))
 # --- A prompt constant expression names the package `a` meant when it was
 # declared, though a later prompt import rebinds `a`. ---
 run_repl "const-expr-keeps-its-binding" \
-'import a "pkg/rcbase"
+'import "pkg/builtins/testing"
+import a "pkg/rcbase"
 const X float64 = a.B * 2.0
 import a "pkg/rcother"
 testing.Println(cast(int, X * 10.0), cast(int, a.B))
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/rcbase loaded
 > > package pkg/rcother loaded
 warning: import a shadowed; existing references retain the old package
@@ -2643,11 +2881,13 @@ warning: import a shadowed; existing references retain the old package
 # --- A line of several entries — an import, declarations, statements — is
 # evaluated entry by entry, in order, as if each were entered on its own. ---
 run_repl "unit-several-entries" \
-'import "pkg/repldemo"; var a int = repldemo.Double(4); func twice(n int) int { return n + n }; testing.Println(a, twice(a))
+'import "pkg/builtins/testing"
+import "pkg/repldemo"; var a int = repldemo.Double(4); func twice(n int) int { return n + n }; testing.Println(a, twice(a))
 var b int = 1; var c int = b + 1
 testing.Println(b, c)
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > 8 16
 package pkg/repldemo loaded
 > > 1 2
@@ -2657,13 +2897,15 @@ package pkg/repldemo loaded
 # instantiation — typed at the prompt, and parked on its initializer's function
 # then resolved — has that type: its fields and methods work. ---
 run_repl "inferred-var-imported-generic" \
-'import "pkg/replgen"
+'import "pkg/builtins/testing"
+import "pkg/replgen"
 var c = replgen.MkCell(5)
 var d = e()
 func e() replgen.Cell[int] { return replgen.MkCell(6) }
 testing.Println(c.v, d.v, c.Get(), d.Get())
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/replgen loaded
 > > variable d parked (pending: e)
 > variable d resolved
@@ -2673,19 +2915,26 @@ testing.Println(c.v, d.v, c.Get(), d.Get())
 # --- A generic function's body monomorphized at the prompt calls a package the
 # session never imports (pkg/replgbody's body reaches pkg/replgdep): its
 # struct-returning callee, constant and impl are registered — whether the
-# generic's package is imported by the main file or at the prompt. ---
+# generic's package was loaded with the main file, which imports it, or by the
+# prompt's import. ---
 run_repl "generic-body-deps-startup-import" \
-'testing.Println(replgbody.Outer[int](1))
+'import "pkg/builtins/testing"
+import "pkg/replgbody"
+testing.Println(replgbody.Outer[int](1))
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
+> package pkg/replgbody loaded
 > 143
 > " "$GBODY_FIXTURE"
 
 run_repl "generic-body-deps-prompt-import" \
-'import "pkg/replgbody"
+'import "pkg/builtins/testing"
+import "pkg/replgbody"
 testing.Println(replgbody.Outer[int](2))
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/replgbody loaded
 > 245
 > "
@@ -2694,7 +2943,8 @@ testing.Println(replgbody.Outer[int](2))
 # each other (parked until both are declared, then resolved together) have those
 # types at the prompt. ---
 run_repl "named-type-self-reference" \
-'type Tree @[]Tree
+'import "pkg/builtins/testing"
+type Tree @[]Tree
 func depth(t Tree) int { var d int = 0; for i := 0; i < len(t); i++ { var c int = depth(t[i]); if c > d { d = c } }; return d + 1 }
 var leaf Tree = make_slice(Tree, 0)
 var top Tree = make_slice(Tree, 1)
@@ -2707,6 +2957,7 @@ sa[1] = make_slice(SA, 3)
 testing.Println(len(sa), len(sa[1]))
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > 2
 > type SA parked (pending: SB)
 > type SB parked (pending: SA)
@@ -2719,7 +2970,8 @@ type SB resolved
 # it (the alias is built first), and a function whose recursive local is
 # destroyed at the prompt. ---
 run_repl "named-type-alias-cycle-and-local" \
-'type TN2 @[]TA2
+'import "pkg/builtins/testing"
+type TN2 @[]TA2
 type TA2 = @[]TN2
 var tn TN2 = make_slice(TA2, 1)
 tn[0] = make_slice(TN2, 2)
@@ -2730,6 +2982,7 @@ func f() int { var t Tree = make_slice(Tree, 2); t[0] = make_slice(Tree, 1); t[0
 testing.Println(f(), f())
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > type TN2 parked (pending: TA2)
 > type TA2 parked (pending: TN2)
 type TN2 resolved
@@ -2744,10 +2997,12 @@ type TA2 resolved
 # does NOT (would be an undefined identifier).  Verifies the
 # alias-bearing branch of evalReplImport. ---
 run_repl "mid-session-import-alias" \
-'import alt "pkg/repldemo"
+'import "pkg/builtins/testing"
+import alt "pkg/repldemo"
 testing.Println(alt.Double(11))
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/repldemo loaded
 > 22
 > "
@@ -2758,11 +3013,13 @@ testing.Println(alt.Double(11))
 # session scope still has the alias defined, so the call works.
 # ---
 run_repl "mid-session-reimport-idempotent" \
-'import "pkg/repldemo"
+'import "pkg/builtins/testing"
+import "pkg/repldemo"
 import "pkg/repldemo"
 testing.Println(repldemo.Double(5))
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/repldemo loaded
 > package pkg/repldemo loaded
 > 10
@@ -2776,11 +3033,13 @@ testing.Println(repldemo.Double(5))
 # null-address SIGSEGV.  testing comes from the fixture, so this exercises
 # SetModuleContext independent of the prompt-import-of-testing path. ---
 run_repl "var-decl-after-mid-session-import" \
-'import "pkg/repldemo"
+'import "pkg/builtins/testing"
+import "pkg/repldemo"
 var g int = 42
 testing.Println(g)
 ' \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/repldemo loaded
 > > 42
 > "
@@ -2816,7 +3075,8 @@ testing.Println(f)
 # parent) and a clean one: the error is reported, the failing package never
 # reaches IR-gen, and the session survives. ---
 run_repl_import_rejected "mid-session-import-bad-generic-parent" \
-'import "pkg/gbad"
+'import "pkg/builtins/testing"
+import "pkg/gbad"
 testing.Println(helper(7))
 ' \
     "Nope" \
@@ -2826,7 +3086,8 @@ testing.Println(helper(7))
 # declared at the prompt is not one the package can use, in its .bn or its
 # interface's generic bodies; the session survives. ---
 run_repl_import_rejected "mid-session-import-no-prompt-names" \
-'type secret int
+'import "pkg/builtins/testing"
+type secret int
 import "pkg/rsecret"
 testing.Println(helper(7))
 ' \
@@ -2836,7 +3097,8 @@ testing.Println(helper(7))
 # --- A package importing a failed one is not imported either (and says so);
 # the session survives. ---
 run_repl_import_rejected "mid-session-import-depends-on-failed" \
-'import "pkg/gbad"
+'import "pkg/builtins/testing"
+import "pkg/gbad"
 import "pkg/gbaddep"
 testing.Println(helper(7))
 ' \
@@ -2846,7 +3108,8 @@ testing.Println(helper(7))
 # --- An import that fails type-checking does not rebind its alias: `x` still
 # names pkg/xa/x, in the checker and in IR-gen alike. ---
 run_repl_import_rejected "mid-session-failed-import-keeps-alias" \
-'import "pkg/xa/x"
+'import "pkg/builtins/testing"
+import "pkg/xa/x"
 import "pkg/xb/x"
 testing.Println(x.G(3))
 ' \
@@ -2855,7 +3118,8 @@ testing.Println(x.G(3))
 
 # --- An import that fails ends its code unit: the statement after it on the
 # same line does not run, and the next line does. ---
-actual=$(printf '%s' 'import "pkg/xb/x"; testing.Println(4242)
+actual=$(printf '%s' 'import "pkg/builtins/testing"
+import "pkg/xb/x"; testing.Println(4242)
 testing.Println(77)
 ' | "$BNI_BIN" --repl \
     -I "$("$BINATE_DIR/scripts/binate-paths.sh" --iface --base "$BINATE_DIR")" -L "$("$BINATE_DIR/scripts/binate-paths.sh" --impl --base "$BINATE_DIR")" \
@@ -2873,7 +3137,8 @@ else
 fi
 
 run_repl_import_rejected "mid-session-import-ccall-rejected" \
-'import "pkg/std/os"
+'import "pkg/builtins/testing"
+import "pkg/std/os"
 testing.Println(helper(7))
 ' \
     "__c_call cannot be interpreted" \
@@ -2885,11 +3150,13 @@ testing.Println(helper(7))
 # REPEATED value 2<<1 = 4 — NOT the plain iota index 1.
 # Transcript verified by driving a gen1-built bni manually. ---
 run_repl "pending-const-group-bare-iota-repeat" \
-"const ( B0 int = M << iota; B1 )
+"import \"pkg/builtins/testing\"
+const ( B0 int = M << iota; B1 )
 const M int = 2
 testing.Println(B1)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > constant B0 parked (pending: M)
 constant B1 parked (pending: M)
 > constant B0 resolved
@@ -2901,12 +3168,14 @@ constant B1 resolved
 # type that does not fit stays parked: its error is shown once, and
 # a later declaration that fits resolves it. ---
 run_repl "failed-retry-stays-parked" \
-"var x int = y
+"import \"pkg/builtins/testing\"
+var x int = y
 var y bool = true
 var y int = 2
 testing.Println(x)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > variable x parked (pending: y)
 > variable x still parked (it does not check)
 <repl>:1:13: cannot assign bool to int
@@ -2931,7 +3200,8 @@ type T struct { b int }
 # method redefinition is dispatched to, a shadowing one is not (the impl
 # keeps the method it was built with). ---
 run_repl "interface-impl-at-prompt" \
-"interface Sizer { Size() int }
+"import \"pkg/builtins/testing\"
+interface Sizer { Size() int }
 type Crate struct { n int }
 func (b *Crate) Size() int { return b.n }
 impl *Crate : Sizer
@@ -2947,6 +3217,7 @@ func (b *Crate) Size(k int) int { return k }
 testing.Println(s.Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > > > 4
 > > 5
 > > 40
@@ -2957,7 +3228,8 @@ testing.Println(s.Size())
 # --- Case 52: impls at the prompt on a value receiver, on a named
 # managed slice, and of a generic interface. ---
 run_repl "impl-receivers-and-generic-interface" \
-"interface Sizer { Size() int }
+"import \"pkg/builtins/testing\"
+interface Sizer { Size() int }
 type V struct { n int }
 func (v V) Size() int { return v.n + 100 }
 impl V : Sizer
@@ -2981,6 +3253,7 @@ var g *Getter[int] = &ib
 testing.Println(g.Get())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > > > 102
 > > > > > > 3
 > > > > > > > > 9
@@ -3014,7 +3287,8 @@ func Sizer() {}
 # conversion needing the impl parks on the impl (`C:Sizer`); declaring the
 # method resolves both. ---
 run_repl "impl-parks-on-method" \
-"interface Sizer { Size() int }
+"import \"pkg/builtins/testing\"
+interface Sizer { Size() int }
 type C struct { n int }
 impl *C : Sizer
 var c C
@@ -3025,6 +3299,7 @@ var s2 *Sizer = &c
 testing.Println(s2.Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > impl *C : Sizer parked (pending: C.Size)
 > > > variable s parked (pending: C:Sizer)
 > impl *C : Sizer resolved
@@ -3035,7 +3310,8 @@ variable s resolved
 # --- Case 55: functions converting to an interface and to its parent
 # wait on an impl; an impl of the child interface resolves both. ---
 run_repl "conversion-waits-on-impl-of-child" \
-"interface P { A() int }
+"import \"pkg/builtins/testing\"
+interface P { A() int }
 interface Q : P { B() int }
 type D struct { n int }
 func asP(d *D) *P { return d }
@@ -3048,6 +3324,7 @@ dd.n = 10
 testing.Println(asP(&dd).A(), asQ(&dd).B())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > function asP parked (pending: D:P)
 > function asQ parked (pending: D:Q)
 > > > function asP resolved
@@ -3058,7 +3335,8 @@ function asQ resolved
 # --- Case 56: an impl waiting on a method, and the method converting its
 # receiver to the impl's interface, resolve together. ---
 run_repl "impl-and-method-resolve-together" \
-"interface Sizer { Size() int }
+"import \"pkg/builtins/testing\"
+interface Sizer { Size() int }
 type E struct { n int }
 impl *E : Sizer
 func (e *E) Size() int { var s *Sizer = e; _ = s; return e.n }
@@ -3068,6 +3346,7 @@ var se *Sizer = &ee
 testing.Println(se.Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > impl *E : Sizer parked (pending: E.Size)
 > method E.Size parked (pending: E:Sizer)
 impl *E : Sizer resolved
@@ -3079,7 +3358,8 @@ method E.Size resolved
 # impl's interface and dispatches through it resolve together: the impl's
 # row is registered before the method is generated. ---
 run_repl "impl-group-boxes-in-method" \
-"interface I { M() int; N() int }
+"import \"pkg/builtins/testing\"
+interface I { M() int; N() int }
 type K struct { n int }
 func (k *K) N() int { return k.n }
 impl *K : I
@@ -3091,6 +3371,7 @@ var j *I = &k
 testing.Println(j.M())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > impl *K : I parked (pending: K.M)
 > method K.M parked (pending: K:I)
 impl *K : I resolved
@@ -3103,7 +3384,8 @@ method K.M resolved
 # points back at the interface: the three resolve together, the alias
 # registered before the interface's method set. ---
 run_repl "interface-alias-struct-group" \
-"interface I { M() SV }
+"import \"pkg/builtins/testing\"
+interface I { M() SV }
 type SV = S
 type S struct { i *I; a int; b int; c int }
 type K struct { n int }
@@ -3116,6 +3398,7 @@ var r SV = ii.M()
 testing.Println(r.a, r.b, r.c)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > interface I parked (pending: SV)
 > type SV parked (pending: S)
 > type S parked (pending: I)
@@ -3128,7 +3411,8 @@ type S resolved
 # --- Case 59: an impl of an imported interface does not stand for an
 # impl of the session's interface of the same name. ---
 run_repl "impl-keys-by-package" \
-"import \"pkg/builtins/lang\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/lang\"
 interface Stringer { String() @[]char }
 type Q struct { n int }
 func asMine(q *Q) *Stringer { return q }
@@ -3139,6 +3423,7 @@ var q Q
 testing.Println(asMine(&q).String())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/lang loaded
 > > > function asMine parked (pending: Q:Stringer)
 > impl *Q : lang.Stringer parked (pending: Q.String)
@@ -3150,7 +3435,8 @@ testing.Println(asMine(&q).String())
 # --- Case 60: an impl of a parent interface does not replace a parked
 # impl of a child interface; both resolve. ---
 run_repl "impl-of-parent-keeps-child-impl" \
-"interface A { M() int }
+"import \"pkg/builtins/testing\"
+interface A { M() int }
 interface B : A { N() int }
 type Crate struct { n int }
 impl *Crate : B
@@ -3163,6 +3449,7 @@ bb.n = 1
 testing.Println(asB(&bb).N())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > impl *Crate : B parked (pending: Crate.M, Crate.N)
 > function asB parked (pending: Crate:B)
 > impl *Crate : A parked (pending: Crate.M)
@@ -3176,7 +3463,8 @@ function asB resolved
 # alias of a pointer to the type; at the prompt the function and the impl
 # report themselves unresolved; the method resolves both. ---
 run_repl "cast-waits-on-alias-receiver-impl" \
-"interface Sizer { Size() int }
+"import \"pkg/builtins/testing\"
+interface Sizer { Size() int }
 type Crate struct { n int }
 type PC = *Crate
 impl PC : Sizer
@@ -3191,6 +3479,7 @@ var t *Sizer = &cr
 testing.Println(t.Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > impl PC : Sizer parked (pending: Crate.Size)
 > function sz parked (pending: Crate:Sizer)
 > > > <repl>:1:17: function sz is unresolved (pending: Crate:Sizer)
@@ -3205,7 +3494,8 @@ function sz resolved
 # method, and resolves together with a method converting its receiver to
 # that instance. ---
 run_repl "impl-of-generic-interface-instance-parks" \
-"interface Getter[T any] { Get() T }
+"import \"pkg/builtins/testing\"
+interface Getter[T any] { Get() T }
 type Cell struct { v int }
 impl *Cell : Getter[int]
 func (c *Cell) Get() int { var g *Getter[int] = c; _ = g; return c.v + 1 }
@@ -3215,6 +3505,7 @@ var g *Getter[int] = &ce
 testing.Println(g.Get())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > impl *Cell : Getter[int] parked (pending: Cell.Get)
 > method Cell.Get parked (pending: Cell:Getter)
 impl *Cell : Getter[int] resolved
@@ -3226,7 +3517,8 @@ method Cell.Get resolved
 # a struct and a named bool: dispatch goes through the receiver thunk
 # (the interface value holds the data by pointer). ---
 run_repl "impl-scalar-value-receivers" \
-"interface Sizer { Size() int }
+"import \"pkg/builtins/testing\"
+interface Sizer { Size() int }
 type N int
 func (n N) Size() int { return cast(int, n) + 1000 }
 impl N : Sizer
@@ -3249,6 +3541,7 @@ var sf *Sizer = &fl
 testing.Println(sf.Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > > 1005
 > > > > > > > > 34
 > > > > > > 1
@@ -3257,7 +3550,8 @@ testing.Println(sf.Size())
 # --- Case 64: a value receiver with a managed field: dispatch through the
 # thunk copies the value properly, so the field's refcount holds. ---
 run_repl "impl-value-receiver-managed-fields" \
-"import \"pkg/builtins/rt\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/rt\"
 type Inner struct { v int }
 var inner @Inner = make(Inner)
 var ptr *uint8 = bit_cast(*uint8, inner)
@@ -3273,6 +3567,7 @@ testing.Println(s.Size(), rt.Refcount(ptr))
 testing.Println(s.Size(), rt.Refcount(ptr))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/rt loaded
 > > > > > > > > > > 2
 > > 3 2
@@ -3283,7 +3578,8 @@ testing.Println(s.Size(), rt.Refcount(ptr))
 # the impl's vtable was built when the impl was declared, so it keeps the
 # method it was declared with. ---
 run_repl "shadow-before-first-box" \
-"interface Sizer { Size() int }
+"import \"pkg/builtins/testing\"
+interface Sizer { Size() int }
 type C struct { n int }
 func (c *C) Size() int { return c.n }
 impl *C : Sizer
@@ -3294,6 +3590,7 @@ var s *Sizer = &c
 testing.Println(s.Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > warning: C.Size shadowed (incompatible signature); existing callers retain old definition
 > > > > 4
 > "
@@ -3302,7 +3599,8 @@ testing.Println(s.Size())
 # extends a parent, and of an imported interface: dispatch through the
 # child, the parent, and the imported interface. ---
 run_repl "impl-parent-alias-imported-interfaces" \
-"import \"pkg/builtins/lang\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/lang\"
 interface Named { Name() int }
 interface Full : Named { Extra() int }
 interface FullA = Full
@@ -3321,6 +3619,7 @@ var st *lang.Stringer = &q
 testing.Println(st.String())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/lang loaded
 > > > > > > > > > > > > 7 8
 > > 7
@@ -3331,7 +3630,8 @@ testing.Println(st.String())
 # into a user interface and into @any: dropping the box releases the
 # struct's managed field (its slot-0 destructor is the struct's). ---
 run_repl "named-struct-box-releases-fields" \
-"import \"pkg/builtins/rt\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/rt\"
 interface Sizer { Size() int }
 type Inner struct { v int }
 type S struct { p @Inner }
@@ -3345,6 +3645,7 @@ boxIt()
 testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/rt loaded
 > > > > > > > > > > > 0
 > "
@@ -3353,7 +3654,8 @@ testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 # its struct definition: dropping a value through either releases the
 # struct's managed field. ---
 run_repl "forward-type-defined-as-struct" \
-"import \"pkg/builtins/rt\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/rt\"
 type Inner struct { v int }
 type S5
 type MPP @@S5
@@ -3370,6 +3672,7 @@ run()
 testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/rt loaded
 > > > > > > > > > > 0
 > > > > 0
@@ -3379,7 +3682,8 @@ testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 # a managed slice, a named type over a struct and a scalar: functions lowered
 # before the definitions release what the values hold. ---
 run_repl "forward-type-defined-as-other-types" \
-"import \"pkg/builtins/rt\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/rt\"
 type Inner struct { v int }
 type Wr struct { n int; p @Inner }
 type FL
@@ -3409,6 +3713,7 @@ run()
 testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/rt loaded
 > > > > > > > > > > > > > > > > > > > > > > > > > > 4
 > 0
@@ -3419,7 +3724,8 @@ testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 # function releases what the value holds; a type never defined stays
 # usable. ---
 run_repl "forward-type-used-before-definition" \
-"import \"pkg/builtins/rt\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/rt\"
 type Inner struct { v int }
 type N
 func clr(pp @@N) { var e @N; *pp = e }
@@ -3439,6 +3745,7 @@ func t() int { var pp @@X = make(@X); clrX(pp); return 2 }
 testing.Println(t())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/rt loaded
 > > > > > 1
 > > > > > > > 0
@@ -3450,7 +3757,8 @@ testing.Println(t())
 # over the struct can; forward-declared types defined as a func value and as a
 # managed slice of themselves. ---
 run_repl "forward-type-alias-rejected-func-value-or-itself" \
-"type Inner struct { v int }
+"import \"pkg/builtins/testing\"
+type Inner struct { v int }
 type F
 type F = Inner
 type F Inner
@@ -3473,6 +3781,7 @@ func f() int { var t Tr = make_slice(Tr, 2); return len(t) }
 testing.Println(f())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > <repl>:1:1: type F is forward-declared; its definition cannot be an alias
 > > > 3
 > > > > > > > 42
@@ -3484,7 +3793,8 @@ testing.Println(f())
 # --- Case 72: a forward-declared type defined over another one not defined
 # yet releases what its values hold once that one is defined. ---
 run_repl "forward-type-defined-over-undefined-forward-type" \
-"import \"pkg/builtins/rt\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/rt\"
 type Inner struct { v int }
 type G
 type F
@@ -3500,6 +3810,7 @@ run3()
 testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/rt loaded
 > > > > > > > > > > 0
 > > > 0
@@ -3509,7 +3820,8 @@ testing.Println(rt.Refcount(bit_cast(*uint8, inr)) - before)
 # function body, a block, a raw func value and a method value — release
 # what they capture when dropped (their closure structs' dtors exist). ---
 run_repl "closure-captures-released-at-prompt" \
-"import \"pkg/builtins/rt\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/rt\"
 type F @func() int
 var bx @Box = make(Box)
 var before int = rt.Refcount(bit_cast(*uint8, bx))
@@ -3529,6 +3841,7 @@ testing.Println(mv())
 testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/rt loaded
 > > > > > 1
 > > 0
@@ -3548,7 +3861,8 @@ testing.Println(rt.Refcount(bit_cast(*uint8, bx)) - before)
 # its name; also when the redeclaration parks and resolves later.  A constant a
 # variable takes the name of is shadowed, with a warning. ---
 run_repl "variable-redeclared-replaced-or-shadowed" \
-"import \"pkg/builtins/rt\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/rt\"
 var x int = 1
 var x bool = true
 testing.Println(x)
@@ -3623,6 +3937,7 @@ var ms @[]char
 testing.Println(len(ms))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/rt loaded
 > > warning: variable x shadowed (incompatible type); existing references retain the old variable
 > true
@@ -3667,13 +3982,15 @@ warning: variable p shadowed (incompatible type); existing references retain the
 # entries of their own), and the later would otherwise be taken for a
 # redefinition of the earlier. ---
 run_repl "group-name-declared-twice" \
-"const ( X float64 = 1.5; Y float64 = X * 2.0; X float64 = 9.0 )
+"import \"pkg/builtins/testing\"
+const ( X float64 = 1.5; Y float64 = X * 2.0; X float64 = 9.0 )
 var ( b int = 1; b int = 2 )
 const X int = 4
 var b bool = true
 testing.Println(X, b)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > <repl>:1:47: X redeclared in this block
 > <repl>:1:18: b redeclared in this block
 > > > 4 true
@@ -3686,7 +4003,8 @@ testing.Println(X, b)
 # emitted per instance, and a redefinition replaces the instances emitted
 # before it. ---
 run_repl "generic-struct-types-at-prompt" \
-"import \"pkg/builtins/rt\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/rt\"
 import \"pkg/std/containers/vec\"
 type G[T any] struct { v T; w Missing }
 type Missing struct { a int; b int }
@@ -3722,6 +4040,7 @@ func copyV() int { var p @vec.Vec[@Box] = vec.New[@Box](); p.Push(bx); var c vec
 testing.Println(copyV(), rt.Refcount(bit_cast(*uint8, bx)) - before)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/rt loaded
 > package pkg/std/containers/vec loaded
 > type G parked (pending: Missing)
@@ -3744,7 +4063,8 @@ testing.Println(copyV(), rt.Refcount(bit_cast(*uint8, bx)) - before)
 # not), or shadows them when its signature differs — as rebinding the name to
 # a non-generic function does, so a later generic function emits its own. ---
 run_repl "generic-funcs-at-prompt" \
-"func id[T any](x T) T { return x }
+"import \"pkg/builtins/testing\"
+func id[T any](x T) T { return x }
 testing.Println(id[int](3), id[bool](true))
 type Cur[T any] struct { v T }
 func gen[T any](x T) T { var c Cur[T]; c.v = x; return c.v }
@@ -3759,6 +4079,7 @@ func id[T any](x T, k int) int { return k * 2 }
 testing.Println(old(), id[int](4, 8))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > 3 true
 > > > > 14
 > > 9
@@ -3775,7 +4096,8 @@ testing.Println(old(), id[int](4, 8))
 # session), and lang's descriptor is the native one, with its satisfaction
 # entries. ---
 run_repl "injected-builtins-native" \
-"import \"pkg/builtins/reflect\"
+"import \"pkg/builtins/testing\"
+import \"pkg/builtins/reflect\"
 import \"pkg/builtins/lang\"
 var n int = 3
 var ti *reflect.TypeInfo = reflect.TypeOf(&n)
@@ -3784,6 +4106,7 @@ testing.Println(ti == f(&n))
 testing.Println(len(lang.__Package().SatEntries) > 0)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > package pkg/builtins/reflect loaded
 > package pkg/builtins/lang loaded
 > > > > true
@@ -3795,7 +4118,8 @@ testing.Println(len(lang.__Package().SatEntries) > 0)
 # retry v is a *T, and the call takes v itself.  An `&v` left from the first
 # attempt passed a **T, and the VM found no method `main..Inc`. ---
 run_repl "retry-reads-syntax-afresh" \
-"type T struct { n int }
+"import \"pkg/builtins/testing\"
+type T struct { n int }
 func (t *T) Inc() int { t.n = t.n + 1; return t.n }
 func add(a int, b int) int { return a + b }
 var v T
@@ -3807,6 +4131,7 @@ testing.Println(y)
 testing.Println(w.n)
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > variable y parked (pending: u)
 > > warning: variable v shadowed (incompatible type); existing references retain the old variable
 > variable y resolved
@@ -3819,11 +4144,13 @@ testing.Println(w.n)
 # string literal is converted to g's raw-slice parameter (lowered without g's
 # signature, the call passes the literal unconverted and len(s) reads 0). ---
 run_repl "group-call-takes-later-member-signature" \
-"func f(n int) int { if n == 0 { return 0 }; return g(\"hello\", n - 1) }
+"import \"pkg/builtins/testing\"
+func f(n int) int { if n == 0 { return 0 }; return g(\"hello\", n - 1) }
 func g(s *[]readonly char, n int) int { if n == 0 { return len(s) }; return f(n - 1) }
 testing.Println(f(1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function f parked (pending: g)
 > function g parked (pending: f)
 function f resolved
@@ -3835,7 +4162,8 @@ function g resolved
 # g's signature, the call passes the bare pointer, and the call through it aborts
 # with \"call of nil interface value\"). ---
 run_repl "group-call-boxes-into-later-member-interface" \
-"interface Greeter { greet() int }
+"import \"pkg/builtins/testing\"
+interface Greeter { greet() int }
 type Thing struct { x int }
 func (t *Thing) greet() int { return t.x }
 impl *Thing : Greeter
@@ -3845,6 +4173,7 @@ func g(gr *Greeter, n int) int { if n == 0 { return gr.greet() }; return f(n - 1
 testing.Println(f(1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > function f parked (pending: g)
 > function g parked (pending: f)
 function f resolved
@@ -3856,11 +4185,13 @@ function g resolved
 # (generated before g is stashed, f's call names no instance, and the VM aborts
 # with \"extern not found\"). ---
 run_repl "group-call-instantiates-later-generic-member" \
-"func f(n int) int { if n == 0 { return 0 }; return g[int](n - 1, 7) }
+"import \"pkg/builtins/testing\"
+func f(n int) int { if n == 0 { return 0 }; return g[int](n - 1, 7) }
 func g[T any](n int, x T) T { if n == 0 { return x }; var _ int = f(n - 1); return x }
 testing.Println(f(1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function f parked (pending: g)
 > function g parked (pending: f)
 function f resolved
@@ -3872,12 +4203,14 @@ function g resolved
 # the method is stashed, the call names no instance, and the VM aborts with
 # \"extern not found\"). ---
 run_repl "group-call-instantiates-later-generic-method" \
-"type Cell[T any] struct { v T }
+"import \"pkg/builtins/testing\"
+type Cell[T any] struct { v T }
 func f(n int) int { var b Cell[int]; b.v = 3; if n == 0 { return 0 }; return b.get(\"hello\", n - 1) }
 func (b *Cell[T]) get(s *[]readonly char, n int) T { if n == 0 { testing.Println(len(s)); return b.v }; var _ int = f(n - 1); return b.v }
 testing.Println(f(1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > function f parked (pending: Cell.get)
 > method Cell.get parked (pending: f)
 function f resolved
@@ -3890,7 +4223,8 @@ method Cell.get resolved
 # them with its signature (lowered without it, f passes p's string literal
 # unconverted and len(s) reads 0). ---
 run_repl "group-redefinition-calls-later-new-member" \
-"func p(s *[]readonly char, n int) int { if n == 0 { return f() }; return q(n) + len(s) }
+"import \"pkg/builtins/testing\"
+func p(s *[]readonly char, n int) int { if n == 0 { return f() }; return q(n) + len(s) }
 func f() int { return 1 }
 func f() int { return p(\"abc\", 1) + 10 }
 func q(n int) int { return 100 + n }
@@ -3898,6 +4232,7 @@ testing.Println(f())
 testing.Println(p(\"\", 0))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function p parked (pending: f, q)
 > > function f parked (pending: p)
 > function p resolved
@@ -3911,7 +4246,8 @@ function f resolved
 # before g is stashed, f's g[int8] is instantiated from the old g, which has no
 # checked copy for it, and IR-gen panics). ---
 run_repl "group-redefinition-instantiates-later-redefined-generic" \
-"func P(n int) int { if n == 0 { return 1 }; var _ int = g[int](n); return f() + q(n) }
+"import \"pkg/builtins/testing\"
+func P(n int) int { if n == 0 { return 1 }; var _ int = g[int](n); return f() + q(n) }
 func g[T any](x T) T { return x }
 testing.Println(g[int](5))
 func f() int { return 0 }
@@ -3923,6 +4259,7 @@ testing.Println(g[int](4))
 testing.Println(P(1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function P parked (pending: g, f, q)
 > > 5
 > > function f parked (pending: P)
@@ -3946,7 +4283,8 @@ new g
 # useh, lowered before the group, keeps the old h (lowered in the order
 # generated, f binds to the old h and reads its 1000 as an int8: -23). ---
 run_repl "group-earlier-redefinition-calls-later-shadowing-one" \
-"func P(n int) int { if n == 0 { return 1 }; return f() + cast(int, h()) + q(n) }
+"import \"pkg/builtins/testing\"
+func P(n int) int { if n == 0 { return 1 }; return f() + cast(int, h()) + q(n) }
 func h() int { return 1000 }
 func useh() int { return h() }
 func f() bool { return false }
@@ -3958,6 +4296,7 @@ testing.Println(useh())
 testing.Println(P(1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function P parked (pending: f, h, q)
 > > > > function f parked (pending: P)
 > function h parked (pending: P)
@@ -3977,7 +4316,8 @@ warning: h shadowed (incompatible signature); existing callers retain old defini
 # its float64 result, while use keeps the old one (with the instance still
 # emitted, f calls it with the old int result). ---
 run_repl "group-earlier-redefinition-calls-shadowing-generic-method" \
-"type Cell[T any] struct { v T }
+"import \"pkg/builtins/testing\"
+type Cell[T any] struct { v T }
 func P(n int) int { if n == 0 { return 1 }; var b Cell[int]; return f() + q(n) + cast(int, b.get()) }
 func (b *Cell[T]) get() int { return 1000 }
 func use() int { var b Cell[int]; return b.get() }
@@ -3991,6 +4331,7 @@ testing.Println(use())
 testing.Println(P(1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > function P parked (pending: f, q, Cell.get)
 > > > 1000
 > > function f parked (pending: P)
@@ -4011,7 +4352,8 @@ warning: Cell.get shadowed (incompatible signature); existing callers retain old
 # after uses the new one (lowered in the order generated, f reads the old 1000
 # as an int8: -23). ---
 run_repl "group-earlier-redefinition-calls-shadowing-value-method" \
-"interface Sz { Size() int }
+"import \"pkg/builtins/testing\"
+interface Sz { Size() int }
 type Vq struct { n int }
 func P(n int) int { if n == 0 { return 1 }; var v Vq; return f() + q(n) + cast(int, v.Size()) }
 func (v Vq) Size() int { return 1000 }
@@ -4034,6 +4376,7 @@ var s8 *Sz8 = &vv
 testing.Println(s8.Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > function P parked (pending: f, q, Vq.Size)
 > > > > > > > 1000 1000
 > > function f parked (pending: P)
@@ -4054,7 +4397,8 @@ warning: Vq.Size shadowed (incompatible signature); existing callers retain old 
 # while olds, lowered before the group, keeps the old ones (lowered in the order
 # generated, g calls the old h and reads its 2000 as an int8: -38). ---
 run_repl "group-shadowing-redefinitions-call-each-other" \
-"func P(n int) int { if n == 0 { return 1 }; return cast(int, g(0)) + cast(int, h(0)) + q(n) + cast(int, gf[int](0)) }
+"import \"pkg/builtins/testing\"
+func P(n int) int { if n == 0 { return 1 }; return cast(int, g(0)) + cast(int, h(0)) + q(n) + cast(int, gf[int](0)) }
 func g(k int) int { return 1000 }
 func h(k int) int { return 2000 }
 func gf[T any](x T) int { return 3000 }
@@ -4067,6 +4411,7 @@ func q(n int) int { return 100 + n }
 testing.Println(g(0), h(0), gf[int](0), olds(), P(1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function P parked (pending: g, h, q, gf)
 > > > > > 6000
 > function g parked (pending: P)
@@ -4088,7 +4433,8 @@ warning: gf shadowed (incompatible signature); existing callers retain old defin
 # them (ps keeps the replaced Second, ps2 runs the new one), as for a struct
 # type. ---
 run_repl "generic-non-struct-method-redefined" \
-"type Pair[T any] [2]T
+"import \"pkg/builtins/testing\"
+type Pair[T any] [2]T
 func (p Pair[T]) Second() T { return p[1] }
 func ps() int { var p Pair[int]; p[0] = 3; p[1] = 4; return p.Second() }
 func pb() bool { var p Pair[bool]; p[0] = true; return p.Second() }
@@ -4100,6 +4446,7 @@ func ps2() int { var p Pair[int]; return p.Second(5) }
 testing.Println(ps2(), ps())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 4 false
 > > 3 true
 > warning: Pair.Second shadowed (incompatible signature); existing callers retain old definition
@@ -4110,7 +4457,8 @@ testing.Println(ps2(), ps())
 # calls the new method, with its arguments; one taken before keeps calling the
 # old method (mvold). ---
 run_repl "method-value-after-shadow" \
-"type Mv struct { n int }
+"import \"pkg/builtins/testing\"
+type Mv struct { n int }
 func (v *Mv) Size() int { return 1000 }
 var mv Mv
 func mvold() int { var m *func() int = mv.Size; return m() }
@@ -4123,6 +4471,7 @@ func mvk() int { var m *func(int) int = mv.Size; return m(42) }
 testing.Println(mvk(), mv.Size(42), mvold())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > 1000
 > warning: Mv.Size shadowed (incompatible signature); existing callers retain old definition
 > > 5 5
@@ -4135,7 +4484,8 @@ testing.Println(mvk(), mv.Size(42), mvold())
 # on Mv.Size, groups them); mvold, lowered before, keeps the old one (with the old
 # wrapper reused, f reads the old 1000 as an int8: -23). ---
 run_repl "group-method-value-of-shadowing-method" \
-"type Mv struct { n int }
+"import \"pkg/builtins/testing\"
+type Mv struct { n int }
 func P(n int) int { if n == 0 { return 1 }; var v Mv; return f() + q(n) + cast(int, v.Size()) }
 func (v *Mv) Size() int { return 1000 }
 var mv Mv
@@ -4150,6 +4500,7 @@ testing.Println(mvold())
 testing.Println(P(1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > function P parked (pending: f, q, Mv.Size)
 > > > > 1000
 > > function f parked (pending: P)
@@ -4169,7 +4520,8 @@ warning: Mv.Size shadowed (incompatible signature); existing callers retain old 
 # h but parked only on P, sees the new h (its int8 use of h checks), while
 # useh, lowered before, keeps the old one. ---
 run_repl "group-shadowing-redefinition-seen-by-parked-user" \
-"func P(n int) int { if n == 0 { return 1 }; return f() + q(n) }
+"import \"pkg/builtins/testing\"
+func P(n int) int { if n == 0 { return 1 }; return f() + q(n) }
 func h() int { return 1000 }
 func useh() int { return h() }
 func f() bool { return false }
@@ -4179,6 +4531,7 @@ func q(n int) int { return 100 + n }
 testing.Println(f(), useh(), P(1))
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > function P parked (pending: f, q)
 > > > > function f parked (pending: P)
 > function h parked (pending: P)
@@ -4193,7 +4546,8 @@ warning: h shadowed (incompatible signature); existing callers retain old defini
 # --- So is a method's: f, which calls mv.Size but parked only on P, calls the
 # new method. ---
 run_repl "group-shadowing-method-seen-by-parked-user" \
-"type Mv struct { n int }
+"import \"pkg/builtins/testing\"
+type Mv struct { n int }
 func P(n int) int { if n == 0 { return 1 }; return f() + q(n) }
 func (v *Mv) Size() int { return 1000 }
 var mv Mv
@@ -4204,6 +4558,7 @@ func q(n int) int { return 100 + n }
 testing.Println(f())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > function P parked (pending: f, q)
 > > > > function f parked (pending: P)
 > method Mv.Size parked (pending: P)
@@ -4218,7 +4573,8 @@ warning: Mv.Size shadowed (incompatible signature); existing callers retain old 
 # --- And a generic type's method's: f calls the new Cell[int].get, with its
 # float64 result, while use keeps the old instance. ---
 run_repl "group-shadowing-generic-method-seen-by-parked-user" \
-"type Cell[T any] struct { v T }
+"import \"pkg/builtins/testing\"
+type Cell[T any] struct { v T }
 func P(n int) int { if n == 0 { return 1 }; return f() + q(n) }
 func (b *Cell[T]) get() int { return 1000 }
 func use() int { var b Cell[int]; return b.get() }
@@ -4230,6 +4586,7 @@ func q(n int) int { return 100 + n }
 testing.Println(f(), use())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > function P parked (pending: f, q)
 > > > 1000
 > > function f parked (pending: P)
@@ -4247,7 +4604,8 @@ warning: Cell.get shadowed (incompatible signature); existing callers retain old
 # the h gf was declared with, so the group does not wait for h's parked
 # redefinition, which resolves after it. ---
 run_repl "group-instance-body-keeps-declared-names" \
-"func h() int { return 1000 }
+"import \"pkg/builtins/testing\"
+func h() int { return 1000 }
 func gf[T any](x T) int { return cast(int, h()) }
 func P(n int) int { if n == 0 { return 1 }; return f() + q(n) }
 func f() bool { return false }
@@ -4257,6 +4615,7 @@ func q(n int) int { return 100 + n }
 testing.Println(f())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > function P parked (pending: f, q)
 > > function f parked (pending: P)
 > function h parked (pending: P)
@@ -4272,7 +4631,8 @@ warning: h shadowed (incompatible signature); existing callers retain old defini
 # redefines with another signature parks on it, though it misses nothing, and
 # calls the new h once that resolves, as f2, parked on P too, does. ---
 run_repl "prompt-declaration-waits-for-parked-redefinition" \
-"func h() int { return 1000 }
+"import \"pkg/builtins/testing\"
+func h() int { return 1000 }
 func h() int8 { return cast(int8, 3 + Q(0)) }
 func f() int { return cast(int, h()) }
 func f2() int { return cast(int, h()) + P(0) }
@@ -4281,6 +4641,7 @@ func Q(n int) int { return 0 }
 testing.Println(f(), f2(), h())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > function h parked (pending: Q)
 > function f parked (pending: h)
 > function f2 parked (pending: P, h)
@@ -4295,7 +4656,8 @@ function f2 resolved
 # the old definition, so A, resolved before it, calls the new h through its
 # function value once it resolves. ---
 run_repl "replacing-redefinition-not-waited-for" \
-"func h() int { return 1000 }
+"import \"pkg/builtins/testing\"
+func h() int { return 1000 }
 var fp *func() int = h
 func A() int { var g *func() int = h; return g() + P(0) }
 func h() int { return 5 + Q(0) }
@@ -4305,6 +4667,7 @@ func Q(n int) int { return 0 }
 testing.Println(A())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > function A parked (pending: P)
 > function h parked (pending: Q)
 > function A resolved
@@ -4316,7 +4679,8 @@ testing.Println(A())
 # redefinition of a name it uses — here found only once mk is declared — and
 # says so; it resolves after the redefinition, against it. ---
 run_repl "parked-user-waits-for-parked-redefinition" \
-"type Mv struct { n int }
+"import \"pkg/builtins/testing\"
+type Mv struct { n int }
 func (v Mv) Size() int { return 1000 }
 func f() int8 { return mk().Size() }
 func (v Mv) Size() int8 { return cast(int8, z) }
@@ -4326,6 +4690,7 @@ var z int = 7
 testing.Println(f(), mk().Size())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > function f parked (pending: mk)
 > method Mv.Size parked (pending: z)
 > > <repl>:1:1: function f is unresolved (pending: Mv.Size)
@@ -4340,7 +4705,8 @@ function f resolved
 # method is redefined with another signature, call the new method; those taken
 # before keep the old one. ---
 run_repl "method-value-after-shadow-receiver-kinds" \
-"type Va struct { n int }
+"import \"pkg/builtins/testing\"
+type Va struct { n int }
 func (v Va) Get() int { return v.n + 1000 }
 var va Va
 va.n = 7
@@ -4366,6 +4732,7 @@ func n2() int8 { var m *func() int8 = ni.Dbl; return m() }
 testing.Println(n2(), n1())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > > > > > > 1007 1007 1009
 > warning: Va.Get shadowed (incompatible signature); existing callers retain old definition
 > > > > 7 7 9 1007 1007 1009
@@ -4377,7 +4744,8 @@ testing.Println(n2(), n1())
 # --- So do method values of a generic non-struct type's method, of each of its
 # instances, and one a prompt variable's initializer takes. ---
 run_repl "method-value-after-shadow-generic-non-struct-and-var-init" \
-"type Pr[T any] [2]T
+"import \"pkg/builtins/testing\"
+type Pr[T any] [2]T
 func (p Pr[T]) Sec() int { return 1000 }
 var pi Pr[int]
 var pb Pr[bool]
@@ -4398,6 +4766,7 @@ var gk *func(int) int = mv.Size
 testing.Println(gk(42), gm())
 " \
 "$BANNER
+> package pkg/builtins/testing loaded
 > > > > > > > 1000 1000
 > warning: Pr.Sec shadowed (incompatible signature); existing callers retain old definition
 > > > 5 5 1000 1000
